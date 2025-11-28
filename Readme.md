@@ -314,7 +314,7 @@ If you use these extensions in your research, please cite:
 
 ```bibtex
 @software{dlib_transformer_extensions,
-  title = {Dlib Transformer Extensions},
+  title = {Dlib Transformer extensions},
   author = {[Cydral Technology, Aldric Pierrain]},
   year = {2025},
   url = {https://github.com/Cydral/Dlib-Transformer-extensions}
