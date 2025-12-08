@@ -72,8 +72,7 @@ namespace dlib
         Classification head for next-token prediction.
     !*/
     template <long num_logits, long embedding_dim, typename SUBNET>
-    using classification_head = loss_multiclass_log<fc<num_logits,
-        fc<embedding_dim / 4, rms_norm<SUBNET>>>>;
+    using classification_head = loss_cross_entropy_per_logit<linear<num_logits, rms_norm<SUBNET>>>;
 
     // Core model parameters
     template<
@@ -116,10 +115,10 @@ namespace dlib
         using network_type = std::conditional_t<is_training,
             classification_head<VOCAB_SIZE, EMBEDDING_DIM,
             repeat<NUM_LAYERS, t_transformer_block,
-            token_embeddings<VOCAB_SIZE, EMBEDDING_DIM, input<matrix<int, 0, 1>>>>>,
+            embeddings<VOCAB_SIZE, EMBEDDING_DIM, input<matrix<int, 0, 1>>>>>,
             classification_head<VOCAB_SIZE, EMBEDDING_DIM,
             repeat<NUM_LAYERS, i_transformer_block,
-            token_embeddings<VOCAB_SIZE, EMBEDDING_DIM, input<matrix<int, 0, 1>>>>>>;
+            embeddings<VOCAB_SIZE, EMBEDDING_DIM, input<matrix<int, 0, 1>>>>>>;
 
         struct model_info {
             static std::string describe() {
@@ -311,7 +310,7 @@ moe_param_info get_moe_param_info(const net_type& net, long num_layers)
     moe_param_info info;
 
     // Access first MoE layer
-    const auto& moe_layer = layer<5>(net).layer_details();
+    const auto& moe_layer = layer<4>(net).layer_details();
 
     // Get MoE configuration
     info.num_experts = moe_layer.num_experts();
@@ -357,6 +356,198 @@ moe_param_info get_moe_param_info(const net_type& net, long num_layers)
     return info;
 }
 
+// Reads entire file content into a string.
+std::string read_file_content(const std::string& filepath)
+{
+    std::ifstream file(filepath, std::ios::binary);
+    if (!file) {
+        cerr << "Warning: Cannot open file: " << filepath << "\n";
+        return "";
+    }
+
+    std::stringstream buffer;
+    buffer << file.rdbuf();
+    return buffer.str();
+}
+
+// Replaces all occurrences of double newlines ("\n\n") with "@@" delimiter.
+std::string normalize_paragraph_delimiters(const std::string& text)
+{
+    std::string result;
+    result.reserve(text.size());
+
+    size_t i = 0;
+    while (i < text.size()) {
+        // Check for double (or more) newlines
+        if (i + 1 < text.size() && text[i] == '\n' && text[i + 1] == '\n') {
+            result += "@@";
+            i += 2;
+
+            // Skip any additional consecutive newlines
+            while (i < text.size() && text[i] == '\n') ++i;
+        }
+        else {
+            result += text[i];
+            ++i;
+        }
+    }
+
+    return result;
+}
+
+// Recursively collects all text files from a directory using Dlib's directory class.
+void collect_text_files_recursive(
+    const directory& dir,
+    std::vector<std::string>& text_files,
+    size_t max_files = 0
+)
+{
+    // Process files in current directory
+    for (const auto& file : dir.get_files()) {
+        if (max_files > 0 && text_files.size() >= max_files) return;
+
+        // Check if it's a text file using file type detection
+        file_content_type content_type;
+        if (detect_file_type(file.full_name(), content_type)) {
+            text_files.push_back(file.full_name());
+            cout << "  Found text file: " << file.name() << "\n";
+        }
+    }
+
+    // Recursively process subdirectories
+    for (const auto& subdir : dir.get_dirs()) {
+        if (max_files > 0 && text_files.size() >= max_files) {
+            return;
+        }
+        collect_text_files_recursive(subdir, text_files, max_files);
+    }
+}
+
+// Loads external text data from a file or directory
+std::string load_external_data(
+    const std::string& path,
+    bool normalize_delimiters = true
+)
+{
+    std::string combined_text;
+
+    try {
+        // Try as directory first
+        directory dir(path);
+
+        cout << "Scanning directory recursively: " << path << "\n";
+
+        std::vector<std::string> text_files;
+        collect_text_files_recursive(dir, text_files);
+
+        cout << "Found " << text_files.size() << " text file(s)\n";
+
+        if (text_files.empty()) {
+            cerr << "Warning: No text files found in directory\n";
+            return "";
+        }
+
+        // Sort files for consistent ordering
+        std::sort(text_files.begin(), text_files.end());
+
+        // Concatenate all files with delimiter
+        size_t total_bytes = 0;
+        for (const auto& filepath : text_files) {
+            std::string content = read_file_content(filepath);
+            if (!content.empty()) {
+                combined_text += content;
+
+                // Ensure content ends with delimiter for next file
+                if (!combined_text.empty() &&
+                    combined_text.size() >= 2 &&
+                    combined_text.substr(combined_text.size() - 2) != "@@") {
+                    combined_text += "@@";
+                }
+
+                total_bytes += content.size();
+            }
+        }
+
+        cout << "Total loaded: " << total_bytes << " bytes from "
+            << text_files.size() << " file(s)\n";
+    }
+    catch (const directory::dir_not_found&) {
+        // Not a directory, try as single file
+        cout << "Loading single text file: " << path << "\n";
+
+        // Verify it's a text file
+        file_content_type content_type;
+        if (!detect_file_type(path, content_type)) {
+            cerr << "Error: File does not appear to be text: " << path << "\n";
+            cerr << "Only plain text files are supported for training.\n";
+            return "";
+        }
+
+        combined_text = read_file_content(path);
+
+        if (combined_text.empty()) {
+            cerr << "Warning: File is empty or could not be read\n";
+            return "";
+        }
+
+        cout << "Loaded " << combined_text.size() << " bytes from file\n";
+    }
+    catch (const std::exception& e) {
+        cerr << "Error loading external data: " << e.what() << "\n";
+        return "";
+    }
+
+    // Normalize paragraph delimiters if requested
+    if (normalize_delimiters && !combined_text.empty())
+        combined_text = normalize_paragraph_delimiters(combined_text);
+
+    return combined_text;
+}
+
+// Parses text with @@ delimiters into individual segments.
+std::vector<std::string> parse_delimited_segments(const std::string& text)
+{
+    std::vector<std::string> segments;
+    std::string delimiter = "@@";
+
+    size_t start = 0;
+    size_t end = text.find(delimiter);
+
+    while (end != std::string::npos) {
+        std::string segment = text.substr(start, end - start);
+
+        // Trim whitespace
+        size_t first = segment.find_first_not_of(" \t\n\r");
+        if (first != std::string::npos) {
+            size_t last = segment.find_last_not_of(" \t\n\r");
+            segment = segment.substr(first, last - first + 1);
+
+            // Add non-empty segments
+            if (!segment.empty()) {
+                segments.push_back(segment);
+            }
+        }
+
+        start = end + delimiter.length();
+        end = text.find(delimiter, start);
+    }
+
+    // Handle last segment
+    if (start < text.size()) {
+        std::string segment = text.substr(start);
+        size_t first = segment.find_first_not_of(" \t\n\r");
+        if (first != std::string::npos) {
+            size_t last = segment.find_last_not_of(" \t\n\r");
+            segment = segment.substr(first, last - first + 1);
+            if (!segment.empty()) {
+                segments.push_back(segment);
+            }
+        }
+    }
+
+    return segments;
+}
+
 int main(int argc, char** argv)
 {
     try
@@ -367,16 +558,17 @@ int main(int argc, char** argv)
         command_line_parser parser;
         parser.add_option("train", "Train a transformer model on internal datasets");
         parser.add_option("generate", "Generate text from a previously trained model");
-        parser.add_option("learning-rate", "Set the learning rate (default: 2e-4)", 1);
+        parser.add_option("learning-rate", "Set the learning rate (default: 3e-4)", 1);
         parser.add_option("batch-size", "Set the mini-batch size (default: 64)", 1);
-        parser.add_option("patience", "Iterations without progress before early stopping (default: 15000)", 1);
-        parser.add_option("max-epochs", "Maximum number of training epochs (default: 100)", 1);
-        parser.add_option("alpha", "Set the weight decay for Adam (default: 0.004)", 1);
+        parser.add_option("patience", "Iterations without progress before early stopping (default: 8000)", 1);
+        parser.add_option("max-epochs", "Maximum number of training epochs (default: 150)", 1);
+        parser.add_option("weight-decay", "Set the weight decay for Adam (default: 0.01)", 1);
         parser.add_option("beta1", "Set Adam's first moment coefficient (default: 0.9)", 1);
         parser.add_option("beta2", "Set Adam's second moment coefficient (default: 0.999)", 1);
         parser.add_option("model-file", "Path for model (default: dlib_lm_moe_model.dat)", 1);
         parser.add_option("tokenizer-file", "Path for tokenizer (default: dlib_lm_tokenizer.vocab)", 1);
         parser.add_option("output-file", "Path for generated output (default: generated_text.txt)", 1);
+        parser.add_option("external-data", "Path to external text data", 1);
         parser.parse(argc, argv);
 
         if (parser.number_of_arguments() == 0 &&
@@ -387,11 +579,11 @@ int main(int argc, char** argv)
         }
 
         // Default values
-        const double learning_rate = get_option(parser, "learning-rate", 2e-4);
+        const double learning_rate = get_option(parser, "learning-rate", 3e-4);
         const size_t batch_size = get_option(parser, "batch-size", 64);
-        const long patience = get_option(parser, "patience", 15000);
-        const size_t max_epochs = get_option(parser, "max-epochs", 100);
-        const double alpha = get_option(parser, "alpha", 0.004);
+        const long patience = get_option(parser, "patience", 8000);
+        const size_t max_epochs = get_option(parser, "max-epochs", 150);
+        const double weight_decay = get_option(parser, "weight-decay", 0.01);
         const double beta1 = get_option(parser, "beta1", 0.9);
         const double beta2 = get_option(parser, "beta2", 0.999);
         const std::string model_file = get_option(parser, "model-file", "dlib_lm_moe_model.dat");
@@ -416,12 +608,43 @@ int main(int argc, char** argv)
 
         // Load internal dataset
         cout << "Loading internal training datasets...\n";
-        std::vector<dataset_id> datasets = {
+        std::vector<dataset_id> text_datasets = {
             dataset_id::BLACK_HOLE_ARTICLE,
             dataset_id::PHYSICS_PARAGRAPHS,
 			dataset_id::GENERAL_KNOWLEDGE
         };
-        auto training_segments = get_dataset_as_segments(datasets);
+        auto text_segments = get_dataset_as_segments(text_datasets);
+
+        // Load external data if provided
+        std::string external_corpus_for_tokenizer;
+        if (parser.option("external-data")) {
+            std::string external_path = parser.option("external-data").argument();
+
+            std::string external_text = load_external_data(external_path, true);
+            if (!external_text.empty()) {
+                // Store raw text for tokenizer training (if needed later)
+                external_corpus_for_tokenizer = external_text;
+
+                // Parse into segments for training
+                cout << "Parsing external data into segments...\n";
+                auto external_segments = parse_delimited_segments(external_text);
+                cout << "Parsed " << external_segments.size() << " external segments\n";
+
+                if (!external_segments.empty()) {
+                    // Add to training data
+                    size_t original_count = text_segments.size();
+                    text_segments.insert(text_segments.end(),
+                        external_segments.begin(), external_segments.end());
+
+                    cout << "Training segments: " << original_count
+                        << " (internal) + " << external_segments.size()
+                        << " (external) = " << text_segments.size() << " (total)\n";
+                }
+            }
+            else {
+                cerr << "Warning: no valid external data loaded, continuing with internal datasets only\n";
+            }
+        }
 
         // Tokens filename
         const std::string tokens_file = "dlib_datasets_tokens.bin";
@@ -465,7 +688,7 @@ int main(int argc, char** argv)
                         total_tokens += segment_tokens.size();
 
                     cout << "Loaded " << full_tokens.size() << " segments ("
-                        << total_tokens << " total tokens) from file.\n";
+                        << total_tokens << " tokens) from file\n";
                     tokens_loaded = true;
                 }
                 catch (const std::exception& e) {
@@ -490,6 +713,9 @@ int main(int argc, char** argv)
                         + get_dataset_as_text(dataset_id::BLACK_HOLE_QA_PARTC) + delimiter
                         + get_dataset_as_text(dataset_id::GENERAL_KNOWLEDGE);
 
+                    if (!external_corpus_for_tokenizer.empty())
+                        tokenizer_corpus += delimiter + external_corpus_for_tokenizer;
+
                     // Replace all "@@" delimiters with spaces
                     size_t pos = 0;
                     while ((pos = tokenizer_corpus.find(delimiter, pos)) != std::string::npos) {
@@ -506,15 +732,18 @@ int main(int argc, char** argv)
                 cout << "Tokenizing input text segments...\n";
                 int text_start_id = tokenizer.get_special_token_id("<text>"),
                     text_end_id = tokenizer.get_special_token_id("</text>");
-                if (text_start_id < 0 || text_end_id < 0)
-                    cout << "Warning: Special tokens not found in tokenizer vocabulary.\n";
+                if (text_start_id < 0 || text_end_id < 0) {
+                    cerr << "ERROR: Required special tokens not found in tokenizer vocabulary!\n";
+                    cerr << "The tokenizer must include: <text>, </text>\n";
+                    return 1;
+                }
 
                 auto start_time = std::chrono::high_resolution_clock::now();
                 full_tokens.clear();
 
-                // Process each segment independently with delimiters
+                // Format : <text>content</text>
                 size_t total_tokens = 0;
-                for (const auto& segment : training_segments) {
+                for (const auto& segment : text_segments) {
                     std::vector<int> segment_tokens;
                     segment_tokens.push_back(text_start_id);
                     auto encoded_tokens = tokenizer.encode(segment);
@@ -527,8 +756,8 @@ int main(int argc, char** argv)
 
                 auto end_time = std::chrono::high_resolution_clock::now();
                 auto tokenize_time = std::chrono::duration_cast<std::chrono::seconds>(end_time - start_time).count();
-                cout << "Tokenization complete: " << total_tokens << " total tokens from "
-                    << training_segments.size() << " segments in " << tokenize_time << "s.\n";
+                cout << "Tokenization complete: " << total_tokens << " tokens in " << tokenize_time << "s.\n";
+                text_segments.clear();
 
                 // Save tokens for future use using Dlib serialization
                 cout << "Saving tokens to file: " << tokens_file << endl;
@@ -573,12 +802,12 @@ int main(int argc, char** argv)
                 !file_exists("chkpt-" + model_file)) deserialize(model_file) >> net >> tokenizer;            
 
             // Create trainer
-            dnn_trainer<net_type, adam> trainer(net, adam(alpha, beta1, beta2), gpus);
+            dnn_trainer<net_type, adam> trainer(net, adam(weight_decay, beta1, beta2), gpus);
             trainer.set_learning_rate(learning_rate);
             trainer.set_min_learning_rate(1e-6);
             trainer.set_mini_batch_size(batch_size);
             trainer.set_iterations_without_progress_threshold(patience);
-            trainer.set_synchronization_file("chkpt-" + model_file, std::chrono::minutes(10));
+            trainer.set_synchronization_file("chkpt-" + model_file, std::chrono::minutes(5));
             trainer.be_quiet();
             cout << net << endl << endl; // Show the model architecture
             cout << "Starting training...\n";
@@ -589,7 +818,8 @@ int main(int argc, char** argv)
             auto epoch_start = std::chrono::high_resolution_clock::now();
 
             // Training loop
-            while (trainer.get_learning_rate() >= 1e-6 && epoch < max_epochs && !g_terminate_flag.load())
+            while (trainer.get_learning_rate() >= trainer.get_min_learning_rate() 
+                && epoch < max_epochs && !g_terminate_flag.load())
             {
                 total_loss = 0.0;
                 batches_seen = 0, samples_seen = 0;
@@ -638,22 +868,20 @@ int main(int argc, char** argv)
 
             // Evaluate on training set
             {
-                if (!g_terminate_flag.load()) {
-                    cout << "Evaluating model accuracy...\n";
-                    my_transformer::network_type<false> g_infer;
-                    deserialize(model_file) >> g_infer >> tokenizer;
-                    auto predicted = g_infer(samples);
-                    size_t correct = 0;
-                    for (size_t i = 0; i < labels.size(); ++i)
-                        if (predicted[i] == labels[i]) correct++;
-                    double accuracy = (double)correct / labels.size();
-                    cout << "Training accuracy: " << (accuracy * 100.0) << "%\n";
+                cout << "Evaluating model accuracy...\n";
+                my_transformer::network_type<false> g_infer;
+                deserialize(model_file) >> g_infer >> tokenizer;
+                auto predicted = g_infer(samples);
+                size_t correct = 0;
+                for (size_t i = 0; i < labels.size(); ++i)
+                    if (predicted[i] == labels[i]) correct++;
+                double accuracy = (double)correct / labels.size();
+                cout << "Training accuracy: " << (accuracy * 100.0) << "%\n";
 
-                    // We need perfect accuracy to reconstruct the internal datasets
-                    if (accuracy < 0.999) {
-                        cout << "WARNING: Model accuracy is less than 99.90%. The model may not "
-                            << "perfectly reconstruct the input text.\n";
-                    }
+                // We need perfect accuracy to reconstruct the internal datasets
+                if (accuracy < 0.999) {
+                    cout << "WARNING: Model accuracy is less than 99.90%. The model may not "
+                        << "perfectly reconstruct the input text.\n";
                 }
             }
         }
@@ -709,7 +937,7 @@ int main(int argc, char** argv)
 
             // Select a segment for generation
             dlib::rand rng(std::chrono::system_clock::now().time_since_epoch().count());
-            size_t segment_idx = rng.get_random_32bit_number() % 50;
+            size_t segment_idx = rng.get_random_32bit_number() % 100;
             cout << "Randomly selected segment #" << segment_idx << " (out of "
                 << tokenized_segments.size() << ") for generation\n";
             const auto& selected_segment = tokenized_segments[segment_idx];
