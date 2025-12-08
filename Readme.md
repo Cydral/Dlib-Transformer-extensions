@@ -230,8 +230,6 @@ Dynamic computation allocation based on input complexity (Graves, 2016), learnin
 
 Specialized loss for sequence models working directly with linear layer output, computing cross-entropy only at the last position of each sequence. This matches autoregressive next-token prediction and avoids dimension flattening required by standard classification loss, preserving sequence structure.
 
-Implements numerically stable softmax computation via log-sum-exp trick to prevent overflow in exponential calculations.
-
 ### Standard classification loss
 
 For smaller models, standard multiclass logarithmic loss with final fully connected layer remains effective, providing dimensionality reduction and additional parameter capacity before classification.
@@ -274,6 +272,132 @@ Sparse conditional computation with enhanced training techniques:
 
 The MoE example demonstrates production-grade training techniques including randomization and noise injection, showing how sparse activation enables efficient scaling. The augmentation utilities improve model robustness when training on large volumes of information.
 
+### Chatbot with conversational fine-tuning
+
+Two-stage training for question-answering systems:
+
+**Stage 1 - Base language model**: trains on pure text corpora using `<text>content</text>` format, learning language structure and domain knowledge without conversational patterns.
+
+**Stage 2 - Conversational fine-tuning**: specializes the base model for Q&A using structured format:
+```
+<question><text>question_text</text><answer><text>answer_text</text>
+```
+
+The fine-tuning stage:
+- loads checkpoint from base training (best validation loss)
+- applies layer-wise learning rate strategy
+- trains on 100-300 Q&A pairs
+- converges in 5-10 epochs
+
+The inference stage demonstrates:
+- per-row softmax for sequence probability distributions
+- temperature-controlled generation
+- multi-technique sampling (repetition penalty, min-p, top-k, nucleus)
+- proper context extraction (last position for next token)
+- conversational context management with role markers
+
+The example includes both deterministic (argmax) and stochastic generation modes, with configurable sampling parameters for controlling output quality and diversity. The complete pipeline from base training through specialized fine-tuning to interactive inference demonstrates production-grade chatbot development.
+
+---
+
+## Inference and text generation
+
+### Stochastic generation techniques
+
+Production-quality text generation requires sophisticated sampling strategies beyond simple argmax decoding. The chatbot example demonstrates a complete inference pipeline with:
+
+**Temperature scaling**: controls output randomness by dividing logits before softmax, with values below 1.0 producing more focused distributions and values above 1.0 increasing diversity.
+
+**Repetition penalty**: discourages token repetition by dividing probabilities of recently generated tokens, preventing loops and improving output quality. Applied to the most recent 20% of context with configurable penalty strength.
+
+**Min-p filtering**: adaptive threshold that filters tokens below a percentage of the maximum probability, automatically adjusting to distribution confidence. More robust than fixed probability thresholds.
+
+**Top-k filtering**: limits consideration to the k most probable tokens, reducing the risk of sampling unlikely tokens while maintaining diversity.
+
+**Nucleus sampling (top-p)**: selects the smallest set of tokens whose cumulative probability exceeds threshold p, dynamically adjusting the candidate set size based on distribution shape.
+
+The complete sampling pipeline applies these techniques sequentially:
+1. Apply repetition penalty to recently seen tokens
+2. Renormalize distribution
+3. Filter by min-p threshold
+4. Sort and apply top-k
+5. Apply nucleus sampling (top-p)
+6. Final renormalization
+7. Sample from filtered distribution
+
+### Per-row softmax for sequence models
+
+Language models output logits with shape `(batch, 1, sequence_length, vocab_size)`, requiring independent probability distributions at each sequence position. The `softmaxm` layer applies row-wise softmax, computing:
+```
+softmaxm(x)[i,j] = exp(x[i,j]) / Σ_k exp(x[i,k])
+```
+
+This differs from global `softmax` which normalizes across all tensor elements, ensuring each position in the sequence has a valid probability distribution over the vocabulary.
+
+### Generation architecture
+
+The chatbot example demonstrates proper inference setup:
+```cpp
+// Inference network with per-row softmax and temperature scaling
+softmaxm<multiply> generator(multiply_(1.0 / temperature));
+
+// Load trained model weights
+infer_net net;
+deserialize(model_checkpoint) >> net;
+generator.subnet().subnet() = net.subnet();
+
+// Extract probabilities at last sequence position
+auto& probs_tensor = generator(input_window);
+const long vocab_size = probs_tensor.nc();
+const long last_pos = probs_tensor.nr() - 1;
+const long offset = last_pos * vocab_size;
+const float* probs = probs_tensor.host() + offset;
+
+// Apply sampling strategy
+int next_token = deterministic ? argmax(probs) : stochastic_sample(probs);
+```
+
+The key insight: only the last position in the sequence is used for next-token prediction, matching the autoregressive training objective.
+
+### Context management for generation
+
+The `inference_context` class maintains conversation history with sliding window behavior:
+
+- configurable capacity with automatic padding
+- efficient FIFO buffer for token sequences
+- window extraction aligned to model's context length
+- support for conversational structure with role-based tokens
+
+Proper context management enables:
+- multi-turn conversations with history preservation
+- long-form generation exceeding model's window
+- structured formats with special tokens (question/answer markers)
+
+### Fine-tuning strategies
+
+Specialized chatbot training employs layer-wise learning rate multipliers:
+```cpp
+// Different adaptation rates for different components
+set_all_learning_rate_multipliers(net, 0.1);      // Base: 10% of learning rate
+layer<1>(net).set_learning_rate_multiplier(1.0);   // Linear head: full learning rate
+layer<2>(net).set_learning_rate_multiplier(0.5);   // Normalization: 50%
+layer(net).set_learning_rate_multiplier(0.5);   // Embeddings: 50%
+```
+
+This strategy:
+- preserves pre-trained representations in intermediate layers
+- allows adaptation of input/output mappings
+- prevents catastrophic forgetting of base knowledge
+- enables efficient fine-tuning with small datasets (100-300 examples)
+
+Training hyperparameters for fine-tuning differ significantly from base training:
+- learning rate: 1e-5 (vs 3e-4 for base training)
+- batch size: 16 (vs 64 for base training)
+- epochs: 5-10 (vs 100+ for base training)
+- patience: 300 steps (vs 8000 for base training)
+
+The reduced batch size provides more frequent gradient updates critical when training on small question-answer datasets.
+
 ---
 
 ## Theoretical background
@@ -314,15 +438,17 @@ If you use these extensions in your research, please cite:
 
 ```bibtex
 @software{dlib_transformer_extensions,
-  title = {Dlib Transformer extensions},
-  author = {[Cydral Technology, Aldric Pierrain]},
+  title = {Dlib Transformer extensions: advanced language modeling},
+  author = {Cydral Technology, Aldric Pierrain},
   year = {2025},
-  url = {https://github.com/Cydral/Dlib-Transformer-extensions}
+  url = {https://github.com/Cydral/Dlib-Transformer-extensions},
+  note = {Transformer architectures with inference utilities for C++}
 }
 ```
 
 Core references:
 - Vaswani et al. (2017). "Attention Is All You Need." NeurIPS.
+- - Holtzman et al. (2020). "The Curious Case of Neural Text Degeneration." ICLR. [nucleus sampling]
 - Bahdanau et al. (2015). "Neural Machine Translation by Jointly Learning to Align and Translate." ICLR.
 - Su et al. (2021). "RoFormer: Enhanced Transformer with Rotary Position Embedding." arXiv:2104.09864.
 - Zhang & Sennrich (2019). "Root Mean Square Layer Normalization." NeurIPS.
