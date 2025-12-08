@@ -83,6 +83,43 @@ The MoE example demonstrates how sparse activation enables scaling model capacit
 
 ---
 
+### slm_chatbot_ex.cpp
+
+Conversational AI with two-stage training and advanced inference techniques.
+
+**Purpose**: demonstrates production-grade chatbot development from base language model training through specialized fine-tuning to interactive generation with sophisticated sampling strategies.
+
+**Key characteristics**:
+- two-stage training pipeline: base language model on pure text, then conversational fine-tuning on Q&A pairs
+- layer-wise learning rate strategy for efficient fine-tuning with small datasets
+- checkpoint-based fine-tuning loading best validation loss from base training
+- structured conversational format with role markers: `<question>`, `<answer>`, `<text>`
+- stochastic text generation with multiple sampling techniques
+- proper per-row softmax for sequence probability distributions
+- conversational context management with sliding window
+
+The chatbot example demonstrates the complete pipeline for creating specialized conversational models, showing how a general language model can be efficiently adapted for question-answering tasks with minimal additional training data.
+
+**Training pipeline**: the program implements industry-standard two-stage training. Stage 1 trains a base language model on domain-specific text corpora using simple `<text>content</text>` format, learning language structure and knowledge without conversational patterns. Stage 2 fine-tunes this base model on 100-300 Q&A pairs using structured format `<question><text>Q</text><answer><text>A</text>`, specializing for conversational interaction. This separation enables efficient knowledge acquisition in stage 1 and behavioral specialization in stage 2.
+
+**Fine-tuning strategy**: as documented in the source file, fine-tuning employs differentiated learning rates across network layers. All layers receive 10% of the base learning rate, while specific components receive higher rates: the linear classification head (100%), normalization layers (50%), and embeddings (50%). This strategy preserves pre-trained representations in intermediate layers while allowing adaptation of input/output mappings, preventing catastrophic forgetting while enabling effective specialization.
+
+**Fine-tuning hyperparameters**: the training parameters differ significantly from base training to reflect the small dataset size and specialization objective. Learning rate is set to 1e-5 (compared to 3e-4 for base training), batch size to 16 (versus 64), maximum epochs to 10 (versus 150), and patience to 300 steps (versus 8000). The reduced batch size provides more frequent gradient updates critical when training on small question-answer datasets, while the low learning rate prevents disruption of pre-trained representations.
+
+**Inference innovations**: the program demonstrates proper sequence model inference with per-row softmax (`softmaxm` layer) that computes independent probability distributions at each sequence position, contrasting with global `softmax` that would normalize across all positions. Temperature scaling via `multiply` layer controls output diversity by scaling logits before normalization. The inference pipeline correctly extracts predictions from the last sequence position only, matching the autoregressive training objective.
+
+**Stochastic generation**: the program implements a comprehensive sampling pipeline combining multiple techniques for quality control. Repetition penalty discourages token repetition by reducing probabilities of recently generated tokens (most recent 20% of context). Min-p filtering sets adaptive thresholds relative to maximum probability, automatically adjusting to distribution confidence. Top-k filtering limits consideration to the k most probable tokens. Nucleus sampling (top-p) dynamically selects the smallest token set whose cumulative probability exceeds threshold p. These techniques are applied sequentially with proper renormalization between steps, enabling fine-grained control over generation quality and diversity.
+
+**Context management**: the `inference_context` class maintains conversation history with FIFO buffer behavior, supporting multi-turn conversations with proper handling of role markers. The sliding window extraction aligns to the model's context length, with automatic padding for incomplete contexts. This enables long-form conversations exceeding the model's training window while preserving conversational structure.
+
+**Architecture specifications**: the model uses the same compact configuration as the MoE example with 4 transformer layers, 6 attention heads, 228-dimensional embeddings, and a 100-token context window. The vocabulary contains 3,500 BPE tokens. This demonstrates that effective conversational models can be built with modest architectures when proper training strategies and inference techniques are applied.
+
+**Generation modes**: the program supports both deterministic (argmax) and stochastic generation, with command-line parameters controlling sampling behavior. Deterministic mode selects the highest probability token at each step, producing consistent but potentially repetitive output. Stochastic mode applies the full sampling pipeline, producing diverse responses with controllable randomness. Parameters include temperature (default 0.8), top-k (50), top-p (0.9), repetition penalty (1.2), and min-p (0.05).
+
+**Dataset structure**: the fine-tuning stage expects Q&A pairs formatted with explicit role markers, enabling the model to learn conversational structure. Questions are wrapped in `<question><text>question_text</text>` and answers in `<answer><text>answer_text</text>`. This structured format allows the model to distinguish between user queries and assistant responses, essential for proper conversational behavior. The program includes utilities to display random training examples, facilitating dataset validation and quality assessment.
+
+---
+
 ## Example progression
 
 The three examples form a pedagogical sequence:
