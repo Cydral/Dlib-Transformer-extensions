@@ -5757,7 +5757,7 @@ namespace dlib
     //   TRANSITION_NET: network type for state transition (e.g., ffn_act_block)
     //   max_steps_: maximum number of computation steps per position
 
-    class adam; // Forward declaration
+    class adamw; // Forward declaration
     template <typename TRANSITION_NET, long max_steps_ = 8>
     class adaptive_computation_time_
     {
@@ -6251,11 +6251,11 @@ namespace dlib
             // Skip if frozen or in gradient check mode
             if (learning_rate_multiplier_ == 0.0 || gradient_check_mode_) return;
 
-            // Initialize Adam solvers on first call
+            // Initialize AdamW solvers on first call
             if (!transition_solvers_initialized_) {
                 transition_solvers_.resize(
                     transition_net_.num_computational_layers,
-                    adam(0.0005, 0.9, 0.999)  // weight_decay, beta1, beta2
+                    adamw(0.0005, 0.9, 0.999)  // weight_decay, beta1, beta2
                 );
                 transition_solvers_initialized_ = true;
             }
@@ -6301,7 +6301,7 @@ namespace dlib
         resizable_tensor input_cache_;
         resizable_tensor current_state_;
 
-        std::vector<adam> transition_solvers_;
+        std::vector<adamw> transition_solvers_;
         bool transition_solvers_initialized_;
     };
 
