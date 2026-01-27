@@ -3293,29 +3293,23 @@ namespace dlib
             long ignore_index
         )
         {
-            float count = 0.0f;
+            float local = 0.0f;
 
-            for (auto sample_idx : grid_stride_range(0, batch_size))
+            for (size_t token_idx : grid_stride_range(0, batch_size* seq_len))
             {
-                for (size_t t = 0; t < seq_len; ++t)
-                {
-                    unsigned long target_class;
-                    if (t < seq_len - 1)
-                    {
-                        const size_t input_idx = sample_idx * seq_len + (t + 1);
-                        target_class = static_cast<unsigned long>(input_data[input_idx]);
-                    }
-                    else
-                    {
-                        target_class = truth[sample_idx];
-                    }
+                const size_t i = token_idx / seq_len;
+                const size_t t = token_idx % seq_len;
 
-                    if (ignore_index < 0 || static_cast<long>(target_class) != ignore_index)
-                        count += 1.0f;
-                }
+                unsigned long target_class =
+                    (t < seq_len - 1)
+                    ? static_cast<unsigned long>(input_data[i * seq_len + t + 1])
+                    : truth[i];
+
+                if (ignore_index < 0 || static_cast<long>(target_class) != ignore_index)
+                    local += 1.0f;
             }
 
-            warp_reduce_atomic_add(*valid_count, count);
+            warp_reduce_atomic_add(*valid_count, local);
         }
 
         __global__ void _cuda_compute_loss_cross_entropy_per_logit(
@@ -3324,78 +3318,66 @@ namespace dlib
             const unsigned long* truth,
             const float* input_data,
             const float* out_data,
-            size_t batch_size,
-            size_t seq_len,
-            size_t vocab_size,
+            long batch_size,
+            long seq_len,
+            long vocab_size,
             float scale,
             long ignore_index,
             float smooth_target,
             float smooth_other
         )
         {
-            float total_loss = 0.0f;
+            float local_loss = 0.0f;
 
-            for (auto sample_idx : grid_stride_range(0, batch_size))
+            for (size_t token_idx : grid_stride_range(0, batch_size* seq_len))
             {
-                for (size_t t = 0; t < seq_len; ++t)
+                const size_t i = token_idx / seq_len;
+                const size_t t = token_idx % seq_len;
+                const size_t base = i * seq_len * vocab_size + t * vocab_size;
+
+                unsigned long target_class =
+                    (t < seq_len - 1)
+                    ? static_cast<unsigned long>(input_data[i * seq_len + t + 1])
+                    : truth[i];
+
+                if (ignore_index >= 0 && static_cast<long>(target_class) == ignore_index)
                 {
-                    unsigned long target_class;
-                    if (t < seq_len - 1)
-                    {
-                        const size_t input_idx = sample_idx * seq_len + (t + 1);
-                        target_class = static_cast<unsigned long>(input_data[input_idx]);
-                    }
-                    else
-                    {
-                        target_class = truth[sample_idx];
-                    }
-
-                    const size_t base_idx = sample_idx * seq_len * vocab_size + t * vocab_size;
-
-                    // Skip ignored tokens
-                    if (ignore_index >= 0 && static_cast<long>(target_class) == ignore_index)
-                    {
-                        for (size_t c = 0; c < vocab_size; ++c)
-                            g[base_idx + c] = 0.0f;
-                        continue;
-                    }
-
-                    // Find max logit for numerical stability
-                    float max_val = out_data[base_idx];
-                    for (size_t c = 1; c < vocab_size; ++c)
-                        max_val = ::max(max_val, out_data[base_idx + c]);
-
-                    // Compute softmax denominator
-                    float sum_exp = 0.0f;
                     for (size_t c = 0; c < vocab_size; ++c)
-                    {
-                        const size_t idx = base_idx + c;
-                        const float exp_val = ::exp(out_data[idx] - max_val);
-                        g[idx] = exp_val;
-                        sum_exp += exp_val;
-                    }
+                        g[base + c] = 0.0f;
+                    continue;
+                }
 
-                    // Compute loss and gradients with label smoothing
-                    for (size_t c = 0; c < vocab_size; ++c)
-                    {
-                        const size_t idx = base_idx + c;
-                        const float softmax_val = g[idx] / sum_exp;
+                float max_val = out_data[base];
+                for (size_t c = 1; c < vocab_size; ++c)
+                    max_val = fmaxf(max_val, out_data[base + c]);
 
-                        // Target probability with label smoothing
-                        const float target_prob = (c == target_class) ? smooth_target : smooth_other;
+                float sum_exp = 0.0f;
+                for (size_t c = 0; c < vocab_size; ++c)
+                {
+                    float e = expf(out_data[base + c] - max_val);
+                    g[base + c] = e;
+                    sum_exp += e;
+                }
 
-                        // Cross-entropy loss: -sum(p * log(q))
-                        if (target_prob > 0.0f)
-                            total_loss -= target_prob * ::log(::max(softmax_val, 1e-10f));
+                for (size_t c = 0; c < vocab_size; ++c)
+                {
+                    float p = g[base + c] / sum_exp;
+                    float tgt = (c == target_class) ? smooth_target : smooth_other;
 
-                        // Gradient: scale * (softmax - target_prob)
-                        //g[idx] = scale * (softmax_val - target_prob);
-                        g[idx] = softmax_val - target_prob;
-                    }
+                    if (tgt > 0)
+                        local_loss -= tgt * logf(fmaxf(p, 1e-10f));
+
+                    g[base + c] = p - tgt;
                 }
             }
 
-            warp_reduce_atomic_add(*loss_out, total_loss);
+            warp_reduce_atomic_add(*loss_out, local_loss);
+        }
+
+        __global__ void scale_gradient_kernel(float* grad, size_t size, float scale)
+        {
+            for (size_t idx : grid_stride_range(0, size))
+                grad[idx] *= scale;
         }
 
         void compute_loss_cross_entropy_per_logit::do_work(
@@ -3467,6 +3449,9 @@ namespace dlib
                 smooth_target,
                 smooth_other
             );
+
+            launch_kernel(scale_gradient_kernel, max_jobs(gradient.size()),
+                gradient.device(), gradient.size(), static_cast<float>(scale));
 
             float floss;
             dlib::cuda::memcpy(&floss, loss_work_buffer);
