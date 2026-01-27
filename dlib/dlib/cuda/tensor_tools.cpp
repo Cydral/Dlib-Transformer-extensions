@@ -1486,6 +1486,8 @@ namespace dlib { namespace tt
             batch_size, seq_len, num_channels, feature_dim);
 #endif
     }
+    
+// ----------------------------------------------------------------------------------------
 
     void apply_act_depth_scaling(
         tensor& gradients,
@@ -1506,6 +1508,22 @@ namespace dlib { namespace tt
 #endif
     }
     
+// ----------------------------------------------------------------------------------------
+
+    void apply_rotary_positional_embedding(
+        bool is_backward,
+        resizable_tensor& data,
+        const resizable_tensor& cos_cache,
+        const resizable_tensor& sin_cache
+    )
+    {
+#ifdef DLIB_USE_CUDA
+        cuda::apply_rotary_positional_embedding(is_backward, data, cos_cache, sin_cache);
+#else
+        cpu::apply_rotary_positional_embedding(is_backward, data, cos_cache, sin_cache);
+#endif
+    }
+
 // ----------------------------------------------------------------------------------------
 
 }}

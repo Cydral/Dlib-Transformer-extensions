@@ -3199,6 +3199,90 @@ namespace dlib
 
     // ----------------------------------------------------------------------------------------
 
+        __global__ void apply_rope_kernel(
+            float* __restrict__ data,
+            const float* __restrict__ cos_cache,
+            const float* __restrict__ sin_cache,
+            const size_t total_pairs,
+            const long num_heads,
+            const long seq_len,
+            const long d_head,
+            const long half_d,
+            const long rot_dim,
+            const bool is_backward)
+        {
+            for (auto pair_id : grid_stride_range(0, total_pairs))
+            {
+                const long pair_idx = pair_id % half_d;
+                const long pos = (pair_id / half_d) % seq_len;
+                const long head = (pair_id / (half_d * seq_len)) % num_heads;
+                const long batch = pair_id / (half_d * seq_len * num_heads);
+
+                const long dim_i = pair_idx * 2;
+                if (dim_i >= rot_dim) continue;
+
+                const long base_offset = ((batch * num_heads + head) * seq_len + pos) * d_head;
+                const long data_offset = base_offset + dim_i;
+                const long trig_offset = pos * half_d + pair_idx;
+
+                const float c = cos_cache[trig_offset];
+                const float s = sin_cache[trig_offset];
+                const float x0 = data[data_offset];
+                const float x1 = data[data_offset + 1];
+
+                if (!is_backward)
+                {
+                    // Forward: rotation standard
+                    data[data_offset] = x0 * c - x1 * s;
+                    data[data_offset + 1] = x0 * s + x1 * c;
+                }
+                else
+                {
+                    // Backward: rotation inverse
+                    data[data_offset] = x0 * c + x1 * s;
+                    data[data_offset + 1] = -x0 * s + x1 * c;
+                }
+            }
+        }
+
+        void apply_rotary_positional_embedding(
+            bool is_backward,
+            tensor& data,
+            const tensor& cos_cache,
+            const tensor& sin_cache)
+        {
+            const long batch_size = data.num_samples();
+            const long num_heads = data.k();
+            const long seq_len = data.nr();
+            const long d_head = data.nc();
+            const long half_d = d_head / 2;
+
+            DLIB_CASSERT(cos_cache.nr() == seq_len, "cos_cache.nr() must match seq_len");
+            DLIB_CASSERT(cos_cache.nc() == half_d, "cos_cache.nc() must be d_head/2");
+            DLIB_CASSERT(sin_cache.nr() == seq_len, "sin_cache.nr() must match seq_len");
+            DLIB_CASSERT(sin_cache.nc() == half_d, "sin_cache.nc() must be d_head/2");
+
+            const bool is_odd = (d_head % 2 != 0);
+            const long rot_dim = is_odd ? d_head - 1 : d_head;
+
+            const size_t total_elements = batch_size * num_heads * seq_len * half_d;
+            if (total_elements == 0) return;
+
+            launch_kernel(apply_rope_kernel, max_jobs(total_elements),
+                data.device(),
+                cos_cache.device(),
+                sin_cache.device(),
+                total_elements,
+                num_heads,
+                seq_len,
+                d_head,
+                half_d,
+                rot_dim,
+                is_backward
+            );
+        }
+
+    // ----------------------------------------------------------------------------------------
 
         __device__ float cuda_log1pexp(float x)
         {

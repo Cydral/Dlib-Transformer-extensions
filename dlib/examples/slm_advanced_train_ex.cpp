@@ -45,188 +45,18 @@
 #include <fstream>
 #include <chrono>
 #include <algorithm>
-#include <csignal>
+
+#include <dlib/dnn.h>
 #include <dlib/data_io.h>
 #include <dlib/cmd_line_parser.h>
-#include <dlib/misc_api.h>
 #include <dlib/tokenizer/bpe_tokenizer.h>
-#include <dlib/serialize.h>
-#include <dlib/dnn.h>
+#include <dlib/misc_api.h>
 
 using namespace std;
 using namespace dlib;
 
-namespace dlib
+namespace dlib_extensions
 {
-    /*!
-        @class rotary_positional_embedding_
-        @brief Implements Rotary Positional Embeddings (RoPE) for transformers
-
-        This layer applies rotary positional embeddings to queries and keys in
-        self-attention layers, providing relative positional information without
-        absolute position embeddings.
-
-        The implementation follows the RoPE formulation from [2], where positions
-        are encoded through rotation matrices applied to pairs of dimensions.
-    !*/
-    class rotary_positional_embedding_ {
-    public:
-        explicit rotary_positional_embedding_() = default;
-
-        template <typename SUBNET>
-        void setup(const SUBNET& sub) {
-            // Precompute the rotation angles and their trigonometric values
-            seq_len = sub.get_output().nr();
-            d_head = sub.get_output().nc();
-            compute_rotation_angles();
-            precompute_trigonometric_values();
-        }
-
-        template <typename SUBNET>
-        void forward(const SUBNET& sub, resizable_tensor& output) {
-            const tensor& input = sub.get_output();
-            output.copy_size(input);
-            tt::copy_tensor(false, output, 0, input, 0, input.k());
-
-            // Apply rotary embedding to the output
-            apply_rotary_embedding(output);
-        }
-
-        template <typename SUBNET>
-        void backward(
-            const tensor& gradient_input,
-            SUBNET& sub,
-            tensor& params_grad
-        ) {
-            tensor& prev = sub.get_gradient_input();
-            resizable_tensor grad_output;
-            grad_output.copy_size(gradient_input);
-            tt::copy_tensor(false, grad_output, 0, gradient_input, 0, gradient_input.k());
-
-            // Apply the inverse rotation to the gradient (transpose of the rotation matrix)
-            apply_rotary_embedding(grad_output, true);
-            tt::copy_tensor(true, prev, 0, grad_output, 0, grad_output.k());
-        }
-
-        const tensor& get_layer_params() const { return params; }
-        tensor& get_layer_params() { return params; }
-
-        friend void serialize(const rotary_positional_embedding_& item, std::ostream& out) {
-            std::string version = "rotary_positional_embedding_";
-            dlib::serialize(version, out);
-            dlib::serialize(item.seq_len, out);
-            dlib::serialize(item.d_head, out);
-            dlib::serialize(item.angles, out);
-            dlib::serialize(item.cos_values, out);
-            dlib::serialize(item.sin_values, out);
-        }
-
-        friend void deserialize(rotary_positional_embedding_& item, std::istream& in) {
-            std::string version;
-            dlib::deserialize(version, in);
-            if (version != "rotary_positional_embedding_")
-                throw serialization_error("Unexpected version found while deserializing rotary_positional_embedding_.");
-            dlib::deserialize(item.seq_len, in);
-            dlib::deserialize(item.d_head, in);
-            dlib::deserialize(item.angles, in);
-            dlib::deserialize(item.cos_values, in);
-            dlib::deserialize(item.sin_values, in);
-        }
-
-        friend std::ostream& operator<<(std::ostream& out, const rotary_positional_embedding_& item) {
-            out << "rotary_positional_embedding";
-            out << " (d_head=" << item.d_head << ", seq_len=" << item.seq_len << ")";
-            return out;
-        }
-
-        friend void to_xml(const rotary_positional_embedding_& item, std::ostream& out)
-        {
-            out << "<rotary_positional_embedding"
-                << " d_head='" << item.d_head << "'"
-                << " seq_len='" << item.seq_len << "'"
-                << "/>\n";
-        }
-
-    protected:
-        void compute_rotation_angles() {
-            // Following the original RoPE paper formulation
-            const float base = 10000.0f;
-            const long half_dim = d_head / 2;
-            angles.set_size(seq_len, half_dim);
-
-            for (long pos = 0; pos < seq_len; ++pos) {
-                for (long i = 0; i < half_dim; ++i) {
-                    float inv_freq = std::pow(base, -2.0f * (i + 0.5f) / d_head);
-                    angles(pos, i) = pos * inv_freq;
-                }
-            }
-        }
-
-        void precompute_trigonometric_values() {
-            // Precompute cos and sin for all angles
-            cos_values.set_size(angles.nr(), angles.nc());
-            sin_values.set_size(angles.nr(), angles.nc());
-
-            for (long i = 0; i < angles.size(); ++i) {
-                cos_values(i) = std::cos(angles(i));
-                sin_values(i) = std::sin(angles(i));
-            }
-        }
-
-        template <typename tensor_type>
-        void apply_rotary_embedding(
-            tensor_type& x,
-            bool is_backward = false
-        ) const {
-            DLIB_CASSERT(x.nc() == d_head, "Input dimension must match d_head param");
-            DLIB_CASSERT(x.nr() == seq_len, "Sequence length must match seq_len param");
-
-            const long batch_size = x.num_samples();
-            const long num_heads = x.k();
-            const bool is_odd = (d_head % 2 != 0);
-            const long rot_dim = is_odd ? d_head - 1 : d_head;
-            
-            auto* ptr = x.host();
-            const long stride = seq_len * d_head;
-
-            for (long n = 0; n < batch_size; ++n) {
-                for (long h = 0; h < num_heads; ++h) {
-                    auto* x_ptr = ptr + (n * num_heads + h) * stride;
-
-                    for (long pos = 0; pos < seq_len; ++pos) {
-                        const float* cos = &cos_values(pos, 0);
-                        const float* sin = &sin_values(pos, 0);
-
-                        for (long i = 0; i < rot_dim; i += 2) {
-                            const float x0 = x_ptr[pos * d_head + i];
-                            const float x1 = x_ptr[pos * d_head + i + 1];
-
-                            if (!is_backward) {
-                                x_ptr[pos * d_head + i] = x0 * cos[i / 2] - x1 * sin[i / 2];
-                                x_ptr[pos * d_head + i + 1] = x0 * sin[i / 2] + x1 * cos[i / 2];
-                            }
-                            else {
-                                x_ptr[pos * d_head + i] = x0 * cos[i / 2] + x1 * sin[i / 2];
-                                x_ptr[pos * d_head + i + 1] = -x0 * sin[i / 2] + x1 * cos[i / 2];
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-    private:
-        long seq_len, d_head;       // Sequence length and dimension of each head
-        matrix<float> angles;       // Precomputed rotation angles (seq_len x d_head/2)
-        matrix<float> cos_values;   // Precomputed cosine values
-        matrix<float> sin_values;   // Precomputed sine values
-        resizable_tensor params;    // Empty tensor (no learnable parameters)
-    };
-
-    // Helper to easily add RoPE to a network
-    template <typename SUBNET>
-    using rope = add_layer<rotary_positional_embedding_, SUBNET>;
-
     template <long d_k_>
     class scale_weights_ : public multiply_ {
     public:
@@ -388,45 +218,6 @@ namespace dlib
             }
         };
     };
-}
-
-// Define a cross-platform signal handling system
-namespace {
-    std::atomic<bool> g_terminate_flag(false);
-
-#ifdef _WIN32
-    // Windows-specific handler
-    BOOL WINAPI console_ctrl_handler(DWORD ctrl_type) {
-        if (ctrl_type == CTRL_C_EVENT) {
-            g_terminate_flag.store(true);
-            cout << "\nCtrl+C detected, cleaning up and closing the program..." << endl;
-            return TRUE;
-        }
-        return FALSE;
-    }
-#else
-    // Unix/Linux/macOS handler
-    void signal_handler(int signal) {
-        if (signal == SIGINT) {
-            g_terminate_flag.store(true);
-            cout << "\nCtrl+C detected, cleaning up and closing the program..." << endl;
-        }
-    }
-#endif
-
-    // Setup the interrupt handler based on platform
-    void setup_interrupt_handler() {
-#ifdef _WIN32
-        if (!SetConsoleCtrlHandler(console_ctrl_handler, TRUE)) {
-            cerr << "ERROR: Could not set control handler" << endl;
-        }
-#else
-        struct sigaction sa {};
-        sigemptyset(&sa.sa_mask);
-        sa.sa_handler = signal_handler;
-        sigaction(SIGINT, &sa, NULL);
-#endif
-    }
 }
 
 // Utility function to get file size
@@ -733,7 +524,7 @@ int main(int argc, char** argv)
     try
     {
         // Setup interrupt handling for clean termination
-        setup_interrupt_handler();
+        signal_handler::setup();
 
         command_line_parser parser;
         parser.add_option("train", "Train a transformer model on enwiki");
@@ -824,7 +615,7 @@ int main(int argc, char** argv)
             parser.option("tokens-file").argument() :
             generate_tokens_filename(enwiki_path, max_bytes);
 
-        using enwiki_transformer = transformer_config<
+        using enwiki_transformer = dlib_extensions::transformer_config<
             num_tokens,     // vocab_size
             num_layers,     // number of layers
             num_heads,      // number of attention heads
@@ -1037,13 +828,13 @@ int main(int argc, char** argv)
 
             double loss, cur_learning_rate = trainer.get_learning_rate(), prev_learning_rate = 0.0;
             while (epoch < max_epochs && cur_learning_rate >= trainer.get_min_learning_rate()
-                && !g_terminate_flag.load())
+                && !signal_handler::is_triggered())
             {
                 // Shuffle for new epoch
                 std::shuffle(indices.begin(), indices.end(), std::default_random_engine{});
 
                 // Process mini-batches
-                for (size_t i = 0; i < samples.size() && !g_terminate_flag.load(); i += batch_size)
+                for (size_t i = 0; i < samples.size() && !signal_handler::is_triggered(); i += batch_size)
                 {
                     // Get current mini-batch
                     std::vector<matrix<int, 0, 1>> batch_samples;
@@ -1104,7 +895,7 @@ int main(int argc, char** argv)
 
             // Evaluate on training set
             {
-                if (!g_terminate_flag.load()) {
+                if (!signal_handler::is_triggered()) {
                     cout << "Evaluating model accuracy...\n";
                     using net_infer = enwiki_transformer::network_type<false>;
                     net_infer g_infer = net;
@@ -1258,7 +1049,7 @@ int main(int argc, char** argv)
             int start_of_text = tokenizer.get_special_token_id("<text>"),
                 end_of_text = tokenizer.get_special_token_id("</text>"), next_token = 0;
             while (total_bytes < target_size && next_token != start_of_text && next_token != end_of_text
-                && !g_terminate_flag.load()) {
+                && !signal_handler::is_triggered()) {
                 // Predict next token
                 next_token = static_cast<int>(net(input_seq));
                 token_buffer.push_back(next_token);

@@ -1617,8 +1617,6 @@ namespace dlib
         }
 
     // -----------------------------------------------------------------------------------
-    // -----------------------------------------------------------------------------------
-    // -----------------------------------------------------------------------------------
 
         namespace ttimpl
         {
@@ -2592,7 +2590,6 @@ namespace dlib
         }
 
     // ------------------------------------------------------------------------------------
-    // ------------------------------------------------------------------------------------
 
         pooling::pooling (
         ) : window_height(0),window_width(0),stride_y(0),stride_x(0),padding_y(0),padding_x(0),do_max_pooling(true)
@@ -2828,8 +2825,6 @@ namespace dlib
 
         }
 
-    // ------------------------------------------------------------------------------------
-    // ------------------------------------------------------------------------------------
     // ------------------------------------------------------------------------------------
 
         void img2col(
@@ -3467,6 +3462,69 @@ namespace dlib
 
     // ------------------------------------------------------------------------------------
     
+        void apply_rotary_positional_embedding(
+            bool is_backward,
+            resizable_tensor& data,
+            const resizable_tensor& cos_cache,
+            const resizable_tensor& sin_cache)
+        {
+            const long batch_size = data.num_samples();
+            const long num_heads = data.k();
+            const long seq_len = data.nr();
+            const long d_head = data.nc();
+            const long half_d = d_head / 2;
+
+            DLIB_CASSERT(cos_cache.nr() == seq_len, "cos_cache rows must match seq_len");
+            DLIB_CASSERT(cos_cache.nc() == half_d, "cos_cache cols must be d_head/2");
+            DLIB_CASSERT(sin_cache.nr() == seq_len, "sin_cache rows must match seq_len");
+            DLIB_CASSERT(sin_cache.nc() == half_d, "sin_cache cols must be d_head/2");
+
+            const bool is_odd = (d_head % 2 != 0);
+            const long rot_dim = is_odd ? d_head - 1 : d_head;
+
+            float* data_ptr = data.host();
+            const float* cos_ptr = cos_cache.host();
+            const float* sin_ptr = sin_cache.host();
+
+            const size_t total_elements = batch_size * num_heads * seq_len * half_d;
+
+            parallel_for(0, total_elements, [&](long idx)
+                {
+                    const long pair_idx = idx % half_d;
+                    const long pos = (idx / half_d) % seq_len;
+                    const long head = (idx / (half_d * seq_len)) % num_heads;
+                    const long batch = idx / (half_d * seq_len * num_heads);
+
+                    const long dim_i = pair_idx * 2;
+                    if (dim_i >= rot_dim) return;
+
+                    const long data_offset = ((batch * num_heads + head) * seq_len + pos) * d_head + dim_i;
+                    const long trig_offset = pos * half_d + pair_idx;
+
+                    const float c = cos_ptr[trig_offset];
+                    const float s = sin_ptr[trig_offset];
+                    const float x0 = data_ptr[data_offset];
+                    const float x1 = data_ptr[data_offset + 1];
+
+                    if (!is_backward)
+                    {
+                        // Forward: [cos -sin] [x0]
+                        //          [sin  cos] [x1]
+                        data_ptr[data_offset] = x0 * c - x1 * s;
+                        data_ptr[data_offset + 1] = x0 * s + x1 * c;
+                    }
+                    else
+                    {
+                        // Backward (inverse rotation): [cos  sin] [x0]
+                        //                              [-sin cos] [x1]
+                        data_ptr[data_offset] = x0 * c + x1 * s;
+                        data_ptr[data_offset + 1] = -x0 * s + x1 * c;
+                    }
+                });
+        }
+
+    // ------------------------------------------------------------------------------------
+
     } 
 }
 

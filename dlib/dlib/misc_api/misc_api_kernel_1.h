@@ -11,6 +11,7 @@
 #include "misc_api_kernel_abstract.h"
 #include "../algs.h"
 #include <string>
+#include <atomic>
 #include "../uintn.h"
 
 namespace dlib
@@ -97,6 +98,23 @@ namespace dlib
     void create_directory (
         const std::string& dir
     );
+
+// ----------------------------------------------------------------------------------------
+
+    struct signal_handler
+    {
+        static void setup();
+        static bool is_triggered() { return get_flag().load(); }
+        static void reset() { get_flag().store(false); }
+        static void trigger_interrupt() { get_flag().store(true); }
+
+    private:
+        static std::atomic<bool>& get_flag()
+        {
+            static std::atomic<bool> flag(false);
+            return flag;
+        }
+    };
 
 // ----------------------------------------------------------------------------------------
 

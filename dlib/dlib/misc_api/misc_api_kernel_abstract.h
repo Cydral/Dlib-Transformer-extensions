@@ -153,6 +153,58 @@ namespace dlib
 
 // ----------------------------------------------------------------------------------------
 
+    struct signal_handler
+    {
+        /*!
+            WHAT THIS OBJECT REPRESENTS
+
+                This object provides a simple, cross-platform mechanism for
+                detecting user interrupt requests (Ctrl+C).
+
+                Once initialized via setup(), the signal_handler allows
+                client code to non-intrusively poll whether an interrupt
+                signal has been received, without throwing exceptions or
+                terminating the process.
+
+                This utility is primarily intended for long-running loops,
+                evaluation programs, or iterative algorithms that need to
+                exit gracefully when the user presses Ctrl+C.
+        !*/
+
+        static void setup(
+        );
+        /*!
+            ensures
+                - installs an operating-system specific signal handler
+                - on POSIX systems, registers a handler for SIGINT
+                - on Windows systems, registers a handler for CTRL_C_EVENT
+                - after this function is called, pressing Ctrl+C will not
+                  terminate the process but instead cause is_triggered()
+                  to return true
+        !*/
+
+        static bool is_triggered(
+        );
+        /*!
+            ensures
+                - returns true if the user has pressed Ctrl+C since the last
+                  call to setup() or reset()
+                - returns false otherwise
+                - this function is safe to call from any thread
+        !*/
+
+        static void reset(
+        );
+        /*!
+            ensures
+                - resets the internal interrupt flag to false
+                - after calling reset(), is_triggered() will return false
+                  until another interrupt signal is received
+        !*/
+    };
+
+// ----------------------------------------------------------------------------------------
+
 }
 
 #endif // DLIB_MISC_API_KERNEl_ABSTRACT_
