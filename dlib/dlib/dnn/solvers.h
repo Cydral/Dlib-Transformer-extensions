@@ -487,6 +487,7 @@ namespace dlib
                 v.copy_size(params_grad);
                 v = 0;
                 s.copy_size(params_grad);
+                s = 0;
             }
 
             ++t;
@@ -649,8 +650,6 @@ namespace dlib
                 v = 0;
                 s.copy_size(params_grad);
             }
-
-            ++t;
 
             // Step 1: compute adaptive gradient update with decoupled weight decay
             if (l.get_bias_learning_rate_multiplier() == 1)
