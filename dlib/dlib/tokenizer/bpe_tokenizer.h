@@ -157,7 +157,7 @@ namespace dlib
             initialize_special_tokens();
 
             if (verbose) {
-                std::cout << "\nTraining complete!" << std::endl;
+                std::cout << "\nTraining completed!" << std::endl;
                 std::cout << "Base vocabulary: " << BPE_BASE_VOCAB_SIZE << " tokens" << std::endl;
                 std::cout << "Merges performed: " << merges_performed << std::endl;
                 std::cout << "Special tokens: " << special_token_list.size() << " tokens" << std::endl;

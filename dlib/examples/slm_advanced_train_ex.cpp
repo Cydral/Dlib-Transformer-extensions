@@ -1096,7 +1096,7 @@ int main(int argc, char** argv)
             auto total_time = std::chrono::duration_cast<std::chrono::seconds>(
                 end_time - start_time).count();
 
-            cout << "Generation complete in " << total_time << " seconds!\n";
+            cout << "Generation completed in " << total_time << " seconds!\n";
             cout << "Generated " << (token_count - input_seq.size()) << " tokens after prompt, "
                 << total_bytes << " bytes total\n";
             cout << "Output saved to " << output_file << "\n";
