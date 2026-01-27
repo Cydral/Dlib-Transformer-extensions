@@ -776,6 +776,141 @@ namespace dlib
 
     // -----------------------------------------------------------------------------------
 
+    class compute_loss_cross_entropy_per_logit
+    {
+        /*!
+            Computes cross-entropy loss for causal language modeling.
+            Uses all sequence positions for training where each position t predicts token at t+1.
+        
+            Input tensor layout: [N, 1, seq_len, 1] containing token ids as floats.
+            Output tensor layout: [N, 1, seq_len, vocab_size] containing logits.
+        
+            Supports:
+            - ignore_index: tokens to exclude from loss computation
+            - label_smoothing: smooths target distribution (recommended: 0.1 for Transformers)
+        !*/
+    public:
+        compute_loss_cross_entropy_per_logit() {}
+
+        template <typename const_label_iterator>
+        void operator()(
+            const_label_iterator truth,
+            const tensor& input_tensor,
+            const tensor& output_tensor,
+            tensor& grad,
+            double& loss,
+            long ignore_index,
+            double label_smoothing
+        ) const
+        {
+            DLIB_CASSERT(output_tensor.k() == 1);
+            DLIB_CASSERT(input_tensor.k() == 1);
+            DLIB_CASSERT(input_tensor.nc() == 1);  // Token ids stored in nr() dimension
+
+            const long batch_size = output_tensor.num_samples();
+            const long seq_len = output_tensor.nr();
+            const long vocab_size = output_tensor.nc();
+
+            const float* out_data = output_tensor.host();
+            const float* in_data = input_tensor.host();
+            float* g = grad.host();
+
+            // Initialize gradient to zero
+            std::fill(g, g + grad.size(), 0.0f);
+
+            // Label smoothing parameters
+            const float smooth_target = (label_smoothing > 0) ? 1.0f - label_smoothing : 1.0f;
+            const float smooth_other = (label_smoothing > 0) ? label_smoothing / (vocab_size - 1) : 0.0f;
+
+            // Single pass: compute loss, gradients, and count valid tokens
+            long valid_tokens = 0;
+            loss = 0.0;
+
+            for (long i = 0; i < batch_size; ++i)
+            {
+                for (long t = 0; t < seq_len; ++t)
+                {
+                    // Extract target token
+                    unsigned long target_class;
+                    if (t < seq_len - 1)
+                    {
+                        // Positions 0 to seq_len-2: target from input_tensor[t+1]
+                        target_class = static_cast<unsigned long>(
+                            in_data[tensor_index(input_tensor, i, 0, t + 1, 0)]
+                        );
+                    }
+                    else
+                    {
+                        // Last position (seq_len-1): target from truth
+                        target_class = *(truth + i);
+                    }
+
+                    // Skip ignored tokens
+                    if (ignore_index >= 0 && static_cast<long>(target_class) == ignore_index)
+                        continue;
+
+                    DLIB_CASSERT(target_class < static_cast<unsigned long>(vocab_size),
+                        "Target class " << target_class << " >= vocab_size " << vocab_size);
+
+                    valid_tokens++;
+
+                    // Find max logit for numerical stability (log-sum-exp trick)
+                    float max_val = out_data[tensor_index(output_tensor, i, 0, t, 0)];
+                    for (long c = 1; c < vocab_size; ++c)
+                    {
+                        const float val = out_data[tensor_index(output_tensor, i, 0, t, c)];
+                        max_val = std::max(max_val, val);
+                    }
+
+                    // Compute softmax and store in gradient temporarily
+                    float sum_exp = 0.0f;
+                    for (long c = 0; c < vocab_size; ++c)
+                    {
+                        const unsigned long idx = tensor_index(output_tensor, i, 0, t, c);
+                        const float exp_val = std::exp(out_data[idx] - max_val);
+                        g[idx] = exp_val;
+                        sum_exp += exp_val;
+                    }
+
+                    // Compute loss and gradients with label smoothing
+                    for (long c = 0; c < vocab_size; ++c)
+                    {
+                        const unsigned long idx = tensor_index(output_tensor, i, 0, t, c);
+                        const float softmax_val = g[idx] / sum_exp;
+
+                        // Target probability with label smoothing
+                        const float target_prob = (static_cast<unsigned long>(c) == target_class) 
+                            ? static_cast<float>(smooth_target) 
+                            : static_cast<float>(smooth_other);
+
+                        // Cross-entropy loss: -sum(p * log(q))
+                        if (target_prob > 0)
+                            loss -= target_prob * std::log(std::max(softmax_val, 1e-10f));
+
+                        // Gradient: softmax - target_prob
+                        g[idx] = softmax_val - target_prob;
+                    }
+                }
+            }
+
+            // Normalize by valid token count
+            if (valid_tokens > 0)
+            {
+                const float inv_valid = 1.0f / valid_tokens;
+                loss *= inv_valid;
+
+                for (size_t i = 0; i < grad.size(); ++i)
+                    g[i] *= inv_valid;
+            }
+            else
+            {
+                loss = 0.0;
+            }
+        }
+    };
+
+    // -----------------------------------------------------------------------------------
+
     class compute_loss_binary_log_per_pixel
     {
 

@@ -3284,6 +3284,197 @@ namespace dlib
 
     // ----------------------------------------------------------------------------------------
 
+        __global__ void _cuda_count_valid_tokens(
+            float* valid_count,
+            const unsigned long* truth,
+            const float* input_data,
+            size_t batch_size,
+            size_t seq_len,
+            long ignore_index
+        )
+        {
+            float count = 0.0f;
+
+            for (auto sample_idx : grid_stride_range(0, batch_size))
+            {
+                for (size_t t = 0; t < seq_len; ++t)
+                {
+                    unsigned long target_class;
+                    if (t < seq_len - 1)
+                    {
+                        const size_t input_idx = sample_idx * seq_len + (t + 1);
+                        target_class = static_cast<unsigned long>(input_data[input_idx]);
+                    }
+                    else
+                    {
+                        target_class = truth[sample_idx];
+                    }
+
+                    if (ignore_index < 0 || static_cast<long>(target_class) != ignore_index)
+                        count += 1.0f;
+                }
+            }
+
+            warp_reduce_atomic_add(*valid_count, count);
+        }
+
+        __global__ void _cuda_compute_loss_cross_entropy_per_logit(
+            float* loss_out,
+            float* g,
+            const unsigned long* truth,
+            const float* input_data,
+            const float* out_data,
+            size_t batch_size,
+            size_t seq_len,
+            size_t vocab_size,
+            float scale,
+            long ignore_index,
+            float smooth_target,
+            float smooth_other
+        )
+        {
+            float total_loss = 0.0f;
+
+            for (auto sample_idx : grid_stride_range(0, batch_size))
+            {
+                for (size_t t = 0; t < seq_len; ++t)
+                {
+                    unsigned long target_class;
+                    if (t < seq_len - 1)
+                    {
+                        const size_t input_idx = sample_idx * seq_len + (t + 1);
+                        target_class = static_cast<unsigned long>(input_data[input_idx]);
+                    }
+                    else
+                    {
+                        target_class = truth[sample_idx];
+                    }
+
+                    const size_t base_idx = sample_idx * seq_len * vocab_size + t * vocab_size;
+
+                    // Skip ignored tokens
+                    if (ignore_index >= 0 && static_cast<long>(target_class) == ignore_index)
+                    {
+                        for (size_t c = 0; c < vocab_size; ++c)
+                            g[base_idx + c] = 0.0f;
+                        continue;
+                    }
+
+                    // Find max logit for numerical stability
+                    float max_val = out_data[base_idx];
+                    for (size_t c = 1; c < vocab_size; ++c)
+                        max_val = ::max(max_val, out_data[base_idx + c]);
+
+                    // Compute softmax denominator
+                    float sum_exp = 0.0f;
+                    for (size_t c = 0; c < vocab_size; ++c)
+                    {
+                        const size_t idx = base_idx + c;
+                        const float exp_val = ::exp(out_data[idx] - max_val);
+                        g[idx] = exp_val;
+                        sum_exp += exp_val;
+                    }
+
+                    // Compute loss and gradients with label smoothing
+                    for (size_t c = 0; c < vocab_size; ++c)
+                    {
+                        const size_t idx = base_idx + c;
+                        const float softmax_val = g[idx] / sum_exp;
+
+                        // Target probability with label smoothing
+                        const float target_prob = (c == target_class) ? smooth_target : smooth_other;
+
+                        // Cross-entropy loss: -sum(p * log(q))
+                        if (target_prob > 0.0f)
+                            total_loss -= target_prob * ::log(::max(softmax_val, 1e-10f));
+
+                        // Gradient: scale * (softmax - target_prob)
+                        //g[idx] = scale * (softmax_val - target_prob);
+                        g[idx] = softmax_val - target_prob;
+                    }
+                }
+            }
+
+            warp_reduce_atomic_add(*loss_out, total_loss);
+        }
+
+        void compute_loss_cross_entropy_per_logit::do_work(
+            cuda_data_ptr<float> loss_work_buffer,
+            cuda_data_ptr<const unsigned long> truth_buffer,
+            const tensor& input_tensor,
+            const tensor& subnetwork_output,
+            tensor& gradient,
+            double& loss,
+            long ignore_index,
+            double label_smoothing
+        )
+        {
+            CHECK_CUDA(cudaMemset(gradient.device(), 0, gradient.size() * sizeof(float)));
+            CHECK_CUDA(cudaMemset(loss_work_buffer, 0, sizeof(float)));
+
+            const long batch_size = subnetwork_output.num_samples();
+            const long seq_len = subnetwork_output.nr();
+            const long vocab_size = subnetwork_output.nc();
+
+            // Compute scale factor
+            double scale;
+            if (ignore_index < 0)
+            {
+                scale = 1.0 / (batch_size * seq_len);
+            }
+            else
+            {
+                cuda_data_void_ptr count_buf = device_global_buffer(sizeof(float));
+                auto valid_count_ptr = static_pointer_cast<float>(count_buf, 1);
+                CHECK_CUDA(cudaMemset(valid_count_ptr, 0, sizeof(float)));
+
+                launch_kernel(_cuda_count_valid_tokens, max_jobs(batch_size),
+                    valid_count_ptr.data(),
+                    truth_buffer.data(),
+                    input_tensor.device(),
+                    batch_size,
+                    seq_len,
+                    ignore_index
+                );
+
+                float valid_count;
+                dlib::cuda::memcpy(&valid_count, valid_count_ptr);
+
+                if (valid_count == 0)
+                {
+                    loss = 0.0;
+                    return;
+                }
+
+                scale = 1.0 / valid_count;
+            }
+
+            // Label smoothing parameters
+            const float smooth_target = (label_smoothing > 0) ? static_cast<float>(1.0 - label_smoothing) : 1.0f;
+            const float smooth_other = (label_smoothing > 0) ? static_cast<float>(label_smoothing / (vocab_size - 1)) : 0.0f;
+
+            launch_kernel(_cuda_compute_loss_cross_entropy_per_logit, max_jobs(batch_size),
+                loss_work_buffer.data(),
+                gradient.device(),
+                truth_buffer.data(),
+                input_tensor.device(),
+                subnetwork_output.device(),
+                batch_size,
+                seq_len,
+                vocab_size,
+                static_cast<float>(scale),
+                ignore_index,
+                smooth_target,
+                smooth_other
+            );
+
+            float floss;
+            dlib::cuda::memcpy(&floss, loss_work_buffer);
+            loss = scale * floss;
+        }
+
+    // ----------------------------------------------------------------------------------------
+
         __device__ float cuda_log1pexp(float x)
         {
             if (x <= -18)

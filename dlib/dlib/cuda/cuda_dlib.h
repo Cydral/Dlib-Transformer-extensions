@@ -673,6 +673,62 @@ namespace dlib
 
     // ----------------------------------------------------------------------------------------
 
+        class compute_loss_cross_entropy_per_logit
+        {
+            /*!
+                The point of this class is to compute the loss computed by
+                loss_cross_entropy_per_logit_, but to do so with CUDA.
+
+                Supports:
+                - ignore_index: tokens to exclude from loss computation
+                - label_smoothing: smooths target distribution (recommended: 0.1 for Transformers)
+            !*/
+        public:
+            compute_loss_cross_entropy_per_logit() {}
+
+            template <typename const_label_iterator>
+            void operator() (
+                const_label_iterator truth,
+                const tensor& input_tensor,
+                const tensor& subnetwork_output,
+                tensor& gradient,
+                double& loss,
+                long ignore_index,
+                double label_smoothing
+                ) const
+            {
+                const size_t bytes_per_sample = sizeof(unsigned long);
+                buf = device_global_buffer(subnetwork_output.num_samples() * bytes_per_sample + sizeof(float));
+                cuda_data_ptr<float> loss_buf = static_pointer_cast<float>(buf, 1);
+                buf = buf + sizeof(float);
+
+                for (long i = 0; i < subnetwork_output.num_samples(); ++i, ++truth)
+                {
+                    const unsigned long t = *truth;
+                    memcpy(buf + i * bytes_per_sample, &t, bytes_per_sample);
+                }
+
+                auto truth_buf = static_pointer_cast<const unsigned long>(buf, subnetwork_output.num_samples());
+                do_work(loss_buf, truth_buf, input_tensor, subnetwork_output, gradient, loss, ignore_index, label_smoothing);
+            }
+
+        private:
+            static void do_work(
+                cuda_data_ptr<float> loss_work_buffer,
+                cuda_data_ptr<const unsigned long> truth_buffer,
+                const tensor& input_tensor,
+                const tensor& subnetwork_output,
+                tensor& gradient,
+                double& loss,
+                long ignore_index,
+                double label_smoothing
+            );
+
+            mutable cuda_data_void_ptr buf;
+        };
+
+    // ----------------------------------------------------------------------------------------
+
         class compute_loss_binary_log_per_pixel
         {
             /*!

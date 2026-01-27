@@ -4686,6 +4686,109 @@ void test_multm_prev()
 
 // ----------------------------------------------------------------------------------------
 
+    void test_loss_cross_entropy_per_logit_cpu_vs_cuda()
+    {
+        print_spinner();
+
+#ifdef DLIB_USE_CUDA
+        constexpr long vocab_size = 16;
+        constexpr long seq_len = 4;
+        constexpr long batch_size = 4;
+        constexpr unsigned long PAD_TOKEN = 0;
+        constexpr double label_smoothing = 0.1;
+
+        dlib::rand rnd(789);
+
+        // Create input tensor [batch_size, 1, seq_len, 1]
+        resizable_tensor input_tensor;
+        input_tensor.set_size(batch_size, 1, seq_len, 1);
+        float* in_data = input_tensor.host();
+        for (long i = 0; i < batch_size * seq_len; ++i)
+            in_data[i] = static_cast<float>(rnd.get_integer_in_range(1, vocab_size));
+
+        // Create output tensor (logits) [batch_size, 1, seq_len, vocab_size]
+        resizable_tensor output_tensor;
+        output_tensor.set_size(batch_size, 1, seq_len, vocab_size);
+        float* out_data = output_tensor.host();
+        for (long i = 0; i < output_tensor.size(); ++i)
+            out_data[i] = rnd.get_random_gaussian() * 0.5f;
+
+        // Create truth labels
+        std::vector<unsigned long> truth(batch_size);
+        for (long i = 0; i < batch_size; ++i)
+            truth[i] = rnd.get_integer_in_range(1, vocab_size);
+
+        // Create gradient tensors
+        resizable_tensor cuda_grad(output_tensor);
+        resizable_tensor cpu_grad(output_tensor);
+
+        // Compute with CUDA
+        cuda::compute_loss_cross_entropy_per_logit cuda_compute;
+        double cuda_loss;
+        cuda_compute(truth.begin(), input_tensor, output_tensor, cuda_grad, cuda_loss,
+            static_cast<long>(PAD_TOKEN), label_smoothing);
+
+        // Compute with CPU
+        cpu::compute_loss_cross_entropy_per_logit cpu_compute;
+        double cpu_loss;
+        cpu_compute(truth.begin(), input_tensor, output_tensor, cpu_grad, cpu_loss,
+            static_cast<long>(PAD_TOKEN), label_smoothing);
+
+        // Compare losses
+        const double loss_diff = std::abs(cuda_loss - cpu_loss);
+        const double loss_rel_err = (cpu_loss != 0) ? loss_diff / std::abs(cpu_loss) : loss_diff;
+        DLIB_TEST_MSG(loss_rel_err < 1e-5,
+            "CPU vs CUDA loss mismatch: cpu=" << cpu_loss << ", cuda=" << cuda_loss
+            << ", rel_err=" << loss_rel_err);
+
+        // Compare gradients
+        DLIB_TEST(cuda_grad.size() == cpu_grad.size());
+        const float* cuda_g = cuda_grad.host();
+        const float* cpu_g = cpu_grad.host();
+
+        double max_grad_diff = 0.0;
+        for (size_t i = 0; i < cuda_grad.size(); ++i)
+        {
+            const double diff = std::abs(cuda_g[i] - cpu_g[i]);
+            max_grad_diff = std::max(max_grad_diff, diff);
+        }
+
+        DLIB_TEST_MSG(max_grad_diff < 1e-5,
+            "CPU vs CUDA gradient mismatch: max_diff=" << max_grad_diff);
+
+        // Test with ignore_index active (add some PAD tokens)
+        for (long i = 0; i < batch_size; ++i)
+        {
+            // Pad last 2 positions
+            in_data[i * seq_len + seq_len - 1] = static_cast<float>(PAD_TOKEN);
+            in_data[i * seq_len + seq_len - 2] = static_cast<float>(PAD_TOKEN);
+        }
+
+        cuda_compute(truth.begin(), input_tensor, output_tensor, cuda_grad, cuda_loss,
+            static_cast<long>(PAD_TOKEN), label_smoothing);
+        cpu_compute(truth.begin(), input_tensor, output_tensor, cpu_grad, cpu_loss,
+            static_cast<long>(PAD_TOKEN), label_smoothing);
+
+        const double loss_diff_pad = std::abs(cuda_loss - cpu_loss);
+        const double loss_rel_err_pad = (cpu_loss != 0) ? loss_diff_pad / std::abs(cpu_loss) : loss_diff_pad;
+        DLIB_TEST_MSG(loss_rel_err_pad < 1e-5,
+            "CPU vs CUDA loss mismatch (with padding): cpu=" << cpu_loss
+            << ", cuda=" << cuda_loss << ", rel_err=" << loss_rel_err_pad);
+
+        max_grad_diff = 0.0;
+        for (size_t i = 0; i < cuda_grad.size(); ++i)
+        {
+            const double diff = std::abs(cuda_grad.host()[i] - cpu_grad.host()[i]);
+            max_grad_diff = std::max(max_grad_diff, diff);
+        }
+
+        DLIB_TEST_MSG(max_grad_diff < 1e-5,
+            "CPU vs CUDA gradient mismatch (with padding): max_diff=" << max_grad_diff);
+#endif
+    }
+
+// ----------------------------------------------------------------------------------------
+
     void test_tensor_resize_bilinear(long samps, long k, long nr, long nc,  long onr, long onc)
     {
         resizable_tensor img(samps,k,nr,nc);
@@ -5416,6 +5519,7 @@ void test_multm_prev()
             test_loss_multiclass_per_pixel_weighted();
             test_loss_multiclass_log_weighted();
             test_loss_multibinary_log();
+            test_loss_cross_entropy_per_logit_cpu_vs_cuda();
             test_serialization();
             test_loss_dot();
             test_loss_multimulticlass_log();
