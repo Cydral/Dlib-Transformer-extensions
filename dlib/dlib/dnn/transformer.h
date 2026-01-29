@@ -115,15 +115,15 @@ namespace dlib
         using fused_ffn = extract<0, 1, 1, d_model,
             DO<fc<d_model, ACT<fc<d_model * 4, SUBNET>>>>>;
 
-        template <template <typename> class DO, long d_model, typename SUBNET>
+        template <long d_model, typename SUBNET>
         using fused_swiglu = extract<0, 1, 1, d_model,
-            DO<fc<d_model, mult_prev7<fc<(d_model * 2) / 7, skip6<
-            tag7<silu<fc<(d_model * 2) / 7, tag6<SUBNET>>>>>>>>>>;
+            fc<d_model, mult_prev7<fc<(d_model * 8) / 3, skip6<
+            tag7<silu<fc<(d_model * 8) / 3, tag6<SUBNET>>>>>>>>>;
 
         template <template <typename> class ACT, template <typename> class DO,
             long d_model, long num_heads, typename SUBNET>
         using transformer_block = 
-            add_prev5<fused_ffn<ACT, DO, d_model, rms_norm<tag5<
+            add_prev5<fused_swiglu<d_model, rms_norm<tag5<
             add_prev1<multihead_attention<ACT, DO, d_model, num_heads, rms_norm<tag1<SUBNET>>>>>>>>;
 
         template<long remaining_layers, template <typename> class ACT, template <typename> class DO,

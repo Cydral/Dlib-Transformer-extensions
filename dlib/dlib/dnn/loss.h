@@ -918,7 +918,7 @@ namespace dlib
         typedef unsigned long training_label_type;
         typedef unsigned long output_label_type;
 
-        loss_cross_entropy_per_logit_() : ignore_index_(-1), label_smoothing_(0.1) {}
+        loss_cross_entropy_per_logit_() : ignore_index_(-1), label_smoothing_(0.0) {}
 
         void set_ignore_index(long idx) { ignore_index_ = idx; }
         long get_ignore_index() const { return ignore_index_; }
@@ -984,6 +984,7 @@ namespace dlib
                 output_tensor.nc() == grad.nc() &&
                 output_tensor.k() == grad.k());
 
+            grad = 0;
             double loss = 0.0;
 #ifdef DLIB_USE_CUDA
             cuda_compute(truth, input_tensor, output_tensor, grad, loss, ignore_index_, label_smoothing_);

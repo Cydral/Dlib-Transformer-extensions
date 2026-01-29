@@ -3295,7 +3295,7 @@ namespace dlib
         {
             float local = 0.0f;
 
-            for (size_t token_idx : grid_stride_range(0, batch_size* seq_len))
+            for (size_t token_idx : grid_stride_range(0, batch_size * seq_len))
             {
                 const size_t i = token_idx / seq_len;
                 const size_t t = token_idx % seq_len;
@@ -3321,7 +3321,6 @@ namespace dlib
             long batch_size,
             long seq_len,
             long vocab_size,
-            float scale,
             long ignore_index,
             float smooth_target,
             float smooth_other
@@ -3329,7 +3328,7 @@ namespace dlib
         {
             float local_loss = 0.0f;
 
-            for (size_t token_idx : grid_stride_range(0, batch_size* seq_len))
+            for (size_t token_idx : grid_stride_range(0, batch_size * seq_len))
             {
                 const size_t i = token_idx / seq_len;
                 const size_t t = token_idx % seq_len;
@@ -3391,18 +3390,18 @@ namespace dlib
             double label_smoothing
         )
         {
-            CHECK_CUDA(cudaMemset(gradient.device(), 0, gradient.size() * sizeof(float)));
             CHECK_CUDA(cudaMemset(loss_work_buffer, 0, sizeof(float)));
 
             const long batch_size = subnetwork_output.num_samples();
             const long seq_len = subnetwork_output.nr();
             const long vocab_size = subnetwork_output.nc();
+            const long total_tokens = batch_size * seq_len;
 
             // Compute scale factor
-            double scale;
+            float scale = 0.0f;
             if (ignore_index < 0)
             {
-                scale = 1.0 / (batch_size * seq_len);
+                scale = 1.0f / total_tokens;
             }
             else
             {
@@ -3410,7 +3409,7 @@ namespace dlib
                 auto valid_count_ptr = static_pointer_cast<float>(count_buf, 1);
                 CHECK_CUDA(cudaMemset(valid_count_ptr, 0, sizeof(float)));
 
-                launch_kernel(_cuda_count_valid_tokens, max_jobs(batch_size),
+                launch_kernel(_cuda_count_valid_tokens, max_jobs(total_tokens),
                     valid_count_ptr.data(),
                     truth_buffer.data(),
                     input_tensor.device(),
@@ -3428,14 +3427,14 @@ namespace dlib
                     return;
                 }
 
-                scale = 1.0 / valid_count;
+                scale = 1.0f / valid_count;
             }
 
             // Label smoothing parameters
             const float smooth_target = (label_smoothing > 0) ? static_cast<float>(1.0 - label_smoothing) : 1.0f;
             const float smooth_other = (label_smoothing > 0) ? static_cast<float>(label_smoothing / (vocab_size - 1)) : 0.0f;
 
-            launch_kernel(_cuda_compute_loss_cross_entropy_per_logit, max_jobs(batch_size),
+            launch_kernel(_cuda_compute_loss_cross_entropy_per_logit, max_jobs(total_tokens),
                 loss_work_buffer.data(),
                 gradient.device(),
                 truth_buffer.data(),
@@ -3444,17 +3443,18 @@ namespace dlib
                 batch_size,
                 seq_len,
                 vocab_size,
-                static_cast<float>(scale),
                 ignore_index,
                 smooth_target,
                 smooth_other
             );
 
+            // Gradient normalization
             launch_kernel(scale_gradient_kernel, max_jobs(gradient.size()),
-                gradient.device(), gradient.size(), static_cast<float>(scale));
+                gradient.device(), gradient.size(), scale);
 
+            // Loss normalization
             float floss;
-            dlib::cuda::memcpy(&floss, loss_work_buffer);
+            dlib::cuda::memcpy(&floss, loss_work_buffer);            
             loss = scale * floss;
         }
 

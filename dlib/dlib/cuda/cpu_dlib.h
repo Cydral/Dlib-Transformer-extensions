@@ -815,12 +815,9 @@ namespace dlib
             const float* in_data = input_tensor.host();
             float* g = grad.host();
 
-            // Initialize gradient to zero
-            std::fill(g, g + grad.size(), 0.0f);
-
             // Label smoothing parameters
-            const float smooth_target = (label_smoothing > 0) ? 1.0f - label_smoothing : 1.0f;
-            const float smooth_other = (label_smoothing > 0) ? label_smoothing / (vocab_size - 1) : 0.0f;
+            const float smooth_target = (label_smoothing > 0) ? 1.0f - static_cast<float>(label_smoothing) : 1.0f;
+            const float smooth_other = (label_smoothing > 0) ? static_cast<float>(label_smoothing / (vocab_size - 1)) : 0.0f;
 
             // Single pass: compute loss, gradients, and count valid tokens
             long valid_tokens = 0;
