@@ -249,7 +249,7 @@ int main(int argc, char** argv)
         }
 
         // Default values
-        const double learning_rate = get_option(parser, "learning-rate", 3e-4);
+        const double learning_rate = get_option(parser, "learning-rate", 2e-4);
         const size_t batch_size = get_option(parser, "batch-size", 64);
         const long patience = get_option(parser, "patience", 8000);
         const size_t max_epochs = get_option(parser, "max-epochs", 250);
