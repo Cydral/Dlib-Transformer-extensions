@@ -51,9 +51,8 @@ using namespace dlib;
 namespace dlib
 {
     // Classification head for next-token prediction
-    template <long num_logits, long embedding_dim, typename SUBNET>
-    using classification_head = loss_multiclass_log<fc<num_logits,
-        fc<embedding_dim / 4, rms_norm<SUBNET>>>>;
+    template <long num_logits, typename SUBNET>
+    using classification_head = loss_multiclass_log<fc<num_logits, rms_norm<SUBNET>>>;
 
     /**
      * @brief Transformer model configuration template
@@ -94,11 +93,13 @@ namespace dlib
 
         template<bool is_training>
         using network_type = std::conditional_t<is_training,
-            classification_head<VOCAB_SIZE, EMBEDDING_DIM,
-            gqa_transformer::transformer_stack<NUM_LAYERS, EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS,
+            classification_head<VOCAB_SIZE,
+            //gqa_transformer::transformer_stack<NUM_LAYERS, EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS,
+            canonical_transformer::transformer_stack<NUM_LAYERS, EMBEDDING_DIM, NUM_HEADS,
             embeddings<VOCAB_SIZE, EMBEDDING_DIM, input<matrix<int, 0, 1>>>>>,
-            classification_head<VOCAB_SIZE, EMBEDDING_DIM,
-            gqa_transformer::transformer_stack<NUM_LAYERS, EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS,
+            classification_head<VOCAB_SIZE,
+            //gqa_transformer::transformer_stack<NUM_LAYERS, EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS,
+            canonical_transformer::transformer_stack<NUM_LAYERS, EMBEDDING_DIM, NUM_HEADS,
             embeddings<VOCAB_SIZE, EMBEDDING_DIM, input<matrix<int, 0, 1>>>>>>;
 
         struct model_info {
@@ -265,7 +266,7 @@ int main(int argc, char** argv)
         const long num_tokens = 2000;
         const long num_layers = 4;
         const long num_heads = 6;
-        const long num_kv_heads = 2;
+        const long num_kv_heads = 6; // 2
         const long embedding_dim = 228;
         const long max_seq_len = 100;
 

@@ -85,12 +85,11 @@ namespace dlib_extensions
         This layer implements multi-head self-attention.
 
         Template parameters:
-            - ACT: Activation function type
             - d_model: Model dimension (must be divisible by num_heads)
             - num_heads: Number of attention heads
     !*/
-    template <template <typename> class ACT,
-        long seq_len, long d_model, long num_heads, typename SUBNET>
+    template <long seq_len, long d_model, long num_heads,
+        typename SUBNET>
     using multihead_attention =
         add_prev1<
         linear_no_bias<d_model, reshape_to<1, seq_len, d_model,
@@ -132,17 +131,16 @@ namespace dlib_extensions
         followed by a feed-forward network, each with residual connections.
 
         Template parameters:
-            - ACT: Activation function type
             - DO: Dropout layer type for regularization
             - seq_len: Sequence length (number of tokens/patches)
             - d_model: Model dimension
             - num_heads: Number of attention heads
     !*/
-    template <template <typename> class ACT, template <typename> class DO,
+    template <template <typename> class DO,
         long seq_len, long d_model, long num_heads, typename SUBNET>
     using transformer_block =
         moe_feed_forward<DO, d_model,
-        multihead_attention<ACT, seq_len, d_model, num_heads, SUBNET>>;
+        multihead_attention<seq_len, d_model, num_heads, SUBNET>>;
 
     // Classification Head   
     template <long num_logits, typename SUBNET>
@@ -160,7 +158,6 @@ namespace dlib_extensions
      * @param num_heads Number of attention heads
      * @param embedding_dim Dimension of token embeddings
      * @param max_seq_len Maximum sequence length
-     * @param activation_func Activation function type
      * @param dropout_policy Dropout regularization policy
      */
     template <
@@ -169,7 +166,6 @@ namespace dlib_extensions
         long num_heads = 8,                                     // Default number of attention heads
         long embedding_dim = 512,                               // Default embedding dimension
         long max_seq_len = 300,                                 // Default maximum sequence length
-        template <typename> class activation_func = gelu,       // Default activation function
         template <typename> class dropout_policy = dropout_10   // Default dropout policy
     >
     struct transformer_config {
@@ -195,11 +191,11 @@ namespace dlib_extensions
         // Network component definitions
         template <typename SUBNET>
         using t_transformer_block =
-            transformer_block<activation_func, dropout_policy, MAX_SEQ_LEN, EMBEDDING_DIM, NUM_HEADS, SUBNET>;
+            transformer_block<dropout_policy, MAX_SEQ_LEN, EMBEDDING_DIM, NUM_HEADS, SUBNET>;
 
         template <typename SUBNET>
         using i_transformer_block =
-            transformer_block<activation_func, multiply, MAX_SEQ_LEN, EMBEDDING_DIM, NUM_HEADS, SUBNET>;
+            transformer_block<multiply, MAX_SEQ_LEN, EMBEDDING_DIM, NUM_HEADS, SUBNET>;
 
         template<bool is_training>
         using network_type = std::conditional_t<is_training,

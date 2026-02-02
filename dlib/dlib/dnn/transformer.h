@@ -32,79 +32,62 @@ namespace dlib
     class repeat_heads_
     {
     public:
-        explicit repeat_heads_()
-            : repeat_factor(repeat_factor_)
-        {
-            DLIB_CASSERT(repeat_factor >= 1);
-        }
+        static_assert(repeat_factor_ >= 1, "repeat_factor must be at least 1");
 
-        repeat_heads_(const repeat_heads_& item)
-            : repeat_factor(item.repeat_factor)
+        explicit repeat_heads_() : repeat_factor(repeat_factor_)
         {
-        }
-
-        repeat_heads_& operator= (const repeat_heads_& item)
-        {
-            if (this == &item)
-                return *this;
-
-            repeat_factor = item.repeat_factor;
-            return *this;
         }
 
         template <typename SUBNET>
         void setup(const SUBNET& /*sub*/)
         {
-            // Input: [num_kv_heads, seq_len, head_dim]
-            // Output: [num_kv_heads * repeat_factor, seq_len, head_dim]
+            // No learnable parameters
         }
 
-        void forward_inplace(const tensor& input, tensor& output)
+        template <typename SUBNET>
+        void forward(const SUBNET& sub, resizable_tensor& output)
         {
-            if (repeat_factor == 1)
-            {
-                output = input;
-                return;
-            }
-
+            const tensor& input = sub.get_output();
             const long batch_size = input.num_samples();
             const long num_kv_heads = input.k();
             const long seq_len = input.nr();
             const long head_dim = input.nc();
 
+            output.set_size(batch_size, num_kv_heads * repeat_factor, seq_len, head_dim);
+
+            if (repeat_factor == 1)
+            {
+                tt::copy_tensor(false, output, 0, input, 0, num_kv_heads);
+                return;
+            }
+
             const float* in_data = input.host();
-            float* out_data = output.host_write_only();
+            float* out_data = output.host();
+            const long kv_head_stride = seq_len * head_dim;
 
             for (long b = 0; b < batch_size; ++b)
             {
                 for (long kv_h = 0; kv_h < num_kv_heads; ++kv_h)
                 {
+                    const float* src = in_data + (b * num_kv_heads + kv_h) * kv_head_stride;
                     for (long r = 0; r < repeat_factor; ++r)
                     {
                         const long out_head = kv_h * repeat_factor + r;
-                        for (long s = 0; s < seq_len; ++s)
-                        {
-                            for (long d = 0; d < head_dim; ++d)
-                            {
-                                const long in_idx = ((b * num_kv_heads + kv_h) * seq_len + s) * head_dim + d;
-                                const long out_idx = ((b * num_kv_heads * repeat_factor + out_head) * seq_len + s) * head_dim + d;
-                                out_data[out_idx] = in_data[in_idx];
-                            }
-                        }
+                        float* dst = out_data + (b * num_kv_heads * repeat_factor + out_head) * kv_head_stride;
+                        std::copy(src, src + kv_head_stride, dst);
                     }
                 }
             }
         }
 
-        void backward_inplace(
-            const tensor& gradient_input,
-            tensor& data_grad,
-            tensor& /*params_grad*/
-        )
+        template <typename SUBNET>
+        void backward(const tensor& gradient_input, SUBNET& sub, tensor& /*params_grad*/)
         {
+            tensor& data_grad = sub.get_gradient_input();
+
             if (repeat_factor == 1)
             {
-                data_grad = gradient_input;
+                tt::copy_tensor(true, data_grad, 0, gradient_input, 0, gradient_input.k());
                 return;
             }
 
@@ -113,27 +96,24 @@ namespace dlib
             const long num_kv_heads = num_heads / repeat_factor;
             const long seq_len = gradient_input.nr();
             const long head_dim = gradient_input.nc();
+            const long kv_head_stride = seq_len * head_dim;
 
             const float* grad_in = gradient_input.host();
-            float* grad_out = data_grad.host_write_only();
+            float* grad_out = data_grad.host();
 
-            std::fill(grad_out, grad_out + data_grad.size(), 0.0f);
-
+            // Accumulate gradients from repeated heads back to original KV heads
             for (long b = 0; b < batch_size; ++b)
             {
                 for (long kv_h = 0; kv_h < num_kv_heads; ++kv_h)
                 {
+                    float* dst = grad_out + (b * num_kv_heads + kv_h) * kv_head_stride;
                     for (long r = 0; r < repeat_factor; ++r)
                     {
                         const long in_head = kv_h * repeat_factor + r;
-                        for (long s = 0; s < seq_len; ++s)
+                        const float* src = grad_in + (b * num_heads + in_head) * kv_head_stride;
+                        for (long i = 0; i < kv_head_stride; ++i)
                         {
-                            for (long d = 0; d < head_dim; ++d)
-                            {
-                                const long in_idx = ((b * num_heads + in_head) * seq_len + s) * head_dim + d;
-                                const long out_idx = ((b * num_kv_heads + kv_h) * seq_len + s) * head_dim + d;
-                                grad_out[out_idx] += grad_in[in_idx];
-                            }
+                            dst[i] += src[i];
                         }
                     }
                 }
@@ -171,14 +151,14 @@ namespace dlib
 
         friend void to_xml(const repeat_heads_& item, std::ostream& out)
         {
-            out << "<dropout"
-                << " repeat_factor='" << item.repeat_factor << "'";
-            out << "/>\n";
+            out << "<repeat_heads"
+                << " repeat_factor='" << item.repeat_factor << "'"
+                << "/>\n";
         }
 
     private:
         long repeat_factor;
-        resizable_tensor params; // unused
+        resizable_tensor params;  // unused, but required by layer interface
     };
 
     template <long RF, typename SUBNET>
@@ -226,7 +206,8 @@ namespace dlib
         // Attention sublayer followed by SwiGLU feed-forward, each with residual connections
         template <long d_model, long num_heads, long num_kv_heads, typename SUBNET>
         using transformer_block =
-            add_prev5<act_steps<swiglu<d_model, 8, 3, input_tensor>, 4, rms_norm<tag5<
+            //add_prev5<act_steps<swiglu<d_model, 8, 3, input_tensor>, 4, rms_norm<tag5<
+            add_prev5<swiglu<d_model, 8, 3, rms_norm<tag5<
             add_prev1<multihead_attention_gqa<d_model, num_heads, num_kv_heads, rms_norm<tag1<
             SUBNET>>>>>>>>;
 
@@ -253,7 +234,7 @@ namespace dlib
     // ----------------------------------------------------------------------------------------
 
     // CANONICAL TRANSFORMER ARCHITECTURE
-    /*namespace canonical_transformer
+    namespace canonical_transformer
     {
 
         template <long d_model, long num_heads, typename SUBNET>
@@ -268,45 +249,41 @@ namespace dlib
         using value = reshape_to<num_heads, -1, d_model / num_heads,
             linear_no_bias<d_model, SUBNET>>;
 
-        template <template <typename> class ACT, template <typename> class DO,
-            long d_model, long num_heads, typename SUBNET>
+        template <long d_model, long num_heads, typename SUBNET>            
         using multihead_attention =
-            DO<linear_no_bias<d_model, reshape_to<1, -1, d_model,
+            linear_no_bias<d_model, reshape_to<1, -1, d_model,
             multm_prev3<softmaxm<tril_mask<
             scale_weights<d_model / num_heads,
             multm_prev4<
-            rope<query<d_model, num_heads, skip1<
+            rope<query<d_model, num_heads, skip2<
             tag4<transpose<
             rope<key<d_model, num_heads, skip2<
             tag3<value<d_model, num_heads,
-            tag2<SUBNET>>>>>>>>>>>>>>>>>>>;
+            tag2<SUBNET>>>>>>>>>>>>>>>>>>;
 
-        template <template <typename> class ACT, template <typename> class DO,
-            long d_model, long num_heads, typename SUBNET>
+        template <long d_model, long num_heads, typename SUBNET>
         using transformer_block = 
-            add_prev5<act<ffn<ACT, DO, d_model, input_tensor>, 4, rms_norm<tag5<
-            add_prev1<multihead_attention<ACT, DO, d_model, num_heads, rms_norm<tag1<SUBNET>>>>>>>>;
+            add_prev5<ffn<gelu, d_model, 4, rms_norm<tag5<
+            add_prev1<multihead_attention<d_model, num_heads, rms_norm<tag1<SUBNET>>>>>>>>;
 
-        template<long remaining_layers, template <typename> class ACT, template <typename> class DO,
-            long d_model, long num_heads, typename SUBNET, typename enabled = void>
+        template<long remaining_layers, long d_model, long num_heads,
+            typename SUBNET, typename enabled = void>
         struct transformer_stack_impl
         {
-            using type = transformer_block<ACT, DO, d_model, num_heads,
-                typename transformer_stack_impl<remaining_layers - 1, ACT, DO, d_model, num_heads, SUBNET>::type>;
+            using type = transformer_block<d_model, num_heads,
+                typename transformer_stack_impl<remaining_layers - 1, d_model, num_heads, SUBNET>::type>;
         };
 
-        template<template <typename> class ACT, template <typename> class DO,
-            long d_model, long num_heads, typename SUBNET>
-        struct transformer_stack_impl<0, ACT, DO, d_model, num_heads, SUBNET, void>
+        template<long d_model, long num_heads, typename SUBNET>
+        struct transformer_stack_impl<0, d_model, num_heads, SUBNET, void>
         {
             using type = tag10<SUBNET>;
         };
 
-        template<long num_layers, template <typename> class ACT, template <typename> class DO,
-            long d_model, long num_heads, typename SUBNET>
-        using transformer_stack = typename transformer_stack_impl<num_layers, ACT, DO, d_model, num_heads, SUBNET>::type;
+        template<long num_layers, long d_model, long num_heads, typename SUBNET>
+        using transformer_stack = typename transformer_stack_impl<num_layers, d_model, num_heads, SUBNET>::type;
 
-    } // namespace canonical_transformer*/
+    } // namespace canonical_transformer
 
     // FUSED TRANSFORMER ARCHITECTURE
     namespace fused_transformer
@@ -328,7 +305,7 @@ namespace dlib
             multm_prev3<softmaxm<tril_mask<
             scale_weights<d_model / num_heads,
             multm_prev4<
-            query<num_heads, d_model, skip1<
+            query<num_heads, d_model, skip2<
             tag4<key<num_heads, d_model, skip2<
             tag3<value<num_heads, d_model,
             tag2<fc_no_bias<d_model * 3,
