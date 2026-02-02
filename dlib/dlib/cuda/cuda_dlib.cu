@@ -2506,8 +2506,7 @@ namespace dlib
         {
             for (auto n : grid_stride_range_y(0, ns))
             {
-                if (threadIdx.x == 0)
-                    scale[n] = 1.0f / std::sqrt(scale[n] + eps);
+                if (threadIdx.x == 0) scale[n] = 1.0f / std::sqrt(scale[n] + eps);
             }
         }
 
@@ -2552,9 +2551,9 @@ namespace dlib
                 "\neps:  " << eps
             );
 
-            const long ns = src.num_samples();
-            const long ks = src.k();
-            const long num = src.nr() * src.nc();
+            const size_t ns = src.num_samples();
+            const size_t ks = src.k();
+            const size_t num = src.nr() * src.nc();
 
             dest.copy_size(src);
             scale.set_size(ns);
@@ -2563,8 +2562,7 @@ namespace dlib
             launch_kernel(_cuda_rms_normalize_accumulate, max_jobs(ks * num, ns),
                 scale.device(), src.device(), ns, ks, num);
 
-            launch_kernel(_cuda_rms_normalize_invert, max_jobs(1, ns),
-                scale.device(), eps, ns);
+            launch_kernel(_cuda_rms_normalize_invert, max_jobs(1, ns), scale.device(), eps, ns);
 
             launch_kernel(_cuda_rms_normalize_apply, max_jobs(ks * num, ns),
                 dest.device(), scale.device(), src.device(), gamma.device(), ns, ks, num);
@@ -3284,178 +3282,239 @@ namespace dlib
 
     // ----------------------------------------------------------------------------------------
 
-        __global__ void _cuda_count_valid_tokens(
-            float* valid_count,
-            const unsigned long* truth,
-            const float* input_data,
-            size_t batch_size,
-            size_t seq_len,
-            long ignore_index
-        )
-        {
-            float local = 0.0f;
-
-            for (size_t token_idx : grid_stride_range(0, batch_size * seq_len))
-            {
-                const size_t i = token_idx / seq_len;
-                const size_t t = token_idx % seq_len;
-
-                unsigned long target_class =
-                    (t < seq_len - 1)
-                    ? static_cast<unsigned long>(input_data[i * seq_len + t + 1])
-                    : truth[i];
-
-                if (ignore_index < 0 || static_cast<long>(target_class) != ignore_index)
-                    local += 1.0f;
-            }
-
-            warp_reduce_atomic_add(*valid_count, local);
-        }
-
-        __global__ void _cuda_compute_loss_cross_entropy_per_logit(
-            float* loss_out,
-            float* g,
-            const unsigned long* truth,
-            const float* input_data,
+        __global__ void _cuda_cross_entropy_compute_max(
+            float* max_vals,
             const float* out_data,
             long batch_size,
             long seq_len,
+            long vocab_size
+        )
+        {
+            for (auto idx : grid_stride_range(0, batch_size * seq_len))
+            {
+                const long i = idx / seq_len;
+                const long t = idx % seq_len;
+                const long base = (i * seq_len + t) * vocab_size;
+
+                float max_val = out_data[base];
+                for (long c = 1; c < vocab_size; ++c)
+                {
+                    max_val = fmaxf(max_val, out_data[base + c]);
+                }
+                max_vals[idx] = max_val;
+            }
+        }
+
+        __global__ void _cuda_cross_entropy_compute_softmax_and_loss(
+            float* grad,
+            float* position_losses,
+            unsigned long long* valid_mask,
+            const float* out_data,
+            const float* in_data,
+            const unsigned long* truth,
+            const float* max_vals,
+            long batch_size,
+            long seq_len,
             long vocab_size,
+            long input_seq_len,
             long ignore_index,
             float smooth_target,
             float smooth_other
         )
         {
-            float local_loss = 0.0f;
-
-            for (size_t token_idx : grid_stride_range(0, batch_size * seq_len))
+            for (auto idx : grid_stride_range(0, batch_size * seq_len))
             {
-                const size_t i = token_idx / seq_len;
-                const size_t t = token_idx % seq_len;
-                const size_t base = i * seq_len * vocab_size + t * vocab_size;
+                const long i = idx / seq_len;
+                const long t = idx % seq_len;
+                const long base = (i * seq_len + t) * vocab_size;
 
-                unsigned long target_class =
-                    (t < seq_len - 1)
-                    ? static_cast<unsigned long>(input_data[i * seq_len + t + 1])
-                    : truth[i];
+                unsigned long target_class;
+                if (t < seq_len - 1)
+                {
+                    const long in_idx = i * input_seq_len + (t + 1);
+                    target_class = static_cast<unsigned long>(in_data[in_idx]);
+                }
+                else
+                {
+                    target_class = truth[i];
+                }
 
                 if (ignore_index >= 0 && static_cast<long>(target_class) == ignore_index)
                 {
-                    for (size_t c = 0; c < vocab_size; ++c)
-                        g[base + c] = 0.0f;
+                    valid_mask[idx] = 0ULL;
+                    position_losses[idx] = 0.0f;
+                    for (long c = 0; c < vocab_size; ++c)
+                    {
+                        grad[base + c] = 0.0f;
+                    }
                     continue;
                 }
 
-                float max_val = out_data[base];
-                for (size_t c = 1; c < vocab_size; ++c)
-                    max_val = fmaxf(max_val, out_data[base + c]);
+                valid_mask[idx] = 1ULL;
+
+                const float max_val = max_vals[idx];
 
                 float sum_exp = 0.0f;
-                for (size_t c = 0; c < vocab_size; ++c)
+                for (long c = 0; c < vocab_size; ++c)
                 {
-                    float e = expf(out_data[base + c] - max_val);
-                    g[base + c] = e;
-                    sum_exp += e;
+                    sum_exp += expf(out_data[base + c] - max_val);
                 }
 
-                for (size_t c = 0; c < vocab_size; ++c)
+                float pos_loss = 0.0f;
+                const float inv_sum_exp = 1.0f / sum_exp;
+
+                for (long c = 0; c < vocab_size; ++c)
                 {
-                    float p = g[base + c] / sum_exp;
-                    float tgt = (c == target_class) ? smooth_target : smooth_other;
+                    const float softmax_val = expf(out_data[base + c] - max_val) * inv_sum_exp;
 
-                    if (tgt > 0)
-                        local_loss -= tgt * logf(fmaxf(p, 1e-10f));
+                    const float target_prob = (static_cast<unsigned long>(c) == target_class)
+                        ? smooth_target
+                        : smooth_other;
 
-                    g[base + c] = p - tgt;
+                    if (target_prob > 0.0f)
+                    {
+                        pos_loss -= target_prob * logf(fmaxf(softmax_val, 1e-10f));
+                    }
+
+                    grad[base + c] = softmax_val - target_prob;
                 }
+
+                position_losses[idx] = pos_loss;
             }
-
-            warp_reduce_atomic_add(*loss_out, local_loss);
         }
 
-        __global__ void scale_gradient_kernel(float* grad, size_t size, float scale)
+        __global__ void _cuda_cross_entropy_sum_loss_and_count(
+            float* total_loss,
+            unsigned long long* total_valid,
+            const float* position_losses,
+            const unsigned long long* valid_mask,
+            long num_positions
+        )
         {
-            for (size_t idx : grid_stride_range(0, size))
-                grad[idx] *= scale;
+            float local_loss = 0.0f;
+            unsigned long long local_count = 0ULL;
+
+            for (auto idx : grid_stride_range(0, num_positions))
+            {
+                local_loss += position_losses[idx];
+                local_count += valid_mask[idx];
+            }
+
+            warp_reduce_atomic_add(*total_loss, local_loss);
+
+            unsigned long long warp_count = local_count;
+            for (int offset = warpSize / 2; offset > 0; offset /= 2)
+            {
+                warp_count += __shfl_down_sync(0xffffffff, warp_count, offset);
+            }
+            if ((threadIdx.x & (warpSize - 1)) == 0)
+            {
+                atomicAdd(total_valid, warp_count);
+            }
+        }
+
+        __global__ void _cuda_cross_entropy_normalize_gradient(
+            float* grad,
+            size_t grad_size,
+            float inv_valid_tokens
+        )
+        {
+            for (auto i : grid_stride_range(0, grad_size))
+            {
+                grad[i] *= inv_valid_tokens;
+            }
         }
 
         void compute_loss_cross_entropy_per_logit::do_work(
-            cuda_data_ptr<float> loss_work_buffer,
-            cuda_data_ptr<const unsigned long> truth_buffer,
+            cuda_data_ptr<float> loss_out,
+            cuda_data_ptr<const unsigned long> truth,
             const tensor& input_tensor,
-            const tensor& subnetwork_output,
-            tensor& gradient,
+            const tensor& output_tensor,
+            tensor& grad,
             double& loss,
             long ignore_index,
             double label_smoothing
         )
         {
-            CHECK_CUDA(cudaMemset(loss_work_buffer, 0, sizeof(float)));
+            DLIB_CASSERT(output_tensor.k() == 1);
+            DLIB_CASSERT(input_tensor.k() == 1);
+            DLIB_CASSERT(input_tensor.nc() == 1);
 
-            const long batch_size = subnetwork_output.num_samples();
-            const long seq_len = subnetwork_output.nr();
-            const long vocab_size = subnetwork_output.nc();
-            const long total_tokens = batch_size * seq_len;
+            const long batch_size = output_tensor.num_samples();
+            const long seq_len = output_tensor.nr();
+            const long vocab_size = output_tensor.nc();
+            const long input_seq_len = input_tensor.nr();
+            const long num_positions = batch_size * seq_len;
 
-            // Compute scale factor
-            float scale = 0.0f;
-            if (ignore_index < 0)
+            // Label smoothing parameters
+            const float smooth_target = (label_smoothing > 0) ? 1.0f - static_cast<float>(label_smoothing) : 1.0f;
+            const float smooth_other = (label_smoothing > 0) ? static_cast<float>(label_smoothing) / (vocab_size - 1) : 0.0f;
+
+            // Allocate temporary buffers
+            const size_t temp_size = num_positions * sizeof(float) +    // max_vals
+                num_positions * sizeof(float) +                         // position_losses
+                num_positions * sizeof(unsigned long long) +            // valid_mask
+                sizeof(unsigned long long);                             // total_valid
+
+            cuda_data_void_ptr temp_buf = device_global_buffer(temp_size);
+
+            auto max_vals = static_pointer_cast<float>(temp_buf, num_positions);
+            auto position_losses = static_pointer_cast<float>(
+                temp_buf + num_positions * sizeof(float), num_positions);
+            auto valid_mask = static_pointer_cast<unsigned long long>(
+                temp_buf + 2 * num_positions * sizeof(float), num_positions);
+            auto total_valid = static_pointer_cast<unsigned long long>(
+                temp_buf + 2 * num_positions * sizeof(float) + num_positions * sizeof(unsigned long long), 1);
+
+            // Initialize accumulators to zero
+            CHECK_CUDA(cudaMemsetAsync(loss_out.data(), 0, sizeof(float)));
+            CHECK_CUDA(cudaMemsetAsync(total_valid.data(), 0, sizeof(unsigned long long)));
+
+            // Step 1: compute max values for numerical stability
+            launch_kernel(_cuda_cross_entropy_compute_max, max_jobs(num_positions),
+                max_vals.data(),
+                output_tensor.device(),
+                batch_size, seq_len, vocab_size);
+
+            // Step 2: compute softmax, loss per position, and gradients
+            launch_kernel(_cuda_cross_entropy_compute_softmax_and_loss, max_jobs(num_positions),
+                grad.device(),
+                position_losses.data(),
+                valid_mask.data(),
+                output_tensor.device(),
+                input_tensor.device(),
+                truth.data(),
+                max_vals.data(),
+                batch_size, seq_len, vocab_size, input_seq_len,
+                ignore_index, smooth_target, smooth_other);
+
+            // Step 3: sum losses and count valid tokens
+            launch_kernel(_cuda_cross_entropy_sum_loss_and_count, max_jobs(num_positions),
+                loss_out.data(),
+                total_valid.data(),
+                position_losses.data(),
+                valid_mask.data(),
+                num_positions);
+
+            // Step 4: normalize loss and gradients
+            unsigned long long h_total_valid = 0ULL;
+            CHECK_CUDA(cudaMemcpy(&h_total_valid, total_valid.data(), sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+
+            if (h_total_valid > 0)
             {
-                scale = 1.0f / total_tokens;
+                const float inv_valid = 1.0f / static_cast<float>(h_total_valid);
+
+                float h_loss = 0.0f;
+                CHECK_CUDA(cudaMemcpy(&h_loss, loss_out.data(), sizeof(float), cudaMemcpyDeviceToHost));
+                loss = static_cast<double>(h_loss * inv_valid);
+
+                launch_kernel(_cuda_cross_entropy_normalize_gradient, max_jobs(grad.size()),
+                    grad.device(), grad.size(), inv_valid);
             }
             else
             {
-                cuda_data_void_ptr count_buf = device_global_buffer(sizeof(float));
-                auto valid_count_ptr = static_pointer_cast<float>(count_buf, 1);
-                CHECK_CUDA(cudaMemset(valid_count_ptr, 0, sizeof(float)));
-
-                launch_kernel(_cuda_count_valid_tokens, max_jobs(total_tokens),
-                    valid_count_ptr.data(),
-                    truth_buffer.data(),
-                    input_tensor.device(),
-                    batch_size,
-                    seq_len,
-                    ignore_index
-                );
-
-                float valid_count;
-                dlib::cuda::memcpy(&valid_count, valid_count_ptr);
-
-                if (valid_count == 0)
-                {
-                    loss = 0.0;
-                    return;
-                }
-
-                scale = 1.0f / valid_count;
+                loss = 0.0;
             }
-
-            // Label smoothing parameters
-            const float smooth_target = (label_smoothing > 0) ? static_cast<float>(1.0 - label_smoothing) : 1.0f;
-            const float smooth_other = (label_smoothing > 0) ? static_cast<float>(label_smoothing / (vocab_size - 1)) : 0.0f;
-
-            launch_kernel(_cuda_compute_loss_cross_entropy_per_logit, max_jobs(total_tokens),
-                loss_work_buffer.data(),
-                gradient.device(),
-                truth_buffer.data(),
-                input_tensor.device(),
-                subnetwork_output.device(),
-                batch_size,
-                seq_len,
-                vocab_size,
-                ignore_index,
-                smooth_target,
-                smooth_other
-            );
-
-            // Gradient normalization
-            launch_kernel(scale_gradient_kernel, max_jobs(gradient.size()),
-                gradient.device(), gradient.size(), scale);
-
-            // Loss normalization
-            float floss;
-            dlib::cuda::memcpy(&floss, loss_work_buffer);            
-            loss = scale * floss;
         }
 
     // ----------------------------------------------------------------------------------------
@@ -3677,4 +3736,3 @@ namespace dlib
 
     }
 }
-

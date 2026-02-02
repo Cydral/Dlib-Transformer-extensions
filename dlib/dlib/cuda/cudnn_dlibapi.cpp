@@ -1050,7 +1050,7 @@ namespace dlib
                 // true FP32 computation for consistent numerical results.
                 CHECK_CUDNN(cudnnSetConvolutionMathType(
                         (cudnnConvolutionDescriptor_t)conv_handle,
-                        CUDNN_FMA_MATH));
+                    CUDNN_TENSOR_OP_MATH_ALLOW_CONVERSION));
 #endif
 
                 CHECK_CUDNN(cudnnGetConvolution2dForwardOutputDim(

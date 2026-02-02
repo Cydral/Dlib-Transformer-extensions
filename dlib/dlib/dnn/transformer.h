@@ -28,6 +28,230 @@ namespace dlib
 
     // ----------------------------------------------------------------------------------------
 
+    template <long repeat_factor>
+    class repeat_heads_
+    {
+    public:
+        explicit repeat_heads_()
+            : r_factor(repeat_factor)
+        {
+            DLIB_CASSERT(repeat_factor >= 1);
+        }
+
+        repeat_heads_(const repeat_heads_& item)
+            : r_factor(item.r_factor)
+        {
+        }
+
+        repeat_heads_& operator= (const repeat_heads_& item)
+        {
+            if (this == &item)
+                return *this;
+
+            r_factor = item.r_factor;
+            return *this;
+        }
+
+        template <typename SUBNET>
+        void setup(const SUBNET& /*sub*/)
+        {
+            // Input: [num_kv_heads, seq_len, head_dim]
+            // Output: [num_kv_heads * repeat_factor, seq_len, head_dim]
+        }
+
+        void forward_inplace(const tensor& input, tensor& output)
+        {
+            if (repeat_factor == 1)
+            {
+                output = input;
+                return;
+            }
+
+            const long batch_size = input.num_samples();
+            const long num_kv_heads = input.k();
+            const long seq_len = input.nr();
+            const long head_dim = input.nc();
+
+            output.set_size(batch_size, num_kv_heads * repeat_factor, seq_len, head_dim);
+
+            const float* in_data = input.host();
+            float* out_data = output.host_write_only();
+
+            for (long b = 0; b < batch_size; ++b)
+            {
+                for (long kv_h = 0; kv_h < num_kv_heads; ++kv_h)
+                {
+                    for (long r = 0; r < repeat_factor; ++r)
+                    {
+                        const long out_head = kv_h * repeat_factor + r;
+                        for (long s = 0; s < seq_len; ++s)
+                        {
+                            for (long d = 0; d < head_dim; ++d)
+                            {
+                                const long in_idx = ((b * num_kv_heads + kv_h) * seq_len + s) * head_dim + d;
+                                const long out_idx = ((b * num_kv_heads * repeat_factor + out_head) * seq_len + s) * head_dim + d;
+                                out_data[out_idx] = in_data[in_idx];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        void backward_inplace(
+            const tensor& gradient_input,
+            tensor& data_grad,
+            tensor& /*params_grad*/
+        )
+        {
+            if (repeat_factor == 1)
+            {
+                data_grad = gradient_input;
+                return;
+            }
+
+            const long batch_size = gradient_input.num_samples();
+            const long num_heads = gradient_input.k();
+            const long num_kv_heads = num_heads / repeat_factor;
+            const long seq_len = gradient_input.nr();
+            const long head_dim = gradient_input.nc();
+
+            data_grad.set_size(batch_size, num_kv_heads, seq_len, head_dim);
+
+            const float* grad_in = gradient_input.host();
+            float* grad_out = data_grad.host_write_only();
+
+            std::fill(grad_out, grad_out + data_grad.size(), 0.0f);
+
+            for (long b = 0; b < batch_size; ++b)
+            {
+                for (long kv_h = 0; kv_h < num_kv_heads; ++kv_h)
+                {
+                    for (long r = 0; r < repeat_factor; ++r)
+                    {
+                        const long in_head = kv_h * repeat_factor + r;
+                        for (long s = 0; s < seq_len; ++s)
+                        {
+                            for (long d = 0; d < head_dim; ++d)
+                            {
+                                const long in_idx = ((b * num_heads + in_head) * seq_len + s) * head_dim + d;
+                                const long out_idx = ((b * num_kv_heads + kv_h) * seq_len + s) * head_dim + d;
+                                grad_out[out_idx] += grad_in[in_idx];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        inline dpoint map_input_to_output(const dpoint& p) const { return p; }
+        inline dpoint map_output_to_input(const dpoint& p) const { return p; }
+
+        const tensor& get_layer_params() const { return params; }
+        tensor& get_layer_params() { return params; }
+
+        friend void serialize(const dropout_& item, std::ostream& out)
+        {
+            serialize("repeat_heads_", out);
+            serialize(item.repeat_factor_, out);
+        }
+
+        friend void deserialize(dropout_& item, std::istream& in)
+        {
+            std::string version;
+            deserialize(version, in);
+            if (version != "repeat_heads_")
+                throw serialization_error("Unexpected version '" + version + "' found while deserializing dlib::repeat_heads_.");
+            deserialize(item.repeat_factor_, in);
+        }
+
+        friend std::ostream& operator<<(std::ostream& out, const dropout_& item)
+        {
+            out << "repeat_heads\t ("
+                << "repeat_factor=" << item.repeat_factor_
+                << ")";
+            return out;
+        }
+
+        friend void to_xml(const dropout_& item, std::ostream& out)
+        {
+            out << "<dropout"
+                << " repeat_factor='" << item.repeat_factor_ << "'";
+            out << "/>\n";
+        }
+
+    private:
+        long repeat_factor_;
+        resizable_tensor params; // unused
+    };
+
+    template <long repeat_factor, typename SUBNET>
+    using repeat_heads = add_layer<repeat_heads_<repeat_factor>, SUBNET>;
+
+    // ----------------------------------------------------------------------------------------
+
+    namespace gqa_transformer
+    {
+        // Query: garde num_heads têtes complètes
+        template <long d_model, long num_heads, typename SUBNET>
+        using query = reshape_to<num_heads, -1, d_model / num_heads,
+            linear_no_bias<d_model, SUBNET>>;
+
+        // Key: utilise num_kv_heads (moins de têtes)
+        template <long num_kv_heads, long head_dim, typename SUBNET>
+        using key = reshape_to<num_kv_heads, -1, head_dim,
+            linear_no_bias<num_kv_heads * head_dim, SUBNET>>;
+
+        // Value: utilise num_kv_heads (moins de têtes)
+        template <long num_kv_heads, long head_dim, typename SUBNET>
+        using value = reshape_to<num_kv_heads, -1, head_dim,
+            linear_no_bias<num_kv_heads * head_dim, SUBNET>>;
+
+        template <template <typename> class ACT, template <typename> class DO,
+            long d_model, long num_heads, long num_kv_heads, typename SUBNET>
+        using multihead_attention_gqa =
+            linear_no_bias<d_model, reshape_to<1, -1, d_model,
+            multm_prev3<softmaxm<tril_mask<
+            scale_weights<d_model / num_heads,
+            multm_prev4<
+            rope<query<d_model, num_heads, skip1<
+            tag4<transpose<
+            repeat_heads<num_heads / num_kv_heads,                          // Répéter K
+            rope<key<num_kv_heads, d_model / num_heads, skip2<          // K avec moins de têtes
+            tag3<repeat_heads<num_heads / num_kv_heads,                     // Répéter V
+            value<num_kv_heads, d_model / num_heads,                    // V avec moins de têtes
+            tag2<SUBNET>>>>>>>>>>>>>>>>>>>>;
+
+        template <template <typename> class ACT, template <typename> class DO,
+            long d_model, long num_heads, long num_kv_heads, typename SUBNET>
+        using transformer_block =
+            add_prev5<act_steps<swiglu<d_model, 8, 3, input_tensor>, 4, rms_norm<tag5<
+            add_prev1<multihead_attention_gqa<ACT, DO, d_model, num_heads, num_kv_heads,
+            rms_norm<tag1<SUBNET>>>>>>>>;
+
+        template<long remaining_layers, template <typename> class ACT, template <typename> class DO,
+            long d_model, long num_heads, long num_kv_heads, typename SUBNET, typename enabled = void>
+        struct transformer_stack_impl
+        {
+            using type = transformer_block<ACT, DO, d_model, num_heads, num_kv_heads,
+                typename transformer_stack_impl<remaining_layers - 1, ACT, DO, d_model, num_heads, num_kv_heads, SUBNET>::type>;
+        };
+
+        template<template <typename> class ACT, template <typename> class DO,
+            long d_model, long num_heads, long num_kv_heads, typename SUBNET>
+        struct transformer_stack_impl<0, ACT, DO, d_model, num_heads, num_kv_heads, SUBNET, void>
+        {
+            using type = tag10<SUBNET>;
+        };
+
+        template<long num_layers, template <typename> class ACT, template <typename> class DO,
+            long d_model, long num_heads, long num_kv_heads, typename SUBNET>
+        using transformer_stack = typename transformer_stack_impl<num_layers, ACT, DO, d_model, num_heads, num_kv_heads, SUBNET>::type;
+
+    } // namespace gqa_transformer
+
+    // ----------------------------------------------------------------------------------------
+
     // CANONICAL TRANSFORMER ARCHITECTURE
     /*namespace canonical_transformer
     {

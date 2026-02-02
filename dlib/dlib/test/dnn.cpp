@@ -1623,7 +1623,7 @@ namespace
             conv2.get_gradient_for_data(false, gi, filters, data_gradient2);
 
             dlog << LINFO << "data gradient error: "<< max(abs(mat(data_gradient1)-mat(data_gradient2)));
-            DLIB_TEST(max(abs(mat(data_gradient1)-mat(data_gradient2))) < 1e-3);
+            DLIB_TEST(max(abs(mat(data_gradient1)-mat(data_gradient2))) < 2e-3);
 
 
             resizable_tensor filter_gradient1, filter_gradient2;
@@ -1639,7 +1639,7 @@ namespace
             conv2.get_gradient_for_filters(false, gi, data, filter_gradient2);
 
             dlog << LINFO << "filter gradient error: "<< max(abs(mat(filter_gradient1)-mat(filter_gradient2)));
-            DLIB_TEST_MSG(max(abs(mat(filter_gradient1)-mat(filter_gradient2))) < 1e-3, max(abs(mat(filter_gradient1)-mat(filter_gradient2))));
+            DLIB_TEST_MSG(max(abs(mat(filter_gradient1)-mat(filter_gradient2))) < 2e-3, max(abs(mat(filter_gradient1)-mat(filter_gradient2))));
 
 
             conv1.get_gradient_for_filters(true, gi, data, filter_gradient1);

@@ -833,8 +833,7 @@ namespace dlib
                     {
                         // Positions 0 to seq_len-2: target from input_tensor[t+1]
                         target_class = static_cast<unsigned long>(
-                            in_data[tensor_index(input_tensor, i, 0, t + 1, 0)]
-                        );
+                            in_data[tensor_index(input_tensor, i, 0, t + 1, 0)]);
                     }
                     else
                     {
