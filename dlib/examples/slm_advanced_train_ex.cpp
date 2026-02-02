@@ -52,7 +52,7 @@ namespace dlib
 {
     // Classification head for next-token prediction
     template <long num_logits, typename SUBNET>
-    using classification_head = loss_multiclass_log<fc<num_logits, rms_norm<SUBNET>>>;
+    using classification_head = loss_cross_entropy_per_logit<linear<num_logits, rms_norm<SUBNET>>>;
 
     /**
      * @brief Transformer model configuration template
@@ -227,7 +227,7 @@ int main(int argc, char** argv)
         parser.add_option("train", "Train a transformer model on internal dataset");
         parser.add_option("generate", "Generate text from a previously trained model");
         parser.add_option("verify", "Verify generated output against original dataset");
-        parser.add_option("learning-rate", "Set the learning rate (default: 2e-4)", 1);
+        parser.add_option("learning-rate", "Set the learning rate (default: 3e-4)", 1);
         parser.add_option("batch-size", "Set the mini-batch size (default: 64)", 1);
         parser.add_option("patience", "Iterations without progress before early stopping (default: 8000)", 1);
         parser.add_option("max-epochs", "Maximum number of training epochs (default: 250)", 1);
@@ -251,7 +251,7 @@ int main(int argc, char** argv)
         }
 
         // Default values
-        const double learning_rate = get_option(parser, "learning-rate", 2e-4);
+        const double learning_rate = get_option(parser, "learning-rate", 3e-4);
         const size_t batch_size = get_option(parser, "batch-size", 64);
         const long patience = get_option(parser, "patience", 8000);
         const size_t max_epochs = get_option(parser, "max-epochs", 250);
@@ -268,7 +268,7 @@ int main(int argc, char** argv)
         const long num_heads = 6;
         const long num_kv_heads = 6; // 2
         const long embedding_dim = 228;
-        const long max_seq_len = 100;
+        const long max_seq_len = 30;
 
         // Define transformer configuration
         using my_transformer = transformer_config<
@@ -421,6 +421,7 @@ int main(int argc, char** argv)
             using net_type = my_transformer::network_type<true>;
             net_type net;
             const int pad_token = tokenizer.get_special_token_id("<pad>");
+            layer<0>(net).loss_details().set_ignore_index(pad_token);
             cout << my_transformer::model_info::describe() << endl;
 
             // Tokenizer stored with model for simplified inference
@@ -445,8 +446,8 @@ int main(int argc, char** argv)
             auto epoch_start = std::chrono::high_resolution_clock::now();
 
             // Training loop
-            while (trainer.get_learning_rate() >= 1e-6 && epoch < max_epochs
-                && !signal_handler::is_triggered())
+            while (trainer.get_learning_rate() >= trainer.get_min_learning_rate()
+                && epoch < max_epochs && !signal_handler::is_triggered())
             {
                 total_loss = 0.0;
                 batches_seen = samples_seen = 0;
