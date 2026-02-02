@@ -94,12 +94,10 @@ namespace dlib
         template<bool is_training>
         using network_type = std::conditional_t<is_training,
             classification_head<VOCAB_SIZE,
-            //gqa_transformer::transformer_stack<NUM_LAYERS, EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS,
-            canonical_transformer::transformer_stack<NUM_LAYERS, EMBEDDING_DIM, NUM_HEADS,
+            gqa_transformer::transformer_stack<NUM_LAYERS, EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS,
             embeddings<VOCAB_SIZE, EMBEDDING_DIM, input<matrix<int, 0, 1>>>>>,
             classification_head<VOCAB_SIZE,
-            //gqa_transformer::transformer_stack<NUM_LAYERS, EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS,
-            canonical_transformer::transformer_stack<NUM_LAYERS, EMBEDDING_DIM, NUM_HEADS,
+            gqa_transformer::transformer_stack<NUM_LAYERS, EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS,
             embeddings<VOCAB_SIZE, EMBEDDING_DIM, input<matrix<int, 0, 1>>>>>>;
 
         struct model_info {
@@ -227,7 +225,7 @@ int main(int argc, char** argv)
         parser.add_option("train", "Train a transformer model on internal dataset");
         parser.add_option("generate", "Generate text from a previously trained model");
         parser.add_option("verify", "Verify generated output against original dataset");
-        parser.add_option("learning-rate", "Set the learning rate (default: 3e-4)", 1);
+        parser.add_option("learning-rate", "Set the learning rate (default: 2e-4)", 1);
         parser.add_option("batch-size", "Set the mini-batch size (default: 64)", 1);
         parser.add_option("patience", "Iterations without progress before early stopping (default: 8000)", 1);
         parser.add_option("max-epochs", "Maximum number of training epochs (default: 250)", 1);
@@ -266,9 +264,9 @@ int main(int argc, char** argv)
         const long num_tokens = 2000;
         const long num_layers = 4;
         const long num_heads = 6;
-        const long num_kv_heads = 6; // 2
+        const long num_kv_heads = 2;
         const long embedding_dim = 228;
-        const long max_seq_len = 30;
+        const long max_seq_len = 100;
 
         // Define transformer configuration
         using my_transformer = transformer_config<
