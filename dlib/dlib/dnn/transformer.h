@@ -28,18 +28,18 @@ namespace dlib
 
     // ----------------------------------------------------------------------------------------
 
-    template <long repeat_factor>
+    template <long repeat_factor_>
     class repeat_heads_
     {
     public:
         explicit repeat_heads_()
-            : r_factor(repeat_factor)
+            : repeat_factor(repeat_factor_)
         {
             DLIB_CASSERT(repeat_factor >= 1);
         }
 
         repeat_heads_(const repeat_heads_& item)
-            : r_factor(item.r_factor)
+            : repeat_factor(item.repeat_factor)
         {
         }
 
@@ -48,7 +48,7 @@ namespace dlib
             if (this == &item)
                 return *this;
 
-            r_factor = item.r_factor;
+            repeat_factor = item.repeat_factor;
             return *this;
         }
 
@@ -71,8 +71,6 @@ namespace dlib
             const long num_kv_heads = input.k();
             const long seq_len = input.nr();
             const long head_dim = input.nc();
-
-            output.set_size(batch_size, num_kv_heads * repeat_factor, seq_len, head_dim);
 
             const float* in_data = input.host();
             float* out_data = output.host_write_only();
@@ -116,8 +114,6 @@ namespace dlib
             const long seq_len = gradient_input.nr();
             const long head_dim = gradient_input.nc();
 
-            data_grad.set_size(batch_size, num_kv_heads, seq_len, head_dim);
-
             const float* grad_in = gradient_input.host();
             float* grad_out = data_grad.host_write_only();
 
@@ -150,103 +146,107 @@ namespace dlib
         const tensor& get_layer_params() const { return params; }
         tensor& get_layer_params() { return params; }
 
-        friend void serialize(const dropout_& item, std::ostream& out)
+        friend void serialize(const repeat_heads_& item, std::ostream& out)
         {
             serialize("repeat_heads_", out);
-            serialize(item.repeat_factor_, out);
+            serialize(item.repeat_factor, out);
         }
 
-        friend void deserialize(dropout_& item, std::istream& in)
+        friend void deserialize(repeat_heads_& item, std::istream& in)
         {
             std::string version;
             deserialize(version, in);
             if (version != "repeat_heads_")
                 throw serialization_error("Unexpected version '" + version + "' found while deserializing dlib::repeat_heads_.");
-            deserialize(item.repeat_factor_, in);
+            deserialize(item.repeat_factor, in);
         }
 
-        friend std::ostream& operator<<(std::ostream& out, const dropout_& item)
+        friend std::ostream& operator<<(std::ostream& out, const repeat_heads_& item)
         {
             out << "repeat_heads\t ("
-                << "repeat_factor=" << item.repeat_factor_
+                << "repeat_factor=" << item.repeat_factor
                 << ")";
             return out;
         }
 
-        friend void to_xml(const dropout_& item, std::ostream& out)
+        friend void to_xml(const repeat_heads_& item, std::ostream& out)
         {
             out << "<dropout"
-                << " repeat_factor='" << item.repeat_factor_ << "'";
+                << " repeat_factor='" << item.repeat_factor << "'";
             out << "/>\n";
         }
 
     private:
-        long repeat_factor_;
+        long repeat_factor;
         resizable_tensor params; // unused
     };
 
-    template <long repeat_factor, typename SUBNET>
-    using repeat_heads = add_layer<repeat_heads_<repeat_factor>, SUBNET>;
+    template <long RF, typename SUBNET>
+    using repeat_heads = add_layer<repeat_heads_<RF>, SUBNET>;
 
     // ----------------------------------------------------------------------------------------
 
     namespace gqa_transformer
     {
-        // Query: garde num_heads têtes complètes
+        // Query projection: projects to d_model then reshapes to (num_heads, seq_len, head_dim)
         template <long d_model, long num_heads, typename SUBNET>
         using query = reshape_to<num_heads, -1, d_model / num_heads,
             linear_no_bias<d_model, SUBNET>>;
 
-        // Key: utilise num_kv_heads (moins de têtes)
+        // Key projection for GQA: uses fewer heads (num_kv_heads) than queries
         template <long num_kv_heads, long head_dim, typename SUBNET>
         using key = reshape_to<num_kv_heads, -1, head_dim,
             linear_no_bias<num_kv_heads * head_dim, SUBNET>>;
 
-        // Value: utilise num_kv_heads (moins de têtes)
+        // Value projection for GQA: same head count as keys
         template <long num_kv_heads, long head_dim, typename SUBNET>
         using value = reshape_to<num_kv_heads, -1, head_dim,
             linear_no_bias<num_kv_heads * head_dim, SUBNET>>;
 
-        template <template <typename> class ACT, template <typename> class DO,
-            long d_model, long num_heads, long num_kv_heads, typename SUBNET>
+        // Grouped Query Attention: K/V heads are repeated to match Q head count
+        // Reduces memory bandwidth while maintaining model quality
+        template <long d_model, long num_heads, long num_kv_heads, typename SUBNET>
         using multihead_attention_gqa =
             linear_no_bias<d_model, reshape_to<1, -1, d_model,
             multm_prev3<softmaxm<tril_mask<
             scale_weights<d_model / num_heads,
             multm_prev4<
-            rope<query<d_model, num_heads, skip1<
+            // Q: apply RoPE after projection
+            rope<query<d_model, num_heads, skip2<
             tag4<transpose<
-            repeat_heads<num_heads / num_kv_heads,                          // Répéter K
-            rope<key<num_kv_heads, d_model / num_heads, skip2<          // K avec moins de têtes
-            tag3<repeat_heads<num_heads / num_kv_heads,                     // Répéter V
-            value<num_kv_heads, d_model / num_heads,                    // V avec moins de têtes
+            // K: project, apply RoPE, then repeat heads to match Q
+            repeat_heads<num_heads / num_kv_heads,
+            rope<key<num_kv_heads, d_model / num_heads, skip2<
+            // V: project and repeat heads (no positional encoding)
+            tag3<repeat_heads<num_heads / num_kv_heads,
+            value<num_kv_heads, d_model / num_heads,
             tag2<SUBNET>>>>>>>>>>>>>>>>>>>>;
 
-        template <template <typename> class ACT, template <typename> class DO,
-            long d_model, long num_heads, long num_kv_heads, typename SUBNET>
+        // Transformer block with pre-norm architecture
+        // Attention sublayer followed by SwiGLU feed-forward, each with residual connections
+        template <long d_model, long num_heads, long num_kv_heads, typename SUBNET>
         using transformer_block =
             add_prev5<act_steps<swiglu<d_model, 8, 3, input_tensor>, 4, rms_norm<tag5<
-            add_prev1<multihead_attention_gqa<ACT, DO, d_model, num_heads, num_kv_heads,
-            rms_norm<tag1<SUBNET>>>>>>>>;
+            add_prev1<multihead_attention_gqa<d_model, num_heads, num_kv_heads, rms_norm<tag1<
+            SUBNET>>>>>>>>;
 
-        template<long remaining_layers, template <typename> class ACT, template <typename> class DO,
-            long d_model, long num_heads, long num_kv_heads, typename SUBNET, typename enabled = void>
+        // Recursive template to stack N transformer blocks
+        template<long remaining_layers, long d_model, long num_heads, long num_kv_heads,
+            typename SUBNET, typename enabled = void>
         struct transformer_stack_impl
         {
-            using type = transformer_block<ACT, DO, d_model, num_heads, num_kv_heads,
-                typename transformer_stack_impl<remaining_layers - 1, ACT, DO, d_model, num_heads, num_kv_heads, SUBNET>::type>;
+            using type = transformer_block<d_model, num_heads, num_kv_heads,
+                typename transformer_stack_impl<remaining_layers - 1, d_model, num_heads, num_kv_heads, SUBNET>::type>;
         };
 
-        template<template <typename> class ACT, template <typename> class DO,
-            long d_model, long num_heads, long num_kv_heads, typename SUBNET>
-        struct transformer_stack_impl<0, ACT, DO, d_model, num_heads, num_kv_heads, SUBNET, void>
+        template<long d_model, long num_heads, long num_kv_heads, typename SUBNET>
+        struct transformer_stack_impl<0, d_model, num_heads, num_kv_heads, SUBNET, void>
         {
             using type = tag10<SUBNET>;
         };
 
-        template<long num_layers, template <typename> class ACT, template <typename> class DO,
-            long d_model, long num_heads, long num_kv_heads, typename SUBNET>
-        using transformer_stack = typename transformer_stack_impl<num_layers, ACT, DO, d_model, num_heads, num_kv_heads, SUBNET>::type;
+        template<long num_layers, long d_model, long num_heads, long num_kv_heads, typename SUBNET>
+        using transformer_stack = typename transformer_stack_impl<num_layers, d_model, num_heads, num_kv_heads, SUBNET>::type;
 
     } // namespace gqa_transformer
 
@@ -372,7 +372,7 @@ namespace dlib
     } // namespace fused_transformer
 
     // Default to canonical transformer implementation
-    //using namespace canonical_transformer;
+    using namespace gqa_transformer;
 
 	// ----------------------------------------------------------------------------------------
 
