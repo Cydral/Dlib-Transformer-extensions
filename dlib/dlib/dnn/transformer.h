@@ -158,7 +158,7 @@ namespace dlib
 
     private:
         long repeat_factor;
-        resizable_tensor params;  // unused, but required by layer interface
+        resizable_tensor params;  // unused
     };
 
     template <long RF, typename SUBNET>
