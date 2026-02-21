@@ -1,5 +1,5 @@
 ﻿/*!
-    @file slm_advanced_train_ex.cpp
+    @file slm_advanced_gqa_train_ex.cpp
     @brief Modern transformer language model with optimized training pipeline
 
     This example demonstrates a production-ready transformer language model using
@@ -20,11 +20,11 @@
     - Model serialization with embedded tokenizer
 
     Usage:
-      slm_advanced_train_ex --train      Train on internal dataset
-      slm_advanced_train_ex --generate   Generate text from trained model
-      slm_advanced_train_ex --verify     Verify output against original
+      slm_advanced_gqa_train_ex --train      Train on internal dataset
+      slm_advanced_gqa_train_ex --generate   Generate text from trained model
+      slm_advanced_gqa_train_ex --verify     Verify output against original
 
-    Model configuration is set via transformer_config<vocab, layers, heads, dim>.
+    Model configuration is set via transformer_config<vocab, layers, heads, kv_heads, dim>.
 !*/
 #include <iostream>
 #include <string>
@@ -70,6 +70,7 @@ namespace dlib
         long vocab_size = 15000,
         long num_layers = 6,
         long num_heads = 8,
+        long num_kv_heads = 2,
         long embedding_dim = 512
     >
     struct transformer_config {
@@ -77,6 +78,7 @@ namespace dlib
         static constexpr long VOCAB_SIZE = vocab_size;
         static constexpr long NUM_LAYERS = num_layers;
         static constexpr long NUM_HEADS = num_heads;
+        static constexpr long NUM_KV_HEADS = num_kv_heads;
         static constexpr long EMBEDDING_DIM = embedding_dim;
 
         // Compile-time validation of model configuration
@@ -84,16 +86,18 @@ namespace dlib
             static_assert(VOCAB_SIZE > 0, "Vocabulary size must be positive");
             static_assert(NUM_LAYERS > 0, "Number of layers must be positive");
             static_assert(NUM_HEADS > 0, "Number of attention heads must be positive");
+            static_assert(NUM_KV_HEADS > 0, "Number of KV heads must be positive");
+            static_assert(NUM_HEADS % NUM_KV_HEADS == 0, "num_heads must be divisible by num_kv_heads");
             static_assert(EMBEDDING_DIM % NUM_HEADS == 0, "Embedding dimension must be divisible by number of heads");
         };
 
         template<bool is_training>
         using network_type = std::conditional_t<is_training,
             classification_head<VOCAB_SIZE,
-            canonical_transformer::transformer_stack<NUM_LAYERS, EMBEDDING_DIM, NUM_HEADS,
+            gqa_transformer::transformer_stack<NUM_LAYERS, EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS,
             embeddings<VOCAB_SIZE, EMBEDDING_DIM, input<matrix<int, 0, 1>>>>>,
             classification_head<VOCAB_SIZE,
-            canonical_transformer::transformer_stack<NUM_LAYERS, EMBEDDING_DIM, NUM_HEADS,
+            gqa_transformer::transformer_stack<NUM_LAYERS, EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS,
             embeddings<VOCAB_SIZE, EMBEDDING_DIM, input<matrix<int, 0, 1>>>>>>;
 
         struct model_info {
@@ -103,6 +107,7 @@ namespace dlib
                     << "- vocabulary size: " << VOCAB_SIZE << "\n"
                     << "- layers: " << NUM_LAYERS << "\n"
                     << "- attention heads: " << NUM_HEADS << "\n"
+                    << "- KV heads (GQA): " << NUM_KV_HEADS << "\n"
                     << "- embedding dimension: " << EMBEDDING_DIM;
                 return ss.str();
             }
@@ -224,10 +229,10 @@ int main(int argc, char** argv)
         parser.add_option("batch-size", "Set the mini-batch size (default: 64)", 1);
         parser.add_option("patience", "Iterations without progress before early stopping (default: 8000)", 1);
         parser.add_option("max-epochs", "Maximum number of training epochs (default: 250)", 1);
-        parser.add_option("alpha", "Set the weight decay for Adam (default: 0.004)", 1);
-        parser.add_option("beta1", "Set Adam's first moment coefficient (default: 0.9)", 1);
-        parser.add_option("beta2", "Set Adam's second moment coefficient (default: 0.999)", 1);
-        parser.add_option("model-file", "Path for model (default: dlib_lm_tokens_model.dat)", 1);
+        parser.add_option("alpha", "Set the weight decay for AdamW (default: 0.004)", 1);
+        parser.add_option("beta1", "Set AdamW's first moment coefficient (default: 0.9)", 1);
+        parser.add_option("beta2", "Set AdamW's second moment coefficient (default: 0.999)", 1);
+        parser.add_option("model-file", "Path for model (default: dlib_lm_tokens_gqa_model.dat)", 1);
         parser.add_option("tokenizer-file", "Path for tokenizer (default: dlib_lm_tokenizer.vocab)", 1);
         parser.add_option("output-file", "Path for generated output (default: generated_text.txt)", 1);
         parser.add_option("max-tokens", "Maximum number of tokens to process (default: all)", 1);
@@ -251,7 +256,7 @@ int main(int argc, char** argv)
         const double alpha = get_option(parser, "alpha", 0.004);
         const double beta1 = get_option(parser, "beta1", 0.9);
         const double beta2 = get_option(parser, "beta2", 0.999);
-        const std::string model_file = get_option(parser, "model-file", "dlib_lm_tokens_model.dat");
+        const std::string model_file = get_option(parser, "model-file", "dlib_lm_tokens_gqa_model.dat");
         const std::string tokenizer_file = get_option(parser, "tokenizer-file", "dlib_lm_tokenizer.vocab");
         const std::string output_file = get_option(parser, "output-file", "generated_text.txt");
         
@@ -259,6 +264,7 @@ int main(int argc, char** argv)
         const long num_tokens = 2000;
         const long num_layers = 4;
         const long num_heads = 6;
+        const long num_kv_heads = 2;
         const long embedding_dim = 228;
         const long max_seq_len = 100;
 
@@ -267,6 +273,7 @@ int main(int argc, char** argv)
             num_tokens,     // vocab
             num_layers,     // layers
             num_heads,      // heads
+            num_kv_heads,   // kv_heads
             embedding_dim   // dim
         >;
 
@@ -419,7 +426,7 @@ int main(int argc, char** argv)
                 !file_exists("chkpt-" + model_file)) deserialize(model_file) >> net >> tokenizer;
 
             // Create trainer
-            dnn_trainer<net_type, adam> trainer(net, adam(alpha, beta1, beta2), gpus);
+            dnn_trainer<net_type, adamw> trainer(net, adamw(alpha, beta1, beta2), gpus);
             trainer.set_learning_rate(learning_rate);
             trainer.set_min_learning_rate(1e-6);
             trainer.set_mini_batch_size(batch_size);
@@ -453,6 +460,11 @@ int main(int argc, char** argv)
                     std::vector<unsigned long> batch_labels(
                         labels.begin() + i, labels.begin() + batch_end);
 
+                    //std::vector<long> pad_lengths(batch_samples.size());
+                    //for (size_t j = 0; j < batch_samples.size(); ++j)
+                    //    pad_lengths[j] = count_leading_padding(batch_samples[j], pad_token);
+                    //tril_padding_context::set_from_lengths(pad_lengths);
+
                     trainer.train_one_step(batch_samples, batch_labels);
                     total_loss += trainer.get_average_loss();
                     batches_seen++;
@@ -476,6 +488,7 @@ int main(int argc, char** argv)
                 }
                 epoch++;
             }
+            //tril_padding_context::clear();
 
             // Save model
             net.clean();
@@ -623,6 +636,8 @@ int main(int argc, char** argv)
             while (total_bytes < target_size && next_token != end_of_text
                 && !signal_handler::is_triggered()) {
                 // Predict next token
+                //long pad_len = count_leading_padding(input_seq, pad_token);
+                //tril_padding_context::set_uniform(pad_len, 1);
                 next_token = net(input_seq);
                 token_buffer.push_back(next_token);
                 token_count++;
@@ -653,6 +668,7 @@ int main(int argc, char** argv)
                 }
                 if (max_tokens_limit > 0 && token_count >= max_tokens_limit) break;
             }
+            //tril_padding_context::clear();
 
             // Flush remaining buffer
             if (!token_buffer.empty()) {
@@ -718,6 +734,7 @@ int main(int argc, char** argv)
  *    + vocabulary size: 2000
  *    + layers: 4
  *    + attention heads: 6
+ *    + KV heads (GQA): 2
  *    + embedding dimension: 228 
  *    + max sequence length: 100
  * - Number of parameters: 2,681,769
