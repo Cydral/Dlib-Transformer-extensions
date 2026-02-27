@@ -223,7 +223,7 @@ int main(int argc, char** argv)
         parser.add_option("learning-rate", "Set the learning rate (default: 2e-4)", 1);
         parser.add_option("batch-size", "Set the mini-batch size (default: 64)", 1);
         parser.add_option("patience", "Iterations without progress before early stopping (default: 8000)", 1);
-        parser.add_option("max-epochs", "Maximum number of training epochs (default: 250)", 1);
+        parser.add_option("max-epochs", "Maximum number of training epochs (default: 300)", 1);
         parser.add_option("alpha", "Set the weight decay for AdamW (default: 0.004)", 1);
         parser.add_option("beta1", "Set AdamW's first moment coefficient (default: 0.9)", 1);
         parser.add_option("beta2", "Set AdamW's second moment coefficient (default: 0.999)", 1);
@@ -247,7 +247,7 @@ int main(int argc, char** argv)
         const double learning_rate = get_option(parser, "learning-rate", 2e-4);
         const size_t batch_size = get_option(parser, "batch-size", 64);
         const long patience = get_option(parser, "patience", 8000);
-        const size_t max_epochs = get_option(parser, "max-epochs", 250);
+        const size_t max_epochs = get_option(parser, "max-epochs", 300);
         const double alpha = get_option(parser, "alpha", 0.004);
         const double beta1 = get_option(parser, "beta1", 0.9);
         const double beta2 = get_option(parser, "beta2", 0.999);
@@ -426,7 +426,7 @@ int main(int argc, char** argv)
             trainer.set_min_learning_rate(1e-6);
             trainer.set_mini_batch_size(batch_size);
             trainer.set_iterations_without_progress_threshold(patience);
-            trainer.set_synchronization_file("chkpt-" + model_file, std::chrono::minutes(15));
+            trainer.set_synchronization_file("chkpt-" + model_file, std::chrono::minutes(10));
             trainer.be_quiet();
 
             cout << "Number of model parameters: " << count_parameters(net) << endl;
@@ -720,22 +720,3 @@ int main(int argc, char** argv)
         return 1;
     }
 }
-
-/*
- * This program demonstrates advanced tokenization and training of a language model
- * on an internal dataset using a BPE-style tokenizer with 2000 vocabulary entries.
- * The training process produces a model file of approximately 12MB on disk.
- *
- * - Transformer model configuration:
- *    + vocabulary size: 2000
- *    + layers: 4
- *    + attention heads: 6
- *    + KV heads (GQA): 2
- *    + embedding dimension: 228 
- *    + max sequence length: 100
- * - Number of parameters: 2,681,769
- *
- * After a 1-step full training, the model achieves perfect memorization of the dataset.
- * The generation option produces text that matches the original dataset byte-for-byte
- * with 100% accuracy.
- */
