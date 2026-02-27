@@ -249,9 +249,10 @@ namespace dlib
         using value = reshape_to<num_heads, -1, d_model / num_heads,
             linear_no_bias<d_model, SUBNET>>;
 
-        template <long d_model, long num_heads, typename SUBNET>            
+        template <template <typename> class DO,
+            long d_model, long num_heads, typename SUBNET>
         using multihead_attention =
-            linear_no_bias<d_model, reshape_to<1, -1, d_model,
+            DO<linear_no_bias<d_model, reshape_to<1, -1, d_model,
             multm_prev3<softmaxm<tril_mask<
             scale_weights<d_model / num_heads,
             multm_prev4<
@@ -259,29 +260,33 @@ namespace dlib
             tag4<transpose<
             rope<key<d_model, num_heads, skip2<
             tag3<value<d_model, num_heads,
-            tag2<SUBNET>>>>>>>>>>>>>>>>>>;
+            tag2<SUBNET>>>>>>>>>>>>>>>>>>>;
 
-        template <long d_model, long num_heads, typename SUBNET>
+        template <template <typename> class ACT, template <typename> class DO,
+            long d_model, long num_heads, typename SUBNET>
         using transformer_block = 
-            add_prev5<ffn<gelu, d_model, 4, rms_norm<tag5<
-            add_prev1<multihead_attention<d_model, num_heads, rms_norm<tag1<SUBNET>>>>>>>>;
+            add_prev5<ffn<ACT, d_model, 4, rms_norm<tag5<
+            add_prev1<multihead_attention<DO, d_model, num_heads, rms_norm<tag1<SUBNET>>>>>>>>;
 
-        template<long remaining_layers, long d_model, long num_heads,
+        template<long remaining_layers, template <typename> class ACT, template <typename> class DO, 
+            long d_model, long num_heads,
             typename SUBNET, typename enabled = void>
         struct transformer_stack_impl
         {
-            using type = transformer_block<d_model, num_heads,
-                typename transformer_stack_impl<remaining_layers - 1, d_model, num_heads, SUBNET>::type>;
+            using type = transformer_block<ACT, DO, d_model, num_heads,
+                typename transformer_stack_impl<remaining_layers - 1, ACT, DO, d_model, num_heads, SUBNET>::type>;
         };
 
-        template<long d_model, long num_heads, typename SUBNET>
-        struct transformer_stack_impl<0, d_model, num_heads, SUBNET, void>
+        template<template <typename> class ACT, template <typename> class DO, 
+            long d_model, long num_heads, typename SUBNET>
+        struct transformer_stack_impl<0, ACT, DO, d_model, num_heads, SUBNET, void>
         {
             using type = tag10<SUBNET>;
         };
 
-        template<long num_layers, long d_model, long num_heads, typename SUBNET>
-        using transformer_stack = typename transformer_stack_impl<num_layers, d_model, num_heads, SUBNET>::type;
+        template<long num_layers, template <typename> class ACT, template <typename> class DO,
+            long d_model, long num_heads, typename SUBNET>
+        using transformer_stack = typename transformer_stack_impl<num_layers, ACT, DO, d_model, num_heads, SUBNET>::type;
 
     } // namespace canonical_transformer
 
@@ -298,7 +303,7 @@ namespace dlib
         template <long num_heads, long d_model, typename SUBNET>
         using value = extract<(d_model * 2), num_heads, d_model / num_heads, 1, SUBNET>;
 
-        template <template <typename> class ACT, template <typename> class DO,
+        template <template <typename> class DO,
             long d_model, long num_heads, typename SUBNET>
         using multihead_attention =
             DO<extract<0, 1, 1, d_model, fc_no_bias<d_model,
@@ -324,8 +329,8 @@ namespace dlib
         template <template <typename> class ACT, template <typename> class DO,
             long d_model, long num_heads, typename SUBNET>
         using transformer_block = 
-            add_prev5<fused_swiglu<d_model, rms_norm<tag5<
-            add_prev1<multihead_attention<ACT, DO, d_model, num_heads, rms_norm<tag1<SUBNET>>>>>>>>;
+            add_prev5<fused_ffn<ACT, DO, d_model, rms_norm<tag5<
+            add_prev1<multihead_attention<DO, d_model, num_heads, rms_norm<tag1<SUBNET>>>>>>>>;
 
         template<long remaining_layers, template <typename> class ACT, template <typename> class DO,
             long d_model, long num_heads, typename SUBNET, typename enabled = void>

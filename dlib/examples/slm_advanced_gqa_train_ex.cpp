@@ -1,30 +1,31 @@
 ﻿/*!
     @file slm_advanced_gqa_train_ex.cpp
-    @brief Modern transformer language model with optimized training pipeline
+    @brief GQA transformer with Adaptive Computation Time FFN: full pipeline from
+           tokenization to byte-accurate text reconstruction
 
-    This example demonstrates a production-ready transformer language model using
-    Grouped Query Attention (GQA). It trains on an internal dataset and
-    generates text autoregressively.
+    This example extends the canonical transformer (slm_advanced_train_ex) with two
+    architectural features from recent LLM research:
 
-    Architecture features:
-    - Grouped Query Attention: fewer K/V heads than Q heads for reduced memory
-    - RoPE positional encoding for better length generalization
-    - SwiGLU feed-forward layers with gated activation
-    - RMSNorm for stable training
-    - BPE tokenization with configurable vocabulary
+    - Grouped Query Attention (GQA): K and V use fewer heads than Q (num_kv_heads
+      num_heads), reducing K/V projection cost. K/V heads are repeated via repeat_heads
+      to match the Q head count before computing attention.
 
-    The example showcases:
-    - Compact network definition via transformer_stack recursive template
-    - Single-token prediction with loss_multiclass_log
-    - Autoregressive generation with sliding context window
-    - Model serialization with embedded tokenizer
+    - Adaptive Computation Time (ACT) as FFN sublayer: each token position learns how
+      many computation steps it requires, up to max_steps. A learned halting probability
+      determines early stopping; the output is the weighted sum of intermediate states.
+      Implements the mechanism from Graves (2016), arXiv:1603.08983. The transition
+      network at each ACT step is a SwiGLU FFN, regularized by a ponder penalty.
 
-    Usage:
-      slm_advanced_gqa_train_ex --train      Train on internal dataset
-      slm_advanced_gqa_train_ex --generate   Generate text from trained model
-      slm_advanced_gqa_train_ex --verify     Verify output against original
+    No dropout is used, consistent with modern LLM practice. Regularization is provided
+    by AdamW weight decay, stochastic mini-batch sampling, RMSNorm, and the ACT ponder
+    penalty. The explicit objective being perfect corpus memorization, dropout would be
+    counterproductive. Training and inference therefore share a single network_type.
 
-    Model configuration is set via transformer_config<vocab, layers, heads, kv_heads, dim>.
+    Architecture (gqa_transformer namespace, via transformer_config):
+    - GQA multi-head attention with RoPE on Q and K, causal mask, scaled dot-product
+    - RMSNorm pre-normalization, residual connections around both sublayers
+    - ACT sublayer: SwiGLU transition network, max 4 steps per position
+    - Cross-entropy classification head with padding excluded via set_ignore_index(<pad>)
 !*/
 #include <iostream>
 #include <string>
@@ -66,7 +67,7 @@ namespace dlib
      * @param num_heads Number of attention heads
      * @param embedding_dim Dimension of token embeddings
      */
-    template <
+    template<
         long vocab_size = 15000,
         long num_layers = 6,
         long num_heads = 8,
@@ -74,31 +75,25 @@ namespace dlib
         long embedding_dim = 512
     >
     struct transformer_config {
-        // Core model parameters
         static constexpr long VOCAB_SIZE = vocab_size;
         static constexpr long NUM_LAYERS = num_layers;
         static constexpr long NUM_HEADS = num_heads;
         static constexpr long NUM_KV_HEADS = num_kv_heads;
         static constexpr long EMBEDDING_DIM = embedding_dim;
 
-        // Compile-time validation of model configuration
         struct validation {
             static_assert(VOCAB_SIZE > 0, "Vocabulary size must be positive");
             static_assert(NUM_LAYERS > 0, "Number of layers must be positive");
             static_assert(NUM_HEADS > 0, "Number of attention heads must be positive");
             static_assert(NUM_KV_HEADS > 0, "Number of KV heads must be positive");
-            static_assert(NUM_HEADS % NUM_KV_HEADS == 0, "num_heads must be divisible by num_kv_heads");
-            static_assert(EMBEDDING_DIM % NUM_HEADS == 0, "Embedding dimension must be divisible by number of heads");
+            static_assert(NUM_HEADS% NUM_KV_HEADS == 0, "num_heads must be divisible by num_kv_heads");
+            static_assert(EMBEDDING_DIM% NUM_HEADS == 0, "Embedding dimension must be divisible by number of heads");
         };
 
-        template<bool is_training>
-        using network_type = std::conditional_t<is_training,
+        using network_type =
             classification_head<VOCAB_SIZE,
             gqa_transformer::transformer_stack<NUM_LAYERS, EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS,
-            embeddings<VOCAB_SIZE, EMBEDDING_DIM, input<matrix<int, 0, 1>>>>>,
-            classification_head<VOCAB_SIZE,
-            gqa_transformer::transformer_stack<NUM_LAYERS, EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS,
-            embeddings<VOCAB_SIZE, EMBEDDING_DIM, input<matrix<int, 0, 1>>>>>>;
+            embeddings<VOCAB_SIZE, EMBEDDING_DIM, input<matrix<int, 0, 1>>>>>;
 
         struct model_info {
             static std::string describe() {
@@ -416,7 +411,7 @@ int main(int argc, char** argv)
             cout << "Created " << samples.size() << " training samples\n";
 
             // Build and train the network
-            using net_type = my_transformer::network_type<true>;
+            using net_type = my_transformer::network_type;
             net_type net;            
             layer<0>(net).loss_details().set_ignore_index(pad_token);
             cout << my_transformer::model_info::describe() << endl;
@@ -499,7 +494,7 @@ int main(int argc, char** argv)
             {
                 if (!signal_handler::is_triggered()) {
                     cout << "Evaluating model accuracy...\n";
-                    my_transformer::network_type<false> g_infer;
+                    my_transformer::network_type g_infer;
                     deserialize(model_file) >> g_infer >> tokenizer;
                     auto predicted = g_infer(samples);
                     size_t correct = 0;
@@ -523,7 +518,7 @@ int main(int argc, char** argv)
             cout << "=== GENERATION MODE ===\n";
 
             // Load the model
-            my_transformer::network_type<false> net;
+            my_transformer::network_type net;
             if (file_exists(model_file)) {
                 deserialize(model_file) >> net >> tokenizer;
                 cout << "Loaded model from " << model_file << "\n";
@@ -657,13 +652,14 @@ int main(int argc, char** argv)
                     auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
                         std::chrono::high_resolution_clock::now() - start_time).count();
                     double tokens_per_second = (token_count - input_seq.size()) / (elapsed > 0 ? elapsed : 1);
+                    const double bytes_per_token = (chunk.size() > 0) ? chunk.size() / (double)buffer_size : 1.0;
 
                     cout << "Generated " << (token_count - input_seq.size()) << " tokens, "
                         << total_bytes << " bytes ("
                         << (total_bytes * 100.0 / target_size) << "%) - "
                         << tokens_per_second << " tokens/sec - "
                         << "Est. completion: "
-                        << (int)((target_size - total_bytes) / (tokens_per_second * (chunk.size() / (double)buffer_size)))
+                        << (int)((target_size - total_bytes) / (tokens_per_second * bytes_per_token))
                         << " seconds\r";
                 }
                 if (max_tokens_limit > 0 && token_count >= max_tokens_limit) break;

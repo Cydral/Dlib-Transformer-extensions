@@ -1,30 +1,37 @@
 ﻿/*!
     @file slm_advanced_train_ex.cpp
-    @brief Modern transformer language model with optimized training pipeline
+    @brief Compact transformer: full pipeline from tokenization to byte-accurate text reconstruction
 
-    This example demonstrates a production-ready transformer language model using
-    Grouped Query Attention (GQA). It trains on an internal dataset and
-    generates text autoregressively.
+    This example demonstrates the complete lifecycle of a Small Language Model (SLM) built
+    on Dlib's canonical transformer architecture. The model is trained to memorize an internal
+    text corpus and is then used to reproduce it autoregressively with byte-for-byte accuracy,
+    which serves as a concrete end-to-end validation of the training and inference pipeline.
 
-    Architecture features:
-    - Grouped Query Attention: fewer K/V heads than Q heads for reduced memory
-    - RoPE positional encoding for better length generalization
-    - SwiGLU feed-forward layers with gated activation
-    - RMSNorm for stable training
-    - BPE tokenization with configurable vocabulary
+    The program covers three successive modes:
+    - Training:      BPE tokenizer training on a multi-domain corpus, dataset tokenization with
+                     special token wrapping (<text> / </text>), sequence preparation via a sliding
+                     context window, AdamW optimization with early stopping, and model serialization
+                     with the tokenizer embedded in the same file.
+    - Generation:    Autoregressive next-token prediction from an initial prompt (loaded from the
+                     pre-tokenized file or re-encoded on the fly), with a sliding context window,
+                     buffered binary output, and live throughput reporting.
+    - Verification:  Byte-for-byte comparison between the generated output file and the original
+                     dataset, reporting mismatches with their byte offsets and hex values.
 
-    The example showcases:
-    - Compact network definition via transformer_stack recursive template
-    - Single-token prediction with loss_multiclass_log
-    - Autoregressive generation with sliding context window
-    - Model serialization with embedded tokenizer
+    Architecture (canonical_transformer namespace, compile-time via transformer_config):
+    - Standard multi-head attention with separate Q, K, V projections
+    - RoPE (Rotary Position Embedding) applied to Q and K
+    - Causal mask (tril_mask) and scaled dot-product attention
+    - Feed-forward network with GELU activation (SwiGLU variant available but commented out)
+    - RMSNorm pre-normalization on attention and FFN sub-layers
+    - Residual connections around both sub-layers
+    - Dropout during training (dropout_10), disabled at inference via multiply layer
+    - Cross-entropy classification head for next-token prediction
 
-    Usage:
-      slm_advanced_train_ex --train      Train on internal dataset
-      slm_advanced_train_ex --generate   Generate text from trained model
-      slm_advanced_train_ex --verify     Verify output against original
-
-    Model configuration is set via transformer_config<vocab, layers, heads, dim>.
+    The model is intentionally compact: given sufficient training, it achieves near-perfect
+    memorization of the training corpus, enabling byte-accurate text reconstruction. This makes
+    the example a practical testbed for validating tokenizer round-trips, training convergence,
+    and autoregressive inference correctness within Dlib's deep learning framework.
 !*/
 #include <iostream>
 #include <string>
@@ -66,11 +73,13 @@ namespace dlib
      * @param num_heads Number of attention heads
      * @param embedding_dim Dimension of token embeddings
      */
-    template <
+    template<
         long vocab_size = 15000,
         long num_layers = 6,
         long num_heads = 8,
-        long embedding_dim = 512
+        long embedding_dim = 512,
+        template <typename> class activation_func = gelu,
+        template <typename> class dropout_policy = dropout_10
     >
     struct transformer_config {
         // Core model parameters
@@ -90,10 +99,10 @@ namespace dlib
         template<bool is_training>
         using network_type = std::conditional_t<is_training,
             classification_head<VOCAB_SIZE,
-            canonical_transformer::transformer_stack<NUM_LAYERS, EMBEDDING_DIM, NUM_HEADS,
+            canonical_transformer::transformer_stack<NUM_LAYERS, activation_func, dropout_policy, EMBEDDING_DIM, NUM_HEADS,
             embeddings<VOCAB_SIZE, EMBEDDING_DIM, input<matrix<int, 0, 1>>>>>,
             classification_head<VOCAB_SIZE,
-            canonical_transformer::transformer_stack<NUM_LAYERS, EMBEDDING_DIM, NUM_HEADS,
+            canonical_transformer::transformer_stack<NUM_LAYERS, activation_func, multiply, EMBEDDING_DIM, NUM_HEADS,
             embeddings<VOCAB_SIZE, EMBEDDING_DIM, input<matrix<int, 0, 1>>>>>>;
 
         struct model_info {
@@ -223,10 +232,10 @@ int main(int argc, char** argv)
         parser.add_option("learning-rate", "Set the learning rate (default: 2e-4)", 1);
         parser.add_option("batch-size", "Set the mini-batch size (default: 64)", 1);
         parser.add_option("patience", "Iterations without progress before early stopping (default: 8000)", 1);
-        parser.add_option("max-epochs", "Maximum number of training epochs (default: 250)", 1);
-        parser.add_option("alpha", "Set the weight decay for Adam (default: 0.004)", 1);
-        parser.add_option("beta1", "Set Adam's first moment coefficient (default: 0.9)", 1);
-        parser.add_option("beta2", "Set Adam's second moment coefficient (default: 0.999)", 1);
+        parser.add_option("max-epochs", "Maximum number of training epochs (default: 300)", 1);
+        parser.add_option("alpha", "Set the weight decay for AdamW (default: 0.004)", 1);
+        parser.add_option("beta1", "Set AdamW's first moment coefficient (default: 0.9)", 1);
+        parser.add_option("beta2", "Set AdamW's second moment coefficient (default: 0.999)", 1);
         parser.add_option("model-file", "Path for model (default: dlib_lm_tokens_model.dat)", 1);
         parser.add_option("tokenizer-file", "Path for tokenizer (default: dlib_lm_tokenizer.vocab)", 1);
         parser.add_option("output-file", "Path for generated output (default: generated_text.txt)", 1);
@@ -247,7 +256,7 @@ int main(int argc, char** argv)
         const double learning_rate = get_option(parser, "learning-rate", 2e-4);
         const size_t batch_size = get_option(parser, "batch-size", 64);
         const long patience = get_option(parser, "patience", 8000);
-        const size_t max_epochs = get_option(parser, "max-epochs", 250);
+        const size_t max_epochs = get_option(parser, "max-epochs", 300);
         const double alpha = get_option(parser, "alpha", 0.004);
         const double beta1 = get_option(parser, "beta1", 0.9);
         const double beta2 = get_option(parser, "beta2", 0.999);
@@ -419,7 +428,7 @@ int main(int argc, char** argv)
                 !file_exists("chkpt-" + model_file)) deserialize(model_file) >> net >> tokenizer;
 
             // Create trainer
-            dnn_trainer<net_type, adam> trainer(net, adam(alpha, beta1, beta2), gpus);
+            dnn_trainer<net_type, adamw> trainer(net, adamw(alpha, beta1, beta2), gpus);
             trainer.set_learning_rate(learning_rate);
             trainer.set_min_learning_rate(1e-6);
             trainer.set_mini_batch_size(batch_size);
@@ -642,13 +651,14 @@ int main(int argc, char** argv)
                     auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
                         std::chrono::high_resolution_clock::now() - start_time).count();
                     double tokens_per_second = (token_count - input_seq.size()) / (elapsed > 0 ? elapsed : 1);
+                    double bytes_per_token = (chunk.size() > 0) ? chunk.size() / (double)buffer_size : 1.0;
 
                     cout << "Generated " << (token_count - input_seq.size()) << " tokens, "
                         << total_bytes << " bytes ("
                         << (total_bytes * 100.0 / target_size) << "%) - "
                         << tokens_per_second << " tokens/sec - "
                         << "Est. completion: "
-                        << (int)((target_size - total_bytes) / (tokens_per_second * (chunk.size() / (double)buffer_size)))
+                        << (int)((target_size - total_bytes) / (tokens_per_second * bytes_per_token))
                         << " seconds\r";
                 }
                 if (max_tokens_limit > 0 && token_count >= max_tokens_limit) break;
@@ -712,7 +722,7 @@ int main(int argc, char** argv)
 /*
  * This program demonstrates advanced tokenization and training of a language model
  * on an internal dataset using a BPE-style tokenizer with 2000 vocabulary entries.
- * The training process produces a model file of approximately 12MB on disk.
+ * The training process produces a model file of approximately 13MB on disk.
  *
  * - Transformer model configuration:
  *    + vocabulary size: 2000
@@ -720,7 +730,7 @@ int main(int argc, char** argv)
  *    + attention heads: 6
  *    + embedding dimension: 228 
  *    + max sequence length: 100
- * - Number of parameters: 2,681,769
+ * - Number of parameters: 2,957,801
  *
  * After a 1-step full training, the model achieves perfect memorization of the dataset.
  * The generation option produces text that matches the original dataset byte-for-byte
