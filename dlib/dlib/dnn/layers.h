@@ -6154,7 +6154,8 @@ namespace dlib
             }
 
             // Apply normalization and depth scaling (only in training mode)
-            if (!gradient_check_mode_) {
+            const bool in_training = !network_context::is_active() || network_context::is_training();
+            if (!gradient_check_mode_ && in_training) {
                 const float inv_total = 1.0f / static_cast<float>(total_positions);
                 for (long i = 0; i < params_grad.size(); ++i)
                     params_grad.host()[i] *= inv_total;
@@ -6164,7 +6165,6 @@ namespace dlib
                         seq_len_, num_channels_, feature_dim_, max_steps_);
                 }
 
-                // Update transition network parameters
                 update_transition_parameters();
             }
         }
@@ -6318,20 +6318,27 @@ namespace dlib
 
         void update_transition_parameters()
         {
-            // Skip if frozen or in gradient check mode
             if (learning_rate_multiplier_ == 0.0 || gradient_check_mode_) return;
 
-            // Initialize AdamW solvers on first call
+            // Prefer network_context learning rate when active: it reflects the
+            // trainer's current value and is updated every step by the training loop.
+            // Fall back to the internally stored value otherwise.
+            const double base_lr = (network_context::is_active())
+                ? network_context::get_learning_rate()
+                : current_learning_rate_;
+
+            // Sync internal value for consistency (e.g. serialization, get_learning_rate())
+            current_learning_rate_ = base_lr;
+
             if (!transition_solvers_initialized_) {
                 transition_solvers_.resize(
                     transition_net_.num_computational_layers,
-                    adamw(0.0005, 0.9, 0.999)  // weight_decay, beta1, beta2
+                    adamw(0.0005, 0.9, 0.999)
                 );
                 transition_solvers_initialized_ = true;
             }
 
-            // Apply learning rate multiplier
-            const double effective_lr = current_learning_rate_ * learning_rate_multiplier_;
+            const double effective_lr = base_lr * learning_rate_multiplier_;
             transition_net_.update_parameters(transition_solvers_, effective_lr);
         }
 

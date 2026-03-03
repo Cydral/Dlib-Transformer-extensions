@@ -366,7 +366,6 @@ namespace dlib
         template <long d_model, long num_heads, long num_kv_heads, typename SUBNET>
         using transformer_block =
             add_prev5<act_steps<swiglu<d_model, 8, 3, input_tensor>, 4, rms_norm<tag5<
-            //add_prev5<swiglu<d_model, 8, 3, rms_norm<tag5<
             add_prev1<multihead_attention_gqa<d_model, num_heads, num_kv_heads, rms_norm<tag1<
             SUBNET>>>>>>>>;
 
@@ -1335,7 +1334,7 @@ namespace dlib
 
         // Expert networks
         std::vector<EXPERT_NET> experts;
-        std::vector<float> expert_usage;     // Usage statistics (for monitoring)
+        std::vector<float> expert_usage;    // Usage statistics (for monitoring)
 
         // Forward/backward cache (training mode only)
         std::vector<std::vector<size_t>> selected_expert_indices_;  // [sample][top_k]
