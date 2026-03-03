@@ -1,31 +1,37 @@
 ﻿/*!
     @file slm_advanced_train_ex.cpp
-    @brief Modern transformer language model with optimized training pipeline
+    @brief Compact transformer: full pipeline from tokenization to byte-accurate text reconstruction
 
-    This program demonstrates a production-ready transformer-based language model
-    implementation using contemporary architectural patterns and training techniques.
-    The example showcases efficient text tokenization, specialized loss computation
-    for autoregressive generation, and streamlined transformer construction using
-    Dlib's high-level building blocks.
+    This example demonstrates the complete lifecycle of a Small Language Model (SLM) built
+    on Dlib's canonical transformer architecture. The model is trained to memorize an internal
+    text corpus and is then used to reproduce it autoregressively with byte-for-byte accuracy,
+    which serves as a concrete end-to-end validation of the training and inference pipeline.
 
-    Key features:
-    - BPE tokenization for efficient vocabulary management and text encoding
-    - Specialized loss function (loss_cross_entropy_per_logit) optimized for
-      next-token prediction without requiring sequence flattening
-    - Modern transformer architecture using transformer_stack for compact definition
-    - Token-level input/output for direct sequence modeling
-    - Complete training, generation, and verification pipeline
+    The program covers three successive modes:
+    - Training:      BPE tokenizer training on a multi-domain corpus, dataset tokenization with
+                     special token wrapping (<text> / </text>), sequence preparation via a sliding
+                     context window, AdamW optimization with early stopping, and model serialization
+                     with the tokenizer embedded in the same file.
+    - Generation:    Autoregressive next-token prediction from an initial prompt (loaded from the
+                     pre-tokenized file or re-encoded on the fly), with a sliding context window,
+                     buffered binary output, and live throughput reporting.
+    - Verification:  Byte-for-byte comparison between the generated output file and the original
+                     dataset, reporting mismatches with their byte offsets and hex values.
 
-    Usage modes:
-    --train      Train model on internal dataset with BPE tokenization
-    --generate   Generate text autoregressively from trained model
-    --verify     Validate generated output byte-for-byte against original
+    Architecture (canonical_transformer namespace, compile-time via transformer_config):
+    - Standard multi-head attention with separate Q, K, V projections
+    - RoPE (Rotary Position Embedding) applied to Q and K
+    - Causal mask (tril_mask) and scaled dot-product attention
+    - Feed-forward network with GELU activation (SwiGLU variant available but commented out)
+    - RMSNorm pre-normalization on attention and FFN sub-layers
+    - Residual connections around both sub-layers
+    - Dropout during training (dropout_10), disabled at inference via multiply layer
+    - Cross-entropy classification head for next-token prediction
 
-    Configuration:
-    - Adjust transformer_config template parameters for model size
-    - Modify learning rate, batch size, and training epochs via command-line
-    - Control dataset size with --max-bytes or --percent options
-    - Set sequence length based on available GPU memory
+    The model is intentionally compact: given sufficient training, it achieves near-perfect
+    memorization of the training corpus, enabling byte-accurate text reconstruction. This makes
+    the example a practical testbed for validating tokenizer round-trips, training convergence,
+    and autoregressive inference correctness within Dlib's deep learning framework.
 !*/
 #include <iostream>
 #include <string>
@@ -41,6 +47,7 @@
 #include <dlib/data_io.h>
 #include <dlib/cmd_line_parser.h>
 #include <dlib/tokenizer/bpe_tokenizer.h>
+#include <dlib/misc_api.h>
 
 // Include internal dataset
 #include "slm_data.h"
@@ -51,9 +58,8 @@ using namespace dlib;
 namespace dlib
 {
     // Classification head for next-token prediction
-    template <long num_logits, long embedding_dim, typename SUBNET>
-    using classification_head = loss_multiclass_log<fc<num_logits,
-        fc<embedding_dim / 4, rms_norm<SUBNET>>>>;
+    template <long num_logits, typename SUBNET>
+    using classification_head = loss_cross_entropy_per_logit<linear<num_logits, rms_norm<SUBNET>>>;
 
     /**
      * @brief Transformer model configuration template
@@ -66,16 +72,12 @@ namespace dlib
      * @param num_layers Number of transformer layers
      * @param num_heads Number of attention heads
      * @param embedding_dim Dimension of token embeddings
-     * @param max_seq_len Maximum sequence length
-     * @param activation_func Activation function type
-     * @param dropout_policy Dropout regularization policy
      */
-    template <
+    template<
         long vocab_size = 15000,
         long num_layers = 6,
         long num_heads = 8,
         long embedding_dim = 512,
-        long max_seq_len = 300,
         template <typename> class activation_func = gelu,
         template <typename> class dropout_policy = dropout_10
     >
@@ -85,7 +87,6 @@ namespace dlib
         static constexpr long NUM_LAYERS = num_layers;
         static constexpr long NUM_HEADS = num_heads;
         static constexpr long EMBEDDING_DIM = embedding_dim;
-        static constexpr long MAX_SEQ_LEN = max_seq_len;
 
         // Compile-time validation of model configuration
         struct validation {
@@ -97,11 +98,11 @@ namespace dlib
 
         template<bool is_training>
         using network_type = std::conditional_t<is_training,
-            classification_head<VOCAB_SIZE, EMBEDDING_DIM,
-            transformer_stack<NUM_LAYERS, activation_func, dropout_policy, MAX_SEQ_LEN, EMBEDDING_DIM, NUM_HEADS,
+            classification_head<VOCAB_SIZE,
+            canonical_transformer::transformer_stack<NUM_LAYERS, activation_func, dropout_policy, EMBEDDING_DIM, NUM_HEADS,
             embeddings<VOCAB_SIZE, EMBEDDING_DIM, input<matrix<int, 0, 1>>>>>,
-            classification_head<VOCAB_SIZE, EMBEDDING_DIM,
-            transformer_stack<NUM_LAYERS, activation_func, multiply, MAX_SEQ_LEN, EMBEDDING_DIM, NUM_HEADS,
+            classification_head<VOCAB_SIZE,
+            canonical_transformer::transformer_stack<NUM_LAYERS, activation_func, multiply, EMBEDDING_DIM, NUM_HEADS,
             embeddings<VOCAB_SIZE, EMBEDDING_DIM, input<matrix<int, 0, 1>>>>>>;
 
         struct model_info {
@@ -111,45 +112,11 @@ namespace dlib
                     << "- vocabulary size: " << VOCAB_SIZE << "\n"
                     << "- layers: " << NUM_LAYERS << "\n"
                     << "- attention heads: " << NUM_HEADS << "\n"
-                    << "- embedding dimension: " << EMBEDDING_DIM << "\n"
-                    << "- sequence length: " << MAX_SEQ_LEN;
+                    << "- embedding dimension: " << EMBEDDING_DIM;
                 return ss.str();
             }
         };
     };
-}
-
-// Signal handling for clean termination
-namespace {
-    std::atomic<bool> g_terminate_flag(false);
-
-#ifdef _WIN32
-    // Windows-specific handler
-    BOOL WINAPI console_ctrl_handler(DWORD ctrl_type) {
-        if (ctrl_type == CTRL_C_EVENT) {
-            g_terminate_flag.store(true);
-            cout << "\nCtrl+C detected, cleaning up and closing the program..." << endl;
-            return TRUE;
-        }
-        return FALSE;
-    }
-
-    void setup_interrupt_handler() {
-        SetConsoleCtrlHandler(console_ctrl_handler, TRUE);
-    }
-#else
-    // Unix/Linux-specific handler
-    void signal_handler(int signal) {
-        if (signal == SIGINT) {
-            g_terminate_flag.store(true);
-            cout << "\nCtrl+C detected, cleaning up and closing the program..." << endl;
-        }
-    }
-
-    void setup_interrupt_handler() {
-        std::signal(SIGINT, signal_handler);
-    }
-#endif
 }
 
 // Utility functions
@@ -256,7 +223,7 @@ int main(int argc, char** argv)
     try
     {
         // Setup interrupt handling for clean termination
-        setup_interrupt_handler();
+        signal_handler::setup();
 
         command_line_parser parser;
         parser.add_option("train", "Train a transformer model on internal dataset");
@@ -265,10 +232,10 @@ int main(int argc, char** argv)
         parser.add_option("learning-rate", "Set the learning rate (default: 2e-4)", 1);
         parser.add_option("batch-size", "Set the mini-batch size (default: 64)", 1);
         parser.add_option("patience", "Iterations without progress before early stopping (default: 8000)", 1);
-        parser.add_option("max-epochs", "Maximum number of training epochs (default: 150)", 1);
-        parser.add_option("alpha", "Set the weight decay for Adam (default: 0.004)", 1);
-        parser.add_option("beta1", "Set Adam's first moment coefficient (default: 0.9)", 1);
-        parser.add_option("beta2", "Set Adam's second moment coefficient (default: 0.999)", 1);
+        parser.add_option("max-epochs", "Maximum number of training epochs (default: 300)", 1);
+        parser.add_option("alpha", "Set the weight decay for AdamW (default: 0.004)", 1);
+        parser.add_option("beta1", "Set AdamW's first moment coefficient (default: 0.9)", 1);
+        parser.add_option("beta2", "Set AdamW's second moment coefficient (default: 0.999)", 1);
         parser.add_option("model-file", "Path for model (default: dlib_lm_tokens_model.dat)", 1);
         parser.add_option("tokenizer-file", "Path for tokenizer (default: dlib_lm_tokenizer.vocab)", 1);
         parser.add_option("output-file", "Path for generated output (default: generated_text.txt)", 1);
@@ -289,7 +256,7 @@ int main(int argc, char** argv)
         const double learning_rate = get_option(parser, "learning-rate", 2e-4);
         const size_t batch_size = get_option(parser, "batch-size", 64);
         const long patience = get_option(parser, "patience", 8000);
-        const size_t max_epochs = get_option(parser, "max-epochs", 150);
+        const size_t max_epochs = get_option(parser, "max-epochs", 300);
         const double alpha = get_option(parser, "alpha", 0.004);
         const double beta1 = get_option(parser, "beta1", 0.9);
         const double beta2 = get_option(parser, "beta2", 0.999);
@@ -298,19 +265,18 @@ int main(int argc, char** argv)
         const std::string output_file = get_option(parser, "output-file", "generated_text.txt");
         
         // Model architecture parameters
-        const long num_tokens = 3500;
+        const long num_tokens = 2000;
         const long num_layers = 4;
-        const long num_heads = 6;        
+        const long num_heads = 6;
         const long embedding_dim = 228;
         const long max_seq_len = 100;
 
         // Define transformer configuration
         using my_transformer = transformer_config<
-            num_tokens,     // vocab_size
-            num_layers,     // number of layers
-            num_heads,      // number of attention heads
-            embedding_dim,  // embedding dimension
-            max_seq_len     // maximum sequence length
+            num_tokens,     // vocab
+            num_layers,     // layers
+            num_heads,      // heads
+            embedding_dim   // dim
         >;
 
         // Load internal dataset
@@ -445,15 +411,16 @@ int main(int argc, char** argv)
             std::vector<matrix<int, 0, 1>> samples;
             std::vector<unsigned long> labels;
 
+            const int pad_token = tokenizer.get_special_token_id("<pad>");
             build_single_token_prediction_dataset({ full_tokens }, max_seq_len,
-                tokenizer.get_special_token_id("<pad>"), false,
-                samples, labels);
+                pad_token, false, samples, labels);
             full_tokens.clear();
             cout << "Created " << samples.size() << " training samples\n";
 
             // Build and train the network
             using net_type = my_transformer::network_type<true>;
-            net_type net;
+            net_type net;            
+            layer<0>(net).loss_details().set_ignore_index(pad_token);
             cout << my_transformer::model_info::describe() << endl;
 
             // Tokenizer stored with model for simplified inference
@@ -461,7 +428,7 @@ int main(int argc, char** argv)
                 !file_exists("chkpt-" + model_file)) deserialize(model_file) >> net >> tokenizer;
 
             // Create trainer
-            dnn_trainer<net_type, adam> trainer(net, adam(alpha, beta1, beta2), gpus);
+            dnn_trainer<net_type, adamw> trainer(net, adamw(alpha, beta1, beta2), gpus);
             trainer.set_learning_rate(learning_rate);
             trainer.set_min_learning_rate(1e-6);
             trainer.set_mini_batch_size(batch_size);
@@ -472,13 +439,13 @@ int main(int argc, char** argv)
             cout << "Number of model parameters: " << count_parameters(net) << endl;
             cout << "Starting training...\n";
 
-            size_t epoch = 0, steps = 0;
-            size_t batches_count = 0, batches_seen = 0, samples_seen = 0;
-            double total_loss = 0.0;
+            size_t epoch = 0, steps = 0, batches_count = 0, batches_seen, samples_seen;
+            double total_loss;
             auto epoch_start = std::chrono::high_resolution_clock::now();
 
             // Training loop
-            while (trainer.get_learning_rate() >= 1e-6 && epoch < max_epochs && !g_terminate_flag.load())
+            while (trainer.get_learning_rate() >= trainer.get_min_learning_rate()
+                && epoch < max_epochs && !signal_handler::is_triggered())
             {
                 total_loss = 0.0;
                 batches_seen = samples_seen = 0;
@@ -487,7 +454,7 @@ int main(int argc, char** argv)
                 // Shuffle the dataset
                 shuffle_training_dataset(samples, labels);
 
-                for (size_t i = 0; i < samples.size() && !g_terminate_flag.load(); i += batch_size)
+                for (size_t i = 0; i < samples.size() && !signal_handler::is_triggered(); i += batch_size)
                 {
                     size_t batch_end = std::min(i + batch_size, samples.size());
                     std::vector<matrix<int, 0, 1>> batch_samples(
@@ -526,7 +493,7 @@ int main(int argc, char** argv)
 
             // Evaluate on training set
             {
-                if (!g_terminate_flag.load()) {
+                if (!signal_handler::is_triggered()) {
                     cout << "Evaluating model accuracy...\n";
                     my_transformer::network_type<false> g_infer;
                     deserialize(model_file) >> g_infer >> tokenizer;
@@ -628,7 +595,8 @@ int main(int argc, char** argv)
             cout << "Using " << prompt_tokens.size() << " tokens for initial prompt\n";
 
             // Put prompt in input sequence
-            inference_context llm_context(max_seq_len, 4, tokenizer.get_special_token_id("<pad>"));
+            const int pad_token = tokenizer.get_special_token_id("<pad>");
+            inference_context llm_context(max_seq_len, 4, pad_token);
             llm_context.add_tokens(prompt_tokens);
             auto input_seq = llm_context.get_input_window();
 
@@ -661,7 +629,8 @@ int main(int argc, char** argv)
 
             // Generate until target size is reached
             int end_of_text = tokenizer.get_special_token_id("</text>"), next_token = 0;
-            while (total_bytes < target_size && next_token != end_of_text && !g_terminate_flag.load()) {
+            while (total_bytes < target_size && next_token != end_of_text
+                && !signal_handler::is_triggered()) {
                 // Predict next token
                 next_token = net(input_seq);
                 token_buffer.push_back(next_token);
@@ -682,13 +651,14 @@ int main(int argc, char** argv)
                     auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
                         std::chrono::high_resolution_clock::now() - start_time).count();
                     double tokens_per_second = (token_count - input_seq.size()) / (elapsed > 0 ? elapsed : 1);
+                    double bytes_per_token = (chunk.size() > 0) ? chunk.size() / (double)buffer_size : 1.0;
 
                     cout << "Generated " << (token_count - input_seq.size()) << " tokens, "
                         << total_bytes << " bytes ("
                         << (total_bytes * 100.0 / target_size) << "%) - "
                         << tokens_per_second << " tokens/sec - "
                         << "Est. completion: "
-                        << (int)((target_size - total_bytes) / (tokens_per_second * (chunk.size() / (double)buffer_size)))
+                        << (int)((target_size - total_bytes) / (tokens_per_second * bytes_per_token))
                         << " seconds\r";
                 }
                 if (max_tokens_limit > 0 && token_count >= max_tokens_limit) break;
@@ -751,16 +721,16 @@ int main(int argc, char** argv)
 
 /*
  * This program demonstrates advanced tokenization and training of a language model
- * on an internal dataset using a BPE-style tokenizer with 3500 vocabulary entries.
- * The training process produces a model file of approximately 18.5MB on disk.
+ * on an internal dataset using a BPE-style tokenizer with 2000 vocabulary entries.
+ * The training process produces a model file of approximately 13MB on disk.
  *
  * - Transformer model configuration:
- *    + vocabulary size: 3500
+ *    + vocabulary size: 2000
  *    + layers: 4
  *    + attention heads: 6
  *    + embedding dimension: 228 
  *    + max sequence length: 100
- * - Number of parameters: 4,002,458
+ * - Number of parameters: 2,957,801
  *
  * After a 1-step full training, the model achieves perfect memorization of the dataset.
  * The generation option produces text that matches the original dataset byte-for-byte
