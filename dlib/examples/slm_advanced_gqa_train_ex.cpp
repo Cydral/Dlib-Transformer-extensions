@@ -455,10 +455,11 @@ int main(int argc, char** argv)
                     std::vector<unsigned long> batch_labels(
                         labels.begin() + i, labels.begin() + batch_end);
 
-                    //std::vector<long> pad_lengths(batch_samples.size());
-                    //for (size_t j = 0; j < batch_samples.size(); ++j)
-                    //    pad_lengths[j] = count_leading_padding(batch_samples[j], pad_token);
-                    //tril_padding_context::set_from_lengths(pad_lengths);
+                    std::vector<long> pad_lengths(batch_samples.size());
+                    for (size_t j = 0; j < batch_samples.size(); ++j)
+                        pad_lengths[j] = count_leading_padding(batch_samples[j], pad_token);
+                    network_context::set_padding_from_lengths(pad_lengths);
+                    network_context::set_learning_rate(trainer.get_learning_rate());
 
                     trainer.train_one_step(batch_samples, batch_labels);
                     total_loss += trainer.get_average_loss();
@@ -483,9 +484,9 @@ int main(int argc, char** argv)
                 }
                 epoch++;
             }
-            //tril_padding_context::clear();
 
             // Save model
+            network_context::reset();
             net.clean();
             serialize(model_file) << net << tokenizer;
             cout << "Model saved to " << model_file << "\n";
@@ -631,8 +632,8 @@ int main(int argc, char** argv)
             while (total_bytes < target_size && next_token != end_of_text
                 && !signal_handler::is_triggered()) {
                 // Predict next token
-                //long pad_len = count_leading_padding(input_seq, pad_token);
-                //tril_padding_context::set_uniform(pad_len, 1);
+                long pad_len = count_leading_padding(input_seq, pad_token);
+                network_context::set_padding_uniform(pad_len, 1);
                 next_token = net(input_seq);
                 token_buffer.push_back(next_token);
                 token_count++;
@@ -664,7 +665,7 @@ int main(int argc, char** argv)
                 }
                 if (max_tokens_limit > 0 && token_count >= max_tokens_limit) break;
             }
-            //tril_padding_context::clear();
+            network_context::clear_padding();
 
             // Flush remaining buffer
             if (!token_buffer.empty()) {
@@ -742,5 +743,5 @@ int main(int argc, char** argv)
  *
  * After full training, the model achieves perfect memorization of the dataset.
  * The generation option produces text that matches the original dataset byte-for-byte
- * with 100% accuracys.
+ * with 100% accuracy.
  */

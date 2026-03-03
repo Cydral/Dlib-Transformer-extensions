@@ -25,6 +25,177 @@
 
 namespace dlib
 {
+    // ----------------------------------------------------------------------------------------
+
+    class network_context
+    {
+        /*!
+            WHAT THIS OBJECT REPRESENTS
+                Thread-safe singleton providing a shared execution context accessible
+                by any layer during forward and backward passes.
+
+                It solves the problem that deeply nested layers (e.g. a transition
+                network inside an ACT layer) cannot directly access information about
+                the enclosing network or the current training state. The caller sets
+                the context once before each forward pass; any layer reads it as needed.
+
+                The context has an explicit active/inactive state. It is considered
+                inactive until at least one setter has been called. Any layer can
+                query is_active() before reading values, allowing graceful fallback
+                to default behavior when the context has not been initialized by the
+                caller.
+
+                The context distinguishes two operating modes:
+                  - Training:   learning_rate > 0, set by the training loop
+                  - Inference:  learning_rate == 0.0 (default)
+
+            THREAD SAFETY
+                All public methods are thread-safe through internal mutex protection.
+                The mutex is non-recursive; methods that must operate under an
+                already-held lock are provided as private _nolock_ variants.
+
+            LIFECYCLE
+                Inactive by default. Becomes active on first setter call.
+                reset() returns it to the inactive state and clears all fields.
+
+            TYPICAL USAGE
+                // --- Training loop (before each train_one_step) ---
+                network_context::set_learning_rate(trainer.get_learning_rate());
+                network_context::set_padding(input_tensor, pad_token);
+
+                // --- Inference (before net forward pass) ---
+                network_context::set_learning_rate(0.0);
+                network_context::set_padding_uniform(0, 1);
+                // or simply do not set padding if no padding is present
+
+                // --- Inside any layer's forward() ---
+                if (network_context::is_active()) {
+                    if (network_context::is_training()) { ... }
+                    long pad = network_context::get_padding_length(sample_idx);
+                    double lr  = network_context::get_learning_rate();
+                }
+
+                // --- Full teardown after pipeline completes ---
+                network_context::reset();
+        !*/
+
+    public:
+
+        // Lifecycle
+
+        static bool is_active();
+        /*!
+            ensures
+                - Returns true iff at least one setter has been called since the
+                  last reset() (or since program start).
+                - Layers should check this before reading any context value, and
+                  fall back to their default behavior when false.
+        !*/
+
+        static void reset();
+        /*!
+            ensures
+                - Returns the singleton to its initial inactive state.
+                - #is_active()          == false
+                - #is_training()        == false
+                - #get_learning_rate()  == 0.0
+                - #is_padding_set()     == false
+        !*/
+
+        // Learning rate / training mode
+
+        static void set_learning_rate(double lr);
+        /*!
+            ensures
+                - Stores the current learning rate.
+                - #get_learning_rate() == lr
+                - #is_training()       == (lr > 0.0)
+                - #is_active()         == true
+                - A value of 0.0 signals inference mode.
+        !*/
+
+        static double get_learning_rate();
+        /*!
+            ensures
+                - Returns the stored learning rate, or 0.0 if never set.
+        !*/
+
+        static bool is_training();
+        /*!
+            ensures
+                - Returns true iff get_learning_rate() > 0.0.
+        !*/
+
+        // Padding context
+
+        static void set_padding(const tensor& input_tokens, long padding_token);
+        /*!
+            requires
+                - input_tokens has shape (batch_size, k, seq_len, nc)
+            ensures
+                - Computes and stores per-sample leading-padding lengths by scanning
+                  input_tokens for leading tokens equal to padding_token.
+                - If padding_token < 0, clears padding state only (is_active unchanged).
+                - #is_padding_set() == true  (unless padding_token < 0)
+                - #is_active()      == true
+        !*/
+
+        static void set_padding_from_lengths(const std::vector<long>& lengths);
+        /*!
+            ensures
+                - Stores the provided per-sample padding lengths directly.
+                - #is_padding_set() == true
+                - #is_active()      == true
+        !*/
+
+        static void set_padding_uniform(long padding_length, long batch_size);
+        /*!
+            ensures
+                - Sets the same padding length for all samples.
+                - #get_padding_length(i) == padding_length for i in [0, batch_size)
+                - #is_padding_set() == true
+                - #is_active()      == true
+        !*/
+
+        static void clear_padding();
+        /*!
+            ensures
+                - Clears padding state only. is_active() and learning rate are unchanged.
+                - #is_padding_set() == false
+        !*/
+
+        static long get_padding_length(long sample_idx);
+        /*!
+            ensures
+                - Returns the padding length for sample_idx, or 0 if !is_padding_set()
+                  or sample_idx is out of range.
+        !*/
+
+        static std::vector<long> get_all_padding_lengths();
+        /*!
+            ensures
+                - Returns a copy of all stored padding lengths.
+                - Returns an empty vector if !is_padding_set().
+        !*/
+
+        static bool is_padding_set();
+        /*!
+            ensures
+                - Returns true iff padding lengths have been stored and not yet cleared.
+        !*/
+    };
+
+    // ------------------------------------------------------------------------------------
+
+    template <typename T>
+    long count_leading_padding(const matrix<T, 0, 1>& seq, T padding_token);
+    /*!
+        ensures
+            - Returns the number of leading elements in seq equal to padding_token.
+            - Returns 0 if seq is empty or seq(0) != padding_token.
+    !*/
+
+    // ------------------------------------------------------------------------------------
 
     template <long d_k_>
     class scale_weights_ : public multiply_

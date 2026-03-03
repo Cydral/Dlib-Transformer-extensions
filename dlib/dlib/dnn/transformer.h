@@ -10,6 +10,165 @@ namespace dlib
 {
     // ----------------------------------------------------------------------------------------
 
+    class network_context
+    {
+    public:
+
+        static bool is_active()
+        {
+            std::lock_guard<std::mutex> lock(get_mutex_());
+            return get_is_active_();
+        }
+
+        static void reset()
+        {
+            std::lock_guard<std::mutex> lock(get_mutex_());
+            reset_nolock_();
+        }
+
+        static void set_learning_rate(double lr)
+        {
+            std::lock_guard<std::mutex> lock(get_mutex_());
+            get_learning_rate_() = lr;
+            get_is_active_() = true;
+        }
+
+        static double get_learning_rate()
+        {
+            std::lock_guard<std::mutex> lock(get_mutex_());
+            return get_learning_rate_();
+        }
+
+        static bool is_training()
+        {
+            std::lock_guard<std::mutex> lock(get_mutex_());
+            return get_learning_rate_() > 0.0;
+        }
+
+        static void set_padding(const tensor& input_tokens, long padding_token)
+        {
+            std::lock_guard<std::mutex> lock(get_mutex_());
+            if (padding_token < 0) {
+                clear_padding_nolock_();
+                return;
+            }
+            const long batch_size = input_tokens.num_samples();
+            const long seq_len = input_tokens.nr();
+            const long k = input_tokens.k();
+            const long nc = input_tokens.nc();
+            const float* data = input_tokens.host();
+            get_padding_lengths_().resize(batch_size);
+            for (long s = 0; s < batch_size; ++s)
+            {
+                long count = 0;
+                for (long t = 0; t < seq_len; ++t)
+                {
+                    const long idx = (s * k * seq_len + t) * nc;
+                    const long token = static_cast<long>(data[idx]);
+                    if (token == padding_token) count++;
+                    else break;
+                }
+                get_padding_lengths_()[s] = count;
+            }
+            get_is_padding_set_() = true;
+            get_is_active_() = true;
+        }
+
+        static void set_padding_from_lengths(const std::vector<long>& lengths)
+        {
+            std::lock_guard<std::mutex> lock(get_mutex_());
+            get_padding_lengths_() = lengths;
+            get_is_padding_set_() = true;
+            get_is_active_() = true;
+        }
+
+        static void set_padding_uniform(long padding_length, long batch_size)
+        {
+            std::lock_guard<std::mutex> lock(get_mutex_());
+            get_padding_lengths_().assign(batch_size, padding_length);
+            get_is_padding_set_() = true;
+            get_is_active_() = true;
+        }
+
+        static void clear_padding()
+        {
+            std::lock_guard<std::mutex> lock(get_mutex_());
+            clear_padding_nolock_();
+        }
+
+        static long get_padding_length(long sample_idx)
+        {
+            std::lock_guard<std::mutex> lock(get_mutex_());
+            if (!get_is_padding_set_() || sample_idx < 0 ||
+                sample_idx >= static_cast<long>(get_padding_lengths_().size()))
+                return 0;
+            return get_padding_lengths_()[sample_idx];
+        }
+
+        static std::vector<long> get_all_padding_lengths()
+        {
+            std::lock_guard<std::mutex> lock(get_mutex_());
+            return get_padding_lengths_();
+        }
+
+        static bool is_padding_set()
+        {
+            std::lock_guard<std::mutex> lock(get_mutex_());
+            return get_is_padding_set_();
+        }
+
+    private:
+
+        static void clear_padding_nolock_()
+        {
+            get_padding_lengths_().clear();
+            get_is_padding_set_() = false;
+        }
+
+        static void reset_nolock_()
+        {
+            get_is_active_() = false;
+            get_learning_rate_() = 0.0;
+            clear_padding_nolock_();
+        }
+
+        static std::mutex& get_mutex_() {
+            static std::mutex m;
+            return m;
+        }
+        static bool& get_is_active_() {
+            static bool v = false;
+            return v;
+        }
+        static double& get_learning_rate_() {
+            static double v = 0.0;
+            return v;
+        }
+        static std::vector<long>& get_padding_lengths_() {
+            static std::vector<long> v;
+            return v;
+        }
+        static bool& get_is_padding_set_() {
+            static bool v = false;
+            return v;
+        }
+    };
+
+    // ----------------------------------------------------------------------------------------
+
+    template <typename T>
+    long count_leading_padding(const matrix<T, 0, 1>& seq, T padding_token)
+    {
+        long count = 0;
+        for (long i = 0; i < seq.size(); ++i) {
+            if (seq(i) == padding_token) count++;
+            else break;
+        }
+        return count;
+    }
+
+    // ----------------------------------------------------------------------------------------
+
     template <long d_k_>
     class scale_weights_ : public multiply_
     {
