@@ -4560,58 +4560,75 @@ namespace dlib
     {
         /*!
             TEMPLATE PARAMETERS
-                - diag_: A long integer specifying the diagonal offset.
-                - tag_: A type tag specifying special values or void for numeric values.
-                - num_: Numerator for numeric diagonal value (default is 0, only used if tag_ is void).
-                - den_: Denominator for numeric diagonal value (default is 1, only used if tag_ is void).
+                - diag_: diagonal offset controlling which elements are masked.
+                - tag_: type tag specifying the fill value; one of neg_infinity_tag,
+                        zero_tag, or void (numeric value).
+                - num_: numerator for the fill value when tag_ is void (default: 0).
+                - den_: denominator for the fill value when tag_ is void (default: 1).
 
             REQUIREMENTS
-                - diag_ must be an integer.
-                - tag_ must be either neg_infinity_tag, zero_tag, or void.
-                - If tag_ is void, num_ and den_ are used to compute the diagonal value.
+                - tag_ must be neg_infinity_tag, zero_tag, or void.
+                - If tag_ is void, den_ must be non-zero.
                 - If tag_ is neg_infinity_tag or zero_tag, num_ and den_ are ignored.
 
             WHAT THIS OBJECT REPRESENTS
-                This object implements a layer in a deep neural network that applies a lower triangular mask to
-                its input tensor. The mask is defined such that all elements above the specified diagonal are set
-                to a given value. The diagonal offset and the mask value are determined by the template parameters.
+                Implements a lower-triangular mask layer. All elements strictly above the
+                specified diagonal are replaced by the fill value; elements on or below the
+                diagonal are left unchanged.
+
+                When network_context is active and carries padding information, the mask is
+                extended to handle padded sequences correctly:
+                  - Padding rows (r < pad_len): fully masked — padding tokens attend to nothing.
+                  - Padding columns (c < pad_len, r >= pad_len): masked — real tokens do not
+                    attend to padding positions.
+                The padding lengths are read from network_context at each forward pass and
+                cached internally; the mask is rebuilt only when the lengths change or the
+                tensor dimensions change.
+
+                An optional prefix_size allows a contiguous prefix of positions to remain
+                visible to all subsequent real-token rows, regardless of the causal constraint.
 
             DIAGONAL VALUE DETERMINATION
-                - If tag_ is neg_infinity_tag: diagonal value is set to negative infinity.
-                - If tag_ is zero_tag: diagonal value is set to zero.
-                - If tag_ is void: diagonal value is set to num_ / den_ as a float.
+                - neg_infinity_tag : fill value is -infinity (standard causal attention mask).
+                - zero_tag         : fill value is 0.
+                - void             : fill value is num_ / den_ as float.
 
             DIAGONAL OFFSET
-                The diag_ parameter determines the diagonal above which elements are masked:
-                - diag_ = 0: main diagonal
-                - diag_ > 0: diag_ steps above the main diagonal
-                - diag_ < 0: |diag_| steps below the main diagonal
+                - diag_ = 0  : main diagonal (standard causal mask).
+                - diag_ > 0  : diag_ steps above the main diagonal.
+                - diag_ < 0  : |diag_| steps below the main diagonal.
+
+            PADDING AWARENESS
+                If network_context::is_padding_set() returns true at forward time, the layer
+                reads per-sample padding lengths via network_context::get_all_padding_lengths()
+                and adjusts the mask accordingly. If the context is inactive or cleared, the
+                layer behaves identically to the original padding-unaware implementation.
 
             EXAMPLE USAGE
-                // Create a layer that masks all elements above the main diagonal with -inf
+                // Standard causal mask (main diagonal, fill -inf)
                 tril_<0, neg_infinity_tag> layer1;
 
-                // Create a layer that masks all elements above the main diagonal with 0
+                // Causal mask with zero fill
                 tril_<0, zero_tag> layer2;
 
-                // Create a layer that masks all elements above the main diagonal with 0.5
+                // Causal mask with custom fill value 0.5
                 tril_<0, void, 1, 2> layer3;
 
-                // Create a layer that masks all elements 5 positions above the main diagonal with -inf
+                // Mask elements 5 steps above the main diagonal with -inf
                 tril_<5, neg_infinity_tag> layer4;
 
-                // Create a layer that masks all elements 3 positions below the main diagonal with 0.25
+                // Mask elements 3 steps below the main diagonal with 0.25
                 tril_<-3, void, 1, 4> layer5;
-
-            SERIALIZATION SUPPORT
-                This object supports serialization and deserialization via the serialize() and deserialize() functions.
         !*/
 
     public:
-        tril_() = default;
+        tril_();
         /*!
             ensures
-                - This object is properly initialized.
+                - diag        == diag_
+                - prefix_size == 0
+                - diag_value  is computed from tag_, num_, den_
+                - mask cache is empty (will be built on first forward call)
         !*/
 
         template <typename SUBNET>
@@ -4620,7 +4637,7 @@ namespace dlib
             requires
                 - SUBNET is a valid network layer type.
             ensures
-                - Initializes the mask based on the dimensions of the input tensor from sub.
+                - No-op: mask is built lazily on the first forward() call.
         !*/
 
         template <typename SUBNET>
@@ -4629,65 +4646,52 @@ namespace dlib
             requires
                 - SUBNET is a valid network layer type.
             ensures
-                - Applies the lower triangular mask to the input tensor from sub and stores the result in output.
+                - Applies the lower-triangular mask (with optional padding masking) to the
+                  input tensor and stores the result in output.
+                - If network_context carries updated padding lengths, the mask cache is
+                  invalidated and rebuilt before applying.
         !*/
 
         template <typename SUBNET>
         void backward(const tensor& gradient_input, SUBNET& sub, tensor& params_grad);
         /*!
             requires
-                - SUBNET is a valid network layer type.
+                - forward() has been called.
             ensures
-                - Computes the gradient of the loss with respect to the input tensor and stores it in sub.
+                - Backpropagates gradient_input through the binary mask into sub.
+        !*/
+
+        void set_prefix_size(long n);
+        /*!
+            ensures
+                - Sets the number of prefix positions that all real-token rows may attend to,
+                  regardless of the causal constraint.
+                - If n != current prefix_size, the mask cache is invalidated.
+                - #get_prefix_size() == n
+        !*/
+
+        long get_prefix_size() const;
+        /*!
+            ensures
+                - Returns the current prefix size (0 if not set).
         !*/
 
         inline dpoint map_input_to_output(const dpoint& p) const;
-        /*!
-            ensures
-                - Maps a point from the input tensor to the corresponding point in the output tensor.
-        !*/
-
         inline dpoint map_output_to_input(const dpoint& p) const;
-        /*!
-            ensures
-                - Maps a point from the output tensor to the corresponding point in the input tensor.
-        !*/
 
         const tensor& get_layer_params() const;
-        /*!
-            ensures
-                - Returns the parameters of this layer.
-        !*/
-
         tensor& get_layer_params();
-        /*!
-            ensures
-                - Returns the parameters of this layer.
-        !*/
 
         friend void serialize(const tril_& item, std::ostream& out);
         /*!
             ensures
-                - Serializes the state of this object to the given output stream.
+                - Serializes diag and diag_value to out.
+                - Runtime state (padding cache, prefix_size) is not serialized.
         !*/
 
         friend void deserialize(tril_& item, std::istream& in);
-        /*!
-            ensures
-                - Deserializes the state of this object from the given input stream.
-        !*/
-
         friend std::ostream& operator<<(std::ostream& out, const tril_& item);
-        /*!
-            ensures
-                - Prints a human-readable representation of this object to the given output stream.
-        !*/
-
         friend void to_xml(const tril_& item, std::ostream& out);
-        /*!
-            ensures
-                - Serializes the state of this object to XML format and writes it to the given output stream.
-        !*/
     };
 
     template <typename SUBNET>

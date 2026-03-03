@@ -5601,23 +5601,39 @@ namespace dlib
     class tril_
     {
     public:
-        tril_(): diag(diag_), diag_value(compute_diag_value()) {}
-        
+        tril_() : diag(diag_), prefix_size(0), diag_value(compute_diag_value()) {}
+
         template <typename SUBNET>
-        void setup(const SUBNET& /*sub*/)
-        {
-        }
-        
+        void setup(const SUBNET& /*sub*/) {}
+
         template <typename SUBNET>
         void forward(const SUBNET& sub, resizable_tensor& output)
         {
             auto& prev = sub.get_output();
             output.set_size(prev.num_samples(), prev.k(), prev.nr(), prev.nc());
 
+            // Sync cached padding lengths with network_context if active
+            if (network_context::is_padding_set())
+            {
+                auto new_lengths = network_context::get_all_padding_lengths();
+                if (new_lengths != cached_padding_lengths_)
+                {
+                    cached_padding_lengths_ = new_lengths;
+                    invalidate_mask();
+                }
+            }
+            else if (!cached_padding_lengths_.empty())
+            {
+                // Context padding was cleared: revert to unpadded mask
+                cached_padding_lengths_.clear();
+                invalidate_mask();
+            }
+
             check_mask(prev);
             tt::multiply(false, output, prev, binary_mask);
             if (diag_value != 0.0f) tt::add(1, output, 1, output_mask);
         }
+
         template <typename SUBNET>
         void backward(const tensor& gradient_input, SUBNET& sub, tensor& /*params_grad*/)
         {
@@ -5630,7 +5646,16 @@ namespace dlib
 
         const tensor& get_layer_params() const { return params; }
         tensor& get_layer_params() { return params; }
-        
+
+        void set_prefix_size(long n)
+        {
+            if (prefix_size != n) {
+                prefix_size = n;
+                invalidate_mask();
+            }
+        }
+        long get_prefix_size() const { return prefix_size; }
+
         friend void serialize(const tril_& item, std::ostream& out)
         {
             serialize("tril_", out);
@@ -5642,23 +5667,27 @@ namespace dlib
             std::string version;
             deserialize(version, in);
             if (version != "tril_")
-                throw serialization_error("Unexpected version '" + version + "' found while deserializing dlib::tril_.");
+                throw serialization_error("Unexpected version '" + version +
+                    "' found while deserializing dlib::tril_.");
             deserialize(item.diag, in);
             deserialize(item.diag_value, in);
         }
 
         friend std::ostream& operator<<(std::ostream& out, const tril_& item)
         {
-            out << "tril (diag=" << item.diag << ", diag_value=" << item.diag_value << ")";
+            out << "tril (diag=" << item.diag
+                << ", diag_value=" << item.diag_value << ")";
             return out;
         }
         friend void to_xml(const tril_& item, std::ostream& out)
         {
-            out << "<tril diag='" << item.diag << "' diag_value='" << item.diag_value << "'/>\n";
+            out << "<tril diag='" << item.diag
+                << "' diag_value='" << item.diag_value << "'/>\n";
         }
 
     private:
-        float compute_diag_value() const {
+        float compute_diag_value() const
+        {
             if (std::is_same<tag_, neg_infinity_tag>::value)
                 return -std::numeric_limits<float>::infinity();
             else if (std::is_same<tag_, zero_tag>::value)
@@ -5667,39 +5696,80 @@ namespace dlib
                 return static_cast<float>(num_) / static_cast<float>(den_);
         }
 
+        void invalidate_mask()
+        {
+            binary_mask.set_size(0, 0, 0, 0);
+            output_mask.set_size(0, 0, 0, 0);
+        }
+
         void check_mask(const tensor& t)
         {
-            if (!have_same_dimensions(binary_mask, t)) {
-                binary_mask.copy_size(t);
-                binary_mask = 1;
-                if (diag_value != 0.0f) {
-                    output_mask.copy_size(t);
-                    output_mask = 0;
-                }                                
-                for (long s = 0; s < output_mask.num_samples(); ++s)
+            if (have_same_dimensions(binary_mask, t)) return;
+
+            binary_mask.copy_size(t);
+            binary_mask = 1;
+
+            const bool use_output_mask = (diag_value != 0.0f);
+            if (use_output_mask) {
+                output_mask.copy_size(t);
+                output_mask = 0;
+            }
+
+            const bool has_padding = !cached_padding_lengths_.empty();
+
+            for (long s = 0; s < t.num_samples(); ++s)
+            {
+                const long pad_len = (has_padding &&
+                    s < static_cast<long>(cached_padding_lengths_.size()))
+                    ? cached_padding_lengths_[s] : 0;
+
+                for (long k = 0; k < t.k(); ++k)
                 {
-                    for (long k = 0; k < output_mask.k(); ++k)
+                    // Mask padding rows entirely: padding tokens attend to nothing
+                    for (long r = 0; r < pad_len; ++r)
                     {
-                        for (long r = 0; r < output_mask.nr(); ++r)
+                        for (long c = 0; c < t.nc(); ++c)
                         {
-                            for (long c = std::max(r + diag + 1, 0L); c < output_mask.nc(); ++c)
-                            {
-                                if (diag_value != 0.0f) output_mask.host()[tensor_index(output_mask, s, k, r, c)] = diag_value;
-                                binary_mask.host()[tensor_index(binary_mask, s, k, r, c)] = 0;
-                            }
+                            const long idx = tensor_index(t, s, k, r, c);
+                            binary_mask.host()[idx] = 0;
+                            if (use_output_mask)
+                                output_mask.host()[idx] = diag_value;
+                        }
+                    }
+
+                    // For real token rows: mask padding columns and future positions
+                    for (long r = pad_len; r < t.nr(); ++r)
+                    {
+                        // Mask padding columns: real tokens do not attend to padding
+                        for (long c = 0; c < pad_len; ++c)
+                        {
+                            const long idx = tensor_index(t, s, k, r, c);
+                            binary_mask.host()[idx] = 0;
+                            if (use_output_mask)
+                                output_mask.host()[idx] = diag_value;
+                        }
+
+                        // Mask future positions (causal), respecting prefix_size
+                        const long causal_start =
+                            std::max({ r + diag + 1, prefix_size, pad_len });
+                        for (long c = causal_start; c < t.nc(); ++c)
+                        {
+                            const long idx = tensor_index(t, s, k, r, c);
+                            binary_mask.host()[idx] = 0;
+                            if (use_output_mask)
+                                output_mask.host()[idx] = diag_value;
                         }
                     }
                 }
             }
         }
 
-        template <typename T>
-        struct always_false : std::false_type {};
-
         resizable_tensor params; // unused
         resizable_tensor binary_mask, output_mask;
         long diag;
+        long prefix_size;
         float diag_value;
+        std::vector<long> cached_padding_lengths_;
     };
 
     template <typename SUBNET>
