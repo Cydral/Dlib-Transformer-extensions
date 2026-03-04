@@ -190,15 +190,10 @@ namespace dlib
 
     namespace impl
     {
-        template<typename T>
-        using has_internal_parameters = decltype(std::declval<const T&>().internal_parameters());
-
-        template<typename T>
-        using has_active_parameters = decltype(std::declval<const T&>().active_parameters());
-
-        struct priority_high {};
         struct priority_low {};
+        struct priority_high : priority_low {};
 
+        // Layers with both internal_parameters() and active_parameters() (e.g. MoE)
         template<typename T>
         auto get_layer_parameter_counts_impl(const T& layer, priority_high)
             -> decltype(layer.internal_parameters(), layer.active_parameters(), parameter_counts{})
@@ -206,14 +201,16 @@ namespace dlib
             return { layer.internal_parameters(), layer.active_parameters() };
         }
 
+        // Layers with internal_parameters() only: all internal params are active
         template<typename T>
         auto get_layer_parameter_counts_impl(const T& layer, priority_low)
-            -> decltype(layer.num_internal_parameters(), parameter_counts{})
+            -> decltype(layer.internal_parameters(), parameter_counts{})
         {
             const size_t n = layer.internal_parameters();
             return { n, n };
         }
 
+        // Fallback: standard layer, no nested subnet
         template<typename T>
         parameter_counts get_layer_parameter_counts_impl(const T&, ...)
         {

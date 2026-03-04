@@ -1,4 +1,5 @@
-﻿/*!
+﻿
+/*!
     @file slm_advanced_gqa_train_ex.cpp
     @brief GQA transformer with Adaptive Computation Time FFN: full pipeline from
            tokenization to byte-accurate text reconstruction
@@ -35,7 +36,6 @@
 #include <random>
 #include <fstream>
 #include <chrono>
-#include <csignal>
 
 #include <dlib/dnn.h>
 #include <dlib/data_io.h>

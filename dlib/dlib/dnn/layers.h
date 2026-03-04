@@ -6172,7 +6172,7 @@ namespace dlib
         const tensor& get_layer_params() const { return halt_params_; }
         tensor& get_layer_params() { return halt_params_; }
 
-        size_t internal_parameters() const { return count_parameters(transition_net_); }
+        size_t num_internal_parameters() const { return count_parameters(transition_net_); }
 
         void set_learning_rate(double lr) {
             current_learning_rate_ = lr;
