@@ -1,4 +1,4 @@
-// Copyright (C) 2025  Davis E. King (davis@dlib.net)
+// Copyright (C) 2026  Cydral Technology (cydraltechnology@gmail.com)
 // License: Boost Software License   See LICENSE.txt for the full license.
 #ifndef DLIB_ARC_AGI_H_
 #define DLIB_ARC_AGI_H_
@@ -25,10 +25,11 @@ namespace dlib
 
     /*!
         Type aliases for ARC-AGI data structures. Grids are represented as matrices
-        of unsigned char values (0-9), and token sequences are column vectors of long.
+        of unsigned char values (0-9), and token sequences are column vectors of int
+        (aligned with the int32 input type expected by all transformer networks).
     !*/
     using arc_grid_t = matrix<unsigned char>;
-    using arc_token_sequence_t = matrix<long, 0, 1>;
+    using arc_token_sequence_t = matrix<int, 0, 1>;
 
     /*!
         Maximum sequence length for LLM-style training. This constant defines the
@@ -51,7 +52,7 @@ namespace dlib
         - TOKEN_PADDING: Padding token for variable-length sequences
         - TOKEN_ROW_END: Marks the end of a grid row (for dimension encoding)
     !*/
-    enum arc_token_id : long
+    enum arc_token_id : int  // int, aligned with arc_token_sequence_t element type
     {
         COLOR_0 = 0, COLOR_1 = 1, COLOR_2 = 2, COLOR_3 = 3, COLOR_4 = 4,
         COLOR_5 = 5, COLOR_6 = 6, COLOR_7 = 7, COLOR_8 = 8, COLOR_9 = 9,
@@ -67,8 +68,8 @@ namespace dlib
     /*!
         Vocabulary size constants for the token set.
     !*/
-    constexpr long ARC_VOCAB_SIZE_COLORS = 10;
-    constexpr long ARC_VOCAB_SIZE_TOTAL = 17;
+    constexpr int ARC_VOCAB_SIZE_COLORS = 10;
+    constexpr int ARC_VOCAB_SIZE_TOTAL = 17;
 
     // ----------------------------------------------------------------------------------------
     // ARC-AGI task data structures
@@ -146,11 +147,11 @@ namespace dlib
         // ------------------------------------------------------------------------------------
 
         inline std::string read_file_to_string(const std::string& path)
-        /*!
-            ensures
-                - Reads the entire contents of a file and returns it as a string
-                - Throws std::runtime_error if the file cannot be opened
-        !*/
+            /*!
+                ensures
+                    - Reads the entire contents of a file and returns it as a string
+                    - Throws std::runtime_error if the file cannot be opened
+            !*/
         {
             std::ifstream file(path);
             if (!file.is_open())
@@ -163,12 +164,12 @@ namespace dlib
         // ------------------------------------------------------------------------------------
 
         inline std::vector<int> parse_int_array(const std::string& str)
-        /*!
-            ensures
-                - Parses a comma-separated string of integers
-                - Returns a vector containing the parsed integers
-                - Whitespace around numbers is automatically stripped
-        !*/
+            /*!
+                ensures
+                    - Parses a comma-separated string of integers
+                    - Returns a vector containing the parsed integers
+                    - Whitespace around numbers is automatically stripped
+            !*/
         {
             std::vector<int> result;
             std::stringstream ss(str);
@@ -187,49 +188,37 @@ namespace dlib
 
         inline raw_arc_grid_t parse_arc_grid(std::string::const_iterator& it,
             const std::string::const_iterator& end)
-        /*!
-            ensures
-                - Parses a 2D grid from JSON array-of-arrays format
-                - Advances the iterator 'it' past the parsed content
-                - Returns a vector of vectors representing the grid rows
-                - Throws std::runtime_error on malformed input
-        !*/
+            /*!
+                ensures
+                    - Parses a 2D grid from JSON array-of-arrays format
+                    - Advances the iterator 'it' past the parsed content
+                    - Returns a vector of vectors representing the grid rows
+                    - Throws std::runtime_error on malformed input
+            !*/
         {
             raw_arc_grid_t grid;
 
-            // Locate the opening bracket of the outer array
             it = std::find(it, end, '[');
             if (it == end) return grid;
             ++it;
 
-            // Skip any leading whitespace
             while (it != end && std::isspace(*it)) ++it;
 
-            // Verify we have an array of arrays (second '[')
             if (it == end || *it != '[') return grid;
 
-            // Parse each row in the grid
             while (it != end)
             {
-                // Skip whitespace between rows
                 while (it != end && std::isspace(*it)) ++it;
 
-                // Check for end of outer array
                 if (it == end || *it == ']') break;
 
-                // Expect a '[' at the start of each row
-                if (*it != '[') {
-                    ++it;
-                    continue;
-                }
+                if (*it != '[') { ++it; continue; }
                 ++it;
 
-                // Find the closing ']' for this row
                 auto inner_end = std::find(it, end, ']');
                 if (inner_end == end)
                     throw std::runtime_error("Missing inner array closing bracket");
 
-                // Parse the integers in this row
                 std::string row_str(it, inner_end);
                 auto row = parse_int_array(row_str);
 
@@ -239,13 +228,11 @@ namespace dlib
                 it = inner_end;
                 ++it;
 
-                // Skip trailing whitespace, commas, and newlines
                 while (it != end && (*it == ' ' || *it == ',' || *it == '\n' ||
                     *it == '\r' || *it == '\t'))
                     ++it;
             }
 
-            // Advance past the closing ']' of the outer array
             if (it != end && *it == ']') ++it;
 
             return grid;
@@ -256,31 +243,33 @@ namespace dlib
         inline std::string::const_iterator find_key_value_start(
             const std::string& content,
             const std::string& key,
-            std::string::const_iterator start_it)
-        /*!
-            ensures
-                - Searches for a JSON key-value pair starting from start_it
-                - Returns an iterator pointing to the first character of the value
-                - Returns content.end() if the key is not found
-        !*/
+            std::string::const_iterator start_it,
+            std::string::const_iterator end_it)
+            /*!
+                ensures
+                    - Searches for a JSON key-value pair in [start_it, end_it)
+                    - Returns an iterator pointing to the first character of the value
+                    - Returns end_it if the key is not found within the specified range
+                    - Bounded search prevents false matches from sibling JSON objects
+            !*/
         {
             std::string search_str = "\"" + key + "\":";
-            auto pos = std::search(start_it, content.end(),
+            auto pos = std::search(start_it, end_it,
                 search_str.begin(), search_str.end());
-            if (pos == content.end()) return content.end();
-            pos += search_str.length();
-            while (pos != content.end() && std::isspace(*pos)) ++pos;
+            if (pos == end_it) return end_it;
+            pos += static_cast<std::ptrdiff_t>(search_str.length());
+            while (pos != end_it && std::isspace(*pos)) ++pos;
             return pos;
         }
 
         // ------------------------------------------------------------------------------------
 
         inline std::string extract_task_id_from_filename(const std::string& filename)
-        /*!
-            ensures
-                - Extracts the task ID from a filename by removing the file extension
-                - If no extension is found, returns the filename unchanged
-        !*/
+            /*!
+                ensures
+                    - Extracts the task ID from a filename by removing the file extension
+                    - If no extension is found, returns the filename unchanged
+            !*/
         {
             size_t dot_pos = filename.find_last_of('.');
             if (dot_pos == std::string::npos)
@@ -322,22 +311,21 @@ namespace dlib
 
         // ------------------------------------------------------------------------------------
 
-        static void append_flat_grid(std::vector<long>& sequence, const arc_grid_t& grid)
-        /*!
-            requires
-                - grid contains valid color values (0-9)
-            ensures
-                - Appends the grid to the sequence in row-major order
-                - Each row is terminated with TOKEN_ROW_END
-                - This encoding preserves grid dimensions for reconstruction
-        !*/
+        static void append_flat_grid(std::vector<int>& sequence, const arc_grid_t& grid)
+            /*!
+                requires
+                    - grid contains valid color values (0-9)
+                ensures
+                    - Appends the grid to the sequence in row-major order
+                    - Each row is terminated with TOKEN_ROW_END
+                    - This encoding preserves grid dimensions for reconstruction
+            !*/
         {
             for (long r = 0; r < grid.nr(); ++r)
             {
                 for (long c = 0; c < grid.nc(); ++c)
-                    sequence.push_back(static_cast<long>(grid(r, c)));
+                    sequence.push_back(static_cast<int>(grid(r, c)));
 
-                // Mark the end of this row to encode dimensional information
                 sequence.push_back(TOKEN_ROW_END);
             }
         }
@@ -345,17 +333,17 @@ namespace dlib
         // ------------------------------------------------------------------------------------
 
         static arc_grid_t to_dlib_matrix(const internal::raw_arc_grid_t& grid)
-        /*!
-            requires
-                - grid is a valid 2D array with consistent row lengths
-                - all values are in the range [0, 9]
-            ensures
-                - Converts a raw vector-of-vectors grid to a dlib matrix
-                - Returns an empty matrix if the input grid is empty
-            throws
-                - DLIB_CASSERT if row lengths are inconsistent
-                - DLIB_CASSERT if pixel values are outside [0, 9]
-        !*/
+            /*!
+                requires
+                    - grid is a valid 2D array with consistent row lengths
+                    - all values are in the range [0, 9]
+                ensures
+                    - Converts a raw vector-of-vectors grid to a dlib matrix
+                    - Returns an empty matrix if the input grid is empty
+                throws
+                    - DLIB_CASSERT if row lengths are inconsistent
+                    - DLIB_CASSERT if pixel values are outside [0, 9]
+            !*/
         {
             if (grid.empty()) return arc_grid_t(0, 0);
             long rows = static_cast<long>(grid.size());
@@ -380,14 +368,14 @@ namespace dlib
 
         arc_task parse_arc_task_from_content(const std::string& content,
             const std::string& filename)
-        /*!
-            ensures
-                - Parses a complete ARC task from JSON content
-                - Returns an arc_task structure with all training and test pairs
-                - Task ID is extracted from the filename
-            throws
-                - std::runtime_error on malformed JSON or missing required fields
-        !*/
+            /*!
+                ensures
+                    - Parses a complete ARC task from JSON content
+                    - Returns an arc_task structure with all training and test pairs
+                    - Task ID is extracted from the filename
+                throws
+                    - std::runtime_error on malformed JSON or missing required fields
+            !*/
         {
             arc_task task;
             task.task_id = internal::extract_task_id_from_filename(filename);
@@ -395,31 +383,24 @@ namespace dlib
             auto parse_pairs = [&](const std::string& key,
                 std::vector<arc_task_pair>& pairs)
                 {
-                    auto it = internal::find_key_value_start(content, key, content.begin());
+                    // Find the top-level array for this key (scoped to full content)
+                    auto it = internal::find_key_value_start(
+                        content, key, content.begin(), content.end());
                     if (it == content.end() || *it != '[')
                         throw std::runtime_error("'" + key + "' array not found");
                     ++it;
 
-                    // Iterate through each object in the array
                     while (it != content.end())
                     {
-                        // Skip inter-object whitespace
                         while (it != content.end() && std::isspace(*it)) ++it;
-
-                        // Check if we've reached the end of the array
                         if (it == content.end() || *it == ']') break;
 
-                        // Locate the opening brace of this object
-                        if (*it != '{') {
-                            ++it;
-                            continue;
-                        }
+                        if (*it != '{') { ++it; continue; }
 
-                        // Mark boundaries for scoped key searches
                         auto object_start = it;
                         ++it;
 
-                        // Find the matching closing brace
+                        // Find the matching closing brace for this object
                         int brace_depth = 1;
                         auto object_end = it;
                         while (object_end != content.end() && brace_depth > 0)
@@ -434,9 +415,10 @@ namespace dlib
 
                         arc_task_pair pair;
 
-                        // Parse the "input" field within this object's scope
-                        auto input_it = internal::find_key_value_start(content, "input", object_start);
-                        if (input_it == content.end() || input_it >= object_end)
+                        // Parse "input" field — search bounded to this object
+                        auto input_it = internal::find_key_value_start(
+                            content, "input", object_start, object_end);
+                        if (input_it == object_end)
                             throw std::runtime_error("'input' not found in " + key + " object");
 
                         auto raw_input = internal::parse_arc_grid(input_it, object_end);
@@ -444,9 +426,11 @@ namespace dlib
                         pair.input_rows = pair.input.nr();
                         pair.input_cols = pair.input.nc();
 
-                        // Parse the "output" field (search starts after input)
-                        auto output_it = internal::find_key_value_start(content, "output", input_it);
-                        if (output_it == content.end() || output_it >= object_end)
+                        // Parse "output" field — search bounded to this object,
+                        // starting from where input_it was left after parse_arc_grid
+                        auto output_it = internal::find_key_value_start(
+                            content, "output", input_it, object_end);
+                        if (output_it == object_end)
                             throw std::runtime_error("'output' not found in " + key + " object");
 
                         auto raw_output = internal::parse_arc_grid(output_it, object_end);
@@ -455,8 +439,6 @@ namespace dlib
                         pair.output_cols = pair.output.nc();
 
                         pairs.push_back(pair);
-
-                        // Advance iterator past this object
                         it = object_end;
                     }
                 };
@@ -470,14 +452,14 @@ namespace dlib
 
         std::vector<arc_task> load_all_tasks(const std::string& directory_path,
             std::map<std::string, size_t>& id_map)
-        /*!
-            ensures
-                - Loads all .json files from the specified directory
-                - Each file is parsed as an ARC task
-                - Returns a vector of successfully loaded tasks
-                - Populates id_map with task_id to index mappings
-                - Outputs diagnostic information to stdout/stderr
-        !*/
+            /*!
+                ensures
+                    - Loads all .json files from the specified directory
+                    - Each file is parsed as an ARC task
+                    - Returns a vector of successfully loaded tasks
+                    - Populates id_map with task_id to index mappings
+                    - Outputs diagnostic information to stdout/stderr
+            !*/
         {
             std::vector<arc_task> tasks;
             std::cout << "Loading tasks from: " << directory_path << std::endl;
@@ -488,7 +470,6 @@ namespace dlib
 
                 std::cout << "Found " << all_files.size() << " files in directory" << std::endl;
 
-                // Filter for JSON files only
                 std::vector<dlib::file> json_files;
                 for (const auto& file : all_files)
                 {
@@ -511,7 +492,6 @@ namespace dlib
                 size_t success_count = 0;
                 size_t error_count = 0;
 
-                // Attempt to load each JSON file
                 for (const auto& file : json_files)
                 {
                     try {
@@ -555,12 +535,12 @@ namespace dlib
 
         void load_data(const std::string& training_path,
             const std::string& evaluation_path)
-        /*!
-            ensures
-                - Loads all ARC tasks from training and evaluation directories
-                - Clears any previously loaded data
-                - Outputs a summary of loaded tasks to stdout
-        !*/
+            /*!
+                ensures
+                    - Loads all ARC tasks from training and evaluation directories
+                    - Clears any previously loaded data
+                    - Outputs a summary of loaded tasks to stdout
+            !*/
         {
             training_task_id_map.clear();
             evaluation_task_id_map.clear();
@@ -577,14 +557,6 @@ namespace dlib
         // ------------------------------------------------------------------------------------
 
         const arc_task& get_training_task(size_t index) const
-        /*!
-            requires
-                - index < num_training_tasks()
-            ensures
-                - Returns a const reference to the training task at the given index
-            throws
-                - DLIB_CASSERT if index is out of bounds
-        !*/
         {
             DLIB_CASSERT(index < training_tasks.size(),
                 "Training task index out of bounds"
@@ -593,32 +565,14 @@ namespace dlib
             return training_tasks[index];
         }
 
-        // ------------------------------------------------------------------------------------
-
         const arc_task& get_evaluation_task(size_t index) const
-        /*!
-            requires
-                - index < num_evaluation_tasks()
-            ensures
-                - Returns a const reference to the evaluation task at the given index
-            throws
-                - DLIB_CASSERT if index is out of bounds
-        !*/
         {
             DLIB_CASSERT(index < evaluation_tasks.size(),
                 "Evaluation task index out of bounds");
             return evaluation_tasks[index];
         }
 
-        // ------------------------------------------------------------------------------------
-
         const arc_task& get_training_task_by_id(const std::string& task_id) const
-        /*!
-            ensures
-                - Returns a const reference to the training task with the given ID
-            throws
-                - std::runtime_error if task_id is not found
-        !*/
         {
             auto it = training_task_id_map.find(task_id);
             if (it == training_task_id_map.end())
@@ -626,15 +580,7 @@ namespace dlib
             return training_tasks[it->second];
         }
 
-        // ------------------------------------------------------------------------------------
-
         const arc_task& get_evaluation_task_by_id(const std::string& task_id) const
-        /*!
-            ensures
-                - Returns a const reference to the evaluation task with the given ID
-            throws
-                - std::runtime_error if task_id is not found
-        !*/
         {
             auto it = evaluation_task_id_map.find(task_id);
             if (it == evaluation_task_id_map.end())
@@ -642,19 +588,12 @@ namespace dlib
             return evaluation_tasks[it->second];
         }
 
-        // ------------------------------------------------------------------------------------
-
-        size_t num_training_tasks() const { return training_tasks.size(); }
+        size_t num_training_tasks()   const { return training_tasks.size(); }
         size_t num_evaluation_tasks() const { return evaluation_tasks.size(); }
 
         // ------------------------------------------------------------------------------------
 
         void serialize(std::ostream& out) const
-        /*!
-            ensures
-                - Serializes the entire dataset to the output stream
-                - Format is versioned for forward compatibility
-        !*/
         {
             dlib::serialize("arc_agi_v1", out);
             dlib::serialize(training_tasks, out);
@@ -663,16 +602,7 @@ namespace dlib
             dlib::serialize(evaluation_task_id_map, out);
         }
 
-        // ------------------------------------------------------------------------------------
-
         void deserialize(std::istream& in)
-        /*!
-            ensures
-                - Deserializes a dataset from the input stream
-                - Replaces any existing data in this object
-            throws
-                - serialization_error if version mismatch is detected
-        !*/
         {
             std::string version;
             dlib::deserialize(version, in);
@@ -690,17 +620,16 @@ namespace dlib
 
         static arc_token_sequence_t tokenize_input_context(const arc_task& task,
             const arc_task_pair& test_pair)
-        /*!
-            ensures
-                - Creates a token sequence representing the input context for a test pair
-                - Format: [train_input, SEP_IO, train_output, SEP_PAIR]* QUERY_START test_input GEN_START
-                - Each grid is tokenized with TOKEN_ROW_END markers preserving dimensions
-                - Returns a column vector of tokens
-        !*/
+            /*!
+                ensures
+                    - Creates a token sequence representing the input context for a test pair
+                    - Format: [train_input SEP_IO train_output SEP_PAIR]* QUERY_START test_input GEN_START
+                    - Each grid is tokenized with TOKEN_ROW_END markers preserving dimensions
+                    - Returns a column vector of int tokens
+            !*/
         {
-            std::vector<long> sequence;
+            std::vector<int> sequence;
 
-            // Encode all training demonstration pairs
             for (const auto& pair : task.train_pairs)
             {
                 append_flat_grid(sequence, pair.input);
@@ -709,36 +638,33 @@ namespace dlib
                 sequence.push_back(TOKEN_SEP_PAIR);
             }
 
-            // Encode the test query
             sequence.push_back(TOKEN_QUERY_START);
             append_flat_grid(sequence, test_pair.input);
             sequence.push_back(TOKEN_GEN_START);
 
-            // Convert to dlib column vector
             arc_token_sequence_t result(static_cast<long>(sequence.size()));
             for (long i = 0; i < static_cast<long>(sequence.size()); ++i)
-                result(i) = sequence[i];
+                result(i) = sequence[static_cast<size_t>(i)];
             return result;
         }
 
         // ------------------------------------------------------------------------------------
 
         static arc_token_sequence_t tokenize_target_output(const arc_task_pair& test_pair)
-        /*!
-            ensures
-                - Creates a token sequence for the target output grid
-                - Format: output_grid END_OF_OUTPUT
-                - Output grid includes TOKEN_ROW_END markers
-                - Returns a column vector of tokens
-        !*/
+            /*!
+                ensures
+                    - Creates a token sequence for the target output grid
+                    - Format: output_grid END_OF_OUTPUT
+                    - Returns a column vector of int tokens
+            !*/
         {
-            std::vector<long> sequence;
+            std::vector<int> sequence;
             append_flat_grid(sequence, test_pair.output);
             sequence.push_back(TOKEN_END_OF_OUTPUT);
 
             arc_token_sequence_t result(static_cast<long>(sequence.size()));
             for (long i = 0; i < static_cast<long>(sequence.size()); ++i)
-                result(i) = sequence[i];
+                result(i) = sequence[static_cast<size_t>(i)];
             return result;
         }
 
@@ -749,30 +675,20 @@ namespace dlib
             long window_len,
             std::vector<arc_token_sequence_t>& training_X_batch,
             std::vector<long>& training_Y_batch)
-        /*!
-            requires
-                - window_len > 1
-            ensures
-                - Generates training samples using a sliding window approach
-                - Each X sample contains window_len tokens of context
-                - Each Y label is the next token following the context window
-                - Padding tokens are used when the window extends beyond sequence boundaries
-                - training_X_batch[i] is a column vector of length window_len
-                - training_Y_batch[i] is the target token for training_X_batch[i]
-                - Processes all test pairs in the task
-            throws
-                - DLIB_CASSERT if window_len <= 1
-
-            IMPLEMENTATION NOTES
-                This function implements causal language modeling for ARC tasks.
-                For each position in the concatenated [context + target] sequence,
-                it creates a training example where:
-                - X = [t_{pos-window_len+1}, ..., t_{pos}]
-                - Y = t_{pos+1}
-
-                The sliding window ensures the model learns to predict each token
-                given the appropriate amount of left context.
-        !*/
+            /*!
+                requires
+                    - window_len > 1
+                ensures
+                    - Generates training samples using a sliding window approach
+                    - Each X sample contains window_len int tokens of context
+                    - Each Y label is the next token (as long, for dlib label compatibility)
+                    - Padding tokens are used when the window extends beyond sequence boundaries
+                    - training_X_batch[i] is a column vector of int of length window_len
+                    - training_Y_batch[i] is the target token for training_X_batch[i]
+                    - Processes all test pairs in the task
+                throws
+                    - DLIB_CASSERT if window_len <= 1
+            !*/
         {
             DLIB_CASSERT(window_len > 1, "Window length must be greater than 1");
 
@@ -781,7 +697,6 @@ namespace dlib
 
             for (const arc_task_pair& test_pair : task.test_pairs)
             {
-                // Tokenize the full sequence: context + target
                 arc_token_sequence_t input_context = tokenize_input_context(task, test_pair);
                 arc_token_sequence_t target_output = tokenize_target_output(test_pair);
 
@@ -789,37 +704,31 @@ namespace dlib
                 long L_out = target_output.size();
                 long L_full = L_in + L_out;
 
-                // Build the complete token sequence
-                std::vector<long> S_vec;
+                // Build the complete token sequence as int
+                std::vector<int> S_vec;
                 S_vec.reserve(static_cast<size_t>(L_full));
 
-                for (long i = 0; i < L_in; ++i)
-                    S_vec.push_back(input_context(i));
-                for (long i = 0; i < L_out; ++i)
-                    S_vec.push_back(target_output(i));
+                for (long i = 0; i < L_in; ++i) S_vec.push_back(input_context(i));
+                for (long i = 0; i < L_out; ++i) S_vec.push_back(target_output(i));
 
                 // Generate sliding window samples
-                // For each position, create a context window of length window_len
                 for (long pos = 0; pos < L_full; ++pos)
                 {
                     arc_token_sequence_t X_window(window_len);
 
-                    // Fill the context window
-                    // Window spans from (pos - window_len + 1) to pos inclusive
                     for (long i = 0; i < window_len; ++i)
                     {
                         long context_idx = pos - window_len + 1 + i;
-
-                        // Use padding for positions before sequence start or after end
                         if (context_idx < 0 || context_idx >= L_full)
                             X_window(i) = TOKEN_PADDING;
                         else
                             X_window(i) = S_vec[static_cast<size_t>(context_idx)];
                     }
 
-                    // The target is the next token after the window
-                    long y_token = (pos + 1 < L_full) ?
-                        S_vec[static_cast<size_t>(pos + 1)] : TOKEN_PADDING;
+                    // Y label stays long for dlib unsigned long label compatibility
+                    long y_token = (pos + 1 < L_full)
+                        ? static_cast<long>(S_vec[static_cast<size_t>(pos + 1)])
+                        : static_cast<long>(TOKEN_PADDING);
 
                     training_X_batch.push_back(std::move(X_window));
                     training_Y_batch.push_back(y_token);
@@ -833,34 +742,26 @@ namespace dlib
 
         static arc_grid_t detokenize_to_grid(const arc_token_sequence_t& tokens,
             long start_idx = 0)
-        /*!
-            ensures
-                - Reconstructs a grid from a tokenized sequence
-                - Uses TOKEN_ROW_END markers to determine row boundaries
-                - Stops at TOKEN_END_OF_OUTPUT, TOKEN_SEP_IO, or TOKEN_SEP_PAIR
-                - Returns a matrix with the reconstructed grid
-                - Returns an empty matrix if no valid grid is found
-            throws
-                - DLIB_CASSERT if row lengths are inconsistent
-
-            IMPLEMENTATION NOTES
-                This function recovers grid dimensions from the token stream by
-                counting tokens between TOKEN_ROW_END markers. This allows the
-                model to generate grids of arbitrary dimensions (1x1 to 30x30)
-                without explicit dimension specification.
-        !*/
+            /*!
+                ensures
+                    - Reconstructs a grid from a tokenized sequence
+                    - Uses TOKEN_ROW_END markers to determine row boundaries
+                    - Stops at TOKEN_END_OF_OUTPUT, TOKEN_SEP_IO, or TOKEN_SEP_PAIR
+                    - Returns a matrix with the reconstructed grid
+                    - Returns an empty matrix if no valid grid is found
+                throws
+                    - DLIB_CASSERT if row lengths are inconsistent
+            !*/
         {
-            // Extract rows from the token sequence
             std::vector<std::vector<unsigned char>> rows;
             std::vector<unsigned char> current_row;
 
             for (long i = start_idx; i < tokens.size(); ++i)
             {
-                long token = tokens(i);
+                int token = tokens(i);
 
                 if (token == TOKEN_ROW_END)
                 {
-                    // End of current row - save it if non-empty
                     if (!current_row.empty())
                     {
                         rows.push_back(current_row);
@@ -871,18 +772,15 @@ namespace dlib
                     token == TOKEN_SEP_IO ||
                     token == TOKEN_SEP_PAIR)
                 {
-                    // End of grid section
                     break;
                 }
                 else if (token >= COLOR_0 && token <= COLOR_9)
                 {
-                    // Valid color token - add to current row
                     current_row.push_back(static_cast<unsigned char>(token));
                 }
-                // Ignore other tokens (padding, etc.)
+                // Ignore padding and other non-grid tokens
             }
 
-            // Build the output matrix
             if (rows.empty())
                 return arc_grid_t(0, 0);
 
@@ -897,7 +795,7 @@ namespace dlib
                     << "\n\tRow " << r << " has " << rows[r].size() << " columns"
                     << "\n\tExpected " << n_cols << " columns");
                 for (long c = 0; c < n_cols; ++c)
-                    grid(r, c) = rows[r][c];
+                    grid(r, c) = rows[r][static_cast<size_t>(c)];
             }
 
             return grid;

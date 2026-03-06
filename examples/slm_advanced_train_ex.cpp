@@ -18,7 +18,7 @@
     - Verification:  Byte-for-byte comparison between the generated output file and the original
                      dataset, reporting mismatches with their byte offsets and hex values.
 
-    Architecture (canonical_transformer namespace, compile-time via transformer_config):
+    Architecture (canonical_transformer namespace, compile-time via canonical_transformer_config):
     - Standard multi-head attention with separate Q, K, V projections
     - RoPE (Rotary Position Embedding) applied to Q and K
     - Causal mask (tril_mask) and scaled dot-product attention
@@ -54,70 +54,6 @@
 
 using namespace std;
 using namespace dlib;
-
-namespace dlib
-{
-    // Classification head for next-token prediction
-    template <long num_logits, typename SUBNET>
-    using classification_head = loss_cross_entropy_per_logit<linear<num_logits, rms_norm<SUBNET>>>;
-
-    /**
-     * @brief Transformer model configuration template
-     *
-     * Provides a flexible and type-safe configuration mechanism for transformer models
-     * with compile-time parameter validation and network generation.
-     *
-     * Template parameters:
-     * @param vocab_size Vocabulary size for token embedding
-     * @param num_layers Number of transformer layers
-     * @param num_heads Number of attention heads
-     * @param embedding_dim Dimension of token embeddings
-     */
-    template<
-        long vocab_size = 15000,
-        long num_layers = 6,
-        long num_heads = 8,
-        long embedding_dim = 512,
-        template <typename> class activation_func = gelu,
-        template <typename> class dropout_policy = dropout_10
-    >
-    struct transformer_config {
-        // Core model parameters
-        static constexpr long VOCAB_SIZE = vocab_size;
-        static constexpr long NUM_LAYERS = num_layers;
-        static constexpr long NUM_HEADS = num_heads;
-        static constexpr long EMBEDDING_DIM = embedding_dim;
-
-        // Compile-time validation of model configuration
-        struct validation {
-            static_assert(VOCAB_SIZE > 0, "Vocabulary size must be positive");
-            static_assert(NUM_LAYERS > 0, "Number of layers must be positive");
-            static_assert(NUM_HEADS > 0, "Number of attention heads must be positive");
-            static_assert(EMBEDDING_DIM % NUM_HEADS == 0, "Embedding dimension must be divisible by number of heads");
-        };
-
-        template<bool is_training>
-        using network_type = std::conditional_t<is_training,
-            classification_head<VOCAB_SIZE,
-            canonical_transformer::transformer_stack<NUM_LAYERS, activation_func, dropout_policy, EMBEDDING_DIM, NUM_HEADS,
-            embeddings<VOCAB_SIZE, EMBEDDING_DIM, input<matrix<int, 0, 1>>>>>,
-            classification_head<VOCAB_SIZE,
-            canonical_transformer::transformer_stack<NUM_LAYERS, activation_func, multiply, EMBEDDING_DIM, NUM_HEADS,
-            embeddings<VOCAB_SIZE, EMBEDDING_DIM, input<matrix<int, 0, 1>>>>>>;
-
-        struct model_info {
-            static std::string describe() {
-                std::stringstream ss;
-                ss << "Transformer model configuration:\n"
-                    << "- vocabulary size: " << VOCAB_SIZE << "\n"
-                    << "- layers: " << NUM_LAYERS << "\n"
-                    << "- attention heads: " << NUM_HEADS << "\n"
-                    << "- embedding dimension: " << EMBEDDING_DIM;
-                return ss.str();
-            }
-        };
-    };
-}
 
 // Utility functions
 std::string generate_tokens_filename(size_t max_bytes)
@@ -272,7 +208,7 @@ int main(int argc, char** argv)
         const long max_seq_len = 100;
 
         // Define transformer configuration
-        using my_transformer = transformer_config<
+        using my_transformer = canonical_transformer_config<
             num_tokens,     // vocab
             num_layers,     // layers
             num_heads,      // heads
@@ -487,6 +423,7 @@ int main(int argc, char** argv)
             }
 
             // Save model
+            trainer.get_net();
             net.clean();
             serialize(model_file) << net << tokenizer;
             cout << "Model saved to " << model_file << "\n";

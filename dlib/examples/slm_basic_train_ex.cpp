@@ -214,6 +214,7 @@ int main(int argc, char** argv)
             cout << "Training accuracy (on this sample set): " << accuracy << "\n";
 
             // 6) Save the model
+            trainer.get_net();
             net.clean();
             serialize(model_file) << net;
             cout << "Model saved to " << model_file << "\n";

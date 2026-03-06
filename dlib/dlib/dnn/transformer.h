@@ -117,6 +117,33 @@ namespace dlib
             return get_is_padding_set_();
         }
 
+        static void set_optimizer_params(double weight_decay, double beta1, double beta2)
+        {
+            std::lock_guard<std::mutex> lock(get_mutex_());            
+            get_optimizer_weight_decay_() = weight_decay;
+            get_optimizer_beta1_() = beta1;
+            get_optimizer_beta2_() = beta2;
+            get_is_active_() = true;
+        }
+
+        static double get_optimizer_weight_decay()
+        {
+            std::lock_guard<std::mutex> lock(get_mutex_());
+			return get_optimizer_weight_decay_();
+        }
+
+        static double get_optimizer_beta1()
+        {
+            std::lock_guard<std::mutex> lock(get_mutex_());
+			return get_optimizer_beta1_();
+        }
+
+        static double get_optimizer_beta2()
+        {
+            std::lock_guard<std::mutex> lock(get_mutex_());
+			return get_optimizer_beta2_();
+        }
+
     private:
 
         static void clear_padding_nolock_()
@@ -129,6 +156,9 @@ namespace dlib
         {
             get_is_active_() = false;
             get_learning_rate_() = 0.0;
+            get_optimizer_weight_decay_() = 0.004;
+            get_optimizer_beta1_() = 0.9;
+            get_optimizer_beta1_() = 0.999;
             clear_padding_nolock_();
         }
 
@@ -150,6 +180,18 @@ namespace dlib
         }
         static bool& get_is_padding_set_() {
             static bool v = false;
+            return v;
+        }
+        static double& get_optimizer_weight_decay_() {
+            static double v = 0.004;
+            return v;
+        }
+        static double& get_optimizer_beta1_() {
+            static double v = 0.9;
+            return v;
+        }
+        static double& get_optimizer_beta2_() {
+            static double v = 0.999;
             return v;
         }
     };
@@ -537,12 +579,8 @@ namespace dlib
             hidden_dim(0),
             learning_rate_multiplier(1.0),
             current_learning_rate_(0.001),
-            h_solvers_initialized_(false),
-            l_solvers_initialized_(false)
+            solvers_initialized_(false)
         {
-            solver_weight_decay_ = 0.1;
-            solver_beta1_ = 0.9;
-            solver_beta2_ = 0.95;
         }
 
         hrm_(const hrm_& other) :
@@ -553,12 +591,8 @@ namespace dlib
             hidden_dim(other.hidden_dim),
             learning_rate_multiplier(other.learning_rate_multiplier),
             current_learning_rate_(other.current_learning_rate_),
-            h_solvers_initialized_(false),
-            l_solvers_initialized_(false)
+            solvers_initialized_(false)
         {
-			solver_weight_decay_ = other.solver_weight_decay_;
-			solver_beta1_ = other.solver_beta1_;
-			solver_beta2_ = other.solver_beta2_;
         }
 
         hrm_& operator=(const hrm_& other)
@@ -571,13 +605,9 @@ namespace dlib
                 hidden_dim = other.hidden_dim;
                 learning_rate_multiplier = other.learning_rate_multiplier;
                 current_learning_rate_ = other.current_learning_rate_;
-                // Solvers are runtime state: reset on copy
-                h_solvers_initialized_ = false;
-                l_solvers_initialized_ = false;
 
-                solver_weight_decay_ = other.solver_weight_decay_;
-                solver_beta1_ = other.solver_beta1_;
-                solver_beta2_ = other.solver_beta2_;
+                // Solvers are runtime state: reset on copy
+                solvers_initialized_ = false;
             }
             return *this;
         }
@@ -711,8 +741,7 @@ namespace dlib
             solver_beta2_ = beta2;
 
             // Force re-initialization on next backward
-            h_solvers_initialized_ = false;
-            l_solvers_initialized_ = false;
+            solvers_initialized_ = false;
         }
 
         size_t internal_parameters() const
@@ -744,6 +773,9 @@ namespace dlib
             serialize(item.hidden_dim, out);
             serialize(item.learning_rate_multiplier, out);
             serialize(item.current_learning_rate_, out);
+            serialize(item.h_solvers_, out);
+            serialize(item.l_solvers_, out);
+            serialize(item.solvers_initialized_, out);
         }
 
         friend void deserialize(hrm_& item, std::istream& in)
@@ -761,10 +793,9 @@ namespace dlib
             deserialize(item.hidden_dim, in);
             deserialize(item.learning_rate_multiplier, in);
             deserialize(item.current_learning_rate_, in);
-
-            // Solvers are runtime state: will be re-initialized on first backward
-            item.h_solvers_initialized_ = false;
-            item.l_solvers_initialized_ = false;
+            deserialize(item.h_solvers_, in);
+            deserialize(item.l_solvers_, in);
+            deserialize(item.solvers_initialized_, in);
         }
 
         friend std::ostream& operator<<(std::ostream& out, const hrm_& item)
@@ -795,27 +826,22 @@ namespace dlib
         void update_subnet_parameters()
         {
             // Prefer network_context learning rate when active
-            const double base_lr = (network_context::is_active())
-                ? network_context::get_learning_rate()
-                : current_learning_rate_;
-            current_learning_rate_ = base_lr;
-
+            if (network_context::is_active())
+				current_learning_rate_ = network_context::get_learning_rate();
             if (learning_rate_multiplier == 0.0) return;
             
-            // Scale down by N*T to compensate for one-step gradient approximation
-            // applied to weights reused N*T times in forward pass
-            const double effective_lr = base_lr * learning_rate_multiplier_
-                / static_cast<double>(N_ * T_);
+            const double effective_lr = current_learning_rate_ * learning_rate_multiplier;
 
-            if (!h_solvers_initialized_) {
-                h_solvers_.resize(h_net.num_computational_layers,
-                    adamw(solver_weight_decay_, solver_beta1_, solver_beta2_));
-                h_solvers_initialized_ = true;
-            }
-            if (!l_solvers_initialized_) {
-                l_solvers_.resize(l_net.num_computational_layers,
-                    adamw(solver_weight_decay_, solver_beta1_, solver_beta2_));
-                l_solvers_initialized_ = true;
+            if (!solvers_initialized_) {
+                const double wd = network_context::is_active()
+                    ? network_context::get_optimizer_weight_decay() : 0.004;
+                const double b1 = network_context::is_active()
+                    ? network_context::get_optimizer_beta1() : 0.9;
+                const double b2 = network_context::is_active()
+                    ? network_context::get_optimizer_beta2() : 0.999;
+                h_solvers_.assign(h_net.num_computational_layers, adamw(wd, b1, b2));
+                l_solvers_.assign(l_net.num_computational_layers, adamw(wd, b1, b2));
+                solvers_initialized_ = true;
             }
 
             h_net.update_parameters(h_solvers_, effective_lr);
@@ -864,8 +890,7 @@ namespace dlib
         // Internal solvers for h_net and l_net (runtime state, not serialized)
         std::vector<adamw> h_solvers_;
         std::vector<adamw> l_solvers_;
-        bool h_solvers_initialized_;
-        bool l_solvers_initialized_;
+        bool solvers_initialized_;
 
         // Temporary computation tensors
         resizable_tensor z_h_current;
@@ -876,10 +901,6 @@ namespace dlib
         // Saved for gradient backward (final step only — truncated BPTT by design)
         resizable_tensor last_h_input;
         resizable_tensor last_l_input;
-
-        double solver_weight_decay_;
-        double solver_beta1_;
-        double solver_beta2_;
 
         resizable_tensor params; // No direct trainable parameters
     };

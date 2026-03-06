@@ -22,7 +22,7 @@
     penalty. The explicit objective being perfect corpus memorization, dropout would be
     counterproductive. Training and inference therefore share a single network_type.
 
-    Architecture (gqa_transformer namespace, via transformer_config):
+    Architecture (gqa_transformer namespace, via gqa_transformer_config):
     - GQA multi-head attention with RoPE on Q and K, causal mask, scaled dot-product
     - RMSNorm pre-normalization, residual connections around both sublayers
     - ACT sublayer: SwiGLU transition network, max 4 steps per position
@@ -40,75 +40,14 @@
 #include <dlib/dnn.h>
 #include <dlib/data_io.h>
 #include <dlib/cmd_line_parser.h>
-#include <dlib/tokenizer/bpe_tokenizer.h>
 #include <dlib/misc_api.h>
+#include <dlib/tokenizer.h>
 
 // Include internal dataset
 #include "slm_data.h"
 
 using namespace std;
 using namespace dlib;
-
-namespace dlib
-{
-    // Classification head for next-token prediction
-    template <long num_logits, typename SUBNET>
-    using classification_head = loss_cross_entropy_per_logit<linear<num_logits, rms_norm<SUBNET>>>;
-
-    /**
-     * @brief Transformer model configuration template
-     *
-     * Provides a flexible and type-safe configuration mechanism for transformer models
-     * with compile-time parameter validation and network generation.
-     *
-     * Template parameters:
-     * @param vocab_size Vocabulary size for token embedding
-     * @param num_layers Number of transformer layers
-     * @param num_heads Number of attention heads
-     * @param embedding_dim Dimension of token embeddings
-     */
-    template<
-        long vocab_size = 15000,
-        long num_layers = 6,
-        long num_heads = 8,
-        long num_kv_heads = 2,
-        long embedding_dim = 512
-    >
-    struct transformer_config {
-        static constexpr long VOCAB_SIZE = vocab_size;
-        static constexpr long NUM_LAYERS = num_layers;
-        static constexpr long NUM_HEADS = num_heads;
-        static constexpr long NUM_KV_HEADS = num_kv_heads;
-        static constexpr long EMBEDDING_DIM = embedding_dim;
-
-        struct validation {
-            static_assert(VOCAB_SIZE > 0, "Vocabulary size must be positive");
-            static_assert(NUM_LAYERS > 0, "Number of layers must be positive");
-            static_assert(NUM_HEADS > 0, "Number of attention heads must be positive");
-            static_assert(NUM_KV_HEADS > 0, "Number of KV heads must be positive");
-            static_assert(NUM_HEADS% NUM_KV_HEADS == 0, "num_heads must be divisible by num_kv_heads");
-            static_assert(EMBEDDING_DIM% NUM_HEADS == 0, "Embedding dimension must be divisible by number of heads");
-        };
-
-        using network_type =
-            classification_head<VOCAB_SIZE,
-            gqa_transformer::transformer_stack<NUM_LAYERS, EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS,
-            embeddings<VOCAB_SIZE, EMBEDDING_DIM, input<matrix<int, 0, 1>>>>>;
-
-        struct model_info {
-            static std::string describe() {
-                std::stringstream ss;
-                ss << "Transformer model configuration:\n"
-                    << "- vocabulary size: " << VOCAB_SIZE << "\n"
-                    << "- layers: " << NUM_LAYERS << "\n"
-                    << "- attention heads: " << NUM_HEADS << "\n"
-                    << "- KV heads (GQA): " << NUM_KV_HEADS << "\n"
-                    << "- embedding dimension: " << EMBEDDING_DIM;
-                return ss.str();
-            }
-        };
-    };
-}
 
 // Utility functions
 std::string generate_tokens_filename(size_t max_bytes)
@@ -264,7 +203,7 @@ int main(int argc, char** argv)
         const long max_seq_len = 100;
 
         // Define transformer configuration
-        using my_transformer = transformer_config<
+        using my_transformer = gqa_transformer_config<
             num_tokens,     // vocab
             num_layers,     // layers
             num_heads,      // heads
@@ -458,6 +397,11 @@ int main(int argc, char** argv)
                     std::vector<long> pad_lengths(batch_samples.size());
                     for (size_t j = 0; j < batch_samples.size(); ++j)
                         pad_lengths[j] = count_leading_padding(batch_samples[j], pad_token);
+
+                    // Synchronize: ensure trainer has finished processing previous batch
+                    // before modifying the shared network_context singleton
+                    trainer.get_net(force_flush_to_disk::no);
+
                     network_context::set_padding_from_lengths(pad_lengths);
                     network_context::set_learning_rate(trainer.get_learning_rate());
 
@@ -485,7 +429,8 @@ int main(int argc, char** argv)
                 epoch++;
             }
 
-            // Save model            
+            // Save model
+            trainer.get_net();
             net.clean();
             serialize(model_file) << net << tokenizer;
             cout << "Model saved to " << model_file << "\n";
