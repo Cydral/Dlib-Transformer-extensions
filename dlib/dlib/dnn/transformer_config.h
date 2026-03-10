@@ -8,6 +8,10 @@
 
 namespace dlib
 {
+    // Forward declarations
+    struct training_mode_tag;
+    struct inference_mode_tag;
+
     // ----------------------------------------------------------------------------------------
 
     // Classification head for next-token prediction
@@ -192,7 +196,7 @@ namespace dlib
         long num_kv_heads_ = 2,
         long embedding_dim_ = 228,
         long num_experts_ = 4,
-        long top_k_ = 0      // 0 = auto (20% of experts, minimum 1)
+        long top_k_ = 0, // 0 = auto (20% of experts, minimum 1)
         template <typename> class dropout_policy = dropout_10
     >
     struct gqa_moe_transformer_config
@@ -220,31 +224,37 @@ namespace dlib
         using expert_net_type = swiglu<EMBEDDING_DIM, 8, 3, input_tensor>;
 
         // Single GQA transformer block with MoE feed-forward sublayer
-        template <
-            typename MODE,
-            typename SUBNET
-        >
-        using gqa_moe_block =
+        template <typename MODE, typename SUBNET>
+        using transformer_block =
             moe_ffn<expert_net_type, NUM_EXPERTS, TOP_K, MODE, dropout_policy,
             add_prev1<multihead_attention_gqa<EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS,
             rms_norm<tag1<SUBNET>>>>>;
 
-        // Network component definitions
-        template <typename SUBNET>
-        using t_block = gqa_moe_block<training_mode_tag, SUBNET>;
+        template<long remaining_layers, typename MODE, typename SUBNET, typename enabled = void>
+        struct transformer_stack_impl
+        {
+            using type = transformer_block<MODE,
+                typename transformer_stack_impl<remaining_layers - 1, MODE, SUBNET>::type>;
+        };
 
-        template <typename SUBNET>
-        using i_block = gqa_moe_block<inference_mode_tag, SUBNET>;
+        template<typename MODE, typename SUBNET>
+        struct transformer_stack_impl<0, MODE, SUBNET, void>
+        {
+            using type = tag10<SUBNET>;
+        };
 
-        // Network definition selector based on training mode (with dropout for training, without for inference)
+        template<long num_layers, typename MODE, typename SUBNET>
+        using transformer_stack = typename transformer_stack_impl<num_layers, MODE, SUBNET>::type;
+
+        // Network definition selector based on training mode
         template <bool is_training>
         using network_type = std::conditional_t<is_training,
-            classification_head<
-            repeat<NUM_LAYERS, t_block,
+            classification_head<VOCAB_SIZE,
+            transformer_stack<NUM_LAYERS, training_mode_tag,
             embeddings<VOCAB_SIZE, EMBEDDING_DIM,
             input<matrix<int, 0, 1>>>>>,
-            classification_head<
-            repeat<NUM_LAYERS, i_block,
+            classification_head<VOCAB_SIZE,
+            transformer_stack<NUM_LAYERS, inference_mode_tag,
             embeddings<VOCAB_SIZE, EMBEDDING_DIM,
             input<matrix<int, 0, 1>>>>>>;
 

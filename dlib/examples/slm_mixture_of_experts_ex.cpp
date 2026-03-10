@@ -787,8 +787,8 @@ int main(int argc, char** argv)
             cout << "Loaded model from " << model_file << "\n";
 
             // Display MoE parameter breakdown and expert usage statistics
-            auto param_info = get_moe_param_info(net, num_layers);
-            param_info.print();
+            //auto param_info = get_moe_param_info(net, num_layers);
+            //param_info.print();
 
             if (tokenizer.get_vocab_size() == 0) {
                 cerr << "Error: Tokenizer not loaded.\n";
