@@ -335,7 +335,7 @@ struct moe_param_info
 // Access the first MoE layer via layer<N> to retrieve expert statistics.
 // The layer index depends on the network head (loss + linear + rms_norm = 3 layers)
 // then the first repeat block's moe_ sits at index 4 in our architecture.
-template <typename net_type>
+/*template <typename net_type>
 moe_param_info get_moe_param_info(const net_type& net, long num_layers)
 {
     moe_param_info info;
@@ -368,7 +368,7 @@ moe_param_info get_moe_param_info(const net_type& net, long num_layers)
     info.expert_usage = moe_layer.get_expert_usage();
 
     return info;
-}
+}*/
 
 int main(int argc, char** argv)
 {
@@ -380,13 +380,13 @@ int main(int argc, char** argv)
         command_line_parser parser;
         parser.add_option("train", "Train a GQA-MoE transformer on internal datasets");
         parser.add_option("generate", "Generate text from a previously trained model");
-        parser.add_option("learning-rate", "Set the peak learning rate (default: 3e-4)", 1);
-        parser.add_option("batch-size", "Set the mini-batch size (default: 96)", 1);
-        parser.add_option("patience", "Steps without progress before early stopping (default: 25000)", 1);
+        parser.add_option("learning-rate", "Set the peak learning rate (default: 2e-4)", 1);
+        parser.add_option("batch-size", "Set the mini-batch size (default: 48)", 1);
+        parser.add_option("patience", "Steps without progress before early stopping (default: 8000)", 1);
         parser.add_option("max-epochs", "Maximum number of training epochs (default: 500)", 1);
-        parser.add_option("weight-decay", "AdamW weight decay (default: 0.01)", 1);
+        parser.add_option("weight-decay", "AdamW weight decay (default: 0.004)", 1);
         parser.add_option("beta1", "AdamW beta1 coefficient (default: 0.9)", 1);
-        parser.add_option("beta2", "AdamW beta2 coefficient (default: 0.999)", 1);
+        parser.add_option("beta2", "AdamW beta2 coefficient (default: 0.998)", 1);
         parser.add_option("model-file", "Path for model file (default: dlib_lm_moe_model.dat)", 1);
         parser.add_option("tokenizer-file", "Path for tokenizer (default: dlib_lm_tokenizer.vocab)", 1);
         parser.add_option("output-file", "Path for generated output (default: generated_text.txt)", 1);
@@ -404,13 +404,13 @@ int main(int argc, char** argv)
         }
 
         // Hyperparameters
-        const double learning_rate = get_option(parser, "learning-rate", 3e-4);
-        const size_t batch_size = get_option(parser, "batch-size", 96);
-        const long   patience = get_option(parser, "patience", 25000);
+        const double learning_rate = get_option(parser, "learning-rate", 2e-4);
+        const size_t batch_size = get_option(parser, "batch-size", 48);
+        const long   patience = get_option(parser, "patience", 8000);
         const size_t max_epochs = get_option(parser, "max-epochs", 500);
-        const double weight_decay = get_option(parser, "weight-decay", 0.01);
+        const double weight_decay = get_option(parser, "weight-decay", 0.004);
         const double beta1 = get_option(parser, "beta1", 0.9);
-        const double beta2 = get_option(parser, "beta2", 0.999);
+        const double beta2 = get_option(parser, "beta2", 0.998);
         const std::string model_file = get_option(parser, "model-file", "dlib_lm_moe_model.dat");
         const std::string tokenizer_file = get_option(parser, "tokenizer-file", "dlib_lm_tokenizer.vocab");
         const std::string output_file = get_option(parser, "output-file", "generated_text.txt");
@@ -423,9 +423,9 @@ int main(int argc, char** argv)
         constexpr long embedding_dim = 228;
         constexpr long num_experts = 4;
         constexpr long top_k = 0;   // auto: 20% = 1 active expert out of 4
-        constexpr long max_seq_len = 128;
+        constexpr long max_seq_len = 100;
 
-        using my_transformer = gqa_moe_transformer_config<
+        /*using my_transformer = gqa_moe_transformer_config<
             num_tokens,
             num_layers,
             num_heads,
@@ -434,8 +434,21 @@ int main(int argc, char** argv)
             num_experts,
             top_k
         >;
-
-        cout << my_transformer::model_info::describe() << "\n";
+        cout << my_transformer::model_info::describe() << "\n";*/
+        /*using my_transformer = gqa_transformer_config<
+            num_tokens,     // vocab
+            num_layers,     // layers
+            num_heads,      // heads
+            num_kv_heads,   // kv_heads
+            embedding_dim   // dim
+        >;*/
+        using my_transformer = hrm_transformer_config<
+            num_tokens,     // vocab
+            num_layers,     // layers
+            num_layers,
+            num_heads,      // heads
+			embedding_dim   // dim
+		>;
 
         // Load internal training datasets
         cout << "Loading internal training datasets...\n";
@@ -481,7 +494,7 @@ int main(int argc, char** argv)
         if (file_exists(tokenizer_file)) {
             cout << "Loading pre-trained tokenizer from: " << tokenizer_file << "\n";
             deserialize(tokenizer_file) >> tokenizer;
-            cout << "Tokenizer loaded — vocabulary size: "
+            cout << "Tokenizer loaded - vocabulary size: "
                 << tokenizer.get_vocab_size() << "\n";
         }
 
@@ -593,11 +606,11 @@ int main(int argc, char** argv)
             cout << "Created " << samples.size() << " training samples\n";
 
             // Augment dataset with 5% noisy copies for robustness
-            augment_training_dataset(
+            /*augment_training_dataset(
                 samples, labels,
                 static_cast<int>(tokenizer.get_special_token_id("<unk>")),
                 pad_token, 0.05);
-            cout << "Augmented dataset size: " << samples.size() << "\n";
+            cout << "Augmented dataset size: " << samples.size() << "\n";*/
 
             full_tokens.clear();
 
@@ -626,8 +639,7 @@ int main(int argc, char** argv)
             trainer.set_learning_rate_shrink_factor(0.1);
             trainer.set_mini_batch_size(batch_size);
             trainer.set_iterations_without_progress_threshold(patience);
-            trainer.set_synchronization_file("chkpt-" + model_file,
-                std::chrono::minutes(15));
+            trainer.set_synchronization_file("chkpt-" + model_file, std::chrono::minutes(15));
             trainer.be_quiet();
 
             // Warmup + cosine LR schedule
@@ -742,13 +754,12 @@ int main(int argc, char** argv)
             {
                 cout << "Evaluating model accuracy on training set...\n";
 
-                using infer_net_type = my_transformer::network_type<false>;
-                infer_net_type g_infer;
+                my_transformer::network_type<false> g_infer;
                 deserialize(model_file) >> g_infer >> tokenizer;
 
                 // Display MoE parameter breakdown
-                auto param_info = get_moe_param_info(g_infer, num_layers);
-                param_info.print();
+                //auto param_info = get_moe_param_info(g_infer, num_layers);
+                //param_info.print();
 
                 std::vector<long> eval_pad_lengths(samples.size());
                 for (size_t i = 0; i < samples.size(); ++i)
@@ -775,9 +786,7 @@ int main(int argc, char** argv)
         {
             cout << "=== GENERATION MODE ===\n";
 
-            using infer_net_type = my_transformer::network_type<false>;
-            infer_net_type net;
-
+            my_transformer::network_type<false> net;
             if (!file_exists(model_file)) {
                 cerr << "Error: model file not found. Please run --train first.\n";
                 return 0;

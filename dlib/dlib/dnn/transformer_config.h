@@ -99,7 +99,8 @@ namespace dlib
             static_assert(EMBEDDING_DIM% NUM_HEADS == 0, "Embedding dimension must be divisible by number of heads");
         };
 
-		// Network definition for GQA transformer (no dropout for simplicity)
+        // Network definition for GQA transformer
+        template<bool is_training>
         using network_type =
             classification_head<VOCAB_SIZE,
             gqa_transformer::transformer_stack<NUM_LAYERS, EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS,

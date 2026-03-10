@@ -435,7 +435,7 @@ int main(int argc, char** argv)
             //    << " (removed samples: " << removed << ")" ccc
 
             // Build network
-            using net_type = my_transformer::network_type;
+            using net_type = my_transformer::network_type<true>;
             net_type net;
             if (file_exists(model_file) && !file_exists("chkpt-" + model_file)) {
                 cout << "Loading existing model from " << model_file << endl;
@@ -530,7 +530,7 @@ int main(int argc, char** argv)
             cout << "=== EVALUATION MODE ===\n";
 
             // Load model
-            my_transformer::network_type net;
+            my_transformer::network_type<false> net;
             if (!file_exists(model_file)) {
                 cerr << "Error: Model file not found: " << model_file << "\n";
                 return 1;
@@ -607,7 +607,7 @@ int main(int argc, char** argv)
                     bool generation_failed = false;
 
                     try {
-                        gen_result = generate_output_for_test_pair_with_info<my_transformer::network_type>(
+                        gen_result = generate_output_for_test_pair_with_info<my_transformer::network_type<false>>(
                             net, task, test_pair, verbose);
                     }
                     catch (const std::exception& e) {

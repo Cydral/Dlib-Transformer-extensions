@@ -1263,7 +1263,7 @@ namespace dlib
                     const float weight = expert_weights[i];
 
                     // Scale gradient by expert weight
-                    if (!weighted_grad.has_ownership() || weighted_grad.size() != (size_t)sample_size)
+                    if (weighted_grad.size() != static_cast<size_t>(sample_size))
                         weighted_grad.set_size(1, k, nr, nc);
 
                     const float* src_data = gradient_input.host() + sample_offset;
