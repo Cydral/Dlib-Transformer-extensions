@@ -40,7 +40,7 @@ using namespace dlib;
 constexpr long MAX_ROWS = 30;
 constexpr long MAX_COLS = 30;
 
-constexpr long WINDOW_LEN = 256; //900;
+constexpr long WINDOW_LEN = 600;
 constexpr long MAX_OUTPUT_TOKENS = (MAX_ROWS * (MAX_COLS + 1) + 1) * 110 / 100;
 
 // Utility function to validate token sequence before detokenization
@@ -296,73 +296,6 @@ generation_result generate_output_for_test_pair_with_info(
     return result;
 }
 
-/*!
-    ensures
-        - Returns true if the sample should be kept for training
-        - Keeps sample if:
-          1. No TOKEN_PADDING in sequence (full context visible), OR
-          2. Has TOKEN_PADDING AND last token is TOKEN_GEN_START
-             (context was left-padded to align TOKEN_GEN_START at end)
-!*/
-inline bool should_keep_sample(const arc_token_sequence_t& input_window,
-    long target_token)
-{
-    const long window_len = input_window.size();
-    bool has_padding = false;
-
-    // Check for padding in the window
-    for (long i = 0; i < window_len; ++i)
-    {
-        if (input_window(i) == TOKEN_PADDING)
-        {
-            has_padding = true;
-            break;
-        }
-    }
-
-    // No padding - keep the sample (full context is visible)
-    if (!has_padding) return true;
-
-    // Has padding - only keep if TOKEN_GEN_START is the last token
-    if (input_window(window_len - 1) == TOKEN_GEN_START) return true;
-
-    // Has padding but TOKEN_GEN_START is not at the end - discard
-    return false;
-}
-
-/*!
-    ensures
-        - Filters training samples to keep only high-quality ones
-        - Removes samples with padding, incorrect TOKEN_GEN_START position, etc.
-        - Returns the number of samples removed
-!*/
-inline size_t filter_training_samples(
-    std::vector<arc_token_sequence_t>& X,
-    std::vector<unsigned long>& Y)
-{
-    DLIB_CASSERT(X.size() == Y.size(), "X and Y must have same size");
-
-    size_t original_size = X.size();
-    std::vector<arc_token_sequence_t> filtered_X;
-    std::vector<unsigned long> filtered_Y;
-
-    filtered_X.reserve(X.size());
-    filtered_Y.reserve(Y.size());
-
-    for (size_t i = 0; i < X.size(); ++i)
-    {
-        if (should_keep_sample(X[i], Y[i]))
-        {
-            filtered_X.push_back(X[i]);
-            filtered_Y.push_back(Y[i]);
-        }
-    }
-    X = std::move(filtered_X);
-    Y = std::move(filtered_Y);
-
-    return (original_size - X.size());
-}
-
 int main(int argc, char** argv)
 {
     try
@@ -376,10 +309,10 @@ int main(int argc, char** argv)
         parser.add_option("training-path", "Path to training JSON files", 1);
         parser.add_option("eval-path", "Path to evaluation JSON files", 1);
         parser.add_option("model-file", "Path for model file", 1);
-        parser.add_option("learning-rate", "Learning rate (default: 3e-4)", 1);
+        parser.add_option("learning-rate", "Learning rate (default: 1e-5)", 1);
         parser.add_option("batch-size", "Mini-batch size (default: 4)", 1);
-        parser.add_option("max-epochs", "Maximum training epochs (default: 300)", 1);
-        parser.add_option("patience", "Early stopping patience (default: 5000)", 1);
+        parser.add_option("max-epochs", "Maximum training epochs (default: 100)", 1);
+        parser.add_option("patience", "Early stopping patience (default: 8000)", 1);
         parser.add_option("weight-decay", "Set the weight decay for AdamW (default: 0.004)", 1);
         parser.add_option("beta1", "Set AdamW's beta1 coefficient (default: 0.9)", 1);
         parser.add_option("beta2", "Set AdamW's beta2 coefficient (default: 0.95)", 1);
@@ -404,8 +337,8 @@ int main(int argc, char** argv)
         const std::string model_file = get_option(parser, "model-file", "dlib_lm_arc_agi_model.dat");
         const double learning_rate = get_option(parser, "learning-rate", 1e-5);
         const size_t batch_size = get_option(parser, "batch-size", 4);
-        const size_t max_epochs = get_option(parser, "max-epochs", 300);
-        const long patience = get_option(parser, "patience", 5000);
+        const size_t max_epochs = get_option(parser, "max-epochs", 100);
+        const long patience = get_option(parser, "patience", 8000);
         const double weight_decay = get_option(parser, "weight-decay", 0.004);
         const double beta1 = get_option(parser, "beta1", 0.9);
         const double beta2 = get_option(parser, "beta2", 0.95);
@@ -413,10 +346,10 @@ int main(int argc, char** argv)
         // Model configuration
         using my_transformer = gqa_transformer_config<
             ARC_VOCAB_SIZE_TOTAL,
-            4,
+            6,
             6,
             2,
-            228
+            384
         >;
         cout << my_transformer::model_info::describe() << "\n\n";
         //cout << hrm_transformer_config::model_info::describe() << "\n\n";
@@ -426,6 +359,38 @@ int main(int argc, char** argv)
         // Load ARC-AGI data
         arc_agi_manager data_mgr;
         data_mgr.load_data(training_path, eval_path);
+
+		// Check size of the tokenized contexts
+        long max_L_in = 0, max_L_full = 0;
+        for (size_t i = 0; i < data_mgr.num_training_tasks(); ++i)
+        {
+            const auto& task = data_mgr.get_training_task(i);
+            for (size_t h = 0; h < task.train_pairs.size(); ++h)
+            {
+                arc_task synthetic;
+                synthetic.task_id = task.task_id;
+                for (size_t j = 0; j < task.train_pairs.size(); ++j)
+                    if (j != h) synthetic.train_pairs.push_back(task.train_pairs[j]);
+
+                auto ctx = arc_agi_manager::tokenize_input_context(
+                    synthetic, task.train_pairs[h]);
+                auto out = arc_agi_manager::tokenize_target_output(
+                    task.train_pairs[h]);
+
+                max_L_in = std::max(max_L_in, ctx.size());
+                max_L_full = std::max(max_L_full, ctx.size() + out.size());
+            }
+        }
+        cout << "Dataset context size analysis:\n";
+        cout << "  max L_in   = " << max_L_in
+            << " (minimum recommended WINDOW_LEN)\n";
+        cout << "  max L_full = " << max_L_full
+            << " (context + longest output)\n";
+        if (max_L_in > WINDOW_LEN)
+            cout << "  WARNING: WINDOW_LEN=" << WINDOW_LEN
+            << " is too small! Many samples will have truncated context.\n";
+        else
+            cout << "  OK: WINDOW_LEN=" << WINDOW_LEN << " covers all contexts.\n";
 
         // Training mode
         if (parser.option("train"))
@@ -449,7 +414,9 @@ int main(int argc, char** argv)
                 std::vector<arc_token_sequence_t> task_X;
                 std::vector<long> task_Y;
 
-                arc_agi_manager::prepare_training_data_batch(task, WINDOW_LEN, task_X, task_Y);
+                //arc_agi_manager::prepare_training_data_batch(task, WINDOW_LEN, task_X, task_Y, false);
+                //arc_agi_manager::prepare_training_data_sliding_window(task, WINDOW_LEN, task_X, task_Y, false);
+                arc_agi_manager::prepare_training_data_pair_only(task, WINDOW_LEN, task_X, task_Y, false);
 
                 all_X.insert(all_X.end(), task_X.begin(), task_X.end());
 
@@ -462,9 +429,10 @@ int main(int argc, char** argv)
                         << data_mgr.num_training_tasks() << " tasks...\r" << flush;
                 }
             }
-            size_t removed = filter_training_samples(all_X, all_Y);
-            cout << "\nTotal training samples: " << all_X.size()
-                << " (removed samples: " << removed << ")" << endl;
+            cout << "\nTotal training samples: " << all_X.size() << endl;
+            //size_t removed = filter_training_samples(all_X, all_Y);
+            //cout << "\nTotal training samples: " << all_X.size()
+            //    << " (removed samples: " << removed << ")" ccc
 
             // Build network
             using net_type = my_transformer::network_type;
@@ -475,7 +443,11 @@ int main(int argc, char** argv)
             }
             layer<0>(net).loss_details().set_ignore_index(TOKEN_PADDING);
             network_context::set_optimizer_params(weight_decay, beta1, beta2);
-            cout << net << endl << endl; // Show the model architecture
+            //cout << net << endl << endl; // Show the model architecture
+
+            arc_token_sequence_t dummy(WINDOW_LEN);
+            for (long i = 0; i < WINDOW_LEN; ++i) dummy(i) = TOKEN_PADDING;
+            net(dummy);
             cout << "Number of model parameters: " << count_parameters(net) << "\n";
 
             // Setup trainer

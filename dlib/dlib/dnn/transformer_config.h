@@ -185,6 +185,92 @@ namespace dlib
         };
     };
 
+    template<
+        long vocab_size_ = 2000,
+        long num_layers_ = 4,
+        long num_heads_ = 6,
+        long num_kv_heads_ = 2,
+        long embedding_dim_ = 228,
+        long num_experts_ = 4,
+        long top_k_ = 0      // 0 = auto (20% of experts, minimum 1)
+        template <typename> class dropout_policy = dropout_10
+    >
+    struct gqa_moe_transformer_config
+    {
+        // Core model parameters
+        static constexpr long VOCAB_SIZE = vocab_size_;
+        static constexpr long NUM_LAYERS = num_layers_;
+        static constexpr long NUM_HEADS = num_heads_;
+        static constexpr long NUM_KV_HEADS = num_kv_heads_;
+        static constexpr long EMBEDDING_DIM = embedding_dim_;
+        static constexpr long NUM_EXPERTS = num_experts_;
+        static constexpr long TOP_K = top_k_;
+
+        // Compile-time validation of model configuration
+        static_assert(VOCAB_SIZE > 0, "Vocabulary size must be positive");
+        static_assert(NUM_LAYERS > 0, "Number of layers must be positive");
+        static_assert(NUM_HEADS > 0, "Number of attention heads must be positive");
+        static_assert(NUM_KV_HEADS > 0, "Number of KV heads must be positive");
+        static_assert(NUM_HEADS% NUM_KV_HEADS == 0, "num_heads must be divisible by num_kv_heads");
+        static_assert(EMBEDDING_DIM% NUM_HEADS == 0, "Embedding dim must be divisible by num_heads");
+        static_assert(NUM_EXPERTS > 0, "Number of experts must be positive");
+
+        // Expert network: SwiGLU with inner hidden dimension = d_model * 8/3
+        // Output shape matches input — required by the MoE routing accumulation
+        using expert_net_type = swiglu<EMBEDDING_DIM, 8, 3, input_tensor>;
+
+        // Single GQA transformer block with MoE feed-forward sublayer
+        template <
+            typename MODE,
+            typename SUBNET
+        >
+        using gqa_moe_block =
+            moe_ffn<expert_net_type, NUM_EXPERTS, TOP_K, MODE, dropout_policy,
+            add_prev1<multihead_attention_gqa<EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS,
+            rms_norm<tag1<SUBNET>>>>>;
+
+        // Network component definitions
+        template <typename SUBNET>
+        using t_block = gqa_moe_block<training_mode_tag, SUBNET>;
+
+        template <typename SUBNET>
+        using i_block = gqa_moe_block<inference_mode_tag, SUBNET>;
+
+        // Network definition selector based on training mode (with dropout for training, without for inference)
+        template <bool is_training>
+        using network_type = std::conditional_t<is_training,
+            classification_head<
+            repeat<NUM_LAYERS, t_block,
+            embeddings<VOCAB_SIZE, EMBEDDING_DIM,
+            input<matrix<int, 0, 1>>>>>,
+            classification_head<
+            repeat<NUM_LAYERS, i_block,
+            embeddings<VOCAB_SIZE, EMBEDDING_DIM,
+            input<matrix<int, 0, 1>>>>>>;
+
+        struct model_info {
+            static std::string describe() {
+                long repeat_factor = NUM_HEADS / NUM_KV_HEADS;
+                long head_dim = EMBEDDING_DIM / NUM_HEADS;
+                long active_experts = (TOP_K == 0)
+                    ? std::max(1L, static_cast<long>(std::floor(NUM_EXPERTS * 0.2f)))
+                    : std::min(TOP_K, NUM_EXPERTS);
+                std::stringstream ss;
+                ss << "GQA-MoE transformer configuration:\n"
+                    << "  vocabulary size   : " << VOCAB_SIZE << "\n"
+                    << "  layers            : " << NUM_LAYERS << "\n"
+                    << "  Q attention heads : " << NUM_HEADS << "\n"
+                    << "  KV attention heads: " << NUM_KV_HEADS
+                    << "  (GQA repeat: " << repeat_factor << "x)\n"
+                    << "  embedding dim     : " << EMBEDDING_DIM << "\n"
+                    << "  head dim          : " << head_dim << "\n"
+                    << "  experts per layer : " << NUM_EXPERTS
+                    << "  (active top-k: " << active_experts << ")\n";
+                return ss.str();
+            }
+        };
+    };
+
 }
 
 #endif // DLIB_DNN_TRANSFORMER_CONFIG_H_

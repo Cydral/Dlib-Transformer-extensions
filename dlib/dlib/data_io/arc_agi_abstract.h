@@ -15,9 +15,6 @@ namespace dlib
     using arc_grid_t = matrix<unsigned char>;
     using arc_token_sequence_t = matrix<long, 0, 1>;
 
-    // Maximum sequence length for LLM-style training
-    constexpr long ARC_MAX_SEQUENCE_LENGTH = 4096;
-
     // Token vocabulary for the Hierarchical Reasoning Model
     enum arc_token_id : long
     {

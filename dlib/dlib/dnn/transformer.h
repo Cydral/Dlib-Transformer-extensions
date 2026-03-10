@@ -1,4 +1,4 @@
-﻿// Copyright (C) 2025  Cydral Technology (cydraltechnology@gmail.com)
+﻿// Copyright (C) 2026  Cydral Technology (cydraltechnology@gmail.com)
 // License: Boost Software License   See LICENSE.txt for the full license.
 #ifndef DLIB_DNN_TRANSFORMER_H_
 #define DLIB_DNN_TRANSFORMER_H_
@@ -8,6 +8,8 @@
 
 namespace dlib
 {
+    class adamw; // Forward declaration
+
     // ----------------------------------------------------------------------------------------
 
     class network_context
@@ -119,7 +121,7 @@ namespace dlib
 
         static void set_optimizer_params(double weight_decay, double beta1, double beta2)
         {
-            std::lock_guard<std::mutex> lock(get_mutex_());            
+            std::lock_guard<std::mutex> lock(get_mutex_());
             get_optimizer_weight_decay_() = weight_decay;
             get_optimizer_beta1_() = beta1;
             get_optimizer_beta2_() = beta2;
@@ -129,19 +131,19 @@ namespace dlib
         static double get_optimizer_weight_decay()
         {
             std::lock_guard<std::mutex> lock(get_mutex_());
-			return get_optimizer_weight_decay_();
+            return get_optimizer_weight_decay_();
         }
 
         static double get_optimizer_beta1()
         {
             std::lock_guard<std::mutex> lock(get_mutex_());
-			return get_optimizer_beta1_();
+            return get_optimizer_beta1_();
         }
 
         static double get_optimizer_beta2()
         {
             std::lock_guard<std::mutex> lock(get_mutex_());
-			return get_optimizer_beta2_();
+            return get_optimizer_beta2_();
         }
 
     private:
@@ -158,7 +160,7 @@ namespace dlib
             get_learning_rate_() = 0.0;
             get_optimizer_weight_decay_() = 0.004;
             get_optimizer_beta1_() = 0.9;
-            get_optimizer_beta1_() = 0.999;
+            get_optimizer_beta2_() = 0.999;
             clear_padding_nolock_();
         }
 
@@ -222,7 +224,7 @@ namespace dlib
     using scale_weights = add_layer<scale_weights_<d_k>, SUBNET>;
 
     // ----------------------------------------------------------------------------------------
-    
+
     template <long num_embeddings, long embedding_length, typename SUBNET>
     using positional_embeddings = positional_encodings<
         embeddings<num_embeddings, embedding_length, SUBNET>>;
@@ -377,12 +379,12 @@ namespace dlib
         // Key projection for GQA: uses fewer heads (num_kv_heads) than queries
         template <long num_kv_heads, long head_dim, typename SUBNET>
         using key = reshape_to<num_kv_heads, -1, head_dim,
-            linear_no_bias<num_kv_heads * head_dim, SUBNET>>;
+            linear_no_bias<num_kv_heads* head_dim, SUBNET>>;
 
         // Value projection for GQA: same head count as keys
         template <long num_kv_heads, long head_dim, typename SUBNET>
         using value = reshape_to<num_kv_heads, -1, head_dim,
-            linear_no_bias<num_kv_heads * head_dim, SUBNET>>;
+            linear_no_bias<num_kv_heads* head_dim, SUBNET>>;
 
         // Grouped Query Attention: K/V heads are repeated to match Q head count
         // Reduces memory bandwidth while maintaining model quality
@@ -464,11 +466,11 @@ namespace dlib
 
         template <template <typename> class ACT, template <typename> class DO,
             long d_model, long num_heads, typename SUBNET>
-        using transformer_block = 
+        using transformer_block =
             add_prev5<ffn<ACT, d_model, 4, rms_norm<tag5<
             add_prev1<multihead_attention<DO, d_model, num_heads, rms_norm<tag1<SUBNET>>>>>>>>;
 
-        template<long remaining_layers, template <typename> class ACT, template <typename> class DO, 
+        template<long remaining_layers, template <typename> class ACT, template <typename> class DO,
             long d_model, long num_heads,
             typename SUBNET, typename enabled = void>
         struct transformer_stack_impl
@@ -477,7 +479,7 @@ namespace dlib
                 typename transformer_stack_impl<remaining_layers - 1, ACT, DO, d_model, num_heads, SUBNET>::type>;
         };
 
-        template<template <typename> class ACT, template <typename> class DO, 
+        template<template <typename> class ACT, template <typename> class DO,
             long d_model, long num_heads, typename SUBNET>
         struct transformer_stack_impl<0, ACT, DO, d_model, num_heads, SUBNET, void>
         {
@@ -528,7 +530,7 @@ namespace dlib
 
         template <template <typename> class ACT, template <typename> class DO,
             long d_model, long num_heads, typename SUBNET>
-        using transformer_block = 
+        using transformer_block =
             add_prev5<fused_ffn<ACT, DO, d_model, rms_norm<tag5<
             add_prev1<multihead_attention<DO, d_model, num_heads, rms_norm<tag1<SUBNET>>>>>>>>;
 
@@ -556,17 +558,16 @@ namespace dlib
     // Default to canonical transformer implementation
     using namespace gqa_transformer;
 
-	// ----------------------------------------------------------------------------------------
+    // ----------------------------------------------------------------------------------------
 
-    // HIERARCHICAL REASONING MODEL (HRM)
-    class adamw; // Forward declaration
+    // HIERARCHICAL REASONING MODEL (HRM)    
     template<
         typename H_NET,
         typename L_NET,
         int N,
         int T
     >
-        class hrm_
+    class hrm_
     {
         static_assert(N > 0, "N (high-level cycles) must be positive");
         static_assert(T > 0, "T (low-level timesteps per cycle) must be positive");
@@ -827,9 +828,9 @@ namespace dlib
         {
             // Prefer network_context learning rate when active
             if (network_context::is_active())
-				current_learning_rate_ = network_context::get_learning_rate();
+                current_learning_rate_ = network_context::get_learning_rate();
             if (learning_rate_multiplier == 0.0) return;
-            
+
             const double effective_lr = current_learning_rate_ * learning_rate_multiplier;
 
             if (!solvers_initialized_) {
@@ -935,6 +936,7 @@ namespace dlib
             - Gate produces logits, optional noise added before softmax (training only)
             - Forward/backward consistency via cached expert selections
             - Tracks expert usage statistics for monitoring
+            - Internal AdamW solvers update expert parameters after each backward pass
 
             Hyperparameters:
             - noise_scale: Gaussian noise std applied to gate logits (exploration)
@@ -947,7 +949,10 @@ namespace dlib
             usage_update_rate(0.05f),
             load_balance_weight(0.01f),
             learning_rate_multiplier(1.0),
-            cached_batch_size_(0)
+            current_learning_rate_(0.001),
+            solvers_initialized_(false),
+            cached_batch_size_(0),
+            load_balance_loss_(0.0f)
         {
         }
 
@@ -958,10 +963,13 @@ namespace dlib
             usage_update_rate(other.usage_update_rate),
             load_balance_weight(other.load_balance_weight),
             learning_rate_multiplier(other.learning_rate_multiplier),
+            current_learning_rate_(other.current_learning_rate_),
             expert_usage(other.expert_usage),
-            cached_batch_size_(0)
+            solvers_initialized_(false),
+            cached_batch_size_(0),
+            load_balance_loss_(0.0f)
         {
-            // Deep copy of expert networks
+            // Deep copy of expert networks; solvers are runtime state, reset on copy
             experts.reserve(other.experts.size());
             for (const auto& expert : other.experts)
                 experts.push_back(expert);
@@ -976,8 +984,14 @@ namespace dlib
                 usage_update_rate = other.usage_update_rate;
                 load_balance_weight = other.load_balance_weight;
                 learning_rate_multiplier = other.learning_rate_multiplier;
+                current_learning_rate_ = other.current_learning_rate_;
                 expert_usage = other.expert_usage;
+
+                // Solvers are runtime state: reset on copy
+                solvers_initialized_ = false;
+                expert_solvers_.clear();
                 cached_batch_size_ = 0;
+                load_balance_loss_ = 0.0f;
 
                 // Deep copy of expert networks
                 experts.clear();
@@ -1018,6 +1032,10 @@ namespace dlib
                 else {
                     top_k = std::min(top_e, n_experts);
                 }
+
+                // Solvers must be re-initialized whenever the expert count changes
+                solvers_initialized_ = false;
+                expert_solvers_.clear();
             }
         }
 
@@ -1202,16 +1220,18 @@ namespace dlib
                 2. For each selected expert:
                    a. Scale incoming gradient by expert's weight
                    b. Backpropagate through expert network
-                   c. Accumulate expert's input gradient
+                   c. Accumulate expert's input gradient into subnet gradient
+                3. Apply load-balancing auxiliary gradient to gate logits
+                4. Update expert parameters via internal AdamW solvers
 
                 Note: Gradients automatically flow back to gate network through
                 Dlib's computational graph without explicit implementation here.
         !*/
         template <typename SUBNET_TYPE>
-        void backward(const tensor& gradient_input, SUBNET_TYPE& sub, tensor& params_grad)
+        void backward(const tensor& gradient_input, SUBNET_TYPE& sub, tensor& /*params_grad*/)
         {
+            // Accumulate into subnet gradient (do not zero — other paths may have contributed)
             tensor& expert_input_grad = sub.get_gradient_input();
-            expert_input_grad = 0;
 
             const tensor& expert_input = sub.get_output();
             const long num_samples = cached_batch_size_;
@@ -1225,10 +1245,12 @@ namespace dlib
 
             alias_tensor sample_alias(1, k, nr, nc);
 
+            // Reusable buffer for weight-scaled gradients (avoids per-iteration allocation)
+            resizable_tensor weighted_grad;
+
             for (long n = 0; n < num_samples; ++n) {
                 const long sample_offset = n * sample_size;
 
-                auto sample_grad = sample_alias(gradient_input, sample_offset);
                 auto sample_input = sample_alias(expert_input, sample_offset);
                 auto sample_input_grad = sample_alias(expert_input_grad, sample_offset);
 
@@ -1241,8 +1263,8 @@ namespace dlib
                     const float weight = expert_weights[i];
 
                     // Scale gradient by expert weight
-                    resizable_tensor weighted_grad;
-                    weighted_grad.copy_size(sample_grad);
+                    if (!weighted_grad.has_ownership() || weighted_grad.size() != (size_t)sample_size)
+                        weighted_grad.set_size(1, k, nr, nc);
 
                     const float* src_data = gradient_input.host() + sample_offset;
                     float* dst_data = weighted_grad.host();
@@ -1253,7 +1275,7 @@ namespace dlib
                     experts[expert_idx].back_propagate_error(sample_input, weighted_grad);
                     const auto& expert_grad = experts[expert_idx].get_gradient_input();
 
-                    // Accumulate gradient
+                    // Accumulate input gradient
                     tt::add(1, sample_input_grad, 1, expert_grad);
                 }
             }
@@ -1291,6 +1313,12 @@ namespace dlib
                     }
                 }
             }
+
+            // Update expert parameters via internal solvers (training mode only)
+            const bool in_training = !network_context::is_active() ||
+                network_context::is_training();
+            if (std::is_same<MODE, training_mode_tag>::value && in_training)
+                update_subnet_parameters();
         }
 
         void clean()
@@ -1309,6 +1337,28 @@ namespace dlib
                 set_all_learning_rate_multipliers(expert, val);
         }
         double get_learning_rate_multiplier() const { return learning_rate_multiplier; }
+
+        void configure_solvers(double weight_decay, double beta1, double beta2)
+        {
+            solver_weight_decay_ = weight_decay;
+            solver_beta1_ = beta1;
+            solver_beta2_ = beta2;
+            solvers_initialized_ = false;
+        }
+
+        // Returns total parameter count across all expert networks
+        size_t internal_parameters() const
+        {
+            if (experts.empty()) return 0;
+            return count_parameters(experts[0]) * static_cast<size_t>(n_experts);
+        }
+
+        // Returns parameter count for the top-k experts active during inference
+        size_t active_parameters() const
+        {
+            if (experts.empty()) return 0;
+            return count_parameters(experts[0]) * static_cast<size_t>(top_k);
+        }
 
         // Direct access to expert networks (for inspection/debugging)
         EXPERT_NET& get_expert(size_t idx) {
@@ -1337,26 +1387,33 @@ namespace dlib
             serialize(item.usage_update_rate, out);
             serialize(item.load_balance_weight, out);
             serialize(item.learning_rate_multiplier, out);
+            serialize(item.current_learning_rate_, out);
             serialize(item.experts, out);
             serialize(item.expert_usage, out);
+            serialize(item.expert_solvers_, out);
+            serialize(item.solvers_initialized_, out);
         }
 
         friend void deserialize(moe_& item, std::istream& in)
         {
             std::string version;
             deserialize(version, in);
-            if (version != "moe_")
+            if (version == "moe_") {                
+                deserialize(item.n_experts, in);
+                deserialize(item.top_k, in);
+                deserialize(item.noise_scale, in);
+                deserialize(item.usage_update_rate, in);
+                deserialize(item.load_balance_weight, in);
+                deserialize(item.learning_rate_multiplier, in);
+                deserialize(item.current_learning_rate_, in);
+                deserialize(item.experts, in);
+                deserialize(item.expert_usage, in);
+                deserialize(item.expert_solvers_, in);
+                deserialize(item.solvers_initialized_, in);
+            }
+            else {
                 throw serialization_error("Incorrect version '" + version + "' found while deserializing moe_.");
-
-            deserialize(item.n_experts, in);
-            deserialize(item.top_k, in);
-            deserialize(item.noise_scale, in);
-            deserialize(item.usage_update_rate, in);
-            deserialize(item.load_balance_weight, in);
-            deserialize(item.learning_rate_multiplier, in);
-            deserialize(item.experts, in);
-            deserialize(item.expert_usage, in);
-
+            }
             item.cached_batch_size_ = 0;
         }
 
@@ -1415,6 +1472,37 @@ namespace dlib
             // No-op if network doesn't have clean() method
         }
 
+        void update_subnet_parameters()
+        {
+            if (network_context::is_active())
+                current_learning_rate_ = network_context::get_learning_rate();
+            if (learning_rate_multiplier == 0.0) return;
+
+            const double effective_lr = current_learning_rate_ * learning_rate_multiplier;
+
+            if (!solvers_initialized_) {
+                const double wd = network_context::is_active()
+                    ? network_context::get_optimizer_weight_decay() : solver_weight_decay_;
+                const double b1 = network_context::is_active()
+                    ? network_context::get_optimizer_beta1() : solver_beta1_;
+                const double b2 = network_context::is_active()
+                    ? network_context::get_optimizer_beta2() : solver_beta2_;
+                expert_solvers_.resize(n_experts);
+                for (long e = 0; e < n_experts; ++e)
+                    expert_solvers_[e].assign(experts[e].num_computational_layers, adamw(wd, b1, b2));
+                solvers_initialized_ = true;
+            }
+
+            // Only update experts activated in this forward pass (others have no valid gradients)
+            std::set<size_t> used_experts;
+            for (const auto& indices : selected_expert_indices_)
+                for (size_t idx : indices)
+                    used_experts.insert(idx);
+
+            for (size_t e : used_experts)
+                experts[e].update_parameters(expert_solvers_[e], effective_lr);
+        }
+
         // Configuration
         long n_experts;                     // Number of expert networks
         float noise_scale;                  // Gaussian noise std for exploration
@@ -1422,10 +1510,18 @@ namespace dlib
         float usage_update_rate;            // EMA smoothing rate for usage tracking
         float load_balance_weight;          // Auxiliary loss coefficient for expert load balancing
         double learning_rate_multiplier;
+        double current_learning_rate_;
 
         // Expert networks
         std::vector<EXPERT_NET> experts;
         std::vector<float> expert_usage;    // Usage statistics (for monitoring)
+
+        // Internal solvers for expert parameter updates
+        std::vector<std::vector<adamw>> expert_solvers_;  // [expert_idx][layer_idx]
+        bool solvers_initialized_;
+        double solver_weight_decay_ = 0.004;
+        double solver_beta1_ = 0.9;
+        double solver_beta2_ = 0.999;
 
         // Forward/backward cache (training mode only)
         std::vector<std::vector<size_t>> selected_expert_indices_;  // [sample][top_k]
@@ -1436,7 +1532,7 @@ namespace dlib
         long cached_batch_size_;
         float load_balance_loss_;
 
-		resizable_tensor params; // Unused
+        resizable_tensor params; // Unused — required for get_layer_params() interface
     };
 
     template<
@@ -1449,6 +1545,12 @@ namespace dlib
     using moe = add_layer<moe_<EXPERT_NET, top_e, MODE, TAG, SUBNET>, SUBNET>;
 
     // This is a drop-in replacement for standard transformer feed-forward layers
+    template <typename SUBNET> using moe_tag_input = add_tag_layer<1600 + 0, SUBNET>;
+    template <typename SUBNET> using moe_tag_gate = add_tag_layer<1600 + 1, SUBNET>;
+    template <typename SUBNET> using add_moe_tag_input = add_prev<moe_tag_input, SUBNET>;
+    using add_moe_tag_input_ = add_prev_<moe_tag_input>;
+    template <typename SUBNET> using skip_moe_tag_input = add_skip_layer<moe_tag_input, SUBNET>;
+
     template<
         typename EXPERT_NET,
         long num_experts,
@@ -1457,8 +1559,9 @@ namespace dlib
         template <typename> class DO,
         typename SUBNET
     >
-    using moe_ffn = add_prev8<moe<EXPERT_NET, top_e, MODE, tag9, rms_norm<skip8<
-        tag9<gate<num_experts, DO, tag8<SUBNET>>>>>>>;
+    using moe_ffn = add_moe_tag_input<moe<EXPERT_NET, top_e, MODE, moe_tag_gate,
+        rms_norm<skip_moe_tag_input<
+        moe_tag_gate<gate<num_experts, DO, moe_tag_input<SUBNET>>>>>>>;
 }
 
 #endif // DLIB_DNN_TRANSFORMER_H_
