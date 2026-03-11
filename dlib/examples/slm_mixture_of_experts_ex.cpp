@@ -623,7 +623,7 @@ int main(int argc, char** argv)
                 deserialize(model_file) >> net >> tokenizer;
             }
 
-            // Propagate optimizer hyperparameters to MoE internal solvers
+            // Propagate optimizer hyperparameters to layer internal solvers
             network_context::set_optimizer_params(weight_decay, beta1, beta2);
 
             cout << net << "\n\n";
@@ -640,13 +640,13 @@ int main(int argc, char** argv)
             trainer.set_synchronization_file("chkpt-" + model_file, std::chrono::minutes(10));
             trainer.be_quiet();
 
-            // Warmup + cosine LR schedule
+            // Warmup and cosine learning-rate schedule
             size_t steps_per_epoch = (samples.size() + batch_size - 1) / batch_size;
             size_t total_steps = steps_per_epoch * max_epochs;
 
             lr_scheduler scheduler(
                 trainer.get_learning_rate(),
-                std::min(size_t(2000), total_steps / 10),
+				total_steps / 100, // warmup for 1% of total steps
                 total_steps,
                 trainer.get_min_learning_rate(),
                 lr_decay_type::COSINE);
@@ -658,7 +658,6 @@ int main(int argc, char** argv)
                     << ", phase: " << scheduler.get_phase_name()
                     << ", lr: " << scheduler.get_learning_rate() << "\n";
             }
-
             cout << "LR schedule:\n"
                 << "  peak lr   : " << scheduler.get_peak_lr() << "\n"
                 << "  min lr    : " << scheduler.get_min_lr() << "\n"
@@ -668,11 +667,8 @@ int main(int argc, char** argv)
                 << "  phase     : " << scheduler.get_phase_name() << "\n\n";
 
             cout << "Starting training...\n";
-
             size_t epoch = 0, batches_count = 0;
-
-            while (!scheduler.is_training_complete()
-                && epoch < max_epochs
+            while (!scheduler.is_training_complete() && epoch < max_epochs
                 && !signal_handler::is_triggered())
             {
                 double total_loss = 0.0;
@@ -701,7 +697,8 @@ int main(int argc, char** argv)
                     trainer.get_net(force_flush_to_disk::no);
 
                     // Update scheduler and propagate learning rate
-                    double current_lr = scheduler.get_learning_rate();
+                    double current_lr = (scheduler.get_learning_rate() < trainer.get_learning_rate()) ?
+                        scheduler.get_learning_rate() : trainer.get_learning_rate();
                     trainer.set_learning_rate(current_lr);
                     network_context::set_learning_rate(current_lr);
                     network_context::set_padding_from_lengths(pad_lengths);
@@ -724,8 +721,9 @@ int main(int argc, char** argv)
 
                         cout << "epoch#: " << (epoch + 1) << "/" << max_epochs
                             << " \t loss: " << std::fixed << std::setprecision(3) << avg_loss
-                            << " \t lr: " << std::scientific << std::setprecision(2) << current_lr
+                            << " \t learning-rate: " << std::scientific << std::setprecision(2) << current_lr
                             << " \t phase: " << scheduler.get_phase_name()
+                            << " \t patience: " << trainer.get_steps_without_progress()
                             << " \t speed: " << std::fixed << std::setprecision(1)
                             << spd << " samples/sec\n";
                         cout.flush();
@@ -740,7 +738,7 @@ int main(int argc, char** argv)
             }
 
             // Save model
-            network_context::reset();
+            trainer.get_net();            
             net.clean();
             serialize(model_file) << net << tokenizer;
             cout << "Model saved to " << model_file << "\n"
@@ -754,10 +752,6 @@ int main(int argc, char** argv)
 
                 my_transformer::network_type<false> g_infer;
                 deserialize(model_file) >> g_infer >> tokenizer;
-
-                // Display MoE parameter breakdown
-                //auto param_info = get_moe_param_info(g_infer, num_layers);
-                //param_info.print();
 
                 std::vector<long> eval_pad_lengths(samples.size());
                 for (size_t i = 0; i < samples.size(); ++i)
@@ -777,6 +771,7 @@ int main(int argc, char** argv)
                 if (accuracy < 0.999)
                     cout << "WARNING: Accuracy below 99.9% — model may not fully memorize the corpus.\n";
             }
+            network_context::reset();
         }
 
         // GENERATION MODE
@@ -825,8 +820,7 @@ int main(int argc, char** argv)
             }
 
             // Select a segment with at least 2 tokens (enough for a 50/50 split)
-            dlib::rand rng(
-                std::chrono::system_clock::now().time_since_epoch().count());
+            dlib::rand rng(std::chrono::system_clock::now().time_since_epoch().count());
 
             // Filter out segments that are too short to split
             std::vector<size_t> valid_indices;
