@@ -1285,30 +1285,31 @@ namespace dlib
                 tensor& gate_grad = layer<TAG>(sub).get_gradient_input();
                 float* gate_grad_data = gate_grad.host();
 
-                // Compute gradient of load balancing loss w.r.t. gate logits
-                // Loss: L_aux = alpha * N * sum_e (f_e * P_e)
-                // where f_e = routing fraction, P_e = gate probability average
+                // Compute gradient of load balancing loss w.r.t. gate logits.
                 //
-                // Gradient through softmax: dL/dz_j = P_j * (w_j - sum_e (w_e * P_e))
-                // where w_e = df_e + dP_e = routing_fraction[e] + gate_prob_avg[e]
+                // Loss:  L = alpha * N_e * sum_e ( F_e * P_e_avg )
+                //   where F_e   = fraction of samples routing to expert e  (discrete, treated as constant)
+                //         P_e_avg = (1/N_s) * sum_n P_{ne}                 (continuous, differentiable)
+                //
+                // Gradient w.r.t. logit z_{nj} (treating F_e as constant — straight-through):
+                //   dL/dz_{nj} = alpha * N_e / N_s * P_{nj} * ( F_j - sum_e F_e * P_{ne} )
+                //              = P_{nj} * ( w_j - sum_e w_e * P_{ne} )
+                //   where  w_e = alpha * N_e * F_e
+                //              = load_balance_weight * n_experts * cached_routing_fraction_[e]
 
                 for (long n = 0; n < num_samples; ++n) {
                     const auto& gate_probs = cached_gate_probs_[n];
 
-                    // First pass: compute weighted sum for softmax normalization term
+                    // First pass: weighted-sum term for the softmax Jacobian denominator
                     float sum_weighted_probs = 0.0f;
                     for (long e = 0; e < n_experts; ++e) {
-                        float w_e = (cached_routing_fraction_[e] + cached_gate_prob_avg_[e]) *
-                            n_experts * load_balance_weight / num_samples;
+                        float w_e = cached_routing_fraction_[e] * n_experts * load_balance_weight;
                         sum_weighted_probs += w_e * gate_probs[e];
                     }
 
-                    // Second pass: apply complete softmax gradient formula
+                    // Second pass: full softmax-gradient formula  dL/dz_{nj} = P_{nj}*(w_j - dot(w,P_n))
                     for (long e = 0; e < n_experts; ++e) {
-                        float w_e = (cached_routing_fraction_[e] + cached_gate_prob_avg_[e]) *
-                            n_experts * load_balance_weight / num_samples;
-
-                        // Gradient component: P_j * (w_j - sum_e (w_e * P_e))
+                        float w_e = cached_routing_fraction_[e] * n_experts * load_balance_weight;
                         gate_grad_data[n * n_experts + e] += gate_probs[e] * (w_e - sum_weighted_probs);
                     }
                 }
