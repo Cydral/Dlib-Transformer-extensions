@@ -53,50 +53,6 @@ using namespace std;
 using namespace dlib;
 
 // Utility functions
-std::string generate_tokens_filename(size_t max_bytes)
-{
-    if (max_bytes > 0)
-        return "dlib_dataset_" + std::to_string(max_bytes) + "_tokens.bin";
-    return "dlib_dataset_tokens.bin";
-}
-
-bool save_tokens_to_file(const std::vector<int>& tokens, const std::string& filename)
-{
-    std::ofstream file(filename, std::ios::binary);
-    if (!file) return false;
-
-    uint64_t num_tokens = tokens.size();
-    file.write(reinterpret_cast<const char*>(&num_tokens), sizeof(num_tokens));
-
-    for (int token : tokens) {
-        uint32_t t = static_cast<uint32_t>(token);
-        file.write(reinterpret_cast<const char*>(&t), sizeof(t));
-    }
-
-    return file.good();
-}
-
-bool load_tokens_from_file(std::vector<int>& tokens, const std::string& filename)
-{
-    std::ifstream file(filename, std::ios::binary);
-    if (!file) return false;
-
-    uint64_t num_tokens;
-    file.read(reinterpret_cast<char*>(&num_tokens), sizeof(num_tokens));
-    if (!file.good()) return false;
-
-    tokens.clear();
-    tokens.reserve(num_tokens);
-
-    for (uint64_t i = 0; i < num_tokens; ++i) {
-        uint32_t t;
-        file.read(reinterpret_cast<char*>(&t), sizeof(t));
-        if (!file.good()) return false;
-        tokens.push_back(static_cast<int>(t));
-    }
-
-    return true;
-}
 
 std::string read_file_content(const std::string& filepath)
 {
@@ -717,7 +673,7 @@ int run_pipeline(
             return 0;
         }
 
-        const std::string tokens_file_gen = "dlib_moe_datasets_tokens.bin";
+        const std::string tokens_file_gen = "dlib_configs_datasets_tokens.bin";
 
         // Load tokenized segments to pick a prompt
         std::vector<std::vector<int>> tokenized_segments;
