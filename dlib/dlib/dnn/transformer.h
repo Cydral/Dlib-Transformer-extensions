@@ -949,7 +949,7 @@ namespace dlib
             usage_update_rate(0.05f),
             load_balance_weight(0.01f),
             learning_rate_multiplier(1.0),
-            current_learning_rate_(0.001),
+            current_learning_rate_(1e-6),
             solvers_initialized_(false),
             cached_batch_size_(0),
             load_balance_loss_(0.0f)
@@ -1166,6 +1166,10 @@ namespace dlib
             // Phase 2: Batched forward through each expert
             alias_tensor sample_alias(1, k, nr, nc);
 
+            // Resize cache to match number of experts
+            if (std::is_same<MODE, training_mode_tag>::value)
+                cached_expert_inputs_.resize(n_experts);
+
             for (long e = 0; e < n_experts; ++e) {
                 const auto& assignments = expert_assignments[e];
                 if (assignments.empty()) continue;
@@ -1186,6 +1190,10 @@ namespace dlib
                     float* dst = batched_input.host() + dst_offset;
                     std::copy(src, src + sample_size, dst);
                 }
+
+                // Cache input for backward (training only)
+                if (std::is_same<MODE, training_mode_tag>::value)
+                    cached_expert_inputs_[e] = batched_input;
 
                 // Forward the entire batch through this expert
                 experts[e].forward(batched_input);
@@ -1269,20 +1277,8 @@ namespace dlib
 
                 const long batch_count = static_cast<long>(assignments.size());
 
-                // Gather batched input (must match what was forwarded)
-                resizable_tensor batched_input;
-                batched_input.set_size(batch_count, k, nr, nc);
-
-                for (long b = 0; b < batch_count; ++b) {
-                    const long src_sample = assignments[b].first;
-                    const float* src = expert_input.host() + src_sample * sample_size;
-                    float* dst = batched_input.host() + b * sample_size;
-                    std::copy(src, src + sample_size, dst);
-                }
-
-                // Re-forward (required by Dlib: back_propagate_error needs
-                // the forward state to be current for this input)
-                experts[e].forward(batched_input);
+                // Use cached input — DO NOT re-forward, it corrupts the expert's internal state
+                const resizable_tensor& batched_input = cached_expert_inputs_[e];
 
                 // Build batched weighted gradient
                 resizable_tensor batched_grad;
@@ -1461,6 +1457,7 @@ namespace dlib
                 throw serialization_error("Incorrect version '" + version + "' found while deserializing moe_.");
             }
             item.cached_batch_size_ = 0;
+            item.cached_expert_inputs_.clear();
         }
 
         friend std::ostream& operator<<(std::ostream& out, const moe_& item)
@@ -1561,6 +1558,7 @@ namespace dlib
         // Expert networks
         std::vector<EXPERT_NET> experts;
         std::vector<float> expert_usage;    // Usage statistics (for monitoring)
+        std::vector<resizable_tensor> cached_expert_inputs_;
 
         // Internal solvers for expert parameter updates
         std::vector<std::vector<adamw>> expert_solvers_;  // [expert_idx][layer_idx]
@@ -1606,8 +1604,8 @@ namespace dlib
         typename SUBNET
     >
     using moe_ffn = add_moe_tag_input<
-        moe<EXPERT_NET, top_e, MODE, moe_tag_gate, skip_moe_tag_input<
-        moe_tag_gate<gate<num_experts, DO, rms_norm<moe_tag_input<SUBNET>>>>>>>;
+        moe<EXPERT_NET, top_e, MODE, moe_tag_gate, rms_norm<skip_moe_tag_input<
+        moe_tag_gate<gate<num_experts, DO, moe_tag_input<SUBNET>>>>>>>;
 }
 
 #endif // DLIB_DNN_TRANSFORMER_H_

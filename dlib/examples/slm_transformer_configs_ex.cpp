@@ -995,10 +995,21 @@ int main(int argc, char** argv)
 
         // ---- Dispatch to the concrete network type ------------------------------------
         if (arch == "moe") {
-            using selected = gqa_moe_transformer_config<
+            /*using selected = gqa_moe_transformer_config<
                 num_tokens, num_layers, num_heads, num_kv_heads,
-                embedding_dim, num_experts, top_k>;
-            return run_pipeline<selected>(
+                embedding_dim, num_experts, top_k>;*/
+            using debug_config = gqa_moe_transformer_config<
+                2000,   // VOCAB_SIZE
+                2,      // NUM_LAYERS   (minimal)
+                6,      // NUM_HEADS
+                2,      // NUM_KV_HEADS
+                228,    // EMBEDDING_DIM
+                1,      // NUM_EXPERTS  <-- single expert: bypasses all routing logic
+                1,      // TOP_K        <-- explicit 1 (not auto-0)
+                multiply                // dropout_policy: inference-safe (no dropout during debug)
+            >;
+
+            return run_pipeline<debug_config>(
                 parser.option("train"), parser.option("generate"),
                 learning_rate, batch_size, patience, max_epochs,
                 weight_decay, beta1, beta2,
