@@ -309,13 +309,13 @@ int main(int argc, char** argv)
         parser.add_option("training-path", "Path to training JSON files", 1);
         parser.add_option("eval-path", "Path to evaluation JSON files", 1);
         parser.add_option("model-file", "Path for model file", 1);
-        parser.add_option("learning-rate", "Learning rate (default: 1e-5)", 1);
+        parser.add_option("learning-rate", "Learning rate (default: 2e-4)", 1);
         parser.add_option("batch-size", "Mini-batch size (default: 4)", 1);
         parser.add_option("max-epochs", "Maximum training epochs (default: 100)", 1);
         parser.add_option("patience", "Early stopping patience (default: 8000)", 1);
         parser.add_option("weight-decay", "Set the weight decay for AdamW (default: 0.004)", 1);
         parser.add_option("beta1", "Set AdamW's beta1 coefficient (default: 0.9)", 1);
-        parser.add_option("beta2", "Set AdamW's beta2 coefficient (default: 0.95)", 1);
+        parser.add_option("beta2", "Set AdamW's beta2 coefficient (default: 0.997)", 1);
         parser.add_option("task-id", "Specific task ID to evaluate", 1);
         parser.add_option("verbose", "Show detailed output during evaluation");
         parser.parse(argc, argv);
@@ -335,26 +335,17 @@ int main(int argc, char** argv)
         const std::string training_path = get_option(parser, "training-path", "data/training");
         const std::string eval_path = get_option(parser, "eval-path", "data/evaluation");
         const std::string model_file = get_option(parser, "model-file", "dlib_lm_arc_agi_model.dat");
-        const double learning_rate = get_option(parser, "learning-rate", 1e-5);
+        const double learning_rate = get_option(parser, "learning-rate", 2e-4);
         const size_t batch_size = get_option(parser, "batch-size", 4);
         const size_t max_epochs = get_option(parser, "max-epochs", 100);
         const long patience = get_option(parser, "patience", 8000);
         const double weight_decay = get_option(parser, "weight-decay", 0.004);
         const double beta1 = get_option(parser, "beta1", 0.9);
-        const double beta2 = get_option(parser, "beta2", 0.95);
+        const double beta2 = get_option(parser, "beta2", 0.997);
 
         // Model configuration
-        using my_transformer = gqa_transformer_config<
-            ARC_VOCAB_SIZE_TOTAL,
-            6,
-            6,
-            2,
-            384
-        >;
+        using my_transformer = hrm_transformer_config<ARC_VOCAB_SIZE_TOTAL, 4, 4, 6, 228>;
         cout << my_transformer::model_info::describe() << "\n\n";
-        //cout << hrm_transformer_config::model_info::describe() << "\n\n";
-        //using train_net_type = hrm_transformer_config::network_type<true>;
-        //using infer_net_type = hrm_transformer_config::network_type<false>;
 
         // Load ARC-AGI data
         arc_agi_manager data_mgr;
@@ -443,7 +434,7 @@ int main(int argc, char** argv)
             }
             layer<0>(net).loss_details().set_ignore_index(TOKEN_PADDING);
             network_context::set_optimizer_params(weight_decay, beta1, beta2);
-            //cout << net << endl << endl; // Show the model architecture
+            cout << net << endl << endl; // Show the model architecture
 
             arc_token_sequence_t dummy(WINDOW_LEN);
             for (long i = 0; i < WINDOW_LEN; ++i) dummy(i) = TOKEN_PADDING;

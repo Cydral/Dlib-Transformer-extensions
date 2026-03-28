@@ -168,11 +168,11 @@ namespace dlib
         template<bool is_training>
         using network_type = std::conditional_t<is_training,
             classification_head<VOCAB_SIZE,
-            tag10<hrm<train_h_net_type, train_l_net_type, HRM_N, HRM_T,
-            embeddings<VOCAB_SIZE, EMBEDDING_DIM, input<matrix<int, 0, 1>>>>>>,
+            hrm<train_h_net_type, train_l_net_type, HRM_N, HRM_T,
+            embeddings<VOCAB_SIZE, EMBEDDING_DIM, input<matrix<int, 0, 1>>>>>,
             classification_head<VOCAB_SIZE,
-            tag10<hrm<infer_h_net_type, infer_l_net_type, HRM_N, HRM_T,
-            embeddings<VOCAB_SIZE, EMBEDDING_DIM, input<matrix<int, 0, 1>>>>>>>;
+            hrm<infer_h_net_type, infer_l_net_type, HRM_N, HRM_T,
+            embeddings<VOCAB_SIZE, EMBEDDING_DIM, input<matrix<int, 0, 1>>>>>>;
 
         struct model_info {
             static std::string describe() {
