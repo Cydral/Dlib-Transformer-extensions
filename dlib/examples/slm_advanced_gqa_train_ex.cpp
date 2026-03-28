@@ -165,7 +165,7 @@ int main(int argc, char** argv)
         parser.add_option("max-epochs", "Maximum number of training epochs (default: 500)", 1);
         parser.add_option("alpha", "Set the weight decay for AdamW (default: 0.004)", 1);
         parser.add_option("beta1", "Set AdamW's first moment coefficient (default: 0.9)", 1);
-        parser.add_option("beta2", "Set AdamW's second moment coefficient (default: 0.999)", 1);
+        parser.add_option("beta2", "Set AdamW's second moment coefficient (default: 0.997)", 1);
         parser.add_option("model-file", "Path for model (default: dlib_lm_tokens_gqa_model.dat)", 1);
         parser.add_option("tokenizer-file", "Path for tokenizer (default: dlib_lm_tokenizer.vocab)", 1);
         parser.add_option("output-file", "Path for generated output (default: generated_text.txt)", 1);
