@@ -66,7 +66,6 @@ std::string read_file_content(const std::string& filepath)
     return buffer.str();
 }
 
-// Replaces all occurrences of double newlines with "@@" paragraph delimiter
 std::string normalize_paragraph_delimiters(const std::string& text)
 {
     std::string result;
@@ -105,7 +104,6 @@ void collect_text_files_recursive(
     }
 }
 
-// Loads and optionally normalizes text from a file or directory
 std::string load_external_data(const std::string& path, bool normalize_delimiters = true)
 {
     std::string combined_text;
@@ -163,7 +161,6 @@ std::string load_external_data(const std::string& path, bool normalize_delimiter
     return combined_text;
 }
 
-// Splits text on "@@" delimiter into individual segments
 std::vector<std::string> parse_delimited_segments(const std::string& text)
 {
     std::vector<std::string> segments;
@@ -325,17 +322,15 @@ moe_param_info get_moe_param_info(const net_type& net, long num_layers)
     return info;
 }*/
 
-// ========================================================================================
-// run_pipeline<TRANSFORMER_CONFIG>
-//
-// Contains all type-dependent training and generation logic.  Called once from main()
-// with the concrete transformer config selected by --arch.
-//
-// The technique: `using my_transformer = TRANSFORMER_CONFIG` is a local alias resolved
-// at the point of template instantiation, so each call site in main() compiles a
-// completely independent version of this function with its own concrete network types.
-// ========================================================================================
-
+/*
+ * run_pipeline<TRANSFORMER_CONFIG>
+ *
+ * Contains all type-dependent training and generation logic.  Called once from main()
+ * with the concrete transformer config selected by --arch.
+ * The technique: `using my_transformer = TRANSFORMER_CONFIG` is a local alias resolved
+ * at the point of template instantiation, so each call site in main() compiles a
+ * completely independent version of this function with its own concrete network types.
+ */
 template <typename TRANSFORMER_CONFIG>
 int run_pipeline(
     bool do_train,
@@ -363,8 +358,8 @@ int run_pipeline(
     constexpr long num_kv_heads = 2;
     constexpr long embedding_dim = 228;
     constexpr long num_experts = 4;
-    constexpr long top_k = 0;   // auto: 20% = 1 active expert out of 4
-    constexpr long max_seq_len = 50;
+    constexpr long top_k = 0;           // auto: 20% = 1 active expert out of 4
+    constexpr long max_seq_len = 100;
 
     // Suppress unused-variable warnings for params not used by all instantiations
     (void)num_kv_heads; (void)num_experts; (void)top_k;
@@ -376,7 +371,7 @@ int run_pipeline(
     // TRAINING MODE
     if (do_train)
     {
-        cout << "=== TRAINING MODE ===\n";
+        cout << "TRAINING MODE\n\n";
 
         // Try to load pre-tokenized tokens
         std::vector<std::vector<int>> full_tokens;
@@ -520,7 +515,7 @@ int run_pipeline(
 
         lr_scheduler scheduler(
             trainer.get_learning_rate(),
-            total_steps / 10, // warmup for 10% of total steps
+            total_steps / 10,           // Warmup for 10% of total steps
             total_steps,
             trainer.get_min_learning_rate(),
             lr_decay_type::COSINE);
@@ -650,7 +645,7 @@ int run_pipeline(
     // GENERATION MODE
     if (do_generate)
     {
-        cout << "=== GENERATION MODE ===\n";
+        cout << "GENERATION MODE\n\n";
 
         typename my_transformer::template network_type<false> net;
         if (!file_exists(model_file)) {
@@ -723,24 +718,24 @@ int run_pipeline(
         const int pad_token = static_cast<int>(
             tokenizer.get_special_token_id("<pad>"));
 
-        // --- Prompt / reference split ---
+        // Prompt / reference split
         //
-        // Case A — segment fits entirely within the window (seg_len < max_seq_len):
+        // Case A — segment fits entirely within the window (seg_len < max_seq_len)
         //   Split the segment 50/50:
-        //     • input_half  : first ceil(seg_len/2) tokens, left-padded to max_seq_len
-        //     • verify_half : remaining tokens, used as ground-truth reference
+        //     - input_half  : first ceil(seg_len/2) tokens, left-padded to max_seq_len
+        //     - verify_half : remaining tokens, used as ground-truth reference
         //
-        // Case B — segment is at least as long as the window (seg_len >= max_seq_len):
+        // Case B — segment is at least as long as the window (seg_len >= max_seq_len)
         //   Standard windowed split:
-        //     • input_half  : first max_seq_len tokens (no padding needed)
-        //     • verify_half : all tokens beyond max_seq_len
+        //     - input_half  : first max_seq_len tokens (no padding needed)
+        //     - verify_half : all tokens beyond max_seq_len
 
         std::vector<int> input_half;   // tokens injected into the model window
         std::vector<int> verify_half;  // tokens used for validation
 
         if (seg_len < static_cast<size_t>(max_seq_len)) {
             // Case A: short segment — 50/50 split with left-padding
-            size_t input_count = (seg_len + 1) / 2;  // ceil division
+            size_t input_count = (seg_len + 1) / 2;
             size_t verify_count = seg_len - input_count;
 
             if (verify_count == 0) {
@@ -907,7 +902,7 @@ int main(int argc, char** argv)
             return 0;
         }
 
-        // ---- Validate and resolve architecture ----------------------------------------
+        // Validate and resolve architecture
         const std::string arch = get_option(parser, "arch", std::string("moe"));
 
         if (arch != "moe" && arch != "hrm") {
@@ -993,23 +988,12 @@ int main(int argc, char** argv)
 
         std::vector<int> gpus{ 0 };
 
-        // ---- Dispatch to the concrete network type ------------------------------------
+        // Dispatch to the concrete network type
         if (arch == "moe") {
-            /*using selected = gqa_moe_transformer_config<
+            using selected = gqa_moe_transformer_config<
                 num_tokens, num_layers, num_heads, num_kv_heads,
-                embedding_dim, num_experts, top_k>;*/
-            using debug_config = gqa_moe_transformer_config<
-                2000,   // VOCAB_SIZE
-                2,      // NUM_LAYERS   (minimal)
-                6,      // NUM_HEADS
-                2,      // NUM_KV_HEADS
-                228,    // EMBEDDING_DIM
-                1,      // NUM_EXPERTS  <-- single expert: bypasses all routing logic
-                1,      // TOP_K        <-- explicit 1 (not auto-0)
-                multiply                // dropout_policy: inference-safe (no dropout during debug)
-            >;
-
-            return run_pipeline<debug_config>(
+                embedding_dim, num_experts, top_k>;
+            return run_pipeline<selected>(
                 parser.option("train"), parser.option("generate"),
                 learning_rate, batch_size, patience, max_epochs,
                 weight_decay, beta1, beta2,

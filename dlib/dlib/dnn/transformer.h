@@ -560,7 +560,19 @@ namespace dlib
 
     // ----------------------------------------------------------------------------------------
 
-    // HIERARCHICAL REASONING MODEL (HRM)    
+    // HIERARCHICAL REASONING MODEL (HRM)
+    //
+    // Implements the dual-recurrent architecture from:
+    //   Wang et al., "Hierarchical Reasoning Model", arXiv:2506.21734
+    //
+    // Architecture:
+    //   - H-module (high-level): slow cycles for abstract planning (N updates)
+    //   - L-module (low-level): fast iterations for detailed computation (T per H-cycle)
+    //   - Total recurrent depth: N * T steps
+    //   - 1-step gradient approximation for O(1) memory training
+    //
+    // Gradient path (1-step approximation):
+    //   loss -> output -> final H-module -> final L-module -> input embedding    
     template<
         typename H_NET,
         typename L_NET,
@@ -606,8 +618,6 @@ namespace dlib
                 hidden_dim = other.hidden_dim;
                 learning_rate_multiplier = other.learning_rate_multiplier;
                 current_learning_rate_ = other.current_learning_rate_;
-
-                // Solvers are runtime state: reset on copy
                 solvers_initialized_ = false;
             }
             return *this;
@@ -621,6 +631,18 @@ namespace dlib
             init_hidden_states();
         }
 
+        // FORWARD: Hierarchical recurrence with 1-step gradient approximation
+        //
+        // From the paper (Section 2, Figure 4):
+        //   z_H, z_L = z_init
+        //   for _i in range(N*T - 1):        # no gradient
+        //     z_L = f_L(z_L + z_H + x)
+        //     if (_i+1) % T == 0:
+        //       z_H = f_H(z_H + z_L)
+        //   # 1-step grad (final L then final H)
+        //   z_L = f_L(z_L + z_H + x)
+        //   z_H = f_H(z_H + z_L)
+        //   output = z_H
         template <typename SUBNET>
         void forward(const SUBNET& sub, resizable_tensor& output)
         {
@@ -629,32 +651,37 @@ namespace dlib
             const long k = x.k();
             const long seq_len = x.nr();
 
+            // Initialize z_H and z_L from their init vectors (broadcast to batch)
             z_h_current.copy_size(x);
             z_l_current.copy_size(x);
+            {
+                auto* z_h_ptr = z_h_current.host();
+                auto* z_l_ptr = z_l_current.host();
+                const auto* h_init_ptr = z_h_init.host();
+                const auto* l_init_ptr = z_l_init.host();
 
-            auto* z_h_ptr = z_h_current.host();
-            auto* z_l_ptr = z_l_current.host();
-            const auto* h_init_ptr = z_h_init.host();
-            const auto* l_init_ptr = z_l_init.host();
-
-            for (long n = 0; n < batch_size; ++n) {
-                for (long kk = 0; kk < k; ++kk) {
-                    for (long r = 0; r < seq_len; ++r) {
-                        for (long c = 0; c < hidden_dim; ++c) {
-                            const long idx = ((n * k + kk) * seq_len + r) * hidden_dim + c;
-                            z_h_ptr[idx] = h_init_ptr[c];
-                            z_l_ptr[idx] = l_init_ptr[c];
+                for (long n = 0; n < batch_size; ++n) {
+                    for (long kk = 0; kk < k; ++kk) {
+                        for (long r = 0; r < seq_len; ++r) {
+                            for (long c = 0; c < hidden_dim; ++c) {
+                                const long idx = ((n * k + kk) * seq_len + r) * hidden_dim + c;
+                                z_h_ptr[idx] = h_init_ptr[c];
+                                z_l_ptr[idx] = l_init_ptr[c];
+                            }
                         }
                     }
                 }
             }
 
+            // Recurrent iterations without gradient tracking (all except final L+H)
             for (int n = 0; n < N; ++n)
             {
                 for (int t = 0; t < T; ++t)
                 {
+                    // Skip the very last L-step (it will be done with gradient below)
                     if (n == N - 1 && t == T - 1) continue;
 
+                    // L-module input: z_L + z_H + x
                     l_input.copy_size(x);
                     tt::copy_tensor(false, l_input, 0, z_l_current, 0, z_l_current.k());
                     tt::add(1.0f, l_input, 1.0f, z_h_current);
@@ -665,8 +692,10 @@ namespace dlib
                     tt::copy_tensor(false, z_l_current, 0, l_out, 0, l_out.k());
                 }
 
+                // H-module update at end of each cycle (except the last one)
                 if (n == N - 1) continue;
 
+                // H-module input: z_H + z_L
                 h_input.copy_size(x);
                 tt::copy_tensor(false, h_input, 0, z_h_current, 0, z_h_current.k());
                 tt::add(1.0f, h_input, 1.0f, z_l_current);
@@ -676,7 +705,8 @@ namespace dlib
                 tt::copy_tensor(false, z_h_current, 0, h_out, 0, h_out.k());
             }
 
-            // Final L-Module update (with gradients)
+            // Final L-Module update (WITH gradient tracking)
+            // Save input for backward: last_l_input = z_L + z_H + x
             last_l_input.copy_size(x);
             tt::copy_tensor(false, last_l_input, 0, z_l_current, 0, z_l_current.k());
             tt::add(1.0f, last_l_input, 1.0f, z_h_current);
@@ -685,7 +715,8 @@ namespace dlib
             l_net.forward(last_l_input);
             const tensor& l_final = l_net.get_output();
 
-            // Final H-Module update (with gradients)
+            // Final H-Module update with gradient tracking
+            // Save input for backward: last_h_input = z_H + z_L_final
             last_h_input.copy_size(x);
             tt::copy_tensor(false, last_h_input, 0, z_h_current, 0, z_h_current.k());
             tt::add(1.0f, last_h_input, 1.0f, l_final);
@@ -693,30 +724,43 @@ namespace dlib
             h_net.forward(last_h_input);
             const tensor& h_final = h_net.get_output();
 
+            // Output is the final H state
             output.copy_size(h_final);
             tt::copy_tensor(false, output, 0, h_final, 0, h_final.k());
         }
 
+        // BACKWARD: 1-step gradient approximation
+        //
+        // Gradient path:
+        //   dL/d(output) = gradient_input
+        //     -> backprop through H: dL/d(last_h_input) = h_net.get_final_data_gradient()
+        //     -> backprop through L: dL/d(last_l_input) = l_net.get_final_data_gradient()
+        //     -> propagate to input x (component of last_l_input)
         template <typename SUBNET>
         void backward(const tensor& gradient_input, SUBNET& sub, tensor& /*params_grad*/)
         {
-            // Backprop through final H-Module
+            // Step 1: backprop through final H-Module
+            // Requires: h_net.forward(last_h_input) was the most recent forward call
             h_net.back_propagate_error(last_h_input, gradient_input);
-            const tensor& grad_h = h_net.get_gradient_input();
+            const tensor& grad_from_h = h_net.get_final_data_gradient();
 
-            // Backprop through final L-Module
-            l_net.back_propagate_error(last_l_input, grad_h);
-            const tensor& grad_l = l_net.get_gradient_input();
+            // Step 2: backprop through final L-Module
+            // grad_from_h flows to z_L_final (component of last_h_input = z_H + z_L_final)
+            // Requires: l_net.forward(last_l_input) was called just before h_net.forward()
+            l_net.back_propagate_error(last_l_input, grad_from_h);
+            // FIX: get_final_data_gradient() is the gradient w.r.t. last_l_input
+            const tensor& grad_from_l = l_net.get_final_data_gradient();
 
-            // Propagate gradient to input x
+            // Step 3: propagate gradient to input x
+            // last_l_input = z_L + z_H + x, so dL/dx = dL/d(last_l_input)
+            // (z_L and z_H are treated as constants in the 1-step approximation)
             tensor& prev_grad = sub.get_gradient_input();
-            tt::add(1.0f, prev_grad, 1.0f, grad_l);
+            tt::add(1.0f, prev_grad, 1.0f, grad_from_l);
 
-            // Update subnet parameters only during training
-            const bool in_training = !network_context::is_active() ||
+            // Step 4: update sub-network parameters using internal solvers
+            const bool in_training = !network_context::is_active() ||                
                 network_context::is_training();
-            if (in_training)
-                update_subnet_parameters();
+            if (in_training) update_subnet_parameters();
         }
 
         void set_learning_rate(double lr)
@@ -740,8 +784,6 @@ namespace dlib
             solver_weight_decay_ = weight_decay;
             solver_beta1_ = beta1;
             solver_beta2_ = beta2;
-
-            // Force re-initialization on next backward
             solvers_initialized_ = false;
         }
 
@@ -824,9 +866,9 @@ namespace dlib
 
     private:
 
+        // Update both H and L network parameters using internal AdamW solvers
         void update_subnet_parameters()
         {
-            // Prefer network_context learning rate when active
             if (network_context::is_active())
                 current_learning_rate_ = network_context::get_learning_rate();
             if (learning_rate_multiplier == 0.0) return;
@@ -835,11 +877,11 @@ namespace dlib
 
             if (!solvers_initialized_) {
                 const double wd = network_context::is_active()
-                    ? network_context::get_optimizer_weight_decay() : 0.004;
+                    ? network_context::get_optimizer_weight_decay() : solver_weight_decay_;
                 const double b1 = network_context::is_active()
-                    ? network_context::get_optimizer_beta1() : 0.9;
+                    ? network_context::get_optimizer_beta1() : solver_beta1_;
                 const double b2 = network_context::is_active()
-                    ? network_context::get_optimizer_beta2() : 0.999;
+                    ? network_context::get_optimizer_beta2() : solver_beta2_;
                 h_solvers_.assign(h_net.num_computational_layers, adamw(wd, b1, b2));
                 l_solvers_.assign(l_net.num_computational_layers, adamw(wd, b1, b2));
                 solvers_initialized_ = true;
@@ -854,8 +896,6 @@ namespace dlib
             z_h_init.set_size(1, 1, 1, hidden_dim);
             z_l_init.set_size(1, 1, 1, hidden_dim);
 
-            // Use a thread-safe incrementing seed to avoid collisions
-            // between instances created within the same second
             static std::atomic<unsigned long> seed_counter{ 0 };
             dlib::rand rnd(seed_counter++);
 
@@ -880,7 +920,7 @@ namespace dlib
         h_net_type h_net;
         l_net_type l_net;
 
-        // Initial hidden states
+        // Initial hidden states (truncated normal, kept fixed during training)
         resizable_tensor z_h_init;
         resizable_tensor z_l_init;
 
@@ -888,22 +928,27 @@ namespace dlib
         double learning_rate_multiplier;
         double current_learning_rate_;
 
-        // Internal solvers for h_net and l_net (runtime state, not serialized)
+        // Solver configuration
+        double solver_weight_decay_ = 0.004;
+        double solver_beta1_ = 0.9;
+        double solver_beta2_ = 0.999;
+
+        // Internal solvers for sub-network parameter updates
         std::vector<adamw> h_solvers_;
         std::vector<adamw> l_solvers_;
         bool solvers_initialized_;
 
-        // Temporary computation tensors
+        // Temporary computation tensors (forward pass)
         resizable_tensor z_h_current;
         resizable_tensor z_l_current;
         resizable_tensor h_input;
         resizable_tensor l_input;
 
-        // Saved for gradient backward (final step only — truncated BPTT by design)
+        // Saved inputs for backward pass (final step only, O(1) memory)
         resizable_tensor last_h_input;
         resizable_tensor last_l_input;
 
-        resizable_tensor params; // No direct trainable parameters
+        resizable_tensor params;  // Empty: no direct trainable parameters
     };
 
     template<typename H_NET, typename L_NET, int N, int T, typename SUBNET>
