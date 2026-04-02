@@ -512,13 +512,8 @@ int run_pipeline(
         // Warmup and cosine learning-rate schedule
         size_t steps_per_epoch = (samples.size() + batch_size - 1) / batch_size;
         size_t total_steps = steps_per_epoch * max_epochs;
-
-        lr_scheduler scheduler(
-            trainer.get_learning_rate(),
-            total_steps / 10,           // Warmup for 10% of total steps
-            total_steps,
-            trainer.get_min_learning_rate(),
-            lr_decay_type::COSINE);
+        auto scheduler = make_transformer_scheduler(trainer.get_learning_rate(), 
+            total_steps, 0.05, trainer.get_min_learning_rate());       
 
         const std::string scheduler_file = "scheduler-" + model_file;
         if (file_exists(scheduler_file)) {
@@ -608,9 +603,7 @@ int run_pipeline(
         trainer.get_net();
         net.clean();
         serialize(model_file) << net << tokenizer;
-        cout << "Model saved to " << model_file << "\n"
-            << "Final step: " << scheduler.get_current_step()
-            << ", final lr: " << scheduler.get_learning_rate() << "\n";
+        cout << "Model saved to " << model_file << "\n";
 
         // Evaluate accuracy on training set
         if (!signal_handler::is_triggered())
@@ -1002,7 +995,7 @@ int main(int argc, char** argv)
         }
         else if (arch == "hrm") {
             using selected = hrm_transformer_config<
-                num_tokens, num_layers / 2, num_layers / 2,
+                num_tokens, num_layers / 2, num_layers,
                 num_heads, embedding_dim, 2, 2>;
             return run_pipeline<selected>(
                 parser.option("train"), parser.option("generate"),

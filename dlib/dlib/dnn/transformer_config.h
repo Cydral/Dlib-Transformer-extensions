@@ -220,16 +220,24 @@ namespace dlib
         static_assert(EMBEDDING_DIM% NUM_HEADS == 0, "Embedding dim must be divisible by num_heads");
         static_assert(NUM_EXPERTS > 0, "Number of experts must be positive");
 
+        // Gating network for MoE expert routing (managed internally by the moe_ layer)
+        // Takes the full input tensor via avg_pool_everything to produce a
+        // sequence-length-invariant representation, then projects to routing logits.
+        using gate_net_type = fc<NUM_EXPERTS, leaky_relu<fc<NUM_EXPERTS * 8,
+            avg_pool_everything<tag10<input_tensor>>>>>;
+
         // Expert network: SwiGLU with inner hidden dimension = d_model * 8/3
         // Output shape matches input — required by the MoE routing accumulation
         using expert_net_type = swiglu<EMBEDDING_DIM, 8, 3, input_tensor>;
 
         // Single GQA transformer block with MoE feed-forward sublayer
+        // The gate network is managed internally by moe_ (not in the main topology),
+        // so the block is a clean residual: attention + residual, then MoE FFN + residual
         template <typename MODE, typename SUBNET>
         using transformer_block =
-            moe_ffn<expert_net_type, NUM_EXPERTS, TOP_K, MODE, dropout_policy,
+            add_prev5<moe<expert_net_type, gate_net_type, NUM_EXPERTS, TOP_K, MODE, rms_norm<tag5<
             add_prev1<multihead_attention_gqa<EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS,
-            rms_norm<tag1<SUBNET>>>>>;
+            rms_norm<tag1<SUBNET>>>>>>>>;
 
         template<long remaining_layers, typename MODE, typename SUBNET, typename enabled = void>
         struct transformer_stack_impl

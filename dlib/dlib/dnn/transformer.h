@@ -956,41 +956,57 @@ namespace dlib
 
     // ----------------------------------------------------------------------------------------
 
-    // Gate network: produces raw logits for expert selection
-    template <long num_experts, template <typename> class DO, typename SUBNET>
-    using gate = fc<num_experts, DO<leaky_relu<fc<num_experts * 8, avg_pool_everything<SUBNET>>>>>;
+// ========================================================================================
+    // MIXTURE OF EXPERTS (MoE) LAYER WITH INTERNAL GATE
+    //
+    // IMPORTANT: GATE_NET and EXPERT_NET definitions must use tag10<input_tensor>
+    // (not raw input_tensor) as their base layer. This is because input_tensor is
+    // defined as input<tensor> which is an input-layer type. When add_layer wraps
+    // an input-layer type directly, its forward() requires sample_expansion_factor
+    // to be initialized via to_tensor() — which is never called for internal
+    // sub-networks managed manually. Wrapping in tag10<> makes the base an
+    // add_tag_layer, which is a non-loss-layer type, and the general add_layer
+    // specialization does NOT check sample_expansion_factor. This is the same
+    // pattern used by canonical_transformer::transformer_stack (base case = tag10<SUBNET>).
+    //
+    // Example gate definition:
+    //   using gate = fc<N, leaky_relu<fc<N*8, avg_pool_everything<tag10<input_tensor>>>>>;
+    //
+    // Example expert definition (swiglu already uses this pattern internally):
+    //   using expert = swiglu<d_model, 8, 3, tag10<input_tensor>>;
+    //
+    // BACKWARD GRADIENT FLOW:
+    //   The gate is an internal routing mechanism. Only expert data gradients flow
+    //   back to the main network's input gradient. The gate backward is called solely
+    //   to compute the gate's own parameter gradients for its internal solver update.
+    //   Gate data gradient is NOT propagated to sub.get_gradient_input().
+    //
+    //   Main network ← expert data gradient only
+    //   Gate params  ← routing gradient + load balance gradient (internal update)
+    // ========================================================================================
 
     struct training_mode_tag {};
     struct inference_mode_tag {};
 
     template<
-        typename EXPERT_NET,                    // Expert network architecture
-        long top_e,                             // Number of experts to activate (0 = auto: 20%)
-        typename MODE,                          // Tag-based mode selection (training/inference)
-        template<typename> class TAG,           // Tag for gate input location
-        typename SUBNET                         // Input subnet type
+        typename EXPERT_NET,
+        typename GATE_NET,
+        long n_experts_,
+        long top_e,
+        typename MODE
     >
     class moe_
     {
+        static_assert(n_experts_ > 0, "Number of experts must be positive");
+
     public:
-        /*!
-            Mixture of Experts layer with sample-wise expert routing.
+        using expert_net_type = EXPERT_NET;
+        using gate_net_type = GATE_NET;
 
-            Key features:
-            - Each sample independently selects top-k experts via gating network
-            - Gate produces logits, optional noise added before softmax (training only)
-            - Forward/backward consistency via cached expert selections
-            - Tracks expert usage statistics for monitoring
-            - Internal AdamW solvers update expert parameters after each backward pass
-
-            Hyperparameters:
-            - noise_scale: Gaussian noise std applied to gate logits (exploration)
-            - usage_update_rate: EMA smoothing for usage statistics
-        !*/
         explicit moe_() :
-            n_experts(0),
+            n_experts(n_experts_),
             noise_scale(0.1f),
-            top_k(top_e),
+            top_k(1),
             usage_update_rate(0.05f),
             load_balance_weight(0.01f),
             learning_rate_multiplier(1.0),
@@ -999,9 +1015,14 @@ namespace dlib
             cached_batch_size_(0),
             load_balance_loss_(0.0f)
         {
+            if (top_e == 0)
+                top_k = std::max(1L, static_cast<long>(std::floor(n_experts * 0.2f)));
+            else
+                top_k = std::min(static_cast<long>(top_e), n_experts);
         }
 
         moe_(const moe_& other) :
+            gate_net(other.gate_net),
             n_experts(other.n_experts),
             noise_scale(other.noise_scale),
             top_k(other.top_k),
@@ -1014,7 +1035,6 @@ namespace dlib
             cached_batch_size_(0),
             load_balance_loss_(0.0f)
         {
-            // Deep copy of expert networks; solvers are runtime state, reset on copy
             experts.reserve(other.experts.size());
             for (const auto& expert : other.experts)
                 experts.push_back(expert);
@@ -1023,6 +1043,7 @@ namespace dlib
         moe_& operator=(const moe_& other)
         {
             if (this != &other) {
+                gate_net = other.gate_net;
                 n_experts = other.n_experts;
                 noise_scale = other.noise_scale;
                 top_k = other.top_k;
@@ -1031,14 +1052,11 @@ namespace dlib
                 learning_rate_multiplier = other.learning_rate_multiplier;
                 current_learning_rate_ = other.current_learning_rate_;
                 expert_usage = other.expert_usage;
-
-                // Solvers are runtime state: reset on copy
                 solvers_initialized_ = false;
                 expert_solvers_.clear();
+                gate_solvers_.clear();
                 cached_batch_size_ = 0;
                 load_balance_loss_ = 0.0f;
-
-                // Deep copy of expert networks
                 experts.clear();
                 experts.reserve(other.experts.size());
                 for (const auto& expert : other.experts)
@@ -1047,103 +1065,95 @@ namespace dlib
             return *this;
         }
 
-        /*!
-            SETUP
-                Initializes expert networks based on gate output dimensions.
-                - Number of experts automatically determined from gate output channels
-                - If top_e == 0 (auto mode), activates 20% of experts (minimum 1)
-        !*/
-        template <typename SUBNET_TYPE>
-        void setup(const SUBNET_TYPE& sub) {
-            const tensor& gate_output = layer<TAG>(sub).get_output();
-            long new_n_experts = gate_output.k();
-
-            // Initialize experts if needed
-            if (new_n_experts != n_experts) {
-                n_experts = new_n_experts;
+        template <typename SUBNET>
+        void setup(const SUBNET& /*sub*/)
+        {
+            if (experts.empty()) {
                 expert_usage.resize(n_experts, 0.0f);
-
-                // Create expert network instances
-                experts.clear();
                 experts.reserve(n_experts);
                 for (long i = 0; i < n_experts; ++i)
                     experts.emplace_back(EXPERT_NET{});
-
-                // Determine top-k activation count
-                if (top_e == 0) {
-                    // Auto mode: activate 20% of experts (minimum 1)
-                    top_k = std::max(1L, static_cast<long>(std::floor(n_experts * 0.2f)));
-                }
-                else {
-                    top_k = std::min(top_e, n_experts);
-                }
-
-                // Solvers must be re-initialized whenever the expert count changes
                 solvers_initialized_ = false;
-                expert_solvers_.clear();
             }
         }
 
-        // FORWARD PASS (batched expert processing)
-        template <typename SUBNET_TYPE>
-        void forward(const SUBNET_TYPE& sub, resizable_tensor& output)
+        // -----------------------------------------------------------------------
+        // FORWARD
+        // -----------------------------------------------------------------------
+        template <typename SUBNET>
+        void forward(const SUBNET& sub, resizable_tensor& output)
         {
             const tensor& expert_input = sub.get_output();
-            const tensor& gate_logits = layer<TAG>(sub).get_output();
-
-            DLIB_CASSERT(gate_logits.k() == n_experts &&
-                gate_logits.nr() == 1 && gate_logits.nc() == 1,
-                "\nExpected gate output shape [batch_size, " << n_experts << ", 1, 1]"
-                << "\nReceived shape [" << gate_logits.num_samples() << ", "
-                << gate_logits.k() << ", " << gate_logits.nr() << ", "
-                << gate_logits.nc() << "]");
-
-            const long num_samples = gate_logits.num_samples();
+            const long num_samples = expert_input.num_samples();
             const long k = expert_input.k();
             const long nr = expert_input.nr();
             const long nc = expert_input.nc();
             const long sample_size = k * nr * nc;
-            const float* logits_data = gate_logits.host();
+            const bool is_training = std::is_same<MODE, training_mode_tag>::value;
 
-            // Initialize output tensor
+            // Cache input for expert and gate backward
+            cached_input_.copy_size(expert_input);
+            tt::copy_tensor(false, cached_input_, 0, expert_input, 0, k);
+
+            // Step 1: Gate forward → routing logits
+            gate_net.forward(cached_input_);
+            const tensor& gate_output = gate_net.get_output();
+
+            // Gate output shape: (batch, n_experts, 1, 1) from fc-based gate
+            //                 or (batch, 1, 1, n_experts) from fused_swiglu-based gate
+            // Detect layout and extract logits accordingly
+            const long gate_k = gate_output.k();
+            const long gate_nc = gate_output.nc();
+            const float* gate_data = gate_output.host();
+
+            DLIB_CASSERT(
+                (gate_k == n_experts && gate_output.nr() == 1 && gate_nc == 1) ||
+                (gate_k == 1 && gate_output.nr() == 1 && gate_nc == n_experts),
+                "\nExpected gate output (batch," << n_experts << ",1,1) or (batch,1,1," << n_experts << ")"
+                << "\nReceived (" << gate_output.num_samples() << "," << gate_k
+                << "," << gate_output.nr() << "," << gate_nc << ")");
+
+            // Logit stride: distance between consecutive expert logits for one sample
+            // For (batch, N, 1, 1): stride = 1, offset between experts along k
+            // For (batch, 1, 1, N): stride = 1, offset between experts along nc
+            // In both cases the N values are contiguous in memory for each sample
+            const long logits_per_sample = n_experts;
+
+            // Initialize output to zero
             output.copy_size(expert_input);
             output = 0;
 
-            // Prepare forward pass cache for backward consistency
-            if (std::is_same<MODE, training_mode_tag>::value) {
+            // Prepare caches (training only)
+            if (is_training) {
                 cached_batch_size_ = num_samples;
                 selected_expert_indices_.resize(num_samples);
                 selected_expert_weights_.resize(num_samples);
                 cached_gate_probs_.resize(num_samples);
             }
 
-            // Track expert usage for monitoring
+            // Track expert usage
             std::vector<float> batch_expert_usage(n_experts, 0.0f);
             std::vector<float> routing_fraction(n_experts, 0.0f);
             std::vector<float> gate_prob_sum(n_experts, 0.0f);
 
-            // Phase 1: Compute routing for all samples
-            // For each expert, collect which samples are routed to it and with what weight
-            // expert_assignments[e] = vector of (sample_index, weight)
+            // Step 2: Per-sample routing
             std::vector<std::vector<std::pair<long, float>>> expert_assignments(n_experts);
 
             for (long n = 0; n < num_samples; ++n) {
-                const float* sample_logits = logits_data + n * n_experts;
+                const float* sample_logits = gate_data + n * logits_per_sample;
 
-                // Apply optional Gaussian noise to logits before softmax
+                // Add Gaussian noise (training only)
                 std::vector<float> noisy_logits(n_experts);
                 for (long e = 0; e < n_experts; ++e) {
                     noisy_logits[e] = sample_logits[e];
-
-                    if (std::is_same<MODE, training_mode_tag>::value && noise_scale > 0) {
+                    if (is_training && noise_scale > 0) {
                         static thread_local dlib::rand rnd(std::time(0));
                         noisy_logits[e] += noise_scale * rnd.get_random_gaussian();
                     }
                 }
 
-                // Softmax: numerically stable implementation
+                // Numerically stable softmax
                 float max_logit = *std::max_element(noisy_logits.begin(), noisy_logits.end());
-
                 std::vector<float> exp_logits(n_experts);
                 float sum_exp = 0.0f;
                 for (long e = 0; e < n_experts; ++e) {
@@ -1156,64 +1166,47 @@ namespace dlib
                     probs[e] = exp_logits[e] / sum_exp;
                     gate_prob_sum[e] += probs[e];
                 }
-                if (std::is_same<MODE, training_mode_tag>::value) {
+                if (is_training)
                     cached_gate_probs_[n] = probs;
-                }
 
-                // Select top-k experts by probability
-                std::vector<std::pair<float, size_t>> expert_scores;
-                expert_scores.reserve(n_experts);
-                for (long e = 0; e < n_experts; ++e)
-                    expert_scores.emplace_back(probs[e], e);
+                // Select top-k experts
+                std::vector<size_t> sorted_indices(n_experts);
+                std::iota(sorted_indices.begin(), sorted_indices.end(), 0);
+                std::partial_sort(sorted_indices.begin(),
+                    sorted_indices.begin() + top_k,
+                    sorted_indices.end(),
+                    [&probs](size_t a, size_t b) { return probs[a] > probs[b]; });
 
-                std::partial_sort(expert_scores.begin(),
-                    expert_scores.begin() + top_k,
-                    expert_scores.end(),
-                    [](const auto& a, const auto& b) { return a.first > b.first; });
-
-                // Renormalize top-k weights to sum to 1
-                float sum_weights = 0.0f;
+                // Renormalize selected weights to sum to 1
+                float selected_sum = 0.0f;
                 for (long i = 0; i < top_k; ++i)
-                    sum_weights += expert_scores[i].first;
+                    selected_sum += probs[sorted_indices[i]];
 
-                // Handle degenerate case (should be extremely rare with softmax)
-                if (sum_weights < 1e-8f) {
-                    sum_weights = static_cast<float>(top_k);
-                    for (long i = 0; i < top_k; ++i)
-                        expert_scores[i].first = 1.0f;
-                }
-
-                for (long i = 0; i < top_k; ++i)
-                    expert_scores[i].first /= sum_weights;
-
-                // Cache selection and build per-expert assignments
-                if (std::is_same<MODE, training_mode_tag>::value) {
-                    selected_expert_indices_[n].resize(top_k);
-                    selected_expert_weights_[n].resize(top_k);
-                }
-
+                std::vector<size_t> chosen_experts(top_k);
+                std::vector<float> chosen_weights(top_k);
                 for (long i = 0; i < top_k; ++i) {
-                    const size_t expert_idx = expert_scores[i].second;
-                    const float weight = expert_scores[i].first;
-
-                    expert_assignments[expert_idx].emplace_back(n, weight);
-
-                    if (std::is_same<MODE, training_mode_tag>::value) {
-                        selected_expert_indices_[n][i] = expert_idx;
-                        selected_expert_weights_[n][i] = weight;
-                        routing_fraction[expert_idx] += 1.0f;
-                    }
-
-                    batch_expert_usage[expert_idx] += weight;
+                    chosen_experts[i] = sorted_indices[i];
+                    chosen_weights[i] = probs[sorted_indices[i]] / selected_sum;
+                    routing_fraction[sorted_indices[i]] += 1.0f;
+                    batch_expert_usage[sorted_indices[i]] += 1.0f;
                 }
+
+                if (is_training) {
+                    selected_expert_indices_[n] = chosen_experts;
+                    selected_expert_weights_[n] = chosen_weights;
+                }
+
+                for (long i = 0; i < top_k; ++i)
+                    expert_assignments[chosen_experts[i]].emplace_back(n, chosen_weights[i]);
             }
 
-            // Phase 2: Batched forward through each expert
+            // Step 3: Batched expert processing
             alias_tensor sample_alias(1, k, nr, nc);
 
-            // Resize cache to match number of experts
-            if (std::is_same<MODE, training_mode_tag>::value)
+            if (is_training) {
                 cached_expert_inputs_.resize(n_experts);
+                cached_expert_outputs_.resize(n_experts);
+            }
 
             for (long e = 0; e < n_experts; ++e) {
                 const auto& assignments = expert_assignments[e];
@@ -1221,53 +1214,50 @@ namespace dlib
 
                 const long batch_count = static_cast<long>(assignments.size());
 
-                // Build batched input tensor for this expert
+                // Gather samples routed to this expert
                 resizable_tensor batched_input;
                 batched_input.set_size(batch_count, k, nr, nc);
-
                 for (long b = 0; b < batch_count; ++b) {
                     const long src_sample = assignments[b].first;
-                    const long src_offset = src_sample * sample_size;
-                    const long dst_offset = b * sample_size;
-
-                    // Copy sample data into batched tensor
-                    const float* src = expert_input.host() + src_offset;
-                    float* dst = batched_input.host() + dst_offset;
+                    const float* src = expert_input.host() + src_sample * sample_size;
+                    float* dst = batched_input.host() + b * sample_size;
                     std::copy(src, src + sample_size, dst);
                 }
 
-                // Cache input for backward (training only)
-                if (std::is_same<MODE, training_mode_tag>::value)
+                // Cache input for backward (no re-forward in backward)
+                if (is_training)
                     cached_expert_inputs_[e] = batched_input;
 
-                // Forward the entire batch through this expert
+                // Forward through expert
                 experts[e].forward(batched_input);
                 const tensor& expert_out = experts[e].get_output();
 
-                // Scatter weighted outputs back to the main output tensor
+                // Cache output for routing gradient
+                if (is_training) {
+                    cached_expert_outputs_[e].copy_size(expert_out);
+                    tt::copy_tensor(false, cached_expert_outputs_[e], 0, expert_out, 0, expert_out.k());
+                }
+
+                // Scatter weighted outputs
                 for (long b = 0; b < batch_count; ++b) {
                     const long dst_sample = assignments[b].first;
                     const float weight = assignments[b].second;
-                    const long dst_offset = dst_sample * sample_size;
-
-                    auto sample_output = sample_alias(output, dst_offset);
-                    auto expert_sample_out = sample_alias(expert_out, b * sample_size);
-
-                    tt::add(1, sample_output, weight, expert_sample_out);
+                    auto out_s = sample_alias(output, dst_sample * sample_size);
+                    auto exp_s = sample_alias(expert_out, b * sample_size);
+                    tt::add(1, out_s, weight, exp_s);
                 }
             }
 
-            // Update exponential moving average of expert usage (for monitoring)
-            if (std::is_same<MODE, training_mode_tag>::value) {
+            // Step 4: Usage statistics and load balance loss (training only)
+            if (is_training) {
                 for (long e = 0; e < n_experts; ++e) {
                     routing_fraction[e] /= num_samples;
                     gate_prob_sum[e] /= num_samples;
                 }
 
                 load_balance_loss_ = 0.0f;
-                for (long e = 0; e < n_experts; ++e) {
+                for (long e = 0; e < n_experts; ++e)
                     load_balance_loss_ += routing_fraction[e] * gate_prob_sum[e];
-                }
                 load_balance_loss_ *= n_experts * load_balance_weight;
 
                 cached_routing_fraction_ = routing_fraction;
@@ -1283,127 +1273,177 @@ namespace dlib
             }
         }
 
-        // BACKWARD PASS (batched expert processing)
-        template <typename SUBNET_TYPE>
-        void backward(const tensor& gradient_input, SUBNET_TYPE& sub, tensor& /*params_grad*/)
+        // -----------------------------------------------------------------------
+        // BACKWARD
+        //
+        // Phase 1: Batched backward through experts → data grad to main network
+        // Phase 2: Compute gate logit gradient (routing + load balance)
+        // Phase 3: Gate backward for gate parameter update ONLY
+        //          (gate data grad is NOT added to sub.get_gradient_input())
+        // Phase 4: Update expert + gate parameters via internal solvers
+        //
+        // The gate is an internal routing mechanism. Only expert data gradients
+        // flow back to the main network. The gate backward computes parameter
+        // gradients for the gate's own solver update, nothing more.
+        // -----------------------------------------------------------------------
+        template <typename SUBNET>
+        void backward(const tensor& gradient_input, SUBNET& sub, tensor& /*params_grad*/)
         {
-            tensor& expert_input_grad = sub.get_gradient_input();
+            tensor& input_grad = sub.get_gradient_input();
 
-            const tensor& expert_input = sub.get_output();
             const long num_samples = cached_batch_size_;
             const long k = gradient_input.k();
             const long nr = gradient_input.nr();
             const long nc = gradient_input.nc();
             const long sample_size = k * nr * nc;
+            const bool is_training = std::is_same<MODE, training_mode_tag>::value;
 
             DLIB_CASSERT(num_samples == (long)selected_expert_indices_.size(),
                 "Forward pass cache missing or invalid in backward pass");
 
-            // Phase 1: Rebuild per-expert assignments from cached routing
-            // expert_assignments[e] = vector of (sample_index, weight)
+            // Rebuild per-expert assignments
             std::vector<std::vector<std::pair<long, float>>> expert_assignments(n_experts);
-
             for (long n = 0; n < num_samples; ++n) {
-                const auto& expert_indices = selected_expert_indices_[n];
-                const auto& expert_weights = selected_expert_weights_[n];
-
-                for (size_t i = 0; i < expert_indices.size(); ++i) {
-                    expert_assignments[expert_indices[i]].emplace_back(
-                        n, expert_weights[i]);
-                }
+                const auto& indices = selected_expert_indices_[n];
+                const auto& weights = selected_expert_weights_[n];
+                for (size_t i = 0; i < indices.size(); ++i)
+                    expert_assignments[indices[i]].emplace_back(n, weights[i]);
             }
 
-            // Phase 2: Batched backward through each expert
+            // Phase 1: Batched backward through experts
             alias_tensor sample_alias(1, k, nr, nc);
+
+            // Per-sample per-expert importance scores for gate gradient
+            std::vector<std::vector<float>> expert_scores;
+            if (is_training && learning_rate_multiplier > 0) {
+                expert_scores.resize(num_samples);
+                for (long n = 0; n < num_samples; ++n)
+                    expert_scores[n].assign(n_experts, 0.0f);
+            }
 
             for (long e = 0; e < n_experts; ++e) {
                 const auto& assignments = expert_assignments[e];
                 if (assignments.empty()) continue;
 
                 const long batch_count = static_cast<long>(assignments.size());
-
-                // Use cached input — DO NOT re-forward, it corrupts the expert's internal state
                 const resizable_tensor& batched_input = cached_expert_inputs_[e];
 
                 // Build batched weighted gradient
                 resizable_tensor batched_grad;
                 batched_grad.set_size(batch_count, k, nr, nc);
-
                 for (long b = 0; b < batch_count; ++b) {
                     const long src_sample = assignments[b].first;
                     const float weight = assignments[b].second;
-
                     const float* src = gradient_input.host() + src_sample * sample_size;
                     float* dst = batched_grad.host() + b * sample_size;
-
                     for (long j = 0; j < sample_size; ++j)
                         dst[j] = src[j] * weight;
                 }
 
-                // Single backward pass per expert:
-                // Parameter gradients are correctly accumulated across all samples
-                // in the batch inside Dlib's backward implementation
+                // Expert backward (parameter + data gradients)
                 experts[e].back_propagate_error(batched_input, batched_grad);
                 const tensor& expert_data_grad = experts[e].get_final_data_gradient();
 
-                // Scatter input gradients back to the main gradient tensor
+                // Scatter expert data gradient back to main network input
                 for (long b = 0; b < batch_count; ++b) {
                     const long dst_sample = assignments[b].first;
-                    auto sample_grad = sample_alias(expert_input_grad, dst_sample * sample_size);
+                    auto in_g = sample_alias(input_grad, dst_sample * sample_size);
+                    auto ex_g = sample_alias(expert_data_grad, b * sample_size);
+                    tt::add(1, in_g, 1, ex_g);
+                }
 
-                    auto expert_sample_grad = sample_alias(expert_data_grad, b * sample_size);
-
-                    tt::add(1, sample_grad, 1, expert_sample_grad);
+                // Compute routing importance scores
+                if (is_training && learning_rate_multiplier > 0) {
+                    const tensor& expert_out = cached_expert_outputs_[e];
+                    for (long b = 0; b < batch_count; ++b) {
+                        const long sample_idx = assignments[b].first;
+                        const float* grad_ptr = gradient_input.host() + sample_idx * sample_size;
+                        const float* out_ptr = expert_out.host() + b * sample_size;
+                        float score = 0.0f;
+                        for (long j = 0; j < sample_size; ++j)
+                            score += grad_ptr[j] * out_ptr[j];
+                        expert_scores[sample_idx][e] = score;
+                    }
                 }
             }
 
-            // Phase 3: Load-balance auxiliary gradient
-            if (std::is_same<MODE, training_mode_tag>::value && load_balance_weight > 0
-                && learning_rate_multiplier > 0) {
-                tensor& gate_grad = layer<TAG>(sub).get_gradient_input();
-                float* gate_grad_data = gate_grad.host();
+            // Phase 2 + 3: Gate gradient computation and gate backward
+            // Gate backward is for gate parameter update ONLY.
+            // Gate data gradient is NOT added to input_grad.
+            if (is_training && learning_rate_multiplier > 0) {
 
-                // Gradient of load balancing loss w.r.t. gate logits.
-                //
-                // Loss:  L = alpha * N_e * sum_e ( F_e * P_e_avg )
-                //   where F_e     = fraction of samples routing to expert e
-                //         P_e_avg = (1/N_s) * sum_n P_{ne}
-                //
-                // Gradient w.r.t. logit z_{nj}:
-                //   dL/dz_{nj} = (alpha * N_e / N_s) * P_{nj} * (F_j - sum_e F_e * P_{ne})
-                //
-                const float inv_ns = 1.0f / static_cast<float>(num_samples);
+                // Build gate logit gradient (same shape as gate output)
+                const tensor& gate_output = gate_net.get_output();
+                resizable_tensor gate_logit_grad;
+                gate_logit_grad.copy_size(gate_output);
+                gate_logit_grad = 0;
+                float* glg = gate_logit_grad.host();
 
+                // Detect gate output layout
+                const long logits_per_sample = n_experts;
+
+                // Part A: Routing gradient — dL/dz_j = P_j * (score_j - E[score])
                 for (long n = 0; n < num_samples; ++n) {
-                    const auto& gate_probs = cached_gate_probs_[n];
+                    const auto& probs = cached_gate_probs_[n];
+                    const auto& scores = expert_scores[n];
 
-                    float sum_weighted_probs = 0.0f;
-                    for (long e = 0; e < n_experts; ++e) {
-                        float w_e = cached_routing_fraction_[e] * n_experts *
-                            load_balance_weight * inv_ns;
-                        sum_weighted_probs += w_e * gate_probs[e];
-                    }
+                    float weighted_score_sum = 0.0f;
+                    for (long e = 0; e < n_experts; ++e)
+                        weighted_score_sum += probs[e] * scores[e];
 
-                    for (long e = 0; e < n_experts; ++e) {
-                        float w_e = cached_routing_fraction_[e] * n_experts *
-                            load_balance_weight * inv_ns;
-                        gate_grad_data[n * n_experts + e] +=
-                            gate_probs[e] * (w_e - sum_weighted_probs);
+                    for (long e = 0; e < n_experts; ++e)
+                        glg[n * logits_per_sample + e] +=
+                        probs[e] * (scores[e] - weighted_score_sum);
+                }
+
+                // Part B: Load balance gradient
+                if (load_balance_weight > 0) {
+                    const float inv_ns = 1.0f / static_cast<float>(num_samples);
+
+                    for (long n = 0; n < num_samples; ++n) {
+                        const auto& probs = cached_gate_probs_[n];
+
+                        float sum_wp = 0.0f;
+                        for (long e = 0; e < n_experts; ++e) {
+                            float w_e = cached_routing_fraction_[e] * n_experts *
+                                load_balance_weight * inv_ns;
+                            sum_wp += w_e * probs[e];
+                        }
+
+                        for (long e = 0; e < n_experts; ++e) {
+                            float w_e = cached_routing_fraction_[e] * n_experts *
+                                load_balance_weight * inv_ns;
+                            glg[n * logits_per_sample + e] +=
+                                probs[e] * (w_e - sum_wp);
+                        }
                     }
                 }
+
+                // Gate backward: computes gate parameter gradients for internal update
+                // gate_net.forward(cached_input_) was called during forward
+                gate_net.back_propagate_error(cached_input_, gate_logit_grad);
+
+                // NOTE: gate_net.get_final_data_gradient() is deliberately NOT added
+                // to input_grad. The gate is an internal routing mechanism; only expert
+                // data gradients flow back to the main network.
             }
 
-            // Phase 4: Update expert parameters
-            const bool in_training = !network_context::is_active() ||
+            // Phase 4: Update expert + gate parameters
+            const bool do_update = !network_context::is_active() ||
                 network_context::is_training();
-            if (std::is_same<MODE, training_mode_tag>::value && in_training)
+            if (is_training && do_update)
                 update_subnet_parameters();
         }
+
+        // -----------------------------------------------------------------------
+        // Public interface
+        // -----------------------------------------------------------------------
 
         void clean()
         {
             for (auto& expert : experts)
                 clean_subnet(expert);
+            clean_subnet(gate_net);
         }
 
         const tensor& get_layer_params() const { return params; }
@@ -1414,6 +1454,7 @@ namespace dlib
             current_learning_rate_ = lr;
             for (auto& expert : experts)
                 set_all_learning_rates(expert, lr);
+            set_all_learning_rates(gate_net, lr);
         }
         double get_learning_rate() const { return current_learning_rate_; }
 
@@ -1422,6 +1463,7 @@ namespace dlib
             learning_rate_multiplier = val;
             for (auto& expert : experts)
                 set_all_learning_rate_multipliers(expert, val);
+            set_all_learning_rate_multipliers(gate_net, val);
         }
         double get_learning_rate_multiplier() const { return learning_rate_multiplier; }
 
@@ -1433,37 +1475,43 @@ namespace dlib
             solvers_initialized_ = false;
         }
 
-        // Returns total parameter count across all expert networks
         size_t internal_parameters() const
         {
-            if (experts.empty()) return 0;
-            return count_parameters(experts[0]) * static_cast<size_t>(n_experts);
+            size_t total = count_parameters(gate_net);
+            if (!experts.empty())
+                total += count_parameters(experts[0]) * static_cast<size_t>(n_experts);
+            return total;
         }
 
-        // Returns parameter count for the top-k experts active during inference
         size_t active_parameters() const
         {
-            if (experts.empty()) return 0;
-            return count_parameters(experts[0]) * static_cast<size_t>(top_k);
+            size_t total = count_parameters(gate_net);
+            if (!experts.empty())
+                total += count_parameters(experts[0]) * static_cast<size_t>(top_k);
+            return total;
         }
 
-        // Direct access to expert networks (for inspection/debugging)
         EXPERT_NET& get_expert(size_t idx) {
             DLIB_CASSERT(idx < experts.size(), "Expert index out of bounds");
             return experts[idx];
         }
-
         const EXPERT_NET& get_expert(size_t idx) const {
             DLIB_CASSERT(idx < experts.size(), "Expert index out of bounds");
             return experts[idx];
         }
 
-        // Accessors
+        GATE_NET& get_gate() { return gate_net; }
+        const GATE_NET& get_gate() const { return gate_net; }
+
         long num_experts() const { return n_experts; }
         long num_active_experts() const { return top_k; }
         bool is_training_mode() const { return std::is_same<MODE, training_mode_tag>::value; }
         const std::vector<float>& get_expert_usage() const { return expert_usage; }
         float get_load_balance_loss() const { return load_balance_loss_; }
+
+        // -----------------------------------------------------------------------
+        // Serialization
+        // -----------------------------------------------------------------------
 
         friend void serialize(const moe_& item, std::ostream& out)
         {
@@ -1475,9 +1523,11 @@ namespace dlib
             serialize(item.load_balance_weight, out);
             serialize(item.learning_rate_multiplier, out);
             serialize(item.current_learning_rate_, out);
+            serialize(item.gate_net, out);
             serialize(item.experts, out);
             serialize(item.expert_usage, out);
             serialize(item.expert_solvers_, out);
+            serialize(item.gate_solvers_, out);
             serialize(item.solvers_initialized_, out);
         }
 
@@ -1485,7 +1535,7 @@ namespace dlib
         {
             std::string version;
             deserialize(version, in);
-            if (version == "moe_") {                
+            if (version == "moe_") {
                 deserialize(item.n_experts, in);
                 deserialize(item.top_k, in);
                 deserialize(item.noise_scale, in);
@@ -1493,16 +1543,20 @@ namespace dlib
                 deserialize(item.load_balance_weight, in);
                 deserialize(item.learning_rate_multiplier, in);
                 deserialize(item.current_learning_rate_, in);
+                deserialize(item.gate_net, in);
                 deserialize(item.experts, in);
                 deserialize(item.expert_usage, in);
                 deserialize(item.expert_solvers_, in);
+                deserialize(item.gate_solvers_, in);
                 deserialize(item.solvers_initialized_, in);
             }
             else {
-                throw serialization_error("Incorrect version '" + version + "' found while deserializing moe_.");
+                throw serialization_error("Incorrect version '" + version +
+                    "' found while deserializing moe_.");
             }
             item.cached_batch_size_ = 0;
             item.cached_expert_inputs_.clear();
+            item.cached_expert_outputs_.clear();
         }
 
         friend std::ostream& operator<<(std::ostream& out, const moe_& item)
@@ -1531,15 +1585,16 @@ namespace dlib
                 << " learning_rate_mult='" << item.learning_rate_multiplier << "'"
                 << " mode='" << (is_training ? "training" : "inference") << "'"
                 << ">\n";
-            for (size_t i = 0; i < item.experts.size(); ++i)
-            {
-                out << "<expert index='" << i << "'>\n";
+            out << "  <gate>\n";
+            to_xml(item.gate_net, out);
+            out << "  </gate>\n";
+            for (size_t i = 0; i < item.experts.size(); ++i) {
+                out << "  <expert index='" << i << "'>\n";
                 to_xml(item.experts[i], out);
-                out << "</expert>\n";
+                out << "  </expert>\n";
             }
-            out << "<expert_usage>";
-            for (size_t i = 0; i < item.expert_usage.size(); ++i)
-            {
+            out << "  <expert_usage>";
+            for (size_t i = 0; i < item.expert_usage.size(); ++i) {
                 if (i > 0) out << " ";
                 out << item.expert_usage[i];
             }
@@ -1548,17 +1603,11 @@ namespace dlib
         }
 
     private:
-        template<typename NET>
-        auto clean_subnet(NET& net) -> decltype(net.clean(), void())
-        {
-            net.clean();
-        }
 
         template<typename NET>
-        void clean_subnet(...)
-        {
-            // No-op if network doesn't have clean() method
-        }
+        auto clean_subnet(NET& net) -> decltype(net.clean(), void()) { net.clean(); }
+        template<typename NET>
+        void clean_subnet(...) {}
 
         void update_subnet_parameters()
         {
@@ -1578,10 +1627,11 @@ namespace dlib
                 expert_solvers_.resize(n_experts);
                 for (long e = 0; e < n_experts; ++e)
                     expert_solvers_[e].assign(experts[e].num_computational_layers, adamw(wd, b1, b2));
+                gate_solvers_.assign(gate_net.num_computational_layers, adamw(wd, b1, b2));
                 solvers_initialized_ = true;
             }
 
-            // Only update experts activated in this forward pass (others have no valid gradients)
+            // Update only experts activated in this forward pass
             std::set<size_t> used_experts;
             for (const auto& indices : selected_expert_indices_)
                 for (size_t idx : indices)
@@ -1589,68 +1639,60 @@ namespace dlib
 
             for (size_t e : used_experts)
                 experts[e].update_parameters(expert_solvers_[e], effective_lr);
+
+            // Update gate (always has valid gradients)
+            gate_net.update_parameters(gate_solvers_, effective_lr);
         }
 
+        // Internal sub-networks
+        GATE_NET gate_net;
+        std::vector<EXPERT_NET> experts;
+
         // Configuration
-        long n_experts;                     // Number of expert networks
-        float noise_scale;                  // Gaussian noise std for exploration
-        long top_k;                         // Number of experts to activate per sample
-        float usage_update_rate;            // EMA smoothing rate for usage tracking
-        float load_balance_weight;          // Auxiliary loss coefficient for expert load balancing
+        long n_experts;
+        float noise_scale;
+        long top_k;
+        float usage_update_rate;
+        float load_balance_weight;
         double learning_rate_multiplier;
         double current_learning_rate_;
 
-        // Expert networks
-        std::vector<EXPERT_NET> experts;
-        std::vector<float> expert_usage;    // Usage statistics (for monitoring)
-        std::vector<resizable_tensor> cached_expert_inputs_;
+        std::vector<float> expert_usage;
 
-        // Internal solvers for expert parameter updates
-        std::vector<std::vector<adamw>> expert_solvers_;  // [expert_idx][layer_idx]
+        // Cached tensors for backward
+        resizable_tensor cached_input_;
+        std::vector<resizable_tensor> cached_expert_inputs_;
+        std::vector<resizable_tensor> cached_expert_outputs_;
+
+        // Internal solvers
+        std::vector<std::vector<adamw>> expert_solvers_;
+        std::vector<adamw> gate_solvers_;
         bool solvers_initialized_;
         double solver_weight_decay_ = 0.004;
         double solver_beta1_ = 0.9;
         double solver_beta2_ = 0.999;
 
-        // Forward/backward cache (training mode only)
-        std::vector<std::vector<size_t>> selected_expert_indices_;  // [sample][top_k]
-        std::vector<std::vector<float>> selected_expert_weights_;   // [sample][top_k]
+        // Forward/backward routing cache (training only)
+        std::vector<std::vector<size_t>> selected_expert_indices_;
+        std::vector<std::vector<float>> selected_expert_weights_;
         std::vector<std::vector<float>> cached_gate_probs_;
         std::vector<float> cached_routing_fraction_;
         std::vector<float> cached_gate_prob_avg_;
         long cached_batch_size_;
         float load_balance_loss_;
 
-        resizable_tensor params; // Unused — required for get_layer_params() interface
+        resizable_tensor params;
     };
 
     template<
         typename EXPERT_NET,
+        typename GATE_NET,
+        long n_experts_,
         long top_e,
         typename MODE,
-        template<typename> class TAG,
         typename SUBNET
     >
-    using moe = add_layer<moe_<EXPERT_NET, top_e, MODE, TAG, SUBNET>, SUBNET>;
-
-    // This is a drop-in replacement for standard transformer feed-forward layers
-    template <typename SUBNET> using moe_tag_input = add_tag_layer<1600 + 0, SUBNET>;
-    template <typename SUBNET> using moe_tag_gate = add_tag_layer<1600 + 1, SUBNET>;
-    template <typename SUBNET> using add_moe_tag_input = add_prev<moe_tag_input, SUBNET>;
-    using add_moe_tag_input_ = add_prev_<moe_tag_input>;
-    template <typename SUBNET> using skip_moe_tag_input = add_skip_layer<moe_tag_input, SUBNET>;
-
-    template<
-        typename EXPERT_NET,
-        long num_experts,
-        long top_e,
-        typename MODE,
-        template <typename> class DO,
-        typename SUBNET
-    >
-    using moe_ffn = add_moe_tag_input<
-        moe<EXPERT_NET, top_e, MODE, moe_tag_gate, rms_norm<skip_moe_tag_input<
-        moe_tag_gate<gate<num_experts, DO, moe_tag_input<SUBNET>>>>>>>;
+    using moe = add_layer<moe_<EXPERT_NET, GATE_NET, n_experts_, top_e, MODE>, SUBNET>;
 }
 
 #endif // DLIB_DNN_TRANSFORMER_H_
