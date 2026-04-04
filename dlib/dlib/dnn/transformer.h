@@ -1393,28 +1393,26 @@ namespace dlib
 
                     for (long e = 0; e < n_experts; ++e)
                         glg[n * logits_per_sample + e] +=
-                        probs[e] * (scores[e] - weighted_score_sum);
+                            probs[e] * (scores[e] - weighted_score_sum);
                 }
 
                 // Part B: Load balance gradient
                 if (load_balance_weight > 0) {
-                    const float inv_ns = 1.0f / static_cast<float>(num_samples);
-
                     for (long n = 0; n < num_samples; ++n) {
                         const auto& probs = cached_gate_probs_[n];
 
                         float sum_wp = 0.0f;
                         for (long e = 0; e < n_experts; ++e) {
-                            float w_e = cached_routing_fraction_[e] * n_experts *
-                                load_balance_weight * inv_ns;
+                            float w_e = load_balance_weight * n_experts *
+                                cached_routing_fraction_[e];
                             sum_wp += w_e * probs[e];
                         }
 
                         for (long e = 0; e < n_experts; ++e) {
-                            float w_e = cached_routing_fraction_[e] * n_experts *
-                                load_balance_weight * inv_ns;
+                            float w_e = load_balance_weight * n_experts *
+                                cached_routing_fraction_[e];
                             glg[n * logits_per_sample + e] +=
-                                probs[e] * (w_e - sum_wp);
+                                probs[e] * (w_e - sum_wp) / static_cast<float>(num_samples);
                         }
                     }
                 }
@@ -1428,11 +1426,8 @@ namespace dlib
                 // data gradients flow back to the main network.
             }
 
-            // Phase 4: Update expert + gate parameters
-            const bool do_update = !network_context::is_active() ||
-                network_context::is_training();
-            if (is_training && do_update)
-                update_subnet_parameters();
+            // Phase 4: Update expert
+            update_subnet_parameters();
         }
 
         // -----------------------------------------------------------------------

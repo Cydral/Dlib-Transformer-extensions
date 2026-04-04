@@ -1,34 +1,31 @@
 ﻿/*!
     @file slm_transformer_configs_ex.cpp
-    @brief Training and generation pipeline for the pre-configured transformer
-           architectures built into Dlib-Transformer.
+    @brief Training and generation pipeline for the pre-configured transformer architectures built into Dlib.
 
-    This example demonstrates how to train and evaluate the three network
-    topologies available as ready-to-use configurations:
+    This example demonstrates how to train and evaluate two network topologies available as
+    ready-to-use configurations:
 
-      --arch moe   Grouped Query Attention + Mixture-of-Experts feed-forward
+      --arch moe   Grouped Query Attention + Mixture-of-Experts feed-forward.
                    Sparse top-k expert activation with load-balancing auxiliary loss.
                    Best for exploring conditional computation and expert specialization.
 
-      --arch hrm   Hierarchical Recurrent Model
-                   Two-level recurrent structure for multi-scale sequence modeling.
+      --arch hrm   Hierarchical Recurrent Model.
+                   Two-level recurrent structure (H+L modules) for multi-scale sequence modeling.
                    Suited for tasks requiring both local and global context.
 
-    All two configurations share the same training and generation pipeline:
-    BPE tokenization, sliding-window dataset construction, AdamW with warmup
-    and cosine LR decay, checkpoint support, and autoregressive text generation
-    with prompt/reference split validation.
+    Both configurations share the same training and generation pipeline: BPE tokenization,
+    sliding-window dataset construction, AdamW optimization with reduce-on-plateau learning rate
+    control, checkpoint support, and autoregressive text generation with prompt/reference split
+    validation.
 
-    The architecture is selected at runtime via --arch; the compiler instantiates
-    the full pipeline independently for each configuration so there is no runtime
-    overhead from the dispatch.
-
-    Model files are automatically named per architecture (dlib_lm_<arch>_model.dat)
+    The architecture is selected at runtime via --arch; the compiler instantiates the full
+    pipeline independently for each configuration so there is no runtime overhead from the
+    dispatch. Model files are automatically named per architecture (dlib_lm_<arch>_model.dat)
     to prevent accidental cross-architecture checkpoint loading.
 
     Usage:
       Training  : slm_transformer_configs_ex --train --arch moe
-      Generation: slm_transformer_configs_ex --generate --arch gqa
+      Generation: slm_transformer_configs_ex --generate --arch hrm
 !*/
 
 #include <iostream>
@@ -46,14 +43,12 @@
 #include <dlib/misc_api.h>
 #include <dlib/tokenizer.h>
 
-// Include internal dataset
 #include "slm_data.h"
 
 using namespace std;
 using namespace dlib;
 
 // Utility functions
-
 std::string read_file_content(const std::string& filepath)
 {
     std::ifstream file(filepath, std::ios::binary);
@@ -70,7 +65,6 @@ std::string normalize_paragraph_delimiters(const std::string& text)
 {
     std::string result;
     result.reserve(text.size());
-
     size_t i = 0;
     while (i < text.size()) {
         if (i + 1 < text.size() && text[i] == '\n' && text[i + 1] == '\n') {
@@ -83,14 +77,10 @@ std::string normalize_paragraph_delimiters(const std::string& text)
             ++i;
         }
     }
-
     return result;
 }
 
-void collect_text_files_recursive(
-    const directory& dir,
-    std::vector<std::string>& text_files,
-    size_t max_files = 0)
+void collect_text_files_recursive(const directory& dir, std::vector<std::string>& text_files, size_t max_files = 0)
 {
     for (const auto& file : dir.get_files()) {
         if (max_files > 0 && text_files.size() >= max_files) return;
@@ -127,14 +117,12 @@ std::string load_external_data(const std::string& path, bool normalize_delimiter
             std::string content = read_file_content(filepath);
             if (!content.empty()) {
                 combined_text += content;
-                if (combined_text.size() >= 2 &&
-                    combined_text.substr(combined_text.size() - 2) != "@@")
+                if (combined_text.size() >= 2 && combined_text.substr(combined_text.size() - 2) != "@@")
                     combined_text += "@@";
                 total_bytes += content.size();
             }
         }
-        cout << "Total loaded: " << total_bytes << " bytes from "
-            << text_files.size() << " file(s)\n";
+        cout << "Total loaded: " << total_bytes << " bytes from " << text_files.size() << " file(s)\n";
     }
     catch (const directory::dir_not_found&) {
         cout << "Loading single text file: " << path << "\n";
@@ -165,7 +153,6 @@ std::vector<std::string> parse_delimited_segments(const std::string& text)
 {
     std::vector<std::string> segments;
     const std::string delimiter = "@@";
-
     size_t start = 0;
     size_t end = text.find(delimiter);
 
@@ -175,8 +162,7 @@ std::vector<std::string> parse_delimited_segments(const std::string& text)
         if (first != std::string::npos) {
             size_t last = segment.find_last_not_of(" \t\n\r");
             segment = segment.substr(first, last - first + 1);
-            if (!segment.empty())
-                segments.push_back(segment);
+            if (!segment.empty()) segments.push_back(segment);
         }
         start = end + delimiter.length();
         end = text.find(delimiter, start);
@@ -188,20 +174,19 @@ std::vector<std::string> parse_delimited_segments(const std::string& text)
         if (first != std::string::npos) {
             size_t last = segment.find_last_not_of(" \t\n\r");
             segment = segment.substr(first, last - first + 1);
-            if (!segment.empty())
-                segments.push_back(segment);
+            if (!segment.empty()) segments.push_back(segment);
         }
     }
 
     return segments;
 }
 
-// MoE parameter analysis
-/*struct moe_param_info
+// MoE parameter and expert usage analysis
+struct moe_param_info
 {
-    size_t single_expert_params;    // Parameters of one expert network
-    size_t total_params;            // Total parameters (all experts, via count_parameters)
-    size_t inference_params;        // Active parameters at inference time (top-k experts)
+    size_t single_expert_params;
+    size_t total_params;
+    size_t inference_params;
     long   num_experts;
     long   num_moe_layers;
     long   top_k;
@@ -225,10 +210,7 @@ std::vector<std::string> parse_delimited_segments(const std::string& text)
         if (!expert_usage.empty()) {
             cout << "Expert usage statistics (EMA):\n";
 
-            float total_usage = 0.0f;
-            float min_usage = expert_usage[0];
-            float max_usage = expert_usage[0];
-
+            float total_usage = 0.0f, min_usage = expert_usage[0], max_usage = expert_usage[0];
             for (float u : expert_usage) {
                 total_usage += u;
                 min_usage = std::min(min_usage, u);
@@ -238,39 +220,31 @@ std::vector<std::string> parse_delimited_segments(const std::string& text)
             float mean_usage = total_usage / num_experts;
             float ideal_usage = 1.0f / num_experts;
             float variance = 0.0f;
-
-            for (float u : expert_usage) {
-                float diff = u - mean_usage;
-                variance += diff * diff;
-            }
+            for (float u : expert_usage) { float diff = u - mean_usage; variance += diff * diff; }
             variance /= num_experts;
             float std_dev = std::sqrt(variance);
             float cv = (mean_usage > 1e-8f) ? (std_dev / mean_usage) : 0.0f;
 
-            cout << "  Mean usage : " << std::fixed << std::setprecision(4)
-                << mean_usage << " (ideal: " << ideal_usage << ")\n"
+            cout << "  Mean usage : " << std::fixed << std::setprecision(4) << mean_usage
+                << " (ideal: " << ideal_usage << ")\n"
                 << "  Range      : [" << min_usage << ", " << max_usage << "]\n"
                 << "  Std dev    : " << std_dev << "\n"
                 << "  CV         : " << cv << "\n"
                 << "  Balance    : ";
 
-            if (cv < 0.3f) cout << "excellent (CV < 0.3)\n";
+            if (cv < 0.3f)      cout << "excellent (CV < 0.3)\n";
             else if (cv < 0.5f) cout << "good (CV < 0.5)\n";
             else if (cv < 0.8f) cout << "fair (CV < 0.8)\n";
-            else                cout << "poor (CV >= 0.8) — possible expert collapse\n";
+            else                cout << "poor (CV >= 0.8) -- possible expert collapse\n";
 
             cout << "\n  Per-expert usage:\n";
             for (long e = 0; e < num_experts; ++e) {
-                cout << "    expert " << e << ": "
-                    << std::fixed << std::setprecision(4) << expert_usage[e];
-
-                int bar_len = (max_usage > 0)
-                    ? static_cast<int>(expert_usage[e] * 20.0f / max_usage) : 0;
+                cout << "    expert " << e << ": " << std::fixed << std::setprecision(4) << expert_usage[e];
+                int bar_len = (max_usage > 0) ? static_cast<int>(expert_usage[e] * 20.0f / max_usage) : 0;
                 cout << " [";
                 for (int i = 0; i < bar_len; ++i) cout << "=";
                 for (int i = bar_len; i < 20; ++i) cout << " ";
                 cout << "]";
-
                 float ratio = expert_usage[e] / ideal_usage;
                 if (ratio < 0.5f) cout << " (underutilized)";
                 else if (ratio > 2.0f) cout << " (overutilized)";
@@ -282,90 +256,62 @@ std::vector<std::string> parse_delimited_segments(const std::string& text)
         }
         cout << "\n";
     }
-};*/
+};
 
-// Access the first MoE layer via layer<N> to retrieve expert statistics.
-// The layer index depends on the network head (loss + linear + rms_norm = 3 layers)
-// then the first repeat block's moe_ sits at index 4 in our architecture.
-/*template <typename net_type>
+// Retrieve expert statistics from the first MoE layer.
+// Layer index in our topology: loss=0, linear=1, rms_norm=2, add_prev=3, moe=4.
+template <typename net_type>
 moe_param_info get_moe_param_info(const net_type& net, long num_layers)
 {
     moe_param_info info;
-
-    // Access the moe_ layer in the first transformer block
-    // (layer 0 = loss, 1 = linear, 2 = rms_norm, 3 = add_prev, 4 = moe)
     const auto& moe_layer = layer<4>(net).layer_details();
 
     info.num_experts = moe_layer.num_experts();
     info.top_k = moe_layer.num_active_experts();
     info.num_moe_layers = num_layers;
-
-    // Single expert parameter count via the new accessor
-    info.single_expert_params = (info.num_experts > 0)
-        ? count_parameters(moe_layer.get_expert(0)) : 0;
-
-    // Total params already accounts for all experts via internal_parameters()
+    info.single_expert_params = (info.num_experts > 0) ? count_parameters(moe_layer.get_expert(0)) : 0;
     info.total_params = count_parameters(net);
 
-    // Inference params = total - inactive expert params across all MoE layers
-    size_t inactive_per_layer =
-        (info.num_experts - info.top_k) * info.single_expert_params;
-    info.inference_params = info.total_params -
-        static_cast<size_t>(num_layers) * inactive_per_layer;
-
+    size_t inactive_per_layer = (info.num_experts - info.top_k) * info.single_expert_params;
+    info.inference_params = info.total_params - static_cast<size_t>(num_layers) * inactive_per_layer;
     info.efficiency_ratio = (info.total_params > 0)
-        ? static_cast<float>(info.inference_params) / static_cast<float>(info.total_params)
-        : 1.0f;
-
+        ? static_cast<float>(info.inference_params) / static_cast<float>(info.total_params) : 1.0f;
     info.expert_usage = moe_layer.get_expert_usage();
 
     return info;
-}*/
+}
 
-/*
- * run_pipeline<TRANSFORMER_CONFIG>
- *
- * Contains all type-dependent training and generation logic.  Called once from main()
- * with the concrete transformer config selected by --arch.
- * The technique: `using my_transformer = TRANSFORMER_CONFIG` is a local alias resolved
- * at the point of template instantiation, so each call site in main() compiles a
- * completely independent version of this function with its own concrete network types.
- */
+// SFINAE helper: prints MoE analysis when the network has a MoE layer at position 4,
+// and silently does nothing for other architectures (e.g. HRM).
+template <typename net_type>
+auto try_print_moe_info(const net_type& net, long num_layers)
+-> decltype(layer<4>(net).layer_details().num_experts(), void())
+{
+    auto info = get_moe_param_info(net, num_layers);
+    if (info.num_experts > 0) info.print();
+}
+
+inline void try_print_moe_info(...) {}
+
+// Type-dependent training and generation logic, called once from main() with the concrete
+// transformer config selected by --arch.  Each call site in main() compiles a completely
+// independent version of this function with its own concrete network types.
 template <typename TRANSFORMER_CONFIG>
 int run_pipeline(
-    bool do_train,
-    bool do_generate,
-    const double learning_rate,
-    const size_t batch_size,
-    const long patience,
-    const size_t max_epochs,
-    const double weight_decay,
-    const double beta1,
-    const double beta2,
-    const std::string& model_file,
-    const std::string& tokenizer_file,
-    std::vector<std::string>& text_segments,
-    std::string& external_corpus_for_tokenizer,
-    bpe_tokenizer& tokenizer,
-    std::vector<int>& gpus)
+    bool do_train, bool do_generate,
+    const double learning_rate, const size_t batch_size, const long patience, const size_t max_epochs,
+    const double weight_decay, const double beta1, const double beta2,
+    const std::string& model_file, const std::string& tokenizer_file,
+    std::vector<std::string>& text_segments, std::string& external_corpus_for_tokenizer,
+    bpe_tokenizer& tokenizer, std::vector<int>& gpus)
 {
     using my_transformer = TRANSFORMER_CONFIG;
 
-    // Model architecture parameters
     constexpr long num_tokens = 2000;
     constexpr long num_layers = 4;
-    constexpr long num_heads = 6;
-    constexpr long num_kv_heads = 2;
-    constexpr long embedding_dim = 228;
-    constexpr long num_experts = 4;
-    constexpr long top_k = 0;           // auto: 20% = 1 active expert out of 4
     constexpr long max_seq_len = 100;
 
-    // Suppress unused-variable warnings for params not used by all instantiations
-    (void)num_kv_heads; (void)num_experts; (void)top_k;
-
     const std::string tokens_file = "dlib_configs_datasets_tokens.bin";
-
     cout << my_transformer::model_info::describe() << "\n";
 
     // TRAINING MODE
@@ -383,13 +329,11 @@ int run_pipeline(
                 dlib::deserialize(tokens_file) >> full_tokens;
                 size_t total_tokens = 0;
                 for (const auto& seg : full_tokens) total_tokens += seg.size();
-                cout << "Loaded " << full_tokens.size() << " segments ("
-                    << total_tokens << " tokens)\n";
+                cout << "Loaded " << full_tokens.size() << " segments (" << total_tokens << " tokens)\n";
                 tokens_loaded = true;
             }
             catch (const std::exception& e) {
-                cerr << "Failed to load tokens: " << e.what()
-                    << "\nWill tokenize again.\n";
+                cerr << "Failed to load tokens: " << e.what() << "\nWill tokenize again.\n";
                 full_tokens.clear();
             }
         }
@@ -411,7 +355,6 @@ int run_pipeline(
                 if (!external_corpus_for_tokenizer.empty())
                     tokenizer_corpus += delimiter + external_corpus_for_tokenizer;
 
-                // Replace "@@" with spaces before training
                 size_t pos = 0;
                 while ((pos = tokenizer_corpus.find(delimiter, pos)) != std::string::npos) {
                     tokenizer_corpus.replace(pos, delimiter.length(), " ");
@@ -427,12 +370,12 @@ int run_pipeline(
             long text_start_id = tokenizer.get_special_token_id("<text>");
             long text_end_id = tokenizer.get_special_token_id("</text>");
             if (text_start_id < 0 || text_end_id < 0) {
-                cerr << "ERROR: Required special tokens not found in tokenizer vocabulary!\n"
+                cerr << "ERROR: Required special tokens not found in tokenizer!\n"
                     << "The tokenizer must include: <text>, </text>\n";
                 return 1;
             }
 
-            // Tokenize all segments: <text>content</text>
+            // Tokenize all segments with <text>...</text> wrapping
             cout << "Tokenizing " << text_segments.size() << " segments...\n";
             auto t_start = std::chrono::high_resolution_clock::now();
             size_t total_tokens = 0;
@@ -449,18 +392,12 @@ int run_pipeline(
 
             auto t_end = std::chrono::high_resolution_clock::now();
             cout << "Tokenization complete: " << total_tokens << " tokens in "
-                << std::chrono::duration_cast<std::chrono::seconds>(t_end - t_start).count()
-                << "s\n";
+                << std::chrono::duration_cast<std::chrono::seconds>(t_end - t_start).count() << "s\n";
             text_segments.clear();
 
             cout << "Saving tokens to: " << tokens_file << "\n";
-            try {
-                serialize(tokens_file) << full_tokens;
-                cout << "Tokens saved.\n";
-            }
-            catch (const std::exception& e) {
-                cerr << "Warning: Failed to save tokens: " << e.what() << "\n";
-            }
+            try { serialize(tokens_file) << full_tokens; cout << "Tokens saved.\n"; }
+            catch (const std::exception& e) { cerr << "Warning: Failed to save tokens: " << e.what() << "\n"; }
         }
 
         // Build training sequences via sliding window
@@ -469,16 +406,13 @@ int run_pipeline(
         std::vector<unsigned long> labels;
 
         const int pad_token = static_cast<int>(tokenizer.get_special_token_id("<pad>"));
-        build_single_token_prediction_dataset(
-            full_tokens, max_seq_len, pad_token, false, samples, labels);
+        build_single_token_prediction_dataset(full_tokens, max_seq_len, pad_token, false, samples, labels);
         cout << "Created " << samples.size() << " training samples\n";
         full_tokens.clear();
 
-        // Augment dataset with 5% noisy copies for robustness
-        augment_training_dataset(
-            samples, labels,
-            static_cast<int>(tokenizer.get_special_token_id("<unk>")),
-            pad_token, 0.03);
+        // Augment dataset with noisy copies for robustness
+        augment_training_dataset(samples, labels,
+            static_cast<int>(tokenizer.get_special_token_id("<unk>")), pad_token, 0.03);
         cout << "Augmented dataset size: " << samples.size() << "\n";
 
         // Build and initialize network
@@ -486,21 +420,19 @@ int run_pipeline(
         train_net_type net;
         layer<0>(net).loss_details().set_ignore_index(pad_token);
 
-        // Restore from final model if no checkpoint is pending
         if (file_exists(model_file) && !file_exists("chkpt-" + model_file)) {
             cout << "Loading existing model from " << model_file << "\n";
             deserialize(model_file) >> net >> tokenizer;
         }
 
-        // Propagate optimizer hyperparameters to layer internal solvers
+        // Propagate optimizer hyperparameters to internal sub-network solvers (HRM H/L, MoE experts/gate)
         network_context::set_optimizer_params(weight_decay, beta1, beta2);
 
         cout << net << "\n\n";
         cout << "Number of model parameters: " << count_parameters(net) << "\n";
 
-        // Create trainer
-        dnn_trainer<train_net_type, adamw> trainer(
-            net, adamw(weight_decay, beta1, beta2), gpus);
+        // Create trainer with reduce-on-plateau learning rate control
+        dnn_trainer<train_net_type, adamw> trainer(net, adamw(weight_decay, beta1, beta2), gpus);
         trainer.set_learning_rate(learning_rate);
         trainer.set_min_learning_rate(1e-8);
         trainer.set_learning_rate_shrink_factor(0.1);
@@ -509,31 +441,12 @@ int run_pipeline(
         trainer.set_synchronization_file("chkpt-" + model_file, std::chrono::minutes(10));
         trainer.be_quiet();
 
-        // Warmup and cosine learning-rate schedule
-        size_t steps_per_epoch = (samples.size() + batch_size - 1) / batch_size;
-        size_t total_steps = steps_per_epoch * max_epochs;
-        auto scheduler = make_transformer_scheduler(trainer.get_learning_rate(), 
-            total_steps, 0.05, trainer.get_min_learning_rate());       
-
-        const std::string scheduler_file = "scheduler-" + model_file;
-        if (file_exists(scheduler_file)) {
-            deserialize(scheduler_file) >> scheduler;
-            cout << "Scheduler resumed: step " << scheduler.get_current_step()
-                << ", phase: " << scheduler.get_phase_name()
-                << ", lr: " << scheduler.get_learning_rate() << "\n";
-        }
-        cout << "LR schedule:\n"
-            << "  peak lr   : " << scheduler.get_peak_lr() << "\n"
-            << "  min lr    : " << scheduler.get_min_lr() << "\n"
-            << "  warmup    : " << scheduler.get_warmup_steps() << " steps\n"
-            << "  total     : " << scheduler.get_total_steps() << " steps\n"
-            << "  current   : " << scheduler.get_current_step() << " steps\n"
-            << "  phase     : " << scheduler.get_phase_name() << "\n\n";
-
+        // Training loop
         cout << "Starting training...\n";
         size_t epoch = 0, batches_count = 0;
-        while (!scheduler.is_training_complete() && epoch < max_epochs
-            && !signal_handler::is_triggered())
+
+        while (trainer.get_learning_rate() >= trainer.get_min_learning_rate()
+            && epoch < max_epochs && !signal_handler::is_triggered())
         {
             double total_loss = 0.0;
             size_t batches_seen = 0, samples_seen = 0;
@@ -541,33 +454,24 @@ int run_pipeline(
 
             shuffle_training_dataset(samples, labels);
 
-            for (size_t i = 0;
-                i < samples.size() && !signal_handler::is_triggered();
-                i += batch_size)
+            for (size_t i = 0; i < samples.size() && !signal_handler::is_triggered(); i += batch_size)
             {
                 size_t batch_end = std::min(i + batch_size, samples.size());
-                std::vector<matrix<int, 0, 1>> batch_X(
-                    samples.begin() + i, samples.begin() + batch_end);
-                std::vector<unsigned long> batch_Y(
-                    labels.begin() + i, labels.begin() + batch_end);
+                std::vector<matrix<int, 0, 1>> batch_X(samples.begin() + i, samples.begin() + batch_end);
+                std::vector<unsigned long> batch_Y(labels.begin() + i, labels.begin() + batch_end);
 
-                // Compute per-sample padding lengths
                 std::vector<long> pad_lengths(batch_X.size());
                 for (size_t j = 0; j < batch_X.size(); ++j)
                     pad_lengths[j] = count_leading_padding(batch_X[j], pad_token);
 
-                // Synchronize: ensure previous batch has completed before
-                // modifying the shared network_context singleton
+                // Synchronize: ensure previous batch has completed before modifying network_context
                 trainer.get_net(force_flush_to_disk::no);
 
-                // Update scheduler and propagate learning rate
-                double current_lr = scheduler.get_learning_rate();
-                trainer.set_learning_rate(current_lr);
-                network_context::set_learning_rate(current_lr);
+                // Propagate the current learning rate to internal sub-networks
+                network_context::set_learning_rate(trainer.get_learning_rate());
                 network_context::set_padding_from_lengths(pad_lengths);
 
                 trainer.train_one_step(batch_X, batch_Y);
-                scheduler.step();
 
                 total_loss += trainer.get_average_loss();
                 batches_seen++;
@@ -581,19 +485,13 @@ int run_pipeline(
 
                     std::ios_base::fmtflags old_flags = cout.flags();
                     std::streamsize old_prec = cout.precision();
-
                     cout << "epoch#: " << (epoch + 1) << "/" << max_epochs
                         << " \t loss: " << std::fixed << std::setprecision(3) << avg_loss
-                        << " \t learning-rate: " << std::scientific << std::setprecision(2) << current_lr
-                        << " \t phase: " << scheduler.get_phase_name()
-                        << " \t speed: " << std::fixed << std::setprecision(1)
-                        << spd << " samples/sec\n";
+                        << " \t lr: " << std::scientific << std::setprecision(2) << trainer.get_learning_rate()
+                        << " \t speed: " << std::fixed << std::setprecision(1) << spd << " samples/sec\n";
                     cout.flush();
-
                     cout.flags(old_flags);
                     cout.precision(old_prec);
-
-                    serialize(scheduler_file) << scheduler;
                 }
             }
             epoch++;
@@ -627,9 +525,8 @@ int run_pipeline(
 
             double accuracy = static_cast<double>(correct) / labels.size();
             cout << "Training accuracy: " << (accuracy * 100.0) << "%\n";
-
             if (accuracy < 0.999)
-                cout << "WARNING: Accuracy below 99.9% — model may not fully memorize the corpus.\n";
+                cout << "WARNING: Accuracy below 99.9% -- model may not fully memorize the corpus.\n";
         }
         network_context::reset();
     }
@@ -647,13 +544,10 @@ int run_pipeline(
 
         deserialize(model_file) >> net >> tokenizer;
         cout << "Loaded model from " << model_file << "\n";
+        cout << "Number of model parameters: " << count_parameters(net) << "\n";
 
-        // Display MoE parameter breakdown and expert usage statistics
-        /*if (arch == "moe") {
-            cout << "\nAnalyzing MoE parameters and expert usage...\n";
-            auto param_info = get_moe_param_info(net, num_layers);
-            param_info.print();
-		}*/
+        // Display MoE expert usage and balance statistics (no-op for HRM)
+        try_print_moe_info(net, num_layers);
 
         if (tokenizer.get_vocab_size() == 0) {
             cerr << "Error: Tokenizer not loaded.\n";
@@ -662,7 +556,6 @@ int run_pipeline(
 
         const std::string tokens_file_gen = "dlib_configs_datasets_tokens.bin";
 
-        // Load tokenized segments to pick a prompt
         std::vector<std::vector<int>> tokenized_segments;
         if (!file_exists(tokens_file_gen)) {
             cerr << "Error: Tokenized file not found. Please run --train first.\n";
@@ -684,102 +577,76 @@ int run_pipeline(
             return 0;
         }
 
-        // Select a segment with at least 2 tokens (enough for a 50/50 split)
+        // Select a random segment with at least 2 tokens for splitting
         dlib::rand rng(std::chrono::system_clock::now().time_since_epoch().count());
 
-        // Filter out segments that are too short to split
         std::vector<size_t> valid_indices;
         for (size_t i = 0; i < tokenized_segments.size(); ++i)
-            if (tokenized_segments[i].size() >= 2)
-                valid_indices.push_back(i);
+            if (tokenized_segments[i].size() >= 2) valid_indices.push_back(i);
 
         if (valid_indices.empty()) {
-            cerr << "Error: No segments with at least 2 tokens found.\n";
+            cerr << "Error: No segments with at least 2 tokens.\n";
             return 1;
         }
 
         size_t pick = rng.get_random_32bit_number() % valid_indices.size();
         size_t segment_idx = valid_indices[pick];
-        cout << "Randomly selected segment #" << segment_idx
-            << " (out of " << tokenized_segments.size() << ", "
-            << valid_indices.size() << " valid)\n";
+        cout << "Randomly selected segment #" << segment_idx << " (out of "
+            << tokenized_segments.size() << ", " << valid_indices.size() << " valid)\n";
 
         const auto& selected_segment = tokenized_segments[segment_idx];
         const size_t seg_len = selected_segment.size();
-
-        const int pad_token = static_cast<int>(
-            tokenizer.get_special_token_id("<pad>"));
+        const int pad_token = static_cast<int>(tokenizer.get_special_token_id("<pad>"));
 
         // Prompt / reference split
         //
-        // Case A — segment fits entirely within the window (seg_len < max_seq_len)
-        //   Split the segment 50/50:
-        //     - input_half  : first ceil(seg_len/2) tokens, left-padded to max_seq_len
-        //     - verify_half : remaining tokens, used as ground-truth reference
+        // Case A: segment fits within the context window (seg_len < max_seq_len)
+        //   Split 50/50: first half is the prompt (left-padded), second half is ground-truth reference.
         //
-        // Case B — segment is at least as long as the window (seg_len >= max_seq_len)
-        //   Standard windowed split:
-        //     - input_half  : first max_seq_len tokens (no padding needed)
-        //     - verify_half : all tokens beyond max_seq_len
+        // Case B: segment >= max_seq_len
+        //   First max_seq_len tokens become the prompt, remaining tokens are the reference.
 
-        std::vector<int> input_half;   // tokens injected into the model window
-        std::vector<int> verify_half;  // tokens used for validation
+        std::vector<int> input_half;
+        std::vector<int> verify_half;
 
         if (seg_len < static_cast<size_t>(max_seq_len)) {
-            // Case A: short segment — 50/50 split with left-padding
             size_t input_count = (seg_len + 1) / 2;
             size_t verify_count = seg_len - input_count;
-
             if (verify_count == 0) {
-                cerr << "Error: Segment too short to produce a non-empty verification half "
-                    << "(" << seg_len << " token(s)).\n";
+                cerr << "Error: Segment too short for verification split (" << seg_len << " token(s)).\n";
                 return 1;
             }
-
-            input_half.assign(selected_segment.begin(),
-                selected_segment.begin() + input_count);
-            verify_half.assign(selected_segment.begin() + input_count,
-                selected_segment.end());
-
+            input_half.assign(selected_segment.begin(), selected_segment.begin() + input_count);
+            verify_half.assign(selected_segment.begin() + input_count, selected_segment.end());
             cout << "Short segment (" << seg_len << " tokens < window " << max_seq_len << "): "
-                << "using 50/50 split — input=" << input_count
-                << " tokens (left-padded), verify=" << verify_count << " tokens\n";
+                << "50/50 split - input=" << input_count << " tokens (left-padded), verify="
+                << verify_count << " tokens\n";
         }
         else {
-            // Case B: full window available — standard split
-            input_half.assign(selected_segment.begin(),
-                selected_segment.begin() + max_seq_len);
-            verify_half.assign(selected_segment.begin() + max_seq_len,
-                selected_segment.end());
-
-            cout << "Full segment (" << seg_len << " tokens): "
-                << "using first " << max_seq_len << " tokens as input, "
-                << verify_half.size() << " tokens for verification\n";
+            input_half.assign(selected_segment.begin(), selected_segment.begin() + max_seq_len);
+            verify_half.assign(selected_segment.begin() + max_seq_len, selected_segment.end());
+            cout << "Full segment (" << seg_len << " tokens): first " << max_seq_len
+                << " as input, " << verify_half.size() << " for verification\n";
         }
 
-        // Build inference window: left-padding fills positions not covered by input_half
+        // Build inference window with left-padding
         inference_context llm_context(max_seq_len, 4, pad_token);
         llm_context.add_tokens(input_half);
         auto input_seq = llm_context.get_input_window();
 
-        // Display the prompt fed to the model
         cout << "\n--- Prompt (input to model) ---\n"
             << tokenizer.decode(input_half, false) << "\n"
             << "-------------------------------\n\n";
 
         cout << "Starting autoregressive generation...\n";
-
         const size_t tokens_to_generate = verify_half.size();
         std::vector<int> generated_tokens;
         generated_tokens.reserve(tokens_to_generate);
 
-        const int end_of_text_id = static_cast<int>(
-            tokenizer.get_special_token_id("</text>"));
+        const int end_of_text_id = static_cast<int>(tokenizer.get_special_token_id("</text>"));
         auto gen_start = std::chrono::high_resolution_clock::now();
 
-        for (size_t i = 0;
-            i < tokens_to_generate && !signal_handler::is_triggered();
-            ++i)
+        for (size_t i = 0; i < tokens_to_generate && !signal_handler::is_triggered(); ++i)
         {
             long pad_len = count_leading_padding(input_seq, pad_token);
             network_context::set_padding_uniform(pad_len, 1);
@@ -794,39 +661,29 @@ int run_pipeline(
                     std::chrono::high_resolution_clock::now() - gen_start).count();
                 double tps = (i + 1) / (elapsed > 0 ? elapsed : 1);
                 cout << "Generated " << (i + 1) << "/" << tokens_to_generate
-                    << " tokens — " << tps << " tokens/sec\r";
+                    << " tokens - " << tps << " tokens/sec\r";
                 cout.flush();
             }
-
             if (next_token == end_of_text_id) break;
         }
         network_context::clear_padding();
 
         auto gen_end = std::chrono::high_resolution_clock::now();
-        long gen_time = std::chrono::duration_cast<std::chrono::seconds>(
-            gen_end - gen_start).count();
-
+        long gen_time = std::chrono::duration_cast<std::chrono::seconds>(gen_end - gen_start).count();
         cout << "\nGeneration complete in " << gen_time << " seconds ("
             << generated_tokens.size() << " tokens generated)\n";
 
-        // Display generated text
-        cout << "\n--- Generated text ---\n"
-            << tokenizer.decode(generated_tokens, false) << "\n"
+        cout << "\n--- Generated text ---\n" << tokenizer.decode(generated_tokens, false) << "\n"
+            << "----------------------\n\n";
+        cout << "--- Reference text ---\n" << tokenizer.decode(verify_half, false) << "\n"
             << "----------------------\n\n";
 
-        // Display reference (ground-truth) text
-        cout << "--- Reference text ---\n"
-            << tokenizer.decode(verify_half, false) << "\n"
-            << "----------------------\n\n";
-
-        // Validate generated tokens against the reference verification half
+        // Validate generated tokens against the reference
         cout << "=== Validation: generated vs. reference ===\n";
 
         size_t compare_len = std::min(verify_half.size(), generated_tokens.size());
-        std::vector<int> ref_subset(verify_half.begin(),
-            verify_half.begin() + compare_len);
-        std::vector<int> gen_subset(generated_tokens.begin(),
-            generated_tokens.begin() + compare_len);
+        std::vector<int> ref_subset(verify_half.begin(), verify_half.begin() + compare_len);
+        std::vector<int> gen_subset(generated_tokens.begin(), generated_tokens.begin() + compare_len);
 
         cout << "Comparing " << compare_len << " tokens\n";
         auto similarity = compute_text_similarity(ref_subset, gen_subset);
@@ -836,21 +693,17 @@ int run_pipeline(
             cout << "Sample comparison (first 100 tokens):\n";
             size_t sample_len = std::min(size_t(100), compare_len);
             size_t diff_count = 0;
-
             for (size_t i = 0; i < sample_len; ++i) {
                 if (ref_subset[i] != gen_subset[i]) {
                     if (diff_count < 10) {
                         cout << "  Position " << i << ": '"
-                            << tokenizer.decode({ ref_subset[i] }, false)
-                            << "' -> '"
-                            << tokenizer.decode({ gen_subset[i] }, false)
-                            << "'\n";
+                            << tokenizer.decode({ ref_subset[i] }, false) << "' -> '"
+                            << tokenizer.decode({ gen_subset[i] }, false) << "'\n";
                     }
                     diff_count++;
                 }
             }
-            cout << "Total differences in sample: " << diff_count
-                << "/" << sample_len << "\n";
+            cout << "Total differences in sample: " << diff_count << "/" << sample_len << "\n";
         }
         else {
             cout << "Excellent match! Generated text closely follows the original.\n";
@@ -864,16 +717,15 @@ int main(int argc, char** argv)
 {
     try
     {
-        // Setup interrupt handling for clean termination
         signal_handler::setup();
 
         command_line_parser parser;
         parser.add_option("train", "Train a transformer on internal datasets");
         parser.add_option("generate", "Generate text from a previously trained model");
-        parser.add_option("arch", "Network architecture: moe | hrm  (default: moe)", 1);
-        parser.add_option("learning-rate", "Set the peak learning rate (default: 2e-4)", 1);
+        parser.add_option("arch", "Network architecture: moe | hrm (default: moe)", 1);
+        parser.add_option("learning-rate", "Set the learning rate (default: 2e-4)", 1);
         parser.add_option("batch-size", "Set the mini-batch size (default: 64)", 1);
-        parser.add_option("patience", "Steps without progress before early stopping (default: 8000)", 1);
+        parser.add_option("patience", "Steps without progress before LR reduction (default: 8000)", 1);
         parser.add_option("max-epochs", "Maximum number of training epochs (default: 100)", 1);
         parser.add_option("weight-decay", "AdamW weight decay (default: 0.004)", 1);
         parser.add_option("beta1", "AdamW beta1 coefficient (default: 0.9)", 1);
@@ -883,8 +735,7 @@ int main(int argc, char** argv)
         parser.add_option("external-data", "Path to external text data for training", 1);
         parser.parse(argc, argv);
 
-        if (parser.number_of_arguments() == 0 &&
-            !parser.option("train") && !parser.option("generate"))
+        if (parser.number_of_arguments() == 0 && !parser.option("train") && !parser.option("generate"))
         {
             parser.print_options();
             cout << "\nExample usage:\n"
@@ -894,17 +745,13 @@ int main(int argc, char** argv)
             return 0;
         }
 
-        // Validate and resolve architecture
         const std::string arch = get_option(parser, "arch", std::string("moe"));
-
         if (arch != "moe" && arch != "hrm") {
-            cerr << "Error: unknown architecture '" << arch
-                << "'. Valid choices: moe, gqa, hrm\n";
+            cerr << "Error: unknown architecture '" << arch << "'. Valid choices: moe, hrm\n";
             return 1;
         }
         cout << "Architecture: " << arch << "\n";
 
-        // Hyperparameters
         const double learning_rate = get_option(parser, "learning-rate", 2e-4);
         const size_t batch_size = get_option(parser, "batch-size", 64);
         const long patience = get_option(parser, "patience", 8000);
@@ -914,16 +761,11 @@ int main(int argc, char** argv)
         const double beta2 = get_option(parser, "beta2", 0.997);
         const std::string tokenizer_file = get_option(parser, "tokenizer-file", "dlib_lm_tokenizer.vocab");
 
-        // Model file: auto-named per arch to prevent cross-arch checkpoint loading.
-        // Can be overridden explicitly with --model-file.
         const std::string model_file = parser.option("model-file")
             ? parser.option("model-file").argument()
             : "dlib_lm_" + arch + "_model.dat";
-
         cout << "Model file : " << model_file << "\n\n";
 
-        // Model architecture parameters (constexpr: required at dispatch call site
-        // because they are template arguments resolved at compile time)
         constexpr long num_tokens = 2000;
         constexpr long num_layers = 4;
         constexpr long num_heads = 6;
@@ -932,16 +774,12 @@ int main(int argc, char** argv)
         constexpr long num_experts = 4;
         constexpr long top_k = 0;
 
-        // Load internal training datasets
         cout << "Loading internal training datasets...\n";
         std::vector<dataset_id> text_datasets = {
-            dataset_id::BLACK_HOLE_ARTICLE,
-            dataset_id::PHYSICS_PARAGRAPHS,
-            dataset_id::GENERAL_KNOWLEDGE
+            dataset_id::BLACK_HOLE_ARTICLE, dataset_id::PHYSICS_PARAGRAPHS, dataset_id::GENERAL_KNOWLEDGE
         };
         auto text_segments = get_dataset_as_segments(text_datasets);
 
-        // Load external data if provided
         std::string external_corpus_for_tokenizer;
         if (parser.option("external-data")) {
             std::string external_path = parser.option("external-data").argument();
@@ -949,61 +787,44 @@ int main(int argc, char** argv)
 
             if (!external_text.empty()) {
                 external_corpus_for_tokenizer = external_text;
-
                 cout << "Parsing external data into segments...\n";
                 auto external_segments = parse_delimited_segments(external_text);
                 cout << "Parsed " << external_segments.size() << " external segments\n";
-
                 if (!external_segments.empty()) {
                     size_t original_count = text_segments.size();
-                    text_segments.insert(text_segments.end(),
-                        external_segments.begin(), external_segments.end());
-                    cout << "Training segments: " << original_count
-                        << " (internal) + " << external_segments.size()
-                        << " (external) = " << text_segments.size() << " (total)\n";
+                    text_segments.insert(text_segments.end(), external_segments.begin(), external_segments.end());
+                    cout << "Training segments: " << original_count << " (internal) + "
+                        << external_segments.size() << " (external) = " << text_segments.size() << " (total)\n";
                 }
             }
             else {
-                cerr << "Warning: No valid external data loaded, "
-                    << "continuing with internal datasets only\n";
+                cerr << "Warning: No valid external data loaded, continuing with internal datasets only\n";
             }
         }
 
-        // Load pre-trained tokenizer if available
         bpe_tokenizer tokenizer;
         if (file_exists(tokenizer_file)) {
             cout << "Loading pre-trained tokenizer from: " << tokenizer_file << "\n";
             deserialize(tokenizer_file) >> tokenizer;
-            cout << "Tokenizer loaded - vocabulary size: "
-                << tokenizer.get_vocab_size() << "\n";
+            cout << "Tokenizer loaded - vocabulary size: " << tokenizer.get_vocab_size() << "\n";
         }
 
         std::vector<int> gpus{ 0 };
 
-        // Dispatch to the concrete network type
         if (arch == "moe") {
             using selected = gqa_moe_transformer_config<
-                num_tokens, num_layers, num_heads, num_kv_heads,
-                embedding_dim, num_experts, top_k>;
+                num_tokens, num_layers, num_heads, num_kv_heads, embedding_dim, num_experts, top_k>;
             return run_pipeline<selected>(
                 parser.option("train"), parser.option("generate"),
-                learning_rate, batch_size, patience, max_epochs,
-                weight_decay, beta1, beta2,
-                model_file, tokenizer_file,
-                text_segments, external_corpus_for_tokenizer,
-                tokenizer, gpus);
+                learning_rate, batch_size, patience, max_epochs, weight_decay, beta1, beta2,
+                model_file, tokenizer_file, text_segments, external_corpus_for_tokenizer, tokenizer, gpus);
         }
         else if (arch == "hrm") {
-            using selected = hrm_transformer_config<
-                num_tokens, num_layers / 2, num_layers,
-                num_heads, embedding_dim, 2, 2>;
+            using selected = hrm_transformer_config<num_tokens, num_layers, num_layers, num_heads, embedding_dim, 1, 2>;
             return run_pipeline<selected>(
                 parser.option("train"), parser.option("generate"),
-                learning_rate, batch_size, patience, max_epochs,
-                weight_decay, beta1, beta2,
-                model_file, tokenizer_file,
-                text_segments, external_corpus_for_tokenizer,
-                tokenizer, gpus);
+                learning_rate, batch_size, patience, max_epochs, weight_decay, beta1, beta2,
+                model_file, tokenizer_file, text_segments, external_corpus_for_tokenizer, tokenizer, gpus);
         }
     }
     catch (exception& e)
