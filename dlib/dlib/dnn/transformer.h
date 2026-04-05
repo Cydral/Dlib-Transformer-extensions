@@ -560,19 +560,20 @@ namespace dlib
 
     // ----------------------------------------------------------------------------------------
 
-    // HIERARCHICAL REASONING MODEL (HRM)
-    //
-    // Implements the dual-recurrent architecture from:
-    //   Wang et al., "Hierarchical Reasoning Model", arXiv:2506.21734
-    //
-    // Architecture:
-    //   - H-module (high-level): slow cycles for abstract planning (N updates)
-    //   - L-module (low-level): fast iterations for detailed computation (T per H-cycle)
-    //   - Total recurrent depth: N * T steps
-    //   - 1-step gradient approximation for O(1) memory training
-    //
-    // Gradient path (1-step approximation):
-    //   loss -> output -> final H-module -> final L-module -> input embedding  
+    /* HIERARCHICAL REASONING MODEL(HRM)
+     *
+     * Implements the dual-recurrent architecture from:
+     *   Wang et al., "Hierarchical Reasoning Model", arXiv:2506.21734
+     *
+     * Architecture:
+     *   - H-module (high-level): slow cycles for abstract planning (N updates)
+     *   - L-module (low-level): fast iterations for detailed computation (T per H-cycle)
+     *   - Total recurrent depth: N * T steps
+     *   - 1-step gradient approximation for O(1) memory training
+     *
+     * Gradient path (1-step approximation):
+     *   loss -> output -> final H-module -> final L-module -> input embedding
+     */
      
     template<
         typename H_NET,
@@ -632,18 +633,19 @@ namespace dlib
             init_hidden_states();
         }
 
-        // FORWARD: Hierarchical recurrence with 1-step gradient approximation
-        //
-        // From the paper (Section 2, Figure 4):
-        //   z_H, z_L = z_init
-        //   for _i in range(N*T - 1):        # no gradient
-        //     z_L = f_L(z_L + z_H + x)
-        //     if (_i+1) % T == 0:
-        //       z_H = f_H(z_H + z_L)
-        //   # 1-step grad (final L then final H)
-        //   z_L = f_L(z_L + z_H + x)
-        //   z_H = f_H(z_H + z_L)
-        //   output = z_H
+        /* FORWARD: Hierarchical recurrence with 1 - step gradient approximation
+         *
+         * From the paper (Section 2, Figure 4):
+         *   z_H, z_L = z_init
+         *   for _i in range(N*T - 1):  # no gradient
+         *     z_L = f_L(z_L + z_H + x)
+         *     if (_i+1) % T == 0:
+         *       z_H = f_H(z_H + z_L)
+         *   # 1-step grad (final L then final H)
+         *   z_L = f_L(z_L + z_H + x)
+         *   z_H = f_H(z_H + z_L)
+         *   output = z_H
+         */
         template <typename SUBNET>
         void forward(const SUBNET& sub, resizable_tensor& output)
         {
@@ -730,13 +732,14 @@ namespace dlib
             tt::copy_tensor(false, output, 0, h_final, 0, h_final.k());
         }
 
-        // BACKWARD: 1-step gradient approximation
-        //
-        // Gradient path:
-        //   dL/d(output) = gradient_input
-        //     -> backprop through H: dL/d(last_h_input) = h_net.get_final_data_gradient()
-        //     -> backprop through L: dL/d(last_l_input) = l_net.get_final_data_gradient()
-        //     -> propagate to input x (component of last_l_input)
+        /* BACKWARD: 1 - step gradient approximation
+         *v
+         * Gradient path:
+         *   dL/d(output) = gradient_input
+         *     -> backprop through H: dL/d(last_h_input) = h_net.get_final_data_gradient()
+         *     -> backprop through L: dL/d(last_l_input) = l_net.get_final_data_gradient()
+         *     -> propagate to input x (component of last_l_input)
+         */
         template <typename SUBNET>
         void backward(const tensor& gradient_input, SUBNET& sub, tensor& /*params_grad*/)
         {
@@ -749,7 +752,6 @@ namespace dlib
             // grad_from_h flows to z_L_final (component of last_h_input = z_H + z_L_final)
             // Requires: l_net.forward(last_l_input) was called just before h_net.forward()
             l_net.back_propagate_error(last_l_input, grad_from_h);
-            // FIX: get_final_data_gradient() is the gradient w.r.t. last_l_input
             const tensor& grad_from_l = l_net.get_final_data_gradient();
 
             // Step 3: propagate gradient to input x
@@ -949,7 +951,7 @@ namespace dlib
         resizable_tensor last_h_input;
         resizable_tensor last_l_input;
 
-        resizable_tensor params;  // Empty: no direct trainable parameters
+        resizable_tensor params;  // Unused
     };
 
     template<typename H_NET, typename L_NET, int N, int T, typename SUBNET>
@@ -957,37 +959,27 @@ namespace dlib
 
     // ----------------------------------------------------------------------------------------
 
-    // MIXTURE OF EXPERTS (MoE) LAYER WITH INTERNAL GATE
-    //
-    // Implements sparse conditional computation via per-sample expert routing.
-    // Each input sample is independently routed to top-k experts based on a learned
-    // gating function, enabling increased model capacity without proportional FLOPs.
-    //
-    // Architecture (Switch Transformer / ST-MoE inspired):
-    //   - Internal gate network produces routing logits from pooled input
-    //   - Softmax with exploration noise selects top-k experts per sample
-    //   - Capacity factor limits per-expert load, overflow goes to next-best expert
-    //   - Expert outputs are weighted by renormalized gate probabilities
-    //
-    // Gate gradient combines three signals:
-    //   - Task gradient: dL/dP_selected via differentiable softmax weight (output = w * expert(x))
-    //   - Load balance loss: alpha * N * sum(f_e * P_bar_e), Switch Transformer formulation
-    //   - Router z-loss: penalizes large logits for numerical stability (ST-MoE)
-    //
-    // Gradient flow:
-    //   Main network <- weighted expert data gradients only
-    //   Gate params  <- task + load-balance + z-loss gradients (internal solver update)
-    //   Gate data gradient is NOT propagated to sub.get_gradient_input()
-    //
-    // IMPORTANT: GATE_NET and EXPERT_NET definitions must use tag10<input_tensor>
-    // (not raw input_tensor) as their base layer. This is required because input_tensor
-    // is an input-layer type whose forward() needs sample_expansion_factor initialization
-    // via to_tensor(), which is never called for internally managed sub-networks.
-    // Wrapping in tag10<> yields an add_tag_layer that bypasses this requirement.
-    //
-    // Example definitions:
-    //   using gate = fc<N, leaky_relu<fc<N*8, avg_pool_everything<tag10<input_tensor>>>>>;
-    //   using expert = swiglu<d_model, 8, 3, tag10<input_tensor>>;
+    /* MIXTURE OF EXPERTS(MoE) LAYER WITH INTERNAL GATE
+     *
+     * Implements sparse conditional computation via per-sample expert routing.
+     * Each input sample is independently routed to top-k experts based on a learned
+     * gating function, enabling increased model capacity without proportional FLOPs.
+     *
+     * Architecture (Switch Transformer / ST-MoE inspired):
+     *   - Internal gate network produces routing logits from pooled input
+     *   - Softmax with exploration noise selects top-k experts per sample
+     *   - Capacity factor limits per-expert load, overflow goes to next-best expert
+     *   - Expert outputs are weighted by renormalized gate probabilities
+     *
+     * Gate gradient combines three signals:
+     *   - Task gradient: dL/dP via differentiable softmax weight (output = w * expert(x))
+     *   - Load balance loss: alpha * N * sum(f_e * P_bar_e), Switch Transformer formulation
+     *   - Router z-loss: penalizes large logits for numerical stability (ST-MoE)
+     *
+     * The load_balance_weight decays exponentially from its initial value toward
+     * load_balance_floor over training steps. This provides strong balancing pressure
+     * early on (preventing expert collapse), then relaxes to allow specialization.
+     */
 
     struct training_mode_tag {};
     struct inference_mode_tag {};
@@ -1014,6 +1006,8 @@ namespace dlib
             capacity_factor(1.5f),
             usage_update_rate(0.05f),
             load_balance_weight(0.1f),
+            load_balance_floor_(0.01f),
+            load_balance_decay_(0.9999f),
             z_loss_weight(0.001f),
             learning_rate_multiplier(1.0),
             current_learning_rate_(1e-4),
@@ -1035,6 +1029,8 @@ namespace dlib
             capacity_factor(other.capacity_factor),
             usage_update_rate(other.usage_update_rate),
             load_balance_weight(other.load_balance_weight),
+            load_balance_floor_(other.load_balance_floor_),
+            load_balance_decay_(other.load_balance_decay_),
             z_loss_weight(other.z_loss_weight),
             learning_rate_multiplier(other.learning_rate_multiplier),
             current_learning_rate_(other.current_learning_rate_),
@@ -1057,6 +1053,8 @@ namespace dlib
                 capacity_factor = other.capacity_factor;
                 usage_update_rate = other.usage_update_rate;
                 load_balance_weight = other.load_balance_weight;
+                load_balance_floor_ = other.load_balance_floor_;
+                load_balance_decay_ = other.load_balance_decay_;
                 z_loss_weight = other.z_loss_weight;
                 learning_rate_multiplier = other.learning_rate_multiplier;
                 current_learning_rate_ = other.current_learning_rate_;
@@ -1094,13 +1092,14 @@ namespace dlib
             const long nr = expert_input.nr();
             const long nc = expert_input.nc();
             const long sample_size = k * nr * nc;
-            const bool is_training = std::is_same<MODE, training_mode_tag>::value;
+            const bool is_training =
+                std::is_same<MODE, training_mode_tag>::value;
 
             // Cache input for gate and expert backward
             cached_input_.copy_size(expert_input);
             tt::copy_tensor(false, cached_input_, 0, expert_input, 0, k);
 
-            // Gate forward: raw logits -> clamped -> noise -> softmax
+            // Gate forward: raw logits
             gate_net.forward(cached_input_);
             const tensor& gate_output = gate_net.get_output();
             const float* gate_data = gate_output.host();
@@ -1108,13 +1107,12 @@ namespace dlib
             output.copy_size(expert_input);
             output = 0;
 
-            // Clamp raw logits before noise to bound the gate's learned range,
-            // then add exploration noise WITHOUT re-clamping so the noise can
-            // freely break ties and prevent routing collapse.
+            // Clamp raw logits before noise to bound the gate's learned
+            // range, then add exploration noise WITHOUT re-clamping so the
+            // noise can freely break ties and prevent routing collapse.
             const float logit_clamp = 3.0f;
             const long expert_capacity = std::max(1L,
-                static_cast<long>(std::ceil(
-                    num_samples * top_k * capacity_factor / n_experts)));
+                static_cast<long>(std::ceil( num_samples * top_k * capacity_factor / n_experts)));
 
             std::vector<std::vector<std::pair<long, float>>> expert_assignments(n_experts);
             std::vector<float> routing_fraction(n_experts, 0.0f);
@@ -1130,7 +1128,7 @@ namespace dlib
             cached_assignments_.resize(n_experts);
             for (long e = 0; e < n_experts; ++e) cached_assignments_[e].clear();
 
-            // Per-sample routing: softmax -> top-k selection with capacity overflow
+            // Per-sample routing
             for (long n = 0; n < num_samples; ++n) {
                 const float* sample_logits = gate_data + n * n_experts;
 
@@ -1145,7 +1143,8 @@ namespace dlib
                 }
 
                 // Numerically stable softmax
-                float max_logit = *std::max_element(logits.begin(), logits.end());
+                float max_logit = *std::max_element(
+                    logits.begin(), logits.end());
                 float sum_exp = 0.0f;
                 std::vector<float> probs(n_experts);
                 for (long e = 0; e < n_experts; ++e) {
@@ -1162,24 +1161,23 @@ namespace dlib
                     cached_logsumexp_[n] = std::log(sum_exp) + max_logit;
                 }
 
-                // Select top-k experts, with capacity overflow to next-best
+                // Top-k selection with capacity overflow
                 std::vector<long> sorted_indices(n_experts);
-                std::iota(sorted_indices.begin(), sorted_indices.end(), 0);
+                std::iota(sorted_indices.begin(),
+                    sorted_indices.end(), 0);
                 std::partial_sort(sorted_indices.begin(),
                     sorted_indices.begin() + top_k, sorted_indices.end(),
-                    [&probs](long a, long b) { return probs[a] > probs[b]; });
+                        [&probs](long a, long b) { return probs[a] > probs[b]; });
 
                 long selected_count = 0;
                 float selected_prob_sum = 0.0f;
                 std::vector<long> chosen;
                 std::vector<float> chosen_probs;
 
-                for (long rank = 0;
-                    rank < n_experts && selected_count < top_k; ++rank)
+                for (long rank = 0; rank < n_experts && selected_count < top_k; ++rank)
                 {
                     long e = sorted_indices[rank];
-                    if (static_cast<long>(expert_assignments[e].size())
-                        < expert_capacity)
+                    if (static_cast<long>(expert_assignments[e].size()) < expert_capacity)
                     {
                         chosen.push_back(e);
                         chosen_probs.push_back(probs[e]);
@@ -1189,7 +1187,8 @@ namespace dlib
                 }
 
                 // Renormalize selected weights to sum to 1
-                for (long i = 0; i < static_cast<long>(chosen.size()); ++i) {
+                for (long i = 0; i < static_cast<long>(chosen.size()); ++i)
+                {
                     float w = (selected_prob_sum > 0)
                         ? chosen_probs[i] / selected_prob_sum : 1.0f;
                     expert_assignments[chosen[i]].emplace_back(n, w);
@@ -1200,7 +1199,7 @@ namespace dlib
             for (long e = 0; e < n_experts; ++e)
                 cached_assignments_[e] = expert_assignments[e];
 
-            // Batched expert processing: gather -> forward -> weighted scatter
+            // Batched expert processing
             alias_tensor sample_alias(1, k, nr, nc);
 
             for (long e = 0; e < n_experts; ++e) {
@@ -1223,13 +1222,13 @@ namespace dlib
                 experts[e].forward(batched_input);
                 const tensor& expert_out = experts[e].get_output();
 
-                // Cache expert output for task gradient in backward
+                // Cache output for task gradient in backward
                 if (is_training) {
                     cached_expert_outputs_[e].copy_size(expert_out);
                     tt::copy_tensor(false, cached_expert_outputs_[e], 0, expert_out, 0, expert_out.k());
                 }
 
-                // Scatter weighted expert outputs: output[sample] += w * expert(x)
+                // Scatter: output[sample] += w * expert(x)
                 for (long b = 0; b < batch_count; ++b) {
                     float w = assignments[b].second;
                     auto out_s = sample_alias(output, assignments[b].first * sample_size);
@@ -1238,9 +1237,10 @@ namespace dlib
                 }
             }
 
-            // Usage statistics and load balance loss (training only)
+            // Usage statistics and load balance loss
             if (is_training) {
-                for (long e = 0; e < n_experts; ++e) routing_fraction[e] /= (num_samples * top_k);
+                for (long e = 0; e < n_experts; ++e)
+                    routing_fraction[e] /= (num_samples * top_k);
                 cached_routing_fraction_ = routing_fraction;
 
                 load_balance_loss_ = 0.0f;
@@ -1252,16 +1252,14 @@ namespace dlib
 
                 if (usage_update_rate > 0) {
                     for (long e = 0; e < n_experts; ++e) {
-                        float frac = static_cast<float>(expert_assignments[e].size())
-                            / (num_samples * top_k);
-                        expert_usage[e] = (1.0f - usage_update_rate)
-                            * expert_usage[e] + usage_update_rate * frac;
+                        float frac = static_cast<float>(expert_assignments[e].size()) / (num_samples * top_k);
+                        expert_usage[e] = (1.0f - usage_update_rate) * expert_usage[e] + usage_update_rate * frac;
                     }
                 }
             }
         }
 
-        // Backward: expert backprop, gate gradient, internal parameter update
+        // Backward: expert backprop, gate gradient, parameter update
         template <typename SUBNET>
         void backward(const tensor& gradient_input, SUBNET& sub, tensor& /*params_grad*/)
         {
@@ -1271,28 +1269,26 @@ namespace dlib
             const long nr = gradient_input.nr();
             const long nc = gradient_input.nc();
             const long sample_size = k * nr * nc;
-            const bool is_training =
-                std::is_same<MODE, training_mode_tag>::value;
-            const float inv_sqrt_dim =
-                1.0f / std::sqrt(static_cast<float>(sample_size));
+            const bool is_training = std::is_same<MODE, training_mode_tag>::value;
+            const float inv_sqrt_dim = 1.0f / std::sqrt(static_cast<float>(sample_size));
 
             alias_tensor sample_alias(1, k, nr, nc);
 
-            // Task scores for gate gradient: dL/dP_selected per sample per expert
+            // Task scores for gate gradient
             std::vector<std::vector<float>> task_scores;
             if (is_training && learning_rate_multiplier > 0) {
                 task_scores.resize(num_samples);
-                for (long n = 0; n < num_samples; ++n) task_scores[n].assign(n_experts, 0.0f);
+                for (long n = 0; n < num_samples; ++n)
+                    task_scores[n].assign(n_experts, 0.0f);
             }
 
             // Phase 1: batched backward through each active expert
             for (long e = 0; e < n_experts; ++e) {
                 const auto& assignments = cached_assignments_[e];
                 if (assignments.empty()) continue;
-                const long batch_count =
-                    static_cast<long>(assignments.size());
+                const long batch_count = static_cast<long>(assignments.size());
 
-                // Gather weighted gradient for this expert's samples
+                // Gather weighted gradient
                 resizable_tensor batched_grad;
                 batched_grad.set_size(batch_count, k, nr, nc);
                 for (long b = 0; b < batch_count; ++b) {
@@ -1302,26 +1298,24 @@ namespace dlib
                     for (long j = 0; j < sample_size; ++j) dst[j] = src[j] * w;
                 }
 
-                // Expert backward: computes parameter + data gradients
+                // Expert backward
                 experts[e].back_propagate_error(cached_expert_inputs_[e], batched_grad);
                 const tensor& expert_data_grad = experts[e].get_final_data_gradient();
 
-                // Scatter expert data gradient back to main network
+                // Scatter data gradient to main network
                 for (long b = 0; b < batch_count; ++b) {
                     auto in_g = sample_alias(input_grad, assignments[b].first * sample_size);
                     auto ex_g = sample_alias(expert_data_grad, b * sample_size);
                     tt::add(1, in_g, 1, ex_g);
                 }
 
-                // Compute task score: dL/dP_e = dot(expert_out, task_grad)
-                // Normalized by 1/sqrt(dim) and clamped for stability
+                // Task score: dot(expert_out, task_grad) / sqrt(dim)
                 if (is_training && learning_rate_multiplier > 0) {
-                    const tensor& expert_out = cached_expert_outputs_[e];
+                    const tensor& expert_out =
+                        cached_expert_outputs_[e];
                     for (long b = 0; b < batch_count; ++b) {
-                        const float* grad_ptr = gradient_input.host()
-                            + assignments[b].first * sample_size;
-                        const float* out_ptr = expert_out.host()
-                            + b * sample_size;
+                        const float* grad_ptr = gradient_input.host() + assignments[b].first * sample_size;
+                        const float* out_ptr = expert_out.host() + b * sample_size;
                         float score = 0.0f;
                         for (long j = 0; j < sample_size; ++j)
                             score += grad_ptr[j] * out_ptr[j];
@@ -1333,8 +1327,7 @@ namespace dlib
             }
 
             // Phase 2: gate gradient and parameter updates
-            const bool do_update = is_training &&
-                (!network_context::is_active() || network_context::is_training());
+            const bool do_update = is_training && (!network_context::is_active() || network_context::is_training());
 
             if (do_update && learning_rate_multiplier > 0) {
                 const tensor& gate_output = gate_net.get_output();
@@ -1345,7 +1338,6 @@ namespace dlib
                 const float inv_batch = 1.0f / static_cast<float>(num_samples);
 
                 // Part A: task gradient through softmax Jacobian
-                // dL/dz_j = P_j * (score_j - sum_e(P_e * score_e))
                 for (long n = 0; n < num_samples; ++n) {
                     const auto& probs = cached_gate_probs_[n];
                     const auto& scores = task_scores[n];
@@ -1355,53 +1347,46 @@ namespace dlib
                         weighted_score_sum += probs[e] * scores[e];
 
                     for (long e = 0; e < n_experts; ++e)
-                        glg[n * n_experts + e] +=
-                        probs[e] * (scores[e] - weighted_score_sum);
+                        glg[n * n_experts + e] += probs[e] * (scores[e] - weighted_score_sum);
                 }
 
-                // Part B: load balance gradient (Switch Transformer)
+                // Part B: load balance gradient
                 if (load_balance_weight > 0) {
                     for (long n = 0; n < num_samples; ++n) {
                         const auto& probs = cached_gate_probs_[n];
                         float sum_wp = 0.0f;
                         for (long e = 0; e < n_experts; ++e) {
-                            float w_e = load_balance_weight * n_experts
-                                * cached_routing_fraction_[e];
+                            float w_e = load_balance_weight * n_experts * cached_routing_fraction_[e];
                             sum_wp += w_e * probs[e];
                         }
                         for (long e = 0; e < n_experts; ++e) {
-                            float w_e = load_balance_weight * n_experts
-                                * cached_routing_fraction_[e];
-                            glg[n * n_experts + e] +=
-                                probs[e] * (w_e - sum_wp) * inv_batch;
+                            float w_e = load_balance_weight * n_experts * cached_routing_fraction_[e];
+                            glg[n * n_experts + e] += probs[e] * (w_e - sum_wp) * inv_batch;
                         }
                     }
                 }
 
                 // Part C: router z-loss gradient (ST-MoE)
-                // Penalizes large logits to prevent softmax saturation
                 if (z_loss_weight > 0) {
                     for (long n = 0; n < num_samples; ++n) {
                         const auto& probs = cached_gate_probs_[n];
                         float lse = cached_logsumexp_[n];
                         for (long e = 0; e < n_experts; ++e)
-                            glg[n * n_experts + e] += 2.0f * z_loss_weight * lse
-                                * probs[e] * inv_batch;
+                            glg[n * n_experts + e] += 2.0f * z_loss_weight * lse * probs[e] * inv_batch;
                     }
                 }
 
-                // Safety clamp on gate gradient
+                // Safety clamp
                 const float grad_clamp = 1.0f;
                 long total_elems = num_samples * n_experts;
                 for (long i = 0; i < total_elems; ++i)
                     glg[i] = std::max(-grad_clamp, std::min(grad_clamp, glg[i]));
 
-                // Gate backward for parameter gradients only
-                // (data gradient NOT propagated to main network)
+                // Gate backward (data gradient NOT propagated)
                 gate_net.back_propagate_error(cached_input_, gate_grad);
             }
 
-            // Phase 3: update expert and gate parameters via internal solvers
+            // Phase 3: update parameters + decay lb weight
             if (do_update) update_subnet_parameters();
         }
 
@@ -1421,7 +1406,10 @@ namespace dlib
                 set_all_learning_rates(expert, lr);
             set_all_learning_rates(gate_net, lr);
         }
-        double get_learning_rate() const { return current_learning_rate_; }
+        double get_learning_rate() const
+        {
+            return current_learning_rate_;
+        }
 
         void set_learning_rate_multiplier(double val)
         {
@@ -1444,6 +1432,7 @@ namespace dlib
             solvers_initialized_ = false;
         }
 
+        // Total parameters across all experts + gate (training footprint)
         size_t internal_parameters() const
         {
             size_t total = count_parameters(gate_net);
@@ -1453,6 +1442,7 @@ namespace dlib
             return total;
         }
 
+        // Parameters active during a single inference pass (top-k experts + gate)
         size_t active_parameters() const
         {
             size_t total = count_parameters(gate_net);
@@ -1484,7 +1474,18 @@ namespace dlib
         {
             return expert_usage;
         }
-        float get_load_balance_loss() const { return load_balance_loss_; }
+        float get_load_balance_loss() const
+        {
+            return load_balance_loss_;
+        }
+        float get_load_balance_weight() const
+        {
+            return load_balance_weight;
+        }
+
+        // -------------------------------------------------------------------
+        // Serialization
+        // -------------------------------------------------------------------
 
         friend void serialize(const moe_& item, std::ostream& out)
         {
@@ -1495,6 +1496,8 @@ namespace dlib
             serialize(item.capacity_factor, out);
             serialize(item.usage_update_rate, out);
             serialize(item.load_balance_weight, out);
+            serialize(item.load_balance_floor_, out);
+            serialize(item.load_balance_decay_, out);
             serialize(item.z_loss_weight, out);
             serialize(item.learning_rate_multiplier, out);
             serialize(item.current_learning_rate_, out);
@@ -1520,6 +1523,8 @@ namespace dlib
             deserialize(item.capacity_factor, in);
             deserialize(item.usage_update_rate, in);
             deserialize(item.load_balance_weight, in);
+            deserialize(item.load_balance_floor_, in);
+            deserialize(item.load_balance_decay_, in);
             deserialize(item.z_loss_weight, in);
             deserialize(item.learning_rate_multiplier, in);
             deserialize(item.current_learning_rate_, in);
@@ -1534,7 +1539,8 @@ namespace dlib
             item.cached_expert_outputs_.clear();
         }
 
-        friend std::ostream& operator<<(std::ostream& out, const moe_& item)
+        friend std::ostream& operator<<(
+            std::ostream& out, const moe_& item)
         {
             const bool training =
                 std::is_same<MODE, training_mode_tag>::value;
@@ -1545,6 +1551,7 @@ namespace dlib
                 << ", noise=" << item.noise_scale
                 << ", cf=" << item.capacity_factor
                 << ", lb=" << item.load_balance_weight
+                << "/" << item.load_balance_floor_
                 << ", z=" << item.z_loss_weight
                 << ") learning_rate_mult="
                 << item.learning_rate_multiplier;
@@ -1559,10 +1566,16 @@ namespace dlib
                 << " num_experts='" << item.n_experts << "'"
                 << " top_k='" << item.top_k << "'"
                 << " noise_scale='" << item.noise_scale << "'"
-                << " capacity_factor='" << item.capacity_factor << "'"
+                << " capacity_factor='"
+                << item.capacity_factor << "'"
                 << " load_balance_weight='"
                 << item.load_balance_weight << "'"
-                << " z_loss_weight='" << item.z_loss_weight << "'"
+                << " load_balance_floor='"
+                << item.load_balance_floor_ << "'"
+                << " load_balance_decay='"
+                << item.load_balance_decay_ << "'"
+                << " z_loss_weight='"
+                << item.z_loss_weight << "'"
                 << " learning_rate_mult='"
                 << item.learning_rate_multiplier << "'"
                 << " mode='"
@@ -1588,48 +1601,47 @@ namespace dlib
     private:
 
         template<typename NET>
-        auto clean_subnet(NET& net) -> decltype(net.clean(), void()) { net.clean(); }
+        auto clean_subnet(NET& net)
+            -> decltype(net.clean(), void()) {
+            net.clean();
+        }
         template<typename NET>
         void clean_subnet(...) {}
 
         void update_subnet_parameters()
         {
             if (network_context::is_active())
-                current_learning_rate_ =
-                network_context::get_learning_rate();
+                current_learning_rate_ = network_context::get_learning_rate();
             if (learning_rate_multiplier == 0.0) return;
 
-            const double effective_lr =
-                current_learning_rate_ * learning_rate_multiplier;
+            const double effective_lr = current_learning_rate_ * learning_rate_multiplier;
 
             if (!solvers_initialized_) {
                 const double wd = network_context::is_active()
-                    ? network_context::get_optimizer_weight_decay()
-                    : solver_weight_decay_;
+                    ? network_context::get_optimizer_weight_decay() : solver_weight_decay_;
                 const double b1 = network_context::is_active()
-                    ? network_context::get_optimizer_beta1()
-                    : solver_beta1_;
+                    ? network_context::get_optimizer_beta1() : solver_beta1_;
                 const double b2 = network_context::is_active()
-                    ? network_context::get_optimizer_beta2()
-                    : solver_beta2_;
+                    ? network_context::get_optimizer_beta2() : solver_beta2_;
                 expert_solvers_.resize(n_experts);
                 for (long e = 0; e < n_experts; ++e)
-                    expert_solvers_[e].assign(
-                        experts[e].num_computational_layers,
-                        adamw(wd, b1, b2));
-                gate_solvers_.assign(
-                    gate_net.num_computational_layers,
-                    adamw(wd, b1, b2));
+                    expert_solvers_[e].assign(experts[e].num_computational_layers, adamw(wd, b1, b2));
+                gate_solvers_.assign(gate_net.num_computational_layers, adamw(wd, b1, b2));
                 solvers_initialized_ = true;
             }
 
-            // Update only experts that were active in this batch
+            // Update only experts active in this batch
             for (long e = 0; e < n_experts; ++e)
                 if (!cached_assignments_[e].empty())
-                    experts[e].update_parameters(
-                        expert_solvers_[e], effective_lr);
+                    experts[e].update_parameters(expert_solvers_[e], effective_lr);
 
             gate_net.update_parameters(gate_solvers_, effective_lr);
+
+            // Exponential decay of load balance weight toward floor
+            // (strong balancing early, then relax for specialization)
+            if (load_balance_weight > load_balance_floor_)
+                load_balance_weight = std::max(load_balance_floor_,
+                    load_balance_weight * load_balance_decay_);
         }
 
         // Internal sub-networks
@@ -1643,6 +1655,8 @@ namespace dlib
         float capacity_factor;
         float usage_update_rate;
         float load_balance_weight;
+        float load_balance_floor_;
+        float load_balance_decay_;
         float z_loss_weight;
         double learning_rate_multiplier;
         double current_learning_rate_;
@@ -1655,7 +1669,7 @@ namespace dlib
         std::vector<resizable_tensor> cached_expert_inputs_;
         std::vector<resizable_tensor> cached_expert_outputs_;
 
-        // Internal AdamW solvers (independent from the main trainer)
+        // Internal AdamW solvers
         std::vector<std::vector<adamw>> expert_solvers_;
         std::vector<adamw> gate_solvers_;
         bool solvers_initialized_;
@@ -1664,14 +1678,15 @@ namespace dlib
         double solver_beta2_ = 0.999;
 
         // Forward/backward routing state
-        std::vector<std::vector<std::pair<long, float>>> cached_assignments_;
+        std::vector<std::vector<std::pair<long, float>>>
+            cached_assignments_;
         std::vector<std::vector<float>> cached_gate_probs_;
         std::vector<float> cached_logsumexp_;
         std::vector<float> cached_routing_fraction_;
         long cached_batch_size_;
         float load_balance_loss_;
 
-        resizable_tensor params;
+        resizable_tensor params;    // Unused
     };
 
     template<
@@ -1682,8 +1697,7 @@ namespace dlib
         typename MODE,
         typename SUBNET
     >
-    using moe = add_layer<
-        moe_<EXPERT_NET, GATE_NET, n_experts_, top_e, MODE>, SUBNET>;
+    using moe = add_layer<moe_<EXPERT_NET, GATE_NET, n_experts_, top_e, MODE>, SUBNET>;
 }
 
 #endif // DLIB_DNN_TRANSFORMER_H_

@@ -429,7 +429,8 @@ int run_pipeline(
         network_context::set_optimizer_params(weight_decay, beta1, beta2);
 
         cout << net << "\n\n";
-        cout << "Number of model parameters: " << count_parameters(net) << "\n";
+        //cout << "Total number of model parameters: " << count_total_parameters(net) << "\n";
+        //cout << "Total number of active parameters: " << count_active_parameters(net) << "\n";
 
         // Create trainer with reduce-on-plateau learning rate control
         dnn_trainer<train_net_type, adamw> trainer(net, adamw(weight_decay, beta1, beta2), gpus);
