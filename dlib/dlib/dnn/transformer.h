@@ -1084,9 +1084,7 @@ namespace dlib
             }
         }
 
-        // -------------------------------------------------------------------
         // Forward: gate routing, batched expert processing, weighted scatter
-        // -------------------------------------------------------------------
         template <typename SUBNET>
         void forward(const SUBNET& sub, resizable_tensor& output)
         {
@@ -1490,7 +1488,7 @@ namespace dlib
 
         friend void serialize(const moe_& item, std::ostream& out)
         {
-            serialize("moe", out);
+            serialize("moe_", out);
             serialize(item.n_experts, out);
             serialize(item.top_k, out);
             serialize(item.noise_scale, out);
