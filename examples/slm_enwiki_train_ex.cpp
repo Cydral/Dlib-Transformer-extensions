@@ -560,23 +560,23 @@ int main(int argc, char** argv)
 
         // Default values
         const double learning_rate = get_option(parser, "learning-rate", 2e-4);
-        const size_t batch_size = get_option(parser, "batch-size", 64);
-        const long patience = get_option(parser, "patience", 15000);
-        const size_t max_epochs = get_option(parser, "max-epochs", 500);
+        const size_t batch_size = get_option(parser, "batch-size", 32);
+        const long patience = get_option(parser, "patience", 5000);
+        const size_t max_epochs = get_option(parser, "max-epochs", 300);
         const double alpha = get_option(parser, "alpha", 0.004);
         const double beta1 = get_option(parser, "beta1", 0.9);
         const double beta2 = get_option(parser, "beta2", 0.999);
         const std::string model_file = get_option(parser, "model-file", "dlib_slm_enwiki_model.dat");
         const std::string output_file = get_option(parser, "output-file", "enwiki_generated.txt");
         const std::string enwiki_path = get_option(parser, "enwiki", "enwiki.txt");
-        const long max_seq_len = 80;
+        const long max_seq_len = 100;
         const long num_layers = 4;
         const long num_heads = 6;
         const long embedding_dim = 228;
         const std::string tokenizer_path = get_option(parser, "tokenizer", "enwiki_tokenizer.vocab");
         // Default number of prompt tokens = input sequence length
         const bool force_tokenize = parser.option("force-tokenize");
-        const long num_tokens = 8000;
+        const long num_tokens = 2000;
 
         // Calculate max bytes to process
         size_t max_bytes = 0, max_tokens = 0;

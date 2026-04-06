@@ -165,7 +165,7 @@ int main(int argc, char** argv)
         parser.add_option("max-epochs", "Maximum number of training epochs (default: 500)", 1);
         parser.add_option("alpha", "Set the weight decay for AdamW (default: 0.004)", 1);
         parser.add_option("beta1", "Set AdamW's first moment coefficient (default: 0.9)", 1);
-        parser.add_option("beta2", "Set AdamW's second moment coefficient (default: 0.999)", 1);
+        parser.add_option("beta2", "Set AdamW's second moment coefficient (default: 0.997)", 1);
         parser.add_option("model-file", "Path for model (default: dlib_lm_tokens_gqa_model.dat)", 1);
         parser.add_option("tokenizer-file", "Path for tokenizer (default: dlib_lm_tokenizer.vocab)", 1);
         parser.add_option("output-file", "Path for generated output (default: generated_text.txt)", 1);
@@ -350,7 +350,7 @@ int main(int argc, char** argv)
             cout << "Created " << samples.size() << " training samples\n";
 
             // Build and train the network
-            using net_type = my_transformer::network_type;
+            using net_type = my_transformer::network_type<true>;
             net_type net;            
             layer<0>(net).loss_details().set_ignore_index(pad_token);
             cout << my_transformer::model_info::describe() << endl;
@@ -439,7 +439,7 @@ int main(int argc, char** argv)
             {
                 if (!signal_handler::is_triggered()) {
                     cout << "Evaluating model accuracy...\n";
-                    my_transformer::network_type g_infer;
+                    my_transformer::network_type<false> g_infer;
                     deserialize(model_file) >> g_infer >> tokenizer;
 
                     // Feed padding context for consistency with training
@@ -471,7 +471,7 @@ int main(int argc, char** argv)
             cout << "=== GENERATION MODE ===\n";
 
             // Load the model
-            my_transformer::network_type net;
+            my_transformer::network_type<false> net;
             if (file_exists(model_file)) {
                 deserialize(model_file) >> net >> tokenizer;
                 cout << "Loaded model from " << model_file << "\n";
