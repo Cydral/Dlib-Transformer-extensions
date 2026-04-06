@@ -538,6 +538,20 @@ namespace dlib
 
     // -----------------------------------------------------------------------------------
 
+        void repeat_channels(
+            tensor& dest,
+            const tensor& src,
+            long repeat_factor
+        );
+
+        void accumulate_repeated_channels(
+            tensor& dest,
+            const tensor& src,
+            long repeat_factor
+        );
+
+    // -----------------------------------------------------------------------------------
+
         void compute_halt_logits(
             tensor& logits,
             tensor& halt_probs,

@@ -578,6 +578,20 @@ namespace dlib
             bool scale
         );
 
+    // -----------------------------------------------------------------------------------
+
+        void repeat_channels(
+            tensor& dest,
+            const tensor& src,
+            long repeat_factor
+        );
+
+        void accumulate_repeated_channels(
+            tensor& dest,
+            const tensor& src,
+            long repeat_factor
+        );
+
     // ----------------------------------------------------------------------------------------
 
         void copy_tensor(

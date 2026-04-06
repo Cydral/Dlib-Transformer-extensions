@@ -543,7 +543,7 @@ int main(int argc, char** argv)
         parser.add_option("alpha", "Set the weight decay for Adam (default: 0.004)", 1);
         parser.add_option("beta1", "Set Adam's first moment coefficient (default: 0.9)", 1);
         parser.add_option("beta2", "Set Adam's second moment coefficient (default: 0.999)", 1);
-        parser.add_option("model-file", "Path for model (default: dlib_slm_enwiki_model.dat)", 1);
+        parser.add_option("model-file", "Path for model (default: dlib_lm_enwiki_model.dat)", 1);
         parser.add_option("output-file", "Path for output (default: enwiki_generated.txt)", 1);
         parser.add_option("tokenizer", "Path to pre-trained tokenizer (default: enwiki_tokenizer.vocab)", 1);
         parser.add_option("tokens-file", "Path to pre-tokenized tokens file (optional)", 1);
@@ -566,7 +566,7 @@ int main(int argc, char** argv)
         const double alpha = get_option(parser, "alpha", 0.004);
         const double beta1 = get_option(parser, "beta1", 0.9);
         const double beta2 = get_option(parser, "beta2", 0.999);
-        const std::string model_file = get_option(parser, "model-file", "dlib_slm_enwiki_model.dat");
+        const std::string model_file = get_option(parser, "model-file", "dlib_lm_enwiki_model.dat");
         const std::string output_file = get_option(parser, "output-file", "enwiki_generated.txt");
         const std::string enwiki_path = get_option(parser, "enwiki", "enwiki.txt");
         const long max_seq_len = 100;

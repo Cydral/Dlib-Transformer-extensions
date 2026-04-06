@@ -1414,6 +1414,54 @@ namespace dlib { namespace tt
 
 // ----------------------------------------------------------------------------------------
 
+    void repeat_channels(
+        tensor& dest,
+        const tensor& src,
+        long repeat_factor
+    )
+    {
+        DLIB_CASSERT(repeat_factor >= 1);
+        DLIB_CASSERT(dest.num_samples() == src.num_samples());
+        DLIB_CASSERT(dest.k() == src.k() * repeat_factor);
+        DLIB_CASSERT(dest.nr() == src.nr() && dest.nc() == src.nc());
+
+        if (repeat_factor == 1) {
+            tt::copy_tensor(false, dest, 0, src, 0, src.k());
+            return;
+        }
+
+#ifdef DLIB_USE_CUDA
+        cuda::repeat_channels(dest, src, repeat_factor);
+#else
+        cpu::repeat_channels(dest, src, repeat_factor);
+#endif
+    }
+
+    void accumulate_repeated_channels(
+        tensor& dest,
+        const tensor& src,
+        long repeat_factor
+    )
+    {
+        DLIB_CASSERT(repeat_factor >= 1);
+        DLIB_CASSERT(dest.num_samples() == src.num_samples());
+        DLIB_CASSERT(src.k() == dest.k() * repeat_factor);
+        DLIB_CASSERT(dest.nr() == src.nr() && dest.nc() == src.nc());
+
+        if (repeat_factor == 1) {
+            tt::copy_tensor(true, dest, 0, src, 0, src.k());
+            return;
+        }
+
+#ifdef DLIB_USE_CUDA
+        cuda::accumulate_repeated_channels(dest, src, repeat_factor);
+#else
+        cpu::accumulate_repeated_channels(dest, src, repeat_factor);
+#endif
+    }
+
+// ----------------------------------------------------------------------------------------
+
     void compute_halt_logits(
         tensor& logits,
         tensor& halt_probs,

@@ -2591,6 +2591,73 @@ namespace dlib
 
     // ------------------------------------------------------------------------------------
 
+        void repeat_channels(
+            tensor& dest,
+            const tensor& src,
+            long repeat_factor
+        )
+        {
+            const long batch_size = src.num_samples();
+            const long src_k = src.k();
+            const long plane_size = src.nr() * src.nc();
+            const long src_sample_stride = src_k * plane_size;
+            const long dest_sample_stride = src_k * repeat_factor * plane_size;
+
+            const float* s = src.host();
+            float* d = dest.host();
+
+            for (long n = 0; n < batch_size; ++n)
+            {
+                const float* sample_src = s + n * src_sample_stride;
+                float* sample_dst = d + n * dest_sample_stride;
+
+                for (long c = 0; c < src_k; ++c)
+                {
+                    const float* channel_src = sample_src + c * plane_size;
+                    for (long r = 0; r < repeat_factor; ++r)
+                    {
+                        float* channel_dst = sample_dst + (c * repeat_factor + r) * plane_size;
+                        std::memcpy(channel_dst, channel_src, plane_size * sizeof(float));
+                    }
+                }
+            }
+        }
+
+        void accumulate_repeated_channels(
+            tensor& dest,
+            const tensor& src,
+            long repeat_factor
+        )
+        {
+            const long batch_size = src.num_samples();
+            const long dest_k = dest.k();
+            const long plane_size = src.nr() * src.nc();
+            const long src_sample_stride = dest_k * repeat_factor * plane_size;
+            const long dest_sample_stride = dest_k * plane_size;
+
+            const float* s = src.host();
+            float* d = dest.host();
+
+            for (long n = 0; n < batch_size; ++n)
+            {
+                const float* sample_src = s + n * src_sample_stride;
+                float* sample_dst = d + n * dest_sample_stride;
+
+                for (long c = 0; c < dest_k; ++c)
+                {
+                    float* channel_dst = sample_dst + c * plane_size;
+                    for (long r = 0; r < repeat_factor; ++r)
+                    {
+                        const float* channel_src = sample_src + (c * repeat_factor + r) * plane_size;
+                        for (long i = 0; i < plane_size; ++i)
+                            channel_dst[i] += channel_src[i];
+                    }
+                }
+            }
+        }
+
+    // ------------------------------------------------------------------------------------
+
         pooling::pooling (
         ) : window_height(0),window_width(0),stride_y(0),stride_x(0),padding_y(0),padding_x(0),do_max_pooling(true)
         {

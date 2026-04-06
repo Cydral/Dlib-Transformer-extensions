@@ -2169,6 +2169,47 @@ namespace dlib { namespace tt
 
 // ----------------------------------------------------------------------------------------
 
+    void repeat_channels(
+        tensor& dest,
+        const tensor& src,
+        long repeat_factor
+    );
+    /*!
+        requires
+            - repeat_factor >= 1
+            - dest.num_samples() == src.num_samples()
+            - dest.k() == src.k() * repeat_factor
+            - dest.nr() == src.nr()
+            - dest.nc() == src.nc()
+        ensures
+            - Replicates each channel (k dimension) of src repeat_factor times into dest.
+            - For each sample n, source channel c, and repeat index r:
+                dest(n, c * repeat_factor + r, :, :) = src(n, c, :, :)
+            - If repeat_factor == 1, equivalent to copy_tensor(false, dest, 0, src, 0, src.k())
+    !*/
+
+    void accumulate_repeated_channels(
+        tensor& dest,
+        const tensor& src,
+        long repeat_factor
+    );
+    /*!
+        requires
+            - repeat_factor >= 1
+            - dest.num_samples() == src.num_samples()
+            - src.k() == dest.k() * repeat_factor
+            - dest.nr() == src.nr()
+            - dest.nc() == src.nc()
+        ensures
+            - Accumulates (adds) groups of repeat_factor channels from src into dest.
+            - For each sample n and destination channel c:
+                dest(n, c, :, :) += sum_{r=0}^{repeat_factor-1} src(n, c * repeat_factor + r, :, :)
+            - Note: this ACCUMULATES into dest (does not zero it first).
+            - If repeat_factor == 1, equivalent to copy_tensor(true, dest, 0, src, 0, src.k())
+    !*/
+
+// ----------------------------------------------------------------------------------------
+
     class multi_device_tensor_averager
     {
         /*!

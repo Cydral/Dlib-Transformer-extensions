@@ -267,90 +267,25 @@ namespace dlib
     public:
         static_assert(repeat_factor_ >= 1, "repeat_factor must be at least 1");
 
-        explicit repeat_heads_() : repeat_factor(repeat_factor_)
-        {
-        }
+        explicit repeat_heads_() : repeat_factor(repeat_factor_) {}
 
         template <typename SUBNET>
-        void setup(const SUBNET& /*sub*/)
-        {
-            // No learnable parameters
-        }
+        void setup(const SUBNET& /*sub*/) {}
 
         template <typename SUBNET>
         void forward(const SUBNET& sub, resizable_tensor& output)
         {
             const tensor& input = sub.get_output();
-            const long batch_size = input.num_samples();
-            const long num_kv_heads = input.k();
-            const long seq_len = input.nr();
-            const long head_dim = input.nc();
-
-            output.set_size(batch_size, num_kv_heads * repeat_factor, seq_len, head_dim);
-
-            if (repeat_factor == 1)
-            {
-                tt::copy_tensor(false, output, 0, input, 0, num_kv_heads);
-                return;
-            }
-
-            const float* in_data = input.host();
-            float* out_data = output.host();
-            const long kv_head_stride = seq_len * head_dim;
-
-            for (long b = 0; b < batch_size; ++b)
-            {
-                for (long kv_h = 0; kv_h < num_kv_heads; ++kv_h)
-                {
-                    const float* src = in_data + (b * num_kv_heads + kv_h) * kv_head_stride;
-                    for (long r = 0; r < repeat_factor; ++r)
-                    {
-                        const long out_head = kv_h * repeat_factor + r;
-                        float* dst = out_data + (b * num_kv_heads * repeat_factor + out_head) * kv_head_stride;
-                        std::copy(src, src + kv_head_stride, dst);
-                    }
-                }
-            }
+            output.set_size(input.num_samples(), input.k() * repeat_factor,
+                input.nr(), input.nc());
+            tt::repeat_channels(output, input, repeat_factor);
         }
 
         template <typename SUBNET>
         void backward(const tensor& gradient_input, SUBNET& sub, tensor& /*params_grad*/)
         {
-            tensor& data_grad = sub.get_gradient_input();
-
-            if (repeat_factor == 1)
-            {
-                tt::copy_tensor(true, data_grad, 0, gradient_input, 0, gradient_input.k());
-                return;
-            }
-
-            const long batch_size = gradient_input.num_samples();
-            const long num_heads = gradient_input.k();
-            const long num_kv_heads = num_heads / repeat_factor;
-            const long seq_len = gradient_input.nr();
-            const long head_dim = gradient_input.nc();
-            const long kv_head_stride = seq_len * head_dim;
-
-            const float* grad_in = gradient_input.host();
-            float* grad_out = data_grad.host();
-
-            // Accumulate gradients from repeated heads back to original KV heads
-            for (long b = 0; b < batch_size; ++b)
-            {
-                for (long kv_h = 0; kv_h < num_kv_heads; ++kv_h)
-                {
-                    float* dst = grad_out + (b * num_kv_heads + kv_h) * kv_head_stride;
-                    for (long r = 0; r < repeat_factor; ++r)
-                    {
-                        const long in_head = kv_h * repeat_factor + r;
-                        const float* src = grad_in + (b * num_heads + in_head) * kv_head_stride;
-                        for (long i = 0; i < kv_head_stride; ++i)
-                        {
-                            dst[i] += src[i];
-                        }
-                    }
-                }
-            }
+            tt::accumulate_repeated_channels(sub.get_gradient_input(),
+                gradient_input, repeat_factor);
         }
 
         inline dpoint map_input_to_output(const dpoint& p) const { return p; }
@@ -370,15 +305,14 @@ namespace dlib
             std::string version;
             deserialize(version, in);
             if (version != "repeat_heads_")
-                throw serialization_error("Unexpected version '" + version + "' found while deserializing dlib::repeat_heads_.");
+                throw serialization_error("Unexpected version '" + version
+                    + "' found while deserializing dlib::repeat_heads_.");
             deserialize(item.repeat_factor, in);
         }
 
         friend std::ostream& operator<<(std::ostream& out, const repeat_heads_& item)
         {
-            out << "repeat_heads\t ("
-                << "repeat_factor=" << item.repeat_factor
-                << ")";
+            out << "repeat_heads\t (repeat_factor=" << item.repeat_factor << ")";
             return out;
         }
 
@@ -391,11 +325,11 @@ namespace dlib
 
     private:
         long repeat_factor;
-        resizable_tensor params;  // unused
+        resizable_tensor params;
     };
 
-    template <long RF, typename SUBNET>
-    using repeat_heads = add_layer<repeat_heads_<RF>, SUBNET>;
+    template <long rep_fact, typename SUBNET>
+    using repeat_heads = add_layer<repeat_heads_<rep_fact>, SUBNET>;
 
     // ----------------------------------------------------------------------------------------
 
@@ -1513,10 +1447,7 @@ namespace dlib
             return load_balance_weight;
         }
 
-        // -------------------------------------------------------------------
         // Serialization
-        // -------------------------------------------------------------------
-
         friend void serialize(const moe_& item, std::ostream& out)
         {
             serialize("moe_", out);

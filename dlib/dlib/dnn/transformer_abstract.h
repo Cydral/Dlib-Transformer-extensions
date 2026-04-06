@@ -27,6 +27,136 @@ namespace dlib
 {
     // ----------------------------------------------------------------------------------------
 
+    template <long repeat_factor_>
+    class repeat_heads_
+    {
+        /*!
+            REQUIREMENTS ON TEMPLATE PARAMETERS
+                - repeat_factor_ >= 1
+
+            WHAT THIS OBJECT REPRESENTS
+                This layer replicates each channel (k dimension) of the input tensor
+                repeat_factor_ times along the k axis. It is used in Grouped Query
+                Attention (GQA) to broadcast Key/Value heads to match the number of
+                Query heads before computing scaled dot-product attention.
+
+                Given an input tensor of shape (batch, num_kv_heads, seq_len, head_dim),
+                the output has shape (batch, num_kv_heads * repeat_factor, seq_len, head_dim)
+                where each KV head is duplicated repeat_factor times consecutively.
+
+                Forward mapping (per sample):
+                    output(n, c * repeat_factor + r, :, :) = input(n, c, :, :)
+                    for c in [0, num_kv_heads), r in [0, repeat_factor)
+
+                Backward mapping (gradient accumulation, per sample):
+                    grad_input(n, c, :, :) += sum_{r=0}^{repeat_factor-1}
+                        grad_output(n, c * repeat_factor + r, :, :)
+
+                When repeat_factor == 1 (standard multi-head attention without GQA),
+                the layer reduces to a simple tensor copy with no overhead.
+        !*/
+
+    public:
+
+        explicit repeat_heads_();
+        /*!
+            ensures
+                - #repeat_factor == repeat_factor_ (from template parameter)
+                - No trainable parameters (get_layer_params() returns empty tensor)
+        !*/
+
+        template <typename SUBNET>
+        void setup(const SUBNET& sub);
+        /*!
+            ensures
+                - No-op: this layer has no learnable parameters to initialize
+        !*/
+
+        template <typename SUBNET>
+        void forward(const SUBNET& sub, resizable_tensor& output);
+        /*!
+            requires
+                - sub.get_output() is a valid tensor with shape
+                  (batch_size, num_kv_heads, seq_len, head_dim)
+            ensures
+                - #output.num_samples() == sub.get_output().num_samples()
+                - #output.k() == sub.get_output().k() * repeat_factor
+                - #output.nr() == sub.get_output().nr()
+                - #output.nc() == sub.get_output().nc()
+                - Each channel c of the input is replicated repeat_factor times
+                  at consecutive positions c * repeat_factor .. c * repeat_factor + repeat_factor - 1
+                - Implemented via tt::repeat_channels()
+        !*/
+
+        template <typename SUBNET>
+        void backward(
+            const tensor& gradient_input,
+            SUBNET& sub,
+            tensor& params_grad
+        );
+        /*!
+            requires
+                - gradient_input has shape (batch_size, num_kv_heads * repeat_factor,
+                  seq_len, head_dim)
+                - sub.get_gradient_input() has shape (batch_size, num_kv_heads,
+                  seq_len, head_dim)
+            ensures
+                - Accumulates gradients from repeated head channels back into the
+                  original KV head channels in sub.get_gradient_input()
+                - For each destination channel c, sums the gradients from the
+                  repeat_factor source channels c * repeat_factor .. c * repeat_factor + repeat_factor - 1
+                - This is an accumulation (+=), not a replacement
+                - Implemented via tt::accumulate_repeated_channels()
+        !*/
+
+        dpoint map_input_to_output(const dpoint& p) const;
+        dpoint map_output_to_input(const dpoint& p) const;
+        /*!
+            ensures
+                - Both return p unchanged (identity spatial mapping)
+        !*/
+
+        const tensor& get_layer_params() const;
+        tensor& get_layer_params();
+        /*!
+            ensures
+                - Returns an empty tensor (this layer has no trainable parameters)
+        !*/
+
+        friend void serialize(const repeat_heads_& item, std::ostream& out);
+        /*!
+            ensures
+                - Serializes with version tag "repeat_heads_"
+                - Saves: repeat_factor
+        !*/
+
+        friend void deserialize(repeat_heads_& item, std::istream& in);
+        /*!
+            ensures
+                - Restores repeat_factor from serialized state
+            throws
+                - serialization_error if version tag does not match "repeat_heads_"
+        !*/
+
+        friend std::ostream& operator<<(
+            std::ostream& out, const repeat_heads_& item);
+        /*!
+            ensures
+                - Prints "repeat_heads (repeat_factor=N)"
+        !*/
+
+        friend void to_xml(const repeat_heads_& item, std::ostream& out);
+        /*!
+            ensures
+                - Writes: <repeat_heads repeat_factor='N'/>
+        !*/
+    };
+
+    template <long rep_fact, typename SUBNET>
+    using repeat_heads = add_layer<repeat_heads_<rep_fact>, SUBNET>;
+
+    // ---------------------------------------------------------------------------------------
+
     class network_context
     {
         /*!
@@ -632,49 +762,68 @@ namespace dlib
     {
         /*!
             REQUIREMENTS ON TEMPLATE ARGUMENTS
-                - H_NET must be a valid dlib network type (complete network with input layer)
-                - L_NET must be a valid dlib network type (complete network with input layer)
+                - H_NET must be a valid dlib network type that can process tensors
+                  through its forward() and back_propagate_error() methods.
+                  Must use tag10<input_tensor> as base layer (not raw input_tensor).
+                - L_NET must be a valid dlib network type with the same constraints.
                 - N > 0 (number of high-level cycles)
-                - T > 0 (number of low-level steps per cycle)
+                - T > 0 (number of low-level steps per high-level cycle)
 
             WHAT THIS OBJECT REPRESENTS
-                This object implements a Hierarchical Reasoning Model (HRM) layer, a dual-
-                recurrent architecture inspired by hierarchical and multi-timescale processing
-                in cognitive systems.
+                This object implements a Hierarchical Reasoning Model (HRM) layer, a
+                dual-recurrent architecture that separates computation into two temporal
+                scales for multi-level sequence processing.
 
-                The model consists of two interdependent recurrent modules:
-                    - High-level module (H_NET): executes N slow cycles for abstract planning
-                      and global reasoning
-                    - Low-level module (L_NET): executes T fast iterations per H-cycle for
-                      detailed, rapid computations
+                The model consists of two interdependent recurrent modules managed as
+                internal sub-networks with their own AdamW solvers:
+                    - High-level module (H_NET): executes N slow cycles for abstract
+                      planning and global reasoning
+                    - Low-level module (L_NET): executes T fast iterations per H-cycle
+                      for detailed, rapid computations
 
-                During forward propagation, the network performs N×T total recurrent steps
-                with hierarchical convergence. For each of the N high-level cycles, the
-                low-level module performs T iterations, converging locally before the
-                high-level module updates.
+                During forward propagation, the network performs N x T total recurrent
+                steps with hierarchical convergence. For each of the N high-level
+                cycles, the low-level module performs T iterations, converging locally
+                before the high-level module updates. All iterations except the final
+                L-step and final H-step are executed without gradient tracking.
 
                 Mathematical formulation:
-                    For each high-level cycle n E [0, N):
-                        For each low-level step t E [0, T):
-                            z_L^{n,t} = f_L(z_L^{prev} + z_H^n + x0)
-                        z_H^{n+1} = f_H(z_H^n + z_L^{n,T-1})
-                    Output: z_H^N
+                    z_H = z_h_init (broadcast to batch)
+                    z_L = z_l_init (broadcast to batch)
+
+                    For each high-level cycle n in [0, N):
+                        For each low-level step t in [0, T):
+                            z_L = f_L(z_L + z_H + x)
+                        z_H = f_H(z_H + z_L)
+
+                    Output = z_H^N
 
                 where:
-                    - x0 is the input with positional encodings
-                    - z_H and z_L are the hidden states of the H and L modules
+                    - x is the input tensor from the subnet
+                    - z_H and z_L are hidden states initialized from learned vectors
                     - f_H and f_L are the recurrent transformations (H_NET and L_NET)
+                    - The + operator denotes element-wise addition (via tt::add)
 
-                The backward pass uses a one-step gradient approximation, computing gradients
-                only through the final update of each module. This provides O(1) memory
-                complexity instead of O(N×T) required by full Backpropagation Through Time
-                (BPTT), while maintaining training stability.
+                The backward pass uses a one-step gradient approximation, computing
+                gradients only through the final H-module and final L-module updates.
+                This provides O(1) memory complexity instead of O(N x T) required by
+                full Backpropagation Through Time (BPTT).
 
-                Key features:
-                    - Hierarchical processing with temporal separation of concerns
-                    - Memory-efficient training (O(1) vs O(N×T) for BPTT)
-                    - Biologically-plausible recurrent computation
-                    - Suitable for complex reasoning tasks requiring iterative refinement
+                Gradient path (1-step approximation):
+                    dL/d(output) = gradient_input
+                      -> backprop through H: h_net.back_propagate_error(last_h_input, ...)
+                      -> backprop through L: l_net.back_propagate_error(last_l_input, ...)
+                      -> accumulate to sub.get_gradient_input()
+
+                Parameter management:
+                    H_NET and L_NET are internal sub-networks invisible to the main
+                    trainer's solver. Their parameters are updated via dedicated AdamW
+                    solvers inside update_subnet_parameters(), called at the end of
+                    backward(). The learning rate is synchronized from network_context
+                    when active. The layer itself has no direct trainable parameters
+                    (get_layer_params() returns an empty tensor); use
+                    internal_parameters() to obtain the total parameter count of both
+                    H_NET and L_NET combined.
 
                 References:
                     - Wang et al., "Hierarchical Reasoning Model", arXiv:2506.21734
@@ -683,40 +832,67 @@ namespace dlib
 
     public:
 
-        hrm_();
+        using h_net_type = H_NET;
+        using l_net_type = L_NET;
+
+        explicit hrm_();
         /*!
             ensures
-                - #seq_len == 0
                 - #hidden_dim == 0
+                - #learning_rate_multiplier == 1.0
+                - #current_learning_rate_ == 0.001
+                - #solvers_initialized_ == false
                 - Internal networks (h_net, l_net) are default-constructed
         !*/
 
-        template <typename SUBNET>
-        void setup(
-            const SUBNET& sub
-        );
+        hrm_(const hrm_& other);
         /*!
             ensures
-                - Initializes the internal H and L networks based on input dimensions
-                - Initializes hidden state vectors z_h_init and z_l_init with truncated
-                  normal distribution (std=1, truncated at ±2)
-                - Stores sequence length and hidden dimension from input
+                - Performs deep copy of h_net, l_net, z_h_init, z_l_init,
+                  hidden_dim, learning_rate_multiplier, current_learning_rate_
+                - Does NOT copy solvers (solvers_initialized_ = false)
+                - Does NOT copy forward/backward computation tensors
+        !*/
+
+        hrm_& operator=(const hrm_& other);
+        /*!
+            ensures
+                - Same deep copy semantics as copy constructor
         !*/
 
         template <typename SUBNET>
-        void forward(
-            const SUBNET& sub,
-            resizable_tensor& output
-        );
+        void setup(const SUBNET& sub);
         /*!
+            requires
+                - sub.get_output() is a valid tensor
             ensures
-                - Performs hierarchical recurrent computation:
-                    * N high-level cycles, each with T low-level steps
-                    * Total of N×T recurrent iterations
-                    * All but the last iteration executed without gradient tracking
-                    * Final iteration computes gradients for one-step approximation
-                - #output contains the final high-level state z_H^{NT}
-                - output has the same dimensions as sub.get_output()
+                - #hidden_dim == sub.get_output().nc()
+                - Initializes z_h_init and z_l_init as 1x1x1xhidden_dim tensors
+                  with truncated normal distribution (std=1, truncated at +/-2)
+                - Uses an atomic seed counter for reproducible but distinct
+                  initialization across multiple hrm_ instances
+        !*/
+
+        template <typename SUBNET>
+        void forward(const SUBNET& sub, resizable_tensor& output);
+        /*!
+            requires
+                - setup(sub) has been called
+                - sub.get_output() is a valid tensor with nc() == hidden_dim
+            ensures
+                - Initializes z_H and z_L by broadcasting z_h_init and z_l_init
+                  across all samples, channels, and sequence positions
+                - Executes N*T-1 recurrent iterations without gradient tracking:
+                    * L-step: l_input = z_L + z_H + x; z_L = l_net.forward(l_input)
+                    * H-step (at end of each cycle except last): h_input = z_H + z_L;
+                      z_H = h_net.forward(h_input)
+                - Executes final L-step and final H-step with gradient tracking:
+                    * Saves last_l_input = z_L + z_H + x for backward
+                    * z_L = l_net.forward(last_l_input)
+                    * Saves last_h_input = z_H + z_L for backward
+                    * z_H = h_net.forward(last_h_input)
+                - #output has same dimensions as sub.get_output()
+                - #output contains the final high-level state z_H^N
         !*/
 
         template <typename SUBNET>
@@ -726,289 +902,412 @@ namespace dlib
             tensor& params_grad
         );
         /*!
+            requires
+                - forward(sub, output) was previously called
+                - gradient_input has same dimensions as the forward() output
             ensures
-                - Performs one-step gradient approximation:
-                    * Backpropagates through final H-module update
-                    * Backpropagates through final L-module update
-                    * Accumulates gradients to input
-                - Memory complexity: O(1) instead of O(N×T) for full BPTT
+                - Backpropagates through final H-module:
+                    h_net.back_propagate_error(last_h_input, gradient_input)
+                - Backpropagates through final L-module:
+                    l_net.back_propagate_error(last_l_input, h_net.get_final_data_gradient())
+                - Accumulates l_net.get_final_data_gradient() into
+                  sub.get_gradient_input() via tt::add
+                - If in training mode (network_context::is_training() or context inactive):
+                    calls update_subnet_parameters() to update H and L network
+                    parameters via their internal AdamW solvers
+                - Memory complexity: O(1) instead of O(N*T) for full BPTT
+        !*/
+
+        void set_learning_rate(double lr);
+        /*!
+            ensures
+                - #current_learning_rate_ == lr
+                - Propagates lr to both h_net and l_net via set_all_learning_rates()
+        !*/
+
+        double get_learning_rate() const;
+        /*!
+            ensures
+                - Returns the current learning rate used by internal solvers
+        !*/
+
+        void set_learning_rate_multiplier(double val);
+        /*!
+            ensures
+                - #learning_rate_multiplier == val
+                - Propagates val to both h_net and l_net via
+                  set_all_learning_rate_multipliers()
+                - If val == 0.0, update_subnet_parameters() becomes a no-op
+        !*/
+
+        double get_learning_rate_multiplier() const;
+        /*!
+            ensures
+                - Returns the learning rate multiplier applied to effective_lr
+        !*/
+
+        void configure_solvers(double weight_decay, double beta1, double beta2);
+        /*!
+            ensures
+                - Stores solver hyperparameters for next solver initialization
+                - #solvers_initialized_ == false (forces re-creation of solvers
+                  on next backward pass)
+        !*/
+
+        size_t internal_parameters() const;
+        /*!
+            ensures
+                - Returns count_parameters(h_net) + count_parameters(l_net)
+                - This is the total number of trainable parameters managed
+                  internally by this layer
+                - Note: get_layer_params().size() returns 0 because the hrm_
+                  layer has no direct parameters; all parameters belong to the
+                  internal H and L sub-networks
+        !*/
+
+        void clean();
+        /*!
+            ensures
+                - Calls clean() on h_net and l_net if they support it
+                - Prepares the networks for inference or serialization
         !*/
 
         const h_net_type& get_h_net() const;
         h_net_type& get_h_net();
+        /*!
+            ensures
+                - Returns a reference to the high-level (H) network module
+        !*/
+
         const l_net_type& get_l_net() const;
         l_net_type& get_l_net();
         /*!
             ensures
-                - Returns a reference to the high-level (H) or low-level (L) network
-                - Allows inspection and manipulation of internal modules
+                - Returns a reference to the low-level (L) network module
         !*/
 
         const tensor& get_layer_params() const;
         tensor& get_layer_params();
         /*!
             ensures
-                - Returns the parameters tensor
-                - Note: hrm_ has no direct trainable parameters; all parameters
-                  are contained within H_NET and L_NET
+                - Returns an empty tensor (size 0)
+                - The hrm_ layer has no direct trainable parameters; all
+                  parameters are contained within H_NET and L_NET and are
+                  accessed via internal_parameters() or get_h_net()/get_l_net()
+        !*/
+
+        friend void serialize(const hrm_& item, std::ostream& out);
+        /*!
+            ensures
+                - Serializes the complete state including:
+                  h_net, l_net, z_h_init, z_l_init, hidden_dim,
+                  learning_rate_multiplier, current_learning_rate_,
+                  h_solvers_, l_solvers_, solvers_initialized_
+                - Version tag: "hrm_"
+        !*/
+
+        friend void deserialize(hrm_& item, std::istream& in);
+        /*!
+            ensures
+                - Restores all serialized state
+            throws
+                - serialization_error if version tag does not match "hrm_"
+        !*/
+
+        friend std::ostream& operator<<(std::ostream& out, const hrm_& item);
+        /*!
+            ensures
+                - Prints "hrm (N=<N>, T=<T>) learning_rate_mult=<val>"
+        !*/
+
+        friend void to_xml(const hrm_& item, std::ostream& out);
+        /*!
+            ensures
+                - Writes XML representation including N, T,
+                  learning_rate_multiplier, and nested XML for h_net and l_net
         !*/
     };
 
     template<typename H_NET, typename L_NET, int N, int T, typename SUBNET>
-    using hrm = add_layer<hrm_<H_NET, L_NET, N, T>, SUBNET>;    
+    using hrm = add_layer<hrm_<H_NET, L_NET, N, T>, SUBNET>;
 
     // ----------------------------------------------------------------------------------------
 
-    // Tags and type definitions for Mixture of Experts (MoE)
+// Tags for compile-time mode selection in MoE layers
     struct training_mode_tag {};
     struct inference_mode_tag {};
 
-    template <long num_experts, template <typename> class DO, typename SUBNET>
-    using gate = some_template_expression;
-    /*!
-        WHAT THIS OBJECT REPRESENTS
-            Gating network that learns to route inputs to experts in a Mixture of Experts model.
-            Produces raw logits for expert selection using a learned hierarchical function
-            with multiple fully-connected layers and dropout for regularization.
-
-        TEMPLATE PARAMETERS
-            - num_experts: number of experts to route between
-            - DO: dropout policy template (e.g., dropout_10 for training, multiply for inference)
-
-        OUTPUT
-            Tensor with shape (batch_size, num_experts, 1, 1) containing raw logits
-            (unnormalized scores) for expert selection. The MoE layer applies softmax
-            to these logits to obtain routing probabilities.
-    !*/
-
     template<
         typename EXPERT_NET,
+        typename GATE_NET,
+        long n_experts_,
         long top_e,
-        typename MODE,
-        template<typename> class TAG,
-        typename SUBNET
+        typename MODE
     >
     class moe_
     {
         /*!
             REQUIREMENTS ON TEMPLATE PARAMETERS
-                - EXPERT_NET must be a valid Dlib network type that can process tensors
-                  through its forward() and back_propagate_error() methods
-                - top_e >= 0 (use 0 for automatic selection of 20% of available experts)
+                - EXPERT_NET must be a valid dlib network type that can process tensors
+                  through its forward() and back_propagate_error() methods.
+                  Must use tag10<input_tensor> as base layer (not raw input_tensor).
+                - GATE_NET must be a valid dlib network type that produces a tensor
+                  with shape (batch_size, n_experts_, 1, 1) or (batch_size, 1, 1, n_experts_)
+                  containing raw routing logits. Must also use tag10<input_tensor> as
+                  base layer.
+                - n_experts_ > 0 (number of expert sub-networks)
+                - top_e >= 0 (use 0 for automatic selection of 20% of experts, minimum 1)
                 - MODE must be either training_mode_tag or inference_mode_tag
-                - TAG must be a valid layer tag template (e.g., tag9, tag8, etc.)
-                - The gate network referenced by TAG must output a tensor with shape
-                  (batch_size, num_experts, 1, 1) containing raw logits
 
             WHAT THIS OBJECT REPRESENTS
-                This layer implements a Mixture of Experts (MoE) architecture with per-sample
-                dynamic routing. Each input sample in a batch independently selects and routes
-                through its own subset of specialized expert networks. This enables:
+                This layer implements a Mixture of Experts (MoE) architecture with
+                per-sample dynamic routing, inspired by Switch Transformer and ST-MoE.
+                Each input sample in a batch is independently routed to the top-k
+                experts based on a learned internal gating function. This enables
+                increased model capacity without proportional computational cost.
 
-                - Conditional computation: only top-k experts are activated per sample,
-                  reducing computational cost while increasing model capacity
-                - Per-sample routing: each sample can route to different experts based on
-                  learned gating probabilities, enabling sample-specific specialization
-                - Load balancing: auxiliary loss encourages balanced expert utilization
-                  to prevent expert collapse
-                - Mode-specific behavior: training mode includes exploration noise and
-                  usage tracking, while inference mode is deterministic
+                Both the gate network and the expert networks are managed as internal
+                sub-networks with their own AdamW solvers, following the same pattern
+                as hrm_. They are invisible to the main trainer's solver; their
+                parameters are updated inside backward() via update_subnet_parameters().
+                The layer itself has no direct trainable parameters (get_layer_params()
+                returns an empty tensor); use internal_parameters() for the total count
+                or active_parameters() for the inference-time count (top-k experts + gate).
+
+                IMPORTANT: Both GATE_NET and EXPERT_NET definitions must use
+                tag10<input_tensor> as their base layer instead of raw input_tensor.
+                This is because input<tensor> requires sample_expansion_factor
+                initialization via to_tensor(), which is never called for internally
+                managed sub-networks. Wrapping in tag10<> yields an add_tag_layer
+                that bypasses this requirement.
+
+                Example definitions:
+                    using gate = fc<N, leaky_relu<fc<N*8,
+                        avg_pool_everything<tag10<input_tensor>>>>>;
+                    using expert = swiglu<d_model, 8, 3, tag10<input_tensor>>;
 
             ROUTING MECHANISM
-                Unlike batch-wide routing that selects the same experts for all samples, this
-                implementation performs independent routing for each sample:
-
                 For each sample in the batch:
-                1. Read that sample's gate logits from layer<TAG>(sub).get_output()
-                2. Add Gaussian exploration noise to logits (training mode only)
-                3. Apply softmax to obtain expert probabilities
-                4. Select top-k experts with highest probabilities
-                5. Renormalize selected expert weights to sum to 1
-                6. Route sample through selected experts with weighted combination
-                7. Cache expert indices and weights for backward consistency
+                1. The internal gate network produces raw logits from the input
+                2. Logits are clamped to [-3, +3] to prevent softmax saturation
+                3. Gaussian exploration noise is added (training only, noise_scale=0.5)
+                   AFTER clamping, so noise can freely break ties
+                4. Numerically stable softmax converts logits to probabilities
+                5. Top-k experts are selected by descending probability
+                6. A capacity factor limits per-expert load; if the preferred expert
+                   is full, the sample overflows to the next-best available expert
+                7. Selected expert weights are renormalized to sum to 1
+                8. Expert outputs are combined: output = sum(w_i * expert_i(input))
 
-                This per-sample routing allows different samples to utilize different experts,
-                providing fine-grained specialization and better model capacity utilization.
+            GATE GRADIENT
+                The gate receives three gradient signals in backward():
 
-            FORWARD PASS DETAILS
-                The forward pass processes each sample independently:
+                Part A - Task gradient (differentiable routing weight):
+                    For each sample, computes score_e = dot(expert_output, task_gradient)
+                    normalized by 1/sqrt(sample_size) and clamped to [-1, +1].
+                    Converted to logit gradient via softmax Jacobian:
+                        dL/dz_j = P_j * (score_j - sum_e(P_e * score_e))
 
-                1. Extract gate logits for each sample from layer<TAG>(sub).get_output()
-                2. For each sample:
-                   a. Add exploration noise to logits: logits += N(0, noise_scale^2)
-                      (training mode only, noise_scale = 0.1 by default)
-                   b. Apply numerically stable softmax to obtain probabilities
-                   c. Select top-k experts with highest probabilities
-                   d. Renormalize selected expert weights to sum to 1
-                   e. Route sample through selected experts
-                   f. Accumulate weighted expert outputs: output = sum(w_i * expert_i(input))
-                3. Track expert usage statistics for monitoring and load balancing
-                4. Compute auxiliary load balancing loss (training mode only)
+                Part B - Load balance loss (Switch Transformer):
+                    L_aux = alpha * N * sum_e(f_e * P_bar_e)
+                    where f_e = routing fraction, P_bar_e = average gate probability.
+                    Gradient through softmax Jacobian with per-batch normalization.
 
-            BACKWARD PASS DETAILS
-                The backward pass uses cached expert selections for consistency:
+                Part C - Router z-loss (ST-MoE):
+                    L_z = c_z * mean(logsumexp(logits)^2)
+                    Penalizes large logits to prevent numerical instability.
+                    Gradient: 2 * c_z * logsumexp * P_j / batch_size
 
-                1. For each sample:
-                   a. Retrieve cached expert indices and weights from forward pass
-                   b. For each activated expert:
-                      - Scale incoming gradient by expert's weight
-                      - Backpropagate through expert network
-                      - Accumulate weighted expert gradient to input gradient
-                2. If load_balance_weight > 0 (training mode):
-                   a. Compute auxiliary load balancing loss gradient
-                   b. Add gradient to gate network via layer<TAG>(sub).get_gradient_input()
-                   c. Uses complete softmax gradient formula with normalization term
+                All gate gradients are clamped to [-1, +1] before back_propagate_error.
+                Gate data gradient is NOT propagated to sub.get_gradient_input();
+                only expert data gradients flow back to the main network.
 
-                Note: Using cached selections ensures forward/backward consistency even with
-                stochastic noise during training.
+            LOAD BALANCE WEIGHT DECAY
+                The load_balance_weight decays exponentially each training step:
+                    lb = max(lb_floor, lb * lb_decay)
+                Starting at 0.1 (strong balancing to prevent expert collapse), it
+                decays toward lb_floor=0.01 at rate lb_decay=0.9999, allowing
+                progressive expert specialization as training proceeds.
 
-            LOAD BALANCING
-                To prevent expert collapse (where few experts dominate), an auxiliary loss
-                encourages balanced expert utilization:
-
-                    L_aux = alpha * N * sum_e (f_e * P_e)
-
-                where:
-                - alpha = load_balance_weight (default: 0.01)
-                - N = number of experts
-                - f_e = fraction of samples routed to expert e in current batch
-                - P_e = average gate probability for expert e across batch
-
-                This loss is minimized when:
-                - f_e = 1/N (uniform routing fraction)
-                - P_e = 1/N (uniform average probability)
-
-                The gradient flows back to the gate network, incentivizing more balanced
-                routing decisions. Higher load_balance_weight increases balancing pressure
-                but may reduce model performance if too strong.
-
-            EXPLORATION NOISE
-                During training, Gaussian noise is added to gate logits before softmax:
-
-                    noisy_logits[e] = logits[e] + N(0, noise_scale^2)
-
-                This encourages exploration of different expert combinations and prevents
-                premature convergence to suboptimal routing patterns. Typical values:
-                - noise_scale = 0.1 (default): moderate exploration
-                - noise_scale = 0.0: no exploration (deterministic routing)
-                - noise_scale = 0.2-0.3: aggressive exploration (use early in training)
-
-            TEMPLATE PARAMETERS
-                - EXPERT_NET: network architecture for each expert (e.g., feed-forward block)
-                - top_e: number of experts to activate per sample
-                  * If top_e == 0: auto-select 20% of experts (minimum 1)
-                  * If top_e > 0: activate exactly top_e experts (capped at num_experts)
-                - MODE: compile-time mode tag (training_mode_tag or inference_mode_tag)
-                - TAG: layer tag for accessing gate network output
+            CAPACITY FACTOR
+                Each expert can process at most:
+                    capacity = ceil(batch_size * top_k * capacity_factor / n_experts)
+                samples per forward pass. When an expert is full, overflow tokens are
+                routed to the next-best expert with available capacity. Default
+                capacity_factor=1.5 ensures all samples are processed while limiting
+                load imbalance.
         !*/
 
     public:
+
+        using expert_net_type = EXPERT_NET;
+        using gate_net_type = GATE_NET;
+
         explicit moe_();
         /*!
             ensures
-                - #num_experts() == 0 (experts created during setup() based on gate)
-                - #num_active_experts() == top_e (or will be auto-selected if top_e == 0)
-                - Initializes hyperparameters with default values:
-                    * noise_scale = 0.1 (Gaussian noise std for exploration)
-                    * usage_update_rate = 0.05 (EMA smoothing for usage tracking)
-                    * load_balance_weight = 0.01 (auxiliary loss coefficient)
-                - cached_batch_size_ = 0 (no forward pass cache yet)
+                - #n_experts == n_experts_ (from template parameter)
+                - #noise_scale == 0.5
+                - #capacity_factor == 1.5
+                - #usage_update_rate == 0.05
+                - #load_balance_weight == 0.1
+                - #load_balance_floor_ == 0.01
+                - #load_balance_decay_ == 0.9999
+                - #z_loss_weight == 0.001
+                - #learning_rate_multiplier == 1.0
+                - #current_learning_rate_ == 1e-4
+                - #solvers_initialized_ == false
+                - #cached_batch_size_ == 0
+                - If top_e == 0: #top_k == max(1, floor(n_experts * 0.2))
+                - If top_e > 0: #top_k == min(top_e, n_experts)
+                - Expert vector is empty (created during setup())
         !*/
 
         moe_(const moe_& other);
         /*!
             ensures
-                - Performs deep copy of all expert networks and configuration
-                - Copies: n_experts, noise_scale, top_k, usage_update_rate,
-                  load_balance_weight, expert_usage
+                - Performs deep copy of gate_net, all experts, expert_usage,
+                  and all configuration fields
+                - Does NOT copy solvers (solvers_initialized_ = false)
                 - Does NOT copy forward/backward cache (cached_batch_size_ = 0)
         !*/
 
         moe_& operator=(const moe_& other);
         /*!
             ensures
-                - Performs deep copy assignment
-                - Same semantics as copy constructor
+                - Same deep copy semantics as copy constructor
+                - Clears expert_solvers_ and gate_solvers_
         !*/
 
-        template <typename SUBNET_TYPE>
-        void setup(const SUBNET_TYPE& sub);
+        template <typename SUBNET>
+        void setup(const SUBNET& sub);
         /*!
-            requires
-                - SUBNET_TYPE implements the SUBNET interface
-                - layer<TAG>(sub).get_output() returns a tensor with shape (N, E, 1, 1)
-                  where N is batch size and E is the number of experts
             ensures
-                - Initializes the MoE layer based on gate network output:
-                    * Creates E expert network instances (E = gate output dimension k)
-                    * #num_experts() == E
-                    * If top_e == 0: #num_active_experts() == max(1, floor(E * 0.2))
-                    * If top_e > 0: #num_active_experts() == min(top_e, E)
-                - Initializes expert_usage vector with zeros
+                - If experts vector is empty:
+                    * Creates n_experts_ instances of EXPERT_NET
+                    * Initializes expert_usage vector with zeros
+                    * Sets solvers_initialized_ = false
                 - Called automatically by Dlib during first forward pass
         !*/
 
-        template <typename SUBNET_TYPE>
-        void forward(const SUBNET_TYPE& sub, resizable_tensor& output);
-        /*!
-            requires
-                - setup(sub) has been called at least once
-                - sub.get_output() is a valid tensor that experts can process
-                - layer<TAG>(sub).get_output() has shape (batch_size, num_experts(), 1, 1)
-                  containing raw logits (unnormalized scores)
-            ensures
-                - Performs per-sample expert routing and computation:
-                    * For each sample in the batch:
-                      - Extracts that sample's gate logits
-                      - Adds Gaussian exploration noise if MODE == training_mode_tag
-                        with noise ~ N(0, noise_scale^2)
-                      - Applies numerically stable softmax to obtain probabilities
-                      - Selects top-k experts with highest probabilities
-                      - Renormalizes selected expert weights to sum to 1
-                      - Routes sample through selected experts
-                      - Combines expert outputs: output = sum(w_i * expert_i(input))
-                - #output has same dimensions as sub.get_output()
-                - If MODE == training_mode_tag:
-                    * Caches expert indices and weights for backward consistency
-                    * Updates expert usage statistics using EMA
-                    * Computes auxiliary load balancing loss
-                - Only num_active_experts() experts activated per sample (sparse)
-        !*/
-
-        template <typename SUBNET_TYPE>
-        void backward(
-            const tensor& gradient_input,
-            SUBNET_TYPE& sub,
-            tensor& params_grad
-        );
+        template <typename SUBNET>
+        void forward(const SUBNET& sub, resizable_tensor& output);
         /*!
             requires
                 - setup(sub) has been called
-                - forward(sub, output) was previously called with the same sub
+                - sub.get_output() is a valid tensor
+            ensures
+                - Caches input for expert and gate backward
+                - Runs gate_net.forward() to obtain routing logits
+                - For each sample in the batch:
+                    * Clamps raw logits to [-3, +3]
+                    * Adds Gaussian noise if MODE == training_mode_tag
+                    * Applies numerically stable softmax
+                    * Selects top-k experts with capacity overflow handling
+                    * Renormalizes selected weights to sum to 1
+                - Gathers samples per expert, runs batched expert forward
+                - Scatters weighted expert outputs: output[n] += w * expert(x[n])
+                - #output has same dimensions as sub.get_output()
+                - If MODE == training_mode_tag:
+                    * Caches assignments, gate probs, logsumexp, expert outputs
+                    * Computes load_balance_loss_
+                    * Updates expert_usage via EMA
+        !*/
+
+        template <typename SUBNET>
+        void backward(const tensor& gradient_input, SUBNET& sub,
+            tensor& params_grad);
+        /*!
+            requires
+                - forward(sub, output) was previously called
                 - gradient_input has same dimensions as the forward() output
             ensures
-                - Backpropagates gradients through the MoE layer:
-                    * For each sample:
-                      - Uses cached expert indices and weights from forward pass
-                      - Scales incoming gradient by expert weight
-                      - Backpropagates through activated experts only
-                      - Accumulates weighted expert gradients to sub.get_gradient_input()
-                - If MODE == training_mode_tag and load_balance_weight > 0:
-                    * Computes auxiliary load balancing loss gradient
-                    * Uses complete softmax gradient formula:
-                      dL/dz_j = P_j * (w_j - sum_e(w_e * P_e))
-                      where w_e = (routing_fraction[e] + gate_prob_avg[e])
-                    * Adds gradient to layer<TAG>(sub).get_gradient_input()
-                    * This gradient flows back to gate network via autodiff
-                - Only backpropagates through num_active_experts() per sample
+                - Phase 1: batched backward through each active expert
+                    * Gathers gradient weighted by routing weight w
+                    * Calls back_propagate_error on each expert's cached input
+                    * Scatters expert data gradient to sub.get_gradient_input()
+                    * Computes task scores: dot(expert_out, task_grad) / sqrt(dim)
+                - Phase 2 (if training and learning_rate_multiplier > 0):
+                    * Computes gate gradient from task + load-balance + z-loss
+                    * Clamps gate gradient to [-1, +1]
+                    * Calls gate_net.back_propagate_error (parameter update only,
+                      gate data gradient NOT propagated to main network)
+                - Phase 3 (if training):
+                    * Calls update_subnet_parameters() to update active experts
+                      and gate via internal AdamW solvers
+                    * Decays load_balance_weight toward load_balance_floor_
         !*/
 
         void clean();
         /*!
             ensures
-                - Calls clean() on each expert network if they implement this method
-                - Prepares the network for inference or serialization
-                - Typically called after training completes
+                - Calls clean() on each expert and on gate_net if supported
+        !*/
+
+        const tensor& get_layer_params() const;
+        tensor& get_layer_params();
+        /*!
+            ensures
+                - Returns an empty tensor (size 0)
+                - The moe_ layer has no direct trainable parameters; all
+                  parameters belong to the internal expert and gate sub-networks
+                  and are accessed via internal_parameters() / active_parameters()
+        !*/
+
+        void set_learning_rate(double lr);
+        /*!
+            ensures
+                - #current_learning_rate_ == lr
+                - Propagates lr to all experts and gate_net via
+                  set_all_learning_rates()
+        !*/
+
+        double get_learning_rate() const;
+        /*!
+            ensures
+                - Returns the current learning rate used by internal solvers
+        !*/
+
+        void set_learning_rate_multiplier(double val);
+        /*!
+            ensures
+                - #learning_rate_multiplier == val
+                - Propagates val to all experts and gate_net via
+                  set_all_learning_rate_multipliers()
+                - If val == 0.0, update_subnet_parameters() becomes a no-op
+        !*/
+
+        double get_learning_rate_multiplier() const;
+        /*!
+            ensures
+                - Returns the multiplier applied to effective learning rate
+        !*/
+
+        void configure_solvers(
+            double weight_decay, double beta1, double beta2);
+        /*!
+            ensures
+                - Stores solver hyperparameters for next initialization
+                - #solvers_initialized_ == false
+        !*/
+
+        size_t internal_parameters() const;
+        /*!
+            ensures
+                - Returns count_parameters(gate_net) +
+                  count_parameters(experts[0]) * n_experts
+                - This is the total training-time parameter footprint
+                - Returns 0 if experts have not been created yet
+        !*/
+
+        size_t active_parameters() const;
+        /*!
+            ensures
+                - Returns count_parameters(gate_net) +
+                  count_parameters(experts[0]) * top_k
+                - This is the inference-time parameter footprint
+                  (only top-k experts are activated per sample)
+                - Returns 0 if experts have not been created yet
         !*/
 
         EXPERT_NET& get_expert(size_t idx);
@@ -1020,92 +1319,101 @@ namespace dlib
                 - Returns reference to the expert network at index idx
         !*/
 
+        GATE_NET& get_gate();
+        const GATE_NET& get_gate() const;
+        /*!
+            ensures
+                - Returns reference to the internal gate network
+        !*/
+
         long num_experts() const;
         /*!
             ensures
-                - Returns the total number of expert networks in this MoE layer
+                - Returns n_experts (the total number of expert sub-networks)
         !*/
 
         long num_active_experts() const;
         /*!
             ensures
-                - Returns the number of experts activated per sample (top-k value)
-                - If top_e == 0: returns max(1, floor(num_experts() * 0.2))
-                - If top_e > 0: returns min(top_e, num_experts())
+                - Returns top_k (the number of experts activated per sample)
         !*/
 
         bool is_training_mode() const;
         /*!
             ensures
                 - Returns true if MODE == training_mode_tag
-                - Returns false if MODE == inference_mode_tag
         !*/
 
         const std::vector<float>& get_expert_usage() const;
         /*!
             ensures
-                - Returns exponential moving average of expert usage statistics
+                - Returns the EMA of expert usage fractions
                 - Vector size == num_experts()
-                - Values represent average expert utilization across recent batches
-                - Range: [0.0, 1.0+] where:
-                    * 0.0 = expert never used
-                    * 1.0 / num_experts() = perfectly balanced usage
-                    * Values >> 1.0 / num_experts() = expert overused
+                - Ideal balanced value: 1.0 / num_experts() for each expert
                 - Updated only in training mode when usage_update_rate > 0
         !*/
 
         float get_load_balance_loss() const;
         /*!
             ensures
-                - Returns the auxiliary load balancing loss from the last forward pass
-                - Only meaningful in training mode
-                - Loss = load_balance_weight * num_experts * sum_e(f_e * P_e)
-                - Used for monitoring expert balance quality
-                - Returns 0.0 if not in training mode or load_balance_weight == 0
+                - Returns the auxiliary load balancing loss from the last
+                  forward pass
+                - Loss = load_balance_weight * n_experts * sum_e(f_e * P_bar_e)
+                - Returns 0.0 if not in training mode
+        !*/
+
+        float get_load_balance_weight() const;
+        /*!
+            ensures
+                - Returns the current load balance weight (decays during training)
         !*/
 
         friend void serialize(const moe_& item, std::ostream& out);
+        /*!
+            ensures
+                - Serializes the complete state with version tag "moe_"
+                - Saves: n_experts, top_k, noise_scale, capacity_factor,
+                  usage_update_rate, load_balance_weight, load_balance_floor_,
+                  load_balance_decay_, z_loss_weight, learning_rate_multiplier,
+                  current_learning_rate_, gate_net, experts, expert_usage,
+                  expert_solvers_, gate_solvers_, solvers_initialized_
+        !*/
+
         friend void deserialize(moe_& item, std::istream& in);
         /*!
             ensures
-                - Provides serialization support for the MoE layer
-                - Saves/loads: n_experts, top_k, noise_scale, usage_update_rate,
-                  load_balance_weight, expert networks, expert_usage
+                - Restores all serialized state
+                - Clears forward/backward cache
+            throws
+                - serialization_error if version tag does not match "moe_"
         !*/
 
-        friend std::ostream& operator<<(std::ostream& out, const moe_& item);
+        friend std::ostream& operator<<(
+            std::ostream& out, const moe_& item);
+        /*!
+            ensures
+                - Prints: "moe (experts=N, top_k=K, mode=train/infer, noise=X,
+                  cf=C, lb=W/F, z=Z) learning_rate_mult=M"
+        !*/
+
         friend void to_xml(const moe_& item, std::ostream& out);
         /*!
             ensures
-                - Writes human-readable summary to output stream
-                - Format: "moe (experts=N, top_k=K, mode=train/infer, noise=X, lb=Y)"
+                - Writes XML representation including all configuration fields,
+                  nested XML for gate_net and each expert, and expert_usage vector
         !*/
     };
 
     template<
         typename EXPERT_NET,
+        typename GATE_NET,
+        long n_experts_,
         long top_e,
         typename MODE,
-        template<typename> class TAG,
         typename SUBNET
     >
-    using moe = add_layer<moe_<EXPERT_NET, top_e, MODE, TAG, SUBNET>, SUBNET>;
-
-    template<
-        typename EXPERT_NET,
-        long num_experts,
-        long top_e,
-        typename MODE,
-        template <typename> class DO,
-        typename SUBNET
-    >
-    using moe_ffn = some_template_expression;
-    /*!
-        WHAT THIS OBJECT REPRESENTS
-            A complete Mixture-of-Experts feed-forward layer that serves as a drop-in
-            replacement for standard transformer feed-forward blocks. Combines gate network,
-            expert routing, RMS normalization, and skip connection in a single template.
-    !*/
+    using moe = add_layer<
+        moe_<EXPERT_NET, GATE_NET, n_experts_, top_e, MODE>, SUBNET>;
 }
 
 #endif // DLIB_DNN_TRANSFORMER_H_

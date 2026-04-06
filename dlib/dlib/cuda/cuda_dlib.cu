@@ -2219,6 +2219,97 @@ namespace dlib
 
     // ----------------------------------------------------------------------------------------
 
+        __global__ void _cuda_repeat_channels(
+            float* dest,
+            const float* src,
+            long batch_size,
+            long src_k,
+            long repeat_factor,
+            long plane_size
+        )
+        {
+            const long total = batch_size * src_k * repeat_factor * plane_size;
+            for (long idx = blockIdx.x * blockDim.x + threadIdx.x;
+                idx < total;
+                idx += blockDim.x * gridDim.x)
+            {
+                const long dest_k = src_k * repeat_factor;
+                const long i = idx % plane_size;
+                const long dk = (idx / plane_size) % dest_k;
+                const long n = idx / (dest_k * plane_size);
+                const long sk = dk / repeat_factor;
+                const long src_idx = (n * src_k + sk) * plane_size + i;
+                dest[idx] = src[src_idx];
+            }
+        }
+
+        __global__ void _cuda_accumulate_repeated_channels(
+            float* dest,
+            const float* src,
+            long batch_size,
+            long dest_k,
+            long repeat_factor,
+            long plane_size
+        )
+        {
+            const long total = batch_size * dest_k * plane_size;
+            for (long idx = blockIdx.x * blockDim.x + threadIdx.x;
+                idx < total;
+                idx += blockDim.x * gridDim.x)
+            {
+                const long i = idx % plane_size;
+                const long c = (idx / plane_size) % dest_k;
+                const long n = idx / (dest_k * plane_size);
+                const long src_k = dest_k * repeat_factor;
+
+                float sum = 0.0f;
+                for (long r = 0; r < repeat_factor; ++r)
+                {
+                    const long src_idx = (n * src_k + c * repeat_factor + r) * plane_size + i;
+                    sum += src[src_idx];
+                }
+                dest[idx] += sum;
+            }
+        }
+
+        void repeat_channels(
+            tensor& dest,
+            const tensor& src,
+            long repeat_factor
+        )
+        {
+            const long batch_size = src.num_samples();
+            const long src_k = src.k();
+            const long plane_size = src.nr() * src.nc();
+            const long total = batch_size * src_k * repeat_factor * plane_size;
+
+            launch_kernel(_cuda_repeat_channels,
+                max_jobs(total),
+                dest.device(),
+                src.device(),
+                batch_size, src_k, repeat_factor, plane_size);
+        }
+
+        void accumulate_repeated_channels(
+            tensor& dest,
+            const tensor& src,
+            long repeat_factor
+        )
+        {
+            const long batch_size = src.num_samples();
+            const long dest_k = dest.k();
+            const long plane_size = src.nr() * src.nc();
+            const long total = batch_size * dest_k * plane_size;
+
+            launch_kernel(_cuda_accumulate_repeated_channels,
+                max_jobs(total),
+                dest.device(),
+                src.device(),
+                batch_size, dest_k, repeat_factor, plane_size);
+        }
+
+    // ----------------------------------------------------------------------------------------
+
         __global__ void _cuda_layer_normalize_accumulate(
             float* m,
             float* v,
