@@ -12,6 +12,36 @@ namespace dlib
 
     // ----------------------------------------------------------------------------------------
 
+    /* Network initialization helper
+     *
+     * Forces a dummy forward pass so that all layers (including internal sub-networks
+     * in moe_, hrm_, etc.) allocate their parameter tensors. This is required before
+     * count_parameters() can return meaningful values on a freshly constructed network.
+     *
+     * The network is expected to accept input<matrix<int,0,1>> (transformer token input).
+     * The dummy sequence is filled with zeros of the specified length.
+     */
+    template <typename net_type>
+    void ensure_network_initialized(net_type& net, long seq_len = 10)
+    {
+        parameter_counts pc = count_parameters(net);
+        if (pc.total > 0) return;
+
+        matrix<int, 0, 1> dummy(seq_len, 1);
+        set_all_elements(dummy, 0);
+        net(dummy);
+    }
+
+    // Convenience: initialize if needed, then return full parameter breakdown
+    template <typename net_type>
+    parameter_counts count_network_parameters(net_type& net, long seq_len = 10)
+    {
+        ensure_network_initialized(net, seq_len);
+        return count_parameters(net);
+    }
+
+    // ----------------------------------------------------------------------------------------
+
     class network_context
     {
     public:

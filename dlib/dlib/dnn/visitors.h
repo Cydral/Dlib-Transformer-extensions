@@ -184,7 +184,6 @@ namespace dlib
     {
         size_t total;
         size_t active;
-
         operator size_t() const { return total; }
     };
 
@@ -225,23 +224,21 @@ namespace dlib
     }
 
     template <typename net_type>
-    size_t count_parameters(
-        const net_type& net
-    )
+    parameter_counts count_parameters(const net_type& net)
     {
         parameter_counts counts = { 0, 0 };
-        
+
         visit_layer_parameters(net, [&](const tensor& t) {
             counts.total += t.size();
             counts.active += t.size();
-        });
-        
+            });
+
         visit_computational_layers(net, [&](const auto& layer) {
-            auto layer_counts = impl::get_layer_parameter_counts(layer);
-            counts.total += layer_counts.total;
-            counts.active += layer_counts.active;
-        });
-        
+            auto lc = impl::get_layer_parameter_counts(layer);
+            counts.total += lc.total;
+            counts.active += lc.active;
+            });
+
         return counts;
     }
 
