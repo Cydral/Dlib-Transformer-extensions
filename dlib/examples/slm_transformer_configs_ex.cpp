@@ -317,8 +317,6 @@ int run_pipeline(
     // TRAINING MODE
     if (do_train)
     {
-        cout << "TRAINING MODE\n\n";
-
         // Try to load pre-tokenized tokens
         std::vector<std::vector<int>> full_tokens;
         bool tokens_loaded = false;
@@ -535,9 +533,7 @@ int run_pipeline(
     // GENERATION MODE
     if (do_generate)
     {
-        cout << "GENERATION MODE\n\n";
-
-        typename my_transformer::template network_type<false> net;
+       typename my_transformer::template network_type<false> net;
         if (!file_exists(model_file)) {
             cerr << "Error: model file not found. Please run --train first.\n";
             return 0;
@@ -727,10 +723,10 @@ int main(int argc, char** argv)
         parser.add_option("learning-rate", "Set the learning rate (default: 2e-4)", 1);
         parser.add_option("batch-size", "Set the mini-batch size (default: 64)", 1);
         parser.add_option("patience", "Steps without progress before LR reduction (default: 8000)", 1);
-        parser.add_option("max-epochs", "Maximum number of training epochs (default: 100)", 1);
+        parser.add_option("max-epochs", "Maximum number of training epochs (default: 300)", 1);
         parser.add_option("weight-decay", "AdamW weight decay (default: 0.004)", 1);
         parser.add_option("beta1", "AdamW beta1 coefficient (default: 0.9)", 1);
-        parser.add_option("beta2", "AdamW beta2 coefficient (default: 0.997)", 1);
+        parser.add_option("beta2", "AdamW beta2 coefficient (default: 0.998)", 1);
         parser.add_option("model-file", "Override model file path (default: auto-named by arch)", 1);
         parser.add_option("tokenizer-file", "Path for tokenizer (default: dlib_lm_tokenizer.vocab)", 1);
         parser.add_option("external-data", "Path to external text data for training", 1);
@@ -756,10 +752,10 @@ int main(int argc, char** argv)
         const double learning_rate = get_option(parser, "learning-rate", 2e-4);
         const size_t batch_size = get_option(parser, "batch-size", 64);
         const long patience = get_option(parser, "patience", 8000);
-        const size_t max_epochs = get_option(parser, "max-epochs", 100);
+        const size_t max_epochs = get_option(parser, "max-epochs", 300);
         const double weight_decay = get_option(parser, "weight-decay", 0.004);
         const double beta1 = get_option(parser, "beta1", 0.9);
-        const double beta2 = get_option(parser, "beta2", 0.997);
+        const double beta2 = get_option(parser, "beta2", 0.998);
         const std::string tokenizer_file = get_option(parser, "tokenizer-file", "dlib_lm_tokenizer.vocab");
 
         const std::string model_file = parser.option("model-file")
