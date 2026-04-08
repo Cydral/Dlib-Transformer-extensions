@@ -480,17 +480,13 @@ int run_pipeline(
                     double avg_loss = total_loss / batches_seen;
                     auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
                         std::chrono::high_resolution_clock::now() - epoch_start).count();
-                    double spd = samples_seen / (elapsed > 0 ? elapsed : 1);
+                    double samples_per_sec = samples_seen / (elapsed > 0 ? elapsed : 1);
 
-                    std::ios_base::fmtflags old_flags = cout.flags();
-                    std::streamsize old_prec = cout.precision();
                     cout << "epoch#: " << (epoch + 1) << "/" << max_epochs
-                        << " \t loss: " << std::fixed << std::setprecision(3) << avg_loss
-                        << " \t lr: " << std::scientific << std::setprecision(2) << trainer.get_learning_rate()
-                        << " \t speed: " << std::fixed << std::setprecision(1) << spd << " samples/sec\n";
+                        << " \t loss: " << avg_loss
+                        << " \t lr: " << trainer.get_learning_rate()
+                        << " \t speed: " << samples_per_sec << " samples/sec\r";
                     cout.flush();
-                    cout.flags(old_flags);
-                    cout.precision(old_prec);
                 }
             }
             epoch++;
@@ -723,7 +719,7 @@ int main(int argc, char** argv)
         parser.add_option("learning-rate", "Set the learning rate (default: 2e-4)", 1);
         parser.add_option("batch-size", "Set the mini-batch size (default: 64)", 1);
         parser.add_option("patience", "Steps without progress before LR reduction (default: 8000)", 1);
-        parser.add_option("max-epochs", "Maximum number of training epochs (default: 300)", 1);
+        parser.add_option("max-epochs", "Maximum number of training epochs (default: 500)", 1);
         parser.add_option("weight-decay", "AdamW weight decay (default: 0.004)", 1);
         parser.add_option("beta1", "AdamW beta1 coefficient (default: 0.9)", 1);
         parser.add_option("beta2", "AdamW beta2 coefficient (default: 0.998)", 1);
@@ -752,7 +748,7 @@ int main(int argc, char** argv)
         const double learning_rate = get_option(parser, "learning-rate", 2e-4);
         const size_t batch_size = get_option(parser, "batch-size", 64);
         const long patience = get_option(parser, "patience", 8000);
-        const size_t max_epochs = get_option(parser, "max-epochs", 300);
+        const size_t max_epochs = get_option(parser, "max-epochs", 500);
         const double weight_decay = get_option(parser, "weight-decay", 0.004);
         const double beta1 = get_option(parser, "beta1", 0.9);
         const double beta2 = get_option(parser, "beta2", 0.998);

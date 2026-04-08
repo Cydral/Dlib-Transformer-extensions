@@ -5,6 +5,7 @@
 
 #include "input.h"
 #include "layers.h"
+#include "transformer.h"
 #include "loss.h"
 
 namespace dlib
@@ -176,6 +177,44 @@ namespace dlib
             - If a layer implements active_parameters(), adds it to active count;
               otherwise uses internal_parameters() for both.
             - Can be implicitly converted to size_t (returns total) for backward compatibility.
+    !*/
+
+// ----------------------------------------------------------------------------------------
+
+    template <typename net_type>
+    void ensure_network_initialized(
+        net_type& net,
+        long seq_len = 10
+    );
+    /*!
+        requires
+            - net_type is a neural network object whose input layer accepts
+              input<matrix<int,0,1>> (i.e. a transformer token-based network).
+            - seq_len > 0
+        ensures
+            - Forces a dummy forward pass through net using a zero-filled token
+              sequence of length seq_len, causing all layer to allocate their
+              parameter tensors.
+            - After this call, get_layer_params(), internal_parameters(), and
+              active_parameters() return valid results on every layer in net.
+            - The network state is otherwise unchanged; no training step occurs.
+    !*/
+
+    template <typename net_type>
+    parameter_counts count_network_parameters(
+        net_type& net,
+        long seq_len = 10
+    );
+    /*!
+        requires
+            - net_type is a neural network object whose input layer accepts
+              input<matrix<int,0,1>>.
+            - seq_len > 0
+        ensures
+            - Calls ensure_network_initialized(net, seq_len) to guarantee all
+              parameter tensors are allocated, then returns count_parameters(net).
+            - This is a convenience function combining initialization and counting
+              into a single call, safe to use on freshly constructed networks.
     !*/
 
 // ----------------------------------------------------------------------------------------

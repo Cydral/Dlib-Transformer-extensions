@@ -6,6 +6,7 @@
 #include "visitors_abstract.h"
 #include "input.h"
 #include "layers.h"
+#include "transformer.h"
 #include "loss.h"
 
 namespace dlib
@@ -240,6 +241,24 @@ namespace dlib
             });
 
         return counts;
+    }
+
+// ----------------------------------------------------------------------------------------
+
+    template <typename net_type>
+    void ensure_network_initialized(net_type& net, long seq_len = 10)
+    {
+        matrix<int, 0, 1> dummy(seq_len, 1);
+        set_all_elements(dummy, 0);
+        net(dummy);
+    }
+
+    // Convenience: initialize if needed, then return full parameter breakdown
+    template <typename net_type>
+    parameter_counts count_network_parameters(net_type& net, long seq_len = 10)
+    {
+        ensure_network_initialized(net, seq_len);
+        return count_parameters(net);
     }
 
 // ----------------------------------------------------------------------------------------
@@ -1226,6 +1245,42 @@ namespace dlib
                 else out << static_cast<float>(num) / static_cast<float>(den);
                 
                 out << "}}";
+                end_node();
+                update(i);
+            }
+
+            template <long repeat_factor, typename U, typename E>
+            void operator()(size_t i, const add_layer<repeat_heads_<repeat_factor>, U, E>&)
+            {
+                start_node(i, "repeat_heads");
+                out << " | {repeat_factor|{" << repeat_factor << "}}";
+                end_node();
+                update(i);
+            }
+
+            template <typename H_NET, typename L_NET, int N, int T, typename U, typename E>
+            void operator()(size_t i, const add_layer<hrm_<H_NET, L_NET, N, T>, U, E>& l)
+            {
+                start_node(i, "hrm");
+                out << " | {H_cycles|{" << N << "}}";
+                out << " | {L_steps|{" << T << "}}";
+                out << " | {hidden_dim|{" << l.layer_details().get_hidden_dim() << "}}";
+                out << " | {h_params|{" << count_parameters(l.layer_details().get_h_net()) << "}}";
+                out << " | {l_params|{" << count_parameters(l.layer_details().get_l_net()) << "}}";
+                end_node();
+                update(i);
+            }
+
+            template <typename EXPERT_NET, typename GATE_NET, long NE, long TOP_E, typename MODE, typename U, typename E>
+            void operator()(size_t i, const add_layer<moe_<EXPERT_NET, GATE_NET, NE, TOP_E, MODE>, U, E>& l)
+            {
+                start_node(i, "moe");
+                out << " | {experts|{" << l.layer_details().num_experts() << "}}";
+                out << " | {top_k|{" << l.layer_details().num_active_experts() << "}}";
+                if (l.layer_details().num_experts() > 0)
+                    out << " | {expert_params|{" << count_parameters(l.layer_details().get_expert(0)) << "}}";
+                out << " | {gate_params|{" << count_parameters(l.layer_details().get_gate()) << "}}";
+                out << " | {training|{" << (l.layer_details().is_training_mode() ? "yes" : "no") << "}}";
                 end_node();
                 update(i);
             }
