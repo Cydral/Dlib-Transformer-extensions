@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <algorithm>
 #include <iostream>
+#include <random>
 #include "../matrix.h"
 #include "../dir_nav.h"
 #include "../serialize.h"

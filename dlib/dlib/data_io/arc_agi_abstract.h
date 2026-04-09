@@ -3,10 +3,18 @@
 #undef DLIB_ARC_AGI_ABSTRACT_H_
 #ifdef DLIB_ARC_AGI_ABSTRACT_H_
 
+#include "arc_agi_abstract.h"
 #include <string>
 #include <vector>
 #include <map>
+#include <fstream>
+#include <sstream>
+#include <stdexcept>
+#include <algorithm>
+#include <iostream>
+#include <random>
 #include "../matrix.h"
+#include "../dir_nav.h"
 #include "../serialize.h"
 
 namespace dlib
