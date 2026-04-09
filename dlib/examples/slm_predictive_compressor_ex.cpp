@@ -139,10 +139,7 @@ void show_progress(const std::string& label, size_t current, size_t total,
     if (current == total) cout << "\n";
 }
 
-// ========================================================================================
 // Bit Stream Classes
-// ========================================================================================
-
 class out_bit_stream {
     std::vector<uint8_t>& buffer;
     uint8_t current_byte = 0;
@@ -202,10 +199,7 @@ public:
     }
 };
 
-// ========================================================================================
 // File I/O
-// ========================================================================================
-
 std::vector<uint8_t> read_file_bytes(const std::string& path)
 {
     std::ifstream file(path, std::ios::binary);
@@ -219,10 +213,7 @@ uint32_t compute_crc32(const std::vector<uint8_t>& data)
     return dlib::crc32(std::string(data.begin(), data.end()));
 }
 
-// ========================================================================================
 // Training
-// ========================================================================================
-
 void train_predictor_model(train_net& net, const std::vector<uint8_t>& data,
     const std::string& input_path)
 {
@@ -260,12 +251,10 @@ void train_predictor_model(train_net& net, const std::vector<uint8_t>& data,
     while (trainer.get_learning_rate() >= trainer.get_min_learning_rate() && !signal_handler::is_triggered())
     {
         trainer.train_one_step(samples, labels);
-        if (trainer.get_train_one_step_calls() % 50 == 0) {
-            cout << "  Step: " << trainer.get_train_one_step_calls()
-                << " | Loss: " << trainer.get_average_loss()
-                << " | LR: " << trainer.get_learning_rate() << "\r";
-            cout.flush();
-        }
+        cout << "  Step: " << trainer.get_train_one_step_calls()
+            << " | Loss: " << trainer.get_average_loss()
+            << " | LR: " << trainer.get_learning_rate() << "\r";
+        cout.flush();
     }
 
     if (signal_handler::is_triggered()) {
@@ -279,10 +268,7 @@ void train_predictor_model(train_net& net, const std::vector<uint8_t>& data,
     net.clean();
 }
 
-// ========================================================================================
 // Compression
-// ========================================================================================
-
 void compress_file(const std::string& input_path, const std::string& output_path, bool do_train)
 {
     cout << "=== COMPRESSION MODE ===" << endl;
@@ -426,10 +412,7 @@ void compress_file(const std::string& input_path, const std::string& output_path
     cout << "File compressed to: " << output_path << endl;
 }
 
-// ========================================================================================
 // Decompression
-// ========================================================================================
-
 void decompress_file(const std::string& input_path, const std::string& output_path)
 {
     cout << "=== DECOMPRESSION MODE ===" << endl;
@@ -538,10 +521,6 @@ void decompress_file(const std::string& input_path, const std::string& output_pa
     cout << "=============================" << endl;
     cout << "Output file: " << output_path << endl;
 }
-
-// ========================================================================================
-// Main
-// ========================================================================================
 
 int main(int argc, char** argv)
 {
