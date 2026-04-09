@@ -79,15 +79,15 @@ A shared support layer, [`slm_data.h`](#slm_datah-shared-data-layer), provides e
 
 At a high level, almost all examples instantiate the same autoregressive idea:
 
-```math
-P(x_1,\dots,x_T)=\prod_{t=1}^{T} P(x_t\mid x_{<t})
-```
+$$
+P(x_1,\ldots,x_T)=\prod_{t=1}^{T} P(x_t \mid x_1,\ldots,x_{t-1})
+$$
 
 and optimize a next-token objective of the form:
 
-```math
-\mathcal{L} = -\sum_t \log P_\theta(x_t \mid x_{<t})
-```
+$$
+\mathcal{L} = -\sum_t \log P_\theta(x_t \mid x_1,\ldots,x_{t-1})
+$$
 
 The key differences between examples come from:
 
