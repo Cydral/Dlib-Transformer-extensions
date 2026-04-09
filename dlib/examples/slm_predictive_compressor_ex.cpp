@@ -22,6 +22,8 @@
       file so that decompression is fully self-contained.
     - Skip-training option: reuse a previously saved model without retraining.
     - Text-mode progress bars with throughput statistics.
+    - Training data capped at MAX_TRAINING_BYTES (150 MB) to limit memory and time;
+      compression and decompression always process the full file.
 
     Compressed file format:
     [MAGIC_NUMBER  4B] [original_size  8B] [CRC32  4B]
@@ -48,19 +50,23 @@
 #include <dlib/misc_api.h>
 #include <dlib/crc32.h>
 
+#include <dlib/dnn/transformer_config.h>
+#include <dlib/dnn/transformer.h>
+
 using namespace std;
 using namespace dlib;
 
 // Constants & Configuration
-const uint32_t MAGIC_NUMBER = 0x444C4943;   // "DLIC" in big-endian
-const int WINDOW_SIZE = 10;                 // Fixed prediction window size
-const long MAX_VOCAB_SIZE = 256;            // Exact byte range (0-255), no padding token needed
+const uint32_t MAGIC_NUMBER = 0x444C4943;           // "DLIC" in big-endian
+const int WINDOW_SIZE = 10;                         // Fixed prediction window size
+const long MAX_VOCAB_SIZE = 256;                    // Exact byte range (0-255)
 const std::string MODEL_SAVE_FILE = "dlib_predictive_compressor.dat";
+const size_t MAX_TRAINING_BYTES = 150 * 1024 * 1024;  // 150 MB cap for training data
 
 // GQA Network architecture parameters
 const long NUM_LAYERS = 2;
 const long NUM_HEADS = 4;
-const long NUM_KV_HEADS = NUM_HEADS;        // Full MHA (set < NUM_HEADS for true GQA)
+const long NUM_KV_HEADS = NUM_HEADS;                // Full MHA (set < NUM_HEADS for true GQA)
 const long EMBEDDING_DIM = 16;
 
 // GQA Transformer configuration: single network type for both training and inference
@@ -70,10 +76,7 @@ using compressor_transformer = gqa_transformer_config<
 using train_net = compressor_transformer::network_type<true>;
 using infer_net = compressor_transformer::network_type<false>;
 
-// ========================================================================================
 // Utility Functions
-// ========================================================================================
-
 std::string format_duration(double seconds)
 {
     int hours = static_cast<int>(seconds / 3600);
@@ -217,13 +220,22 @@ uint32_t compute_crc32(const std::vector<uint8_t>& data)
 void train_predictor_model(train_net& net, const std::vector<uint8_t>& data,
     const std::string& input_path)
 {
+    // Cap training data to MAX_TRAINING_BYTES to limit memory and training time.
+    // The full file is always used for compression/decompression regardless.
+    size_t training_size = data.size();
+    if (training_size > MAX_TRAINING_BYTES) {
+        training_size = MAX_TRAINING_BYTES;
+        cout << "File exceeds training limit (" << format_size(MAX_TRAINING_BYTES)
+            << "). Training on first " << format_size(training_size) << " only." << endl;
+    }
+
     cout << "Preparing dataset for training (no padding)..." << endl;
 
     std::vector<matrix<int, 0, 1>> samples;
     std::vector<unsigned long> labels;
 
     matrix<int, 0, 1> window(WINDOW_SIZE, 1);
-    for (size_t i = WINDOW_SIZE; i < data.size(); ++i)
+    for (size_t i = WINDOW_SIZE; i < training_size; ++i)
     {
         long pos = 0;
         for (long j = i - WINDOW_SIZE; j < static_cast<long>(i); ++j)
@@ -251,10 +263,12 @@ void train_predictor_model(train_net& net, const std::vector<uint8_t>& data,
     while (trainer.get_learning_rate() >= trainer.get_min_learning_rate() && !signal_handler::is_triggered())
     {
         trainer.train_one_step(samples, labels);
-        cout << "  Step: " << trainer.get_train_one_step_calls()
-            << " | Loss: " << trainer.get_average_loss()
-            << " | LR: " << trainer.get_learning_rate() << "\r";
-        cout.flush();
+        if (trainer.get_train_one_step_calls() % 50 == 0) {
+            cout << "  Step: " << trainer.get_train_one_step_calls()
+                << " | Loss: " << trainer.get_average_loss()
+                << " | LR: " << trainer.get_learning_rate() << "\r";
+            cout.flush();
+        }
     }
 
     if (signal_handler::is_triggered()) {
@@ -326,7 +340,7 @@ void compress_file(const std::string& input_path, const std::string& output_path
     // Build inference network
     infer_net net(t_net);
 
-    // Compress data stream
+    // Compress data stream (always processes the full file)
     cout << "\nCompressing data stream..." << endl;
 
     std::vector<uint8_t> literal_seed(data.begin(), data.begin() + WINDOW_SIZE);
