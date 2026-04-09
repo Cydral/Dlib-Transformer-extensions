@@ -76,28 +76,6 @@ This is especially important for checkpoints whose behavior depends not only on 
 
 ---
 
-## Documentation philosophy for this page
-
-This README intentionally avoids becoming a second copy of the examples documentation.
-
-For that reason, it does **not** try to systematically enumerate, for each model:
-
-- the exact number of parameters
-- the full internal architectural breakdown
-- the full training history
-- all hyperparameters already described elsewhere
-
-Those details are often more useful in the **source example**, in the **training program**, or in the **artifact naming itself** than in a long descriptive page here.
-
-The present page therefore favors:
-
-- **clarity**
-- **quick orientation**
-- **direct linkage to the relevant example workflow**
-- **lighter maintenance over time** as new checkpoints are added or refreshed
-
----
-
 ## Practical reading guide
 
 A simple rule of thumb is:
@@ -122,15 +100,3 @@ For best results, keep aligned:
 - the **same prompt or input formatting conventions**
 
 If you plan to publish additional checkpoints later, it is often enough to keep the naming consistent with the associated example so that users can immediately infer the intended workflow.
-
----
-
-## Final note
-
-This directory should be read as a **practical model access layer** for the repository:
-
-- lighter than the technical documentation in `examples/`
-- focused on **checkpoint reuse** rather than deep implementation detail
-- aligned with the repository's broader goal of making **modern Transformer workflows in Dlib** easier to learn, test, and reuse
-
-If you are unsure where to begin, start from the example that matches your intended use case, then come back here to retrieve the corresponding trained artifact when available.
