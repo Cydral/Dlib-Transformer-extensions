@@ -4,9 +4,8 @@
 > **Dlib Transformer Extensions** brings modern **Transformer-oriented modeling** into the **Dlib** ecosystem through reusable architectural components, language-model utilities, training helpers, progressive examples, and reusable checkpoints — all designed for practical use in standard **C++14**.
 
 > [!NOTE]
-> This repository is documented through three complementary entry points:
+> This repository is documented through two complementary entry points:
 >
-> - **this main README** for the project vision, architecture map, and strategic scope
 > - [`examples/`](examples) for the progressive workflows and runnable demonstrations
 > - [`models/`](models) for reusable artifacts and pre-trained checkpoints
 
@@ -38,15 +37,16 @@ In concrete terms, the project gives Dlib users a way to explore, implement, tes
 - [How to read the repository](#how-to-read-the-repository)
 - [Future directions](#future-directions)
 - [Design philosophy](#design-philosophy)
-- [References](#references)
+- [Citing this project](#citing-this-project)
+- [Academic references](#academic-references)
 
 ---
 
 ## Project overview
 
-Transformers were introduced in the 2017 paper **“Attention Is All You Need”**, which proposed an architecture based on attention mechanisms rather than recurrence or convolution. The paper presented a full **encoder-decoder** architecture and emphasized improved parallelization and stronger modeling of sequence relationships.
+Transformers were introduced in the 2017 paper **“Attention Is All You Need”**, which proposed an architecture based on attention mechanisms rather than recurrence or convolution.[^vaswani2017] The paper presented a full **encoder-decoder** architecture and emphasized improved parallelization and stronger modeling of sequence relationships.[^vaswani2017]
 
-Since then, Transformers have become a dominant architecture across many machine learning applications. They are now widely used for a broad range of language model applications, with encoder/decoder variants and self-attention at the core of their operation.
+Since then, Transformers have become a dominant architecture across many machine learning applications. They are now widely used for a broad range of language-modeling and sequence-processing tasks, with encoder/decoder variants and self-attention at the core of their operation.[^google-transformers]
 
 This repository brings that evolution into the Dlib world by extending Dlib with a practical base for:
 
@@ -56,17 +56,17 @@ This repository brings that evolution into the Dlib world by extending Dlib with
 - progressive example programs
 - reusable trained model artifacts
 
-The project is publicly exposed on GitHub as an open-source repository and is licensed under **BSL-1.0**, which reinforces its role as a reusable and inspectable codebase rather than a closed demonstration artifact.
+The project is publicly exposed on GitHub as an open-source repository and is licensed under **BSL-1.0**, reinforcing its role as a reusable and inspectable codebase rather than a closed demonstration artifact.
 
 ---
 
 ## Why this project matters
 
 ### 1. It expands Dlib into a strategically important AI space
-The repository positions Dlib within a domain that has become central to modern AI: Transformer-based modeling. It brings together **modern transformer architectures**, **attention mechanisms**, and **language modeling utilities** for Dlib in **C++14**.
+The repository positions Dlib within a domain that has become central to modern AI: Transformer-based modeling. In practice, this means giving Dlib users access to a family of methods that now underpins a wide range of state-of-the-art sequence and representation workflows.[^google-transformers][^islam2023]
 
 ### 2. It helps keep advanced model development open and inspectable
-Because the repository is public and open source, it offers something valuable that many teams actively look for: a codebase that can be **read, modified, audited, adapted, and self-hosted**. That matters especially for teams that want to reduce dependence on opaque hosted services and instead build **specialized, controlled, or sovereign AI workflows** around code they can inspect directly.
+Because the repository is public and open source, it offers something many teams actively look for: a codebase that can be **read, modified, audited, adapted, and self-hosted**. That matters especially for organizations that want to reduce dependence on opaque hosted services and instead build **specialized, controlled, or sovereign AI workflows** around code they can inspect directly.
 
 ### 3. It makes specialization more realistic than generic model consumption
 Large general-purpose models are powerful, but many real-world needs are domain-specific. This repository is particularly interesting because it does not stop at generic theory: it provides **example programs**, **training paths**, and **artifact organization** that make specialization more concrete.
@@ -87,14 +87,14 @@ One of the strongest strategic dimensions of the project is that it supports an 
 
 ## What are Transformers?
 
-Transformers are a family of neural network architectures built around **attention**, especially **self-attention**, which allows each token in a sequence to directly weigh the importance of other tokens in the same sequence.
+Transformers are a family of neural network architectures built around **attention**, especially **self-attention**, which allows each token in a sequence to directly weigh the importance of other tokens in the same sequence.[^google-transformers]
 
 The original Transformer introduced in 2017 used an **encoder-decoder** design. In broad terms:
 
 - the **encoder** transforms the input sequence into an internal representation
 - the **decoder** consumes that representation to produce an output sequence
 
-This architecture was first applied to machine translation, but the same underlying principles generalized well beyond that initial use case.
+This architecture was first applied to machine translation, but the same underlying principles generalized well beyond that initial use case.[^vaswani2017]
 
 ### Why Transformers changed the field
 
@@ -105,7 +105,7 @@ Transformers became so influential because they solved several practical limitat
 - they scaled better under parallel hardware training
 - they generalized across many task families
 
-This is one of the key reasons the architecture went on to underpin major modern model families and expanded far beyond NLP.
+This is one of the key reasons the architecture went on to underpin major modern model families and expanded far beyond NLP.[^google-transformers][^islam2023]
 
 ### Main Transformer families today
 
@@ -206,13 +206,13 @@ A practical rule of thumb is:
 The long-term evolution of a repository like this naturally points beyond the current language-first emphasis.
 
 ### Stronger encoder-decoder coverage
-The original Transformer was introduced in an encoder-decoder form, and that family remains essential for translation, conditional generation, and structured sequence transduction. A natural future step is therefore to make encoder-decoder workflows more explicit and more complete within the repository.
+The original Transformer was introduced in an encoder-decoder form, and that family remains essential for translation, conditional generation, and structured sequence transduction.[^vaswani2017][^google-transformers] A natural future step is therefore to make encoder-decoder workflows more explicit and more complete within the repository.
 
 ### Image-oriented Transformer workflows
-Transformers are no longer limited to text. Extending the repository toward image-oriented support is therefore a very natural next step.
+Transformers are no longer limited to text. Survey literature explicitly describes their importance in computer vision and other non-text domains, which makes image-oriented support a very natural next step for this project.[^islam2023]
 
 ### Multimodal modeling
-Transformer-based multimodal learning is now a major research and application area. That makes multimodal expansion — for example text + image — a highly coherent future path for this repository.
+Transformer-based multimodal learning is now a major research and application area. Dedicated survey work explicitly treats multimodal Transformers as an important and growing field, which makes multimodal expansion — for example text + image — a highly coherent future path for this repository.[^xu2023]
 
 ### Broader reusable ecosystem
 Additional future progress can also happen around:
@@ -226,24 +226,33 @@ In other words, this project already looks like a strong foundation for a much b
 
 ---
 
-## Design philosophy
+## Citing this project
 
-The project remains aligned with a practical Dlib-style approach:
+If you wish to reference this project in a publication, report, article, technical note, or any other document, you can cite the repository in a software-oriented form such as the BibTeX entry below.
 
-- keep the implementation in standard **C++14**
-- expose reusable components rather than only monolithic demos
-- support both **learning** and **reuse**
-- bridge low-level building blocks and higher-level application workflows
-- grow progressively from language-centered experiments toward broader Transformer usage
+```bibtex
+@misc{cydral_dlib_transformer_extensions,
+  author       = {Cydral Technology, Aldric PIERRAIN},
+  title        = {Dlib Transformer Extensions},
+  howpublished = {GitHub repository},
+  url          = {https://github.com/Cydral/Dlib-Transformer-extensions},
+  note         = {Open-source repository for transformer architectures, language-model utilities, examples, and reusable artifacts for Dlib}
+}
+```
+
+If you are discussing the broader methodological foundations rather than the repository itself, it is also appropriate to cite the key academic references listed below.
 
 ---
 
-## References
+## Academic references
 
-- Vaswani et al., **Attention Is All You Need** (2017)
-- Google Developers, **LLMs: What's a large language model? / What's a Transformer?**
-- Xu et al., **Multimodal Learning with Transformers: A Survey**
-- Islam et al., **A Comprehensive Survey on Applications of Transformers for Deep Learning Tasks**
+[^vaswani2017]: Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N. Gomez, Lukasz Kaiser, and Illia Polosukhin. **Attention Is All You Need**. *Advances in Neural Information Processing Systems (NeurIPS)*, 2017.
+
+[^google-transformers]: Google Developers. **LLMs: What's a large language model? / What's a Transformer?** Machine Learning Crash Course.
+
+[^xu2023]: Peng Xu, Xiatian Zhu, and David A. Clifton. **Multimodal Learning with Transformers: A Survey**. *IEEE Transactions on Pattern Analysis and Machine Intelligence (TPAMI)*, 2023.
+
+[^islam2023]: Saidul Islam, Hanae Elmekki, Ahmed Elsebai, Jamal Bentahar, Najat Drawel, Gaith Rjoub, and Witold Pedrycz. **A Comprehensive Survey on Applications of Transformers for Deep Learning Tasks**. arXiv, 2023.
 
 ---
 
