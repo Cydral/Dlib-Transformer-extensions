@@ -172,7 +172,7 @@ Today, the project is especially strong as a platform for:
 
 ## Repository structure
 
-The repository is easiest to understand if you read it as four complementary zones.
+The repository is easiest to understand if you read it as three complementary zones.
 
 ### 1. Core implementation: [`dlib/`](dlib)
 This is where the reusable library-side components live.
