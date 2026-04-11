@@ -365,6 +365,8 @@ void compress_file(const std::string& input_path, const std::string& output_path
             cout << "Training new model from scratch." << endl;
         }
 
+        cout << "Model parameters: " << count_network_parameters(t_net, WINDOW_SIZE) << ")\n";
+
         train_predictor_model(t_net, data, input_path);
 
         if (signal_handler::is_triggered()) {
