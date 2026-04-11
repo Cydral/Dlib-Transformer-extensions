@@ -57,13 +57,14 @@
 #include <dlib/cmd_line_parser.h>
 #include <dlib/misc_api.h>
 #include <dlib/crc32.h>
+#include <dlib/compress_stream.h>
 
 using namespace std;
 using namespace dlib;
 
 // Constants & configuration
 const uint32_t MAGIC_NUMBER = 0x444C4943;              // "DLIC" in big-endian
-const int WINDOW_SIZE = 20;                            // Fixed prediction window size
+const int WINDOW_SIZE = 16;                            // Fixed prediction window size
 const long MAX_VOCAB_SIZE = 256;                       // Exact byte range (0-255)
 const std::string MODEL_SAVE_FILE = "dlib_predictive_compressor.dat";
 const size_t MAX_TRAINING_BYTES = 350 * 1024 * 1024;   // 350 MB cap for training data
@@ -85,6 +86,8 @@ using train_net = compressor_transformer::network_type<true>;
 using infer_net = compressor_transformer::network_type<false>;
 
 // Utility functions
+typedef dlib::compress_stream::kernel_1ec entropy_codec;
+
 std::string format_duration(double seconds)
 {
     int hours = static_cast<int>(seconds / 3600);
@@ -425,6 +428,25 @@ void compress_file(const std::string& input_path, const std::string& output_path
 
     bit_writer.flush();
 
+    // Entropy-encode the bitstream for additional compression
+    std::string raw_bits(compressed_data.begin(), compressed_data.end());
+    std::istringstream raw_input(raw_bits);
+    std::ostringstream encoded_output;
+    
+    entropy_codec codec;
+    codec.compress(raw_input, encoded_output);
+
+    std::string encoded_str = encoded_output.str();
+    std::vector<uint8_t> entropy_data(encoded_str.begin(), encoded_str.end());
+
+    // Report entropy gain
+    cout << "Bitstream before entropy coding: " << format_size(compressed_data.size()) << endl;
+    cout << "Bitstream after entropy coding : " << format_size(entropy_data.size())
+        << "  " << format_ratio(entropy_data.size(), compressed_data.size()) << endl;
+
+    // Replace compressed_data with entropy-coded version for serialization
+    compressed_data.swap(entropy_data);
+
     auto comp_end = std::chrono::steady_clock::now();
     double comp_seconds = std::chrono::duration<double>(comp_end - comp_start).count();
 
@@ -548,6 +570,19 @@ void decompress_file(const std::string& input_path, const std::string& output_pa
     in_file.close();
 
     cout << "Compressed data: " << format_size(compressed_data.size()) << endl;
+
+    // Entropy-decode the bitstream
+    std::string encoded_bits(compressed_data.begin(), compressed_data.end());
+    std::istringstream encoded_input(encoded_bits);
+    std::ostringstream decoded_output;
+
+    entropy_codec codec;
+    codec.decompress(encoded_input, decoded_output);
+
+    std::string decoded_str = decoded_output.str();
+    compressed_data.assign(decoded_str.begin(), decoded_str.end());
+
+    cout << "Entropy-decoded bitstream: " << format_size(compressed_data.size()) << endl;
 
     // Reconstruct byte stream
     cout << "\nRestoring byte stream..." << endl;
