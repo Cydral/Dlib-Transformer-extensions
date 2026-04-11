@@ -126,15 +126,11 @@ int main(int argc, char** argv)
         const long embedding_dim = 64;
         const long max_seq_len = 50; // Small sequence length for the example
 
-        using train_fused_transformer =
-            loss_multiclass_log<fc<vocab_size, rms_norm<
-            fused_transformer::transformer_stack<num_layers, gelu, dropout_10, embedding_dim, num_heads,
-            positional_embeddings<vocab_size, embedding_dim, input<matrix<int, 0, 1>>>>>>>;
+        using transformer_config = fused_transformer_config<
+            vocab_size, num_layers, num_heads, embedding_dim>;
 
-        using infer_fused_transformer =
-            loss_multiclass_log<fc<vocab_size, rms_norm<
-            fused_transformer::transformer_stack<num_layers, gelu, multiply, embedding_dim, num_heads,
-            positional_embeddings<vocab_size, embedding_dim, input<matrix<int, 0, 1>>>>>>>;
+        using train_fused_transformer = transformer_config::network_type<true>;
+        using infer_fused_transformer = transformer_config::network_type<false>;
 
         // For GPU usage (if any), set gpus = {0} for a single GPU, etc.
         std::vector<int> gpus{ 0 };

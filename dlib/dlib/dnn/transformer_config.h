@@ -18,6 +18,9 @@ namespace dlib
     template <long num_logits, typename SUBNET>
     using classification_head = loss_cross_entropy_per_logit<linear<num_logits, rms_norm<SUBNET>>>;
 
+    template <long num_logits, typename SUBNET>
+    using fused_classification_head = loss_multiclass_log<fc<num_logits, rms_norm<SUBNET>>>;
+
     // ----------------------------------------------------------------------------------------
 
     /**
@@ -27,6 +30,52 @@ namespace dlib
      * with compile-time parameter validation and network generation.
      *
      */
+
+    template<
+        long vocab_size = 2000,
+        long num_layers = 4,
+        long num_heads = 6,
+        long embedding_dim = 228,
+        template <typename> class activation_func = gelu,
+        template <typename> class dropout_policy = dropout_10
+    >
+    struct fused_transformer_config {
+        // Core model parameters
+        static constexpr long VOCAB_SIZE = vocab_size;
+        static constexpr long NUM_LAYERS = num_layers;
+        static constexpr long NUM_HEADS = num_heads;
+        static constexpr long EMBEDDING_DIM = embedding_dim;
+
+        // Compile-time validation of model configuration
+        struct validation {
+            static_assert(VOCAB_SIZE > 0, "Vocabulary size must be positive");
+            static_assert(NUM_LAYERS > 0, "Number of layers must be positive");
+            static_assert(NUM_HEADS > 0, "Number of attention heads must be positive");
+            static_assert(EMBEDDING_DIM% NUM_HEADS == 0, "Embedding dimension must be divisible by number of heads");
+        };
+
+        // Network definition selector based on training mode (with dropout for training, without for inference)
+        template<bool is_training>
+        using network_type = std::conditional_t<is_training,
+            fused_classification_head<VOCAB_SIZE,
+            fused_transformer::transformer_stack<NUM_LAYERS, activation_func, dropout_policy, EMBEDDING_DIM, NUM_HEADS,
+            positional_embeddings<VOCAB_SIZE, EMBEDDING_DIM, input<matrix<int, 0, 1>>>>>,
+            fused_classification_head<VOCAB_SIZE,
+            fused_transformer::transformer_stack<NUM_LAYERS, activation_func, multiply, EMBEDDING_DIM, NUM_HEADS,
+            positional_embeddings<VOCAB_SIZE, EMBEDDING_DIM, input<matrix<int, 0, 1>>>>>>;
+
+        struct model_info {
+            static std::string describe() {
+                std::stringstream ss;
+                ss << "Transformer model configuration (fused version):\n"
+                    << "- vocabulary size: " << VOCAB_SIZE << "\n"
+                    << "- layers: " << NUM_LAYERS << "\n"
+                    << "- attention heads: " << NUM_HEADS << "\n"
+                    << "- embedding dimension: " << EMBEDDING_DIM;
+                return ss.str();
+            }
+        };
+    };
 
     template<
         long vocab_size = 2000,

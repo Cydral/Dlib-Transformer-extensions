@@ -1,6 +1,6 @@
 /*!
     @file slm_predictive_compressor_ex.cpp
-    @brief Byte-level predictive compression using a GQA Transformer.
+    @brief Byte-level predictive compression using a Transformer.
 
     This example demonstrates an advanced application of AI generative models beyond
     traditional chatbot use cases. It implements a compression/decompression system
@@ -12,26 +12,33 @@
 
     Key features:
     - True bit-packing stream to physically shrink the serialized file.
-    - Uses Grouped Query Attention (GQA) for reduced parameter count and faster inference.
     - Eliminates padding entirely: the model only operates on fully populated context windows.
     - The first WINDOW_SIZE bytes are stored uncompressed to prime the prediction engine.
     - Graceful interruption (CTRL+C) via dlib::signal_handler with training checkpoints.
     - Early-stopping: interrupting training continues directly to compression.
     - CRC32 integrity verification on decompression.
-    - Model persistence: the trained model is saved to disk and embedded in the compressed
-      file so that decompression is fully self-contained.
+    - Model persistence: the trained model is saved to disk and optionally embedded in the
+      compressed file so that decompression is fully self-contained.
     - Skip-training option: reuse a previously saved model without retraining.
+    - No-embed option: produce a smaller compressed file without the model (requires the
+      external model file for decompression).
     - Text-mode progress bars with throughput statistics.
-    - Training data capped at MAX_TRAINING_BYTES (150 MB) to limit memory and time;
+    - Training data capped at MAX_TRAINING_BYTES (350 MB) to limit memory and time;
       compression and decompression always process the full file.
+    - Memory-efficient training: mini-batches are sampled on-the-fly from raw byte data,
+      avoiding pre-building the full dataset in memory.
 
     Compressed file format:
-    [MAGIC_NUMBER  4B] [original_size  8B] [CRC32  4B]
-    [serialized model (dlib serialize)] [literal_seed] [compressed_data]
+    [MAGIC_NUMBER 4B] [original_size 8B] [CRC32 4B] [flags 1B]
+    [serialized model if embedded] [literal_seed] [compressed_data]
+
+    Flags byte:
+    - bit 0: model is embedded (1) or external (0)
 
     Usage:
     --compress   --input <file> [--output <file>]
-    --compress   --input <file> --no-train          (skip training, reuse saved model)
+    --compress   --input <file> --no-train            (skip training, reuse saved model)
+    --compress   --input <file> --no-embed-model       (do not embed model in output)
     --decompress --input <file> [--output <file>]
 !*/
 
@@ -43,6 +50,7 @@
 #include <cmath>
 #include <iomanip>
 #include <chrono>
+#include <random>
 
 #include <dlib/dnn.h>
 #include <dlib/data_io.h>
@@ -50,33 +58,33 @@
 #include <dlib/misc_api.h>
 #include <dlib/crc32.h>
 
-#include <dlib/dnn/transformer_config.h>
-#include <dlib/dnn/transformer.h>
-
 using namespace std;
 using namespace dlib;
 
-// Constants & Configuration
-const uint32_t MAGIC_NUMBER = 0x444C4943;           // "DLIC" in big-endian
-const int WINDOW_SIZE = 10;                         // Fixed prediction window size
-const long MAX_VOCAB_SIZE = 256;                    // Exact byte range (0-255)
+// Constants & configuration
+const uint32_t MAGIC_NUMBER = 0x444C4943;              // "DLIC" in big-endian
+const int WINDOW_SIZE = 20;                            // Fixed prediction window size
+const long MAX_VOCAB_SIZE = 256;                       // Exact byte range (0-255)
 const std::string MODEL_SAVE_FILE = "dlib_predictive_compressor.dat";
-const size_t MAX_TRAINING_BYTES = 150 * 1024 * 1024;  // 150 MB cap for training data
+const size_t MAX_TRAINING_BYTES = 350 * 1024 * 1024;   // 350 MB cap for training data
+const int BATCH_SIZE = 128;                            // Mini-batch size for training
 
-// GQA Network architecture parameters
+// Flags byte layout
+const uint8_t FLAG_MODEL_EMBEDDED = 0x01;              // bit 0: model is embedded
+
+// Network architecture parameters
 const long NUM_LAYERS = 2;
 const long NUM_HEADS = 4;
-const long NUM_KV_HEADS = NUM_HEADS;                // Full MHA (set < NUM_HEADS for true GQA)
-const long EMBEDDING_DIM = 16;
+const long EMBEDDING_DIM = 32;
 
-// GQA Transformer configuration: single network type for both training and inference
-using compressor_transformer = gqa_transformer_config<
-    MAX_VOCAB_SIZE, NUM_LAYERS, NUM_HEADS, NUM_KV_HEADS, EMBEDDING_DIM>;
+// Transformer configuration: single network type for both training and inference
+using compressor_transformer = fused_transformer_config<
+    MAX_VOCAB_SIZE, NUM_LAYERS, NUM_HEADS, EMBEDDING_DIM>;
 
 using train_net = compressor_transformer::network_type<true>;
 using infer_net = compressor_transformer::network_type<false>;
 
-// Utility Functions
+// Utility functions
 std::string format_duration(double seconds)
 {
     int hours = static_cast<int>(seconds / 3600);
@@ -115,6 +123,21 @@ std::string format_size(size_t bytes)
     return oss.str();
 }
 
+// Format a compression ratio: positive = reduction, negative = expansion.
+// Example: 23000 -> 7000 yields "+69.57%", 23000 -> 30000 yields "-30.43%"
+std::string format_ratio(size_t compressed, size_t original)
+{
+    if (original == 0) return "N/A";
+    double reduction = (1.0 - static_cast<double>(compressed) / original) * 100.0;
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(2);
+    if (reduction >= 0)
+        oss << "+" << reduction << "%";
+    else
+        oss << reduction << "%";
+    return oss.str();
+}
+
 void show_progress(const std::string& label, size_t current, size_t total,
     std::chrono::steady_clock::time_point start_time)
 {
@@ -142,7 +165,7 @@ void show_progress(const std::string& label, size_t current, size_t total,
     if (current == total) cout << "\n";
 }
 
-// Bit Stream Classes
+// Bit stream classes
 class out_bit_stream {
     std::vector<uint8_t>& buffer;
     uint8_t current_byte = 0;
@@ -216,12 +239,40 @@ uint32_t compute_crc32(const std::vector<uint8_t>& data)
     return dlib::crc32(std::string(data.begin(), data.end()));
 }
 
-// Training
+// Training with on-the-fly batch sampling
+// Builds a single mini-batch by sampling random positions from the raw byte stream.
+// No full dataset is ever materialized: memory usage is O(batch_size), not O(file_size).
+void sample_batch(
+    const std::vector<uint8_t>& data,
+    size_t training_size,
+    std::mt19937& rng,
+    std::vector<matrix<int, 0, 1>>& batch_samples,
+    std::vector<unsigned long>& batch_labels
+)
+{
+    batch_samples.clear();
+    batch_labels.clear();
+    batch_samples.reserve(BATCH_SIZE);
+    batch_labels.reserve(BATCH_SIZE);
+
+    std::uniform_int_distribution<size_t> dist(WINDOW_SIZE, training_size - 1);
+
+    matrix<int, 0, 1> window(WINDOW_SIZE, 1);
+    for (int b = 0; b < BATCH_SIZE; ++b)
+    {
+        size_t target_pos = dist(rng);
+        long pos = 0;
+        for (size_t j = target_pos - WINDOW_SIZE; j < target_pos; ++j)
+            window(pos++) = data[j];
+
+        batch_samples.push_back(window);
+        batch_labels.push_back(data[target_pos]);
+    }
+}
+
 void train_predictor_model(train_net& net, const std::vector<uint8_t>& data,
     const std::string& input_path)
 {
-    // Cap training data to MAX_TRAINING_BYTES to limit memory and training time.
-    // The full file is always used for compression/decompression regardless.
     size_t training_size = data.size();
     if (training_size > MAX_TRAINING_BYTES) {
         training_size = MAX_TRAINING_BYTES;
@@ -229,42 +280,35 @@ void train_predictor_model(train_net& net, const std::vector<uint8_t>& data,
             << "). Training on first " << format_size(training_size) << " only." << endl;
     }
 
-    cout << "Preparing dataset for training (no padding)..." << endl;
+    size_t num_transitions = training_size - WINDOW_SIZE;
+    if (num_transitions == 0) return;
 
-    std::vector<matrix<int, 0, 1>> samples;
-    std::vector<unsigned long> labels;
+    cout << "Training transitions available: " << num_transitions << endl;
+    cout << "Mini-batch size: " << BATCH_SIZE << endl;
 
-    matrix<int, 0, 1> window(WINDOW_SIZE, 1);
-    for (size_t i = WINDOW_SIZE; i < training_size; ++i)
-    {
-        long pos = 0;
-        for (long j = i - WINDOW_SIZE; j < static_cast<long>(i); ++j)
-            window(pos++) = data[j];
-
-        samples.push_back(window);
-        labels.push_back(data[i]);
-    }
-
-    if (samples.empty()) return;
-
-    dnn_trainer<train_net, adam> trainer(net, adam(0.01, 0.9, 0.999));
-    trainer.set_learning_rate(1e-3);
-    trainer.set_min_learning_rate(1e-5);
-    trainer.set_mini_batch_size(64);
+    dnn_trainer<train_net, adam> trainer(net, adam(0.004, 0.9, 0.999));
+    trainer.set_learning_rate(1e-4);
+    trainer.set_min_learning_rate(1e-8);
+    trainer.set_iterations_without_progress_threshold(8000);
 
     std::string checkpoint_file = input_path + ".chkpt";
     trainer.set_synchronization_file(checkpoint_file, std::chrono::minutes(1));
     trainer.be_quiet();
 
-    cout << "Training predictor on " << samples.size() << " full-context transitions..." << endl;
     cout << "Checkpoint file: " << checkpoint_file << endl;
     cout << "Press CTRL+C to interrupt safely and proceed to compression.\n" << endl;
 
+    std::mt19937 rng(static_cast<unsigned>(std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::vector<matrix<int, 0, 1>> batch_samples;
+    std::vector<unsigned long> batch_labels;
+
     while (trainer.get_learning_rate() >= trainer.get_min_learning_rate() && !signal_handler::is_triggered())
     {
-        trainer.train_one_step(samples, labels);
+        sample_batch(data, training_size, rng, batch_samples, batch_labels);
+        trainer.train_one_step(batch_samples, batch_labels);
+
         if (trainer.get_train_one_step_calls() % 50 == 0) {
-            cout << "  Step: " << trainer.get_train_one_step_calls()
+            cout << "Step: " << trainer.get_train_one_step_calls()
                 << " | Loss: " << trainer.get_average_loss()
                 << " | LR: " << trainer.get_learning_rate() << "\r";
             cout.flush();
@@ -283,12 +327,14 @@ void train_predictor_model(train_net& net, const std::vector<uint8_t>& data,
 }
 
 // Compression
-void compress_file(const std::string& input_path, const std::string& output_path, bool do_train)
+void compress_file(const std::string& input_path, const std::string& output_path,
+    bool do_train, bool embed_model)
 {
     cout << "=== COMPRESSION MODE ===" << endl;
-    cout << "Input file : " << input_path << endl;
-    cout << "Output file: " << output_path << endl;
-    cout << "Training   : " << (do_train ? "Yes" : "No (reuse saved model)") << endl;
+    cout << "Input file   : " << input_path << endl;
+    cout << "Output file  : " << output_path << endl;
+    cout << "Training     : " << (do_train ? "Yes" : "No (reuse saved model)") << endl;
+    cout << "Embed model  : " << (embed_model ? "Yes" : "No (external model required for decompression)") << endl;
     cout << endl;
 
     // Read input
@@ -318,13 +364,11 @@ void compress_file(const std::string& input_path, const std::string& output_path
 
         train_predictor_model(t_net, data, input_path);
 
-        // Continue compression even if training was interrupted
         if (signal_handler::is_triggered()) {
             cout << "Training interrupted. Proceeding to compression with partial model..." << endl;
             signal_handler::reset();
         }
 
-        // Save trained model
         serialize(MODEL_SAVE_FILE) << t_net;
         cout << "Model saved to: " << MODEL_SAVE_FILE << endl;
     }
@@ -397,7 +441,10 @@ void compress_file(const std::string& input_path, const std::string& output_path
         << " (" << format_throughput(data.size() / comp_seconds) << ")" << endl;
 
     // Write output file
+    // Format: [MAGIC 4B] [original_size 8B] [CRC32 4B] [flags 1B]
+    //         [model if embedded] [literal_seed] [compressed_data]
     uint64_t original_size = data.size();
+    uint8_t flags = embed_model ? FLAG_MODEL_EMBEDDED : 0;
 
     std::ofstream out_file(output_path, std::ios::binary);
     if (!out_file) throw std::runtime_error("Cannot create output file: " + output_path);
@@ -405,23 +452,44 @@ void compress_file(const std::string& input_path, const std::string& output_path
     serialize(MAGIC_NUMBER, out_file);
     serialize(original_size, out_file);
     serialize(crc, out_file);
-    serialize(net, out_file);
+    serialize(flags, out_file);
+
+    // Record position before model to measure its serialized size
+    std::streampos pos_before_model = out_file.tellp();
+    if (embed_model) {
+        serialize(net, out_file);
+    }
+    std::streampos pos_after_model = out_file.tellp();
+    size_t model_size_in_file = static_cast<size_t>(pos_after_model - pos_before_model);
+
     serialize(literal_seed, out_file);
     serialize(compressed_data, out_file);
 
-    std::streampos final_size = out_file.tellp();
+    std::streampos final_pos = out_file.tellp();
+    size_t final_size = static_cast<size_t>(final_pos);
     out_file.close();
 
-    double theoretical_size = WINDOW_SIZE + ((total_predictions * 8.0) - bits_saved) / 8.0;
-    double bitstream_ratio = (theoretical_size / data.size()) * 100.0;
-    double overall_ratio = (static_cast<double>(final_size) / data.size()) * 100.0;
+    // Compute sizes for summary
+    // Header = magic(4) + original_size(8) + crc(4) + flags(1) = 17 bytes
+    const size_t header_size = 17;
+    size_t data_payload_size = final_size - model_size_in_file;
 
     cout << "\n=== COMPRESSION SUMMARY ===" << endl;
-    cout << "Original size            : " << format_size(data.size()) << endl;
-    cout << "Bitstream (theoretical)  : " << format_size(static_cast<size_t>(theoretical_size))
-        << " (" << std::fixed << std::setprecision(2) << bitstream_ratio << "%)" << endl;
-    cout << "Final file (w/ model)    : " << format_size(static_cast<size_t>(final_size))
-        << " (" << std::fixed << std::setprecision(2) << overall_ratio << "%)" << endl;
+    cout << "Original size          : " << format_size(data.size())
+        << " (" << data.size() << " bytes)" << endl;
+    cout << "Prediction accuracy    : " << std::fixed << std::setprecision(2) << accuracy << "%" << endl;
+    cout << "Data payload           : " << format_size(data_payload_size)
+        << "  compression: " << format_ratio(data_payload_size, data.size()) << endl;
+    if (embed_model) {
+        cout << "Embedded model         : " << format_size(model_size_in_file) << endl;
+        cout << "Total file (w/ model)  : " << format_size(final_size)
+            << "  vs original: " << format_ratio(final_size, data.size()) << endl;
+    }
+    else {
+        cout << "Model                  : external (" << MODEL_SAVE_FILE << ")" << endl;
+        cout << "Total file (no model)  : " << format_size(final_size)
+            << "  compression: " << format_ratio(final_size, data.size()) << endl;
+    }
     cout << "===========================" << endl;
     cout << "File compressed to: " << output_path << endl;
 }
@@ -449,14 +517,28 @@ void decompress_file(const std::string& input_path, const std::string& output_pa
     uint32_t stored_crc;
     deserialize(stored_crc, in_file);
 
+    uint8_t flags;
+    deserialize(flags, in_file);
+
+    bool model_embedded = (flags & FLAG_MODEL_EMBEDDED) != 0;
+
     cout << "Original file size: " << format_size(static_cast<size_t>(original_size)) << endl;
     cout << "Stored CRC32: " << std::hex << std::setfill('0') << std::setw(8) << stored_crc
         << std::dec << endl;
+    cout << "Model: " << (model_embedded ? "embedded" : "external") << endl;
 
-    // Load embedded model
-    cout << "Loading embedded model..." << endl;
+    // Load model
     infer_net net;
-    deserialize(net, in_file);
+    if (model_embedded) {
+        cout << "Loading embedded model..." << endl;
+        deserialize(net, in_file);
+    }
+    else {
+        cout << "Loading external model: " << MODEL_SAVE_FILE << endl;
+        if (!file_exists(MODEL_SAVE_FILE))
+            throw std::runtime_error("External model file not found: " + MODEL_SAVE_FILE);
+        deserialize(MODEL_SAVE_FILE) >> net;
+    }
 
     std::vector<uint8_t> literal_seed;
     deserialize(literal_seed, in_file);
@@ -548,15 +630,18 @@ int main(int argc, char** argv)
         parser.add_option("input", "Input file path", 1);
         parser.add_option("output", "Output file path (optional)", 1);
         parser.add_option("no-train", "Skip training, reuse previously saved model");
+        parser.add_option("no-embed-model", "Do not embed the model in the compressed file");
 
         parser.parse(argc, argv);
 
         if (!parser.option("compress") && !parser.option("decompress")) {
-            cout << "Dlib Predictive Compressor (GQA Edition)\n\n";
+            cout << "Dlib predictive compressor\n\n";
             parser.print_options();
             cout << "\nExamples:\n";
-            cout << "  Compress with training:\n";
+            cout << "  Compress with training (model embedded):\n";
             cout << "    " << argv[0] << " --compress --input data.txt --output data.dpc\n\n";
+            cout << "  Compress without embedding model (smaller output):\n";
+            cout << "    " << argv[0] << " --compress --input data.txt --no-embed-model\n\n";
             cout << "  Compress without training (reuse model):\n";
             cout << "    " << argv[0] << " --compress --input data.txt --no-train\n\n";
             cout << "  Decompress:\n";
@@ -585,7 +670,8 @@ int main(int argc, char** argv)
 
         if (parser.option("compress")) {
             bool do_train = !parser.option("no-train");
-            compress_file(input_path, output_path, do_train);
+            bool embed_model = !parser.option("no-embed-model");
+            compress_file(input_path, output_path, do_train, embed_model);
         }
         else {
             decompress_file(input_path, output_path);
