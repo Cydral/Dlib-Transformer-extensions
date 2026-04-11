@@ -11,7 +11,7 @@
 
 ---
 
-## Executive summary
+## At a glance
 
 This repository exists to make **modern Transformer development more accessible, inspectable, and reusable inside Dlib**.
 
@@ -23,22 +23,6 @@ It is not just a collection of example programs, and it is not just a low-level 
 - **reusable trained artifacts**
 
 In concrete terms, the project gives Dlib users a way to explore, implement, test, and progressively industrialize Transformer-based workflows in a codebase that remains close to the strengths of the Dlib philosophy: **clarity, portability, composability, and C++ integration**.
-
----
-
-## On this page
-
-- [Project overview](#project-overview)
-- [Why this project matters](#why-this-project-matters)
-- [What are Transformers?](#what-are-transformers)
-- [Why Dlib for Transformers?](#why-dlib-for-transformers)
-- [What the project currently covers](#what-the-project-currently-covers)
-- [Repository structure](#repository-structure)
-- [How to read the repository](#how-to-read-the-repository)
-- [Future directions](#future-directions)
-- [Design philosophy](#design-philosophy)
-- [Citing this project](#citing-this-project)
-- [Academic references](#academic-references)
 
 ---
 
@@ -244,18 +228,6 @@ If you are discussing the broader methodological foundations rather than the rep
 
 ---
 
-## Academic references
-
-[^vaswani2017]: Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N. Gomez, Lukasz Kaiser, and Illia Polosukhin. **Attention Is All You Need**. *Advances in Neural Information Processing Systems (NeurIPS)*, 2017.
-
-[^google-transformers]: Google Developers. **LLMs: What's a large language model? / What's a Transformer?** Machine Learning Crash Course.
-
-[^xu2023]: Peng Xu, Xiatian Zhu, and David A. Clifton. **Multimodal Learning with Transformers: A Survey**. *IEEE Transactions on Pattern Analysis and Machine Intelligence (TPAMI)*, 2023.
-
-[^islam2023]: Saidul Islam, Hanae Elmekki, Ahmed Elsebai, Jamal Bentahar, Najat Drawel, Gaith Rjoub, and Witold Pedrycz. **A Comprehensive Survey on Applications of Transformers for Deep Learning Tasks**. arXiv, 2023.
-
----
-
 ## Final note
 
 This main page is intended to remain the **stable architectural front door** of the repository:
@@ -265,4 +237,14 @@ This main page is intended to remain the **stable architectural front door** of 
 - concise enough not to duplicate the detailed example and model pages
 - structured enough to support future growth of the repository
 
-For practical use, the most natural next steps are to continue with [`examples/`](examples) for workflows or [`models/`](models) for ready-to-use artifacts.
+---
+
+## Academic references
+
+[^vaswani2017]: Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N. Gomez, Lukasz Kaiser, and Illia Polosukhin. **Attention Is All You Need**. *Advances in Neural Information Processing Systems (NeurIPS)*, 2017.
+
+[^google-transformers]: Google Developers. **LLMs: What's a large language model? / What's a Transformer?** Machine Learning Crash Course.
+
+[^xu2023]: Peng Xu, Xiatian Zhu, and David A. Clifton. **Multimodal Learning with Transformers: A Survey**. *IEEE Transactions on Pattern Analysis and Machine Intelligence (TPAMI)*, 2023.
+
+[^islam2023]: Saidul Islam, Hanae Elmekki, Ahmed Elsebai, Jamal Bentahar, Najat Drawel, Gaith Rjoub, and Witold Pedrycz. **A Comprehensive Survey on Applications of Transformers for Deep Learning Tasks**. arXiv, 2023.
