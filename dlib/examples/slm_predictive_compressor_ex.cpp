@@ -295,7 +295,7 @@ void train_predictor_model(train_net& net, const std::vector<uint8_t>& data,
     trainer.set_iterations_without_progress_threshold(8000);
 
     std::string checkpoint_file = input_path + ".chkpt";
-    trainer.set_synchronization_file(checkpoint_file, std::chrono::minutes(1));
+    trainer.set_synchronization_file(checkpoint_file, std::chrono::minutes(10));
     trainer.be_quiet();
 
     cout << "Checkpoint file: " << checkpoint_file << endl;

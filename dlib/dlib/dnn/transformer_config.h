@@ -54,15 +54,18 @@ namespace dlib
             static_assert(EMBEDDING_DIM% NUM_HEADS == 0, "Embedding dimension must be divisible by number of heads");
         };
 
+        template <long vocab, template <typename> class ACT, typename SUBNET>
+        using se = fc<vocab / 16, ACT<bn_fc<fc<vocab / 8, SUBNET>>>>;
+
         // Network definition selector based on training mode (with dropout for training, without for inference)
         template<bool is_training>
         using network_type = std::conditional_t<is_training,
-            fused_classification_head<VOCAB_SIZE,
+            fused_classification_head<VOCAB_SIZE, se<VOCAB_SIZE, dropout_policy,
             fused_transformer::transformer_stack<NUM_LAYERS, activation_func, dropout_policy, EMBEDDING_DIM, NUM_HEADS,
-            positional_embeddings<VOCAB_SIZE, EMBEDDING_DIM, input<matrix<int, 0, 1>>>>>,
-            fused_classification_head<VOCAB_SIZE,
+            positional_embeddings<VOCAB_SIZE, EMBEDDING_DIM, input<matrix<int, 0, 1>>>>>>,
+            fused_classification_head<VOCAB_SIZE, se<VOCAB_SIZE, dropout_policy,
             fused_transformer::transformer_stack<NUM_LAYERS, activation_func, multiply, EMBEDDING_DIM, NUM_HEADS,
-            positional_embeddings<VOCAB_SIZE, EMBEDDING_DIM, input<matrix<int, 0, 1>>>>>>;
+            positional_embeddings<VOCAB_SIZE, EMBEDDING_DIM, input<matrix<int, 0, 1>>>>>>>;
 
         struct model_info {
             static std::string describe() {

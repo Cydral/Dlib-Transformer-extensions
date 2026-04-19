@@ -465,7 +465,7 @@ namespace dlib
         template <template <typename> class ACT, template <typename> class DO,
             long d_model, long num_heads, typename SUBNET>
         using transformer_block =
-            add_prev5<fused_ffn<ACT, DO, d_model, rms_norm<tag5<
+            add_prev5<fused_swiglu<d_model, rms_norm<tag5<
             add_prev1<multihead_attention<DO, d_model, num_heads, rms_norm<tag1<SUBNET>>>>>>>>;
 
         template<long remaining_layers, template <typename> class ACT, template <typename> class DO,
