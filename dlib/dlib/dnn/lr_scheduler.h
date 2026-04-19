@@ -1,4 +1,4 @@
-// Copyright (C) 2025  Cydral (cydraltechnology@gmail.com)
+// Copyright (C) 2026  Cydral (cydraltechnology@gmail.com)
 // License: Boost Software License   See LICENSE.txt for the full license.
 #ifndef DLIB_DNN_LR_SCHEDULER_H_
 #define DLIB_DNN_LR_SCHEDULER_H_

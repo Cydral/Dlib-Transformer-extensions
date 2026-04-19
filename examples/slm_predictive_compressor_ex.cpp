@@ -23,7 +23,7 @@
     - No-embed option: produce a smaller compressed file without the model (requires the
       external model file for decompression).
     - Text-mode progress bars with throughput statistics.
-    - Training data capped at MAX_TRAINING_BYTES (350 MB) to limit memory and time;
+    - Training data capped at MAX_TRAINING_BYTES (500 MB) to limit memory and time;
       compression and decompression always process the full file.
     - Memory-efficient training: mini-batches are sampled on-the-fly from raw byte data,
       avoiding pre-building the full dataset in memory.
@@ -67,7 +67,7 @@ const uint32_t MAGIC_NUMBER = 0x444C4943;              // "DLIC" in big-endian
 const int WINDOW_SIZE = 16;                            // Fixed prediction window size
 const long MAX_VOCAB_SIZE = 256;                       // Exact byte range (0-255)
 const std::string MODEL_SAVE_FILE = "dlib_predictive_compressor.dat";
-const size_t MAX_TRAINING_BYTES = 350 * 1024 * 1024;   // 350 MB cap for training data
+const size_t MAX_TRAINING_BYTES = 500 * 1024 * 1024;   // 500 MB cap for training data
 const int BATCH_SIZE = 128;                            // Mini-batch size for training
 
 // Flags byte layout
@@ -295,7 +295,7 @@ void train_predictor_model(train_net& net, const std::vector<uint8_t>& data,
     trainer.set_iterations_without_progress_threshold(8000);
 
     std::string checkpoint_file = input_path + ".chkpt";
-    trainer.set_synchronization_file(checkpoint_file, std::chrono::minutes(1));
+    trainer.set_synchronization_file(checkpoint_file, std::chrono::minutes(10));
     trainer.be_quiet();
 
     cout << "Checkpoint file: " << checkpoint_file << endl;

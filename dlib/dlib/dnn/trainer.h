@@ -1,4 +1,4 @@
-// Copyright (C) 2015  Davis E. King (davis@dlib.net)
+// Copyright (C) 2026  Cydral (cydraltechnology@gmail.com)
 // License: Boost Software License   See LICENSE.txt for the full license.
 #ifndef DLIB_DNn_TRAINER_H_
 #define DLIB_DNn_TRAINER_H_

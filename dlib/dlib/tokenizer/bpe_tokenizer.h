@@ -165,72 +165,90 @@ namespace dlib
             }
         }
 
-        // Encode text into tokens
+        // Encode text into tokens (parallelized for large inputs)
         std::vector<int> encode(const std::string& text) const
         {
             if (text.empty()) return {};
 
-            // Convert to initial tokens
-            std::vector<int> tokens;
-            tokens.reserve(text.size());
-            for (unsigned char byte : text) {
-                tokens.push_back(static_cast<int>(byte));
+            long num_threads = compute_num_threads(text.size());
+            if (num_threads <= 1) return encode_sequential(text);
+
+            // Split text at newline boundaries into approximately equal chunks.
+            // Newline splitting preserves pre-token boundaries so each chunk
+            // produces the same token IDs as a single-pass sequential encode.
+            std::vector<std::pair<size_t, size_t>> chunks;
+            size_t chunk_target = text.size() / num_threads;
+            size_t start = 0;
+            for (long i = 0; i < num_threads; ++i) {
+                if (start >= text.size()) break;
+                size_t end = (i == num_threads - 1)
+                    ? text.size()
+                    : std::min(start + chunk_target, text.size());
+                while (end < text.size() && text[end] != '\n') ++end;
+                if (end < text.size()) ++end;
+                chunks.push_back({ start, end - start });
+                start = end;
+            }
+            if (start < text.size()) {
+                if (!chunks.empty())
+                    chunks.back().second = text.size() - chunks.back().first;
+                else
+                    chunks.push_back({ 0, text.size() });
             }
 
-            // Apply all merges in order
-            for (size_t merge_idx = BPE_BASE_VOCAB_SIZE; merge_idx < merges.size(); merge_idx++) {
-                const Merge& m = merges[merge_idx];
+            long n_chunks = static_cast<long>(chunks.size());
+            std::vector<std::vector<int>> chunk_tokens(n_chunks);
+            std::vector<std::thread> workers;
+            workers.reserve(n_chunks);
 
-                std::vector<int> new_tokens;
-                new_tokens.reserve(tokens.size());
-
-                for (size_t i = 0; i < tokens.size(); ) {
-                    if (i < tokens.size() - 1 && tokens[i] == m.left && tokens[i + 1] == m.right) {
-                        new_tokens.push_back(m.token_id);
-                        i += 2;
-                    }
-                    else {
-                        new_tokens.push_back(tokens[i]);
-                        i++;
-                    }
-                }
-
-                tokens = std::move(new_tokens);
+            for (long i = 0; i < n_chunks; ++i) {
+                workers.emplace_back([this, &text, &chunks, &chunk_tokens, i]() {
+                    chunk_tokens[i] = encode_sequential(
+                        text.substr(chunks[i].first, chunks[i].second));
+                    });
             }
+            for (auto& w : workers) w.join();
 
-            return tokens;
+            size_t total = 0;
+            for (auto& ct : chunk_tokens) total += ct.size();
+            std::vector<int> result;
+            result.reserve(total);
+            for (auto& ct : chunk_tokens)
+                result.insert(result.end(), ct.begin(), ct.end());
+            return result;
         }
 
-        // Decode tokens back to text
+        // Decode tokens back to text (parallelized for large inputs)
         std::string decode(const std::vector<int>& tokens, bool display_special_tokens = true) const
         {
-            std::vector<uint8_t> result;
-            result.reserve(tokens.size() * 4); // Estimate
+            if (tokens.empty()) return {};
 
-            for (int token : tokens) {
-                if (token >= 0 && token < static_cast<int>(merges.size())) {
-                    // Base token or merge token
-                    const std::vector<uint8_t>& pattern = merges[token].pattern;
-                    result.insert(result.end(), pattern.begin(), pattern.end());
-                }
-                else if (token >= static_cast<int>(merges.size()) &&
-                    token < static_cast<int>(get_vocab_size())) {
-                    // Special token
-                    if (display_special_tokens) {
-                        auto it = special_token_map.find(token);
-                        if (it != special_token_map.end()) {
-                            const std::string& special_str = it->second;
-                            result.insert(result.end(), special_str.begin(), special_str.end());
-                        }
-                    }
-                }
-                else {
-                    const std::string tok_unk = "<unk>";
-                    result.insert(result.end(), tok_unk.begin(), tok_unk.end());
-                }
+            long num_threads = compute_num_threads(tokens.size());
+            if (num_threads <= 1) return decode_sequential(tokens, display_special_tokens);
+
+            long n_chunks = num_threads;
+            size_t chunk_size = tokens.size() / n_chunks;
+            std::vector<std::string> chunk_strings(n_chunks);
+            std::vector<std::thread> workers;
+            workers.reserve(n_chunks);
+
+            for (long i = 0; i < n_chunks; ++i) {
+                workers.emplace_back([this, &tokens, &chunk_strings, i, n_chunks,
+                    chunk_size, display_special_tokens]() {
+                        size_t start = i * chunk_size;
+                        size_t end = (i == n_chunks - 1) ? tokens.size() : start + chunk_size;
+                        std::vector<int> chunk(tokens.begin() + start, tokens.begin() + end);
+                        chunk_strings[i] = decode_sequential(chunk, display_special_tokens);
+                    });
             }
+            for (auto& w : workers) w.join();
 
-            return std::string(result.begin(), result.end());
+            size_t total_len = 0;
+            for (auto& s : chunk_strings) total_len += s.size();
+            std::string result;
+            result.reserve(total_len);
+            for (auto& s : chunk_strings) result += s;
+            return result;
         }
 
         // Decode single token (for compatibility)
@@ -352,6 +370,78 @@ namespace dlib
                 special_token_map[next_id] = token;
                 next_id++;
             }
+        }
+
+        // Compute the number of worker threads for parallel encode/decode.
+        // Progressive scaling: below 10k elements use 1 thread (sequential),
+        // then scale proportionally up to (hardware_concurrency - 4).
+        static long compute_num_threads(size_t input_size)
+        {
+            if (input_size < 10000) return 1;
+            long hw = static_cast<long>(std::thread::hardware_concurrency());
+            long max_threads = std::max(1L, hw - 4);
+            long scaled = static_cast<long>(input_size / 10000);
+            return std::max(1L, std::min(max_threads, scaled));
+        }
+
+        // Sequential encode: converts text to byte tokens then applies all
+        // merges in order.  Used directly for small inputs and as the per-chunk
+        // worker for parallel encode.
+        std::vector<int> encode_sequential(const std::string& text) const
+        {
+            if (text.empty()) return {};
+            std::vector<int> tokens;
+            tokens.reserve(text.size());
+            for (unsigned char byte : text)
+                tokens.push_back(static_cast<int>(byte));
+
+            for (size_t merge_idx = BPE_BASE_VOCAB_SIZE; merge_idx < merges.size(); merge_idx++) {
+                const Merge& m = merges[merge_idx];
+                std::vector<int> new_tokens;
+                new_tokens.reserve(tokens.size());
+                for (size_t i = 0; i < tokens.size(); ) {
+                    if (i < tokens.size() - 1 && tokens[i] == m.left && tokens[i + 1] == m.right) {
+                        new_tokens.push_back(m.token_id);
+                        i += 2;
+                    }
+                    else {
+                        new_tokens.push_back(tokens[i]);
+                        i++;
+                    }
+                }
+                tokens = std::move(new_tokens);
+            }
+            return tokens;
+        }
+
+        // Sequential decode: maps each token ID to its byte pattern.
+        // Used directly for small inputs and as the per-chunk worker
+        // for parallel decode.
+        std::string decode_sequential(const std::vector<int>& tokens, bool display_special_tokens) const
+        {
+            std::vector<uint8_t> result;
+            result.reserve(tokens.size() * 4);
+            for (int token : tokens) {
+                if (token >= 0 && token < static_cast<int>(merges.size())) {
+                    const std::vector<uint8_t>& pattern = merges[token].pattern;
+                    result.insert(result.end(), pattern.begin(), pattern.end());
+                }
+                else if (token >= static_cast<int>(merges.size()) &&
+                    token < static_cast<int>(get_vocab_size())) {
+                    if (display_special_tokens) {
+                        auto it = special_token_map.find(token);
+                        if (it != special_token_map.end()) {
+                            const std::string& special_str = it->second;
+                            result.insert(result.end(), special_str.begin(), special_str.end());
+                        }
+                    }
+                }
+                else {
+                    const std::string tok_unk = "<unk>";
+                    result.insert(result.end(), tok_unk.begin(), tok_unk.end());
+                }
+            }
+            return std::string(result.begin(), result.end());
         }
 
         // Segment-based training functions from BPETokenizer

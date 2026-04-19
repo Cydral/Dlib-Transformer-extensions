@@ -1,4 +1,4 @@
-﻿// Copyright (C) 2026  Cydral Technology (cydraltechnology@gmail.com)
+﻿// Copyright (C) 2026  Cydral (cydraltechnology@gmail.com)
 // License: Boost Software License   See LICENSE.txt for the full license.
 #ifndef DLIB_DNN_TRANSFORMER_CONFIG_H_
 #define DLIB_DNN_TRANSFORMER_CONFIG_H_
