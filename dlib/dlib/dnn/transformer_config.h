@@ -55,7 +55,7 @@ namespace dlib
         };
 
         template <long vocab, template <typename> class ACT, typename SUBNET>
-        using se = fc<vocab / 16, ACT<bn_fc<fc<vocab / 8, SUBNET>>>>;
+        using se = fc<vocab/4, ACT<bn_fc<fc<vocab/2, SUBNET>>>>;
 
         // Network definition selector based on training mode (with dropout for training, without for inference)
         template<bool is_training>
