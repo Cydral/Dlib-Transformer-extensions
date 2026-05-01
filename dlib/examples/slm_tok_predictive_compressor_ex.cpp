@@ -77,15 +77,15 @@
 
 using namespace std;
 using namespace dlib;
-const char     MAGIC[3] = { 'D', 'L', 'C' };  // 3-byte file signature
-const long     MAX_VOCAB_SIZE = 1400;                // BPE vocabulary target
-const int      WINDOW_SIZE = 16;                  // Prediction context in tokens
+const char     MAGIC[3] = { 'D', 'L', 'C' };        // 3-byte file signature
+const long     MAX_VOCAB_SIZE = 1400;               // BPE vocabulary target
+const int      WINDOW_SIZE = 16;                    // Prediction context in tokens
 const long     NUM_LAYERS = 2;
 const long     NUM_HEADS = 4;
 const long     EMBEDDING_DIM = 32;
-const int      BATCH_SIZE = 128;                 // Training mini-batch
-const size_t   MAX_TRAINING_BYTES = 500UL * 1024 * 1024; // Cap for BPE tokenizer training
-const size_t   MAX_TRAINING_TOKENS = 50000000UL;           // 50M token cap for transformer training
+const int      BATCH_SIZE = 128;                    // Training mini-batch
+const size_t   MAX_TRAINING_BYTES = 500UL * 1024 * 1024;    // Cap for BPE tokenizer training
+const size_t   MAX_TRAINING_TOKENS = 50000000UL;            // 50M token cap for transformer training
 const uint8_t  FLAG_MODEL_EMBEDDED = 0x01;
 
 const std::string MODEL_SAVE_FILE = "dlib_tok_predictive_compressor.dat";

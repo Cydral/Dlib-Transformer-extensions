@@ -133,7 +133,7 @@ int main(int argc, char** argv)
         const std::string tokenizer_file = get_option(parser, "tokenizer-file", std::string("dlib_lm_tokenizer.vocab"));
 
         // Strict alignment with MoE configuration
-        constexpr long num_tokens = 2000;
+        constexpr long num_tokens = 1400;
         constexpr long max_seq_len = 100;
         constexpr long num_layers = 4;
         constexpr long num_heads = 6;

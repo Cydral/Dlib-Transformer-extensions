@@ -576,7 +576,7 @@ int main(int argc, char** argv)
         const std::string tokenizer_path = get_option(parser, "tokenizer", "enwiki_tokenizer.vocab");
         // Default number of prompt tokens = input sequence length
         const bool force_tokenize = parser.option("force-tokenize");
-        const long num_tokens = 1200;
+        const long num_tokens = 1000;
 
         // Calculate max bytes to process
         size_t max_bytes = 0, max_tokens = 0;

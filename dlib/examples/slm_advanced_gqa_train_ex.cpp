@@ -195,7 +195,7 @@ int main(int argc, char** argv)
         const std::string output_file = get_option(parser, "output-file", "generated_text.txt");
         
         // Model architecture parameters
-        const long num_tokens = 2000;
+        const long num_tokens = 1400;
         const long num_layers = 4;
         const long num_heads = 6;
         const long num_kv_heads = 2;

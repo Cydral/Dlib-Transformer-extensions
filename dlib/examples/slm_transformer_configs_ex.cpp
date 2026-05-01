@@ -307,9 +307,9 @@ int run_pipeline(
 {
     using my_transformer = TRANSFORMER_CONFIG;
 
-    constexpr long num_tokens = 2000;
+    constexpr long num_tokens = 1400;
     constexpr long num_layers = 4;
-    constexpr long max_seq_len = 100;
+    constexpr long max_seq_len = 50;
 
     const std::string tokens_file = "dlib_configs_datasets_tokens.bin";
     cout << my_transformer::model_info::describe() << "\n";
@@ -410,7 +410,7 @@ int run_pipeline(
 
         // Augment dataset with noisy copies for robustness
         augment_training_dataset(samples, labels,
-            static_cast<int>(tokenizer.get_special_token_id("<unk>")), pad_token, 0.03);
+            static_cast<int>(tokenizer.get_special_token_id("<unk>")), pad_token, 0.01);
         cout << "Augmented dataset size: " << samples.size() << "\n";
 
         // Build and initialize network
@@ -717,12 +717,12 @@ int main(int argc, char** argv)
         parser.add_option("generate", "Generate text from a previously trained model");
         parser.add_option("arch", "Network architecture: moe | hrm (default: moe)", 1);
         parser.add_option("learning-rate", "Set the learning rate (default: 2e-4)", 1);
-        parser.add_option("batch-size", "Set the mini-batch size (default: 64)", 1);
+        parser.add_option("batch-size", "Set the mini-batch size (default: 128)", 1);
         parser.add_option("patience", "Steps without progress before LR reduction (default: 8000)", 1);
         parser.add_option("max-epochs", "Maximum number of training epochs (default: 500)", 1);
         parser.add_option("weight-decay", "AdamW weight decay (default: 0.004)", 1);
         parser.add_option("beta1", "AdamW beta1 coefficient (default: 0.9)", 1);
-        parser.add_option("beta2", "AdamW beta2 coefficient (default: 0.998)", 1);
+        parser.add_option("beta2", "AdamW beta2 coefficient (default: 0.98)", 1);
         parser.add_option("model-file", "Override model file path (default: auto-named by arch)", 1);
         parser.add_option("tokenizer-file", "Path for tokenizer (default: dlib_lm_tokenizer.vocab)", 1);
         parser.add_option("external-data", "Path to external text data for training", 1);
@@ -746,12 +746,12 @@ int main(int argc, char** argv)
         cout << "Architecture: " << arch << "\n";
 
         const double learning_rate = get_option(parser, "learning-rate", 2e-4);
-        const size_t batch_size = get_option(parser, "batch-size", 64);
+        const size_t batch_size = get_option(parser, "batch-size", 128);
         const long patience = get_option(parser, "patience", 8000);
         const size_t max_epochs = get_option(parser, "max-epochs", 500);
         const double weight_decay = get_option(parser, "weight-decay", 0.004);
         const double beta1 = get_option(parser, "beta1", 0.9);
-        const double beta2 = get_option(parser, "beta2", 0.998);
+        const double beta2 = get_option(parser, "beta2", 0.98);
         const std::string tokenizer_file = get_option(parser, "tokenizer-file", "dlib_lm_tokenizer.vocab");
 
         const std::string model_file = parser.option("model-file")
@@ -759,7 +759,7 @@ int main(int argc, char** argv)
             : "dlib_lm_" + arch + "_model.dat";
         cout << "Model file : " << model_file << "\n\n";
 
-        constexpr long num_tokens = 2000;
+        constexpr long num_tokens = 1400;
         constexpr long num_layers = 4;
         constexpr long num_heads = 6;
         constexpr long num_kv_heads = 2;
