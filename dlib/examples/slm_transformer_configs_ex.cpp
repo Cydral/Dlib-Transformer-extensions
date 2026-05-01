@@ -482,15 +482,27 @@ int run_pipeline(
                         std::chrono::high_resolution_clock::now() - epoch_start).count();
                     double samples_per_sec = samples_seen / (elapsed > 0 ? elapsed : 1);
 
-                    cout << "epoch#: " << (epoch + 1) << "/" << max_epochs
-                        << " \t loss: " << avg_loss
-                        << " \t lr: " << trainer.get_learning_rate()
-                        << " \t speed: " << samples_per_sec << " samples/sec\r";
-                    cout.flush();
+                    // Build the progress line with fixed-width fields so a shorter update never
+                    // leaves stale characters from a previous longer line. The trailing spaces
+                    // pad to a known total width before the carriage return.
+                    std::ostringstream line;
+                    line << "epoch#: " << std::setw(4) << std::right << (epoch + 1)
+                        << "/" << std::left << std::setw(4) << max_epochs
+                        << "  loss: " << std::fixed << std::setprecision(4)
+                        << std::setw(8) << std::right << avg_loss
+                        << "  lr: " << std::scientific << std::setprecision(2)
+                        << std::setw(9) << trainer.get_learning_rate()
+                        << "  speed: " << std::fixed << std::setprecision(0)
+                        << std::setw(6) << std::right << samples_per_sec << " samples/sec";
+
+                    std::string s = line.str();
+                    if (s.size() < 90) s.append(90 - s.size(), ' ');
+                    cout << "\r" << s << std::flush;
                 }
             }
             epoch++;
         }
+        cout << "\n";
 
         // Save model
         trainer.get_net();
