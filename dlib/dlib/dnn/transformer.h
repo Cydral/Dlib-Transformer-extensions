@@ -1370,9 +1370,20 @@ namespace dlib
         size_t internal_parameters() const
         {
             size_t total = count_parameters(gate_net);
+            // Find any expert whose parameters have been allocated. After a single forward
+            // pass with top_k < n_experts, only the routed experts have allocated params,
+            // so experts[0] is not always representative. All experts share the same
+            // architecture, so any initialized one gives the correct per-expert count.
             if (!experts.empty())
-                total += count_parameters(experts[0])
-                * static_cast<size_t>(n_experts);
+            {
+                size_t per_expert = 0;
+                for (const auto& e : experts)
+                {
+                    const size_t n = count_parameters(e);
+                    if (n > 0) { per_expert = n; break; }
+                }
+                total += per_expert * static_cast<size_t>(n_experts);
+            }
             return total;
         }
 
@@ -1381,8 +1392,15 @@ namespace dlib
         {
             size_t total = count_parameters(gate_net);
             if (!experts.empty())
-                total += count_parameters(experts[0])
-                * static_cast<size_t>(top_k);
+            {
+                size_t per_expert = 0;
+                for (const auto& e : experts)
+                {
+                    const size_t n = count_parameters(e);
+                    if (n > 0) { per_expert = n; break; }
+                }
+                total += per_expert * static_cast<size_t>(top_k);
+            }
             return total;
         }
 
