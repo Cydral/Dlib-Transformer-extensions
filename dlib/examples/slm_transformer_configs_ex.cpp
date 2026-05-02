@@ -309,7 +309,7 @@ int run_pipeline(
 
     constexpr long num_tokens = 1400;
     constexpr long num_layers = 4;
-    constexpr long max_seq_len = 50;
+    constexpr long max_seq_len = 192;
 
     // TRAINING MODE
     cout << my_transformer::model_info::describe() << "\n";
@@ -436,10 +436,15 @@ int run_pipeline(
                 << aux_target << "); using all available\n";
         }
 
+        const size_t num_specials = tokenizer.get_specials_size();
+        const int random_max = static_cast<int>(tokenizer.get_vocab_size() - num_specials - 1);
+        const int random_min = 256;
+
         // Augment ONLY the main flat-corpus samples; cold-start samples teach a
-        // distinct skill (handling short contexts) and should not be perturbed.
+        // distinct skill (handling short contexts) and should not be perturbed
         augment_training_dataset(samples, labels,
-            static_cast<int>(tokenizer.get_special_token_id("<unk>")), pad_token, 0.05);
+            static_cast<int>(tokenizer.get_special_token_id("<unk>")), pad_token, 0.05,
+            1, 3, 0, augmentation_mode::random_token, random_min, random_max);
         
         // Combine main and auxiliary samples
         samples.insert(samples.end(),
@@ -466,7 +471,6 @@ int run_pipeline(
         // Propagate optimizer hyperparameters to internal sub-network solvers (HRM H/L, MoE experts/gate)
         network_context::set_optimizer_params(weight_decay, beta1, beta2);
 
-        cout << net << "\n";
         parameter_counts param_count = count_network_parameters(net, max_seq_len);
         cout << "Model parameters: " << param_count.total << " (active: " << param_count.active << ")\n";
 
@@ -516,7 +520,7 @@ int run_pipeline(
                 batches_seen++;
                 samples_seen += batch_X.size();
 
-                if (batches_count++ % 50 == 0) {
+                if (batches_count++ % 25 == 0) {
                     double avg_loss = total_loss / batches_seen;
                     auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::high_resolution_clock::now() - epoch_start).count();
@@ -583,7 +587,7 @@ int run_pipeline(
     // GENERATION MODE
     if (do_generate)
     {
-       typename my_transformer::template network_type<false> net;
+        typename my_transformer::template network_type<false> net;
         if (!file_exists(model_file)) {
             cerr << "Error: model file not found. Please run --train first.\n";
             return 0;
@@ -601,38 +605,45 @@ int run_pipeline(
             return 0;
         }
 
-        const std::string tokens_file_gen = "dlib_configs_datasets_tokens.bin";
+        const long text_start_id = tokenizer.get_special_token_id("<text>");
+        const long text_end_id = tokenizer.get_special_token_id("</text>");
+        if (text_start_id < 0 || text_end_id < 0) {
+            cerr << "Error: Required special tokens <text>/</text> missing from tokenizer.\n";
+            return 1;
+        }
+
+        // Tokenize segments on the fly for reference selection. We rebuild the
+        // per-segment token lists from the in-memory text_segments instead of
+        // relying on a serialized cache, keeping --generate self-contained.
+        if (text_segments.empty()) {
+            cerr << "Error: No text segments available for reference selection.\n";
+            return 1;
+        }
 
         std::vector<std::vector<int>> tokenized_segments;
-        if (!file_exists(tokens_file_gen)) {
-            cerr << "Error: Tokenized file not found. Please run --train first.\n";
-            return 0;
+        tokenized_segments.reserve(text_segments.size());
+        for (const auto& segment : text_segments)
+        {
+            std::vector<int> seg;
+            seg.push_back(static_cast<int>(text_start_id));
+            auto encoded = tokenizer.encode(segment);
+            seg.insert(seg.end(), encoded.begin(), encoded.end());
+            seg.push_back(static_cast<int>(text_end_id));
+            tokenized_segments.push_back(std::move(seg));
         }
+        cout << "Tokenized " << tokenized_segments.size() << " segments for reference selection\n";
 
-        cout << "Loading tokenized segments from: " << tokens_file_gen << "\n";
-        try {
-            deserialize(tokens_file_gen) >> tokenized_segments;
-            cout << "Loaded " << tokenized_segments.size() << " tokenized segments\n";
-        }
-        catch (const std::exception& e) {
-            cerr << "Error loading tokens: " << e.what() << "\n";
-            return 0;
-        }
-
-        if (tokenized_segments.empty()) {
-            cerr << "Error: No segments found in tokens file.\n";
-            return 0;
-        }
-
-        // Select a random segment with at least 2 tokens for splitting
+        // Select a random segment with enough content to support a prompt/reference split
         dlib::rand rng(std::chrono::system_clock::now().time_since_epoch().count());
 
         std::vector<size_t> valid_indices;
-        for (size_t i = 0; i < tokenized_segments.size(); ++i)
-            if (tokenized_segments[i].size() >= 2) valid_indices.push_back(i);
+        for (size_t i = 0; i < tokenized_segments.size(); ++i) {
+            // Need at least 2 content tokens (excluding the <text>/</text> wrappers)
+            if (tokenized_segments[i].size() >= 4) valid_indices.push_back(i);
+        }
 
         if (valid_indices.empty()) {
-            cerr << "Error: No segments with at least 2 tokens.\n";
+            cerr << "Error: No segments with enough content for a prompt/reference split.\n";
             return 1;
         }
 
@@ -642,39 +653,66 @@ int run_pipeline(
             << tokenized_segments.size() << ", " << valid_indices.size() << " valid)\n";
 
         const auto& selected_segment = tokenized_segments[segment_idx];
-        const size_t seg_len = selected_segment.size();
         const int pad_token = static_cast<int>(tokenizer.get_special_token_id("<pad>"));
+
+        // Strip wrapping special tokens before split so the model is evaluated on
+        // real content, not on its ability to predict <text>/</text> boundaries.
+        // The <text> marker is reinjected at the head of the prompt so the model
+        // sees a context consistent with what it was trained on.
+        std::vector<int> content(selected_segment.begin(), selected_segment.end());
+        if (!content.empty() && content.front() == static_cast<int>(text_start_id))
+            content.erase(content.begin());
+        if (!content.empty() && content.back() == static_cast<int>(text_end_id))
+            content.pop_back();
+
+        const size_t seg_len = content.size();
 
         // Prompt / reference split
         //
-        // Case A: segment fits within the context window (seg_len < max_seq_len)
+        // Case A: content fits within the context window (seg_len < max_seq_len)
         //   Split 50/50: first half is the prompt (left-padded), second half is ground-truth reference.
         //
-        // Case B: segment >= max_seq_len
+        // Case B: content >= max_seq_len
         //   First max_seq_len tokens become the prompt, remaining tokens are the reference.
 
         std::vector<int> input_half;
         std::vector<int> verify_half;
 
-        if (seg_len < static_cast<size_t>(max_seq_len)) {
+        // Force a short-prompt scenario in ~30% of runs to exercise the cold-start
+        // behaviour the model was trained on with left-padded samples.
+        const bool force_short_prompt = (rng.get_random_32bit_number() % 100) < 30;
+
+        if (force_short_prompt && content.size() > 8) {
+            // Use only the first few tokens as prompt to test cold-start behaviour
+            const size_t short_input = 4 + (rng.get_random_32bit_number() % 8);   // 4..11 tokens
+            input_half.assign(content.begin(), content.begin() + short_input);
+            verify_half.assign(content.begin() + short_input,
+                content.begin() + std::min(content.size(), short_input + max_seq_len));
+            cout << "Short-prompt test (cold-start scenario): input=" << input_half.size()
+                << " tokens (left-padded), verify=" << verify_half.size() << " tokens\n";
+        }
+        else if (seg_len < static_cast<size_t>(max_seq_len)) {
             size_t input_count = (seg_len + 1) / 2;
             size_t verify_count = seg_len - input_count;
             if (verify_count == 0) {
                 cerr << "Error: Segment too short for verification split (" << seg_len << " token(s)).\n";
                 return 1;
             }
-            input_half.assign(selected_segment.begin(), selected_segment.begin() + input_count);
-            verify_half.assign(selected_segment.begin() + input_count, selected_segment.end());
-            cout << "Short segment (" << seg_len << " tokens < window " << max_seq_len << "): "
+            input_half.assign(content.begin(), content.begin() + input_count);
+            verify_half.assign(content.begin() + input_count, content.end());
+            cout << "Short segment (" << seg_len << " content tokens < window " << max_seq_len << "): "
                 << "50/50 split - input=" << input_count << " tokens (left-padded), verify="
                 << verify_count << " tokens\n";
         }
         else {
-            input_half.assign(selected_segment.begin(), selected_segment.begin() + max_seq_len);
-            verify_half.assign(selected_segment.begin() + max_seq_len, selected_segment.end());
-            cout << "Full segment (" << seg_len << " tokens): first " << max_seq_len
+            input_half.assign(content.begin(), content.begin() + max_seq_len);
+            verify_half.assign(content.begin() + max_seq_len, content.end());
+            cout << "Full segment (" << seg_len << " content tokens): first " << max_seq_len
                 << " as input, " << verify_half.size() << " for verification\n";
         }
+
+        // Reinject <text> at the head of the prompt to match training-time context
+        input_half.insert(input_half.begin(), static_cast<int>(text_start_id));
 
         // Build inference window with left-padding
         inference_context llm_context(max_seq_len, 4, pad_token);
@@ -690,7 +728,7 @@ int run_pipeline(
         std::vector<int> generated_tokens;
         generated_tokens.reserve(tokens_to_generate);
 
-        const int end_of_text_id = static_cast<int>(tokenizer.get_special_token_id("</text>"));
+        const int end_of_text_id = static_cast<int>(text_end_id);
         auto gen_start = std::chrono::high_resolution_clock::now();
 
         for (size_t i = 0; i < tokens_to_generate && !signal_handler::is_triggered(); ++i)
@@ -704,12 +742,18 @@ int run_pipeline(
             input_seq = llm_context.get_input_window();
 
             if ((i + 1) % 50 == 0) {
-                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::high_resolution_clock::now() - gen_start).count();
-                double tps = (i + 1) / (elapsed > 0 ? elapsed : 1);
-                cout << "Generated " << (i + 1) << "/" << tokens_to_generate
-                    << " tokens - " << tps << " tokens/sec\r";
-                cout.flush();
+                double tps = (elapsed_ms > 0) ? ((i + 1) * 1000.0 / elapsed_ms) : 0.0;
+
+                std::ostringstream line;
+                line << "Generated " << std::setw(5) << std::right << (i + 1)
+                    << "/" << std::left << std::setw(5) << tokens_to_generate
+                    << "  speed: " << std::fixed << std::setprecision(1)
+                    << std::setw(6) << std::right << tps << " tokens/sec";
+                std::string s = line.str();
+                if (s.size() < 60) s.append(60 - s.size(), ' ');
+                cout << "\r" << s << std::flush;
             }
             if (next_token == end_of_text_id) break;
         }
@@ -772,7 +816,7 @@ int main(int argc, char** argv)
         parser.add_option("arch", "Network architecture: moe | hrm (default: moe)", 1);
         parser.add_option("learning-rate", "Set the learning rate (default: 2e-4)", 1);
         parser.add_option("batch-size", "Set the mini-batch size (default: 128)", 1);
-        parser.add_option("patience", "Steps without progress before LR reduction (default: 8000)", 1);
+        parser.add_option("patience", "Steps without progress before LR reduction (default: 6000)", 1);
         parser.add_option("max-epochs", "Maximum number of training epochs (default: 500)", 1);
         parser.add_option("weight-decay", "AdamW weight decay (default: 0.004)", 1);
         parser.add_option("beta1", "AdamW beta1 coefficient (default: 0.9)", 1);
@@ -801,7 +845,7 @@ int main(int argc, char** argv)
 
         const double learning_rate = get_option(parser, "learning-rate", 2e-4);
         const size_t batch_size = get_option(parser, "batch-size", 128);
-        const long patience = get_option(parser, "patience", 8000);
+        const long patience = get_option(parser, "patience", 6000);
         const size_t max_epochs = get_option(parser, "max-epochs", 500);
         const double weight_decay = get_option(parser, "weight-decay", 0.004);
         const double beta1 = get_option(parser, "beta1", 0.9);

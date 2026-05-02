@@ -902,16 +902,25 @@ namespace dlib
         }
     }
 
+    enum class augmentation_mode
+    {
+        unk_token,
+        random_token
+    };
+
     template <typename sample_type, typename label_type>
     void augment_training_dataset(
         std::vector<sample_type>& samples,
         std::vector<label_type>& labels,
-        int unk_token,
+        int noise_token,
         int padding_token,
         double augmentation_ratio = 0.2,
         long min_noise_tokens = 1,
         long max_noise_tokens = 3,
-        unsigned long seed = 0)
+        unsigned long seed = 0,
+        augmentation_mode mode = augmentation_mode::unk_token,
+        int random_token_min = 0,
+        int random_token_max = -1)
     {
         DLIB_CASSERT(samples.size() == labels.size(),
             "samples and labels must have the same size");
@@ -920,31 +929,50 @@ namespace dlib
         DLIB_CASSERT(min_noise_tokens >= 0 && max_noise_tokens >= min_noise_tokens,
             "Invalid noise token range: min=" << min_noise_tokens << ", max=" << max_noise_tokens);
 
+        if (mode == augmentation_mode::random_token)
+        {
+            DLIB_CASSERT(random_token_min >= 0 && random_token_max > random_token_min,
+                "Invalid random token range for random_token mode: ["
+                << random_token_min << ", " << random_token_max << "]");
+        }
+
         const size_t original_size = samples.size();
         if (original_size == 0 || augmentation_ratio == 0.0) return;
 
-        // Calculate number of augmented samples to create
-        // Note: actual count may be less if samples have no valid (non-padding) positions
         const size_t num_augmented = static_cast<size_t>(original_size * augmentation_ratio);
         if (num_augmented == 0) return;
 
-        // Reserve space to avoid multiple reallocations
         samples.reserve(original_size + num_augmented);
         labels.reserve(original_size + num_augmented);
 
         dlib::rand rng;
         if (seed != 0) rng = dlib::rand(seed);
 
+        // Helper to draw a random token in [random_token_min, random_token_max] while
+        // avoiding both padding_token and noise_token. The exclusion is best-effort:
+        // if the range is too narrow, we just retry a few times then return what we have.
+        auto draw_random_token = [&]() -> int
+            {
+                const int range_size = random_token_max - random_token_min + 1;
+                for (int attempt = 0; attempt < 8; ++attempt)
+                {
+                    const int candidate = random_token_min +
+                        static_cast<int>(rng.get_random_32bit_number() % range_size);
+                    if (candidate != padding_token && candidate != noise_token)
+                        return candidate;
+                }
+                // Fallback: return any value in range, even if it collides
+                return random_token_min +
+                    static_cast<int>(rng.get_random_32bit_number() % range_size);
+            };
+
         for (size_t aug_idx = 0; aug_idx < num_augmented; ++aug_idx)
         {
-            // Select a random sample to augment
             const size_t source_idx = rng.get_random_32bit_number() % original_size;
 
-            // Create a copy of the sample and its label
             auto augmented_sample = samples[source_idx];
             auto augmented_label = labels[source_idx];
 
-            // Identify non-padding positions in the sample
             std::vector<long> valid_positions;
             const long sample_length = augmented_sample.nr();
 
@@ -954,10 +982,8 @@ namespace dlib
                     valid_positions.push_back(i);
             }
 
-            // Skip if no valid positions to add noise
             if (valid_positions.empty()) continue;
 
-            // Determine number of tokens to replace with noise
             const long num_valid = static_cast<long>(valid_positions.size());
             const long effective_max = std::min(max_noise_tokens, num_valid);
             const long effective_min = std::min(min_noise_tokens, effective_max);
@@ -969,27 +995,28 @@ namespace dlib
                     (rng.get_random_32bit_number() % (effective_max - effective_min + 1));
             }
 
-            // Ensure noise ratio is reasonable (max 30% of non-padding tokens)
             const long max_reasonable = std::max(1L, static_cast<long>(num_valid * 0.3));
             num_noise = std::min(num_noise, max_reasonable);
 
-            // Randomly select positions to replace with UNK
             std::vector<long> noise_positions = valid_positions;
-
-            // Fisher-Yates shuffle to select random positions
             for (long i = static_cast<long>(noise_positions.size()) - 1; i > 0; --i)
             {
                 long j = rng.get_random_32bit_number() % (i + 1);
                 std::swap(noise_positions[i], noise_positions[j]);
             }
 
-            // Apply noise to the first num_noise positions
             for (long i = 0; i < num_noise; ++i)
             {
-                augmented_sample(noise_positions[i]) = unk_token;
+                if (mode == augmentation_mode::unk_token)
+                {
+                    augmented_sample(noise_positions[i]) = noise_token;
+                }
+                else  // random_token mode: each replaced position gets its own random draw
+                {
+                    augmented_sample(noise_positions[i]) = draw_random_token();
+                }
             }
 
-            // Add augmented sample and label to the dataset
             samples.push_back(std::move(augmented_sample));
             labels.push_back(std::move(augmented_label));
         }
