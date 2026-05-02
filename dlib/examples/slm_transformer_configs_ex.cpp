@@ -311,107 +311,147 @@ int run_pipeline(
     constexpr long num_layers = 4;
     constexpr long max_seq_len = 50;
 
-    const std::string tokens_file = "dlib_configs_datasets_tokens.bin";
-    cout << my_transformer::model_info::describe() << "\n";
-
     // TRAINING MODE
+    cout << my_transformer::model_info::describe() << "\n";
     if (do_train)
     {
-        // Try to load pre-tokenized tokens
-        std::vector<std::vector<int>> full_tokens;
-        bool tokens_loaded = false;
+        // Train a new tokenizer if needed
+        if (!file_exists(tokenizer_file)) {
+            cout << "Training new BPE tokenizer (vocab size " << num_tokens << ")...\n";
 
-        if (file_exists(tokens_file)) {
-            cout << "Found pre-tokenized tokens file: " << tokens_file << "\n";
-            try {
-                dlib::deserialize(tokens_file) >> full_tokens;
-                size_t total_tokens = 0;
-                for (const auto& seg : full_tokens) total_tokens += seg.size();
-                cout << "Loaded " << full_tokens.size() << " segments (" << total_tokens << " tokens)\n";
-                tokens_loaded = true;
+            const std::string delimiter = "@@";
+            std::string tokenizer_corpus =
+                get_dataset_as_text(dataset_id::BLACK_HOLE_ARTICLE) + delimiter
+                + get_dataset_as_text(dataset_id::PHYSICS_PARAGRAPHS) + delimiter
+                + get_dataset_as_text(dataset_id::BLACK_HOLE_QA_PARTA) + delimiter
+                + get_dataset_as_text(dataset_id::BLACK_HOLE_QA_PARTB) + delimiter
+                + get_dataset_as_text(dataset_id::BLACK_HOLE_QA_PARTC) + delimiter
+                + get_dataset_as_text(dataset_id::GENERAL_KNOWLEDGE);
+
+            if (!external_corpus_for_tokenizer.empty())
+                tokenizer_corpus += delimiter + external_corpus_for_tokenizer;
+
+            size_t pos = 0;
+            while ((pos = tokenizer_corpus.find(delimiter, pos)) != std::string::npos) {
+                tokenizer_corpus.replace(pos, delimiter.length(), " ");
+                pos += 1;
             }
-            catch (const std::exception& e) {
-                cerr << "Failed to load tokens: " << e.what() << "\nWill tokenize again.\n";
-                full_tokens.clear();
-            }
+
+            tokenizer.train(tokenizer_corpus, num_tokens, 1e6, true);
+            serialize(tokenizer_file) << tokenizer;
+            cout << "Tokenizer saved to " << tokenizer_file << "\n";
         }
 
-        if (!tokens_loaded) {
-            // Train a new tokenizer if needed
-            if (!file_exists(tokenizer_file)) {
-                cout << "Training new BPE tokenizer (vocab size " << num_tokens << ")...\n";
-
-                const std::string delimiter = "@@";
-                std::string tokenizer_corpus =
-                    get_dataset_as_text(dataset_id::BLACK_HOLE_ARTICLE) + delimiter
-                    + get_dataset_as_text(dataset_id::PHYSICS_PARAGRAPHS) + delimiter
-                    + get_dataset_as_text(dataset_id::BLACK_HOLE_QA_PARTA) + delimiter
-                    + get_dataset_as_text(dataset_id::BLACK_HOLE_QA_PARTB) + delimiter
-                    + get_dataset_as_text(dataset_id::BLACK_HOLE_QA_PARTC) + delimiter
-                    + get_dataset_as_text(dataset_id::GENERAL_KNOWLEDGE);
-
-                if (!external_corpus_for_tokenizer.empty())
-                    tokenizer_corpus += delimiter + external_corpus_for_tokenizer;
-
-                size_t pos = 0;
-                while ((pos = tokenizer_corpus.find(delimiter, pos)) != std::string::npos) {
-                    tokenizer_corpus.replace(pos, delimiter.length(), " ");
-                    pos += 1;
-                }
-
-                tokenizer.train(tokenizer_corpus, num_tokens, 1e6, true);
-                serialize(tokenizer_file) << tokenizer;
-                cout << "Tokenizer saved to " << tokenizer_file << "\n";
-            }
-
-            // Validate required special tokens
-            long text_start_id = tokenizer.get_special_token_id("<text>");
-            long text_end_id = tokenizer.get_special_token_id("</text>");
-            if (text_start_id < 0 || text_end_id < 0) {
-                cerr << "ERROR: Required special tokens not found in tokenizer!\n"
-                    << "The tokenizer must include: <text>, </text>\n";
-                return 1;
-            }
-
-            // Tokenize all segments with <text>...</text> wrapping
-            cout << "Tokenizing " << text_segments.size() << " segments...\n";
-            auto t_start = std::chrono::high_resolution_clock::now();
-            size_t total_tokens = 0;
-
-            for (const auto& segment : text_segments) {
-                std::vector<int> seg_tokens;
-                seg_tokens.push_back(static_cast<int>(text_start_id));
-                auto encoded = tokenizer.encode(segment);
-                seg_tokens.insert(seg_tokens.end(), encoded.begin(), encoded.end());
-                seg_tokens.push_back(static_cast<int>(text_end_id));
-                total_tokens += seg_tokens.size();
-                full_tokens.push_back(std::move(seg_tokens));
-            }
-
-            auto t_end = std::chrono::high_resolution_clock::now();
-            cout << "Tokenization complete: " << total_tokens << " tokens in "
-                << std::chrono::duration_cast<std::chrono::seconds>(t_end - t_start).count() << "s\n";
-            text_segments.clear();
-
-            cout << "Saving tokens to: " << tokens_file << "\n";
-            try { serialize(tokens_file) << full_tokens; cout << "Tokens saved.\n"; }
-            catch (const std::exception& e) { cerr << "Warning: Failed to save tokens: " << e.what() << "\n"; }
+        // Validate required special tokens
+        long text_start_id = tokenizer.get_special_token_id("<text>"),
+             text_end_id = tokenizer.get_special_token_id("</text>");
+        if (text_start_id < 0 || text_end_id < 0) {
+            cerr << "ERROR: Required special tokens not found in tokenizer!\n"
+                << "The tokenizer must include: <text>, </text>\n";
+            return 1;
         }
 
-        // Build training sequences via sliding window
+        // Tokenize all segments with <text>...</text> wrapping. Each segment is encoded
+        // once and stored in per_segment_tokens; the flat corpus used for the main
+        // pre-training pass is derived by concatenation in the same loop.
+        cout << "Tokenizing " << text_segments.size() << " segments...\n";
+        auto t_start = std::chrono::high_resolution_clock::now();
+
+        std::vector<std::vector<int>> per_segment_tokens;
+        std::vector<std::vector<int>> flat_corpus(1);
+        per_segment_tokens.reserve(text_segments.size());
+        flat_corpus[0].reserve(1u << 20);
+
+        for (const auto& segment : text_segments)
+        {
+            std::vector<int> seg;
+            seg.push_back(static_cast<int>(text_start_id));
+            auto encoded = tokenizer.encode(segment);
+            seg.insert(seg.end(), encoded.begin(), encoded.end());
+            seg.push_back(static_cast<int>(text_end_id));
+
+            // Mirror this segment into the flat stream
+            flat_corpus[0].insert(flat_corpus[0].end(), seg.begin(), seg.end());
+            per_segment_tokens.push_back(std::move(seg));
+        }
+
+        auto t_end = std::chrono::high_resolution_clock::now();
+        cout << "Tokenization complete: " << flat_corpus[0].size() << " tokens in "
+            << std::chrono::duration_cast<std::chrono::seconds>(t_end - t_start).count() << "s\n";
+        text_segments.clear();
+
+        // Main pre-training samples from the flat corpus
         cout << "Preparing training sequences (window=" << max_seq_len << ")...\n";
         std::vector<matrix<int, 0, 1>> samples;
         std::vector<unsigned long> labels;
-
         const int pad_token = static_cast<int>(tokenizer.get_special_token_id("<pad>"));
-        build_single_token_prediction_dataset(full_tokens, max_seq_len, pad_token, false, samples, labels);
-        cout << "Created " << samples.size() << " training samples\n";
-        full_tokens.clear();
+        build_single_token_prediction_dataset(flat_corpus, max_seq_len, pad_token, false, samples, labels);
+        const size_t main_size = samples.size();
+        cout << "Main samples (flat, no padding): " << main_size << "\n";
 
-        // Augment dataset with noisy copies for robustness
+        // Auxiliary cold-start samples with progressive left padding
+        std::vector<matrix<int, 0, 1>> aux_samples;
+        std::vector<unsigned long> aux_labels;
+        build_single_token_prediction_dataset(per_segment_tokens, max_seq_len, pad_token, true, aux_samples, aux_labels);
+
+        // Keep only the genuinely left-padded samples. Non-padded sliding windows from
+        // per-segment processing duplicate windows already present in the main flat
+        // corpus, so dropping them avoids skewing the training distribution.
+        {
+            std::vector<matrix<int, 0, 1>> filtered_X;
+            std::vector<unsigned long> filtered_Y;
+            filtered_X.reserve(aux_samples.size());
+            filtered_Y.reserve(aux_samples.size());
+            for (size_t i = 0; i < aux_samples.size(); ++i)
+            {
+                if (count_leading_padding(aux_samples[i], pad_token) > 0)
+                {
+                    filtered_X.push_back(std::move(aux_samples[i]));
+                    filtered_Y.push_back(aux_labels[i]);
+                }
+            }
+            aux_samples = std::move(filtered_X);
+            aux_labels = std::move(filtered_Y);
+        }
+
+        // Cap auxiliary set at ~5% of main to avoid distribution skew
+        const size_t aux_target = main_size / 20;
+        if (aux_samples.size() > aux_target)
+        {
+            // Random subsample to keep diversity across segments
+            dlib::rand rng(std::chrono::system_clock::now().time_since_epoch().count());
+            for (size_t i = aux_samples.size(); i > aux_target; --i)
+            {
+                const size_t idx = rng.get_random_64bit_number() % i;
+                aux_samples[idx] = std::move(aux_samples.back());
+                aux_samples.pop_back();
+                aux_labels[idx] = aux_labels.back();
+                aux_labels.pop_back();
+            }
+        }
+        cout << "Cold-start samples generated: " << aux_samples.size() << "\n";
+        if (aux_samples.size() < aux_target)
+        {
+            cout << "  Note: cold-start pool smaller than 5% target ("
+                << aux_target << "); using all available\n";
+        }
+
+        // Augment ONLY the main flat-corpus samples; cold-start samples teach a
+        // distinct skill (handling short contexts) and should not be perturbed.
         augment_training_dataset(samples, labels,
-            static_cast<int>(tokenizer.get_special_token_id("<unk>")), pad_token, 0.01);
-        cout << "Augmented dataset size: " << samples.size() << "\n";
+            static_cast<int>(tokenizer.get_special_token_id("<unk>")), pad_token, 0.05);
+        
+        // Combine main and auxiliary samples
+        samples.insert(samples.end(),
+            std::make_move_iterator(aux_samples.begin()),
+            std::make_move_iterator(aux_samples.end()));
+        labels.insert(labels.end(), aux_labels.begin(), aux_labels.end());
+
+        const size_t main_after_aug = samples.size() - aux_samples.size();
+        cout << "Final dataset size: main=" << main_size
+            << " (+" << (main_after_aug - main_size) << " augmented)"
+            << ", cold-start=" << aux_samples.size()
+            << ", total=" << samples.size() << "\n";
 
         // Build and initialize network
         using train_net_type = typename my_transformer::template network_type<true>;
@@ -478,9 +518,11 @@ int run_pipeline(
 
                 if (batches_count++ % 50 == 0) {
                     double avg_loss = total_loss / batches_seen;
-                    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::high_resolution_clock::now() - epoch_start).count();
-                    double samples_per_sec = samples_seen / (elapsed > 0 ? elapsed : 1);
+                    double samples_per_sec = (elapsed_ms > 0)
+                        ? (samples_seen * 1000.0 / elapsed_ms)
+                        : 0.0;
 
                     // Build the progress line with fixed-width fields so a shorter update never
                     // leaves stale characters from a previous longer line. The trailing spaces
@@ -532,8 +574,8 @@ int run_pipeline(
 
             double accuracy = static_cast<double>(correct) / labels.size();
             cout << "Training accuracy: " << (accuracy * 100.0) << "%\n";
-            if (accuracy < 0.999)
-                cout << "WARNING: Accuracy below 99.9% -- model may not fully memorize the corpus.\n";
+            if (accuracy < 0.98)
+                cout << "WARNING: Accuracy below 98% -- check loss curve and learning rate schedule.\n";
         }
         network_context::reset();
     }
