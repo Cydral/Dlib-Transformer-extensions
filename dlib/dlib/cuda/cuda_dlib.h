@@ -741,6 +741,62 @@ namespace dlib
             mutable cuda_data_void_ptr buf;
         };
 
+        class compute_loss_cross_entropy_per_logit_multi
+        {
+            /*!
+                Multi-index variant of compute_loss_cross_entropy_per_logit. A
+                position is excluded from loss and gradient when its target
+                token appears in the configured ignore_indices set.
+
+                Used during instruct fine-tuning to mask the prompt portion of
+                samples so gradients only flow through response tokens.
+
+                Supports:
+                - ignore_indices: arbitrary set of tokens to exclude
+                - label_smoothing: smooths target distribution (recommended: 0.1)
+            !*/
+        public:
+            compute_loss_cross_entropy_per_logit_multi() {}
+
+            template <typename const_label_iterator>
+            void operator() (
+                const_label_iterator truth,
+                const tensor& input_tensor,
+                const tensor& subnetwork_output,
+                tensor& gradient,
+                double& loss,
+                const std::vector<long>& ignore_indices,
+                double label_smoothing
+                ) const
+            {
+                const size_t bytes_per_sample = sizeof(unsigned long);
+                buf = device_global_buffer(subnetwork_output.num_samples() * bytes_per_sample + sizeof(float));
+                cuda_data_ptr<float> loss_buf = static_pointer_cast<float>(buf, 1);
+                buf = buf + sizeof(float);
+                for (long i = 0; i < subnetwork_output.num_samples(); ++i, ++truth)
+                {
+                    const unsigned long t = *truth;
+                    memcpy(buf + i * bytes_per_sample, &t, bytes_per_sample);
+                }
+                auto truth_buf = static_pointer_cast<const unsigned long>(buf, subnetwork_output.num_samples());
+                do_work(loss_buf, truth_buf, input_tensor, subnetwork_output, gradient, loss,
+                    ignore_indices, label_smoothing);
+            }
+
+        private:
+            static void do_work(
+                cuda_data_ptr<float> loss_work_buffer,
+                cuda_data_ptr<const unsigned long> truth_buffer,
+                const tensor& input_tensor,
+                const tensor& subnetwork_output,
+                tensor& gradient,
+                double& loss,
+                const std::vector<long>& ignore_indices,
+                double label_smoothing
+            );
+            mutable cuda_data_void_ptr buf;
+        };
+
     // ----------------------------------------------------------------------------------------
 
         class compute_loss_binary_log_per_pixel

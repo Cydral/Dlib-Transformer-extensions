@@ -809,6 +809,195 @@ namespace dlib
     template <typename SUBNET>
     using loss_multibinary_log = add_loss_layer<loss_multibinary_log_, SUBNET>;
 
+    // ----------------------------------------------------------------------------------------
+
+    class loss_cross_entropy_per_logit_
+    {
+        /*!
+            WHAT THIS OBJECT REPRESENTS
+                This object implements the loss layer interface defined above by
+                EXAMPLE_LOSS_LAYER_.  In particular, it implements per-position
+                cross-entropy loss for sequence-to-sequence and language modeling
+                tasks where each output position must produce a probability
+                distribution over a discrete vocabulary.
+
+                Unlike loss_multiclass_log which expects one label per sample,
+                this loss expects per-sample logits arranged as a sequence: the
+                output tensor is interpreted as a (batch_size, 1, seq_len, vocab_size)
+                tensor where each (b, 0, t, :) slice is the logit distribution for
+                the token at position t of sample b.
+
+                The loss for a sample is the average cross-entropy across all
+                positions in the sequence, with optional label smoothing and
+                optional masking of selected target indices.
+
+                MASKING
+                Two complementary masking mechanisms are provided:
+
+                - Single ignore index (legacy): set via set_ignore_index(idx).
+                  Positions whose target label equals idx contribute neither to
+                  the loss nor to the gradient.
+
+                - Multi-index ignore (instruct fine-tuning): set via
+                  set_ignore_indices(...) or add_ignore_index(...). Any position
+                  whose target label appears in the configured set is excluded
+                  from loss and gradient computation. This is useful when
+                  training on prompt/response pairs and the gradient should
+                  only flow through response tokens.
+
+                When ignore_indices is non-empty, it takes precedence over the
+                single ignore_index value. The two are kept in sync so that
+                set_ignore_indices({k}) is equivalent to set_ignore_index(k).
+
+                LABEL SMOOTHING
+                Label smoothing distributes a small probability mass eps
+                uniformly over all classes other than the target. This
+                regularizes the model by preventing it from producing overly
+                confident predictions and is widely used in transformer
+                language models. The default smoothing value is 0.1.
+        !*/
+
+    public:
+        typedef unsigned long training_label_type;
+        typedef unsigned long output_label_type;
+
+        loss_cross_entropy_per_logit_(
+        );
+        /*!
+            ensures
+                - #get_ignore_index() == -1
+                - #get_ignore_indices().empty() == true
+                - #get_label_smoothing() == 0.1
+        !*/
+
+        void set_ignore_index(
+            long idx
+        );
+        /*!
+            ensures
+                - #get_ignore_index() == idx
+                - Positions whose target label equals idx will be skipped during
+                  loss and gradient computation.
+                - This call does not affect any previously configured multi-index
+                  ignore set; that set takes precedence when non-empty.
+        !*/
+
+        long get_ignore_index(
+        ) const;
+        /*!
+            ensures
+                - returns the legacy single ignore index. A value of -1 means no
+                  legacy ignore index is configured. The active masking depends
+                  on whether ignore_indices() is empty.
+        !*/
+
+        void set_ignore_indices(
+            const std::vector<long>& indices
+        );
+        /*!
+            ensures
+                - #get_ignore_indices() == indices
+                - Positions whose target label appears in indices will be skipped
+                  during loss and gradient computation.
+                - If indices is empty, the loss falls back to the single
+                  ignore_index path.
+                - get_ignore_index() is updated to the first element of indices,
+                  or -1 if indices is empty, to keep the two APIs in sync.
+        !*/
+
+        const std::vector<long>& get_ignore_indices(
+        ) const;
+        /*!
+            ensures
+                - returns the active set of ignore indices. When non-empty, this
+                  set is the masking criterion used during loss computation.
+        !*/
+
+        void add_ignore_index(
+            long idx
+        );
+        /*!
+            ensures
+                - if (idx is not already present in get_ignore_indices())
+                    then idx is appended to the ignore indices set
+                - if (get_ignore_index() == -1)
+                    then #get_ignore_index() == idx
+        !*/
+
+        void clear_ignore_indices(
+        );
+        /*!
+            ensures
+                - #get_ignore_indices().empty() == true
+                - #get_ignore_index() == -1
+                - All masking is disabled until a new ignore index or set is configured.
+        !*/
+
+        void set_label_smoothing(
+            double eps
+        );
+        /*!
+            requires
+                - 0.0 <= eps < 1.0
+            ensures
+                - #get_label_smoothing() == eps
+        !*/
+
+        double get_label_smoothing(
+        ) const;
+        /*!
+            ensures
+                - returns the label smoothing coefficient currently in effect.
+        !*/
+
+        template <typename SUB_TYPE, typename label_iterator>
+        void to_label(
+            const tensor& input_tensor,
+            const SUB_TYPE& sub,
+            label_iterator iter
+        ) const;
+        /*!
+            requires
+                - sub.sample_expansion_factor() == 1
+                - sub.get_output().k() == 1
+                - input_tensor.num_samples() == sub.get_output().num_samples()
+            ensures
+                - For each sample b in [0, input_tensor.num_samples()),
+                  *(iter + b) is set to the index of the maximum logit at the
+                  last sequence position (i.e. sub.get_output()(b, 0, seq_len-1, :)).
+                  This corresponds to the next-token argmax for autoregressive
+                  language modeling.
+        !*/
+
+        template <typename const_label_iterator, typename SUBNET>
+        double compute_loss_value_and_gradient(
+            const tensor& input_tensor,
+            const_label_iterator truth,
+            SUBNET& sub
+        ) const;
+        /*!
+            requires
+                - sub.sample_expansion_factor() == 1
+                - input_tensor.num_samples() != 0
+                - input_tensor.num_samples() == sub.get_output().num_samples()
+                - input_tensor.num_samples() == sub.get_gradient_input().num_samples()
+            ensures
+                - Computes per-position cross-entropy loss with optional label
+                  smoothing and optional target masking.
+                - Writes the gradient w.r.t. the logits into sub.get_gradient_input().
+                - Returns the average loss across all non-masked positions in the
+                  batch.
+                - If get_ignore_indices() is non-empty, positions whose target
+                  label appears in that set are excluded.
+                - Otherwise, if get_ignore_index() != -1, positions whose target
+                  equals that value are excluded.
+                - Otherwise, all positions contribute.
+        !*/
+    };
+
+    template <typename SUBNET>
+    using loss_cross_entropy_per_logit = add_loss_layer<loss_cross_entropy_per_logit_, SUBNET>;
+    
 // ----------------------------------------------------------------------------------------
 
     class loss_multibinary_log_

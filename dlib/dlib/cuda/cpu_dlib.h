@@ -919,6 +919,144 @@ namespace dlib
         }
     };
 
+    class compute_loss_cross_entropy_per_logit_multi
+    {
+        /*!
+            Multi-index variant of compute_loss_cross_entropy_per_logit.
+            Identical computation, except that any position whose target token
+            appears in `ignore_indices` is excluded from loss and gradient.
+
+            This is the workhorse used during instruct fine-tuning to mask out
+            the prompt portion of a sample (question + role markers) so that
+            gradients only flow through the response tokens.
+
+            For a single-element ignore set, this produces results identical to
+            compute_loss_cross_entropy_per_logit.
+        !*/
+    public:
+        compute_loss_cross_entropy_per_logit_multi() {}
+
+        template <typename const_label_iterator>
+        void operator()(
+            const_label_iterator truth,
+            const tensor& input_tensor,
+            const tensor& output_tensor,
+            tensor& grad,
+            double& loss,
+            const std::vector<long>& ignore_indices,
+            double label_smoothing
+            ) const
+        {
+            DLIB_CASSERT(output_tensor.k() == 1);
+            DLIB_CASSERT(input_tensor.k() == 1);
+            DLIB_CASSERT(input_tensor.nc() == 1);
+
+            const long batch_size = output_tensor.num_samples();
+            const long seq_len = output_tensor.nr();
+            const long vocab_size = output_tensor.nc();
+
+            const float* out_data = output_tensor.host();
+            const float* in_data = input_tensor.host();
+            float* g = grad.host();
+
+            // Label smoothing parameters
+            const float smooth_target = (label_smoothing > 0) ? 1.0f - static_cast<float>(label_smoothing) : 1.0f;
+            const float smooth_other = (label_smoothing > 0) ? static_cast<float>(label_smoothing / (vocab_size - 1)) : 0.0f;
+
+            // Build a fast lookup for the ignore set. For typical instruct
+            // fine-tuning the set is small (< 30 entries), so a sorted vector
+            // with binary search is simpler and faster than a hash set, and
+            // avoids per-call allocation.
+            std::vector<long> sorted_ignore(ignore_indices);
+            std::sort(sorted_ignore.begin(), sorted_ignore.end());
+            const auto ignore_begin = sorted_ignore.begin();
+            const auto ignore_end = sorted_ignore.end();
+
+            auto is_ignored = [&](long target) -> bool
+                {
+                    return std::binary_search(ignore_begin, ignore_end, target);
+                };
+
+            long valid_tokens = 0;
+            loss = 0.0;
+
+            for (long i = 0; i < batch_size; ++i)
+            {
+                for (long t = 0; t < seq_len; ++t)
+                {
+                    // Extract target token (same logic as single-index variant)
+                    unsigned long target_class;
+                    if (t < seq_len - 1)
+                    {
+                        target_class = static_cast<unsigned long>(
+                            in_data[tensor_index(input_tensor, i, 0, t + 1, 0)]);
+                    }
+                    else
+                    {
+                        target_class = *(truth + i);
+                    }
+
+                    // Skip positions whose target appears in the ignore set
+                    if (is_ignored(static_cast<long>(target_class)))
+                        continue;
+
+                    DLIB_CASSERT(target_class < static_cast<unsigned long>(vocab_size),
+                        "Target class " << target_class << " >= vocab_size " << vocab_size);
+
+                    valid_tokens++;
+
+                    // Numerical-stability max
+                    float max_val = out_data[tensor_index(output_tensor, i, 0, t, 0)];
+                    for (long c = 1; c < vocab_size; ++c)
+                    {
+                        const float val = out_data[tensor_index(output_tensor, i, 0, t, c)];
+                        max_val = std::max(max_val, val);
+                    }
+
+                    // Softmax (stored temporarily in grad)
+                    float sum_exp = 0.0f;
+                    for (long c = 0; c < vocab_size; ++c)
+                    {
+                        const unsigned long idx = tensor_index(output_tensor, i, 0, t, c);
+                        const float exp_val = std::exp(out_data[idx] - max_val);
+                        g[idx] = exp_val;
+                        sum_exp += exp_val;
+                    }
+
+                    // Loss + gradient with label smoothing
+                    for (long c = 0; c < vocab_size; ++c)
+                    {
+                        const unsigned long idx = tensor_index(output_tensor, i, 0, t, c);
+                        const float softmax_val = g[idx] / sum_exp;
+
+                        const float target_prob = (static_cast<unsigned long>(c) == target_class)
+                            ? smooth_target
+                            : smooth_other;
+
+                        if (target_prob > 0)
+                            loss -= target_prob * std::log(std::max(softmax_val, 1e-10f));
+
+                        g[idx] = softmax_val - target_prob;
+                    }
+                }
+            }
+
+            // Normalize by valid token count
+            if (valid_tokens > 0)
+            {
+                const float inv_valid = 1.0f / valid_tokens;
+                loss *= inv_valid;
+
+                for (size_t i = 0; i < grad.size(); ++i)
+                    g[i] *= inv_valid;
+            }
+            else
+            {
+                loss = 0.0;
+            }
+        }
+    };
+
     // -----------------------------------------------------------------------------------
 
     class compute_loss_binary_log_per_pixel

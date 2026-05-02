@@ -923,6 +923,31 @@ namespace dlib
         void set_ignore_index(long idx) { ignore_index_ = idx; }
         long get_ignore_index() const { return ignore_index_; }
 
+        // Multi-index ignore: positions whose target label matches any of these
+        // indices contribute neither to the loss nor to the gradient. This is
+        // useful for instruct fine-tuning where the prompt portion (question +
+        // role markers) should not influence the gradient
+        void set_ignore_indices(const std::vector<long>& indices)
+        {
+            ignore_indices_ = indices;
+            // Keep ignore_index_ as the first element for legacy code paths
+            ignore_index_ = indices.empty() ? -1 : indices.front();
+        }
+        const std::vector<long>& get_ignore_indices() const { return ignore_indices_; }
+
+        void add_ignore_index(long idx)
+        {
+            if (std::find(ignore_indices_.begin(), ignore_indices_.end(), idx) == ignore_indices_.end())
+                ignore_indices_.push_back(idx);
+            if (ignore_index_ == -1) ignore_index_ = idx;
+        }
+
+        void clear_ignore_indices()
+        {
+            ignore_indices_.clear();
+            ignore_index_ = -1;
+        }
+
         void set_label_smoothing(double eps)
         {
             DLIB_CASSERT(eps >= 0.0 && eps < 1.0, "Label smoothing must be in [0, 1)");
@@ -986,11 +1011,28 @@ namespace dlib
 
             grad = 0;
             double loss = 0.0;
+
+            // If a multi-index list is configured, use it; otherwise fall back to
+            // the legacy single-index path. Both code paths are equivalent when
+            // ignore_indices_ contains exactly one element
+            if (ignore_indices_.empty())
+            {
 #ifdef DLIB_USE_CUDA
-            cuda_compute(truth, input_tensor, output_tensor, grad, loss, ignore_index_, label_smoothing_);
+                cuda_compute(truth, input_tensor, output_tensor, grad, loss, ignore_index_, label_smoothing_);
 #else
-            cpu_compute(truth, input_tensor, output_tensor, grad, loss, ignore_index_, label_smoothing_);
+                cpu_compute(truth, input_tensor, output_tensor, grad, loss, ignore_index_, label_smoothing_);
 #endif
+            }
+            else
+            {
+#ifdef DLIB_USE_CUDA
+                cuda_compute_multi(truth, input_tensor, output_tensor, grad, loss,
+                    ignore_indices_, label_smoothing_);
+#else
+                cpu_compute_multi(truth, input_tensor, output_tensor, grad, loss,
+                    ignore_indices_, label_smoothing_);
+#endif
+            }
             return loss;
         }
 
@@ -999,6 +1041,7 @@ namespace dlib
             serialize("loss_cross_entropy_per_logit_", out);
             serialize(item.ignore_index_, out);
             serialize(item.label_smoothing_, out);
+            serialize(item.ignore_indices_, out);
         }
 
         friend void deserialize(loss_cross_entropy_per_logit_& item, std::istream& in)
@@ -1009,6 +1052,7 @@ namespace dlib
             {
                 deserialize(item.ignore_index_, in);
                 deserialize(item.label_smoothing_, in);
+                deserialize(item.ignore_indices_, in);
             }
             else
             {
@@ -1019,7 +1063,20 @@ namespace dlib
         friend std::ostream& operator<<(std::ostream& out, const loss_cross_entropy_per_logit_& item)
         {
             out << "loss_cross_entropy_per_logit";
-            out << " (ignore_index=" << item.ignore_index_;
+            if (!item.ignore_indices_.empty())
+            {
+                out << " (ignore_indices=[";
+                for (size_t i = 0; i < item.ignore_indices_.size(); ++i)
+                {
+                    if (i > 0) out << ",";
+                    out << item.ignore_indices_[i];
+                }
+                out << "]";
+            }
+            else
+            {
+                out << " (ignore_index=" << item.ignore_index_;
+            }
             out << ", label_smoothing=" << item.label_smoothing_ << ")";
             return out;
         }
@@ -1028,17 +1085,30 @@ namespace dlib
         {
             out << "<loss_cross_entropy_per_logit"
                 << " ignore_index='" << item.ignore_index_ << "'"
-                << " label_smoothing='" << item.label_smoothing_ << "'/>\n";
+                << " label_smoothing='" << item.label_smoothing_ << "'";
+            if (!item.ignore_indices_.empty())
+            {
+                out << " ignore_indices='";
+                for (size_t i = 0; i < item.ignore_indices_.size(); ++i)
+                {
+                    if (i > 0) out << ",";
+                    out << item.ignore_indices_[i];
+                }
+                out << "'";
+            }
+            out << "/>\n";
         }
 
     private:
         long ignore_index_;
+        std::vector<long> ignore_indices_;
         double label_smoothing_;
-
 #ifdef DLIB_USE_CUDA
         cuda::compute_loss_cross_entropy_per_logit cuda_compute;
+        cuda::compute_loss_cross_entropy_per_logit_multi cuda_compute_multi;
 #else
         cpu::compute_loss_cross_entropy_per_logit cpu_compute;
+        cpu::compute_loss_cross_entropy_per_logit_multi cpu_compute_multi;
 #endif            
     };
 

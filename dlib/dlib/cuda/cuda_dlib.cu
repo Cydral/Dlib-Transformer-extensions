@@ -3610,6 +3610,219 @@ namespace dlib
 
     // ----------------------------------------------------------------------------------------
 
+// ----------------------------------------------------------------------------------------
+
+    // Multi-index variant: a position is ignored if its target token appears in
+    // ignore_indices. The kernel does a linear scan over the small ignore list,
+    // which is optimal for the typical use case of < 30 entries.
+
+        __global__ void _cuda_cross_entropy_compute_softmax_and_loss_multi(
+            float* grad,
+            float* position_losses,
+            unsigned long long* valid_mask,
+            const float* out_data,
+            const float* in_data,
+            const unsigned long* truth,
+            const float* max_vals,
+            long batch_size,
+            long seq_len,
+            long vocab_size,
+            long input_seq_len,
+            const long* ignore_indices,
+            long num_ignore,
+            float smooth_target,
+            float smooth_other
+        )
+        {
+            for (auto idx : grid_stride_range(0, batch_size* seq_len))
+            {
+                const long i = idx / seq_len;
+                const long t = idx % seq_len;
+                const long base = (i * seq_len + t) * vocab_size;
+
+                unsigned long target_class;
+                if (t < seq_len - 1)
+                {
+                    const long in_idx = i * input_seq_len + (t + 1);
+                    target_class = static_cast<unsigned long>(in_data[in_idx]);
+                }
+                else
+                {
+                    target_class = truth[i];
+                }
+
+                // Linear scan over the ignore list. The list is tiny (typically < 30),
+                // so a scan is faster than any sorted-search alternative on GPU because
+                // the branch is predictable when the list is small and the entries are
+                // hit by the same warp from the constant access pattern.
+                bool ignored = false;
+                const long target_long = static_cast<long>(target_class);
+                for (long k = 0; k < num_ignore; ++k)
+                {
+                    if (ignore_indices[k] == target_long) { ignored = true; break; }
+                }
+
+                if (ignored)
+                {
+                    valid_mask[idx] = 0ULL;
+                    position_losses[idx] = 0.0f;
+                    for (long c = 0; c < vocab_size; ++c)
+                    {
+                        grad[base + c] = 0.0f;
+                    }
+                    continue;
+                }
+
+                valid_mask[idx] = 1ULL;
+
+                const float max_val = max_vals[idx];
+
+                float sum_exp = 0.0f;
+                for (long c = 0; c < vocab_size; ++c)
+                {
+                    sum_exp += expf(out_data[base + c] - max_val);
+                }
+
+                float pos_loss = 0.0f;
+                const float inv_sum_exp = 1.0f / sum_exp;
+
+                for (long c = 0; c < vocab_size; ++c)
+                {
+                    const float softmax_val = expf(out_data[base + c] - max_val) * inv_sum_exp;
+
+                    const float target_prob = (static_cast<unsigned long>(c) == target_class)
+                        ? smooth_target
+                        : smooth_other;
+
+                    if (target_prob > 0.0f)
+                    {
+                        pos_loss -= target_prob * logf(fmaxf(softmax_val, 1e-10f));
+                    }
+
+                    grad[base + c] = softmax_val - target_prob;
+                }
+
+                position_losses[idx] = pos_loss;
+            }
+        }
+
+        // ----------------------------------------------------------------------------------------
+
+        void compute_loss_cross_entropy_per_logit_multi::do_work(
+            cuda_data_ptr<float> loss_out,
+            cuda_data_ptr<const unsigned long> truth,
+            const tensor& input_tensor,
+            const tensor& output_tensor,
+            tensor& grad,
+            double& loss,
+            const std::vector<long>& ignore_indices,
+            double label_smoothing
+        )
+        {
+            DLIB_CASSERT(output_tensor.k() == 1);
+            DLIB_CASSERT(input_tensor.k() == 1);
+            DLIB_CASSERT(input_tensor.nc() == 1);
+
+            const long batch_size = output_tensor.num_samples();
+            const long seq_len = output_tensor.nr();
+            const long vocab_size = output_tensor.nc();
+            const long input_seq_len = input_tensor.nr();
+            const long num_positions = batch_size * seq_len;
+            const long num_ignore = static_cast<long>(ignore_indices.size());
+
+            // Label smoothing parameters
+            const float smooth_target = (label_smoothing > 0) ? 1.0f - static_cast<float>(label_smoothing) : 1.0f;
+            const float smooth_other = (label_smoothing > 0) ? static_cast<float>(label_smoothing) / (vocab_size - 1) : 0.0f;
+
+            // Allocate temporary buffers. Layout matches the single-index variant
+            // and additionally holds the ignore-index list.
+            const size_t ignore_bytes = num_ignore * sizeof(long);
+            const size_t temp_size = num_positions * sizeof(float) +    // max_vals
+                num_positions * sizeof(float) +                         // position_losses
+                num_positions * sizeof(unsigned long long) +            // valid_mask
+                sizeof(unsigned long long) +                            // total_valid
+                ignore_bytes;                                           // ignore_indices
+
+            cuda_data_void_ptr temp_buf = device_global_buffer(temp_size);
+
+            auto max_vals = static_pointer_cast<float>(temp_buf, num_positions);
+            auto position_losses = static_pointer_cast<float>(
+                temp_buf + num_positions * sizeof(float), num_positions);
+            auto valid_mask = static_pointer_cast<unsigned long long>(
+                temp_buf + 2 * num_positions * sizeof(float), num_positions);
+            auto total_valid = static_pointer_cast<unsigned long long>(
+                temp_buf + 2 * num_positions * sizeof(float) + num_positions * sizeof(unsigned long long), 1);
+            auto ignore_dev = static_pointer_cast<long>(
+                temp_buf + 2 * num_positions * sizeof(float)
+                + num_positions * sizeof(unsigned long long)
+                + sizeof(unsigned long long),
+                num_ignore);
+
+            // Initialize accumulators
+            CHECK_CUDA(cudaMemsetAsync(loss_out.data(), 0, sizeof(float)));
+            CHECK_CUDA(cudaMemsetAsync(total_valid.data(), 0, sizeof(unsigned long long)));
+
+            // Upload the ignore-index list to the device. The list is small (typically
+            // < 30 entries) so this copy is negligible compared to the kernel work.
+            if (num_ignore > 0)
+            {
+                CHECK_CUDA(cudaMemcpyAsync(
+                    ignore_dev.data(),
+                    ignore_indices.data(),
+                    ignore_bytes,
+                    cudaMemcpyHostToDevice));
+            }
+
+            // Step 1: compute max values for numerical stability (unchanged from single-index)
+            launch_kernel(_cuda_cross_entropy_compute_max, max_jobs(num_positions),
+                max_vals.data(),
+                output_tensor.device(),
+                batch_size, seq_len, vocab_size);
+
+            // Step 2: compute softmax, loss per position, and gradients with multi-index masking
+            launch_kernel(_cuda_cross_entropy_compute_softmax_and_loss_multi, max_jobs(num_positions),
+                grad.device(),
+                position_losses.data(),
+                valid_mask.data(),
+                output_tensor.device(),
+                input_tensor.device(),
+                truth.data(),
+                max_vals.data(),
+                batch_size, seq_len, vocab_size, input_seq_len,
+                ignore_dev.data(), num_ignore,
+                smooth_target, smooth_other);
+
+            // Step 3: sum losses and count valid tokens (unchanged)
+            launch_kernel(_cuda_cross_entropy_sum_loss_and_count, max_jobs(num_positions),
+                loss_out.data(),
+                total_valid.data(),
+                position_losses.data(),
+                valid_mask.data(),
+                num_positions);
+
+            // Step 4: normalize loss and gradients (unchanged)
+            unsigned long long h_total_valid = 0ULL;
+            CHECK_CUDA(cudaMemcpy(&h_total_valid, total_valid.data(), sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+
+            if (h_total_valid > 0)
+            {
+                const float inv_valid = 1.0f / static_cast<float>(h_total_valid);
+
+                float h_loss = 0.0f;
+                CHECK_CUDA(cudaMemcpy(&h_loss, loss_out.data(), sizeof(float), cudaMemcpyDeviceToHost));
+                loss = static_cast<double>(h_loss * inv_valid);
+
+                launch_kernel(_cuda_cross_entropy_normalize_gradient, max_jobs(grad.size()),
+                    grad.device(), grad.size(), inv_valid);
+            }
+            else
+            {
+                loss = 0.0;
+            }
+        }
+
+    // ----------------------------------------------------------------------------------------
+
         __device__ float cuda_log1pexp(float x)
         {
             if (x <= -18)
