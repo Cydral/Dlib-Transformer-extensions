@@ -296,7 +296,7 @@ inline void try_print_moe_info(...) {}
 // Type-dependent training and generation logic, called once from main() with the concrete
 // transformer config selected by --arch.  Each call site in main() compiles a completely
 // independent version of this function with its own concrete network types.
-template <typename TRANSFORMER_CONFIG>
+template <typename TRANSFORMER_CONFIG, long NUM_LAYERS, long MAX_SEQ_LEN, long NUM_TOKENS>
 int run_pipeline(
     bool do_train, bool do_generate,
     const double learning_rate, const size_t batch_size, const long patience, const size_t max_epochs,
@@ -307,9 +307,9 @@ int run_pipeline(
 {
     using my_transformer = TRANSFORMER_CONFIG;
 
-    constexpr long num_tokens = 1400;
-    constexpr long num_layers = 4;
-    constexpr long max_seq_len = 192;
+    constexpr long num_tokens = NUM_TOKENS;
+    constexpr long num_layers = NUM_LAYERS;
+    constexpr long max_seq_len = MAX_SEQ_LEN;
 
     // TRAINING MODE
     cout << my_transformer::model_info::describe() << "\n";
@@ -857,6 +857,7 @@ int main(int argc, char** argv)
             : "dlib_lm_" + arch + "_model.dat";
         cout << "Model file : " << model_file << "\n\n";
 
+		constexpr long max_seq_len = 192;
         constexpr long num_tokens = 1400;
         constexpr long num_layers = 4;
         constexpr long num_heads = 6;
@@ -905,14 +906,14 @@ int main(int argc, char** argv)
         if (arch == "moe") {
             using selected = gqa_moe_transformer_config<
                 num_tokens, num_layers, num_heads, num_kv_heads, embedding_dim, num_experts, top_k>;
-            return run_pipeline<selected>(
+            return run_pipeline<selected, num_layers, max_seq_len, num_tokens>(
                 parser.option("train"), parser.option("generate"),
                 learning_rate, batch_size, patience, max_epochs, weight_decay, beta1, beta2,
                 model_file, tokenizer_file, text_segments, external_corpus_for_tokenizer, tokenizer, gpus);
         }
         else if (arch == "hrm") {
             using selected = hrm_transformer_config<num_tokens, num_layers, num_layers, num_heads, embedding_dim, 1, 2>;
-            return run_pipeline<selected>(
+            return run_pipeline<selected, num_layers, max_seq_len, num_tokens>(
                 parser.option("train"), parser.option("generate"),
                 learning_rate, batch_size, patience, max_epochs, weight_decay, beta1, beta2,
                 model_file, tokenizer_file, text_segments, external_corpus_for_tokenizer, tokenizer, gpus);
