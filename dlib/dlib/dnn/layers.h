@@ -6549,7 +6549,7 @@ namespace dlib
 
         friend void serialize(const rotary_positional_embedding_& item, std::ostream& out)
         {
-            serialize("rope_", out);
+            serialize("rotary_positional_embedding_", out);
             serialize(item.theta_base, out);
             serialize(item.cos_cache, out);
             serialize(item.sin_cache, out);
@@ -6565,9 +6565,9 @@ namespace dlib
         {
             std::string version;
             deserialize(version, in);
-            if (version != "rope_")
+            if (version != "rotary_positional_embedding_")
                 throw serialization_error("Unexpected version '" + version +
-                    "' while deserializing rope_");
+                    "' while deserializing rotary_positional_embedding_");
 
             deserialize(item.theta_base, in);
             deserialize(item.cos_cache, in);
@@ -6582,7 +6582,7 @@ namespace dlib
 
         friend std::ostream& operator<<(std::ostream& out, const rotary_positional_embedding_& item)
         {
-            out << "rope (theta_base=" << item.theta_base
+            out << "rotary_positional_embedding (theta_base=" << item.theta_base
                 << ", yarn.alpha=" << item.yarn.alpha
                 << ", yarn.beta=" << item.yarn.beta
                 << ", yarn.original_len=" << item.yarn.original_len
@@ -6593,7 +6593,7 @@ namespace dlib
 
         friend void to_xml(const rotary_positional_embedding_& item, std::ostream& out)
         {
-            out << "<rope"
+            out << "<rotary_positional_embedding"
                 << " theta_base='" << item.theta_base << "'"
                 << " yarn_alpha='" << item.yarn.alpha << "'"
                 << " yarn_beta='" << item.yarn.beta << "'"
@@ -6685,6 +6685,78 @@ namespace dlib
 
     template <typename SUBNET>
     using rope = add_layer<rotary_positional_embedding_, SUBNET>;
+
+// ----------------------------------------------------------------------------------------
+
+    template <long repeat_factor_>
+    class repeat_heads_
+    {
+    public:
+        static_assert(repeat_factor_ >= 1, "repeat_factor must be at least 1");
+
+        explicit repeat_heads_() : repeat_factor(repeat_factor_) {}
+
+        template <typename SUBNET>
+        void setup(const SUBNET& /*sub*/) {}
+
+        template <typename SUBNET>
+        void forward(const SUBNET& sub, resizable_tensor& output)
+        {
+            const tensor& input = sub.get_output();
+            output.set_size(input.num_samples(), input.k() * repeat_factor,
+                input.nr(), input.nc());
+            tt::repeat_channels(output, input, repeat_factor);
+        }
+
+        template <typename SUBNET>
+        void backward(const tensor& gradient_input, SUBNET& sub, tensor& /*params_grad*/)
+        {
+            tt::accumulate_repeated_channels(sub.get_gradient_input(),
+                gradient_input, repeat_factor);
+        }
+
+        inline dpoint map_input_to_output(const dpoint& p) const { return p; }
+        inline dpoint map_output_to_input(const dpoint& p) const { return p; }
+
+        const tensor& get_layer_params() const { return params; }
+        tensor& get_layer_params() { return params; }
+
+        friend void serialize(const repeat_heads_& item, std::ostream& out)
+        {
+            serialize("repeat_heads_", out);
+            serialize(item.repeat_factor, out);
+        }
+
+        friend void deserialize(repeat_heads_& item, std::istream& in)
+        {
+            std::string version;
+            deserialize(version, in);
+            if (version != "repeat_heads_")
+                throw serialization_error("Unexpected version '" + version
+                    + "' found while deserializing dlib::repeat_heads_.");
+            deserialize(item.repeat_factor, in);
+        }
+
+        friend std::ostream& operator<<(std::ostream& out, const repeat_heads_& item)
+        {
+            out << "repeat_heads\t (repeat_factor=" << item.repeat_factor << ")";
+            return out;
+        }
+
+        friend void to_xml(const repeat_heads_& item, std::ostream& out)
+        {
+            out << "<repeat_heads"
+                << " repeat_factor='" << item.repeat_factor << "'"
+                << "/>\n";
+        }
+
+    private:
+        long repeat_factor;
+        resizable_tensor params;
+    };
+
+    template <long rep_fact, typename SUBNET>
+    using repeat_heads = add_layer<repeat_heads_<rep_fact>, SUBNET>;
 
 // ----------------------------------------------------------------------------------------
 

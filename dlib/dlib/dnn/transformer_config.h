@@ -126,47 +126,100 @@ namespace dlib
         };
     };
 
+    // Selector for the attention implementation backing the transformer stack.
+    //   - chained: legacy implementation built from a chain of ~16 elementary
+    //     Dlib layers (linear, reshape, RoPE, repeat_heads, multm_prev, tril,
+    //     softmax, etc.). This is the historical reference.
+    //   - unified: fused gqa_attention_ layer that consolidates the same
+    //     operations into a single Dlib layer with an embedded RoPE/tril and
+    //     hooks reserved for a future KV cache.
+    enum class attention_impl
+    {
+        chained,
+        unified
+    };
+
+    namespace impl
+    {
+        // Dispatcher: selects the appropriate transformer_stack alias based on
+        // the requested attention_impl. Specialized per enum value below
+        template <attention_impl Impl, long num_layers, long d_model,
+            long num_heads, long num_kv_heads, typename SUBNET>
+        struct gqa_stack_selector;
+
+        template <long num_layers, long d_model, long num_heads, long num_kv_heads, typename SUBNET>
+        struct gqa_stack_selector<attention_impl::chained, num_layers, d_model, num_heads, num_kv_heads, SUBNET>
+        {
+            using type = gqa_transformer::transformer_stack<
+                num_layers, d_model, num_heads, num_kv_heads, SUBNET>;
+            static const char* name() { return "chained"; }
+        };
+
+        template <long num_layers, long d_model, long num_heads, long num_kv_heads, typename SUBNET>
+        struct gqa_stack_selector<attention_impl::unified, num_layers, d_model, num_heads, num_kv_heads, SUBNET>
+        {
+            using type = gqa_transformer_unified::transformer_stack<
+                num_layers, d_model, num_heads, num_kv_heads, SUBNET>;
+            static const char* name() { return "unified"; }
+        };
+    }
+
     template<
         long vocab_size = 2000,
         long num_layers = 4,
         long num_heads = 6,
         long num_kv_heads = 2,
-        long embedding_dim = 228
+        long embedding_dim = 228,
+        attention_impl impl = attention_impl::chained
     >
-    struct gqa_transformer_config {
+    struct gqa_transformer_config
+    {
         // Core model parameters
         static constexpr long VOCAB_SIZE = vocab_size;
         static constexpr long NUM_LAYERS = num_layers;
         static constexpr long NUM_HEADS = num_heads;
         static constexpr long NUM_KV_HEADS = num_kv_heads;
         static constexpr long EMBEDDING_DIM = embedding_dim;
+        static constexpr attention_impl IMPL = impl;
 
         // Compile-time validation of model configuration
-        struct validation {
+        struct validation
+        {
             static_assert(VOCAB_SIZE > 0, "Vocabulary size must be positive");
             static_assert(NUM_LAYERS > 0, "Number of layers must be positive");
             static_assert(NUM_HEADS > 0, "Number of attention heads must be positive");
             static_assert(NUM_KV_HEADS > 0, "Number of KV heads must be positive");
-            static_assert(NUM_HEADS% NUM_KV_HEADS == 0, "num_heads must be divisible by num_kv_heads");
-            static_assert(EMBEDDING_DIM% NUM_HEADS == 0, "Embedding dimension must be divisible by number of heads");
+            static_assert(NUM_HEADS% NUM_KV_HEADS == 0,
+                "num_heads must be divisible by num_kv_heads");
+            static_assert(EMBEDDING_DIM% NUM_HEADS == 0,
+                "Embedding dimension must be divisible by number of heads");
+            static_assert((EMBEDDING_DIM / NUM_HEADS) % 2 == 0,
+                "head_dim (embedding_dim / num_heads) must be even for RoPE");
         };
 
-        // Network definition for GQA transformer
-        template<bool is_training>
+        // Network definition. The selected attention implementation determines
+        // whether the stack is built from chained Dlib primitives or from the
+        // fused gqa_attention_ layer
+        template <bool is_training>
         using network_type =
             classification_head<VOCAB_SIZE,
-            gqa_transformer::transformer_stack<NUM_LAYERS, EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS,
-            embeddings<VOCAB_SIZE, EMBEDDING_DIM, input<matrix<int, 0, 1>>>>>;
+            typename impl::gqa_stack_selector<IMPL, NUM_LAYERS, EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS,
+            embeddings<VOCAB_SIZE, EMBEDDING_DIM, input<matrix<int, 0, 1>>>>::type>;
 
-        struct model_info {
-            static std::string describe() {
+        struct model_info
+        {
+            static std::string describe()
+            {
                 std::stringstream ss;
                 ss << "Transformer model configuration:\n"
-                    << "- vocabulary size: " << VOCAB_SIZE << "\n"
-                    << "- layers: " << NUM_LAYERS << "\n"
-                    << "- attention heads: " << NUM_HEADS << "\n"
-                    << "- KV heads (GQA): " << NUM_KV_HEADS << "\n"
-                    << "- embedding dimension: " << EMBEDDING_DIM;
+                    << "- vocabulary size  : " << VOCAB_SIZE << "\n"
+                    << "- layers           : " << NUM_LAYERS << "\n"
+                    << "- attention heads  : " << NUM_HEADS << "\n"
+                    << "- KV heads (GQA)   : " << NUM_KV_HEADS << "\n"
+                    << "- embedding dim    : " << EMBEDDING_DIM << "\n"
+                    << "- head dim         : " << (EMBEDDING_DIM / NUM_HEADS) << "\n"
+                    << "- attention impl   : " << impl::gqa_stack_selector<
+                        IMPL, NUM_LAYERS, EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS, void>::name();
                 return ss.str();
             }
         };

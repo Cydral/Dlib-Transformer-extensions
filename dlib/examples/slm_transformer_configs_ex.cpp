@@ -912,10 +912,10 @@ int main(int argc, char** argv)
                 model_file, tokenizer_file, text_segments, external_corpus_for_tokenizer, tokenizer, gpus);
         }
         else if (arch == "hrm") {
-            using selected = hrm_transformer_config<num_tokens, num_layers, num_layers, num_heads, embedding_dim, 1, 2>;
+            using selected = hrm_transformer_config<num_tokens, num_layers/2, num_layers, num_heads, embedding_dim, 1, 2>;
             return run_pipeline<selected, num_layers, max_seq_len, num_tokens>(
                 parser.option("train"), parser.option("generate"),
-                learning_rate, batch_size, patience, max_epochs, weight_decay, beta1, beta2,
+                learning_rate, batch_size/2, patience, max_epochs, weight_decay, beta1, beta2,
                 model_file, tokenizer_file, text_segments, external_corpus_for_tokenizer, tokenizer, gpus);
         }
     }

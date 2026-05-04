@@ -208,8 +208,9 @@ int main(int argc, char** argv)
             num_layers,     // layers
             num_heads,      // heads
             num_kv_heads,   // kv_heads
-            embedding_dim   // dim
-        >;
+            embedding_dim,  // dim
+            attention_impl::unified
+        >;        
 
         // Load internal dataset
         cout << "Loading internal training dataset...\n";

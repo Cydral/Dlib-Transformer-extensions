@@ -231,75 +231,486 @@ namespace dlib
 
     // ----------------------------------------------------------------------------------------
 
-    template <long repeat_factor_>
-    class repeat_heads_
+    template <long EMBEDDING_DIM_, long NUM_HEADS_, long NUM_KV_HEADS_, long HEAD_DIM_>
+    class gqa_attention_
     {
     public:
-        static_assert(repeat_factor_ >= 1, "repeat_factor must be at least 1");
+        static constexpr long EMBEDDING_DIM = EMBEDDING_DIM_;
+        static constexpr long NUM_HEADS = NUM_HEADS_;
+        static constexpr long NUM_KV_HEADS = NUM_KV_HEADS_;
+        static constexpr long HEAD_DIM = HEAD_DIM_;
+        static constexpr long REPEAT_FACTOR = NUM_HEADS / NUM_KV_HEADS;
+        static constexpr long KV_PROJ_DIM = NUM_KV_HEADS * HEAD_DIM;
 
-        explicit repeat_heads_() : repeat_factor(repeat_factor_) {}
+        static_assert(EMBEDDING_DIM > 0, "EMBEDDING_DIM must be positive");
+        static_assert(NUM_HEADS > 0 && (EMBEDDING_DIM % NUM_HEADS) == 0,
+            "EMBEDDING_DIM must be a multiple of NUM_HEADS");
+        static_assert(NUM_KV_HEADS > 0 && (NUM_HEADS % NUM_KV_HEADS) == 0,
+            "NUM_HEADS must be a multiple of NUM_KV_HEADS");
+        static_assert(HEAD_DIM == EMBEDDING_DIM / NUM_HEADS,
+            "HEAD_DIM must equal EMBEDDING_DIM / NUM_HEADS");
+        static_assert(HEAD_DIM % 2 == 0, "HEAD_DIM must be even (RoPE constraint)");
+
+        // Reserved for future KV-cache integration
+        enum class cache_mode { disabled, full_init, incremental };
+
+        gqa_attention_()
+            : learning_rate_multiplier_(1),
+            weight_decay_multiplier_(1),
+            cache_mode_(cache_mode::disabled)
+        {
+        }
+
+        double get_learning_rate_multiplier() const { return learning_rate_multiplier_; }
+        double get_weight_decay_multiplier() const { return weight_decay_multiplier_; }
+        void set_learning_rate_multiplier(double v) { learning_rate_multiplier_ = v; }
+        void set_weight_decay_multiplier(double v) { weight_decay_multiplier_ = v; }
+        void set_cache_mode(cache_mode m) { cache_mode_ = m; }
+        cache_mode get_cache_mode() const { return cache_mode_; }
+
+        // Forwarders to the embedded RoPE configuration
+        void set_yarn_params(float alpha, float beta,
+            long original_len = 0, bool enabled = true)
+        {
+            rope_q_helper_.get().set_yarn_params(alpha, beta, original_len, enabled);
+            rope_k_helper_.get().set_yarn_params(alpha, beta, original_len, enabled);
+        }
+        const yarn_config& get_yarn_config() const
+        {
+            return rope_q_helper_.get().get_yarn_config();
+        }
 
         template <typename SUBNET>
-        void setup(const SUBNET& /*sub*/) {}
+        void setup(const SUBNET& sub)
+        {
+            const tensor& x = sub.get_output();
+            DLIB_CASSERT(x.k() == 1, "gqa_attention expects k()==1 input");
+            DLIB_CASSERT(x.nc() == EMBEDDING_DIM,
+                "gqa_attention input nc()==" << x.nc()
+                << " does not match EMBEDDING_DIM=" << EMBEDDING_DIM);
+
+            // Pack four weight matrices in a single contiguous params tensor:
+            // layout is [W_Q | W_K | W_V | W_O]
+            const long total_params =
+                EMBEDDING_DIM * EMBEDDING_DIM
+                + EMBEDDING_DIM * KV_PROJ_DIM
+                + EMBEDDING_DIM * KV_PROJ_DIM
+                + EMBEDDING_DIM * EMBEDDING_DIM;
+
+            params.set_size(1, total_params);
+
+            dlib::rand rnd(std::rand());
+            randomize_block(rnd, EMBEDDING_DIM, EMBEDDING_DIM,
+                params, 0);
+            randomize_block(rnd, EMBEDDING_DIM, KV_PROJ_DIM,
+                params, EMBEDDING_DIM * EMBEDDING_DIM);
+            randomize_block(rnd, EMBEDDING_DIM, KV_PROJ_DIM,
+                params, EMBEDDING_DIM * EMBEDDING_DIM
+                + EMBEDDING_DIM * KV_PROJ_DIM);
+            randomize_block(rnd, EMBEDDING_DIM, EMBEDDING_DIM,
+                params, EMBEDDING_DIM * EMBEDDING_DIM
+                + 2 * EMBEDDING_DIM * KV_PROJ_DIM);
+
+            wq_alias = alias_tensor(EMBEDDING_DIM, EMBEDDING_DIM);
+            wk_alias = alias_tensor(EMBEDDING_DIM, KV_PROJ_DIM);
+            wv_alias = alias_tensor(EMBEDDING_DIM, KV_PROJ_DIM);
+            wo_alias = alias_tensor(EMBEDDING_DIM, EMBEDDING_DIM);
+
+            wq_offset = 0;
+            wk_offset = EMBEDDING_DIM * EMBEDDING_DIM;
+            wv_offset = wk_offset + EMBEDDING_DIM * KV_PROJ_DIM;
+            wo_offset = wv_offset + EMBEDDING_DIM * KV_PROJ_DIM;
+
+            // Pre-allocate RoPE caches based on the current input shape
+            // The embedded layers will resize them dynamically if seq_len
+            // changes later
+            if (x.nr() > 0)
+            {
+                resizable_tensor q_probe(x.num_samples(), NUM_HEADS, x.nr(), HEAD_DIM);
+                resizable_tensor k_probe(x.num_samples(), NUM_KV_HEADS, x.nr(), HEAD_DIM);
+                rope_q_helper_.setup(q_probe);
+                rope_k_helper_.setup(k_probe);
+            }
+        }
 
         template <typename SUBNET>
         void forward(const SUBNET& sub, resizable_tensor& output)
         {
-            const tensor& input = sub.get_output();
-            output.set_size(input.num_samples(), input.k() * repeat_factor,
-                input.nr(), input.nc());
-            tt::repeat_channels(output, input, repeat_factor);
+            const tensor& x = sub.get_output();
+            const long B = x.num_samples();
+            const long N = x.nr();
+            DLIB_CASSERT(x.k() == 1 && x.nc() == EMBEDDING_DIM);
+
+            auto wq = wq_alias(params, wq_offset);
+            auto wk = wk_alias(params, wk_offset);
+            auto wv = wv_alias(params, wv_offset);
+            auto wo = wo_alias(params, wo_offset);
+
+            const float qk_scale = 1.0f / std::sqrt(static_cast<float>(HEAD_DIM));
+
+            // Step 1: Q (pre-scaled), K, V projections
+            scratch_q_flat.set_size(B, 1, N, EMBEDDING_DIM);
+            scratch_k_flat.set_size(B, 1, N, KV_PROJ_DIM);
+            scratch_v_flat.set_size(B, 1, N, KV_PROJ_DIM);
+            {
+                alias_tensor x_2d(B * N, EMBEDDING_DIM);
+                auto x_view = x_2d(const_cast<tensor&>(x), 0);
+
+                alias_tensor q_2d(B * N, EMBEDDING_DIM);
+                auto q_view = q_2d(scratch_q_flat, 0);
+                tt::gemm(0.0f, q_view, qk_scale, x_view, false, wq, false);
+
+                alias_tensor k_2d(B * N, KV_PROJ_DIM);
+                auto k_view = k_2d(scratch_k_flat, 0);
+                tt::gemm(0.0f, k_view, 1.0f, x_view, false, wk, false);
+
+                alias_tensor v_2d(B * N, KV_PROJ_DIM);
+                auto v_view = v_2d(scratch_v_flat, 0);
+                tt::gemm(0.0f, v_view, 1.0f, x_view, false, wv, false);
+            }
+
+            // Step 2: reinterpret as multi-head 4D, materialize to dedicated
+            // buffers (RoPE writes in-place; the post-RoPE buffers are read
+            // again in backward)
+            saved_q_pre_rope.set_size(B, NUM_HEADS, N, HEAD_DIM);
+            saved_k_pre_rope.set_size(B, NUM_KV_HEADS, N, HEAD_DIM);
+            scratch_v_pre_repeat.set_size(B, NUM_KV_HEADS, N, HEAD_DIM);
+            {
+                alias_tensor q_4d(B, NUM_HEADS, N, HEAD_DIM);
+                alias_tensor k_4d(B, NUM_KV_HEADS, N, HEAD_DIM);
+                alias_tensor v_4d(B, NUM_KV_HEADS, N, HEAD_DIM);
+
+                auto q_view = q_4d(scratch_q_flat, 0);
+                tt::copy_tensor(false, saved_q_pre_rope, 0, q_view, 0, NUM_HEADS);
+
+                auto k_view = k_4d(scratch_k_flat, 0);
+                tt::copy_tensor(false, saved_k_pre_rope, 0, k_view, 0, NUM_KV_HEADS);
+
+                auto v_view = v_4d(scratch_v_flat, 0);
+                tt::copy_tensor(false, scratch_v_pre_repeat, 0, v_view, 0, NUM_KV_HEADS);
+            }
+
+            // Step 3: RoPE on Q and K
+            rope_q_helper_.forward(saved_q_pre_rope, scratch_q);
+            rope_k_helper_.forward(saved_k_pre_rope, scratch_k_pre_repeat);
+
+            // Step 4: GQA repeat on K and V
+            scratch_k.set_size(B, NUM_HEADS, N, HEAD_DIM);
+            scratch_v.set_size(B, NUM_HEADS, N, HEAD_DIM);
+            for (long kv_h = 0; kv_h < NUM_KV_HEADS; ++kv_h)
+            {
+                for (long r = 0; r < REPEAT_FACTOR; ++r)
+                {
+                    const size_t dst_h = static_cast<size_t>(kv_h * REPEAT_FACTOR + r);
+                    tt::copy_tensor(false, scratch_k, dst_h,
+                        scratch_k_pre_repeat, static_cast<size_t>(kv_h), 1);
+                    tt::copy_tensor(false, scratch_v, dst_h,
+                        scratch_v_pre_repeat, static_cast<size_t>(kv_h), 1);
+                }
+            }
+
+            // Step 5: Q @ K^T (Q already pre-scaled)
+            scratch_scores.set_size(B, NUM_HEADS, N, N);
+            tt::gemm(0.0f, scratch_scores, 1.0f,
+                scratch_q, false,
+                scratch_k, true,
+                operation_mode::PLANE_WISE);
+
+            // Step 6: causal mask
+            scratch_scores_masked.copy_size(scratch_scores);
+            tril_helper_.forward(scratch_scores, scratch_scores_masked);
+
+            // Step 7: softmax
+            saved_attn.copy_size(scratch_scores_masked);
+            tt::softmax(saved_attn, scratch_scores_masked, operation_mode::PLANE_WISE);
+
+            // Step 8: attn @ V
+            scratch_ctx.set_size(B, NUM_HEADS, N, HEAD_DIM);
+            tt::gemm(0.0f, scratch_ctx, 1.0f,
+                saved_attn, false,
+                scratch_v, false,
+                operation_mode::PLANE_WISE);
+
+            // Step 9: reinterpret context as flat
+            scratch_ctx_flat.set_size(B, 1, N, EMBEDDING_DIM);
+            {
+                alias_tensor ctx_4d_alias(B, NUM_HEADS, N, HEAD_DIM);
+                auto ctx_view = ctx_4d_alias(scratch_ctx_flat, 0);
+                tt::copy_tensor(false, ctx_view, 0, scratch_ctx, 0, NUM_HEADS);
+            }
+
+            // Step 10: output projection
+            output.set_size(B, 1, N, EMBEDDING_DIM);
+            {
+                alias_tensor ctx_2d(B * N, EMBEDDING_DIM);
+                auto ctx_view = ctx_2d(scratch_ctx_flat, 0);
+
+                alias_tensor o_2d(B * N, EMBEDDING_DIM);
+                auto o_view = o_2d(output, 0);
+
+                tt::gemm(0.0f, o_view, 1.0f, ctx_view, false, wo, false);
+            }
+
+            saved_x_shape_B = B;
+            saved_x_shape_N = N;
         }
 
         template <typename SUBNET>
-        void backward(const tensor& gradient_input, SUBNET& sub, tensor& /*params_grad*/)
+        void backward(const tensor& gradient_input, SUBNET& sub, tensor& params_grad)
         {
-            tt::accumulate_repeated_channels(sub.get_gradient_input(),
-                gradient_input, repeat_factor);
-        }
+            const long B = saved_x_shape_B;
+            const long N = saved_x_shape_N;
+            DLIB_CASSERT(gradient_input.num_samples() == B);
+            DLIB_CASSERT(gradient_input.nr() == N);
 
-        inline dpoint map_input_to_output(const dpoint& p) const { return p; }
-        inline dpoint map_output_to_input(const dpoint& p) const { return p; }
+            const tensor& x = sub.get_output();
+            tensor& dx = sub.get_gradient_input();
+
+            auto wq = wq_alias(params, wq_offset);
+            auto wk = wk_alias(params, wk_offset);
+            auto wv = wv_alias(params, wv_offset);
+            auto wo = wo_alias(params, wo_offset);
+
+            auto dwq = wq_alias(params_grad, wq_offset);
+            auto dwk = wk_alias(params_grad, wk_offset);
+            auto dwv = wv_alias(params_grad, wv_offset);
+            auto dwo = wo_alias(params_grad, wo_offset);
+
+            const float qk_scale = 1.0f / std::sqrt(static_cast<float>(HEAD_DIM));
+
+            // Step 10 backward
+            resizable_tensor dctx_flat(B, 1, N, EMBEDDING_DIM);
+            {
+                alias_tensor go_2d(B * N, EMBEDDING_DIM);
+                auto go_view = go_2d(const_cast<tensor&>(gradient_input), 0);
+
+                alias_tensor dctx_2d(B * N, EMBEDDING_DIM);
+                auto dctx_view = dctx_2d(dctx_flat, 0);
+
+                tt::gemm(0.0f, dctx_view, 1.0f, go_view, false, wo, true);
+
+                alias_tensor cf_2d(B * N, EMBEDDING_DIM);
+                auto cf_view = cf_2d(scratch_ctx_flat, 0);
+                tt::gemm(1.0f, dwo, 1.0f, cf_view, true, go_view, false);
+            }
+
+            // Step 9 backward
+            resizable_tensor dctx(B, NUM_HEADS, N, HEAD_DIM);
+            {
+                alias_tensor dctx_4d(B, NUM_HEADS, N, HEAD_DIM);
+                auto dctx_view = dctx_4d(dctx_flat, 0);
+                tt::copy_tensor(false, dctx, 0, dctx_view, 0, NUM_HEADS);
+            }
+
+            // Step 8 backward
+            resizable_tensor dattn(B, NUM_HEADS, N, N);
+            resizable_tensor dV_repeated(B, NUM_HEADS, N, HEAD_DIM);
+            tt::gemm(0.0f, dattn, 1.0f, dctx, false, scratch_v, true,
+                operation_mode::PLANE_WISE);
+            tt::gemm(0.0f, dV_repeated, 1.0f, saved_attn, true, dctx, false,
+                operation_mode::PLANE_WISE);
+
+            // Step 7 backward
+            resizable_tensor dscores_masked(B, NUM_HEADS, N, N);
+            tt::softmax_gradient(dscores_masked, saved_attn, dattn,
+                operation_mode::PLANE_WISE);
+
+            // Step 6 backward
+            resizable_tensor dscores;
+            tril_helper_.backward(dscores_masked, scratch_scores, dscores);
+
+            // Step 5 backward
+            resizable_tensor dQ(B, NUM_HEADS, N, HEAD_DIM);
+            resizable_tensor dK(B, NUM_HEADS, N, HEAD_DIM);
+            tt::gemm(0.0f, dQ, qk_scale, dscores, false, scratch_k, false,
+                operation_mode::PLANE_WISE);
+            tt::gemm(0.0f, dK, 1.0f, dscores, true, scratch_q, false,
+                operation_mode::PLANE_WISE);
+
+            // Step 4 backward (sum across replicated heads).
+            resizable_tensor dK_pre_repeat(B, NUM_KV_HEADS, N, HEAD_DIM);
+            resizable_tensor dV_pre_repeat(B, NUM_KV_HEADS, N, HEAD_DIM);
+            dK_pre_repeat = 0;
+            dV_pre_repeat = 0;
+            for (long kv_h = 0; kv_h < NUM_KV_HEADS; ++kv_h)
+            {
+                for (long r = 0; r < REPEAT_FACTOR; ++r)
+                {
+                    const size_t src_h = static_cast<size_t>(kv_h * REPEAT_FACTOR + r);
+                    tt::copy_tensor(true, dK_pre_repeat, static_cast<size_t>(kv_h),
+                        dK, src_h, 1);
+                    tt::copy_tensor(true, dV_pre_repeat, static_cast<size_t>(kv_h),
+                        dV_repeated, src_h, 1);
+                }
+            }
+
+            // Step 3 backward
+            resizable_tensor dQ_pre_rope;
+            resizable_tensor dK_pre_rope;
+            rope_q_helper_.backward(dQ, saved_q_pre_rope, dQ_pre_rope);
+            rope_k_helper_.backward(dK_pre_repeat, saved_k_pre_rope, dK_pre_rope);
+
+            // Step 2 backward
+            resizable_tensor dQ_flat(B, 1, N, EMBEDDING_DIM);
+            resizable_tensor dK_flat(B, 1, N, KV_PROJ_DIM);
+            resizable_tensor dV_flat(B, 1, N, KV_PROJ_DIM);
+            {
+                alias_tensor dQ_4d(B, NUM_HEADS, N, HEAD_DIM);
+                auto dQ_view = dQ_4d(dQ_flat, 0);
+                tt::copy_tensor(false, dQ_view, 0, dQ_pre_rope, 0, NUM_HEADS);
+
+                alias_tensor dK_4d(B, NUM_KV_HEADS, N, HEAD_DIM);
+                auto dK_view = dK_4d(dK_flat, 0);
+                tt::copy_tensor(false, dK_view, 0, dK_pre_rope, 0, NUM_KV_HEADS);
+
+                alias_tensor dV_4d(B, NUM_KV_HEADS, N, HEAD_DIM);
+                auto dV_view = dV_4d(dV_flat, 0);
+                tt::copy_tensor(false, dV_view, 0, dV_pre_repeat, 0, NUM_KV_HEADS);
+            }
+
+            // Step 1 backward
+            {
+                alias_tensor x_2d(B * N, EMBEDDING_DIM);
+                auto x_view = x_2d(const_cast<tensor&>(x), 0);
+
+                alias_tensor dx_2d(B * N, EMBEDDING_DIM);
+                auto dx_view = dx_2d(dx, 0);
+
+                alias_tensor dQ_2d(B * N, EMBEDDING_DIM);
+                auto dQ_view = dQ_2d(dQ_flat, 0);
+                alias_tensor dK_2d(B * N, KV_PROJ_DIM);
+                auto dK_view = dK_2d(dK_flat, 0);
+                alias_tensor dV_2d(B * N, KV_PROJ_DIM);
+                auto dV_view = dV_2d(dV_flat, 0);
+
+                tt::gemm(1.0f, dx_view, 1.0f, dQ_view, false, wq, true);
+                tt::gemm(1.0f, dx_view, 1.0f, dK_view, false, wk, true);
+                tt::gemm(1.0f, dx_view, 1.0f, dV_view, false, wv, true);
+
+                tt::gemm(1.0f, dwq, 1.0f, x_view, true, dQ_view, false);
+                tt::gemm(1.0f, dwk, 1.0f, x_view, true, dK_view, false);
+                tt::gemm(1.0f, dwv, 1.0f, x_view, true, dV_view, false);
+            }
+        }
 
         const tensor& get_layer_params() const { return params; }
         tensor& get_layer_params() { return params; }
 
-        friend void serialize(const repeat_heads_& item, std::ostream& out)
+        friend void serialize(const gqa_attention_& item, std::ostream& out)
         {
-            serialize("repeat_heads_", out);
-            serialize(item.repeat_factor, out);
+            serialize("gqa_attention_", out);
+            serialize(item.params, out);
+            serialize(item.learning_rate_multiplier_, out);
+            serialize(item.weight_decay_multiplier_, out);
+            serialize(item.rope_q_helper_, out);
+            serialize(item.rope_k_helper_, out);
+            serialize(item.tril_helper_, out);
         }
 
-        friend void deserialize(repeat_heads_& item, std::istream& in)
+        friend void deserialize(gqa_attention_& item, std::istream& in)
         {
             std::string version;
             deserialize(version, in);
-            if (version != "repeat_heads_")
-                throw serialization_error("Unexpected version '" + version
-                    + "' found while deserializing dlib::repeat_heads_.");
-            deserialize(item.repeat_factor, in);
+            if (version != "gqa_attention_")
+                throw serialization_error(
+                    "Unexpected version found while deserializing dlib::gqa_attention_. ");
+            deserialize(item.params, in);
+            deserialize(item.learning_rate_multiplier_, in);
+            deserialize(item.weight_decay_multiplier_, in);
+            deserialize(item.rope_q_helper_, in);
+            deserialize(item.rope_k_helper_, in);
+            deserialize(item.tril_helper_, in);
+            item.rebuild_aliases();
         }
 
-        friend std::ostream& operator<<(std::ostream& out, const repeat_heads_& item)
+        friend std::ostream& operator<<(std::ostream& out, const gqa_attention_& item)
         {
-            out << "repeat_heads\t (repeat_factor=" << item.repeat_factor << ")";
+            out << "gqa_attention"
+                << " (emb=" << EMBEDDING_DIM
+                << ", heads=" << NUM_HEADS
+                << ", kv_heads=" << NUM_KV_HEADS
+                << ", head_dim=" << HEAD_DIM << ")"
+                << " learning_rate_mult=" << item.learning_rate_multiplier_
+                << " weight_decay_mult=" << item.weight_decay_multiplier_;
             return out;
         }
 
-        friend void to_xml(const repeat_heads_& item, std::ostream& out)
+        friend void to_xml(const gqa_attention_& item, std::ostream& out)
         {
-            out << "<repeat_heads"
-                << " repeat_factor='" << item.repeat_factor << "'"
-                << "/>\n";
+            out << "<gqa_attention"
+                << " emb='" << EMBEDDING_DIM << "'"
+                << " heads='" << NUM_HEADS << "'"
+                << " kv_heads='" << NUM_KV_HEADS << "'"
+                << " head_dim='" << HEAD_DIM << "'"
+                << " learning_rate_mult='" << item.learning_rate_multiplier_ << "'"
+                << " weight_decay_mult='" << item.weight_decay_multiplier_ << "'/>\n";
         }
 
     private:
-        long repeat_factor;
         resizable_tensor params;
+        alias_tensor wq_alias, wk_alias, wv_alias, wo_alias;
+        size_t wq_offset = 0, wk_offset = 0, wv_offset = 0, wo_offset = 0;
+
+        // Forward scratch buffers, saved between forward and backward
+        resizable_tensor scratch_q_flat;
+        resizable_tensor scratch_k_flat;
+        resizable_tensor scratch_v_flat;
+        resizable_tensor saved_q_pre_rope;
+        resizable_tensor saved_k_pre_rope;
+        resizable_tensor scratch_v_pre_repeat;
+        resizable_tensor scratch_q;
+        resizable_tensor scratch_k_pre_repeat;
+        resizable_tensor scratch_k;
+        resizable_tensor scratch_v;
+        resizable_tensor scratch_scores;
+        resizable_tensor scratch_scores_masked;
+        resizable_tensor scratch_ctx;
+        resizable_tensor scratch_ctx_flat;
+        resizable_tensor saved_attn;
+
+        long saved_x_shape_B = 0;
+        long saved_x_shape_N = 0;
+
+        double learning_rate_multiplier_;
+        double weight_decay_multiplier_;
+        cache_mode cache_mode_;
+
+        // Embedded parameter-free Dlib layers
+        layer_helper<rotary_positional_embedding_>   rope_q_helper_;
+        layer_helper<rotary_positional_embedding_>   rope_k_helper_;
+        layer_helper<tril_<0, neg_infinity_tag>>     tril_helper_;
+
+        void rebuild_aliases()
+        {
+            wq_alias = alias_tensor(EMBEDDING_DIM, EMBEDDING_DIM);
+            wk_alias = alias_tensor(EMBEDDING_DIM, KV_PROJ_DIM);
+            wv_alias = alias_tensor(EMBEDDING_DIM, KV_PROJ_DIM);
+            wo_alias = alias_tensor(EMBEDDING_DIM, EMBEDDING_DIM);
+            wq_offset = 0;
+            wk_offset = EMBEDDING_DIM * EMBEDDING_DIM;
+            wv_offset = wk_offset + EMBEDDING_DIM * KV_PROJ_DIM;
+            wo_offset = wv_offset + EMBEDDING_DIM * KV_PROJ_DIM;
+        }
+
+        // Initialise a [rows, cols] block of `dest` at the given element offset
+        // using Dlib's randomize_parameters helper
+        void randomize_block(
+            dlib::rand& rnd,
+            long rows, long cols,
+            tensor& dest, size_t offset)
+        {
+            resizable_tensor tmp(rows, cols);
+            randomize_parameters(tmp, rows + cols, rnd);
+
+            alias_tensor dest_view(rows, cols);
+            auto view = dest_view(dest, offset);
+            tt::copy_tensor(false, view, 0, tmp, 0, tmp.k());
+        }
     };
 
-    template <long rep_fact, typename SUBNET>
-    using repeat_heads = add_layer<repeat_heads_<rep_fact>, SUBNET>;
+    template <long EMBEDDING_DIM, long NUM_HEADS, long NUM_KV_HEADS, long HEAD_DIM, typename SUBNET>
+    using gqa_attention = add_layer<
+        gqa_attention_<EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM>, SUBNET>;
 
     // ----------------------------------------------------------------------------------------
 
@@ -366,6 +777,55 @@ namespace dlib
         using transformer_stack = typename transformer_stack_impl<num_layers, d_model, num_heads, num_kv_heads, SUBNET>::type;
 
     } // namespace gqa_transformer
+
+    // ----------------------------------------------------------------------------------------
+
+    // Multi-head Grouped Query Attention, fused into a single layer
+    namespace gqa_transformer_unified
+    {        
+        template<long d_model, long num_heads, long num_kv_heads, typename SUBNET>
+        using multihead_attention_gqa = gqa_attention<d_model, num_heads, num_kv_heads,
+            d_model / num_heads, SUBNET>;
+
+        // Transformer block with pre-norm architecture, identical in topology to
+        // the chained version: attention sublayer with residual connection,
+        // followed by SwiGLU feed-forward sublayer with residual connection.
+        //
+        // The only structural difference vs. gqa_transformer::transformer_block
+        // is that the attention sublayer is now a single layer (gqa_attention_)
+        // rather than a chain of 16 layers. The residual connections (add_prev1
+        // and add_prev5), the RMS normalizations, and the SwiGLU feed-forward
+        // are unchanged.
+        template<long d_model, long num_heads, long num_kv_heads, typename SUBNET>
+        using transformer_block =
+            add_prev5<act_steps<swiglu<d_model, 8, 3, input_tensor>, 4, rms_norm<tag5<
+            add_prev1<multihead_attention_gqa<d_model, num_heads, num_kv_heads, rms_norm<tag1<
+            SUBNET>>>>>>>>;
+
+        // Recursive template to stack N transformer blocks. The recursion shape
+        // mirrors the chained namespace exactly so that any external code that
+        // relies on the tag10 sentinel at the bottom of the stack continues to
+        // work unchanged.
+        template<long remaining_layers, long d_model, long num_heads, long num_kv_heads,
+            typename SUBNET, typename enabled = void>
+        struct transformer_stack_impl
+        {
+            using type = transformer_block<d_model, num_heads, num_kv_heads,
+                typename transformer_stack_impl<remaining_layers - 1, d_model, num_heads, 
+                    num_kv_heads, SUBNET>::type>;
+        };
+
+        template<long d_model, long num_heads, long num_kv_heads, typename SUBNET>
+            struct transformer_stack_impl<0, d_model, num_heads, num_kv_heads, SUBNET, void>
+        {
+            using type = tag10<SUBNET>;
+        };
+
+        template<long num_layers, long d_model, long num_heads, long num_kv_heads, typename SUBNET>
+            using transformer_stack = typename transformer_stack_impl<num_layers, d_model, num_heads,
+                num_kv_heads, SUBNET>::type;
+
+    } // namespace gqa_transformer_unified
 
     // ----------------------------------------------------------------------------------------
 
@@ -662,7 +1122,7 @@ namespace dlib
         }
 
         /* BACKWARD: 1 - step gradient approximation
-         *v
+         *
          * Gradient path:
          *   dL/d(output) = gradient_input
          *     -> backprop through H: dL/d(last_h_input) = h_net.get_final_data_gradient()

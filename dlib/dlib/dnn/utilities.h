@@ -84,6 +84,88 @@ namespace dlib
 
 // ----------------------------------------------------------------------------------------
 
+    template <typename LayerType>
+    class layer_helper
+    {
+    public:
+        layer_helper() = default;
+
+        LayerType& get() { return layer_; }
+        const LayerType& get() const { return layer_; }
+
+        // Run the wrapped layer's setup with `input_proxy` standing in for
+        // sub.get_output(). Useful when the host layer wants to pre-allocate
+        // caches that depend on input shape
+        void setup(const tensor& input_proxy)
+        {
+            forward_subnet adapter{ input_proxy };
+            layer_.setup(adapter);
+        }
+
+        // Forward: applies the wrapped layer to `input` and writes to `output`
+        void forward(const tensor& input, resizable_tensor& output)
+        {
+            forward_subnet adapter{ input };
+            layer_.forward(adapter, output);
+        }
+
+        // Backward: given the gradient w.r.t. the layer's output and the
+        // original input that was passed to forward, computes the gradient
+        // w.r.t. that input and writes it into `input_grad`
+        //
+        // The destination `input_grad` is initialised to zero internally so
+        // that wrapped layers using add-to semantics in their backward
+        // (most Dlib layers) produce the expected stand-alone gradient
+        void backward(
+            const tensor& gradient_input,
+            const tensor& original_input,
+            resizable_tensor& input_grad)
+        {
+            input_grad.copy_size(original_input);
+            input_grad = 0;
+            backward_subnet adapter{ original_input, input_grad };
+            resizable_tensor unused_params_grad;
+            layer_.backward(gradient_input, adapter, unused_params_grad);
+        }
+
+        friend void serialize(const layer_helper& item, std::ostream& out)
+        {
+            serialize("layer_helper_v1", out);
+            serialize(item.layer_, out);
+        }
+
+        friend void deserialize(layer_helper& item, std::istream& in)
+        {
+            std::string version;
+            deserialize(version, in);
+            if (version != "layer_helper_v1")
+                throw serialization_error(
+                    "Unexpected version while deserializing layer_helper: " + version);
+            deserialize(item.layer_, in);
+        }
+
+    private:
+        LayerType layer_;
+
+        // Adapter exposing only get_output() (used by setup and forward)
+        struct forward_subnet
+        {
+            const tensor& output_ref;
+            const tensor& get_output() const { return output_ref; }
+        };
+
+        // Adapter exposing get_output() and get_gradient_input() for backward
+        struct backward_subnet
+        {
+            const tensor& output_ref;
+            tensor& gradient_input_ref;
+            const tensor& get_output() const { return output_ref; }
+            tensor& get_gradient_input() { return gradient_input_ref; }
+        };
+    };
+
+// ----------------------------------------------------------------------------------------
+
 }
 
 #endif // DLIB_DNn_UTILITIES_H_ 

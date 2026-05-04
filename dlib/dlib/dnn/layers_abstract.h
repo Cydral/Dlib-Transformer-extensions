@@ -5073,6 +5073,136 @@ namespace dlib
 
 // ----------------------------------------------------------------------------------------
 
+    template <long repeat_factor_>
+    class repeat_heads_
+    {
+        /*!
+            REQUIREMENTS ON TEMPLATE PARAMETERS
+                - repeat_factor_ >= 1
+
+            WHAT THIS OBJECT REPRESENTS
+                This layer replicates each channel (k dimension) of the input tensor
+                repeat_factor_ times along the k axis. It is used in Grouped Query
+                Attention (GQA) to broadcast Key/Value heads to match the number of
+                Query heads before computing scaled dot-product attention.
+
+                Given an input tensor of shape (batch, num_kv_heads, seq_len, head_dim),
+                the output has shape (batch, num_kv_heads * repeat_factor, seq_len, head_dim)
+                where each KV head is duplicated repeat_factor times consecutively.
+
+                Forward mapping (per sample):
+                    output(n, c * repeat_factor + r, :, :) = input(n, c, :, :)
+                    for c in [0, num_kv_heads), r in [0, repeat_factor)
+
+                Backward mapping (gradient accumulation, per sample):
+                    grad_input(n, c, :, :) += sum_{r=0}^{repeat_factor-1}
+                        grad_output(n, c * repeat_factor + r, :, :)
+
+                When repeat_factor == 1 (standard multi-head attention without GQA),
+                the layer reduces to a simple tensor copy with no overhead.
+        !*/
+
+    public:
+
+        explicit repeat_heads_();
+        /*!
+            ensures
+                - #repeat_factor == repeat_factor_ (from template parameter)
+                - No trainable parameters (get_layer_params() returns empty tensor)
+        !*/
+
+        template <typename SUBNET>
+        void setup(const SUBNET& sub);
+        /*!
+            ensures
+                - No-op: this layer has no learnable parameters to initialize
+        !*/
+
+        template <typename SUBNET>
+        void forward(const SUBNET& sub, resizable_tensor& output);
+        /*!
+            requires
+                - sub.get_output() is a valid tensor with shape
+                  (batch_size, num_kv_heads, seq_len, head_dim)
+            ensures
+                - #output.num_samples() == sub.get_output().num_samples()
+                - #output.k() == sub.get_output().k() * repeat_factor
+                - #output.nr() == sub.get_output().nr()
+                - #output.nc() == sub.get_output().nc()
+                - Each channel c of the input is replicated repeat_factor times
+                  at consecutive positions c * repeat_factor .. c * repeat_factor + repeat_factor - 1
+                - Implemented via tt::repeat_channels()
+        !*/
+
+        template <typename SUBNET>
+        void backward(
+            const tensor& gradient_input,
+            SUBNET& sub,
+            tensor& params_grad
+        );
+        /*!
+            requires
+                - gradient_input has shape (batch_size, num_kv_heads * repeat_factor,
+                  seq_len, head_dim)
+                - sub.get_gradient_input() has shape (batch_size, num_kv_heads,
+                  seq_len, head_dim)
+            ensures
+                - Accumulates gradients from repeated head channels back into the
+                  original KV head channels in sub.get_gradient_input()
+                - For each destination channel c, sums the gradients from the
+                  repeat_factor source channels c * repeat_factor .. c * repeat_factor + repeat_factor - 1
+                - This is an accumulation (+=), not a replacement
+                - Implemented via tt::accumulate_repeated_channels()
+        !*/
+
+        dpoint map_input_to_output(const dpoint& p) const;
+        dpoint map_output_to_input(const dpoint& p) const;
+        /*!
+            ensures
+                - Both return p unchanged (identity spatial mapping)
+        !*/
+
+        const tensor& get_layer_params() const;
+        tensor& get_layer_params();
+        /*!
+            ensures
+                - Returns an empty tensor (this layer has no trainable parameters)
+        !*/
+
+        friend void serialize(const repeat_heads_& item, std::ostream& out);
+        /*!
+            ensures
+                - Serializes with version tag "repeat_heads_"
+                - Saves: repeat_factor
+        !*/
+
+        friend void deserialize(repeat_heads_& item, std::istream& in);
+        /*!
+            ensures
+                - Restores repeat_factor from serialized state
+            throws
+                - serialization_error if version tag does not match "repeat_heads_"
+        !*/
+
+        friend std::ostream& operator<<(
+            std::ostream& out, const repeat_heads_& item);
+        /*!
+            ensures
+                - Prints "repeat_heads (repeat_factor=N)"
+        !*/
+
+        friend void to_xml(const repeat_heads_& item, std::ostream& out);
+        /*!
+            ensures
+                - Writes: <repeat_heads repeat_factor='N'/>
+        !*/
+    };
+
+    template <long rep_fact, typename SUBNET>
+    using repeat_heads = add_layer<repeat_heads_<rep_fact>, SUBNET>;
+
+// ----------------------------------------------------------------------------------------
+
 }
 
 #endif // DLIB_DNn_LAYERS_ABSTRACT_H_
