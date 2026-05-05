@@ -491,7 +491,7 @@ namespace dlib
 
                 alias_tensor cf_2d(B * N, EMBEDDING_DIM);
                 auto cf_view = cf_2d(scratch_ctx_flat, 0);
-                tt::gemm(1.0f, dwo, 1.0f, cf_view, true, go_view, false);
+                tt::gemm(0.0f, dwo, 1.0f, cf_view, true, go_view, false);
             }
 
             // Step 9 backward
@@ -587,9 +587,9 @@ namespace dlib
                 tt::gemm(1.0f, dx_view, 1.0f, dK_view, false, wk, true);
                 tt::gemm(1.0f, dx_view, 1.0f, dV_view, false, wv, true);
 
-                tt::gemm(1.0f, dwq, 1.0f, x_view, true, dQ_view, false);
-                tt::gemm(1.0f, dwk, 1.0f, x_view, true, dK_view, false);
-                tt::gemm(1.0f, dwv, 1.0f, x_view, true, dV_view, false);
+                tt::gemm(0.0f, dwq, 1.0f, x_view, true, dQ_view, false);
+                tt::gemm(0.0f, dwk, 1.0f, x_view, true, dK_view, false);
+                tt::gemm(0.0f, dwv, 1.0f, x_view, true, dV_view, false);
             }
         }
 
