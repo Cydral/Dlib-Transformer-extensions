@@ -1449,7 +1449,7 @@ namespace dlib
             }
         }
 
-// -----------------------------------------------------------------------------------
+    // -----------------------------------------------------------------------------------
 
         void rms_normalize(
             const double eps,
@@ -1460,55 +1460,52 @@ namespace dlib
         )
         {
             DLIB_CASSERT(
-                gamma.k() == src.k() &&
+                gamma.num_samples() == 1 &&
+                gamma.k() == 1 &&
                 gamma.nr() == 1 &&
-                gamma.nc() == 1 &&
+                gamma.nc() == src.nc() &&
                 eps > 0,
-                "\nsrc.k():    " << src.k() <<
-                "\ngamma.k():  " << gamma.k() <<
-                "\ngamma.nr(): " << gamma.nr() <<
-                "\ngamma.nc(): " << gamma.nc() <<
-                "\neps:  " << eps
+                "\nsrc.nc():    " << src.nc() <<
+				"\ngamma.num_samples(): " << gamma.num_samples() <<
+				"\ngamma.k():   " << gamma.k() <<
+                "\ngamma.nr():  " << gamma.nr() <<
+                "\ngamma.nc():  " << gamma.nc() <<
+                "\neps:         " << eps
             );
 
             const long ns = src.num_samples();
             const long ks = src.k();
-            const long num = src.nr() * src.nc();
+            const long nrs = src.nr();
+            const long ncs = src.nc();
 
             dest.copy_size(src);
-            scale.set_size(ns);
+            scale.set_size(ns, ks, nrs, 1);
 
-            // Compute RMS values
-            scale = 0;
             const float* p_src = src.host();
-            float* p_scale = scale.host();
-            for (long n = 0; n < ns; ++n)
-            {
-                for (long k = 0; k < ks; ++k)
-                {
-                    for (long i = 0; i < num; ++i)
-                    {
-                        p_scale[n] += (*p_src) * (*p_src);
-                        ++p_src;
-                    }
-                }
-                p_scale[n] = 1.0f / std::sqrt(p_scale[n] / (ks * num) + static_cast<float>(eps));
-            }
-            scale.host();
-
-            // Apply RMS normalization
-            p_src = src.host();
-            float* p_dest = dest.host();
             const float* p_gamma = gamma.host();
+            float* p_dest = dest.host();
+            float* p_scale = scale.host();
+
+            // For each (sample, channel, row), compute the RMS over the nc dimension
+            // and apply the normalization.
             for (long n = 0; n < ns; ++n)
             {
                 for (long k = 0; k < ks; ++k)
                 {
-                    for (long i = 0; i < num; ++i)
+                    for (long i = 0; i < nrs; ++i)
                     {
-                        *p_dest = (*p_src) * p_scale[n] * p_gamma[k];
-                        ++p_src;
-                        ++p_dest;
+                        // Accumulate squared sum across nc
+                        float sum_sq = 0.0f;
+                        const float* p_row = p_src + ((n * ks + k) * nrs + i) * ncs;
+                        for (long j = 0; j < ncs; ++j)
+                            sum_sq += p_row[j] * p_row[j];
+
+                        const float inv_rms = 1.0f / std::sqrt(sum_sq / ncs + static_cast<float>(eps));
+                        p_scale[(n * ks + k) * nrs + i] = inv_rms;
+
+                        float* p_dest_row = p_dest + ((n * ks + k) * nrs + i) * ncs;
+                        for (long j = 0; j < ncs; ++j)
+                            p_dest_row[j] = p_row[j] * inv_rms * p_gamma[j];
                     }
                 }
             }
@@ -1524,64 +1521,87 @@ namespace dlib
             resizable_tensor& dscale
         )
         {
-            DLIB_CASSERT(src.num_samples() == scale.size());
+            DLIB_CASSERT(scale.num_samples() == src.num_samples());
+            DLIB_CASSERT(scale.k() == src.k());
+            DLIB_CASSERT(scale.nr() == src.nr());
+            DLIB_CASSERT(scale.nc() == 1);
             DLIB_CASSERT(have_same_dimensions(gamma, gamma_grad));
-            DLIB_CASSERT(gamma.k() == src.k());
+            DLIB_CASSERT(gamma.num_samples() == 1);
+            DLIB_CASSERT(gamma.k() == 1);
             DLIB_CASSERT(gamma.nr() == 1);
-            DLIB_CASSERT(gamma.nc() == 1);
+            DLIB_CASSERT(gamma.nc() == src.nc());
             DLIB_CASSERT(have_same_dimensions(gradient_input, src));
             DLIB_CASSERT(have_same_dimensions(gradient_input, src_grad));
 
             const long ns = src.num_samples();
             const long ks = src.k();
-            const long num = src.nr() * src.nc();
+            const long nrs = src.nr();
+            const long ncs = src.nc();
 
             gamma_grad = 0;
             dscale.copy_size(scale);
             dscale = 0;
 
-            auto p_grad = gradient_input.host();
-            auto p_src = src.host();
-            const auto p_gamma = gamma.host();
-            const auto p_gamma_grad = gamma_grad.host();
-            const auto p_scale = scale.host();
-            auto p_dscale = dscale.host();
+            const float* p_src = src.host();
+            const float* p_grad = gradient_input.host();
+            const float* p_gamma = gamma.host();
+            const float* p_scale = scale.host();
+            float* p_gamma_grad = gamma_grad.host();
+            float* p_dscale = dscale.host();
+            float* p_src_grad = src_grad.host();
 
+            // Pass 1: accumulate gamma_grad and dscale (the gradient w.r.t. inv_rms
+            // for each position).
             for (long n = 0; n < ns; ++n)
             {
-                const float scale_pow = -0.5f * std::pow(p_scale[n], 3.0f);
                 for (long k = 0; k < ks; ++k)
                 {
-                    for (long i = 0; i < num; ++i)
+                    for (long i = 0; i < nrs; ++i)
                     {
-                        const float x_hat = *p_src * p_scale[n];
-                        p_gamma_grad[k] += (*p_grad) * x_hat;
+                        const long row_idx = (n * ks + k) * nrs + i;
+                        const float inv_rms = p_scale[row_idx];
+                        const float scale_pow = -0.5f * inv_rms * inv_rms * inv_rms;
 
-                        const float dx = *p_grad * p_gamma[k];
-                        p_dscale[n] += dx * *p_src * scale_pow;
+                        const float* p_src_row = p_src + row_idx * ncs;
+                        const float* p_grad_row = p_grad + row_idx * ncs;
 
-                        ++p_grad;
-                        ++p_src;
+                        float ds = 0.0f;
+                        for (long j = 0; j < ncs; ++j)
+                        {
+                            const float x_hat = p_src_row[j] * inv_rms;
+                            p_gamma_grad[j] += p_grad_row[j] * x_hat;
+
+                            const float dx = p_grad_row[j] * p_gamma[j];
+                            ds += dx * p_src_row[j];
+                        }
+                        p_dscale[row_idx] = ds * scale_pow;
                     }
                 }
             }
 
-            p_grad = gradient_input.host();
-            p_src = src.host();
-            auto p_src_grad = src_grad.host();
-            const float invnum = 1.0f / (ks * num);
+            // Pass 2: compute src_grad combining the two contributions:
+            //   - direct: gradient_input * gamma * inv_rms
+            //   - through inv_rms: dscale * 2 * src / nc (chain rule on RMS computation)
+            const float inv_nc = 1.0f / static_cast<float>(ncs);
             for (long n = 0; n < ns; ++n)
             {
                 for (long k = 0; k < ks; ++k)
                 {
-                    for (long i = 0; i < num; ++i)
+                    for (long i = 0; i < nrs; ++i)
                     {
-                        const float dx = *p_grad * p_gamma[k];
-                        *p_src_grad += dx * p_scale[n] + p_dscale[n] * 2 * *p_src * invnum;
+                        const long row_idx = (n * ks + k) * nrs + i;
+                        const float inv_rms = p_scale[row_idx];
+                        const float ds = p_dscale[row_idx];
 
-                        ++p_grad;
-                        ++p_src;
-                        ++p_src_grad;
+                        const float* p_src_row = p_src + row_idx * ncs;
+                        const float* p_grad_row = p_grad + row_idx * ncs;
+                        float* p_src_grad_row = p_src_grad + row_idx * ncs;
+
+                        for (long j = 0; j < ncs; ++j)
+                        {
+                            const float dx = p_grad_row[j] * p_gamma[j];
+                            p_src_grad_row[j] += dx * inv_rms + ds * 2.0f * p_src_row[j] * inv_nc;
+                        }
                     }
                 }
             }
@@ -3588,6 +3608,94 @@ namespace dlib
                         data_ptr[data_offset + 1] = -x0 * s + x1 * c;
                     }
                 });
+        }
+
+    // ------------------------------------------------------------------------------------
+
+        void split_heads(
+            bool add_to,
+            tensor& dst,
+            const tensor& src
+        )
+        {
+            DLIB_CASSERT(src.k() == 1);
+            DLIB_CASSERT(dst.num_samples() == src.num_samples());
+            DLIB_CASSERT(dst.nr() == src.nr());
+            DLIB_CASSERT(src.nc() == dst.k() * dst.nc());
+            DLIB_CASSERT(!is_same_object(dst, src));
+
+            const long B = dst.num_samples();
+            const long NHEADS = dst.k();
+            const long N = dst.nr();
+            const long HDIM = dst.nc();
+
+            const float* s = src.host();
+            float* d = dst.host();
+
+            // src layout: [B, 1, N, NHEADS*HDIM], offset = ((b*1 + 0)*N + n)*NHEADS*HDIM + h*HDIM + j
+            // dst layout: [B, NHEADS, N, HDIM],   offset = ((b*NHEADS + h)*N + n)*HDIM + j
+            for (long b = 0; b < B; ++b)
+            {
+                for (long h = 0; h < NHEADS; ++h)
+                {
+                    for (long n = 0; n < N; ++n)
+                    {
+                        const float* s_row = s + (b * N + n) * NHEADS * HDIM + h * HDIM;
+                        float* d_row = d + ((b * NHEADS + h) * N + n) * HDIM;
+                        if (add_to)
+                        {
+                            for (long j = 0; j < HDIM; ++j) d_row[j] += s_row[j];
+                        }
+                        else
+                        {
+                            std::memcpy(d_row, s_row, HDIM * sizeof(float));
+                        }
+                    }
+                }
+            }
+        }
+
+        void merge_heads(
+            bool add_to,
+            tensor& dst,
+            const tensor& src
+        )
+        {
+            DLIB_CASSERT(dst.k() == 1);
+            DLIB_CASSERT(dst.num_samples() == src.num_samples());
+            DLIB_CASSERT(dst.nr() == src.nr());
+            DLIB_CASSERT(dst.nc() == src.k() * src.nc());
+            DLIB_CASSERT(!is_same_object(dst, src));
+
+            const long B = src.num_samples();
+            const long NHEADS = src.k();
+            const long N = src.nr();
+            const long HDIM = src.nc();
+
+            const float* s = src.host();
+            float* d = dst.host();
+
+            // src layout: [B, NHEADS, N, HDIM],   offset = ((b*NHEADS + h)*N + n)*HDIM + j
+            // dst layout: [B, 1, N, NHEADS*HDIM], offset = ((b*1 + 0)*N + n)*NHEADS*HDIM + h*HDIM + j
+            for (long b = 0; b < B; ++b)
+            {
+                for (long h = 0; h < NHEADS; ++h)
+                {
+                    for (long n = 0; n < N; ++n)
+                    {
+                        const float* s_row = s + ((b * NHEADS + h) * N + n) * HDIM;
+                        float* d_row = d + (b * N + n) * NHEADS * HDIM + h * HDIM;
+                        if (add_to)
+                        {
+                            for (long j = 0; j < HDIM; ++j) d_row[j] += s_row[j];
+                        }
+                        else
+                        {
+                            std::memcpy(d_row, s_row, HDIM * sizeof(float));
+                        }
+                    }
+                }
+            }
         }
 
     // ------------------------------------------------------------------------------------

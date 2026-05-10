@@ -613,6 +613,20 @@ namespace dlib
             const resizable_tensor& sin_cache
         );
 
+    // ----------------------------------------------------------------------------------------
+
+        void split_heads(
+            bool add_to,
+            tensor& dst,
+            const tensor& src
+        );
+
+        void merge_heads(
+            bool add_to,
+            tensor& dst,
+            const tensor& src
+        );
+
     // -----------------------------------------------------------------------------------
 
         class pooling

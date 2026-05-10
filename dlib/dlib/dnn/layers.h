@@ -1721,7 +1721,9 @@ namespace dlib
         template <typename SUBNET>
         void setup(const SUBNET& sub)
         {
-            gamma = alias_tensor(1, sub.get_output().k());
+            // Position-wise RMSNorm: one gamma scalar per embedding dimension (nc),
+            // shared across all positions and channels.
+            gamma = alias_tensor(1, 1, 1, sub.get_output().nc());
             params.set_size(gamma.size());
             gamma(params, 0) = 1;
         }
@@ -1738,11 +1740,12 @@ namespace dlib
         {
             auto g = gamma(params, 0);
             auto g_grad = gamma(params_grad, 0);
-            tt::rms_normalize_gradient(gradient_input, scale, sub.get_output(), g, sub.get_gradient_input(), g_grad, dscale);
+            tt::rms_normalize_gradient(gradient_input, scale, sub.get_output(), g,
+                sub.get_gradient_input(), g_grad, dscale);
         }
 
-        const tensor& get_layer_params() const { return params; };
-        tensor& get_layer_params() { return params; };
+        const tensor& get_layer_params() const { return params; }
+        tensor& get_layer_params() { return params; }
 
         friend void serialize(const rms_norm_& item, std::ostream& out)
         {
@@ -1761,7 +1764,8 @@ namespace dlib
             std::string version;
             deserialize(version, in);
             if (version != "rms_norm_")
-                throw serialization_error("Unexpected version '" + version + "' found while deserializing dlib::rms_norm_.");
+                throw serialization_error("Unexpected version '" + version
+                    + "' found while deserializing dlib::rms_norm_.");
             deserialize(item.params, in);
             deserialize(item.gamma, in);
             deserialize(item.learning_rate_multiplier, in);
@@ -6463,6 +6467,28 @@ namespace dlib
         }
         const yarn_config& get_yarn_config() const { return yarn; }
 
+        // Public access to the precomputed RoPE caches. Useful when an external
+        // caller (typically a fused attention layer maintaining its own KV cache)
+        // needs to apply RoPE at a specific absolute position outside the
+        // standard forward call.
+        const tensor& get_cos_cache() const { return cos_cache; }
+        const tensor& get_sin_cache() const { return sin_cache; }
+
+        // Ensures the trig caches cover at least `target_seq_len` positions and
+        // that they were computed for `d_head` head dimension. If they are
+        // insufficient or stale, recompute them. This lets external callers
+        // guarantee the caches are sized appropriately before reading them.
+        void ensure_caches_at_least(long target_seq_len, long d_head_)
+        {
+            if (seq_len < target_seq_len || d_head != d_head_)
+            {
+                seq_len = target_seq_len;
+                d_head = d_head_;
+                if (yarn.original_len == 0) yarn.original_len = target_seq_len;
+                compute_and_cache_trig_values();
+            }
+        }
+
         template <typename SUBNET>
         void setup(const SUBNET& sub)
         {
@@ -6479,7 +6505,7 @@ namespace dlib
             if (yarn.original_len == 0) yarn.original_len = seq_len;
 
             // Precompute rotation angles and trigonometric values
-            compute_and_cache_trig_values(seq_len);
+            compute_and_cache_trig_values();
         }
 
         template <typename SUBNET>
@@ -6487,60 +6513,97 @@ namespace dlib
         {
             const tensor& input = sub.get_output();
 
-            // Validate shape; we expect shape (batch, num_heads, seq_len, d_head)
             const long in_seq_len = input.nr();
             const long in_d_head = input.nc();
 
             DLIB_CASSERT(in_d_head >= 2, "d_head must be at least 2 for rotation");
             DLIB_CASSERT(in_seq_len > 0, "seq_len must be positive");
 
-            // If setup() was not called or the incoming sequence length changed from
-            // the cached seq_len (e.g. inference with a different context window),
-            // recompute trig caches for the current seq_len.
-            if (seq_len != in_seq_len || d_head != in_d_head
+            // Recompute caches if they are too small or if d_head changed. We never
+            // recompute when the existing cache already covers in_seq_len, since the
+            // values for positions [0, in_seq_len) are independent of the cache size
+            // (in the non-YaRN case) or assumed-stable-by-the-user (YaRN case).
+            if (seq_len < in_seq_len || d_head != in_d_head
                 || cos_cache.size() == 0 || sin_cache.size() == 0)
             {
-                // If we don't have a recorded original_len yet, set it here (first observed seq_len)
                 if (yarn.original_len == 0) yarn.original_len = in_seq_len;
-
-                // Update internal dimensions and recompute caches targeted to in_seq_len
                 seq_len = in_seq_len;
                 d_head = in_d_head;
-                compute_and_cache_trig_values(seq_len);
+                compute_and_cache_trig_values();
             }
 
             output.copy_size(input);
-
-            // Copy input to output
             tt::copy_tensor(false, output, 0, input, 0, input.k());
 
-            // Apply rotary embedding in-place
-            tt::apply_rotary_positional_embedding(
-                false,  // forward pass
-                output,
-                cos_cache,
-                sin_cache
-            );
+            // Build a slice of the trig caches matching the input length exactly.
+            // This is required because tt::apply_rotary_positional_embedding asserts
+            // cos_cache.nr() == data.nr().
+            if (cos_cache.nr() == in_seq_len)
+            {
+                // Cache exactly matches: apply directly
+                tt::apply_rotary_positional_embedding(false, output, cos_cache, sin_cache);
+            }
+            else
+            {
+                // Cache is larger than the input. Take a head-slice [0, in_seq_len)
+                const long half_dim = in_d_head / 2;
+                resizable_tensor cos_slice(1, 1, in_seq_len, half_dim);
+                resizable_tensor sin_slice(1, 1, in_seq_len, half_dim);
+                tt::copy_tensor(false, cos_slice,
+                    /*dk=*/0, /*dnr=*/0, /*dnc=*/0,
+                    cos_cache,
+                    /*sk=*/0, /*snr=*/0, /*snc=*/0,
+                    /*k=*/1,
+                    /*nr=*/static_cast<size_t>(in_seq_len),
+                    /*nc=*/static_cast<size_t>(half_dim));
+                tt::copy_tensor(false, sin_slice,
+                    /*dk=*/0, /*dnr=*/0, /*dnc=*/0,
+                    sin_cache,
+                    /*sk=*/0, /*snr=*/0, /*snc=*/0,
+                    /*k=*/1,
+                    /*nr=*/static_cast<size_t>(in_seq_len),
+                    /*nc=*/static_cast<size_t>(half_dim));
+                tt::apply_rotary_positional_embedding(false, output, cos_slice, sin_slice);
+            }
         }
 
         template <typename SUBNET>
         void backward(const tensor& gradient_input, SUBNET& sub, tensor& /*params_grad*/)
         {
             tensor& prev_grad = sub.get_gradient_input();
+            const long in_seq_len = gradient_input.nr();
+            const long in_d_head = gradient_input.nc();
 
-            // Apply inverse rotation to gradients
             resizable_tensor grad_output;
             grad_output.copy_size(gradient_input);
             tt::copy_tensor(false, grad_output, 0, gradient_input, 0, gradient_input.k());
 
-            tt::apply_rotary_positional_embedding(
-                true,   // backward pass (inverse rotation)
-                grad_output,
-                cos_cache,
-                sin_cache
-            );
+            if (cos_cache.nr() == in_seq_len)
+            {
+                tt::apply_rotary_positional_embedding(true, grad_output, cos_cache, sin_cache);
+            }
+            else
+            {
+                const long half_dim = in_d_head / 2;
+                resizable_tensor cos_slice(1, 1, in_seq_len, half_dim);
+                resizable_tensor sin_slice(1, 1, in_seq_len, half_dim);
+                tt::copy_tensor(false, cos_slice,
+                    /*dk=*/0, /*dnr=*/0, /*dnc=*/0,
+                    cos_cache,
+                    /*sk=*/0, /*snr=*/0, /*snc=*/0,
+                    /*k=*/1,
+                    /*nr=*/static_cast<size_t>(in_seq_len),
+                    /*nc=*/static_cast<size_t>(half_dim));
+                tt::copy_tensor(false, sin_slice,
+                    /*dk=*/0, /*dnr=*/0, /*dnc=*/0,
+                    sin_cache,
+                    /*sk=*/0, /*snr=*/0, /*snc=*/0,
+                    /*k=*/1,
+                    /*nr=*/static_cast<size_t>(in_seq_len),
+                    /*nc=*/static_cast<size_t>(half_dim));
+                tt::apply_rotary_positional_embedding(true, grad_output, cos_slice, sin_slice);
+            }
 
-            // Accumulate gradients
             tt::copy_tensor(true, prev_grad, 0, grad_output, 0, grad_output.k());
         }
 
@@ -6606,54 +6669,72 @@ namespace dlib
         inline dpoint map_output_to_input(const dpoint& p) const { return p; }
 
     private:
-        // Compute and cache cosine/sine tables for target_seq_len
-        // This function uses YaRN scaling when yarn.enabled is true
-        void compute_and_cache_trig_values(long target_seq_len)
+        // Compute and cache cosine/sine tables for the requested length.
+        //
+        // On entry, the caller is expected to have set the member `seq_len` to the
+        // target cache length they want available. This function will:
+        //   - Allocate cos_cache and sin_cache of size [1, 1, seq_len, d_head/2].
+        //   - Fill all `seq_len` positions of the caches with the correct trigonometric
+        //     values, so that any subsequent read at position `pos` (with 0 <= pos < seq_len)
+        //     yields cos/sin of the absolute position pos.
+        //
+        // Important property (in the non-YaRN case): the value at position `pos` is
+        // purely a function of pos, theta_base, and d_head. It does not depend on
+        // seq_len. This is what enables KV-cache-based incremental inference: a cache
+        // computed for length L1 and a cache computed for length L2 will agree on
+        // every common position.
+        //
+        // In the YaRN case the position is rescaled by a factor that depends on the
+        // ratio (target_len / train_len). For YaRN to be consistent across cache
+        // resizes, the user must explicitly fix `yarn.original_len` to the model's
+        // reference training length and then keep that value constant across calls.
+        // We use that fixed value (rather than the current `seq_len`) as the YaRN
+        // reference length, so that the values at a given position are stable.
+        void compute_and_cache_trig_values()
         {
             if (seq_len == 0 || d_head == 0) return;
 
-            // Half the head dimension (we rotate pairs)
+            // Half the head dimension (RoPE rotates pairs)
             const long half_dim = d_head / 2;
 
-            // Allocate cache tensors: shape (1, 1, seq_len, half_dim)
             cos_cache.set_size(1, 1, seq_len, half_dim);
             sin_cache.set_size(1, 1, seq_len, half_dim);
 
-            // Compute on host side
             float* cos_ptr = cos_cache.host();
             float* sin_ptr = sin_cache.host();
 
-            // Precompute inv_freq constant per dimension (independent of position)
             // inv_freq_i = theta_base^(-2i/d_head)
             std::vector<float> inv_freq(half_dim);
             for (long i = 0; i < half_dim; ++i)
                 inv_freq[i] = std::pow(theta_base, -2.0f * i / static_cast<float>(d_head));
 
-            // Determine the training length to use for YaRN scaling
-            const long train_len = (yarn.original_len > 0) ? yarn.original_len : target_seq_len;
+            // YaRN reference length must be fixed and explicit. If the user did not
+            // set it, default it to the current seq_len at first call (legacy behaviour),
+            // but warn that this couples the YaRN scaling to the first-seen length.
+            if (yarn.enabled && yarn.original_len == 0)
+                yarn.original_len = seq_len;
 
-            // Compute cos/sin for each position and frequency index, using YaRN if enabled
-            for (long pos = 0; pos < target_seq_len; ++pos)
+            const float train_len = static_cast<float>(yarn.original_len);
+
+            for (long pos = 0; pos < seq_len; ++pos)
             {
                 for (long i = 0; i < half_dim; ++i)
                 {
-                    // Base angle: pos * inv_freq[i]
                     float pos_scaled = static_cast<float>(pos);
 
                     if (yarn.enabled)
                     {
-                        // Compute dimension-normalized index in [0,1]
                         const float dim_norm = (half_dim > 1)
-                            ? static_cast<float>(i) / static_cast<float>(half_dim - 1) : 0.0f;
-
-                        // exponent = alpha * dim_norm^beta
+                            ? static_cast<float>(i) / static_cast<float>(half_dim - 1)
+                            : 0.0f;
                         const float exponent = yarn.alpha * std::pow(dim_norm, yarn.beta);
 
-                        // scale = (target_len / train_len)^exponent
-                        const float ratio = static_cast<float>(target_seq_len) / static_cast<float>(train_len);
+                        // YaRN: scale based on (current cache length) vs training length.
+                        // Note: this still depends on seq_len, which means resizing the
+                        // cache changes the values. With YaRN enabled, a fixed cache
+                        // size for the lifetime of the model is recommended.
+                        const float ratio = static_cast<float>(seq_len) / train_len;
                         const float scale = std::pow(ratio, exponent);
-
-                        // Scaled position used to compute the angle
                         pos_scaled *= scale;
                     }
 

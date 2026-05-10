@@ -1,40 +1,48 @@
-﻿/*!
-    @file slm_advanced_gqa_train_ex.cpp
-    @brief GQA transformer with Adaptive Computation Time FFN: full pipeline from
-           tokenization to byte-accurate text reconstruction.
+﻿
+/*!
+    @file slm_advanced_gqa_kvc_train_ex.cpp
+    @brief Variant of slm_advanced_gqa_train_ex.cpp using the unified GQA attention
+           with a KV cache, validating end-to-end byte-accurate generation.
 
-    This example extends the canonical transformer (slm_advanced_train_ex) with two
-    architectural features from recent LLM research:
+    This program shares its dataset, tokenizer, training pipeline, prompting workflow
+    and command-line options with slm_advanced_gqa_train_ex.cpp; please refer to that
+    example for the general description. The two differences are:
 
-    - Grouped Query Attention (GQA): K and V use fewer heads than Q
-      (num_kv_heads < num_heads), reducing K/V projection cost. K/V heads are
-      repeated via repeat_heads to match the Q head count before computing attention.
+    1. Attention implementation
+       This program selects the *unified* attention implementation, in which the
+       full attention sub-graph (Q/K/V projections, RoPE on Q and K, optional GQA
+       repeat, scaled dot-product, output projection) is fused into a single Dlib
+       layer (gqa_attention_). The fused layer maintains a per-instance KV cache
+       and exposes prefill / incremental inference modes via network_context.
 
-    - Adaptive Computation Time (ACT) as FFN sublayer: each token position learns
-      how many computation steps it requires, up to max_steps. A learned halting
-      probability determines early stopping; the output is the weighted sum of
-      intermediate states. Implements the mechanism from Graves (2016),
-      arXiv:1603.08983. The transition network at each ACT step is a SwiGLU FFN,
-      regularized by a ponder penalty.
+    2. Inference loop
+       Instead of running a full forward pass on the entire context window for
+       every new token, the generation loop drives the network through three modes:
 
-    No dropout is used, consistent with modern LLM practice. Regularization is provided
-    by AdamW weight decay, stochastic mini-batch sampling, position-wise RMSNorm, and
-    the ACT ponder penalty. The explicit objective being perfect corpus memorization,
-    dropout would be counterproductive. Training and inference therefore share a
-    single network_type.
+         - prefill     : a single forward on the initial prompt populates each
+                         attention layer's KV cache with the new tokens' K (before
+                         RoPE) and V tensors, restricted to the effective
+                         (non-padded) positions.
 
-    This program selects the *chained* attention implementation, in which each
-    attention sub-step (Q/K/V projections, RoPE, repeat, scores, softmax, output
-    projection) is materialized as a separate Dlib layer. Inference is done by
-    running a full forward pass over the entire context window for every new
-    token; no KV cache is used. See slm_advanced_gqa_kvc_train_ex.cpp for the
-    fused/cached variant.
+         - incremental : each subsequent step feeds a 1-token input to the network.
+                         Each attention layer projects Q/K/V for the new position,
+                         appends K (pre-RoPE) and V to its cache, applies RoPE on
+                         the entire cached K window with positions [0, L-1] and on
+                         the new Q with position L-1, then computes attention
+                         against the cached window.
 
-    Architecture (gqa_transformer namespace, via gqa_transformer_config):
-    - GQA multi-head attention with RoPE on Q and K, causal mask, scaled dot-product
-    - Position-wise RMSNorm pre-normalization, residual connections around both sublayers
-    - ACT sublayer: SwiGLU transition network, max 4 steps per position
-    - Cross-entropy classification head with padding excluded via set_ignore_index(<pad>)
+         - sliding window: when an incremental step would push cache_filled_len_
+                         past cache_capacity_ (= max_seq_len), the attention layer
+                         automatically shifts its cache one position to the left,
+                         dropping the oldest entry and freeing room for the new
+                         one. RoPE positions therefore always remain inside
+                         [0, max_seq_len), the range observed during training.
+                         The generation loop has nothing to manage at this level.
+
+    The KV cache itself is held inside each gqa_attention_ instance and is runtime-
+    only (not serialized with the model). Mode and cache capacity are configured
+    via the network_context singleton; the attention layer consults them at the
+    start of every forward call.
 !*/
 #include <iostream>
 #include <string>
@@ -156,6 +164,21 @@ bool verify_match(const std::string& original, const std::string& generated)
 
 // ----------------------------------------------------------------------------------------
 
+/*
+    Returns the current KV cache fill length from the first gqa_attention
+    layer in the network (layer<8> in the standard 4-layer GQA stack).
+    All attention layers in the stack maintain caches of identical length
+    since they all observe the same prefill/incremental dispatching, so
+    reading any one of them suffices.
+*/
+template <typename net_type>
+long gqa_cache_full_len(net_type& net)
+{
+    return dlib::layer<8>(net).layer_details().get_kv_cache_filled_len();
+}
+
+// ----------------------------------------------------------------------------------------
+
 int main(int argc, char** argv)
 {
     try
@@ -170,11 +193,11 @@ int main(int argc, char** argv)
         parser.add_option("learning-rate", "Set the learning rate (default: 2e-4)", 1);
         parser.add_option("batch-size", "Set the mini-batch size (default: 64)", 1);
         parser.add_option("patience", "Iterations without progress before early stopping (default: 8000)", 1);
-        parser.add_option("max-epochs", "Maximum number of training epochs (default: 400)", 1);
+        parser.add_option("max-epochs", "Maximum number of training epochs (default: 300)", 1);
         parser.add_option("alpha", "Set the weight decay for AdamW (default: 0.004)", 1);
         parser.add_option("beta1", "Set AdamW's first moment coefficient (default: 0.9)", 1);
         parser.add_option("beta2", "Set AdamW's second moment coefficient (default: 0.998)", 1);
-        parser.add_option("model-file", "Path for model (default: dlib_lm_tokens_gqa_model.dat)", 1);
+        parser.add_option("model-file", "Path for model (default: dlib_lm_tokens_gqa_kvc_model.dat)", 1);
         parser.add_option("tokenizer-file", "Path for tokenizer (default: dlib_lm_tokenizer.vocab)", 1);
         parser.add_option("output-file", "Path for generated output (default: generated_text.txt)", 1);
         parser.add_option("max-tokens", "Maximum number of tokens to process (default: all)", 1);
@@ -194,14 +217,14 @@ int main(int argc, char** argv)
         const double learning_rate = get_option(parser, "learning-rate", 2e-4);
         const size_t batch_size = get_option(parser, "batch-size", 64);
         const long patience = get_option(parser, "patience", 8000);
-        const size_t max_epochs = get_option(parser, "max-epochs", 400);
+        const size_t max_epochs = get_option(parser, "max-epochs", 300);
         const double alpha = get_option(parser, "alpha", 0.004);
         const double beta1 = get_option(parser, "beta1", 0.9);
         const double beta2 = get_option(parser, "beta2", 0.998);
-        const std::string model_file = get_option(parser, "model-file", "dlib_lm_tokens_gqa_model.dat");
+        const std::string model_file = get_option(parser, "model-file", "dlib_lm_tokens_gqa_kvc_model.dat");
         const std::string tokenizer_file = get_option(parser, "tokenizer-file", "dlib_lm_tokenizer.vocab");
         const std::string output_file = get_option(parser, "output-file", "generated_text.txt");
-
+        
         // Model architecture parameters
         const long num_tokens = 1400;
         const long num_layers = 4;
@@ -216,8 +239,9 @@ int main(int argc, char** argv)
             num_layers,     // layers
             num_heads,      // heads
             num_kv_heads,   // kv_heads
-            embedding_dim  // dim
-        >;
+            embedding_dim,  // dim
+			attention_impl::unified // attention implementation
+        >;        
 
         // Load internal dataset
         cout << "Loading internal training dataset...\n";
@@ -359,7 +383,7 @@ int main(int argc, char** argv)
 
             // Build and train the network
             using net_type = my_transformer::network_type<true>;
-            net_type net;
+            net_type net;            
             layer<0>(net).loss_details().set_ignore_index(pad_token);
             cout << my_transformer::model_info::describe() << endl;
 
@@ -417,7 +441,7 @@ int main(int argc, char** argv)
                     total_loss += trainer.get_average_loss();
                     batches_seen++;
                     samples_seen += batch_samples.size();
-                    steps += batch_samples.size();
+					steps += batch_samples.size();
 
                     // Progress reporting
                     if (batches_count++ % 50 == 0) {
@@ -427,7 +451,7 @@ int main(int argc, char** argv)
                         double samples_per_sec = samples_seen / (elapsed > 0 ? elapsed : 1);
 
                         cout << "epoch#: " << (epoch + 1) << "/" << max_epochs
-                            << " (ksteps: " << (steps / 1000) << ")"
+							<< " (ksteps: " << (steps / 1000) << ")"
                             << " \t loss: " << avg_loss
                             << " \t patience: " << trainer.get_steps_without_progress()
                             << " \t speed: " << samples_per_sec << " samples/sec\n";
@@ -496,10 +520,73 @@ int main(int argc, char** argv)
                 return 0;
             }
 
-            // Read beginning of the dataset for prompt
-            std::vector<int> prompt_tokens;
+            // =========================================================================
+            // EQUIVALENCE TEST
+            //
+            // Verifies that prefill+incremental produces the same prediction as a
+            // single full forward on the same sequence. With the pre-RoPE KV cache
+            // and matching position conventions in both paths, the two predictions
+            // must be identical (modulo floating-point rounding).
+            // =========================================================================
+            {
+                cout << "\n=== EQUIVALENCE TEST ===\n";
 
-            // Check if we have pre-tokenized tokens
+                // Use first 11 tokens from the dataset
+                std::vector<int> diag_tokens;
+                {
+                    std::ifstream file(tokens_file, std::ios::binary);
+                    if (file) {
+                        uint64_t num_tokens_in_file;
+                        file.read(reinterpret_cast<char*>(&num_tokens_in_file), sizeof(num_tokens_in_file));
+                        for (int i = 0; i < 11; ++i) {
+                            uint32_t t;
+                            file.read(reinterpret_cast<char*>(&t), sizeof(t));
+                            diag_tokens.push_back(static_cast<int>(t));
+                        }
+                    }
+                }
+                DLIB_CASSERT(diag_tokens.size() == 11);
+
+                // Path A: full forward on 11 tokens, no padding
+                network_context::reset();
+                network_context::set_inference_mode(network_context::inference_mode::full);
+                network_context::clear_padding();
+
+                matrix<int, 0, 1> input_full(11, 1);
+                for (int i = 0; i < 11; ++i) input_full(i) = diag_tokens[i];
+                int next_full = net(input_full);
+                cout << "Path A (full on 11 tokens): predicted = " << next_full << "\n";
+
+                // Path B: prefill on first 10 tokens + incremental on 11th
+                network_context::reset();
+                network_context::set_kv_cache_capacity(max_seq_len);
+                network_context::set_inference_mode(network_context::inference_mode::prefill);
+                network_context::clear_padding();
+
+                matrix<int, 0, 1> input_pref(10, 1);
+                for (int i = 0; i < 10; ++i) input_pref(i) = diag_tokens[i];
+                int next_after_10 = net(input_pref);
+                cout << "Path B prefill (10 tokens): predicted=" << next_after_10
+                    << " cache_len=" << gqa_cache_full_len(net) << "\n";
+
+                network_context::set_inference_mode(network_context::inference_mode::incremental);
+                network_context::clear_padding();
+
+                matrix<int, 0, 1> incr_input(1, 1);
+                incr_input(0) = diag_tokens[10];
+                int next_incr = net(incr_input);
+                cout << "Path B incr (11th token): predicted=" << next_incr
+                    << " cache_len=" << gqa_cache_full_len(net) << "\n";
+
+                if (next_incr == next_full)
+                    cout << "[OK: equivalent]\n";
+                else
+                    cout << "[FAIL: " << next_incr << " vs " << next_full << "]\n";
+
+                network_context::reset();
+            }
+
+            std::vector<int> prompt_tokens;
             if (file_exists(tokens_file)) {
                 cout << "Found pre-tokenized tokens file: " << tokens_file << endl;
                 cout << "Loading tokens for prompt...\n";
@@ -509,11 +596,9 @@ int main(int argc, char** argv)
                     cerr << "Failed to open tokens file: " << tokens_file << endl;
                 }
                 else {
-                    // Read total number of tokens
                     uint64_t num_tokens_in_file;
                     file.read(reinterpret_cast<char*>(&num_tokens_in_file), sizeof(num_tokens_in_file));
 
-                    // Read only the first max_seq_len tokens
                     size_t tokens_to_read = std::min(static_cast<size_t>(max_seq_len),
                         static_cast<size_t>(num_tokens_in_file));
                     prompt_tokens.resize(tokens_to_read);
@@ -528,11 +613,9 @@ int main(int argc, char** argv)
                 }
             }
 
-            // If we couldn't load tokens, tokenize the prompt text
             if (prompt_tokens.empty()) {
                 cout << "Tokenizing initial prompt from internal dataset...\n";
 
-                // Use beginning of internal dataset for prompt
                 std::string prompt_text = training_text.substr(0, std::min(training_text.size(),
                     static_cast<size_t>(max_seq_len * 10)));
 
@@ -543,7 +626,6 @@ int main(int argc, char** argv)
                 prompt_tokens.insert(prompt_tokens.end(), encoded_tokens.begin(), encoded_tokens.end());
             }
 
-            // Limit to requested number of tokens
             if (prompt_tokens.size() > (size_t)max_seq_len) {
                 prompt_tokens.resize(max_seq_len);
             }
@@ -554,17 +636,9 @@ int main(int argc, char** argv)
             }
             cout << "Using " << prompt_tokens.size() << " tokens for initial prompt\n";
 
-            // Put prompt in input sequence
-            const int pad_token = tokenizer.get_special_token_id("<pad>");
-            inference_context llm_context(max_seq_len, 4, pad_token);
-            llm_context.add_tokens(prompt_tokens);
-            auto input_seq = llm_context.get_input_window();
-
-            // Determine text size to generate
             size_t target_size = (max_bytes > 0) ? max_bytes : training_text.size();
             cout << "Will generate approximately " << target_size << " bytes\n";
 
-            // Open output file
             std::ofstream outfile(output_file, std::ios::binary);
             if (!outfile) {
                 cerr << "Error: Cannot open output file: " << output_file << "\n";
@@ -575,55 +649,53 @@ int main(int argc, char** argv)
             std::string initial_text = tokenizer.decode(prompt_tokens, false);
             outfile.write(initial_text.c_str(), initial_text.size());
 
-            // Generate the rest of the text autoregressively
-            cout << "Starting autoregressive generation (full-mode, no padding)...\n";
+            // The cache capacity equals max_seq_len : positions[0, max_seq_len) are
+            // the only ones the model has seen during training. The attention layer
+            // automatically slides the window left when the cache is full, so the
+            // generation loop has nothing to manage beyond feeding the next token.
+            cout << "Starting autoregressive generation (KV-cache mode)...\n";
 
-            // Buffer for accumulation before writing
             std::vector<int> token_buffer;
             const size_t buffer_size = 100;
-
-            // Save start time to measure execution time
             auto start_time = std::chrono::high_resolution_clock::now();
             size_t total_bytes = initial_text.size();
             size_t token_count = prompt_tokens.size();
 
-            // Maintain the running context as a plain vector of token ids. We keep
-            // only the trailing max_seq_len tokens so the input tensor never exceeds
-            // the model's training context window.
-            std::vector<int> running_context = prompt_tokens;
-
             const int end_of_text = tokenizer.get_special_token_id("</text>");
             int next_token = 0;
 
-            // Make sure no leftover padding info or KV cache state interferes with this test.
             network_context::reset();
-            network_context::set_inference_mode(network_context::inference_mode::full);
+            network_context::set_kv_cache_capacity(max_seq_len);
+
+            // Prefill on the prompt (no padding)
+            {
+                network_context::set_inference_mode(network_context::inference_mode::prefill);
+                network_context::clear_padding();
+
+                matrix<int, 0, 1> prefill_input(prompt_tokens.size(), 1);
+                for (size_t i = 0; i < prompt_tokens.size(); ++i)
+                    prefill_input(i) = prompt_tokens[i];
+
+                next_token = net(prefill_input);
+                token_buffer.push_back(next_token);
+                token_count++;
+                cout << "[Prefill done] cache_filled_len=" << gqa_cache_full_len(net)
+                    << " next_token=" << next_token << "\n";
+            }
+
+            // Incremental generation
+            network_context::set_inference_mode(network_context::inference_mode::incremental);
             network_context::clear_padding();
 
             while (total_bytes < target_size && next_token != end_of_text
                 && !signal_handler::is_triggered())
             {
-                // Build an exact-size input tensor from the running context. No padding.
-                const long ctx_len = static_cast<long>(running_context.size());
-                matrix<int, 0, 1> input_exact(ctx_len, 1);
-                for (long i = 0; i < ctx_len; ++i)
-                    input_exact(i) = running_context[i];
-
-                // Forward without padding: the model sees positions 0..ctx_len-1.
-                next_token = net(input_exact);
-
+                matrix<int, 0, 1> incr_input(1, 1);
+                incr_input(0) = next_token;
+                next_token = net(incr_input);
                 token_buffer.push_back(next_token);
                 token_count++;
 
-                // Append the newly generated token to the running context, and trim
-                // from the left if we exceed the model's training window.
-                running_context.push_back(next_token);
-                if (static_cast<long>(running_context.size()) > max_seq_len)
-                    running_context.erase(running_context.begin(),
-                        running_context.begin()
-                        + (running_context.size() - max_seq_len));
-
-                // If buffer is full, write to file
                 if (token_buffer.size() >= buffer_size)
                 {
                     std::string chunk = tokenizer.decode(token_buffer, false);
@@ -646,7 +718,7 @@ int main(int argc, char** argv)
                 }
                 if (max_tokens_limit > 0 && token_count >= max_tokens_limit) break;
             }
-            network_context::clear_padding();
+            network_context::reset();
 
             // Flush remaining buffer
             if (!token_buffer.empty()) {
@@ -662,7 +734,7 @@ int main(int argc, char** argv)
                 end_time - start_time).count();
 
             cout << "\nGeneration complete in " << total_time << " seconds! (100%)\n";
-            cout << "Generated " << (token_count - input_seq.size()) << " tokens after prompt, "
+            cout << "Generated " << (token_count - prompt_tokens.size()) << " tokens after prompt, "
                 << total_bytes << " bytes total\n";
             cout << "Output saved to " << output_file << "\n";
         }

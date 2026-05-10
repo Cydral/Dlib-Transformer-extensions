@@ -1574,6 +1574,32 @@ namespace dlib { namespace tt
 
 // ----------------------------------------------------------------------------------------
 
+    void split_heads(
+        bool add_to,
+        tensor& dst,
+        const tensor& src)
+    {
+#ifdef DLIB_USE_CUDA
+        cuda::split_heads(add_to, dst, src);
+#else
+        cpu::split_heads(add_to, dst, src);
+#endif
+    }
+
+    void merge_heads(
+        bool add_to,
+        tensor& dst,
+        const tensor& src)
+    {
+#ifdef DLIB_USE_CUDA
+        cuda::merge_heads(add_to, dst, src);
+#else
+        cpu::merge_heads(add_to, dst, src);
+#endif
+    }
+
+// ----------------------------------------------------------------------------------------
+
 }}
 
 #endif // DLIB_TeNSOR_TOOLS_CPP_

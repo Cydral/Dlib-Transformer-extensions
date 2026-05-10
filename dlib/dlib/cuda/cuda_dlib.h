@@ -687,6 +687,20 @@ namespace dlib
 
     // ----------------------------------------------------------------------------------------
 
+        void split_heads(
+            bool add_to,
+            tensor& dst,
+            const tensor& src
+        );
+
+        void merge_heads(
+            bool add_to,
+            tensor& dst,
+            const tensor& src
+        );
+
+    // ----------------------------------------------------------------------------------------
+
         class compute_loss_cross_entropy_per_logit
         {
             /*!

@@ -904,17 +904,23 @@ namespace dlib { namespace tt
     /*!
         requires
             - eps > 0
-            - gamma.k() == src.k()
+            - gamma.num_samples() == 1
+            - gamma.k() == 1
             - gamma.nr() == 1
-            - gamma.nc() == 1
+            - gamma.nc() == src.nc()
         ensures
             - have_same_dimensions(#dest, src) == true
-            - #scale.size() == src.num_samples()
-            - #dest == the RMS normalized version of src
-            - #scale contains the RMS (Root Mean Square) values used to normalize each sample of src.
-            - Each element of #dest is computed as:
-                - #dest[n, k, i, j] == src[n, k, i, j] * gamma[k] / scale[n]
-            where n is the sample index, k is the channel index, and i, j are the spatial indices.
+            - #scale.num_samples() == src.num_samples()
+            - #scale.k()           == src.k()
+            - #scale.nr()          == src.nr()
+            - #scale.nc()          == 1
+            - #dest is the position-wise RMS-normalized version of src.
+            - For each (n, k, i): the vector src[n, k, i, :] is normalized by its
+              own RMS, then multiplied element-wise by gamma along the nc axis:
+                #dest[n, k, i, j] == src[n, k, i, j] * gamma[j] / scale[n, k, i, 0]
+            - This is the position-wise RMSNorm convention used in modern transformer
+              architectures (LLaMA, etc.), where each embedding vector is normalized
+              independently of the others in the sequence.
     !*/
 
     void rms_normalize_gradient(
@@ -928,19 +934,14 @@ namespace dlib { namespace tt
     );
     /*!
         requires
-            - scale.size() == src.num_samples()
+            - have_same_dimensions(scale.num_samples(), src.num_samples())
+              and analogously for k() and nr(); scale.nc() == 1.
             - have_same_dimensions(gamma, gamma_grad)
-            - gamma.k() == src.k()
-            - gamma.nr() == 1
-            - gamma.nc() == 1
+            - gamma.num_samples() == 1, gamma.k() == 1, gamma.nr() == 1, gamma.nc() == src.nc()
             - have_same_dimensions(gradient_input, src)
             - have_same_dimensions(gradient_input, src_grad)
         ensures
-            - Let f(src, gamma) == dot(gradient_input, dest output of
-                rms_normalize(eps, dest, scale, src, gamma))
-            - Adds the gradient of f() with respect to src to #src_grad
-            - Assigns the gradient of f() with respect to gamma to #gamma_grad
-            - #dscale contains the gradients of f() with respect to the RMS values.
+            - Backward of position-wise RMSNorm.
     !*/
 
 // -----------------------------------------------------------------------------------
@@ -2643,6 +2644,42 @@ namespace dlib { namespace tt
                     data[pos,i]   = data[pos,i] * cos_cache[pos,i/2] + data[pos,i+1] * sin_cache[pos,i/2]
                     data[pos,i+1] = -data[pos,i] * sin_cache[pos,i/2] + data[pos,i+1] * cos_cache[pos,i/2]
         !*/
+
+// ----------------------------------------------------------------------------------------
+
+    void split_heads(bool add_to, tensor& dst, const tensor& src);
+    /*!
+        Multi-head split: reinterprets a flat tensor [B, 1, N, NHEADS*HDIM] as a
+        canonical multi-head tensor [B, NHEADS, N, HDIM] by physically reordering
+        the data. Each new "head" channel h holds the slice [h*HDIM : (h+1)*HDIM)
+        from the source's nc dimension.
+
+        Concretely:
+            dst[b, h, n, d] = src[b, 0, n, h*HDIM + d]    if add_to is false
+            dst[b, h, n, d] += src[b, 0, n, h*HDIM + d]   if add_to is true
+
+        Constraints:
+            - src.k() == 1
+            - src.nc() == dst.k() * dst.nc()
+            - dst.num_samples() == src.num_samples()
+            - dst.nr() == src.nr()
+    !*/
+
+    void merge_heads(bool add_to, tensor& dst, const tensor& src);
+    /*!
+        Inverse of split_heads: gathers a multi-head tensor [B, NHEADS, N, HDIM]
+        back into a flat tensor [B, 1, N, NHEADS*HDIM]. This is exactly the
+        gradient operation of split_heads.
+
+        dst[b, 0, n, h*HDIM + d] = src[b, h, n, d]    if add_to is false
+        dst[b, 0, n, h*HDIM + d] += src[b, h, n, d]   if add_to is true
+
+        Constraints:
+            - dst.k() == 1
+            - dst.nc() == src.k() * src.nc()
+            - dst.num_samples() == src.num_samples()
+            - dst.nr() == src.nr()
+    !*/
 
 // ----------------------------------------------------------------------------------------
 

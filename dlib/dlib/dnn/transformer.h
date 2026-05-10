@@ -16,6 +16,27 @@ namespace dlib
     {
     public:
 
+        enum class inference_mode
+        {
+            // No inference-time state management. Used during training and for
+            // any forward call that should not interact with the KV cache.
+            training,
+
+            // Standard inference forward without cache. Equivalent to training
+            // mode for the attention layers but signals "we are not training".
+            full,
+
+            // Prefill mode: forward pass on the initial prompt; attention layers
+            // populate their KV caches in addition to producing the regular
+            // output. This is the first step of an autoregressive generation.
+            prefill,
+
+            // Incremental mode: forward pass on a single new token; attention
+            // layers read the existing KV cache, append the new token's K/V, and
+            // produce the output for this single position.
+            incremental
+        };
+
         static bool is_active()
         {
             std::lock_guard<std::mutex> lock(get_mutex_());
@@ -146,6 +167,77 @@ namespace dlib
             return get_optimizer_beta2_();
         }
 
+        // Sets the active inference mode. Attention layers read this to decide
+        // how to interact with their KV caches. The default value is
+        // inference_mode::training, which corresponds to the legacy behavior.
+        static void set_inference_mode(inference_mode m)
+        {
+            std::lock_guard<std::mutex> lock(get_mutex_());
+            get_inference_mode_() = m;
+            get_is_active_() = true;
+        }
+
+        static inference_mode get_inference_mode()
+        {
+            std::lock_guard<std::mutex> lock(get_mutex_());
+            return get_inference_mode_();
+        }
+
+        // Sets the maximum number of positions that each per-layer KV cache
+        // can hold. When the cache reaches this capacity, the generation loop
+        // is expected to trigger a sliding-window reset (re-prefill). A value
+        // of 0 means "no preset capacity"; the cache will then grow on demand
+        // and the generation loop is responsible for managing its size.
+        static void set_kv_cache_capacity(long capacity)
+        {
+            std::lock_guard<std::mutex> lock(get_mutex_());
+            DLIB_CASSERT(capacity >= 0, "KV cache capacity must be non-negative");
+            get_kv_cache_capacity_() = capacity;
+            get_is_active_() = true;
+        }
+
+        static long get_kv_cache_capacity()
+        {
+            std::lock_guard<std::mutex> lock(get_mutex_());
+            return get_kv_cache_capacity_();
+        }
+
+        // Signals to all KV-cache-aware layers that any cached state should be
+        // discarded on the next forward pass. The flag auto-resets after being
+        // observed (each layer that consumes it during forward will set it back
+        // to false on its own end). Concretely: this is a one-shot "please
+        // clear caches" marker. Layers can also manage their cache lifetime
+        // independently.
+        static void request_kv_cache_clear()
+        {
+            std::lock_guard<std::mutex> lock(get_mutex_());
+            get_kv_cache_clear_request_() = true;
+            get_is_active_() = true;
+        }
+
+        // Layers call this at the start of forward to check whether they should
+        // discard their cache. Returns true once and resets the flag so that
+        // subsequent layers/calls in the same forward pass also see the
+        // request, but it does not persist beyond the current forward sweep.
+        static bool consume_kv_cache_clear_request()
+        {
+            std::lock_guard<std::mutex> lock(get_mutex_());
+            const bool flag = get_kv_cache_clear_request_();
+            // The flag is intentionally NOT cleared here. The generation loop
+            // is responsible for clearing it explicitly via clear_kv_cache_request().
+            // This way, all attention layers in the same forward pass observe
+            // the same value.
+            return flag;
+        }
+
+        // Explicitly clears the cache-clear request flag. The generation loop
+        // calls this after a forward pass that has consumed the request.
+        static void clear_kv_cache_request()
+        {
+            std::lock_guard<std::mutex> lock(get_mutex_());
+            get_kv_cache_clear_request_() = false;
+        }
+
     private:
 
         static void clear_padding_nolock_()
@@ -161,6 +253,9 @@ namespace dlib
             get_optimizer_weight_decay_() = 0.004;
             get_optimizer_beta1_() = 0.9;
             get_optimizer_beta2_() = 0.999;
+            get_inference_mode_() = inference_mode::training;
+            get_kv_cache_capacity_() = 0;
+            get_kv_cache_clear_request_() = false;
             clear_padding_nolock_();
         }
 
@@ -196,6 +291,19 @@ namespace dlib
             static double v = 0.999;
             return v;
         }
+
+        static inference_mode& get_inference_mode_() {
+            static inference_mode v = inference_mode::training;
+            return v;
+        }
+        static long& get_kv_cache_capacity_() {
+            static long v = 0;
+            return v;
+        }
+        static bool& get_kv_cache_clear_request_() {
+            static bool v = false;
+            return v;
+        }
     };
 
     // ----------------------------------------------------------------------------------------
@@ -209,6 +317,21 @@ namespace dlib
             else break;
         }
         return count;
+    }
+
+    // ----------------------------------------------------------------------------------------
+
+    // Returns the effective (non-padded) length of sample `sample_idx` given a
+    // total sequence length `total_seq_len`. Reads the active padding lengths
+    // from network_context. If no padding is set for this sample, returns
+    // total_seq_len.
+    // This is the canonical way for layers to know how many "real" positions
+    // they should consider when interacting with the KV cache or any other
+    // position-dependent state.
+    inline long effective_length(long sample_idx, long total_seq_len)
+    {
+        const long pad_len = network_context::get_padding_length(sample_idx);
+        return std::max<long>(0, total_seq_len - pad_len);
     }
 
     // ----------------------------------------------------------------------------------------
@@ -251,13 +374,9 @@ namespace dlib
             "HEAD_DIM must equal EMBEDDING_DIM / NUM_HEADS");
         static_assert(HEAD_DIM % 2 == 0, "HEAD_DIM must be even (RoPE constraint)");
 
-        // Reserved for future KV-cache integration
-        enum class cache_mode { disabled, full_init, incremental };
-
         gqa_attention_()
             : learning_rate_multiplier_(1),
-            weight_decay_multiplier_(1),
-            cache_mode_(cache_mode::disabled)
+            weight_decay_multiplier_(1)
         {
         }
 
@@ -265,10 +384,8 @@ namespace dlib
         double get_weight_decay_multiplier() const { return weight_decay_multiplier_; }
         void set_learning_rate_multiplier(double v) { learning_rate_multiplier_ = v; }
         void set_weight_decay_multiplier(double v) { weight_decay_multiplier_ = v; }
-        void set_cache_mode(cache_mode m) { cache_mode_ = m; }
-        cache_mode get_cache_mode() const { return cache_mode_; }
 
-        // Forwarders to the embedded RoPE configuration
+        // YaRN forwarders to the embedded RoPE helpers
         void set_yarn_params(float alpha, float beta,
             long original_len = 0, bool enabled = true)
         {
@@ -280,6 +397,11 @@ namespace dlib
             return rope_q_helper_.get().get_yarn_config();
         }
 
+        // KV cache state accessors
+        void reset_kv_cache() { cache_filled_len_ = 0; }
+        long get_kv_cache_filled_len() const { return cache_filled_len_; }
+        long get_kv_cache_capacity() const { return cache_capacity_; }
+
         template <typename SUBNET>
         void setup(const SUBNET& sub)
         {
@@ -289,8 +411,6 @@ namespace dlib
                 "gqa_attention input nc()==" << x.nc()
                 << " does not match EMBEDDING_DIM=" << EMBEDDING_DIM);
 
-            // Pack four weight matrices in a single contiguous params tensor:
-            // layout is [W_Q | W_K | W_V | W_O]
             const long total_params =
                 EMBEDDING_DIM * EMBEDDING_DIM
                 + EMBEDDING_DIM * KV_PROJ_DIM
@@ -300,15 +420,11 @@ namespace dlib
             params.set_size(1, total_params);
 
             dlib::rand rnd(std::rand());
-            randomize_block(rnd, EMBEDDING_DIM, EMBEDDING_DIM,
-                params, 0);
-            randomize_block(rnd, EMBEDDING_DIM, KV_PROJ_DIM,
-                params, EMBEDDING_DIM * EMBEDDING_DIM);
-            randomize_block(rnd, EMBEDDING_DIM, KV_PROJ_DIM,
-                params, EMBEDDING_DIM * EMBEDDING_DIM
+            randomize_block(rnd, EMBEDDING_DIM, EMBEDDING_DIM, params, 0);
+            randomize_block(rnd, EMBEDDING_DIM, KV_PROJ_DIM, params, EMBEDDING_DIM * EMBEDDING_DIM);
+            randomize_block(rnd, EMBEDDING_DIM, KV_PROJ_DIM, params, EMBEDDING_DIM * EMBEDDING_DIM
                 + EMBEDDING_DIM * KV_PROJ_DIM);
-            randomize_block(rnd, EMBEDDING_DIM, EMBEDDING_DIM,
-                params, EMBEDDING_DIM * EMBEDDING_DIM
+            randomize_block(rnd, EMBEDDING_DIM, EMBEDDING_DIM, params, EMBEDDING_DIM * EMBEDDING_DIM
                 + 2 * EMBEDDING_DIM * KV_PROJ_DIM);
 
             wq_alias = alias_tensor(EMBEDDING_DIM, EMBEDDING_DIM);
@@ -321,9 +437,6 @@ namespace dlib
             wv_offset = wk_offset + EMBEDDING_DIM * KV_PROJ_DIM;
             wo_offset = wv_offset + EMBEDDING_DIM * KV_PROJ_DIM;
 
-            // Pre-allocate RoPE caches based on the current input shape
-            // The embedded layers will resize them dynamically if seq_len
-            // changes later
             if (x.nr() > 0)
             {
                 resizable_tensor q_probe(x.num_samples(), NUM_HEADS, x.nr(), HEAD_DIM);
@@ -337,122 +450,20 @@ namespace dlib
         void forward(const SUBNET& sub, resizable_tensor& output)
         {
             const tensor& x = sub.get_output();
-            const long B = x.num_samples();
-            const long N = x.nr();
             DLIB_CASSERT(x.k() == 1 && x.nc() == EMBEDDING_DIM);
 
-            auto wq = wq_alias(params, wq_offset);
-            auto wk = wk_alias(params, wk_offset);
-            auto wv = wv_alias(params, wv_offset);
-            auto wo = wo_alias(params, wo_offset);
+            const auto inference_mode_now = network_context::get_inference_mode();
+            if (network_context::consume_kv_cache_clear_request())
+                reset_kv_cache();
 
-            const float qk_scale = 1.0f / std::sqrt(static_cast<float>(HEAD_DIM));
-
-            // Step 1: Q (pre-scaled), K, V projections
-            scratch_q_flat.set_size(B, 1, N, EMBEDDING_DIM);
-            scratch_k_flat.set_size(B, 1, N, KV_PROJ_DIM);
-            scratch_v_flat.set_size(B, 1, N, KV_PROJ_DIM);
+            if (inference_mode_now == network_context::inference_mode::incremental
+                && x.nr() == 1 && cache_filled_len_ > 0)
             {
-                alias_tensor x_2d(B * N, EMBEDDING_DIM);
-                auto x_view = x_2d(const_cast<tensor&>(x), 0);
-
-                alias_tensor q_2d(B * N, EMBEDDING_DIM);
-                auto q_view = q_2d(scratch_q_flat, 0);
-                tt::gemm(0.0f, q_view, qk_scale, x_view, false, wq, false);
-
-                alias_tensor k_2d(B * N, KV_PROJ_DIM);
-                auto k_view = k_2d(scratch_k_flat, 0);
-                tt::gemm(0.0f, k_view, 1.0f, x_view, false, wk, false);
-
-                alias_tensor v_2d(B * N, KV_PROJ_DIM);
-                auto v_view = v_2d(scratch_v_flat, 0);
-                tt::gemm(0.0f, v_view, 1.0f, x_view, false, wv, false);
+                forward_incremental(x, output);
+                return;
             }
 
-            // Step 2: reinterpret as multi-head 4D, materialize to dedicated
-            // buffers (RoPE writes in-place; the post-RoPE buffers are read
-            // again in backward)
-            saved_q_pre_rope.set_size(B, NUM_HEADS, N, HEAD_DIM);
-            saved_k_pre_rope.set_size(B, NUM_KV_HEADS, N, HEAD_DIM);
-            scratch_v_pre_repeat.set_size(B, NUM_KV_HEADS, N, HEAD_DIM);
-            {
-                alias_tensor q_4d(B, NUM_HEADS, N, HEAD_DIM);
-                alias_tensor k_4d(B, NUM_KV_HEADS, N, HEAD_DIM);
-                alias_tensor v_4d(B, NUM_KV_HEADS, N, HEAD_DIM);
-
-                auto q_view = q_4d(scratch_q_flat, 0);
-                tt::copy_tensor(false, saved_q_pre_rope, 0, q_view, 0, NUM_HEADS);
-
-                auto k_view = k_4d(scratch_k_flat, 0);
-                tt::copy_tensor(false, saved_k_pre_rope, 0, k_view, 0, NUM_KV_HEADS);
-
-                auto v_view = v_4d(scratch_v_flat, 0);
-                tt::copy_tensor(false, scratch_v_pre_repeat, 0, v_view, 0, NUM_KV_HEADS);
-            }
-
-            // Step 3: RoPE on Q and K
-            rope_q_helper_.forward(saved_q_pre_rope, scratch_q);
-            rope_k_helper_.forward(saved_k_pre_rope, scratch_k_pre_repeat);
-
-            // Step 4: GQA repeat on K and V
-            scratch_k.set_size(B, NUM_HEADS, N, HEAD_DIM);
-            scratch_v.set_size(B, NUM_HEADS, N, HEAD_DIM);
-            for (long kv_h = 0; kv_h < NUM_KV_HEADS; ++kv_h)
-            {
-                for (long r = 0; r < REPEAT_FACTOR; ++r)
-                {
-                    const size_t dst_h = static_cast<size_t>(kv_h * REPEAT_FACTOR + r);
-                    tt::copy_tensor(false, scratch_k, dst_h,
-                        scratch_k_pre_repeat, static_cast<size_t>(kv_h), 1);
-                    tt::copy_tensor(false, scratch_v, dst_h,
-                        scratch_v_pre_repeat, static_cast<size_t>(kv_h), 1);
-                }
-            }
-
-            // Step 5: Q @ K^T (Q already pre-scaled)
-            scratch_scores.set_size(B, NUM_HEADS, N, N);
-            tt::gemm(0.0f, scratch_scores, 1.0f,
-                scratch_q, false,
-                scratch_k, true,
-                operation_mode::PLANE_WISE);
-
-            // Step 6: causal mask
-            scratch_scores_masked.copy_size(scratch_scores);
-            tril_helper_.forward(scratch_scores, scratch_scores_masked);
-
-            // Step 7: softmax
-            saved_attn.copy_size(scratch_scores_masked);
-            tt::softmax(saved_attn, scratch_scores_masked, operation_mode::PLANE_WISE);
-
-            // Step 8: attn @ V
-            scratch_ctx.set_size(B, NUM_HEADS, N, HEAD_DIM);
-            tt::gemm(0.0f, scratch_ctx, 1.0f,
-                saved_attn, false,
-                scratch_v, false,
-                operation_mode::PLANE_WISE);
-
-            // Step 9: reinterpret context as flat
-            scratch_ctx_flat.set_size(B, 1, N, EMBEDDING_DIM);
-            {
-                alias_tensor ctx_4d_alias(B, NUM_HEADS, N, HEAD_DIM);
-                auto ctx_view = ctx_4d_alias(scratch_ctx_flat, 0);
-                tt::copy_tensor(false, ctx_view, 0, scratch_ctx, 0, NUM_HEADS);
-            }
-
-            // Step 10: output projection
-            output.set_size(B, 1, N, EMBEDDING_DIM);
-            {
-                alias_tensor ctx_2d(B * N, EMBEDDING_DIM);
-                auto ctx_view = ctx_2d(scratch_ctx_flat, 0);
-
-                alias_tensor o_2d(B * N, EMBEDDING_DIM);
-                auto o_view = o_2d(output, 0);
-
-                tt::gemm(0.0f, o_view, 1.0f, ctx_view, false, wo, false);
-            }
-
-            saved_x_shape_B = B;
-            saved_x_shape_N = N;
+            forward_full(x, output, inference_mode_now);
         }
 
         template <typename SUBNET>
@@ -490,44 +501,35 @@ namespace dlib
                 tt::gemm(0.0f, dctx_view, 1.0f, go_view, false, wo, true);
 
                 alias_tensor cf_2d(B * N, EMBEDDING_DIM);
-                auto cf_view = cf_2d(scratch_ctx_flat, 0);
+                auto cf_view = cf_2d(saved_ctx_flat, 0);
                 tt::gemm(0.0f, dwo, 1.0f, cf_view, true, go_view, false);
             }
 
             // Step 9 backward
-            resizable_tensor dctx(B, NUM_HEADS, N, HEAD_DIM);
-            {
-                alias_tensor dctx_4d(B, NUM_HEADS, N, HEAD_DIM);
-                auto dctx_view = dctx_4d(dctx_flat, 0);
-                tt::copy_tensor(false, dctx, 0, dctx_view, 0, NUM_HEADS);
-            }
+            resizable_tensor dctx_4d(B, NUM_HEADS, N, HEAD_DIM);
+            tt::split_heads(false, dctx_4d, dctx_flat);
 
             // Step 8 backward
             resizable_tensor dattn(B, NUM_HEADS, N, N);
             resizable_tensor dV_repeated(B, NUM_HEADS, N, HEAD_DIM);
-            tt::gemm(0.0f, dattn, 1.0f, dctx, false, scratch_v, true,
-                operation_mode::PLANE_WISE);
-            tt::gemm(0.0f, dV_repeated, 1.0f, saved_attn, true, dctx, false,
-                operation_mode::PLANE_WISE);
+            tt::gemm(0.0f, dattn, 1.0f, dctx_4d, false, saved_v_repeated, true, operation_mode::PLANE_WISE);
+            tt::gemm(0.0f, dV_repeated, 1.0f, saved_attn, true, dctx_4d, false, operation_mode::PLANE_WISE);
 
             // Step 7 backward
             resizable_tensor dscores_masked(B, NUM_HEADS, N, N);
-            tt::softmax_gradient(dscores_masked, saved_attn, dattn,
-                operation_mode::PLANE_WISE);
+            tt::softmax_gradient(dscores_masked, saved_attn, dattn, operation_mode::PLANE_WISE);
 
             // Step 6 backward
             resizable_tensor dscores;
-            tril_helper_.backward(dscores_masked, scratch_scores, dscores);
+            tril_helper_.backward(dscores_masked, saved_scores, dscores);
 
             // Step 5 backward
             resizable_tensor dQ(B, NUM_HEADS, N, HEAD_DIM);
-            resizable_tensor dK(B, NUM_HEADS, N, HEAD_DIM);
-            tt::gemm(0.0f, dQ, qk_scale, dscores, false, scratch_k, false,
-                operation_mode::PLANE_WISE);
-            tt::gemm(0.0f, dK, 1.0f, dscores, true, scratch_q, false,
-                operation_mode::PLANE_WISE);
+            resizable_tensor dK_repeated(B, NUM_HEADS, N, HEAD_DIM);
+            tt::gemm(0.0f, dQ, qk_scale, dscores, false, saved_k_repeated, false, operation_mode::PLANE_WISE);
+            tt::gemm(0.0f, dK_repeated, 1.0f, dscores, true, saved_q_post_rope, false, operation_mode::PLANE_WISE);
 
-            // Step 4 backward (sum across replicated heads).
+            // Step 4 backward (GQA repeat sum)
             resizable_tensor dK_pre_repeat(B, NUM_KV_HEADS, N, HEAD_DIM);
             resizable_tensor dV_pre_repeat(B, NUM_KV_HEADS, N, HEAD_DIM);
             dK_pre_repeat = 0;
@@ -537,38 +539,26 @@ namespace dlib
                 for (long r = 0; r < REPEAT_FACTOR; ++r)
                 {
                     const size_t src_h = static_cast<size_t>(kv_h * REPEAT_FACTOR + r);
-                    tt::copy_tensor(true, dK_pre_repeat, static_cast<size_t>(kv_h),
-                        dK, src_h, 1);
-                    tt::copy_tensor(true, dV_pre_repeat, static_cast<size_t>(kv_h),
-                        dV_repeated, src_h, 1);
+                    tt::copy_tensor(true, dK_pre_repeat, static_cast<size_t>(kv_h), dK_repeated, src_h, 1);
+                    tt::copy_tensor(true, dV_pre_repeat, static_cast<size_t>(kv_h), dV_repeated, src_h, 1);
                 }
             }
 
-            // Step 3 backward
+            // Step 3 backward (RoPE on Q and K)
             resizable_tensor dQ_pre_rope;
             resizable_tensor dK_pre_rope;
             rope_q_helper_.backward(dQ, saved_q_pre_rope, dQ_pre_rope);
             rope_k_helper_.backward(dK_pre_repeat, saved_k_pre_rope, dK_pre_rope);
 
-            // Step 2 backward
+            // Step 2 backward (merge heads)
             resizable_tensor dQ_flat(B, 1, N, EMBEDDING_DIM);
             resizable_tensor dK_flat(B, 1, N, KV_PROJ_DIM);
             resizable_tensor dV_flat(B, 1, N, KV_PROJ_DIM);
-            {
-                alias_tensor dQ_4d(B, NUM_HEADS, N, HEAD_DIM);
-                auto dQ_view = dQ_4d(dQ_flat, 0);
-                tt::copy_tensor(false, dQ_view, 0, dQ_pre_rope, 0, NUM_HEADS);
+            tt::merge_heads(false, dQ_flat, dQ_pre_rope);
+            tt::merge_heads(false, dK_flat, dK_pre_rope);
+            tt::merge_heads(false, dV_flat, dV_pre_repeat);
 
-                alias_tensor dK_4d(B, NUM_KV_HEADS, N, HEAD_DIM);
-                auto dK_view = dK_4d(dK_flat, 0);
-                tt::copy_tensor(false, dK_view, 0, dK_pre_rope, 0, NUM_KV_HEADS);
-
-                alias_tensor dV_4d(B, NUM_KV_HEADS, N, HEAD_DIM);
-                auto dV_view = dV_4d(dV_flat, 0);
-                tt::copy_tensor(false, dV_view, 0, dV_pre_repeat, 0, NUM_KV_HEADS);
-            }
-
-            // Step 1 backward
+            // Step 1 backward (linear projections)
             {
                 alias_tensor x_2d(B * N, EMBEDDING_DIM);
                 auto x_view = x_2d(const_cast<tensor&>(x), 0);
@@ -621,6 +611,13 @@ namespace dlib
             deserialize(item.rope_k_helper_, in);
             deserialize(item.tril_helper_, in);
             item.rebuild_aliases();
+
+            // KV cache state is runtime-only.
+            item.K_cache.clear();
+            item.V_cache.clear();
+            item.cache_filled_len_ = 0;
+            item.cache_capacity_ = 0;
+            item.cache_batch_size_ = 0;
         }
 
         friend std::ostream& operator<<(std::ostream& out, const gqa_attention_& item)
@@ -647,38 +644,59 @@ namespace dlib
         }
 
     private:
+        // Parameter storage (W_Q | W_K | W_V | W_O packed contiguously)
         resizable_tensor params;
         alias_tensor wq_alias, wk_alias, wv_alias, wo_alias;
         size_t wq_offset = 0, wk_offset = 0, wv_offset = 0, wo_offset = 0;
 
-        // Forward scratch buffers, saved between forward and backward
-        resizable_tensor scratch_q_flat;
-        resizable_tensor scratch_k_flat;
-        resizable_tensor scratch_v_flat;
+        // Forward state saved for backward (training only)
         resizable_tensor saved_q_pre_rope;
         resizable_tensor saved_k_pre_rope;
-        resizable_tensor scratch_v_pre_repeat;
-        resizable_tensor scratch_q;
-        resizable_tensor scratch_k_pre_repeat;
-        resizable_tensor scratch_k;
-        resizable_tensor scratch_v;
-        resizable_tensor scratch_scores;
-        resizable_tensor scratch_scores_masked;
-        resizable_tensor scratch_ctx;
-        resizable_tensor scratch_ctx_flat;
+        resizable_tensor saved_q_post_rope;
+        resizable_tensor saved_k_post_rope;
+        resizable_tensor saved_v_4d;
+        resizable_tensor saved_k_repeated;
+        resizable_tensor saved_v_repeated;
+        resizable_tensor saved_scores;
         resizable_tensor saved_attn;
+        resizable_tensor saved_ctx_flat;
 
         long saved_x_shape_B = 0;
         long saved_x_shape_N = 0;
 
         double learning_rate_multiplier_;
         double weight_decay_multiplier_;
-        cache_mode cache_mode_;
 
-        // Embedded parameter-free Dlib layers
-        layer_helper<rotary_positional_embedding_>   rope_q_helper_;
-        layer_helper<rotary_positional_embedding_>   rope_k_helper_;
-        layer_helper<tril_<0, neg_infinity_tag>>     tril_helper_;
+        // Embedded parameter-free layers
+        layer_helper<rotary_positional_embedding_>  rope_q_helper_;
+        layer_helper<rotary_positional_embedding_>  rope_k_helper_;
+        layer_helper<tril_<0, neg_infinity_tag>>    tril_helper_;
+
+        // KV cache: stores K *before* RoPE and V (no transformation).
+        // RoPE is re-applied at every attention computation. Layout:
+        // [B, NUM_KV_HEADS, capacity, HEAD_DIM]. cache_filled_len_ is the
+        // number of valid positions in [0, cache_filled_len_). When the
+        // cache is full and a new position is incoming, the oldest position
+        // is dropped via a left shift, keeping cache_filled_len_ at capacity.
+        resizable_tensor K_cache;
+        resizable_tensor V_cache;
+        long cache_filled_len_ = 0;
+        long cache_capacity_ = 0;
+        long cache_batch_size_ = 0;
+
+        // Incremental scratch buffers (reused across calls)
+        resizable_tensor inc_q;
+        resizable_tensor inc_k;
+        resizable_tensor inc_v;
+        resizable_tensor inc_k_window;
+        resizable_tensor inc_v_window;
+        resizable_tensor inc_k_window_rep;
+        resizable_tensor inc_v_window_rep;
+        resizable_tensor inc_k_window_rope;
+        resizable_tensor inc_q_rope;
+        resizable_tensor inc_scores;
+        resizable_tensor inc_attn;
+        resizable_tensor inc_ctx;
 
         void rebuild_aliases()
         {
@@ -692,8 +710,6 @@ namespace dlib
             wo_offset = wv_offset + EMBEDDING_DIM * KV_PROJ_DIM;
         }
 
-        // Initialise a [rows, cols] block of `dest` at the given element offset
-        // using Dlib's randomize_parameters helper
         void randomize_block(
             dlib::rand& rnd,
             long rows, long cols,
@@ -705,6 +721,380 @@ namespace dlib
             alias_tensor dest_view(rows, cols);
             auto view = dest_view(dest, offset);
             tt::copy_tensor(false, view, 0, tmp, 0, tmp.k());
+        }
+
+        // Allocate the K/V caches if needed. The capacity is the maximum
+        // number of positions the cache will ever hold; the sliding window
+        // mechanism keeps the actual filled length at most equal to this.
+        void ensure_cache_allocated(long batch_size, long min_capacity)
+        {
+            const long requested_cap = network_context::get_kv_cache_capacity();
+            const long target_cap = std::max(min_capacity, requested_cap);
+
+            if (cache_capacity_ >= target_cap && cache_batch_size_ == batch_size
+                && K_cache.size() > 0 && V_cache.size() > 0) return;
+
+            K_cache.set_size(batch_size, NUM_KV_HEADS, target_cap, HEAD_DIM);
+            V_cache.set_size(batch_size, NUM_KV_HEADS, target_cap, HEAD_DIM);
+            K_cache = 0;
+            V_cache = 0;
+
+            cache_capacity_ = target_cap;
+            cache_batch_size_ = batch_size;
+            cache_filled_len_ = 0;
+        }
+
+        // Shift the K/V caches one position to the left, dropping the oldest
+        // entry. After this call cache_filled_len_ is decreased by 1 and a
+        // free slot is available at the end of the valid range.
+        void shift_cache_left()
+        {
+            DLIB_CASSERT(cache_filled_len_ > 0);
+
+            const long new_len = cache_filled_len_ - 1;
+
+            // Use a temporary buffer to perform the shift since copy_tensor
+            // does not support overlapping source/destination ranges safely.
+            resizable_tensor tmp_k(cache_batch_size_, NUM_KV_HEADS, new_len, HEAD_DIM);
+            resizable_tensor tmp_v(cache_batch_size_, NUM_KV_HEADS, new_len, HEAD_DIM);
+
+            tt::copy_tensor(false, tmp_k,
+                /*dk=*/0, /*dnr=*/0, /*dnc=*/0,
+                K_cache,
+                /*sk=*/0, /*snr=*/1, /*snc=*/0,
+                /*k=*/NUM_KV_HEADS,
+                /*nr=*/static_cast<size_t>(new_len),
+                /*nc=*/HEAD_DIM);
+            tt::copy_tensor(false, tmp_v,
+                /*dk=*/0, /*dnr=*/0, /*dnc=*/0,
+                V_cache,
+                /*sk=*/0, /*snr=*/1, /*snc=*/0,
+                /*k=*/NUM_KV_HEADS,
+                /*nr=*/static_cast<size_t>(new_len),
+                /*nc=*/HEAD_DIM);
+
+            tt::copy_tensor(false, K_cache,
+                /*dk=*/0, /*dnr=*/0, /*dnc=*/0,
+                tmp_k,
+                /*sk=*/0, /*snr=*/0, /*snc=*/0,
+                /*k=*/NUM_KV_HEADS,
+                /*nr=*/static_cast<size_t>(new_len),
+                /*nc=*/HEAD_DIM);
+            tt::copy_tensor(false, V_cache,
+                /*dk=*/0, /*dnr=*/0, /*dnc=*/0,
+                tmp_v,
+                /*sk=*/0, /*snr=*/0, /*snc=*/0,
+                /*k=*/NUM_KV_HEADS,
+                /*nr=*/static_cast<size_t>(new_len),
+                /*nc=*/HEAD_DIM);
+
+            cache_filled_len_ = new_len;
+        }
+
+        // Full forward path. Used in training/full mode (no cache write) and
+        // in prefill mode (writes K_pre_rope and V into the cache for the
+        // effective non-padded positions of the prompt).
+        void forward_full(const tensor& x, resizable_tensor& output,
+            network_context::inference_mode mode)
+        {
+            const long B = x.num_samples();
+            const long N = x.nr();
+
+            auto wq = wq_alias(params, wq_offset);
+            auto wk = wk_alias(params, wk_offset);
+            auto wv = wv_alias(params, wv_offset);
+            auto wo = wo_alias(params, wo_offset);
+
+            const float qk_scale = 1.0f / std::sqrt(static_cast<float>(HEAD_DIM));
+
+            // Step 1: Q (pre-scaled), K, V projections
+            resizable_tensor q_flat(B, 1, N, EMBEDDING_DIM);
+            resizable_tensor k_flat(B, 1, N, KV_PROJ_DIM);
+            resizable_tensor v_flat(B, 1, N, KV_PROJ_DIM);
+            {
+                alias_tensor x_2d(B * N, EMBEDDING_DIM);
+                auto x_view = x_2d(const_cast<tensor&>(x), 0);
+
+                alias_tensor q_2d(B * N, EMBEDDING_DIM);
+                auto q_view = q_2d(q_flat, 0);
+                tt::gemm(0.0f, q_view, qk_scale, x_view, false, wq, false);
+
+                alias_tensor k_2d(B * N, KV_PROJ_DIM);
+                auto k_view = k_2d(k_flat, 0);
+                tt::gemm(0.0f, k_view, 1.0f, x_view, false, wk, false);
+
+                alias_tensor v_2d(B * N, KV_PROJ_DIM);
+                auto v_view = v_2d(v_flat, 0);
+                tt::gemm(0.0f, v_view, 1.0f, x_view, false, wv, false);
+            }
+
+            // Step 2: split heads
+            saved_q_pre_rope.set_size(B, NUM_HEADS, N, HEAD_DIM);
+            saved_k_pre_rope.set_size(B, NUM_KV_HEADS, N, HEAD_DIM);
+            saved_v_4d.set_size(B, NUM_KV_HEADS, N, HEAD_DIM);
+
+            tt::split_heads(false, saved_q_pre_rope, q_flat);
+            tt::split_heads(false, saved_k_pre_rope, k_flat);
+            tt::split_heads(false, saved_v_4d, v_flat);
+
+            // Step 3: RoPE on Q and K (used locally for attention; not stored
+            // in the cache - the cache holds K *before* RoPE)
+            rope_q_helper_.forward(saved_q_pre_rope, saved_q_post_rope);
+            rope_k_helper_.forward(saved_k_pre_rope, saved_k_post_rope);
+
+            // Step 3.5: prefill-mode cache write (K pre-RoPE and V).
+            // Only effective non-padded positions are kept; padding is
+            // stripped by adjusting the source row offset.
+            if (mode == network_context::inference_mode::prefill)
+            {
+                const long pad_len = network_context::get_padding_length(0);
+                const long eff_len = std::max<long>(0, N - pad_len);
+
+                if (eff_len > 0)
+                {
+                    ensure_cache_allocated(B, eff_len);
+
+                    tt::copy_tensor(false, K_cache,
+                        /*dk=*/0, /*dnr=*/0, /*dnc=*/0,
+                        saved_k_pre_rope,
+                        /*sk=*/0, /*snr=*/static_cast<size_t>(pad_len), /*snc=*/0,
+                        /*k=*/NUM_KV_HEADS,
+                        /*nr=*/static_cast<size_t>(eff_len),
+                        /*nc=*/HEAD_DIM);
+
+                    tt::copy_tensor(false, V_cache,
+                        /*dk=*/0, /*dnr=*/0, /*dnc=*/0,
+                        saved_v_4d,
+                        /*sk=*/0, /*snr=*/static_cast<size_t>(pad_len), /*snc=*/0,
+                        /*k=*/NUM_KV_HEADS,
+                        /*nr=*/static_cast<size_t>(eff_len),
+                        /*nc=*/HEAD_DIM);
+
+                    cache_filled_len_ = eff_len;
+                }
+                else
+                {
+                    cache_filled_len_ = 0;
+                }
+            }
+
+            // Step 4: GQA repeat
+            saved_k_repeated.set_size(B, NUM_HEADS, N, HEAD_DIM);
+            saved_v_repeated.set_size(B, NUM_HEADS, N, HEAD_DIM);
+            for (long kv_h = 0; kv_h < NUM_KV_HEADS; ++kv_h)
+            {
+                for (long r = 0; r < REPEAT_FACTOR; ++r)
+                {
+                    const size_t dst_h = static_cast<size_t>(kv_h * REPEAT_FACTOR + r);
+                    tt::copy_tensor(false, saved_k_repeated, dst_h,
+                        saved_k_post_rope, static_cast<size_t>(kv_h), 1);
+                    tt::copy_tensor(false, saved_v_repeated, dst_h,
+                        saved_v_4d, static_cast<size_t>(kv_h), 1);
+                }
+            }
+
+            // Step 5: Q @ K^T
+            saved_scores.set_size(B, NUM_HEADS, N, N);
+            tt::gemm(0.0f, saved_scores, 1.0f,
+                saved_q_post_rope, false,
+                saved_k_repeated, true,
+                operation_mode::PLANE_WISE);
+
+            // Step 6: causal mask
+            resizable_tensor scores_masked;
+            scores_masked.copy_size(saved_scores);
+            tril_helper_.forward(saved_scores, scores_masked);
+
+            // Step 7: softmax
+            saved_attn.copy_size(scores_masked);
+            tt::softmax(saved_attn, scores_masked, operation_mode::PLANE_WISE);
+
+            // Step 8: attn @ V
+            resizable_tensor ctx_4d(B, NUM_HEADS, N, HEAD_DIM);
+            tt::gemm(0.0f, ctx_4d, 1.0f,
+                saved_attn, false,
+                saved_v_repeated, false,
+                operation_mode::PLANE_WISE);
+
+            // Step 9: merge heads
+            saved_ctx_flat.set_size(B, 1, N, EMBEDDING_DIM);
+            tt::merge_heads(false, saved_ctx_flat, ctx_4d);
+
+            // Step 10: W_O projection
+            output.set_size(B, 1, N, EMBEDDING_DIM);
+            {
+                alias_tensor ctx_2d(B * N, EMBEDDING_DIM);
+                auto ctx_view = ctx_2d(saved_ctx_flat, 0);
+
+                alias_tensor o_2d(B * N, EMBEDDING_DIM);
+                auto o_view = o_2d(output, 0);
+
+                tt::gemm(0.0f, o_view, 1.0f, ctx_view, false, wo, false);
+            }
+
+            saved_x_shape_B = B;
+            saved_x_shape_N = N;
+        }
+
+        // Incremental forward path.
+        // Input  : x of shape [1, 1, 1, EMBEDDING_DIM]
+        // Output : [1, 1, 1, EMBEDDING_DIM]
+        //
+        // Workflow:
+        //   1. Project the new token into Q/K/V (no RoPE yet).
+        //   2. If the cache is full, shift it left to make room.
+        //   3. Append the new K_pre_rope and V to the cache.
+        //   4. Build a K window of length L = cache_filled_len_ from the cache.
+        //   5. Apply RoPE to the entire K window with positions [0, L-1],
+        //      and to Q with position L-1.
+        //   6. GQA repeat, attention, and W_O projection.
+        void forward_incremental(const tensor& x, resizable_tensor& output)
+        {
+            const long B = x.num_samples();
+            DLIB_CASSERT(B == 1, "Incremental mode supports B=1 only");
+            DLIB_CASSERT(x.nr() == 1, "Incremental mode expects exactly one new position");
+            DLIB_CASSERT(cache_capacity_ > 0, "KV cache must be allocated before incremental");
+
+            auto wq = wq_alias(params, wq_offset);
+            auto wk = wk_alias(params, wk_offset);
+            auto wv = wv_alias(params, wv_offset);
+            auto wo = wo_alias(params, wo_offset);
+
+            const float qk_scale = 1.0f / std::sqrt(static_cast<float>(HEAD_DIM));
+
+            // Step 1: project the new token into Q, K, V (no RoPE)
+            inc_q.set_size(1, NUM_HEADS, 1, HEAD_DIM);
+            inc_k.set_size(1, NUM_KV_HEADS, 1, HEAD_DIM);
+            inc_v.set_size(1, NUM_KV_HEADS, 1, HEAD_DIM);
+            {
+                alias_tensor x_2d(1, EMBEDDING_DIM);
+                auto x_view = x_2d(const_cast<tensor&>(x), 0);
+
+                alias_tensor q_2d(1, EMBEDDING_DIM);
+                auto q_view = q_2d(inc_q, 0);
+                tt::gemm(0.0f, q_view, qk_scale, x_view, false, wq, false);
+
+                alias_tensor k_2d(1, KV_PROJ_DIM);
+                auto k_view = k_2d(inc_k, 0);
+                tt::gemm(0.0f, k_view, 1.0f, x_view, false, wk, false);
+
+                alias_tensor v_2d(1, KV_PROJ_DIM);
+                auto v_view = v_2d(inc_v, 0);
+                tt::gemm(0.0f, v_view, 1.0f, x_view, false, wv, false);
+            }
+
+            // Step 2: make room in the cache if full (sliding window)
+            if (cache_filled_len_ >= cache_capacity_)
+                shift_cache_left();
+
+            // Step 3: append the new K_pre_rope and V to the cache
+            const long insert_pos = cache_filled_len_;
+            tt::copy_tensor(false, K_cache,
+                /*dk=*/0, /*dnr=*/static_cast<size_t>(insert_pos), /*dnc=*/0,
+                inc_k,
+                /*sk=*/0, /*snr=*/0, /*snc=*/0,
+                /*k=*/NUM_KV_HEADS, /*nr=*/1, /*nc=*/HEAD_DIM);
+            tt::copy_tensor(false, V_cache,
+                /*dk=*/0, /*dnr=*/static_cast<size_t>(insert_pos), /*dnc=*/0,
+                inc_v,
+                /*sk=*/0, /*snr=*/0, /*snc=*/0,
+                /*k=*/NUM_KV_HEADS, /*nr=*/1, /*nc=*/HEAD_DIM);
+            cache_filled_len_ = insert_pos + 1;
+
+            const long L = cache_filled_len_;
+
+            // Step 4: extract the K and V windows of length L
+            inc_k_window.set_size(1, NUM_KV_HEADS, L, HEAD_DIM);
+            inc_v_window.set_size(1, NUM_KV_HEADS, L, HEAD_DIM);
+            tt::copy_tensor(false, inc_k_window,
+                /*dk=*/0, /*dnr=*/0, /*dnc=*/0,
+                K_cache,
+                /*sk=*/0, /*snr=*/0, /*snc=*/0,
+                /*k=*/NUM_KV_HEADS,
+                /*nr=*/static_cast<size_t>(L),
+                /*nc=*/HEAD_DIM);
+            tt::copy_tensor(false, inc_v_window,
+                /*dk=*/0, /*dnr=*/0, /*dnc=*/0,
+                V_cache,
+                /*sk=*/0, /*snr=*/0, /*snc=*/0,
+                /*k=*/NUM_KV_HEADS,
+                /*nr=*/static_cast<size_t>(L),
+                /*nc=*/HEAD_DIM);
+
+            // Step 5a: apply RoPE on the entire K window (positions [0, L-1])
+            inc_k_window_rope.copy_size(inc_k_window);
+            rope_k_helper_.forward(inc_k_window, inc_k_window_rope);
+
+            // Step 5b: apply RoPE on Q with position L-1, by extracting cos/sin
+            // slices from the Q helper's caches and rotating in place
+            const long half_d = HEAD_DIM / 2;
+            rope_q_helper_.get().ensure_caches_at_least(L, HEAD_DIM);
+            const auto& q_cos = rope_q_helper_.get().get_cos_cache();
+            const auto& q_sin = rope_q_helper_.get().get_sin_cache();
+
+            resizable_tensor q_cos_slice(1, 1, 1, half_d);
+            resizable_tensor q_sin_slice(1, 1, 1, half_d);
+            tt::copy_tensor(false, q_cos_slice,
+                /*dk=*/0, /*dnr=*/0, /*dnc=*/0,
+                q_cos,
+                /*sk=*/0, /*snr=*/static_cast<size_t>(L - 1), /*snc=*/0,
+                /*k=*/1, /*nr=*/1, /*nc=*/static_cast<size_t>(half_d));
+            tt::copy_tensor(false, q_sin_slice,
+                /*dk=*/0, /*dnr=*/0, /*dnc=*/0,
+                q_sin,
+                /*sk=*/0, /*snr=*/static_cast<size_t>(L - 1), /*snc=*/0,
+                /*k=*/1, /*nr=*/1, /*nc=*/static_cast<size_t>(half_d));
+
+            inc_q_rope.set_size(1, NUM_HEADS, 1, HEAD_DIM);
+            tt::copy_tensor(false, inc_q_rope, 0, inc_q, 0, NUM_HEADS);
+            tt::apply_rotary_positional_embedding(false, inc_q_rope, q_cos_slice, q_sin_slice);
+
+            // Step 6: GQA repeat from NUM_KV_HEADS to NUM_HEADS
+            inc_k_window_rep.set_size(1, NUM_HEADS, L, HEAD_DIM);
+            inc_v_window_rep.set_size(1, NUM_HEADS, L, HEAD_DIM);
+            for (long kv_h = 0; kv_h < NUM_KV_HEADS; ++kv_h)
+            {
+                for (long r = 0; r < REPEAT_FACTOR; ++r)
+                {
+                    const size_t dst_h = static_cast<size_t>(kv_h * REPEAT_FACTOR + r);
+                    tt::copy_tensor(false, inc_k_window_rep, dst_h,
+                        inc_k_window_rope, static_cast<size_t>(kv_h), 1);
+                    tt::copy_tensor(false, inc_v_window_rep, dst_h,
+                        inc_v_window, static_cast<size_t>(kv_h), 1);
+                }
+            }
+
+            // Step 7: scores = Q @ K_window^T (no causal mask needed)
+            inc_scores.set_size(1, NUM_HEADS, 1, L);
+            tt::gemm(0.0f, inc_scores, 1.0f, inc_q_rope, false, inc_k_window_rep, true,
+                operation_mode::PLANE_WISE);
+
+            // Step 8: softmax
+            inc_attn.set_size(1, NUM_HEADS, 1, L);
+            tt::softmax(inc_attn, inc_scores, operation_mode::PLANE_WISE);
+
+            // Step 9: ctx = attn @ V_window
+            inc_ctx.set_size(1, NUM_HEADS, 1, HEAD_DIM);
+            tt::gemm(0.0f, inc_ctx, 1.0f, inc_attn, false, inc_v_window_rep, false,
+                operation_mode::PLANE_WISE);
+
+            // Step 10: merge heads + W_O projection
+            resizable_tensor ctx_flat(1, 1, 1, EMBEDDING_DIM);
+            tt::merge_heads(false, ctx_flat, inc_ctx);
+
+            output.set_size(1, 1, 1, EMBEDDING_DIM);
+            {
+                alias_tensor ctx_2d(1, EMBEDDING_DIM);
+                auto ctx_view = ctx_2d(ctx_flat, 0);
+
+                alias_tensor o_2d(1, EMBEDDING_DIM);
+                auto o_view = o_2d(output, 0);
+
+                tt::gemm(0.0f, o_view, 1.0f, ctx_view, false, wo, false);
+            }
+
+            saved_x_shape_B = 1;
+            saved_x_shape_N = 1;
         }
     };
 
