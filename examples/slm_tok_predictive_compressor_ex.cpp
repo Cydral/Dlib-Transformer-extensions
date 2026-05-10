@@ -17,7 +17,7 @@
     1. BPE tokenization: reduces the byte stream to a shorter token sequence.
 
     2. Transformer training: a next-token predictor is trained on the token
-       sequence using Dlib's dnn_trainer with Adam.
+       sequence using Dlib's dnn_trainer with AdamW.
 
     3. Predictive compression: for each token beyond the seed window, the
        model predicts via argmax.  If correct, one bit is written.  If wrong,
@@ -66,9 +66,6 @@
 #include <random>
 #include <algorithm>
 #include <cstring>
-#include <thread>
-#include <atomic>
-#include <mutex>
 
 #include <dlib/dnn.h>
 #include <dlib/data_io.h>
@@ -80,20 +77,6 @@
 
 using namespace std;
 using namespace dlib;
-
-// Thread-safe progress display: workers use try_lock to avoid blocking.
-// If the mutex is already held, the progress update is simply skipped.
-// This guarantees clean output: at most one writer at any time, and no
-// thread ever blocks on console I/O.
-static std::mutex progress_mutex;
-
-// Default number of worker threads: keep 4 cores for OS/system, cap at 10
-// to avoid diminishing returns and excessive memory usage from network copies.
-long default_num_threads()
-{
-    long hw = static_cast<long>(std::thread::hardware_concurrency());
-    return std::max(1L, std::min(10L, hw - 4));
-}
 const char     MAGIC[3] = { 'D', 'L', 'C' };        // 3-byte file signature
 const long     MAX_VOCAB_SIZE = 1400;               // BPE vocabulary target
 const int      WINDOW_SIZE = 16;                    // Prediction context in tokens
@@ -194,12 +177,9 @@ std::vector<uint8_t> read_file_bytes(const std::string& path)
         (std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
 }
 
-// Thread-safe progress bar helper: prints only if the mutex is available,
-// silently skips otherwise.  This avoids interleaved output without blocking.
-void try_show_progress(const std::string& label, size_t done, size_t total,
+void show_progress(const std::string& label, size_t done, size_t total,
     std::chrono::steady_clock::time_point t0, const std::string& unit = "tok/s")
 {
-    if (!progress_mutex.try_lock()) return;
     double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     double pct = (double)done / std::max(total, (size_t)1) * 100.0;
     double speed = (elapsed > 0) ? done / elapsed : 0;
@@ -208,94 +188,6 @@ void try_show_progress(const std::string& label, size_t done, size_t total,
     cout << "\r  " << label << " [";
     for (int j = 0; j < bar_w; ++j) cout << (j < filled ? '#' : '.');
     cout << "] " << std::fixed << std::setprecision(1) << pct << "% " << (long)speed << " " << unit << "  ETA: " << eta << "     " << std::flush;
-    progress_mutex.unlock();
-}
-
-// Parallel BPE tokenization: split text at newline boundaries, encode each
-// chunk in parallel via dlib::parallel_for, concatenate in order.  Correct
-// because BPE encode() operates on whitespace-delimited pre-tokens and does
-// not inject special tokens.
-std::vector<int> parallel_encode(const bpe_tokenizer& tokenizer, const std::string& text, long num_threads = 0)
-{
-    if (num_threads <= 0) num_threads = default_num_threads();
-    if (num_threads == 1 || text.size() < 100000) return tokenizer.encode(text);
-
-    // Split text at newline boundaries into approximately equal chunks
-    std::vector<std::pair<size_t, size_t>> chunks;  // (start, length)
-    size_t chunk_target = text.size() / num_threads;
-    size_t start = 0;
-    for (long i = 0; i < num_threads; ++i) {
-        if (start >= text.size()) break;
-        size_t end = (i == num_threads - 1) ? text.size() : std::min(start + chunk_target, text.size());
-        while (end < text.size() && text[end] != '\n') ++end;
-        if (end < text.size()) ++end;
-        chunks.push_back({ start, end - start });
-        start = end;
-    }
-    if (start < text.size()) {
-        if (!chunks.empty()) chunks.back().second = text.size() - chunks.back().first;
-        else chunks.push_back({ 0, text.size() });
-    }
-
-    long n_chunks = static_cast<long>(chunks.size());
-    std::vector<std::vector<int>> chunk_tokens(n_chunks);
-
-    std::atomic<long> chunks_done(0);
-    std::atomic<size_t> bytes_done(0);
-    auto tok_start = std::chrono::steady_clock::now();
-    size_t total_bytes = text.size();
-
-    cout << "  Parallel tokenization: " << n_chunks << " chunks, " << num_threads
-        << " threads, " << format_size(total_bytes) << endl;
-
-    dlib::parallel_for(num_threads, 0L, n_chunks, [&](long i) {
-        chunk_tokens[i] = tokenizer.encode(text.substr(chunks[i].first, chunks[i].second));
-        bytes_done += chunks[i].second;
-        chunks_done++;
-        try_show_progress("Tokenizing", bytes_done.load(), total_bytes, tok_start, "B/s");
-        });
-
-    double total_secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - tok_start).count();
-    cout << "\r  Tokenizing [##############################] 100.0%  "
-        << format_size((size_t)(total_bytes / std::max(total_secs, 0.001))) << "/s  " << format_duration(total_secs)
-        << "                    " << endl;
-
-    size_t total = 0;
-    for (auto& ct : chunk_tokens) total += ct.size();
-    std::vector<int> result;
-    result.reserve(total);
-    for (auto& ct : chunk_tokens) result.insert(result.end(), ct.begin(), ct.end());
-
-    cout << "  Tokenization complete: " << result.size() << " tokens from " << n_chunks << " chunks" << endl;
-    return result;
-}
-
-// Parallel BPE detokenization: each token decodes independently (simple byte
-// pattern lookup), so we split the token vector and decode chunks in parallel.
-std::string parallel_decode(const bpe_tokenizer& tokenizer, const std::vector<int>& tokens, long num_threads = 0)
-{
-    if (num_threads <= 0) num_threads = default_num_threads();
-    if (num_threads == 1 || tokens.size() < 10000) return tokenizer.decode(tokens, false);
-
-    long n_chunks = std::min(num_threads, static_cast<long>(tokens.size() / 1000));
-    if (n_chunks < 1) n_chunks = 1;
-    size_t chunk_size = tokens.size() / n_chunks;
-
-    std::vector<std::string> chunk_strings(n_chunks);
-
-    dlib::parallel_for(num_threads, 0L, n_chunks, [&](long i) {
-        size_t start = i * chunk_size;
-        size_t end = (i == n_chunks - 1) ? tokens.size() : start + chunk_size;
-        std::vector<int> chunk(tokens.begin() + start, tokens.begin() + end);
-        chunk_strings[i] = tokenizer.decode(chunk, false);
-        });
-
-    size_t total_len = 0;
-    for (auto& s : chunk_strings) total_len += s.size();
-    std::string result;
-    result.reserve(total_len);
-    for (auto& s : chunk_strings) result += s;
-    return result;
 }
 
 void sample_batch(
@@ -347,7 +239,7 @@ void train_predictor(
     trainer.set_iterations_without_progress_threshold(8000);
 
     std::string chkpt = input_path + ".chkpt";
-    trainer.set_synchronization_file(chkpt, std::chrono::minutes(10));
+    trainer.set_synchronization_file(chkpt, std::chrono::minutes(1));
     trainer.be_quiet();
 
     cout << "Checkpoint: " << chkpt << endl;
@@ -431,18 +323,18 @@ void compress_file(const std::string& input_path, const std::string& output_path
 
     cout << "Vocab: " << tokenizer.get_vocab_size() << " (specials: " << tokenizer.get_specials_size() << ")" << endl;
 
-    tokens = parallel_encode(tokenizer, text);
+    tokens = tokenizer.encode(text);
     cout << "Tokens: " << tokens.size() << " (" << std::fixed << std::setprecision(2)
         << (double)data.size() / tokens.size() << " bytes/token)" << endl;
 
     // Verify lossless round-trip
-    std::string decoded = parallel_decode(tokenizer, tokens);
+    std::string decoded = tokenizer.decode(tokens, false);
     if (decoded != text) { decoded = tokenizer.decode(tokens, true); }
     if (decoded != text) {
         throw std::runtime_error("BPE round-trip failure (decoded " + std::to_string(decoded.size()) +
             " vs original " + std::to_string(text.size()) + " bytes). Cannot proceed.");
     }
-    cout << "BPE round-trip: OK" << endl;
+    cout << "BPE round-trip: OK" << endl << endl;
 
     // Ensure the token sequence is long enough for the prediction window
     if (tokens.size() <= (size_t)WINDOW_SIZE) {
@@ -502,7 +394,7 @@ void compress_file(const std::string& input_path, const std::string& output_path
     }
 
     // Stage 2: Transformer training
-    cout << endl << "--- Stage 2: Transformer training ---" << endl;
+    cout << "--- Stage 2: Transformer training ---" << endl;
     train_net t_net;
 
     if (do_train) {
@@ -575,7 +467,7 @@ void compress_file(const std::string& input_path, const std::string& output_path
         }
 
         size_t done = i - WINDOW_SIZE + 1;
-        if (done % 2000 == 0) try_show_progress("Compressing", done, tokens_to_compress, comp_start);
+        if (done % 2000 == 0) show_progress("Compressing", done, tokens_to_compress, comp_start);
     }
     bit_writer.flush();
 
@@ -731,7 +623,7 @@ void decompress_file(const std::string& input_path, const std::string& output_pa
             decoded_tokens.push_back(actual);
         }
 
-        if ((i + 1) % 2000 == 0) try_show_progress("Decompressing", i + 1, tokens_to_decode, decomp_start);
+        if ((i + 1) % 2000 == 0) show_progress("Decompressing", i + 1, tokens_to_decode, decomp_start);
     }
 
     if (signal_handler::is_triggered()) {
@@ -745,7 +637,7 @@ void decompress_file(const std::string& input_path, const std::string& output_pa
     cout << "\r  Decompressing [##############################] 100.0%  " << format_duration(decomp_secs) << "                    " << endl;
 
     cout << "Detokenizing " << decoded_tokens.size() << " tokens..." << endl;
-    std::string restored_text = parallel_decode(tokenizer, decoded_tokens);
+    std::string restored_text = tokenizer.decode(decoded_tokens, false);
 
     std::vector<uint8_t> restored_bytes(restored_text.begin(), restored_text.end());
     uint32_t computed_crc = compute_crc32(restored_bytes);
