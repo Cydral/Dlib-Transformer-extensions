@@ -736,95 +736,222 @@ namespace
 
 // ----------------------------------------------------------------------------------------
 
-    void test_rms_normalize()
-    {
-        resizable_tensor x(2, 3, 4, 5);
-        resizable_tensor y_cpu(x);
-        tt::tensor_rand rnd(0);
-        rnd.fill_uniform(x);
-        resizable_tensor scale_cpu;
-        resizable_tensor gamma(1, x.k());
-        gamma = 1;
-        const float eps = 1e-5;
-        cpu::rms_normalize(eps, y_cpu, scale_cpu, x, gamma);
+// ----------------------------------------------------------------------------------------
 
-        // check that the output is correctly normalized
+    void test_rms_normalize_one_axis(bool axis_is_nc, const char* label)
+    {
+        dlog << LINFO << "  rms_normalize axis=" << label;
+
+        // Choose a 4D tensor where both k() and nc() are > 1 to exercise both
+        // conventions on a non-trivial layout (similar to an image-shaped tensor).
+        resizable_tensor x(2, 3, 4, 5);
+        tt::tensor_rand rnd(0);
+        rnd.fill_gaussian(x);
+
+        const long emb_dim = axis_is_nc ? x.nc() : x.k();
+        resizable_tensor gamma(1, 1, 1, emb_dim);
+        // Use a non-trivial gamma so multiplication by gamma is actually exercised.
+        for (long i = 0; i < gamma.size(); ++i)
+            gamma.host()[i] = 1.0f + 0.1f * static_cast<float>(i);
+
+        const float eps = 1e-5f;
+
+        // FORWARD (CPU)
+        resizable_tensor y_cpu(x);
+        resizable_tensor scale_cpu;
+        cpu::rms_normalize(eps, y_cpu, scale_cpu, x, gamma, axis_is_nc);
+
+        // Check that scale has the expected shape.
+        if (axis_is_nc)
+        {
+            DLIB_TEST(scale_cpu.num_samples() == x.num_samples()
+                && scale_cpu.k() == x.k()
+                && scale_cpu.nr() == x.nr()
+                && scale_cpu.nc() == 1);
+        }
+        else
+        {
+            DLIB_TEST(scale_cpu.num_samples() == x.num_samples()
+                && scale_cpu.k() == 1
+                && scale_cpu.nr() == x.nr()
+                && scale_cpu.nc() == x.nc());
+        }
+
+        // Check the forward result by recomputing each output element manually.
         const float* p_x = x.host();
         const float* p_y = y_cpu.host();
         const float* p_scale = scale_cpu.host();
-        bool error_found = false;
-        for (long n = 0; n < x.num_samples(); ++n)
-        {
-            for (long k = 0; k < x.k(); ++k)
-            {
-                for (long r = 0; r < x.nr(); ++r)
-                {
-                    for (long c = 0; c < x.nc(); ++c)
-                    {
-                        float x_val = p_x[tensor_index(x, n, k, r, c)];
-                        float y_val = p_y[tensor_index(y_cpu, n, k, r, c)];
-                        float rms_val = p_scale[n];
-                        if (std::abs(y_val - x_val * rms_val) >= 1e-5) error_found = true;
-                    }
-                }
-            }
-        }
-        DLIB_TEST(!error_found);
-
-        // check the backward pass
-        resizable_tensor gradient_input(x);
-        resizable_tensor src_grad_cpu(x), gamma_grad_cpu(1, x.k());
-        resizable_tensor dscale_cpu(x.num_samples());
-        rnd.fill_gaussian(gradient_input);
-        src_grad_cpu = 0;
-        cpu::rms_normalize_gradient(gradient_input, scale_cpu, x, gamma, src_grad_cpu, gamma_grad_cpu, dscale_cpu);
-
-        const float* p_gradient_input = gradient_input.host();
-        const float* p_src = x.host();
-        const float* p_src_grad_cpu = src_grad_cpu.host();
         const float* p_gamma = gamma.host();
-        const float* p_scale_cpu = scale_cpu.host();
-        const float* p_dscale_cpu = dscale_cpu.host();
-
-        bool backward_error_found = false;
+        bool forward_error = false;
         for (long n = 0; n < x.num_samples(); ++n)
-        {
-            const float scale_pow = -0.5 * std::pow(p_scale_cpu[n], 3.0f);
             for (long k = 0; k < x.k(); ++k)
-            {
                 for (long r = 0; r < x.nr(); ++r)
-                {
                     for (long c = 0; c < x.nc(); ++c)
                     {
-                        float gradient_input_val = p_gradient_input[tensor_index(gradient_input, n, k, r, c)];
-                        float src_val = p_src[tensor_index(x, n, k, r, c)];
-                        float rms_val = p_scale_cpu[n];
-                        float expected_src_grad = gradient_input_val * p_gamma[k] * rms_val + p_dscale_cpu[n] * 2 * src_val * 1.0f / (x.k() * x.nr() * x.nc());
-                        float src_grad_val = p_src_grad_cpu[tensor_index(src_grad_cpu, n, k, r, c)];
-                        if (std::abs(src_grad_val - expected_src_grad) >= 1e-4)
-                            backward_error_found = true;
+                        const long src_idx = tensor_index(x, n, k, r, c);
+                        float scale_val, gamma_val;
+                        if (axis_is_nc)
+                        {
+                            const long sc_idx = ((n * x.k() + k) * x.nr() + r) * 1 + 0;
+                            scale_val = p_scale[sc_idx];
+                            gamma_val = p_gamma[c];
+                        }
+                        else
+                        {
+                            const long sc_idx = (n * x.nr() + r) * x.nc() + c;
+                            scale_val = p_scale[sc_idx];
+                            gamma_val = p_gamma[k];
+                        }
+                        const float expected = p_x[src_idx] * scale_val * gamma_val;
+                        const float got = p_y[src_idx];
+                        if (std::abs(got - expected) >= 1e-5f) forward_error = true;
                     }
-                }
-            }
-        }
-        DLIB_TEST(!backward_error_found);        
+        DLIB_TEST(!forward_error);
 
-        // check that the CPU and the CUDA implementation are equivalent 
-#ifdef DLIB_USE_CUDA 
+        // BACKWARD (CPU)
+        resizable_tensor gradient_input(x);
+        rnd.fill_gaussian(gradient_input);
+
+        resizable_tensor src_grad_cpu(x);
+        resizable_tensor gamma_grad_cpu;
+        gamma_grad_cpu.copy_size(gamma);
+        resizable_tensor dscale_cpu;
+        src_grad_cpu = 0;
+        cpu::rms_normalize_gradient(gradient_input, scale_cpu, x, gamma,
+            src_grad_cpu, gamma_grad_cpu, dscale_cpu, axis_is_nc);
+
+        // Cross-check src_grad against the analytical formula:
+        //   src_grad[n,k,r,c] = grad_in[n,k,r,c] * gamma_factor * inv_rms
+        //                     + dscale[group] * 2 * src[n,k,r,c] / norm_size
+        // where group, inv_rms and norm_size depend on the axis.
+        const float* p_grad_in = gradient_input.host();
+        const float* p_src_grad = src_grad_cpu.host();
+        const float* p_dscale = dscale_cpu.host();
+        const float inv_norm_size = axis_is_nc
+            ? 1.0f / static_cast<float>(x.nc())
+            : 1.0f / static_cast<float>(x.k());
+        bool backward_error = false;
+        for (long n = 0; n < x.num_samples(); ++n)
+            for (long k = 0; k < x.k(); ++k)
+                for (long r = 0; r < x.nr(); ++r)
+                    for (long c = 0; c < x.nc(); ++c)
+                    {
+                        const long src_idx = tensor_index(x, n, k, r, c);
+                        float inv_rms, ds, gamma_val;
+                        if (axis_is_nc)
+                        {
+                            const long sc_idx = (n * x.k() + k) * x.nr() + r;
+                            inv_rms = p_scale[sc_idx];
+                            ds = p_dscale[sc_idx];
+                            gamma_val = p_gamma[c];
+                        }
+                        else
+                        {
+                            const long sc_idx = (n * x.nr() + r) * x.nc() + c;
+                            inv_rms = p_scale[sc_idx];
+                            ds = p_dscale[sc_idx];
+                            gamma_val = p_gamma[k];
+                        }
+                        const float expected = p_grad_in[src_idx] * gamma_val * inv_rms
+                            + ds * 2.0f * p_x[src_idx] * inv_norm_size;
+                        const float got = p_src_grad[src_idx];
+                        if (std::abs(got - expected) >= 1e-4f) backward_error = true;
+                    }
+        DLIB_TEST(!backward_error);
+
+        // Cross-check gamma_grad by direct recomputation:
+        //   gamma_grad[i] = sum over all positions where the embedding-axis index
+        //                   equals i, of grad_in[idx] * x[idx] * inv_rms[group].
+        const float* p_gg = gamma_grad_cpu.host();
+        bool gamma_grad_error = false;
+        for (long i = 0; i < emb_dim; ++i)
+        {
+            float expected_gg = 0.0f;
+            for (long n = 0; n < x.num_samples(); ++n)
+                for (long k = 0; k < x.k(); ++k)
+                    for (long r = 0; r < x.nr(); ++r)
+                        for (long c = 0; c < x.nc(); ++c)
+                        {
+                            if (axis_is_nc)
+                            {
+                                if (c != i) continue;
+                                const long src_idx = tensor_index(x, n, k, r, c);
+                                const long sc_idx = (n * x.k() + k) * x.nr() + r;
+                                expected_gg += p_grad_in[src_idx] * p_x[src_idx] * p_scale[sc_idx];
+                            }
+                            else
+                            {
+                                if (k != i) continue;
+                                const long src_idx = tensor_index(x, n, k, r, c);
+                                const long sc_idx = (n * x.nr() + r) * x.nc() + c;
+                                expected_gg += p_grad_in[src_idx] * p_x[src_idx] * p_scale[sc_idx];
+                            }
+                        }
+            if (std::abs(p_gg[i] - expected_gg) >= 1e-4f) gamma_grad_error = true;
+        }
+        DLIB_TEST(!gamma_grad_error);
+
+        // Verify that src_grad matches the finite-difference derivative of the
+        // forward output projected onto gradient_input. We pick a handful of
+        // positions to perturb so the test stays fast.
+        const float h = 1e-3f;
+        const long positions_to_check[] = { 0, 7, 23, 47, static_cast<long>(x.size()) - 1 };
+        bool numerical_error = false;
+        for (long pos : positions_to_check)
+        {
+            if (pos < 0 || pos >= x.size()) continue;
+            const float orig = x.host()[pos];
+
+            x.host()[pos] = orig + h;
+            resizable_tensor y_plus, scale_plus;
+            cpu::rms_normalize(eps, y_plus, scale_plus, x, gamma, axis_is_nc);
+
+            x.host()[pos] = orig - h;
+            resizable_tensor y_minus, scale_minus;
+            cpu::rms_normalize(eps, y_minus, scale_minus, x, gamma, axis_is_nc);
+
+            x.host()[pos] = orig;
+
+            double slope = 0.0;
+            for (long i = 0; i < y_plus.size(); ++i)
+                slope += static_cast<double>(p_grad_in[i])
+                * (y_plus.host()[i] - y_minus.host()[i]);
+            slope /= (2.0 * h);
+
+            const double analytical = static_cast<double>(p_src_grad[pos]);
+            if (std::abs(slope - analytical) >= 1e-2) numerical_error = true;
+        }
+        DLIB_TEST(!numerical_error);
+
+        // CPU vs CUDA equivalence
+#ifdef DLIB_USE_CUDA
         resizable_tensor y_cuda(x);
         resizable_tensor scale_cuda;
-        cuda::rms_normalize(eps, y_cuda, scale_cuda, x, gamma);
+        cuda::rms_normalize(eps, y_cuda, scale_cuda, x, gamma, axis_is_nc);
         DLIB_TEST(max(abs(mat(y_cpu) - mat(y_cuda))) < 1e-5);
         DLIB_TEST(max(abs(mat(scale_cpu) - mat(scale_cuda))) < 1e-5);
 
-        resizable_tensor src_grad_cuda(x), gamma_grad_cuda(1, x.k());
-        resizable_tensor dscale_cuda(x.num_samples());
+        resizable_tensor src_grad_cuda(x);
+        resizable_tensor gamma_grad_cuda;
+        gamma_grad_cuda.copy_size(gamma);
+        resizable_tensor dscale_cuda;
         src_grad_cuda = 0;
-        cuda::rms_normalize_gradient(gradient_input, scale_cuda, x, gamma, src_grad_cuda, gamma_grad_cuda, dscale_cuda);
+        cuda::rms_normalize_gradient(gradient_input, scale_cuda, x, gamma,
+            src_grad_cuda, gamma_grad_cuda, dscale_cuda, axis_is_nc);
         DLIB_TEST(max(abs(mat(src_grad_cpu) - mat(src_grad_cuda))) < 1e-5);
         DLIB_TEST(max(abs(mat(gamma_grad_cpu) - mat(gamma_grad_cuda))) < 1e-5);
         DLIB_TEST(max(abs(mat(dscale_cpu) - mat(dscale_cuda))) < 1e-5);
-#endif        
+#endif
+    }
+
+    void test_rms_normalize()
+    {
+        // Cover both supported conventions of the rms_normalize primitive:
+        //   axis = nc : embedding axis on nc() (linear-style; LLaMA convention).
+        //   axis = k  : embedding axis on k()  (fc-style and channel-norm on
+        //               image-shaped [B, C, H, W] tensors).
+        test_rms_normalize_one_axis(true, "nc");
+        test_rms_normalize_one_axis(false, "k");
     }
 
 // ----------------------------------------------------------------------------------------
