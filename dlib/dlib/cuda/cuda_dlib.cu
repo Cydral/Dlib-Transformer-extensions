@@ -2569,27 +2569,24 @@ namespace dlib
 
    // ----------------------------------------------------------------------------------------
 
-        __global__ void _cuda_rms_normalize_accumulate(
+        // FORWARD — axis = nc (embedding dimension on nc())
+        __global__ void _cuda_rms_normalize_accumulate_nc(
             float* scale,
             const float* src,
             size_t total_rows,
             size_t ncs)
         {
-            // For each (sample, channel, row), accumulate sum of squares of the
-            // ncs elements into scale[row]. Multiple thread blocks may cooperate
-            // on the same row via atomic adds.
             for (auto row : grid_stride_range_y(0, total_rows))
             {
                 const float* p = src + row * ncs;
                 float sum_squares = 0.0f;
                 for (auto j : grid_stride_range(0, ncs))
                     sum_squares += p[j] * p[j];
-                // Mean over the ncs elements (i.e. embedding dimension):
                 warp_reduce_atomic_add(scale[row], sum_squares / static_cast<float>(ncs));
             }
         }
 
-        __global__ void _cuda_rms_normalize_invert(
+        __global__ void _cuda_rms_normalize_invert_nc(
             float* scale,
             float eps,
             size_t total_rows)
@@ -2601,7 +2598,7 @@ namespace dlib
             }
         }
 
-        __global__ void _cuda_rms_normalize_apply(
+        __global__ void _cuda_rms_normalize_apply_nc(
             float* dest,
             const float* scale,
             const float* src,
@@ -2619,50 +2616,136 @@ namespace dlib
             }
         }
 
+        // FORWARD — axis = k (embedding dimension on k())
+
+        // Layout: src[n, k, i, j] at offset ((n * ks + k) * nrs + i) * ncs + j.
+        // We accumulate squares over k for each (n, i, j) into scale[n, 0, i, j],
+        // then invert, then apply.
+        //
+        // total_groups = ns * nrs * ncs (one accumulator per (n, i, j)).
+        __global__ void _cuda_rms_normalize_accumulate_k(
+            float* scale,
+            const float* src,
+            size_t ns,
+            size_t ks,
+            size_t nrs,
+            size_t ncs)
+        {
+            const size_t total_groups = ns * nrs * ncs;
+            for (auto g : grid_stride_range_y(0, total_groups))
+            {
+                // Decompose g into (n, i, j)
+                const size_t j = g % ncs;
+                const size_t i = (g / ncs) % nrs;
+                const size_t n = g / (ncs * nrs);
+
+                float sum_squares = 0.0f;
+                for (auto k : grid_stride_range(0, ks))
+                {
+                    const size_t off = ((n * ks + k) * nrs + i) * ncs + j;
+                    sum_squares += src[off] * src[off];
+                }
+                warp_reduce_atomic_add(scale[g], sum_squares / static_cast<float>(ks));
+            }
+        }
+
+        __global__ void _cuda_rms_normalize_invert_k(
+            float* scale,
+            float eps,
+            size_t total_groups)
+        {
+            for (auto g : grid_stride_range_y(0, total_groups))
+            {
+                if (threadIdx.x == 0)
+                    scale[g] = 1.0f / std::sqrt(scale[g] + eps);
+            }
+        }
+
+        __global__ void _cuda_rms_normalize_apply_k(
+            float* dest,
+            const float* scale,
+            const float* src,
+            const float* gamma,
+            size_t ns,
+            size_t ks,
+            size_t nrs,
+            size_t ncs)
+        {
+            const size_t total_groups = ns * nrs * ncs;
+            for (auto g : grid_stride_range_y(0, total_groups))
+            {
+                const size_t j = g % ncs;
+                const size_t i = (g / ncs) % nrs;
+                const size_t n = g / (ncs * nrs);
+
+                const float inv_rms = scale[g];
+                for (auto k : grid_stride_range(0, ks))
+                {
+                    const size_t off = ((n * ks + k) * nrs + i) * ncs + j;
+                    dest[off] = src[off] * inv_rms * gamma[k];
+                }
+            }
+        }
+
         void rms_normalize(
             const double eps,
             resizable_tensor& dest,
             resizable_tensor& scale,
             const tensor& src,
-            const tensor& gamma)
+            const tensor& gamma,
+            bool axis_is_nc)
         {
-            DLIB_CASSERT(
-                gamma.num_samples() == 1 &&
-                gamma.k() == 1 &&
-                gamma.nr() == 1 &&
-                gamma.nc() == src.nc() &&
-                eps > 0,
-				"\nsrc.nc():    " << src.nc() <<
-				"\ngamma.num_samples(): " << gamma.num_samples() <<
-				"\ngamma.k():   " << gamma.k() <<
-				"\ngamma.nr():  " << gamma.nr() <<
-                "\ngamma.nc():  " << gamma.nc() <<
-                "\neps:         " << eps);
-
             const size_t ns = src.num_samples();
             const size_t ks = src.k();
             const size_t nrs = src.nr();
             const size_t ncs = src.nc();
-            const size_t total_rows = ns * ks * nrs;
 
             dest.copy_size(src);
-            scale.set_size(ns, ks, nrs, 1);
-            scale = 0;
 
-            launch_kernel(_cuda_rms_normalize_accumulate, max_jobs(ncs, total_rows),
-                scale.device(), src.device(), total_rows, ncs);
+            if (axis_is_nc)
+            {
+                DLIB_CASSERT(gamma.num_samples() == 1 && gamma.k() == 1
+                    && gamma.nr() == 1 && gamma.nc() == src.nc() && eps > 0);
 
-            launch_kernel(_cuda_rms_normalize_invert, max_jobs(1, total_rows),
-                scale.device(), static_cast<float>(eps), total_rows);
+                const size_t total_rows = ns * ks * nrs;
+                scale.set_size(ns, ks, nrs, 1);
+                scale = 0;
 
-            launch_kernel(_cuda_rms_normalize_apply, max_jobs(ncs, total_rows),
-                dest.device(), scale.device(), src.device(), gamma.device(),
-                total_rows, ncs);
+                launch_kernel(_cuda_rms_normalize_accumulate_nc, max_jobs(ncs, total_rows),
+                    scale.device(), src.device(), total_rows, ncs);
+
+                launch_kernel(_cuda_rms_normalize_invert_nc, max_jobs(1, total_rows),
+                    scale.device(), static_cast<float>(eps), total_rows);
+
+                launch_kernel(_cuda_rms_normalize_apply_nc, max_jobs(ncs, total_rows),
+                    dest.device(), scale.device(), src.device(), gamma.device(),
+                    total_rows, ncs);
+            }
+            else
+            {
+                DLIB_CASSERT(gamma.num_samples() == 1 && gamma.k() == 1
+                    && gamma.nr() == 1 && gamma.nc() == src.k() && eps > 0);
+
+                const size_t total_groups = ns * nrs * ncs;
+                scale.set_size(ns, 1, nrs, ncs);
+                scale = 0;
+
+                launch_kernel(_cuda_rms_normalize_accumulate_k, max_jobs(ks, total_groups),
+                    scale.device(), src.device(), ns, ks, nrs, ncs);
+
+                launch_kernel(_cuda_rms_normalize_invert_k, max_jobs(1, total_groups),
+                    scale.device(), static_cast<float>(eps), total_groups);
+
+                launch_kernel(_cuda_rms_normalize_apply_k, max_jobs(ks, total_groups),
+                    dest.device(), scale.device(), src.device(), gamma.device(),
+                    ns, ks, nrs, ncs);
+            }
         }
 
-   // ----------------------------------------------------------------------------------------
+    // ----------------------------------------------------------------------------------------
 
-        __global__ void _cuda_rms_normalize_gradient_accumulate_dscale(
+        // BACKWARD — axis = nc
+        __global__ void _cuda_rms_normalize_gradient_accumulate_dscale_nc(
             float* dscale,
             const float* src,
             const float* gradient_input,
@@ -2689,7 +2772,7 @@ namespace dlib
             }
         }
 
-        __global__ void _cuda_rms_normalize_gradient_accumulate_gamma(
+        __global__ void _cuda_rms_normalize_gradient_accumulate_gamma_nc(
             float* gamma_grad,
             const float* src,
             const float* gradient_input,
@@ -2711,7 +2794,7 @@ namespace dlib
             }
         }
 
-        __global__ void _cuda_rms_normalize_gradient_apply(
+        __global__ void _cuda_rms_normalize_gradient_apply_nc(
             float* src_grad,
             const float* dscale,
             const float* src,
@@ -2739,6 +2822,103 @@ namespace dlib
             }
         }
 
+        // BACKWARD — axis = k
+
+        // total_groups = ns * nrs * ncs. For each group (n, i, j) we accumulate
+        // dscale over k. For gamma_grad we iterate over k externally and accumulate
+        // over groups.
+        __global__ void _cuda_rms_normalize_gradient_accumulate_dscale_k(
+            float* dscale,
+            const float* src,
+            const float* gradient_input,
+            const float* scale,
+            const float* gamma,
+            size_t ns,
+            size_t ks,
+            size_t nrs,
+            size_t ncs)
+        {
+            const size_t total_groups = ns * nrs * ncs;
+            for (auto g : grid_stride_range_y(0, total_groups))
+            {
+                const size_t j = g % ncs;
+                const size_t i = (g / ncs) % nrs;
+                const size_t n = g / (ncs * nrs);
+
+                const float inv_rms = scale[g];
+                const float scale_pow = -0.5f * inv_rms * inv_rms * inv_rms;
+
+                float temp_ds = 0.0f;
+                for (auto k : grid_stride_range(0, ks))
+                {
+                    const size_t off = ((n * ks + k) * nrs + i) * ncs + j;
+                    const float dx = gradient_input[off] * gamma[k];
+                    temp_ds += dx * src[off];
+                }
+                warp_reduce_atomic_add(dscale[g], temp_ds * scale_pow);
+            }
+        }
+
+        __global__ void _cuda_rms_normalize_gradient_accumulate_gamma_k(
+            float* gamma_grad,
+            const float* src,
+            const float* gradient_input,
+            const float* scale,
+            size_t ns,
+            size_t ks,
+            size_t nrs,
+            size_t ncs)
+        {
+            const size_t total_groups = ns * nrs * ncs;
+            for (auto k : grid_stride_range_y(0, ks))
+            {
+                float temp_gg = 0.0f;
+                for (auto g : grid_stride_range(0, total_groups))
+                {
+                    const size_t j = g % ncs;
+                    const size_t i = (g / ncs) % nrs;
+                    const size_t n = g / (ncs * nrs);
+                    const size_t off = ((n * ks + k) * nrs + i) * ncs + j;
+
+                    const float inv_rms = scale[g];
+                    temp_gg += gradient_input[off] * src[off] * inv_rms;
+                }
+                warp_reduce_atomic_add(gamma_grad[k], temp_gg);
+            }
+        }
+
+        __global__ void _cuda_rms_normalize_gradient_apply_k(
+            float* src_grad,
+            const float* dscale,
+            const float* src,
+            const float* gradient_input,
+            const float* scale,
+            const float* gamma,
+            size_t ns,
+            size_t ks,
+            size_t nrs,
+            size_t ncs)
+        {
+            const float inv_k = 1.0f / static_cast<float>(ks);
+            const size_t total_groups = ns * nrs * ncs;
+            for (auto g : grid_stride_range_y(0, total_groups))
+            {
+                const size_t j = g % ncs;
+                const size_t i = (g / ncs) % nrs;
+                const size_t n = g / (ncs * nrs);
+
+                const float inv_rms = scale[g];
+                const float ds = dscale[g];
+
+                for (auto k : grid_stride_range(0, ks))
+                {
+                    const size_t off = ((n * ks + k) * nrs + i) * ncs + j;
+                    const float dx = gradient_input[off] * gamma[k];
+                    src_grad[off] += dx * inv_rms + ds * 2.0f * src[off] * inv_k;
+                }
+            }
+        }
+
         void rms_normalize_gradient(
             const tensor& gradient_input,
             const tensor& scale,
@@ -2746,17 +2926,13 @@ namespace dlib
             const tensor& gamma,
             tensor& src_grad,
             tensor& gamma_grad,
-            resizable_tensor& dscale)
+            resizable_tensor& dscale,
+            bool axis_is_nc)
         {
-            DLIB_CASSERT(scale.num_samples() == src.num_samples());
-            DLIB_CASSERT(scale.k() == src.k());
-            DLIB_CASSERT(scale.nr() == src.nr());
-            DLIB_CASSERT(scale.nc() == 1);
             DLIB_CASSERT(have_same_dimensions(gamma, gamma_grad));
             DLIB_CASSERT(gamma.num_samples() == 1);
             DLIB_CASSERT(gamma.k() == 1);
             DLIB_CASSERT(gamma.nr() == 1);
-            DLIB_CASSERT(gamma.nc() == src.nc());
             DLIB_CASSERT(have_same_dimensions(gradient_input, src));
             DLIB_CASSERT(have_same_dimensions(gradient_input, src_grad));
 
@@ -2764,36 +2940,69 @@ namespace dlib
             const size_t ks = src.k();
             const size_t nrs = src.nr();
             const size_t ncs = src.nc();
-            const size_t total_rows = ns * ks * nrs;
 
             gamma_grad = 0;
             dscale.copy_size(scale);
             dscale = 0;
 
-            // dscale: one accumulator per row, threads of a warp share the same row
-            launch_kernel(_cuda_rms_normalize_gradient_accumulate_dscale,
-                max_jobs(ncs, total_rows),
-                dscale.device(),
-                src.device(), gradient_input.device(),
-                scale.device(), gamma.device(),
-                total_rows, ncs);
+            if (axis_is_nc)
+            {
+                DLIB_CASSERT(gamma.nc() == src.nc());
+                DLIB_CASSERT(scale.num_samples() == ns && scale.k() == ks
+                    && scale.nr() == nrs && scale.nc() == 1);
 
-            // gamma_grad: one accumulator per embedding dim j, threads of a warp share the same j
-            launch_kernel(_cuda_rms_normalize_gradient_accumulate_gamma,
-                max_jobs(total_rows, ncs),
-                gamma_grad.device(),
-                src.device(), gradient_input.device(),
-                scale.device(),
-                total_rows, ncs);
+                const size_t total_rows = ns * ks * nrs;
 
-            // src_grad: one block per row, no atomic adds needed
-            launch_kernel(_cuda_rms_normalize_gradient_apply, max_jobs(ncs, total_rows),
-                src_grad.device(),
-                dscale.device(), src.device(), gradient_input.device(),
-                scale.device(), gamma.device(),
-                total_rows, ncs);
+                launch_kernel(_cuda_rms_normalize_gradient_accumulate_dscale_nc,
+                    max_jobs(ncs, total_rows),
+                    dscale.device(),
+                    src.device(), gradient_input.device(),
+                    scale.device(), gamma.device(),
+                    total_rows, ncs);
+
+                launch_kernel(_cuda_rms_normalize_gradient_accumulate_gamma_nc,
+                    max_jobs(total_rows, ncs),
+                    gamma_grad.device(),
+                    src.device(), gradient_input.device(),
+                    scale.device(),
+                    total_rows, ncs);
+
+                launch_kernel(_cuda_rms_normalize_gradient_apply_nc, max_jobs(ncs, total_rows),
+                    src_grad.device(),
+                    dscale.device(), src.device(), gradient_input.device(),
+                    scale.device(), gamma.device(),
+                    total_rows, ncs);
+            }
+            else
+            {
+                DLIB_CASSERT(gamma.nc() == src.k());
+                DLIB_CASSERT(scale.num_samples() == ns && scale.k() == 1
+                    && scale.nr() == nrs && scale.nc() == ncs);
+
+                const size_t total_groups = ns * nrs * ncs;
+
+                launch_kernel(_cuda_rms_normalize_gradient_accumulate_dscale_k,
+                    max_jobs(ks, total_groups),
+                    dscale.device(),
+                    src.device(), gradient_input.device(),
+                    scale.device(), gamma.device(),
+                    ns, ks, nrs, ncs);
+
+                launch_kernel(_cuda_rms_normalize_gradient_accumulate_gamma_k,
+                    max_jobs(total_groups, ks),
+                    gamma_grad.device(),
+                    src.device(), gradient_input.device(),
+                    scale.device(),
+                    ns, ks, nrs, ncs);
+
+                launch_kernel(_cuda_rms_normalize_gradient_apply_k, max_jobs(ks, total_groups),
+                    src_grad.device(),
+                    dscale.device(), src.device(), gradient_input.device(),
+                    scale.device(), gamma.device(),
+                    ns, ks, nrs, ncs);
+            }
         }
-
+    
     // ----------------------------------------------------------------------------------------
 
         __global__ void _cuda_copy_tensor_add_to (float* dest, size_t size,  const float* src,  size_t dest_stride, size_t src_stride, size_t block_size)

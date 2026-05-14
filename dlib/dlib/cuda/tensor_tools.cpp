@@ -769,13 +769,14 @@ namespace dlib { namespace tt
         resizable_tensor& dest,
         resizable_tensor& scale,
         const tensor& src,
-        const tensor& gamma
+        const tensor& gamma,
+        bool axis_is_nc
     )
     {            
 #ifdef DLIB_USE_CUDA
-        cuda::rms_normalize(eps, dest, scale, src, gamma);
+        cuda::rms_normalize(eps, dest, scale, src, gamma, axis_is_nc);
 #else
-        cpu::rms_normalize(eps, dest, scale, src, gamma);
+        cpu::rms_normalize(eps, dest, scale, src, gamma, axis_is_nc);
 #endif
     }
 
@@ -786,13 +787,14 @@ namespace dlib { namespace tt
         const tensor& gamma,
         tensor& src_grad,
         tensor& gamma_grad,
-        resizable_tensor& dscale
+        resizable_tensor& dscale,
+        bool axis_is_nc
     )
     {            
 #ifdef DLIB_USE_CUDA
-        cuda::rms_normalize_gradient(gradient_input, scale, src, gamma, src_grad, gamma_grad, dscale);
+        cuda::rms_normalize_gradient(gradient_input, scale, src, gamma, src_grad, gamma_grad, dscale, axis_is_nc);
 #else
-        cpu::rms_normalize_gradient(gradient_input, scale, src, gamma, src_grad, gamma_grad, dscale);
+        cpu::rms_normalize_gradient(gradient_input, scale, src, gamma, src_grad, gamma_grad, dscale, axis_is_nc);
 #endif
     }
 

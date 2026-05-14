@@ -262,7 +262,8 @@ namespace dlib
             resizable_tensor& dest,
             resizable_tensor& scale,
             const tensor& src,
-            const tensor& gamma
+            const tensor& gamma,
+            bool axis_is_nc
         );
 
         void rms_normalize_gradient(
@@ -272,7 +273,8 @@ namespace dlib
             const tensor& gamma,
             tensor& src_grad,
             tensor& gamma_grad,
-            resizable_tensor& dscale
+            resizable_tensor& dscale,
+            bool axis_is_nc
         );
 
     // -----------------------------------------------------------------------------------

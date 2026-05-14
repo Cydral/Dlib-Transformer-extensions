@@ -1692,14 +1692,13 @@ namespace dlib
     class rms_norm_
     {
     public:
-        explicit rms_norm_(
-            double eps_ = DEFAULT_RMS_NORM_EPS
-        ) :
-            learning_rate_multiplier(1),
+        explicit rms_norm_(double eps_ = DEFAULT_RMS_NORM_EPS)
+            : learning_rate_multiplier(1),
             weight_decay_multiplier(0),
             bias_learning_rate_multiplier(1),
             bias_weight_decay_multiplier(1),
-            eps(eps_)
+            eps(eps_),
+            axis_is_nc(true)
         {
         }
 
@@ -1721,9 +1720,19 @@ namespace dlib
         template <typename SUBNET>
         void setup(const SUBNET& sub)
         {
-            // Position-wise RMSNorm: one gamma scalar per embedding dimension (nc),
-            // shared across all positions and channels.
-            gamma = alias_tensor(1, 1, 1, sub.get_output().nc());
+            const tensor& x = sub.get_output();
+            // Auto-detect the embedding axis.
+            //   - "linear-style" tensors carry the embedding dimension on nc()
+            //     (e.g. [B, 1, N, D]); we normalize over nc().
+            //   - "fc-style" tensors carry the embedding dimension on k()
+            //     (e.g. [B, D, 1, 1]); we normalize over k().
+            // Detection rule: if k()==1 we are in linear-style, otherwise in fc-style.
+            // For tensors where both k() > 1 and nc() > 1 (uncommon), axis=k is
+            // chosen by default; this matches the layout coming out of Dlib's fc().
+            axis_is_nc = (x.k() == 1);
+
+            const long emb_dim = axis_is_nc ? x.nc() : x.k();
+            gamma = alias_tensor(1, 1, 1, emb_dim);
             params.set_size(gamma.size());
             gamma(params, 0) = 1;
         }
@@ -1732,7 +1741,7 @@ namespace dlib
         void forward(const SUBNET& sub, resizable_tensor& output)
         {
             auto g = gamma(params, 0);
-            tt::rms_normalize(eps, output, scale, sub.get_output(), g);
+            tt::rms_normalize(eps, output, scale, sub.get_output(), g, axis_is_nc);
         }
 
         template <typename SUBNET>
@@ -1741,7 +1750,7 @@ namespace dlib
             auto g = gamma(params, 0);
             auto g_grad = gamma(params_grad, 0);
             tt::rms_normalize_gradient(gradient_input, scale, sub.get_output(), g,
-                sub.get_gradient_input(), g_grad, dscale);
+                sub.get_gradient_input(), g_grad, dscale, axis_is_nc);
         }
 
         const tensor& get_layer_params() const { return params; }
@@ -1757,6 +1766,7 @@ namespace dlib
             serialize(item.bias_learning_rate_multiplier, out);
             serialize(item.bias_weight_decay_multiplier, out);
             serialize(item.eps, out);
+            serialize(item.axis_is_nc, out);
         }
 
         friend void deserialize(rms_norm_& item, std::istream& in)
@@ -1773,12 +1783,14 @@ namespace dlib
             deserialize(item.bias_learning_rate_multiplier, in);
             deserialize(item.bias_weight_decay_multiplier, in);
             deserialize(item.eps, in);
+            deserialize(item.axis_is_nc, in);
         }
 
         friend std::ostream& operator<<(std::ostream& out, const rms_norm_& item)
         {
             out << "rms_norm";
-            out << " (eps=" << item.eps << ")";
+            out << " (eps=" << item.eps;
+            out << ", axis=" << (item.axis_is_nc ? "nc" : "k") << ")";
             out << " learning_rate_mult=" << item.learning_rate_multiplier;
             out << " weight_decay_mult=" << item.weight_decay_multiplier;
             out << " bias_learning_rate_mult=" << item.bias_learning_rate_multiplier;
@@ -1790,6 +1802,7 @@ namespace dlib
         {
             out << "<rms_norm";
             out << " eps='" << item.eps << "'";
+            out << " axis='" << (item.axis_is_nc ? "nc" : "k") << "'";
             out << " learning_rate_mult='" << item.learning_rate_multiplier << "'";
             out << " weight_decay_mult='" << item.weight_decay_multiplier << "'";
             out << " bias_learning_rate_mult='" << item.bias_learning_rate_multiplier << "'";
@@ -1809,6 +1822,7 @@ namespace dlib
         double bias_learning_rate_multiplier;
         double bias_weight_decay_multiplier;
         double eps;
+        bool axis_is_nc;
     };
 
     template <typename SUBNET>

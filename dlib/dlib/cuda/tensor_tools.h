@@ -899,7 +899,8 @@ namespace dlib { namespace tt
         resizable_tensor& dest,
         resizable_tensor& scale,
         const tensor& src,
-        const tensor& gamma
+        const tensor& gamma,
+        bool axis_is_nc
     );
     /*!
         requires
@@ -907,20 +908,35 @@ namespace dlib { namespace tt
             - gamma.num_samples() == 1
             - gamma.k() == 1
             - gamma.nr() == 1
-            - gamma.nc() == src.nc()
+            - if axis_is_nc:  gamma.nc() == src.nc()
+              else:           gamma.nc() == src.k()
         ensures
             - have_same_dimensions(#dest, src) == true
-            - #scale.num_samples() == src.num_samples()
-            - #scale.k()           == src.k()
-            - #scale.nr()          == src.nr()
-            - #scale.nc()          == 1
-            - #dest is the position-wise RMS-normalized version of src.
-            - For each (n, k, i): the vector src[n, k, i, :] is normalized by its
-              own RMS, then multiplied element-wise by gamma along the nc axis:
-                #dest[n, k, i, j] == src[n, k, i, j] * gamma[j] / scale[n, k, i, 0]
-            - This is the position-wise RMSNorm convention used in modern transformer
-              architectures (LLaMA, etc.), where each embedding vector is normalized
-              independently of the others in the sequence.
+            - #dest is the RMS-normalized version of src along the embedding axis
+              selected by axis_is_nc:
+              * axis_is_nc == true  : embedding axis is nc(). Each src[n, k, i, :]
+                vector is normalized independently by its own RMS, then multiplied
+                element-wise by gamma along nc. This is the convention used by
+                modern transformer architectures (LLaMA, etc.) where the embedding
+                dimension sits on nc().
+                    #scale.num_samples() == src.num_samples()
+                    #scale.k()           == src.k()
+                    #scale.nr()          == src.nr()
+                    #scale.nc()          == 1
+                    #dest[n, k, i, j] == src[n, k, i, j] * gamma[j] / scale[n, k, i, 0]
+              * axis_is_nc == false : embedding axis is k(). Each src[n, :, i, j]
+                vector is normalized independently by its own RMS, then multiplied
+                element-wise by gamma along k. This is the convention used when
+                the embedding dimension sits on k(), typically after a Dlib fc()
+                layer that flattens nr() and nc() to 1.
+                    #scale.num_samples() == src.num_samples()
+                    #scale.k()           == 1
+                    #scale.nr()          == src.nr()
+                    #scale.nc()          == src.nc()
+                    #dest[n, k, i, j] == src[n, k, i, j] * gamma[k] / scale[n, 0, i, j]
+            - In both cases, the value of #scale at each normalized location is
+              1 / sqrt(mean(src_vector^2) + eps), where the mean is taken over the
+              selected embedding axis.
     !*/
 
     void rms_normalize_gradient(
@@ -930,18 +946,29 @@ namespace dlib { namespace tt
         const tensor& gamma,
         tensor& src_grad,
         tensor& gamma_grad,
-        resizable_tensor& dscale
+        resizable_tensor& dscale,
+        bool axis_is_nc
     );
     /*!
         requires
-            - have_same_dimensions(scale.num_samples(), src.num_samples())
-              and analogously for k() and nr(); scale.nc() == 1.
-            - have_same_dimensions(gamma, gamma_grad)
-            - gamma.num_samples() == 1, gamma.k() == 1, gamma.nr() == 1, gamma.nc() == src.nc()
             - have_same_dimensions(gradient_input, src)
             - have_same_dimensions(gradient_input, src_grad)
+            - have_same_dimensions(gamma, gamma_grad)
+            - gamma.num_samples() == 1
+            - gamma.k() == 1
+            - gamma.nr() == 1
+            - scale and gamma shapes match the convention selected by axis_is_nc, as
+              documented in rms_normalize() above:
+              * axis_is_nc == true  : gamma.nc() == src.nc()
+                                      scale shape == (src.num_samples(), src.k(), src.nr(), 1)
+              * axis_is_nc == false : gamma.nc() == src.k()
+                                      scale shape == (src.num_samples(), 1, src.nr(), src.nc())
         ensures
-            - Backward of position-wise RMSNorm.
+            - Computes the backward pass of rms_normalize().
+            - Accumulates the gradient with respect to src into src_grad, and the
+              gradient with respect to gamma into gamma_grad.
+            - dscale is used internally as scratch storage; it is resized to match
+              scale before use.
     !*/
 
 // -----------------------------------------------------------------------------------

@@ -1456,58 +1456,85 @@ namespace dlib
             resizable_tensor& dest,
             resizable_tensor& scale,
             const tensor& src,
-            const tensor& gamma
+            const tensor& gamma,
+            bool axis_is_nc
         )
         {
-            DLIB_CASSERT(
-                gamma.num_samples() == 1 &&
-                gamma.k() == 1 &&
-                gamma.nr() == 1 &&
-                gamma.nc() == src.nc() &&
-                eps > 0,
-                "\nsrc.nc():    " << src.nc() <<
-				"\ngamma.num_samples(): " << gamma.num_samples() <<
-				"\ngamma.k():   " << gamma.k() <<
-                "\ngamma.nr():  " << gamma.nr() <<
-                "\ngamma.nc():  " << gamma.nc() <<
-                "\neps:         " << eps
-            );
-
             const long ns = src.num_samples();
             const long ks = src.k();
             const long nrs = src.nr();
             const long ncs = src.nc();
 
-            dest.copy_size(src);
-            scale.set_size(ns, ks, nrs, 1);
-
-            const float* p_src = src.host();
-            const float* p_gamma = gamma.host();
-            float* p_dest = dest.host();
-            float* p_scale = scale.host();
-
-            // For each (sample, channel, row), compute the RMS over the nc dimension
-            // and apply the normalization.
-            for (long n = 0; n < ns; ++n)
+            if (axis_is_nc)
             {
-                for (long k = 0; k < ks; ++k)
-                {
+                DLIB_CASSERT(gamma.num_samples() == 1 && gamma.k() == 1
+                    && gamma.nr() == 1 && gamma.nc() == ncs && eps > 0);
+
+                dest.copy_size(src);
+                // One scale per (sample, channel, row), normalize over nc
+                scale.set_size(ns, ks, nrs, 1);
+
+                const float* p_src = src.host();
+                const float* p_gamma = gamma.host();
+                float* p_dest = dest.host();
+                float* p_scale = scale.host();
+
+                for (long n = 0; n < ns; ++n)
+                    for (long k = 0; k < ks; ++k)
+                        for (long i = 0; i < nrs; ++i)
+                        {
+                            const long row = (n * ks + k) * nrs + i;
+                            const float* row_src = p_src + row * ncs;
+
+                            float sum_sq = 0.0f;
+                            for (long j = 0; j < ncs; ++j)
+                                sum_sq += row_src[j] * row_src[j];
+                            const float inv_rms = 1.0f / std::sqrt(sum_sq / ncs + (float)eps);
+                            p_scale[row] = inv_rms;
+
+                            float* row_dst = p_dest + row * ncs;
+                            for (long j = 0; j < ncs; ++j)
+                                row_dst[j] = row_src[j] * inv_rms * p_gamma[j];
+                        }
+            }
+            else
+            {
+                // Normalize over k. gamma has size ks
+                DLIB_CASSERT(gamma.num_samples() == 1 && gamma.k() == 1
+                    && gamma.nr() == 1 && gamma.nc() == ks && eps > 0);
+
+                dest.copy_size(src);
+                // One scale per (sample, row, col); normalize over k
+                scale.set_size(ns, 1, nrs, ncs);
+
+                const float* p_src = src.host();
+                const float* p_gamma = gamma.host();
+                float* p_dest = dest.host();
+                float* p_scale = scale.host();
+
+                // For fc-style with k as embedding dim, the layout is [B, K, NR, NC]
+                // where typically nr=1, nc=1. We sum src[n,k,i,j]^2 over k for fixed
+                // (n, i, j) and apply scale[n, 0, i, j] elementwise.
+                for (long n = 0; n < ns; ++n)
                     for (long i = 0; i < nrs; ++i)
-                    {
-                        // Accumulate squared sum across nc
-                        float sum_sq = 0.0f;
-                        const float* p_row = p_src + ((n * ks + k) * nrs + i) * ncs;
                         for (long j = 0; j < ncs; ++j)
-                            sum_sq += p_row[j] * p_row[j];
+                        {
+                            float sum_sq = 0.0f;
+                            for (long k = 0; k < ks; ++k)
+                            {
+                                const long off = ((n * ks + k) * nrs + i) * ncs + j;
+                                sum_sq += p_src[off] * p_src[off];
+                            }
+                            const float inv_rms = 1.0f / std::sqrt(sum_sq / ks + (float)eps);
+                            const long sc_idx = (n * nrs + i) * ncs + j;
+                            p_scale[sc_idx] = inv_rms;
 
-                        const float inv_rms = 1.0f / std::sqrt(sum_sq / ncs + static_cast<float>(eps));
-                        p_scale[(n * ks + k) * nrs + i] = inv_rms;
-
-                        float* p_dest_row = p_dest + ((n * ks + k) * nrs + i) * ncs;
-                        for (long j = 0; j < ncs; ++j)
-                            p_dest_row[j] = p_row[j] * inv_rms * p_gamma[j];
-                    }
-                }
+                            for (long k = 0; k < ks; ++k)
+                            {
+                                const long off = ((n * ks + k) * nrs + i) * ncs + j;
+                                p_dest[off] = p_src[off] * inv_rms * p_gamma[k];
+                            }
+                        }
             }
         }
 
@@ -1518,21 +1545,10 @@ namespace dlib
             const tensor& gamma,
             tensor& src_grad,
             tensor& gamma_grad,
-            resizable_tensor& dscale
+            resizable_tensor& dscale,
+            bool axis_is_nc
         )
         {
-            DLIB_CASSERT(scale.num_samples() == src.num_samples());
-            DLIB_CASSERT(scale.k() == src.k());
-            DLIB_CASSERT(scale.nr() == src.nr());
-            DLIB_CASSERT(scale.nc() == 1);
-            DLIB_CASSERT(have_same_dimensions(gamma, gamma_grad));
-            DLIB_CASSERT(gamma.num_samples() == 1);
-            DLIB_CASSERT(gamma.k() == 1);
-            DLIB_CASSERT(gamma.nr() == 1);
-            DLIB_CASSERT(gamma.nc() == src.nc());
-            DLIB_CASSERT(have_same_dimensions(gradient_input, src));
-            DLIB_CASSERT(have_same_dimensions(gradient_input, src_grad));
-
             const long ns = src.num_samples();
             const long ks = src.k();
             const long nrs = src.nr();
@@ -1550,60 +1566,90 @@ namespace dlib
             float* p_dscale = dscale.host();
             float* p_src_grad = src_grad.host();
 
-            // Pass 1: accumulate gamma_grad and dscale (the gradient w.r.t. inv_rms
-            // for each position).
-            for (long n = 0; n < ns; ++n)
+            if (axis_is_nc)
             {
-                for (long k = 0; k < ks; ++k)
-                {
-                    for (long i = 0; i < nrs; ++i)
-                    {
-                        const long row_idx = (n * ks + k) * nrs + i;
-                        const float inv_rms = p_scale[row_idx];
-                        const float scale_pow = -0.5f * inv_rms * inv_rms * inv_rms;
-
-                        const float* p_src_row = p_src + row_idx * ncs;
-                        const float* p_grad_row = p_grad + row_idx * ncs;
-
-                        float ds = 0.0f;
-                        for (long j = 0; j < ncs; ++j)
+                // Pass 1: gamma_grad (per-j accumulation across all rows) and dscale (per-row)
+                for (long n = 0; n < ns; ++n)
+                    for (long k = 0; k < ks; ++k)
+                        for (long i = 0; i < nrs; ++i)
                         {
-                            const float x_hat = p_src_row[j] * inv_rms;
-                            p_gamma_grad[j] += p_grad_row[j] * x_hat;
+                            const long row = (n * ks + k) * nrs + i;
+                            const float inv_rms = p_scale[row];
+                            const float scale_pow = -0.5f * inv_rms * inv_rms * inv_rms;
 
-                            const float dx = p_grad_row[j] * p_gamma[j];
-                            ds += dx * p_src_row[j];
+                            const float* row_src = p_src + row * ncs;
+                            const float* row_grad = p_grad + row * ncs;
+
+                            float ds = 0.0f;
+                            for (long j = 0; j < ncs; ++j)
+                            {
+                                const float x_hat = row_src[j] * inv_rms;
+                                p_gamma_grad[j] += row_grad[j] * x_hat;
+                                const float dx = row_grad[j] * p_gamma[j];
+                                ds += dx * row_src[j];
+                            }
+                            p_dscale[row] = ds * scale_pow;
                         }
-                        p_dscale[row_idx] = ds * scale_pow;
-                    }
-                }
+
+                // Pass 2: src_grad combining direct path and path through inv_rms
+                const float inv_nc = 1.0f / (float)ncs;
+                for (long n = 0; n < ns; ++n)
+                    for (long k = 0; k < ks; ++k)
+                        for (long i = 0; i < nrs; ++i)
+                        {
+                            const long row = (n * ks + k) * nrs + i;
+                            const float inv_rms = p_scale[row];
+                            const float ds = p_dscale[row];
+                            const float* row_src = p_src + row * ncs;
+                            const float* row_grad = p_grad + row * ncs;
+                            float* row_src_grad = p_src_grad + row * ncs;
+                            for (long j = 0; j < ncs; ++j)
+                            {
+                                const float dx = row_grad[j] * p_gamma[j];
+                                row_src_grad[j] += dx * inv_rms + ds * 2.0f * row_src[j] * inv_nc;
+                            }
+                        }
             }
-
-            // Pass 2: compute src_grad combining the two contributions:
-            //   - direct: gradient_input * gamma * inv_rms
-            //   - through inv_rms: dscale * 2 * src / nc (chain rule on RMS computation)
-            const float inv_nc = 1.0f / static_cast<float>(ncs);
-            for (long n = 0; n < ns; ++n)
+            else
             {
-                for (long k = 0; k < ks; ++k)
-                {
+                // Axis = k
+                // Pass 1: gamma_grad[k] accumulates over (n,i,j); dscale[n,0,i,j] per (n,i,j)
+                for (long n = 0; n < ns; ++n)
                     for (long i = 0; i < nrs; ++i)
-                    {
-                        const long row_idx = (n * ks + k) * nrs + i;
-                        const float inv_rms = p_scale[row_idx];
-                        const float ds = p_dscale[row_idx];
-
-                        const float* p_src_row = p_src + row_idx * ncs;
-                        const float* p_grad_row = p_grad + row_idx * ncs;
-                        float* p_src_grad_row = p_src_grad + row_idx * ncs;
-
                         for (long j = 0; j < ncs; ++j)
                         {
-                            const float dx = p_grad_row[j] * p_gamma[j];
-                            p_src_grad_row[j] += dx * inv_rms + ds * 2.0f * p_src_row[j] * inv_nc;
+                            const long sc_idx = (n * nrs + i) * ncs + j;
+                            const float inv_rms = p_scale[sc_idx];
+                            const float scale_pow = -0.5f * inv_rms * inv_rms * inv_rms;
+
+                            float ds = 0.0f;
+                            for (long k = 0; k < ks; ++k)
+                            {
+                                const long off = ((n * ks + k) * nrs + i) * ncs + j;
+                                const float x_hat = p_src[off] * inv_rms;
+                                p_gamma_grad[k] += p_grad[off] * x_hat;
+                                const float dx = p_grad[off] * p_gamma[k];
+                                ds += dx * p_src[off];
+                            }
+                            p_dscale[sc_idx] = ds * scale_pow;
                         }
-                    }
-                }
+
+                // Pass 2
+                const float inv_k = 1.0f / (float)ks;
+                for (long n = 0; n < ns; ++n)
+                    for (long i = 0; i < nrs; ++i)
+                        for (long j = 0; j < ncs; ++j)
+                        {
+                            const long sc_idx = (n * nrs + i) * ncs + j;
+                            const float inv_rms = p_scale[sc_idx];
+                            const float ds = p_dscale[sc_idx];
+                            for (long k = 0; k < ks; ++k)
+                            {
+                                const long off = ((n * ks + k) * nrs + i) * ncs + j;
+                                const float dx = p_grad[off] * p_gamma[k];
+                                p_src_grad[off] += dx * inv_rms + ds * 2.0f * p_src[off] * inv_k;
+                            }
+                        }
             }
         }
 
