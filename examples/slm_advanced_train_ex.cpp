@@ -667,7 +667,7 @@ int main(int argc, char** argv)
  *    + attention heads: 6
  *    + embedding dimension: 228 
  *    + max sequence length: 100
- * - Number of parameters: 2,957,801
+ * - Number of parameters: 2,822,444
  *
  * After a 1-step full training, the model achieves perfect memorization of the dataset.
  * The generation option produces text that matches the original dataset byte-for-byte

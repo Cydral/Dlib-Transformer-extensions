@@ -289,7 +289,7 @@ int main(int argc, char** argv)
  *    + attention heads: 4
  *    + embedding dimension: 64
  *    + max sequence length: 50
- * - Number of parameters: 5,185,864
+ * - Number of parameters: 4,798,593
  *
  * The training can be performed using the following command line:
  * > ./slm_basic_train_ex --train --shuffle

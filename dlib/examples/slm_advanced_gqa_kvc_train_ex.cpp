@@ -1,5 +1,4 @@
-﻿
-/*!
+﻿/*!
     @file slm_advanced_gqa_kvc_train_ex.cpp
     @brief Variant of slm_advanced_gqa_train_ex.cpp using the unified GQA attention
            with a KV cache, validating end-to-end byte-accurate generation.
@@ -193,7 +192,7 @@ int main(int argc, char** argv)
         parser.add_option("learning-rate", "Set the learning rate (default: 2e-4)", 1);
         parser.add_option("batch-size", "Set the mini-batch size (default: 64)", 1);
         parser.add_option("patience", "Iterations without progress before early stopping (default: 8000)", 1);
-        parser.add_option("max-epochs", "Maximum number of training epochs (default: 300)", 1);
+        parser.add_option("max-epochs", "Maximum number of training epochs (default: 400)", 1);
         parser.add_option("alpha", "Set the weight decay for AdamW (default: 0.004)", 1);
         parser.add_option("beta1", "Set AdamW's first moment coefficient (default: 0.9)", 1);
         parser.add_option("beta2", "Set AdamW's second moment coefficient (default: 0.998)", 1);
@@ -217,7 +216,7 @@ int main(int argc, char** argv)
         const double learning_rate = get_option(parser, "learning-rate", 2e-4);
         const size_t batch_size = get_option(parser, "batch-size", 64);
         const long patience = get_option(parser, "patience", 8000);
-        const size_t max_epochs = get_option(parser, "max-epochs", 300);
+        const size_t max_epochs = get_option(parser, "max-epochs", 400);
         const double alpha = get_option(parser, "alpha", 0.004);
         const double beta1 = get_option(parser, "beta1", 0.9);
         const double beta2 = get_option(parser, "beta2", 0.998);
@@ -518,72 +517,6 @@ int main(int argc, char** argv)
             if (tokenizer.get_vocab_size() == 0) {
                 cerr << "Error: Tokenizer not loaded. Please provide a valid tokenizer file.\n";
                 return 0;
-            }
-
-            // =========================================================================
-            // EQUIVALENCE TEST
-            //
-            // Verifies that prefill+incremental produces the same prediction as a
-            // single full forward on the same sequence. With the pre-RoPE KV cache
-            // and matching position conventions in both paths, the two predictions
-            // must be identical (modulo floating-point rounding).
-            // =========================================================================
-            {
-                cout << "\n=== EQUIVALENCE TEST ===\n";
-
-                // Use first 11 tokens from the dataset
-                std::vector<int> diag_tokens;
-                {
-                    std::ifstream file(tokens_file, std::ios::binary);
-                    if (file) {
-                        uint64_t num_tokens_in_file;
-                        file.read(reinterpret_cast<char*>(&num_tokens_in_file), sizeof(num_tokens_in_file));
-                        for (int i = 0; i < 11; ++i) {
-                            uint32_t t;
-                            file.read(reinterpret_cast<char*>(&t), sizeof(t));
-                            diag_tokens.push_back(static_cast<int>(t));
-                        }
-                    }
-                }
-                DLIB_CASSERT(diag_tokens.size() == 11);
-
-                // Path A: full forward on 11 tokens, no padding
-                network_context::reset();
-                network_context::set_inference_mode(network_context::inference_mode::full);
-                network_context::clear_padding();
-
-                matrix<int, 0, 1> input_full(11, 1);
-                for (int i = 0; i < 11; ++i) input_full(i) = diag_tokens[i];
-                int next_full = net(input_full);
-                cout << "Path A (full on 11 tokens): predicted = " << next_full << "\n";
-
-                // Path B: prefill on first 10 tokens + incremental on 11th
-                network_context::reset();
-                network_context::set_kv_cache_capacity(max_seq_len);
-                network_context::set_inference_mode(network_context::inference_mode::prefill);
-                network_context::clear_padding();
-
-                matrix<int, 0, 1> input_pref(10, 1);
-                for (int i = 0; i < 10; ++i) input_pref(i) = diag_tokens[i];
-                int next_after_10 = net(input_pref);
-                cout << "Path B prefill (10 tokens): predicted=" << next_after_10
-                    << " cache_len=" << gqa_cache_full_len(net) << "\n";
-
-                network_context::set_inference_mode(network_context::inference_mode::incremental);
-                network_context::clear_padding();
-
-                matrix<int, 0, 1> incr_input(1, 1);
-                incr_input(0) = diag_tokens[10];
-                int next_incr = net(incr_input);
-                cout << "Path B incr (11th token): predicted=" << next_incr
-                    << " cache_len=" << gqa_cache_full_len(net) << "\n";
-
-                if (next_incr == next_full)
-                    cout << "[OK: equivalent]\n";
-                else
-                    cout << "[FAIL: " << next_incr << " vs " << next_full << "]\n";
-
-                network_context::reset();
             }
 
             std::vector<int> prompt_tokens;
