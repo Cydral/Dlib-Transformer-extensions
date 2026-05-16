@@ -1,27 +1,40 @@
 ﻿/*!
     @file slm_transformer_configs_ex.cpp
-    @brief Training and generation pipeline for the pre-configured transformer architectures built into Dlib.
+    @brief Training and generation pipeline for two transformer architectures,
+           both built on the fused gqa_attention_ layer (with built-in KV cache).
 
-    This example demonstrates how to train and evaluate two network topologies available as
-    ready-to-use configurations:
+    This example demonstrates how to train and evaluate two network topologies
+    sharing a single attention implementation:
 
-      --arch moe   Grouped Query Attention + Mixture-of-Experts feed-forward.
-                   Sparse top-k expert activation with load-balancing auxiliary loss.
-                   Best for exploring conditional computation and expert specialization.
+      --arch moe   Grouped Query Attention (unified gqa_attention_) combined
+                   with a Mixture-of-Experts feed-forward sublayer. Sparse top-k
+                   expert activation with load-balancing auxiliary loss.
+                   Generation exercises the prefill + incremental code path of
+                   gqa_attention_, including the automatic sliding window at
+                   cache capacity.
 
-      --arch hrm   Hierarchical Recurrent Model.
-                   Two-level recurrent structure (H+L modules) for multi-scale sequence modeling.
-                   Suited for tasks requiring both local and global context.
+      --arch hrm   Hierarchical Recurrent Model whose H and L sub-networks are
+                   also built on the unified GQA attention. The two sub-networks
+                   are looped N*T times per forward to produce two scales of
+                   recurrent reasoning. Even though the attention layer carries
+                   a KV cache, the HRM cannot exploit it during autoregressive
+                   generation: each forward calls the sub-networks several times
+                   on multi-position inputs (state + sequence), which is
+                   incompatible with the per-call cache semantics. The cache
+                   therefore stays idle inside HRM forwards and generation falls
+                   back to a full forward at every step.
 
-    Both configurations share the same training and generation pipeline: BPE tokenization,
-    sliding-window dataset construction, AdamW optimization with reduce-on-plateau learning rate
-    control, checkpoint support, and autoregressive text generation with prompt/reference split
-    validation.
+    Sharing the same attention implementation across both architectures yields a
+    uniform topology (single rms_norm + gqa_attention_ + residual block), a more
+    consistent parameter footprint, and the same training-time performance
+    profile (one fused kernel per attention sublayer rather than a chain of ~16
+    elementary kernels).
 
-    The architecture is selected at runtime via --arch; the compiler instantiates the full
-    pipeline independently for each configuration so there is no runtime overhead from the
-    dispatch. Model files are automatically named per architecture (dlib_lm_<arch>_model.dat)
-    to prevent accidental cross-architecture checkpoint loading.
+    Both configurations share the same training pipeline: BPE tokenization,
+    sliding-window dataset construction (with a small cold-start auxiliary set
+    of left-padded samples), AdamW optimization with reduce-on-plateau learning
+    rate control, checkpoint support, and autoregressive text generation with
+    prompt / reference split validation.
 
     Usage:
       Training  : slm_transformer_configs_ex --train --arch moe
@@ -294,11 +307,23 @@ auto try_print_moe_info(const net_type& net, long num_layers)
 inline void try_print_moe_info(...) {}
 
 // Type-dependent training and generation logic, called once from main() with the concrete
-// transformer config selected by --arch.  Each call site in main() compiles a completely
+// transformer config selected by --arch. Each call site in main() compiles a completely
 // independent version of this function with its own concrete network types.
+//
+// The use_kv_cache flag selects the inference strategy at generation time:
+//   - true  : prefill on the prompt + per-token incremental forward, leveraging
+//             the built-in KV cache and sliding window of gqa_attention_.
+//             Used for gqa_moe_transformer_config: every attention sublayer is
+//             directly visible at the top level of the network, so the inference
+//             mode set on network_context propagates correctly.
+//   - false : full forward at every step over a sliding-window context, with
+//             left-padding handled via network_context. Used for HRM even
+//             though its sub-networks now use gqa_attention_: the HRM cycles
+//             those sub-networks N*T times per global forward on multi-position
+//             inputs, which is incompatible with the per-call cache semantics.
 template <typename TRANSFORMER_CONFIG, long NUM_LAYERS, long MAX_SEQ_LEN, long NUM_TOKENS>
 int run_pipeline(
-    bool do_train, bool do_generate,
+    bool do_train, bool do_generate, bool use_kv_cache,
     const double learning_rate, const size_t batch_size, const long patience, const size_t max_epochs,
     const double weight_decay, const double beta1, const double beta2,
     const std::string& model_file, const std::string& tokenizer_file,
@@ -344,7 +369,7 @@ int run_pipeline(
 
         // Validate required special tokens
         long text_start_id = tokenizer.get_special_token_id("<text>"),
-             text_end_id = tokenizer.get_special_token_id("</text>");
+            text_end_id = tokenizer.get_special_token_id("</text>");
         if (text_start_id < 0 || text_end_id < 0) {
             cerr << "ERROR: Required special tokens not found in tokenizer!\n"
                 << "The tokenizer must include: <text>, </text>\n";
@@ -445,7 +470,7 @@ int run_pipeline(
         augment_training_dataset(samples, labels,
             static_cast<int>(tokenizer.get_special_token_id("<unk>")), pad_token, 0.05,
             1, 3, 0, augmentation_mode::random_token, random_min, random_max);
-        
+
         // Combine main and auxiliary samples
         samples.insert(samples.end(),
             std::make_move_iterator(aux_samples.begin()),
@@ -670,7 +695,7 @@ int run_pipeline(
         // Prompt / reference split
         //
         // Case A: content fits within the context window (seg_len < max_seq_len)
-        //   Split 50/50: first half is the prompt (left-padded), second half is ground-truth reference.
+        //   Split 50/50: first half is the prompt, second half is ground-truth reference.
         //
         // Case B: content >= max_seq_len
         //   First max_seq_len tokens become the prompt, remaining tokens are the reference.
@@ -689,7 +714,7 @@ int run_pipeline(
             verify_half.assign(content.begin() + short_input,
                 content.begin() + std::min(content.size(), short_input + max_seq_len));
             cout << "Short-prompt test (cold-start scenario): input=" << input_half.size()
-                << " tokens (left-padded), verify=" << verify_half.size() << " tokens\n";
+                << " tokens, verify=" << verify_half.size() << " tokens\n";
         }
         else if (seg_len < static_cast<size_t>(max_seq_len)) {
             size_t input_count = (seg_len + 1) / 2;
@@ -701,7 +726,7 @@ int run_pipeline(
             input_half.assign(content.begin(), content.begin() + input_count);
             verify_half.assign(content.begin() + input_count, content.end());
             cout << "Short segment (" << seg_len << " content tokens < window " << max_seq_len << "): "
-                << "50/50 split - input=" << input_count << " tokens (left-padded), verify="
+                << "50/50 split - input=" << input_count << " tokens, verify="
                 << verify_count << " tokens\n";
         }
         else {
@@ -714,16 +739,16 @@ int run_pipeline(
         // Reinject <text> at the head of the prompt to match training-time context
         input_half.insert(input_half.begin(), static_cast<int>(text_start_id));
 
-        // Build inference window with left-padding
-        inference_context llm_context(max_seq_len, 4, pad_token);
-        llm_context.add_tokens(input_half);
-        auto input_seq = llm_context.get_input_window();
-
         cout << "\n--- Prompt (input to model) ---\n"
             << tokenizer.decode(input_half, false) << "\n"
             << "-------------------------------\n\n";
 
+        cout << "Inference strategy: "
+            << (use_kv_cache ? "prefill + incremental (KV cache)"
+                : "full forward at every step")
+            << "\n";
         cout << "Starting autoregressive generation...\n";
+
         const size_t tokens_to_generate = verify_half.size();
         std::vector<int> generated_tokens;
         generated_tokens.reserve(tokens_to_generate);
@@ -731,33 +756,99 @@ int run_pipeline(
         const int end_of_text_id = static_cast<int>(text_end_id);
         auto gen_start = std::chrono::high_resolution_clock::now();
 
-        for (size_t i = 0; i < tokens_to_generate && !signal_handler::is_triggered(); ++i)
+        if (use_kv_cache)
         {
-            long pad_len = count_leading_padding(input_seq, pad_token);
-            network_context::set_padding_uniform(pad_len, 1);
-            int next_token = net(input_seq);
+            // KV-cache strategy: a single prefill forward over the whole prompt
+            // populates each gqa_attention_ layer's K/V cache; subsequent tokens
+            // are produced by single-token incremental forwards. The attention
+            // layer applies an automatic sliding-window shift once the cache
+            // reaches max_seq_len, so the generation loop has nothing to manage
+            // beyond feeding the next token.
+            network_context::reset();
+            network_context::set_kv_cache_capacity(max_seq_len);
+            network_context::clear_padding();
+
+            // Prefill on the prompt (no padding: positions are 0..L-1)
+            network_context::set_inference_mode(network_context::inference_mode::prefill);
+
+            matrix<int, 0, 1> prefill_input(static_cast<long>(input_half.size()), 1);
+            for (size_t i = 0; i < input_half.size(); ++i)
+                prefill_input(i) = input_half[i];
+
+            int next_token = net(prefill_input);
             generated_tokens.push_back(next_token);
 
-            llm_context.add_token(next_token);
-            input_seq = llm_context.get_input_window();
+            // Incremental generation
+            network_context::set_inference_mode(network_context::inference_mode::incremental);
 
-            if ((i + 1) % 50 == 0) {
-                auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::high_resolution_clock::now() - gen_start).count();
-                double tps = (elapsed_ms > 0) ? ((i + 1) * 1000.0 / elapsed_ms) : 0.0;
+            for (size_t i = 1; i < tokens_to_generate && !signal_handler::is_triggered(); ++i)
+            {
+                if (next_token == end_of_text_id) break;
 
-                std::ostringstream line;
-                line << "Generated " << std::setw(5) << std::right << (i + 1)
-                    << "/" << std::left << std::setw(5) << tokens_to_generate
-                    << "  speed: " << std::fixed << std::setprecision(1)
-                    << std::setw(6) << std::right << tps << " tokens/sec";
-                std::string s = line.str();
-                if (s.size() < 60) s.append(60 - s.size(), ' ');
-                cout << "\r" << s << std::flush;
+                matrix<int, 0, 1> incr_input(1, 1);
+                incr_input(0) = next_token;
+                next_token = net(incr_input);
+                generated_tokens.push_back(next_token);
+
+                if ((i + 1) % 50 == 0) {
+                    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::high_resolution_clock::now() - gen_start).count();
+                    double tps = (elapsed_ms > 0) ? ((i + 1) * 1000.0 / elapsed_ms) : 0.0;
+
+                    std::ostringstream line;
+                    line << "Generated " << std::setw(5) << std::right << (i + 1)
+                        << "/" << std::left << std::setw(5) << tokens_to_generate
+                        << "  speed: " << std::fixed << std::setprecision(1)
+                        << std::setw(6) << std::right << tps << " tokens/sec";
+                    std::string s = line.str();
+                    if (s.size() < 60) s.append(60 - s.size(), ' ');
+                    cout << "\r" << s << std::flush;
+                }
             }
-            if (next_token == end_of_text_id) break;
+            network_context::reset();
         }
-        network_context::clear_padding();
+        else
+        {
+            // Full-forward strategy: at every step the network sees the entire
+            // sliding-window context (left-padded if shorter than max_seq_len).
+            // Used by HRM: its H and L sub-networks rely on gqa_attention_ too,
+            // but the HRM cycles them N*T times per global forward on
+            // multi-position inputs, which does not match the per-call cache
+            // semantics. We therefore keep the cache idle (training/full mode
+            // by default) and recompute the attention over the full window at
+            // each step.
+            inference_context llm_context(max_seq_len, 4, pad_token);
+            llm_context.add_tokens(input_half);
+            auto input_seq = llm_context.get_input_window();
+
+            for (size_t i = 0; i < tokens_to_generate && !signal_handler::is_triggered(); ++i)
+            {
+                long pad_len = count_leading_padding(input_seq, pad_token);
+                network_context::set_padding_uniform(pad_len, 1);
+                int next_token = net(input_seq);
+                generated_tokens.push_back(next_token);
+
+                llm_context.add_token(next_token);
+                input_seq = llm_context.get_input_window();
+
+                if ((i + 1) % 50 == 0) {
+                    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::high_resolution_clock::now() - gen_start).count();
+                    double tps = (elapsed_ms > 0) ? ((i + 1) * 1000.0 / elapsed_ms) : 0.0;
+
+                    std::ostringstream line;
+                    line << "Generated " << std::setw(5) << std::right << (i + 1)
+                        << "/" << std::left << std::setw(5) << tokens_to_generate
+                        << "  speed: " << std::fixed << std::setprecision(1)
+                        << std::setw(6) << std::right << tps << " tokens/sec";
+                    std::string s = line.str();
+                    if (s.size() < 60) s.append(60 - s.size(), ' ');
+                    cout << "\r" << s << std::flush;
+                }
+                if (next_token == end_of_text_id) break;
+            }
+            network_context::clear_padding();
+        }
 
         auto gen_end = std::chrono::high_resolution_clock::now();
         long gen_time = std::chrono::duration_cast<std::chrono::seconds>(gen_end - gen_start).count();
@@ -857,7 +948,7 @@ int main(int argc, char** argv)
             : "dlib_lm_" + arch + "_model.dat";
         cout << "Model file : " << model_file << "\n\n";
 
-		constexpr long max_seq_len = 192;
+        constexpr long max_seq_len = 192;
         constexpr long num_tokens = 1400;
         constexpr long num_layers = 4;
         constexpr long num_heads = 6;
@@ -903,19 +994,34 @@ int main(int argc, char** argv)
 
         std::vector<int> gpus{ 0 };
 
+        // Both architectures are built on the same fused attention layer
+        // (gqa_attention_). The use_kv_cache flag below selects the inference
+        // strategy at generation time:
+        //   - moe : the attention sublayers sit directly at the top level of the
+        //           network, so prefill/incremental modes flow through them
+        //           naturally; use_kv_cache=true.
+        //   - hrm : the attention sublayers live inside the H and L sub-networks
+        //           that are cycled N*T times per global forward on
+        //           multi-position inputs. The per-call cache semantics does not
+        //           match this pattern, so generation uses full forwards over a
+        //           sliding-window context and the cache stays idle inside HRM
+        //           forwards (use_kv_cache=false).
         if (arch == "moe") {
             using selected = gqa_moe_transformer_config<
                 num_tokens, num_layers, num_heads, num_kv_heads, embedding_dim, num_experts, top_k>;
             return run_pipeline<selected, num_layers, max_seq_len, num_tokens>(
-                parser.option("train"), parser.option("generate"),
+                parser.option("train"), parser.option("generate"), /*use_kv_cache=*/true,
                 learning_rate, batch_size, patience, max_epochs, weight_decay, beta1, beta2,
                 model_file, tokenizer_file, text_segments, external_corpus_for_tokenizer, tokenizer, gpus);
         }
         else if (arch == "hrm") {
-            using selected = hrm_transformer_config<num_tokens, num_layers/2, num_layers, num_heads, embedding_dim, 1, 2>;
+            using selected = hrm_transformer_config<
+                num_tokens, num_layers / 2, num_layers, num_heads, embedding_dim, 1, 2,
+                gelu, dropout_10,                        // activation / dropout (ignored when impl=unified)
+                attention_impl::unified, num_kv_heads>;  // select fused GQA attention for H and L sub-networks
             return run_pipeline<selected, num_layers, max_seq_len, num_tokens>(
-                parser.option("train"), parser.option("generate"),
-                learning_rate, batch_size/2, patience, max_epochs, weight_decay, beta1, beta2,
+                parser.option("train"), parser.option("generate"), /*use_kv_cache=*/false,
+                learning_rate, batch_size / 2, patience, max_epochs, weight_decay, beta1, beta2,
                 model_file, tokenizer_file, text_segments, external_corpus_for_tokenizer, tokenizer, gpus);
         }
     }

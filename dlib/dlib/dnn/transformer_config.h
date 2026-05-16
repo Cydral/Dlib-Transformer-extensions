@@ -162,6 +162,32 @@ namespace dlib
                 num_layers, d_model, num_heads, num_kv_heads, SUBNET>;
             static const char* name() { return "unified"; }
         };
+
+        template <attention_impl Impl, long num_layers,
+            long d_model, long num_heads, long num_kv_heads,
+            template <typename> class ACT, template <typename> class DO,
+            typename SUBNET>
+        struct hrm_stack_selector;
+
+        template <long num_layers, long d_model, long num_heads, long num_kv_heads,
+            template <typename> class ACT, template <typename> class DO, typename SUBNET>
+        struct hrm_stack_selector<attention_impl::chained, num_layers,
+            d_model, num_heads, num_kv_heads, ACT, DO, SUBNET>
+        {
+            using type = canonical_transformer::transformer_stack<
+                num_layers, ACT, DO, d_model, num_heads, SUBNET>;
+            static const char* name() { return "canonical (multi-head)"; }
+        };
+
+        template <long num_layers, long d_model, long num_heads, long num_kv_heads,
+            template <typename> class ACT, template <typename> class DO, typename SUBNET>
+        struct hrm_stack_selector<attention_impl::unified, num_layers,
+            d_model, num_heads, num_kv_heads, ACT, DO, SUBNET>
+        {
+            using type = gqa_transformer_unified::transformer_stack<
+                num_layers, d_model, num_heads, num_kv_heads, SUBNET>;
+            static const char* name() { return "unified (gqa_attention_)"; }
+        };
     }
 
     template<
@@ -234,7 +260,9 @@ namespace dlib
         long hrm_N = 4,
         long hrm_T = 4,
         template <typename> class activation_func = gelu,
-        template <typename> class dropout_policy = dropout_10
+        template <typename> class dropout_policy = dropout_10,
+        attention_impl impl = attention_impl::chained,
+        long num_kv_heads = 2
     >
     struct hrm_transformer_config {
         // Core model parameters
@@ -242,34 +270,43 @@ namespace dlib
         static constexpr long NUM_H_LAYERS = num_h_layers;
         static constexpr long NUM_L_LAYERS = num_l_layers;
         static constexpr long NUM_HEADS = num_heads;
+        static constexpr long NUM_KV_HEADS = num_kv_heads;
         static constexpr long EMBEDDING_DIM = embedding_dim;
         static constexpr long HRM_N = hrm_N;
         static constexpr long HRM_T = hrm_T;
+        static constexpr attention_impl IMPL = impl;
 
-        // Compile-time validation of model configuration
+        // Compile-time validation
         struct validation {
             static_assert(VOCAB_SIZE > 0, "Vocabulary size must be positive");
             static_assert(NUM_H_LAYERS > 0, "Number of H layers must be positive");
             static_assert(NUM_L_LAYERS > 0, "Number of L layers must be positive");
             static_assert(NUM_HEADS > 0, "Number of attention heads must be positive");
-            static_assert(EMBEDDING_DIM% NUM_HEADS == 0, "Embedding dimension must be divisible by number of heads");
+            static_assert(EMBEDDING_DIM% NUM_HEADS == 0,
+                "Embedding dimension must be divisible by number of heads");
             static_assert(HRM_N > 0, "HRM N cycles must be positive");
             static_assert(HRM_T > 0, "HRM T steps must be positive");
+            // Extra checks active only when using unified attention
+            static_assert(IMPL != attention_impl::unified || NUM_KV_HEADS > 0,
+                "num_kv_heads must be positive when using unified attention");
+            static_assert(IMPL != attention_impl::unified || NUM_HEADS % NUM_KV_HEADS == 0,
+                "num_heads must be divisible by num_kv_heads when using unified attention");
+            static_assert(IMPL != attention_impl::unified || (EMBEDDING_DIM / NUM_HEADS) % 2 == 0,
+                "head_dim must be even (RoPE constraint) when using unified attention");
         };
 
-        // Network component definitions for training (with dropout)
-        using train_h_net_type = canonical_transformer::transformer_stack<NUM_H_LAYERS, activation_func, dropout_policy,
-            EMBEDDING_DIM, NUM_HEADS, input_tensor>;
-        using train_l_net_type = canonical_transformer::transformer_stack<NUM_L_LAYERS, activation_func, dropout_policy,
-            EMBEDDING_DIM, NUM_HEADS, input_tensor>;
+        // H and L sub-network types dispatched by the attention implementation
+        using train_h_net_type = typename impl::hrm_stack_selector<IMPL, NUM_H_LAYERS,
+            EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS, activation_func, dropout_policy, input_tensor>::type;
+        using train_l_net_type = typename impl::hrm_stack_selector<IMPL, NUM_L_LAYERS,
+            EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS, activation_func, dropout_policy, input_tensor>::type;
 
-        // Network component definitions for inference (without dropout)
-        using infer_h_net_type = canonical_transformer::transformer_stack<NUM_H_LAYERS, activation_func, multiply,
-            EMBEDDING_DIM, NUM_HEADS, input_tensor>;
-        using infer_l_net_type = canonical_transformer::transformer_stack<NUM_L_LAYERS, activation_func, multiply,
-            EMBEDDING_DIM, NUM_HEADS, input_tensor>;
+        using infer_h_net_type = typename impl::hrm_stack_selector<IMPL, NUM_H_LAYERS,
+            EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS, activation_func, multiply, input_tensor>::type;
+        using infer_l_net_type = typename impl::hrm_stack_selector<IMPL, NUM_L_LAYERS,
+            EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS, activation_func, multiply, input_tensor>::type;
 
-		// Network definition selector based on training mode (with dropout for training, without for inference)
+        // Network definition selector based on training mode
         template<bool is_training>
         using network_type = std::conditional_t<is_training,
             classification_head<VOCAB_SIZE,
@@ -283,13 +320,22 @@ namespace dlib
             static std::string describe() {
                 std::stringstream ss;
                 ss << "HRM network configuration:\n"
-                    << "- Vocabulary: " << VOCAB_SIZE << " tokens\n"
-                    << "- H module: " << NUM_H_LAYERS << " transformer layers\n"
-                    << "- L module: " << NUM_L_LAYERS << " transformer layers\n"
-                    << "- Attention heads: " << NUM_HEADS << "\n"
-                    << "- Embedding dimension: " << EMBEDDING_DIM << "\n"
-                    << "- HRM cycles: N=" << HRM_N << " (high-level), T=" << HRM_T << " (low-level)\n"
-                    << "- Total reasoning steps: " << (HRM_N * HRM_T) << " iterations";
+                    << "- Vocabulary       : " << VOCAB_SIZE << " tokens\n"
+                    << "- H module         : " << NUM_H_LAYERS << " transformer layers\n"
+                    << "- L module         : " << NUM_L_LAYERS << " transformer layers\n"
+                    << "- Attention heads  : " << NUM_HEADS << "\n";
+                if (IMPL == attention_impl::unified) {
+                    const long repeat_factor = NUM_HEADS / NUM_KV_HEADS;
+                    ss << "- KV heads (GQA)   : " << NUM_KV_HEADS
+                        << " (repeat: " << repeat_factor << "x)\n"
+                        << "- Head dim         : " << (EMBEDDING_DIM / NUM_HEADS) << "\n";
+                }
+                ss << "- Embedding dim    : " << EMBEDDING_DIM << "\n"
+                    << "- Attention impl   : " << impl::hrm_stack_selector<IMPL, 1,
+                    EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS,
+                    activation_func, dropout_policy, void>::name() << "\n"
+                    << "- HRM cycles       : N=" << HRM_N << " (high-level), T=" << HRM_T << " (low-level)\n"
+                    << "- Total reasoning  : " << (HRM_N * HRM_T) << " iterations";
                 return ss.str();
             }
         };
