@@ -305,14 +305,14 @@ namespace dlib
         long top_k_ = 0, // 0 = auto (20% of experts, minimum 1)
         template <typename> class dropout_policy = dropout_10
     >
-    struct gqa_moe_transformer_config
-    {
+    struct gqa_moe_transformer_config {
         // Core model parameters
         static constexpr long VOCAB_SIZE = vocab_size_;
         static constexpr long NUM_LAYERS = num_layers_;
         static constexpr long NUM_HEADS = num_heads_;
         static constexpr long NUM_KV_HEADS = num_kv_heads_;
         static constexpr long EMBEDDING_DIM = embedding_dim_;
+        static constexpr long HEAD_DIM = embedding_dim_ / num_heads_;
         static constexpr long NUM_EXPERTS = num_experts_;
         static constexpr long TOP_K = top_k_;
 
@@ -323,6 +323,7 @@ namespace dlib
         static_assert(NUM_KV_HEADS > 0, "Number of KV heads must be positive");
         static_assert(NUM_HEADS% NUM_KV_HEADS == 0, "num_heads must be divisible by num_kv_heads");
         static_assert(EMBEDDING_DIM% NUM_HEADS == 0, "Embedding dim must be divisible by num_heads");
+        static_assert(HEAD_DIM % 2 == 0, "head_dim (embedding_dim / num_heads) must be even for RoPE");
         static_assert(NUM_EXPERTS > 0, "Number of experts must be positive");
 
         // Gating network for MoE expert routing (managed internally by the moe_ layer)
@@ -335,13 +336,17 @@ namespace dlib
         // Output shape matches input — required by the MoE routing accumulation
         using expert_net_type = swiglu<EMBEDDING_DIM, 8, 3, input_tensor>;
 
-        // Single GQA transformer block with MoE feed-forward sublayer
+        // Single GQA transformer block with MoE feed-forward sublayer.
+        // The attention sublayer uses the fused gqa_attention_ layer, which embeds
+        // RoPE on Q and K, GQA repeat, scaled dot-product attention, causal mask
+        // and output projection in a single Dlib layer, with optional KV cache
+        // for fast incremental inference.
         // The gate network is managed internally by moe_ (not in the main topology),
-        // so the block is a clean residual: attention + residual, then MoE FFN + residual
+        // so the block is a clean residual: attention + residual, then MoE FFN + residual.
         template <typename MODE, typename SUBNET>
         using transformer_block =
             add_prev5<moe<expert_net_type, gate_net_type, NUM_EXPERTS, TOP_K, MODE, rms_norm<tag5<
-            add_prev1<multihead_attention_gqa<EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS,
+            add_prev1<gqa_attention<EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM,
             rms_norm<tag1<SUBNET>>>>>>>>;
 
         template<long remaining_layers, typename MODE, typename SUBNET, typename enabled = void>
@@ -375,7 +380,6 @@ namespace dlib
         struct model_info {
             static std::string describe() {
                 long repeat_factor = NUM_HEADS / NUM_KV_HEADS;
-                long head_dim = EMBEDDING_DIM / NUM_HEADS;
                 long active_experts = (TOP_K == 0)
                     ? std::max(1L, static_cast<long>(std::floor(NUM_EXPERTS * 0.2f)))
                     : std::min(TOP_K, NUM_EXPERTS);
@@ -387,14 +391,14 @@ namespace dlib
                     << "  KV attention heads: " << NUM_KV_HEADS
                     << "  (GQA repeat: " << repeat_factor << "x)\n"
                     << "  embedding dim     : " << EMBEDDING_DIM << "\n"
-                    << "  head dim          : " << head_dim << "\n"
+                    << "  head dim          : " << HEAD_DIM << "\n"
+                    << "  attention impl    : unified (gqa_attention_)\n"
                     << "  experts per layer : " << NUM_EXPERTS
                     << "  (active top-k: " << active_experts << ")\n";
                 return ss.str();
             }
         };
     };
-
 }
 
 #endif // DLIB_DNN_TRANSFORMER_CONFIG_H_

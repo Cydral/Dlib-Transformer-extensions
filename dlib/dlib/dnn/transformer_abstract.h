@@ -7,26 +7,52 @@
 
 /*!
     The transformer.h file contains specialized layers and building blocks designed
-    specifically for transformer architectures and attention mechanisms.
+    for transformer architectures and attention mechanisms.
 
-    Two architectural variants are provided:
+    Four architectural variants are provided:
 
     1. CANONICAL TRANSFORMER (namespace canonical_transformer):
        - Separate Q, K, V projections using linear_no_bias
        - Explicit reshape operations
-       - More modular, easier to understand
-       - Suitable for fine-grained control
+       - Standard multi-head attention (no GQA)
+       - More modular and easier to understand
+       - Suitable for fine-grained control and prototyping
 
     2. FUSED TRANSFORMER (namespace fused_transformer):
-       - Combined QKV projection
-       - Extraction-based separation
+       - Combined QKV projection through fc_no_bias
+       - Extract-based separation
        - Optimized for performance and memory efficiency
+       - Tensors carry the embedding dimension on k() (fc-style layout)
+
+    3. GQA TRANSFORMER, CHAINED (namespace gqa_transformer):
+       - Grouped Query Attention: fewer K/V heads than Q heads
+       - Built from ~16 elementary Dlib layers (reshape, RoPE, repeat_heads,
+         multm_prev, tril_mask, softmax, etc.)
+       - Historical reference implementation
+       - Re-aliased by `using namespace gqa_transformer;` so its symbols are
+         available unqualified as the default GQA implementation
+
+    4. GQA TRANSFORMER, UNIFIED (namespace gqa_transformer_unified):
+       - Same topology as the chained version (same residual structure and
+         RMSNorms), but the attention sublayer is the fused gqa_attention_
+         layer (single Dlib layer with embedded RoPE, GQA repeat, scaled
+         dot-product, causal mask, output projection, and KV cache)
+       - Supports prefill / incremental inference modes via network_context
+       - Drop-in replacement for gqa_transformer in any topology
+
+    Auxiliary classes:
+       - network_context  : thread-safe singleton sharing learning rate,
+                            padding lengths, inference mode and KV cache
+                            configuration across all layers.
+       - hrm_             : Hierarchical Reasoning Model (Wang et al., 2025).
+       - moe_             : Mixture of Experts with internal gate network
+                            and per-sample top-k routing.
 !*/
 
 namespace dlib
 {
 
-    // ---------------------------------------------------------------------------------------
+    // ----------------------------------------------------------------------------------------
 
     class network_context
     {
@@ -36,9 +62,10 @@ namespace dlib
                 by any layer during forward and backward passes.
 
                 It solves the problem that deeply nested layers (e.g. a transition
-                network inside an ACT layer) cannot directly access information about
-                the enclosing network or the current training state. The caller sets
-                the context once before each forward pass; any layer reads it as needed.
+                network inside an ACT layer, or a KV-cache-aware attention layer)
+                cannot directly access information about the enclosing network or
+                the current execution state. The caller sets the context once before
+                each forward pass; any layer reads it as needed.
 
                 The context has an explicit active/inactive state. It is considered
                 inactive until at least one setter has been called. Any layer can
@@ -46,9 +73,13 @@ namespace dlib
                 to default behavior when the context has not been initialized by the
                 caller.
 
-                The context distinguishes two operating modes:
-                  - Training:   learning_rate > 0, set by the training loop
-                  - Inference:  learning_rate == 0.0 (default)
+                The context distinguishes the following operating modes:
+                  - Training       : learning_rate > 0, set by the training loop
+                  - Inference full : default inference, no KV cache interaction
+                  - Inference prefill : initial forward on the prompt that also
+                                        populates the per-layer KV caches
+                  - Inference incremental : subsequent single-token forwards that
+                                            read and extend the KV caches
 
             THREAD SAFETY
                 All public methods are thread-safe through internal mutex protection.
@@ -64,23 +95,48 @@ namespace dlib
                 network_context::set_learning_rate(trainer.get_learning_rate());
                 network_context::set_padding(input_tensor, pad_token);
 
-                // --- Inference (before net forward pass) ---
-                network_context::set_learning_rate(0.0);
-                network_context::set_padding_uniform(0, 1);
-                // or simply do not set padding if no padding is present
+                // --- Inference (full mode, no cache) ---
+                network_context::reset();
+                network_context::set_inference_mode(
+                    network_context::inference_mode::full);
 
-                // --- Inside any layer's forward() ---
-                if (network_context::is_active()) {
-                    if (network_context::is_training()) { ... }
-                    long pad = network_context::get_padding_length(sample_idx);
-                    double lr  = network_context::get_learning_rate();
-                }
+                // --- Inference (prefill + incremental, with KV cache) ---
+                network_context::reset();
+                network_context::set_kv_cache_capacity(max_seq_len);
+                network_context::set_inference_mode(
+                    network_context::inference_mode::prefill);
+                // ... forward on the prompt ...
+                network_context::set_inference_mode(
+                    network_context::inference_mode::incremental);
+                // ... forward on single new tokens, in a loop ...
 
                 // --- Full teardown after pipeline completes ---
                 network_context::reset();
         !*/
 
     public:
+
+        enum class inference_mode
+        {
+            // No inference-time state management. Used during training and for
+            // any forward call that should not interact with the KV cache.
+            training,
+
+            // Standard inference forward without cache. Equivalent to training
+            // mode for the attention layers but signals "we are not training".
+            full,
+
+            // Prefill mode: forward pass on the initial prompt; attention layers
+            // populate their KV caches in addition to producing the regular
+            // output. This is the first step of an autoregressive generation.
+            prefill,
+
+            // Incremental mode: forward pass on a single new token; attention
+            // layers read the existing KV cache, append the new token's K/V, and
+            // produce the output for this single position. When the cache is
+            // full, attention layers apply an automatic sliding-window shift.
+            incremental
+        };
 
         // Lifecycle
 
@@ -96,14 +152,20 @@ namespace dlib
         static void reset();
         /*!
             ensures
-                - Returns the singleton to its initial inactive state.
-                - #is_active()          == false
-                - #is_training()        == false
-                - #get_learning_rate()  == 0.0
-                - #is_padding_set()     == false
+                - Returns the singleton to its initial inactive state and clears
+                  all fields:
+                    * #is_active()             == false
+                    * #is_training()           == false
+                    * #get_learning_rate()     == 0.0
+                    * #is_padding_set()        == false
+                    * #get_inference_mode()    == inference_mode::training
+                    * #get_kv_cache_capacity() == 0
+                    * The internal "clear KV cache" flag is cleared.
+                    * Optimizer hyperparameters revert to their defaults
+                      (weight_decay=0.004, beta1=0.9, beta2=0.999).
         !*/
 
-        // Learning rate / training mode
+        // Learning rate and training mode
 
         static void set_learning_rate(double lr);
         /*!
@@ -112,7 +174,7 @@ namespace dlib
                 - #get_learning_rate() == lr
                 - #is_training()       == (lr > 0.0)
                 - #is_active()         == true
-                - A value of 0.0 signals inference mode.
+                - A value of 0.0 signals inference mode (no parameter updates).
         !*/
 
         static double get_learning_rate();
@@ -184,9 +246,101 @@ namespace dlib
             ensures
                 - Returns true iff padding lengths have been stored and not yet cleared.
         !*/
+
+        // Optimizer hyperparameters (read by AdamW-style internal solvers in
+        // sub-network layers such as hrm_ and moe_)
+
+        static void set_optimizer_params(double weight_decay, double beta1, double beta2);
+        /*!
+            ensures
+                - Stores the optimizer hyperparameters used by internally managed
+                  sub-networks (hrm_, moe_, ...).
+                - #get_optimizer_weight_decay() == weight_decay
+                - #get_optimizer_beta1()        == beta1
+                - #get_optimizer_beta2()        == beta2
+                - #is_active()                  == true
+        !*/
+
+        static double get_optimizer_weight_decay();
+        static double get_optimizer_beta1();
+        static double get_optimizer_beta2();
+        /*!
+            ensures
+                - Return the stored optimizer hyperparameters (defaults:
+                  weight_decay=0.004, beta1=0.9, beta2=0.999).
+        !*/
+
+        // Inference mode and KV cache configuration
+
+        static void set_inference_mode(inference_mode m);
+        /*!
+            ensures
+                - Stores the active inference mode. KV-cache-aware attention
+                  layers read this at the start of every forward call to decide
+                  whether to use cached K/V tensors.
+                - #get_inference_mode() == m
+                - #is_active()          == true
+        !*/
+
+        static inference_mode get_inference_mode();
+        /*!
+            ensures
+                - Returns the current inference mode (default
+                  inference_mode::training, which corresponds to the legacy
+                  no-cache behavior).
+        !*/
+
+        static void set_kv_cache_capacity(long capacity);
+        /*!
+            requires
+                - capacity >= 0
+            ensures
+                - Stores the maximum number of positions each per-layer KV cache
+                  may hold. When the cache reaches this capacity in incremental
+                  mode, attention layers apply an automatic sliding-window shift
+                  (oldest position dropped, remaining shifted left, new position
+                  appended).
+                - A value of 0 means "no preset capacity"; the cache then grows
+                  on demand and the generation loop becomes responsible for
+                  managing its size (e.g. by re-prefilling).
+                - #get_kv_cache_capacity() == capacity
+                - #is_active()             == true
+        !*/
+
+        static long get_kv_cache_capacity();
+        /*!
+            ensures
+                - Returns the configured KV cache capacity, or 0 if never set.
+        !*/
+
+        static void request_kv_cache_clear();
+        /*!
+            ensures
+                - Sets an internal one-shot flag instructing every KV-cache-aware
+                  layer to discard its cached state on the next forward pass.
+                - The flag must be explicitly cleared via clear_kv_cache_request()
+                  by the generation loop once it has been consumed by all layers
+                  in a forward pass.
+                - #is_active() == true
+        !*/
+
+        static bool consume_kv_cache_clear_request();
+        /*!
+            ensures
+                - Returns the current value of the cache-clear flag.
+                - Does NOT clear the flag (so that every attention layer in the
+                  same forward pass observes the same value).
+        !*/
+
+        static void clear_kv_cache_request();
+        /*!
+            ensures
+                - Clears the cache-clear flag. The generation loop calls this
+                  after a forward pass that has consumed the request.
+        !*/
     };
 
-    // ------------------------------------------------------------------------------------
+    // ----------------------------------------------------------------------------------------
 
     template <typename T>
     long count_leading_padding(const matrix<T, 0, 1>& seq, T padding_token);
@@ -196,7 +350,7 @@ namespace dlib
             - Returns 0 if seq is empty or seq(0) != padding_token.
     !*/
 
-    // ------------------------------------------------------------------------------------
+    // ----------------------------------------------------------------------------------------
 
     template <long d_k_>
     class scale_weights_ : public multiply_
@@ -222,404 +376,617 @@ namespace dlib
     // ----------------------------------------------------------------------------------------
 
     template <long num_embeddings, long embedding_length, typename SUBNET>
-    using token_embeddings = some_template_expression;
+    using positional_embeddings = some_template_expression;
     /*!
         WHAT THIS OBJECT REPRESENTS
-            Converts discrete token IDs to continuous embedding vectors with positional
-            encoding.
+            Converts discrete token IDs to continuous embedding vectors with
+            additive positional encoding.
 
         ARCHITECTURE FLOW
-            1. Token embedding lookup: maps token IDs to dense vectors
-            2. Positional encoding: adds learnable position information
+            1. Token embedding lookup: maps token IDs to dense vectors of size
+               embedding_length.
+            2. Positional encoding: adds learnable position information.
 
         TEMPLATE PARAMETERS
-            - num_embeddings: vocabulary size (number of unique tokens)
-            - embedding_length: embedding dimension (typically d_model)
+            - num_embeddings:   vocabulary size (number of unique tokens).
+            - embedding_length: embedding dimension (typically d_model).
 
         INPUT/OUTPUT SHAPES
-            Input:  (batch_size, 1, seq_len, 1) - matrix of token IDs (long integers)
-            Output: (batch_size, 1, seq_len, embedding_length) - embedding vectors
+            Input:  (batch_size, 1, seq_len, 1)              - token IDs as longs.
+            Output: (batch_size, 1, seq_len, embedding_length) - embedding vectors.
 
         TYPICAL USAGE
             using my_model =
-                loss_multiclass_log<fc<vocab_size,
-                transformer_stack<6, gelu, dropout_10, seq_len, d_model, num_heads,
-                token_embeddings<vocab_size, d_model,
-                input<matrix<int, 0, 1>>>>>>;
+                classification_head<vocab_size,
+                transformer_stack<6, 256, 8, 2,
+                positional_embeddings<vocab_size, 256,
+                input<matrix<int, 0, 1>>>>>;
 
         NOTES
-            - Input tokens must be integers in range [0, num_embeddings)
-            - embedding_length should match d_model for transformer architectures
+            - Token IDs must be integers in range [0, num_embeddings).
+            - embedding_length should match d_model in the rest of the network.
     !*/
+
+    // ----------------------------------------------------------------------------------------
+
+    template <long EMBEDDING_DIM_, long NUM_HEADS_, long NUM_KV_HEADS_, long HEAD_DIM_>
+    class gqa_attention_
+    {
+        /*!
+            REQUIREMENTS ON TEMPLATE ARGUMENTS
+                - EMBEDDING_DIM_  > 0
+                - NUM_HEADS_      > 0 and EMBEDDING_DIM_ % NUM_HEADS_ == 0
+                - NUM_KV_HEADS_   > 0 and NUM_HEADS_ % NUM_KV_HEADS_ == 0
+                - HEAD_DIM_       == EMBEDDING_DIM_ / NUM_HEADS_
+                - HEAD_DIM_       even (RoPE rotates pairs of components)
+
+            WHAT THIS OBJECT REPRESENTS
+                Fused Grouped-Query Attention layer with built-in RoPE, causal
+                mask, and KV cache. Consolidates into a single Dlib layer what
+                the gqa_transformer chained namespace builds from ~16 separate
+                elementary layers.
+
+                The layer performs, in order:
+                  1. Linear projections W_Q, W_K, W_V (with Q pre-scaled by
+                     1/sqrt(HEAD_DIM)).
+                  2. Transposition into the canonical multi-head 4D layout
+                     [B, NUM_HEADS,    N, HEAD_DIM] for Q
+                     [B, NUM_KV_HEADS, N, HEAD_DIM] for K and V.
+                  3. Rotary Positional Embedding on Q and K.
+                  4. GQA repeat of K/V from NUM_KV_HEADS to NUM_HEADS.
+                  5. Scaled dot-product scores = Q @ K^T (Q already pre-scaled).
+                  6. Causal mask via embedded tril_<0, neg_infinity_tag>.
+                  7. Softmax over the last dimension.
+                  8. ctx = attn @ V.
+                  9. Merge heads back to [B, 1, N, EMBEDDING_DIM].
+                 10. Final linear projection W_O.
+
+                Three inference modes are dispatched at runtime through
+                network_context::get_inference_mode() (read at the start of
+                each forward call):
+
+                  - training / full : standard forward (full path), no cache
+                    interaction. backward() is well-defined only after a
+                    forward in one of these two modes.
+
+                  - prefill : same compute as full, plus the side-effect of
+                    populating K_cache and V_cache with the K and V of the
+                    effective (non-padded) prompt positions. The cache stores
+                    K *before* RoPE is applied; RoPE is reapplied at every
+                    subsequent attention computation. This makes sliding-window
+                    shifts trivially consistent and keeps RoPE positions inside
+                    [0, max_seq_len_train).
+
+                  - incremental : single-token forward (x.nr() == 1).
+                    Projects the new Q/K/V; if the cache is full, applies a
+                    sliding-window shift one position to the left to free a
+                    slot at the end; appends the new K_pre_rope and V to the
+                    cache; reads back the K/V window; applies RoPE to the
+                    K window with positions [0, L-1] and to Q with position
+                    L-1; performs the GQA repeat, attention and W_O
+                    projection. Currently restricted to batch size 1.
+
+                Numerical equivalence: in incremental mode, the output at
+                output[0,0,0,:] matches (within floating-point rounding) what
+                forward_full would produce at output[0,0,N-1,:] when invoked
+                with the equivalent length-N prompt, provided positions are
+                consistent.
+
+                The parameter tensor stores W_Q, W_K, W_V and W_O contiguously
+                in a single resizable_tensor, with alias_tensor views over
+                each sub-matrix. The KV cache state is run-time only and is
+                NOT serialized.
+
+            EXPORTED CONSTANTS
+                - EMBEDDING_DIM   == EMBEDDING_DIM_
+                - NUM_HEADS       == NUM_HEADS_
+                - NUM_KV_HEADS    == NUM_KV_HEADS_
+                - HEAD_DIM        == HEAD_DIM_
+                - REPEAT_FACTOR   == NUM_HEADS / NUM_KV_HEADS
+                - KV_PROJ_DIM     == NUM_KV_HEADS * HEAD_DIM
+        !*/
+
+    public:
+
+        gqa_attention_();
+        /*!
+            ensures
+                - #get_learning_rate_multiplier() == 1
+                - #get_weight_decay_multiplier()  == 1
+                - The KV cache is empty (filled_len == 0, capacity == 0).
+        !*/
+
+        double get_learning_rate_multiplier() const;
+        double get_weight_decay_multiplier() const;
+        void set_learning_rate_multiplier(double v);
+        void set_weight_decay_multiplier(double v);
+
+        void set_yarn_params(float alpha, float beta,
+            long original_len = 0, bool enabled = true);
+        /*!
+            ensures
+                - Forwards the YaRN parameters to the two embedded RoPE helpers
+                  (one for Q, one for K). See rotary_positional_embedding_
+                  for the meaning of alpha/beta/original_len/enabled.
+        !*/
+
+        const yarn_config& get_yarn_config() const;
+        /*!
+            ensures
+                - Returns the YaRN configuration currently held by the embedded
+                  RoPE helpers (Q and K share the same configuration).
+        !*/
+
+        void reset_kv_cache();
+        /*!
+            ensures
+                - Marks the KV cache as logically empty (cache_filled_len_ == 0).
+                  The underlying storage is preserved and will be reused on the
+                  next prefill / incremental forward.
+        !*/
+
+        long get_kv_cache_filled_len() const;
+        /*!
+            ensures
+                - Returns the number of valid positions currently held in the
+                  KV cache (0 if the cache has never been written or has been
+                  reset).
+        !*/
+
+        long get_kv_cache_capacity() const;
+        /*!
+            ensures
+                - Returns the allocated capacity of the KV cache. 0 if the cache
+                  has not been allocated yet.
+        !*/
+
+        template <typename SUBNET>
+        void setup(const SUBNET& sub);
+        /*!
+            requires
+                - sub.get_output().k()  == 1
+                - sub.get_output().nc() == EMBEDDING_DIM
+            ensures
+                - Allocates and randomly initializes the four weight matrices
+                  W_Q, W_K, W_V, W_O (each with Glorot scaling derived from its
+                  own row+column count), packed contiguously in the layer's
+                  parameter tensor.
+                - Probes the embedded RoPE helpers with q_probe and k_probe of
+                  the input's sequence length so their trigonometric caches are
+                  pre-allocated.
+        !*/
+
+        template <typename SUBNET>
+        void forward(const SUBNET& sub, resizable_tensor& output);
+        /*!
+            requires
+                - sub.get_output().k()  == 1
+                - sub.get_output().nc() == EMBEDDING_DIM
+            ensures
+                - Reads the active inference mode from network_context and
+                  observes the cache-clear flag (resetting the cache if set).
+                - If the active mode is incremental and the input is a single
+                  position with a non-empty cache, runs the incremental path.
+                  Otherwise runs the full path; if the active mode is prefill,
+                  the full path additionally writes K_pre_rope and V to the
+                  cache for the effective (non-padded) positions.
+                - #output is the attention output with the same outer shape
+                  as the input ([B, 1, N, EMBEDDING_DIM]); in incremental mode
+                  it is [1, 1, 1, EMBEDDING_DIM].
+        !*/
+
+        template <typename SUBNET>
+        void backward(const tensor& gradient_input, SUBNET& sub, tensor& params_grad);
+        /*!
+            requires
+                - The most recent forward() call ran the full path
+                  (training, full, or prefill mode), not the incremental path.
+                - gradient_input has the same shape as that forward()'s output.
+            ensures
+                - Accumulates the gradient with respect to the layer parameters
+                  into params_grad (in the same packed layout as get_layer_params()).
+                - Accumulates the gradient with respect to the input into
+                  sub.get_gradient_input().
+        !*/
+
+        const tensor& get_layer_params() const;
+        tensor& get_layer_params();
+        /*!
+            ensures
+                - Returns the packed parameter tensor (W_Q, W_K, W_V, W_O laid
+                  out contiguously). Use the alias views internally maintained
+                  by the layer for partial access.
+        !*/
+
+        friend void serialize(const gqa_attention_& item, std::ostream& out);
+        friend void deserialize(gqa_attention_& item, std::istream& in);
+        /*!
+            ensures
+                - Serializes / deserializes the parameter tensor, the learning
+                  rate and weight decay multipliers, and the embedded RoPE and
+                  tril helpers.
+                - Does NOT serialize the KV cache state; on deserialize the
+                  cache is reset (empty, no allocation).
+                - Version tag: "gqa_attention_".
+            throws
+                - serialization_error if the version tag does not match.
+        !*/
+
+        friend std::ostream& operator<<(std::ostream& out, const gqa_attention_& item);
+        friend void to_xml(const gqa_attention_& item, std::ostream& out);
+    };
+
+    template <long EMBEDDING_DIM, long NUM_HEADS, long NUM_KV_HEADS, long HEAD_DIM, typename SUBNET>
+    using gqa_attention = add_layer<
+        gqa_attention_<EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM>, SUBNET>;
+
+    // ----------------------------------------------------------------------------------------
+
+    namespace gqa_transformer
+    {
+        /*!
+            WHAT THIS NAMESPACE REPRESENTS
+                Grouped-Query Attention (GQA) transformer assembled from a chain
+                of elementary Dlib layers. This is the historical reference
+                implementation: K and V projections produce NUM_KV_HEADS heads
+                (with NUM_KV_HEADS <= NUM_HEADS), then repeat_heads expands them
+                to NUM_HEADS so the attention computation can proceed as in a
+                standard multi-head attention.
+
+                RoPE is applied on Q and K after their projections, scaled
+                dot-product attention is performed with a causal mask, and the
+                concatenated heads are projected back to d_model.
+
+                The transformer_block places the attention sublayer and an ACT
+                steps sublayer (with SwiGLU transition) inside two pre-norm
+                residual paths (rms_norm on each input).
+
+            NOTE: this namespace is re-aliased at the end of transformer.h via
+            `using namespace gqa_transformer;` so that its symbols are also
+            available unqualified as the default GQA implementation.
+        !*/
+
+        template <long d_model, long num_heads, typename SUBNET>
+        using query = some_template_expression;
+        /*!
+            requires
+                - d_model % num_heads == 0
+            ensures
+                - Linear_no_bias projection to d_model followed by reshape into
+                  (num_heads, -1, d_model / num_heads).
+        !*/
+
+        template <long num_kv_heads, long head_dim, typename SUBNET>
+        using key = some_template_expression;
+        /*!
+            ensures
+                - Linear_no_bias projection to num_kv_heads * head_dim, then
+                  reshape into (num_kv_heads, -1, head_dim).
+        !*/
+
+        template <long num_kv_heads, long head_dim, typename SUBNET>
+        using value = some_template_expression;
+        /*!
+            ensures
+                - Linear_no_bias projection to num_kv_heads * head_dim, then
+                  reshape into (num_kv_heads, -1, head_dim).
+        !*/
+
+        template <long d_model, long num_heads, long num_kv_heads, typename SUBNET>
+        using multihead_attention_gqa = some_template_expression;
+        /*!
+            requires
+                - num_heads    % num_kv_heads == 0
+                - d_model      % num_heads    == 0
+            ensures
+                - Builds the full GQA attention sub-graph as a chain of Dlib
+                  layers: Q/K/V projections (with K and V using only num_kv_heads
+                  heads), RoPE on Q and K, repeat_heads to match the Q head
+                  count, scale_weights, multm_prev for the scores, tril_mask,
+                  softmaxm, multm_prev for the context, reshape, and final
+                  linear_no_bias projection to d_model.
+        !*/
+
+        template <long d_model, long num_heads, long num_kv_heads, typename SUBNET>
+        using transformer_block = some_template_expression;
+        /*!
+            ensures
+                - Pre-norm transformer block: rms_norm -> attention -> residual,
+                  then rms_norm -> act_steps<swiglu, 4> -> residual.
+        !*/
+
+        template<long num_layers, long d_model, long num_heads, long num_kv_heads,
+            typename SUBNET>
+        using transformer_stack = some_template_expression;
+        /*!
+            ensures
+                - Stacks num_layers transformer_block units, with a tag10<>
+                  sentinel at the bottom of the stack for external addressing.
+        !*/
+
+    } // namespace gqa_transformer
+
+    // ----------------------------------------------------------------------------------------
+
+    namespace gqa_transformer_unified
+    {
+        /*!
+            WHAT THIS NAMESPACE REPRESENTS
+                Same transformer topology as gqa_transformer, but the attention
+                sublayer is the single fused gqa_attention_ layer rather than a
+                chain of ~16 elementary layers. The residual connections, the
+                RMSNorms and the act_steps<swiglu> feed-forward are unchanged.
+
+                Beyond the structural compaction, the fused attention also
+                supports prefill / incremental inference modes with a built-in
+                KV cache: a generation loop can call set_inference_mode(prefill)
+                once on the prompt, then set_inference_mode(incremental) for
+                each new token, with the layer handling cache lookup, RoPE
+                application, GQA repeat and sliding window internally.
+
+                External code that referenced gqa_transformer::transformer_stack
+                or its tag10<> sentinel can switch to this namespace without
+                further changes to the surrounding topology.
+        !*/
+
+        template<long d_model, long num_heads, long num_kv_heads, typename SUBNET>
+        using multihead_attention_gqa = some_template_expression;
+        /*!
+            ensures
+                - Alias for gqa_attention<d_model, num_heads, num_kv_heads,
+                  d_model / num_heads, SUBNET>.
+        !*/
+
+        template<long d_model, long num_heads, long num_kv_heads, typename SUBNET>
+        using transformer_block = some_template_expression;
+        /*!
+            ensures
+                - Same residual topology as gqa_transformer::transformer_block
+                  but with the fused attention sublayer.
+        !*/
+
+        template<long num_layers, long d_model, long num_heads, long num_kv_heads,
+            typename SUBNET>
+        using transformer_stack = some_template_expression;
+        /*!
+            ensures
+                - Stacks num_layers fused-attention transformer_block units with
+                  a tag10<> sentinel at the bottom of the stack.
+        !*/
+
+    } // namespace gqa_transformer_unified
+
+    // ----------------------------------------------------------------------------------------
 
     namespace canonical_transformer
     {
         /*!
-            WHAT THIS REPRESENTS
-                Standard transformer implementation with separate Q, K, V projections.
-
-                This architecture uses three independent linear transformations followed
-                by reshape operations to create the multi-head attention structure.
+            WHAT THIS NAMESPACE REPRESENTS
+                Standard multi-head attention transformer (no GQA), implemented
+                with separate Q, K, V projections via linear_no_bias followed by
+                explicit reshape operations. This is the most modular variant.
 
                 Advantages:
-                - Conceptually clearer and more modular
-                - Easier to debug and understand
-                - Each projection can be independently modified or analyzed
+                - Conceptually clearer and easier to debug.
+                - Each projection can be independently inspected or modified.
 
                 Use cases:
-                - When fine-grained control over each projection is needed
-                - Prototyping new attention mechanisms
+                - Prototyping new attention mechanisms.
+                - Fine-grained control over each projection.
+
+                Tensors keep the embedding dimension on nc() throughout the
+                pipeline (linear-style layout).
         !*/
 
-        template <long seq_len, long d_model, long num_heads, typename SUBNET>
+        template <long d_model, long num_heads, typename SUBNET>
         using query = some_template_expression;
         /*!
             requires
                 - d_model % num_heads == 0
             ensures
-                - Creates Query projection for multi-head attention
-                - Output shape: (batch, num_heads, seq_len, d_model/num_heads)
+                - linear_no_bias projection to d_model followed by reshape into
+                  (num_heads, -1, d_model / num_heads).
         !*/
 
-        template <long seq_len, long d_model, long num_heads, typename SUBNET>
+        template <long d_model, long num_heads, typename SUBNET>
         using key = some_template_expression;
         /*!
             requires
                 - d_model % num_heads == 0
             ensures
-                - Creates Key projection for multi-head attention
-                - Output shape: (batch, num_heads, seq_len, d_model/num_heads)
+                - linear_no_bias projection to d_model followed by reshape into
+                  (num_heads, -1, d_model / num_heads).
         !*/
 
-        template <long seq_len, long d_model, long num_heads, typename SUBNET>
+        template <long d_model, long num_heads, typename SUBNET>
         using value = some_template_expression;
         /*!
             requires
                 - d_model % num_heads == 0
             ensures
-                - Creates Value projection for multi-head attention
-                - Output shape: (batch, num_heads, seq_len, d_model/num_heads)
+                - linear_no_bias projection to d_model followed by reshape into
+                  (num_heads, -1, d_model / num_heads).
         !*/
 
-        template <template <typename> class ACT, template <typename> class DO,
-            long seq_len, long d_model, long num_heads, typename SUBNET>
+        template <template <typename> class DO,
+            long d_model, long num_heads, typename SUBNET>
         using multihead_attention = some_template_expression;
         /*!
             WHAT THIS REPRESENTS
-                This template implements a complete multi-head self-attention mechanism with
-                causal masking, rotary positional embeddings (RoPE), and post-attention
-                normalization.
+                Complete multi-head self-attention sub-graph with causal masking
+                and Rotary Positional Embedding on Q and K.
 
-                The attention mechanism computes:
-                    Attention(Q, K, V) = softmax((Q*K^T) / sqrt(d_k)) * V
-
-                Where Q, K, V are the Query, Key, and Value projections respectively.
+                Computes Attention(Q, K, V) = softmax((Q*K^T) / sqrt(d_head)) * V
+                with a causal mask, then linearly projects the concatenated heads
+                back to d_model.
 
             ARCHITECTURE FLOW
-                1. RMS normalization
-                2. Input is split into Query, Key, and Value projections
-                3. RoPE is applied to Query and Key for positional encoding
-                4. Scaled dot-product attention: Q*K^T / sqrt(d_head)
-                5. Causal masking (tril_mask) prevents attending to future positions
-                6. Softmax normalization across the sequence dimension
-                7. Attention weights multiply Values: softmax(scores)*V
-                8. Reshape and project back to d_model dimension
-                9. Residual connection with input                
+                1. Q, K, V projections (each into num_heads heads of size
+                   d_model / num_heads).
+                2. RoPE applied to Q and K.
+                3. Scaled dot-product scores: Q @ K^T / sqrt(d_head).
+                4. Causal mask via tril_mask.
+                5. softmaxm over the last dimension.
+                6. Multiplication by V.
+                7. Reshape to (1, -1, d_model) and linear_no_bias projection
+                   to d_model.
+                8. Dropout policy DO applied to the result.
 
             TEMPLATE PARAMETERS
-                - ACT: activation function template (e.g., silu, gelu, relu)
-                - DO: dropout policy template (e.g., dropout_10, multiply for inference)
-                - seq_len: maximum sequence length (context window size)
-                - d_model: model dimension (must be divisible by num_heads)
-                - num_heads: number of parallel attention heads
-
-            INPUT/OUTPUT SHAPES
-                Input:  (batch_size, 1, seq_len, d_model)
-                Output: (batch_size, 1, seq_len, d_model)
-
-            NOTES
-                - Uses causal masking (tril_mask) for autoregressive generation
-                - RoPE is applied to both Query and Key for relative position encoding
-                - The d_head per head is d_model / num_heads
-                - Attention scores are scaled by 1/sqrt(d_head) for stability
-        !*/
-
-        template <template <typename> class ACT, template <typename> class DO,
-            long d_model, typename SUBNET>
-        using std_ffn = some_template_expression;
-        /*!
-            WHAT THIS REPRESENTS
-                Standard position-wise feed-forward network used in transformer blocks.
-                Implements a two-layer MLP with one intermediate activation and dropout
-                regularization.
-
-            ARCHITECTURE FLOW
-                1. Linear expansion: d_model => 4*d_model
-                2. Activation function (ACT)
-                3. Linear projection: 4*d_model => d_model
-                4. Dropout (DO) for regularization
-
-            TEMPLATE PARAMETERS
-                - ACT: activation function template (e.g., gelu, silu, relu)
-                - DO: dropout policy template (dropout_10 in training, multiply in inference)
-                - d_model: model dimension (input and output size)
-
-            INPUT/OUTPUT SHAPES
-                Input:  (batch_size, 1, seq_len, d_model)
-                Output: (batch_size, 1, seq_len, d_model)
-
-            NOTES
-                - Expansion factor is fixed at 4x (standard transformer practice)
-                - Single dropout applied after final projection
-                - No normalization inside FFN (handled by transformer_block)
-        !*/
-
-        template <template <typename> class ACT, template <typename> class DO,
-            long d_model, typename SUBNET>
-        using swiglu = some_template_expression;
-        /*!
-            WHAT THIS REPRESENTS
-                SwiGLU (Swish-Gated Linear Unit) feed-forward network, an alternative to
-                standard FFN with improved performance on language modeling tasks.
-
-            REFERENCE
-                Noam Shazeer, "GLU Variants Improve Transformer" (https://arxiv.org/abs/2002.05202)
-
-            ARCHITECTURE FLOW
-                1. Split into two branches from input:
-                   - Gate branch: W1 projection => ACT activation
-                   - Linear branch: V projection
-                2. Element-wise multiplication of branches (Hadamard product)
-                3. Final projection: W2 => d_model
-                4. Dropout for regularization
-
-            TEMPLATE PARAMETERS
-                - ACT: activation function template (typically silu for true SwiGLU)
-                - DO: dropout policy template (dropout_10 in training, multiply in inference)
-                - d_model: model dimension (input and output size)
-
-            INPUT/OUTPUT SHAPES
-                Input:  (batch_size, 1, seq_len, d_model)
-                Output: (batch_size, 1, seq_len, d_model)
-
-            NOTES
-                - Uses (8*d_model)/3 for hidden dimension (equivalent parameters to 4x expansion)
-                - More expressive than standard FFN due to gating mechanism
-                - Single dropout applied after final projection
-                - ACT is typically silu (Swish) for standard SwiGLU
-        !*/
-
-        template <template <typename> class ACT, template <typename> class DO,
-            long seq_len, long d_model, long num_heads, typename SUBNET>
-        using transformer_block = some_template_expression;
-        /*!
-            WHAT THIS REPRESENTS
-                A complete transformer decoder block combining multi-head self-attention and
-                feed-forward network with residual connections and RMS normalization.
-
-            ARCHITECTURE FLOW
-                Input => MultiHeadAttention => FFN => Output
-                Each sub-layer uses the pattern: RMSNorm(input + SubLayer(input))
-
-            TEMPLATE PARAMETERS
-                - ACT: activation function template (e.g., silu, gelu, relu)
-                - DO: dropout policy template (e.g., dropout_10, multiply for inference)
-                - seq_len: maximum sequence length (context window size)
-                - d_model: model dimension (must be divisible by num_heads)
-                - num_heads: number of parallel attention heads
-
-            INPUT/OUTPUT SHAPES
-                Input:  (batch_size, 1, seq_len, d_model)
-                Output: (batch_size, 1, seq_len, d_model)
-
-            NOTES
-                - Decoder-only architecture with causal masking
-                - Uses RMS normalization for improved training stability
-                - Cannot be used directly with repeat<> due to multiple template parameters
-                  (use transformer_stack<> instead for stacking multiple blocks)
-        !*/
-
-        template<long num_layers, template <typename> class ACT, template <typename> class DO,
-            long seq_len, long d_model, long num_heads, typename SUBNET>
-        using transformer_stack = some_template_expression;
-        /*!
-            WHAT THIS REPRESENTS
-                Stacks multiple transformer blocks using compile-time recursion.
-
-            TEMPLATE PARAMETERS
-                - num_layers: number of transformer blocks to stack (model depth)
-                - ACT: activation function template
-                - DO: dropout policy template
-                - seq_len: maximum sequence length
-                - d_model: model dimension
-                - num_heads: number of attention heads
-
-            TYPICAL USAGE
-                Create a 6-layer transformer:
-
-                using my_model =
-					loss_multiclass_log<fc<vocab_size, rms_norm<
-                    transformer_stack<6, silu, dropout_10, 512, 256, 8,
-                    token_embeddings<vocab_size, 256,
-                    input<matrix<int, 0, 1>>>>>>>;
-
-            NOTES
-                - Each layer has independent trainable parameters
-                - Equivalent to manually nesting num_layers transformer_block definitions
-        !*/
-
-    } // namespace std_transformer
-
-    namespace fused_transformer
-    {
-
-        /*!
-            WHAT THIS REPRESENTS
-                Optimized transformer implementation with fused QKV projections,
-                sometimes referred to as "kernel-fused" attention in the literature
-
-                This architecture uses a single fc_no_bias layer to compute all Q, K, V
-                projections simultaneously (dimension: d_model => 3*d_model), then uses
-                extract layers to separate them. This approach leverages Dlib's fc_ layer
-                optimizations and reduces memory access patterns.
-
-                Advantages:
-                - Single matrix multiplication instead of three
-                - Reduced memory bandwidth requirements
-                - Better GPU utilization through larger operations
-
-                Performance considerations:
-                - Typically 10-30% faster than standard implementation
-                - Lower memory footprint during forward/backward passes
-                - Better cache utilization
-        !*/
-
-        template <long num_heads, long d_model, typename SUBNET>
-        using query = some_template_expression;
-        /*!
-            requires
-                - d_model % num_heads == 0
-            ensures
-                - Extracts Query projection from fused QKV output
-                - Uses extract layer for efficient separation
-                - Output shape: (batch, num_heads, d_model/num_heads, 1)
-        !*/
-
-        template <long num_heads, long d_model, typename SUBNET>
-        using key = some_template_expression;
-        /*!
-            requires
-                - d_model % num_heads == 0
-            ensures
-                - Extracts Key projection from fused QKV output
-                - Uses extract layer for efficient separation
-                - Output shape: (batch, num_heads, 1, d_model/num_heads)
-        !*/
-
-        template <long num_heads, long d_model, typename SUBNET>
-        using value = some_template_expression;
-        /*!
-            requires
-                - d_model % num_heads == 0
-            ensures
-                - Extracts Value projection from fused QKV output
-                - Uses extract layer for efficient separation
-                - Output shape: (batch, num_heads, d_model/num_heads, 1)
+                - DO        : dropout policy (e.g. dropout_10 in training,
+                              multiply in inference).
+                - d_model   : model dimension (divisible by num_heads).
+                - num_heads : number of attention heads.
         !*/
 
         template <template <typename> class ACT, template <typename> class DO,
             long d_model, long num_heads, typename SUBNET>
-        using multihead_attention = some_template_expression;
-        /*!
-            WHAT THIS OBJECT REPRESENTS
-                Optimized multi-head self-attention using fused QKV projection.
-                Functionally equivalent to canonical version but with better performance.
-
-            ARCHITECTURE FLOW
-                1. RMS normalization
-                2. Single fused projection: d_model => 3*d_model for Q, K, V
-                3. Extract Q, K, V from combined output
-                4. Compute attention with causal masking
-                5. Concatenate heads and project
-                6. Residual connection and normalization
-
-            TEMPLATE PARAMETERS
-                - ACT: activation function (for compatibility)
-                - DO: dropout policy
-                - d_model: model dimension
-                - num_heads: number of attention heads
-        !*/
-
-        template <template <typename> class ACT, template <typename> class DO,
-            long d_model, typename SUBNET>
-        using std_ffn = some_template_expression;
-        /*!
-            WHAT THIS REPRESENTS
-                Fused implementation of standard feed-forward network using fc layers with
-                automatic dimension flattening for better BLAS/GEMM utilization.
-
-            ARCHITECTURE FLOW
-                1. fc layer: d_model => 4*d_model (with dimension flattening)
-                2. Activation function (ACT)
-                3. fc layer: 4*d_model => d_model
-                4. Dropout (DO)
-                5. extract operation to restore proper tensor dimensions
-
-            TEMPLATE PARAMETERS
-                - ACT: activation function template (e.g., gelu, silu, relu)
-                - DO: dropout policy template (dropout_10 in training, multiply in inference)
-                - d_model: model dimension (input and output size)
-
-            INPUT/OUTPUT SHAPES
-                Input:  (batch_size, 1, seq_len, d_model)
-                Output: (batch_size, 1, seq_len, d_model)
-        !*/
-
-        template <template <typename> class ACT, template <typename> class DO,
-            long d_model, typename SUBNET>
-        using swiglu = some_template_expression;
-        /*!
-            WHAT THIS REPRESENTS
-                Fused implementation of SwiGLU using fc layers with automatic dimension
-                flattening for better BLAS/GEMM utilization.
-
-            REFERENCE
-                Noam Shazeer, "GLU Variants Improve Transformer" (https://arxiv.org/abs/2002.05202)
-
-            ARCHITECTURE FLOW
-                1. fc projections with dimension flattening
-                2. Split into gate and linear branches
-                3. Element-wise multiplication
-                4. Final fc projection with extraction
-                5. Dropout for regularization
-
-            TEMPLATE PARAMETERS
-                - ACT: activation function template (typically silu)
-                - DO: dropout policy template
-                - d_model: model dimension
-
-            INPUT/OUTPUT SHAPES
-                Input:  (batch_size, 1, seq_len, d_model)
-                Output: (batch_size, 1, seq_len, d_model)
-        !*/
-
-        template <template <typename> class ACT, template <typename> class DO,
-            long seq_len, long d_model, long num_heads, typename SUBNET>
         using transformer_block = some_template_expression;
         /*!
-            Same interface as canonical_transformer::transformer_block but with
-            optimized implementation using fused operations.
+            WHAT THIS REPRESENTS
+                Pre-norm transformer block: rms_norm -> multihead_attention
+                -> residual, then rms_norm -> ffn<ACT, d_model, 4> -> residual.
+
+                The feed-forward expansion factor is 4 (standard practice).
+
+            TEMPLATE PARAMETERS
+                - ACT       : activation function template (e.g. gelu, silu).
+                - DO        : dropout policy template.
+                - d_model   : model dimension.
+                - num_heads : number of attention heads.
+
+            INPUT/OUTPUT SHAPES
+                Input:  (batch_size, 1, seq_len, d_model)
+                Output: (batch_size, 1, seq_len, d_model)
         !*/
 
         template<long num_layers, template <typename> class ACT, template <typename> class DO,
-            long seq_len, long d_model, long num_heads, typename SUBNET>
+            long d_model, long num_heads, typename SUBNET>
         using transformer_stack = some_template_expression;
         /*!
-            Same interface as canonical_transformer::transformer_stack but with
-            optimized implementation using fused operations.
+            ensures
+                - Stacks num_layers transformer_block units, with a tag10<>
+                  sentinel at the bottom of the stack.
+
+            TYPICAL USAGE
+                using my_model =
+                    classification_head<vocab_size,
+                    canonical_transformer::transformer_stack<6, gelu, dropout_10, 256, 8,
+                    embeddings<vocab_size, 256,
+                    input<matrix<int, 0, 1>>>>>;
+        !*/
+
+    } // namespace canonical_transformer
+
+    // ----------------------------------------------------------------------------------------
+
+    namespace fused_transformer
+    {
+        /*!
+            WHAT THIS NAMESPACE REPRESENTS
+                Performance-optimized transformer variant: Q, K and V are
+                computed by a single fc_no_bias projection of width 3*d_model,
+                then separated through extract operations. The same fc_no_bias
+                pattern is used in the feed-forward sublayer.
+
+                Advantages:
+                - One large GEMM instead of three smaller ones for QKV.
+                - Better GPU utilization through larger matrix operations.
+                - Reduced memory bandwidth requirements.
+
+                Tensors in this namespace carry the embedding dimension on k()
+                (fc-style layout), which is why the embedded rms_norm auto-
+                detects the embedding axis to remain consistent.
+        !*/
+
+        template <long num_heads, long d_model, typename SUBNET>
+        using query = some_template_expression;
+        /*!
+            requires
+                - d_model % num_heads == 0
+            ensures
+                - extract<0, num_heads, d_model/num_heads, 1, SUBNET> applied to
+                  the fused QKV projection: pulls out the Q block.
+        !*/
+
+        template <long num_heads, long d_model, typename SUBNET>
+        using key = some_template_expression;
+        /*!
+            requires
+                - d_model % num_heads == 0
+            ensures
+                - extract<d_model, num_heads, 1, d_model/num_heads, SUBNET>:
+                  pulls out the K block from the fused QKV projection in a
+                  transposed shape ready for the Q @ K^T multiplication.
+        !*/
+
+        template <long num_heads, long d_model, typename SUBNET>
+        using value = some_template_expression;
+        /*!
+            requires
+                - d_model % num_heads == 0
+            ensures
+                - extract<2*d_model, num_heads, d_model/num_heads, 1, SUBNET>:
+                  pulls out the V block from the fused QKV projection.
+        !*/
+
+        template <template <typename> class DO,
+            long d_model, long num_heads, typename SUBNET>
+        using multihead_attention = some_template_expression;
+        /*!
+            WHAT THIS REPRESENTS
+                Fused-QKV multi-head self-attention. Functionally equivalent to
+                canonical_transformer::multihead_attention but built around a
+                single fc_no_bias<d_model*3> projection.
+
+            ARCHITECTURE FLOW
+                1. fc_no_bias to d_model*3 (fused QKV).
+                2. extract Q, K, V.
+                3. Scaled dot-product scores Q @ K^T (no explicit RoPE in this
+                   variant; positional information comes through learnable
+                   positional_embeddings upstream).
+                4. tril_mask + softmaxm.
+                5. Multiplication by V, reshape to (1, -1, d_model).
+                6. fc_no_bias output projection followed by extract and dropout
+                   policy DO.
+        !*/
+
+        template <template <typename> class ACT, template <typename> class DO,
+            long d_model, typename SUBNET>
+        using fused_ffn = some_template_expression;
+        /*!
+            ensures
+                - Feed-forward built from fc<d_model*4> -> ACT -> fc<d_model>
+                  -> DO, with an extract<0, 1, 1, d_model> at the front so the
+                  fc layers see the expected layout.
+        !*/
+
+        template <template <typename> class ACT, template <typename> class DO,
+            long d_model, long num_heads, typename SUBNET>
+        using transformer_block = some_template_expression;
+        /*!
+            ensures
+                - Pre-norm transformer block, same residual topology as the
+                  canonical variant, with the fused attention and fused_ffn
+                  sublayers.
+        !*/
+
+        template<long num_layers, template <typename> class ACT, template <typename> class DO,
+            long d_model, long num_heads, typename SUBNET>
+        using transformer_stack = some_template_expression;
+        /*!
+            ensures
+                - Stacks num_layers fused-attention transformer_block units with
+                  a tag10<> sentinel at the bottom of the stack.
         !*/
 
     } // namespace fused_transformer
+
+    // The chained GQA namespace is re-exported as the default GQA
+    // implementation at the end of transformer.h:
+    //   using namespace gqa_transformer;
+    // so that gqa_transformer::transformer_stack and friends are also
+    // available unqualified.
 
     // ----------------------------------------------------------------------------------------
 
@@ -904,7 +1271,7 @@ namespace dlib
 
     // ----------------------------------------------------------------------------------------
 
-// Tags for compile-time mode selection in MoE layers
+    // Tags for compile-time mode selection in MoE layers
     struct training_mode_tag {};
     struct inference_mode_tag {};
 
@@ -1094,14 +1461,8 @@ namespace dlib
                 - gradient_input has same dimensions as the forward() output
             ensures
                 - Phase 1: batched backward through each active expert
-                    * Gathers gradient weighted by routing weight w
-                    * Calls back_propagate_error on each expert's cached input
-                    * Scatters expert data gradient to sub.get_gradient_input()
-                    * Computes task scores: dot(expert_out, task_grad) / sqrt(dim)
-                - Phase 2 (if training and learning_rate_multiplier > 0):
-                    * Computes gate gradient from task + load-balance + z-loss
-                    * Clamps gate gradient to [-1, +1]
-                    * Calls gate_net.back_propagate_error (parameter update only,
+                - Phase 2: backward through gate net (with task gradient,
+                      load balance gradient and z-loss gradient combined;
                       gate data gradient NOT propagated to main network)
                 - Phase 3 (if training):
                     * Calls update_subnet_parameters() to update active experts
@@ -1285,6 +1646,7 @@ namespace dlib
     >
     using moe = add_layer<
         moe_<EXPERT_NET, GATE_NET, n_experts_, top_e, MODE>, SUBNET>;
+
 }
 
-#endif // DLIB_DNN_TRANSFORMER_H_
+#endif // DLIB_DNN_TRANSFORMER_ABSTRACT_H_
