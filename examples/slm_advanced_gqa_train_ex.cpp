@@ -208,7 +208,7 @@ int main(int argc, char** argv)
         const long num_heads = 6;
         const long num_kv_heads = 2;
         const long embedding_dim = 228;
-        const long max_seq_len = 300;
+        const long max_seq_len = 200;
 
         // Define transformer configuration
         using my_transformer = gqa_transformer_config<

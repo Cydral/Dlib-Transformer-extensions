@@ -907,11 +907,11 @@ int main(int argc, char** argv)
         parser.add_option("arch", "Network architecture: moe | hrm (default: moe)", 1);
         parser.add_option("learning-rate", "Set the learning rate (default: 2e-4)", 1);
         parser.add_option("batch-size", "Set the mini-batch size (default: 128)", 1);
-        parser.add_option("patience", "Steps without progress before LR reduction (default: 6000)", 1);
+        parser.add_option("patience", "Steps without progress before LR reduction (default: 8000)", 1);
         parser.add_option("max-epochs", "Maximum number of training epochs (default: 500)", 1);
         parser.add_option("weight-decay", "AdamW weight decay (default: 0.004)", 1);
         parser.add_option("beta1", "AdamW beta1 coefficient (default: 0.9)", 1);
-        parser.add_option("beta2", "AdamW beta2 coefficient (default: 0.98)", 1);
+        parser.add_option("beta2", "AdamW beta2 coefficient (default: 0.998)", 1);
         parser.add_option("model-file", "Override model file path (default: auto-named by arch)", 1);
         parser.add_option("tokenizer-file", "Path for tokenizer (default: dlib_lm_tokenizer.vocab)", 1);
         parser.add_option("external-data", "Path to external text data for training", 1);
@@ -936,11 +936,11 @@ int main(int argc, char** argv)
 
         const double learning_rate = get_option(parser, "learning-rate", 2e-4);
         const size_t batch_size = get_option(parser, "batch-size", 128);
-        const long patience = get_option(parser, "patience", 6000);
+        const long patience = get_option(parser, "patience", 8000);
         const size_t max_epochs = get_option(parser, "max-epochs", 500);
         const double weight_decay = get_option(parser, "weight-decay", 0.004);
         const double beta1 = get_option(parser, "beta1", 0.9);
-        const double beta2 = get_option(parser, "beta2", 0.98);
+        const double beta2 = get_option(parser, "beta2", 0.998);
         const std::string tokenizer_file = get_option(parser, "tokenizer-file", "dlib_lm_tokenizer.vocab");
 
         const std::string model_file = parser.option("model-file")
@@ -948,13 +948,12 @@ int main(int argc, char** argv)
             : "dlib_lm_" + arch + "_model.dat";
         cout << "Model file : " << model_file << "\n\n";
 
-        constexpr long max_seq_len = 192;
+        constexpr long max_seq_len = 200;
         constexpr long num_tokens = 1400;
-        constexpr long num_layers = 4;
         constexpr long num_heads = 6;
         constexpr long num_kv_heads = 2;
         constexpr long embedding_dim = 228;
-        constexpr long num_experts = 4;
+        constexpr long num_experts = 3;
         constexpr long top_k = 0;
 
         cout << "Loading internal training datasets...\n";
@@ -1008,18 +1007,18 @@ int main(int argc, char** argv)
         //           forwards (use_kv_cache=false).
         if (arch == "moe") {
             using selected = gqa_moe_transformer_config<
-                num_tokens, num_layers, num_heads, num_kv_heads, embedding_dim, num_experts, top_k>;
-            return run_pipeline<selected, num_layers, max_seq_len, num_tokens>(
+                num_tokens, 3, num_heads, num_kv_heads, embedding_dim, num_experts, top_k>;
+            return run_pipeline<selected, 3, max_seq_len, num_tokens>(
                 parser.option("train"), parser.option("generate"), /*use_kv_cache=*/true,
                 learning_rate, batch_size, patience, max_epochs, weight_decay, beta1, beta2,
                 model_file, tokenizer_file, text_segments, external_corpus_for_tokenizer, tokenizer, gpus);
         }
         else if (arch == "hrm") {
             using selected = hrm_transformer_config<
-                num_tokens, num_layers / 2, num_layers, num_heads, embedding_dim, 1, 2,
+                num_tokens, 1, 2, num_heads, embedding_dim, 1, 2,
                 gelu, dropout_10,                        // activation / dropout (ignored when impl=unified)
                 attention_impl::unified, num_kv_heads>;  // select fused GQA attention for H and L sub-networks
-            return run_pipeline<selected, num_layers, max_seq_len, num_tokens>(
+            return run_pipeline<selected, 3, max_seq_len, num_tokens>(
                 parser.option("train"), parser.option("generate"), /*use_kv_cache=*/false,
                 learning_rate, batch_size / 2, patience, max_epochs, weight_decay, beta1, beta2,
                 model_file, tokenizer_file, text_segments, external_corpus_for_tokenizer, tokenizer, gpus);

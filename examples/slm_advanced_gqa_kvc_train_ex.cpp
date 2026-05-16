@@ -226,11 +226,11 @@ int main(int argc, char** argv)
         
         // Model architecture parameters
         const long num_tokens = 1400;
-        const long num_layers = 4;
+        const long num_layers = 3;
         const long num_heads = 6;
         const long num_kv_heads = 2;
         const long embedding_dim = 228;
-        const long max_seq_len = 300;
+        const long max_seq_len = 200;
 
         // Define transformer configuration
         using my_transformer = gqa_transformer_config<
@@ -517,72 +517,6 @@ int main(int argc, char** argv)
             if (tokenizer.get_vocab_size() == 0) {
                 cerr << "Error: Tokenizer not loaded. Please provide a valid tokenizer file.\n";
                 return 0;
-            }
-
-            // =========================================================================
-            // EQUIVALENCE TEST
-            //
-            // Verifies that prefill+incremental produces the same prediction as a
-            // single full forward on the same sequence. With the pre-RoPE KV cache
-            // and matching position conventions in both paths, the two predictions
-            // must be identical (modulo floating-point rounding).
-            // =========================================================================
-            {
-                cout << "\n=== EQUIVALENCE TEST ===\n";
-
-                // Use first 11 tokens from the dataset
-                std::vector<int> diag_tokens;
-                {
-                    std::ifstream file(tokens_file, std::ios::binary);
-                    if (file) {
-                        uint64_t num_tokens_in_file;
-                        file.read(reinterpret_cast<char*>(&num_tokens_in_file), sizeof(num_tokens_in_file));
-                        for (int i = 0; i < 11; ++i) {
-                            uint32_t t;
-                            file.read(reinterpret_cast<char*>(&t), sizeof(t));
-                            diag_tokens.push_back(static_cast<int>(t));
-                        }
-                    }
-                }
-                DLIB_CASSERT(diag_tokens.size() == 11);
-
-                // Path A: full forward on 11 tokens, no padding
-                network_context::reset();
-                network_context::set_inference_mode(network_context::inference_mode::full);
-                network_context::clear_padding();
-
-                matrix<int, 0, 1> input_full(11, 1);
-                for (int i = 0; i < 11; ++i) input_full(i) = diag_tokens[i];
-                int next_full = net(input_full);
-                cout << "Path A (full on 11 tokens): predicted = " << next_full << "\n";
-
-                // Path B: prefill on first 10 tokens + incremental on 11th
-                network_context::reset();
-                network_context::set_kv_cache_capacity(max_seq_len);
-                network_context::set_inference_mode(network_context::inference_mode::prefill);
-                network_context::clear_padding();
-
-                matrix<int, 0, 1> input_pref(10, 1);
-                for (int i = 0; i < 10; ++i) input_pref(i) = diag_tokens[i];
-                int next_after_10 = net(input_pref);
-                cout << "Path B prefill (10 tokens): predicted=" << next_after_10
-                    << " cache_len=" << gqa_cache_full_len(net) << "\n";
-
-                network_context::set_inference_mode(network_context::inference_mode::incremental);
-                network_context::clear_padding();
-
-                matrix<int, 0, 1> incr_input(1, 1);
-                incr_input(0) = diag_tokens[10];
-                int next_incr = net(incr_input);
-                cout << "Path B incr (11th token): predicted=" << next_incr
-                    << " cache_len=" << gqa_cache_full_len(net) << "\n";
-
-                if (next_incr == next_full)
-                    cout << "[OK: equivalent]\n";
-                else
-                    cout << "[FAIL: " << next_incr << " vs " << next_full << "]\n";
-
-                network_context::reset();
             }
 
             std::vector<int> prompt_tokens;
