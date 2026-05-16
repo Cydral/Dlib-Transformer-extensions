@@ -238,7 +238,7 @@ void train_predictor(
     trainer.set_min_learning_rate(1e-8);
     trainer.set_iterations_without_progress_threshold(8000);
 
-    std::string chkpt = input_path + ".chkpt";
+    std::string chkpt = input_path + ".tok-chkpt";
     trainer.set_synchronization_file(chkpt, std::chrono::minutes(1));
     trainer.be_quiet();
 
