@@ -506,7 +506,7 @@ int main(int argc, char** argv)
             if (file_exists(model_file)) {
                 deserialize(model_file) >> net >> tokenizer;
                 cout << "Loaded model from " << model_file << "\n";
-                cout << "Number of model parameters: " << count_parameters(net) << endl;
+                cout << "Number of model parameters: " << count_network_parameters(net, max_seq_len) << endl;
             }
             else {
                 cerr << "Error: model file not found. Please run --train first.\n";

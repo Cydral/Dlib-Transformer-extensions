@@ -372,7 +372,7 @@ int main(int argc, char** argv)
             trainer.set_synchronization_file("chkpt-" + model_file, std::chrono::minutes(15));
             trainer.be_quiet();
 
-            cout << "Number of model parameters: " << count_parameters(net) << endl;
+            cout << "Number of model parameters: " << count_network_parameters(net, max_seq_len) << endl;
             cout << "Starting training...\n";
 
             size_t epoch = 0, steps = 0, batches_count = 0, batches_seen, samples_seen;

@@ -233,7 +233,7 @@ int main(int argc, char** argv)
                 cerr << "Error: model file not found. Please run --train first.\n";
                 return 0;
             }
-            cout << "Model parameters: " << count_parameters(net) << endl << endl;
+            cout << "Model parameters: " << count_network_parameters(net, max_seq_len) << endl << endl;
 
             // 2) Get the prompt from the included slm_data.h
             if (prompt_text.empty())
