@@ -66,19 +66,19 @@ using namespace std;
 using namespace dlib;
 
 // Single source of truth for model configuration. MUST match the values used
-// when pre-training the base model in slm_transformer_configs_ex.cpp, otherwise
+// when pre-training the base model in slm_euro_moe_ex.cpp, otherwise
 // deserialization will fail or produce silently incorrect results.
 
 struct pipeline_constants
 {
-    static constexpr long num_tokens = 1400;
+    static constexpr long num_tokens = 5850;
     static constexpr long num_layers = 4;
     static constexpr long num_heads = 6;
     static constexpr long num_kv_heads = 2;
     static constexpr long embedding_dim = 228;
     static constexpr long num_experts = 4;
-    static constexpr long top_k = 0;
-    static constexpr long max_seq_len = 192;
+    static constexpr long top_k = 2;
+    static constexpr long max_seq_len = 300;
 };
 
 // ----------------------------------------------------------------------------------------
@@ -291,8 +291,8 @@ int main(int argc, char** argv)
         parser.add_option("batch-size", "Batch size (default: 64)", 1);
         parser.add_option("max-epochs", "Max number of epochs (default: 500)", 1);
         parser.add_option("patience", "Iterations without progress before LR shrink (default: 8000)", 1);
-        parser.add_option("model-file", "Base model path (default: dlib_lm_moe_model.dat)", 1);
-        parser.add_option("tokenizer-file", "Tokenizer path (default: dlib_lm_tokenizer.vocab)", 1);
+        parser.add_option("model-file", "Base model path (default: dlib_euro_moe_model.dat)", 1);
+        parser.add_option("tokenizer-file", "Tokenizer path (default: dlib_euro_moe_tokenizer.vocab)", 1);
         parser.add_option("temperature", "Sampling temperature (default: 0.8)", 1);
         parser.add_option("top-k", "Top-k filter (default: 50)", 1);
         parser.add_option("top-p", "Nucleus sampling (default: 0.9)", 1);
@@ -317,8 +317,8 @@ int main(int argc, char** argv)
         const double beta1 = 0.9;
         const double beta2 = 0.98;
 
-        const std::string model_file = get_option(parser, "model-file", std::string("dlib_lm_moe_model.dat"));
-        const std::string tokenizer_file = get_option(parser, "tokenizer-file", std::string("dlib_lm_tokenizer.vocab"));
+        const std::string model_file = get_option(parser, "model-file", std::string("dlib_euro_moe_model.dat"));
+        const std::string tokenizer_file = get_option(parser, "tokenizer-file", std::string("dlib_euro_moe_tokenizer.vocab"));
 
         // Bind the architecture using the shared constants. Any drift between
         // these values and the pre-training program will cause deserialization
@@ -562,6 +562,12 @@ int main(int argc, char** argv)
             // Inference context with capacity 3x the window for multi-turn dialogue.
             inference_context ctx(pipeline_constants::max_seq_len, 3, pad_token);
 
+            // Activate KV cache mode for the whole dialogue. At each user
+            // turn we re-prefill the windowed dialogue (cache cleared between
+            // turns) and then generate the response incrementally.
+            network_context::reset();
+            network_context::set_kv_cache_capacity(pipeline_constants::max_seq_len);
+
             while (!signal_handler::is_triggered())
             {
                 cout << "You: ";
@@ -652,28 +658,66 @@ int main(int argc, char** argv)
                 int next_token = -1;
                 const int max_response_tokens = 3 * pipeline_constants::max_seq_len;
 
-                for (int i = 0; i < max_response_tokens && !signal_handler::is_triggered(); ++i)
+                // Helper extracting next-token probabilities from the
+                // softmaxm output tensor at the last sequence position.
+                auto pick_next_token = [&](const tensor& probs_tensor) -> int
+                    {
+                        const long seq_len = probs_tensor.nr();
+                        const long v_size = probs_tensor.nc();
+                        const long last_pos = seq_len - 1;
+                        const long offset = tensor_index(probs_tensor, 0, 0, last_pos, 0);
+                        const float* probs = probs_tensor.host() + offset;
+
+                        if (deterministic_mode) {
+                            const float* max_ptr = std::max_element(probs, probs + v_size);
+                            return static_cast<int>(std::distance(probs, max_ptr));
+                        }
+                        return static_cast<int>(
+                            top_k_p_sample(probs, v_size, top_k, top_p, repeat_penalty, min_p));
+                    };
+
+                // Prefill the windowed dialogue. The cache from any previous
+                // turn is discarded via request_kv_cache_clear(); each
+                // gqa_attention_ layer observes the flag and resets its cache
+                // on its first forward call of this turn. Padding (leading
+                // pad tokens in the windowed view) is stripped from the
+                // cache by the attention layer itself.
                 {
                     auto input_seq = ctx.get_input_window();
                     long pad_len = count_leading_padding(input_seq, pad_token);
+
+                    network_context::request_kv_cache_clear();
                     network_context::set_padding_uniform(pad_len, 1);
+                    network_context::set_inference_mode(network_context::inference_mode::prefill);
 
                     auto& probs_tensor = generator(input_seq);
+                    next_token = pick_next_token(probs_tensor);
 
-                    const long seq_len = probs_tensor.nr();
-                    const long v_size = probs_tensor.nc();
-                    const long last_pos = seq_len - 1;
-                    const long offset = tensor_index(probs_tensor, 0, 0, last_pos, 0);
-                    const float* probs = probs_tensor.host() + offset;
+                    network_context::clear_kv_cache_request();
+                    network_context::clear_padding();
+                    network_context::set_inference_mode(network_context::inference_mode::incremental);
+                }
 
-                    if (deterministic_mode) {
-                        const float* max_ptr = std::max_element(probs, probs + v_size);
-                        next_token = static_cast<int>(std::distance(probs, max_ptr));
-                    }
-                    else {
-                        next_token = static_cast<int>(top_k_p_sample(probs, v_size, top_k, top_p, repeat_penalty, min_p));
-                    }
+                ctx.add_token(next_token);
+                if (text_end_id < 0 || next_token != text_end_id) {
+                    std::string token_text = tokenizer.decode(next_token, false);
+                    cout << token_text;
+                    cout.flush();
+                }
 
+                // Incremental generation: one token at a time, the cache
+                // supplies the rest. Sliding-window shifts happen
+                // automatically inside gqa_attention_ when the cache is
+                // full.
+                for (int i = 1; i < max_response_tokens && !signal_handler::is_triggered(); ++i)
+                {
+                    if (text_end_id >= 0 && next_token == text_end_id) break;
+
+                    matrix<int, 0, 1> incr_input(1, 1);
+                    incr_input(0) = next_token;
+
+                    auto& probs_tensor = generator(incr_input);
+                    next_token = pick_next_token(probs_tensor);
                     ctx.add_token(next_token);
 
                     if (text_end_id >= 0 && next_token == text_end_id) break;
@@ -683,9 +727,11 @@ int main(int argc, char** argv)
                     cout.flush();
                 }
 
-                network_context::clear_padding();
                 cout << "\n\n";
             }
+
+            // End of dialogue: release the KV cache and any other context state.
+            network_context::reset();
         }
         return 0;
     }
