@@ -1653,29 +1653,54 @@ namespace dlib
 
             WHAT THIS OBJECT REPRESENTS
                 This is an implementation of the EXAMPLE_COMPUTATIONAL_LAYER_ interface
-                defined above. It defines a layer that reshapes or resizes an input tensor
-                into a different shape. The layer operates in two modes:
+                defined above. It defines a layer that reshapes or resizes an input
+                tensor into a different shape. The layer operates in one of four modes,
+                selected automatically in setup() from the input and output dimensions:
 
-                1. Pure Reshape Mode: When the total number of elements in the input tensor
-                   equals the total number of elements in the output tensor, this layer
-                   performs a simple reshaping operation without changing the values.
+                1. Pure Reshape Mode: The total number of elements is preserved and
+                   the new shape is not a head-split or head-merge pattern. The
+                   underlying data is reinterpreted with new strides; no element
+                   reordering is performed.
 
-                2. Spatial Rescaling Mode: When the channel dimension (k) remains constant
-                   but the total number of elements changes, this layer performs bilinear
-                   interpolation to resize the spatial dimensions while preserving the
-                   channel information.
+                2. Spatial Rescaling Mode: The channel dimension (k) remains constant
+                   but the total number of elements changes. Bilinear interpolation is
+                   applied along the spatial dimensions; the channel content is
+                   preserved.
 
-                The dimensions of the output tensor are determined by the template parameters:
-                    - If k_ is -1, the output tensor will have the same number of channels as the input.
-                    - If nr_ is -1, the output tensor will have the same number of rows as the input.
-                    - If nc_ is -1, the output tensor will have the same number of columns as the input.
+                3. Head Split Mode: The input has shape [B, 1, N, H*D'] and the output
+                   has shape [B, H, N, D'] with H > 1. The layer physically reorders
+                   the data so that
+                       output(b, h, n, d) == input(b, 0, n, h*D' + d)
+                   This is the canonical multi-head split used in attention layers.
+                   The reordering is required because the standard Dlib memory layout
+                   would otherwise interleave positions and head dimensions in a way
+                   that breaks per-token operations like RMSNorm and RoPE.
 
-                Setting a value of -1 for any dimension means "keep the original dimension from the input."
+                4. Head Merge Mode: The input has shape [B, H, N, D'] with H > 1 and
+                   the output has shape [B, 1, N, H*D']. The layer physically gathers
+                   the per-head slices so that
+                       output(b, 0, n, h*D' + d) == input(b, h, n, d)
+                   This is the inverse of Head Split Mode and is used at the end of
+                   multi-head attention sublayers to reconstitute a flat embedding.
 
-                Note that this layer will throw an exception if you attempt to change both the
-                channel count (k) and the total number of elements. Either:
-                - Keep the total number of elements the same (Pure Reshape Mode), or
-                - Keep the channel count the same and only change spatial dimensions (Spatial Rescaling Mode)
+                Mode selection rules (applied in setup()):
+                    - Spatial Rescaling: total element count changes AND input_k == output_k.
+                    - Head Split:        input_k == 1, output_k > 1, input_nr == output_nr,
+                                         and input_nc == output_k * output_nc.
+                    - Head Merge:        input_k > 1, output_k == 1, input_nr == output_nr,
+                                         and output_nc == input_k * input_nc.
+                    - Pure Reshape:      any other case where the element count is preserved.
+
+                Target dimensions for the output tensor are derived from the template
+                parameters:
+                    - If k_ is -1, the output uses the input's k().
+                    - If nr_ is -1, the output uses the input's nr().
+                    - If nc_ is -1, the output uses the input's nc().
+
+                An exception is thrown in setup() if the requested output shape is not
+                reachable by any of the four modes above (i.e. the element count
+                changes but k_ is also being changed, which is incompatible with
+                spatial rescaling).
         !*/
 
     public:
@@ -1690,22 +1715,25 @@ namespace dlib
         long get_output_k() const;
         /*!
             ensures
-                - Returns the number of channels in the output tensor. If this value is -1,
-                  then the output will have the same number of channels as the input.
+                - Returns the target number of channels in the output tensor. If this
+                  value is -1, then the output will have the same number of channels
+                  as the input.
         !*/
 
         long get_output_nr() const;
         /*!
             ensures
-                - Returns the number of rows in the output tensor. If this value is -1,
-                  then the output will have the same number of rows as the input.
+                - Returns the target number of rows in the output tensor. If this
+                  value is -1, then the output will have the same number of rows as
+                  the input.
         !*/
 
         long get_output_nc() const;
         /*!
             ensures
-                - Returns the number of columns in the output tensor. If this value is -1,
-                  then the output will have the same number of columns as the input.
+                - Returns the target number of columns in the output tensor. If this
+                  value is -1, then the output will have the same number of columns
+                  as the input.
         !*/
 
         void set_output_k(long k);
@@ -1738,9 +1766,12 @@ namespace dlib
                 - SUBNET implements the SUBNET interface defined at the top of this file.
             ensures
                 - Configures this layer to operate on the output of sub.
-                - If the total number of elements in the input tensor doesn't match the total
-                  number of elements in the output tensor and the channel dimension is different,
-                  an exception will be thrown.
+                - Selects the operating mode (pure reshape, spatial rescaling, head
+                  split, or head merge) from the input and target output dimensions
+                  as described in WHAT THIS OBJECT REPRESENTS.
+                - Throws an exception if the element count changes while the channel
+                  dimension is also being changed, since this is incompatible with
+                  spatial rescaling.
         !*/
 
         template <typename SUBNET> void forward(const SUBNET& sub, resizable_tensor& output);
@@ -1749,12 +1780,20 @@ namespace dlib
                 - SUBNET implements the SUBNET interface defined at the top of this file.
                 - setup() has been called.
             ensures
-                - Reshapes or resizes the output of sub and stores it in #output.
-                - If is_spatial_rescale() == false, then performs a pure reshape operation.
-                - If is_spatial_rescale() == true, then performs bilinear interpolation to resize
-                  the spatial dimensions while preserving the channel information.
+                - Produces #output according to the mode selected in setup():
+                    * Pure Reshape:      reinterprets the input memory with the
+                                         output strides; no element reordering.
+                    * Spatial Rescaling: applies bilinear interpolation along nr/nc;
+                                         the channel content is preserved.
+                    * Head Split:        physical reorder such that
+                                             #output(b, h, n, d) == sub.get_output()(b, 0, n, h*D' + d)
+                                         where D' == #output.nc() and H == #output.k().
+                    * Head Merge:        physical reorder such that
+                                             #output(b, 0, n, h*D' + d) == sub.get_output()(b, h, n, d)
+                                         where D' == sub.get_output().nc() and
+                                               H  == sub.get_output().k().
                 - #output.num_samples() == sub.get_output().num_samples()
-                - #output.k() == get_output_k() if get_output_k() != -1, otherwise sub.get_output().k()
+                - #output.k()  == get_output_k()  if get_output_k()  != -1, otherwise sub.get_output().k()
                 - #output.nr() == get_output_nr() if get_output_nr() != -1, otherwise sub.get_output().nr()
                 - #output.nc() == get_output_nc() if get_output_nc() != -1, otherwise sub.get_output().nc()
         !*/
@@ -1770,25 +1809,35 @@ namespace dlib
                 - setup() has been called.
                 - gradient_input has the same dimensions as the output of forward().
             ensures
-                - Computes the gradients of this layer with respect to the input tensor and
-                  parameters, and stores them in sub.get_gradient_input() and params_grad,
-                  respectively.
-                - This function supports both pure reshaping and spatial rescaling operations.
+                - Accumulates the gradient with respect to the input of sub into
+                  sub.get_gradient_input(). The path mirrors the mode selected by
+                  setup():
+                    * Pure Reshape:      gradient is reinterpreted with the input
+                                         strides and added in place.
+                    * Spatial Rescaling: bilinear-interpolation gradient.
+                    * Head Split:        gradient is gathered across heads (inverse
+                                         of the forward split).
+                    * Head Merge:        gradient is scattered back to heads (inverse
+                                         of the forward merge).
+                - This layer has no parameters, so params_grad is unused.
         !*/
 
         dpoint map_input_to_output(dpoint p) const;
         /*!
             ensures
-                - Maps a point in the input tensor's coordinate system to the corresponding point
-                  in the output tensor. This is useful for tracking how spatial locations change
-                  through the network, especially during spatial rescaling.
+                - Maps a point in the input tensor's coordinate system to the
+                  corresponding point in the output tensor. Useful for tracking how
+                  spatial locations change through the network, especially during
+                  spatial rescaling. The mapping uses the ratios of nr and nc between
+                  input and output.
         !*/
 
         dpoint map_output_to_input(dpoint p) const;
         /*!
             ensures
-                - Maps a point in the output tensor's coordinate system to the corresponding point
-                  in the input tensor. This is the inverse of map_input_to_output().
+                - Maps a point in the output tensor's coordinate system to the
+                  corresponding point in the input tensor. This is the inverse of
+                  map_input_to_output().
         !*/
 
         const tensor& get_layer_params() const;
@@ -1810,7 +1859,7 @@ namespace dlib
     using reshape_to = add_layer<reshape_to_<k, nr, nc>, SUBNET>;
 
     template <long k, long nr, long nc, typename SUBNET>
-    using flatten = add_layer<reshape_to_<k * nr, * nc, 1, 1>, SUBNET>;
+    using flatten = add_layer<reshape_to_<k* nr* nc, 1, 1>, SUBNET>;
 
 // ----------------------------------------------------------------------------------------
 
@@ -2099,100 +2148,95 @@ namespace dlib
 
 // ----------------------------------------------------------------------------------------
 
-    const float DEFAULT_RMS_NORM_EPS = 1e-5f;
+    const double DEFAULT_RMS_NORM_EPS = 1e-5;
 
     class rms_norm_
     {
         /*!
             WHAT THIS OBJECT REPRESENTS
                 This object implements the EXAMPLE_COMPUTATIONAL_LAYER_ interface
-                defined above, specifically defining a root mean square (RMS) normalization layer.
+                defined above, specifically defining a root mean square (RMS)
+                normalization layer.
 
-                RMS normalization is a technique that normalizes the input tensor based on the
-                root mean square (RMS) of its elements. Unlike traditional layer normalization,
-                which both centers and scales the data, RMS normalization only scales by the RMS
-                value. This makes it computationally more efficient, as it avoids the need to
-                compute the mean and subtract it from each element.
+                RMS normalization scales the input tensor by the inverse of the
+                root mean square of its elements along a single axis. Unlike
+                layer normalization, it does not subtract the mean, which makes
+                it cheaper to compute. A learnable scaling vector gamma is
+                applied after normalization.
 
-                This layer produces output tensors with the same dimensionality as the input tensors.
-                Specifically, for an input tensor with shape [num_samples, k, nr, nc], the RMS
-                normalization is applied across the [nr, nc] dimensions independently for each
-                element in the [k] dimension and for each sample in the [num_samples] dimension.
-                The scaling factor (RMS) and the learnable scaling parameter (gamma) are both of
-                size [k].
+                Axis selection
+                    The layer auto-detects the embedding axis in setup() from the
+                    input tensor's shape:
 
-                The key characteristics of this layer are:
-                - The RMS of the elements in each sample is standardized to 1.
-                - It does not center the data (i.e., it does not subtract the mean).
-                - A learnable scaling factor (gamma) is applied after normalization, allowing the
-                model to adapt the scaling dynamically.
+                      - "linear-style" input [num_samples, 1, nr, nc]
+                            normalization runs along nc;
+                            gamma has size nc;
+                            one RMS scale is computed per (num_samples, k, nr).
+                            This is the shape produced by linear / linear_no_bias
+                            layers and is the default in the transformer stack.
 
-                This layer is particularly effective in various natural language processing tasks,
-                where it has been shown to provide performance similar to or better than traditional
-                layer normalization, with reduced computational overhead.
+                      - "fc-style" input [num_samples, k, 1, 1] (or any layout with k > 1)
+                            normalization runs along k;
+                            gamma has size k;
+                            one RMS scale is computed per (num_samples, nr, nc).
+                            This matches the layout coming out of fc / fc_no_bias.
+
+                    Detection rule: axis == nc when input.k() == 1, otherwise axis == k.
+                    The detected axis is captured at setup() time and frozen for
+                    the lifetime of the layer; it is serialized with the model.
+
+                Key properties
+                    - The RMS along the selected axis is normalized to 1.
+                    - No mean subtraction is performed.
+                    - A learnable per-axis scaling vector gamma is applied.
+                    - The output tensor has the same shape as the input.
+
+                This layer is widely used in transformer language models, where
+                it has been shown to provide performance similar to or better
+                than layer normalization with reduced computational cost.
         !*/
 
     public:
-        rms_norm_(
-        );
-        /*!
-            ensures
-                - #get_learning_rate_multiplier() == 1
-                - #get_weight_decay_multiplier()  == 0
-                - #get_bias_learning_rate_multiplier()  == 1
-                - #get_bias_weight_decay_multiplier()   == 1            
-                - #get_eps() == DEFAULT_RMS_NORM_EPS
-        !*/
-
         explicit rms_norm_(
-            float eps_ = DEFAULT_RMS_NORM_EPS
+            double eps_ = DEFAULT_RMS_NORM_EPS
         );
         /*!
             requires
-                - eps > 0
+                - eps_ > 0
             ensures
-                - #get_learning_rate_multiplier() == 1
-                - #get_weight_decay_multiplier()  == 0
-                - #get_bias_learning_rate_multiplier()  == 1
-                - #get_bias_weight_decay_multiplier()   == 1            
+                - #get_learning_rate_multiplier()      == 1
+                - #get_weight_decay_multiplier()       == 0
+                - #get_bias_learning_rate_multiplier() == 1
+                - #get_bias_weight_decay_multiplier()  == 1
                 - #get_eps() == eps_
         !*/
 
-        float get_eps(
+        double get_eps(
         ) const;
         /*!
             ensures
-                - When doing RMS normalization, we are dividing by the root mean square.
-                This epsilon value returned by this function is added to the
-                mean square to prevent division by zero.
+                - When doing RMS normalization, we divide by the root mean
+                  square along the detected axis. The value returned here is
+                  added to the mean square before taking the square root, to
+                  prevent division by zero.
         !*/
-
-        void set_eps(
-            float val
-        );
-        /*!
-            requires
-                - val > 0
-            ensures
-                - #get_eps() == val
-        !*/    
 
         double get_learning_rate_multiplier(
         ) const;
         /*!
             ensures
-                - returns a multiplier number. The interpretation is that this object is
-                requesting that the learning rate used to optimize its parameters be
-                multiplied by get_learning_rate_multiplier().
+                - returns a multiplier number. The interpretation is that this
+                  object is requesting that the learning rate used to optimize
+                  its parameters be multiplied by get_learning_rate_multiplier().
         !*/
 
         double get_weight_decay_multiplier(
         ) const;
         /*!
             ensures
-                - returns a multiplier number. The interpretation is that this object is
-                requesting that the weight decay used to optimize its parameters be
-                multiplied by get_weight_decay_multiplier().
+                - returns a multiplier number. The interpretation is that this
+                  object is requesting that the weight decay used to optimize
+                  its parameters be multiplied by get_weight_decay_multiplier().
         !*/
 
         void set_learning_rate_multiplier(
@@ -2219,18 +2263,20 @@ namespace dlib
         ) const;
         /*!
             ensures
-                - returns a multiplier number.  The interpretation is that this object is
-                requesting that the learning rate used to optimize its bias parameters be
-                multiplied by get_learning_rate_multiplier()*get_bias_learning_rate_multiplier().
+                - returns a multiplier number. The interpretation is that this
+                  object is requesting that the learning rate used to optimize
+                  its bias parameters be multiplied by
+                  get_learning_rate_multiplier() * get_bias_learning_rate_multiplier().
         !*/
 
         double get_bias_weight_decay_multiplier(
         ) const;
         /*!
             ensures
-                - returns a multiplier number.  The interpretation is that this object is
-                requesting that the weight decay used to optimize its bias parameters be
-                multiplied by get_weight_decay_multiplier()*get_bias_weight_decay_multiplier().
+                - returns a multiplier number. The interpretation is that this
+                  object is requesting that the weight decay used to optimize
+                  its bias parameters be multiplied by
+                  get_weight_decay_multiplier() * get_bias_weight_decay_multiplier().
         !*/
 
         void set_bias_learning_rate_multiplier(
@@ -2253,7 +2299,22 @@ namespace dlib
                 - #get_bias_weight_decay_multiplier() == val
         !*/
 
-        template <typename SUBNET> void setup (const SUBNET& sub);
+        template <typename SUBNET> void setup(const SUBNET& sub);
+        /*!
+            requires
+                - SUBNET implements the SUBNET interface defined at the top of
+                  this file.
+            ensures
+                - Configures this layer to operate on the output of sub.
+                - Selects the embedding axis from sub.get_output().k():
+                    * if sub.get_output().k() == 1, axis is nc and gamma has
+                      size sub.get_output().nc().
+                    * otherwise, axis is k and gamma has size sub.get_output().k().
+                - The selected axis is locked for the lifetime of the layer and
+                  is included in the serialized state.
+                - gamma is initialized to 1 along the selected axis.
+        !*/
+
         template <typename SUBNET> void forward(const SUBNET& sub, resizable_tensor& output);
         template <typename SUBNET> void backward(const tensor& gradient_input, SUBNET& sub, tensor& params_grad);
         dpoint map_input_to_output(dpoint p) const;
@@ -2261,7 +2322,8 @@ namespace dlib
         const tensor& get_layer_params() const;
         tensor& get_layer_params();
         /*!
-            These functions are implemented as described in the EXAMPLE_COMPUTATIONAL_LAYER_ interface.
+            These functions are implemented as described in the
+            EXAMPLE_COMPUTATIONAL_LAYER_ interface.
         !*/
     };
 
@@ -4561,10 +4623,10 @@ namespace dlib
         /*!
             TEMPLATE PARAMETERS
                 - diag_: diagonal offset controlling which elements are masked.
-                - tag_: type tag specifying the fill value; one of neg_infinity_tag,
-                        zero_tag, or void (numeric value).
-                - num_: numerator for the fill value when tag_ is void (default: 0).
-                - den_: denominator for the fill value when tag_ is void (default: 1).
+                - tag_:  type tag specifying the fill value; one of neg_infinity_tag,
+                         zero_tag, or void (numeric value).
+                - num_:  numerator for the fill value when tag_ is void (default: 0).
+                - den_:  denominator for the fill value when tag_ is void (default: 1).
 
             REQUIREMENTS
                 - tag_ must be neg_infinity_tag, zero_tag, or void.
@@ -4572,37 +4634,60 @@ namespace dlib
                 - If tag_ is neg_infinity_tag or zero_tag, num_ and den_ are ignored.
 
             WHAT THIS OBJECT REPRESENTS
-                Implements a lower-triangular mask layer. All elements strictly above the
-                specified diagonal are replaced by the fill value; elements on or below the
-                diagonal are left unchanged.
+                Implements a triangular mask layer. All elements strictly above the
+                diagonal at offset diag_ are replaced by a fill value; elements on
+                or below that diagonal pass through unchanged. The layer is the
+                standard ingredient of causal attention.
 
-                When network_context is active and carries padding information, the mask is
-                extended to handle padded sequences correctly:
-                  - Padding rows (r < pad_len): fully masked — padding tokens attend to nothing.
-                  - Padding columns (c < pad_len, r >= pad_len): masked — real tokens do not
-                    attend to padding positions.
-                The padding lengths are read from network_context at each forward pass and
-                cached internally; the mask is rebuilt only when the lengths change or the
-                tensor dimensions change.
+                Forward operation
+                    Two internal mask tensors are maintained, sized like the input:
+                      - binary_mask : 1 at unmasked positions, 0 at masked positions.
+                      - output_mask : diag_value at masked positions, 0 elsewhere.
+                                      Only materialized when diag_value != 0.
 
-                An optional prefix_size allows a contiguous prefix of positions to remain
-                visible to all subsequent real-token rows, regardless of the causal constraint.
+                    The output is computed as:
+                        output[i, j] = input[i, j] * binary_mask[i, j] + output_mask[i, j]
+                    For zero_tag (diag_value == 0) the second term is omitted; for
+                    neg_infinity_tag and void tags the second term injects the fill
+                    value at masked positions.
+
+                Padding awareness
+                    If network_context::is_padding_set() returns true at forward
+                    time, the per-sample padding lengths are read via
+                    network_context::get_all_padding_lengths() and merged into the
+                    mask:
+                      - Padding rows (r < pad_len)              : fully masked.
+                      - Padding columns (c < pad_len, r >= ...) : masked for real
+                                                                  token rows.
+                    The padding lengths are cached internally. The mask cache is
+                    invalidated and rebuilt at the start of forward() whenever:
+                      - the cached padding lengths differ from the current context;
+                      - the context padding has been cleared after being active;
+                      - the input tensor dimensions have changed.
+
+                Prefix-LM semantics (prefix_size > 0)
+                    The causal column threshold for a row r is
+                        causal_start = max(r + diag_ + 1, prefix_size, pad_len)
+                    All columns from causal_start to nc - 1 are masked. The effect:
+                      - Real-token rows r >= prefix_size : standard causal mask,
+                        but the prefix range [pad_len, prefix_size) remains
+                        visible.
+                      - Real-token rows r < prefix_size  : also see the full
+                        prefix range, i.e. attention is bidirectional within the
+                        prefix.
+                    With prefix_size == 0 this term has no effect and the layer
+                    behaves as a pure causal mask.
 
             DIAGONAL VALUE DETERMINATION
-                - neg_infinity_tag : fill value is -infinity (standard causal attention mask).
+                - neg_infinity_tag : fill value is -infinity (standard causal
+                                     attention mask, used before softmax).
                 - zero_tag         : fill value is 0.
                 - void             : fill value is num_ / den_ as float.
 
             DIAGONAL OFFSET
-                - diag_ = 0  : main diagonal (standard causal mask).
-                - diag_ > 0  : diag_ steps above the main diagonal.
-                - diag_ < 0  : |diag_| steps below the main diagonal.
-
-            PADDING AWARENESS
-                If network_context::is_padding_set() returns true at forward time, the layer
-                reads per-sample padding lengths via network_context::get_all_padding_lengths()
-                and adjusts the mask accordingly. If the context is inactive or cleared, the
-                layer behaves identically to the original padding-unaware implementation.
+                - diag_ == 0 : main diagonal (standard causal mask).
+                - diag_  > 0 : diag_ steps above the main diagonal.
+                - diag_  < 0 : |diag_| steps below the main diagonal.
 
             EXAMPLE USAGE
                 // Standard causal mask (main diagonal, fill -inf)
@@ -4637,7 +4722,7 @@ namespace dlib
             requires
                 - SUBNET is a valid network layer type.
             ensures
-                - No-op: mask is built lazily on the first forward() call.
+                - No-op: the masks are built lazily on the first forward() call.
         !*/
 
         template <typename SUBNET>
@@ -4646,10 +4731,16 @@ namespace dlib
             requires
                 - SUBNET is a valid network layer type.
             ensures
-                - Applies the lower-triangular mask (with optional padding masking) to the
-                  input tensor and stores the result in output.
-                - If network_context carries updated padding lengths, the mask cache is
-                  invalidated and rebuilt before applying.
+                - Synchronizes the cached padding lengths with network_context,
+                  invalidating the mask cache if they have changed or if the
+                  context padding has just been cleared.
+                - Rebuilds binary_mask (and output_mask when diag_value != 0) if
+                  the cache is invalid or the input dimensions have changed.
+                - Computes output[i, j] = input[i, j] * binary_mask[i, j]
+                                       + output_mask[i, j]   if diag_value != 0
+                          output[i, j] = input[i, j] * binary_mask[i, j]
+                                                              if diag_value == 0
+                - #output has the same shape as sub.get_output().
         !*/
 
         template <typename SUBNET>
@@ -4658,15 +4749,18 @@ namespace dlib
             requires
                 - forward() has been called.
             ensures
-                - Backpropagates gradient_input through the binary mask into sub.
+                - Accumulates gradient_input * binary_mask into
+                  sub.get_gradient_input() (gradient is zero at masked positions,
+                  identity at unmasked positions).
+                - params_grad is unused (this layer has no trainable parameters).
         !*/
 
         void set_prefix_size(long n);
         /*!
             ensures
-                - Sets the number of prefix positions that all real-token rows may attend to,
-                  regardless of the causal constraint.
-                - If n != current prefix_size, the mask cache is invalidated.
+                - Sets the prefix length used by the Prefix-LM masking rule.
+                - If n differs from the previous prefix_size, the mask cache is
+                  invalidated.
                 - #get_prefix_size() == n
         !*/
 
@@ -4677,10 +4771,30 @@ namespace dlib
         !*/
 
         inline dpoint map_input_to_output(const dpoint& p) const;
+        /*!
+            ensures
+                - Returns p unchanged (the layer does not move spatial locations).
+        !*/
+
         inline dpoint map_output_to_input(const dpoint& p) const;
+        /*!
+            ensures
+                - Returns p unchanged (the layer does not move spatial locations).
+        !*/
 
         const tensor& get_layer_params() const;
+        /*!
+            ensures
+                - Returns the layer's parameters. This layer has no parameters,
+                  so this always returns an empty tensor.
+        !*/
+
         tensor& get_layer_params();
+        /*!
+            ensures
+                - Returns the layer's parameters. This layer has no parameters,
+                  so this always returns an empty tensor.
+        !*/
 
         friend void serialize(const tril_& item, std::ostream& out);
         /*!

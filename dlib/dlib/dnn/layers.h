@@ -977,7 +977,7 @@ namespace dlib
     
 // ----------------------------------------------------------------------------------------
 
-    template <long k_ = -1, long nr_ = -1, long nc_ = -1>
+    template <long k_, long nr_, long nc_>
     class reshape_to_
     {
     public:
@@ -992,6 +992,8 @@ namespace dlib
 
             input_k = input_nr = input_nc = 0;
             needs_rescale = false;
+            is_head_split = false;
+            is_head_merge = false;
         }
 
         // Getters for dimensions
@@ -1026,36 +1028,65 @@ namespace dlib
             if (nr_ == -1) output_nr = input_nr;
             if (nc_ == -1) output_nc = input_nc;
 
-            // Check if this is well a pure reshape
-            long input_elements = input_k * input_nr * input_nc;
-            long output_elements = output_k * output_nr * output_nc;
-            if (input_elements != output_elements && input_k == output_k) needs_rescale = true;
+            const long input_elements = input_k * input_nr * input_nc;
+            const long output_elements = output_k * output_nr * output_nc;
+
+            // Spatial rescale: same channel count but different element count
+            needs_rescale = (input_elements != output_elements && input_k == output_k);
+
             DLIB_CASSERT(input_elements == output_elements || needs_rescale,
                 "Cannot reshape tensor of " << input_elements <<
                 " elements into shape with " << output_elements << " elements. " <<
                 "For spatial rescaling, the channel dimension (k) must remain constant.");
+
+            // Detect head split / merge. These match the multi-head attention
+            // patterns and require physical reordering rather than a flat
+            // memcpy on an alias_tensor.
+            is_head_split = false;
+            is_head_merge = false;
+            if (!needs_rescale)
+            {
+                if (input_k == 1 && output_k > 1 &&
+                    input_nr == output_nr &&
+                    input_nc == output_k * output_nc)
+                {
+                    is_head_split = true;
+                }
+                else if (input_k > 1 && output_k == 1 &&
+                    input_nr == output_nr &&
+                    output_nc == input_k * input_nc)
+                {
+                    is_head_merge = true;
+                }
+            }
         }
 
         template <typename SUBNET>
         void forward(const SUBNET& sub, resizable_tensor& output)
         {
-            // Set the output size (always preserving batch dimension)
             const tensor& input = sub.get_output();
             output.set_size(input.num_samples(), output_k, output_nr, output_nc);
 
-            if (!needs_rescale)
+            if (needs_rescale)
             {
-                // Create an alias of the input tensor with the output shape
-                alias_tensor input_alias(output.num_samples(), output_k, output_nr, output_nc);
-                // Get a view of the input tensor with the new shape
-                auto input_reshaped = input_alias(const_cast<tensor&>(input), 0);
-                // Copy the view to the output tensor
-                tt::copy_tensor(false, output, 0, input_reshaped, 0, input_reshaped.k());
+                tt::resize_bilinear(output, input);
+            }
+            else if (is_head_split)
+            {
+                // dst[b, h, n, j] = src[b, 0, n, h*HDIM + j]
+                tt::split_heads(false, output, input);
+            }
+            else if (is_head_merge)
+            {
+                // dst[b, 0, n, h*HDIM + j] = src[b, h, n, j]
+                tt::merge_heads(false, output, input);
             }
             else
             {
-                // Only spatial dimensions need to be resized
-                tt::resize_bilinear(output, input);
+                // Pure reshape: same memory layout, different strides
+                alias_tensor input_alias(output.num_samples(), output_k, output_nr, output_nc);
+                auto input_reshaped = input_alias(const_cast<tensor&>(input), 0);
+                tt::copy_tensor(false, output, 0, input_reshaped, 0, input_reshaped.k());
             }
         }
 
@@ -1064,18 +1095,27 @@ namespace dlib
         {
             auto& grad = sub.get_gradient_input();
 
-            if (!needs_rescale) {
-                // Create an alias of the gradient tensor with the original input shape
-                alias_tensor grad_alias(grad.num_samples(), grad.k(), grad.nr(), grad.nc());
-                // Get a view of the input gradient with the required shape
-                auto grad_reshaped = grad_alias(const_cast<tensor&>(gradient_input), 0);
-                // Copy the view to the output gradient
-                tt::copy_tensor(true, grad, 0, grad_reshaped, 0, grad_reshaped.k());
+            if (needs_rescale)
+            {
+                tt::resize_bilinear_gradient(grad, gradient_input);
+            }
+            else if (is_head_split)
+            {
+                // Gradient of split_heads gathers heads back into the [B, 1, N, H*HDIM]
+                // upstream gradient, accumulating onto whatever is already there.
+                tt::merge_heads(true, grad, gradient_input);
+            }
+            else if (is_head_merge)
+            {
+                // Gradient of merge_heads scatters back into the [B, H, N, HDIM]
+                // upstream gradient.
+                tt::split_heads(true, grad, gradient_input);
             }
             else
             {
-                // Only spatial dimensions were resized
-                tt::resize_bilinear_gradient(grad, gradient_input);
+                alias_tensor grad_alias(grad.num_samples(), grad.k(), grad.nr(), grad.nc());
+                auto grad_reshaped = grad_alias(const_cast<tensor&>(gradient_input), 0);
+                tt::copy_tensor(true, grad, 0, grad_reshaped, 0, grad_reshaped.k());
             }
         }
 
@@ -1104,6 +1144,8 @@ namespace dlib
             serialize(item.output_nr, out);
             serialize(item.output_nc, out);
             serialize(item.needs_rescale, out);
+            serialize(item.is_head_split, out);
+            serialize(item.is_head_merge, out);
         }
 
         friend void deserialize(reshape_to_& item, std::istream& in)
@@ -1119,33 +1161,47 @@ namespace dlib
             deserialize(item.output_nr, in);
             deserialize(item.output_nc, in);
             deserialize(item.needs_rescale, in);
+            deserialize(item.is_head_split, in);
+            deserialize(item.is_head_merge, in);
         }
 
         friend std::ostream& operator<<(std::ostream& out, const reshape_to_& item)
         {
+            const char* mode = "pure_reshape";
+            if (item.needs_rescale)      mode = "spatial_rescale";
+            else if (item.is_head_split) mode = "head_split";
+            else if (item.is_head_merge) mode = "head_merge";
+
             out << "reshape_to (";
             out << "k=" << std::to_string(item.output_k);
             out << ", nr=" << std::to_string(item.output_nr);
             out << ", nc=" << std::to_string(item.output_nc);
-            out << ", mode=" << (item.needs_rescale ? "spatial_rescale" : "pure_reshape");
+            out << ", mode=" << mode;
             out << ")";
             return out;
         }
 
         friend void to_xml(const reshape_to_& item, std::ostream& out)
         {
+            const char* mode = "pure_reshape";
+            if (item.needs_rescale)      mode = "spatial_rescale";
+            else if (item.is_head_split) mode = "head_split";
+            else if (item.is_head_merge) mode = "head_merge";
+
             out << "<reshape_to"
                 << " k='" << item.output_k << "'"
                 << " nr='" << item.output_nr << "'"
                 << " nc='" << item.output_nc << "'"
-                << " mode='" << (item.needs_rescale ? "spatial_rescale" : "pure_reshape") << "'"
+                << " mode='" << mode << "'"
                 << "/>\n";
         }
 
-    private:        
-        long input_k, input_nr, input_nc;       // Input dimensions        
-		long output_k, output_nr, output_nc;    // Output dimensions        
-        bool needs_rescale;        
+    private:
+        long input_k, input_nr, input_nc;       // Input dimensions
+        long output_k, output_nr, output_nc;    // Output dimensions
+        bool needs_rescale;                     // Spatial rescaling mode (resize_bilinear)
+        bool is_head_split;                     // [B, 1, N, H*D'] -> [B, H, N, D']
+        bool is_head_merge;                     // [B, H, N, D'] -> [B, 1, N, H*D']
         resizable_tensor params;                // No trainable parameters
     };
 
