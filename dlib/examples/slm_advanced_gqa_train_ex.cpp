@@ -204,7 +204,7 @@ int main(int argc, char** argv)
 
         // Model architecture parameters
         const long num_tokens = 1400;
-        const long num_layers = 4;
+        const long num_layers = 3;
         const long num_heads = 6;
         const long num_kv_heads = 2;
         const long embedding_dim = 228;

@@ -907,7 +907,7 @@ int main(int argc, char** argv)
         parser.add_option("arch", "Network architecture: moe | hrm (default: moe)", 1);
         parser.add_option("learning-rate", "Set the learning rate (default: 2e-4)", 1);
         parser.add_option("batch-size", "Set the mini-batch size (default: 128)", 1);
-        parser.add_option("patience", "Steps without progress before LR reduction (default: 8000)", 1);
+        parser.add_option("patience", "Steps without progress before LR reduction (default: 10000)", 1);
         parser.add_option("max-epochs", "Maximum number of training epochs (default: 500)", 1);
         parser.add_option("weight-decay", "AdamW weight decay (default: 0.004)", 1);
         parser.add_option("beta1", "AdamW beta1 coefficient (default: 0.9)", 1);
@@ -936,7 +936,7 @@ int main(int argc, char** argv)
 
         const double learning_rate = get_option(parser, "learning-rate", 2e-4);
         const size_t batch_size = get_option(parser, "batch-size", 128);
-        const long patience = get_option(parser, "patience", 8000);
+        const long patience = get_option(parser, "patience", 10000);
         const size_t max_epochs = get_option(parser, "max-epochs", 500);
         const double weight_decay = get_option(parser, "weight-decay", 0.004);
         const double beta1 = get_option(parser, "beta1", 0.9);
@@ -950,6 +950,7 @@ int main(int argc, char** argv)
 
         constexpr long max_seq_len = 200;
         constexpr long num_tokens = 1400;
+        constexpr long num_layers = 3;
         constexpr long num_heads = 6;
         constexpr long num_kv_heads = 2;
         constexpr long embedding_dim = 228;
@@ -1007,18 +1008,24 @@ int main(int argc, char** argv)
         //           forwards (use_kv_cache=false).
         if (arch == "moe") {
             using selected = gqa_moe_transformer_config<
-                num_tokens, 3, num_heads, num_kv_heads, embedding_dim, num_experts, top_k>;
-            return run_pipeline<selected, 3, max_seq_len, num_tokens>(
+                num_tokens, num_layers, num_heads, num_kv_heads, embedding_dim, num_experts, top_k>;
+            return run_pipeline<selected, num_layers, max_seq_len, num_tokens>(
                 parser.option("train"), parser.option("generate"), /*use_kv_cache=*/true,
                 learning_rate, batch_size, patience, max_epochs, weight_decay, beta1, beta2,
                 model_file, tokenizer_file, text_segments, external_corpus_for_tokenizer, tokenizer, gpus);
         }
         else if (arch == "hrm") {
+            // HRM splits its layer budget across an H module and an L module,
+            // and adds two recurrence factors (hrm_N, hrm_T). These do not map
+            // one-to-one onto num_layers, so the H/L split and the recurrence
+            // factors are kept as explicit literals. The run_pipeline
+            // NUM_LAYERS template argument is only used for parameter
+            // accounting and remains consistent with num_layers.
             using selected = hrm_transformer_config<
                 num_tokens, 1, 2, num_heads, embedding_dim, 1, 2,
                 gelu, dropout_10,                        // activation / dropout (ignored when impl=unified)
                 attention_impl::unified, num_kv_heads>;  // select fused GQA attention for H and L sub-networks
-            return run_pipeline<selected, 3, max_seq_len, num_tokens>(
+            return run_pipeline<selected, num_layers, max_seq_len, num_tokens>(
                 parser.option("train"), parser.option("generate"), /*use_kv_cache=*/false,
                 learning_rate, batch_size / 2, patience, max_epochs, weight_decay, beta1, beta2,
                 model_file, tokenizer_file, text_segments, external_corpus_for_tokenizer, tokenizer, gpus);
