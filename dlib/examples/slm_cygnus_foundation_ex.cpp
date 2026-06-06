@@ -1,28 +1,38 @@
 /*!
-    @file slm_euro_moe_ex.cpp
-    @brief Training pipeline for a multilingual SLM based on GQA + MoE.
+    @file slm_cygnus_foundation_ex.cpp
+    @brief Foundation pre-training pipeline for the Cygnus small language model series.
 
-    This program trains a compact small language model using Grouped Query Attention (GQA) combined
-    with Mixture-of-Experts (MoE) feed-forward blocks for conditional computation. At inference,
-    only a fraction of the total parameters are activated per token thanks to top-k sparse routing.
+    Cygnus is a family of compact small language models (SLM, not LLM) built on the
+    target architecture of this library: Grouped Query Attention (GQA) with a
+    Mixture-of-Experts (MoE) feed-forward sublayer. At inference only a fraction of
+    the parameters are activated per token thanks to top-k sparse routing, and the
+    fused gqa_attention_ layer carries a KV cache for fast autoregressive generation.
 
-    Five modes are exposed:
+    This program covers the full foundation objective and nothing else:
 
       --build-tokenizer   Train a BPE tokenizer on the corpus (run once).
       --train             Pre-train the model (resumes from checkpoint if any).
-      --fine-tune         Instruction fine-tuning (placeholder at this stage).
-      --prompt            Interactive generation loop (placeholder at this stage).
       --generate          Autoregressive generation sanity check.
 
-    Typical usage:
-      Build tokenizer : slm_euro_moe_ex --build-tokenizer --external-data corpus.txt
-      Pre-train       : slm_euro_moe_ex --train --external-data corpus.txt
-      Generate sample : slm_euro_moe_ex --generate
+    Foundation objective and design choices:
+      - The corpus is concatenated into a single token stream with <text> ... </text>
+        document separators, then sliced into fixed-length contiguous windows
+        (no left padding). This is the standard causal pre-training objective.
+      - The loss is loss_cross_entropy_per_token (the per-position causal-LM loss),
+        which supervises every position via teacher forcing: contexts of length
+        1..window are learned inside every window. No left-padded cold-start set is
+        needed and none is built.
+      - No input-token augmentation: random-token noise perturbs the conditional the
+        model must learn and creates a train/inference token mismatch.
+      - Output z-regularization (z-loss) is enabled to bound logit drift and stabilize
+        long runs; label smoothing is left at its default.
+      - Large corpora are streamed from disk in chunks so the tokenized stream and the
+        training samples never need to fit in RAM at once.
 
-    Architecture note (ACT extension):
-    Replacing the MoE feed-forward by an ACT-wrapped FFN in the upper layers would add adaptive-depth
-    reasoning while keeping MoE specialization in the lower layers. This requires either extending
-    gqa_moe_transformer_config or building the hybrid network manually.
+    Typical usage:
+      Build tokenizer : slm_cygnus_foundation_ex --build-tokenizer --external-data corpus.txt
+      Pre-train       : slm_cygnus_foundation_ex --train --external-data corpus.txt
+      Generate sample : slm_cygnus_foundation_ex --generate
 !*/
 
 #include <iostream>
@@ -49,45 +59,48 @@
 using namespace std;
 using namespace dlib;
 
-/*
- * Static architecture parameters. These are compile-time template arguments for the network type
- * and must match the tokenizer vocabulary size. To change the architecture, edit the constants
- * here and recompile.
- */
-constexpr long NUM_TOKENS = 5850;
-constexpr long NUM_LAYERS = 4;
-constexpr long NUM_HEADS = 6;
-constexpr long NUM_KV_HEADS = 2;
-constexpr long EMBEDDING_DIM = 228;
-constexpr long NUM_EXPERTS = 4;
-constexpr long TOP_K = 2;
-constexpr long MAX_SEQ_LEN = 300;
+/* Series identity. The model artifacts are prefixed with the series name so they
+   never collide with other example programs of the library. Downstream programs
+   (fine-tuning, serving) should be pointed to these same default names. */
+constexpr char SERIES_NAME[] = "Cygnus";
 
-// Default sampling budget for tokenizer training (in bytes)
+/* Static architecture parameters: the Cygnus target topology. These are compile-time
+   template arguments for the network type and must match the tokenizer vocabulary
+   size. To define a different size in the series, edit these constants and recompile. */
+constexpr long NUM_TOKENS    = 5850;
+constexpr long NUM_LAYERS    = 4;
+constexpr long NUM_HEADS     = 6;
+constexpr long NUM_KV_HEADS  = 2;
+constexpr long EMBEDDING_DIM = 228;
+constexpr long NUM_EXPERTS   = 4;
+constexpr long TOP_K         = 2;
+constexpr long MAX_SEQ_LEN   = 300;
+
+/* z-loss weight added at every supervised position by loss_cross_entropy_per_token.
+   0 disables it. A small value stabilizes foundation training without distorting the
+   conditional; it is appropriate here because the goal is generalization, not the
+   byte-exact reproduction targeted by the GQA-only reconstruction example. */
+constexpr double Z_LOSS_WEIGHT = 1e-4;
+
+/* Default sampling budget for tokenizer training (in bytes). */
 constexpr size_t DEFAULT_MAX_TOKENIZER_BYTES = 200ull * 1024 * 1024;
 
-/*
- * Derive the tokens cache filename from the source corpus path. When the same corpus is reused
- * across runs, the cached tokens are reloaded instead of re-tokenizing.
- */
+/* Derive the tokens cache filename from the source corpus path. When the same corpus
+   is reused across runs, the cached tokens are reloaded instead of re-tokenizing. */
 std::string derive_tokens_filename(const std::string& external_path)
 {
-    if (external_path.empty()) return "dlib_euro_moe_tokens.bin";
+    if (external_path.empty()) return "cygnus_tokens.bin";
     size_t sep = external_path.find_last_of("/\\");
     std::string base = (sep == std::string::npos) ? external_path : external_path.substr(sep + 1);
     size_t dot = base.find_last_of('.');
     if (dot != std::string::npos) base = base.substr(0, dot);
-    return "dlib_euro_moe_tokens_" + base + ".bin";
+    return "cygnus_tokens_" + base + ".bin";
 }
 
-/*
- * Read file content, optionally applying stratified sampling. When sample is false, returns the
- * full file content verbatim.
- *
- * When sample is true and the file exceeds max_bytes, the file is divided into N equal windows and
- * a chunk is taken from each one, ensuring uniform coverage across the entire file. Each chunk is
- * aligned on whitespace boundaries to avoid truncating words.
- */
+/* Read file content, optionally applying stratified sampling. When sample is false the
+   full content is returned verbatim. When sample is true and the file exceeds max_bytes,
+   the file is divided into equal windows and a whitespace-aligned chunk is taken from
+   each one, ensuring uniform coverage without truncating words. */
 std::string read_file_content(const std::string& filepath, bool sample = false, size_t max_bytes = 0)
 {
     std::ifstream file(filepath, std::ios::binary);
@@ -103,7 +116,6 @@ std::string read_file_content(const std::string& filepath, bool sample = false, 
         return buffer.str();
     }
 
-    // Stratified sampling path
     constexpr size_t num_samples = 1024;
     constexpr size_t alignment_margin = 1024;
     const size_t chunk_size = max_bytes / num_samples;
@@ -140,10 +152,8 @@ std::string read_file_content(const std::string& filepath, bool sample = false, 
     return result;
 }
 
-/*
- * Load a text corpus and group consecutive non-blank lines into coherent training segments. Each
- * segment contains lines_per_segment source lines joined by '\n'.
- */
+/* Load a text corpus and group consecutive non-blank lines into coherent training
+   segments. Each segment contains lines_per_segment source lines joined by '\n'. */
 std::vector<std::string> load_external_corpus_grouped(const std::string& path, size_t lines_per_segment)
 {
     std::vector<std::string> segments;
@@ -178,8 +188,7 @@ std::vector<std::string> load_external_corpus_grouped(const std::string& path, s
     return segments;
 }
 
-// MoE parameter and expert usage analysis
-
+/* MoE parameter and expert usage analysis. */
 struct moe_param_info
 {
     size_t single_expert_params, total_params, inference_params;
@@ -239,7 +248,7 @@ struct moe_param_info
     }
 };
 
-// Layer index in topology: loss=0, linear=1, rms_norm=2, add_prev=3, moe=4
+/* Layer index in the topology: loss=0, linear=1, rms_norm=2, add_prev=3, moe=4. */
 template <typename net_type>
 moe_param_info get_moe_param_info(const net_type& net, long num_layers)
 {
@@ -257,6 +266,8 @@ moe_param_info get_moe_param_info(const net_type& net, long num_layers)
     return info;
 }
 
+/* SFINAE: prints the MoE analysis when the network exposes a MoE layer at position 4,
+   and is a silent no-op for other topologies. */
 template <typename net_type>
 auto try_print_moe_info(const net_type& net, long nl) -> decltype(layer<4>(net).layer_details().num_experts(), void())
 {
@@ -264,42 +275,28 @@ auto try_print_moe_info(const net_type& net, long nl) -> decltype(layer<4>(net).
 }
 inline void try_print_moe_info(...) {}
 
-/*
- * Tokenizer building (standalone mode). The bpe_tokenizer class pre-registers special tokens
- * in its constructor, so no manual registration is needed. Large corpora are sampled down to
- * max_tokenizer_bytes with stratified sampling to keep BPE training tractable.
- */
- // ---------------------------------------------------------------------------
- // Chunked on-disk tokens storage
- //
- // For very large corpora the tokenized stream and the resulting training
- // samples no longer fit in RAM. Beyond TOKEN_STREAMING_THRESHOLD total tokens,
- // the tokens cache file switches from the legacy single-vector format to a
- // chunked format described below, and the training loop iterates chunks
- // sequentially:
- //   - one chunk is loaded from disk;
- //   - its main samples (flat sliding windows) and cold-start auxiliary
- //     samples are rebuilt from the chunk's segments;
- //   - the trainer processes those samples;
- //   - the chunk is dropped before the next one is loaded.
- //
- // File layout (little-endian):
- //   [8 bytes]  Magic "DLEMTKNS"
- //   [4 bytes]  Version (uint32)
- //   [8 bytes]  Number of chunks (uint64)
- //   [8 bytes]  Total token count (uint64)
- //   [N*8 bytes] Per-chunk byte offsets (uint64)
- //   [N*8 bytes] Per-chunk token counts (uint64)
- //   [...]      Chunk 0 ... Chunk N-1: each a dlib::serialize'd
- //              std::vector<std::vector<int>> (segments contained in the chunk)
- //
- // The reader caches the most recently fetched chunk so consecutive
- // get_chunk(i) calls do not trigger a disk read.
- // ---------------------------------------------------------------------------
+/* Chunked on-disk tokens storage.
 
-constexpr size_t TOKEN_STREAMING_THRESHOLD = 100000;     // total tokens above which streaming kicks in
-constexpr size_t CHUNK_TOKEN_TARGET = 500000;            // approximate tokens per disk chunk
-constexpr char CHUNKED_TOKENS_MAGIC[8] = { 'D','L','E','M','T','K','N','S' };
+   Beyond TOKEN_STREAMING_THRESHOLD total tokens, the tokens cache switches from a
+   single serialized vector to a chunked format and the training loop iterates chunks
+   sequentially: one chunk is loaded, its flat windowed samples are rebuilt, the trainer
+   processes them, then the chunk is dropped before the next is loaded.
+
+   File layout (little-endian):
+     [8 bytes]   Magic "CYGNTKNS"
+     [4 bytes]   Version (uint32)
+     [8 bytes]   Number of chunks (uint64)
+     [8 bytes]   Total token count (uint64)
+     [N*8 bytes] Per-chunk byte offsets (uint64)
+     [N*8 bytes] Per-chunk token counts (uint64)
+     [...]       Chunk 0 ... Chunk N-1: each a dlib::serialize'd
+                 std::vector<std::vector<int>> (the wrapped segments in the chunk)
+
+   The reader caches the most recently fetched chunk so consecutive get_chunk(i) calls
+   do not trigger a disk read. */
+constexpr size_t TOKEN_STREAMING_THRESHOLD = 100000;
+constexpr size_t CHUNK_TOKEN_TARGET = 500000;
+constexpr char CHUNKED_TOKENS_MAGIC[8] = { 'C','Y','G','N','T','K','N','S' };
 constexpr uint32_t CHUNKED_TOKENS_VERSION = 1;
 
 bool is_chunked_tokens_file(const std::string& path)
@@ -315,7 +312,6 @@ void write_chunked_tokens(const std::string& path,
     std::vector<std::vector<int>>& full_tokens,
     size_t chunk_token_target)
 {
-    // Partition segments greedily into chunks of >= chunk_token_target tokens
     std::vector<std::pair<size_t, size_t>> ranges; // [start, end) over full_tokens
     {
         size_t start = 0, accum = 0;
@@ -342,7 +338,6 @@ void write_chunked_tokens(const std::string& path,
     out.write(reinterpret_cast<const char*>(&num_chunks), sizeof(num_chunks));
     out.write(reinterpret_cast<const char*>(&total_tokens), sizeof(total_tokens));
 
-    // Reserve space for offset and count tables, to be backfilled.
     const std::streampos table_pos = out.tellp();
     std::vector<uint64_t> offsets(num_chunks, 0), counts(num_chunks, 0);
     out.write(reinterpret_cast<const char*>(offsets.data()), num_chunks * sizeof(uint64_t));
@@ -361,7 +356,6 @@ void write_chunked_tokens(const std::string& path,
         dlib::serialize(chunk, out);
     }
 
-    // Backfill the offset and count tables now that we know them.
     out.seekp(table_pos);
     out.write(reinterpret_cast<const char*>(offsets.data()), num_chunks * sizeof(uint64_t));
     out.write(reinterpret_cast<const char*>(counts.data()), num_chunks * sizeof(uint64_t));
@@ -425,81 +419,50 @@ private:
     bool cache_valid_;
 };
 
-// Build the per-chunk (or full-corpus, in-memory mode) training samples.
-// Produces: flat-corpus main samples + filtered cold-start auxiliary samples
-// + random-token augmentation on main. Cold-start is capped at 5% of main.
-void build_samples_from_segments(
+/* Build the foundation training samples for one chunk (streaming) or the whole corpus
+   (in-memory). Segments already carry their <text> ... </text> wrappers, so the flat
+   stream is their plain concatenation. Windows are fixed-length and contiguous (no left
+   padding): the standard foundation objective. The per-token loss supervises every
+   position, so contexts of length 1..window are learned inside each window without any
+   cold-start set, and no input-token augmentation is applied. */
+void build_flat_samples_from_segments(
     const std::vector<std::vector<int>>& segments,
-    long max_seq_len, int pad_token, const bpe_tokenizer& tokenizer,
+    long max_seq_len, int pad_token,
     std::vector<matrix<int, 0, 1>>& out_samples,
-    std::vector<unsigned long>& out_labels,
-    size_t& out_main_size, size_t& out_aux_kept)
+    std::vector<unsigned long>& out_labels)
 {
-    out_samples.clear();
-    out_labels.clear();
+    std::vector<std::vector<int>> flat_corpus(1);
+    size_t flat_total = 0;
+    for (const auto& seg : segments) flat_total += seg.size();
+    flat_corpus[0].reserve(flat_total);
+    for (const auto& seg : segments)
+        flat_corpus[0].insert(flat_corpus[0].end(), seg.begin(), seg.end());
 
-    // Flat-corpus main samples
-    {
-        std::vector<std::vector<int>> flat_corpus(1);
-        size_t flat_total = 0;
-        for (const auto& seg : segments) flat_total += seg.size();
-        flat_corpus[0].reserve(flat_total);
-        for (const auto& seg : segments)
-            flat_corpus[0].insert(flat_corpus[0].end(), seg.begin(), seg.end());
-        build_single_token_prediction_dataset(flat_corpus, max_seq_len, pad_token, false, out_samples, out_labels);
+    build_single_token_prediction_dataset(flat_corpus, max_seq_len, pad_token, false, out_samples, out_labels);
+}
+
+/* Load a handful of wrapped segments for the generation sanity check. Handles both the
+   legacy single-vector cache and the chunked format (the first chunk is enough to build
+   a prompt). */
+std::vector<std::vector<int>> load_eval_segments(const std::string& tokens_file, size_t max_segments)
+{
+    std::vector<std::vector<int>> segs;
+    if (!file_exists(tokens_file)) return segs;
+
+    if (is_chunked_tokens_file(tokens_file)) {
+        chunked_tokens_reader reader(tokens_file);
+        if (reader.num_chunks() > 0) segs = reader.get_chunk(0);
     }
-    out_main_size = out_samples.size();
-
-    // Cold-start: per-segment with progressive left padding, then keep only padded ones
-    std::vector<matrix<int, 0, 1>> aux_samples;
-    std::vector<unsigned long> aux_labels;
-    build_single_token_prediction_dataset(segments, max_seq_len, pad_token, true, aux_samples, aux_labels);
-    {
-        std::vector<matrix<int, 0, 1>> fx;
-        std::vector<unsigned long> fy;
-        fx.reserve(aux_samples.size());
-        fy.reserve(aux_samples.size());
-        for (size_t i = 0; i < aux_samples.size(); ++i) {
-            if (count_leading_padding(aux_samples[i], pad_token) > 0) {
-                fx.push_back(std::move(aux_samples[i]));
-                fy.push_back(aux_labels[i]);
-            }
-        }
-        aux_samples = std::move(fx);
-        aux_labels = std::move(fy);
+    else {
+        dlib::deserialize(tokens_file) >> segs;
     }
-
-    const size_t aux_target = out_main_size / 20;
-    if (aux_samples.size() > aux_target) {
-        dlib::rand rng(std::chrono::system_clock::now().time_since_epoch().count());
-        for (size_t i = aux_samples.size(); i > aux_target; --i) {
-            const size_t idx = rng.get_random_64bit_number() % i;
-            aux_samples[idx] = std::move(aux_samples.back());
-            aux_samples.pop_back();
-            aux_labels[idx] = aux_labels.back();
-            aux_labels.pop_back();
-        }
-    }
-    out_aux_kept = aux_samples.size();
-
-    // Augment ONLY the main samples (cold-start teaches short contexts and must not be perturbed)
-    const size_t num_specials = tokenizer.get_specials_size();
-    const int random_max = static_cast<int>(tokenizer.get_vocab_size() - num_specials - 1);
-    const int random_min = 256;
-    augment_training_dataset(out_samples, out_labels,
-        static_cast<int>(tokenizer.get_special_token_id("<unk>")), pad_token, 0.05,
-        1, 3, 0, augmentation_mode::random_token, random_min, random_max);
-
-    // Combine main+aux
-    out_samples.insert(out_samples.end(),
-        std::make_move_iterator(aux_samples.begin()),
-        std::make_move_iterator(aux_samples.end()));
-    out_labels.insert(out_labels.end(), aux_labels.begin(), aux_labels.end());
+    if (max_segments > 0 && segs.size() > max_segments) segs.resize(max_segments);
+    return segs;
 }
 
 int run_build_tokenizer(const std::string& external_path, const std::string& tokenizer_file, size_t max_tokenizer_bytes)
 {
-    cout << "=== BUILDING BPE TOKENIZER ===\n"
+    cout << "=== BUILDING BPE TOKENIZER (" << SERIES_NAME << ") ===\n"
         << "Target vocabulary size  : " << NUM_TOKENS << "\n"
         << "Max corpus size (sample): " << (max_tokenizer_bytes / (1024.0 * 1024.0)) << " MB\n";
 
@@ -527,8 +490,7 @@ int run_build_tokenizer(const std::string& external_path, const std::string& tok
     return 0;
 }
 
-// Pre-training and generation pipeline
-
+/* Pre-training and generation pipeline for the Cygnus target architecture. */
 template <typename TRANSFORMER_CONFIG>
 int run_pipeline(bool do_train, bool do_generate, const double learning_rate, const size_t batch_size,
     const long patience, const size_t max_epochs, const double weight_decay, const double beta1, const double beta2,
@@ -539,7 +501,6 @@ int run_pipeline(bool do_train, bool do_generate, const double learning_rate, co
     cout << my_transformer::model_info::describe() << "\n";
     cout << "Tokens cache file: " << tokens_file << "\n";
 
-    // Training mode
     if (do_train)
     {
         if (tokenizer.get_vocab_size() == 0) { cerr << "Error: tokenizer is empty. Run --build-tokenizer first.\n"; return 1; }
@@ -571,8 +532,6 @@ int run_pipeline(bool do_train, bool do_generate, const double learning_rate, co
                     cout << "Loaded " << full_tokens.size() << " segments ("
                         << total_token_count << " tokens)\n";
                     tokens_loaded = true;
-                    // Migrate legacy tokens cache to chunked if it crosses the streaming threshold,
-                    // so the next run streams from disk instead of reloading everything.
                     if (total_token_count > TOKEN_STREAMING_THRESHOLD) {
                         cout << "Token count exceeds streaming threshold (" << TOKEN_STREAMING_THRESHOLD
                             << "); migrating cache to chunked format...\n";
@@ -649,7 +608,6 @@ int run_pipeline(bool do_train, bool do_generate, const double learning_rate, co
         std::vector<unsigned long> labels;
         const int pad_token = static_cast<int>(tokenizer.get_special_token_id("<pad>"));
         std::unique_ptr<chunked_tokens_reader> stream_reader;
-        size_t in_memory_main_size = 0, in_memory_aux_kept = 0;
 
         if (use_streaming) {
             cout << "Preparing chunked streaming training (window=" << MAX_SEQ_LEN << ")...\n";
@@ -659,26 +617,25 @@ int run_pipeline(bool do_train, bool do_generate, const double learning_rate, co
         }
         else {
             cout << "Preparing training sequences in memory (window=" << MAX_SEQ_LEN << ")...\n";
-            build_samples_from_segments(full_tokens, MAX_SEQ_LEN, pad_token, tokenizer,
-                samples, labels, in_memory_main_size, in_memory_aux_kept);
+            build_flat_samples_from_segments(full_tokens, MAX_SEQ_LEN, pad_token, samples, labels);
             full_tokens.clear();
-            cout << "Final dataset size: main=" << in_memory_main_size
-                << " (+" << (samples.size() - in_memory_main_size - in_memory_aux_kept) << " augmented)"
-                << ", cold-start=" << in_memory_aux_kept
-                << ", total=" << samples.size() << "\n";
+            cout << "Training samples (flat, no padding): " << samples.size() << "\n";
         }
 
         using train_net_type = typename my_transformer::template network_type<true>;
         train_net_type net;
         layer<0>(net).loss_details().set_ignore_index(pad_token);
+        layer<0>(net).loss_details().set_z_loss_weight(Z_LOSS_WEIGHT);
 
         if (file_exists(model_file) && !file_exists("chkpt-" + model_file)) {
             cout << "Loading existing model from " << model_file << "\n";
             deserialize(model_file) >> net >> tokenizer;
         }
 
+        /* Propagate optimizer hyperparameters to the MoE internal sub-network solvers
+           (gate and experts), which read them from the shared context. */
         network_context::set_optimizer_params(weight_decay, beta1, beta2);
-        cout << net << "\n";
+
         parameter_counts param_count = count_network_parameters(net, MAX_SEQ_LEN);
         cout << "Model parameters: " << param_count.total << " (active: " << param_count.active << ")\n";
 
@@ -691,24 +648,28 @@ int run_pipeline(bool do_train, bool do_generate, const double learning_rate, co
         trainer.set_synchronization_file("chkpt-" + model_file, std::chrono::minutes(15));
         trainer.be_quiet();
 
-        cout << "Starting training...\n";
+        cout << "Starting foundation training...\n";
         size_t epoch = 0, batches_count = 0;
 
-        // One pass over a (batch, label) pair: synchronize trainer, propagate
-        // learning rate and padding to the context, then train_one_step. Used
-        // by both in-memory and streaming modes.
+        /* The foundation dataset has no leading padding, so no per-batch padding state is
+           pushed to the context. The only context value that must track the trainer is the
+           learning rate (read by the MoE sub-solvers); it changes rarely under reduce-on-
+           plateau, so it is propagated only on change. Touching the shared context requires
+           a synchronization barrier (get_net) to avoid racing the async trainer thread. */
+        double ctx_lr = -1.0;
+
         auto run_one_step = [&](std::vector<matrix<int, 0, 1>>& batch_X,
             std::vector<unsigned long>& batch_Y,
             double& total_loss, size_t& batches_seen, size_t& samples_seen,
             std::chrono::high_resolution_clock::time_point epoch_start)
             {
-                std::vector<long> pad_lengths(batch_X.size());
-                for (size_t j = 0; j < batch_X.size(); ++j)
-                    pad_lengths[j] = count_leading_padding(batch_X[j], pad_token);
+                const double cur_lr = trainer.get_learning_rate();
+                if (cur_lr != ctx_lr) {
+                    trainer.get_net(force_flush_to_disk::no);
+                    network_context::set_learning_rate(cur_lr);
+                    ctx_lr = cur_lr;
+                }
 
-                trainer.get_net(force_flush_to_disk::no);
-                network_context::set_learning_rate(trainer.get_learning_rate());
-                network_context::set_padding_from_lengths(pad_lengths);
                 trainer.train_one_step(batch_X, batch_Y);
 
                 total_loss += trainer.get_average_loss();
@@ -742,7 +703,6 @@ int run_pipeline(bool do_train, bool do_generate, const double learning_rate, co
 
         if (!use_streaming)
         {
-            // In-memory mode: a full epoch is one shuffle + one pass over all samples.
             while (trainer.get_learning_rate() >= trainer.get_min_learning_rate()
                 && epoch < max_epochs && !signal_handler::is_triggered())
             {
@@ -755,12 +715,9 @@ int run_pipeline(bool do_train, bool do_generate, const double learning_rate, co
         }
         else
         {
-            // Streaming mode: an epoch is one pass over all chunks (in shuffled
-            // order). Each chunk is loaded from disk, its samples are rebuilt,
-            // the trainer runs through them, then the samples are freed before
-            // the next chunk is loaded. The reader caches the most recently
-            // loaded chunk so the case where the same chunk index is requested
-            // twice in a row never triggers a redundant disk read.
+            /* An epoch is one pass over all chunks in shuffled order. Each chunk is loaded
+               from disk, its flat windowed samples are rebuilt, the trainer runs through
+               them, then the samples are freed before the next chunk is loaded. */
             std::vector<size_t> chunk_order(stream_reader->num_chunks());
             std::iota(chunk_order.begin(), chunk_order.end(), 0);
             dlib::rand chunk_rng(std::chrono::system_clock::now().time_since_epoch().count());
@@ -768,8 +725,6 @@ int run_pipeline(bool do_train, bool do_generate, const double learning_rate, co
             while (trainer.get_learning_rate() >= trainer.get_min_learning_rate()
                 && epoch < max_epochs && !signal_handler::is_triggered())
             {
-                // Shuffle chunk order each outer epoch to avoid presenting the
-                // corpus in the same disk order every time.
                 for (size_t i = chunk_order.size(); i > 1; --i) {
                     size_t j = static_cast<size_t>(chunk_rng.get_random_64bit_number() % i);
                     std::swap(chunk_order[i - 1], chunk_order[j]);
@@ -787,14 +742,11 @@ int run_pipeline(bool do_train, bool do_generate, const double learning_rate, co
 
                     std::vector<matrix<int, 0, 1>> chunk_samples;
                     std::vector<unsigned long> chunk_labels;
-                    size_t main_size = 0, aux_kept = 0;
-                    build_samples_from_segments(chunk_segments, MAX_SEQ_LEN, pad_token, tokenizer,
-                        chunk_samples, chunk_labels, main_size, aux_kept);
+                    build_flat_samples_from_segments(chunk_segments, MAX_SEQ_LEN, pad_token, chunk_samples, chunk_labels);
 
                     run_one_dataset_pass(chunk_samples, chunk_labels,
                         total_loss, batches_seen, samples_seen, epoch_start);
 
-                    // Release per-chunk samples before moving on.
                     std::vector<matrix<int, 0, 1>>().swap(chunk_samples);
                     std::vector<unsigned long>().swap(chunk_labels);
                 }
@@ -810,7 +762,6 @@ int run_pipeline(bool do_train, bool do_generate, const double learning_rate, co
         network_context::reset();
     }
 
-    // Generation mode
     if (do_generate)
     {
         typename my_transformer::template network_type<false> net;
@@ -822,79 +773,74 @@ int run_pipeline(bool do_train, bool do_generate, const double learning_rate, co
         try_print_moe_info(net, NUM_LAYERS);
 
         if (tokenizer.get_vocab_size() == 0) { cerr << "Error: Tokenizer not loaded.\n"; return 0; }
-        if (!file_exists(tokens_file)) { cerr << "Error: Tokenized file not found. Run --train first.\n"; return 0; }
 
-        cout << "Loading tokenized segments from: " << tokens_file << "\n";
-        std::vector<std::vector<int>> tokenized_segments;
-        deserialize(tokens_file) >> tokenized_segments;
-        cout << "Loaded " << tokenized_segments.size() << " segments\n";
+        cout << "Loading sample segments from: " << tokens_file << "\n";
+        std::vector<std::vector<int>> eval_segments = load_eval_segments(tokens_file, 0);
+        if (eval_segments.empty()) { cerr << "Error: No segments available. Run --train first.\n"; return 0; }
+        cout << "Loaded " << eval_segments.size() << " segments\n";
 
         std::vector<size_t> valid;
-        for (size_t i = 0; i < tokenized_segments.size(); ++i)
-            if (tokenized_segments[i].size() >= 2) valid.push_back(i);
-        if (valid.empty()) { cerr << "Error: No segments with at least 2 tokens.\n"; return 1; }
+        for (size_t i = 0; i < eval_segments.size(); ++i)
+            if (eval_segments[i].size() >= 4) valid.push_back(i);
+        if (valid.empty()) { cerr << "Error: No segments with enough content for a prompt/reference split.\n"; return 1; }
 
         dlib::rand rng(std::chrono::system_clock::now().time_since_epoch().count());
         size_t segment_idx = valid[rng.get_random_32bit_number() % valid.size()];
         cout << "Randomly selected segment #" << segment_idx << "\n";
 
-        const auto& seg = tokenized_segments[segment_idx];
-        const size_t seg_len = seg.size();
-        const int pad_token = static_cast<int>(tokenizer.get_special_token_id("<pad>"));
+        const long text_start_id = tokenizer.get_special_token_id("<text>");
+        const long text_end_id = tokenizer.get_special_token_id("</text>");
+        const int  eot_id = static_cast<int>(text_end_id);
 
+        /* Strip the <text>/</text> wrappers so the model is evaluated on real content,
+           then reinject <text> at the head of the prompt to match the training context. */
+        std::vector<int> content(eval_segments[segment_idx].begin(), eval_segments[segment_idx].end());
+        if (!content.empty() && content.front() == static_cast<int>(text_start_id)) content.erase(content.begin());
+        if (!content.empty() && content.back() == static_cast<int>(text_end_id)) content.pop_back();
+
+        const size_t seg_len = content.size();
         std::vector<int> input_half, verify_half;
         if (seg_len < static_cast<size_t>(MAX_SEQ_LEN)) {
             size_t input_count = (seg_len + 1) / 2;
             if (seg_len - input_count == 0) { cerr << "Error: Segment too short for verification.\n"; return 1; }
-            input_half.assign(seg.begin(), seg.begin() + input_count);
-            verify_half.assign(seg.begin() + input_count, seg.end());
+            input_half.assign(content.begin(), content.begin() + input_count);
+            verify_half.assign(content.begin() + input_count, content.end());
         }
         else {
-            input_half.assign(seg.begin(), seg.begin() + MAX_SEQ_LEN);
-            verify_half.assign(seg.begin() + MAX_SEQ_LEN, seg.end());
+            input_half.assign(content.begin(), content.begin() + MAX_SEQ_LEN);
+            verify_half.assign(content.begin() + MAX_SEQ_LEN, content.end());
         }
-
-        inference_context ctx(MAX_SEQ_LEN, 3, pad_token);
-        ctx.add_tokens(input_half);
+        input_half.insert(input_half.begin(), static_cast<int>(text_start_id));
 
         cout << "\n--- Prompt ---\n" << tokenizer.decode(input_half, false) << "\n--------------\n\n";
-        cout << "Generating...\n";
+        cout << "Generating (KV-cache prefill + incremental)...\n";
         const size_t target = verify_half.size();
         std::vector<int> generated;
         generated.reserve(target);
-        const int eot_id = static_cast<int>(tokenizer.get_special_token_id("</text>"));
         auto t0 = std::chrono::high_resolution_clock::now();
 
-        // KV cache strategy: one prefill forward over the (windowed, possibly
-        // padded) prompt populates each gqa_attention_ layer's K/V cache, then
-        // each subsequent token is produced by a single-token incremental
-        // forward. The attention layer slides its cache automatically once it
-        // reaches MAX_SEQ_LEN, so the generation loop only feeds the next token.
+        /* The prompt is fed cold at positions 0..L-1 (no padding), which matches how
+           per-position training exposes short contexts at low positions. A single prefill
+           forward populates each attention layer's KV cache; each subsequent token is a
+           single-token incremental forward. The cache slides automatically at capacity. */
         network_context::reset();
         network_context::set_kv_cache_capacity(MAX_SEQ_LEN);
-
-        // Prefill on the windowed prompt; padding (if any) is stripped from
-        // the cache by gqa_attention_ via network_context::get_padding_length.
-        auto input_seq = ctx.get_input_window();
-        long pad_len = count_leading_padding(input_seq, pad_token);
-        network_context::set_padding_uniform(pad_len, 1);
+        network_context::clear_padding();
         network_context::set_inference_mode(network_context::inference_mode::prefill);
 
-        int next_tok = net(input_seq);
+        matrix<int, 0, 1> prefill_input(static_cast<long>(input_half.size()), 1);
+        for (size_t i = 0; i < input_half.size(); ++i) prefill_input(i) = input_half[i];
+
+        int next_tok = net(prefill_input);
         generated.push_back(next_tok);
-        ctx.add_token(next_tok);
 
-        // Switch to incremental: no padding info needed (single-token inputs).
-        network_context::clear_padding();
         network_context::set_inference_mode(network_context::inference_mode::incremental);
-
         for (size_t i = 1; i < target && !signal_handler::is_triggered(); ++i) {
             if (next_tok == eot_id) break;
             matrix<int, 0, 1> incr_input(1, 1);
             incr_input(0) = next_tok;
             next_tok = net(incr_input);
             generated.push_back(next_tok);
-            ctx.add_token(next_tok);
         }
         network_context::reset();
 
@@ -916,24 +862,6 @@ int run_pipeline(bool do_train, bool do_generate, const double learning_rate, co
     return 0;
 }
 
-// Fine-tuning mode (instruction tuning) -- placeholder
-int run_fine_tune(const std::string& model_file, const std::string& /*tokenizer_file*/)
-{
-    cout << "=== FINE-TUNING MODE (placeholder) ===\n"
-        << "This mode will load " << model_file << " and apply instruction fine-tuning.\n"
-        << "Not yet implemented in this iteration.\n";
-    return 0;
-}
-
-// Interactive prompt mode -- placeholder
-int run_prompt(const std::string& model_file, const std::string& /*tokenizer_file*/)
-{
-    cout << "=== INTERACTIVE PROMPT MODE (placeholder) ===\n"
-        << "This mode will load " << model_file << " for interactive generation.\n"
-        << "Not yet implemented in this iteration.\n";
-    return 0;
-}
-
 int main(int argc, char** argv)
 {
     try
@@ -943,11 +871,9 @@ int main(int argc, char** argv)
 
         parser.add_option("build-tokenizer", "Train the BPE tokenizer on the corpus and exit");
         parser.add_option("train", "Pre-train the model (requires a previously built tokenizer)");
-        parser.add_option("fine-tune", "Instruction fine-tuning of a pre-trained model (placeholder)");
-        parser.add_option("prompt", "Interactive generation loop (placeholder)");
         parser.add_option("generate", "Autoregressive generation sanity check");
 
-        parser.add_option("external-data", "Path to external corpus file or directory", 1);
+        parser.add_option("external-data", "Path to external corpus file", 1);
         parser.add_option("lines-per-segment", "Number of consecutive lines grouped as one segment (default: 10)", 1);
         parser.add_option("max-tokenizer-bytes", "Max corpus size in MB for BPE training (default: 200)", 1);
 
@@ -959,24 +885,21 @@ int main(int argc, char** argv)
         parser.add_option("beta1", "AdamW beta1 coefficient (default: 0.9)", 1);
         parser.add_option("beta2", "AdamW beta2 coefficient (default: 0.98)", 1);
 
-        parser.add_option("model-file", "Model file path (default: dlib_euro_moe_model.dat)", 1);
-        parser.add_option("tokenizer-file", "Tokenizer file path (default: dlib_euro_moe_tokenizer.vocab)", 1);
+        parser.add_option("model-file", "Model file path (default: cygnus_model.dat)", 1);
+        parser.add_option("tokenizer-file", "Tokenizer file path (default: cygnus_tokenizer.vocab)", 1);
 
         parser.parse(argc, argv);
 
         const bool do_build_tok = parser.option("build-tokenizer");
         const bool do_train = parser.option("train");
-        const bool do_fine_tune = parser.option("fine-tune");
-        const bool do_prompt = parser.option("prompt");
         const bool do_generate = parser.option("generate");
 
-        if (!do_build_tok && !do_train && !do_fine_tune && !do_prompt && !do_generate) {
+        if (!do_build_tok && !do_train && !do_generate) {
             parser.print_options();
-            cout << "\nExample usage:\n"
+            cout << "\n" << SERIES_NAME << " foundation pre-training\n"
+                << "Example usage:\n"
                 << "  Build tokenizer : " << argv[0] << " --build-tokenizer --external-data corpus.txt\n"
                 << "  Pre-train       : " << argv[0] << " --train --external-data corpus.txt\n"
-                << "  Fine-tune       : " << argv[0] << " --fine-tune\n"
-                << "  Interactive     : " << argv[0] << " --prompt\n"
                 << "  Generate sample : " << argv[0] << " --generate\n";
             return 0;
         }
@@ -992,20 +915,19 @@ int main(int argc, char** argv)
         const size_t max_tok_mb = get_option(parser, "max-tokenizer-bytes", DEFAULT_MAX_TOKENIZER_BYTES / (1024 * 1024));
         const size_t max_tok_bytes = max_tok_mb * 1024 * 1024;
 
-        const std::string tokenizer_file = get_option(parser, "tokenizer-file", std::string("dlib_euro_moe_tokenizer.vocab"));
-        const std::string model_file = get_option(parser, "model-file", std::string("dlib_euro_moe_model.dat"));
+        const std::string tokenizer_file = get_option(parser, "tokenizer-file", std::string("cygnus_tokenizer.vocab"));
+        const std::string model_file = get_option(parser, "model-file", std::string("cygnus_model.dat"));
         const std::string external_path = parser.option("external-data") ? parser.option("external-data").argument() : "";
 
-        cout << "=== Configuration ===\n"
+        cout << "=== " << SERIES_NAME << " configuration ===\n"
             << "  Model file       : " << model_file << "\n"
             << "  Tokenizer file   : " << tokenizer_file << "\n"
             << "  Architecture     : " << NUM_TOKENS << "/" << NUM_LAYERS << "/" << NUM_HEADS << "/" << NUM_KV_HEADS
-            << "/" << EMBEDDING_DIM << "/" << NUM_EXPERTS << "/" << TOP_K << "\n"
-            << "  Max seq len      : " << MAX_SEQ_LEN << "\n\n";
+            << "/" << EMBEDDING_DIM << "/" << NUM_EXPERTS << "/" << TOP_K << " (vocab/layers/heads/kv/dim/experts/top-k)\n"
+            << "  Max seq len      : " << MAX_SEQ_LEN << "\n"
+            << "  z-loss weight    : " << Z_LOSS_WEIGHT << "\n\n";
 
         if (do_build_tok) return run_build_tokenizer(external_path, tokenizer_file, max_tok_bytes);
-        if (do_fine_tune) return run_fine_tune(model_file, tokenizer_file);
-        if (do_prompt)    return run_prompt(model_file, tokenizer_file);
 
         bpe_tokenizer tokenizer;
         if (!file_exists(tokenizer_file)) {
@@ -1018,7 +940,7 @@ int main(int argc, char** argv)
 
         std::vector<std::string> text_segments;
         if (do_train) {
-            cout << "Loading internal datasets...\n";
+            cout << "Loading internal bootstrap datasets...\n";
             std::vector<dataset_id> internal_ids = { dataset_id::GENERAL_KNOWLEDGE, dataset_id::PHYSICS_PARAGRAPHS };
             auto internal_segs = get_dataset_as_segments(internal_ids);
             text_segments.insert(text_segments.end(), internal_segs.begin(), internal_segs.end());

@@ -912,25 +912,25 @@ namespace dlib
 
 // ----------------------------------------------------------------------------------------
 
-    class loss_cross_entropy_per_logit_
+    class loss_cross_entropy_per_token_
     {
     public:
         typedef unsigned long training_label_type;
         typedef unsigned long output_label_type;
 
-        loss_cross_entropy_per_logit_() : ignore_index_(-1), label_smoothing_(0.1) {}
+        loss_cross_entropy_per_token_()
+            : ignore_index_(-1), label_smoothing_(0.1), pad_index_(-1), z_loss_weight_(0.0) {
+        }
 
         void set_ignore_index(long idx) { ignore_index_ = idx; }
         long get_ignore_index() const { return ignore_index_; }
 
-        // Multi-index ignore: positions whose target label matches any of these
-        // indices contribute neither to the loss nor to the gradient. This is
-        // useful for instruct fine-tuning where the prompt portion (question +
-        // role markers) should not influence the gradient
+        /* Multi-index ignore: positions whose target label matches any of these indices
+           contribute neither to the loss nor to the gradient. Used for instruct
+           fine-tuning, where the prompt portion must not drive the gradient. */
         void set_ignore_indices(const std::vector<long>& indices)
         {
             ignore_indices_ = indices;
-            // Keep ignore_index_ as the first element for legacy code paths
             ignore_index_ = indices.empty() ? -1 : indices.front();
         }
         const std::vector<long>& get_ignore_indices() const { return ignore_indices_; }
@@ -955,6 +955,25 @@ namespace dlib
         }
         double get_label_smoothing() const { return label_smoothing_; }
 
+        /* Padding token used for query-side masking. A position whose own input token
+           equals this index is skipped, because attention masks padding rows and their
+           output carries no context. A value < 0 disables query masking explicitly.
+           In single-index mode it defaults to ignore_index_ (in causal pretraining the
+           pad token is exactly the ignored target). In multi-index mode it must be set
+           explicitly, since the ignore set there holds prompt markers, not the pad. */
+        void set_pad_index(long idx) { pad_index_ = idx; }
+        long get_pad_index() const { return pad_index_; }
+
+        /* Output z-regularization weight (PaLM/ST-MoE z-loss). 0 disables it and
+           reproduces plain per-position cross-entropy. A small value (e.g. 1e-4)
+           stabilizes long runs and bounds logit drift. */
+        void set_z_loss_weight(double w)
+        {
+            DLIB_CASSERT(w >= 0.0, "z-loss weight must be non-negative");
+            z_loss_weight_ = w;
+        }
+        double get_z_loss_weight() const { return z_loss_weight_; }
+
         template <typename SUB_TYPE, typename label_iterator>
         void to_label(
             const tensor& input_tensor,
@@ -970,22 +989,16 @@ namespace dlib
             const long batch_size = output_tensor.num_samples();
             const long seq_len = output_tensor.nr();
             const long vocab_size = output_tensor.nc();
-
             const float* out_data = output_tensor.host();
 
             for (long i = 0; i < batch_size; ++i, ++iter)
             {
-                // Find the class with the maximum logit at the last position
                 long max_idx = 0;
                 float max_val = out_data[tensor_index(output_tensor, i, 0, seq_len - 1, 0)];
                 for (long c = 1; c < vocab_size; ++c)
                 {
                     const float val = out_data[tensor_index(output_tensor, i, 0, seq_len - 1, c)];
-                    if (val > max_val)
-                    {
-                        max_val = val;
-                        max_idx = c;
-                    }
+                    if (val > max_val) { max_val = val; max_idx = c; }
                 }
                 *iter = static_cast<unsigned long>(max_idx);
             }
@@ -1012,57 +1025,67 @@ namespace dlib
             grad = 0;
             double loss = 0.0;
 
-            // If a multi-index list is configured, use it; otherwise fall back to
-            // the legacy single-index path. Both code paths are equivalent when
-            // ignore_indices_ contains exactly one element
+            /* Single-index mode: the ignored target IS the pad token, so the query
+               mask follows ignore_index_ unless overridden. Multi-index mode: query
+               mask uses pad_index_ only (never the marker set). */
+            const long effective_pad = (ignore_indices_.empty())
+                ? (pad_index_ >= 0 ? pad_index_ : ignore_index_)
+                : pad_index_;
+
             if (ignore_indices_.empty())
             {
 #ifdef DLIB_USE_CUDA
-                cuda_compute(truth, input_tensor, output_tensor, grad, loss, ignore_index_, label_smoothing_);
+                cuda_compute(truth, input_tensor, output_tensor, grad, loss,
+                    ignore_index_, label_smoothing_, effective_pad, z_loss_weight_);
 #else
-                cpu_compute(truth, input_tensor, output_tensor, grad, loss, ignore_index_, label_smoothing_);
+                cpu_compute(truth, input_tensor, output_tensor, grad, loss,
+                    ignore_index_, label_smoothing_, effective_pad, z_loss_weight_);
 #endif
             }
             else
             {
 #ifdef DLIB_USE_CUDA
                 cuda_compute_multi(truth, input_tensor, output_tensor, grad, loss,
-                    ignore_indices_, label_smoothing_);
+                    ignore_indices_, label_smoothing_, effective_pad, z_loss_weight_);
 #else
                 cpu_compute_multi(truth, input_tensor, output_tensor, grad, loss,
-                    ignore_indices_, label_smoothing_);
+                    ignore_indices_, label_smoothing_, effective_pad, z_loss_weight_);
 #endif
             }
             return loss;
         }
 
-        friend void serialize(const loss_cross_entropy_per_logit_& item, std::ostream& out)
+        friend void serialize(const loss_cross_entropy_per_token_& item, std::ostream& out)
         {
-            serialize("loss_cross_entropy_per_logit_", out);
+            serialize("loss_cross_entropy_per_token_", out);
             serialize(item.ignore_index_, out);
             serialize(item.label_smoothing_, out);
             serialize(item.ignore_indices_, out);
+            serialize(item.pad_index_, out);
+            serialize(item.z_loss_weight_, out);
         }
 
-        friend void deserialize(loss_cross_entropy_per_logit_& item, std::istream& in)
+        friend void deserialize(loss_cross_entropy_per_token_& item, std::istream& in)
         {
             std::string version;
             deserialize(version, in);
-            if (version == "loss_cross_entropy_per_logit_")
+            if (version == "loss_cross_entropy_per_token_")
             {
                 deserialize(item.ignore_index_, in);
                 deserialize(item.label_smoothing_, in);
                 deserialize(item.ignore_indices_, in);
+                deserialize(item.pad_index_, in);
+                deserialize(item.z_loss_weight_, in);
             }
             else
             {
-                throw serialization_error("Unexpected version found while deserializing dlib::loss_cross_entropy_per_logit_.");
+                throw serialization_error("Unexpected version found while deserializing dlib::loss_cross_entropy_per_token_.");
             }
         }
 
-        friend std::ostream& operator<<(std::ostream& out, const loss_cross_entropy_per_logit_& item)
+        friend std::ostream& operator<<(std::ostream& out, const loss_cross_entropy_per_token_& item)
         {
-            out << "loss_cross_entropy_per_logit";
+            out << "loss_cross_entropy_per_token";
             if (!item.ignore_indices_.empty())
             {
                 out << " (ignore_indices=[";
@@ -1077,15 +1100,19 @@ namespace dlib
             {
                 out << " (ignore_index=" << item.ignore_index_;
             }
-            out << ", label_smoothing=" << item.label_smoothing_ << ")";
+            out << ", pad_index=" << item.pad_index_
+                << ", label_smoothing=" << item.label_smoothing_
+                << ", z_loss_weight=" << item.z_loss_weight_ << ")";
             return out;
         }
 
-        friend void to_xml(const loss_cross_entropy_per_logit_& item, std::ostream& out)
+        friend void to_xml(const loss_cross_entropy_per_token_& item, std::ostream& out)
         {
-            out << "<loss_cross_entropy_per_logit"
+            out << "<loss_cross_entropy_per_token"
                 << " ignore_index='" << item.ignore_index_ << "'"
-                << " label_smoothing='" << item.label_smoothing_ << "'";
+                << " pad_index='" << item.pad_index_ << "'"
+                << " label_smoothing='" << item.label_smoothing_ << "'"
+                << " z_loss_weight='" << item.z_loss_weight_ << "'";
             if (!item.ignore_indices_.empty())
             {
                 out << " ignore_indices='";
@@ -1103,17 +1130,19 @@ namespace dlib
         long ignore_index_;
         std::vector<long> ignore_indices_;
         double label_smoothing_;
+        long pad_index_;
+        double z_loss_weight_;
 #ifdef DLIB_USE_CUDA
-        cuda::compute_loss_cross_entropy_per_logit cuda_compute;
-        cuda::compute_loss_cross_entropy_per_logit_multi cuda_compute_multi;
+        cuda::compute_loss_cross_entropy_per_token cuda_compute;
+        cuda::compute_loss_cross_entropy_per_token_multi cuda_compute_multi;
 #else
-        cpu::compute_loss_cross_entropy_per_logit cpu_compute;
-        cpu::compute_loss_cross_entropy_per_logit_multi cpu_compute_multi;
-#endif            
+        cpu::compute_loss_cross_entropy_per_token cpu_compute;
+        cpu::compute_loss_cross_entropy_per_token_multi cpu_compute_multi;
+#endif
     };
 
     template <typename SUBNET>
-    using loss_cross_entropy_per_logit = add_loss_layer<loss_cross_entropy_per_logit_, SUBNET>;
+    using loss_cross_entropy_per_token = add_loss_layer<loss_cross_entropy_per_token_, SUBNET>;
 
 // ----------------------------------------------------------------------------------------
 

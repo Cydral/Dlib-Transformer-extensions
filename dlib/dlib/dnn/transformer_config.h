@@ -16,7 +16,7 @@ namespace dlib
 
     // Classification head for next-token prediction
     template <long num_logits, typename SUBNET>
-    using classification_head = loss_cross_entropy_per_logit<linear<num_logits, rms_norm<SUBNET>>>;
+    using classification_head = loss_cross_entropy_per_token<linear<num_logits, rms_norm<SUBNET>>>;
 
     template <long num_logits, typename SUBNET>
     using fused_classification_head = loss_multiclass_log<fc<num_logits, rms_norm<SUBNET>>>;
