@@ -461,25 +461,15 @@ int run_pipeline(
                 << aux_target << "); using all available\n";
         }
 
-        const size_t num_specials = tokenizer.get_specials_size();
-        const int random_max = static_cast<int>(tokenizer.get_vocab_size() - num_specials - 1);
-        const int random_min = 256;
-
-        // Augment ONLY the main flat-corpus samples; cold-start samples teach a
-        // distinct skill (handling short contexts) and should not be perturbed
-        augment_training_dataset(samples, labels,
-            static_cast<int>(tokenizer.get_special_token_id("<unk>")), pad_token, 0.05,
-            1, 3, 0, augmentation_mode::random_token, random_min, random_max);
-
-        // Combine main and auxiliary samples
+        // Combine main and cold-start samples. No input-token augmentation here:
+        // random-token noise perturbs the conditional the model must reproduce and
+        // creates a train/inference token mismatch on a corpus this small.
         samples.insert(samples.end(),
             std::make_move_iterator(aux_samples.begin()),
             std::make_move_iterator(aux_samples.end()));
         labels.insert(labels.end(), aux_labels.begin(), aux_labels.end());
 
-        const size_t main_after_aug = samples.size() - aux_samples.size();
         cout << "Final dataset size: main=" << main_size
-            << " (+" << (main_after_aug - main_size) << " augmented)"
             << ", cold-start=" << aux_samples.size()
             << ", total=" << samples.size() << "\n";
 
@@ -487,6 +477,7 @@ int run_pipeline(
         using train_net_type = typename my_transformer::template network_type<true>;
         train_net_type net;
         layer<0>(net).loss_details().set_ignore_index(pad_token);
+        layer<0>(net).loss_details().set_z_loss_weight(1e-4);
 
         if (file_exists(model_file) && !file_exists("chkpt-" + model_file)) {
             cout << "Loading existing model from " << model_file << "\n";
