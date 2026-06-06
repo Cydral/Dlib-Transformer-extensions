@@ -1,9 +1,8 @@
-﻿// Copyright (C) 2025  Davis E. King (davis@dlib.net)
+// Copyright (C) 2025  Davis E. King (davis@dlib.net)
 // License: Boost Software License   See LICENSE.txt for the full license.
 #undef DLIB_ARC_AGI_ABSTRACT_H_
 #ifdef DLIB_ARC_AGI_ABSTRACT_H_
 
-#include "arc_agi_abstract.h"
 #include <string>
 #include <vector>
 #include <map>
@@ -21,10 +20,10 @@ namespace dlib
 {
     // Type aliases for ARC-AGI data structures
     using arc_grid_t = matrix<unsigned char>;
-    using arc_token_sequence_t = matrix<long, 0, 1>;
+    using arc_token_sequence_t = matrix<int, 0, 1>;
 
     // Token vocabulary for the Hierarchical Reasoning Model
-    enum arc_token_id : long
+    enum arc_token_id : int
     {
         COLOR_0 = 0, COLOR_1 = 1, COLOR_2 = 2, COLOR_3 = 3, COLOR_4 = 4,
         COLOR_5 = 5, COLOR_6 = 6, COLOR_7 = 7, COLOR_8 = 8, COLOR_9 = 9,
@@ -38,33 +37,30 @@ namespace dlib
     };
 
     // Vocabulary size constants
-    constexpr long ARC_VOCAB_SIZE_COLORS = 10;
-    constexpr long ARC_VOCAB_SIZE_TOTAL = 17;
+    constexpr int ARC_VOCAB_SIZE_COLORS = 10;
+    constexpr int ARC_VOCAB_SIZE_TOTAL = arc_token_id::TOKEN_ROW_END + 1;
 
     struct arc_task_pair
     {
         /*!
             WHAT THIS OBJECT REPRESENTS
                 Represents a single Input/Output example pair within an ARC task.
-                Each pair demonstrates a transformation pattern that the model must learn.
+                Each pair demonstrates a transformation pattern that the model must
+                learn.
         !*/
 
         arc_grid_t input;
-        /*!
-            The input grid (2D matrix of color values 0-9)
-        !*/
-
         arc_grid_t output;
-        /*!
-            The corresponding output grid showing the transformed result
-        !*/
-
         long input_rows;
         long input_cols;
         long output_rows;
         long output_cols;
+
+        friend void serialize(const arc_task_pair& item, std::ostream& out);
+        friend void deserialize(arc_task_pair& item, std::istream& in);
         /*!
-            Dimensions of the input and output grids
+            ensures
+                - Standard dlib serialization protocol. All six fields are persisted.
         !*/
     };
 
@@ -73,23 +69,19 @@ namespace dlib
         /*!
             WHAT THIS OBJECT REPRESENTS
                 Represents a complete ARC-AGI reasoning task containing:
-                - Multiple training pairs demonstrating a pattern
-                - One or more test pairs where the model must predict outputs
+                - Multiple training pairs demonstrating a pattern;
+                - One or more test pairs where the model must predict outputs.
         !*/
 
         std::string task_id;
-        /*!
-            Unique identifier extracted from the JSON filename
-        !*/
-
         std::vector<arc_task_pair> train_pairs;
-        /*!
-            Training examples demonstrating the pattern to learn
-        !*/
-
         std::vector<arc_task_pair> test_pairs;
+
+        friend void serialize(const arc_task& item, std::ostream& out);
+        friend void deserialize(arc_task& item, std::istream& in);
         /*!
-            Test cases where the model must predict the output
+            ensures
+                - Standard dlib serialization protocol.
         !*/
     };
 
@@ -98,24 +90,24 @@ namespace dlib
         /*!
             WHAT THIS OBJECT REPRESENTS
                 This object provides utilities for loading, accessing, and preparing
-                ARC-AGI (Abstraction and Reasoning Corpus for Artificial General Intelligence)
-                dataset for training Transformer-based models such as the Hierarchical
-                Reasoning Model (HRM).
+                ARC-AGI (Abstraction and Reasoning Corpus for Artificial General
+                Intelligence) data for training Transformer-based models such as the
+                Hierarchical Reasoning Model (HRM).
 
-                The ARC-AGI dataset consists of visual reasoning tasks where each task
-                contains:
-                - Training pairs: Input/Output grid examples demonstrating a pattern
-                - Test pairs: Input grids where the model must predict the output
+                The ARC-AGI dataset consists of visual reasoning tasks where each
+                task contains:
+                - Training pairs: Input/Output grid examples demonstrating a pattern;
+                - Test pairs: Input grids where the model must predict the output.
 
-                Each grid is a 2D matrix of integers (0-9) representing colors/symbols,
+                Each grid is a 2D matrix of integers (0-9) representing colors,
                 with maximum dimensions of 30x30.
 
                 TOKENIZATION STRATEGY
                     Grids are tokenized row-by-row with TOKEN_ROW_END markers inserted
-                    at the end of each row. This encoding preserves dimensional information
-                    implicitly, allowing the model to learn and generate grids of arbitrary
-                    dimensions (1x1 to 30x30, including non-square grids) without requiring
-                    explicit dimension specification.
+                    at the end of each row. This encoding preserves dimensional
+                    information implicitly, allowing the model to learn and generate
+                    grids of arbitrary dimensions (1x1 to 30x30, including non-square
+                    grids) without requiring explicit dimension specification.
 
                 The dataset is available from: https://github.com/fchollet/ARC-AGI
         !*/
@@ -124,7 +116,7 @@ namespace dlib
         arc_agi_manager();
         /*!
             ensures
-                - Constructs an empty arc_agi_manager object
+                - Constructs an empty arc_agi_manager object.
         !*/
 
         void load_data(
@@ -133,83 +125,52 @@ namespace dlib
         );
         /*!
             ensures
-                - Attempts to load the ARC-AGI dataset from the specified directories
-                - training_path should contain JSON files for training tasks
-                - evaluation_path should contain JSON files for evaluation tasks
-                - Each JSON file represents one task with training and test pairs
-                - Task IDs are extracted from filenames (without .json extension)
+                - Loads the ARC-AGI dataset from the specified directories.
+                - training_path should contain JSON files for training tasks.
+                - evaluation_path should contain JSON files for evaluation tasks.
+                - Each JSON file represents one task with training and test pairs.
+                - Task IDs are extracted from filenames (without .json extension).
             throws
                 - std::runtime_error if directories cannot be accessed or files
-                  cannot be parsed
+                  cannot be parsed.
         !*/
 
         const arc_task& get_training_task(size_t index) const;
-        /*!
-            requires
-                - index < num_training_tasks()
-            ensures
-                - Returns the training task at the specified index
-            throws
-                - std::out_of_range if index is out of bounds
-        !*/
-
         const arc_task& get_evaluation_task(size_t index) const;
         /*!
             requires
-                - index < num_evaluation_tasks()
+                - index < num_training_tasks() (resp. num_evaluation_tasks()).
             ensures
-                - Returns the evaluation task at the specified index
+                - Returns the task at the specified index.
             throws
-                - std::out_of_range if index is out of bounds
+                - std::out_of_range if index is out of bounds.
         !*/
 
         const arc_task& get_training_task_by_id(const std::string& task_id) const;
-        /*!
-            requires
-                - task_id is a valid task identifier
-            ensures
-                - Returns the training task with the specified task_id
-            throws
-                - std::runtime_error if task_id is not found
-        !*/
-
         const arc_task& get_evaluation_task_by_id(const std::string& task_id) const;
         /*!
-            requires
-                - task_id is a valid task identifier
             ensures
-                - Returns the evaluation task with the specified task_id
+                - Returns the task with the specified task_id.
             throws
-                - std::runtime_error if task_id is not found
+                - std::runtime_error if task_id is not found.
         !*/
 
         size_t num_training_tasks() const;
-        /*!
-            ensures
-                - Returns the number of loaded training tasks
-        !*/
-
         size_t num_evaluation_tasks() const;
         /*!
             ensures
-                - Returns the number of loaded evaluation tasks
+                - Returns the number of loaded tasks of the corresponding kind.
         !*/
 
         void serialize(std::ostream& out) const;
-        /*!
-            ensures
-                - Writes the entire dataset to the output stream in Dlib's
-                  serialization format
-                - Can be saved to a .dat file for faster loading
-        !*/
-
         void deserialize(std::istream& in);
         /*!
             ensures
-                - Loads the entire dataset from the input stream
-                - Stream must contain data previously written by serialize()
+                - Writes / reads the entire dataset to / from the stream using
+                  dlib's serialization format. The output can be saved as a .dat
+                  file for faster loading on subsequent runs.
             throws
-                - serialization_error if data format is invalid
+                - serialization_error on invalid data format.
         !*/
 
         static arc_token_sequence_t tokenize_input_context(
@@ -218,14 +179,19 @@ namespace dlib
         );
         /*!
             ensures
-                - Converts the task's training pairs and the specified test input
-                  into a token sequence suitable for LLM-style training
-                - Returns a sequence: [grid_tokens..., ROW_END, SEP_IO,
-                  grid_tokens..., ROW_END, SEP_PAIR, ..., QUERY_START,
-                  test_input_tokens..., ROW_END, GEN_START]
+                - Builds the token sequence the model uses as context for the
+                  specified test pair:
+                      for each training pair p:
+                          [p.input flattened with TOKEN_ROW_END]
+                          TOKEN_SEP_IO
+                          [p.output flattened with TOKEN_ROW_END]
+                          TOKEN_SEP_PAIR
+                      TOKEN_QUERY_START
+                      [test_pair.input flattened with TOKEN_ROW_END]
+                      TOKEN_GEN_START
                 - Each grid is encoded with TOKEN_ROW_END markers at the end of
-                  each row to preserve dimensional information
-                - This represents the context that the model uses to predict the output
+                  every row to preserve dimensional information.
+                - Returns a column vector of int tokens.
         !*/
 
         static arc_token_sequence_t tokenize_target_output(
@@ -233,47 +199,110 @@ namespace dlib
         );
         /*!
             ensures
-                - Converts the test output grid into a token sequence
-                - Returns a sequence: [grid_tokens..., ROW_END, ..., END_OF_OUTPUT]
-                - Each row is terminated with TOKEN_ROW_END to preserve dimensions
-                - This represents the ground truth that the model should predict
+                - Builds the token sequence the model must predict for the
+                  specified test pair:
+                      [test_pair.output flattened with TOKEN_ROW_END]
+                      TOKEN_END_OF_OUTPUT
+                - Returns a column vector of int tokens.
+        !*/
+
+        // ----------------------------------------------------------------------
+        // Training-data builders
+        //
+        // Three strategies are provided to feed an autoregressive transformer
+        // with ARC-AGI samples. They differ in how the demonstration pairs of a
+        // task are exposed to the model, and serve different stages of training.
+        // ----------------------------------------------------------------------
+
+        static void prepare_training_data_pair_only(
+            const arc_task& task,
+            long window_len,
+            std::vector<arc_token_sequence_t>& training_X_batch,
+            std::vector<long>& training_Y_batch,
+            bool debug = false
+        );
+        /*!
+            requires
+                - window_len > 1.
+            ensures
+                - For every pair p in task.train_pairs and task.test_pairs,
+                  builds the sequence
+                      [p.input flattened] TOKEN_GEN_START [p.output flattened]
+                      TOKEN_END_OF_OUTPUT
+                  and produces one training sample (window of size window_len,
+                  next-token label) at every position inside the output portion.
+                - The model is NOT exposed to other pairs while predicting a given
+                  output. Useful as a warmup phase to teach the encoding scheme
+                  before introducing few-shot demonstrations.
+                - Left-pads with TOKEN_PADDING when the window extends past the
+                  start of the sequence.
+            throws
+                - DLIB_CASSERT if window_len <= 1.
+        !*/
+
+        static void prepare_training_data_sliding_window(
+            const arc_task& task,
+            long window_len,
+            std::vector<arc_token_sequence_t>& training_X_batch,
+            std::vector<long>& training_Y_batch,
+            bool debug = false
+        );
+        /*!
+            requires
+                - window_len > 1.
+            ensures
+                - Builds the FULL task sequence:
+                      [train_in_1] SEP_IO [train_out_1] SEP_PAIR ...
+                      QUERY_START [test_in] GEN_START [test_out] END_OF_OUTPUT ...
+                  and emits one training sample at every position of that
+                  sequence, including positions that fall inside demonstration
+                  pairs (i.e. the model is trained to predict every token, not
+                  only the test output).
+                - The test_pair outputs are exposed to the model during training
+                  in this mode. Suitable for tasks where the model should learn
+                  generic next-token modelling over the full task structure.
+                - Left-pads with TOKEN_PADDING when needed.
+            throws
+                - DLIB_CASSERT if window_len <= 1.
         !*/
 
         static void prepare_training_data_batch(
             const arc_task& task,
             long window_len,
             std::vector<arc_token_sequence_t>& training_X_batch,
-            std::vector<long>& training_Y_batch
+            std::vector<long>& training_Y_batch,
+            bool debug = false
         );
         /*!
             requires
-                - window_len > 1
+                - window_len > 1.
             ensures
-                - Prepares training data in the format required by dlib::dnn::trainer
-                  using a sliding window approach for causal language modeling
-                - For each test pair in the task, generates training samples where:
-                  * Each X sample is a context window of size window_len containing
-                    the previous window_len tokens
-                  * Each Y label is the next token that should follow the context
-                - #training_X_batch.size() == #training_Y_batch.size()
-                - Each training_X_batch[i] is a column vector (matrix<long, 0, 1>)
-                  of size window_len x 1
-                - Each training_Y_batch[i] is a single token (long) representing
-                  the target to predict
-                - Implements left-padding with TOKEN_PADDING when the context window
-                  extends before the sequence start, preserving recent context on
-                  the right side (standard for causal language models)
-                - The concatenated sequence is: [input_context, target_output]
+                - Implements the held-out few-shot training strategy used to teach
+                  ARC-style reasoning:
+                    * For every pair p in task.train_pairs (held-out role):
+                        - Builds a synthetic task whose demonstrations are the
+                          OTHER train_pairs and whose target is p.
+                        - Concatenates tokenize_input_context(synthetic, p) and
+                          tokenize_target_output(p) to obtain the full sequence.
+                        - Locates the TOKEN_GEN_START position and considers only
+                          the prediction positions strictly inside the output.
+                        - Keeps only positions whose target token is a color
+                          (COLOR_0..COLOR_9), TOKEN_ROW_END, or TOKEN_END_OF_OUTPUT,
+                          discarding positions whose target is structural or
+                          padding.
+                        - Randomly subsamples those positions to at most 256 per
+                          held-out pair to bound the per-task sample budget.
+                        - For each retained position, extracts a left-padded
+                          window of length window_len ending at that position.
+                          Windows with more than 80% padding tokens are dropped.
+                    * task.test_pairs are NOT used (their labels are unknown at
+                      training time; they are reserved for evaluation).
+                - This strategy exposes the model to multiple demonstration pairs
+                  while predicting one held-out target, which is the canonical
+                  setup for learning few-shot reasoning over ARC tasks.
+                - The RNG is a thread-local std::mt19937 seeded once per thread.
             throws
-                - std::invalid_argument if window_len <= 1
-
-            EXAMPLE
-                For a sequence [A, B, C, D, E] with window_len=3:
-                X[0] = [PAD, PAD, A]  => Y[0] = B
-                X[1] = [PAD, A, B]    => Y[1] = C
-                X[2] = [A, B, C]      => Y[2] = D
-                X[3] = [B, C, D]      => Y[3] = E
-                X[4] = [C, D, E]      => Y[4] = PAD
+                - DLIB_CASSERT if window_len <= 1.
         !*/
 
         static arc_grid_t detokenize_to_grid(
@@ -282,23 +311,25 @@ namespace dlib
         );
         /*!
             requires
-                - tokens contains a valid tokenized grid sequence with TOKEN_ROW_END markers
+                - tokens contains a valid tokenized grid sequence with
+                  TOKEN_ROW_END markers.
             ensures
-                - Reconstructs a grid from a tokenized sequence
-                - Uses TOKEN_ROW_END markers to determine row boundaries and infer
-                  grid dimensions
-                - Parsing stops at TOKEN_END_OF_OUTPUT, TOKEN_SEP_IO, or TOKEN_SEP_PAIR
-                - Returns a matrix containing the reconstructed grid
-                - Returns an empty matrix (0x0) if no valid grid is found
-                - Grid dimensions are automatically determined from the token stream:
-                  * Number of rows = count of TOKEN_ROW_END markers
-                  * Number of columns = tokens between consecutive TOKEN_ROW_END markers
+                - Reconstructs a grid from a tokenized sequence:
+                  * TOKEN_ROW_END terminates the current row;
+                  * Parsing stops at TOKEN_END_OF_OUTPUT, TOKEN_SEP_IO, or
+                    TOKEN_SEP_PAIR;
+                  * Color tokens (COLOR_0..COLOR_9) become grid cells;
+                  * Other tokens (including TOKEN_PADDING) are ignored.
+                - Returns the reconstructed matrix.
+                - Returns an empty matrix (0x0) if no valid row is found.
+                - Grid dimensions are inferred from the row structure of the
+                  token stream.
             throws
-                - DLIB_CASSERT if row lengths are inconsistent (indicating malformed data)
+                - DLIB_CASSERT if row lengths are inconsistent.
 
             EXAMPLE
-                Input tokens: [1, 2, 3, ROW_END, 4, 5, 6, ROW_END, END_OF_OUTPUT]
-                Returns: 2x3 grid = [[1, 2, 3], [4, 5, 6]]
+                tokens = [1, 2, 3, ROW_END, 4, 5, 6, ROW_END, END_OF_OUTPUT]
+                returns the 2x3 grid [[1, 2, 3], [4, 5, 6]].
         !*/
     };
 

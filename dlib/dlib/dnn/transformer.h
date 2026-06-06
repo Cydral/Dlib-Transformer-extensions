@@ -1683,18 +1683,11 @@ namespace dlib
             z_h_init.set_size(1, 1, 1, hidden_dim);
             z_l_init.set_size(1, 1, 1, hidden_dim);
 
-            static std::atomic<unsigned long> seed_counter{ 0 };
-            dlib::rand rnd(seed_counter++);
-
             auto* h_ptr = z_h_init.host();
             auto* l_ptr = z_l_init.host();
-
             for (long c = 0; c < hidden_dim; ++c) {
-                float h_val, l_val;
-                do { h_val = rnd.get_random_gaussian(); } while (std::abs(h_val) > 2.0f);
-                do { l_val = rnd.get_random_gaussian(); } while (std::abs(l_val) > 2.0f);
-                h_ptr[c] = h_val;
-                l_ptr[c] = l_val;
+                h_ptr[c] = 0.0f;
+                l_ptr[c] = 0.0f;
             }
         }
 

@@ -36,11 +36,16 @@
 using namespace std;
 using namespace dlib;
 
-// ARC-AGI contrainte
+// ARC-AGI grid bounds
 constexpr long MAX_ROWS = 30;
 constexpr long MAX_COLS = 30;
 
-constexpr long WINDOW_LEN = 600;
+// Training context window. Sized to comfortably hold 2-3 demonstration pairs
+// while keeping attention compute tractable for HRM (no KV cache during
+// inference: each generated token reprocesses the full window). With grids
+// up to ~150-400 tokens including row separators, 768 is a pragmatic
+// compromise; raise once initial convergence is established.
+constexpr long WINDOW_LEN = 768;
 constexpr long MAX_OUTPUT_TOKENS = (MAX_ROWS * (MAX_COLS + 1) + 1) * 110 / 100;
 
 // Utility function to validate token sequence before detokenization
@@ -193,19 +198,12 @@ generation_result generate_output_for_test_pair_with_info(
     const arc_task_pair& test_pair,
     bool verbose = false)
 {
-    // Tokenize input context (all training examples + test input)
+    // Tokenize the full input context (all training demonstrations + test input)
     auto input_context = arc_agi_manager::tokenize_input_context(task, test_pair);
-
-    // Calculate actual context size needed (no truncation)
     const long actual_context_size = input_context.size();
-
-    // Use actual context size for inference (supports longer than MAX_OUTPUT_TOKENS)
     const long inference_window_size = actual_context_size;
 
-    // Create result with actual context info
     generation_result result(actual_context_size, WINDOW_LEN);
-
-    // Update result to reflect we're using full context
     result.context_fits = true;
     result.tokens_truncated = 0;
 
@@ -223,27 +221,40 @@ generation_result generate_output_for_test_pair_with_info(
         }
     }
 
-    // Initialize context window with actual size (not truncated)
-    std::vector<int> context_window(inference_window_size);
+    // Important: the hrm_ layer re-initializes its recurrence states (z_H, z_L)
+    // from learned init vectors at every forward call and runs N*T internal
+    // sub-net forwards over the *current* sequence length. This makes KV cache
+    // semantics (prefill + 1-token incremental) inapplicable: the cached K/V
+    // would be associated with stale recurrence states from a prior call, and
+    // a single-token incremental forward would re-run the full N*T recurrence
+    // over that one position, which cannot reproduce the multi-position
+    // recurrence trajectory the model was trained with.
+    //
+    // For HRM, autoregressive generation must therefore use a full forward at
+    // every step. The sliding window keeps the input length bounded; each token
+    // generation recomputes attention from scratch. attention_impl::unified is
+    // still safe here because we never call set_inference_mode(prefill /
+    // incremental) and never call set_kv_cache_capacity(), so gqa_attention_
+    // stays on its standard (training-mode) code path.
 
+    // Initialize context window with the actual input context
+    std::vector<int> context_window(inference_window_size);
     for (long i = 0; i < inference_window_size; ++i)
         context_window[i] = input_context(i);
 
-    // Generate tokens
+    network_context::clear_padding();
+
     std::vector<int> generated_tokens;
     generation_state state;
     long generated_count = 0;
 
-    while (generated_count < MAX_OUTPUT_TOKENS)
+    while (generated_count < MAX_OUTPUT_TOKENS && !signal_handler::is_triggered())
     {
-        // Create input sequence with current context size
-        const long current_window_size = context_window.size();
+        const long current_window_size = static_cast<long>(context_window.size());
         arc_token_sequence_t input_seq(current_window_size);
-
         for (long i = 0; i < current_window_size; ++i)
             input_seq(i) = context_window[i];
 
-        // Predict next token (network handles variable length thanks to YaRN + linear)
         const int next_token = static_cast<int>(net(input_seq));
 
         if (next_token == TOKEN_END_OF_OUTPUT) {
@@ -253,28 +264,23 @@ generation_result generate_output_for_test_pair_with_info(
 
         generated_tokens.push_back(next_token);
         generated_count++;
-
         state.add_token(next_token);
 
-        if (state.should_stop())
-        {
+        if (state.should_stop()) {
             if (verbose) {
                 cout << "  Early stopping: invalid generation detected\n";
                 cout << "    Rows generated: " << state.num_rows() << "\n";
             }
-
             if (!state.is_valid && state.num_rows() < 2)
                 throw std::runtime_error("generation failed, invalid grid structure");
             break;
         }
-
-        if (state.num_rows() >= MAX_ROWS)
-        {
+        if (state.num_rows() >= MAX_ROWS) {
             if (verbose) cout << "  Stopping: maximum rows reached\n";
             break;
         }
 
-        // Slide window: shift left and add new token
+        // Slide window: drop oldest, append newest
         for (long i = 0; i < current_window_size - 1; ++i)
             context_window[i] = context_window[i + 1];
         context_window[current_window_size - 1] = next_token;
@@ -310,9 +316,9 @@ int main(int argc, char** argv)
         parser.add_option("eval-path", "Path to evaluation JSON files", 1);
         parser.add_option("model-file", "Path for model file", 1);
         parser.add_option("learning-rate", "Learning rate (default: 2e-4)", 1);
-        parser.add_option("batch-size", "Mini-batch size (default: 4)", 1);
-        parser.add_option("max-epochs", "Maximum training epochs (default: 100)", 1);
-        parser.add_option("patience", "Early stopping patience (default: 8000)", 1);
+        parser.add_option("batch-size", "Mini-batch size (default: 8)", 1);
+        parser.add_option("max-epochs", "Maximum training epochs (default: 500)", 1);
+        parser.add_option("patience", "Early stopping patience (default: 10000)", 1);
         parser.add_option("weight-decay", "Set the weight decay for AdamW (default: 0.004)", 1);
         parser.add_option("beta1", "Set AdamW's beta1 coefficient (default: 0.9)", 1);
         parser.add_option("beta2", "Set AdamW's beta2 coefficient (default: 0.997)", 1);
@@ -336,22 +342,48 @@ int main(int argc, char** argv)
         const std::string eval_path = get_option(parser, "eval-path", "data/evaluation");
         const std::string model_file = get_option(parser, "model-file", "dlib_lm_arc_agi_model.dat");
         const double learning_rate = get_option(parser, "learning-rate", 2e-4);
-        const size_t batch_size = get_option(parser, "batch-size", 4);
-        const size_t max_epochs = get_option(parser, "max-epochs", 100);
-        const long patience = get_option(parser, "patience", 8000);
+        const size_t batch_size = get_option(parser, "batch-size", 8);
+        const size_t max_epochs = get_option(parser, "max-epochs", 500);
+        const long patience = get_option(parser, "patience", 10000);
         const double weight_decay = get_option(parser, "weight-decay", 0.004);
         const double beta1 = get_option(parser, "beta1", 0.9);
         const double beta2 = get_option(parser, "beta2", 0.997);
 
-        // Model configuration
-        using my_transformer = hrm_transformer_config<ARC_VOCAB_SIZE_TOTAL, 4, 4, 6, 228>;
+        // Model configuration tuned for a 10 GB GPU and ARC-AGI reasoning.
+        // HRM splits its layer budget between a thin H module (slow loop,
+        // 1 layer) and a deeper L module (fast loop, 2 layers); the recurrence
+        // factors (hrm_N=1, hrm_T=2) match the canonical HRM setup. Attention
+        // uses the unified gqa_attention_ layer with 2 KV heads (GQA, 3x KV
+        // memory reduction vs MHA); embedding_dim=192 yields head_dim=32 with
+        // num_heads=6.
+        //
+        // KV cache caveat: the hrm_ layer re-initializes its recurrence state
+        // (z_H, z_L) at every forward call and runs N*T internal sub-net
+        // forwards over the current sequence. KV cache semantics (prefill +
+        // 1-token incremental) are therefore not applicable to HRM, even with
+        // unified attention. The inference path below always does a full
+        // sliding-window forward and never calls set_inference_mode(prefill)
+        // or set_kv_cache_capacity(); attention_impl::unified is still safe
+        // since gqa_attention_ stays on its standard (training-mode) code path.
+        using my_transformer = hrm_transformer_config<
+            ARC_VOCAB_SIZE_TOTAL,        // vocab_size
+            1,                           // num_h_layers
+            2,                           // num_l_layers
+            6,                           // num_heads
+            192,                         // embedding_dim
+            1,                           // hrm_N (outer recurrence)
+            2,                           // hrm_T (inner recurrence)
+            gelu,                        // activation
+            dropout_10,                  // dropout policy
+            attention_impl::unified,     // gqa_attention_ (cache never engaged for HRM)
+            2>;                          // num_kv_heads (GQA)
         cout << my_transformer::model_info::describe() << "\n\n";
 
         // Load ARC-AGI data
         arc_agi_manager data_mgr;
         data_mgr.load_data(training_path, eval_path);
 
-		// Check size of the tokenized contexts
+        // Check size of the tokenized contexts
         long max_L_in = 0, max_L_full = 0;
         for (size_t i = 0; i < data_mgr.num_training_tasks(); ++i)
         {
@@ -405,9 +437,13 @@ int main(int argc, char** argv)
                 std::vector<arc_token_sequence_t> task_X;
                 std::vector<long> task_Y;
 
-                //arc_agi_manager::prepare_training_data_batch(task, WINDOW_LEN, task_X, task_Y, false);
-                //arc_agi_manager::prepare_training_data_sliding_window(task, WINDOW_LEN, task_X, task_Y, false);
-                arc_agi_manager::prepare_training_data_pair_only(task, WINDOW_LEN, task_X, task_Y, false);
+                // Held-out few-shot strategy: each train_pair is treated in turn
+                // as the target while the others act as demonstrations. This is
+                // the canonical ARC-AGI training scheme; the alternative
+                // prepare_training_data_pair_only (no demos) and
+                // prepare_training_data_sliding_window (uses test outputs too)
+                // are available for warmup or different setups.
+                arc_agi_manager::prepare_training_data_batch(task, WINDOW_LEN, task_X, task_Y, false);
 
                 all_X.insert(all_X.end(), task_X.begin(), task_X.end());
 
@@ -433,6 +469,13 @@ int main(int argc, char** argv)
                 deserialize(model_file) >> net;
             }
             layer<0>(net).loss_details().set_ignore_index(TOKEN_PADDING);
+            // Disable label smoothing during initial training. With the
+            // expected uniform-softmax baseline at init (~log(17) = 2.83 for
+            // a 17-token vocabulary), a clean cross-entropy loss is easier
+            // to monitor than the smoothed variant whose interactions with
+            // the floor in the loss kernel can mask early convergence
+            // issues. Re-enable (set to 0.1) once convergence is solid.
+            layer<0>(net).loss_details().set_label_smoothing(0.0);
             network_context::set_optimizer_params(weight_decay, beta1, beta2);
             cout << net << endl << endl; // Show the model architecture
 
@@ -446,6 +489,7 @@ int main(int argc, char** argv)
             dnn_trainer<net_type, adamw> trainer(net, adamw(weight_decay, beta1, beta2), gpus);
             trainer.set_learning_rate(learning_rate);
             trainer.set_min_learning_rate(1e-8);
+            trainer.set_learning_rate_shrink_factor(0.1);
             trainer.set_mini_batch_size(batch_size);
             trainer.set_iterations_without_progress_threshold(patience);
             trainer.set_synchronization_file("chkpt-" + model_file, std::chrono::minutes(10));
@@ -457,7 +501,7 @@ int main(int argc, char** argv)
             auto start_time = std::chrono::steady_clock::now();
 
             size_t batches_count = 0;
-			while (trainer.get_learning_rate() >= trainer.get_min_learning_rate()
+            while (trainer.get_learning_rate() >= trainer.get_min_learning_rate()
                 && epoch < max_epochs && !signal_handler::is_triggered())
             {
                 // Shuffle the dataset
@@ -568,9 +612,11 @@ int main(int argc, char** argv)
                 }
             }
 
-            // Evaluate each task
-            network_context::set_learning_rate(0.0);
-            network_context::clear_padding();
+            // Evaluate each task. Inference mode and KV cache are managed
+            // per-test-pair inside generate_output_for_test_pair_with_info(),
+            // so the global network_context is only cleared here as a safety
+            // measure before the first call.
+            network_context::reset();
             for (const arc_task* task_ptr : tasks_to_eval)
             {
                 const arc_task& task = *task_ptr;
