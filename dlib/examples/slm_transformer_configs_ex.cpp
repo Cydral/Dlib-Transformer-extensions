@@ -899,7 +899,7 @@ int main(int argc, char** argv)
         parser.add_option("learning-rate", "Set the learning rate (default: 2e-4)", 1);
         parser.add_option("batch-size", "Set the mini-batch size (default: 128)", 1);
         parser.add_option("patience", "Steps without progress before LR reduction (default: 10000)", 1);
-        parser.add_option("max-epochs", "Maximum number of training epochs (default: 500)", 1);
+        parser.add_option("max-epochs", "Maximum number of training epochs (default: 150)", 1);
         parser.add_option("weight-decay", "AdamW weight decay (default: 0.004)", 1);
         parser.add_option("beta1", "AdamW beta1 coefficient (default: 0.9)", 1);
         parser.add_option("beta2", "AdamW beta2 coefficient (default: 0.998)", 1);
@@ -928,7 +928,7 @@ int main(int argc, char** argv)
         const double learning_rate = get_option(parser, "learning-rate", 2e-4);
         const size_t batch_size = get_option(parser, "batch-size", 128);
         const long patience = get_option(parser, "patience", 10000);
-        const size_t max_epochs = get_option(parser, "max-epochs", 500);
+        const size_t max_epochs = get_option(parser, "max-epochs", 150);
         const double weight_decay = get_option(parser, "weight-decay", 0.004);
         const double beta1 = get_option(parser, "beta1", 0.9);
         const double beta2 = get_option(parser, "beta2", 0.998);
