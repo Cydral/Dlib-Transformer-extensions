@@ -309,11 +309,20 @@ int run_fine_tune(const std::string& model_file, const std::string& tokenizer_fi
                 auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::high_resolution_clock::now() - epoch_start).count();
                 double sps = (ms > 0) ? (samples_seen * 1000.0 / ms) : 0.0;
-                cout << "epoch#: " << (epoch + 1) << "/" << max_epochs
-                    << " \t loss: " << std::fixed << std::setprecision(4) << avg_loss
-                    << " \t lr: " << std::scientific << std::setprecision(2) << trainer.get_learning_rate()
-                    << " \t speed: " << std::fixed << std::setprecision(0) << sps << " samples/sec\r";
-                cout.flush();
+
+                std::ostringstream line;
+                line << "epoch#: " << std::setw(4) << std::right << (epoch + 1)
+                    << "/" << std::left << std::setw(4) << max_epochs
+                    << "  loss: " << std::fixed << std::setprecision(4)
+                    << std::setw(8) << std::right << avg_loss
+                    << "  lr: " << std::scientific << std::setprecision(2)
+                    << std::setw(9) << trainer.get_learning_rate()
+                    << "  speed: " << std::fixed << std::setprecision(0)
+                    << std::setw(6) << std::right << sps << " samples/sec";
+
+                std::string s = line.str();
+                if (s.size() < 90) s.append(90 - s.size(), ' ');
+                cout << "\r" << s << std::flush;
             }
         }
         epoch++;
@@ -507,7 +516,7 @@ int main(int argc, char** argv)
 
         parser.add_option("learning-rate", "Fine-tuning learning rate (default: 5e-5)", 1);
         parser.add_option("batch-size", "Mini-batch size (default: 64)", 1);
-        parser.add_option("max-epochs", "Maximum number of epochs (default: 500)", 1);
+        parser.add_option("max-epochs", "Maximum number of epochs (default: 15)", 1);
         parser.add_option("patience", "Steps without progress before LR reduction (default: 8000)", 1);
 
         parser.add_option("model-file", "Foundation model path (default: cygnus_model.dat)", 1);
@@ -537,8 +546,8 @@ int main(int argc, char** argv)
 
         if (parser.option("fine-tune")) {
             const double learning_rate = get_option(parser, "learning-rate", 5e-5);
-            const long batch_size = get_option(parser, "batch-size", 64);
-            const long max_epochs = get_option(parser, "max-epochs", 500);
+            const long batch_size = get_option(parser, "batch-size", 16);
+            const long max_epochs = get_option(parser, "max-epochs", 15);
             const long patience = get_option(parser, "patience", 8000);
             const double weight_decay = 0.004;
             const double beta1 = 0.9;
