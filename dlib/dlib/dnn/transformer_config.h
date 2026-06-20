@@ -166,26 +166,26 @@ namespace dlib
         template <attention_impl Impl, long num_layers,
             long d_model, long num_heads, long num_kv_heads,
             template <typename> class ACT, template <typename> class DO,
-            typename SUBNET>
+            typename SUBNET, bool UseAct = false>
         struct hrm_stack_selector;
 
         template <long num_layers, long d_model, long num_heads, long num_kv_heads,
-            template <typename> class ACT, template <typename> class DO, typename SUBNET>
+            template <typename> class ACT, template <typename> class DO, typename SUBNET, bool UseAct>
         struct hrm_stack_selector<attention_impl::chained, num_layers,
-            d_model, num_heads, num_kv_heads, ACT, DO, SUBNET>
+            d_model, num_heads, num_kv_heads, ACT, DO, SUBNET, UseAct>
         {
             using type = canonical_transformer::transformer_stack<
-                num_layers, ACT, DO, d_model, num_heads, SUBNET>;
+                num_layers, ACT, DO, d_model, num_heads, SUBNET> ;
             static const char* name() { return "canonical (multi-head)"; }
         };
 
         template <long num_layers, long d_model, long num_heads, long num_kv_heads,
-            template <typename> class ACT, template <typename> class DO, typename SUBNET>
+            template <typename> class ACT, template <typename> class DO, typename SUBNET, bool UseAct>
         struct hrm_stack_selector<attention_impl::unified, num_layers,
-            d_model, num_heads, num_kv_heads, ACT, DO, SUBNET>
+            d_model, num_heads, num_kv_heads, ACT, DO, SUBNET, UseAct>
         {
             using type = gqa_transformer_unified::transformer_stack<
-                num_layers, d_model, num_heads, num_kv_heads, SUBNET>;
+                num_layers, d_model, num_heads, num_kv_heads, SUBNET, UseAct>;
             static const char* name() { return "unified (gqa_attention_)"; }
         };
     }
@@ -262,7 +262,8 @@ namespace dlib
         template <typename> class activation_func = gelu,
         template <typename> class dropout_policy = dropout_10,
         attention_impl impl = attention_impl::chained,
-        long num_kv_heads = 2
+        long num_kv_heads = 2,
+        bool use_act = false        // HRM recurs at the module level; ACT off by default
     >
     struct hrm_transformer_config {
         // Core model parameters
@@ -271,6 +272,7 @@ namespace dlib
         static constexpr long NUM_L_LAYERS = num_l_layers;
         static constexpr long NUM_HEADS = num_heads;
         static constexpr long NUM_KV_HEADS = num_kv_heads;
+        static constexpr bool USE_ACT = use_act;
         static constexpr long EMBEDDING_DIM = embedding_dim;
         static constexpr long HRM_N = hrm_N;
         static constexpr long HRM_T = hrm_T;
@@ -297,14 +299,14 @@ namespace dlib
 
         // H and L sub-network types dispatched by the attention implementation
         using train_h_net_type = typename impl::hrm_stack_selector<IMPL, NUM_H_LAYERS,
-            EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS, activation_func, dropout_policy, input_tensor>::type;
+            EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS, activation_func, dropout_policy, input_tensor, USE_ACT>::type;
         using train_l_net_type = typename impl::hrm_stack_selector<IMPL, NUM_L_LAYERS,
-            EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS, activation_func, dropout_policy, input_tensor>::type;
+            EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS, activation_func, dropout_policy, input_tensor, USE_ACT>::type;
 
         using infer_h_net_type = typename impl::hrm_stack_selector<IMPL, NUM_H_LAYERS,
-            EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS, activation_func, multiply, input_tensor>::type;
+            EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS, activation_func, multiply, input_tensor, USE_ACT>::type;
         using infer_l_net_type = typename impl::hrm_stack_selector<IMPL, NUM_L_LAYERS,
-            EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS, activation_func, multiply, input_tensor>::type;
+            EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS, activation_func, multiply, input_tensor, USE_ACT>::type;
 
         // Network definition selector based on training mode
         template<bool is_training>

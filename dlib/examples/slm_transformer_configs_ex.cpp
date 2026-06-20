@@ -486,9 +486,7 @@ int run_pipeline(
 
         // Propagate optimizer hyperparameters to internal sub-network solvers (HRM H/L, MoE experts/gate)
         network_context::set_optimizer_params(weight_decay, beta1, beta2);
-
-        parameter_counts param_count = count_network_parameters(net, max_seq_len);
-        cout << "Model parameters: " << param_count.total << " (active: " << param_count.active << ")\n";
+        bool params_reported = false;
 
         // Create trainer with reduce-on-plateau learning rate control
         dnn_trainer<train_net_type, adamw> trainer(net, adamw(weight_decay, beta1, beta2), gpus);
@@ -523,14 +521,17 @@ int run_pipeline(
                 for (size_t j = 0; j < batch_X.size(); ++j)
                     pad_lengths[j] = count_leading_padding(batch_X[j], pad_token);
 
-                // Synchronize: ensure previous batch has completed before modifying network_context
-                trainer.get_net(force_flush_to_disk::no);
-
                 // Propagate the current learning rate to internal sub-networks
                 network_context::set_learning_rate(trainer.get_learning_rate());
                 network_context::set_padding_from_lengths(pad_lengths);
 
                 trainer.train_one_step(batch_X, batch_Y);
+                trainer.get_net(force_flush_to_disk::no);
+                if (!params_reported) {
+                    parameter_counts pc = count_parameters(net);
+                    cout << "Model parameters: " << pc.total << " (active: " << pc.active << ")\n";
+                    params_reported = true;
+                }
 
                 total_loss += trainer.get_average_loss();
                 batches_seen++;
@@ -1013,7 +1014,7 @@ int main(int argc, char** argv)
             // NUM_LAYERS template argument is only used for parameter
             // accounting and remains consistent with num_layers.
             using selected = hrm_transformer_config<
-                num_tokens, 1, 2, num_heads, embedding_dim, 1, 2,
+                num_tokens, 4, 4, num_heads, embedding_dim, 1, 2,
                 gelu, dropout_10,                        // activation / dropout (ignored when impl=unified)
                 attention_impl::unified, num_kv_heads>;  // select fused GQA attention for H and L sub-networks
             return run_pipeline<selected, num_layers, max_seq_len, num_tokens>(

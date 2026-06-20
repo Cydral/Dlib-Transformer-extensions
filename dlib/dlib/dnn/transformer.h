@@ -1186,34 +1186,54 @@ namespace dlib
         // rather than a chain of 16 layers. The residual connections (add_prev1
         // and add_prev5), the RMS normalizations, and the SwiGLU feed-forward
         // are unchanged.
-        template<long d_model, long num_heads, long num_kv_heads, typename SUBNET>
+ 
+        // Feed-forward sublayer selector. With UseAct=true the SwiGLU transition is wrapped
+        // in an Adaptive Computation Time layer (per-position latent recurrence); with
+        // UseAct=false it is a plain SwiGLU. Networks that already recur at a higher level
+        // (e.g. HRM, which loops the whole stack) build with UseAct=false to avoid nesting
+        // two recurrence mechanisms.
+        template<bool UseAct, long d_model, long max_steps, typename SUBNET>
+        struct ffn_selector
+        {
+            using type = act_steps<swiglu<d_model, 8, 3, input_tensor>, max_steps, SUBNET>;
+        };
+        template<long d_model, long max_steps, typename SUBNET>
+        struct ffn_selector<false, d_model, max_steps, SUBNET>
+        {
+            using type = swiglu<d_model, 8, 3, SUBNET>;
+        };
+        template<bool UseAct, long d_model, long max_steps, typename SUBNET>
+        using ffn_sublayer = typename ffn_selector<UseAct, d_model, max_steps, SUBNET>::type;
+
+        // Transformer block with pre-norm architecture. Attention sublayer is the fused
+        // gqa_attention_ layer; feed-forward sublayer is SwiGLU, optionally ACT-wrapped.
+        template<bool UseAct, long d_model, long num_heads, long num_kv_heads, typename SUBNET>
         using transformer_block =
-            add_prev5<act_steps<swiglu<d_model, 8, 3, input_tensor>, 4, rms_norm<tag5<
+            add_prev5<ffn_sublayer<UseAct, d_model, 4, rms_norm<tag5<
             add_prev1<multihead_attention_gqa<d_model, num_heads, num_kv_heads, rms_norm<tag1<
             SUBNET>>>>>>>>;
 
-        // Recursive template to stack N transformer blocks. The recursion shape
-        // mirrors the chained namespace exactly so that any external code that
-        // relies on the tag10 sentinel at the bottom of the stack continues to
-        // work unchanged.
-        template<long remaining_layers, long d_model, long num_heads, long num_kv_heads,
+        template<long remaining_layers, bool UseAct, long d_model, long num_heads, long num_kv_heads,
             typename SUBNET, typename enabled = void>
         struct transformer_stack_impl
         {
-            using type = transformer_block<d_model, num_heads, num_kv_heads,
-                typename transformer_stack_impl<remaining_layers - 1, d_model, num_heads, 
-                    num_kv_heads, SUBNET>::type>;
+            using type = transformer_block<UseAct, d_model, num_heads, num_kv_heads,
+                typename transformer_stack_impl<remaining_layers - 1, UseAct, d_model, num_heads,
+                num_kv_heads, SUBNET>::type>;
         };
 
-        template<long d_model, long num_heads, long num_kv_heads, typename SUBNET>
-            struct transformer_stack_impl<0, d_model, num_heads, num_kv_heads, SUBNET, void>
+        template<bool UseAct, long d_model, long num_heads, long num_kv_heads, typename SUBNET>
+        struct transformer_stack_impl<0, UseAct, d_model, num_heads, num_kv_heads, SUBNET, void>
         {
             using type = tag10<SUBNET>;
         };
 
-        template<long num_layers, long d_model, long num_heads, long num_kv_heads, typename SUBNET>
-            using transformer_stack = typename transformer_stack_impl<num_layers, d_model, num_heads,
-                num_kv_heads, SUBNET>::type;
+        // UseAct trails with a default of true so existing dense configurations that omit it
+        // keep their ACT feed-forward unchanged.
+        template<long num_layers, long d_model, long num_heads, long num_kv_heads, typename SUBNET,
+            bool UseAct = true>
+        using transformer_stack = typename transformer_stack_impl<num_layers, UseAct, d_model,
+            num_heads, num_kv_heads, SUBNET>::type;
 
     } // namespace gqa_transformer_unified
 
