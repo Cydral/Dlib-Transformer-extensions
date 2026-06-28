@@ -1,4 +1,4 @@
-// Copyright (C) 2025 Davis E. King (davis@dlib.net)
+// Copyright (C) 2026 Cydral Technology (cydraltechnology@gmail.com)
 // License: Boost Software License   See LICENSE.txt for the full license.
 #ifndef DLIB_DECODER_TRANSFORMER_CONFIG_Hh_
 #define DLIB_DECODER_TRANSFORMER_CONFIG_Hh_
@@ -23,7 +23,9 @@ namespace dlib
                     RMSNorm -> RoPE grouped-query attention -> residual add
                     RMSNorm -> SwiGLU feed-forward            -> residual add,
               - a final RMSNorm and an output projection (the classification head).
-            Adaptive computation time is disabled and there is no mixture of experts.
+            Adaptive computation time is disabled and there is no mixture of experts. The
+            feed-forward and the output projection are bias-free (LINEAR_NO_BIAS), matching
+            the Llama family, which carries no bias on any projection.
 
             The feed-forward hidden size is given as the exact rational ffn_num/ffn_den of
             the model dimension, so that arbitrary intermediate sizes (for example Llama-2-7B's
@@ -69,18 +71,19 @@ namespace dlib
         static constexpr long FFN_HIDDEN    = embedding_dim * ffn_num / ffn_den;
 
         /* The decoder stack: num_layers pre-norm GQA + SwiGLU blocks over the token
-           embeddings, with ACT disabled and the exact feed-forward ratio. */
+           embeddings, with ACT disabled, the exact feed-forward ratio, and bias-free
+           feed-forward projections (Llama carries no bias). */
         using subnet = gqa_transformer_unified::transformer_stack<
             NUM_LAYERS, EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS,
             embeddings<VOCAB_SIZE, EMBEDDING_DIM, input<matrix<int, 0, 1>>>,
-            /*UseAct=*/false, FFN_NUM, FFN_DEN>;
+            /*UseAct=*/false, FFN_NUM, FFN_DEN, /*FFN linear=*/linear_no_bias>;
 
-        /* The full network: final RMSNorm + output projection + per-token loss head. The
-           is_training flag is accepted for API symmetry with the other configurations; the
-           attention layer selects its training or inference behavior at run time, so the
-           network type itself is identical in both cases. */
+        /* The full network: final RMSNorm + bias-free output projection + per-token loss
+           head. The is_training flag is accepted for API symmetry with the other
+           configurations; the attention layer selects its training or inference behavior at
+           run time, so the network type itself is identical in both cases. */
         template <bool is_training>
-        using network_type = classification_head<VOCAB_SIZE, subnet>;
+        using network_type = loss_cross_entropy_per_token<linear_no_bias<VOCAB_SIZE, rms_norm<subnet>>>;
 
         struct model_info
         {

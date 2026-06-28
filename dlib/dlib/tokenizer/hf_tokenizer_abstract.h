@@ -1,4 +1,4 @@
-// Copyright (C) 2025 Davis E. King (davis@dlib.net)
+// Copyright (C) 2026 Cydral Technology (cydraltechnology@gmail.com)
 // License: Boost Software License   See LICENSE.txt for the full license.
 #undef DLIB_HF_TOKENIZER_ABSTRACT_
 #ifdef DLIB_HF_TOKENIZER_ABSTRACT_
@@ -12,6 +12,10 @@
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
+
+#include "hf_tokenizer_abstract.h"
+#include "../data_io.h"
+#include "../serialize.h"
 
 namespace dlib
 {

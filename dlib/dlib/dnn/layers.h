@@ -5887,9 +5887,10 @@ namespace dlib
     // SwiGLU FFN implementation
     // Reference: Noam Shazeer's "GLU Variants Improve Transformer" (https://arxiv.org/abs/2002.05202)
     // Architecture: uses gated linear units with SiLU activation
-    template <long d_model, long hidden_num, long hidden_denom, typename SUBNET>
-    using swiglu = linear<d_model, mult_fprev1<linear<(d_model * hidden_num) / hidden_denom, fskip0<
-        ftag1<silu<linear<(d_model * hidden_num) / hidden_denom, ftag0<SUBNET>>>>>>>>;
+    template <long d_model, long hidden_num, long hidden_denom, typename SUBNET,
+        template <unsigned long, typename> class LINEAR = linear>
+    using swiglu = LINEAR<d_model, mult_fprev1<LINEAR<(d_model* hidden_num) / hidden_denom, fskip0<
+        ftag1<silu<LINEAR<(d_model* hidden_num) / hidden_denom, ftag0<SUBNET>>>>>>>>;
 
     // Adaptive Computation Time (ACT) layer
     //

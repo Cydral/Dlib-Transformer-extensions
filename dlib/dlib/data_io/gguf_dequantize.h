@@ -1,3 +1,5 @@
+// Copyright (C) 2026 Cydral Technology (cydraltechnology@gmail.com)
+// License: Boost Software License   See LICENSE.txt for the full license.
 // GGUF tensor dequantization to float.
 //
 // Converts the raw on-disk bytes of a GGUF tensor (as returned by gguf_reader) into a

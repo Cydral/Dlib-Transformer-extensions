@@ -1192,40 +1192,46 @@ namespace dlib
         // UseAct=false it is a plain SwiGLU. Networks that already recur at a higher level
         // (e.g. HRM, which loops the whole stack) build with UseAct=false to avoid nesting
         // two recurrence mechanisms.
-        template<bool UseAct, long d_model, long hidden_num, long hidden_den, long max_steps, typename SUBNET>
+        template<bool UseAct, long d_model, long hidden_num, long hidden_den, long max_steps, typename SUBNET,
+            template <unsigned long, typename> class LINEAR = linear>
         struct ffn_selector
         {
-            using type = act_steps<swiglu<d_model, hidden_num, hidden_den, input_tensor>, max_steps, SUBNET>;
+            using type = act_steps<swiglu<d_model, hidden_num, hidden_den, input_tensor, LINEAR>, max_steps, SUBNET>;
         };
-        template<long d_model, long hidden_num, long hidden_den, long max_steps, typename SUBNET>
-        struct ffn_selector<false, d_model, hidden_num, hidden_den, max_steps, SUBNET>
+        template<long d_model, long hidden_num, long hidden_den, long max_steps, typename SUBNET,
+            template <unsigned long, typename> class LINEAR>
+        struct ffn_selector<false, d_model, hidden_num, hidden_den, max_steps, SUBNET, LINEAR>
         {
-            using type = swiglu<d_model, hidden_num, hidden_den, SUBNET>;
+            using type = swiglu<d_model, hidden_num, hidden_den, SUBNET, LINEAR>;
         };
-        template<bool UseAct, long d_model, long hidden_num, long hidden_den, long max_steps, typename SUBNET>
-        using ffn_sublayer = typename ffn_selector<UseAct, d_model, hidden_num, hidden_den, max_steps, SUBNET>::type;
+        template<bool UseAct, long d_model, long hidden_num, long hidden_den, long max_steps, typename SUBNET,
+            template <unsigned long, typename> class LINEAR = linear>
+        using ffn_sublayer = typename ffn_selector<UseAct, d_model, hidden_num, hidden_den, max_steps, SUBNET, LINEAR>::type;
 
         // Transformer block with pre-norm architecture. Attention sublayer is the fused
         // gqa_attention_ layer; feed-forward sublayer is SwiGLU, optionally ACT-wrapped.
         template<bool UseAct, long d_model, long num_heads, long num_kv_heads,
-            long hidden_num, long hidden_den, typename SUBNET>
+            long hidden_num, long hidden_den, typename SUBNET,
+            template <unsigned long, typename> class LINEAR = linear>
         using transformer_block =
             add_prev5<ffn_sublayer<UseAct, d_model, hidden_num, hidden_den, 4, rms_norm<tag5<
             add_prev1<multihead_attention_gqa<d_model, num_heads, num_kv_heads, rms_norm<tag1<
-            SUBNET>>>>>>>>;
+            SUBNET>>>>>>, LINEAR >> ;
 
         template<long remaining_layers, bool UseAct, long d_model, long num_heads, long num_kv_heads,
-            long hidden_num, long hidden_den, typename SUBNET, typename enabled = void>
+            long hidden_num, long hidden_den, typename SUBNET,
+            template <unsigned long, typename> class LINEAR = linear, typename enabled = void>
         struct transformer_stack_impl
         {
             using type = transformer_block<UseAct, d_model, num_heads, num_kv_heads, hidden_num, hidden_den,
                 typename transformer_stack_impl<remaining_layers - 1, UseAct, d_model, num_heads,
-                num_kv_heads, hidden_num, hidden_den, SUBNET>::type>;
+                num_kv_heads, hidden_num, hidden_den, SUBNET, LINEAR>::type, LINEAR>;
         };
         template<bool UseAct, long d_model, long num_heads, long num_kv_heads,
-            long hidden_num, long hidden_den, typename SUBNET>
+            long hidden_num, long hidden_den, typename SUBNET,
+            template <unsigned long, typename> class LINEAR>
         struct transformer_stack_impl<0, UseAct, d_model, num_heads, num_kv_heads,
-            hidden_num, hidden_den, SUBNET, void>
+            hidden_num, hidden_den, SUBNET, LINEAR, void>
         {
             using type = tag10<SUBNET>;
         };
@@ -1233,9 +1239,10 @@ namespace dlib
         // UseAct trails with a default of true so existing dense configurations that omit it
         // keep their ACT feed-forward unchanged.
         template<long num_layers, long d_model, long num_heads, long num_kv_heads, typename SUBNET,
-            bool UseAct = true, long hidden_num = 8, long hidden_den = 3>
+            bool UseAct = true, long hidden_num = 8, long hidden_den = 3,
+            template <unsigned long, typename> class LINEAR = linear>
         using transformer_stack = typename transformer_stack_impl<num_layers, UseAct, d_model,
-            num_heads, num_kv_heads, hidden_num, hidden_den, SUBNET>::type;
+            num_heads, num_kv_heads, hidden_num, hidden_den, SUBNET, LINEAR>::type;
 
     } // namespace gqa_transformer_unified
 

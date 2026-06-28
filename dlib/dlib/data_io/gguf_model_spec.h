@@ -1,3 +1,5 @@
+// Copyright (C) 2026 Cydral Technology (cydraltechnology@gmail.com)
+// License: Boost Software License   See LICENSE.txt for the full license.
 // GGUF -> Dlib model specification.
 //
 // Reads the architecture metadata of a GGUF file into a neutral model_spec, checks

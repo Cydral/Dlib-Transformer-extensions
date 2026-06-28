@@ -60,7 +60,7 @@ add_subdirectory(../dlib dlib_build)
 # are going to compile one of the dlib example programs which has only one .cpp
 # file, assignment_learning_ex.cpp.  If your program consisted of multiple .cpp
 # files you would simply list them here in the add_executable() statement.  
-add_executable(assignment_learning_ex assignment_learning_ex.cpp)
+#add_executable(assignment_learning_ex assignment_learning_ex.cpp)
 # Finally, you need to tell CMake that this program, assignment_learning_ex,
 # depends on dlib.  You do that with this statement: 
 target_link_libraries(assignment_learning_ex dlib::dlib)
@@ -168,6 +168,9 @@ add_example(slm_cygnus_instruct_ex)
 add_example(slm_predictive_compressor_ex)
 add_example(slm_tok_predictive_compressor_ex)
 add_example(slm_gguf_import_ex)
+if (MSVC)
+   target_compile_options(slm_gguf_import_ex PRIVATE /bigobj)
+endif()
 #add_gui_example(3d_point_cloud_ex)
 #add_example(bayes_net_ex)
 #add_example(bayes_net_from_disk_ex)

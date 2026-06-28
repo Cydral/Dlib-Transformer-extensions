@@ -1,3 +1,5 @@
+// Copyright (C) 2026 Cydral Technology (cydraltechnology@gmail.com)
+// License: Boost Software License   See LICENSE.txt for the full license.
 // GGUF file reader (header-only).
 //
 // Parses the GGUF container used by llama.cpp / HuggingFace GGUF downloads:

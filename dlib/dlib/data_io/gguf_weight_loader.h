@@ -1,4 +1,4 @@
-// Copyright (C) 2025 Davis E. King (davis@dlib.net)
+// Copyright (C) 2026 Cydral Technology (cydraltechnology@gmail.com)
 // License: Boost Software License   See LICENSE.txt for the full license.
 #ifndef DLIB_GGUF_WEIGHT_LOADER_Hh_
 #define DLIB_GGUF_WEIGHT_LOADER_Hh_
@@ -78,24 +78,40 @@ namespace dlib
             return out;
         }
 
+        /* Copy src into the layer parameter tensor. Llama weights carry no bias, so when the
+           Dlib layer is larger than the source (a linear layer keeps weights followed by a
+           bias), the weight part is filled and the trailing bias is zeroed. */
         inline void copy_into(tensor& dst, const std::vector<float>& src, const std::string& what)
         {
-            if (dst.size() != src.size())
-                throw std::runtime_error("import_gguf_weights: size mismatch for " + what
+            if (src.size() > dst.size())
+                throw std::runtime_error("import_gguf_weights: source larger than layer for " + what
                     + " (layer " + std::to_string(dst.size()) + " vs source " + std::to_string(src.size()) + ")");
-            std::memcpy(dst.host(), src.data(), src.size() * sizeof(float));
+            float* h = dst.host();
+            std::memcpy(h, src.data(), src.size() * sizeof(float));
+            if (src.size() < dst.size())
+                std::memset(h + src.size(), 0, (dst.size() - src.size()) * sizeof(float));
         }
 
-        /* Collect, in network visit order, the writable parameter tensors of the
-           computational layers that actually hold parameters. */
-        struct collector
+        /* The embedding layer keeps its table in a private member exposed by get_embeddings,
+           not in get_layer_params. This visitor targets exactly that layer (SFINAE on the
+           presence of get_embeddings) and copies the table directly, no transpose, since GGUF
+           token_embd is [vocab, d_model] and the Dlib table is [vocab, d_model] too. */
+        struct embedding_loader
         {
-            std::vector<tensor*> params;
-            template <typename T> void operator()(T& layer)
+            const std::vector<float>* src;
+            bool* done;
+            template <typename T>
+            auto set(T& layer, int) -> decltype((void)layer.get_embeddings())
             {
-                tensor& p = layer.get_layer_params();
-                if (p.size() > 0) params.push_back(&p);
+                tensor& e = layer.get_embeddings();
+                if (e.size() == src->size())
+                {
+                    std::memcpy(e.host(), src->data(), src->size() * sizeof(float));
+                    *done = true;
+                }
             }
+            template <typename T> void set(T&, long) {}
+            template <typename T> void operator()(T& layer) { set(layer, 0); }
         };
     }
 
@@ -124,21 +140,29 @@ namespace dlib
         }
         network_context::reset();
 
-        collector c;
-        visit_computational_layers(net, c);
+        /* Collect the writable parameter tensors of the parameter-bearing computational
+           layers, in network visit order. The vector is captured by reference so the result
+           survives even though visit_computational_layers takes the visitor by value. */
+        std::vector<tensor*> params;
+        visit_computational_layers(net, [&params](auto& layer) {
+            tensor& p = layer.get_layer_params();
+            if (p.size() > 0) params.push_back(&p);
+        });
 
         /* Expected order, from the output side inward (the order visit_computational_layers
            produces): lm_head, output_norm, then for each block from the last to the first
            [ffn_down, ffn_a, ffn_b, ffn_norm, attention, attn_norm], then the embedding. */
         size_t k = 0;
         auto next = [&](const std::string& what) -> tensor& {
-            if (k >= c.params.size())
+            if (k >= params.size())
                 throw std::runtime_error("import_gguf_weights: ran out of layers at " + what);
-            return *c.params[k++];
+            return *params[k++];
         };
 
-        const std::string gate_name = opt.swap_gate_up ? "ffn_up" : "ffn_gate";
-        const std::string up_name = opt.swap_gate_up ? "ffn_gate" : "ffn_up";
+        /* The SwiGLU is down( silu(gate(x)) * up(x) ). In visit order (output to input) the
+           two inner linears appear as up first, then gate. swap_gate_up flips the mapping. */
+        const std::string up_inner   = opt.swap_gate_up ? "ffn_gate" : "ffn_up";
+        const std::string gate_inner = opt.swap_gate_up ? "ffn_up" : "ffn_gate";
 
         /* lm_head: output.weight is [vocab, d_model] in GGUF -> transpose to [d_model, vocab]. */
         {
@@ -159,16 +183,17 @@ namespace dlib
                 transpose_into(src, d, ff, dst.data(), 0, 0, false);
                 copy_into(next("ffn_down"), dst, p + "ffn_down");
             }
-            /* gate then up (visit order of the two inner linears). Each [ff, d] in GGUF -> [d, ff]. */
+            /* up then gate: the visit order of the two inner SwiGLU linears. Each is
+               [ff, d_model] in GGUF -> [d_model, ff]. */
             {
-                std::vector<float> src = fetch(g, p + gate_name + ".weight"), dst(static_cast<size_t>(d) * ff);
+                std::vector<float> src = fetch(g, p + up_inner + ".weight"), dst(static_cast<size_t>(d) * ff);
                 transpose_into(src, ff, d, dst.data(), 0, 0, false);
-                copy_into(next("ffn_gate"), dst, p + gate_name);
+                copy_into(next("ffn_up"), dst, p + up_inner);
             }
             {
-                std::vector<float> src = fetch(g, p + up_name + ".weight"), dst(static_cast<size_t>(d) * ff);
+                std::vector<float> src = fetch(g, p + gate_inner + ".weight"), dst(static_cast<size_t>(d) * ff);
                 transpose_into(src, ff, d, dst.data(), 0, 0, false);
-                copy_into(next("ffn_up"), dst, p + up_name);
+                copy_into(next("ffn_gate"), dst, p + gate_inner);
             }
             copy_into(next("ffn_norm"), fetch(g, p + "ffn_norm.weight"), p + "ffn_norm");
 
@@ -193,16 +218,24 @@ namespace dlib
                 std::cout << "  loaded block " << b << "\r" << std::flush;
         }
 
-        /* Embedding table: token_embd.weight is [vocab, d_model], assumed to match the
-           layer's [vocab, d_model] layout directly. */
-        copy_into(next("token_embd"), fetch(g, "token_embd.weight"), "token_embd");
+        if (k != params.size())
+            throw std::runtime_error("import_gguf_weights: assigned " + std::to_string(k)
+                + " of " + std::to_string(params.size())
+                + " parameter tensors; the layer order assumption is wrong");
+
+        /* The embedding table is held by the embeddings layer outside get_layer_params, so it
+           is assigned separately through get_embeddings. */
+        {
+            std::vector<float> emb = fetch(g, "token_embd.weight");
+            bool done = false;
+            embedding_loader el{ &emb, &done };
+            visit_computational_layers(net, el);
+            if (!done)
+                throw std::runtime_error("import_gguf_weights: failed to set the embedding table");
+        }
 
         if (opt.verbose)
-            std::cout << "  loaded " << k << " parameter tensors of " << c.params.size() << "\n";
-        if (k != c.params.size())
-            throw std::runtime_error("import_gguf_weights: assigned " + std::to_string(k)
-                + " tensors but the network has " + std::to_string(c.params.size())
-                + "; the layer order assumption is wrong");
+            std::cout << "  loaded " << k << " parameter tensors plus the embedding table\n";
     }
 }
 
