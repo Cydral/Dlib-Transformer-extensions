@@ -34,6 +34,7 @@
 #include "dnn/visitors.h"
 #include "dnn/transformer.h"
 #include "dnn/transformer_config.h"
+#include "dnn/decoder_transformer_config.h"
 
 #endif // DLIB_DNn_
 
