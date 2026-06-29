@@ -113,6 +113,25 @@ namespace dlib
             template <typename T> void set(T&, long) {}
             template <typename T> void operator()(T& layer) { set(layer, 0); }
         };
+
+        /* Pushes the model's runtime attention settings into every attention layer that
+           exposes them: the RoPE frequency base and the QK-Norm epsilon. SFINAE on
+           set_rope_theta_base (only the fused attention layer has it) makes this a no-op for
+           every other layer. Must run before the first forward pass, since the RoPE trig
+           caches are built then and are not recomputed on a later base change. */
+        struct attention_config_setter
+        {
+            float rope_base;
+            double qk_eps;
+            template <typename T>
+            auto set(T& layer, int) -> decltype((void)layer.set_rope_theta_base(0.f))
+            {
+                layer.set_rope_theta_base(rope_base);
+                layer.set_qk_norm_eps(qk_eps);
+            }
+            template <typename T> void set(T&, long) {}
+            template <typename T> void operator()(T& layer) { set(layer, 0); }
+        };
     }
 
     template <typename net_type>
@@ -126,8 +145,17 @@ namespace dlib
         const long ff = spec.d_ffn;
         const long nh = spec.n_heads;
         const long hd = spec.head_dim;
+        const long qd = nh * hd;          // query/output projection width (decoupled head_dim)
         const long V = spec.vocab_size;
         const long L = spec.n_layers;
+
+        /* Push RoPE base and QK-Norm epsilon into the attention layers before the first
+           forward, so the RoPE caches are built with the right base (they are not rebuilt on a
+           later change) and QK-Norm uses the model's epsilon. No-op for other layers. */
+        {
+            attention_config_setter cfg{ static_cast<float>(spec.rope_freq_base), spec.rms_eps };
+            visit_computational_layers(net, cfg);
+        }
 
         /* Allocate every parameter tensor with a single forward pass on one token. */
         network_context::reset();
@@ -197,19 +225,33 @@ namespace dlib
             }
             copy_into(next("ffn_norm"), fetch(g, p + "ffn_norm.weight"), p + "ffn_norm");
 
-            /* Attention: one packed tensor [wq | wk | wv | wo]. */
+            /* Attention: one packed tensor [wq | wk | wv | wo (| gamma_q | gamma_k)]. wq is
+               [d, qd] and wo is [qd, d] with qd = n_heads * head_dim, which equals d for the
+               usual head_dim = d / n_heads and differs only when head_dim is decoupled (Qwen3). */
             {
-                const size_t nq = static_cast<size_t>(d) * d;
+                const size_t nq = static_cast<size_t>(d) * qd;
                 const size_t nkv = static_cast<size_t>(d) * kv;
-                std::vector<float> fused(2 * nq + 2 * nkv);
+                const size_t ng = spec.qk_norm ? static_cast<size_t>(hd) : 0;
+                std::vector<float> fused(2 * nq + 2 * nkv + 2 * ng);
                 std::vector<float> sq = fetch(g, p + "attn_q.weight");
                 std::vector<float> sk = fetch(g, p + "attn_k.weight");
                 std::vector<float> sv = fetch(g, p + "attn_v.weight");
                 std::vector<float> so = fetch(g, p + "attn_output.weight");
-                transpose_into(sq, d, d, fused.data(), nh, hd, opt.rope_permute);          // wq (RoPE)
+                transpose_into(sq, qd, d, fused.data(), nh, hd, opt.rope_permute);          // wq (RoPE)
                 transpose_into(sk, kv, d, fused.data() + nq, spec.n_kv_heads, hd, opt.rope_permute); // wk (RoPE)
                 transpose_into(sv, kv, d, fused.data() + nq + nkv, 0, 0, false);            // wv
-                transpose_into(so, d, d, fused.data() + nq + nkv + nkv, 0, 0, false);       // wo
+                transpose_into(so, d, qd, fused.data() + nq + nkv + nkv, 0, 0, false);      // wo
+                if (spec.qk_norm)
+                {
+                    /* Per-head Q/K RMSNorm gammas (head_dim each), copied verbatim after W_O to
+                       match the attention [wq|wk|wv|wo|gamma_q|gamma_k] parameter packing. */
+                    std::vector<float> gq = fetch(g, p + "attn_q_norm.weight");
+                    std::vector<float> gk = fetch(g, p + "attn_k_norm.weight");
+                    if (static_cast<long>(gq.size()) != hd || static_cast<long>(gk.size()) != hd)
+                        throw std::runtime_error("import_gguf_weights: unexpected QK-Norm gamma size in " + p);
+                    std::memcpy(fused.data() + 2 * nq + 2 * nkv, gq.data(), ng * sizeof(float));
+                    std::memcpy(fused.data() + 2 * nq + 2 * nkv + ng, gk.data(), ng * sizeof(float));
+                }
                 copy_into(next("attention"), fused, p + "attention");
             }
             copy_into(next("attn_norm"), fetch(g, p + "attn_norm.weight"), p + "attn_norm");

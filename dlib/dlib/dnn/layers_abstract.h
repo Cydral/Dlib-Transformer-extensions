@@ -2332,6 +2332,46 @@ namespace dlib
 
 // ----------------------------------------------------------------------------------------
 
+    class rms_norm_per_head_
+    {
+        /*!
+            WHAT THIS OBJECT REPRESENTS
+                This object is a per-head variant of rms_norm_. It performs root mean square
+                layer normalization over the last tensor dimension nc() only, regardless of the
+                value of k(). It is intended for head-split tensors of shape
+                (num_samples, num_heads, seq_len, head_dim): for each (sample, head, position)
+                it normalizes the head_dim-vector by its root mean square and scales it by a
+                learnable gamma of size head_dim that is shared across heads and positions. No
+                bias (beta) term is used.
+
+                This differs from rms_norm_, which auto-detects the normalization axis and would
+                normalize over k() when k() > 1 (the head axis), giving a different result. Use
+                rms_norm_per_head_ for QK-Norm (e.g. Qwen3), applied to the per-head query and
+                key projections before the rotary positional embedding.
+        !*/
+
+    public:
+        explicit rms_norm_per_head_(double eps_ = DEFAULT_RMS_NORM_EPS);
+        /*!
+            ensures
+                - #get_eps() == eps_
+                - the layer has a learnable gamma initialized to 1 and no bias term.
+        !*/
+
+        double get_eps() const;
+        /*!
+            ensures
+                - returns the epsilon added to the mean square before the inverse square root.
+        !*/
+
+        // The learning-rate and weight-decay multiplier accessors behave as in rms_norm_.
+    };
+
+    template <typename SUBNET>
+    using rms_norm_per_head = add_layer<rms_norm_per_head_, SUBNET>;
+
+// ----------------------------------------------------------------------------------------
+
     enum layer_mode
     {
         CONV_MODE = 0, // convolutional mode

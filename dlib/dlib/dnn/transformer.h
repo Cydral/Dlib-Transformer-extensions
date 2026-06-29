@@ -354,7 +354,8 @@ namespace dlib
 
     // ----------------------------------------------------------------------------------------
 
-    template <long EMBEDDING_DIM_, long NUM_HEADS_, long NUM_KV_HEADS_, long HEAD_DIM_>
+    template <long EMBEDDING_DIM_, long NUM_HEADS_, long NUM_KV_HEADS_, long HEAD_DIM_,
+        bool USE_QK_NORM_ = false>
     class gqa_attention_
     {
     public:
@@ -362,16 +363,23 @@ namespace dlib
         static constexpr long NUM_HEADS = NUM_HEADS_;
         static constexpr long NUM_KV_HEADS = NUM_KV_HEADS_;
         static constexpr long HEAD_DIM = HEAD_DIM_;
+        // When true, a per-head RMSNorm (QK-Norm) is applied to Q and K after the head split
+        // and before RoPE, each scaled by its own gamma of size HEAD_DIM (used by Qwen3).
+        // Default false leaves every other model unchanged: no extra parameters, same compute.
+        static constexpr bool USE_QK_NORM = USE_QK_NORM_;
         static constexpr long REPEAT_FACTOR = NUM_HEADS / NUM_KV_HEADS;
         static constexpr long KV_PROJ_DIM = NUM_KV_HEADS * HEAD_DIM;
+        // Query/output projection width. Decoupled from EMBEDDING_DIM: with a non-standard
+        // head_dim (e.g. Qwen3, where head_dim != EMBEDDING_DIM / NUM_HEADS) this differs from
+        // EMBEDDING_DIM. When head_dim == EMBEDDING_DIM / NUM_HEADS it equals EMBEDDING_DIM, so
+        // existing models are unaffected.
+        static constexpr long Q_PROJ_DIM = NUM_HEADS * HEAD_DIM;
 
         static_assert(EMBEDDING_DIM > 0, "EMBEDDING_DIM must be positive");
-        static_assert(NUM_HEADS > 0 && (EMBEDDING_DIM % NUM_HEADS) == 0,
-            "EMBEDDING_DIM must be a multiple of NUM_HEADS");
+        static_assert(NUM_HEADS > 0, "NUM_HEADS must be positive");
         static_assert(NUM_KV_HEADS > 0 && (NUM_HEADS % NUM_KV_HEADS) == 0,
             "NUM_HEADS must be a multiple of NUM_KV_HEADS");
-        static_assert(HEAD_DIM == EMBEDDING_DIM / NUM_HEADS,
-            "HEAD_DIM must equal EMBEDDING_DIM / NUM_HEADS");
+        static_assert(HEAD_DIM > 0, "HEAD_DIM must be positive");
         static_assert(HEAD_DIM % 2 == 0, "HEAD_DIM must be even (RoPE constraint)");
 
         gqa_attention_()
@@ -397,6 +405,20 @@ namespace dlib
             return rope_q_helper_.get().get_yarn_config();
         }
 
+        // QK-Norm epsilon (only meaningful when USE_QK_NORM is true). Set it to the model's
+        // RMSNorm epsilon (e.g. 1e-6 for Qwen3) before loading weights.
+        void set_qk_norm_eps(double eps) { qk_norm_eps_ = eps; }
+        double get_qk_norm_eps() const { return qk_norm_eps_; }
+
+        // RoPE frequency base (theta). Set it to the model's value (e.g. 1000000 for Qwen3,
+        // 500000 for Llama 3) before the first forward pass, since the trig caches are built
+        // then and are not recomputed on a later base change.
+        void set_rope_theta_base(float base)
+        {
+            rope_q_helper_.get().set_theta_base(base);
+            rope_k_helper_.get().set_theta_base(base);
+        }
+
         // KV cache state accessors
         void reset_kv_cache() { cache_filled_len_ = 0; }
         long get_kv_cache_filled_len() const { return cache_filled_len_; }
@@ -412,30 +434,38 @@ namespace dlib
                 << " does not match EMBEDDING_DIM=" << EMBEDDING_DIM);
 
             const long total_params =
-                EMBEDDING_DIM * EMBEDDING_DIM
+                EMBEDDING_DIM * Q_PROJ_DIM
                 + EMBEDDING_DIM * KV_PROJ_DIM
                 + EMBEDDING_DIM * KV_PROJ_DIM
-                + EMBEDDING_DIM * EMBEDDING_DIM;
+                + Q_PROJ_DIM * EMBEDDING_DIM
+                + (USE_QK_NORM ? 2 * HEAD_DIM : 0);
 
             params.set_size(1, total_params);
 
             dlib::rand rnd(std::rand());
-            randomize_block(rnd, EMBEDDING_DIM, EMBEDDING_DIM, params, 0);
-            randomize_block(rnd, EMBEDDING_DIM, KV_PROJ_DIM, params, EMBEDDING_DIM * EMBEDDING_DIM);
-            randomize_block(rnd, EMBEDDING_DIM, KV_PROJ_DIM, params, EMBEDDING_DIM * EMBEDDING_DIM
+            randomize_block(rnd, EMBEDDING_DIM, Q_PROJ_DIM, params, 0);
+            randomize_block(rnd, EMBEDDING_DIM, KV_PROJ_DIM, params, EMBEDDING_DIM * Q_PROJ_DIM);
+            randomize_block(rnd, EMBEDDING_DIM, KV_PROJ_DIM, params, EMBEDDING_DIM * Q_PROJ_DIM
                 + EMBEDDING_DIM * KV_PROJ_DIM);
-            randomize_block(rnd, EMBEDDING_DIM, EMBEDDING_DIM, params, EMBEDDING_DIM * EMBEDDING_DIM
+            randomize_block(rnd, Q_PROJ_DIM, EMBEDDING_DIM, params, EMBEDDING_DIM * Q_PROJ_DIM
                 + 2 * EMBEDDING_DIM * KV_PROJ_DIM);
 
-            wq_alias = alias_tensor(EMBEDDING_DIM, EMBEDDING_DIM);
+            wq_alias = alias_tensor(EMBEDDING_DIM, Q_PROJ_DIM);
             wk_alias = alias_tensor(EMBEDDING_DIM, KV_PROJ_DIM);
             wv_alias = alias_tensor(EMBEDDING_DIM, KV_PROJ_DIM);
-            wo_alias = alias_tensor(EMBEDDING_DIM, EMBEDDING_DIM);
+            wo_alias = alias_tensor(Q_PROJ_DIM, EMBEDDING_DIM);
 
             wq_offset = 0;
-            wk_offset = EMBEDDING_DIM * EMBEDDING_DIM;
+            wk_offset = EMBEDDING_DIM * Q_PROJ_DIM;
             wv_offset = wk_offset + EMBEDDING_DIM * KV_PROJ_DIM;
             wo_offset = wv_offset + EMBEDDING_DIM * KV_PROJ_DIM;
+
+            if (USE_QK_NORM)
+            {
+                setup_qk_norm_aliases();
+                gamma_q_alias(params, gamma_q_offset) = 1;
+                gamma_k_alias(params, gamma_k_offset) = 1;
+            }
 
             if (x.nr() > 0)
             {
@@ -490,17 +520,17 @@ namespace dlib
             const float qk_scale = 1.0f / std::sqrt(static_cast<float>(HEAD_DIM));
 
             // Step 10 backward
-            resizable_tensor dctx_flat(B, 1, N, EMBEDDING_DIM);
+            resizable_tensor dctx_flat(B, 1, N, Q_PROJ_DIM);
             {
                 alias_tensor go_2d(B * N, EMBEDDING_DIM);
                 auto go_view = go_2d(const_cast<tensor&>(gradient_input), 0);
 
-                alias_tensor dctx_2d(B * N, EMBEDDING_DIM);
+                alias_tensor dctx_2d(B * N, Q_PROJ_DIM);
                 auto dctx_view = dctx_2d(dctx_flat, 0);
 
                 tt::gemm(0.0f, dctx_view, 1.0f, go_view, false, wo, true);
 
-                alias_tensor cf_2d(B * N, EMBEDDING_DIM);
+                alias_tensor cf_2d(B * N, Q_PROJ_DIM);
                 auto cf_view = cf_2d(saved_ctx_flat, 0);
                 tt::gemm(0.0f, dwo, 1.0f, cf_view, true, go_view, false);
             }
@@ -544,14 +574,40 @@ namespace dlib
                 }
             }
 
-            // Step 3 backward (RoPE on Q and K)
+            // Step 3 backward: RoPE, then (optional) QK-Norm. When QK-Norm is active, the tensor
+            // RoPE saw in forward was the *normed* Q/K, so RoPE backward yields the gradient w.r.t.
+            // the normed tensor, which then flows back through the per-head RMSNorm to the pre-norm
+            // Q/K while accumulating the gamma gradients.
             resizable_tensor dQ_pre_rope;
             resizable_tensor dK_pre_rope;
-            rope_q_helper_.backward(dQ, saved_q_pre_rope, dQ_pre_rope);
-            rope_k_helper_.backward(dK_pre_repeat, saved_k_pre_rope, dK_pre_rope);
+            if (USE_QK_NORM)
+            {
+                auto gq = gamma_q_alias(params, gamma_q_offset);
+                auto gk = gamma_k_alias(params, gamma_k_offset);
+                auto dgq = gamma_q_alias(params_grad, gamma_q_offset);
+                auto dgk = gamma_k_alias(params_grad, gamma_k_offset);
+
+                resizable_tensor dQ_norm, dK_norm, dscale_tmp;
+                rope_q_helper_.backward(dQ, saved_q_normed, dQ_norm);
+                rope_k_helper_.backward(dK_pre_repeat, saved_k_normed, dK_norm);
+
+                // rms_normalize_gradient accumulates into src_grad, so zero it first.
+                dQ_pre_rope.copy_size(saved_q_pre_rope); dQ_pre_rope = 0;
+                dK_pre_rope.copy_size(saved_k_pre_rope); dK_pre_rope = 0;
+
+                tt::rms_normalize_gradient(dQ_norm, qk_scale_q, saved_q_pre_rope, gq,
+                    dQ_pre_rope, dgq, dscale_tmp, true);
+                tt::rms_normalize_gradient(dK_norm, qk_scale_k, saved_k_pre_rope, gk,
+                    dK_pre_rope, dgk, dscale_tmp, true);
+            }
+            else
+            {
+                rope_q_helper_.backward(dQ, saved_q_pre_rope, dQ_pre_rope);
+                rope_k_helper_.backward(dK_pre_repeat, saved_k_pre_rope, dK_pre_rope);
+            }
 
             // Step 2 backward (merge heads)
-            resizable_tensor dQ_flat(B, 1, N, EMBEDDING_DIM);
+            resizable_tensor dQ_flat(B, 1, N, Q_PROJ_DIM);
             resizable_tensor dK_flat(B, 1, N, KV_PROJ_DIM);
             resizable_tensor dV_flat(B, 1, N, KV_PROJ_DIM);
             tt::merge_heads(false, dQ_flat, dQ_pre_rope);
@@ -566,7 +622,7 @@ namespace dlib
                 alias_tensor dx_2d(B * N, EMBEDDING_DIM);
                 auto dx_view = dx_2d(dx, 0);
 
-                alias_tensor dQ_2d(B * N, EMBEDDING_DIM);
+                alias_tensor dQ_2d(B * N, Q_PROJ_DIM);
                 auto dQ_view = dQ_2d(dQ_flat, 0);
                 alias_tensor dK_2d(B * N, KV_PROJ_DIM);
                 auto dK_view = dK_2d(dK_flat, 0);
@@ -595,6 +651,10 @@ namespace dlib
             serialize(item.rope_q_helper_, out);
             serialize(item.rope_k_helper_, out);
             serialize(item.tril_helper_, out);
+            // qk_norm_eps_ is part of the stream only for QK-Norm layers, so every other
+            // model keeps the exact same serialized format.
+            if (USE_QK_NORM)
+                serialize(item.qk_norm_eps_, out);
         }
 
         friend void deserialize(gqa_attention_& item, std::istream& in)
@@ -610,6 +670,8 @@ namespace dlib
             deserialize(item.rope_q_helper_, in);
             deserialize(item.rope_k_helper_, in);
             deserialize(item.tril_helper_, in);
+            if (USE_QK_NORM)
+                deserialize(item.qk_norm_eps_, in);
             item.rebuild_aliases();
 
             // KV cache state is runtime-only.
@@ -626,7 +688,8 @@ namespace dlib
                 << " (emb=" << EMBEDDING_DIM
                 << ", heads=" << NUM_HEADS
                 << ", kv_heads=" << NUM_KV_HEADS
-                << ", head_dim=" << HEAD_DIM << ")"
+                << ", head_dim=" << HEAD_DIM
+                << ", qk_norm=" << (USE_QK_NORM ? "on" : "off") << ")"
                 << " learning_rate_mult=" << item.learning_rate_multiplier_
                 << " weight_decay_mult=" << item.weight_decay_multiplier_;
             return out;
@@ -639,15 +702,20 @@ namespace dlib
                 << " heads='" << NUM_HEADS << "'"
                 << " kv_heads='" << NUM_KV_HEADS << "'"
                 << " head_dim='" << HEAD_DIM << "'"
+                << " qk_norm='" << (USE_QK_NORM ? "true" : "false") << "'"
                 << " learning_rate_mult='" << item.learning_rate_multiplier_ << "'"
                 << " weight_decay_mult='" << item.weight_decay_multiplier_ << "'/>\n";
         }
 
     private:
-        // Parameter storage (W_Q | W_K | W_V | W_O packed contiguously)
+        // Parameter storage (W_Q | W_K | W_V | W_O [| gamma_q | gamma_k]) packed contiguously.
+        // The two QK-Norm gammas are present only when USE_QK_NORM is true.
         resizable_tensor params;
         alias_tensor wq_alias, wk_alias, wv_alias, wo_alias;
         size_t wq_offset = 0, wk_offset = 0, wv_offset = 0, wo_offset = 0;
+        alias_tensor gamma_q_alias, gamma_k_alias;
+        size_t gamma_q_offset = 0, gamma_k_offset = 0;
+        double qk_norm_eps_ = DEFAULT_RMS_NORM_EPS;
 
         // Forward state saved for backward (training only)
         resizable_tensor saved_q_pre_rope;
@@ -660,6 +728,11 @@ namespace dlib
         resizable_tensor saved_scores;
         resizable_tensor saved_attn;
         resizable_tensor saved_ctx_flat;
+        // QK-Norm forward state (training): normed Q/K fed to RoPE, and the per-row inverse RMS.
+        resizable_tensor saved_q_normed;
+        resizable_tensor saved_k_normed;
+        resizable_tensor qk_scale_q;
+        resizable_tensor qk_scale_k;
 
         long saved_x_shape_B = 0;
         long saved_x_shape_N = 0;
@@ -697,17 +770,33 @@ namespace dlib
         resizable_tensor inc_scores;
         resizable_tensor inc_attn;
         resizable_tensor inc_ctx;
+        // QK-Norm incremental scratch (inference): normed Q and normed K window, plus scales.
+        resizable_tensor inc_q_normed;
+        resizable_tensor inc_k_window_normed;
+        resizable_tensor inc_scale_q;
+        resizable_tensor inc_scale_k;
 
         void rebuild_aliases()
         {
-            wq_alias = alias_tensor(EMBEDDING_DIM, EMBEDDING_DIM);
+            wq_alias = alias_tensor(EMBEDDING_DIM, Q_PROJ_DIM);
             wk_alias = alias_tensor(EMBEDDING_DIM, KV_PROJ_DIM);
             wv_alias = alias_tensor(EMBEDDING_DIM, KV_PROJ_DIM);
-            wo_alias = alias_tensor(EMBEDDING_DIM, EMBEDDING_DIM);
+            wo_alias = alias_tensor(Q_PROJ_DIM, EMBEDDING_DIM);
             wq_offset = 0;
-            wk_offset = EMBEDDING_DIM * EMBEDDING_DIM;
+            wk_offset = EMBEDDING_DIM * Q_PROJ_DIM;
             wv_offset = wk_offset + EMBEDDING_DIM * KV_PROJ_DIM;
             wo_offset = wv_offset + EMBEDDING_DIM * KV_PROJ_DIM;
+            if (USE_QK_NORM)
+                setup_qk_norm_aliases();
+        }
+
+        // Place the two QK-Norm gammas right after W_O in the packed parameter blob.
+        void setup_qk_norm_aliases()
+        {
+            gamma_q_offset = wo_offset + static_cast<size_t>(Q_PROJ_DIM) * EMBEDDING_DIM;
+            gamma_k_offset = gamma_q_offset + static_cast<size_t>(HEAD_DIM);
+            gamma_q_alias = alias_tensor(1, 1, 1, HEAD_DIM);
+            gamma_k_alias = alias_tensor(1, 1, 1, HEAD_DIM);
         }
 
         void randomize_block(
@@ -808,14 +897,14 @@ namespace dlib
             const float qk_scale = 1.0f / std::sqrt(static_cast<float>(HEAD_DIM));
 
             // Step 1: Q (pre-scaled), K, V projections
-            resizable_tensor q_flat(B, 1, N, EMBEDDING_DIM);
+            resizable_tensor q_flat(B, 1, N, Q_PROJ_DIM);
             resizable_tensor k_flat(B, 1, N, KV_PROJ_DIM);
             resizable_tensor v_flat(B, 1, N, KV_PROJ_DIM);
             {
                 alias_tensor x_2d(B * N, EMBEDDING_DIM);
                 auto x_view = x_2d(const_cast<tensor&>(x), 0);
 
-                alias_tensor q_2d(B * N, EMBEDDING_DIM);
+                alias_tensor q_2d(B * N, Q_PROJ_DIM);
                 auto q_view = q_2d(q_flat, 0);
                 tt::gemm(0.0f, q_view, qk_scale, x_view, false, wq, false);
 
@@ -837,10 +926,24 @@ namespace dlib
             tt::split_heads(false, saved_k_pre_rope, k_flat);
             tt::split_heads(false, saved_v_4d, v_flat);
 
-            // Step 3: RoPE on Q and K (used locally for attention; not stored
-            // in the cache - the cache holds K *before* RoPE)
-            rope_q_helper_.forward(saved_q_pre_rope, saved_q_post_rope);
-            rope_k_helper_.forward(saved_k_pre_rope, saved_k_post_rope);
+            // Step 3: optional QK-Norm (per-head RMSNorm on Q and K), then RoPE. The norm is
+            // applied after the head split and before RoPE; the prefill cache below still stores
+            // K before RoPE and before norm, since the norm is a deterministic per-token map
+            // re-applied wherever K is used (locally here, and on the window in incremental mode).
+            if (USE_QK_NORM)
+            {
+                auto gq = gamma_q_alias(params, gamma_q_offset);
+                auto gk = gamma_k_alias(params, gamma_k_offset);
+                tt::rms_normalize(qk_norm_eps_, saved_q_normed, qk_scale_q, saved_q_pre_rope, gq, true);
+                tt::rms_normalize(qk_norm_eps_, saved_k_normed, qk_scale_k, saved_k_pre_rope, gk, true);
+                rope_q_helper_.forward(saved_q_normed, saved_q_post_rope);
+                rope_k_helper_.forward(saved_k_normed, saved_k_post_rope);
+            }
+            else
+            {
+                rope_q_helper_.forward(saved_q_pre_rope, saved_q_post_rope);
+                rope_k_helper_.forward(saved_k_pre_rope, saved_k_post_rope);
+            }
 
             // Step 3.5: prefill-mode cache write (K pre-RoPE and V).
             // Only effective non-padded positions are kept; padding is
@@ -917,13 +1020,13 @@ namespace dlib
                 operation_mode::PLANE_WISE);
 
             // Step 9: merge heads
-            saved_ctx_flat.set_size(B, 1, N, EMBEDDING_DIM);
+            saved_ctx_flat.set_size(B, 1, N, Q_PROJ_DIM);
             tt::merge_heads(false, saved_ctx_flat, ctx_4d);
 
             // Step 10: W_O projection
             output.set_size(B, 1, N, EMBEDDING_DIM);
             {
-                alias_tensor ctx_2d(B * N, EMBEDDING_DIM);
+                alias_tensor ctx_2d(B * N, Q_PROJ_DIM);
                 auto ctx_view = ctx_2d(saved_ctx_flat, 0);
 
                 alias_tensor o_2d(B * N, EMBEDDING_DIM);
@@ -970,7 +1073,7 @@ namespace dlib
                 alias_tensor x_2d(1, EMBEDDING_DIM);
                 auto x_view = x_2d(const_cast<tensor&>(x), 0);
 
-                alias_tensor q_2d(1, EMBEDDING_DIM);
+                alias_tensor q_2d(1, Q_PROJ_DIM);
                 auto q_view = q_2d(inc_q, 0);
                 tt::gemm(0.0f, q_view, qk_scale, x_view, false, wq, false);
 
@@ -1021,9 +1124,18 @@ namespace dlib
                 /*nr=*/static_cast<size_t>(L),
                 /*nc=*/HEAD_DIM);
 
-            // Step 5a: apply RoPE on the entire K window (positions [0, L-1])
+            // Step 5a: optional QK-Norm on the K window, then RoPE (positions [0, L-1])
             inc_k_window_rope.copy_size(inc_k_window);
-            rope_k_helper_.forward(inc_k_window, inc_k_window_rope);
+            if (USE_QK_NORM)
+            {
+                auto gk = gamma_k_alias(params, gamma_k_offset);
+                tt::rms_normalize(qk_norm_eps_, inc_k_window_normed, inc_scale_k, inc_k_window, gk, true);
+                rope_k_helper_.forward(inc_k_window_normed, inc_k_window_rope);
+            }
+            else
+            {
+                rope_k_helper_.forward(inc_k_window, inc_k_window_rope);
+            }
 
             // Step 5b: apply RoPE on Q with position L-1, by extracting cos/sin
             // slices from the Q helper's caches and rotating in place
@@ -1046,7 +1158,16 @@ namespace dlib
                 /*k=*/1, /*nr=*/1, /*nc=*/static_cast<size_t>(half_d));
 
             inc_q_rope.set_size(1, NUM_HEADS, 1, HEAD_DIM);
-            tt::copy_tensor(false, inc_q_rope, 0, inc_q, 0, NUM_HEADS);
+            if (USE_QK_NORM)
+            {
+                auto gq = gamma_q_alias(params, gamma_q_offset);
+                tt::rms_normalize(qk_norm_eps_, inc_q_normed, inc_scale_q, inc_q, gq, true);
+                tt::copy_tensor(false, inc_q_rope, 0, inc_q_normed, 0, NUM_HEADS);
+            }
+            else
+            {
+                tt::copy_tensor(false, inc_q_rope, 0, inc_q, 0, NUM_HEADS);
+            }
             tt::apply_rotary_positional_embedding(false, inc_q_rope, q_cos_slice, q_sin_slice);
 
             // Step 6: GQA repeat from NUM_KV_HEADS to NUM_HEADS
@@ -1079,12 +1200,12 @@ namespace dlib
                 operation_mode::PLANE_WISE);
 
             // Step 10: merge heads + W_O projection
-            resizable_tensor ctx_flat(1, 1, 1, EMBEDDING_DIM);
+            resizable_tensor ctx_flat(1, 1, 1, Q_PROJ_DIM);
             tt::merge_heads(false, ctx_flat, inc_ctx);
 
             output.set_size(1, 1, 1, EMBEDDING_DIM);
             {
-                alias_tensor ctx_2d(1, EMBEDDING_DIM);
+                alias_tensor ctx_2d(1, Q_PROJ_DIM);
                 auto ctx_view = ctx_2d(ctx_flat, 0);
 
                 alias_tensor o_2d(1, EMBEDDING_DIM);
@@ -1098,9 +1219,10 @@ namespace dlib
         }
     };
 
-    template <long EMBEDDING_DIM, long NUM_HEADS, long NUM_KV_HEADS, long HEAD_DIM, typename SUBNET>
+    template <long EMBEDDING_DIM, long NUM_HEADS, long NUM_KV_HEADS, long HEAD_DIM, typename SUBNET,
+        bool USE_QK_NORM = false>
     using gqa_attention = add_layer<
-        gqa_attention_<EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM>, SUBNET>;
+        gqa_attention_<EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, USE_QK_NORM>, SUBNET>;
 
     // ----------------------------------------------------------------------------------------
 
@@ -1173,9 +1295,10 @@ namespace dlib
     // Multi-head Grouped Query Attention, fused into a single layer
     namespace gqa_transformer_unified
     {        
-        template<long d_model, long num_heads, long num_kv_heads, typename SUBNET>
+        template<long d_model, long num_heads, long num_kv_heads, typename SUBNET,
+            long head_dim = d_model / num_heads, bool use_qk_norm = false>
         using multihead_attention_gqa = gqa_attention<d_model, num_heads, num_kv_heads,
-            d_model / num_heads, SUBNET>;
+            head_dim, SUBNET, use_qk_norm>;
 
         // Transformer block with pre-norm architecture, identical in topology to
         // the chained version: attention sublayer with residual connection,
@@ -1212,26 +1335,29 @@ namespace dlib
         // gqa_attention_ layer; feed-forward sublayer is SwiGLU, optionally ACT-wrapped.
         template<bool UseAct, long d_model, long num_heads, long num_kv_heads,
             long hidden_num, long hidden_den, typename SUBNET,
-            template <unsigned long, typename> class LINEAR = linear>
+            template <unsigned long, typename> class LINEAR = linear,
+            long head_dim = d_model / num_heads, bool use_qk_norm = false>
         using transformer_block =
             add_prev5<ffn_sublayer<UseAct, d_model, hidden_num, hidden_den, 4, rms_norm<tag5<
             add_prev1<multihead_attention_gqa<d_model, num_heads, num_kv_heads, rms_norm<tag1<
-            SUBNET>>>>>>, LINEAR >> ;
+            SUBNET>>, head_dim, use_qk_norm>>>>, LINEAR >> ;
 
         template<long remaining_layers, bool UseAct, long d_model, long num_heads, long num_kv_heads,
             long hidden_num, long hidden_den, typename SUBNET,
-            template <unsigned long, typename> class LINEAR = linear, typename enabled = void>
+            template <unsigned long, typename> class LINEAR = linear,
+            long head_dim = d_model / num_heads, bool use_qk_norm = false, typename enabled = void>
         struct transformer_stack_impl
         {
             using type = transformer_block<UseAct, d_model, num_heads, num_kv_heads, hidden_num, hidden_den,
                 typename transformer_stack_impl<remaining_layers - 1, UseAct, d_model, num_heads,
-                num_kv_heads, hidden_num, hidden_den, SUBNET, LINEAR>::type, LINEAR>;
+                num_kv_heads, hidden_num, hidden_den, SUBNET, LINEAR, head_dim, use_qk_norm>::type,
+                LINEAR, head_dim, use_qk_norm>;
         };
         template<bool UseAct, long d_model, long num_heads, long num_kv_heads,
             long hidden_num, long hidden_den, typename SUBNET,
-            template <unsigned long, typename> class LINEAR>
+            template <unsigned long, typename> class LINEAR, long head_dim, bool use_qk_norm>
         struct transformer_stack_impl<0, UseAct, d_model, num_heads, num_kv_heads,
-            hidden_num, hidden_den, SUBNET, LINEAR, void>
+            hidden_num, hidden_den, SUBNET, LINEAR, head_dim, use_qk_norm, void>
         {
             using type = tag10<SUBNET>;
         };
@@ -1240,9 +1366,10 @@ namespace dlib
         // keep their ACT feed-forward unchanged.
         template<long num_layers, long d_model, long num_heads, long num_kv_heads, typename SUBNET,
             bool UseAct = true, long hidden_num = 8, long hidden_den = 3,
-            template <unsigned long, typename> class LINEAR = linear>
+            template <unsigned long, typename> class LINEAR = linear,
+            long head_dim = d_model / num_heads, bool use_qk_norm = false>
         using transformer_stack = typename transformer_stack_impl<num_layers, UseAct, d_model,
-            num_heads, num_kv_heads, hidden_num, hidden_den, SUBNET, LINEAR>::type;
+            num_heads, num_kv_heads, hidden_num, hidden_den, SUBNET, LINEAR, head_dim, use_qk_norm>::type;
 
     } // namespace gqa_transformer_unified
 

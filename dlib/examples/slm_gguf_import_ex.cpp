@@ -23,8 +23,13 @@
                imported_model.h and declares namespace imported_model) and extract the
                tokenizer.
       Phase 2  recompile WITH WITH_IMPORTED_MODEL defined. The generated header is included
-               and --chat / --probe-logits / --convert become available. A deep network type
-               is instantiated, so build this phase with /bigobj (MSVC).
+               and --chat / --probe-logits / --convert become available. Enable it at configure
+               time through the CMake option, for example from dlib/examples:
+                 cmake -S . -B build -DWITH_IMPORTED_MODEL=ON
+                 cmake --build build --config Release
+               A deep network type is instantiated, so this phase needs /bigobj on MSVC (added
+               by the example CMakeLists), and imported_model.h must sit next to this file or on
+               the include path.
 
     The utility headers gguf_reader.h, gguf_dequantize.h, gguf_model_spec.h and
     gguf_weight_loader.h live under dlib/data_io; hf_tokenizer.h lives under dlib/tokenizer.
@@ -95,6 +100,18 @@ void extract_tokenizer(const gguf_reader& g, const string& out_path, const strin
     }
     cout << (all_ok ? "Round-trip passed.\n" : "Round-trip MISMATCH (see above).\n");
 
+    /* Show how the chat-template markers tokenize: a single id means a dedicated special
+       token, several ids mean an ordinary subword sequence (the case for the standard
+       Llama-2 vocabulary, which has no dedicated chat markers). */
+    cout << "\nChat-template markers:\n";
+    for (const string& m : { string("<|user|>"), string("<|assistant|>"), string("<|system|>") })
+    {
+        const std::vector<int> ids = tok.encode(m, /*add_bos=*/false, /*add_eos=*/false);
+        cout << "  \"" << m << "\" -> " << ids.size() << (ids.size() == 1 ? " token  [" : " tokens [");
+        for (size_t i = 0; i < ids.size(); ++i) cout << (i ? " " : "") << ids[i];
+        cout << "]\n";
+    }
+
     ofstream out(out_path, ios::binary);
     if (!out) throw runtime_error("cannot write " + out_path);
     serialize(tok, out);
@@ -126,6 +143,11 @@ void build_expected_tensors(const model_spec& s, std::vector<expected_tensor>& o
         out.push_back({ p + "attn_k.weight",      d * kv });
         out.push_back({ p + "attn_v.weight",      d * kv });
         out.push_back({ p + "attn_output.weight", q * d });
+        if (s.qk_norm)
+        {
+            out.push_back({ p + "attn_q_norm.weight", s.head_dim });
+            out.push_back({ p + "attn_k_norm.weight", s.head_dim });
+        }
         out.push_back({ p + "ffn_norm.weight",    d });
         out.push_back({ p + "ffn_gate.weight",    d * ff });
         out.push_back({ p + "ffn_up.weight",      d * ff });
@@ -230,7 +252,8 @@ int pick_next(const tensor& probs, const std::vector<int>& recent, bool determin
 
 int run_chat(gguf_reader& g, const model_spec& spec, const gguf_load_options& lopt,
     double temperature, size_t top_k, float top_p,
-    float min_p, float repeat_penalty, bool deterministic, long ctx_len)
+    float min_p, float repeat_penalty, bool deterministic, long ctx_len, bool use_template,
+    const std::string& system_prompt)
 {
     if (!model_matches_header(spec))
     { cerr << "Error: model does not match the compiled-in header. Regenerate and recompile.\n"; return 1; }
@@ -241,6 +264,7 @@ int run_chat(gguf_reader& g, const model_spec& spec, const gguf_load_options& lo
 
     hf_tokenizer tok;
     tok.load_from_gguf(g);
+    const int eos = tok.eos_id();
 
     const float temp = deterministic ? 1.0f : static_cast<float>(temperature);
     generator_type generator(multiply_(1.0 / temp));
@@ -252,6 +276,15 @@ int run_chat(gguf_reader& g, const model_spec& spec, const gguf_load_options& lo
     const int max_response = 512;
 
     cout << "\nReady. Type 'quit' or 'exit' to stop.\n\n";
+
+    /* Validated KV-cache pattern: a single prefill on the first turn, then everything else,
+       the response and every later turn's tokens, is fed one token at a time in incremental
+       mode, never clearing or re-prefilling. This is the only path the cache is known to
+       reproduce exactly; the attention layer slides its window automatically when the
+       capacity is reached. */
+    network_context::set_inference_mode(network_context::inference_mode::prefill);
+    network_context::clear_padding();
+    bool primed = false;
     std::vector<int> ctx;
     while (true)
     {
@@ -263,28 +296,61 @@ int run_chat(gguf_reader& g, const model_spec& spec, const gguf_load_options& lo
         if (line.empty()) continue;
         if (line == "quit" || line == "exit") break;
 
-        const bool first = ctx.empty();
-        std::vector<int> toks = tok.encode(line, /*add_bos=*/first, /*add_eos=*/false);
-        ctx.insert(ctx.end(), toks.begin(), toks.end());
+        std::vector<int> turn;
+        if (use_template)
+        {
+            /* TinyLlama / Zephyr chat template. The first turn carries the system block,
+               <|system|>\n{system}</s>\n , ahead of the user turn; later turns send only
+               <|user|>\n{msg}</s>\n<|assistant|>\n . Each turn is encoded in a single call so the
+               SentencePiece dummy space prefix is applied once; the literal </s> markers are
+               recognized as the eos special token and split internally, and the space prefix is
+               allowed only on the first turn, matching a single continuous tokenization of the
+               whole conversation. */
+            const bool first = !primed;
+            const std::string turn_text = first
+                ? "<|system|>\n" + system_prompt + "</s>\n<|user|>\n" + line + "</s>\n<|assistant|>\n"
+                : "<|user|>\n" + line + "</s>\n<|assistant|>\n";
+            turn = tok.encode(turn_text, /*add_bos=*/first, /*add_eos=*/false,
+                /*parse_special=*/true, /*allow_space_prefix=*/first);
+        }
+        else
+        {
+            turn = tok.encode(line, /*add_bos=*/!primed, /*add_eos=*/false);
+        }
 
-        const size_t start = ctx.size() > static_cast<size_t>(ctx_len) ? ctx.size() - ctx_len : 0;
-        const long win = static_cast<long>(ctx.size() - start);
-        matrix<int, 0, 1> prefill(win, 1);
-        for (long i = 0; i < win; ++i) prefill(i) = ctx[start + i];
-
-        network_context::request_kv_cache_clear();
-        network_context::clear_padding();
-        network_context::set_inference_mode(network_context::inference_mode::prefill);
-        int nxt = pick_next(generator(prefill), ctx, deterministic, top_k, top_p, min_p, repeat_penalty, rng);
-        network_context::clear_kv_cache_request();
-        network_context::set_inference_mode(network_context::inference_mode::incremental);
+        int nxt = 0;
+        if (!primed)
+        {
+            /* First turn: a single prefill over the whole turn. */
+            matrix<int, 0, 1> pf(static_cast<long>(turn.size()), 1);
+            for (long i = 0; i < static_cast<long>(turn.size()); ++i) pf(i) = turn[static_cast<size_t>(i)];
+            nxt = pick_next(generator(pf), ctx, deterministic, top_k, top_p, min_p, repeat_penalty, rng);
+            ctx.insert(ctx.end(), turn.begin(), turn.end());
+            network_context::set_inference_mode(network_context::inference_mode::incremental);
+            network_context::clear_padding();
+            primed = true;
+        }
+        else
+        {
+            /* Later turns: feed the new tokens incrementally, continuing the same cache; the
+               last one yields the first response token. */
+            for (size_t j = 0; j < turn.size(); ++j)
+            {
+                matrix<int, 0, 1> step(1, 1);
+                step(0) = turn[j];
+                const tensor& out = generator(step);
+                ctx.push_back(turn[j]);
+                if (j + 1 == turn.size())
+                    nxt = pick_next(out, ctx, deterministic, top_k, top_p, min_p, repeat_penalty, rng);
+            }
+        }
 
         cout << "Model: " << std::flush;
         std::vector<int> out_toks;
         size_t printed = 0;
         for (int i = 0; i < max_response; ++i)
         {
-            if (nxt == tok.eos_id()) break;
+            if (nxt == eos) break;
             ctx.push_back(nxt);
             out_toks.push_back(nxt);
             std::string full = tok.decode(out_toks, true);
@@ -292,6 +358,15 @@ int run_chat(gguf_reader& g, const model_spec& spec, const gguf_load_options& lo
             matrix<int, 0, 1> step(1, 1);
             step(0) = nxt;
             nxt = pick_next(generator(step), ctx, deterministic, top_k, top_p, min_p, repeat_penalty, rng);
+        }
+        if (use_template)
+        {
+            /* Close the assistant turn with </s> in the cache so the next turn continues
+               cleanly; advance the cache past it without sampling. */
+            matrix<int, 0, 1> step(1, 1);
+            step(0) = eos;
+            generator(step);
+            ctx.push_back(eos);
         }
         cout << "\n\n";
     }
@@ -391,6 +466,8 @@ int main(int argc, char** argv)
         parser.add_option("min-p", "Relative min-p threshold (default: 0.05)", 1);
         parser.add_option("repeat-penalty", "Repetition penalty (default: 1.1)", 1);
         parser.add_option("deterministic", "Greedy decoding (argmax)");
+        parser.add_option("raw", "Chat without the chat template (raw text completion)");
+        parser.add_option("system", "System prompt used by --chat (default: a helpful assistant)", 1);
         parser.add_option("rope-permute", "Permute Q/K projection rows for RoPE (weight-loader knob)");
         parser.add_option("swap-gate-up", "Swap ffn_gate / ffn_up assignment (weight-loader knob)");
         parser.parse(argc, argv);
@@ -444,7 +521,9 @@ int main(int argc, char** argv)
                     get_option(parser, "min-p", 0.05f),
                     get_option(parser, "repeat-penalty", 1.1f),
                     parser.option("deterministic"),
-                    get_option(parser, "context", long(512)));
+                    get_option(parser, "context", long(512)),
+                    /*use_template=*/!parser.option("raw"),
+                    get_option(parser, "system", std::string("You are a helpful assistant.")));
 
             if (parser.option("convert"))
                 return run_convert(g, spec, lopt, prefix + ".dat");
@@ -453,8 +532,11 @@ int main(int argc, char** argv)
                 get_option(parser, "prompt", std::string("The capital of France is")));
 #else
             cerr << "This build has no model header compiled in.\n"
-                 << "Generate it first (run with --out-prefix imported_model), then recompile\n"
-                 << "this file with WITH_IMPORTED_MODEL defined (and /bigobj on MSVC).\n";
+                 << "Generate it first (run with --out-prefix imported_model), then reconfigure\n"
+                 << "with the CMake option enabled and rebuild:\n"
+                 << "    cmake -S . -B build -DWITH_IMPORTED_MODEL=ON\n"
+                 << "    cmake --build build --config Release\n"
+                 << "(/bigobj is added by the example CMakeLists on MSVC).\n";
             return 1;
 #endif
         }

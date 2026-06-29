@@ -107,9 +107,9 @@ macro(add_example name)
    add_executable(${name} ${name}.cpp)
    target_link_libraries(${name} dlib::dlib )
 
-   if(${CMAKE_VERSION} VERSION_GREATER_EQUAL "3.13.0") 
-   # And strip symbols to make your binary smaller if you like.  Certainly not
-   # required though.
+   if(${CMAKE_VERSION} VERSION_GREATER_EQUAL "3.13.0" AND NOT MSVC)
+   # -s is a GCC/Clang linker flag; on MSVC it becomes /s and triggers LNK4044,
+   # so apply it only on non-MSVC toolchains.
        target_link_options(${name} PRIVATE $<$<CONFIG:RELEASE>:-s>)
    endif()
 
@@ -168,8 +168,15 @@ add_example(slm_cygnus_instruct_ex)
 add_example(slm_predictive_compressor_ex)
 add_example(slm_tok_predictive_compressor_ex)
 add_example(slm_gguf_import_ex)
-if (MSVC)
-   target_compile_options(slm_gguf_import_ex PRIVATE /bigobj)
+if(MSVC)
+    target_compile_options(slm_gguf_import_ex PRIVATE /bigobj)
+    # The imported network is one very deep template instantiation (28 Qwen3 blocks
+    # plus the QK-Norm branches). Combined with whole-program optimization
+    # (/GL -> /LTCG) it can yield an object the linker cannot read (LNK1107 at
+    # 0xFFFFFFFF) and can make the LTCG link run out of memory. /bigobj already
+    # handles the object size, so disable link-time code generation for this target.
+    set_target_properties(slm_gguf_import_ex PROPERTIES INTERPROCEDURAL_OPTIMIZATION OFF)
+    target_compile_options(slm_gguf_import_ex PRIVATE /GL-)
 endif()
 #add_gui_example(3d_point_cloud_ex)
 #add_example(bayes_net_ex)

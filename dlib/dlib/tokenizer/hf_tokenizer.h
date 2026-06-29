@@ -178,11 +178,11 @@ namespace dlib
         }
 
         std::vector<int> encode(const std::string& text, bool add_bos, bool add_eos,
-            bool parse_special = true) const
+            bool parse_special = true, bool allow_space_prefix = true) const
         {
             std::vector<int> out;
             if (add_bos && bos_ >= 0) out.push_back(bos_);
-            encode_text(text, parse_special, out);
+            encode_text(text, parse_special, allow_space_prefix, out);
             if (add_eos && eos_ >= 0) out.push_back(eos_);
             return out;
         }
@@ -311,12 +311,15 @@ namespace dlib
         }
 
         /* Split the raw text on special pieces, encoding the spans in between. The dummy
-           space prefix (SentencePiece) is applied only to the first text fragment. */
-        void encode_text(const std::string& text, bool parse_special, std::vector<int>& out) const
+           space prefix (SentencePiece) is applied only to the first text fragment, and only
+           when the caller allows it; a continuation turn passes allow_space_prefix=false so no
+           leading space token is inserted mid-conversation. */
+        void encode_text(const std::string& text, bool parse_special, bool allow_space_prefix,
+            std::vector<int>& out) const
         {
             if (!parse_special || special_pieces_.empty())
             {
-                encode_fragment(text, true, out);
+                encode_fragment(text, true, allow_space_prefix, out);
                 return;
             }
             size_t pos = 0, frag_start = 0;
@@ -328,7 +331,7 @@ namespace dlib
                 {
                     if (pos > frag_start)
                     {
-                        encode_fragment(text.substr(frag_start, pos - frag_start), first, out);
+                        encode_fragment(text.substr(frag_start, pos - frag_start), first, allow_space_prefix, out);
                         first = false;
                     }
                     out.push_back(sid);
@@ -338,13 +341,14 @@ namespace dlib
                 else ++pos;
             }
             if (frag_start < text.size())
-                encode_fragment(text.substr(frag_start), first, out);
+                encode_fragment(text.substr(frag_start), first, allow_space_prefix, out);
         }
 
-        void encode_fragment(const std::string& frag, bool first, std::vector<int>& out) const
+        void encode_fragment(const std::string& frag, bool first, bool allow_space_prefix,
+            std::vector<int>& out) const
         {
             std::vector<int> ids = (kind_ == kind::spm)
-                ? encode_spm(frag, first && add_space_prefix_)
+                ? encode_spm(frag, first && allow_space_prefix && add_space_prefix_)
                 : encode_bpe(frag);
             out.insert(out.end(), ids.begin(), ids.end());
         }

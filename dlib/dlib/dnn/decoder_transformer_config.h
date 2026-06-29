@@ -56,7 +56,9 @@ namespace dlib
         long num_kv_heads,
         long embedding_dim,
         long ffn_num,
-        long ffn_den
+        long ffn_den,
+        long head_dim = embedding_dim / num_heads,
+        bool use_qk_norm = false
     >
     struct decoder_transformer_config
     {
@@ -65,7 +67,8 @@ namespace dlib
         static constexpr long NUM_HEADS     = num_heads;
         static constexpr long NUM_KV_HEADS  = num_kv_heads;
         static constexpr long EMBEDDING_DIM = embedding_dim;
-        static constexpr long HEAD_DIM      = embedding_dim / num_heads;
+        static constexpr long HEAD_DIM      = head_dim;
+        static constexpr bool USE_QK_NORM   = use_qk_norm;
         static constexpr long FFN_NUM       = ffn_num;
         static constexpr long FFN_DEN       = ffn_den;
         static constexpr long FFN_HIDDEN    = embedding_dim * ffn_num / ffn_den;
@@ -76,7 +79,8 @@ namespace dlib
         using subnet = gqa_transformer_unified::transformer_stack<
             NUM_LAYERS, EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS,
             embeddings<VOCAB_SIZE, EMBEDDING_DIM, input<matrix<int, 0, 1>>>,
-            /*UseAct=*/false, FFN_NUM, FFN_DEN, /*FFN linear=*/linear_no_bias>;
+            /*UseAct=*/false, FFN_NUM, FFN_DEN, /*FFN linear=*/linear_no_bias,
+            /*head_dim=*/HEAD_DIM, /*use_qk_norm=*/USE_QK_NORM>;
 
         /* The full network: final RMSNorm + bias-free output projection + per-token loss
            head. The is_training flag is accepted for API symmetry with the other
@@ -96,6 +100,7 @@ namespace dlib
                   << "  heads        : " << NUM_HEADS << " (kv " << NUM_KV_HEADS
                   << ", head_dim " << HEAD_DIM << ")\n"
                   << "  d_model      : " << EMBEDDING_DIM << "\n"
+                  << "  qk_norm      : " << (USE_QK_NORM ? "on" : "off") << "\n"
                   << "  ffn_hidden   : " << FFN_HIDDEN
                   << " (= d_model * " << FFN_NUM << " / " << FFN_DEN << ")";
                 return o.str();

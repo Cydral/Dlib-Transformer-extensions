@@ -19,7 +19,7 @@
 
 namespace dlib
 {
-    enum class arch_family { llama, mistral, gemma, gemma2, qwen2, mixtral, unknown };
+    enum class arch_family { llama, mistral, gemma, gemma2, qwen2, qwen3, mixtral, unknown };
 
     inline arch_family arch_family_from_name(const std::string& a)
     {
@@ -28,6 +28,7 @@ namespace dlib
         if (a == "gemma")   return arch_family::gemma;
         if (a == "gemma2")  return arch_family::gemma2;
         if (a == "qwen2")   return arch_family::qwen2;
+        if (a == "qwen3")   return arch_family::qwen3;
         return arch_family::unknown;
     }
 
@@ -43,6 +44,7 @@ namespace dlib
         long n_experts = 0, n_experts_used = 0; // > 0 => mixture of experts
         bool tied_embeddings = false;           // no separate output.weight tensor
         bool quantized = false;                 // at least one tensor is neither F32 nor F16
+        bool qk_norm = false;                   // per-head RMSNorm on Q and K (Qwen3)
     };
 
     inline long gcd_long(long a, long b)
@@ -63,7 +65,12 @@ namespace dlib
         s.n_kv_heads = static_cast<long>(g.get_int(p + ".attention.head_count_kv", s.n_heads));
         s.d_model    = static_cast<long>(g.get_int(p + ".embedding_length"));
         s.d_ffn      = static_cast<long>(g.get_int(p + ".feed_forward_length"));
-        s.head_dim   = s.n_heads > 0 ? s.d_model / s.n_heads : 0;
+        /* Qwen3 (and some others) decouple head_dim from d_model / n_heads; prefer the explicit
+           attention.key_length metadata when present, else fall back to the derived value. */
+        {
+            const long kl = static_cast<long>(g.get_int(p + ".attention.key_length", 0));
+            s.head_dim = kl > 0 ? kl : (s.n_heads > 0 ? s.d_model / s.n_heads : 0);
+        }
         s.rms_eps    = g.get_double(p + ".attention.layer_norm_rms_epsilon", 1e-5);
         s.rope_freq_base = g.get_double(p + ".rope.freq_base", 10000.0);
         s.n_experts  = static_cast<long>(g.get_int(p + ".expert_count", 0));
@@ -82,6 +89,7 @@ namespace dlib
         }
 
         s.tied_embeddings = (g.find_tensor("output.weight") == nullptr);
+        s.qk_norm = (g.find_tensor("blk.0.attn_q_norm.weight") != nullptr);
         for (const auto& t : g.tensors()) if (t.is_quantized()) { s.quantized = true; break; }
         return s;
     }
@@ -103,6 +111,7 @@ namespace dlib
           << "RoPE freq base     : " << s.rope_freq_base << "\n"
           << "Experts            : " << s.n_experts
           << (s.n_experts ? " (used " + std::to_string(s.n_experts_used) + ")" : "") << "\n"
+          << "QK-Norm            : " << (s.qk_norm ? "yes" : "no") << "\n"
           << "Tied embeddings    : " << (s.tied_embeddings ? "yes" : "no") << "\n"
           << "Quantized weights  : " << (s.quantized ? "yes" : "no") << "\n";
         return o.str();
@@ -129,7 +138,7 @@ namespace dlib
         if (s.d_model <= 0 || s.n_layers <= 0 || s.vocab_size <= 0)
             r.blockers.push_back("incomplete metadata (missing dimensions)");
         if (s.quantized)
-            r.notes.push_back("Weights are quantized; the converter will dequantize (F16 and Q8_0 supported first)");
+            r.notes.push_back("Weights are quantized; the converter dequantizes legacy (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0) and k-quant (Q2_K..Q6_K) formats; i-quants (IQ*) are not supported");
         r.ok = r.blockers.empty();
         return r;
     }
@@ -153,11 +162,14 @@ namespace dlib
             << "    static constexpr long NUM_HEADS     = " << s.n_heads << ";\n"
             << "    static constexpr long NUM_KV_HEADS  = " << s.n_kv_heads << ";\n"
             << "    static constexpr long EMBEDDING_DIM = " << s.d_model << ";\n"
+            << "    static constexpr long HEAD_DIM      = " << s.head_dim << ";\n"
+            << "    static constexpr bool USE_QK_NORM   = " << (s.qk_norm ? "true" : "false") << ";\n"
             << "    static constexpr long FFN_NUM       = " << s.ffn_num
             << ";  // hidden = EMBEDDING_DIM * FFN_NUM / FFN_DEN = " << s.d_ffn << "\n"
             << "    static constexpr long FFN_DEN       = " << s.ffn_den << ";\n\n"
             << "    using config = dlib::decoder_transformer_config<\n"
-            << "        VOCAB_SIZE, NUM_LAYERS, NUM_HEADS, NUM_KV_HEADS, EMBEDDING_DIM, FFN_NUM, FFN_DEN>;\n\n"
+            << "        VOCAB_SIZE, NUM_LAYERS, NUM_HEADS, NUM_KV_HEADS, EMBEDDING_DIM, FFN_NUM, FFN_DEN,\n"
+            << "        HEAD_DIM, USE_QK_NORM>;\n\n"
             << "    // Strict model definition. network_type<false> is the inference network\n"
             << "    // (generation / chatbot); network_type<true> is the training network used\n"
             << "    // for fine-tuning. The imported weights are loaded into this exact type.\n"
@@ -168,6 +180,7 @@ namespace dlib
             << (s.tied_embeddings ? " (output tied to token_embd)" : ", output.weight") << "\n"
             << "    //   blk.{i}.attn_norm.weight\n"
             << "    //   blk.{i}.attn_q.weight, blk.{i}.attn_k.weight, blk.{i}.attn_v.weight, blk.{i}.attn_output.weight\n"
+            << (s.qk_norm ? "    //   blk.{i}.attn_q_norm.weight, blk.{i}.attn_k_norm.weight\n" : "")
             << "    //   blk.{i}.ffn_norm.weight\n"
             << "    //   blk.{i}.ffn_gate.weight, blk.{i}.ffn_up.weight, blk.{i}.ffn_down.weight\n"
             << "}\n\n#endif // IMPORTED_MODEL_H_\n";

@@ -16,7 +16,6 @@
 #include "hf_tokenizer_abstract.h"
 #include "../data_io.h"
 #include "../serialize.h"
-
 namespace dlib
 {
 
@@ -217,7 +216,8 @@ namespace dlib
             const std::string& text,
             bool add_bos,
             bool add_eos,
-            bool parse_special = true
+            bool parse_special = true,
+            bool allow_space_prefix = true
         ) const;
         /*!
             ensures
@@ -228,6 +228,11 @@ namespace dlib
                   user-defined token are emitted as that single token id; the spans between
                   them are tokenized normally. If parse_special is false, the whole text is
                   tokenized as ordinary content.
+                - for SentencePiece, the leading meta-space (dummy prefix) is added to the
+                  first text fragment only when both add_space_prefix() and allow_space_prefix
+                  are true. Pass allow_space_prefix == false to encode a continuation that is
+                  logically in the middle of an already-started sequence, so that no leading
+                  space token is inserted. For byte-level BPE this argument has no effect.
         !*/
 
         std::string decode(
