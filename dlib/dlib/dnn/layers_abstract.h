@@ -5004,6 +5004,35 @@ namespace dlib
 
 // ----------------------------------------------------------------------------------------
 
+    struct yarn_config
+    {
+        /*!
+            WHAT THIS OBJECT REPRESENTS
+                Configuration of the YaRN (Yet another RoPE extensioN) scaling used by
+                rotary_positional_embedding_ to extrapolate beyond the training context
+                length. When enabled, the position used to compute the rotation angle of
+                frequency dimension i is rescaled by
+                    (cache_len / original_len) ^ (alpha * dim_norm^beta)
+                where dim_norm spans [0, 1] across the frequency dimensions, so low
+                frequencies are stretched more than high frequencies.
+
+                YaRN is DISABLED by default: with enabled == false the layer computes
+                classical RoPE and the trigonometric values at a given position are
+                independent of the cache length. Enabling YaRN is an explicit opt-in
+                through rotary_positional_embedding_::set_yarn_params(), and requires
+                original_len to be pinned to the model's training context length;
+                otherwise the scaling ratio, hence the cached values, would silently
+                depend on the first sequence length the layer happens to observe.
+        !*/
+
+        float alpha = 1.0f;     // overall scaling intensity (typical ~1.0)
+        float beta = 0.5f;      // curvature across frequency dimensions (typical 0.25..0.5)
+        long original_len = 0;  // training context length; 0 => captured at first use
+        bool enabled = false;   // opt-in; false => classical RoPE
+    };
+
+// ----------------------------------------------------------------------------------------
+
     class rotary_positional_embedding_
     {
         /*!
@@ -5030,12 +5059,14 @@ namespace dlib
                     angles are recomputed on-the-fly. This allows models trained on shorter
                     sequences to handle longer contexts at inference time.
 
-                YARN EXTENSION (OPTIONAL):
+                YARN EXTENSION (OPTIONAL, DISABLED BY DEFAULT):
                     Optionally supports YaRN (Yet another RoPE extensioN) scaling for
                     improved extrapolation to longer sequences than seen during training.
                     YaRN applies frequency-dependent scaling that preserves low-frequency
-                    information while adapting high-frequency components. Enable via
-                    set_yarn_params().
+                    information while adapting high-frequency components. It is disabled
+                    by default (classical RoPE) and must be enabled explicitly via
+                    set_yarn_params(), pinning original_len to the model's training
+                    context length. See yarn_config for the scaling formula.
 
                 This layer has no trainable parameters. All rotation angles are precomputed
                 during setup based on the sequence length and head dimension.
@@ -5098,10 +5129,11 @@ namespace dlib
         ) const;
         /*!
             ensures
-                - Returns the most recent sequence length processed by this layer
-                - Returns 0 if forward() has not been called yet
-                - Note: this value may change between forward() calls if sequences
-                  of different lengths are processed
+                - Returns the number of positions currently covered by the trigonometric
+                  caches. This is the largest sequence length processed so far (the
+                  caches only grow), the length passed to ensure_caches_at_least(), or
+                  the value restored by deserialization.
+                - Returns 0 if the caches have not been built yet.
         !*/
 
         long get_d_head(
@@ -5127,9 +5159,13 @@ namespace dlib
                 - Configures YaRN (Yet another RoPE extensioN) scaling parameters
                 - alpha controls the overall intensity of scaling (typical: 1.0)
                 - beta controls the curvature of scaling across frequency dimensions (typical: 0.25 to 0.5)
-                - original_len is the sequence length used during training
-                  If 0, it will be set to the first sequence length observed in forward()
-                - enabled determines whether YaRN scaling is active
+                - original_len is the sequence length used during training.
+                  If 0, it will be set to the first sequence length observed; pin it
+                  explicitly to the model's training context length, since the scaling
+                  ratio (hence the cached values) is relative to it.
+                - #get_yarn_config().enabled == (enabled && alpha > 0)
+                - YaRN is disabled by default (classical RoPE); this call is the only
+                  way to activate it.
                 - YaRN allows better extrapolation to sequence lengths longer than training
                 - Should be called before forward() to take effect
         !*/
@@ -5139,6 +5175,44 @@ namespace dlib
         /*!
             ensures
                 - Returns the current YaRN configuration
+        !*/
+
+        void ensure_caches_at_least(
+            long target_seq_len,
+            long d_head
+        );
+        /*!
+            requires
+                - target_seq_len > 0
+                - d_head >= 2
+            ensures
+                - #get_seq_len() >= target_seq_len
+                - #get_d_head() == d_head
+                - The trigonometric caches cover at least target_seq_len positions for
+                  head dimension d_head; they are recomputed only when the current
+                  caches are too small or were built for a different d_head.
+                - Lets an external caller (typically a fused attention layer applying
+                  RoPE at absolute positions against its own KV cache) guarantee the
+                  caches are sized before reading them via get_cos_cache() /
+                  get_sin_cache().
+        !*/
+
+        const tensor& get_cos_cache(
+        ) const;
+        /*!
+            ensures
+                - Returns the precomputed cosine cache, of shape
+                  (1, 1, get_seq_len(), get_d_head()/2).
+                - Row pos holds cos(angle(pos, i)) for each frequency dimension i.
+        !*/
+
+        const tensor& get_sin_cache(
+        ) const;
+        /*!
+            ensures
+                - Returns the precomputed sine cache, of shape
+                  (1, 1, get_seq_len(), get_d_head()/2).
+                - Row pos holds sin(angle(pos, i)) for each frequency dimension i.
         !*/
 
         template <typename SUBNET>
@@ -5174,9 +5248,14 @@ namespace dlib
             ensures
                 - Applies rotary positional embeddings to the input
                 - #output has the same dimensions as sub.get_output()
-                - If the input sequence length differs from get_seq_len(), or if
-                  this is the first forward pass after deserialization, the rotation
-                  angles are automatically recomputed for the current sequence length.
+                - The trigonometric caches are recomputed only when the input sequence
+                  length exceeds get_seq_len(), when the head dimension changes, or when
+                  the caches are empty. When the caches cover more positions than the
+                  input, a slice of the first nr() positions is used; in the non-YaRN
+                  case the values at a given position are independent of the cache size,
+                  so both paths are equivalent. With YaRN enabled the cached values
+                  depend on the ratio cache_len / original_len, which is why
+                  original_len must be pinned (see set_yarn_params()).
                 - For each position pos and dimension pair (i, i+1):
                     output[pos,i]   = input[pos,i] * cos(θ_pos,i/2) - input[pos,i+1] * sin(θ_pos,i/2)
                     output[pos,i+1] = input[pos,i] * sin(θ_pos,i/2) + input[pos,i+1] * cos(θ_pos,i/2)

@@ -48,6 +48,31 @@ constexpr long MAX_COLS = 30;
 constexpr long WINDOW_LEN = 768;
 constexpr long MAX_OUTPUT_TOKENS = (MAX_ROWS * (MAX_COLS + 1) + 1) * 110 / 100;
 
+/* YaRN context extension. Evaluation can feed contexts longer than WINDOW_LEN (full
+   forward per generated token, no KV cache), so the RoPE frequencies must be rescaled
+   for lengths beyond the training window. YaRN is opt-in in the library (classical
+   RoPE by default); enabling it here with original_len pinned to WINDOW_LEN keeps the
+   scaling stable across trig-cache rebuilds and independent of the first forward size.
+   The setter targets every layer exposing set_yarn_params (the fused attention and the
+   standalone rotary embedding), and is a no-op for all other layers. */
+struct yarn_enabler
+{
+    template <typename T>
+    auto set(T& layer, int) -> decltype((void)layer.set_yarn_params(0.0f, 0.0f, 0, false))
+    {
+        layer.set_yarn_params(1.0f, 0.5f, WINDOW_LEN, true);
+    }
+    template <typename T> void set(T&, long) {}
+    template <typename T> void operator()(T& layer) { set(layer, 0); }
+};
+
+template <typename net_type>
+void enable_yarn_context_extension(net_type& net)
+{
+    yarn_enabler v;
+    visit_computational_layers(net, v);
+}
+
 // Utility function to validate token sequence before detokenization
 bool validate_token_sequence(const std::vector<int>& tokens, bool verbose = false)
 {
@@ -476,6 +501,9 @@ int main(int argc, char** argv)
             // the floor in the loss kernel can mask early convergence
             // issues. Re-enable (set to 0.1) once convergence is solid.
             layer<0>(net).loss_details().set_label_smoothing(0.0);
+            /* Enable YaRN before the first forward so the serialized model carries the
+               extended-context RoPE configuration, whatever the library default. */
+            enable_yarn_context_extension(net);
             network_context::set_optimizer_params(weight_decay, beta1, beta2);
             cout << net << endl << endl; // Show the model architecture
 
@@ -572,6 +600,10 @@ int main(int argc, char** argv)
             }
 
             deserialize(model_file) >> net;
+            /* Re-apply the YaRN configuration after loading: this overrides whatever
+               state the model file carries, so models serialized before or after a
+               library-default change behave identically in extended-context runs. */
+            enable_yarn_context_extension(net);
             cout << "Model loaded.\n";
             cout << "Number of model parameters: " << count_parameters(net) << "\n";
 

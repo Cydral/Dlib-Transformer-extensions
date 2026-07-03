@@ -324,17 +324,6 @@ int run_chat(gguf_reader& g, const model_spec& spec, const gguf_load_options& lo
             turn = tok.encode(line, /*add_bos=*/!primed, /*add_eos=*/false);
         }
 
-        /* DIAGNOSTIC (remove once the chat is validated): print how this turn tokenizes so it
-           can be compared, id for id, against llama.cpp on the exact same templated string. */
-        {
-            std::cout << "[tok] " << turn.size() << " ids:";
-            for (size_t z = 0; z < turn.size(); ++z) std::cout << ' ' << turn[z];
-            std::cout << "\n[tok] pieces:";
-            for (size_t z = 0; z < turn.size(); ++z)
-            { std::vector<int> one{ turn[z] }; std::cout << " [" << tok.decode(one, false) << "]"; }
-            std::cout << "\n";
-        }
-
         int nxt = 0;
         if (!primed)
         {
@@ -342,22 +331,6 @@ int run_chat(gguf_reader& g, const model_spec& spec, const gguf_load_options& lo
             matrix<int, 0, 1> pf(static_cast<long>(turn.size()), 1);
             for (long i = 0; i < static_cast<long>(turn.size()); ++i) pf(i) = turn[static_cast<size_t>(i)];
             const tensor& pr = generator(pf);
-            /* DIAGNOSTIC (remove later): processed length and the top-5 first-token candidates
-               at the last position, to compare against llama.cpp on the identical 39-token prompt. */
-            {
-                const long sl = pr.nr(), Vt = pr.nc();
-                const float* prow = pr.host() + tensor_index(pr, 0, 0, sl - 1, 0);
-                std::vector<std::pair<int, float>> cc(static_cast<size_t>(Vt));
-                for (long i = 0; i < Vt; ++i) cc[static_cast<size_t>(i)] = { static_cast<int>(i), prow[i] };
-                std::partial_sort(cc.begin(), cc.begin() + 5, cc.end(),
-                    [](const std::pair<int, float>& a, const std::pair<int, float>& b) { return a.second > b.second; });
-                std::cout << "[top5 seq=" << sl << "]";
-                for (int i = 0; i < 5; ++i)
-                { std::vector<int> o{ cc[static_cast<size_t>(i)].first };
-                  std::cout << ' ' << cc[static_cast<size_t>(i)].first << ':' << cc[static_cast<size_t>(i)].second
-                            << "[" << tok.decode(o, false) << "]"; }
-                std::cout << "\n";
-            }
             nxt = pick_next(pr, ctx, deterministic, top_k, top_p, min_p, repeat_penalty, rng);
             /* The prefill consumed the clear request and every layer reset its cache. Reset the
                flag now: consume_kv_cache_clear_request does not clear it (so all layers in a pass
@@ -459,7 +432,8 @@ int run_probe(gguf_reader& g, const model_spec& spec, const gguf_load_options& l
              << "  \"" << tok.decode(one, false) << "\"\n";
     }
 
-    // TEMP DIAGNOSTIC: echo token ids and per-position argmax for divergence localization.
+    // Echo the token ids and the per-position argmax. Feeding the same ids to a reference
+    // implementation localizes the first diverging position when validating an import.
     cout << "\nToken ids fed:";
     for (long i = 0; i < static_cast<long>(toks.size()); ++i) cout << " " << toks[i];
     cout << "\nPer-position argmax (pos: predicted_id 'tok' prob):\n";
@@ -531,6 +505,20 @@ int run_probe_ids(gguf_reader& g, const model_spec& spec, const gguf_load_option
         cout << "  " << cand[static_cast<size_t>(i)].second << "  id " << cand[static_cast<size_t>(i)].first
              << "  \"" << tok.decode(one, false) << "\"\n";
     }
+
+    // Per-position argmax. In a causal model the prediction at position p depends only on
+    // tokens [0, p], so comparing this dump against a reference implementation fed with the
+    // exact same ids localizes the first diverging position when validating an import.
+    cout << "\nPer-position argmax (pos: predicted_id 'tok' prob):\n";
+    for (long p = 0; p < seq_len; ++p)
+    {
+        const float* rp = probs.host() + tensor_index(probs, 0, 0, p, 0);
+        long am = 0; float mx = rp[0];
+        for (long i = 1; i < V; ++i) if (rp[i] > mx) { mx = rp[i]; am = i; }
+        std::vector<int> one{ static_cast<int>(am) };
+        cout << "  " << p << ": " << am << " '" << tok.decode(one, false) << "' " << mx << "\n";
+    }
+
     network_context::reset();
     return 0;
 }
@@ -581,7 +569,7 @@ int main(int argc, char** argv)
         parser.add_option("deterministic", "Greedy decoding (argmax)");
         parser.add_option("raw", "Chat without the chat template (raw text completion)");
         parser.add_option("system", "System prompt used by --chat (default: a helpful assistant)", 1);
-        parser.add_option("rope-permute", "Permute Q/K projection rows for RoPE (weight-loader knob)");
+        parser.add_option("rope-permute", "Permute Q/K rows from split-half (NeoX) to interleaved RoPE ordering; leave off for llama-family GGUFs, expected for NeoX-convention architectures");
         parser.add_option("swap-gate-up", "Swap ffn_gate / ffn_up assignment (weight-loader knob)");
         parser.parse(argc, argv);
 

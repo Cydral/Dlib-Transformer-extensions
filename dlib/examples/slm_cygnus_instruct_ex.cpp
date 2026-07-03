@@ -497,6 +497,13 @@ int run_chat(const std::string& model_file, double temperature, size_t top_k, fl
             stream_emit(next_tok);
         }
 
+        /* Keep the recorded dialogue template-consistent: the answer must end with the
+           closing tag even when it is the very first sampled token or when the response
+           is truncated by max_response_tokens. The next turn re-prefills from `dialogue`,
+           so a missing close tag would expose an unclosed answer to the model. */
+        if (dialogue.empty() || dialogue.back() != sp.text_close)
+            dialogue.push_back(sp.text_close);
+
         cout << "\n\n";
     }
 

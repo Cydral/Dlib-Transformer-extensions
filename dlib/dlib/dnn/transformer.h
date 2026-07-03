@@ -5,7 +5,6 @@
 
 #include "transformer_abstract.h"
 #include "layers.h"
-#include <iostream> // TEMP: for attention-profile diagnostic
 
 namespace dlib
 {
@@ -1012,43 +1011,6 @@ namespace dlib
             // Step 7: softmax
             saved_attn.copy_size(scores_masked);
             tt::softmax(saved_attn, scores_masked, operation_mode::PLANE_WISE);
-
-            // TEMP DIAGNOSTIC: last-query attention profile, per layer (prefill only).
-            {
-                static long dbg_N = -1;
-                static int  dbg_L = 0;
-                if (dbg_N != N) { dbg_N = N; dbg_L = 0; }
-                if (N > 1 && dbg_L < 40)
-                {
-                    const long q = N - 1;
-                    const float* aw = saved_attn.host();
-                    float mx0 = -1.0f; long am0 = -1; float wbos0 = 0.0f, wl5_0 = 0.0f;
-                    for (long k = 0; k < N; ++k)
-                    {
-                        const float w = aw[tensor_index(saved_attn, 0, 0, q, k)];
-                        if (w > mx0) { mx0 = w; am0 = k; }
-                        if (k == 0) wbos0 = w;
-                        if (k >= N - 5) wl5_0 += w;
-                    }
-                    float sum_mx = 0.0f;
-                    for (long h = 0; h < NUM_HEADS; ++h)
-                    {
-                        float mh = -1.0f;
-                        for (long k = 0; k < N; ++k)
-                        {
-                            const float w = aw[tensor_index(saved_attn, 0, h, q, k)];
-                            if (w > mh) mh = w;
-                        }
-                        sum_mx += mh;
-                    }
-                    std::cerr << "[attn L" << dbg_L << "] N=" << N
-                              << " h0_argmax=" << am0 << " h0_maxw=" << mx0
-                              << " h0_wbos=" << wbos0 << " h0_wlast5=" << wl5_0
-                              << " mean_maxw=" << (sum_mx / static_cast<float>(NUM_HEADS))
-                              << " unif=" << (1.0f / static_cast<float>(N)) << "\n";
-                    ++dbg_L;
-                }
-            }
 
             // Step 8: attn @ V
             resizable_tensor ctx_4d(B, NUM_HEADS, N, HEAD_DIM);
