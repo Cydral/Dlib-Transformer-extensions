@@ -6612,8 +6612,13 @@ namespace dlib
         // If 0, it will be set to the first seq_len observed (common pattern)
         long original_len = 0;
 
-        // Enable/disable YaRN; if false, behavior is identical to classical RoPE
-        bool enabled = true;
+        // Enable/disable YaRN; if false, behavior is identical to classical RoPE.
+        // Disabled by default: YaRN rescales positions by a factor that depends on
+        // the current cache length, so it must be an explicit opt-in through
+        // set_yarn_params. A default-on YaRN silently diverges from the standard
+        // RoPE the model was trained with whenever the cache is rebuilt for a
+        // length different from original_len.
+        bool enabled = false;
     };
 
     class rotary_positional_embedding_

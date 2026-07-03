@@ -310,30 +310,27 @@ namespace dlib
             return false;
         }
 
-        /* Split the raw text on special pieces, encoding the spans in between. The dummy
-           space prefix (SentencePiece) is applied only to the first text fragment, and only
-           when the caller allows it; a continuation turn passes allow_space_prefix=false so no
-           leading space token is inserted mid-conversation. */
+        /* Split the raw text on special pieces, encoding the spans in between. Matching
+           SentencePiece (and llama.cpp), the dummy space prefix is applied to every text
+           fragment, including those that follow a special token, whenever the caller allows
+           it; pass allow_space_prefix=false to suppress it entirely (for a raw continuation
+           that is not preceded by a special token). */
         void encode_text(const std::string& text, bool parse_special, bool allow_space_prefix,
             std::vector<int>& out) const
         {
             if (!parse_special || special_pieces_.empty())
             {
-                encode_fragment(text, true, allow_space_prefix, out);
+                encode_fragment(text, allow_space_prefix, out);
                 return;
             }
             size_t pos = 0, frag_start = 0;
-            bool first = true;
             while (pos < text.size())
             {
                 int sid = -1; size_t slen = 0;
                 if (match_special(text, pos, sid, slen))
                 {
                     if (pos > frag_start)
-                    {
-                        encode_fragment(text.substr(frag_start, pos - frag_start), first, allow_space_prefix, out);
-                        first = false;
-                    }
+                        encode_fragment(text.substr(frag_start, pos - frag_start), allow_space_prefix, out);
                     out.push_back(sid);
                     pos += slen;
                     frag_start = pos;
@@ -341,14 +338,14 @@ namespace dlib
                 else ++pos;
             }
             if (frag_start < text.size())
-                encode_fragment(text.substr(frag_start), first, allow_space_prefix, out);
+                encode_fragment(text.substr(frag_start), allow_space_prefix, out);
         }
 
-        void encode_fragment(const std::string& frag, bool first, bool allow_space_prefix,
+        void encode_fragment(const std::string& frag, bool allow_space_prefix,
             std::vector<int>& out) const
         {
             std::vector<int> ids = (kind_ == kind::spm)
-                ? encode_spm(frag, first && allow_space_prefix && add_space_prefix_)
+                ? encode_spm(frag, allow_space_prefix && add_space_prefix_)
                 : encode_bpe(frag);
             out.insert(out.end(), ids.begin(), ids.end());
         }

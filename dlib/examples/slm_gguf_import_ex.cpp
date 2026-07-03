@@ -41,6 +41,7 @@
 #include <fstream>
 #include <cmath>
 #include <algorithm>
+#include <sstream>
 
 #include <dlib/cmd_line_parser.h>
 #include <dlib/data_io/gguf_reader.h>
@@ -272,6 +273,12 @@ int run_chat(gguf_reader& g, const model_spec& spec, const gguf_load_options& lo
 
     network_context::reset();
     network_context::set_kv_cache_capacity(ctx_len);
+    /* Clear the KV cache before the first prefill. The weight-import allocation pass
+       leaves one dummy token in the attention caches; run_probe clears it the same way.
+       Without this, the first turn runs on a polluted cache (shifted RoPE positions and a
+       stale token seen by attention), which is what made the chat degenerate into
+       repetition and spurious role markers. */
+    network_context::request_kv_cache_clear();
     dlib::rand rng(std::time(nullptr));
     const int max_response = 512;
 
@@ -299,23 +306,33 @@ int run_chat(gguf_reader& g, const model_spec& spec, const gguf_load_options& lo
         std::vector<int> turn;
         if (use_template)
         {
-            /* TinyLlama / Zephyr chat template. The first turn carries the system block,
-               <|system|>\n{system}</s>\n , ahead of the user turn; later turns send only
-               <|user|>\n{msg}</s>\n<|assistant|>\n . Each turn is encoded in a single call so the
-               SentencePiece dummy space prefix is applied once; the literal </s> markers are
-               recognized as the eos special token and split internally, and the space prefix is
-               allowed only on the first turn, matching a single continuous tokenization of the
-               whole conversation. */
+            /* TinyLlama / Zephyr chat template. The first turn carries the system block ahead
+               of the user turn; later turns begin with the newline that follows the assistant's
+               closing </s>, so the running token stream matches a single continuous tokenization
+               of the whole conversation. </s> is parsed as the eos special token, and the
+               SentencePiece dummy space prefix is applied to every fragment, including those
+               after a special token, exactly as llama.cpp does. */
             const bool first = !primed;
             const std::string turn_text = first
                 ? "<|system|>\n" + system_prompt + "</s>\n<|user|>\n" + line + "</s>\n<|assistant|>\n"
-                : "<|user|>\n" + line + "</s>\n<|assistant|>\n";
+                : "\n<|user|>\n" + line + "</s>\n<|assistant|>\n";
             turn = tok.encode(turn_text, /*add_bos=*/first, /*add_eos=*/false,
-                /*parse_special=*/true, /*allow_space_prefix=*/first);
+                /*parse_special=*/true, /*allow_space_prefix=*/true);
         }
         else
         {
             turn = tok.encode(line, /*add_bos=*/!primed, /*add_eos=*/false);
+        }
+
+        /* DIAGNOSTIC (remove once the chat is validated): print how this turn tokenizes so it
+           can be compared, id for id, against llama.cpp on the exact same templated string. */
+        {
+            std::cout << "[tok] " << turn.size() << " ids:";
+            for (size_t z = 0; z < turn.size(); ++z) std::cout << ' ' << turn[z];
+            std::cout << "\n[tok] pieces:";
+            for (size_t z = 0; z < turn.size(); ++z)
+            { std::vector<int> one{ turn[z] }; std::cout << " [" << tok.decode(one, false) << "]"; }
+            std::cout << "\n";
         }
 
         int nxt = 0;
@@ -324,7 +341,29 @@ int run_chat(gguf_reader& g, const model_spec& spec, const gguf_load_options& lo
             /* First turn: a single prefill over the whole turn. */
             matrix<int, 0, 1> pf(static_cast<long>(turn.size()), 1);
             for (long i = 0; i < static_cast<long>(turn.size()); ++i) pf(i) = turn[static_cast<size_t>(i)];
-            nxt = pick_next(generator(pf), ctx, deterministic, top_k, top_p, min_p, repeat_penalty, rng);
+            const tensor& pr = generator(pf);
+            /* DIAGNOSTIC (remove later): processed length and the top-5 first-token candidates
+               at the last position, to compare against llama.cpp on the identical 39-token prompt. */
+            {
+                const long sl = pr.nr(), Vt = pr.nc();
+                const float* prow = pr.host() + tensor_index(pr, 0, 0, sl - 1, 0);
+                std::vector<std::pair<int, float>> cc(static_cast<size_t>(Vt));
+                for (long i = 0; i < Vt; ++i) cc[static_cast<size_t>(i)] = { static_cast<int>(i), prow[i] };
+                std::partial_sort(cc.begin(), cc.begin() + 5, cc.end(),
+                    [](const std::pair<int, float>& a, const std::pair<int, float>& b) { return a.second > b.second; });
+                std::cout << "[top5 seq=" << sl << "]";
+                for (int i = 0; i < 5; ++i)
+                { std::vector<int> o{ cc[static_cast<size_t>(i)].first };
+                  std::cout << ' ' << cc[static_cast<size_t>(i)].first << ':' << cc[static_cast<size_t>(i)].second
+                            << "[" << tok.decode(o, false) << "]"; }
+                std::cout << "\n";
+            }
+            nxt = pick_next(pr, ctx, deterministic, top_k, top_p, min_p, repeat_penalty, rng);
+            /* The prefill consumed the clear request and every layer reset its cache. Reset the
+               flag now: consume_kv_cache_clear_request does not clear it (so all layers in a pass
+               see the same value), and if it stayed set, every incremental step below would wipe
+               the cache, the model would lose all context, and the output would be blank. */
+            network_context::clear_kv_cache_request();
             ctx.insert(ctx.end(), turn.begin(), turn.end());
             network_context::set_inference_mode(network_context::inference_mode::incremental);
             network_context::clear_padding();
@@ -419,6 +458,79 @@ int run_probe(gguf_reader& g, const model_spec& spec, const gguf_load_options& l
         cout << "  " << cand[i].second << "  id " << cand[i].first
              << "  \"" << tok.decode(one, false) << "\"\n";
     }
+
+    // TEMP DIAGNOSTIC: echo token ids and per-position argmax for divergence localization.
+    cout << "\nToken ids fed:";
+    for (long i = 0; i < static_cast<long>(toks.size()); ++i) cout << " " << toks[i];
+    cout << "\nPer-position argmax (pos: predicted_id 'tok' prob):\n";
+    for (long p = 0; p < seq_len; ++p)
+    {
+        const float* rp = probs.host() + tensor_index(probs, 0, 0, p, 0);
+        long am = 0; float mx = rp[0];
+        for (long i = 1; i < V; ++i) if (rp[i] > mx) { mx = rp[i]; am = i; }
+        std::vector<int> one{ static_cast<int>(am) };
+        cout << "  " << p << ": " << am << " '" << tok.decode(one, false) << "' " << mx << "\n";
+    }
+
+    network_context::reset();
+    return 0;
+}
+
+/* Probe on an explicit token-id sequence, bypassing the tokenizer. This isolates forward-pass
+   behavior for a chosen sequence, for instance to measure the effect of a control token such
+   as the eos </s> in the middle of a prompt. The ids must already include BOS if wanted. */
+int run_probe_ids(gguf_reader& g, const model_spec& spec, const gguf_load_options& lopt,
+    const std::string& id_string)
+{
+    if (!model_matches_header(spec))
+    { cerr << "Error: model does not match the compiled-in header. Regenerate and recompile.\n"; return 1; }
+
+    infer_net net;
+    cout << "Importing weights into the network...\n";
+    import_gguf_weights(net, g, spec, lopt);
+
+    hf_tokenizer tok;
+    tok.load_from_gguf(g);
+    generator_type generator(multiply_(1.0));
+    generator.subnet().subnet() = net.subnet();
+
+    std::vector<int> toks;
+    {
+        std::string s = id_string;
+        for (char& c : s) if (c == ',') c = ' ';
+        std::istringstream iss(s);
+        long v;
+        while (iss >> v) toks.push_back(static_cast<int>(v));
+    }
+    if (toks.empty()) { cerr << "Error: --probe-ids received no ids.\n"; return 1; }
+
+    matrix<int, 0, 1> in(static_cast<long>(toks.size()), 1);
+    for (long i = 0; i < static_cast<long>(toks.size()); ++i) in(i) = toks[static_cast<size_t>(i)];
+
+    network_context::reset();
+    network_context::set_kv_cache_capacity(static_cast<long>(toks.size()));
+    network_context::request_kv_cache_clear();
+    network_context::clear_padding();
+    network_context::set_inference_mode(network_context::inference_mode::prefill);
+
+    const tensor& probs = generator(in);
+    const long seq_len = probs.nr();
+    const long V = probs.nc();
+    const float* row = probs.host() + tensor_index(probs, 0, 0, seq_len - 1, 0);
+
+    std::vector<std::pair<int, float>> cand(static_cast<size_t>(V));
+    for (long i = 0; i < V; ++i) cand[static_cast<size_t>(i)] = { static_cast<int>(i), row[i] };
+    std::partial_sort(cand.begin(), cand.begin() + 8, cand.end(),
+        [](const std::pair<int, float>& a, const std::pair<int, float>& b) { return a.second > b.second; });
+
+    cout << "\nFed " << toks.size() << " explicit token ids (seq=" << seq_len << ").\n"
+         << "Most probable next tokens:\n";
+    for (int i = 0; i < 8; ++i)
+    {
+        std::vector<int> one{ cand[static_cast<size_t>(i)].first };
+        cout << "  " << cand[static_cast<size_t>(i)].second << "  id " << cand[static_cast<size_t>(i)].first
+             << "  \"" << tok.decode(one, false) << "\"\n";
+    }
     network_context::reset();
     return 0;
 }
@@ -459,6 +571,7 @@ int main(int argc, char** argv)
         parser.add_option("convert", "Load the model and serialize it to <out-prefix>.dat");
         parser.add_option("probe-logits", "Print the most probable next tokens for --prompt (weight validation)");
         parser.add_option("prompt", "Prompt used by --probe-logits (default: 'The capital of France is')", 1);
+        parser.add_option("probe-ids", "Print next-token predictions for an explicit space-separated id list", 1);
         parser.add_option("context", "KV cache length for --chat (default: 512)", 1);
         parser.add_option("temperature", "Sampling temperature (default: 0.8)", 1);
         parser.add_option("top-k", "Top-k filter (default: 40)", 1);
@@ -506,7 +619,7 @@ int main(int argc, char** argv)
             return 1;
         }
 
-        if (parser.option("chat") || parser.option("probe-logits") || parser.option("convert"))
+        if (parser.option("chat") || parser.option("probe-logits") || parser.option("convert") || parser.option("probe-ids"))
         {
 #ifdef WITH_IMPORTED_MODEL
             gguf_load_options lopt;
@@ -527,6 +640,9 @@ int main(int argc, char** argv)
 
             if (parser.option("convert"))
                 return run_convert(g, spec, lopt, prefix + ".dat");
+
+            if (parser.option("probe-ids"))
+                return run_probe_ids(g, spec, lopt, parser.option("probe-ids").argument());
 
             return run_probe(g, spec, lopt,
                 get_option(parser, "prompt", std::string("The capital of France is")));

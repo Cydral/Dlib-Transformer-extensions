@@ -115,10 +115,13 @@ namespace dlib
         };
 
         /* Pushes the model's runtime attention settings into every attention layer that
-           exposes them: the RoPE frequency base and the QK-Norm epsilon. SFINAE on
-           set_rope_theta_base (only the fused attention layer has it) makes this a no-op for
-           every other layer. Must run before the first forward pass, since the RoPE trig
-           caches are built then and are not recomputed on a later base change. */
+           exposes them: the RoPE frequency base, the QK-Norm epsilon, and classical RoPE
+           (YaRN disabled). SFINAE on set_rope_theta_base (only the fused attention layer
+           has it) makes this a no-op for every other layer. Must run before the first
+           forward pass, since the RoPE trig caches are built then and are not recomputed
+           on a later base change. Disabling YaRN explicitly matters: the import pipeline
+           runs a 1-token allocation forward, which would otherwise capture original_len=1
+           and make any YaRN-style rescaling length-dependent and destructive. */
         struct attention_config_setter
         {
             float rope_base;
@@ -128,6 +131,7 @@ namespace dlib
             {
                 layer.set_rope_theta_base(rope_base);
                 layer.set_qk_norm_eps(qk_eps);
+                layer.set_yarn_params(0.0f, 0.0f, 0, false); // classical RoPE only
             }
             template <typename T> void set(T&, long) {}
             template <typename T> void operator()(T& layer) { set(layer, 0); }

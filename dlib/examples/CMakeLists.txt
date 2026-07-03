@@ -40,7 +40,29 @@ project(examples)
 # Tell cmake we will need dlib.  This command will pull in dlib and compile it
 # into your project.  Note that you don't need to compile or install dlib.  All
 # cmake needs is the dlib source code folder and it will take care of everything.
+# Whole-program optimization (/GL plus the matching /LTCG link) is turned on by the parent
+# configuration and applies to dlib and to every example here. On the very deep DNN template
+# instantiations (in particular the imported transformer network) the /LTCG link is extremely
+# slow and can leave an object the linker cannot read (LNK1107 at 0xFFFFFFFF). Turning it off
+# for this whole tree, dlib included, keeps everything functionally identical and links cleanly.
+set(CMAKE_INTERPROCEDURAL_OPTIMIZATION OFF)
+if (MSVC)
+    foreach(_cfg "" "_DEBUG" "_RELEASE" "_RELWITHDEBINFO" "_MINSIZEREL")
+        foreach(_base CMAKE_C_FLAGS CMAKE_CXX_FLAGS CMAKE_EXE_LINKER_FLAGS
+                      CMAKE_SHARED_LINKER_FLAGS CMAKE_STATIC_LINKER_FLAGS CMAKE_MODULE_LINKER_FLAGS)
+            string(REPLACE "/GL"   "" ${_base}${_cfg} "${${_base}${_cfg}}")
+            string(REPLACE "/LTCG" "" ${_base}${_cfg} "${${_base}${_cfg}}")
+        endforeach()
+    endforeach()
+endif()
+
 add_subdirectory(../dlib dlib_build)
+
+# dlib was just configured above; force its interprocedural optimization off too, so the static
+# library carries no /GL objects (those would otherwise drag every example link back to /LTCG).
+if (TARGET dlib)
+    set_target_properties(dlib PROPERTIES INTERPROCEDURAL_OPTIMIZATION OFF)
+endif()
 
 # If you have cmake 3.14 or newer you can even use FetchContent instead of
 # add_subdirectory() to pull in dlib as a dependency.  So instead of using the
@@ -107,9 +129,10 @@ macro(add_example name)
    add_executable(${name} ${name}.cpp)
    target_link_libraries(${name} dlib::dlib )
 
-   if(${CMAKE_VERSION} VERSION_GREATER_EQUAL "3.13.0" AND NOT MSVC)
-   # -s is a GCC/Clang linker flag; on MSVC it becomes /s and triggers LNK4044,
-   # so apply it only on non-MSVC toolchains.
+   if(${CMAKE_VERSION} VERSION_GREATER_EQUAL "3.13.0" AND NOT MSVC) 
+   # And strip symbols to make your binary smaller if you like.  Certainly not
+   # required though.  -s is a GCC/Clang linker flag; on MSVC it becomes /s and
+   # triggers LNK4044, so restrict it to non-MSVC toolchains.
        target_link_options(${name} PRIVATE $<$<CONFIG:RELEASE>:-s>)
    endif()
 
@@ -170,13 +193,6 @@ add_example(slm_tok_predictive_compressor_ex)
 add_example(slm_gguf_import_ex)
 if(MSVC)
     target_compile_options(slm_gguf_import_ex PRIVATE /bigobj)
-    # The imported network is one very deep template instantiation (28 Qwen3 blocks
-    # plus the QK-Norm branches). Combined with whole-program optimization
-    # (/GL -> /LTCG) it can yield an object the linker cannot read (LNK1107 at
-    # 0xFFFFFFFF) and can make the LTCG link run out of memory. /bigobj already
-    # handles the object size, so disable link-time code generation for this target.
-    set_target_properties(slm_gguf_import_ex PROPERTIES INTERPROCEDURAL_OPTIMIZATION OFF)
-    target_compile_options(slm_gguf_import_ex PRIVATE /GL-)
 endif()
 #add_gui_example(3d_point_cloud_ex)
 #add_example(bayes_net_ex)
