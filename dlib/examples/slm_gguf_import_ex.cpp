@@ -43,6 +43,14 @@
 #include <algorithm>
 #include <sstream>
 
+#ifdef _WIN32
+#  define WIN32_LEAN_AND_MEAN
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <windows.h>
+#endif
+
 #include <dlib/cmd_line_parser.h>
 #include <dlib/data_io/gguf_reader.h>
 #include <dlib/data_io/gguf_dequantize.h>
@@ -251,20 +259,14 @@ int pick_next(const tensor& probs, const std::vector<int>& recent, bool determin
     return cand.empty() ? 0 : cand[0].first;
 }
 
-int run_chat(gguf_reader& g, const model_spec& spec, const gguf_load_options& lopt,
+/* Interactive chat loop over an already-loaded network and tokenizer. The callers below
+   provide the two loading paths: run_chat imports the weights from the GGUF, run_chat_dat
+   reads back a previously converted .dat archive. */
+int chat_loop(infer_net& net, hf_tokenizer& tok,
     double temperature, size_t top_k, float top_p,
     float min_p, float repeat_penalty, bool deterministic, long ctx_len, bool use_template,
     const std::string& system_prompt)
 {
-    if (!model_matches_header(spec))
-    { cerr << "Error: model does not match the compiled-in header. Regenerate and recompile.\n"; return 1; }
-
-    infer_net net;
-    cout << "Importing weights into the network...\n";
-    import_gguf_weights(net, g, spec, lopt);
-
-    hf_tokenizer tok;
-    tok.load_from_gguf(g);
     const int eos = tok.eos_id();
 
     const float temp = deterministic ? 1.0f : static_cast<float>(temperature);
@@ -324,6 +326,11 @@ int run_chat(gguf_reader& g, const model_spec& spec, const gguf_load_options& lo
             turn = tok.encode(line, /*add_bos=*/!primed, /*add_eos=*/false);
         }
 
+        /* A single status line covers the whole turn: the (potentially long) prefill or
+           delta feed, then the token-by-token generation. Tokens are not streamed; the
+           complete answer replaces the indicator once generation finishes. */
+        cout << "Model: thinking" << std::flush;
+
         int nxt = 0;
         if (!primed)
         {
@@ -357,16 +364,14 @@ int run_chat(gguf_reader& g, const model_spec& spec, const gguf_load_options& lo
             }
         }
 
-        cout << "Model: " << std::flush;
         std::vector<int> out_toks;
-        size_t printed = 0;
         for (int i = 0; i < max_response; ++i)
         {
             if (nxt == eos) break;
             ctx.push_back(nxt);
             out_toks.push_back(nxt);
-            std::string full = tok.decode(out_toks, true);
-            if (full.size() > printed) { cout << full.substr(printed) << std::flush; printed = full.size(); }
+            static const char* const dots[] = { ".  ", ".. ", "..." };
+            cout << "\rModel: thinking" << dots[(i / 8) % 3] << std::flush;
             matrix<int, 0, 1> step(1, 1);
             step(0) = nxt;
             nxt = pick_next(generator(step), ctx, deterministic, top_k, top_p, min_p, repeat_penalty, rng);
@@ -380,10 +385,48 @@ int run_chat(gguf_reader& g, const model_spec& spec, const gguf_load_options& lo
             generator(step);
             ctx.push_back(eos);
         }
-        cout << "\n\n";
+
+        /* Erase the indicator and print the complete answer in its place. */
+        cout << "\r" << std::string(20, ' ') << "\r";
+        cout << "Model: " << tok.decode(out_toks, true) << "\n\n";
     }
     network_context::reset();
     return 0;
+}
+
+/* Chat after importing the weights from the GGUF container. */
+int run_chat(gguf_reader& g, const model_spec& spec, const gguf_load_options& lopt,
+    double temperature, size_t top_k, float top_p,
+    float min_p, float repeat_penalty, bool deterministic, long ctx_len, bool use_template,
+    const std::string& system_prompt)
+{
+    if (!model_matches_header(spec))
+    { cerr << "Error: model does not match the compiled-in header. Regenerate and recompile.\n"; return 1; }
+
+    infer_net net;
+    cout << "Importing weights into the network...\n";
+    import_gguf_weights(net, g, spec, lopt);
+
+    hf_tokenizer tok;
+    tok.load_from_gguf(g);
+    return chat_loop(net, tok, temperature, top_k, top_p, min_p, repeat_penalty,
+        deterministic, ctx_len, use_template, system_prompt);
+}
+
+/* Chat over a previously converted model: the network and the tokenizer are read back
+   from the .dat archive written by --convert, skipping the GGUF import entirely. The
+   archive must have been produced by a build compiled with the same model header. */
+int run_chat_dat(const std::string& dat_path,
+    double temperature, size_t top_k, float top_p,
+    float min_p, float repeat_penalty, bool deterministic, long ctx_len, bool use_template,
+    const std::string& system_prompt)
+{
+    infer_net net;
+    hf_tokenizer tok;
+    cout << "Loading converted model from " << dat_path << " ...\n";
+    deserialize(dat_path) >> net >> tok;
+    return chat_loop(net, tok, temperature, top_k, top_p, min_p, repeat_penalty,
+        deterministic, ctx_len, use_template, system_prompt);
 }
 
 /* Print the most probable next tokens for a prompt's last position. Compare these with a
@@ -551,9 +594,17 @@ int main(int argc, char** argv)
 {
     try
     {
+#ifdef _WIN32
+        /* The Windows console defaults to the OEM code page (CP850 on French systems),
+           which garbles the UTF-8 byte stream the tokenizer emits and reads. Switch both
+           directions to UTF-8 so accented output and input display correctly. */
+        SetConsoleOutputCP(CP_UTF8);
+        SetConsoleCP(CP_UTF8);
+#endif
         command_line_parser parser;
         parser.add_option("input", "Path to the source .gguf model", 1);
-        parser.add_option("out-prefix", "Output prefix for generated files (default: imported_model)", 1);
+        parser.add_option("out-prefix", "Output prefix for generated files (default: derived from the model name)", 1);
+        parser.add_option("load", "Path to a converted .dat model; with --chat, skips the GGUF import entirely", 1);
         parser.add_option("probe", "Extra string to round-trip through the tokenizer", 1);
         parser.add_option("chat", "Load the model and start an interactive completion session");
         parser.add_option("convert", "Load the model and serialize it to <out-prefix>.dat");
@@ -573,6 +624,27 @@ int main(int argc, char** argv)
         parser.add_option("swap-gate-up", "Swap ffn_gate / ffn_up assignment (weight-loader knob)");
         parser.parse(argc, argv);
 
+        /* Chat over an already-converted model: no GGUF needed, the .dat archive carries
+           both the network weights and the tokenizer. */
+        if (parser.option("load") && parser.option("chat"))
+        {
+#ifdef WITH_IMPORTED_MODEL
+            return run_chat_dat(parser.option("load").argument(),
+                get_option(parser, "temperature", 0.8),
+                get_option(parser, "top-k", size_t(40)),
+                get_option(parser, "top-p", 0.9f),
+                get_option(parser, "min-p", 0.05f),
+                get_option(parser, "repeat-penalty", 1.1f),
+                parser.option("deterministic"),
+                get_option(parser, "context", long(512)),
+                /*use_template=*/!parser.option("raw"),
+                get_option(parser, "system", std::string("You are a helpful assistant.")));
+#else
+            cerr << "This build has no model header compiled in; rebuild with WITH_IMPORTED_MODEL.\n";
+            return 1;
+#endif
+        }
+
         if (!parser.option("input"))
         {
             cout << "Import a GGUF model into the Dlib transformer stack.\n\n";
@@ -582,12 +654,12 @@ int main(int argc, char** argv)
                  << " --input tinyllama-1.1b-chat-v1.0.Q8_0.gguf --out-prefix imported_model\n"
                  << "  Phase 2 (built with WITH_IMPORTED_MODEL):\n    " << argv[0]
                  << " --input tinyllama-1.1b-chat-v1.0.Q8_0.gguf --probe-logits --prompt \"The capital of France is\"\n    " << argv[0]
-                 << " --input tinyllama-1.1b-chat-v1.0.Q8_0.gguf --chat\n";
+                 << " --input tinyllama-1.1b-chat-v1.0.Q8_0.gguf --convert\n    " << argv[0]
+                 << " --load tinyllama_1_1b_chat_v1_0.dat --chat\n";
             return 0;
         }
 
         const string input  = parser.option("input").argument();
-        const string prefix = get_option(parser, "out-prefix", string("imported_model"));
 
         cout << "Reading GGUF: " << input << "\n";
         gguf_reader g(input);
@@ -597,6 +669,13 @@ int main(int argc, char** argv)
 
         const model_spec spec = detect_model(g);
         cout << describe(spec) << "\n";
+
+        /* Every produced file defaults to the model identity (sanitized general.name), so
+           successive imports of different models do not overwrite one another. The header
+           used by this example's own build is regenerated with an explicit
+           --out-prefix imported_model. */
+        const string prefix = parser.option("out-prefix")
+            ? parser.option("out-prefix").argument() : model_identifier(spec);
 
         const compat_result compat = check_compatibility(spec);
         for (const auto& n : compat.notes)    cout << "note: "    << n << "\n";
