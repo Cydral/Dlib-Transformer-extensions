@@ -295,6 +295,12 @@ int chat_loop(infer_net& net, hf_tokenizer& tok,
     network_context::clear_padding();
     bool primed = false;
     std::vector<int> ctx;
+    /* Surface runtime failures explicitly: without this handler, a CUDA error thrown
+       mid-generation unwinds through the tensor destructors, whose own failure logs
+       (cudaFree / cudaStreamDestroy on a sticky-error device) flood the console and
+       bury the primary message that names the failing call. */
+    try
+    {
     while (true)
     {
         cout << "You: " << std::flush;
@@ -389,6 +395,19 @@ int chat_loop(infer_net& net, hf_tokenizer& tok,
         /* Erase the indicator and print the complete answer in its place. */
         cout << "\r" << std::string(20, ' ') << "\r";
         cout << "Model: " << tok.decode(out_toks, true) << "\n\n";
+    }
+    }
+    catch (const std::exception& e)
+    {
+        /* Print the primary error first: for CUDA faults, e.what() carries the failing
+           call with its file and line, which identifies the kernel or library call at
+           the origin. The device is left in an undefined (sticky-error) state, so the
+           destructor logs that follow are secondary noise. */
+        cout << "\n";
+        cerr << "\nFATAL during generation: " << e.what() << "\n"
+             << "The CUDA device is now in an undefined state; restart the program.\n";
+        network_context::reset();
+        return 1;
     }
     network_context::reset();
     return 0;
