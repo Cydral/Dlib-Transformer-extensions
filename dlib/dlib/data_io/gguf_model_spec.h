@@ -54,11 +54,30 @@ namespace dlib
         return a < 0 ? -a : a;
     }
 
+    /* GGUF files converted from HuggingFace often carry general.name in the
+       "<organization>_<repository>" form; when the repository itself starts with the
+       organization name (e.g. "tinyllama_tinyllama-1.1b-chat-v1.0"), the prefix is
+       redundant and only the repository part is kept. */
+    inline std::string clean_model_name(const std::string& name)
+    {
+        const size_t p = name.find('_');
+        if (p == std::string::npos || p == 0 || p + 1 >= name.size()) return name;
+        auto lower = [](std::string v) {
+            for (char& c : v) if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+            return v;
+        };
+        const std::string org = lower(name.substr(0, p));
+        const std::string rest = name.substr(p + 1);
+        if (rest.size() >= org.size() && lower(rest).compare(0, org.size(), org) == 0)
+            return rest;
+        return name;
+    }
+
     inline model_spec detect_model(const gguf_reader& g)
     {
         model_spec s;
         s.arch_name = g.get_str("general.architecture", "unknown");
-        s.model_name = g.get_str("general.name", s.arch_name);
+        s.model_name = clean_model_name(g.get_str("general.name", s.arch_name));
         s.family = arch_family_from_name(s.arch_name);
 
         const std::string p = s.arch_name;   // metadata keys are prefixed by the architecture
