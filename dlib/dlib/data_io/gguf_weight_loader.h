@@ -136,6 +136,22 @@ namespace dlib
             template <typename T> void set(T&, long) {}
             template <typename T> void operator()(T& layer) { set(layer, 0); }
         };
+
+        /* Pushes the model's RMSNorm epsilon into every rms_norm layer of the network
+           (attention norms, FFN norms and the final norm). SFINAE on set_eps makes this
+           a no-op for every other layer. Imported models carry their own value (e.g.
+           1e-6 for Qwen3) which may differ from the library default. */
+        struct norm_eps_setter
+        {
+            double eps;
+            template <typename T>
+            auto set(T& layer, int) -> decltype((void)layer.set_eps(0.0))
+            {
+                layer.set_eps(eps);
+            }
+            template <typename T> void set(T&, long) {}
+            template <typename T> void operator()(T& layer) { set(layer, 0); }
+        };
     }
 
     template <typename net_type>
@@ -159,6 +175,8 @@ namespace dlib
         {
             attention_config_setter cfg{ static_cast<float>(spec.rope_freq_base), spec.rms_eps };
             visit_computational_layers(net, cfg);
+            norm_eps_setter neps{ spec.rms_eps };
+            visit_computational_layers(net, neps);
         }
 
         /* Allocate every parameter tensor with a single forward pass on one token. */

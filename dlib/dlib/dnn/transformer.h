@@ -202,6 +202,26 @@ namespace dlib
             return get_kv_cache_capacity_();
         }
 
+        // Number of initial cache positions that are never evicted when the KV cache is
+        // full ("attention sinks": typically the BOS token and the system block). Small
+        // decoder models concentrate a large share of attention mass on the first
+        // positions; evicting them collapses generation into repetitive output, so the
+        // sliding mechanism keeps them and evicts a block of the oldest evictable
+        // positions instead. A value of 0 gives a plain sliding window.
+        static void set_kv_cache_keep_length(long keep)
+        {
+            std::lock_guard<std::mutex> lock(get_mutex_());
+            DLIB_CASSERT(keep >= 0, "KV cache keep length must be non-negative");
+            get_kv_cache_keep_length_() = keep;
+            get_is_active_() = true;
+        }
+
+        static long get_kv_cache_keep_length()
+        {
+            std::lock_guard<std::mutex> lock(get_mutex_());
+            return get_kv_cache_keep_length_();
+        }
+
         // Signals to all KV-cache-aware layers that any cached state should be
         // discarded on the next forward pass. The flag auto-resets after being
         // observed (each layer that consumes it during forward will set it back
@@ -255,6 +275,7 @@ namespace dlib
             get_optimizer_beta2_() = 0.999;
             get_inference_mode_() = inference_mode::training;
             get_kv_cache_capacity_() = 0;
+            get_kv_cache_keep_length_() = 0;
             get_kv_cache_clear_request_() = false;
             clear_padding_nolock_();
         }
@@ -297,6 +318,10 @@ namespace dlib
             return v;
         }
         static long& get_kv_cache_capacity_() {
+            static long v = 0;
+            return v;
+        }
+        static long& get_kv_cache_keep_length_() {
             static long v = 0;
             return v;
         }
@@ -833,51 +858,64 @@ namespace dlib
             cache_filled_len_ = 0;
         }
 
-        // Shift the K/V caches one position to the left, dropping the oldest
-        // entry. After this call cache_filled_len_ is decreased by 1 and a
-        // free slot is available at the end of the valid range.
-        void shift_cache_left()
+        // Evict a block from the K/V caches while preserving the first `keep`
+        // positions (attention sinks). Rows [keep, keep + discard) are dropped
+        // and rows [keep + discard, cache_filled_len_) move down to start at
+        // row `keep`. After the call cache_filled_len_ is reduced by `discard`.
+        //
+        // Because the caches hold K before rotary encoding, the moved keys are
+        // simply re-encoded at their new window positions on the next forward;
+        // relative distances among the surviving positions are preserved and
+        // the sinks stay at the lowest positions, which is the behavior small
+        // decoder models require to keep generating coherently once the window
+        // is full. Evicting a block (rather than one position per step) also
+        // amortizes the cache compaction cost over many generated tokens.
+        void evict_cache_block(long keep, long discard)
         {
-            DLIB_CASSERT(cache_filled_len_ > 0);
+            DLIB_CASSERT(keep >= 0 && discard > 0);
+            DLIB_CASSERT(keep + discard <= cache_filled_len_);
 
-            const long new_len = cache_filled_len_ - 1;
+            const long tail = cache_filled_len_ - keep - discard;
 
-            // Use a temporary buffer to perform the shift since copy_tensor
-            // does not support overlapping source/destination ranges safely.
-            resizable_tensor tmp_k(cache_batch_size_, NUM_KV_HEADS, new_len, HEAD_DIM);
-            resizable_tensor tmp_v(cache_batch_size_, NUM_KV_HEADS, new_len, HEAD_DIM);
+            if (tail > 0)
+            {
+                // Use temporary buffers for the compaction since copy_tensor
+                // does not support overlapping source/destination ranges safely.
+                resizable_tensor tmp_k(cache_batch_size_, NUM_KV_HEADS, tail, HEAD_DIM);
+                resizable_tensor tmp_v(cache_batch_size_, NUM_KV_HEADS, tail, HEAD_DIM);
 
-            tt::copy_tensor(false, tmp_k,
-                /*dk=*/0, /*dnr=*/0, /*dnc=*/0,
-                K_cache,
-                /*sk=*/0, /*snr=*/1, /*snc=*/0,
-                /*k=*/NUM_KV_HEADS,
-                /*nr=*/static_cast<size_t>(new_len),
-                /*nc=*/HEAD_DIM);
-            tt::copy_tensor(false, tmp_v,
-                /*dk=*/0, /*dnr=*/0, /*dnc=*/0,
-                V_cache,
-                /*sk=*/0, /*snr=*/1, /*snc=*/0,
-                /*k=*/NUM_KV_HEADS,
-                /*nr=*/static_cast<size_t>(new_len),
-                /*nc=*/HEAD_DIM);
+                tt::copy_tensor(false, tmp_k,
+                    /*dk=*/0, /*dnr=*/0, /*dnc=*/0,
+                    K_cache,
+                    /*sk=*/0, /*snr=*/static_cast<size_t>(keep + discard), /*snc=*/0,
+                    /*k=*/NUM_KV_HEADS,
+                    /*nr=*/static_cast<size_t>(tail),
+                    /*nc=*/HEAD_DIM);
+                tt::copy_tensor(false, tmp_v,
+                    /*dk=*/0, /*dnr=*/0, /*dnc=*/0,
+                    V_cache,
+                    /*sk=*/0, /*snr=*/static_cast<size_t>(keep + discard), /*snc=*/0,
+                    /*k=*/NUM_KV_HEADS,
+                    /*nr=*/static_cast<size_t>(tail),
+                    /*nc=*/HEAD_DIM);
 
-            tt::copy_tensor(false, K_cache,
-                /*dk=*/0, /*dnr=*/0, /*dnc=*/0,
-                tmp_k,
-                /*sk=*/0, /*snr=*/0, /*snc=*/0,
-                /*k=*/NUM_KV_HEADS,
-                /*nr=*/static_cast<size_t>(new_len),
-                /*nc=*/HEAD_DIM);
-            tt::copy_tensor(false, V_cache,
-                /*dk=*/0, /*dnr=*/0, /*dnc=*/0,
-                tmp_v,
-                /*sk=*/0, /*snr=*/0, /*snc=*/0,
-                /*k=*/NUM_KV_HEADS,
-                /*nr=*/static_cast<size_t>(new_len),
-                /*nc=*/HEAD_DIM);
+                tt::copy_tensor(false, K_cache,
+                    /*dk=*/0, /*dnr=*/static_cast<size_t>(keep), /*dnc=*/0,
+                    tmp_k,
+                    /*sk=*/0, /*snr=*/0, /*snc=*/0,
+                    /*k=*/NUM_KV_HEADS,
+                    /*nr=*/static_cast<size_t>(tail),
+                    /*nc=*/HEAD_DIM);
+                tt::copy_tensor(false, V_cache,
+                    /*dk=*/0, /*dnr=*/static_cast<size_t>(keep), /*dnc=*/0,
+                    tmp_v,
+                    /*sk=*/0, /*snr=*/0, /*snc=*/0,
+                    /*k=*/NUM_KV_HEADS,
+                    /*nr=*/static_cast<size_t>(tail),
+                    /*nc=*/HEAD_DIM);
+            }
 
-            cache_filled_len_ = new_len;
+            cache_filled_len_ -= discard;
         }
 
         // Full forward path. Used in training/full mode (no cache write) and
@@ -1086,9 +1124,18 @@ namespace dlib
                 tt::gemm(0.0f, v_view, 1.0f, x_view, false, wv, false);
             }
 
-            // Step 2: make room in the cache if full (sliding window)
+            // Step 2: make room in the cache if full. The first `keep` positions
+            // (attention sinks, configured by the generation loop: typically the
+            // BOS token and the system block) are preserved; half of the evictable
+            // range is dropped in one block, so the compaction cost is amortized
+            // over the following (capacity - keep) / 2 generated tokens.
             if (cache_filled_len_ >= cache_capacity_)
-                shift_cache_left();
+            {
+                const long keep = std::max<long>(0,
+                    std::min(network_context::get_kv_cache_keep_length(), cache_capacity_ - 2));
+                const long discard = std::max<long>(1, (cache_capacity_ - keep) / 2);
+                evict_cache_block(keep, discard);
+            }
 
             // Step 3: append the new K_pre_rope and V to the cache
             const long insert_pos = cache_filled_len_;

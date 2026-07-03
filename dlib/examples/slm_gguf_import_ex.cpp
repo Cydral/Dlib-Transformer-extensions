@@ -281,6 +281,24 @@ int chat_loop(infer_net& net, hf_tokenizer& tok,
        stale token seen by attention), which is what made the chat degenerate into
        repetition and spurious role markers. */
     network_context::request_kv_cache_clear();
+
+    /* Attention sinks: the BOS token and the system block are pinned in the KV cache and
+       survive window evictions. Small decoder models concentrate a large share of their
+       attention mass on the first positions; letting them slide out once the window is
+       full collapses generation into repetitive output. The keep length is measured on
+       the exact token prefix the first prefill produces, so the pinned rows are precisely
+       the sink positions. In raw mode only the BOS is pinned. */
+    if (use_template)
+    {
+        const std::vector<int> sink = tok.encode("<|system|>\n" + system_prompt + "</s>\n",
+            /*add_bos=*/true, /*add_eos=*/false, /*parse_special=*/true, /*allow_space_prefix=*/true);
+        network_context::set_kv_cache_keep_length(static_cast<long>(sink.size()));
+    }
+    else
+    {
+        network_context::set_kv_cache_keep_length(1);
+    }
+
     dlib::rand rng(std::time(nullptr));
     const int max_response = 512;
 

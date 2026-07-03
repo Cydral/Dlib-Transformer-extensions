@@ -1760,6 +1760,15 @@ namespace dlib
 
         double get_eps() const { return eps; }
 
+        // Sets the numerical-stability epsilon. Imported open-weight models carry their
+        // own value (e.g. 1e-6 for Qwen3 vs the 1e-5 default); the GGUF loader pushes it
+        // here before the weights are copied so the forward matches the source model.
+        void set_eps(double val)
+        {
+            DLIB_CASSERT(val > 0, "rms_norm epsilon must be positive");
+            eps = val;
+        }
+
         double get_learning_rate_multiplier() const { return learning_rate_multiplier; }
         double get_weight_decay_multiplier() const { return weight_decay_multiplier; }
         void set_learning_rate_multiplier(double val) { learning_rate_multiplier = val; }

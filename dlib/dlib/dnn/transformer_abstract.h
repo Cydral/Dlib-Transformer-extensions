@@ -134,7 +134,9 @@ namespace dlib
             // Incremental mode: forward pass on a single new token; attention
             // layers read the existing KV cache, append the new token's K/V, and
             // produce the output for this single position. When the cache is
-            // full, attention layers apply an automatic sliding-window shift.
+            // full, attention layers evict a block of the oldest evictable
+            // positions, preserving the configured attention sinks (see
+            // set_kv_cache_keep_length).
             incremental
         };
 
@@ -297,9 +299,11 @@ namespace dlib
             ensures
                 - Stores the maximum number of positions each per-layer KV cache
                   may hold. When the cache reaches this capacity in incremental
-                  mode, attention layers apply an automatic sliding-window shift
-                  (oldest position dropped, remaining shifted left, new position
-                  appended).
+                  mode, attention layers evict a block of the oldest evictable
+                  positions in one operation: the first get_kv_cache_keep_length()
+                  positions are preserved (attention sinks), then half of the
+                  remaining range is dropped and the tail is compacted down, so
+                  the compaction cost is amortized over many generated tokens.
                 - A value of 0 means "no preset capacity"; the cache then grows
                   on demand and the generation loop becomes responsible for
                   managing its size (e.g. by re-prefilling).
@@ -311,6 +315,31 @@ namespace dlib
         /*!
             ensures
                 - Returns the configured KV cache capacity, or 0 if never set.
+        !*/
+
+        static void set_kv_cache_keep_length(long keep);
+        /*!
+            requires
+                - keep >= 0
+            ensures
+                - Stores the number of initial cache positions that are never
+                  evicted when a full KV cache is compacted in incremental mode
+                  ("attention sinks": typically the BOS token and the system
+                  block of the prompt). Small decoder models concentrate a large
+                  share of attention mass on the first positions; evicting them
+                  collapses generation into repetitive output, so the eviction
+                  drops a block of the oldest positions after the sinks instead.
+                - The value is clamped by the attention layers so that at least
+                  two evictable positions remain.
+                - A value of 0 gives a plain sliding window.
+                - #get_kv_cache_keep_length() == keep
+                - #is_active()                == true
+        !*/
+
+        static long get_kv_cache_keep_length();
+        /*!
+            ensures
+                - Returns the configured keep length, or 0 if never set.
         !*/
 
         static void request_kv_cache_clear();
@@ -458,9 +487,11 @@ namespace dlib
                     [0, max_seq_len_train).
 
                   - incremental : single-token forward (x.nr() == 1).
-                    Projects the new Q/K/V; if the cache is full, applies a
-                    sliding-window shift one position to the left to free a
-                    slot at the end; appends the new K_pre_rope and V to the
+                    Projects the new Q/K/V; if the cache is full, evicts a
+                    block of the oldest evictable positions (preserving the
+                    first network_context::get_kv_cache_keep_length() sink
+                    positions and dropping half of the remaining range) to
+                    free room; appends the new K_pre_rope and V to the
                     cache; reads back the K/V window; applies RoPE to the
                     K window with positions [0, L-1] and to Q with position
                     L-1; performs the GQA repeat, attention and W_O
