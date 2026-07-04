@@ -2920,6 +2920,10 @@ namespace dlib
         float get_multiply_value (
         ) const { return val; }
 
+        void set_multiply_value (
+            float val_
+        ) { val = val_; }
+
         template <typename SUBNET>
         void setup (const SUBNET& /*sub*/)
         {

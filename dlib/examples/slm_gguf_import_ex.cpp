@@ -269,10 +269,12 @@ int pick_next(const tensor& probs, const std::vector<int>& recent, bool determin
     return cand.empty() ? 0 : cand[0].first;
 }
 
-/* Interactive chat loop over an already-loaded network and tokenizer. The callers below
-   provide the two loading paths: run_chat imports the weights from the GGUF, run_chat_dat
-   reads back a previously converted .dat archive. */
-int chat_loop(infer_net& net, hf_tokenizer& tok,
+/* Interactive chat loop over an already-loaded generator and tokenizer. The callers
+   below provide the two loading paths: run_chat imports the weights from the GGUF,
+   run_chat_dat reads back a previously converted .dat archive. The generator is loaded
+   by the caller so that exactly one copy of the parameters is ever resident: the
+   temperature scaling is applied here through the multiply layer's setter. */
+int chat_loop(generator_type& generator, hf_tokenizer& tok,
     double temperature, size_t top_k, float top_p,
     float min_p, float repeat_penalty, bool deterministic, long ctx_len, bool use_template,
     const std::string& system_prompt)
@@ -296,8 +298,7 @@ int chat_loop(infer_net& net, hf_tokenizer& tok,
     if (repeat_penalty < 0.0f) repeat_penalty = fmt.default_repeat_penalty();
 
     const float temp = deterministic ? 1.0f : static_cast<float>(temperature);
-    generator_type generator(multiply_(1.0 / temp));
-    generator.subnet().subnet() = net.subnet();
+    layer<1>(generator).layer_details().set_multiply_value(1.0f / temp);
 
     network_context::reset();
     network_context::set_kv_cache_capacity(ctx_len);
@@ -459,7 +460,9 @@ int chat_loop(infer_net& net, hf_tokenizer& tok,
     return 0;
 }
 
-/* Chat after importing the weights from the GGUF container. */
+/* Chat after importing the weights from the GGUF container. The weights are imported
+   directly into the generator (the softmax/multiply head carries no parameters, so the
+   layer visit order is identical), keeping a single resident copy of the model. */
 int run_chat(gguf_reader& g, const model_spec& spec, const gguf_load_options& lopt,
     double temperature, size_t top_k, float top_p,
     float min_p, float repeat_penalty, bool deterministic, long ctx_len, bool use_template,
@@ -468,29 +471,37 @@ int run_chat(gguf_reader& g, const model_spec& spec, const gguf_load_options& lo
     if (!model_matches_header(spec))
     { cerr << "Error: model does not match the compiled-in header. Regenerate and recompile.\n"; return 1; }
 
-    infer_net net;
+    generator_type generator(multiply_(1.0));
     cout << "Importing weights into the network...\n";
-    import_gguf_weights(net, g, spec, lopt);
+    import_gguf_weights(generator, g, spec, lopt);
 
     hf_tokenizer tok;
     tok.load_from_gguf(g);
-    return chat_loop(net, tok, temperature, top_k, top_p, min_p, repeat_penalty,
+    return chat_loop(generator, tok, temperature, top_k, top_p, min_p, repeat_penalty,
         deterministic, ctx_len, use_template, system_prompt);
 }
 
 /* Chat over a previously converted model: the network and the tokenizer are read back
    from the .dat archive written by --convert, skipping the GGUF import entirely. The
-   archive must have been produced by a build compiled with the same model header. */
+   archive must have been produced by a build compiled with the same model header. The
+   deserialized network lives in a scope that ends right after its layers are copied
+   into the generator, so a single copy of the parameters remains resident afterwards
+   (deserialization targets host memory; the device upload happens at the first
+   forward, after the temporary is gone). */
 int run_chat_dat(const std::string& dat_path,
     double temperature, size_t top_k, float top_p,
     float min_p, float repeat_penalty, bool deterministic, long ctx_len, bool use_template,
     const std::string& system_prompt)
 {
-    infer_net net;
+    generator_type generator(multiply_(1.0));
     hf_tokenizer tok;
-    cout << "Loading converted model from " << dat_path << " ...\n";
-    deserialize(dat_path) >> net >> tok;
-    return chat_loop(net, tok, temperature, top_k, top_p, min_p, repeat_penalty,
+    {
+        infer_net net;
+        cout << "Loading converted model from " << dat_path << " ...\n";
+        deserialize(dat_path) >> net >> tok;
+        generator.subnet().subnet() = net.subnet();
+    }
+    return chat_loop(generator, tok, temperature, top_k, top_p, min_p, repeat_penalty,
         deterministic, ctx_len, use_template, system_prompt);
 }
 
@@ -502,14 +513,12 @@ int run_probe(gguf_reader& g, const model_spec& spec, const gguf_load_options& l
     if (!model_matches_header(spec))
     { cerr << "Error: model does not match the compiled-in header. Regenerate and recompile.\n"; return 1; }
 
-    infer_net net;
+    generator_type generator(multiply_(1.0));
     cout << "Importing weights into the network...\n";
-    import_gguf_weights(net, g, spec, lopt);
+    import_gguf_weights(generator, g, spec, lopt);
 
     hf_tokenizer tok;
     tok.load_from_gguf(g);
-    generator_type generator(multiply_(1.0));
-    generator.subnet().subnet() = net.subnet();
 
     std::vector<int> toks = tok.encode(prompt, /*add_bos=*/true, /*add_eos=*/false);
     matrix<int, 0, 1> in(static_cast<long>(toks.size()), 1);
@@ -567,14 +576,12 @@ int run_probe_ids(gguf_reader& g, const model_spec& spec, const gguf_load_option
     if (!model_matches_header(spec))
     { cerr << "Error: model does not match the compiled-in header. Regenerate and recompile.\n"; return 1; }
 
-    infer_net net;
+    generator_type generator(multiply_(1.0));
     cout << "Importing weights into the network...\n";
-    import_gguf_weights(net, g, spec, lopt);
+    import_gguf_weights(generator, g, spec, lopt);
 
     hf_tokenizer tok;
     tok.load_from_gguf(g);
-    generator_type generator(multiply_(1.0));
-    generator.subnet().subnet() = net.subnet();
 
     std::vector<int> toks;
     {
