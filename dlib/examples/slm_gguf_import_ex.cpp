@@ -1,38 +1,35 @@
 /*!
     @file slm_gguf_import_ex.cpp
-    @brief Import a GGUF model (Llama 2 first) into the Dlib transformer stack.
+    @brief Import a GGUF open-weight model into the Dlib transformer stack.
 
-    This example runs the front of the import pipeline:
+    The program covers the whole import pipeline:
       stage 0  read the GGUF container (gguf_reader)
       stage 1  detect the architecture into a neutral model_spec
       stage 2  check compatibility against the available Dlib layers
       stage 3  emit a Dlib model header for the detected model
       stage 4  extract the tokenizer, round-trip test it, serialize it
-
-    Weight dequantization and repacking is the next increment.
+      stage 5  dequantize and repack the weights into the network, then probe the
+               logits, convert to a self-contained .dat, or chat
 
     Usage:
-      slm_gguf_import_ex --input model.gguf --out-prefix imported_model
-      slm_gguf_import_ex --input model.gguf --out-prefix m --probe "Hello, world!"
+      slm_gguf_import_ex --input model.gguf --out-prefix slm_imported_model
+      slm_gguf_import_ex --input model.gguf --probe-logits --prompt "The capital of France is"
+      slm_gguf_import_ex --input model.gguf --convert
+      slm_gguf_import_ex --load model.dat --chat
 
     Two-phase build (resolves the chicken-and-egg of needing the generated header to
     compile the model-using code):
-      Phase 1  compile WITHOUT WITH_IMPORTED_MODEL. No model header is included and no
-               network is instantiated, so the file always compiles. Run it to detect the
-               model, emit its header (use --out-prefix imported_model so the file is named
-               imported_model.h and declares namespace imported_model) and extract the
-               tokenizer.
-      Phase 2  recompile WITH WITH_IMPORTED_MODEL defined. The generated header is included
-               and --chat / --probe-logits / --convert become available. Enable it at configure
-               time through the CMake option, for example from dlib/examples:
-                 cmake -S . -B build -DWITH_IMPORTED_MODEL=ON
-                 cmake --build build --config Release
-               A deep network type is instantiated, so this phase needs /bigobj on MSVC (added
-               by the example CMakeLists), and imported_model.h must sit next to this file or on
-               the include path.
+      Phase 1  no slm_imported_model.h exists yet: the model half is skipped by the
+               __has_include detection, so the file always compiles. Run it to detect
+               the model, emit its header (use --out-prefix slm_imported_model so the
+               file is named slm_imported_model.h) and extract the tokenizer.
+      Phase 2  rebuild the target: the generated header is now detected and included,
+               and --chat / --probe-logits / --convert become available. A deep network
+               type is instantiated, so this phase needs /bigobj on MSVC.
 
     The utility headers gguf_reader.h, gguf_dequantize.h, gguf_model_spec.h and
-    gguf_weight_loader.h live under dlib/data_io; hf_tokenizer.h lives under dlib/tokenizer.
+    gguf_weight_loader.h live under dlib/data_io; hf_tokenizer.h and chat_template.h
+    live under dlib/tokenizer.
 !*/
 
 #include <iostream>
@@ -57,16 +54,29 @@
 #include <dlib/data_io/gguf_model_spec.h>
 #include <dlib/tokenizer/hf_tokenizer.h>
 
-#define WITH_IMPORTED_MODEL 1
+/* The model-dependent half of this program (probes, conversion, chat) compiles only
+   when the generated model header is present. __has_include acts as the build switch:
+   phase 1, before any header exists, always compiles; once slm_imported_model.h has
+   been generated next to this file (or anywhere on the include path), the next build
+   of the target enables the model commands automatically. Note that a header created
+   after a previous build is not tracked as a dependency of the old object file, so
+   rebuild the target explicitly after the first generation. An external definition of
+   WITH_IMPORTED_MODEL or IMPORTED_MODEL_HEADER keeps priority over the detection. */
+#ifndef IMPORTED_MODEL_HEADER
+#  define IMPORTED_MODEL_HEADER "slm_imported_model.h"
+#endif
+#if !defined(WITH_IMPORTED_MODEL) && defined(__has_include)
+#  if __has_include(IMPORTED_MODEL_HEADER)
+#    define WITH_IMPORTED_MODEL 1
+#  endif
+#endif
 
 #ifdef WITH_IMPORTED_MODEL
 #  include <random>
 #  include <ctime>
 #  include <dlib/dnn.h>
 #  include <dlib/data_io/gguf_weight_loader.h>
-#  ifndef IMPORTED_MODEL_HEADER
-#    define IMPORTED_MODEL_HEADER "imported_model.h"
-#  endif
+#  include <dlib/tokenizer/chat_template.h>
 #  include IMPORTED_MODEL_HEADER
 #endif
 
@@ -269,6 +279,22 @@ int chat_loop(infer_net& net, hf_tokenizer& tok,
 {
     const int eos = tok.eos_id();
 
+    /* Model-aware conversation formatting. The template family is detected from the
+       tokenizer itself (the eos piece identifies it), so the same logic covers both
+       the GGUF import path and the .dat loading path. Sampling values left unset on
+       the command line fall back to the family's published presets. */
+    const chat_template_formatter fmt = use_template
+        ? chat_template_formatter::for_tokenizer(tok)
+        : chat_template_formatter(chat_template_kind::raw);
+    if (use_template)
+        cout << "Chat template: " << chat_template_formatter::name(fmt.kind()) << "\n";
+
+    if (temperature < 0.0)     temperature    = fmt.default_temperature();
+    if (top_k == 0)            top_k          = fmt.default_top_k();
+    if (top_p < 0.0f)          top_p          = fmt.default_top_p();
+    if (min_p < 0.0f)          min_p          = fmt.default_min_p();
+    if (repeat_penalty < 0.0f) repeat_penalty = fmt.default_repeat_penalty();
+
     const float temp = deterministic ? 1.0f : static_cast<float>(temperature);
     generator_type generator(multiply_(1.0 / temp));
     generator.subnet().subnet() = net.subnet();
@@ -282,16 +308,18 @@ int chat_loop(infer_net& net, hf_tokenizer& tok,
        repetition and spurious role markers. */
     network_context::request_kv_cache_clear();
 
-    /* Attention sinks: the BOS token and the system block are pinned in the KV cache and
-       survive window evictions. Small decoder models concentrate a large share of their
-       attention mass on the first positions; letting them slide out once the window is
-       full collapses generation into repetitive output. The keep length is measured on
-       the exact token prefix the first prefill produces, so the pinned rows are precisely
-       the sink positions. In raw mode only the BOS is pinned. */
+    /* Attention sinks: the conversation's immutable prefix (system block, plus BOS for
+       the families that use one) is pinned in the KV cache and survives window
+       evictions. Small decoder models concentrate a large share of their attention
+       mass on the first positions; letting them slide out once the window is full
+       collapses generation into repetitive output. The keep length is measured on the
+       exact token prefix the first prefill produces. In raw mode only the BOS is
+       pinned. */
     if (use_template)
     {
-        const std::vector<int> sink = tok.encode("<|system|>\n" + system_prompt + "</s>\n",
-            /*add_bos=*/true, /*add_eos=*/false, /*parse_special=*/true, /*allow_space_prefix=*/true);
+        const std::vector<int> sink = tok.encode(fmt.system_prefix(system_prompt),
+            /*add_bos=*/fmt.add_bos_on_first_turn(), /*add_eos=*/false,
+            /*parse_special=*/true, /*allow_space_prefix=*/true);
         network_context::set_kv_cache_keep_length(static_cast<long>(sink.size()));
     }
     else
@@ -332,18 +360,18 @@ int chat_loop(infer_net& net, hf_tokenizer& tok,
         std::vector<int> turn;
         if (use_template)
         {
-            /* TinyLlama / Zephyr chat template. The first turn carries the system block ahead
-               of the user turn; later turns begin with the newline that follows the assistant's
-               closing </s>, so the running token stream matches a single continuous tokenization
-               of the whole conversation. </s> is parsed as the eos special token, and the
-               SentencePiece dummy space prefix is applied to every fragment, including those
-               after a special token, exactly as llama.cpp does. */
+            /* The turn strings are designed so the running token stream matches a single
+               continuous tokenization of the whole conversation: the first turn carries
+               the system block ahead of the user turn; later turns begin with the newline
+               that follows the assistant's closing eos. Special markers are parsed as
+               special tokens, and the SentencePiece dummy space prefix is applied to
+               every fragment for the families that use it, exactly as llama.cpp does. */
             const bool first = !primed;
             const std::string turn_text = first
-                ? "<|system|>\n" + system_prompt + "</s>\n<|user|>\n" + line + "</s>\n<|assistant|>\n"
-                : "\n<|user|>\n" + line + "</s>\n<|assistant|>\n";
-            turn = tok.encode(turn_text, /*add_bos=*/first, /*add_eos=*/false,
-                /*parse_special=*/true, /*allow_space_prefix=*/true);
+                ? fmt.first_turn(system_prompt, line)
+                : fmt.next_turn(line);
+            turn = tok.encode(turn_text, /*add_bos=*/first && fmt.add_bos_on_first_turn(),
+                /*add_eos=*/false, /*parse_special=*/true, /*allow_space_prefix=*/true);
         }
         else
         {
@@ -412,7 +440,7 @@ int chat_loop(infer_net& net, hf_tokenizer& tok,
 
         /* Erase the indicator and print the complete answer in its place. */
         cout << "\r" << std::string(20, ' ') << "\r";
-        cout << "Model: " << tok.decode(out_toks, true) << "\n\n";
+        cout << "Model: " << fmt.clean_answer(tok.decode(out_toks, true)) << "\n\n";
     }
     }
     catch (const std::exception& e)
@@ -649,9 +677,9 @@ int main(int argc, char** argv)
         parser.add_option("prompt", "Prompt used by --probe-logits (default: 'The capital of France is')", 1);
         parser.add_option("probe-ids", "Print next-token predictions for an explicit space-separated id list", 1);
         parser.add_option("context", "KV cache length for --chat (default: 512)", 1);
-        parser.add_option("temperature", "Sampling temperature (default: 0.8)", 1);
-        parser.add_option("top-k", "Top-k filter (default: 40)", 1);
-        parser.add_option("top-p", "Nucleus threshold (default: 0.9)", 1);
+        parser.add_option("temperature", "Sampling temperature (default: model template preset)", 1);
+        parser.add_option("top-k", "Top-k filter (default: model template preset)", 1);
+        parser.add_option("top-p", "Nucleus threshold (default: model template preset)", 1);
         parser.add_option("min-p", "Relative min-p threshold (default: 0.05)", 1);
         parser.add_option("repeat-penalty", "Repetition penalty (default: 1.1)", 1);
         parser.add_option("deterministic", "Greedy decoding (argmax)");
@@ -667,17 +695,18 @@ int main(int argc, char** argv)
         {
 #ifdef WITH_IMPORTED_MODEL
             return run_chat_dat(parser.option("load").argument(),
-                get_option(parser, "temperature", 0.8),
-                get_option(parser, "top-k", size_t(40)),
-                get_option(parser, "top-p", 0.9f),
-                get_option(parser, "min-p", 0.05f),
-                get_option(parser, "repeat-penalty", 1.1f),
+                get_option(parser, "temperature", -1.0),
+                get_option(parser, "top-k", size_t(0)),
+                get_option(parser, "top-p", -1.0f),
+                get_option(parser, "min-p", -1.0f),
+                get_option(parser, "repeat-penalty", -1.0f),
                 parser.option("deterministic"),
                 get_option(parser, "context", long(512)),
                 /*use_template=*/!parser.option("raw"),
                 get_option(parser, "system", std::string("You are a helpful assistant.")));
 #else
-            cerr << "This build has no model header compiled in; rebuild with WITH_IMPORTED_MODEL.\n";
+            cerr << "This build has no model header compiled in; generate slm_imported_model.h\n"
+                 << "(run with --out-prefix slm_imported_model) and rebuild the target.\n";
             return 1;
 #endif
         }
@@ -688,7 +717,7 @@ int main(int argc, char** argv)
             parser.print_options();
             cout << "\nExamples:\n"
                  << "  Phase 1 (generate header + tokenizer, any build):\n    " << argv[0]
-                 << " --input tinyllama-1.1b-chat-v1.0.Q8_0.gguf --out-prefix imported_model\n"
+                 << " --input tinyllama-1.1b-chat-v1.0.Q8_0.gguf --out-prefix slm_imported_model\n"
                  << "  Phase 2 (built with WITH_IMPORTED_MODEL):\n    " << argv[0]
                  << " --input tinyllama-1.1b-chat-v1.0.Q8_0.gguf --probe-logits --prompt \"The capital of France is\"\n    " << argv[0]
                  << " --input tinyllama-1.1b-chat-v1.0.Q8_0.gguf --convert\n    " << argv[0]
@@ -710,7 +739,7 @@ int main(int argc, char** argv)
         /* Every produced file defaults to the model identity (sanitized general.name), so
            successive imports of different models do not overwrite one another. The header
            used by this example's own build is regenerated with an explicit
-           --out-prefix imported_model. */
+           --out-prefix slm_imported_model. */
         const string prefix = parser.option("out-prefix")
             ? parser.option("out-prefix").argument() : model_identifier(spec);
 
@@ -732,11 +761,11 @@ int main(int argc, char** argv)
 
             if (parser.option("chat"))
                 return run_chat(g, spec, lopt,
-                    get_option(parser, "temperature", 0.8),
-                    get_option(parser, "top-k", size_t(40)),
-                    get_option(parser, "top-p", 0.9f),
-                    get_option(parser, "min-p", 0.05f),
-                    get_option(parser, "repeat-penalty", 1.1f),
+                    get_option(parser, "temperature", -1.0),
+                    get_option(parser, "top-k", size_t(0)),
+                    get_option(parser, "top-p", -1.0f),
+                    get_option(parser, "min-p", -1.0f),
+                    get_option(parser, "repeat-penalty", -1.0f),
                     parser.option("deterministic"),
                     get_option(parser, "context", long(512)),
                     /*use_template=*/!parser.option("raw"),
@@ -752,11 +781,9 @@ int main(int argc, char** argv)
                 get_option(parser, "prompt", std::string("The capital of France is")));
 #else
             cerr << "This build has no model header compiled in.\n"
-                 << "Generate it first (run with --out-prefix imported_model), then reconfigure\n"
-                 << "with the CMake option enabled and rebuild:\n"
-                 << "    cmake -S . -B build -DWITH_IMPORTED_MODEL=ON\n"
-                 << "    cmake --build build --config Release\n"
-                 << "(/bigobj is added by the example CMakeLists on MSVC).\n";
+                 << "Generate it first (run with --out-prefix slm_imported_model), then rebuild\n"
+                 << "the target: the header is detected and included automatically\n"
+                 << "(/bigobj is required on MSVC).\n";
             return 1;
 #endif
         }

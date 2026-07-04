@@ -7,6 +7,7 @@
 #include "tokenizer/tokenizer_kernel_c.h"
 #include "tokenizer/bpe_tokenizer.h"
 #include "tokenizer/hf_tokenizer.h"
+#include "tokenizer/chat_template.h"
 
 namespace dlib
 {
