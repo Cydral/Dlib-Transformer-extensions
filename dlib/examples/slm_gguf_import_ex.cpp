@@ -53,6 +53,7 @@
 #include <dlib/data_io/gguf_dequantize.h>
 #include <dlib/data_io/gguf_model_spec.h>
 #include <dlib/tokenizer/hf_tokenizer.h>
+#include <dlib/tokenizer/chat_template.h>
 
 /* The model-dependent half of this program (probes, conversion, chat) compiles only
    when the generated model header is present. __has_include acts as the build switch:
@@ -76,7 +77,6 @@
 #  include <ctime>
 #  include <dlib/dnn.h>
 #  include <dlib/data_io/gguf_weight_loader.h>
-#  include <dlib/tokenizer/chat_template.h>
 #  include IMPORTED_MODEL_HEADER
 #endif
 
@@ -122,13 +122,43 @@ void extract_tokenizer(const gguf_reader& g, const string& out_path, const strin
     /* Show how the chat-template markers tokenize: a single id means a dedicated special
        token, several ids mean an ordinary subword sequence (the case for the standard
        Llama-2 vocabulary, which has no dedicated chat markers). */
-    cout << "\nChat-template markers:\n";
-    for (const string& m : { string("<|user|>"), string("<|assistant|>"), string("<|system|>") })
+    /* Report the conversation-format detection: the template the model declares when
+       the container carries one, otherwise the eos-piece fallback. A model fine-tuned
+       on a format its container does not declare (e.g. Guanaco on old GGUFs) cannot be
+       identified here; chat with --template to force the right family. The marker
+       tokenizations show how the detected family's delimiters map onto this
+       vocabulary (single ids for genuine special tokens, several for plain text). */
+    const chat_template_formatter fmt = chat_template_formatter::for_tokenizer(tok);
+    cout << "\nChat template       : " << chat_template_formatter::name(fmt.kind())
+         << (tok.chat_template().empty()
+             ? " (fallback from the eos piece; none declared by the model)"
+             : " (declared by the model)") << "\n";
+    std::vector<string> markers;
+    switch (fmt.kind())
     {
-        const std::vector<int> ids = tok.encode(m, /*add_bos=*/false, /*add_eos=*/false);
-        cout << "  \"" << m << "\" -> " << ids.size() << (ids.size() == 1 ? " token  [" : " tokens [");
-        for (size_t i = 0; i < ids.size(); ++i) cout << (i ? " " : "") << ids[i];
-        cout << "]\n";
+    case chat_template_kind::zephyr:
+        markers = { "<|user|>", "<|assistant|>", "<|system|>", "</s>" };
+        break;
+    case chat_template_kind::chatml:
+        markers = { "<|im_start|>", "<|im_end|>", "<think>" };
+        break;
+    case chat_template_kind::guanaco:
+        markers = { "### Human:", "### Assistant:" };
+        break;
+    default:
+        break;
+    }
+    if (!markers.empty())
+    {
+        cout << "Template markers:\n";
+        for (const string& m : markers)
+        {
+            const std::vector<int> ids = tok.encode(m, /*add_bos=*/false, /*add_eos=*/false,
+                /*parse_special=*/true, /*allow_space_prefix=*/false);
+            cout << "  \"" << m << "\" -> " << ids.size() << (ids.size() == 1 ? " token  [" : " tokens [");
+            for (size_t i = 0; i < ids.size(); ++i) cout << (i ? " " : "") << ids[i];
+            cout << "]\n";
+        }
     }
 
     ofstream out(out_path, ios::binary);
@@ -199,20 +229,49 @@ void validate_weights(gguf_reader& g, const model_spec& spec)
          << "Shape mismatches    : " << mismatched << "\n"
          << "Total parameters    : " << total_params << "\n";
 
-    /* Exercise the dequantizer on a representative weight and report basic statistics,
-       a cheap sanity check that the values land in a plausible range. */
-    const gguf_tensor_info* sample = g.find_tensor("blk.0.attn_q.weight");
-    if (sample)
+    /* Exercise the dequantizer on tensors spread across the whole data section and
+       report basic statistics. Weight values of a trained model land in a narrow,
+       plausible range (rms typically 1e-2..1, |min|,|max| below ~30, mean near 0);
+       a misread data offset corrupts every tensor past the drift point, so sampling
+       the first, middle and last blocks plus the embedding and output tensors makes
+       positional file-reading faults directly visible. */
     {
-        std::vector<float> w;
-        gguf_read_dequantized(g, *sample, w);
-        float mn = w.empty() ? 0.f : w[0], mx = mn;
-        double sum = 0.0, sumsq = 0.0;
-        for (float v : w) { mn = std::min(mn, v); mx = std::max(mx, v); sum += v; sumsq += double(v) * v; }
-        const double mean = w.empty() ? 0.0 : sum / w.size();
-        const double rms = w.empty() ? 0.0 : std::sqrt(sumsq / w.size());
-        cout << "Dequantized sample  : blk.0.attn_q.weight (" << w.size() << " values)\n"
-             << "  min " << mn << "  max " << mx << "  mean " << mean << "  rms " << rms << "\n";
+        const long last = spec.n_layers - 1;
+        const long mid = spec.n_layers / 2;
+        const std::string names[] = {
+            "token_embd.weight",
+            "blk.0.attn_q.weight",
+            "blk." + std::to_string(mid) + ".attn_output.weight",
+            "blk." + std::to_string(mid) + ".ffn_down.weight",
+            "blk." + std::to_string(last) + ".ffn_up.weight",
+            "blk." + std::to_string(last) + ".attn_v.weight",
+            "output_norm.weight",
+            spec.tied_embeddings ? std::string() : std::string("output.weight")
+        };
+        cout << "Dequantized samples (type, count, min, max, mean, rms):\n";
+        for (const std::string& name : names)
+        {
+            if (name.empty()) continue;
+            const gguf_tensor_info* t = g.find_tensor(name);
+            if (!t) continue;
+            std::vector<float> w;
+            gguf_read_dequantized(g, *t, w);
+            float mn = w.empty() ? 0.f : w[0], mx = mn;
+            double sum = 0.0, sumsq = 0.0;
+            bool finite = true;
+            for (float v : w)
+            {
+                if (!std::isfinite(v)) finite = false;
+                mn = std::min(mn, v); mx = std::max(mx, v);
+                sum += v; sumsq += double(v) * v;
+            }
+            const double mean = w.empty() ? 0.0 : sum / w.size();
+            const double rms = w.empty() ? 0.0 : std::sqrt(sumsq / w.size());
+            cout << "  " << name << " : type " << static_cast<uint32_t>(t->type)
+                 << ", " << w.size() << " values, min " << mn << ", max " << mx
+                 << ", mean " << mean << ", rms " << rms
+                 << (finite ? "" : "  [NON-FINITE VALUES]") << "\n";
+        }
     }
 
     if (missing == 0 && mismatched == 0)
@@ -277,17 +336,22 @@ int pick_next(const tensor& probs, const std::vector<int>& recent, bool determin
 int chat_loop(generator_type& generator, hf_tokenizer& tok,
     double temperature, size_t top_k, float top_p,
     float min_p, float repeat_penalty, bool deterministic, long ctx_len, bool use_template,
-    const std::string& system_prompt)
+    const std::string& system_prompt, const std::string& template_override, bool offload_params)
 {
     const int eos = tok.eos_id();
 
     /* Model-aware conversation formatting. The template family is detected from the
-       tokenizer itself (the eos piece identifies it), so the same logic covers both
-       the GGUF import path and the .dat loading path. Sampling values left unset on
-       the command line fall back to the family's published presets. */
-    const chat_template_formatter fmt = use_template
-        ? chat_template_formatter::for_tokenizer(tok)
-        : chat_template_formatter(chat_template_kind::raw);
+       chat template the model declares (falling back to the eos piece), so the same
+       logic covers both the GGUF import path and the .dat loading path. Models whose
+       container declares nothing usable can force a family through the override (e.g.
+       guanaco, undetectable on old GGUFs). Sampling values left unset on the command
+       line fall back to the family's published presets. */
+    const chat_template_formatter fmt = !use_template
+        ? chat_template_formatter(chat_template_kind::raw)
+        : (template_override.empty() || template_override == "auto")
+            ? chat_template_formatter::for_tokenizer(tok)
+            : chat_template_formatter::for_tokenizer(tok,
+                  chat_template_formatter::from_name(template_override));
     if (use_template)
         cout << "Chat template: " << chat_template_formatter::name(fmt.kind()) << "\n";
 
@@ -301,6 +365,11 @@ int chat_loop(generator_type& generator, hf_tokenizer& tok,
     layer<1>(generator).layer_details().set_multiply_value(1.0f / temp);
 
     network_context::reset();
+    /* Host residency for the layer parameters (simulated unified memory): must be set
+       after reset() and after the generator holds the weights, and before the first
+       forward, so the capture happens on real weights during inference only. */
+    if (offload_params)
+        network_context::set_parameter_residency(network_context::parameter_residency::host_f32);
     network_context::set_kv_cache_capacity(ctx_len);
     /* Clear the KV cache before the first prefill. The weight-import allocation pass
        leaves one dummy token in the attention caches; run_probe clears it the same way.
@@ -418,11 +487,18 @@ int chat_loop(generator_type& generator, hf_tokenizer& tok,
         }
 
         std::vector<int> out_toks;
+        const std::string stop = fmt.stop_string();
         for (int i = 0; i < max_response; ++i)
         {
             if (nxt == eos) break;
             ctx.push_back(nxt);
             out_toks.push_back(nxt);
+            /* Some template families end a turn by starting the next one instead of
+               emitting eos; stop as soon as the marker appears in the decoded answer.
+               The marker tokens already fed remain in the KV cache; the eos closing
+               below still seals the turn, and clean_answer trims the display. */
+            if (!stop.empty() && tok.decode(out_toks, true).find(stop) != std::string::npos)
+                break;
             static const char* const dots[] = { ".  ", ".. ", "..." };
             cout << "\rModel: thinking" << dots[(i / 8) % 3] << std::flush;
             matrix<int, 0, 1> step(1, 1);
@@ -466,7 +542,7 @@ int chat_loop(generator_type& generator, hf_tokenizer& tok,
 int run_chat(gguf_reader& g, const model_spec& spec, const gguf_load_options& lopt,
     double temperature, size_t top_k, float top_p,
     float min_p, float repeat_penalty, bool deterministic, long ctx_len, bool use_template,
-    const std::string& system_prompt)
+    const std::string& system_prompt, const std::string& template_override, bool offload_params)
 {
     if (!model_matches_header(spec))
     { cerr << "Error: model does not match the compiled-in header. Regenerate and recompile.\n"; return 1; }
@@ -478,31 +554,40 @@ int run_chat(gguf_reader& g, const model_spec& spec, const gguf_load_options& lo
     hf_tokenizer tok;
     tok.load_from_gguf(g);
     return chat_loop(generator, tok, temperature, top_k, top_p, min_p, repeat_penalty,
-        deterministic, ctx_len, use_template, system_prompt);
+        deterministic, ctx_len, use_template, system_prompt, template_override, offload_params);
 }
 
-/* Chat over a previously converted model: the network and the tokenizer are read back
-   from the .dat archive written by --convert, skipping the GGUF import entirely. The
-   archive must have been produced by a build compiled with the same model header. The
-   deserialized network lives in a scope that ends right after its layers are copied
-   into the generator, so a single copy of the parameters remains resident afterwards
-   (deserialization targets host memory; the device upload happens at the first
-   forward, after the temporary is gone). */
+/* Chat over a previously converted model: the parameters and the tokenizer are read
+   back from the .dat archive written by --convert, skipping the GGUF import entirely.
+   The archive carries the parameter subnet directly, deserialized straight
+   into the generator: no temporary network exists at any point, so peak memory equals
+   a single copy of the model. The archive must have been produced by a build compiled
+   with the same model header. */
 int run_chat_dat(const std::string& dat_path,
     double temperature, size_t top_k, float top_p,
     float min_p, float repeat_penalty, bool deterministic, long ctx_len, bool use_template,
-    const std::string& system_prompt)
+    const std::string& system_prompt, const std::string& template_override, bool offload_params)
 {
     generator_type generator(multiply_(1.0));
     hf_tokenizer tok;
+    cout << "Loading converted model from " << dat_path << " ...\n";
     {
-        infer_net net;
-        cout << "Loading converted model from " << dat_path << " ...\n";
-        deserialize(dat_path) >> net >> tok;
-        generator.subnet().subnet() = net.subnet();
+        std::ifstream fin(dat_path, std::ios::binary);
+        if (!fin) { cerr << "Error: cannot open " << dat_path << "\n"; return 1; }
+        std::string tag, model_name;
+        deserialize(tag, fin);
+        if (tag != "gguf_import_model")
+        {
+            cerr << "Error: '" << dat_path << "' is not a model archive produced by --convert; regenerate it.\n";
+            return 1;
+        }
+        deserialize(model_name, fin);
+        deserialize(generator.subnet().subnet(), fin);
+        deserialize(tok, fin);
+        cout << "Model: " << model_name << "\n";
     }
     return chat_loop(generator, tok, temperature, top_k, top_p, min_p, repeat_penalty,
-        deterministic, ctx_len, use_template, system_prompt);
+        deterministic, ctx_len, use_template, system_prompt, template_override, offload_params);
 }
 
 /* Print the most probable next tokens for a prompt's last position. Compare these with a
@@ -520,7 +605,11 @@ int run_probe(gguf_reader& g, const model_spec& spec, const gguf_load_options& l
     hf_tokenizer tok;
     tok.load_from_gguf(g);
 
-    std::vector<int> toks = tok.encode(prompt, /*add_bos=*/true, /*add_eos=*/false);
+    /* Tokenize with the model's own declared conventions (tokenizer.ggml.add_bos_token
+       and friends). Forcing a BOS is wrong for models that declare none: SmolLM2's id 1
+       is <|im_start|>, a chat control token never seen followed by raw text during
+       training, so prepending it puts the probe out of distribution. */
+    std::vector<int> toks = tok.encode(prompt);
     matrix<int, 0, 1> in(static_cast<long>(toks.size()), 1);
     for (long i = 0; i < static_cast<long>(toks.size()); ++i) in(i) = toks[i];
 
@@ -654,8 +743,15 @@ int run_convert(gguf_reader& g, const model_spec& spec, const gguf_load_options&
     hf_tokenizer tok;
     tok.load_from_gguf(g);
 
+    /* Archive format: a format tag, the model name, the parameter-bearing subnet
+       (the loss head carries no parameters) and the tokenizer. Serializing the subnet
+       rather than the full loss network lets --load deserialize straight into the
+       generator, so a single copy of the parameters is ever allocated; the alternative of
+       serializing the full network would need a temporary at load time, transiently
+       doubling the pinned host memory. */
     cout << "Serializing model to " << out_path << " ...\n";
-    serialize(out_path) << net << tok;
+    serialize(out_path) << std::string("gguf_import_model") << spec.model_name
+                        << net.subnet() << tok;
     cout << "Done. Wrote " << out_path << "\n";
     return 0;
 }
@@ -692,6 +788,8 @@ int main(int argc, char** argv)
         parser.add_option("deterministic", "Greedy decoding (argmax)");
         parser.add_option("raw", "Chat without the chat template (raw text completion)");
         parser.add_option("system", "System prompt used by --chat (default: a helpful assistant)", 1);
+        parser.add_option("template", "Chat template override: auto, zephyr, chatml, guanaco (default: auto)", 1);
+        parser.add_option("offload-params", "Keep supported layer parameters in host memory and materialize them per layer (lowers VRAM)");
         parser.add_option("rope-permute", "Permute Q/K rows from split-half (NeoX) to interleaved RoPE ordering; leave off for llama-family GGUFs, expected for NeoX-convention architectures");
         parser.add_option("swap-gate-up", "Swap ffn_gate / ffn_up assignment (weight-loader knob)");
         parser.parse(argc, argv);
@@ -710,7 +808,9 @@ int main(int argc, char** argv)
                 parser.option("deterministic"),
                 get_option(parser, "context", long(512)),
                 /*use_template=*/!parser.option("raw"),
-                get_option(parser, "system", std::string("You are a helpful assistant.")));
+                get_option(parser, "system", std::string("You are a helpful assistant.")),
+                get_option(parser, "template", std::string("auto")),
+                parser.option("offload-params"));
 #else
             cerr << "This build has no model header compiled in; generate slm_imported_model.h\n"
                  << "(run with --out-prefix slm_imported_model) and rebuild the target.\n";
@@ -776,7 +876,9 @@ int main(int argc, char** argv)
                     parser.option("deterministic"),
                     get_option(parser, "context", long(512)),
                     /*use_template=*/!parser.option("raw"),
-                    get_option(parser, "system", std::string("You are a helpful assistant.")));
+                    get_option(parser, "system", std::string("You are a helpful assistant.")),
+                    get_option(parser, "template", std::string("auto")),
+                parser.option("offload-params"));
 
             if (parser.option("convert"))
                 return run_convert(g, spec, lopt, prefix + ".dat");

@@ -157,6 +157,10 @@ namespace dlib
             v.add_space_prefix = g.has("tokenizer.ggml.add_space_prefix")
                 ? (g.get_int("tokenizer.ggml.add_space_prefix") != 0) : true;
             v.pretokenizer = g.get_str("tokenizer.ggml.pre", "");
+            /* The declared chat template travels with the tokenizer so any program
+               (including one loading a serialized model archive) can identify the
+               conversation format without the source container. */
+            chat_template_ = g.get_str("tokenizer.chat_template", "");
 
             load(v);
         }
@@ -165,6 +169,12 @@ namespace dlib
         kind type() const { return kind_; }
         int bos_id() const { return bos_; }
         int eos_id() const { return eos_; }
+
+        // The chat template declared by the source model (raw Jinja string from
+        // tokenizer.chat_template), or an empty string when the model declares none.
+        // Persisted with the tokenizer, so it survives model archive round-trips;
+        // chat_template_formatter fingerprints it to select the conversation format.
+        const std::string& chat_template() const { return chat_template_; }
         int unk_id() const { return unk_; }
         int pad_id() const { return pad_; }
         bool add_bos_default() const { return add_bos_; }
@@ -194,7 +204,7 @@ namespace dlib
 
         friend void serialize(const hf_tokenizer& t, std::ostream& out)
         {
-            dlib::serialize(std::string("hf_tokenizer_v2"), out);
+            dlib::serialize(std::string("hf_tokenizer"), out);
             dlib::serialize(static_cast<int>(t.kind_), out);
             dlib::serialize(t.id_to_token_, out);
             dlib::serialize(t.scores_, out);
@@ -208,13 +218,14 @@ namespace dlib
             dlib::serialize(t.add_eos_, out);
             dlib::serialize(t.add_space_prefix_, out);
             dlib::serialize(t.pre_, out);
+            dlib::serialize(t.chat_template_, out);
         }
 
         friend void deserialize(hf_tokenizer& t, std::istream& in)
         {
             std::string version;
             dlib::deserialize(version, in);
-            if (version != "hf_tokenizer_v2")
+            if (version != "hf_tokenizer")
                 throw serialization_error("hf_tokenizer: unexpected version '" + version + "'");
             int k = 0;
             dlib::deserialize(k, in);
@@ -231,6 +242,7 @@ namespace dlib
             dlib::deserialize(t.add_eos_, in);
             dlib::deserialize(t.add_space_prefix_, in);
             dlib::deserialize(t.pre_, in);
+            dlib::deserialize(t.chat_template_, in);
             t.finalize();
         }
 
@@ -310,27 +322,30 @@ namespace dlib
             return false;
         }
 
-        /* Split the raw text on special pieces, encoding the spans in between. Matching
-           SentencePiece (and llama.cpp), the dummy space prefix is applied to every text
-           fragment, including those that follow a special token, whenever the caller allows
-           it; pass allow_space_prefix=false to suppress it entirely (for a raw continuation
-           that is not preceded by a special token). */
+        /* Split the raw text on special pieces, encoding the spans in between. The dummy
+           space prefix (SentencePiece) is applied only to the first text fragment, and only
+           when the caller allows it; a continuation turn passes allow_space_prefix=false so no
+           leading space token is inserted mid-conversation. */
         void encode_text(const std::string& text, bool parse_special, bool allow_space_prefix,
             std::vector<int>& out) const
         {
             if (!parse_special || special_pieces_.empty())
             {
-                encode_fragment(text, allow_space_prefix, out);
+                encode_fragment(text, true, allow_space_prefix, out);
                 return;
             }
             size_t pos = 0, frag_start = 0;
+            bool first = true;
             while (pos < text.size())
             {
                 int sid = -1; size_t slen = 0;
                 if (match_special(text, pos, sid, slen))
                 {
                     if (pos > frag_start)
-                        encode_fragment(text.substr(frag_start, pos - frag_start), allow_space_prefix, out);
+                    {
+                        encode_fragment(text.substr(frag_start, pos - frag_start), first, allow_space_prefix, out);
+                        first = false;
+                    }
                     out.push_back(sid);
                     pos += slen;
                     frag_start = pos;
@@ -338,14 +353,14 @@ namespace dlib
                 else ++pos;
             }
             if (frag_start < text.size())
-                encode_fragment(text.substr(frag_start), allow_space_prefix, out);
+                encode_fragment(text.substr(frag_start), first, allow_space_prefix, out);
         }
 
-        void encode_fragment(const std::string& frag, bool allow_space_prefix,
+        void encode_fragment(const std::string& frag, bool first, bool allow_space_prefix,
             std::vector<int>& out) const
         {
             std::vector<int> ids = (kind_ == kind::spm)
-                ? encode_spm(frag, allow_space_prefix && add_space_prefix_)
+                ? encode_spm(frag, first && allow_space_prefix && add_space_prefix_)
                 : encode_bpe(frag);
             out.insert(out.end(), ids.begin(), ids.end());
         }
@@ -644,6 +659,7 @@ namespace dlib
         int bos_ = -1, eos_ = -1, unk_ = -1, pad_ = -1;
         bool add_bos_ = false, add_eos_ = false, add_space_prefix_ = true;
         std::string pre_;
+        std::string chat_template_;   // raw declared chat template (may be empty)
 
         /* Derived, rebuilt by finalize(); not serialized. */
         std::unordered_map<std::string, int> token_to_id_;

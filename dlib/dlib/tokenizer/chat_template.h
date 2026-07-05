@@ -29,7 +29,7 @@
 
 namespace dlib
 {
-    enum class chat_template_kind { raw, zephyr, chatml };
+    enum class chat_template_kind { raw, zephyr, chatml, guanaco };
 
     class chat_template_formatter
     {
@@ -58,10 +58,19 @@ namespace dlib
 
         explicit chat_template_formatter(chat_template_kind k) : kind_(k) {}
 
-        // Identify the template family from the tokenizer's eos piece. Falls back to
-        // raw when the piece matches no known family.
+        // Identify the template family. The primary criterion is the chat template the
+        // model itself declares (persisted with the tokenizer): fingerprinting its
+        // marker strings follows the reference implementation's approach and tracks
+        // whatever format the model was actually fine-tuned with. When no template is
+        // declared, the text of the eos special token is used as a fallback heuristic.
         static chat_template_kind detect(const hf_tokenizer& tok)
         {
+            const std::string& tpl = tok.chat_template();
+            if (!tpl.empty())
+            {
+                if (tpl.find("<|im_start|>") != std::string::npos) return chat_template_kind::chatml;
+                if (tpl.find("<|user|>") != std::string::npos)     return chat_template_kind::zephyr;
+            }
             const std::vector<int> one{ tok.eos_id() };
             const std::string piece = tok.decode(one, /*skip_special=*/false);
             if (piece == "<|im_end|>") return chat_template_kind::chatml;
@@ -71,7 +80,15 @@ namespace dlib
 
         static chat_template_formatter for_tokenizer(const hf_tokenizer& tok)
         {
-            chat_template_formatter fmt(detect(tok));
+            return for_tokenizer(tok, detect(tok));
+        }
+
+        // Same as above with the template kind forced by the caller, for models whose
+        // container declares no template and whose fallback detection is wrong (e.g.
+        // Guanaco fine-tunes carried by old GGUFs).
+        static chat_template_formatter for_tokenizer(const hf_tokenizer& tok, chat_template_kind forced)
+        {
+            chat_template_formatter fmt(forced);
             if (fmt.kind_ == chat_template_kind::chatml)
             {
                 /* ChatML covers both reasoning models (Qwen3) and plain instruct models
@@ -85,12 +102,23 @@ namespace dlib
             return fmt;
         }
 
+        // Parse a template name ("raw", "zephyr", "chatml", "guanaco"); anything else
+        // yields raw.
+        static chat_template_kind from_name(const std::string& n)
+        {
+            if (n == "zephyr")  return chat_template_kind::zephyr;
+            if (n == "chatml")  return chat_template_kind::chatml;
+            if (n == "guanaco") return chat_template_kind::guanaco;
+            return chat_template_kind::raw;
+        }
+
         static const char* name(chat_template_kind k)
         {
             switch (k)
             {
-            case chat_template_kind::zephyr: return "zephyr";
-            case chat_template_kind::chatml: return "chatml";
+            case chat_template_kind::zephyr:  return "zephyr";
+            case chat_template_kind::chatml:  return "chatml";
+            case chat_template_kind::guanaco: return "guanaco";
             default:                         return "raw";
             }
         }
@@ -101,7 +129,8 @@ namespace dlib
         // conversations start with BOS; ChatML models (Qwen) use no leading BOS.
         bool add_bos_on_first_turn() const
         {
-            return kind_ == chat_template_kind::zephyr;
+            return kind_ == chat_template_kind::zephyr
+                || kind_ == chat_template_kind::guanaco;
         }
 
         // The immutable conversation prefix: BOS-side system block. Generation loops
@@ -115,6 +144,10 @@ namespace dlib
                 return "<|system|>\n" + system_prompt + "</s>\n";
             case chat_template_kind::chatml:
                 return "<|im_start|>system\n" + system_prompt + "<|im_end|>\n";
+            case chat_template_kind::guanaco:
+                /* Guanaco has no formal system block; a leading instruction followed by
+                   a blank line is the common usage. */
+                return system_prompt.empty() ? std::string() : system_prompt + "\n\n";
             default:
                 return std::string();
             }
@@ -132,6 +165,9 @@ namespace dlib
                 return system_prefix(system_prompt)
                     + "<|im_start|>user\n" + user_text + "<|im_end|>\n"
                     + assistant_header();
+            case chat_template_kind::guanaco:
+                return system_prefix(system_prompt)
+                    + "### Human: " + user_text + "\n### Assistant:";
             default:
                 return user_text;
             }
@@ -149,26 +185,53 @@ namespace dlib
             case chat_template_kind::chatml:
                 return "\n<|im_start|>user\n" + user_text + "<|im_end|>\n"
                     + assistant_header();
+            case chat_template_kind::guanaco:
+                return "\n### Human: " + user_text + "\n### Assistant:";
             default:
                 return user_text;
             }
         }
 
-        // Remove reasoning spans ("<think> ... </think>") from a decoded answer and
-        // trim the leading whitespace they leave behind. No-op for non-chatml kinds.
+        // Remove template artifacts from a decoded answer: reasoning spans for chatml
+        // ("<think> ... </think>"), and anything from a leaked next-turn marker onward
+        // for guanaco (these models often start the next "### Human:" turn instead of
+        // emitting eos). Leading and trailing whitespace left behind is trimmed.
         std::string clean_answer(std::string text) const
         {
-            if (kind_ != chat_template_kind::chatml) return text;
-            for (;;)
+            if (kind_ == chat_template_kind::chatml)
             {
-                const size_t b = text.find("<think>");
-                if (b == std::string::npos) break;
-                const size_t e = text.find("</think>", b);
-                if (e == std::string::npos) { text.erase(b); break; }
-                text.erase(b, e + 8 - b);
+                for (;;)
+                {
+                    const size_t b = text.find("<think>");
+                    if (b == std::string::npos) break;
+                    const size_t e = text.find("</think>", b);
+                    if (e == std::string::npos) { text.erase(b); break; }
+                    text.erase(b, e + 8 - b);
+                }
+            }
+            else if (kind_ == chat_template_kind::guanaco)
+            {
+                const size_t b = text.find("###");
+                if (b != std::string::npos) text.erase(b);
+            }
+            else
+            {
+                return text;
             }
             const size_t p = text.find_first_not_of(" \t\r\n");
-            return p == std::string::npos ? std::string() : text.substr(p);
+            if (p == std::string::npos) return std::string();
+            const size_t q = text.find_last_not_of(" \t\r\n");
+            return text.substr(p, q - p + 1);
+        }
+
+        // Text whose appearance in the generated answer must stop the generation, or an
+        // empty string when eos is the only stop condition. Guanaco models frequently
+        // end a turn by opening a new "### ..." section instead of emitting eos, and
+        // the section name varies ("### Human:", "### Interaction:", ...), so any
+        // section opening on a fresh line stops the turn.
+        std::string stop_string() const
+        {
+            return kind_ == chat_template_kind::guanaco ? "\n###" : std::string();
         }
 
         // Sampling presets matching the model family's published recommendations.

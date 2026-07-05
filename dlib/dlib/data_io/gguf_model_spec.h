@@ -43,6 +43,9 @@ namespace dlib
         long ffn_num = 0, ffn_den = 1;          // d_ffn = d_model * ffn_num / ffn_den (reduced)
         double rms_eps = 1e-5, rope_freq_base = 10000.0;
         long n_experts = 0, n_experts_used = 0; // > 0 => mixture of experts
+        std::string rope_scaling_type;          // "", "none", "linear" or "yarn"
+        double rope_scaling_factor = 0.0;       // position scaling factor when declared
+        long rope_orig_ctx = 0;                 // original context length when declared
         bool tied_embeddings = false;           // no separate output.weight tensor
         bool quantized = false;                 // at least one tensor is neither F32 nor F16
         bool qk_norm = false;                   // per-head RMSNorm on Q and K (Qwen3)
@@ -94,6 +97,19 @@ namespace dlib
         }
         s.rms_eps    = g.get_double(p + ".attention.layer_norm_rms_epsilon", 1e-5);
         s.rope_freq_base = g.get_double(p + ".rope.freq_base", 10000.0);
+        /* RoPE position scaling. Modern GGUFs declare it under rope.scaling.*; older
+           files carry the legacy rope.scale_linear factor. llama.cpp applies a linear
+           factor to every position, so ignoring a declared scaling silently diverges
+           from the reference; the compatibility check below turns it into a blocker
+           until the corresponding support lands in the rotary layer. */
+        s.rope_scaling_type = g.get_str(p + ".rope.scaling.type", "");
+        s.rope_scaling_factor = g.get_double(p + ".rope.scaling.factor", 0.0);
+        s.rope_orig_ctx = static_cast<long>(g.get_int(p + ".rope.scaling.original_context_length", 0));
+        if (s.rope_scaling_type.empty() && g.has(p + ".rope.scale_linear"))
+        {
+            s.rope_scaling_type = "linear";
+            s.rope_scaling_factor = g.get_double(p + ".rope.scale_linear", 0.0);
+        }
         s.n_experts  = static_cast<long>(g.get_int(p + ".expert_count", 0));
         s.n_experts_used = static_cast<long>(g.get_int(p + ".expert_used_count", 0));
 
@@ -157,6 +173,12 @@ namespace dlib
           << "Vocab size         : " << s.vocab_size << "\n"
           << "RMSNorm epsilon    : " << s.rms_eps << "\n"
           << "RoPE freq base     : " << s.rope_freq_base << "\n"
+          << "RoPE scaling       : "
+          << (s.rope_scaling_type.empty() || s.rope_scaling_type == "none"
+              ? std::string("none")
+              : s.rope_scaling_type + " (factor " + std::to_string(s.rope_scaling_factor)
+                + (s.rope_orig_ctx ? ", original ctx " + std::to_string(s.rope_orig_ctx) : "") + ")")
+          << "\n"
           << "Experts            : " << s.n_experts
           << (s.n_experts ? " (used " + std::to_string(s.n_experts_used) + ")" : "") << "\n"
           << "QK-Norm            : " << (s.qk_norm ? "yes" : "no") << "\n"
@@ -179,6 +201,12 @@ namespace dlib
             r.blockers.push_back("Gemma family needs (1+w) RMSNorm, embedding scaling and GeGLU, not available yet");
         if (s.n_experts > 0)
             r.blockers.push_back("MoE routing convention must be aligned with moe_ before enabling import");
+        if (s.rope_scaling_type == "linear" && s.rope_scaling_factor > 0.0)
+            r.blockers.push_back("declared linear RoPE scaling (factor "
+                + std::to_string(s.rope_scaling_factor)
+                + ") is applied to every position by the reference and is not supported yet");
+        if (s.rope_scaling_type == "yarn")
+            r.notes.push_back("declared YaRN RoPE scaling is not applied on import; sequences beyond the original context length will degrade");
         if (s.head_dim <= 0 || (s.head_dim % 2) != 0)
             r.blockers.push_back("head_dim must be even for RoPE");
         if (s.n_kv_heads <= 0 || (s.n_heads % s.n_kv_heads) != 0)

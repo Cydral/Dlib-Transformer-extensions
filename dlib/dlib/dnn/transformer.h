@@ -5,6 +5,9 @@
 
 #include "transformer_abstract.h"
 #include "layers.h"
+#include <cstring>
+#include <vector>
+#include <iostream> // TEMP: for the attention-row diagnostic
 
 namespace dlib
 {
@@ -222,6 +225,44 @@ namespace dlib
             return get_kv_cache_keep_length_();
         }
 
+        // Residency of the network parameters during inference. With `off` every layer
+        // keeps its parameters resident on the device. With `host_f32` the parameter
+        // tensors of the layers that support offloading are moved to host memory after
+        // their first inference forward, and each forward materializes the weights of
+        // the running layer just in time into a small pool of shared device buffers.
+        // Device memory for those parameters then drops to the pool size (twice the
+        // largest offloaded layer) whatever the number of layers, traded against one
+        // host-to-device transfer per layer and per forward. Inference-only: training
+        // mode ignores the setting. Enable it after the weights are loaded and before
+        // the first inference forward.
+        enum class parameter_residency { off, host_f32 };
+
+        static void set_parameter_residency(parameter_residency r)
+        {
+            std::lock_guard<std::mutex> lock(get_mutex_());
+            get_parameter_residency_() = r;
+            get_is_active_() = true;
+        }
+
+        static parameter_residency get_parameter_residency()
+        {
+            std::lock_guard<std::mutex> lock(get_mutex_());
+            return get_parameter_residency_();
+        }
+
+        // Shared pool of parameter materialization buffers, rotated across calls. Two
+        // buffers so a later increment can prefetch the next layer asynchronously while
+        // the current one computes; the synchronous path simply alternates. Single
+        // generation thread assumed, like the rest of the inference state.
+        static resizable_tensor& acquire_param_buffer()
+        {
+            static resizable_tensor buffers[2];
+            static int next = 0;
+            resizable_tensor& b = buffers[static_cast<size_t>(next)];
+            next = (next + 1) % 2;
+            return b;
+        }
+
         // Signals to all KV-cache-aware layers that any cached state should be
         // discarded on the next forward pass. The flag auto-resets after being
         // observed (each layer that consumes it during forward will set it back
@@ -276,6 +317,7 @@ namespace dlib
             get_inference_mode_() = inference_mode::training;
             get_kv_cache_capacity_() = 0;
             get_kv_cache_keep_length_() = 0;
+            get_parameter_residency_() = parameter_residency::off;
             get_kv_cache_clear_request_() = false;
             clear_padding_nolock_();
         }
@@ -323,6 +365,10 @@ namespace dlib
         }
         static long& get_kv_cache_keep_length_() {
             static long v = 0;
+            return v;
+        }
+        static parameter_residency& get_parameter_residency_() {
+            static parameter_residency v = parameter_residency::off;
             return v;
         }
         static bool& get_kv_cache_clear_request_() {
@@ -378,6 +424,50 @@ namespace dlib
         embeddings<num_embeddings, embedding_length, SUBNET>>;
 
     // ----------------------------------------------------------------------------------------
+
+    // ------------------------------------------------------------------------------------
+
+    class param_offload_store
+    {
+        /*!
+            WHAT THIS OBJECT REPRESENTS
+                Host-side rest storage for the parameters of one layer when the
+                network_context parameter residency is enabled. capture() moves the
+                layer's parameter tensor to host memory and releases its tensor
+                storage; materialize() copies the weights just in time into one of
+                the shared device buffers of network_context::acquire_param_buffer().
+                The returned buffer stays valid until the pool hands the same slot
+                out again, i.e. across one full layer forward when every layer
+                materializes at most once per pass.
+        !*/
+    public:
+
+        bool active() const { return !host_.empty(); }
+
+        void capture(resizable_tensor& params)
+        {
+            n_ = params.num_samples(); k_ = params.k(); nr_ = params.nr(); nc_ = params.nc();
+            host_.assign(params.host(), params.host() + params.size());
+            params.set_size(0, 0, 0, 0);
+            // TEMP diagnostic: prove the offload triggers and count the moved bytes.
+            std::cerr << "[offload] captured " << host_.size() * sizeof(float) / (1024.0 * 1024.0)
+                      << " MB to host\n";
+        }
+
+        const tensor& materialize() const
+        {
+            resizable_tensor& buf = network_context::acquire_param_buffer();
+            buf.set_size(n_, k_, nr_, nc_);
+            std::memcpy(buf.host(), host_.data(), host_.size() * sizeof(float));
+            return buf;   // the device upload happens on first device access
+        }
+
+    private:
+        std::vector<float> host_;
+        long n_ = 0, k_ = 0, nr_ = 0, nc_ = 0;
+    };
+
+    // ------------------------------------------------------------------------------------
 
     template <long EMBEDDING_DIM_, long NUM_HEADS_, long NUM_KV_HEADS_, long HEAD_DIM_,
         bool USE_QK_NORM_ = false>
@@ -442,6 +532,21 @@ namespace dlib
         {
             rope_q_helper_.get().set_theta_base(base);
             rope_k_helper_.get().set_theta_base(base);
+        }
+        float get_rope_theta_base() const
+        {
+            return rope_q_helper_.get().get_theta_base();
+        }
+        // Read one cosine value of the rotary cache at the given position, ensuring
+        // the cache covers it. A negative dim selects the last frequency dimension.
+        // Diagnostic accessor: cos(pos=1, dim=0) must equal cos(1) ~= 0.5403 for any
+        // theta base, and dim 1 discriminates the base numerically.
+        float get_rope_cos_probe(long pos, long dim)
+        {
+            rope_q_helper_.get().ensure_caches_at_least(pos + 1, HEAD_DIM);
+            const tensor& c = rope_q_helper_.get().get_cos_cache();
+            if (dim < 0 || dim >= c.nc()) dim = c.nc() - 1;
+            return c.host()[static_cast<size_t>(pos) * c.nc() + dim];
         }
 
         // KV cache state accessors
@@ -766,6 +871,28 @@ namespace dlib
         double weight_decay_multiplier_;
 
         // Embedded parameter-free layers
+        param_offload_store offload_;
+
+        /* Source of the weights for the inference forwards. When host residency is
+           active (inference modes only), the parameter tensor is captured to host
+           memory on first use and every forward reads a just-in-time materialization
+           from the shared buffer pool; bind the result once per forward, since the
+           pool slot is reused two acquisitions later. Training always reads the
+           resident tensor, so the optimizer semantics are untouched. */
+        const tensor& active_params()
+        {
+            using ctx = network_context;
+            if (ctx::get_parameter_residency() == ctx::parameter_residency::host_f32
+                && ctx::get_inference_mode() != ctx::inference_mode::training)
+            {
+                if (!offload_.active() && params.size() > 0)
+                    offload_.capture(params);
+                if (offload_.active())
+                    return offload_.materialize();
+            }
+            return params;
+        }
+
         layer_helper<rotary_positional_embedding_>  rope_q_helper_;
         layer_helper<rotary_positional_embedding_>  rope_k_helper_;
         layer_helper<tril_<0, neg_infinity_tag>>    tril_helper_;
@@ -927,10 +1054,11 @@ namespace dlib
             const long B = x.num_samples();
             const long N = x.nr();
 
-            auto wq = wq_alias(params, wq_offset);
-            auto wk = wk_alias(params, wk_offset);
-            auto wv = wv_alias(params, wv_offset);
-            auto wo = wo_alias(params, wo_offset);
+            const tensor& P = active_params();
+            auto wq = wq_alias(P, wq_offset);
+            auto wk = wk_alias(P, wk_offset);
+            auto wv = wv_alias(P, wv_offset);
+            auto wo = wo_alias(P, wo_offset);
 
             const float qk_scale = 1.0f / std::sqrt(static_cast<float>(HEAD_DIM));
 
@@ -970,8 +1098,8 @@ namespace dlib
             // re-applied wherever K is used (locally here, and on the window in incremental mode).
             if (USE_QK_NORM)
             {
-                auto gq = gamma_q_alias(params, gamma_q_offset);
-                auto gk = gamma_k_alias(params, gamma_k_offset);
+                auto gq = gamma_q_alias(P, gamma_q_offset);
+                auto gk = gamma_k_alias(P, gamma_k_offset);
                 tt::rms_normalize(qk_norm_eps_, saved_q_normed, qk_scale_q, saved_q_pre_rope, gq, true);
                 tt::rms_normalize(qk_norm_eps_, saved_k_normed, qk_scale_k, saved_k_pre_rope, gk, true);
                 rope_q_helper_.forward(saved_q_normed, saved_q_post_rope);
@@ -1050,6 +1178,29 @@ namespace dlib
             saved_attn.copy_size(scores_masked);
             tt::softmax(saved_attn, scores_masked, operation_mode::PLANE_WISE);
 
+            // TEMP DIAGNOSTIC: full head-0 attention rows for the first two layers on
+            // short prefills. At layer 0 the hidden states are the normalized token
+            // embeddings, so these rows directly test the imported Q/K weights and
+            // their rotary encoding: rows should be causal and structured, not flat.
+            {
+                static long dbg_N = -1;
+                static int  dbg_L = 0;
+                if (dbg_N != N) { dbg_N = N; dbg_L = 0; }
+                if (N > 1 && N <= 12 && dbg_L < 2)
+                {
+                    const float* aw = saved_attn.host();
+                    std::cerr << "[attn-rows L" << dbg_L << "] N=" << N << " head 0\n";
+                    for (long q = 0; q < N; ++q)
+                    {
+                        std::cerr << "  q" << q << ":";
+                        for (long k = 0; k <= q; ++k)
+                            std::cerr << ' ' << aw[tensor_index(saved_attn, 0, 0, q, k)];
+                        std::cerr << "\n";
+                    }
+                    ++dbg_L;
+                }
+            }
+
             // Step 8: attn @ V
             resizable_tensor ctx_4d(B, NUM_HEADS, N, HEAD_DIM);
             tt::gemm(0.0f, ctx_4d, 1.0f,
@@ -1096,10 +1247,11 @@ namespace dlib
             DLIB_CASSERT(x.nr() == 1, "Incremental mode expects exactly one new position");
             DLIB_CASSERT(cache_capacity_ > 0, "KV cache must be allocated before incremental");
 
-            auto wq = wq_alias(params, wq_offset);
-            auto wk = wk_alias(params, wk_offset);
-            auto wv = wv_alias(params, wv_offset);
-            auto wo = wo_alias(params, wo_offset);
+            const tensor& P = active_params();
+            auto wq = wq_alias(P, wq_offset);
+            auto wk = wk_alias(P, wk_offset);
+            auto wv = wv_alias(P, wv_offset);
+            auto wo = wo_alias(P, wo_offset);
 
             const float qk_scale = 1.0f / std::sqrt(static_cast<float>(HEAD_DIM));
 
@@ -1175,7 +1327,7 @@ namespace dlib
             inc_k_window_rope.copy_size(inc_k_window);
             if (USE_QK_NORM)
             {
-                auto gk = gamma_k_alias(params, gamma_k_offset);
+                auto gk = gamma_k_alias(P, gamma_k_offset);
                 tt::rms_normalize(qk_norm_eps_, inc_k_window_normed, inc_scale_k, inc_k_window, gk, true);
                 rope_k_helper_.forward(inc_k_window_normed, inc_k_window_rope);
             }
@@ -1207,7 +1359,7 @@ namespace dlib
             inc_q_rope.set_size(1, NUM_HEADS, 1, HEAD_DIM);
             if (USE_QK_NORM)
             {
-                auto gq = gamma_q_alias(params, gamma_q_offset);
+                auto gq = gamma_q_alias(P, gamma_q_offset);
                 tt::rms_normalize(qk_norm_eps_, inc_q_normed, inc_scale_q, inc_q, gq, true);
                 tt::copy_tensor(false, inc_q_rope, 0, inc_q_normed, 0, NUM_HEADS);
             }

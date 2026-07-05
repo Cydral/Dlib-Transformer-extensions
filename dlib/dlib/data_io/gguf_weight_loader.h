@@ -152,6 +152,28 @@ namespace dlib
             template <typename T> void set(T&, long) {}
             template <typename T> void operator()(T& layer) { set(layer, 0); }
         };
+
+        /* Reads back the RoPE state actually held by the first attention layer: the
+           theta base and three cosine values of the trig cache at position 1. Used by
+           the verbose import diagnostic; a member-template visitor must live at
+           namespace scope, since local classes cannot hold template members. */
+        struct rope_probe_reader
+        {
+            float* theta; float* c0; float* c1; float* cl;
+            template <typename T>
+            auto rd(T& layer, int) -> decltype((void)layer.get_rope_cos_probe(0, 0))
+            {
+                if (*theta < 0.0f)
+                {
+                    *theta = layer.get_rope_theta_base();
+                    *c0 = layer.get_rope_cos_probe(1, 0);
+                    *c1 = layer.get_rope_cos_probe(1, 1);
+                    *cl = layer.get_rope_cos_probe(1, -1);
+                }
+            }
+            template <typename T> void rd(T&, long) {}
+            template <typename T> void operator()(T& layer) { rd(layer, 0); }
+        };
     }
 
     template <typename net_type>
@@ -177,6 +199,20 @@ namespace dlib
             visit_computational_layers(net, cfg);
             norm_eps_setter neps{ spec.rms_eps };
             visit_computational_layers(net, neps);
+        }
+
+        /* Read back the RoPE state actually held by the first attention layer: the theta
+           base and three cosine values of the trig cache at position 1. cos(dim 0) must
+           equal cos(1) ~= 0.5403 whatever the base (that frequency is base^0 = 1); a
+           printed 1.0 means the rotation is effectively the identity. cos(dim 1) equals
+           cos(base^(-2/head_dim)) and therefore identifies the base numerically. */
+        if (opt.verbose)
+        {
+            float applied = -1.0f, c0 = 0, c1 = 0, cl = 0;
+            rope_probe_reader pr{ &applied, &c0, &c1, &cl };
+            visit_computational_layers(net, pr);
+            std::cout << "  RoPE theta applied : " << applied
+                      << "  cos@pos1: dim0=" << c0 << " dim1=" << c1 << " last=" << cl << "\n";
         }
 
         /* Allocate every parameter tensor with a single forward pass on one token. */
