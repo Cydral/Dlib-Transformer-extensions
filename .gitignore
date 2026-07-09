@@ -1,0 +1,4 @@
+build-cpu/
+build-cuda/
+*:Zone.Identifier
+*:sec.endpointdlp
