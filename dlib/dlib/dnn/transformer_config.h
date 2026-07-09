@@ -3,8 +3,9 @@
 #ifndef DLIB_DNN_TRANSFORMER_CONFIG_H_
 #define DLIB_DNN_TRANSFORMER_CONFIG_H_
 
-#include "../dlib/data_io.h"
+#include "input.h"
 #include "layers.h"
+#include "loss.h"
 
 namespace dlib
 {

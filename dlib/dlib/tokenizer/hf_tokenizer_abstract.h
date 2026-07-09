@@ -14,7 +14,7 @@
 #include <stdexcept>
 
 #include "hf_tokenizer_abstract.h"
-#include "../data_io.h"
+#include "../data_io/gguf_reader.h"
 #include "../serialize.h"
 namespace dlib
 {
