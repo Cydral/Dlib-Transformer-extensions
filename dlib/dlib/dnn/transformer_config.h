@@ -253,7 +253,10 @@ namespace dlib
     };
 
     template<
-        long vocab_size = ARC_VOCAB_SIZE_TOTAL,
+        /* Placeholder default sized for ARC-style symbol vocabularies; every real
+           instantiation passes its vocabulary size explicitly. A library header must
+           not depend on constants defined by example programs. */
+        long vocab_size = 16,
         long num_h_layers = 4,
         long num_l_layers = 4,
         long num_heads = 6,

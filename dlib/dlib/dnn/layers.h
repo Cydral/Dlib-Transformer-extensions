@@ -5,6 +5,7 @@
 
 #include "layers_abstract.h"
 #include "../cuda/tensor.h"
+#include "network_context.h"
 #include "core.h"
 #include <iostream>
 #include <string>
