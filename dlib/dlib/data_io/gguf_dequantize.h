@@ -40,7 +40,11 @@ namespace dlib
                 uint32_t m = mant;
                 while ((m & 0x400u) == 0) { m <<= 1; ++e; }   // normalize the subnormal
                 m &= 0x3FFu;
-                bits = sign | (static_cast<uint32_t>(127 - 15 - e) << 23) | (m << 13);
+                /* value = (1 + m/1024) * 2^(-14 - e), so the float exponent field is
+                   127 - 14 - e. An off-by-one here halves every subnormal, and k-quant
+                   super-block scales (d ~ block_max / 1e3) do land in the subnormal
+                   range for low-magnitude blocks, silently halving their weights. */
+                bits = sign | (static_cast<uint32_t>(127 - 14 - e) << 23) | (m << 13);
             }
         }
         else if (exp == 0x1Fu)
