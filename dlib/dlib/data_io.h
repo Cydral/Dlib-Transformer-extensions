@@ -9,8 +9,8 @@
 #include "data_io/cifar.h"
 #include "data_io/arc_agi.h"
 #include "data_io/language_model_data.h"
-#include "data_io/gguf_model_spec.h"
 #include "data_io/gguf_dequantize.h"
+#include "data_io/gguf_model_spec.h"
 #include "data_io/gguf_reader.h"
 #include "data_io/gguf_weight_loader.h"
 
