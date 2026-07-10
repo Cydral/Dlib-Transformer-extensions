@@ -27,7 +27,7 @@ namespace dlib
           - RMSNorm gammas and the embedding table are copied directly.
 
         VALIDATION KNOBS (the two conventions that cannot be settled without a numeric check
-        against a reference such as llama.cpp; see gguf_load_options):
+        against an external reference implementation; see gguf_load_options):
           - rope_permute : whether the Q/K projection rows must be permuted to match the
                            layer's RoPE convention. Default off (GGUF-native ordering).
           - swap_gate_up : whether ffn_gate and ffn_up must be swapped. Default off.

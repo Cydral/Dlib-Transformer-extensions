@@ -2,7 +2,7 @@
 // License: Boost Software License   See LICENSE.txt for the full license.
 // GGUF file reader (header-only).
 //
-// Parses the GGUF container used by llama.cpp / HuggingFace GGUF downloads:
+// Parses the GGUF container used by the open-weight model ecosystem:
 //   header (magic, version, tensor_count, metadata_kv_count)
 //   metadata key/value pairs (typed scalars, strings and arrays)
 //   tensor descriptors (name, ggml type, dimensions, data offset)

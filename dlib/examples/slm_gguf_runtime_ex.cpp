@@ -11,12 +11,15 @@
     Usage:
       slm_gguf_runtime_ex --input model.gguf --probe-logits --prompt "The capital of France is"
       slm_gguf_runtime_ex --input model.gguf --probe-ids "1 450 7483 310 3444 338"
+      slm_gguf_runtime_ex --input model.gguf --save-dat model.dat
+      slm_gguf_runtime_ex --input model.dat --chat
 !*/
 
 #include <iostream>
 #include <string>
 #include <vector>
 #include <sstream>
+#include <fstream>
 #include <algorithm>
 
 #ifdef _WIN32
@@ -27,9 +30,12 @@
 #  include <windows.h>
 #endif
 
+#include <random>
+
 #include <dlib/cmd_line_parser.h>
 #include <dlib/dnn/runtime_transformer.h>
 #include <dlib/tokenizer/hf_tokenizer.h>
+#include <dlib/tokenizer/chat_template.h>
 
 using namespace std;
 using namespace dlib;
@@ -79,6 +85,131 @@ static void report_logits(const tensor& logits, const std::vector<int>& toks, hf
     }
 }
 
+/* Sample the next token from a [1,1,1,vocab] logits tensor: repeat penalty over the
+   recent window, temperature, top-k, min-p and top-p nucleus filtering. Deterministic
+   mode returns the argmax. */
+static int pick_next(const tensor& logits, const std::vector<int>& recent,
+    double temperature, size_t top_k, float top_p, float min_p, float repeat_penalty,
+    bool deterministic, std::mt19937& rng)
+{
+    const long V = logits.nc();
+    const float* row = logits.host();
+    std::vector<double> lg(row, row + V);
+
+    for (int t : recent)
+    {
+        double& v = lg[static_cast<size_t>(t)];
+        v = v > 0 ? v / repeat_penalty : v * repeat_penalty;
+    }
+    if (deterministic)
+        return static_cast<int>(std::max_element(lg.begin(), lg.end()) - lg.begin());
+
+    std::vector<long> order(static_cast<size_t>(V));
+    for (long v = 0; v < V; ++v) order[static_cast<size_t>(v)] = v;
+    const size_t k = std::min<size_t>(top_k ? top_k : static_cast<size_t>(V), static_cast<size_t>(V));
+    std::partial_sort(order.begin(), order.begin() + k, order.end(),
+        [&](long a, long b) { return lg[a] > lg[b]; });
+
+    std::vector<double> p(k);
+    const double mx = lg[order[0]];
+    double sum = 0.0;
+    for (size_t i = 0; i < k; ++i) { p[i] = std::exp((lg[order[i]] - mx) / temperature); sum += p[i]; }
+    for (size_t i = 0; i < k; ++i) p[i] /= sum;
+
+    size_t last = k;
+    double kept = 0.0;
+    for (size_t i = 0; i < k; ++i)
+    {
+        if (p[i] < min_p * p[0]) { last = i; break; }
+        kept += p[i];
+        if (kept >= top_p) { last = i + 1; break; }
+    }
+    if (last == 0) last = 1;
+
+    std::discrete_distribution<size_t> dist(p.begin(), p.begin() + last);
+    return static_cast<int>(order[dist(rng)]);
+}
+
+/* Interactive chat: first turn through the prefill, every later token through the
+   incremental step, continuous tokenization across turns. */
+static int chat_loop(runtime_transformer& rt, hf_tokenizer& tok, const chat_template_formatter& fmt,
+    long ctx_len, double temperature, size_t top_k, float top_p, float min_p,
+    float repeat_penalty, bool deterministic, const std::string& system_prompt)
+{
+    const int eos = tok.eos_id();
+    const std::string stop = fmt.stop_string();
+    std::mt19937 rng(std::random_device{}());
+
+    /* Pin the immutable BOS + system prefix across cache evictions. */
+    const std::string prefix = fmt.system_prefix(system_prompt);
+    long keep = fmt.add_bos_on_first_turn() ? 1 : 0;
+    if (!prefix.empty())
+        keep += static_cast<long>(tok.encode(prefix, false, false, true, false).size());
+    rt.set_context(ctx_len, keep);
+
+    cout << "Chat template: " << chat_template_formatter::name(fmt.kind()) << "\n";
+    cout << "Ready. Type 'quit' or 'exit' to stop.\n";
+
+    bool first = true;
+    std::vector<int> recent;
+    for (;;)
+    {
+        cout << "You: " << std::flush;
+        std::string user;
+        if (!std::getline(std::cin, user)) break;
+        if (user == "quit" || user == "exit") break;
+        if (user.empty()) continue;
+
+        const std::string turn = first ? fmt.first_turn(system_prompt, user) : fmt.next_turn(user);
+        std::vector<int> toks = tok.encode(turn, first && fmt.add_bos_on_first_turn(), false, true, false);
+
+        const tensor* logits = nullptr;
+        if (first)
+        {
+            logits = &rt.forward_prefill(toks);
+            /* The prefill returns every position; sampling reads the last row. */
+            alias_tensor last_row(1, 1, 1, logits->nc());
+            static resizable_tensor last;
+            last.set_size(1, 1, 1, logits->nc());
+            auto lr = last_row(const_cast<tensor&>(*logits),
+                static_cast<size_t>((logits->nr() - 1)) * logits->nc());
+            memcpy(last, lr);
+            logits = &last;
+            first = false;
+        }
+        else
+        {
+            for (int t : toks) logits = &rt.step(t);
+        }
+
+        cout << "Model: " << std::flush;
+        /* Accumulate the ids and decode the whole sequence: SentencePiece carries the
+           leading space in the piece marker, and a lone token decodes as a sequence
+           start, so per-token decoding would drop every inter-word space. */
+        std::vector<int> out;
+        std::string answer;
+        for (;;)
+        {
+            const int next = pick_next(*logits, recent, temperature, top_k, top_p,
+                min_p, repeat_penalty, deterministic, rng);
+            if (next == eos) break;
+            out.push_back(next);
+            answer = tok.decode(out, true);
+            recent.push_back(next);
+            if (recent.size() > 64) recent.erase(recent.begin());
+            if (!stop.empty() && answer.find(stop) != std::string::npos)
+            {
+                answer.erase(answer.find(stop));
+                break;
+            }
+            logits = &rt.step(next);
+        }
+        cout << fmt.clean_answer(answer) << "\n";
+        rt.step(eos);   // close the assistant turn in the token stream
+    }
+    return 0;
+}
+
 int main(int argc, char** argv)
 {
     try
@@ -88,11 +219,18 @@ int main(int argc, char** argv)
         SetConsoleCP(CP_UTF8);
 #endif
         command_line_parser parser;
-        parser.add_option("input", "Path to the source .gguf model", 1);
+        parser.add_option("input", "Path to the source model: .gguf, or a runtime .dat archive", 1);
+        parser.add_option("save-dat", "After loading a GGUF, write a self-contained runtime archive (model + tokenizer)", 1);
         parser.add_option("probe-logits", "Run a prefill and report the logits");
         parser.add_option("probe-ids", "Feed explicit token ids (space or comma separated)", 1);
         parser.add_option("prompt", "Prompt for --probe-logits (default: capital of France)", 1);
         parser.add_option("rope-permute", "Map split-half (NeoX) Q/K layouts to the interleaved kernel");
+        parser.add_option("chat", "Interactive chat with the loaded model");
+        parser.add_option("system", "System prompt for chat mode", 1);
+        parser.add_option("context", "KV cache capacity in tokens (default: 2048)", 1);
+        parser.add_option("template", "Chat template override: auto, zephyr, chatml, guanaco", 1);
+        parser.add_option("temp", "Sampling temperature (default: template preset)", 1);
+        parser.add_option("deterministic", "Greedy decoding");
         parser.add_option("resident", "Dequantize all weights at load time (fastest forward, full f32 footprint); default keeps them quantized at rest");
         parser.parse(argc, argv);
 
@@ -104,31 +242,72 @@ int main(int argc, char** argv)
         }
 
         const string input = parser.option("input").argument();
-        cout << "Reading GGUF: " << input << "\n";
-        gguf_reader g(input);
-        const model_spec spec = detect_model(g);
-        cout << describe(spec) << "\n";
+        runtime_transformer rt;
+        hf_tokenizer tok;
 
-        const compat_result rep = check_compatibility(spec);
-        for (const string& n : rep.notes) cout << "note: " << n << "\n";
-        if (!rep.blockers.empty())
+        const bool from_archive = input.size() > 4 && input.substr(input.size() - 4) == ".dat";
+        if (from_archive)
         {
-            for (const string& b : rep.blockers) cerr << "blocker: " << b << "\n";
-            return 1;
+            cout << "Loading runtime archive: " << input << "\n";
+            std::ifstream in(input, std::ios::binary);
+            if (!in) { cerr << "Cannot open " << input << "\n"; return 1; }
+            rt.load(in);
+            deserialize(tok, in);
+            cout << describe(rt.spec()) << "\n";
+        }
+        else
+        {
+            cout << "Reading GGUF: " << input << "\n";
+            gguf_reader g(input);
+            const model_spec spec = detect_model(g);
+            cout << describe(spec) << "\n";
+
+            const compat_result rep = check_compatibility(spec);
+            for (const string& n : rep.notes) cout << "note: " << n << "\n";
+            if (!rep.blockers.empty())
+            {
+                for (const string& b : rep.blockers) cerr << "blocker: " << b << "\n";
+                return 1;
+            }
+
+            gguf_load_options lopt;
+            lopt.rope_permute = parser.option("rope-permute");
+            lopt.verbose = true;
+
+            rt.set_quantized_at_rest(!parser.option("resident"));
+            cout << "Loading weights (runtime engine"
+                 << (rt.quantized_at_rest() ? ", quantized at rest" : "") << ")...\n";
+            rt.load(g, spec, lopt);
+            tok.load_from_gguf(g);
+
+            if (parser.option("save-dat"))
+            {
+                const string path = parser.option("save-dat").argument();
+                std::ofstream out(path, std::ios::binary);
+                if (!out) { cerr << "Cannot write " << path << "\n"; return 1; }
+                rt.save(out);
+                serialize(tok, out);
+                cout << "Runtime archive written: " << path << "\n";
+            }
         }
 
-        gguf_load_options lopt;
-        lopt.rope_permute = parser.option("rope-permute");
-        lopt.verbose = true;
-
-        runtime_transformer rt;
-        rt.set_quantized_at_rest(!parser.option("resident"));
-        cout << "Loading weights (runtime engine"
-             << (rt.quantized_at_rest() ? ", quantized at rest" : "") << ")...\n";
-        rt.load(g, spec, lopt);
-
-        hf_tokenizer tok;
-        tok.load_from_gguf(g);
+        if (parser.option("chat"))
+        {
+            chat_template_formatter fmt = parser.option("template")
+                ? chat_template_formatter::for_tokenizer(tok,
+                    chat_template_formatter::from_name(parser.option("template").argument()))
+                : chat_template_formatter::for_tokenizer(tok);
+            const double temp = parser.option("temp")
+                ? std::stod(parser.option("temp").argument()) : fmt.default_temperature();
+            const long ctx = parser.option("context")
+                ? std::stol(parser.option("context").argument()) : 2048;
+            const std::string sys = parser.option("system")
+                ? parser.option("system").argument()
+                : std::string("You are a helpful assistant.");
+            return chat_loop(rt, tok, fmt, ctx, temp, fmt.default_top_k(), fmt.default_top_p(),
+                fmt.default_min_p(), fmt.default_repeat_penalty(),
+                parser.option("deterministic"), sys);
+        }
 
         std::vector<int> toks;
         if (parser.option("probe-ids"))

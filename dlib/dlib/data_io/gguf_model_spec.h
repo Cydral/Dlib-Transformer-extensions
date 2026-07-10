@@ -98,7 +98,7 @@ namespace dlib
         s.rms_eps    = g.get_double(p + ".attention.layer_norm_rms_epsilon", 1e-5);
         s.rope_freq_base = g.get_double(p + ".rope.freq_base", 10000.0);
         /* RoPE position scaling. Modern GGUFs declare it under rope.scaling.*; older
-           files carry the legacy rope.scale_linear factor. llama.cpp applies a linear
+           files carry the legacy rope.scale_linear factor. Reference implementations apply a linear
            factor to every position, so ignoring a declared scaling silently diverges
            from the reference; the compatibility check below turns it into a blocker
            until the corresponding support lands in the rotary layer. */

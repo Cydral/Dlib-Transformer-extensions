@@ -86,7 +86,7 @@ using namespace dlib;
 /* Extract the tokenizer from the GGUF metadata, run a round-trip sanity check, and
    serialize it. The round-trip is the cheap local validation: encode then decode a few
    strings and confirm the text is recovered. For exact parity, compare the token ids
-   against llama.cpp on the same strings. */
+   against an external reference on the same strings. */
 void extract_tokenizer(const gguf_reader& g, const string& out_path, const string& probe)
 {
     hf_tokenizer tok;
@@ -435,7 +435,7 @@ int chat_loop(generator_type& generator, hf_tokenizer& tok,
                the system block ahead of the user turn; later turns begin with the newline
                that follows the assistant's closing eos. Special markers are parsed as
                special tokens, and the SentencePiece dummy space prefix is applied to
-               every fragment for the families that use it, exactly as llama.cpp does. */
+               every fragment for the families that use it, exactly as the reference implementations do. */
             const bool first = !primed;
             const std::string turn_text = first
                 ? fmt.first_turn(system_prompt, line)
@@ -591,7 +591,7 @@ int run_chat_dat(const std::string& dat_path,
 }
 
 /* Print the most probable next tokens for a prompt's last position. Compare these with a
-   reference (for example llama.cpp) to validate the weight repacking. */
+   reference (for example an external GGUF runtime) to validate the weight repacking. */
 int run_probe(gguf_reader& g, const model_spec& spec, const gguf_load_options& lopt,
     const std::string& prompt)
 {

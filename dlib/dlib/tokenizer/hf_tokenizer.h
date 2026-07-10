@@ -80,7 +80,7 @@ namespace dlib
     public:
         enum class kind { spm, bpe };
 
-        // GGUF token-type values (the llama.cpp convention).
+        // GGUF token-type values (the common GGUF convention).
         enum token_type
         {
             TT_UNDEFINED = 0, TT_NORMAL = 1, TT_UNKNOWN = 2, TT_CONTROL = 3,

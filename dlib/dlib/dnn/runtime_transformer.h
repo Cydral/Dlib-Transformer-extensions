@@ -19,9 +19,12 @@
 //     footprint close to the on-disk file size (e.g. ~1.1 GB instead of ~7 GB for a
 //     1.7B model), traded against one dequantization per matrix and per forward.
 //
-// This increment covers the prefill forward and full-sequence logits, which is what
-// the probe-based validation protocol needs; the incremental KV-cache path for chat
-// generation is the next increment.
+// Generation runs in two phases: forward_prefill() processes the prompt and, when a
+// context capacity is set, fills the KV cache; step() then extends the sequence one
+// token at a time. Keys are cached before rotary encoding and encoded at read time
+// on their compacted index, so the attention-sink eviction (keep the first rows,
+// discard a block after them) keeps a coherent self-attention geometry without any
+// shifting machinery, exactly like the template path.
 
 #ifndef DLIB_DNN_RUNTIME_TRANSFORMER_H_
 #define DLIB_DNN_RUNTIME_TRANSFORMER_H_
@@ -66,6 +69,58 @@ namespace dlib
             long in_dim = 0, out_dim = 0;
             bool permute = false;
         };
+
+        /* One transformer block: norms, projections and its KV cache. Declared here
+           because member functions take it by reference, and parameter types must be
+           visible at the point of declaration. */
+        struct layer
+        {
+            resizable_tensor attn_norm_g, ffn_norm_g;
+            stored_matrix wq, wk, wv, wo, w_gate, w_up, w_down;
+            resizable_tensor k_cache, v_cache;   // pre-rotary keys, values
+        };
+
+        static void serialize_matrix(const stored_matrix& m, std::ostream& out)
+        {
+            const int kind = m.raw.empty() ? 0 : 1;
+            dlib::serialize(kind, out);
+            dlib::serialize(m.in_dim, out);
+            dlib::serialize(m.out_dim, out);
+            dlib::serialize(m.permute, out);
+            if (kind == 1)
+            {
+                dlib::serialize(static_cast<uint32_t>(m.type), out);
+                dlib::serialize(m.dims, out);
+                dlib::serialize(m.raw, out);
+            }
+            else
+            {
+                dlib::serialize(m.resident, out);
+            }
+        }
+
+        static void deserialize_matrix(stored_matrix& m, std::istream& in)
+        {
+            int kind = 0;
+            dlib::deserialize(kind, in);
+            dlib::deserialize(m.in_dim, in);
+            dlib::deserialize(m.out_dim, in);
+            dlib::deserialize(m.permute, in);
+            m.raw.clear();
+            m.resident.set_size(0, 0, 0, 0);
+            if (kind == 1)
+            {
+                uint32_t t = 0;
+                dlib::deserialize(t, in);
+                m.type = static_cast<ggml_type>(t);
+                dlib::deserialize(m.dims, in);
+                dlib::deserialize(m.raw, in);
+            }
+            else
+            {
+                dlib::deserialize(m.resident, in);
+            }
+        }
 
     public:
 
@@ -126,8 +181,39 @@ namespace dlib
             }
         }
 
+        // Configure the KV cache for incremental generation: capacity in tokens, and
+        // the number of leading positions (attention sinks: BOS and system prompt)
+        // pinned across evictions. Call before forward_prefill(); resets the cache.
+        void set_context(long capacity, long keep_length = 0)
+        {
+            cap_ = capacity;
+            keep_ = keep_length;
+            reset_cache();
+        }
+
+        void reset_cache()
+        {
+            cur_len_ = 0;
+            for (layer& L : layers_)
+            {
+                if (cap_ > 0)
+                {
+                    L.k_cache.set_size(1, spec_.n_kv_heads, cap_, head_dim());
+                    L.v_cache.set_size(1, spec_.n_kv_heads, cap_, head_dim());
+                }
+                else
+                {
+                    L.k_cache.set_size(0, 0, 0, 0);
+                    L.v_cache.set_size(0, 0, 0, 0);
+                }
+            }
+        }
+
+        long cache_length() const { return cur_len_; }
+
         // Full prefill forward. Returns the logits of every position in a
-        // [1, 1, N, vocab] tensor.
+        // [1, 1, N, vocab] tensor. When a context capacity is set, the pre-rotary
+        // keys and the values of every layer are appended to the KV cache.
         const tensor& forward_prefill(const std::vector<int>& tokens)
         {
             const long N  = static_cast<long>(tokens.size());
@@ -139,6 +225,12 @@ namespace dlib
             const float qk_scale = 1.0f / std::sqrt(static_cast<float>(hd));
             const float eps = static_cast<float>(spec_.rms_eps);
             DLIB_CASSERT(N > 0);
+            if (cap_ > 0 && cur_len_ + N > cap_)
+                throw std::runtime_error("runtime_transformer: prompt exceeds the context capacity");
+            /* The prefill computes attention within the chunk only, which is exact on
+               an empty cache; later chunks must go through step() so every token
+               attends to the whole cached context. */
+            DLIB_CASSERT(cur_len_ == 0, "forward_prefill() requires an empty cache; use step() to extend");
 
             /* Embedding gather on the host, single upload. */
             x_.set_size(1, 1, N, d);
@@ -180,6 +272,9 @@ namespace dlib
                 tt::split_heads(false, q4_, q_flat_);
                 tt::split_heads(false, k4_, k_flat_);
                 tt::split_heads(false, v4_, v_flat_);
+
+                if (cap_ > 0)
+                    append_to_cache(L, k4_, v4_, N);   // pre-rotary keys, values
 
                 tt::apply_rotary_positional_embedding(false, q4_, cos_cache_, sin_cache_);
                 tt::apply_rotary_positional_embedding(false, k4_, cos_cache_, sin_cache_);
@@ -248,6 +343,9 @@ namespace dlib
                 tt::add(x_, x_, ffn_out_);
             }
 
+            if (cap_ > 0)
+                cur_len_ += N;
+
             /* ---- final norm and logits ---- */
             tt::rms_normalize(eps, xn_, rms_scale_, x_, final_norm_g_, true);
             logits_.set_size(1, 1, N, spec_.vocab_size);
@@ -260,9 +358,284 @@ namespace dlib
             return logits_;
         }
 
+        // One-token incremental forward. Requires a prior forward_prefill() with a
+        // context capacity set. Appends the token to the KV cache, evicting a middle
+        // block first when the cache is full, and returns the [1, 1, 1, vocab] logits.
+        const tensor& step(int token)
+        {
+            DLIB_CASSERT(cap_ > 0, "set_context() must be called before step()");
+            DLIB_CASSERT(cur_len_ > 0, "forward_prefill() must run before step()");
+            if (cur_len_ + 1 > cap_)
+                evict_middle_block();
+
+            const long d  = spec_.d_model;
+            const long H  = spec_.n_heads;
+            const long KV = spec_.n_kv_heads;
+            const long hd = head_dim();
+            const long rep = H / KV;
+            const long pos = cur_len_;
+            const long len = cur_len_ + 1;
+            const float qk_scale = 1.0f / std::sqrt(static_cast<float>(hd));
+            const float eps = static_cast<float>(spec_.rms_eps);
+
+            x_.set_size(1, 1, 1, d);
+            gather_embedding_row(token, x_.host_write_only());
+            build_trig_caches(len);   // covers the read positions 0..len-1
+
+            for (layer& L : layers_)
+            {
+                /* ---- attention block ---- */
+                tt::rms_normalize(eps, xn_, rms_scale_, x_, L.attn_norm_g, true);
+
+                q_flat_.set_size(1, 1, 1, H * hd);
+                k_flat_.set_size(1, 1, 1, KV * hd);
+                v_flat_.set_size(1, 1, 1, KV * hd);
+                {
+                    alias_tensor x_2d(1, d), q_2d(1, H * hd), kv_2d(1, KV * hd);
+                    auto xv = x_2d(xn_, 0);
+                    auto qv = q_2d(q_flat_, 0);
+                    auto kv_v = kv_2d(k_flat_, 0);
+                    auto vv = kv_2d(v_flat_, 0);
+                    tt::gemm(0.0f, qv, qk_scale, xv, false, weight(L.wq), false);
+                    tt::gemm(0.0f, kv_v, 1.0f, xv, false, weight(L.wk), false);
+                    tt::gemm(0.0f, vv, 1.0f, xv, false, weight(L.wv), false);
+                }
+                q4_.set_size(1, H, 1, hd);
+                k4_.set_size(1, KV, 1, hd);
+                v4_.set_size(1, KV, 1, hd);
+                tt::split_heads(false, q4_, q_flat_);
+                tt::split_heads(false, k4_, k_flat_);
+                tt::split_heads(false, v4_, v_flat_);
+                append_to_cache(L, k4_, v4_, 1);   // pre-rotary key, value at row pos
+
+                /* Rotate the query at its position: a one-row slice of the caches. */
+                {
+                    alias_tensor row(1, 1, 1, hd / 2);
+                    auto cr = row(cos_cache_, static_cast<size_t>(pos) * (hd / 2));
+                    auto sr = row(sin_cache_, static_cast<size_t>(pos) * (hd / 2));
+                    tt::apply_rotary_positional_embedding(false, q4_, cr, sr);
+                }
+
+                /* Gather the cached window (contiguous per channel), rotate the keys
+                   on their compacted indices 0..len-1. */
+                k_win_.set_size(1, KV, len, hd);
+                v_win_.set_size(1, KV, len, hd);
+                {
+                    alias_tensor w_2d(1, 1, len, hd);
+                    for (long c = 0; c < KV; ++c)
+                    {
+                        auto kw = w_2d(k_win_, static_cast<size_t>(c) * len * hd);
+                        auto vw = w_2d(v_win_, static_cast<size_t>(c) * len * hd);
+                        auto ks = w_2d(L.k_cache, static_cast<size_t>(c) * cap_ * hd);
+                        auto vs = w_2d(L.v_cache, static_cast<size_t>(c) * cap_ * hd);
+                        memcpy(kw, ks);
+                        memcpy(vw, vs);
+                    }
+                }
+                tt::apply_rotary_positional_embedding(false, k_win_, cos_cache_, sin_cache_);
+
+                k_rep_.set_size(1, H, len, hd);
+                v_rep_.set_size(1, H, len, hd);
+                for (long h = 0; h < H; ++h)
+                {
+                    tt::copy_tensor(false, k_rep_, h, k_win_, h / rep, 1);
+                    tt::copy_tensor(false, v_rep_, h, v_win_, h / rep, 1);
+                }
+
+                /* Single query row: every cached position is in the past, no mask. */
+                scores_.set_size(1, H, 1, len);
+                tt::gemm(0.0f, scores_, 1.0f, q4_, false, k_rep_, true, operation_mode::PLANE_WISE);
+                attn_.copy_size(scores_);
+                tt::softmax(attn_, scores_, operation_mode::PLANE_WISE);
+
+                ctx4_.set_size(1, H, 1, hd);
+                tt::gemm(0.0f, ctx4_, 1.0f, attn_, false, v_rep_, false, operation_mode::PLANE_WISE);
+                ctx_flat_.set_size(1, 1, 1, H * hd);
+                tt::merge_heads(false, ctx_flat_, ctx4_);
+
+                attn_out_.set_size(1, 1, 1, d);
+                {
+                    alias_tensor c_2d(1, H * hd), o_2d(1, d);
+                    auto cv = c_2d(ctx_flat_, 0);
+                    auto ov = o_2d(attn_out_, 0);
+                    tt::gemm(0.0f, ov, 1.0f, cv, false, weight(L.wo), false);
+                }
+                tt::add(x_, x_, attn_out_);
+
+                /* ---- feed-forward block (SwiGLU) ---- */
+                tt::rms_normalize(eps, xn_, rms_scale_, x_, L.ffn_norm_g, true);
+                gate_.set_size(1, 1, 1, spec_.d_ffn);
+                up_.set_size(1, 1, 1, spec_.d_ffn);
+                {
+                    alias_tensor n_2d(1, d), f_2d(1, spec_.d_ffn);
+                    auto nv = n_2d(xn_, 0);
+                    auto gv = f_2d(gate_, 0);
+                    auto uv = f_2d(up_, 0);
+                    tt::gemm(0.0f, gv, 1.0f, nv, false, weight(L.w_gate), false);
+                    tt::gemm(0.0f, uv, 1.0f, nv, false, weight(L.w_up), false);
+                }
+                sig_.copy_size(gate_);
+                tt::sigmoid(sig_, gate_);
+                tt::multiply(false, gate_, gate_, sig_);
+                tt::multiply(false, gate_, gate_, up_);
+                ffn_out_.set_size(1, 1, 1, d);
+                {
+                    alias_tensor h_2d(1, spec_.d_ffn), f_2d(1, d);
+                    auto hv = h_2d(gate_, 0);
+                    auto fv = f_2d(ffn_out_, 0);
+                    tt::gemm(0.0f, fv, 1.0f, hv, false, weight(L.w_down), false);
+                }
+                tt::add(x_, x_, ffn_out_);
+            }
+            cur_len_ = len;
+
+            tt::rms_normalize(eps, xn_, rms_scale_, x_, final_norm_g_, true);
+            logits_.set_size(1, 1, 1, spec_.vocab_size);
+            {
+                alias_tensor n_2d(1, d), l_2d(1, spec_.vocab_size);
+                auto nv = n_2d(xn_, 0);
+                auto lv = l_2d(logits_, 0);
+                tt::gemm(0.0f, lv, 1.0f, nv, false, weight(lm_head_), false);
+            }
+            return logits_;
+        }
+
         const model_spec& spec() const { return spec_; }
 
+        /* Self-contained runtime archive: the model spec and every weight in its
+           current storage form, quantized blocks at rest or dequantized floats. This
+           format belongs to the engine, so loading never depends on the template
+           network types nor on their serialization internals; models fine-tuned
+           through the template path reach it via an export visitor on that side. */
+        void save(std::ostream& out) const
+        {
+            dlib::serialize("rtm_1", out);
+            dlib::serialize(spec_.model_name, out);
+            dlib::serialize(spec_.n_layers, out);
+            dlib::serialize(spec_.n_heads, out);
+            dlib::serialize(spec_.n_kv_heads, out);
+            dlib::serialize(spec_.d_model, out);
+            dlib::serialize(spec_.d_ffn, out);
+            dlib::serialize(spec_.head_dim, out);
+            dlib::serialize(spec_.vocab_size, out);
+            dlib::serialize(spec_.rms_eps, out);
+            dlib::serialize(spec_.rope_freq_base, out);
+            dlib::serialize(spec_.tied_embeddings, out);
+            for (const layer& L : layers_)
+            {
+                dlib::serialize(L.attn_norm_g, out);
+                dlib::serialize(L.ffn_norm_g, out);
+                serialize_matrix(L.wq, out);
+                serialize_matrix(L.wk, out);
+                serialize_matrix(L.wv, out);
+                serialize_matrix(L.wo, out);
+                serialize_matrix(L.w_gate, out);
+                serialize_matrix(L.w_up, out);
+                serialize_matrix(L.w_down, out);
+            }
+            dlib::serialize(final_norm_g_, out);
+            serialize_matrix(lm_head_, out);
+            dlib::serialize(embd_, out);
+            dlib::serialize(embd_raw_.raw, out);
+            dlib::serialize(static_cast<uint32_t>(embd_raw_.type), out);
+            dlib::serialize(embd_raw_.dims, out);
+            dlib::serialize(static_cast<uint64_t>(embd_row_bytes_), out);
+        }
+
+        void load(std::istream& in)
+        {
+            std::string tag;
+            dlib::deserialize(tag, in);
+            if (tag != "rtm_1")
+                throw std::runtime_error("runtime_transformer: not a runtime archive (tag '" + tag + "')");
+            spec_ = model_spec();
+            dlib::deserialize(spec_.model_name, in);
+            dlib::deserialize(spec_.n_layers, in);
+            dlib::deserialize(spec_.n_heads, in);
+            dlib::deserialize(spec_.n_kv_heads, in);
+            dlib::deserialize(spec_.d_model, in);
+            dlib::deserialize(spec_.d_ffn, in);
+            dlib::deserialize(spec_.head_dim, in);
+            dlib::deserialize(spec_.vocab_size, in);
+            dlib::deserialize(spec_.rms_eps, in);
+            dlib::deserialize(spec_.rope_freq_base, in);
+            dlib::deserialize(spec_.tied_embeddings, in);
+            layers_.clear();
+            layers_.resize(static_cast<size_t>(spec_.n_layers));
+            for (layer& L : layers_)
+            {
+                dlib::deserialize(L.attn_norm_g, in);
+                dlib::deserialize(L.ffn_norm_g, in);
+                deserialize_matrix(L.wq, in);
+                deserialize_matrix(L.wk, in);
+                deserialize_matrix(L.wv, in);
+                deserialize_matrix(L.wo, in);
+                deserialize_matrix(L.w_gate, in);
+                deserialize_matrix(L.w_up, in);
+                deserialize_matrix(L.w_down, in);
+            }
+            dlib::deserialize(final_norm_g_, in);
+            deserialize_matrix(lm_head_, in);
+            dlib::deserialize(embd_, in);
+            dlib::deserialize(embd_raw_.raw, in);
+            uint32_t t = 0;
+            dlib::deserialize(t, in);
+            embd_raw_.type = static_cast<ggml_type>(t);
+            dlib::deserialize(embd_raw_.dims, in);
+            uint64_t rb = 0;
+            dlib::deserialize(rb, in);
+            embd_row_bytes_ = static_cast<size_t>(rb);
+            at_rest_ = !layers_.empty() && !layers_.front().wq.raw.empty();
+            reset_cache();
+        }
+
     private:
+
+        /* Append n pre-rotary key rows and value rows to every-channel caches at the
+           current length. Rows are contiguous within a channel. */
+        void append_to_cache(layer& L, const resizable_tensor& k, const resizable_tensor& v, long n)
+        {
+            const long hd = head_dim();
+            DLIB_CASSERT(cur_len_ + n <= cap_);
+            alias_tensor blk(1, 1, n, hd);
+            for (long c = 0; c < spec_.n_kv_heads; ++c)
+            {
+                auto ks = blk(const_cast<resizable_tensor&>(k), static_cast<size_t>(c) * n * hd);
+                auto vs = blk(const_cast<resizable_tensor&>(v), static_cast<size_t>(c) * n * hd);
+                auto kd = blk(L.k_cache, static_cast<size_t>(c) * cap_ * hd + cur_len_ * hd);
+                auto vd = blk(L.v_cache, static_cast<size_t>(c) * cap_ * hd + cur_len_ * hd);
+                memcpy(kd, ks);
+                memcpy(vd, vs);
+            }
+        }
+
+        /* Attention-sink eviction: keep the first keep_ rows, discard half of the
+           remainder, slide the tail down. Keys are stored pre-rotary and encoded on
+           their compacted index at read time, so the surviving rows keep a coherent
+           relative geometry without any shifting pass. */
+        void evict_middle_block()
+        {
+            const long discard = std::max<long>(1, (cap_ - keep_) / 2);
+            const long tail = cur_len_ - keep_ - discard;
+            DLIB_CASSERT(tail >= 0);
+            const long hd = head_dim();
+            alias_tensor blk(1, 1, tail, hd);
+            for (layer& L : layers_)
+            {
+                for (long c = 0; c < spec_.n_kv_heads; ++c)
+                {
+                    const size_t base = static_cast<size_t>(c) * cap_ * hd;
+                    auto ks = blk(L.k_cache, base + (keep_ + discard) * hd);
+                    auto kd = blk(L.k_cache, base + keep_ * hd);
+                    memcpy(kd, ks);
+                    auto vs = blk(L.v_cache, base + (keep_ + discard) * hd);
+                    auto vd = blk(L.v_cache, base + keep_ * hd);
+                    memcpy(vd, vs);
+                }
+            }
+            cur_len_ -= discard;
+        }
+
 
         long head_dim() const
         {
@@ -387,14 +760,10 @@ namespace dlib
                     m[r * N + cidx] = (cidx <= r) ? 0.0f : -1e9f;
         }
 
-        struct layer
-        {
-            resizable_tensor attn_norm_g, ffn_norm_g;
-            stored_matrix wq, wk, wv, wo, w_gate, w_up, w_down;
-        };
 
         model_spec spec_;
         bool at_rest_ = true;
+        long cap_ = 0, keep_ = 0, cur_len_ = 0;
         std::vector<layer> layers_;
         resizable_tensor final_norm_g_;
         stored_matrix lm_head_;
@@ -414,6 +783,7 @@ namespace dlib
         /* Work buffers, reused across layers and calls. */
         resizable_tensor x_, xn_, rms_scale_;
         resizable_tensor q_flat_, k_flat_, v_flat_, q4_, k4_, v4_, k_rep_, v_rep_;
+        resizable_tensor k_win_, v_win_;
         resizable_tensor scores_, attn_, ctx4_, ctx_flat_, attn_out_;
         resizable_tensor gate_, up_, sig_, ffn_out_;
         resizable_tensor cos_cache_, sin_cache_, mask_, logits_;
