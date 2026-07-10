@@ -9,11 +9,19 @@
 // time, so the engine compiles once and loads any supported GGUF model dynamically.
 // It runs on the same tensor primitives (gemm, split/merge heads, rotary embedding,
 // rms normalization, plane-wise softmax) as the template stack, on CPU or CUDA
-// according to the build, and is validated by logit parity against it.
+// according to the build, and is validated by logit parity against llama.cpp.
 //
-// This first increment covers the prefill forward and full-sequence logits, which is
-// what the probe-based validation protocol needs; the incremental KV-cache path for
-// chat generation is the next increment.
+// Two weight residencies are supported:
+//   - resident (default): every matrix is dequantized once at load time; fastest
+//     forward, memory footprint of the full float32 model;
+//   - quantized at rest: the raw GGUF bytes stay in memory and each matrix is
+//     dequantized just in time into a small shared pool at every use, keeping the
+//     footprint close to the on-disk file size (e.g. ~1.1 GB instead of ~7 GB for a
+//     1.7B model), traded against one dequantization per matrix and per forward.
+//
+// This increment covers the prefill forward and full-sequence logits, which is what
+// the probe-based validation protocol needs; the incremental KV-cache path for chat
+// generation is the next increment.
 
 #ifndef DLIB_DNN_RUNTIME_TRANSFORMER_H_
 #define DLIB_DNN_RUNTIME_TRANSFORMER_H_
@@ -34,16 +42,39 @@ namespace dlib
         /*!
             WHAT THIS OBJECT REPRESENTS
                 A decoder-only transformer (Llama/Qwen family) whose architecture is
-                resolved at load time from a model_spec. load() dequantizes the GGUF
-                weights into per-layer device tensors; forward_prefill() runs the full
-                forward over a token sequence and returns the logits of every position.
+                resolved at load time from a model_spec. load() ingests the GGUF
+                weights; forward_prefill() runs the full forward over a token
+                sequence and returns the logits of every position.
 
-                The numeric path mirrors the template attention layer exactly: Q scaled
-                by 1/sqrt(head_dim) at projection, rotary encoding applied to Q and K
-                with positions 0..N-1, GQA repeat by channel copy, causal masking by
-                additive bias, plane-wise softmax, and a SwiGLU feed-forward.
+                The numeric path mirrors the template attention layer exactly: Q
+                scaled by 1/sqrt(head_dim) at projection, rotary encoding applied to
+                Q and K with positions 0..N-1, GQA repeat by channel copy, causal
+                masking by additive per-head bias, plane-wise softmax, and a SwiGLU
+                feed-forward.
         !*/
+
+        /* Storage of one weight matrix. In resident mode the dequantized, transposed
+           tensor lives in `resident`. At rest, the raw GGUF bytes live in `raw` and
+           the matrix is dequantized and transposed just in time into the shared pool
+           at every use. */
+        struct stored_matrix
+        {
+            resizable_tensor resident;
+            std::vector<uint8_t> raw;
+            ggml_type type = ggml_type::F32;
+            std::vector<uint64_t> dims;
+            long in_dim = 0, out_dim = 0;
+            bool permute = false;
+        };
+
     public:
+
+        // Weight residency, to set before load(). Quantized at rest is the default:
+        // memory stays close to the file size and, on CUDA builds, device memory
+        // holds only the materialization pool. Disable it to trade memory for the
+        // fastest forward (no per-use dequantization or upload).
+        void set_quantized_at_rest(bool enabled) { at_rest_ = enabled; }
+        bool quantized_at_rest() const { return at_rest_; }
 
         void load(gguf_reader& g, const model_spec& spec, const gguf_load_options& opt)
         {
@@ -72,13 +103,27 @@ namespace dlib
             load_matrix(g, spec.tied_embeddings ? "token_embd.weight" : "output.weight",
                 d, spec.vocab_size, lm_head_, opt);
 
-            /* The embedding table stays on the host: the per-token row gather is a
-               trivial host operation and the activations are uploaded in one block. */
+            /* The embedding table stays on the host. Resident mode keeps it as a flat
+               float array; at rest, the raw quantized rows are kept and gathered rows
+               are dequantized on demand (a token row spans only a few blocks). */
             const gguf_tensor_info* e = g.find_tensor("token_embd.weight");
             if (!e) throw std::runtime_error("runtime_transformer: token_embd.weight not found");
-            gguf_read_dequantized(g, *e, embd_);
-            if (embd_.size() != static_cast<size_t>(spec.vocab_size) * d)
-                throw std::runtime_error("runtime_transformer: embedding table size mismatch");
+            if (at_rest_)
+            {
+                embd_raw_.type = e->type;
+                embd_raw_.dims = e->dims;
+                g.read_tensor_raw(*e, embd_raw_.raw);
+                const ggml_type_traits tr = get_ggml_type_traits(e->type);
+                if (static_cast<uint64_t>(d) % tr.block_size != 0)
+                    throw std::runtime_error("runtime_transformer: embedding row not block-aligned");
+                embd_row_bytes_ = static_cast<size_t>(d) / tr.block_size * tr.type_size;
+            }
+            else
+            {
+                gguf_read_dequantized(g, *e, embd_);
+                if (embd_.size() != static_cast<size_t>(spec.vocab_size) * d)
+                    throw std::runtime_error("runtime_transformer: embedding table size mismatch");
+            }
         }
 
         // Full prefill forward. Returns the logits of every position in a
@@ -98,20 +143,19 @@ namespace dlib
             /* Embedding gather on the host, single upload. */
             x_.set_size(1, 1, N, d);
             {
-                float* xh = x_.host();
+                float* xh = x_.host_write_only();
                 for (long t = 0; t < N; ++t)
                 {
                     const long id = tokens[static_cast<size_t>(t)];
                     DLIB_CASSERT(id >= 0 && id < spec_.vocab_size, "token id out of range");
-                    std::memcpy(xh + t * d, embd_.data() + static_cast<size_t>(id) * d,
-                        static_cast<size_t>(d) * sizeof(float));
+                    gather_embedding_row(id, xh + t * d);
                 }
             }
 
             build_trig_caches(N);
             build_causal_mask(N);
 
-            for (const layer& L : layers_)
+            for (layer& L : layers_)
             {
                 /* ---- attention block ---- */
                 tt::rms_normalize(eps, xn_, rms_scale_, x_, L.attn_norm_g, true);
@@ -125,9 +169,9 @@ namespace dlib
                     auto qv = q_2d(q_flat_, 0);
                     auto kv_v = kv_2d(k_flat_, 0);
                     auto vv = kv_2d(v_flat_, 0);
-                    tt::gemm(0.0f, qv, qk_scale, xv, false, L.wq, false);
-                    tt::gemm(0.0f, kv_v, 1.0f, xv, false, L.wk, false);
-                    tt::gemm(0.0f, vv, 1.0f, xv, false, L.wv, false);
+                    tt::gemm(0.0f, qv, qk_scale, xv, false, weight(L.wq), false);
+                    tt::gemm(0.0f, kv_v, 1.0f, xv, false, weight(L.wk), false);
+                    tt::gemm(0.0f, vv, 1.0f, xv, false, weight(L.wv), false);
                 }
 
                 q4_.set_size(1, H, N, hd);
@@ -174,7 +218,7 @@ namespace dlib
                     alias_tensor c_2d(N, H * hd), o_2d(N, d);
                     auto cv = c_2d(ctx_flat_, 0);
                     auto ov = o_2d(attn_out_, 0);
-                    tt::gemm(0.0f, ov, 1.0f, cv, false, L.wo, false);
+                    tt::gemm(0.0f, ov, 1.0f, cv, false, weight(L.wo), false);
                 }
                 tt::add(x_, x_, attn_out_);
 
@@ -187,8 +231,8 @@ namespace dlib
                     auto nv = n_2d(xn_, 0);
                     auto gv = f_2d(gate_, 0);
                     auto uv = f_2d(up_, 0);
-                    tt::gemm(0.0f, gv, 1.0f, nv, false, L.w_gate, false);
-                    tt::gemm(0.0f, uv, 1.0f, nv, false, L.w_up, false);
+                    tt::gemm(0.0f, gv, 1.0f, nv, false, weight(L.w_gate), false);
+                    tt::gemm(0.0f, uv, 1.0f, nv, false, weight(L.w_up), false);
                 }
                 sig_.copy_size(gate_);
                 tt::sigmoid(sig_, gate_);
@@ -199,7 +243,7 @@ namespace dlib
                     alias_tensor h_2d(N, spec_.d_ffn), f_2d(N, d);
                     auto hv = h_2d(gate_, 0);
                     auto fv = f_2d(ffn_out_, 0);
-                    tt::gemm(0.0f, fv, 1.0f, hv, false, L.w_down, false);
+                    tt::gemm(0.0f, fv, 1.0f, hv, false, weight(L.w_down), false);
                 }
                 tt::add(x_, x_, ffn_out_);
             }
@@ -211,7 +255,7 @@ namespace dlib
                 alias_tensor n_2d(N, d), l_2d(N, spec_.vocab_size);
                 auto nv = n_2d(xn_, 0);
                 auto lv = l_2d(logits_, 0);
-                tt::gemm(0.0f, lv, 1.0f, nv, false, lm_head_, false);
+                tt::gemm(0.0f, lv, 1.0f, nv, false, weight(lm_head_), false);
             }
             return logits_;
         }
@@ -226,25 +270,62 @@ namespace dlib
         }
 
         void load_matrix(gguf_reader& g, const std::string& name, long in_dim, long out_dim,
-            resizable_tensor& dst, const gguf_load_options& opt)
+            stored_matrix& dst, const gguf_load_options& opt)
         {
             const gguf_tensor_info* t = g.find_tensor(name);
             if (!t) throw std::runtime_error("runtime_transformer: missing tensor " + name);
-            std::vector<float> src;
-            gguf_read_dequantized(g, *t, src);
-            if (src.size() != static_cast<size_t>(in_dim) * out_dim)
+            if (t->n_elements() != static_cast<uint64_t>(in_dim) * out_dim)
                 throw std::runtime_error("runtime_transformer: shape mismatch for " + name);
-            dst.set_size(in_dim, out_dim);
+            dst.in_dim = in_dim;
+            dst.out_dim = out_dim;
             /* GGUF stores [out, in] row-major; the engine multiplies x[N,in] @ W[in,out],
-               so transpose here, honoring the optional rotate-half permutation exactly
-               like the template-path loader. The head arguments only matter when the
-               permutation applies. */
-            const bool permute = opt.rope_permute
+               so the materialization transposes, honoring the optional rotate-half
+               permutation exactly like the template-path loader. */
+            dst.permute = opt.rope_permute
                 && (name.find("attn_q") != std::string::npos || name.find("attn_k") != std::string::npos);
-            gguf_load_impl::transpose_into(src, out_dim, in_dim, dst.host(),
-                permute ? out_dim / head_dim() : 1,
-                permute ? head_dim() : out_dim,
-                permute);
+            if (at_rest_)
+            {
+                dst.type = t->type;
+                dst.dims = t->dims;
+                g.read_tensor_raw(*t, dst.raw);
+            }
+            else
+            {
+                std::vector<float> src;
+                gguf_read_dequantized(g, *t, src);
+                dst.resident.set_size(in_dim, out_dim);
+                transpose_matrix(src, dst, dst.resident.host());
+            }
+        }
+
+        /* Source tensor for one gemm: the resident copy, or a just-in-time
+           materialization into the rotating pool. The returned reference stays valid
+           until the same pool slot is handed out again, i.e. beyond the single gemm
+           that consumes it. */
+        const tensor& weight(stored_matrix& m)
+        {
+            if (m.resident.size() != 0)
+                return m.resident;
+            gguf_tensor_info info;
+            info.type = m.type;
+            info.dims = m.dims;
+            gguf_dequantize(info, m.raw, scratch_);
+            resizable_tensor& slot = pool_[pool_next_];
+            pool_next_ = (pool_next_ + 1) % 2;
+            slot.set_size(m.in_dim, m.out_dim);
+            /* Pure overwrite: host_write_only() skips the device-to-host refresh that
+               host() would perform on a device-current tensor. */
+            transpose_matrix(scratch_, m, slot.host_write_only());
+            return slot;
+        }
+
+        void transpose_matrix(const std::vector<float>& src, const stored_matrix& m, float* dst) const
+        {
+            const long hd = const_cast<runtime_transformer*>(this)->head_dim();
+            gguf_load_impl::transpose_into(src, m.out_dim, m.in_dim, dst,
+                m.permute ? m.out_dim / hd : 1,
+                m.permute ? hd : m.out_dim,
+                m.permute);
         }
 
         void load_gamma(gguf_reader& g, const std::string& name, long d, resizable_tensor& dst)
@@ -259,13 +340,33 @@ namespace dlib
             std::memcpy(dst.host(), src.data(), src.size() * sizeof(float));
         }
 
+        /* Copy the embedding row of one token into dst. At rest, only the blocks of
+           that row are dequantized (a row spans row_bytes on disk). */
+        void gather_embedding_row(long id, float* dst)
+        {
+            const long d = spec_.d_model;
+            if (!at_rest_)
+            {
+                std::memcpy(dst, embd_.data() + static_cast<size_t>(id) * d,
+                    static_cast<size_t>(d) * sizeof(float));
+                return;
+            }
+            gguf_tensor_info info;
+            info.type = embd_raw_.type;
+            info.dims = { static_cast<uint64_t>(d) };
+            row_bytes_.assign(embd_raw_.raw.begin() + static_cast<size_t>(id) * embd_row_bytes_,
+                embd_raw_.raw.begin() + static_cast<size_t>(id + 1) * embd_row_bytes_);
+            gguf_dequantize(info, row_bytes_, row_values_);
+            std::memcpy(dst, row_values_.data(), static_cast<size_t>(d) * sizeof(float));
+        }
+
         void build_trig_caches(long N)
         {
             const long half = head_dim() / 2;
             cos_cache_.set_size(1, 1, N, half);
             sin_cache_.set_size(1, 1, N, half);
-            float* c = cos_cache_.host();
-            float* s = sin_cache_.host();
+            float* c = cos_cache_.host_write_only();
+            float* s = sin_cache_.host_write_only();
             for (long pos = 0; pos < N; ++pos)
                 for (long i = 0; i < half; ++i)
                 {
@@ -280,7 +381,7 @@ namespace dlib
         void build_causal_mask(long N)
         {
             mask_.set_size(1, 1, N, N);
-            float* m = mask_.host();
+            float* m = mask_.host_write_only();
             for (long r = 0; r < N; ++r)
                 for (long cidx = 0; cidx < N; ++cidx)
                     m[r * N + cidx] = (cidx <= r) ? 0.0f : -1e9f;
@@ -288,14 +389,27 @@ namespace dlib
 
         struct layer
         {
-            resizable_tensor attn_norm_g, wq, wk, wv, wo;
-            resizable_tensor ffn_norm_g, w_gate, w_up, w_down;
+            resizable_tensor attn_norm_g, ffn_norm_g;
+            stored_matrix wq, wk, wv, wo, w_gate, w_up, w_down;
         };
 
         model_spec spec_;
+        bool at_rest_ = true;
         std::vector<layer> layers_;
-        resizable_tensor final_norm_g_, lm_head_;
+        resizable_tensor final_norm_g_;
+        stored_matrix lm_head_;
+
+        /* Embedding table: resident floats, or raw rows at rest. */
         std::vector<float> embd_;
+        stored_matrix embd_raw_;
+        size_t embd_row_bytes_ = 0;
+        std::vector<uint8_t> row_bytes_;
+        std::vector<float> row_values_;
+
+        /* Just-in-time materialization pool and scratch. */
+        resizable_tensor pool_[2];
+        int pool_next_ = 0;
+        std::vector<float> scratch_;
 
         /* Work buffers, reused across layers and calls. */
         resizable_tensor x_, xn_, rms_scale_;

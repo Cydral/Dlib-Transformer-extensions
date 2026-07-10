@@ -93,6 +93,7 @@ int main(int argc, char** argv)
         parser.add_option("probe-ids", "Feed explicit token ids (space or comma separated)", 1);
         parser.add_option("prompt", "Prompt for --probe-logits (default: capital of France)", 1);
         parser.add_option("rope-permute", "Map split-half (NeoX) Q/K layouts to the interleaved kernel");
+        parser.add_option("resident", "Dequantize all weights at load time (fastest forward, full f32 footprint); default keeps them quantized at rest");
         parser.parse(argc, argv);
 
         if (!parser.option("input"))
@@ -121,7 +122,9 @@ int main(int argc, char** argv)
         lopt.verbose = true;
 
         runtime_transformer rt;
-        cout << "Loading weights (runtime engine)...\n";
+        rt.set_quantized_at_rest(!parser.option("resident"));
+        cout << "Loading weights (runtime engine"
+             << (rt.quantized_at_rest() ? ", quantized at rest" : "") << ")...\n";
         rt.load(g, spec, lopt);
 
         hf_tokenizer tok;
