@@ -196,14 +196,15 @@ namespace dlib
 
     inline compat_result check_compatibility(const model_spec& s, bool fused_attention_path = true)
     {
-        /* The qwen2 family carries QKV biases, which the fused attention parameter
-           packing of the template path cannot represent; the runtime engine loads
-           and applies them, so it passes fused_attention_path = false. */
+        /* fused_attention_path distinguishes the two consumers: the template network
+           packs [wq|wk|wv|wo] with no bias slots, so the QKV biases of the qwen2
+           family are not representable there; the runtime engine loads and applies
+           them and passes false. */
         compat_result r;
         if (s.family == arch_family::gemma || s.family == arch_family::gemma2)
-            if (fused_attention_path && s.arch_name == "qwen2")
+            r.blockers.push_back("Gemma family needs (1+w) RMSNorm, embedding scaling and GeGLU, not available yet");
+        if (fused_attention_path && s.arch_name == "qwen2")
             r.blockers.push_back("QKV biases (qwen2 family) are not representable in the fused attention packing; import through the runtime engine");
-        r.blockers.push_back("Gemma family needs (1+w) RMSNorm, embedding scaling and GeGLU, not available yet");
         if (s.n_experts > 0)
             r.blockers.push_back("MoE routing convention must be aligned with moe_ before enabling import");
         if (s.rope_scaling_type == "linear" && s.rope_scaling_factor > 0.0)

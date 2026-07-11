@@ -36,6 +36,7 @@
 #include "dnn/transformer_config.h"
 #include "dnn/decoder_transformer_config.h"
 #include "dnn/runtime_transformer.h"
+#include "dnn/decoder_models.h"
 
 #endif // DLIB_DNn_
 
