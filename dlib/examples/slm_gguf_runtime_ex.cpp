@@ -262,7 +262,7 @@ int main(int argc, char** argv)
             const model_spec spec = detect_model(g);
             cout << describe(spec) << "\n";
 
-            const compat_result rep = check_compatibility(spec);
+            const compat_result rep = check_compatibility(spec, /*fused_attention_path=*/false);
             for (const string& n : rep.notes) cout << "note: " << n << "\n";
             if (!rep.blockers.empty())
             {
