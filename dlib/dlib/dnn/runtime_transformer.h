@@ -79,6 +79,7 @@ namespace dlib
             resizable_tensor attn_norm_g, ffn_norm_g;
             stored_matrix wq, wk, wv, wo, w_gate, w_up, w_down;
             resizable_tensor bq, bk, bv;         // optional QKV biases (Qwen2 family)
+            resizable_tensor qnorm_g, knorm_g;   // optional per-head QK-norm gammas (Qwen3)
             resizable_tensor k_cache, v_cache;   // pre-rotary keys, values
         };
 
@@ -160,6 +161,8 @@ namespace dlib
                 load_optional_bias(g, p + "attn_q.bias", qd, L.bq, rope_permute_);
                 load_optional_bias(g, p + "attn_k.bias", kv, L.bk, rope_permute_);
                 load_optional_bias(g, p + "attn_v.bias", kv, L.bv, false);
+                load_optional_head_gamma(g, p + "attn_q_norm.weight", L.qnorm_g, true);
+                load_optional_head_gamma(g, p + "attn_k_norm.weight", L.knorm_g, false);
                 load_matrix(g, p + "attn_output.weight", qd, d, L.wo, opt);
                 load_gamma (g, p + "ffn_norm.weight", d, L.ffn_norm_g);
                 load_matrix(g, p + "ffn_gate.weight", d, spec.d_ffn, L.w_gate, opt);
@@ -292,8 +295,10 @@ namespace dlib
                 tt::split_heads(false, k4_, k_flat_);
                 tt::split_heads(false, v4_, v_flat_);
 
+                apply_qk_norm(L, eps);
+
                 if (cap_ > 0)
-                    append_to_cache(L, k4_, v4_, N);   // pre-rotary keys, values
+                    append_to_cache(L, k4_, v4_, N);   // normalized, pre-rotary keys
 
                 tt::apply_rotary_positional_embedding(false, q4_, cos_cache_, sin_cache_);
                 tt::apply_rotary_positional_embedding(false, k4_, cos_cache_, sin_cache_);
@@ -432,7 +437,8 @@ namespace dlib
                 tt::split_heads(false, q4_, q_flat_);
                 tt::split_heads(false, k4_, k_flat_);
                 tt::split_heads(false, v4_, v_flat_);
-                append_to_cache(L, k4_, v4_, 1);   // pre-rotary key, value at row pos
+                apply_qk_norm(L, eps);
+                append_to_cache(L, k4_, v4_, 1);   // normalized, pre-rotary key at row pos
 
                 /* Rotate the query at its position: a one-row slice of the caches. */
                 {
@@ -568,6 +574,8 @@ namespace dlib
                 dlib::serialize(L.bq, out);
                 dlib::serialize(L.bk, out);
                 dlib::serialize(L.bv, out);
+                dlib::serialize(L.qnorm_g, out);
+                dlib::serialize(L.knorm_g, out);
                 serialize_matrix(L.wo, out);
                 serialize_matrix(L.w_gate, out);
                 serialize_matrix(L.w_up, out);
@@ -625,6 +633,8 @@ namespace dlib
                 dlib::deserialize(L.bq, in);
                 dlib::deserialize(L.bk, in);
                 dlib::deserialize(L.bv, in);
+                dlib::deserialize(L.qnorm_g, in);
+                dlib::deserialize(L.knorm_g, in);
                 deserialize_matrix(L.wo, in);
                 deserialize_matrix(L.w_gate, in);
                 deserialize_matrix(L.w_up, in);
@@ -790,6 +800,46 @@ namespace dlib
             }
         }
 
+        /* Optional per-head QK-norm gamma (Qwen3), one vector of head_dim values shared
+           by every head, stored [1,1,1,hd] for rms_normalize. Two adjustments happen at
+           load: the rotary layout permutation (the gamma indexes the same permuted
+           space as the Q/K rows), and, for the Q side, the 1/sqrt(head_dim) attention
+           prescale folded into the gamma, since normalization erases any scale applied
+           upstream (rms_norm(s*q) == rms_norm(q)) and would silently drop the prescale
+           carried by the projection gemm. */
+        void load_optional_head_gamma(gguf_reader& g, const std::string& name,
+            resizable_tensor& dst, bool fold_qk_scale)
+        {
+            const gguf_tensor_info* t = g.find_tensor(name);
+            if (!t) { dst.set_size(0, 0, 0, 0); return; }
+            const long hd = head_dim();
+            std::vector<float> src;
+            gguf_read_dequantized(g, *t, src);
+            if (src.size() != static_cast<size_t>(hd))
+                throw std::runtime_error("runtime_transformer: shape mismatch for " + name);
+            const float s = fold_qk_scale ? 1.0f / std::sqrt(static_cast<float>(hd)) : 1.0f;
+            const long half = hd / 2;
+            dst.set_size(1, 1, 1, hd);
+            float* out = dst.host_write_only();
+            for (long r = 0; r < hd; ++r)
+            {
+                const long ri = rope_permute_ ? ((r < half) ? (2 * r) : (2 * (r - half) + 1)) : r;
+                out[ri] = src[static_cast<size_t>(r)] * s;
+            }
+        }
+
+        /* Per-head RMS normalization of Q and K (Qwen3): rms_normalize over the last
+           dimension of the [1, heads, rows, head_dim] tensors, gammas carrying the
+           layout permutation and, on the Q side, the attention prescale. */
+        void apply_qk_norm(const layer& L, float eps)
+        {
+            if (L.qnorm_g.size() == 0) return;
+            tt::rms_normalize(eps, qk_norm_tmp_, rms_scale_, q4_, L.qnorm_g, true);
+            memcpy(q4_, qk_norm_tmp_);
+            tt::rms_normalize(eps, qk_norm_tmp_, rms_scale_, k4_, L.knorm_g, true);
+            memcpy(k4_, qk_norm_tmp_);
+        }
+
         void ensure_ones(long n)
         {
             if (ones_.num_samples() == n) return;
@@ -874,6 +924,7 @@ namespace dlib
         std::vector<float> row_values_;
 
         /* Just-in-time materialization pool and scratch. */
+        resizable_tensor qk_norm_tmp_;
         resizable_tensor ones_;
         resizable_tensor pool_[2];
         int pool_next_ = 0;
