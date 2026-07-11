@@ -194,11 +194,16 @@ namespace dlib
         std::vector<std::string> notes;
     };
 
-    inline compat_result check_compatibility(const model_spec& s)
+    inline compat_result check_compatibility(const model_spec& s, bool fused_attention_path = true)
     {
+        /* The qwen2 family carries QKV biases, which the fused attention parameter
+           packing of the template path cannot represent; the runtime engine loads
+           and applies them, so it passes fused_attention_path = false. */
         compat_result r;
         if (s.family == arch_family::gemma || s.family == arch_family::gemma2)
-            r.blockers.push_back("Gemma family needs (1+w) RMSNorm, embedding scaling and GeGLU, not available yet");
+            if (fused_attention_path && s.arch_name == "qwen2")
+            r.blockers.push_back("QKV biases (qwen2 family) are not representable in the fused attention packing; import through the runtime engine");
+        r.blockers.push_back("Gemma family needs (1+w) RMSNorm, embedding scaling and GeGLU, not available yet");
         if (s.n_experts > 0)
             r.blockers.push_back("MoE routing convention must be aligned with moe_ before enabling import");
         if (s.rope_scaling_type == "linear" && s.rope_scaling_factor > 0.0)
@@ -214,7 +219,7 @@ namespace dlib
         if (s.d_model <= 0 || s.n_layers <= 0 || s.vocab_size <= 0)
             r.blockers.push_back("incomplete metadata (missing dimensions)");
         if (s.quantized)
-            r.notes.push_back("Weights are quantized; the converter dequantizes legacy (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0) and k-quant (Q2_K..Q6_K) formats; i-quants (IQ*) are not supported");
+            r.notes.push_back("Weights are quantized; the converter dequantizes legacy (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0) k-quant (Q2_K..Q6_K) and IQ4_NL formats; grid-based i-quants (IQ1/IQ2/IQ3) are not supported");
         r.ok = r.blockers.empty();
         return r;
     }

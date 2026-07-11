@@ -6,7 +6,7 @@
     resolved at load time from the GGUF metadata, so this program compiles once and
     probes any supported model. It shares the validation protocol of the static path,
     same options, same output format, so the per-position dumps of the two engines
-    and of the llama.cpp reference are directly comparable.
+    and of an external reference implementation are directly comparable.
 
     Usage:
       slm_gguf_runtime_ex --input model.gguf --probe-logits --prompt "The capital of France is"

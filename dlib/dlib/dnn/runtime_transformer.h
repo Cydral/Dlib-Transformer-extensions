@@ -9,7 +9,8 @@
 // time, so the engine compiles once and loads any supported GGUF model dynamically.
 // It runs on the same tensor primitives (gemm, split/merge heads, rotary embedding,
 // rms normalization, plane-wise softmax) as the template stack, on CPU or CUDA
-// according to the build, and is validated by logit parity against llama.cpp.
+// according to the build, and is validated by logit parity against external
+// reference implementations.
 //
 // Two weight residencies are supported:
 //   - resident (default): every matrix is dequantized once at load time; fastest
@@ -77,6 +78,7 @@ namespace dlib
         {
             resizable_tensor attn_norm_g, ffn_norm_g;
             stored_matrix wq, wk, wv, wo, w_gate, w_up, w_down;
+            resizable_tensor bq, bk, bv;         // optional QKV biases (Qwen2 family)
             resizable_tensor k_cache, v_cache;   // pre-rotary keys, values
         };
 
@@ -134,6 +136,13 @@ namespace dlib
         void load(gguf_reader& g, const model_spec& spec, const gguf_load_options& opt)
         {
             spec_ = spec;
+            /* Rotary convention: llama-family GGUFs carry Q/K weights pre-permuted for
+               the interleaved kernel, while the qwen families keep the split-half
+               (NeoX) layout; the load-time permutation maps the latter onto the
+               interleaved kernel. Selected from the architecture, with the option as
+               a manual override for exotic exports. */
+            rope_permute_ = opt.rope_permute
+                || spec.arch_name == "qwen2" || spec.arch_name == "qwen3";
             const long d  = spec.d_model;
             const long qd = spec.n_heads * head_dim();
             const long kv = spec.n_kv_heads * head_dim();
@@ -148,6 +157,9 @@ namespace dlib
                 load_matrix(g, p + "attn_q.weight",      d, qd, L.wq, opt);
                 load_matrix(g, p + "attn_k.weight",      d, kv, L.wk, opt);
                 load_matrix(g, p + "attn_v.weight",      d, kv, L.wv, opt);
+                load_optional_bias(g, p + "attn_q.bias", qd, L.bq, rope_permute_);
+                load_optional_bias(g, p + "attn_k.bias", kv, L.bk, rope_permute_);
+                load_optional_bias(g, p + "attn_v.bias", kv, L.bv, false);
                 load_matrix(g, p + "attn_output.weight", qd, d, L.wo, opt);
                 load_gamma (g, p + "ffn_norm.weight", d, L.ffn_norm_g);
                 load_matrix(g, p + "ffn_gate.weight", d, spec.d_ffn, L.w_gate, opt);
@@ -264,6 +276,13 @@ namespace dlib
                     tt::gemm(0.0f, qv, qk_scale, xv, false, weight(L.wq), false);
                     tt::gemm(0.0f, kv_v, 1.0f, xv, false, weight(L.wk), false);
                     tt::gemm(0.0f, vv, 1.0f, xv, false, weight(L.wv), false);
+                    if (L.bq.size())
+                    {
+                        ensure_ones(N);
+                        tt::gemm(1.0f, qv, qk_scale, ones_, false, L.bq, false);
+                        tt::gemm(1.0f, kv_v, 1.0f, ones_, false, L.bk, false);
+                        tt::gemm(1.0f, vv, 1.0f, ones_, false, L.bv, false);
+                    }
                 }
 
                 q4_.set_size(1, H, N, hd);
@@ -399,6 +418,13 @@ namespace dlib
                     tt::gemm(0.0f, qv, qk_scale, xv, false, weight(L.wq), false);
                     tt::gemm(0.0f, kv_v, 1.0f, xv, false, weight(L.wk), false);
                     tt::gemm(0.0f, vv, 1.0f, xv, false, weight(L.wv), false);
+                    if (L.bq.size())
+                    {
+                        ensure_ones(1);
+                        tt::gemm(1.0f, qv, qk_scale, ones_, false, L.bq, false);
+                        tt::gemm(1.0f, kv_v, 1.0f, ones_, false, L.bk, false);
+                        tt::gemm(1.0f, vv, 1.0f, ones_, false, L.bv, false);
+                    }
                 }
                 q4_.set_size(1, H, 1, hd);
                 k4_.set_size(1, KV, 1, hd);
@@ -510,7 +536,9 @@ namespace dlib
         void save(std::ostream& out) const
         {
             dlib::serialize("rtm_1", out);
+            dlib::serialize(spec_.arch_name, out);
             dlib::serialize(spec_.model_name, out);
+            dlib::serialize(static_cast<int>(spec_.family), out);
             dlib::serialize(spec_.n_layers, out);
             dlib::serialize(spec_.n_heads, out);
             dlib::serialize(spec_.n_kv_heads, out);
@@ -518,9 +546,18 @@ namespace dlib
             dlib::serialize(spec_.d_ffn, out);
             dlib::serialize(spec_.head_dim, out);
             dlib::serialize(spec_.vocab_size, out);
+            dlib::serialize(spec_.ffn_num, out);
+            dlib::serialize(spec_.ffn_den, out);
             dlib::serialize(spec_.rms_eps, out);
             dlib::serialize(spec_.rope_freq_base, out);
+            dlib::serialize(spec_.n_experts, out);
+            dlib::serialize(spec_.n_experts_used, out);
+            dlib::serialize(spec_.rope_scaling_type, out);
+            dlib::serialize(spec_.rope_scaling_factor, out);
+            dlib::serialize(spec_.rope_orig_ctx, out);
             dlib::serialize(spec_.tied_embeddings, out);
+            dlib::serialize(spec_.quantized, out);
+            dlib::serialize(spec_.qk_norm, out);
             for (const layer& L : layers_)
             {
                 dlib::serialize(L.attn_norm_g, out);
@@ -528,6 +565,9 @@ namespace dlib
                 serialize_matrix(L.wq, out);
                 serialize_matrix(L.wk, out);
                 serialize_matrix(L.wv, out);
+                dlib::serialize(L.bq, out);
+                dlib::serialize(L.bk, out);
+                dlib::serialize(L.bv, out);
                 serialize_matrix(L.wo, out);
                 serialize_matrix(L.w_gate, out);
                 serialize_matrix(L.w_up, out);
@@ -549,7 +589,11 @@ namespace dlib
             if (tag != "rtm_1")
                 throw std::runtime_error("runtime_transformer: not a runtime archive (tag '" + tag + "')");
             spec_ = model_spec();
+            dlib::deserialize(spec_.arch_name, in);
             dlib::deserialize(spec_.model_name, in);
+            int fam = 0;
+            dlib::deserialize(fam, in);
+            spec_.family = static_cast<arch_family>(fam);
             dlib::deserialize(spec_.n_layers, in);
             dlib::deserialize(spec_.n_heads, in);
             dlib::deserialize(spec_.n_kv_heads, in);
@@ -557,9 +601,18 @@ namespace dlib
             dlib::deserialize(spec_.d_ffn, in);
             dlib::deserialize(spec_.head_dim, in);
             dlib::deserialize(spec_.vocab_size, in);
+            dlib::deserialize(spec_.ffn_num, in);
+            dlib::deserialize(spec_.ffn_den, in);
             dlib::deserialize(spec_.rms_eps, in);
             dlib::deserialize(spec_.rope_freq_base, in);
+            dlib::deserialize(spec_.n_experts, in);
+            dlib::deserialize(spec_.n_experts_used, in);
+            dlib::deserialize(spec_.rope_scaling_type, in);
+            dlib::deserialize(spec_.rope_scaling_factor, in);
+            dlib::deserialize(spec_.rope_orig_ctx, in);
             dlib::deserialize(spec_.tied_embeddings, in);
+            dlib::deserialize(spec_.quantized, in);
+            dlib::deserialize(spec_.qk_norm, in);
             layers_.clear();
             layers_.resize(static_cast<size_t>(spec_.n_layers));
             for (layer& L : layers_)
@@ -569,6 +622,9 @@ namespace dlib
                 deserialize_matrix(L.wq, in);
                 deserialize_matrix(L.wk, in);
                 deserialize_matrix(L.wv, in);
+                dlib::deserialize(L.bq, in);
+                dlib::deserialize(L.bk, in);
+                dlib::deserialize(L.bv, in);
                 deserialize_matrix(L.wo, in);
                 deserialize_matrix(L.w_gate, in);
                 deserialize_matrix(L.w_up, in);
@@ -654,7 +710,7 @@ namespace dlib
             /* GGUF stores [out, in] row-major; the engine multiplies x[N,in] @ W[in,out],
                so the materialization transposes, honoring the optional rotate-half
                permutation exactly like the template-path loader. */
-            dst.permute = opt.rope_permute
+            dst.permute = rope_permute_
                 && (name.find("attn_q") != std::string::npos || name.find("attn_k") != std::string::npos);
             if (at_rest_)
             {
@@ -699,6 +755,47 @@ namespace dlib
                 m.permute ? m.out_dim / hd : 1,
                 m.permute ? hd : m.out_dim,
                 m.permute);
+        }
+
+        /* Optional per-projection bias vector, stored as [1, dim] so the addition is
+           a rank-one gemm: ones[N,1] @ b[1,dim] accumulated into the projection. The
+           tensor stays empty when the model carries no bias. When the rotary layout
+           permutation applies to the projection, it must apply to its bias too: the
+           bias lives in the same output space as the permuted weight rows, and every
+           quantity indexed by that space follows the same reordering. */
+        void load_optional_bias(gguf_reader& g, const std::string& name, long dim,
+            resizable_tensor& dst, bool permute)
+        {
+            const gguf_tensor_info* t = g.find_tensor(name);
+            if (!t) { dst.set_size(0, 0, 0, 0); return; }
+            std::vector<float> src;
+            gguf_read_dequantized(g, *t, src);
+            if (src.size() != static_cast<size_t>(dim))
+                throw std::runtime_error("runtime_transformer: shape mismatch for " + name);
+            dst.set_size(1, dim);
+            float* out = dst.host_write_only();
+            if (!permute)
+            {
+                std::memcpy(out, src.data(), src.size() * sizeof(float));
+                return;
+            }
+            const long hd = head_dim();
+            const long half = hd / 2;
+            for (long o = 0; o < dim; ++o)
+            {
+                const long h = o / hd;
+                const long r = o % hd;
+                const long ri = (r < half) ? (2 * r) : (2 * (r - half) + 1);
+                out[h * hd + ri] = src[static_cast<size_t>(o)];
+            }
+        }
+
+        void ensure_ones(long n)
+        {
+            if (ones_.num_samples() == n) return;
+            ones_.set_size(n, 1);
+            float* p = ones_.host_write_only();
+            for (long i = 0; i < n; ++i) p[i] = 1.0f;
         }
 
         void load_gamma(gguf_reader& g, const std::string& name, long d, resizable_tensor& dst)
@@ -763,6 +860,7 @@ namespace dlib
 
         model_spec spec_;
         bool at_rest_ = true;
+        bool rope_permute_ = false;
         long cap_ = 0, keep_ = 0, cur_len_ = 0;
         std::vector<layer> layers_;
         resizable_tensor final_norm_g_;
@@ -776,6 +874,7 @@ namespace dlib
         std::vector<float> row_values_;
 
         /* Just-in-time materialization pool and scratch. */
+        resizable_tensor ones_;
         resizable_tensor pool_[2];
         int pool_next_ = 0;
         std::vector<float> scratch_;

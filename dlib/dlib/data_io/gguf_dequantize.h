@@ -7,10 +7,12 @@
 // Matrix transposition, RoPE head permutation and fused packing for the Dlib layers are
 // the repacking stage's responsibility, not this one.
 //
-// Supported now: F32, F16, the legacy blocks (Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1) and the
-// k-quants (Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K). The _S/_M/_L mixes (e.g. Q4_K_M) are not
-// tensor types: each tensor in such a file already carries one of the types above, so they
-// are handled with no extra code. The codebook-based i-quants (IQ*) are not covered and throw.
+// Supported now: F32, F16, the legacy blocks (Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1), the
+// k-quants (Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K) and IQ4_NL (4-bit with a fixed non-linear
+// value table, used as the fallback when a row is not a multiple of the k-quant super-block).
+// The _S/_M/_L mixes (e.g. Q4_K_M) are not tensor types: each tensor in such a file already
+// carries one of the types above, so they are handled with no extra code. The grid-based
+// i-quants (IQ1/IQ2/IQ3, IQ4_XS) are not covered and throw.
 
 #ifndef DLIB_GGUF_DEQUANTIZE_H_
 #define DLIB_GGUF_DEQUANTIZE_H_
@@ -133,6 +135,22 @@ namespace dlib
         const float d = gguf_rd_half(p);
         const int8_t* qs = reinterpret_cast<const int8_t*>(p + 4);
         for (int j = 0; j < 32; ++j) y[j] = qs[j] * d;
+    }
+
+    /* IQ4_NL, 32 values per block: one fp16 scale then 16 bytes of nibbles indexing a
+       fixed non-linear table of 16 signed values, w = d * table[q]. */
+    inline void gguf_dq_iq4_nl(const uint8_t* p, float* y)
+    {
+        static const int8_t kvalues[16] = {
+            -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113
+        };
+        const float d = gguf_rd_half(p);
+        const uint8_t* qs = p + 2;
+        for (int j = 0; j < 16; ++j)
+        {
+            y[j]      = d * kvalues[qs[j] & 0x0F];
+            y[j + 16] = d * kvalues[qs[j] >>   4];
+        }
     }
 
     /* K-quant super-block formats, 256 values per super-block split into sub-blocks. Sub-block
@@ -371,6 +389,7 @@ namespace dlib
         case ggml_type::Q5_K: gguf_dq_blocks(t, raw, out, 256, 176, gguf_dq_q5_K); break;
         case ggml_type::Q6_K: gguf_dq_blocks(t, raw, out, 256, 210, gguf_dq_q6_K); break;
         case ggml_type::Q8_K: gguf_dq_blocks(t, raw, out, 256, 292, gguf_dq_q8_K); break;
+        case ggml_type::IQ4_NL: gguf_dq_blocks(t, raw, out, 32, 18, gguf_dq_iq4_nl); break;
         default:
             throw std::runtime_error("gguf_dequantize: ggml type not yet supported: "
                 + std::to_string(static_cast<uint32_t>(t.type)));

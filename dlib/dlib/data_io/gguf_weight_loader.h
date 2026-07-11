@@ -295,8 +295,12 @@ namespace dlib
                 std::vector<float> sk = fetch(g, p + "attn_k.weight");
                 std::vector<float> sv = fetch(g, p + "attn_v.weight");
                 std::vector<float> so = fetch(g, p + "attn_output.weight");
-                transpose_into(sq, qd, d, fused.data(), nh, hd, opt.rope_permute);          // wq (RoPE)
-                transpose_into(sk, kv, d, fused.data() + nq, spec.n_kv_heads, hd, opt.rope_permute); // wk (RoPE)
+                /* qwen families keep the split-half (NeoX) Q/K layout; llama-family
+                   files come pre-permuted for the interleaved kernel. */
+                const bool neox_layout = opt.rope_permute
+                    || spec.arch_name == "qwen2" || spec.arch_name == "qwen3";
+                transpose_into(sq, qd, d, fused.data(), nh, hd, neox_layout);          // wq (RoPE)
+                transpose_into(sk, kv, d, fused.data() + nq, spec.n_kv_heads, hd, neox_layout); // wk (RoPE)
                 transpose_into(sv, kv, d, fused.data() + nq + nkv, 0, 0, false);            // wv
                 transpose_into(so, d, qd, fused.data() + nq + nkv + nkv, 0, 0, false);      // wo
                 if (spec.qk_norm)
