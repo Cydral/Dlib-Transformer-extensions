@@ -125,6 +125,18 @@ namespace dlib
 
         chat_template_kind kind() const { return kind_; }
 
+        // Whether the detected model exposes a reasoning mode (ChatML with a native
+        // "<think>" special token, e.g. Qwen3).
+        bool supports_reasoning() const { return thinking_; }
+
+        // Enables or disables the reasoning trace for thinking-capable models. Off by
+        // default: the assistant header then carries the empty think block, the
+        // documented soft switch for non-thinking mode. When enabled, the bare header
+        // lets the model open its own "<think>" span; clean_answer() strips it from
+        // the displayed text. No effect on models without a reasoning mode.
+        void set_reasoning(bool enabled) { reasoning_ = enabled; }
+        bool reasoning() const { return reasoning_ && thinking_; }
+
         // Whether the first prefill must be prepended with the BOS token. Zephyr
         // conversations start with BOS; ChatML models (Qwen) use no leading BOS.
         bool add_bos_on_first_turn() const
@@ -259,13 +271,14 @@ namespace dlib
         // header, as their template defines no think markup.
         std::string assistant_header() const
         {
-            return thinking_
+            return (thinking_ && !reasoning_)
                 ? "<|im_start|>assistant\n<think>\n\n</think>\n\n"
                 : "<|im_start|>assistant\n";
         }
 
         chat_template_kind kind_ = chat_template_kind::raw;
         bool thinking_ = false;
+        bool reasoning_ = false;
     };
 }
 

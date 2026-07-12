@@ -217,6 +217,23 @@ namespace dlib
         ) const;
         /*!
             ensures
+                - Returns true when the detected model exposes a reasoning mode
+                  (ChatML with a native "<think>" special token, e.g. Qwen3).
+        !*/
+
+        void set_reasoning(bool enabled);
+        /*!
+            ensures
+                - For thinking-capable models, selects between the reasoning trace
+                  (bare assistant header, the model opens its own "<think>" span) and
+                  the non-thinking soft switch (empty think block in the header, the
+                  default). clean_answer() strips reasoning spans in both cases. No
+                  effect on models without a reasoning mode.
+        !*/
+
+        bool supports_reasoning() const;
+        /*!
+            ensures
                 - Returns a text whose appearance in a generated answer must stop the
                   generation ("\n###" for the guanaco kind, which frequently opens a
                   new section of varying name instead of emitting eos), or an empty

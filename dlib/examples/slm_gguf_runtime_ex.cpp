@@ -28,6 +28,9 @@
 #    define NOMINMAX
 #  endif
 #  include <windows.h>
+#else
+#  include <sys/ioctl.h>
+#  include <unistd.h>
 #endif
 
 #include <random>
@@ -130,6 +133,21 @@ static int pick_next(const tensor& logits, const std::vector<int>& recent,
     return static_cast<int>(order[dist(rng)]);
 }
 
+/* Width of the terminal, for the physical-row accounting of the erase sequences. */
+static long terminal_width()
+{
+#ifdef _WIN32
+    CONSOLE_SCREEN_BUFFER_INFO info;
+    if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &info))
+        return info.srWindow.Right - info.srWindow.Left + 1;
+#else
+    winsize w{};
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) == 0 && w.ws_col > 0)
+        return w.ws_col;
+#endif
+    return 80;
+}
+
 /* Interactive chat: first turn through the prefill, every later token through the
    incremental step, continuous tokenization across turns. */
 static int chat_loop(runtime_transformer& rt, hf_tokenizer& tok, const chat_template_formatter& fmt,
@@ -152,6 +170,7 @@ static int chat_loop(runtime_transformer& rt, hf_tokenizer& tok, const chat_temp
 
     bool first = true;
     std::vector<int> recent;
+    resizable_tensor last_logits;   // last-row copy of the prefill logits
     for (;;)
     {
         cout << "You: " << std::flush;
@@ -169,12 +188,11 @@ static int chat_loop(runtime_transformer& rt, hf_tokenizer& tok, const chat_temp
             logits = &rt.forward_prefill(toks);
             /* The prefill returns every position; sampling reads the last row. */
             alias_tensor last_row(1, 1, 1, logits->nc());
-            static resizable_tensor last;
-            last.set_size(1, 1, 1, logits->nc());
+            last_logits.set_size(1, 1, 1, logits->nc());
             auto lr = last_row(const_cast<tensor&>(*logits),
                 static_cast<size_t>((logits->nr() - 1)) * logits->nc());
-            memcpy(last, lr);
-            logits = &last;
+            memcpy(last_logits, lr);
+            logits = &last_logits;
             first = false;
         }
         else
@@ -182,12 +200,20 @@ static int chat_loop(runtime_transformer& rt, hf_tokenizer& tok, const chat_temp
             for (int t : toks) logits = &rt.step(t);
         }
 
-        cout << "Model: " << std::flush;
-        /* Accumulate the ids and decode the whole sequence: SentencePiece carries the
-           leading space in the piece marker, and a lone token decodes as a sequence
-           start, so per-token decoding would drop every inter-word space. */
+        /* Token-by-token streaming, in two regimes. Text destined to disappear (the
+           reasoning span, template residues) is shown as a one-line ticker rewritten
+           in place with the tail of the trace: it never wraps nor scrolls, so it can
+           always be erased, unlike a multi-row region whose top may leave the screen,
+           beyond the reach of any cursor sequence. The visible answer, obtained by
+           cleaning the partial decode at every step (an open reasoning span cleans to
+           its start), streams normally by stable suffix and persists. The whole
+           sequence is re-decoded at each step because SentencePiece carries the
+           inter-word spaces in the piece markers. */
         std::vector<int> out;
-        std::string answer;
+        std::string answer, shown_clean;
+        const long tick_width = std::max<long>(20, terminal_width() - 12);
+        bool ticker_active = false;
+        cout << "Model: " << std::flush;
         for (;;)
         {
             const int next = pick_next(*logits, recent, temperature, top_k, top_p,
@@ -197,14 +223,47 @@ static int chat_loop(runtime_transformer& rt, hf_tokenizer& tok, const chat_temp
             answer = tok.decode(out, true);
             recent.push_back(next);
             if (recent.size() > 64) recent.erase(recent.begin());
+            bool stopped = false;
             if (!stop.empty() && answer.find(stop) != std::string::npos)
             {
                 answer.erase(answer.find(stop));
-                break;
+                stopped = true;
             }
+            const std::string clean = fmt.clean_answer(answer);
+            if (clean.size() > shown_clean.size()
+                && clean.compare(0, shown_clean.size(), shown_clean) == 0)
+            {
+                if (ticker_active)
+                {
+                    cout << "\r\033[KModel: ";
+                    ticker_active = false;
+                }
+                cout << clean.substr(shown_clean.size()) << std::flush;
+                shown_clean = clean;
+            }
+            else if (clean == shown_clean && shown_clean.empty())
+            {
+                /* Reasoning in progress: rolling tail of the hidden trace, dimmed,
+                   newlines flattened, on the single rewritten line. */
+                std::string tail = answer.size() > static_cast<size_t>(tick_width)
+                    ? answer.substr(answer.size() - tick_width) : answer;
+                for (char& c : tail) if (c == '\n' || c == '\r') c = ' ';
+                cout << "\r\033[KModel: \033[2m" << tail << "\033[0m" << std::flush;
+                ticker_active = true;
+            }
+            if (stopped) break;
             logits = &rt.step(next);
         }
-        cout << fmt.clean_answer(answer) << "\n";
+        /* Epilogue: settle the display on the final cleaned answer. */
+        const std::string clean = fmt.clean_answer(answer);
+        if (ticker_active)
+            cout << "\r\033[KModel: ";
+        if (clean.size() > shown_clean.size()
+            && clean.compare(0, shown_clean.size(), shown_clean) == 0)
+            cout << clean.substr(shown_clean.size());
+        else if (clean != shown_clean)
+            cout << (shown_clean.empty() ? "" : "\nModel: ") << clean;
+        cout << "\n";
         rt.step(eos);   // close the assistant turn in the token stream
     }
     return 0;
@@ -217,12 +276,19 @@ int main(int argc, char** argv)
 #ifdef _WIN32
         SetConsoleOutputCP(CP_UTF8);
         SetConsoleCP(CP_UTF8);
+        {
+            HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+            DWORD mode = 0;
+            if (h != INVALID_HANDLE_VALUE && GetConsoleMode(h, &mode))
+                SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+        }
 #endif
         command_line_parser parser;
         parser.add_option("input", "Path to the source model: .gguf, or a runtime .dat archive", 1);
         parser.add_option("save-dat", "After loading a GGUF, write a self-contained runtime archive (model + tokenizer)", 1);
         parser.add_option("probe-logits", "Run a prefill and report the logits");
         parser.add_option("probe-ids", "Feed explicit token ids (space or comma separated)", 1);
+        parser.add_option("probe-step", "Self-consistency check: last-position logits of a full prefill versus prefill(N-1) + step(last)");
         parser.add_option("prompt", "Prompt for --probe-logits (default: capital of France)", 1);
         parser.add_option("rope-permute", "Map split-half (NeoX) Q/K layouts to the interleaved kernel");
         parser.add_option("chat", "Interactive chat with the loaded model");
@@ -231,6 +297,7 @@ int main(int argc, char** argv)
         parser.add_option("template", "Chat template override: auto, zephyr, chatml, guanaco", 1);
         parser.add_option("temp", "Sampling temperature (default: template preset)", 1);
         parser.add_option("deterministic", "Greedy decoding");
+        parser.add_option("think", "Let thinking-capable models produce their reasoning trace (streamed, then hidden)");
         parser.add_option("resident", "Dequantize all weights at load time (fastest forward, full f32 footprint); default keeps them quantized at rest");
         parser.parse(argc, argv);
 
@@ -297,6 +364,11 @@ int main(int argc, char** argv)
                 ? chat_template_formatter::for_tokenizer(tok,
                     chat_template_formatter::from_name(parser.option("template").argument()))
                 : chat_template_formatter::for_tokenizer(tok);
+            if (parser.option("think"))
+            {
+                if (fmt.supports_reasoning()) fmt.set_reasoning(true);
+                else cout << "note: this model exposes no reasoning mode; --think ignored\n";
+            }
             const double temp = parser.option("temp")
                 ? std::stod(parser.option("temp").argument()) : fmt.default_temperature();
             const long ctx = parser.option("context")
@@ -327,6 +399,41 @@ int main(int argc, char** argv)
             cout << "Prompt (" << toks.size() << " tokens): \"" << prompt << "\"\n";
         }
         if (toks.empty()) { cerr << "Nothing to feed.\n"; return 1; }
+
+        if (parser.option("probe-step"))
+        {
+            /* The prefill path is the reference (validated by external parity); the
+               incremental path must reproduce its last-position logits through the KV
+               cache machinery: append, window gather, rotation on read, QK-norm
+               ordering. Differences beyond float accumulation indicate a step bug. */
+            if (toks.size() < 2) { cerr << "probe-step needs at least 2 tokens.\n"; return 1; }
+            const tensor& full = rt.forward_prefill(toks);
+            const long V = full.nc();
+            std::vector<float> ref(full.host() + (full.nr() - 1) * V,
+                                   full.host() + full.nr() * V);
+
+            rt.set_context(static_cast<long>(toks.size()) + 8);
+            std::vector<int> head(toks.begin(), toks.end() - 1);
+            rt.forward_prefill(head);
+            const tensor& inc = rt.step(toks.back());
+
+            const float* a = inc.host();
+            double dmax = 0.0;
+            long amax = 0;
+            for (long v = 0; v < V; ++v)
+            {
+                const double dv = std::abs(static_cast<double>(a[v]) - ref[static_cast<size_t>(v)]);
+                if (dv > dmax) { dmax = dv; amax = v; }
+            }
+            const long am_full = static_cast<long>(std::max_element(ref.begin(), ref.end()) - ref.begin());
+            const long am_inc = static_cast<long>(std::max_element(a, a + V) - a);
+            cout << "Self-consistency prefill vs incremental (last position):\n"
+                 << "  max |logit diff| " << dmax << " at id " << amax << "\n"
+                 << "  argmax full " << am_full << " '" << tok.decode({ static_cast<int>(am_full) }, false)
+                 << "'  vs incremental " << am_inc << " '" << tok.decode({ static_cast<int>(am_inc) }, false) << "'\n"
+                 << ((am_full == am_inc && dmax < 1e-3) ? "  CONSISTENT\n" : "  DIVERGENT\n");
+            return 0;
+        }
 
         const tensor& logits = rt.forward_prefill(toks);
         report_logits(logits, toks, tok);
