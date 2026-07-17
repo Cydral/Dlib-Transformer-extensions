@@ -2,3 +2,6 @@ build-cpu/
 build-cuda/
 *:Zone.Identifier
 *:sec.endpointdlp
+# Generated artifacts of the GGUF import examples
+dlib/examples/slm_imported_model*.h
+dlib/examples/*_tokenizer.dat
