@@ -1,7 +1,9 @@
 // Copyright (C) 2026 Cydral Technology (cydraltechnology@gmail.com)
 // License: Boost Software License   See LICENSE.txt for the full license.
-#ifndef DLIB_DECODER_TRANSFORMER_CONFIG_Hh_
-#define DLIB_DECODER_TRANSFORMER_CONFIG_Hh_
+#ifndef DLIB_DECODER_TRANSFORMER_CONFIG_H_
+#define DLIB_DECODER_TRANSFORMER_CONFIG_H_
+
+#include "decoder_transformer_config_abstract.h"
 
 #include "transformer_config.h"
 #include <string>
@@ -9,46 +11,11 @@
 
 namespace dlib
 {
-    /*!
-        decoder_transformer_config
-
-        WHAT THIS OBJECT REPRESENTS
-            This is a high-level configuration describing a Llama-family decoder-only
-            transformer, used as the reconstruction target when importing an open-weight
-            model from the GGUF container (Llama 1/2/3, Mistral, Qwen-dense and similar).
-
-            The architecture it expresses is fixed and matches that family exactly:
-              - token embeddings,
-              - num_layers pre-norm blocks, each one
-                    RMSNorm -> RoPE grouped-query attention -> residual add
-                    RMSNorm -> SwiGLU feed-forward            -> residual add,
-              - a final RMSNorm and an output projection (the classification head).
-            Adaptive computation time is disabled and there is no mixture of experts. The
-            feed-forward and the output projection are bias-free (LINEAR_NO_BIAS), matching
-            the Llama family, which carries no bias on any projection.
-
-            The feed-forward hidden size is given as the exact rational ffn_num/ffn_den of
-            the model dimension, so that arbitrary intermediate sizes (for example Llama-2-7B's
-            11008 = 4096 * 43 / 16) are represented without rounding.
-
-            It is a thin, named composition over the library's existing layers, chosen so the
-            forward pass, the RoPE convention, the grouped-query expansion and the KV cache are
-            exactly those already validated elsewhere in the library; only the weights differ.
-
-        TEMPLATE PARAMETERS
-            - vocab_size     : size of the token vocabulary.
-            - num_layers     : number of transformer blocks.
-            - num_heads      : number of query heads.
-            - num_kv_heads   : number of key/value heads (num_heads for plain MHA).
-            - embedding_dim  : model dimension d_model.
-            - ffn_num/ffn_den: feed-forward hidden size = embedding_dim * ffn_num / ffn_den.
-
-        REQUIREMENTS ON THE TEMPLATE PARAMETERS
-            - all values are > 0,
-            - num_heads is a multiple of num_kv_heads,
-            - embedding_dim is a multiple of num_heads (head_dim = embedding_dim / num_heads),
-            - embedding_dim * ffn_num is a multiple of ffn_den.
-    !*/
+    /* High-level configuration of a Llama-family decoder-only transformer (token
+       embeddings, pre-norm GQA + SwiGLU blocks, final RMSNorm and bias-free output
+       head). Serves both as the reconstruction target of the GGUF import and as a
+       directly trainable structure. See decoder_transformer_config_abstract.h for
+       the full contract, requirements and exported types. */
     template <
         long vocab_size,
         long num_layers,
@@ -109,4 +76,4 @@ namespace dlib
     };
 }
 
-#endif // DLIB_DECODER_TRANSFORMER_CONFIG_Hh_
+#endif // DLIB_DECODER_TRANSFORMER_CONFIG_H_

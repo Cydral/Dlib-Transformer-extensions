@@ -1,4 +1,4 @@
-﻿// Copyright (C) 2025  Davis E. King (davis@dlib.net)
+﻿// Copyright (C) 2026 Cydral Technology (cydraltechnology@gmail.com)
 // License: Boost Software License   See LICENSE.txt for the full license.
 #undef DLIB_LANGUAGE_MODEL_DATA_ABSTRACT_H_
 #ifdef DLIB_LANGUAGE_MODEL_DATA_ABSTRACT_H_

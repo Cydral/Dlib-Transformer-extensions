@@ -24,6 +24,8 @@
 #ifndef DLIB_DECODER_MODELS_H_
 #define DLIB_DECODER_MODELS_H_
 
+#include "decoder_models_abstract.h"
+
 #include "decoder_transformer_config.h"
 
 namespace dlib
@@ -58,10 +60,10 @@ namespace dlib
         /*d_model*/4096, /*ffn*/7, 2>;
 
     /* Qwen2 0.5B (instruct). RMSNorm eps 1e-6, RoPE theta 1e6, tied embeddings.
-       The structure is exact, but note that this family carries QKV projection
-       biases which the fused attention packing does not hold yet: GGUF import of
-       pretrained qwen2 weights goes through the runtime engine until the packing
-       gains bias slots. Training this structure from scratch (bias-free) is fine. */
+       This family carries QKV projection biases: the attention layer's bias slots
+       receive them on GGUF import (enabled automatically from the tensor table);
+       standalone use enables them via set_qkv_bias_enabled or the attention
+       configuration visitor. */
     using qwen2_0_5b = decoder_transformer_config<
         /*vocab*/151936, /*layers*/24, /*heads*/14, /*kv_heads*/2,
         /*d_model*/896, /*ffn*/38, 7>;

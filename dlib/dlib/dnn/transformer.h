@@ -8,7 +8,6 @@
 #include "layers.h"
 #include <cstring>
 #include <vector>
-#include <iostream> // TEMP: for the attention-row diagnostic
 
 namespace dlib
 {
@@ -89,9 +88,6 @@ namespace dlib
             n_ = params.num_samples(); k_ = params.k(); nr_ = params.nr(); nc_ = params.nc();
             host_.assign(params.host(), params.host() + params.size());
             params.set_size(0, 0, 0, 0);
-            // TEMP diagnostic: prove the offload triggers and count the moved bytes.
-            std::cerr << "[offload] captured " << host_.size() * sizeof(float) / (1024.0 * 1024.0)
-                      << " MB to host\n";
         }
 
         const tensor& materialize() const
@@ -208,7 +204,11 @@ namespace dlib
                 + EMBEDDING_DIM * KV_PROJ_DIM
                 + EMBEDDING_DIM * KV_PROJ_DIM
                 + Q_PROJ_DIM * EMBEDDING_DIM
-                + (USE_QK_NORM ? 2 * HEAD_DIM : 0);
+                + (USE_QK_NORM ? 2 * HEAD_DIM : 0)
+                /* Constant-layout QKV bias slots [bq|bk|bv]: ~10 KB per layer, zeroed
+                   and inert for bias-free models, filled and enabled by the loader for
+                   the qwen2 family. A runtime flag avoids any template plumbing. */
+                + Q_PROJ_DIM + 2 * KV_PROJ_DIM;
 
             params.set_size(1, total_params);
 
@@ -229,6 +229,11 @@ namespace dlib
             wk_offset = EMBEDDING_DIM * Q_PROJ_DIM;
             wv_offset = wk_offset + EMBEDDING_DIM * KV_PROJ_DIM;
             wo_offset = wv_offset + EMBEDDING_DIM * KV_PROJ_DIM;
+            setup_bias_offsets();
+            {
+                alias_tensor ball(1, Q_PROJ_DIM + 2 * KV_PROJ_DIM);
+                ball(params, bq_offset) = 0;   // bias slots start inert
+            }
 
             if (USE_QK_NORM)
             {
@@ -286,6 +291,14 @@ namespace dlib
             auto dwk = wk_alias(params_grad, wk_offset);
             auto dwv = wv_alias(params_grad, wv_offset);
             auto dwo = wo_alias(params_grad, wo_offset);
+
+            /* Bias support, first tranche: biases stay frozen at their imported
+               values; the optimizer consumes the whole params_grad blob, so their
+               gradient region must be explicitly zeroed. */
+            {
+                alias_tensor ball(1, Q_PROJ_DIM + 2 * KV_PROJ_DIM);
+                ball(params_grad, bq_offset) = 0;
+            }
 
             const float qk_scale = 1.0f / std::sqrt(static_cast<float>(HEAD_DIM));
 
@@ -412,12 +425,20 @@ namespace dlib
         const tensor& get_layer_params() const { return params; }
         tensor& get_layer_params() { return params; }
 
+        // QKV projection biases (qwen2 family). The slots always exist in the packed
+        // parameters; this flag arms their application in the inference forwards. The
+        // first support tranche freezes them during training: their gradient region
+        // is zeroed, pending the training-forward application and bias gradients.
+        void set_qkv_bias_enabled(bool enabled) { has_qkv_bias_ = enabled; }
+        bool qkv_bias_enabled() const { return has_qkv_bias_; }
+
         friend void serialize(const gqa_attention_& item, std::ostream& out)
         {
             serialize("gqa_attention_", out);
             serialize(item.params, out);
             serialize(item.learning_rate_multiplier_, out);
             serialize(item.weight_decay_multiplier_, out);
+            serialize(item.has_qkv_bias_, out);
             serialize(item.rope_q_helper_, out);
             serialize(item.rope_k_helper_, out);
             serialize(item.tril_helper_, out);
@@ -437,6 +458,7 @@ namespace dlib
             deserialize(item.params, in);
             deserialize(item.learning_rate_multiplier_, in);
             deserialize(item.weight_decay_multiplier_, in);
+            deserialize(item.has_qkv_bias_, in);
             deserialize(item.rope_q_helper_, in);
             deserialize(item.rope_k_helper_, in);
             deserialize(item.tril_helper_, in);
@@ -485,6 +507,9 @@ namespace dlib
         size_t wq_offset = 0, wk_offset = 0, wv_offset = 0, wo_offset = 0;
         alias_tensor gamma_q_alias, gamma_k_alias;
         size_t gamma_q_offset = 0, gamma_k_offset = 0;
+        size_t bq_offset = 0, bk_offset = 0, bv_offset = 0;
+        bool has_qkv_bias_ = false;
+        resizable_tensor bias_ones_;
         double qk_norm_eps_ = DEFAULT_RMS_NORM_EPS;
 
         // Forward state saved for backward (training only)
@@ -578,8 +603,26 @@ namespace dlib
             wk_offset = EMBEDDING_DIM * Q_PROJ_DIM;
             wv_offset = wk_offset + EMBEDDING_DIM * KV_PROJ_DIM;
             wo_offset = wv_offset + EMBEDDING_DIM * KV_PROJ_DIM;
+            setup_bias_offsets();
             if (USE_QK_NORM)
                 setup_qk_norm_aliases();
+        }
+
+        /* The bias slots sit at the very end of the packed blob, after the QK-Norm
+           gammas when present, so every prior offset is unchanged. */
+        void setup_bias_offsets()
+        {
+            bq_offset = wo_offset + static_cast<size_t>(Q_PROJ_DIM) * EMBEDDING_DIM
+                + (USE_QK_NORM ? 2 * static_cast<size_t>(HEAD_DIM) : 0);
+            bk_offset = bq_offset + static_cast<size_t>(Q_PROJ_DIM);
+            bv_offset = bk_offset + static_cast<size_t>(KV_PROJ_DIM);
+        }
+
+        void ensure_bias_ones(long n)
+        {
+            if (bias_ones_.num_samples() == n) return;
+            bias_ones_.set_size(n, 1);
+            bias_ones_ = 1;
         }
 
         // Place the two QK-Norm gammas right after W_O in the packed parameter blob.
@@ -721,6 +764,18 @@ namespace dlib
                 alias_tensor v_2d(B * N, KV_PROJ_DIM);
                 auto v_view = v_2d(v_flat, 0);
                 tt::gemm(0.0f, v_view, 1.0f, x_view, false, wv, false);
+
+                if (has_qkv_bias_)
+                {
+                    ensure_bias_ones(x_view.num_samples());
+                    alias_tensor bqa(1, Q_PROJ_DIM), bkva(1, KV_PROJ_DIM);
+                    auto bq = bqa(P, bq_offset);
+                    auto bk = bkva(P, bk_offset);
+                    auto bv = bkva(P, bv_offset);
+                    tt::gemm(1.0f, q_view, qk_scale, bias_ones_, false, bq, false);
+                    tt::gemm(1.0f, k_view, 1.0f, bias_ones_, false, bk, false);
+                    tt::gemm(1.0f, v_view, 1.0f, bias_ones_, false, bv, false);
+                }
             }
 
             // Step 2: split heads
@@ -818,29 +873,6 @@ namespace dlib
             saved_attn.copy_size(scores_masked);
             tt::softmax(saved_attn, scores_masked, operation_mode::PLANE_WISE);
 
-            // TEMP DIAGNOSTIC: full head-0 attention rows for the first two layers on
-            // short prefills. At layer 0 the hidden states are the normalized token
-            // embeddings, so these rows directly test the imported Q/K weights and
-            // their rotary encoding: rows should be causal and structured, not flat.
-            {
-                static long dbg_N = -1;
-                static int  dbg_L = 0;
-                if (dbg_N != N) { dbg_N = N; dbg_L = 0; }
-                if (N > 1 && N <= 12 && dbg_L < 2)
-                {
-                    const float* aw = saved_attn.host();
-                    std::cerr << "[attn-rows L" << dbg_L << "] N=" << N << " head 0\n";
-                    for (long q = 0; q < N; ++q)
-                    {
-                        std::cerr << "  q" << q << ":";
-                        for (long k = 0; k <= q; ++k)
-                            std::cerr << ' ' << aw[tensor_index(saved_attn, 0, 0, q, k)];
-                        std::cerr << "\n";
-                    }
-                    ++dbg_L;
-                }
-            }
-
             // Step 8: attn @ V
             resizable_tensor ctx_4d(B, NUM_HEADS, N, HEAD_DIM);
             tt::gemm(0.0f, ctx_4d, 1.0f,
@@ -914,6 +946,18 @@ namespace dlib
                 alias_tensor v_2d(1, KV_PROJ_DIM);
                 auto v_view = v_2d(inc_v, 0);
                 tt::gemm(0.0f, v_view, 1.0f, x_view, false, wv, false);
+
+                if (has_qkv_bias_)
+                {
+                    ensure_bias_ones(x_view.num_samples());
+                    alias_tensor bqa(1, Q_PROJ_DIM), bkva(1, KV_PROJ_DIM);
+                    auto bq = bqa(P, bq_offset);
+                    auto bk = bkva(P, bk_offset);
+                    auto bv = bkva(P, bv_offset);
+                    tt::gemm(1.0f, q_view, qk_scale, bias_ones_, false, bq, false);
+                    tt::gemm(1.0f, k_view, 1.0f, bias_ones_, false, bk, false);
+                    tt::gemm(1.0f, v_view, 1.0f, bias_ones_, false, bv, false);
+                }
             }
 
             // Step 2: make room in the cache if full. The first `keep` positions

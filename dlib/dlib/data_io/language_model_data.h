@@ -1,4 +1,6 @@
-﻿#ifndef DLIB_LANGUAGE_MODEL_DATA_H_
+﻿// Copyright (C) 2026 Cydral Technology (cydraltechnology@gmail.com)
+// License: Boost Software License   See LICENSE.txt for the full license.
+#ifndef DLIB_LANGUAGE_MODEL_DATA_H_
 #define DLIB_LANGUAGE_MODEL_DATA_H_
 
 #include "language_model_data_abstract.h"

@@ -1,11 +1,22 @@
 // Copyright (C) 2026 Cydral Technology (cydraltechnology@gmail.com)
 // License: Boost Software License   See LICENSE.txt for the full license.
-#ifndef DLIB_GGUF_WEIGHT_LOADER_Hh_
-#define DLIB_GGUF_WEIGHT_LOADER_Hh_
+// GGUF -> Dlib weight import.
+//
+// Repacking stage of the import pipeline: dequantizes the tensors of a Llama-family
+// GGUF file and copies them, with the required transpositions and RoPE permutations,
+// into a network built from decoder_transformer_config. See the abstract header for
+// the weight layout and the validation procedure.
+
+#ifndef DLIB_GGUF_WEIGHT_LOADER_H_
+#define DLIB_GGUF_WEIGHT_LOADER_H_
+
+#include "gguf_weight_loader_abstract.h"
 
 #include <vector>
 #include <string>
 #include <stdexcept>
+#include <cstring>
+#include <iostream>
 
 #include "gguf_reader.h"
 #include "gguf_dequantize.h"
@@ -14,29 +25,6 @@
 
 namespace dlib
 {
-    /*!
-        import_gguf_weights repacks the dequantized GGUF weights of a Llama-family model
-        into a network built from decoder_transformer_config.
-
-        WEIGHT LAYOUT (verified against the fused attention layer and the SwiGLU composition):
-          - GGUF stores every 2D weight as [out, in] row-major; the Dlib linear/attention
-            projections expect [in, out], so each matrix is transposed on load.
-          - The attention layer holds one parameter tensor packed as [wq | wk | wv | wo], with
-            wq, wo of shape [d_model, d_model] and wk, wv of shape [d_model, kv_dim].
-          - The SwiGLU feed-forward is three separate linear layers (gate, up, down).
-          - RMSNorm gammas and the embedding table are copied directly.
-
-        VALIDATION KNOBS (the two conventions that cannot be settled without a numeric check
-        against an external reference implementation; see gguf_load_options):
-          - rope_permute : whether the Q/K projection rows must be permuted to match the
-                           layer's RoPE convention. Default off (GGUF-native ordering).
-          - swap_gate_up : whether ffn_gate and ffn_up must be swapped. Default off.
-
-        The recommended procedure is to import, run a forward pass on a short prompt, and
-        compare the first-position logits with the reference. If they disagree, the cause is
-        almost always one of the two knobs above or the embedding orientation.
-    !*/
-
     struct gguf_load_options
     {
         bool rope_permute = false;
@@ -126,12 +114,14 @@ namespace dlib
         {
             float rope_base;
             double qk_eps;
+            bool qkv_bias = false;
             template <typename T>
             auto set(T& layer, int) -> decltype((void)layer.set_rope_theta_base(0.f))
             {
                 layer.set_rope_theta_base(rope_base);
                 layer.set_qk_norm_eps(qk_eps);
                 layer.set_yarn_params(0.0f, 0.0f, 0, false); // classical RoPE only
+                layer.set_qkv_bias_enabled(qkv_bias);
             }
             template <typename T> void set(T&, long) {}
             template <typename T> void operator()(T& layer) { set(layer, 0); }
@@ -180,6 +170,10 @@ namespace dlib
     void import_gguf_weights(net_type& net, gguf_reader& g, const model_spec& spec,
         const gguf_load_options& opt = gguf_load_options())
     {
+        /* QKV bias tensors present (qwen2 family)? Detected up front from the reader,
+           since the config setter pushing the flag into the attention layers runs
+           before the packing loop. */
+        const bool has_qkv_bias = g.find_tensor("blk.0.attn_q.bias") != nullptr;
         using namespace gguf_load_impl;
 
         const long d = spec.d_model;
@@ -195,7 +189,8 @@ namespace dlib
            forward, so the RoPE caches are built with the right base (they are not rebuilt on a
            later change) and QK-Norm uses the model's epsilon. No-op for other layers. */
         {
-            attention_config_setter cfg{ static_cast<float>(spec.rope_freq_base), spec.rms_eps };
+            attention_config_setter cfg{ static_cast<float>(spec.rope_freq_base), spec.rms_eps,
+                has_qkv_bias };
             visit_computational_layers(net, cfg);
             norm_eps_setter neps{ spec.rms_eps };
             visit_computational_layers(net, neps);
@@ -290,7 +285,10 @@ namespace dlib
                 const size_t nq = static_cast<size_t>(d) * qd;
                 const size_t nkv = static_cast<size_t>(d) * kv;
                 const size_t ng = spec.qk_norm ? static_cast<size_t>(hd) : 0;
-                std::vector<float> fused(2 * nq + 2 * nkv + 2 * ng);
+                /* Constant-layout bias slots [bq|bk|bv] close the packed blob; they
+                   stay zero for bias-free families. */
+                const size_t nb = static_cast<size_t>(qd) + 2 * static_cast<size_t>(kv);
+                std::vector<float> fused(2 * nq + 2 * nkv + 2 * ng + nb, 0.0f);
                 std::vector<float> sq = fetch(g, p + "attn_q.weight");
                 std::vector<float> sk = fetch(g, p + "attn_k.weight");
                 std::vector<float> sv = fetch(g, p + "attn_v.weight");
@@ -313,6 +311,33 @@ namespace dlib
                         throw std::runtime_error("import_gguf_weights: unexpected QK-Norm gamma size in " + p);
                     std::memcpy(fused.data() + 2 * nq + 2 * nkv, gq.data(), ng * sizeof(float));
                     std::memcpy(fused.data() + 2 * nq + 2 * nkv + ng, gk.data(), ng * sizeof(float));
+                }
+                if (g.find_tensor(p + "attn_q.bias"))
+                {
+                    /* QKV biases (qwen2 family). The Q and K vectors live in the same
+                       output space as the permuted projection rows, so the NeoX layout
+                       reordering applies to them identically; V is rotation-free. */
+                    std::vector<float> bq = fetch(g, p + "attn_q.bias");
+                    std::vector<float> bk = fetch(g, p + "attn_k.bias");
+                    std::vector<float> bv = fetch(g, p + "attn_v.bias");
+                    if (static_cast<long>(bq.size()) != qd || static_cast<long>(bk.size()) != kv
+                        || static_cast<long>(bv.size()) != kv)
+                        throw std::runtime_error("import_gguf_weights: unexpected QKV bias size in " + p);
+                    const size_t bb = 2 * nq + 2 * nkv + 2 * ng;
+                    auto put = [&](const std::vector<float>& src, size_t off)
+                    {
+                        const long half = hd / 2;
+                        for (long o = 0; o < static_cast<long>(src.size()); ++o)
+                        {
+                            const long h = o / hd, r = o % hd;
+                            const long ri = neox_layout ? ((r < half) ? 2 * r : 2 * (r - half) + 1) : r;
+                            fused[off + static_cast<size_t>(h) * hd + ri] = src[static_cast<size_t>(o)];
+                        }
+                    };
+                    put(bq, bb);
+                    put(bk, bb + static_cast<size_t>(qd));
+                    /* V is rotation-free: copied verbatim, never permuted. */
+                    std::memcpy(fused.data() + bb + qd + kv, bv.data(), bv.size() * sizeof(float));
                 }
                 copy_into(next("attention"), fused, p + "attention");
             }
@@ -343,4 +368,4 @@ namespace dlib
     }
 }
 
-#endif // DLIB_GGUF_WEIGHT_LOADER_Hh_
+#endif // DLIB_GGUF_WEIGHT_LOADER_H_

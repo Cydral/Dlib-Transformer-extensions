@@ -266,11 +266,10 @@ namespace dlib
         }
 
         // Signals to all KV-cache-aware layers that any cached state should be
-        // discarded on the next forward pass. The flag auto-resets after being
-        // observed (each layer that consumes it during forward will set it back
-        // to false on its own end). Concretely: this is a one-shot "please
-        // clear caches" marker. Layers can also manage their cache lifetime
-        // independently.
+        // discarded on the next forward pass. The flag persists until the
+        // generation loop explicitly calls clear_kv_cache_request(), so that
+        // every attention layer of the sweep observes the same request. Layers
+        // can also manage their cache lifetime independently.
         static void request_kv_cache_clear()
         {
             std::lock_guard<std::mutex> lock(get_mutex_());
@@ -279,9 +278,9 @@ namespace dlib
         }
 
         // Layers call this at the start of forward to check whether they should
-        // discard their cache. Returns true once and resets the flag so that
-        // subsequent layers/calls in the same forward pass also see the
-        // request, but it does not persist beyond the current forward sweep.
+        // discard their cache. Returns the current value of the flag without
+        // clearing it, so every layer of the same forward pass sees the same
+        // request; the generation loop clears it afterwards.
         static bool consume_kv_cache_clear_request()
         {
             std::lock_guard<std::mutex> lock(get_mutex_());

@@ -30,6 +30,8 @@
 #ifndef DLIB_DNN_RUNTIME_TRANSFORMER_H_
 #define DLIB_DNN_RUNTIME_TRANSFORMER_H_
 
+#include "runtime_transformer_abstract.h"
+
 #include <cmath>
 #include <cstring>
 #include <string>

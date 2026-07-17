@@ -17,6 +17,8 @@
 #ifndef DLIB_GGUF_DEQUANTIZE_H_
 #define DLIB_GGUF_DEQUANTIZE_H_
 
+#include "gguf_dequantize_abstract.h"
+
 #include "gguf_reader.h"
 #include <vector>
 #include <cstdint>
@@ -127,6 +129,13 @@ namespace dlib
             y[j]      = ((qs[j] & 0x0F) | h0) * d + m;
             y[j + 16] = ((qs[j] >>   4) | h1) * d + m;
         }
+    }
+
+    inline void gguf_dq_q8_0(const uint8_t* p, float* y)
+    {
+        const float d = gguf_rd_half(p);
+        const int8_t* qs = reinterpret_cast<const int8_t*>(p + 2);
+        for (int j = 0; j < 32; ++j) y[j] = qs[j] * d;
     }
 
     inline void gguf_dq_q8_1(const uint8_t* p, float* y)
@@ -357,31 +366,11 @@ namespace dlib
             }
             break;
         }
-        case ggml_type::Q8_0:
-        {
-            /* Block of 32 values: one fp16 scale d, then 32 int8 quants; 34 bytes total.
-               Dequantized value = q * d. */
-            constexpr uint64_t QK = 32;
-            if (n % QK != 0) throw std::runtime_error("gguf_dequantize: Q8_0 element count not a multiple of 32 for '" + t.name + "'");
-            const uint64_t nb = n / QK;
-            if (raw.size() < nb * 34) throw std::runtime_error("gguf_dequantize: short Q8_0 buffer for '" + t.name + "'");
-            const uint8_t* p = raw.data();
-            for (uint64_t b = 0; b < nb; ++b)
-            {
-                uint16_t dh;
-                std::memcpy(&dh, p, 2);
-                const float d = gguf_half_to_float(dh);
-                const int8_t* qs = reinterpret_cast<const int8_t*>(p + 2);
-                float* o = out.data() + static_cast<size_t>(b * QK);
-                for (uint64_t j = 0; j < QK; ++j) o[j] = static_cast<float>(qs[j]) * d;
-                p += 34;
-            }
-            break;
-        }
         case ggml_type::Q4_0: gguf_dq_blocks(t, raw, out,  32,  18, gguf_dq_q4_0); break;
         case ggml_type::Q4_1: gguf_dq_blocks(t, raw, out,  32,  20, gguf_dq_q4_1); break;
         case ggml_type::Q5_0: gguf_dq_blocks(t, raw, out,  32,  22, gguf_dq_q5_0); break;
         case ggml_type::Q5_1: gguf_dq_blocks(t, raw, out,  32,  24, gguf_dq_q5_1); break;
+        case ggml_type::Q8_0: gguf_dq_blocks(t, raw, out,  32,  34, gguf_dq_q8_0); break;
         case ggml_type::Q8_1: gguf_dq_blocks(t, raw, out,  32,  36, gguf_dq_q8_1); break;
         case ggml_type::Q2_K: gguf_dq_blocks(t, raw, out, 256,  84, gguf_dq_q2_K); break;
         case ggml_type::Q3_K: gguf_dq_blocks(t, raw, out, 256, 110, gguf_dq_q3_K); break;

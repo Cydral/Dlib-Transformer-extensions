@@ -128,16 +128,73 @@ namespace dlib
 
     // ----------------------------------------------------------------------------------------
 
-    template <long EMBEDDING_DIM_, long NUM_HEADS_, long NUM_KV_HEADS_, long HEAD_DIM_>
+    class param_offload_store
+    {
+        /*!
+            WHAT THIS OBJECT REPRESENTS
+                Host-side residency store for a layer's parameter tensor, used by the
+                inference-only "host resident" mode selected through
+                network_context::set_parameter_residency(). On first use under that
+                mode, capture() moves the parameter tensor to a host float buffer and
+                releases the resident tensor; every subsequent forward calls
+                materialize(), which copies the weights into a slot of the shared
+                rotating buffer pool owned by network_context.
+
+                The returned buffer stays valid until the pool hands the same slot
+                out again, i.e. across one full layer forward when every layer
+                materializes at most once per pass. Training never engages this
+                mechanism: the optimizer always reads the resident tensor.
+        !*/
+    public:
+
+        bool active() const;
+        /*!
+            ensures
+                - Returns true if and only if a parameter tensor has been captured
+                  to host memory.
+        !*/
+
+        void capture(resizable_tensor& params);
+        /*!
+            ensures
+                - Copies the contents and geometry of params to host memory.
+                - #params.size() == 0 (the resident tensor is released).
+                - #active() == true
+        !*/
+
+        const tensor& materialize() const;
+        /*!
+            requires
+                - active() == true
+            ensures
+                - Returns a tensor with the captured geometry and weights, backed by
+                  a slot of the shared buffer pool. The reference is only guaranteed
+                  valid until the pool recycles the slot; bind it once per forward.
+        !*/
+    };
+
+    // ----------------------------------------------------------------------------------------
+
+    template <long EMBEDDING_DIM_, long NUM_HEADS_, long NUM_KV_HEADS_, long HEAD_DIM_,
+        bool USE_QK_NORM_ = false>
     class gqa_attention_
     {
         /*!
             REQUIREMENTS ON TEMPLATE ARGUMENTS
                 - EMBEDDING_DIM_  > 0
-                - NUM_HEADS_      > 0 and EMBEDDING_DIM_ % NUM_HEADS_ == 0
+                - NUM_HEADS_      > 0
                 - NUM_KV_HEADS_   > 0 and NUM_HEADS_ % NUM_KV_HEADS_ == 0
-                - HEAD_DIM_       == EMBEDDING_DIM_ / NUM_HEADS_
-                - HEAD_DIM_       even (RoPE rotates pairs of components)
+                - HEAD_DIM_       > 0 and even (RoPE rotates pairs of components).
+                                  Typically EMBEDDING_DIM_ / NUM_HEADS_, but it may
+                                  be decoupled from the model dimension (e.g. Qwen3
+                                  uses head_dim 128 with d_model 1024 and 16 heads);
+                                  the query/output projection width is then
+                                  NUM_HEADS_ * HEAD_DIM_ instead of EMBEDDING_DIM_.
+                - USE_QK_NORM_    when true, a per-head RMSNorm (QK-Norm) is applied
+                                  to Q and K after the head split and before RoPE,
+                                  each scaled by its own learned gamma of size
+                                  HEAD_DIM_. Default false adds no parameter and
+                                  changes no computation.
 
             WHAT THIS OBJECT REPRESENTS
                 Fused Grouped-Query Attention layer with built-in RoPE, causal
@@ -147,18 +204,21 @@ namespace dlib
 
                 The layer performs, in order:
                   1. Linear projections W_Q, W_K, W_V (with Q pre-scaled by
-                     1/sqrt(HEAD_DIM)).
+                     1/sqrt(HEAD_DIM)), plus the b_q/b_k/b_v biases when the
+                     QKV-bias mode is enabled (see set_qkv_bias_enabled()).
                   2. Transposition into the canonical multi-head 4D layout
                      [B, NUM_HEADS,    N, HEAD_DIM] for Q
                      [B, NUM_KV_HEADS, N, HEAD_DIM] for K and V.
-                  3. Rotary Positional Embedding on Q and K.
-                  4. GQA repeat of K/V from NUM_KV_HEADS to NUM_HEADS.
-                  5. Scaled dot-product scores = Q @ K^T (Q already pre-scaled).
-                  6. Causal mask via embedded tril_<0, neg_infinity_tag>.
-                  7. Softmax over the last dimension.
-                  8. ctx = attn @ V.
-                  9. Merge heads back to [B, 1, N, EMBEDDING_DIM].
-                 10. Final linear projection W_O.
+                  3. When USE_QK_NORM is true, per-head RMSNorm of Q and K,
+                     each scaled by its learned gamma (gamma_q, gamma_k).
+                  4. Rotary Positional Embedding on Q and K.
+                  5. GQA repeat of K/V from NUM_KV_HEADS to NUM_HEADS.
+                  6. Scaled dot-product scores = Q @ K^T (Q already pre-scaled).
+                  7. Causal mask via embedded tril_<0, neg_infinity_tag>.
+                  8. Softmax over the last dimension.
+                  9. ctx = attn @ V.
+                 10. Merge heads back to [B, 1, N, Q_PROJ_DIM].
+                 11. Final linear projection W_O back to EMBEDDING_DIM.
 
                 Three inference modes are dispatched at runtime through
                 network_context::get_inference_mode() (read at the start of
@@ -193,17 +253,28 @@ namespace dlib
                 with the equivalent length-N prompt, provided positions are
                 consistent.
 
-                The parameter tensor stores W_Q, W_K, W_V and W_O contiguously
-                in a single resizable_tensor, with alias_tensor views over
-                each sub-matrix. The KV cache state is run-time only and is
-                NOT serialized.
+                The parameter tensor stores, contiguously in a single
+                resizable_tensor with alias_tensor views over each part:
+                    [ W_Q | W_K | W_V | W_O (| gamma_q | gamma_k) | b_q | b_k | b_v ]
+                W_Q maps EMBEDDING_DIM to Q_PROJ_DIM, W_K and W_V map
+                EMBEDDING_DIM to KV_PROJ_DIM, and W_O maps Q_PROJ_DIM back to
+                EMBEDDING_DIM. The gamma slots exist only when USE_QK_NORM is
+                true. The bias slots are always present (constant layout across
+                families) and stay zero-initialized and inert unless the
+                QKV-bias mode is enabled. When host-resident inference is
+                selected via network_context::set_parameter_residency(), the
+                tensor is captured by an internal param_offload_store and
+                materialized just in time at each forward. The KV cache state
+                is run-time only and is NOT serialized.
 
             EXPORTED CONSTANTS
                 - EMBEDDING_DIM   == EMBEDDING_DIM_
                 - NUM_HEADS       == NUM_HEADS_
                 - NUM_KV_HEADS    == NUM_KV_HEADS_
                 - HEAD_DIM        == HEAD_DIM_
+                - USE_QK_NORM     == USE_QK_NORM_
                 - REPEAT_FACTOR   == NUM_HEADS / NUM_KV_HEADS
+                - Q_PROJ_DIM      == NUM_HEADS * HEAD_DIM
                 - KV_PROJ_DIM     == NUM_KV_HEADS * HEAD_DIM
         !*/
 
@@ -238,6 +309,48 @@ namespace dlib
                   RoPE helpers (Q and K share the same configuration).
         !*/
 
+        void set_rope_theta_base(float base);
+        float get_rope_theta_base() const;
+        /*!
+            ensures
+                - Sets / returns the rotary frequency base (theta) shared by the
+                  two embedded RoPE helpers.
+                - Must be set before the first forward pass touching a given
+                  sequence length: the trigonometric caches are built on first
+                  use for that length and are not rebuilt on a later base change.
+        !*/
+
+        float get_rope_cos_probe(long pos, long dim);
+        /*!
+            requires
+                - A forward pass (or RoPE probe) has already populated the cosine
+                  cache, and pos/dim index inside it.
+            ensures
+                - Returns the cached cos value at position pos, component dim, of
+                  the Q RoPE helper. Diagnostic accessor used to verify which
+                  rotary state a network is actually running with.
+        !*/
+
+        void set_qk_norm_eps(double eps);
+        double get_qk_norm_eps() const;
+        /*!
+            ensures
+                - Sets / returns the epsilon used by the per-head QK RMSNorm.
+                - Only meaningful when USE_QK_NORM is true; ignored otherwise.
+        !*/
+
+        void set_qkv_bias_enabled(bool enabled);
+        bool qkv_bias_enabled() const;
+        /*!
+            ensures
+                - Enables / disables the addition of the b_q/b_k/b_v bias slots
+                  after the Q/K/V projections (used by families such as Qwen2
+                  that carry QKV projection biases).
+                - The slots exist in the parameter layout either way; disabled,
+                  they stay zero and cost nothing numerically. The flag is
+                  serialized with the layer.
+        !*/
+
         void reset_kv_cache();
         /*!
             ensures
@@ -268,10 +381,12 @@ namespace dlib
                 - sub.get_output().k()  == 1
                 - sub.get_output().nc() == EMBEDDING_DIM
             ensures
-                - Allocates and randomly initializes the four weight matrices
-                  W_Q, W_K, W_V, W_O (each with Glorot scaling derived from its
-                  own row+column count), packed contiguously in the layer's
-                  parameter tensor.
+                - Allocates the packed parameter tensor and randomly initializes
+                  the four weight matrices W_Q, W_K, W_V, W_O (each with Glorot
+                  scaling derived from its own row+column count); when
+                  USE_QK_NORM is true the gamma_q/gamma_k slots are initialized
+                  to 1; the b_q/b_k/b_v bias slots are zeroed (inert until
+                  enabled).
                 - Probes the embedded RoPE helpers with q_probe and k_probe of
                   the input's sequence length so their trigonometric caches are
                   pre-allocated.
@@ -314,9 +429,10 @@ namespace dlib
         tensor& get_layer_params();
         /*!
             ensures
-                - Returns the packed parameter tensor (W_Q, W_K, W_V, W_O laid
-                  out contiguously). Use the alias views internally maintained
-                  by the layer for partial access.
+                - Returns the packed parameter tensor, laid out as
+                  [W_Q | W_K | W_V | W_O (| gamma_q | gamma_k) | b_q | b_k | b_v].
+                  Use the alias views internally maintained by the layer for
+                  partial access.
         !*/
 
         friend void serialize(const gqa_attention_& item, std::ostream& out);
@@ -324,8 +440,11 @@ namespace dlib
         /*!
             ensures
                 - Serializes / deserializes the parameter tensor, the learning
-                  rate and weight decay multipliers, and the embedded RoPE and
-                  tril helpers.
+                  rate and weight decay multipliers, the QKV-bias flag, and the
+                  embedded RoPE and tril helpers. When USE_QK_NORM is true the
+                  QK-Norm epsilon is also part of the stream (and only then, so
+                  every non-QK-Norm model keeps the exact same serialized
+                  format as before the feature existed).
                 - Does NOT serialize the KV cache state; on deserialize the
                   cache is reset (empty, no allocation).
                 - Version tag: "gqa_attention_".
@@ -337,9 +456,10 @@ namespace dlib
         friend void to_xml(const gqa_attention_& item, std::ostream& out);
     };
 
-    template <long EMBEDDING_DIM, long NUM_HEADS, long NUM_KV_HEADS, long HEAD_DIM, typename SUBNET>
+    template <long EMBEDDING_DIM, long NUM_HEADS, long NUM_KV_HEADS, long HEAD_DIM, typename SUBNET,
+        bool USE_QK_NORM = false>
     using gqa_attention = add_layer<
-        gqa_attention_<EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM>, SUBNET>;
+        gqa_attention_<EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, USE_QK_NORM>, SUBNET>;
 
     // ----------------------------------------------------------------------------------------
 
@@ -450,29 +570,65 @@ namespace dlib
                 further changes to the surrounding topology.
         !*/
 
-        template<long d_model, long num_heads, long num_kv_heads, typename SUBNET>
+        template<long d_model, long num_heads, long num_kv_heads, typename SUBNET,
+            long head_dim = d_model / num_heads, bool use_qk_norm = false>
         using multihead_attention_gqa = some_template_expression;
         /*!
             ensures
                 - Alias for gqa_attention<d_model, num_heads, num_kv_heads,
-                  d_model / num_heads, SUBNET>.
+                  head_dim, SUBNET, use_qk_norm>. The trailing defaults keep
+                  every pre-existing instantiation unchanged.
         !*/
 
-        template<long d_model, long num_heads, long num_kv_heads, typename SUBNET>
+        template<bool UseAct, long d_model, long hidden_num, long hidden_den,
+            long max_steps, typename SUBNET,
+            template <unsigned long, typename> class LINEAR = linear>
+        using ffn_sublayer = some_template_expression;
+        /*!
+            ensures
+                - The feed-forward sublayer of a block. With UseAct == true the
+                  SwiGLU transition is wrapped in an Adaptive Computation Time
+                  layer (act_steps, per-position latent recurrence, at most
+                  max_steps steps); with UseAct == false it is a plain SwiGLU.
+                  Networks that already recur at a higher level (e.g. HRM, which
+                  loops the whole stack) build with UseAct == false to avoid
+                  nesting two recurrence mechanisms.
+                - The SwiGLU hidden size is d_model * hidden_num / hidden_den,
+                  and LINEAR selects the projection layer of its three linears
+                  (linear, or linear_no_bias for the bias-free Llama family).
+        !*/
+
+        template<bool UseAct, long d_model, long num_heads, long num_kv_heads,
+            long hidden_num, long hidden_den, typename SUBNET,
+            template <unsigned long, typename> class LINEAR = linear,
+            long head_dim = d_model / num_heads, bool use_qk_norm = false>
         using transformer_block = some_template_expression;
         /*!
             ensures
-                - Same residual topology as gqa_transformer::transformer_block
-                  but with the fused attention sublayer.
+                - Same pre-norm residual topology as
+                  gqa_transformer::transformer_block but with the fused attention
+                  sublayer and the ffn_sublayer feed-forward described above:
+                  rms_norm -> gqa_attention -> residual, then
+                  rms_norm -> ffn_sublayer -> residual.
         !*/
 
         template<long num_layers, long d_model, long num_heads, long num_kv_heads,
-            typename SUBNET>
+            typename SUBNET, bool UseAct = true,
+            long hidden_num = 8, long hidden_den = 3,
+            template <unsigned long, typename> class LINEAR = linear,
+            long head_dim = d_model / num_heads, bool use_qk_norm = false>
         using transformer_stack = some_template_expression;
         /*!
             ensures
                 - Stacks num_layers fused-attention transformer_block units with
                   a tag10<> sentinel at the bottom of the stack.
+                - The trailing parameters default to the historical behavior
+                  (ACT-wrapped feed-forward, 8/3 hidden ratio, biased linears,
+                  standard head_dim, no QK-Norm) so existing dense
+                  configurations that omit them are unchanged. Decoder imports
+                  (decoder_transformer_config) pass UseAct == false, the exact
+                  model ratio, linear_no_bias, and the model's head_dim /
+                  qk_norm.
         !*/
 
     } // namespace gqa_transformer_unified

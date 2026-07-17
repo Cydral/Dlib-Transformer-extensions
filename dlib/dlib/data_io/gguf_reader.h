@@ -17,6 +17,8 @@
 #ifndef DLIB_GGUF_READER_H_
 #define DLIB_GGUF_READER_H_
 
+#include "gguf_reader_abstract.h"
+
 #include <cstdint>
 #include <string>
 #include <vector>

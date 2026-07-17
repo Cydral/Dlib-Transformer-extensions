@@ -10,6 +10,8 @@
 #ifndef DLIB_GGUF_MODEL_SPEC_H_
 #define DLIB_GGUF_MODEL_SPEC_H_
 
+#include "gguf_model_spec_abstract.h"
+
 #include "gguf_reader.h"
 #include <string>
 #include <vector>
@@ -203,8 +205,10 @@ namespace dlib
         compat_result r;
         if (s.family == arch_family::gemma || s.family == arch_family::gemma2)
             r.blockers.push_back("Gemma family needs (1+w) RMSNorm, embedding scaling and GeGLU, not available yet");
-        if (fused_attention_path && s.arch_name == "qwen2")
-            r.blockers.push_back("QKV biases (qwen2 family) are not representable in the fused attention packing; import through the runtime engine");
+        /* qwen2 QKV biases are held by the constant-layout bias slots of the fused
+           attention packing; the first support tranche applies them in the inference
+           forwards and freezes them during training (their gradients are zeroed). */
+        (void)fused_attention_path;
         if (s.n_experts > 0)
             r.blockers.push_back("MoE routing convention must be aligned with moe_ before enabling import");
         if (s.rope_scaling_type == "linear" && s.rope_scaling_factor > 0.0)
@@ -285,6 +289,9 @@ namespace dlib
             << "namespace imported_model = " << id << ";\n"
             << "#endif\n"
             << "\n#endif // " << guard << "\n";
+
+        out.flush();
+        if (!out) throw std::runtime_error("emit_header: failed writing " + path);
     }
 }
 

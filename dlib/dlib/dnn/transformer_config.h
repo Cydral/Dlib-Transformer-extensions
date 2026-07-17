@@ -3,6 +3,8 @@
 #ifndef DLIB_DNN_TRANSFORMER_CONFIG_H_
 #define DLIB_DNN_TRANSFORMER_CONFIG_H_
 
+#include "transformer_config_abstract.h"
+
 #include "input.h"
 #include "layers.h"
 #include "loss.h"
@@ -24,13 +26,10 @@ namespace dlib
 
     // ----------------------------------------------------------------------------------------
 
-    /**
-     * @brief Transformer model configuration templates
-     *
-     * Provides a flexible and type-safe configuration mechanism for transformer models
-     * with compile-time parameter validation and network generation.
-     *
-     */
+    /* High-level transformer model configurations: each struct fixes the model
+       dimensions at compile time, validates them statically, and exposes a
+       network_type<is_training> alias building the complete network. See
+       transformer_config_abstract.h for the full contracts. */
 
     template<
         long vocab_size = 2000,
@@ -104,7 +103,7 @@ namespace dlib
             static_assert(EMBEDDING_DIM% NUM_HEADS == 0, "Embedding dimension must be divisible by number of heads");
         };
 
-		// Network definition selector based on training mode (with dropout for training, without for inference)
+        // Network definition selector based on training mode (with dropout for training, without for inference)
         template<bool is_training>
         using network_type = std::conditional_t<is_training,
             classification_head<VOCAB_SIZE,
@@ -132,8 +131,8 @@ namespace dlib
     //     Dlib layers (linear, reshape, RoPE, repeat_heads, multm_prev, tril,
     //     softmax, etc.). This is the historical reference.
     //   - unified: fused gqa_attention_ layer that consolidates the same
-    //     operations into a single Dlib layer with an embedded RoPE/tril and
-    //     hooks reserved for a future KV cache.
+    //     operations into a single Dlib layer with embedded RoPE/tril and a
+    //     KV cache enabling prefill / incremental inference.
     enum class attention_impl
     {
         chained,
