@@ -32,6 +32,7 @@
 
 #include "runtime_transformer_abstract.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <string>
@@ -83,6 +84,13 @@ namespace dlib
             resizable_tensor bq, bk, bv;         // optional QKV biases (Qwen2 family)
             resizable_tensor qnorm_g, knorm_g;   // optional per-head QK-norm gammas (Qwen3)
             resizable_tensor k_cache, v_cache;   // pre-rotary keys, values
+
+            /* Mixture-of-experts feed-forward (spec.n_experts > 0): the router
+               projects to one logit per expert, and each expert is an independent
+               SwiGLU triple sliced out of the 3D *_exps tensors. Dense models leave
+               these empty and use w_gate/w_up/w_down above. */
+            stored_matrix router;
+            std::vector<stored_matrix> e_gate, e_up, e_down;
         };
 
         static void serialize_matrix(const stored_matrix& m, std::ostream& out)
@@ -167,9 +175,19 @@ namespace dlib
                 load_optional_head_gamma(g, p + "attn_k_norm.weight", L.knorm_g, false);
                 load_matrix(g, p + "attn_output.weight", qd, d, L.wo, opt);
                 load_gamma (g, p + "ffn_norm.weight", d, L.ffn_norm_g);
-                load_matrix(g, p + "ffn_gate.weight", d, spec.d_ffn, L.w_gate, opt);
-                load_matrix(g, p + "ffn_up.weight",   d, spec.d_ffn, L.w_up,   opt);
-                load_matrix(g, p + "ffn_down.weight", spec.d_ffn, d, L.w_down, opt);
+                if (spec.n_experts > 0)
+                {
+                    load_matrix(g, p + "ffn_gate_inp.weight", d, spec.n_experts, L.router, opt);
+                    load_expert_matrices(g, p + "ffn_gate_exps.weight", d, spec.d_ffn, L.e_gate);
+                    load_expert_matrices(g, p + "ffn_up_exps.weight",   d, spec.d_ffn, L.e_up);
+                    load_expert_matrices(g, p + "ffn_down_exps.weight", spec.d_ffn, d, L.e_down);
+                }
+                else
+                {
+                    load_matrix(g, p + "ffn_gate.weight", d, spec.d_ffn, L.w_gate, opt);
+                    load_matrix(g, p + "ffn_up.weight",   d, spec.d_ffn, L.w_up,   opt);
+                    load_matrix(g, p + "ffn_down.weight", spec.d_ffn, d, L.w_down, opt);
+                }
             }
             load_gamma(g, "output_norm.weight", d, final_norm_g_);
             load_matrix(g, spec.tied_embeddings ? "token_embd.weight" : "output.weight",
@@ -239,7 +257,9 @@ namespace dlib
             const long KV = spec_.n_kv_heads;
             const long hd = head_dim();
             const long rep = H / KV;
-            const float qk_scale = 1.0f / std::sqrt(static_cast<float>(hd));
+            const float qk_scale = spec_.attention_scale > 0.0
+                ? static_cast<float>(spec_.attention_scale)
+                : 1.0f / std::sqrt(static_cast<float>(hd));
             const float eps = static_cast<float>(spec_.rms_eps);
             DLIB_CASSERT(N > 0);
             if (cap_ > 0 && cur_len_ + N > cap_)
@@ -260,6 +280,8 @@ namespace dlib
                     gather_embedding_row(id, xh + t * d);
                 }
             }
+            if (spec_.embedding_scale != 1.0)
+                tt::affine_transform(x_, x_, static_cast<float>(spec_.embedding_scale), 0.0f);
 
             build_trig_caches(N);
             build_causal_mask(N);
@@ -341,32 +363,37 @@ namespace dlib
                     auto ov = o_2d(attn_out_, 0);
                     tt::gemm(0.0f, ov, 1.0f, cv, false, weight(L.wo), false);
                 }
-                tt::add(x_, x_, attn_out_);
+                add_residual(x_, attn_out_);
 
-                /* ---- feed-forward block (SwiGLU) ---- */
+                /* ---- feed-forward block (dense SwiGLU or mixture of experts) ---- */
                 tt::rms_normalize(eps, xn_, rms_scale_, x_, L.ffn_norm_g, true);
-                gate_.set_size(1, 1, N, spec_.d_ffn);
-                up_.set_size(1, 1, N, spec_.d_ffn);
+                if (spec_.n_experts > 0)
+                    moe_ffn(L, N);
+                else
                 {
-                    alias_tensor n_2d(N, d), f_2d(N, spec_.d_ffn);
-                    auto nv = n_2d(xn_, 0);
-                    auto gv = f_2d(gate_, 0);
-                    auto uv = f_2d(up_, 0);
-                    tt::gemm(0.0f, gv, 1.0f, nv, false, weight(L.w_gate), false);
-                    tt::gemm(0.0f, uv, 1.0f, nv, false, weight(L.w_up), false);
+                    gate_.set_size(1, 1, N, spec_.d_ffn);
+                    up_.set_size(1, 1, N, spec_.d_ffn);
+                    {
+                        alias_tensor n_2d(N, d), f_2d(N, spec_.d_ffn);
+                        auto nv = n_2d(xn_, 0);
+                        auto gv = f_2d(gate_, 0);
+                        auto uv = f_2d(up_, 0);
+                        tt::gemm(0.0f, gv, 1.0f, nv, false, weight(L.w_gate), false);
+                        tt::gemm(0.0f, uv, 1.0f, nv, false, weight(L.w_up), false);
+                    }
+                    sig_.copy_size(gate_);
+                    tt::sigmoid(sig_, gate_);
+                    tt::multiply(false, gate_, gate_, sig_);   // silu(g) = g * sigmoid(g)
+                    tt::multiply(false, gate_, gate_, up_);    // swiglu = silu(g) * up
+                    ffn_out_.set_size(1, 1, N, d);
+                    {
+                        alias_tensor h_2d(N, spec_.d_ffn), f_2d(N, d);
+                        auto hv = h_2d(gate_, 0);
+                        auto fv = f_2d(ffn_out_, 0);
+                        tt::gemm(0.0f, fv, 1.0f, hv, false, weight(L.w_down), false);
+                    }
                 }
-                sig_.copy_size(gate_);
-                tt::sigmoid(sig_, gate_);
-                tt::multiply(false, gate_, gate_, sig_);   // silu(g) = g * sigmoid(g)
-                tt::multiply(false, gate_, gate_, up_);    // swiglu = silu(g) * up
-                ffn_out_.set_size(1, 1, N, d);
-                {
-                    alias_tensor h_2d(N, spec_.d_ffn), f_2d(N, d);
-                    auto hv = h_2d(gate_, 0);
-                    auto fv = f_2d(ffn_out_, 0);
-                    tt::gemm(0.0f, fv, 1.0f, hv, false, weight(L.w_down), false);
-                }
-                tt::add(x_, x_, ffn_out_);
+                add_residual(x_, ffn_out_);
             }
 
             if (cap_ > 0)
@@ -379,7 +406,9 @@ namespace dlib
                 alias_tensor n_2d(N, d), l_2d(N, spec_.vocab_size);
                 auto nv = n_2d(xn_, 0);
                 auto lv = l_2d(logits_, 0);
-                tt::gemm(0.0f, lv, 1.0f, nv, false, weight(lm_head_), false);
+                const float logit_alpha = spec_.logit_scale > 0.0
+                    ? 1.0f / static_cast<float>(spec_.logit_scale) : 1.0f;
+                tt::gemm(0.0f, lv, logit_alpha, nv, false, weight(lm_head_), false);
             }
             return logits_;
         }
@@ -401,11 +430,15 @@ namespace dlib
             const long rep = H / KV;
             const long pos = cur_len_;
             const long len = cur_len_ + 1;
-            const float qk_scale = 1.0f / std::sqrt(static_cast<float>(hd));
+            const float qk_scale = spec_.attention_scale > 0.0
+                ? static_cast<float>(spec_.attention_scale)
+                : 1.0f / std::sqrt(static_cast<float>(hd));
             const float eps = static_cast<float>(spec_.rms_eps);
 
             x_.set_size(1, 1, 1, d);
             gather_embedding_row(token, x_.host_write_only());
+            if (spec_.embedding_scale != 1.0)
+                tt::affine_transform(x_, x_, static_cast<float>(spec_.embedding_scale), 0.0f);
             build_trig_caches(len);   // covers the read positions 0..len-1
 
             for (layer& L : layers_)
@@ -494,32 +527,37 @@ namespace dlib
                     auto ov = o_2d(attn_out_, 0);
                     tt::gemm(0.0f, ov, 1.0f, cv, false, weight(L.wo), false);
                 }
-                tt::add(x_, x_, attn_out_);
+                add_residual(x_, attn_out_);
 
                 /* ---- feed-forward block (SwiGLU) ---- */
                 tt::rms_normalize(eps, xn_, rms_scale_, x_, L.ffn_norm_g, true);
-                gate_.set_size(1, 1, 1, spec_.d_ffn);
-                up_.set_size(1, 1, 1, spec_.d_ffn);
+                if (spec_.n_experts > 0)
+                    moe_ffn(L, 1);
+                else
                 {
-                    alias_tensor n_2d(1, d), f_2d(1, spec_.d_ffn);
-                    auto nv = n_2d(xn_, 0);
-                    auto gv = f_2d(gate_, 0);
-                    auto uv = f_2d(up_, 0);
-                    tt::gemm(0.0f, gv, 1.0f, nv, false, weight(L.w_gate), false);
-                    tt::gemm(0.0f, uv, 1.0f, nv, false, weight(L.w_up), false);
+                    gate_.set_size(1, 1, 1, spec_.d_ffn);
+                    up_.set_size(1, 1, 1, spec_.d_ffn);
+                    {
+                        alias_tensor n_2d(1, d), f_2d(1, spec_.d_ffn);
+                        auto nv = n_2d(xn_, 0);
+                        auto gv = f_2d(gate_, 0);
+                        auto uv = f_2d(up_, 0);
+                        tt::gemm(0.0f, gv, 1.0f, nv, false, weight(L.w_gate), false);
+                        tt::gemm(0.0f, uv, 1.0f, nv, false, weight(L.w_up), false);
+                    }
+                    sig_.copy_size(gate_);
+                    tt::sigmoid(sig_, gate_);
+                    tt::multiply(false, gate_, gate_, sig_);
+                    tt::multiply(false, gate_, gate_, up_);
+                    ffn_out_.set_size(1, 1, 1, d);
+                    {
+                        alias_tensor h_2d(1, spec_.d_ffn), f_2d(1, d);
+                        auto hv = h_2d(gate_, 0);
+                        auto fv = f_2d(ffn_out_, 0);
+                        tt::gemm(0.0f, fv, 1.0f, hv, false, weight(L.w_down), false);
+                    }
                 }
-                sig_.copy_size(gate_);
-                tt::sigmoid(sig_, gate_);
-                tt::multiply(false, gate_, gate_, sig_);
-                tt::multiply(false, gate_, gate_, up_);
-                ffn_out_.set_size(1, 1, 1, d);
-                {
-                    alias_tensor h_2d(1, spec_.d_ffn), f_2d(1, d);
-                    auto hv = h_2d(gate_, 0);
-                    auto fv = f_2d(ffn_out_, 0);
-                    tt::gemm(0.0f, fv, 1.0f, hv, false, weight(L.w_down), false);
-                }
-                tt::add(x_, x_, ffn_out_);
+                add_residual(x_, ffn_out_);
             }
             cur_len_ = len;
 
@@ -529,7 +567,9 @@ namespace dlib
                 alias_tensor n_2d(1, d), l_2d(1, spec_.vocab_size);
                 auto nv = n_2d(xn_, 0);
                 auto lv = l_2d(logits_, 0);
-                tt::gemm(0.0f, lv, 1.0f, nv, false, weight(lm_head_), false);
+                const float logit_alpha = spec_.logit_scale > 0.0
+                    ? 1.0f / static_cast<float>(spec_.logit_scale) : 1.0f;
+                tt::gemm(0.0f, lv, logit_alpha, nv, false, weight(lm_head_), false);
             }
             return logits_;
         }
@@ -543,7 +583,8 @@ namespace dlib
            through the template path reach it via an export visitor on that side. */
         void save(std::ostream& out) const
         {
-            dlib::serialize("rtm_1", out);
+            const bool moe = spec_.n_experts > 0;
+            dlib::serialize(moe ? "rtm_2" : "rtm_1", out);
             dlib::serialize(spec_.arch_name, out);
             dlib::serialize(spec_.model_name, out);
             dlib::serialize(static_cast<int>(spec_.family), out);
@@ -566,6 +607,13 @@ namespace dlib
             dlib::serialize(spec_.tied_embeddings, out);
             dlib::serialize(spec_.quantized, out);
             dlib::serialize(spec_.qk_norm, out);
+            if (moe)
+            {
+                dlib::serialize(spec_.embedding_scale, out);
+                dlib::serialize(spec_.residual_scale, out);
+                dlib::serialize(spec_.attention_scale, out);
+                dlib::serialize(spec_.logit_scale, out);
+            }
             for (const layer& L : layers_)
             {
                 dlib::serialize(L.attn_norm_g, out);
@@ -582,6 +630,13 @@ namespace dlib
                 serialize_matrix(L.w_gate, out);
                 serialize_matrix(L.w_up, out);
                 serialize_matrix(L.w_down, out);
+                if (moe)
+                {
+                    serialize_matrix(L.router, out);
+                    for (const stored_matrix& m : L.e_gate) serialize_matrix(m, out);
+                    for (const stored_matrix& m : L.e_up)   serialize_matrix(m, out);
+                    for (const stored_matrix& m : L.e_down) serialize_matrix(m, out);
+                }
             }
             dlib::serialize(final_norm_g_, out);
             serialize_matrix(lm_head_, out);
@@ -596,8 +651,9 @@ namespace dlib
         {
             std::string tag;
             dlib::deserialize(tag, in);
-            if (tag != "rtm_1")
+            if (tag != "rtm_1" && tag != "rtm_2")
                 throw std::runtime_error("runtime_transformer: not a runtime archive (tag '" + tag + "')");
+            const bool moe = (tag == "rtm_2");
             spec_ = model_spec();
             dlib::deserialize(spec_.arch_name, in);
             dlib::deserialize(spec_.model_name, in);
@@ -623,6 +679,13 @@ namespace dlib
             dlib::deserialize(spec_.tied_embeddings, in);
             dlib::deserialize(spec_.quantized, in);
             dlib::deserialize(spec_.qk_norm, in);
+            if (moe)
+            {
+                dlib::deserialize(spec_.embedding_scale, in);
+                dlib::deserialize(spec_.residual_scale, in);
+                dlib::deserialize(spec_.attention_scale, in);
+                dlib::deserialize(spec_.logit_scale, in);
+            }
             layers_.clear();
             layers_.resize(static_cast<size_t>(spec_.n_layers));
             for (layer& L : layers_)
@@ -641,6 +704,16 @@ namespace dlib
                 deserialize_matrix(L.w_gate, in);
                 deserialize_matrix(L.w_up, in);
                 deserialize_matrix(L.w_down, in);
+                if (moe)
+                {
+                    deserialize_matrix(L.router, in);
+                    L.e_gate.assign(static_cast<size_t>(spec_.n_experts), stored_matrix());
+                    L.e_up.assign(static_cast<size_t>(spec_.n_experts), stored_matrix());
+                    L.e_down.assign(static_cast<size_t>(spec_.n_experts), stored_matrix());
+                    for (stored_matrix& m : L.e_gate) deserialize_matrix(m, in);
+                    for (stored_matrix& m : L.e_up)   deserialize_matrix(m, in);
+                    for (stored_matrix& m : L.e_down) deserialize_matrix(m, in);
+                }
             }
             dlib::deserialize(final_norm_g_, in);
             deserialize_matrix(lm_head_, in);
@@ -739,11 +812,61 @@ namespace dlib
             }
         }
 
+        /* Load a 3D expert tensor ([in, out, n_experts] in ggml dims order, one
+           [out, in] matrix per expert) and split it per expert. Expert boundaries
+           fall on row boundaries, and each row is block-aligned by the GGUF format,
+           so at rest the raw bytes are sliced without requantization; the per-expert
+           slices then behave exactly like ordinary 2D matrices (same weight()
+           materialization, same transposition, no rotary permutation). */
+        void load_expert_matrices(gguf_reader& g, const std::string& name,
+            long in_dim, long out_dim, std::vector<stored_matrix>& dst)
+        {
+            const long n_exp = spec_.n_experts;
+            const gguf_tensor_info* t = g.find_tensor(name);
+            if (!t) throw std::runtime_error("runtime_transformer: missing tensor " + name
+                + " (legacy per-expert GGUF splits are not supported; re-convert with a recent tool)");
+            if (t->n_elements() != static_cast<uint64_t>(in_dim) * out_dim * n_exp)
+                throw std::runtime_error("runtime_transformer: shape mismatch for " + name);
+            dst.assign(static_cast<size_t>(n_exp), stored_matrix());
+            if (at_rest_)
+            {
+                std::vector<uint8_t> raw;
+                g.read_tensor_raw(*t, raw);
+                const size_t exp_bytes = raw.size() / static_cast<size_t>(n_exp);
+                for (long e = 0; e < n_exp; ++e)
+                {
+                    stored_matrix& m = dst[static_cast<size_t>(e)];
+                    m.in_dim = in_dim;
+                    m.out_dim = out_dim;
+                    m.type = t->type;
+                    m.dims = { static_cast<uint64_t>(in_dim), static_cast<uint64_t>(out_dim) };
+                    m.raw.assign(raw.begin() + static_cast<size_t>(e) * exp_bytes,
+                                 raw.begin() + static_cast<size_t>(e + 1) * exp_bytes);
+                }
+            }
+            else
+            {
+                std::vector<float> src;
+                gguf_read_dequantized(g, *t, src);
+                const size_t exp_elems = static_cast<size_t>(in_dim) * out_dim;
+                std::vector<float> slice(exp_elems);
+                for (long e = 0; e < n_exp; ++e)
+                {
+                    stored_matrix& m = dst[static_cast<size_t>(e)];
+                    m.in_dim = in_dim;
+                    m.out_dim = out_dim;
+                    std::memcpy(slice.data(), src.data() + static_cast<size_t>(e) * exp_elems,
+                        exp_elems * sizeof(float));
+                    m.resident.set_size(in_dim, out_dim);
+                    transpose_matrix(slice, m, m.resident.host());
+                }
+            }
+        }
+
         /* Source tensor for one gemm: the resident copy, or a just-in-time
            materialization into the rotating pool. The returned reference stays valid
            until the same pool slot is handed out again, i.e. beyond the single gemm
-           that consumes it. */
-        const tensor& weight(stored_matrix& m)
+           that consumes it. */        const tensor& weight(stored_matrix& m)
         {
             if (m.resident.size() != 0)
                 return m.resident;
@@ -850,6 +973,126 @@ namespace dlib
             for (long i = 0; i < n; ++i) p[i] = 1.0f;
         }
 
+        /* Residual accumulation, honoring the residual scale declared by some
+           families (granitemoe): x += residual_scale * y. */
+        void add_residual(resizable_tensor& x, const resizable_tensor& y)
+        {
+            const float rs = static_cast<float>(spec_.residual_scale);
+            if (rs == 1.0f) tt::add(x, x, y);
+            else tt::affine_transform(x, x, y, 1.0f, rs);
+        }
+
+        /* Mixture-of-experts feed-forward over the normalized activations
+           xn_ [1, 1, N, d], writing the combined result into ffn_out_ [1, 1, N, d].
+           Routing follows the mixtral/granitemoe convention: softmax over the router
+           logits, top-k selection, renormalization of the selected weights to sum 1.
+           Tokens routed to the same expert are gathered into one batch, so each
+           active expert materializes its three matrices once per call whatever the
+           token count; in quantized-at-rest mode the dequantization cost is thus
+           bounded by the number of active experts, not by tokens x top_k. */
+        void moe_ffn(layer& L, long N)
+        {
+            const long d = spec_.d_model;
+            const long n_exp = spec_.n_experts;
+            const long top_k = spec_.n_experts_used;
+
+            /* Router logits, then per-token selection on the host (n_exp is small). */
+            router_logits_.set_size(1, 1, N, n_exp);
+            {
+                alias_tensor n_2d(N, d), r_2d(N, n_exp);
+                auto nv = n_2d(xn_, 0);
+                auto rv = r_2d(router_logits_, 0);
+                tt::gemm(0.0f, rv, 1.0f, nv, false, weight(L.router), false);
+            }
+            const float* rl = router_logits_.host();
+            route_e_.assign(static_cast<size_t>(N) * top_k, 0);
+            route_w_.assign(static_cast<size_t>(N) * top_k, 0.0f);
+            probs_.resize(static_cast<size_t>(n_exp));
+            for (long t = 0; t < N; ++t)
+            {
+                const float* row = rl + t * n_exp;
+                float mx = row[0];
+                for (long e = 1; e < n_exp; ++e) mx = std::max(mx, row[e]);
+                float sum = 0.0f;
+                for (long e = 0; e < n_exp; ++e)
+                {
+                    probs_[static_cast<size_t>(e)] = std::exp(row[e] - mx);
+                    sum += probs_[static_cast<size_t>(e)];
+                }
+                float sel = 0.0f;
+                for (long k = 0; k < top_k; ++k)
+                {
+                    long best = 0;
+                    for (long e = 1; e < n_exp; ++e)
+                        if (probs_[static_cast<size_t>(e)] > probs_[static_cast<size_t>(best)]) best = e;
+                    route_e_[static_cast<size_t>(t) * top_k + k] = best;
+                    route_w_[static_cast<size_t>(t) * top_k + k] = probs_[static_cast<size_t>(best)] / sum;
+                    sel += probs_[static_cast<size_t>(best)] / sum;
+                    probs_[static_cast<size_t>(best)] = -1.0f;   // exclude from further picks
+                }
+                for (long k = 0; k < top_k; ++k)
+                    route_w_[static_cast<size_t>(t) * top_k + k] /= sel;
+            }
+
+            ffn_out_.set_size(1, 1, N, d);
+            ffn_out_ = 0;
+            alias_tensor row(1, 1, 1, d);
+            for (long e = 0; e < n_exp; ++e)
+            {
+                /* Gather the tokens routed to this expert. */
+                sel_tok_.clear();
+                sel_wgt_.clear();
+                for (long t = 0; t < N; ++t)
+                    for (long k = 0; k < top_k; ++k)
+                        if (route_e_[static_cast<size_t>(t) * top_k + k] == e)
+                        {
+                            sel_tok_.push_back(t);
+                            sel_wgt_.push_back(route_w_[static_cast<size_t>(t) * top_k + k]);
+                        }
+                const long m = static_cast<long>(sel_tok_.size());
+                if (m == 0) continue;
+
+                xg_.set_size(1, 1, m, d);
+                for (long i = 0; i < m; ++i)
+                {
+                    auto src = row(xn_, static_cast<size_t>(sel_tok_[static_cast<size_t>(i)]) * d);
+                    auto dst = row(xg_, static_cast<size_t>(i) * d);
+                    memcpy(dst, src);
+                }
+
+                /* SwiGLU of the gathered batch through this expert. */
+                eg_.set_size(1, 1, m, spec_.d_ffn);
+                eu_.set_size(1, 1, m, spec_.d_ffn);
+                {
+                    alias_tensor x_2d(m, d), f_2d(m, spec_.d_ffn);
+                    auto xv = x_2d(xg_, 0);
+                    auto gv = f_2d(eg_, 0);
+                    auto uv = f_2d(eu_, 0);
+                    tt::gemm(0.0f, gv, 1.0f, xv, false, weight(L.e_gate[static_cast<size_t>(e)]), false);
+                    tt::gemm(0.0f, uv, 1.0f, xv, false, weight(L.e_up[static_cast<size_t>(e)]), false);
+                }
+                esig_.copy_size(eg_);
+                tt::sigmoid(esig_, eg_);
+                tt::multiply(false, eg_, eg_, esig_);
+                tt::multiply(false, eg_, eg_, eu_);
+                ey_.set_size(1, 1, m, d);
+                {
+                    alias_tensor h_2d(m, spec_.d_ffn), y_2d(m, d);
+                    auto hv = h_2d(eg_, 0);
+                    auto yv = y_2d(ey_, 0);
+                    tt::gemm(0.0f, yv, 1.0f, hv, false, weight(L.e_down[static_cast<size_t>(e)]), false);
+                }
+
+                /* Scatter-accumulate the weighted expert output. */
+                for (long i = 0; i < m; ++i)
+                {
+                    auto y = row(ey_, static_cast<size_t>(i) * d);
+                    auto o = row(ffn_out_, static_cast<size_t>(sel_tok_[static_cast<size_t>(i)]) * d);
+                    tt::affine_transform(o, o, y, 1.0f, sel_wgt_[static_cast<size_t>(i)]);
+                }
+            }
+        }
+
         void load_gamma(gguf_reader& g, const std::string& name, long d, resizable_tensor& dst)
         {
             const gguf_tensor_info* t = g.find_tensor(name);
@@ -931,6 +1174,11 @@ namespace dlib
         resizable_tensor pool_[2];
         int pool_next_ = 0;
         std::vector<float> scratch_;
+
+        /* Mixture-of-experts routing and gather buffers. */
+        resizable_tensor router_logits_, xg_, eg_, eu_, esig_, ey_;
+        std::vector<float> probs_, route_w_, sel_wgt_;
+        std::vector<long> route_e_, sel_tok_;
 
         /* Work buffers, reused across layers and calls. */
         resizable_tensor x_, xn_, rms_scale_;

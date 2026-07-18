@@ -31,8 +31,12 @@ namespace dlib
                 Q scaled by 1/sqrt(head_dim) at projection, optional QKV biases,
                 optional per-head QK RMSNorm, rotary encoding of Q and K, GQA
                 repeat by channel copy, causal masking by additive per-head
-                bias, plane-wise softmax, SwiGLU feed-forward, pre-norm
-                residuals, final RMSNorm and lm_head projection. It runs on the
+                bias, plane-wise softmax, SwiGLU feed-forward (dense, or routed
+                across experts for mixture-of-experts models), pre-norm
+                residuals, final RMSNorm and lm_head projection. The global
+                scale factors declared by some families (granitemoe: embedding,
+                residual, attention and logit scales) are applied at their
+                respective points. It runs on the
                 same tensor primitives (gemm, rotary embedding, rms
                 normalization, plane-wise softmax) as the template stack, on
                 CPU or CUDA according to the build, and is validated by logit
@@ -48,6 +52,18 @@ namespace dlib
                     rotating pool at every use, keeping the footprint close to
                     the on-disk file size, traded against one dequantization
                     per matrix and per forward.
+
+            MIXTURE OF EXPERTS
+                When spec().n_experts > 0, the feed-forward of each block routes
+                every token through its top spec().n_experts_used experts:
+                softmax over the router logits, top-k selection, renormalization
+                of the selected weights to sum 1 (the mixtral / granitemoe
+                convention), then the weighted sum of the selected experts'
+                SwiGLU outputs. Tokens routed to the same expert are batched, so
+                each active expert materializes its matrices once per forward;
+                in quantized-at-rest mode only the experts actually selected are
+                dequantized, which keeps the per-token cost proportional to the
+                active parameters rather than the total parameters.
 
             KV CACHE AND GENERATION
                 Generation runs in two phases: forward_prefill() processes the
@@ -94,7 +110,10 @@ namespace dlib
                   feed-forward projections, optional QKV biases and QK-Norm
                   gammas (detected from the tensor table), final norm, lm_head
                   (the embedding table when spec.tied_embeddings is true) and
-                  the token embedding table.
+                  the token embedding table. For mixture-of-experts models the
+                  feed-forward weights are the per-block router and the 3D
+                  expert tensors, sliced into one matrix per expert (raw
+                  quantized slices in at-rest mode).
                 - Projection matrices are stored transposed to the [in, out]
                   orientation used by the forward path; the RoPE row permutation
                   is applied according to the architecture family and
@@ -192,13 +211,17 @@ namespace dlib
                   (quantized blocks at rest, or dequantized floats). Loading it
                   never depends on the template network types nor on their
                   serialization internals.
-                - Format tag: "rtm_1".
+                - Format tag: "rtm_1" for dense models (byte-identical to the
+                  previous format), "rtm_2" for mixture-of-experts models
+                  (adds the global scale factors and the router and expert
+                  weights).
         !*/
 
         void load(std::istream& in);
         /*!
             ensures
-                - Restores an engine from a runtime archive written by save():
+                - Restores an engine from a runtime archive written by save()
+                  (accepting both the "rtm_1" and "rtm_2" formats):
                   specification, weights in their saved storage form, and an
                   empty KV cache (set_context() must be called again for
                   generation).

@@ -21,7 +21,7 @@
 
 namespace dlib
 {
-    enum class arch_family { llama, mistral, gemma, gemma2, qwen2, qwen3, mixtral, unknown };
+    enum class arch_family { llama, mistral, gemma, gemma2, qwen2, qwen3, mixtral, granite_moe, unknown };
 
     inline arch_family arch_family_from_name(const std::string& a)
     {
@@ -31,6 +31,8 @@ namespace dlib
         if (a == "gemma2")  return arch_family::gemma2;
         if (a == "qwen2")   return arch_family::qwen2;
         if (a == "qwen3")   return arch_family::qwen3;
+        if (a == "mixtral") return arch_family::mixtral;
+        if (a == "granitemoe") return arch_family::granite_moe;
         return arch_family::unknown;
     }
 
@@ -45,6 +47,15 @@ namespace dlib
         long ffn_num = 0, ffn_den = 1;          // d_ffn = d_model * ffn_num / ffn_den (reduced)
         double rms_eps = 1e-5, rope_freq_base = 10000.0;
         long n_experts = 0, n_experts_used = 0; // > 0 => mixture of experts
+
+        /* Global scale factors declared by some families (granitemoe). The sentinel
+           values mean "not declared": embedding and residual scales default to 1
+           (identity), attention_scale 0 selects the standard 1/sqrt(head_dim), and
+           logit_scale 0 leaves the logits unscaled. */
+        double embedding_scale = 1.0;
+        double residual_scale  = 1.0;
+        double attention_scale = 0.0;
+        double logit_scale     = 0.0;
         std::string rope_scaling_type;          // "", "none", "linear" or "yarn"
         double rope_scaling_factor = 0.0;       // position scaling factor when declared
         long rope_orig_ctx = 0;                 // original context length when declared
@@ -114,6 +125,10 @@ namespace dlib
         }
         s.n_experts  = static_cast<long>(g.get_int(p + ".expert_count", 0));
         s.n_experts_used = static_cast<long>(g.get_int(p + ".expert_used_count", 0));
+        s.embedding_scale = g.get_double(p + ".embedding_scale", 1.0);
+        s.residual_scale  = g.get_double(p + ".residual_scale", 1.0);
+        s.attention_scale = g.get_double(p + ".attention.scale", 0.0);
+        s.logit_scale     = g.get_double(p + ".logit_scale", 0.0);
 
         if (g.has("tokenizer.ggml.tokens"))
             s.vocab_size = static_cast<long>(g.at("tokenizer.ggml.tokens").arr_str.size());
@@ -182,8 +197,14 @@ namespace dlib
                 + (s.rope_orig_ctx ? ", original ctx " + std::to_string(s.rope_orig_ctx) : "") + ")")
           << "\n"
           << "Experts            : " << s.n_experts
-          << (s.n_experts ? " (used " + std::to_string(s.n_experts_used) + ")" : "") << "\n"
-          << "QK-Norm            : " << (s.qk_norm ? "yes" : "no") << "\n"
+          << (s.n_experts ? " (used " + std::to_string(s.n_experts_used) + ")" : "") << "\n";
+        if (s.embedding_scale != 1.0 || s.residual_scale != 1.0
+            || s.attention_scale != 0.0 || s.logit_scale != 0.0)
+            o << "Scales             : embedding " << s.embedding_scale
+              << ", residual " << s.residual_scale
+              << ", attention " << s.attention_scale
+              << ", logit " << s.logit_scale << "\n";
+        o << "QK-Norm            : " << (s.qk_norm ? "yes" : "no") << "\n"
           << "Tied embeddings    : " << (s.tied_embeddings ? "yes" : "no") << "\n"
           << "Quantized weights  : " << (s.quantized ? "yes" : "no") << "\n";
         return o.str();
@@ -210,7 +231,24 @@ namespace dlib
            forwards and freezes them during training (their gradients are zeroed). */
         (void)fused_attention_path;
         if (s.n_experts > 0)
-            r.blockers.push_back("MoE routing convention must be aligned with moe_ before enabling import");
+        {
+            /* MoE support scope: the runtime engine implements the canonical routing
+               (softmax over the router logits, top-k selection, renormalization of
+               the selected weights) with independent SwiGLU experts, which covers
+               the mixtral and granitemoe conventions; llama/mistral cover Mixtral
+               files that declare the base architecture. Families with a shared
+               expert or a different gating (qwen2moe, deepseek) stay blocked, and
+               the template network path has no MoE-capable feed-forward packing. */
+            const bool runtime_moe_family =
+                s.family == arch_family::llama || s.family == arch_family::mistral
+                || s.family == arch_family::mixtral || s.family == arch_family::granite_moe;
+            if (fused_attention_path)
+                r.blockers.push_back("MoE models import only through the runtime engine (no expert packing in the template network)");
+            else if (!runtime_moe_family)
+                r.blockers.push_back("MoE routing convention of architecture '" + s.arch_name + "' is not supported");
+            else if (s.n_experts_used <= 0 || s.n_experts_used > s.n_experts)
+                r.blockers.push_back("invalid expert_used_count in metadata");
+        }
         if (s.rope_scaling_type == "linear" && s.rope_scaling_factor > 0.0)
             r.blockers.push_back("declared linear RoPE scaling (factor "
                 + std::to_string(s.rope_scaling_factor)

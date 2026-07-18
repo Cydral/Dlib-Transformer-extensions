@@ -50,6 +50,8 @@ namespace dlib
                 qwen2    - Qwen2 family (QKV biases, tied embeddings on small sizes)
                 qwen3    - Qwen3 family (per-head QK-Norm, decoupled head_dim)
                 mixtral  - Mixture-of-experts Mistral variants
+                granite_moe - IBM Granite mixture-of-experts models (declare
+                           global embedding/residual/attention/logit scales)
                 unknown  - Any architecture string not listed above
         !*/
     };
@@ -99,6 +101,15 @@ namespace dlib
                 rope_orig_ctx       - Original context length when declared
                 n_experts           - Expert count; > 0 means mixture of experts
                 n_experts_used      - Experts active per token
+                embedding_scale     - Global multiplier applied to the token
+                                      embeddings (granitemoe); 1 when undeclared
+                residual_scale      - Multiplier applied to every residual branch
+                                      before accumulation; 1 when undeclared
+                attention_scale     - Replaces the standard 1/sqrt(head_dim)
+                                      attention prescale when > 0; 0 (sentinel)
+                                      selects the standard prescale
+                logit_scale         - The logits are divided by this value when
+                                      > 0; 0 (sentinel) leaves them unscaled
                 tied_embeddings     - True when there is no separate output.weight
                                       tensor (the lm_head shares the embedding table)
                 quantized           - True when at least one tensor is neither F32
@@ -115,6 +126,7 @@ namespace dlib
         long d_model, d_ffn, head_dim, vocab_size;
         long ffn_num, ffn_den;
         double rms_eps, rope_freq_base;
+        double embedding_scale, residual_scale, attention_scale, logit_scale;
         long n_experts, n_experts_used;
         std::string rope_scaling_type;
         double rope_scaling_factor;
@@ -235,16 +247,20 @@ namespace dlib
               layers and returns the blockers and notes.
             - #compat_result::ok == true if and only if no blocker was found.
             - Current blockers include: the Gemma families (require (1+w) RMSNorm,
-              embedding scaling and GeGLU), mixture-of-experts models (routing
-              convention not aligned yet), declared linear RoPE scaling, odd or
+              embedding scaling and GeGLU), declared linear RoPE scaling, odd or
               missing head_dim, n_heads not a multiple of n_kv_heads, and incomplete
               dimension metadata.
+            - Mixture-of-experts models: blocked on the template path
+              (fused_attention_path == true, no expert packing there); accepted on
+              the runtime path for the families following the canonical routing
+              (softmax over the router logits, top-k, renormalization): llama and
+              mistral (covering Mixtral files declaring the base architecture),
+              mixtral, and granite_moe. Families with a shared expert or a
+              different gating remain blocked.
             - fused_attention_path distinguishes the two consumers of the check: the
               statically generated template network (true) and the shape-dynamic
-              runtime engine (false). Both currently share the same rules; the
-              parameter is kept so consumer-specific constraints (such as bias
-              handling in the fused attention packing) can diverge without an API
-              change.
+              runtime engine (false). The rules diverge on mixture-of-experts
+              support as described above.
     !*/
 
     // ---------------------------------------------------------------------------------
