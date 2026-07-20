@@ -325,10 +325,9 @@ public:
           top_p_(top_p), min_p_(min_p), repeat_(repeat_penalty), det_(deterministic),
           rng_(std::random_device{}())
     {
-        std::vector<dlib::chat_model_info> infos;
-        for (const served_model& m : models_)
-            infos.push_back(dlib::chat_model_info{ m.name, m.fmt.supports_reasoning() });
-        set_models(infos);
+        std::vector<std::string> names;
+        for (const served_model& m : models_) names.push_back(m.name);
+        set_model_names(names);
     }
 
 private:
@@ -341,9 +340,7 @@ private:
         served_model& use = *selp;
         runtime_transformer& rt_ = *use.rt;
         hf_tokenizer& tok_ = *use.tok;
-        chat_template_formatter fmt_ = use.fmt;
-        if (req.reasoning >= 0 && fmt_.supports_reasoning())
-            fmt_.set_reasoning(req.reasoning == 1);
+        const chat_template_formatter& fmt_ = use.fmt;
 
         /* Split the wire messages: system content joins the system block, then the
            user/assistant alternation drives the template turns. */
@@ -408,9 +405,6 @@ private:
 
         dlib::chat_result res;
         res.prompt_tokens = static_cast<long>(ids.size());
-        /* Token pieces go out as produced; the server's streaming path buffers any
-           incomplete UTF-8 tail, so multi-byte characters split across byte-fallback
-           tokens still reach the client whole. */
         std::vector<int> answer, recent(ids.end() - std::min<size_t>(ids.size(), 64), ids.end());
         const std::string stop = fmt_.stop_string();
         std::string text;
@@ -492,23 +486,10 @@ int main(int argc, char** argv)
 
         std::vector<string> inputs;
         {
-            /* The shell only expands a leading tilde on the first word, so the
-               second and later comma-separated paths arrive verbatim; expand it
-               here for every entry. */
-            const char* home = std::getenv("HOME");
-#ifdef _WIN32
-            if (!home) home = std::getenv("USERPROFILE");
-#endif
             string all = parser.option("input").argument();
             std::istringstream iss(all);
             string p;
-            while (std::getline(iss, p, ','))
-            {
-                if (p.empty()) continue;
-                if (home && p.size() >= 2 && p[0] == '~' && (p[1] == '/' || p[1] == '\\'))
-                    p = string(home) + p.substr(1);
-                inputs.push_back(p);
-            }
+            while (std::getline(iss, p, ',')) if (!p.empty()) inputs.push_back(p);
         }
         const string input = inputs.front();
         if (inputs.size() > 1 && !parser.option("serve"))

@@ -1,7 +1,7 @@
 // Copyright (C) 2026 Cydral Technology (cydraltechnology@gmail.com)
 // License: Boost Software License   See LICENSE.txt for the full license.
-#ifndef DLIB_HF_TOKENIZER_Hh_
-#define DLIB_HF_TOKENIZER_Hh_
+#ifndef DLIB_HF_TOKENIZER_H_
+#define DLIB_HF_TOKENIZER_H_
 
 #include <string>
 #include <vector>
@@ -672,4 +672,4 @@ namespace dlib
     };
 }
 
-#endif // DLIB_HF_TOKENIZER_Hh_
+#endif // DLIB_HF_TOKENIZER_H_

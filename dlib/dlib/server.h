@@ -6,6 +6,7 @@
 #include "server/server_kernel.h"
 #include "server/server_iostream.h"
 #include "server/server_http.h"
+#include "server/server_chat.h"
 
 
 #endif // DLIB_SERVEr_

@@ -8,19 +8,25 @@
 // they ask the formatter for the text of each turn instead of hardcoding markers.
 //
 // Supported templates:
-//   - zephyr : "<|system|>\n...</s>\n<|user|>\n...</s>\n<|assistant|>\n"
-//              (TinyLlama-Chat and other Zephyr-formatted Llama-family models);
-//   - chatml : "<|im_start|>role\n...<|im_end|>\n" (Qwen family and derivatives);
-//   - raw    : no markup, plain text completion.
+//   - zephyr  : "<|system|>\n...</s>\n<|user|>\n...</s>\n<|assistant|>\n"
+//               (TinyLlama-Chat and other Zephyr-formatted Llama-family models);
+//   - chatml  : "<|im_start|>role\n...<|im_end|>\n" (Qwen family and derivatives);
+//   - guanaco : "### Human: ...\n### Assistant:" (OpenAssistant-Guanaco fine-tunes);
+//   - granite : "<|start_of_role|>role<|end_of_role|>...<|end_of_text|>\n"
+//               (IBM Granite instruct models, dense and MoE);
+//   - raw     : no markup, plain text completion.
 //
-// The template kind is detected from the tokenizer itself: the text of the eos
-// special token identifies the family ("</s>" -> zephyr, "<|im_end|>" -> chatml).
+// The template kind is detected from the declared template when the model carries
+// one, else from the text of the eos special token ("</s>" -> zephyr,
+// "<|im_end|>" -> chatml, "<|end_of_text|>" -> granite).
 // Detecting from the tokenizer, rather than from GGUF metadata, makes the same
 // logic work for models imported live from a GGUF and for models loaded back from
 // a serialized .dat archive, where the container metadata is no longer available.
 
 #ifndef DLIB_CHAT_TEMPLATE_H_
 #define DLIB_CHAT_TEMPLATE_H_
+
+#include "chat_template_abstract.h"
 
 #include <string>
 #include <vector>
@@ -29,7 +35,7 @@
 
 namespace dlib
 {
-    enum class chat_template_kind { raw, zephyr, chatml, guanaco };
+    enum class chat_template_kind { raw, zephyr, chatml, guanaco, granite };
 
     class chat_template_formatter
     {
@@ -42,7 +48,7 @@ namespace dlib
                 conversation: the first turn carries the system block, later turns
                 begin with the newline that follows the assistant's closing token, and
                 every assistant turn is closed by the tokenizer's eos token (</s> for
-                zephyr, <|im_end|> for chatml).
+                zephyr, <|im_end|> for chatml, <|end_of_text|> for granite).
 
                 For chatml, the assistant header depends on the model: thinking-capable
                 models (Qwen3, detected by "<think>" encoding to a single special token)
@@ -68,13 +74,15 @@ namespace dlib
             const std::string& tpl = tok.chat_template();
             if (!tpl.empty())
             {
+                if (tpl.find("<|start_of_role|>") != std::string::npos) return chat_template_kind::granite;
                 if (tpl.find("<|im_start|>") != std::string::npos) return chat_template_kind::chatml;
                 if (tpl.find("<|user|>") != std::string::npos)     return chat_template_kind::zephyr;
             }
             const std::vector<int> one{ tok.eos_id() };
             const std::string piece = tok.decode(one, /*skip_special=*/false);
-            if (piece == "<|im_end|>") return chat_template_kind::chatml;
-            if (piece == "</s>")       return chat_template_kind::zephyr;
+            if (piece == "<|im_end|>")      return chat_template_kind::chatml;
+            if (piece == "</s>")            return chat_template_kind::zephyr;
+            if (piece == "<|end_of_text|>") return chat_template_kind::granite;
             return chat_template_kind::raw;
         }
 
@@ -109,6 +117,7 @@ namespace dlib
             if (n == "zephyr")  return chat_template_kind::zephyr;
             if (n == "chatml")  return chat_template_kind::chatml;
             if (n == "guanaco") return chat_template_kind::guanaco;
+            if (n == "granite") return chat_template_kind::granite;
             return chat_template_kind::raw;
         }
 
@@ -119,6 +128,7 @@ namespace dlib
             case chat_template_kind::zephyr:  return "zephyr";
             case chat_template_kind::chatml:  return "chatml";
             case chat_template_kind::guanaco: return "guanaco";
+            case chat_template_kind::granite: return "granite";
             default:                         return "raw";
             }
         }
@@ -160,6 +170,10 @@ namespace dlib
                 /* Guanaco has no formal system block; a leading instruction followed by
                    a blank line is the common usage. */
                 return system_prompt.empty() ? std::string() : system_prompt + "\n\n";
+            case chat_template_kind::granite:
+                return system_prompt.empty() ? std::string()
+                    : "<|start_of_role|>system<|end_of_role|>" + system_prompt
+                      + "<|end_of_text|>\n";
             default:
                 return std::string();
             }
@@ -180,6 +194,10 @@ namespace dlib
             case chat_template_kind::guanaco:
                 return system_prefix(system_prompt)
                     + "### Human: " + user_text + "\n### Assistant:";
+            case chat_template_kind::granite:
+                return system_prefix(system_prompt)
+                    + "<|start_of_role|>user<|end_of_role|>" + user_text
+                    + "<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>";
             default:
                 return user_text;
             }
@@ -199,6 +217,9 @@ namespace dlib
                     + assistant_header();
             case chat_template_kind::guanaco:
                 return "\n### Human: " + user_text + "\n### Assistant:";
+            case chat_template_kind::granite:
+                return "\n<|start_of_role|>user<|end_of_role|>" + user_text
+                    + "<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>";
             default:
                 return user_text;
             }

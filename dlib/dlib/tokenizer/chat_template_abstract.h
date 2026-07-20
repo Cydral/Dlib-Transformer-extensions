@@ -16,7 +16,8 @@ namespace dlib
         raw,     // no markup, plain text completion
         zephyr,  // "<|system|>\n...</s>\n<|user|>\n...</s>\n<|assistant|>\n"
         chatml,  // "<|im_start|>role\n...<|im_end|>\n"
-        guanaco  // "### Human: ...\n### Assistant: ..."
+        guanaco, // "### Human: ...\n### Assistant: ..."
+        granite  // "<|start_of_role|>role<|end_of_role|>...<|end_of_text|>\n"
     };
     /*!
         WHAT THIS OBJECT REPRESENTS
@@ -25,8 +26,9 @@ namespace dlib
             exact markers seen during fine-tuning; zephyr covers TinyLlama-Chat and
             other Zephyr-formatted Llama-family models, chatml covers the Qwen family
             and derivatives such as SmolLM2-Instruct, guanaco covers models fine-tuned
-            on the OpenAssistant-Guanaco turn format, and raw disables any markup for
-            plain completion.
+            on the OpenAssistant-Guanaco turn format, granite covers the IBM Granite
+            instruct models (dense and mixture-of-experts), and raw disables any
+            markup for plain completion.
     !*/
 
 // ----------------------------------------------------------------------------------------
@@ -45,7 +47,7 @@ namespace dlib
                 dialogue: the first turn carries the system block, every later turn
                 begins with the newline that follows the assistant's closing token,
                 and each assistant turn is closed by the tokenizer's eos token (</s>
-                for zephyr, <|im_end|> for chatml). A generation loop therefore only
+                for zephyr, <|im_end|> for chatml, <|end_of_text|> for granite). A generation loop therefore only
                 has to feed first_turn() once, then next_turn() per exchange, and to
                 append the eos token after each generated answer.
 
@@ -87,11 +89,12 @@ namespace dlib
                 - Identifies the template family. The primary criterion is the chat
                   template the model declares (tokenizer.chat_template in the source
                   container, persisted with the tokenizer): a template containing
-                  "<|im_start|>" yields chatml and one containing "<|user|>" yields
-                  zephyr. When the model declares no template, the text of the
-                  tokenizer's eos special token is used as a fallback heuristic:
-                  "<|im_end|>" yields chatml, "</s>" yields zephyr, anything else
-                  yields raw.
+                  "<|start_of_role|>" yields granite, one containing "<|im_start|>"
+                  yields chatml and one containing "<|user|>" yields zephyr. When the
+                  model declares no template, the text of the tokenizer's eos special
+                  token is used as a fallback heuristic: "<|im_end|>" yields chatml,
+                  "</s>" yields zephyr, "<|end_of_text|>" yields granite, anything
+                  else yields raw.
                 - Detecting from the tokenizer, rather than from container metadata
                   read at import time, makes the same logic work for models imported
                   live from a GGUF and for models loaded back from a serialized
@@ -128,8 +131,8 @@ namespace dlib
         );
         /*!
             ensures
-                - Returns the kind named by n ("zephyr", "chatml", "guanaco"); any
-                  other string yields chat_template_kind::raw.
+                - Returns the kind named by n ("zephyr", "chatml", "guanaco",
+                  "granite"); any other string yields chat_template_kind::raw.
         !*/
 
         static const char* name(
@@ -137,8 +140,8 @@ namespace dlib
         );
         /*!
             ensures
-                - Returns a human-readable identifier of k: "raw", "zephyr", "chatml"
-                  or "guanaco".
+                - Returns a human-readable identifier of k: "raw", "zephyr",
+                  "chatml", "guanaco" or "granite".
         !*/
 
         chat_template_kind kind(
@@ -154,8 +157,9 @@ namespace dlib
             ensures
                 - Returns true if the first prefill of a conversation must be
                   prepended with the tokenizer's BOS token (zephyr and guanaco,
-                  Llama-family SentencePiece models), false otherwise (chatml models
-                  use no leading BOS, raw follows the caller's convention).
+                  Llama-family SentencePiece models), false otherwise (chatml and
+                  granite models use no leading BOS, raw follows the caller's
+                  convention).
         !*/
 
         std::string system_prefix(
@@ -217,8 +221,11 @@ namespace dlib
         ) const;
         /*!
             ensures
-                - Returns true when the detected model exposes a reasoning mode
-                  (ChatML with a native "<think>" special token, e.g. Qwen3).
+                - Returns a text whose appearance in a generated answer must stop the
+                  generation ("\n###" for the guanaco kind, which frequently opens a
+                  new section of varying name instead of emitting eos), or an empty
+                  string when the eos token is the only stop condition (zephyr,
+                  chatml, granite, raw).
         !*/
 
         void set_reasoning(bool enabled);
@@ -234,10 +241,8 @@ namespace dlib
         bool supports_reasoning() const;
         /*!
             ensures
-                - Returns a text whose appearance in a generated answer must stop the
-                  generation ("\n###" for the guanaco kind, which frequently opens a
-                  new section of varying name instead of emitting eos), or an empty
-                  string when the eos token is the only stop condition.
+                - Returns true when the detected model exposes a reasoning mode
+                  (ChatML with a native "<think>" special token, e.g. Qwen3).
         !*/
 
         double default_temperature(

@@ -1,7 +1,7 @@
 // Copyright (C) 2026 Cydral Technology (cydraltechnology@gmail.com)
 // License: Boost Software License   See LICENSE.txt for the full license.
-#undef DLIB_HF_TOKENIZER_ABSTRACT_
-#ifdef DLIB_HF_TOKENIZER_ABSTRACT_
+#undef DLIB_HF_TOKENIZER_ABSTRACT_H_
+#ifdef DLIB_HF_TOKENIZER_ABSTRACT_H_
 
 #include <string>
 #include <vector>
@@ -13,8 +13,7 @@
 #include <limits>
 #include <stdexcept>
 
-#include "hf_tokenizer_abstract.h"
-#include "../data_io/gguf_reader.h"
+#include "../data_io/gguf_reader_abstract.h"
 #include "../serialize.h"
 namespace dlib
 {
@@ -182,6 +181,17 @@ namespace dlib
                 - returns whether the single-argument encode() appends eos_id() by default.
         !*/
 
+        const std::string& chat_template(
+        ) const;
+        /*!
+            ensures
+                - returns the raw chat template declared by the source model
+                  (tokenizer.chat_template in the GGUF container), or an empty string
+                  when the model declares none. The template is persisted with the
+                  tokenizer; chat_template_formatter fingerprints it to select the
+                  conversation format.
+        !*/
+
         const std::string& pretokenizer(
         ) const;
         /*!
@@ -273,4 +283,4 @@ namespace dlib
     !*/
 }
 
-#endif // DLIB_HF_TOKENIZER_ABSTRACT_
+#endif // DLIB_HF_TOKENIZER_ABSTRACT_H_
