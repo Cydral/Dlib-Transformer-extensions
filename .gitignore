@@ -5,3 +5,11 @@ build-cuda/
 # Generated artifacts of the GGUF import examples
 dlib/examples/slm_imported_model*.h
 dlib/examples/*_tokenizer.dat
+
+# Windows metadata carried over Explorer/sshfs copies
+*Zone.Identifier
+# Local build trees and validation artifacts
+build-cpu/
+nr_logs*/
+*.gguf
+*.dat

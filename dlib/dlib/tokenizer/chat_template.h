@@ -69,14 +69,26 @@ namespace dlib
         // marker strings follows the reference implementation's approach and tracks
         // whatever format the model was actually fine-tuned with. When no template is
         // declared, the text of the eos special token is used as a fallback heuristic.
-        static chat_template_kind detect(const hf_tokenizer& tok)
+        static chat_template_kind detect(const hf_tokenizer& tok, const std::string& name_hint = "")
         {
+            /* The guanaco format is plain-text markup: no dedicated special token
+               (its eos is the generic </s>) and, when the container declares a
+               template at all, it is typically inherited from the base model by the
+               conversion rather than reflecting the fine-tune. The model identity
+               is therefore the strongest signal and is consulted first. */
+            if (!name_hint.empty())
+            {
+                std::string h = name_hint;
+                for (char& c : h) if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+                if (h.find("guanaco") != std::string::npos) return chat_template_kind::guanaco;
+            }
             const std::string& tpl = tok.chat_template();
             if (!tpl.empty())
             {
                 if (tpl.find("<|start_of_role|>") != std::string::npos) return chat_template_kind::granite;
                 if (tpl.find("<|im_start|>") != std::string::npos) return chat_template_kind::chatml;
                 if (tpl.find("<|user|>") != std::string::npos)     return chat_template_kind::zephyr;
+                if (tpl.find("### Human") != std::string::npos)    return chat_template_kind::guanaco;
             }
             const std::vector<int> one{ tok.eos_id() };
             const std::string piece = tok.decode(one, /*skip_special=*/false);
@@ -89,6 +101,14 @@ namespace dlib
         static chat_template_formatter for_tokenizer(const hf_tokenizer& tok)
         {
             return for_tokenizer(tok, detect(tok));
+        }
+
+        // Same as above with a model-name hint refining the detection (used for
+        // formats such as guanaco that leave no signature in the tokenizer).
+        static chat_template_formatter for_tokenizer(const hf_tokenizer& tok,
+            const std::string& name_hint)
+        {
+            return for_tokenizer(tok, detect(tok, name_hint));
         }
 
         // Same as above with the template kind forced by the caller, for models whose

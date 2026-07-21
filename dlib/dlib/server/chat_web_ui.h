@@ -148,14 +148,16 @@ font-size:12.5px;color:var(--accent)}
 #pending .p{position:relative}
 #pending .rm{position:absolute;top:-7px;right:-7px;background:var(--danger);color:#fff;border-radius:50%;
 width:18px;height:18px;font-size:12px;line-height:18px;text-align:center;z-index:1}
-#inputwrap{max-width:780px;margin:0 auto;display:flex;gap:8px;align-items:flex-end;background:var(--panel);
-border:1px solid var(--line);border-radius:24px;padding:10px 12px 10px 14px;box-shadow:var(--shadow);
+#inputwrap{max-width:780px;margin:0 auto;display:flex;flex-direction:column;gap:7px;background:var(--panel);
+border:1px solid var(--line);border-radius:22px;padding:10px 12px 9px 14px;box-shadow:var(--shadow);
 transition:border-color .15s}
 #inputwrap:focus-within{border-color:var(--accent)}
-#thinkrow{max-width:780px;margin:6px auto 0;display:none;padding:0 4px}
+#inputrow{display:flex;gap:8px;align-items:flex-end}
+#thinkrow{display:flex;padding:0 2px}
 #thinkbtn{display:inline-flex;align-items:center;gap:5px;font-size:12px;color:var(--dim);
-border:1px solid var(--line);border-radius:16px;padding:4px 11px;transition:all .15s}
+border:1px solid var(--line);border-radius:16px;padding:3px 11px;transition:all .15s}
 #thinkbtn.on{color:#fff;background:var(--grad);border-color:transparent}
+#thinkbtn:disabled{opacity:.4;cursor:default}
 #thinkbtn .msy{font-size:15px}
 #attach{color:var(--dim);padding:6px;border-radius:10px}
 #attach:hover{color:var(--accent)}
@@ -224,14 +226,16 @@ padding:12px;overflow:auto;max-height:52vh;font-size:12.5px;line-height:1.5;whit
   <div id="inputbar">
     <div id="pending"></div>
     <div id="inputwrap">
-      <button id="attach" title="Attach files or images"><span class="msy" style="font-size:22px">attach_file</span></button>
-      <input id="filein" type="file" multiple hidden>
-      <textarea id="input" rows="1" placeholder="Send a message"></textarea>
-      <select id="modelsel" title="Model"></select>
-      <button id="send" title="Send"><span class="msy" style="font-size:24px">send</span></button>
+      <div id="inputrow">
+        <button id="attach" title="Attach files or images"><span class="msy" style="font-size:22px">attach_file</span></button>
+        <input id="filein" type="file" multiple hidden>
+        <textarea id="input" rows="1" placeholder="Send a message"></textarea>
+        <select id="modelsel" title="Model"></select>
+        <button id="send" title="Send"><span class="msy" style="font-size:24px">send</span></button>
+      </div>
+      <div id="thinkrow"><button id="thinkbtn" title="Deep thinking mode of the selected model">
+        <span class="msy">emoji_objects</span><span>Thinking</span></button></div>
     </div>
-    <div id="thinkrow"><button id="thinkbtn" title="Deep thinking mode of the selected model">
-      <span class="msy">emoji_objects</span><span>Thinking</span></button></div>
   </div>
 </main>
 
@@ -796,8 +800,10 @@ const modelCaps={};   // id -> reasoning capable
 let thinking=true;    // default on, for capable models
 function refreshThink(){
   const cap=!!modelCaps[el('modelsel').value];
-  el('thinkrow').style.display=cap?'block':'none';
-  el('thinkbtn').classList.toggle('on',thinking);
+  el('thinkbtn').disabled=!cap;
+  el('thinkbtn').title=cap?'Deep thinking mode of the selected model'
+    :'The selected model has no deep thinking mode';
+  el('thinkbtn').classList.toggle('on',cap&&thinking);
 }
 async function loadModels(){
   try{

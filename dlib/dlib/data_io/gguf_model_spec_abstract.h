@@ -153,13 +153,22 @@ namespace dlib
     );
     /*!
         ensures
-            - Returns the model name with a redundant organization prefix removed.
+            - Returns the model name normalized for display: the redundant
+              organization prefix and any trailing quantization or container
+              markers are removed.
             - GGUF files converted from model hubs often carry general.name in the
               "<organization>_<repository>" form; when the repository itself starts
               with the organization name (case-insensitively), only the repository
-              part is kept, otherwise name is returned unchanged.
-            - Example: "tinyllama_tinyllama-1.1b-chat-v1.0" becomes
-              "tinyllama-1.1b-chat-v1.0".
+              part is kept.
+            - Trailing storage tags of the GGUF ecosystem (legacy and k-quant
+              formats such as Q4_K_S or Q8_0, i-quants, F16/F32/BF16, and the
+              GGUF container marker), preceded by '.', '-' or '_', are stripped
+              case-insensitively, repeatedly when stacked; the tag list follows
+              the formats handled by the import pipeline.
+            - Examples: "tinyllama_tinyllama-1.1b-chat-v1.0" becomes
+              "tinyllama-1.1b-chat-v1.0"; "granite-3.0-1b-a400m-instruct.Q4_K_S"
+              becomes "granite-3.0-1b-a400m-instruct";
+              "TinyLlama-1.1B-Chat-v1.0-GGUF" becomes "TinyLlama-1.1B-Chat-v1.0".
     !*/
 
     model_spec detect_model(

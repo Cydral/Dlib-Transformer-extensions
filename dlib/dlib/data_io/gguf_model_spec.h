@@ -76,17 +76,56 @@ namespace dlib
        redundant and only the repository part is kept. */
     inline std::string clean_model_name(const std::string& name)
     {
-        const size_t p = name.find('_');
-        if (p == std::string::npos || p == 0 || p + 1 >= name.size()) return name;
         auto lower = [](std::string v) {
             for (char& c : v) if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
             return v;
         };
-        const std::string org = lower(name.substr(0, p));
-        const std::string rest = name.substr(p + 1);
-        if (rest.size() >= org.size() && lower(rest).compare(0, org.size(), org) == 0)
-            return rest;
-        return name;
+
+        /* Redundant organization prefix ("<org>_<repo>" where the repository
+           itself starts with the organization name). */
+        std::string out = name;
+        const size_t p = out.find('_');
+        if (p != std::string::npos && p > 0 && p + 1 < out.size())
+        {
+            const std::string org = lower(out.substr(0, p));
+            const std::string rest = out.substr(p + 1);
+            if (rest.size() >= org.size() && lower(rest).compare(0, org.size(), org) == 0)
+                out = rest;
+        }
+
+        /* Trailing quantization or container markers ("model.Q4_K_S",
+           "model-GGUF", "model_f16"...), possibly stacked: strip them from the
+           end until none remains. The tag list mirrors the storage formats of
+           the GGUF ecosystem; matching is case-insensitive and requires a
+           separator so a genuine name ending in, say, "v2" is left alone. */
+        static const char* tags[] = {
+            "iq1_s", "iq1_m", "iq2_xxs", "iq2_xs", "iq2_s", "iq2_m",
+            "iq3_xxs", "iq3_xs", "iq3_s", "iq3_m", "iq4_nl", "iq4_xs",
+            "q2_k", "q3_k_s", "q3_k_m", "q3_k_l", "q4_k_s", "q4_k_m",
+            "q5_k_s", "q5_k_m", "q6_k", "q8_k",
+            "q4_0", "q4_1", "q5_0", "q5_1", "q8_0",
+            "f16", "f32", "bf16", "gguf"
+        };
+        for (bool changed = true; changed; )
+        {
+            changed = false;
+            const std::string low = lower(out);
+            for (const char* tag : tags)
+            {
+                const size_t n = std::char_traits<char>::length(tag);
+                if (low.size() > n + 1 && low.compare(low.size() - n, n, tag) == 0)
+                {
+                    const char sep = low[low.size() - n - 1];
+                    if (sep == '.' || sep == '-' || sep == '_')
+                    {
+                        out.erase(out.size() - n - 1);
+                        changed = true;
+                        break;
+                    }
+                }
+            }
+        }
+        return out;
     }
 
     inline model_spec detect_model(const gguf_reader& g)

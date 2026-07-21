@@ -82,15 +82,22 @@ namespace dlib
         !*/
 
         static chat_template_kind detect(
-            const hf_tokenizer& tok
+            const hf_tokenizer& tok,
+            const std::string& name_hint = ""
         );
         /*!
             ensures
                 - Identifies the template family. The primary criterion is the chat
                   template the model declares (tokenizer.chat_template in the source
-                  container, persisted with the tokenizer): a template containing
-                  "<|start_of_role|>" yields granite, one containing "<|im_start|>"
-                  yields chatml and one containing "<|user|>" yields zephyr. When the
+                  container, persisted with the tokenizer): the optional name_hint
+                  (typically the model's declared name) is consulted first: a name
+                  containing "guanaco" yields guanaco, that format leaving no
+                  signature in the tokenizer itself (plain-text markup, generic
+                  </s> eos) while any declared template is typically inherited from
+                  the base model by the conversion. The declared template is
+                  fingerprinted next: "<|start_of_role|>" yields granite,
+                  "<|im_start|>" yields chatml, "<|user|>" yields zephyr and
+                  "### Human" yields guanaco. When the
                   model declares no template, the text of the tokenizer's eos special
                   token is used as a fallback heuristic: "<|im_end|>" yields chatml,
                   "</s>" yields zephyr, "<|end_of_text|>" yields granite, anything
@@ -104,6 +111,15 @@ namespace dlib
         static chat_template_formatter for_tokenizer(
             const hf_tokenizer& tok
         );
+
+        static chat_template_formatter for_tokenizer(
+            const hf_tokenizer& tok,
+            const std::string& name_hint
+        );
+        /*!
+            ensures
+                - Equivalent to for_tokenizer(tok, detect(tok, name_hint)).
+        !*/
         /*!
             ensures
                 - Returns for_tokenizer(tok, detect(tok)).

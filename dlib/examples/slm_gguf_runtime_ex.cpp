@@ -235,7 +235,31 @@ static int chat_loop(runtime_transformer& rt, hf_tokenizer& tok, const chat_temp
                 answer.erase(answer.find(stop));
                 stopped = true;
             }
-            const std::string clean = fmt.clean_answer(answer);
+            std::string clean = fmt.clean_answer(answer);
+            if (!stopped && !stop.empty())
+            {
+                /* Hold back the longest tail that is a prefix of the stop marker:
+                   it may complete into it at the next token, and a terminal cannot
+                   unprint. The held characters are flushed by the epilogue when
+                   they turn out to be genuine answer text. */
+                const size_t maxh = std::min(clean.size(), stop.size() - 1);
+                for (size_t h = maxh; h > 0; --h)
+                    if (clean.compare(clean.size() - h, h, stop, 0, h) == 0)
+                    {
+                        clean.erase(clean.size() - h);
+                        break;
+                    }
+            }
+            if (!stopped)
+            {
+                /* Likewise, hold back trailing whitespace: it prints later, once
+                   followed by visible text, and the final clean_answer() trims it
+                   when it turns out to be terminal, so printing it early would
+                   leave the display ahead of the definitive answer. */
+                while (!clean.empty() && (clean.back() == '\n' || clean.back() == '\r'
+                    || clean.back() == ' ' || clean.back() == '\t'))
+                    clean.pop_back();
+            }
             if (clean.size() > shown_clean.size()
                 && clean.compare(0, shown_clean.size(), shown_clean) == 0)
             {
@@ -267,7 +291,11 @@ static int chat_loop(runtime_transformer& rt, hf_tokenizer& tok, const chat_temp
         if (clean.size() > shown_clean.size()
             && clean.compare(0, shown_clean.size(), shown_clean) == 0)
             cout << clean.substr(shown_clean.size());
-        else if (clean != shown_clean)
+        else if (clean != shown_clean
+            && !(clean.size() <= shown_clean.size()
+                 && shown_clean.compare(0, clean.size(), clean) == 0))
+            /* Only a genuine divergence reprints; the display merely being ahead
+               by held-back or trimmed trailing characters is left as is. */
             cout << (shown_clean.empty() ? "" : "\nModel: ") << clean;
         cout << "\n";
         rt.step(eos);   // close the assistant turn in the token stream
@@ -567,7 +595,7 @@ int main(int argc, char** argv)
             chat_template_formatter fmt = parser.option("template")
                 ? chat_template_formatter::for_tokenizer(tok,
                     chat_template_formatter::from_name(parser.option("template").argument()))
-                : chat_template_formatter::for_tokenizer(tok);
+                : chat_template_formatter::for_tokenizer(tok, rt.spec().model_name);
             if (parser.option("think"))
             {
                 if (fmt.supports_reasoning()) fmt.set_reasoning(true);
@@ -590,7 +618,7 @@ int main(int argc, char** argv)
             chat_template_formatter fmt = parser.option("template")
                 ? chat_template_formatter::for_tokenizer(tok,
                     chat_template_formatter::from_name(parser.option("template").argument()))
-                : chat_template_formatter::for_tokenizer(tok);
+                : chat_template_formatter::for_tokenizer(tok, rt.spec().model_name);
             if (parser.option("think") && fmt.supports_reasoning()) fmt.set_reasoning(true);
             const double temp = parser.option("temp")
                 ? std::stod(parser.option("temp").argument()) : fmt.default_temperature();
@@ -605,9 +633,13 @@ int main(int argc, char** argv)
             std::vector<std::unique_ptr<hf_tokenizer>> extra_tok;
             std::vector<served_model> models;
             auto label = [](const runtime_transformer& r, const string& path) {
-                if (!r.spec().model_name.empty()) return r.spec().model_name;
                 const size_t sl = path.find_last_of("/\\");
-                return sl == string::npos ? path : path.substr(sl + 1);
+                string stem = sl == string::npos ? path : path.substr(sl + 1);
+                if (stem.size() > 5 && stem.compare(stem.size() - 5, 5, ".gguf") == 0)
+                    stem.erase(stem.size() - 5);
+                else if (stem.size() > 4 && stem.compare(stem.size() - 4, 4, ".dat") == 0)
+                    stem.erase(stem.size() - 4);
+                return stem.empty() ? r.spec().model_name : stem;
             };
             models.push_back(served_model{ label(rt, input), &rt, &tok, fmt });
             for (size_t i = 1; i < inputs.size(); ++i)
@@ -645,7 +677,7 @@ int main(int argc, char** argv)
                 chat_template_formatter f2 = parser.option("template")
                     ? chat_template_formatter::for_tokenizer(t,
                         chat_template_formatter::from_name(parser.option("template").argument()))
-                    : chat_template_formatter::for_tokenizer(t);
+                    : chat_template_formatter::for_tokenizer(t, r.spec().model_name);
                 models.push_back(served_model{ label(r, path), &r, &t, f2 });
             }
 
