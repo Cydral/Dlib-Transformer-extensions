@@ -15,6 +15,7 @@
 #include <vector>
 #include <string>
 #include <stdexcept>
+#include <cmath>
 #include <cstring>
 #include <iostream>
 
@@ -303,14 +304,36 @@ namespace dlib
                 transpose_into(so, d, qd, fused.data() + nq + nkv + nkv, 0, 0, false);      // wo
                 if (spec.qk_norm)
                 {
-                    /* Per-head Q/K RMSNorm gammas (head_dim each), copied verbatim after W_O to
-                       match the attention [wq|wk|wv|wo|gamma_q|gamma_k] parameter packing. */
+                    /* Per-head Q/K RMSNorm gammas (head_dim each), stored after W_O to match the
+                       attention [wq|wk|wv|wo|gamma_q|gamma_k] parameter packing. Two adjustments
+                       are applied here, both consequences of where the normalization sits in the
+                       attention block.
+
+                       The gamma indexes the same output space as the projection rows it scales,
+                       so it carries the same rotary layout permutation. Copied in the container's
+                       order while the rows are permuted, each coefficient would land on the wrong
+                       channel.
+
+                       The Q gamma also absorbs the 1 / sqrt(head_dim) attention prescale. The
+                       projection gemm applies that factor upstream, but normalizing erases any
+                       upstream scale (rms_norm(s * q) == rms_norm(q)), and the score gemm does
+                       not reapply it, so without the fold the scores would come out scaled by
+                       sqrt(head_dim) and the softmax far too peaked. The K side has no prescale
+                       to carry. */
                     std::vector<float> gq = fetch(g, p + "attn_q_norm.weight");
                     std::vector<float> gk = fetch(g, p + "attn_k_norm.weight");
                     if (static_cast<long>(gq.size()) != hd || static_cast<long>(gk.size()) != hd)
                         throw std::runtime_error("import_gguf_weights: unexpected QK-Norm gamma size in " + p);
-                    std::memcpy(fused.data() + 2 * nq + 2 * nkv, gq.data(), ng * sizeof(float));
-                    std::memcpy(fused.data() + 2 * nq + 2 * nkv + ng, gk.data(), ng * sizeof(float));
+                    const float qk_scale = 1.0f / std::sqrt(static_cast<float>(hd));
+                    const long half = hd / 2;
+                    float* dst_gq = fused.data() + 2 * nq + 2 * nkv;
+                    float* dst_gk = dst_gq + ng;
+                    for (long r = 0; r < hd; ++r)
+                    {
+                        const long ri = neox_layout ? ((r < half) ? (2 * r) : (2 * (r - half) + 1)) : r;
+                        dst_gq[ri] = gq[static_cast<size_t>(r)] * qk_scale;
+                        dst_gk[ri] = gk[static_cast<size_t>(r)];
+                    }
                 }
                 if (g.find_tensor(p + "attn_q.bias"))
                 {

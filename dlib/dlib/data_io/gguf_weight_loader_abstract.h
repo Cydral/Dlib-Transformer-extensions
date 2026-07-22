@@ -29,16 +29,22 @@ namespace dlib
               bias-free families and receive the QKV biases of the qwen2 family.
             - The SwiGLU feed-forward is three separate linear layers (gate, up,
               down).
-            - RMSNorm gammas and the embedding table are copied directly, without
-              transposition.
+            - Block RMSNorm gammas and the embedding table are copied directly,
+              without transposition. The per-head QK-Norm gammas are not: they
+              index the same output space as the Q/K projection rows, so they
+              carry the rotary layout permutation, and the Q gamma additionally
+              absorbs the 1 / sqrt(head_dim) attention prescale, which the
+              normalization would otherwise erase (rms_norm(s * q) equals
+              rms_norm(q)) since the score product does not reapply it.
 
         ROPE LAYOUT
             Two per-head orderings of the Q/K projection rows exist in the wild:
             the interleaved layout the Dlib rotary kernel uses, and the split-half
             (NeoX) layout. Llama-family GGUF files come pre-permuted for the
             interleaved kernel; the qwen families keep the NeoX layout and are
-            permuted on load (the QKV biases, living in the same output space,
-            follow the same permutation, except V which is rotation-free).
+            permuted on load. Every quantity living in that same output space
+            follows the same permutation: the QKV biases and the per-head QK-Norm
+            gammas. V is rotation-free and is never permuted.
 
         VALIDATION PROCEDURE
             The two conventions that cannot be settled from metadata alone are
