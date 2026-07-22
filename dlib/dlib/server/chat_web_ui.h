@@ -189,6 +189,9 @@ border-radius:10px;color:var(--text);padding:9px 11px;font-family:inherit;font-s
 .modal p{font-size:13.5px;color:var(--dim);line-height:1.6;margin:6px 0}
 .modal a{color:var(--accent)}
 .modal .hint{font-size:11.5px;color:var(--dim);margin-top:4px;line-height:1.5}
+.modal .srow{display:flex;gap:8px}
+.modal .srow span{flex:1;display:flex;flex-direction:column;gap:2px}
+.modal .srow small{font-size:10.5px;color:var(--dim)}
 .help{display:inline-flex;align-items:center;justify-content:center;width:15px;height:15px;
 border-radius:50%;background:var(--panel2);border:1px solid var(--line);font-size:10.5px;
 color:var(--dim);cursor:help;margin-left:4px}
@@ -249,8 +252,24 @@ padding:12px;overflow:auto;max-height:52vh;font-size:12.5px;line-height:1.5;whit
   <label>Conversation window sent to the model (characters) <span class="help" title="How much conversation history each request carries, in characters (roughly 4 per token). Older exchanges beyond this budget are dropped in the browser before sending; the server keeps no state. Keep it below the server context capacity (--context, 2048 tokens by default, about 8000 characters) minus the response length.">?</span></label>
   <input id="s_ctx" type="number" min="500" max="60000" step="500">
   <div class="hint">This is the context window: history above this size is trimmed, oldest first, before each request.</div>
-  <div class="btns"><button onclick="closeModal('settings')">Cancel</button>
-  <button class="primary" onclick="saveSettings()">Save</button></div>
+  <label>Sampling overrides <span class="help" title="Left blank, each model uses its own recommended presets. A value here overrides the preset for every model.">?</span></label>
+  <div class="srow">
+    <span><small>top_k</small><input id="s_topk" type="number" min="0" max="500" step="1" placeholder="auto"></span>
+    <span><small>top_p</small><input id="s_topp" type="number" min="0" max="1" step="0.01" placeholder="auto"></span>
+    <span><small>min_p</small><input id="s_minp" type="number" min="0" max="1" step="0.01" placeholder="auto"></span>
+    <span><small>repeat</small><input id="s_rep" type="number" min="0.5" max="2" step="0.01" placeholder="auto"></span>
+  </div>
+  <div class="hint">Blank = model preset. These map to the top_k / top_p / min_p / repeat_penalty request fields.</div>
+  <div class="btns" style="justify-content:space-between">
+    <span style="display:flex;gap:8px">
+      <button onclick="resetSettings()" title="Restore all settings to their defaults">Reset settings</button>
+      <button onclick="resetDatabase()" style="color:var(--danger)" title="Delete all conversations and preferences stored in this browser">Reset database</button>
+    </span>
+    <span style="display:flex;gap:8px">
+      <button onclick="closeModal('settings')">Cancel</button>
+      <button class="primary" onclick="saveSettings()">Save</button>
+    </span>
+  </div>
 </div></div>
 
 <div class="overlay" id="viewer"><div class="modal viewer">
@@ -326,7 +345,8 @@ function migrate(c){
 }
 
 /* ---------------- settings & theme ---------------- */
-const DEFAULTS={system:'You are a helpful assistant.',temp:0.7,max:512,ctx:6000};
+const DEFAULTS={system:'You are a helpful assistant.',temp:0.7,max:512,ctx:6000,
+  top_k:'',top_p:'',min_p:'',repeat:''};
 let settings=Object.assign({},DEFAULTS);
 let theme='light';
 function applyTheme(){
@@ -334,12 +354,37 @@ function applyTheme(){
   el('themeicon').textContent=theme==='light'?'dark_mode':'light_mode';
   el('themelabel').textContent=theme==='light'?'Dark':'Light';
 }
+function fillSettings(){
+  el('s_system').value=settings.system;el('s_temp').value=settings.temp;
+  el('s_max').value=settings.max;el('s_ctx').value=settings.ctx;
+  el('s_topk').value=settings.top_k;el('s_topp').value=settings.top_p;
+  el('s_minp').value=settings.min_p;el('s_rep').value=settings.repeat;
+}
 function saveSettings(){
   settings.system=el('s_system').value;
   settings.temp=parseFloat(el('s_temp').value)||0;
   settings.max=parseInt(el('s_max').value)||DEFAULTS.max;
   settings.ctx=parseInt(el('s_ctx').value)||DEFAULTS.ctx;
+  settings.top_k=el('s_topk').value.trim();
+  settings.top_p=el('s_topp').value.trim();
+  settings.min_p=el('s_minp').value.trim();
+  settings.repeat=el('s_rep').value.trim();
   setPref('settings',settings);closeModal('settings');
+}
+function resetSettings(){
+  settings=Object.assign({},DEFAULTS);
+  setPref('settings',settings);fillSettings();
+}
+function resetDatabase(){
+  closeModal('settings');
+  showConfirm('Delete ALL conversations and preferences stored in this browser? '
+    +'Use this after a data model revision. This cannot be undone.',async()=>{
+    try{db&&db.close()}catch(e){}
+    await new Promise(r=>{const q=indexedDB.deleteDatabase('dlib_chat');
+      q.onsuccess=q.onerror=q.onblocked=()=>r()});
+    localStorage.removeItem('dlib_chat_settings');
+    location.reload();
+  });
 }
 
 /* ---------------- conversations ---------------- */
@@ -659,7 +704,11 @@ function userParts(v){
   return parts;
 }
 function buildPayload(upTo,q,atts){
-  const msgs=[{role:'system',content:settings.system}];
+  /* The system prompt travels as the canonical leading OpenAI system message;
+     an empty or blank one is simply omitted, as a conforming client does. */
+  const msgs=[];
+  const sys=(settings.system||'').trim();
+  if(sys)msgs.push({role:'system',content:sys});
   let budget=settings.ctx,keep=[];
   /* The current question, embedded files included, consumes the budget first;
      history only fills what remains. */
@@ -744,6 +793,10 @@ async function runExchange(i,q,atts){
       body:JSON.stringify(Object.assign({model:model,messages:buildPayload(i,q,atts),
         temperature:settings.temp,max_tokens:settings.max,stream:true,
         request_id:activeRequestId},
+        settings.top_k!==''?{top_k:parseInt(settings.top_k)}:{},
+        settings.top_p!==''?{top_p:parseFloat(settings.top_p)}:{},
+        settings.min_p!==''?{min_p:parseFloat(settings.min_p)}:{},
+        settings.repeat!==''?{repeat_penalty:parseFloat(settings.repeat)}:{},
         modelCaps[model]?{reasoning:thinking}:{}))});
     const ctype=(r.headers.get('Content-Type')||'');
     if(ctype.includes('text/event-stream')&&r.body){
@@ -841,11 +894,7 @@ el('collapse').onclick=async()=>{
   await setPref('sidebar',document.body.classList.contains('collapsed')?'collapsed':'open');
 };
 el('themebtn').onclick=async()=>{theme=theme==='light'?'dark':'light';applyTheme();await setPref('theme',theme)};
-el('settingsbtn').onclick=()=>{
-  el('s_system').value=settings.system;el('s_temp').value=settings.temp;
-  el('s_max').value=settings.max;el('s_ctx').value=settings.ctx;
-  openModal('settings');
-};
+el('settingsbtn').onclick=()=>{fillSettings();openModal('settings')};
 el('aboutbtn').onclick=()=>openModal('about');
 document.querySelectorAll('.overlay').forEach(o=>o.addEventListener('click',e=>{
   if(e.target===o)o.classList.remove('open')}));

@@ -150,6 +150,11 @@ namespace dlib
                 temperature - Sampling temperature, or a negative value when the
                               request did not set it (backend default applies).
                 top_p       - Nucleus threshold, or a negative value when unset.
+                top_k       - Top-k cutoff, or a negative value when unset.
+                min_p       - Minimum-probability cutoff, or negative when unset.
+                repeat_penalty - Repetition penalty, or negative when unset. These
+                              three mirror the homonymous extension fields common
+                              across OpenAI-compatible servers.
                 max_tokens  - Response length limit, or 0 when unset.
                 stream      - True when the request asked for server-sent-events
                               streaming ("stream": true).

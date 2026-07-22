@@ -21,7 +21,6 @@
 #include <sstream>
 #include <fstream>
 #include <algorithm>
-#include <csignal>
 
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
@@ -34,13 +33,13 @@
 #  include <unistd.h>
 #endif
 
-#include <atomic>
 #include <chrono>
 #include <memory>
 #include <random>
 #include <thread>
 
 #include <dlib/cmd_line_parser.h>
+#include <dlib/misc_api.h>
 #include <dlib/dnn/runtime_transformer.h>
 #include <dlib/tokenizer/hf_tokenizer.h>
 #include <dlib/tokenizer/chat_template.h>
@@ -158,7 +157,8 @@ static long terminal_width()
    incremental step, continuous tokenization across turns. */
 static int chat_loop(runtime_transformer& rt, hf_tokenizer& tok, const chat_template_formatter& fmt,
     long ctx_len, double temperature, size_t top_k, float top_p, float min_p,
-    float repeat_penalty, bool deterministic, const std::string& system_prompt)
+    float repeat_penalty, bool deterministic, const std::string& system_prompt,
+    bool trace_prompt = false)
 {
     const int eos = tok.eos_id();
     const std::string stop = fmt.stop_string();
@@ -187,6 +187,17 @@ static int chat_loop(runtime_transformer& rt, hf_tokenizer& tok, const chat_temp
 
         const std::string turn = first ? fmt.first_turn(system_prompt, user) : fmt.next_turn(user);
         std::vector<int> toks = tok.encode(turn, first && fmt.add_bos_on_first_turn(), false, true, false);
+        if (trace_prompt)
+        {
+            std::cout << "---- chat turn (" << toks.size() << " tokens) ----\n"
+                      << tok.decode(toks, false) << "\n---- ids:";
+            for (int id : toks) std::cout << ' ' << id;
+            std::cout << "\n---- sampling: temp " << (deterministic ? 0.0 : temperature)
+                      << (deterministic ? " (greedy)" : "")
+                      << ", top_k " << top_k << ", top_p " << top_p
+                      << ", min_p " << min_p << ", repeat " << repeat_penalty
+                      << " ----" << std::endl;
+        }
 
         const tensor* logits = nullptr;
         if (first)
@@ -303,30 +314,6 @@ static int chat_loop(runtime_transformer& rt, hf_tokenizer& tok, const chat_temp
     return 0;
 }
 
-/* Cooperative shutdown for serve mode: Ctrl-C (and console close on Windows) sets
-   an atomic flag, the only operation that is safe inside a signal handler; the main
-   thread polls it and performs the actual server shutdown. */
-static std::atomic<bool> g_stop_requested{ false };
-#ifdef _WIN32
-static BOOL WINAPI console_ctrl_handler(DWORD type)
-{
-    if (type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT || type == CTRL_CLOSE_EVENT)
-    {
-        g_stop_requested = true;
-        return TRUE;   // handled: the process keeps running for the graceful stop
-    }
-    return FALSE;
-}
-static void install_stop_handler() { SetConsoleCtrlHandler(console_ctrl_handler, TRUE); }
-#else
-static void posix_stop_handler(int) { g_stop_requested = true; }
-static void install_stop_handler()
-{
-    std::signal(SIGINT, posix_stop_handler);
-    std::signal(SIGTERM, posix_stop_handler);
-}
-#endif
-
 /* One model served by the chat endpoint: the engine, its tokenizer and the chat
    template detected for it. Several can be loaded side by side; the request's
    "model" field selects one, the first being the default. */
@@ -347,11 +334,11 @@ struct served_model
 class runtime_chat_server : public dlib::server_chat
 {
 public:
-    runtime_chat_server(std::vector<served_model> models, long ctx, double temp,
-        size_t top_k, float top_p, float min_p, float repeat_penalty, bool deterministic)
-        : models_(std::move(models)), ctx_(ctx), temp_(temp), top_k_(top_k),
-          top_p_(top_p), min_p_(min_p), repeat_(repeat_penalty), det_(deterministic),
-          rng_(std::random_device{}())
+    runtime_chat_server(std::vector<served_model> models, long ctx,
+        double forced_temp, bool temp_forced, bool deterministic, bool trace_prompt)
+        : models_(std::move(models)), ctx_(ctx), temp_(forced_temp),
+          temp_forced_(temp_forced), det_(deterministic),
+          trace_prompt_(trace_prompt), rng_(std::random_device{}())
     {
         std::vector<dlib::chat_model_info> infos;
         for (const served_model& m : models_)
@@ -398,8 +385,11 @@ private:
                 user_text += "\n[attached image: not visible to this text-only model]";
             if (!first_user_seen)
             {
+                /* Encoded exactly as the interactive loop encodes its turns: in
+                   particular no space prefix, which would malform the role header
+                   right after the opening special token. */
                 const std::vector<int> t = tok_.encode(fmt_.first_turn(sys, user_text),
-                    fmt_.add_bos_on_first_turn(), false, true, true);
+                    fmt_.add_bos_on_first_turn(), false, true, false);
                 ids.insert(ids.end(), t.begin(), t.end());
                 first_user_seen = true;
             }
@@ -427,9 +417,32 @@ private:
             throw std::runtime_error("prompt exceeds the context capacity; reduce the "
                 "context budget in the interface settings");
 
-        const double temp = req.temperature >= 0.0 ? req.temperature : temp_;
-        const float top_p = req.top_p >= 0.0 ? static_cast<float>(req.top_p) : top_p_;
+        /* Sampling parameters resolve per request against the target model's own
+           presets (each template family carries its recommended defaults), never
+           against another served model's. */
+        const double temp = req.temperature >= 0.0 ? req.temperature
+            : (temp_forced_ ? temp_ : fmt_.default_temperature());
+        const float top_p = req.top_p >= 0.0 ? static_cast<float>(req.top_p)
+            : fmt_.default_top_p();
+        const size_t top_k = req.top_k >= 0 ? static_cast<size_t>(req.top_k)
+            : fmt_.default_top_k();
+        const float min_p = req.min_p >= 0.0 ? static_cast<float>(req.min_p)
+            : fmt_.default_min_p();
+        const float repeat = req.repeat_penalty >= 0.0
+            ? static_cast<float>(req.repeat_penalty) : fmt_.default_repeat_penalty();
         const bool greedy = det_ || temp <= 0.0;
+
+        if (trace_prompt_)
+        {
+            std::cout << "---- prompt to " << use.name << " (" << ids.size()
+                      << " tokens) ----\n" << tok_.decode(ids, false)
+                      << "\n---- ids:";
+            for (int id : ids) std::cout << ' ' << id;
+            std::cout << "\n---- sampling: temp " << temp << (greedy ? " (greedy)" : "")
+                      << ", top_k " << top_k << ", top_p " << top_p
+                      << ", min_p " << min_p << ", repeat " << repeat
+                      << " ----" << std::endl;
+        }
 
         rt_.set_context(std::min(need, ctx_));
         const tensor* logits = &rt_.forward_prefill(ids);
@@ -439,15 +452,16 @@ private:
         /* Token pieces go out as produced; the server's streaming path buffers any
            incomplete UTF-8 tail, so multi-byte characters split across byte-fallback
            tokens still reach the client whole. */
-        std::vector<int> answer, recent(ids.end() - std::min<size_t>(ids.size(), 64), ids.end());
+        std::vector<int> answer, recent;
         const std::string stop = fmt_.stop_string();
         std::string text;
         for (long n = 0; n < max_new; ++n)
         {
-            if (g_stop_requested || (req.is_cancelled && req.is_cancelled()))
+            if (dlib::signal_handler::is_triggered()
+                || (req.is_cancelled && req.is_cancelled()))
                 break;
-            const int next = pick_next(*logits, recent, greedy ? 1.0 : temp, top_k_,
-                top_p, min_p_, repeat_, greedy, rng_);
+            const int next = pick_next(*logits, recent, greedy ? 1.0 : temp, top_k,
+                top_p, min_p, repeat, greedy, rng_);
             if (next == tok_.eos_id()) break;
             if (rt_.cache_length() + 1 >= ctx_) { res.finish_reason = "length"; break; }
             answer.push_back(next);
@@ -470,10 +484,10 @@ private:
     }
 
     std::vector<served_model> models_;
+    bool trace_prompt_ = false;
     long ctx_;
     double temp_;
-    size_t top_k_;
-    float top_p_, min_p_, repeat_;
+    bool temp_forced_;
     bool det_;
     std::mt19937 rng_;
 };
@@ -502,6 +516,7 @@ int main(int argc, char** argv)
         parser.add_option("rope-permute", "Map split-half (NeoX) Q/K layouts to the interleaved kernel");
         parser.add_option("chat", "Interactive chat with the loaded model");
         parser.add_option("serve", "Serve the web chat interface and an OpenAI-compatible API on the given port", 1);
+        parser.add_option("trace-prompt", "In serve mode, print the rebuilt prompt of every request (specials included)");
         parser.add_option("system", "System prompt for chat mode", 1);
         parser.add_option("context", "KV cache capacity in tokens (default: 2048)", 1);
         parser.add_option("template", "Chat template override: auto, zephyr, chatml, guanaco, granite", 1);
@@ -610,7 +625,7 @@ int main(int argc, char** argv)
                 : std::string("You are a helpful assistant.");
             return chat_loop(rt, tok, fmt, ctx, temp, fmt.default_top_k(), fmt.default_top_p(),
                 fmt.default_min_p(), fmt.default_repeat_penalty(),
-                parser.option("deterministic"), sys);
+                parser.option("deterministic"), sys, parser.option("trace-prompt"));
         }
 
         if (parser.option("serve"))
@@ -620,8 +635,6 @@ int main(int argc, char** argv)
                     chat_template_formatter::from_name(parser.option("template").argument()))
                 : chat_template_formatter::for_tokenizer(tok, rt.spec().model_name);
             if (parser.option("think") && fmt.supports_reasoning()) fmt.set_reasoning(true);
-            const double temp = parser.option("temp")
-                ? std::stod(parser.option("temp").argument()) : fmt.default_temperature();
             const long ctx = parser.option("context")
                 ? std::stol(parser.option("context").argument()) : 2048;
             const int port = std::stoi(parser.option("serve").argument());
@@ -632,14 +645,16 @@ int main(int argc, char** argv)
             std::vector<std::unique_ptr<runtime_transformer>> extra_rt;
             std::vector<std::unique_ptr<hf_tokenizer>> extra_tok;
             std::vector<served_model> models;
+            /* Display identity: the file stem is always descriptive (metadata
+               general.name sometimes is not), normalized by the shared cleaner
+               which also strips the quantization and container markers. */
             auto label = [](const runtime_transformer& r, const string& path) {
                 const size_t sl = path.find_last_of("/\\");
                 string stem = sl == string::npos ? path : path.substr(sl + 1);
-                if (stem.size() > 5 && stem.compare(stem.size() - 5, 5, ".gguf") == 0)
-                    stem.erase(stem.size() - 5);
-                else if (stem.size() > 4 && stem.compare(stem.size() - 4, 4, ".dat") == 0)
+                if (stem.size() > 4 && stem.compare(stem.size() - 4, 4, ".dat") == 0)
                     stem.erase(stem.size() - 4);
-                return stem.empty() ? r.spec().model_name : stem;
+                stem = clean_model_name(stem);
+                return stem.empty() ? clean_model_name(r.spec().model_name) : stem;
             };
             models.push_back(served_model{ label(rt, input), &rt, &tok, fmt });
             for (size_t i = 1; i < inputs.size(); ++i)
@@ -681,16 +696,22 @@ int main(int argc, char** argv)
                 models.push_back(served_model{ label(r, path), &r, &t, f2 });
             }
 
-            runtime_chat_server srv(std::move(models), ctx, temp, fmt.default_top_k(),
-                fmt.default_top_p(), fmt.default_min_p(), fmt.default_repeat_penalty(),
-                parser.option("deterministic"));
+            cout << "Serving " << models.size() << " model(s):\n";
+            for (const served_model& m : models)
+                cout << "  " << m.name
+                     << "  [template " << chat_template_formatter::name(m.fmt.kind())
+                     << (m.fmt.supports_reasoning() ? ", reasoning" : "") << "]\n";
+
+            runtime_chat_server srv(std::move(models), ctx,
+                parser.option("temp") ? std::stod(parser.option("temp").argument()) : 0.0,
+                parser.option("temp") != 0,
+                parser.option("deterministic"), parser.option("trace-prompt"));
             srv.set_listening_port(port);
-            cout << "Chat template: " << chat_template_formatter::name(fmt.kind()) << "\n"
-                 << "Serving http://localhost:" << port
+            cout << "Serving http://localhost:" << port
                  << "  (chat interface on /, API on /v1/chat/completions; Ctrl-C to stop)\n";
-            install_stop_handler();
+            dlib::signal_handler::setup();
             srv.start_async();
-            while (!g_stop_requested && srv.is_running())
+            while (!dlib::signal_handler::is_triggered() && srv.is_running())
                 std::this_thread::sleep_for(std::chrono::milliseconds(200));
             cout << "\nShutting down (waiting for in-flight requests)...\n";
             srv.clear();   // shuts connections, waits for handlers, releases the port

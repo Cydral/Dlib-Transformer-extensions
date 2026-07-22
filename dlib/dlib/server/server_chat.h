@@ -327,6 +327,9 @@ namespace dlib
         std::vector<chat_message> messages;  // full conversation, oldest first
         double temperature = -1.0;           // < 0 => backend default
         double top_p = -1.0;                 // < 0 => backend default
+        long top_k = -1;                     // < 0 => backend default
+        double min_p = -1.0;                 // < 0 => backend default
+        double repeat_penalty = -1.0;        // < 0 => backend default
         long max_tokens = 0;                 // 0 => backend default
         bool stream = false;                 // server-sent-events streaming requested
         int reasoning = -1;                  // -1 unset, 0 disable, 1 enable deep thinking
@@ -562,6 +565,9 @@ namespace dlib
                 req.request_id = req.raw["request_id"].as_string();
                 if (req.raw["temperature"].is_number()) req.temperature = req.raw["temperature"].as_number();
                 if (req.raw["top_p"].is_number())       req.top_p = req.raw["top_p"].as_number();
+                if (req.raw["top_k"].is_number())       req.top_k = req.raw["top_k"].as_long();
+                if (req.raw["min_p"].is_number())       req.min_p = req.raw["min_p"].as_number();
+                if (req.raw["repeat_penalty"].is_number()) req.repeat_penalty = req.raw["repeat_penalty"].as_number();
                 if (req.raw["max_tokens"].is_number())  req.max_tokens = req.raw["max_tokens"].as_long();
                 req.stream = req.raw["stream"].as_bool(false);
                 if (req.raw["reasoning"].type() == chat_json::kind::boolean_v)

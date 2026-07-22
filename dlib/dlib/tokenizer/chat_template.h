@@ -185,7 +185,14 @@ namespace dlib
             case chat_template_kind::zephyr:
                 return "<|system|>\n" + system_prompt + "</s>\n";
             case chat_template_kind::chatml:
-                return "<|im_start|>system\n" + system_prompt + "<|im_end|>\n";
+                /* The ChatML reference templates (Qwen family) never emit an empty
+                   system block: when the conversation carries no system message,
+                   they inject the canonical default. An empty block is outside the
+                   training distribution and destabilizes small quantized models. */
+                return "<|im_start|>system\n"
+                    + (system_prompt.empty()
+                       ? std::string("You are a helpful assistant.") : system_prompt)
+                    + "<|im_end|>\n";
             case chat_template_kind::guanaco:
                 /* Guanaco has no formal system block; a leading instruction followed by
                    a blank line is the common usage. */

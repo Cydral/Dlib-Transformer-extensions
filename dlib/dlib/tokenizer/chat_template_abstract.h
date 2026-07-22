@@ -184,7 +184,12 @@ namespace dlib
         /*!
             ensures
                 - Returns the immutable conversation prefix holding the system block,
-                  or an empty string for the raw kind.
+                  or an empty string for the raw kind. Formats without a formal
+                  empty-system representation (guanaco, granite) return an empty
+                  string when system_prompt is empty; chatml never emits an empty
+                  block and injects the family's canonical default ("You are a
+                  helpful assistant.") instead, matching the reference templates of
+                  the Qwen models.
                 - The returned text is a strict prefix of first_turn(system_prompt, u)
                   for any user text u, and tokenizes to a strict prefix of the first
                   turn's token sequence. Generation loops measure this prefix (encoded
