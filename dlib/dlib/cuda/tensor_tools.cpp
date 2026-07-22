@@ -242,10 +242,24 @@ namespace dlib { namespace tt
         }
         else if (mode == operation_mode::PLANE_WISE)
         {
-            auto is_matrix = [](const auto& tensor) {
-                return ((tensor.num_samples() * tensor.k() == 1 && tensor.nr() * tensor.nc() > 1) ||
-                    (tensor.num_samples() * tensor.k() > 1 && tensor.nr() * tensor.nc() == 1));
-                };
+            /* Disambiguate the two matrix layouts against the batch geometry of the
+               operands: when one of them is unambiguously plane-batched and carries
+               the same (num_samples, k), the tensor belongs to that batch and its
+               1x1 planes are planes, not the cells of a matrix. */
+            auto plane_batched = [](const tensor& t) {
+                return t.num_samples() * t.k() > 1 && t.nr() * t.nc() > 1;
+            };
+            auto shares_batch = [&](const tensor& t) {
+                auto same = [&](const tensor& o) {
+                    return plane_batched(o)
+                        && o.num_samples() == t.num_samples() && o.k() == t.k();
+                    };
+                return same(lhs) || same(rhs) || same(dest);
+            };
+            auto is_matrix = [&](const tensor& t) {
+                if (t.num_samples() * t.k() == 1) return t.nr() * t.nc() > 1;
+                return t.nr() * t.nc() == 1 && !shares_batch(t);
+            };
 
             long num_samples = std::min({ lhs.num_samples(), rhs.num_samples(), dest.num_samples() });
             long num_channels = std::min({ lhs.k(), rhs.k(), dest.k() });
