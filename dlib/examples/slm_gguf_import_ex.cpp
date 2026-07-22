@@ -87,7 +87,8 @@ using namespace dlib;
    serialize it. The round-trip is the cheap local validation: encode then decode a few
    strings and confirm the text is recovered. For exact parity, compare the token ids
    against an external reference on the same strings. */
-void extract_tokenizer(const gguf_reader& g, const string& out_path, const string& probe)
+void extract_tokenizer(const gguf_reader& g, const string& out_path, const string& probe,
+    const string& model_name)
 {
     hf_tokenizer tok;
     tok.load_from_gguf(g);
@@ -123,12 +124,13 @@ void extract_tokenizer(const gguf_reader& g, const string& out_path, const strin
        token, several ids mean an ordinary subword sequence (the case for the standard
        Llama-2 vocabulary, which has no dedicated chat markers). */
     /* Report the conversation-format detection: the template the model declares when
-       the container carries one, otherwise the eos-piece fallback. A model fine-tuned
-       on a format its container does not declare (e.g. Guanaco on old GGUFs) cannot be
-       identified here; chat with --template to force the right family. The marker
-       tokenizations show how the detected family's delimiters map onto this
-       vocabulary (single ids for genuine special tokens, several for plain text). */
-    const chat_template_formatter fmt = chat_template_formatter::for_tokenizer(tok);
+       the container carries one, otherwise the eos-piece fallback, refined by the model
+       name. The name matters for the families that leave no signature in the tokenizer:
+       a Guanaco fine-tune inherits the declared template of its base model, so the name
+       hint has to win over what the container claims. The marker tokenizations show how
+       the detected family's delimiters map onto this vocabulary (single ids for genuine
+       special tokens, several for plain text). */
+    const chat_template_formatter fmt = chat_template_formatter::for_tokenizer(tok, model_name);
     cout << "\nChat template       : " << chat_template_formatter::name(fmt.kind())
          << (tok.chat_template().empty()
              ? " (fallback from the eos piece; none declared by the model)"
@@ -144,6 +146,9 @@ void extract_tokenizer(const gguf_reader& g, const string& out_path, const strin
         break;
     case chat_template_kind::guanaco:
         markers = { "### Human:", "### Assistant:" };
+        break;
+    case chat_template_kind::granite:
+        markers = { "<|start_of_role|>", "<|end_of_role|>", "<|end_of_text|>" };
         break;
     default:
         break;
@@ -283,14 +288,21 @@ void validate_weights(gguf_reader& g, const model_spec& spec)
 #ifdef WITH_IMPORTED_MODEL
 
 /* The chat and probe modes use the network type compiled in from the generated header, so
-   the GGUF dimensions must match that header. */
+   the GGUF geometry must match that header. Every shape the network type is built from is
+   compared, not only the outer dimensions: a derivative sharing the layer count, the head
+   geometry and the width but carrying a different feed-forward ratio or head dimension
+   would otherwise pass the check and have its weights repacked into the wrong slots. */
 bool model_matches_header(const model_spec& s)
 {
     return s.vocab_size == imported_model::VOCAB_SIZE
         && s.n_layers == imported_model::NUM_LAYERS
         && s.n_heads == imported_model::NUM_HEADS
         && s.n_kv_heads == imported_model::NUM_KV_HEADS
-        && s.d_model == imported_model::EMBEDDING_DIM;
+        && s.d_model == imported_model::EMBEDDING_DIM
+        && s.head_dim == imported_model::HEAD_DIM
+        && s.qk_norm == imported_model::USE_QK_NORM
+        && s.ffn_num == imported_model::FFN_NUM
+        && s.ffn_den == imported_model::FFN_DEN;
 }
 
 using infer_net = imported_model::network_type<false>;
@@ -336,20 +348,23 @@ int pick_next(const tensor& probs, const std::vector<int>& recent, bool determin
 int chat_loop(generator_type& generator, hf_tokenizer& tok,
     double temperature, size_t top_k, float top_p,
     float min_p, float repeat_penalty, bool deterministic, long ctx_len, bool use_template,
-    const std::string& system_prompt, const std::string& template_override, bool offload_params)
+    const std::string& system_prompt, const std::string& template_override,
+    const std::string& model_name, bool offload_params)
 {
     const int eos = tok.eos_id();
 
-    /* Model-aware conversation formatting. The template family is detected from the
-       chat template the model declares (falling back to the eos piece), so the same
-       logic covers both the GGUF import path and the .dat loading path. Models whose
-       container declares nothing usable can force a family through the override (e.g.
-       guanaco, undetectable on old GGUFs). Sampling values left unset on the command
+    /* Model-aware conversation formatting. The family is detected from the chat template
+       the model declares, falling back to the eos piece, and refined by the model name;
+       the same logic covers the GGUF import path and the .dat loading path, which carries
+       the name in its archive. The name hint is what identifies the families that leave no
+       signature in the tokenizer: a Guanaco fine-tune inherits the declared template of
+       its base model, so trusting the container alone selects the wrong family. The
+       override still forces a family explicitly. Sampling values left unset on the command
        line fall back to the family's published presets. */
     const chat_template_formatter fmt = !use_template
         ? chat_template_formatter(chat_template_kind::raw)
         : (template_override.empty() || template_override == "auto")
-            ? chat_template_formatter::for_tokenizer(tok)
+            ? chat_template_formatter::for_tokenizer(tok, model_name)
             : chat_template_formatter::for_tokenizer(tok,
                   chat_template_formatter::from_name(template_override));
     if (use_template)
@@ -554,7 +569,8 @@ int run_chat(gguf_reader& g, const model_spec& spec, const gguf_load_options& lo
     hf_tokenizer tok;
     tok.load_from_gguf(g);
     return chat_loop(generator, tok, temperature, top_k, top_p, min_p, repeat_penalty,
-        deterministic, ctx_len, use_template, system_prompt, template_override, offload_params);
+        deterministic, ctx_len, use_template, system_prompt, template_override,
+        spec.model_name, offload_params);
 }
 
 /* Chat over a previously converted model: the parameters and the tokenizer are read
@@ -570,6 +586,7 @@ int run_chat_dat(const std::string& dat_path,
 {
     generator_type generator(multiply_(1.0));
     hf_tokenizer tok;
+    std::string name_hint;
     cout << "Loading converted model from " << dat_path << " ...\n";
     {
         std::ifstream fin(dat_path, std::ios::binary);
@@ -585,9 +602,11 @@ int run_chat_dat(const std::string& dat_path,
         deserialize(generator.subnet().subnet(), fin);
         deserialize(tok, fin);
         cout << "Model: " << model_name << "\n";
+        name_hint = model_name;
     }
     return chat_loop(generator, tok, temperature, top_k, top_p, min_p, repeat_penalty,
-        deterministic, ctx_len, use_template, system_prompt, template_override, offload_params);
+        deterministic, ctx_len, use_template, system_prompt, template_override,
+        name_hint, offload_params);
 }
 
 /* Print the most probable next tokens for a prompt's last position. Compare these with a
@@ -788,7 +807,7 @@ int main(int argc, char** argv)
         parser.add_option("deterministic", "Greedy decoding (argmax)");
         parser.add_option("raw", "Chat without the chat template (raw text completion)");
         parser.add_option("system", "System prompt used by --chat (default: a helpful assistant)", 1);
-        parser.add_option("template", "Chat template override: auto, zephyr, chatml, guanaco (default: auto)", 1);
+        parser.add_option("template", "Chat template override: auto, zephyr, chatml, guanaco, granite (default: auto)", 1);
         parser.add_option("offload-params", "Keep supported layer parameters in host memory and materialize them per layer (lowers VRAM)");
         parser.add_option("rope-permute", "Permute Q/K rows from split-half (NeoX) to interleaved RoPE ordering; leave off for llama-family GGUFs, expected for NeoX-convention architectures");
         parser.add_option("swap-gate-up", "Swap ffn_gate / ffn_up assignment (weight-loader knob)");
@@ -902,7 +921,7 @@ int main(int argc, char** argv)
         cout << "\nGenerated model header: " << header_path << "\n\n";
 
         const string probe = parser.option("probe") ? parser.option("probe").argument() : "";
-        extract_tokenizer(g, prefix + "_tokenizer.dat", probe);
+        extract_tokenizer(g, prefix + "_tokenizer.dat", probe, spec.model_name);
 
         cout << "\nValidating weights:\n";
         validate_weights(g, spec);
