@@ -15,7 +15,6 @@
 #include <vector>
 #include <string>
 #include <stdexcept>
-#include <cmath>
 #include <cstring>
 #include <iostream>
 
@@ -314,24 +313,21 @@ namespace dlib
                        order while the rows are permuted, each coefficient would land on the wrong
                        channel.
 
-                       The Q gamma also absorbs the 1 / sqrt(head_dim) attention prescale. The
-                       projection gemm applies that factor upstream, but normalizing erases any
-                       upstream scale (rms_norm(s * q) == rms_norm(q)), and the score gemm does
-                       not reapply it, so without the fold the scores would come out scaled by
-                       sqrt(head_dim) and the softmax far too peaked. The K side has no prescale
-                       to carry. */
+                       No scale is folded in: the attention layer applies the
+                       1 / sqrt(head_dim) factor at the score product, downstream of the
+                       normalization, so the gamma stored here is exactly the gamma the source
+                       model declares. */
                     std::vector<float> gq = fetch(g, p + "attn_q_norm.weight");
                     std::vector<float> gk = fetch(g, p + "attn_k_norm.weight");
                     if (static_cast<long>(gq.size()) != hd || static_cast<long>(gk.size()) != hd)
                         throw std::runtime_error("import_gguf_weights: unexpected QK-Norm gamma size in " + p);
-                    const float qk_scale = 1.0f / std::sqrt(static_cast<float>(hd));
                     const long half = hd / 2;
                     float* dst_gq = fused.data() + 2 * nq + 2 * nkv;
                     float* dst_gk = dst_gq + ng;
                     for (long r = 0; r < hd; ++r)
                     {
                         const long ri = neox_layout ? ((r < half) ? (2 * r) : (2 * (r - half) + 1)) : r;
-                        dst_gq[ri] = gq[static_cast<size_t>(r)] * qk_scale;
+                        dst_gq[ri] = gq[static_cast<size_t>(r)];
                         dst_gk[ri] = gk[static_cast<size_t>(r)];
                     }
                 }

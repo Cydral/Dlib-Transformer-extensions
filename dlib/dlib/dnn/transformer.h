@@ -339,8 +339,11 @@ namespace dlib
             // Step 5 backward
             resizable_tensor dQ(B, NUM_HEADS, N, HEAD_DIM);
             resizable_tensor dK_repeated(B, NUM_HEADS, N, HEAD_DIM);
+            /* S = qk_scale * Q @ K^T, so both branches carry the factor. It used to sit in
+               the Q projection, which made the K branch alpha-free because the saved Q
+               already held it. */
             tt::gemm(0.0f, dQ, qk_scale, dscores, false, saved_k_repeated, false, operation_mode::PLANE_WISE);
-            tt::gemm(0.0f, dK_repeated, 1.0f, dscores, true, saved_q_post_rope, false, operation_mode::PLANE_WISE);
+            tt::gemm(0.0f, dK_repeated, qk_scale, dscores, true, saved_q_post_rope, false, operation_mode::PLANE_WISE);
 
             // Step 4 backward (GQA repeat sum)
             resizable_tensor dK_pre_repeat(B, NUM_KV_HEADS, N, HEAD_DIM);
@@ -755,7 +758,7 @@ namespace dlib
 
                 alias_tensor q_2d(B * N, Q_PROJ_DIM);
                 auto q_view = q_2d(q_flat, 0);
-                tt::gemm(0.0f, q_view, qk_scale, x_view, false, wq, false);
+                tt::gemm(0.0f, q_view, 1.0f, x_view, false, wq, false);
 
                 alias_tensor k_2d(B * N, KV_PROJ_DIM);
                 auto k_view = k_2d(k_flat, 0);
@@ -772,7 +775,7 @@ namespace dlib
                     auto bq = bqa(P, bq_offset);
                     auto bk = bkva(P, bk_offset);
                     auto bv = bkva(P, bv_offset);
-                    tt::gemm(1.0f, q_view, qk_scale, bias_ones_, false, bq, false);
+                    tt::gemm(1.0f, q_view, 1.0f, bias_ones_, false, bq, false);
                     tt::gemm(1.0f, k_view, 1.0f, bias_ones_, false, bk, false);
                     tt::gemm(1.0f, v_view, 1.0f, bias_ones_, false, bv, false);
                 }
@@ -857,9 +860,13 @@ namespace dlib
                 }
             }
 
-            // Step 5: Q @ K^T
+            /* Step 5: scaled Q @ K^T. The 1 / sqrt(head_dim) factor is applied here rather
+               than folded into the Q projection: with QK-Norm enabled the normalization sits
+               between the projection and this product and erases any upstream scale
+               (rms_norm(s * q) == rms_norm(q)), so a prescaled projection would silently lose
+               it. Applied as the gemm's alpha it costs nothing and holds for both cases. */
             saved_scores.set_size(B, NUM_HEADS, N, N);
-            tt::gemm(0.0f, saved_scores, 1.0f,
+            tt::gemm(0.0f, saved_scores, qk_scale,
                 saved_q_post_rope, false,
                 saved_k_repeated, true,
                 operation_mode::PLANE_WISE);
@@ -937,7 +944,7 @@ namespace dlib
 
                 alias_tensor q_2d(1, Q_PROJ_DIM);
                 auto q_view = q_2d(inc_q, 0);
-                tt::gemm(0.0f, q_view, qk_scale, x_view, false, wq, false);
+                tt::gemm(0.0f, q_view, 1.0f, x_view, false, wq, false);
 
                 alias_tensor k_2d(1, KV_PROJ_DIM);
                 auto k_view = k_2d(inc_k, 0);
@@ -954,7 +961,7 @@ namespace dlib
                     auto bq = bqa(P, bq_offset);
                     auto bk = bkva(P, bk_offset);
                     auto bv = bkva(P, bv_offset);
-                    tt::gemm(1.0f, q_view, qk_scale, bias_ones_, false, bq, false);
+                    tt::gemm(1.0f, q_view, 1.0f, bias_ones_, false, bq, false);
                     tt::gemm(1.0f, k_view, 1.0f, bias_ones_, false, bk, false);
                     tt::gemm(1.0f, v_view, 1.0f, bias_ones_, false, bv, false);
                 }
@@ -1068,9 +1075,9 @@ namespace dlib
                 }
             }
 
-            // Step 7: scores = Q @ K_window^T (no causal mask needed)
+            // Step 7: scaled scores = Q @ K_window^T (no causal mask needed)
             inc_scores.set_size(1, NUM_HEADS, 1, L);
-            tt::gemm(0.0f, inc_scores, 1.0f, inc_q_rope, false, inc_k_window_rep, true,
+            tt::gemm(0.0f, inc_scores, qk_scale, inc_q_rope, false, inc_k_window_rep, true,
                 operation_mode::PLANE_WISE);
 
             // Step 8: softmax
