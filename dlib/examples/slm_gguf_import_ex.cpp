@@ -83,6 +83,16 @@
 using namespace std;
 using namespace dlib;
 
+/* Display and file identity of the imported model: the container's general.name run
+   through the shared cleaner, which drops a redundant organization prefix and any
+   quantization or container marker left in that field. model_spec::model_name keeps the
+   raw value, so describe() still reports what the container actually declares. */
+string model_display_name(const model_spec& s)
+{
+    const string cleaned = clean_model_name(s.model_name);
+    return cleaned.empty() ? s.arch_name : cleaned;
+}
+
 /* Extract the tokenizer from the GGUF metadata, run a round-trip sanity check, and
    serialize it. The round-trip is the cheap local validation: encode then decode a few
    strings and confirm the text is recovered. For exact parity, compare the token ids
@@ -601,6 +611,9 @@ int run_chat_dat(const std::string& dat_path,
         deserialize(model_name, fin);
         deserialize(generator.subnet().subnet(), fin);
         deserialize(tok, fin);
+        /* Cleaned on read as well, so archives written before the identity was
+           normalized at conversion time display and detect the same way. */
+        model_name = clean_model_name(model_name);
         cout << "Model: " << model_name << "\n";
         name_hint = model_name;
     }
@@ -769,7 +782,7 @@ int run_convert(gguf_reader& g, const model_spec& spec, const gguf_load_options&
        serializing the full network would need a temporary at load time, transiently
        doubling the pinned host memory. */
     cout << "Serializing model to " << out_path << " ...\n";
-    serialize(out_path) << std::string("gguf_import_model") << spec.model_name
+    serialize(out_path) << std::string("gguf_import_model") << model_display_name(spec)
                         << net.subnet() << tok;
     cout << "Done. Wrote " << out_path << "\n";
     return 0;
@@ -862,12 +875,13 @@ int main(int argc, char** argv)
         const model_spec spec = detect_model(g);
         cout << describe(spec) << "\n";
 
-        /* Every produced file defaults to the model identity (sanitized general.name), so
-           successive imports of different models do not overwrite one another. The header
-           used by this example's own build is regenerated with an explicit
-           --out-prefix slm_imported_model. */
+        /* Every produced file defaults to the model identity (the cleaned general.name,
+           sanitized into an identifier), so successive imports of different models do not
+           overwrite one another. The header used by this example's own build is
+           regenerated with an explicit --out-prefix slm_imported_model. */
         const string prefix = parser.option("out-prefix")
-            ? parser.option("out-prefix").argument() : model_identifier(spec);
+            ? parser.option("out-prefix").argument()
+            : sanitize_identifier(model_display_name(spec));
 
         const compat_result compat = check_compatibility(spec);
         for (const auto& n : compat.notes)    cout << "note: "    << n << "\n";
