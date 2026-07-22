@@ -931,7 +931,11 @@ int main(int argc, char** argv)
         }
 
         const string header_path = prefix + ".h";
-        emit_header(spec, header_path);
+        /* Same identity for the file, the include guard and the namespace: the cleaned
+           model name sanitized into an identifier. Left to itself emit_header derives the
+           namespace from the raw general.name, which would drift from the file name
+           whenever the cleaner has something to strip. */
+        emit_header(spec, header_path, sanitize_identifier(model_display_name(spec)));
         cout << "\nGenerated model header: " << header_path << "\n\n";
 
         const string probe = parser.option("probe") ? parser.option("probe").argument() : "";
