@@ -536,6 +536,138 @@ namespace dlib
         int random_token_max = -1
     );
 
+
+// ----------------------------------------------------------------------------------------
+
+    struct supervised_example
+    {
+        /*!
+            WHAT THIS OBJECT REPRESENTS
+                One already tokenized supervised example. The split between the two fields is
+                the supervision mask: only the response positions are scored, the prompt being
+                context the model conditions on rather than reproduces.
+
+            FIELDS
+                prompt   - Rendered turn markers, system block and user content
+                response - Target tokens, terminator included when the caller wants the model
+                           to learn to stop
+
+            NOTE
+                Callers tokenize with the model's own chat template rather than inventing a
+                prompt layout: an instruction model already knows its turn markers, and
+                reusing them keeps the fine-tuned model usable through the unchanged
+                inference path.
+        !*/
+    };
+
+    enum class sequence_overflow_policy
+    {
+        /*!
+            WHAT THIS ENUM REPRESENTS
+                What to do with an example longer than the window.
+
+            VALUES
+                skip                   - Drop the example (safe default)
+                truncate_prompt_head   - Trim the head of the prompt, keeping the whole
+                                         response and the most recent context
+                truncate_response_tail - Trim the tail of the response, which teaches the
+                                         model to stop mid-sentence and suits completion only
+        !*/
+    };
+
+    struct dataset_report
+    {
+        /*!
+            WHAT THIS OBJECT REPRESENTS
+                The accounting of a dataset build: how many examples survived the window and
+                what fraction of positions carry a gradient. Both become invisible once the
+                tensors exist, and both decide whether a run can work at all.
+
+            METHODS
+                supervision_ratio() - scored positions over total positions
+                describe()          - human-readable summary
+        !*/
+    };
+
+// ----------------------------------------------------------------------------------------
+
+    dataset_report build_causal_lm_dataset(
+        const std::vector<std::vector<int>>& documents,
+        long window_len,
+        long stride,
+        int padding_token,
+        unsigned long ignore_label,
+        bool pack_documents,
+        std::vector<matrix<int, 0, 1>>& X,
+        std::vector<matrix<unsigned long, 0, 1>>& Y
+    );
+    /*!
+        requires
+            - window_len > 1
+            - stride > 0
+        ensures
+            - Builds causal language-model windows for the knowledge-alignment stage: the
+              label of position t is the token at t + 1, and every position is scored.
+            - #X.size() == #Y.size(), each element holding window_len entries.
+            - With pack_documents the documents are concatenated into one stream and cut into
+              full windows, wasting no position on padding but letting a window straddle two
+              documents; append a separator to each document when that matters. Without
+              packing each document yields its own windows and the last one is padded, its
+              padded positions carrying ignore_label.
+            - stride below window_len overlaps consecutive windows; stride equal to
+              window_len is the cheapest and the usual choice on a large corpus.
+            - Returns the build accounting.
+    !*/
+
+    dataset_report build_supervised_finetuning_dataset(
+        const std::vector<supervised_example>& examples,
+        long window_len,
+        int padding_token,
+        unsigned long ignore_label,
+        sequence_overflow_policy policy,
+        std::vector<matrix<int, 0, 1>>& X,
+        std::vector<matrix<unsigned long, 0, 1>>& Y
+    );
+    /*!
+        requires
+            - window_len > 1
+        ensures
+            - Builds one window per example for the task-alignment stage: prompt then
+              response, with every prompt position labelled ignore_label so that only the
+              answer contributes to the loss. Scoring the prompt would teach the model to
+              reproduce the questions.
+            - The label of position t is the token at t + 1, so the first scored position is
+              the last token of the prompt, where the answer must begin.
+            - Examples longer than window_len + 1 are handled according to policy; examples
+              with an empty response are skipped.
+            - The loss layer must be given ignore_label through set_ignore_index(), and
+              padding_token should be an id no real token uses, or the tokenizer's pad id.
+            - Returns the build accounting.
+    !*/
+
+    template <typename sample_type, typename label_type>
+    void split_training_dataset(
+        const std::vector<sample_type>& samples,
+        const std::vector<label_type>& labels,
+        double validation_fraction,
+        unsigned long seed,
+        std::vector<sample_type>& train_samples,
+        std::vector<label_type>& train_labels,
+        std::vector<sample_type>& validation_samples,
+        std::vector<label_type>& validation_labels
+    );
+    /*!
+        requires
+            - samples.size() == labels.size()
+            - 0 <= validation_fraction < 1
+        ensures
+            - Shuffles before cutting, so a corpus ordered by source, date or severity does
+              not yield a validation set drawn from one end of it.
+            - A non-zero seed makes the split stable across runs, which is what makes two
+              training curves comparable.
+            - #validation_samples.size() == samples.size() * validation_fraction, truncated.
+    !*/
+
 } // namespace dlib
 
 #endif // DLIB_LANGUAGE_MODEL_DATA_ABSTRACT_H_

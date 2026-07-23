@@ -171,8 +171,8 @@ namespace dlib
                 load_optional_bias(g, p + "attn_q.bias", qd, L.bq, rope_permute_);
                 load_optional_bias(g, p + "attn_k.bias", kv, L.bk, rope_permute_);
                 load_optional_bias(g, p + "attn_v.bias", kv, L.bv, false);
-                load_optional_head_gamma(g, p + "attn_q_norm.weight", L.qnorm_g, true);
-                load_optional_head_gamma(g, p + "attn_k_norm.weight", L.knorm_g, false);
+                load_optional_head_gamma(g, p + "attn_q_norm.weight", L.qnorm_g);
+                load_optional_head_gamma(g, p + "attn_k_norm.weight", L.knorm_g);
                 load_matrix(g, p + "attn_output.weight", qd, d, L.wo, opt);
                 load_gamma (g, p + "ffn_norm.weight", d, L.ffn_norm_g);
                 if (spec.n_experts > 0)
@@ -300,13 +300,13 @@ namespace dlib
                     auto qv = q_2d(q_flat_, 0);
                     auto kv_v = kv_2d(k_flat_, 0);
                     auto vv = kv_2d(v_flat_, 0);
-                    tt::gemm(0.0f, qv, qk_scale, xv, false, weight(L.wq), false);
+                    tt::gemm(0.0f, qv, 1.0f, xv, false, weight(L.wq), false);
                     tt::gemm(0.0f, kv_v, 1.0f, xv, false, weight(L.wk), false);
                     tt::gemm(0.0f, vv, 1.0f, xv, false, weight(L.wv), false);
                     if (L.bq.size())
                     {
                         ensure_ones(N);
-                        tt::gemm(1.0f, qv, qk_scale, ones_, false, L.bq, false);
+                        tt::gemm(1.0f, qv, 1.0f, ones_, false, L.bq, false);
                         tt::gemm(1.0f, kv_v, 1.0f, ones_, false, L.bk, false);
                         tt::gemm(1.0f, vv, 1.0f, ones_, false, L.bv, false);
                     }
@@ -335,8 +335,11 @@ namespace dlib
                     tt::copy_tensor(false, v_rep_, h, v4_, h / rep, 1);
                 }
 
+                /* Scaled Q @ K^T. The factor is applied here, downstream of the optional
+                   QK normalization which would otherwise erase it, and not folded into the
+                   Q projection. Same placement as the template attention layer. */
                 scores_.set_size(1, H, N, N);
-                tt::gemm(0.0f, scores_, 1.0f, q4_, false, k_rep_, true, operation_mode::PLANE_WISE);
+                tt::gemm(0.0f, scores_, qk_scale, q4_, false, k_rep_, true, operation_mode::PLANE_WISE);
                 /* Causal mask, added per head plane: dlib's add() does not broadcast
                    unit dimensions, it zero-pads sources outside their bounds, so a
                    [1,1,N,N] mask added to [1,H,N,N] scores would only mask head 0. */
@@ -455,13 +458,13 @@ namespace dlib
                     auto qv = q_2d(q_flat_, 0);
                     auto kv_v = kv_2d(k_flat_, 0);
                     auto vv = kv_2d(v_flat_, 0);
-                    tt::gemm(0.0f, qv, qk_scale, xv, false, weight(L.wq), false);
+                    tt::gemm(0.0f, qv, 1.0f, xv, false, weight(L.wq), false);
                     tt::gemm(0.0f, kv_v, 1.0f, xv, false, weight(L.wk), false);
                     tt::gemm(0.0f, vv, 1.0f, xv, false, weight(L.wv), false);
                     if (L.bq.size())
                     {
                         ensure_ones(1);
-                        tt::gemm(1.0f, qv, qk_scale, ones_, false, L.bq, false);
+                        tt::gemm(1.0f, qv, 1.0f, ones_, false, L.bq, false);
                         tt::gemm(1.0f, kv_v, 1.0f, ones_, false, L.bk, false);
                         tt::gemm(1.0f, vv, 1.0f, ones_, false, L.bv, false);
                     }
@@ -511,7 +514,7 @@ namespace dlib
 
                 /* Single query row: every cached position is in the past, no mask. */
                 scores_.set_size(1, H, 1, len);
-                tt::gemm(0.0f, scores_, 1.0f, q4_, false, k_rep_, true, operation_mode::PLANE_WISE);
+                tt::gemm(0.0f, scores_, qk_scale, q4_, false, k_rep_, true, operation_mode::PLANE_WISE);
                 attn_.copy_size(scores_);
                 tt::softmax(attn_, scores_, operation_mode::PLANE_WISE);
 
@@ -932,8 +935,12 @@ namespace dlib
            prescale folded into the gamma, since normalization erases any scale applied
            upstream (rms_norm(s*q) == rms_norm(q)) and would silently drop the prescale
            carried by the projection gemm. */
+        /* Per-head QK-Norm gamma. It indexes the same output space as the projection rows
+           it scales, so it carries the rotary layout permutation. No scale is folded in: the
+           attention prescale is applied at the score product, downstream of the
+           normalization, so the stored gamma is the one the source model declares. */
         void load_optional_head_gamma(gguf_reader& g, const std::string& name,
-            resizable_tensor& dst, bool fold_qk_scale)
+            resizable_tensor& dst)
         {
             const gguf_tensor_info* t = g.find_tensor(name);
             if (!t) { dst.set_size(0, 0, 0, 0); return; }
@@ -942,14 +949,13 @@ namespace dlib
             gguf_read_dequantized(g, *t, src);
             if (src.size() != static_cast<size_t>(hd))
                 throw std::runtime_error("runtime_transformer: shape mismatch for " + name);
-            const float s = fold_qk_scale ? 1.0f / std::sqrt(static_cast<float>(hd)) : 1.0f;
             const long half = hd / 2;
             dst.set_size(1, 1, 1, hd);
             float* out = dst.host_write_only();
             for (long r = 0; r < hd; ++r)
             {
                 const long ri = rope_permute_ ? ((r < half) ? (2 * r) : (2 * (r - half) + 1)) : r;
-                out[ri] = src[static_cast<size_t>(r)] * s;
+                out[ri] = src[static_cast<size_t>(r)];
             }
         }
 

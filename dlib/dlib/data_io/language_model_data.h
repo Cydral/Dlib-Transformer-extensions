@@ -1024,6 +1024,311 @@ namespace dlib
         }
     }
 
+
+    // ---------------------------------------------------------------------------------
+    // Fine-tuning datasets
+    // ---------------------------------------------------------------------------------
+
+    /* One supervised example, already tokenized. The split between the two fields is what
+       carries the supervision mask: the model is scored on its prediction of the response
+       tokens only, the prompt being context it must condition on, not reproduce. Callers
+       tokenize with the model's own chat template rather than inventing a prompt layout:
+       an instruction model already knows its turn markers, and reusing them means the
+       fine-tuned model stays usable through the same inference path, unchanged. */
+    struct supervised_example
+    {
+        std::vector<int> prompt;     // rendered turn markers, system block and user content
+        std::vector<int> response;   // target tokens, terminator included when wanted
+    };
+
+    /* What to do with an example that does not fit the window. Dropping is the safe default;
+       trimming the head of the prompt keeps the whole answer and the most recent context,
+       which is what a conversation would naturally do; trimming the tail of the response
+       teaches the model to stop mid-sentence and is only reasonable for pure completion. */
+    enum class sequence_overflow_policy
+    {
+        skip,
+        truncate_prompt_head,
+        truncate_response_tail
+    };
+
+    /* Accounting of a dataset build. Reported rather than inferred, because the two numbers
+       that decide whether a fine-tuning run can work at all, how many examples survived the
+       window and what fraction of positions actually carry a gradient, are invisible once
+       the tensors are built. */
+    struct dataset_report
+    {
+        size_t examples_in = 0;
+        size_t examples_kept = 0;
+        size_t examples_skipped = 0;
+        size_t examples_truncated = 0;
+        size_t windows = 0;
+        size_t supervised_positions = 0;
+        size_t ignored_positions = 0;
+
+        double supervision_ratio() const
+        {
+            const size_t total = supervised_positions + ignored_positions;
+            return total ? static_cast<double>(supervised_positions) / total : 0.0;
+        }
+
+        std::string describe() const
+        {
+            std::ostringstream o;
+            o << "examples      : " << examples_kept << " kept";
+            if (examples_skipped)   o << ", " << examples_skipped << " skipped";
+            if (examples_truncated) o << ", " << examples_truncated << " truncated";
+            o << " (out of " << examples_in << ")\n"
+              << "windows       : " << windows << "\n"
+              << "supervision   : " << supervised_positions << " scored positions, "
+              << ignored_positions << " ignored ("
+              << static_cast<long>(100.0 * supervision_ratio() + 0.5) << "% scored)";
+            return o.str();
+        }
+    };
+
+    /* Causal language-model windows over a corpus, for the knowledge-alignment stage: the
+       model is exposed to the domain's vocabulary and phrasing before being taught a task.
+       Every position is scored, the label of position t being the token at t + 1.
+
+       With pack_documents the documents are concatenated into one stream and cut into full
+       windows, which wastes no position on padding but lets a window straddle two documents.
+       Callers who care append a separator token to each document. Without packing each
+       document yields its own windows and the last one is padded, its padded positions
+       carrying ignore_label so they contribute no gradient.
+
+       stride below window_len overlaps consecutive windows, which multiplies the number of
+       samples and gives every token a chance to be predicted from a full context; stride
+       equal to window_len is the cheapest and the usual choice on a large corpus. */
+    inline dataset_report build_causal_lm_dataset(
+        const std::vector<std::vector<int>>& documents,
+        long window_len,
+        long stride,
+        int padding_token,
+        unsigned long ignore_label,
+        bool pack_documents,
+        std::vector<matrix<int, 0, 1>>& X,
+        std::vector<matrix<unsigned long, 0, 1>>& Y)
+    {
+        DLIB_CASSERT(window_len > 1, "window_len must be greater than 1");
+        DLIB_CASSERT(stride > 0, "stride must be positive");
+
+        X.clear();
+        Y.clear();
+        dataset_report rep;
+        rep.examples_in = documents.size();
+
+        auto emit_window = [&](const std::vector<int>& stream, long start)
+        {
+            matrix<int, 0, 1> x(window_len, 1);
+            matrix<unsigned long, 0, 1> y(window_len, 1);
+            const long len = static_cast<long>(stream.size());
+            for (long t = 0; t < window_len; ++t)
+            {
+                const long i = start + t;
+                x(t) = (i < len) ? stream[static_cast<size_t>(i)] : padding_token;
+                if (i + 1 < len)
+                {
+                    y(t) = static_cast<unsigned long>(stream[static_cast<size_t>(i + 1)]);
+                    rep.supervised_positions++;
+                }
+                else
+                {
+                    y(t) = ignore_label;
+                    rep.ignored_positions++;
+                }
+            }
+            X.push_back(std::move(x));
+            Y.push_back(std::move(y));
+            rep.windows++;
+        };
+
+        if (pack_documents)
+        {
+            std::vector<int> stream;
+            size_t total = 0;
+            for (const auto& d : documents) total += d.size();
+            stream.reserve(total);
+            for (const auto& d : documents)
+            {
+                if (d.empty()) { rep.examples_skipped++; continue; }
+                stream.insert(stream.end(), d.begin(), d.end());
+                rep.examples_kept++;
+            }
+            const long len = static_cast<long>(stream.size());
+            for (long start = 0; start + 1 < len; start += stride)
+            {
+                emit_window(stream, start);
+                if (start + window_len >= len) break;
+            }
+            return rep;
+        }
+
+        for (const auto& d : documents)
+        {
+            if (d.size() < 2) { rep.examples_skipped++; continue; }
+            rep.examples_kept++;
+            const long len = static_cast<long>(d.size());
+            for (long start = 0; start + 1 < len; start += stride)
+            {
+                emit_window(d, start);
+                if (start + window_len >= len) break;
+            }
+        }
+        return rep;
+    }
+
+    /* Supervised fine-tuning windows, for the task-alignment stage. One window per example,
+       prompt then response, with the prompt positions labelled ignore_label so that only the
+       answer contributes to the loss. Scoring the prompt as well would teach the model to
+       reproduce the questions, which is both wasted capacity and a source of parroting.
+
+       The label of position t is the token at t + 1, so the first scored position is the last
+       token of the prompt: that is where the model must start producing the answer. Set the
+       loss layer's ignore index to ignore_label, and give the padding token an id that no
+       real token uses, or reuse the tokenizer's pad id. */
+    inline dataset_report build_supervised_finetuning_dataset(
+        const std::vector<supervised_example>& examples,
+        long window_len,
+        int padding_token,
+        unsigned long ignore_label,
+        sequence_overflow_policy policy,
+        std::vector<matrix<int, 0, 1>>& X,
+        std::vector<matrix<unsigned long, 0, 1>>& Y)
+    {
+        DLIB_CASSERT(window_len > 1, "window_len must be greater than 1");
+
+        X.clear();
+        Y.clear();
+        dataset_report rep;
+        rep.examples_in = examples.size();
+
+        /* A window of window_len inputs scores window_len targets, the last of them being the
+           token just past the window, so window_len + 1 tokens fit without loss. */
+        const long capacity = window_len + 1;
+
+        for (const supervised_example& ex : examples)
+        {
+            if (ex.response.empty()) { rep.examples_skipped++; continue; }
+
+            std::vector<int> prompt = ex.prompt;
+            std::vector<int> response = ex.response;
+            long total = static_cast<long>(prompt.size() + response.size());
+
+            if (total > capacity)
+            {
+                switch (policy)
+                {
+                case sequence_overflow_policy::skip:
+                    rep.examples_skipped++;
+                    continue;
+
+                case sequence_overflow_policy::truncate_prompt_head:
+                {
+                    const long room = capacity - static_cast<long>(response.size());
+                    if (room <= 0) { rep.examples_skipped++; continue; }
+                    prompt.erase(prompt.begin(), prompt.end() - room);
+                    rep.examples_truncated++;
+                    break;
+                }
+
+                case sequence_overflow_policy::truncate_response_tail:
+                {
+                    const long room = capacity - static_cast<long>(prompt.size());
+                    if (room <= 0) { rep.examples_skipped++; continue; }
+                    response.resize(static_cast<size_t>(room));
+                    rep.examples_truncated++;
+                    break;
+                }
+                }
+                total = static_cast<long>(prompt.size() + response.size());
+            }
+
+            std::vector<int> full;
+            full.reserve(static_cast<size_t>(total));
+            full.insert(full.end(), prompt.begin(), prompt.end());
+            full.insert(full.end(), response.begin(), response.end());
+
+            /* Position t predicts full[t + 1]. The first response token lives at index
+               prompt.size(), so it is predicted at t = prompt.size() - 1: everything before
+               that is context and stays unscored. */
+            const long first_scored = static_cast<long>(prompt.size()) - 1;
+
+            matrix<int, 0, 1> x(window_len, 1);
+            matrix<unsigned long, 0, 1> y(window_len, 1);
+            for (long t = 0; t < window_len; ++t)
+            {
+                x(t) = (t < total) ? full[static_cast<size_t>(t)] : padding_token;
+                if (t >= first_scored && t + 1 < total)
+                {
+                    y(t) = static_cast<unsigned long>(full[static_cast<size_t>(t + 1)]);
+                    rep.supervised_positions++;
+                }
+                else
+                {
+                    y(t) = ignore_label;
+                    rep.ignored_positions++;
+                }
+            }
+            X.push_back(std::move(x));
+            Y.push_back(std::move(y));
+            rep.examples_kept++;
+            rep.windows++;
+        }
+        return rep;
+    }
+
+    /* Deterministic split into a training and a validation set. The shuffle runs before the
+       cut, so a corpus ordered by source, by date or by severity does not end up with a
+       validation set drawn from one end of it. Pass a fixed seed to keep the split stable
+       across runs, which is what makes two training curves comparable. */
+    template <typename sample_type, typename label_type>
+    void split_training_dataset(
+        const std::vector<sample_type>& samples,
+        const std::vector<label_type>& labels,
+        double validation_fraction,
+        unsigned long seed,
+        std::vector<sample_type>& train_samples,
+        std::vector<label_type>& train_labels,
+        std::vector<sample_type>& validation_samples,
+        std::vector<label_type>& validation_labels)
+    {
+        DLIB_CASSERT(samples.size() == labels.size(),
+            "samples and labels must have the same size");
+        DLIB_CASSERT(validation_fraction >= 0.0 && validation_fraction < 1.0,
+            "validation_fraction must be in [0, 1)");
+
+        const size_t n = samples.size();
+        std::vector<size_t> order(n);
+        for (size_t i = 0; i < n; ++i) order[i] = i;
+
+        dlib::rand rng;
+        if (seed != 0) rng = dlib::rand(seed);
+        for (size_t i = n; i > 1; --i)
+            std::swap(order[i - 1], order[rng.get_random_32bit_number() % i]);
+
+        const size_t n_val = static_cast<size_t>(n * validation_fraction);
+        train_samples.clear();      train_labels.clear();
+        validation_samples.clear(); validation_labels.clear();
+        train_samples.reserve(n - n_val);      train_labels.reserve(n - n_val);
+        validation_samples.reserve(n_val);     validation_labels.reserve(n_val);
+
+        for (size_t k = 0; k < n; ++k)
+        {
+            const size_t i = order[k];
+            if (k < n_val)
+            {
+                validation_samples.push_back(samples[i]);
+                validation_labels.push_back(labels[i]);
+            }
+            else
+            {
+                train_samples.push_back(samples[i]);
+                train_labels.push_back(labels[i]);
+            }
+        }
+    }
+
 } // namespace dlib
 
 #endif // DLIB_LANGUAGE_MODEL_DATA_H_
