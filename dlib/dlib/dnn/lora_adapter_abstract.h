@@ -202,9 +202,17 @@ namespace dlib
                 - forward() was called on the same batch
                 - dy is the gradient of the adapted output
             ensures
-                - Accumulates into #dx, #da, #db and #dm rather than overwriting them, so
-                  the caller may add the frozen projection's own contribution to dx before
-                  or after, in any order.
+                - #dx receives the input gradient of the whole adapted projection, the
+                  frozen base term included. That term belongs here rather than to the
+                  caller because it is not dy times the frozen weight: DoRA rescales the
+                  entire output, base part and low-rank part alike, so the gradient
+                  reaching W carries the column factors, which only the adapter knows. A
+                  caller adding dy times W on its own would be wrong by exactly the
+                  deviation of those factors from one, which trains a slightly wrong model
+                  rather than failing.
+                - A layer must therefore let the adapter compute dx for an adapted
+                  projection instead of doing it itself.
+                - Accumulates into #dx, #da, #db and #dm rather than overwriting them.
                 - The magnitude path is exact: the dependency of the column norms on A and
                   B is differentiated, not detached.
         !*/

@@ -52,9 +52,9 @@ struct reference_adapter
     long in_dim = 0, out_dim = 0, rank = 0;
     bool dora = false;
     double s = 0.0;
-    vector<double> W, A, B, M;
+    std::vector<double> W, A, B, M;
 
-    void merged_weight(vector<double>& out_w) const
+    void merged_weight(std::vector<double>& out_w) const
     {
         out_w.assign(static_cast<size_t>(in_dim) * out_dim, 0.0);
         for (long i = 0; i < in_dim; ++i)
@@ -80,9 +80,9 @@ struct reference_adapter
         }
     }
 
-    void forward(const vector<double>& x, long rows, vector<double>& y) const
+    void forward(const std::vector<double>& x, long rows, std::vector<double>& y) const
     {
-        vector<double> w;
+        std::vector<double> w;
         merged_weight(w);
         y.assign(static_cast<size_t>(rows) * out_dim, 0.0);
         for (long p = 0; p < rows; ++p)
@@ -96,9 +96,9 @@ struct reference_adapter
     }
 
     // Scalar objective whose gradient the finite differences approximate.
-    double loss(const vector<double>& x, long rows, const vector<double>& dy) const
+    double loss(const std::vector<double>& x, long rows, const std::vector<double>& dy) const
     {
-        vector<double> y;
+        std::vector<double> y;
         forward(x, rows, y);
         double acc = 0.0;
         for (size_t i = 0; i < y.size(); ++i) acc += y[i] * dy[i];
@@ -106,7 +106,7 @@ struct reference_adapter
     }
 };
 
-static void copy_from(const tensor& t, vector<double>& dst)
+static void copy_from(const tensor& t, std::vector<double>& dst)
 {
     dst.assign(t.size(), 0.0);
     const float* p = t.host();
@@ -116,7 +116,7 @@ static void copy_from(const tensor& t, vector<double>& dst)
 /* Largest relative discrepancy between an analytic gradient and its finite-difference
    estimate, scaled by the magnitude of the gradient rather than element by element: a
    near-zero component would otherwise dominate the report without meaning anything. */
-static double compare(const float* analytic, const vector<double>& numeric)
+static double compare(const float* analytic, const std::vector<double>& numeric)
 {
     double scale = 0.0;
     for (size_t i = 0; i < numeric.size(); ++i) scale = std::max(scale, std::abs(numeric[i]));
@@ -127,10 +127,10 @@ static double compare(const float* analytic, const vector<double>& numeric)
     return worst;
 }
 
-static vector<double> finite_differences(reference_adapter& ref, vector<double>& target,
-    const vector<double>& x, long rows, const vector<double>& dy, double eps)
+static std::vector<double> finite_differences(reference_adapter& ref, std::vector<double>& target,
+    const std::vector<double>& x, long rows, const std::vector<double>& dy, double eps)
 {
-    vector<double> g(target.size(), 0.0);
+    std::vector<double> g(target.size(), 0.0);
     for (size_t i = 0; i < target.size(); ++i)
     {
         const double keep = target[i];
@@ -228,7 +228,7 @@ static bool run_case(adapter_method method, long in_dim, long out_dim, long rank
     copy_from(b, ref.B);
     if (dora) copy_from(m, ref.M);
 
-    vector<double> xd, dyd;
+    std::vector<double> xd, dyd;
     copy_from(x, xd);
     copy_from(dy, dyd);
 
@@ -236,7 +236,7 @@ static bool run_case(adapter_method method, long in_dim, long out_dim, long rank
     memcpy(y, y_base);
     adapter.forward(x, base_w, a, b, m, y);
     {
-        vector<double> y_ref;
+        std::vector<double> y_ref;
         ref.forward(xd, rows, y_ref);
         report("forward vs merged", compare(y.host(), y_ref), tol, false);
     }
@@ -253,13 +253,11 @@ static bool run_case(adapter_method method, long in_dim, long out_dim, long rank
     if (dora)
         report("gradient dm", compare(dm.host(), finite_differences(ref, ref.M, xd, rows, dyd, eps)), tol, false);
     {
-        /* dx from the adapter is the low-rank path only; the reference differentiates the
-           whole projection, so the frozen base contribution is added before comparing. */
-        vector<double> gx = finite_differences(ref, xd, xd, rows, dyd, eps);
-        resizable_tensor dx_total(rows, in_dim);
-        memcpy(dx_total, dx);
-        tt::gemm(1.0f, dx_total, 1.0f, dy, false, base_w, true);
-        report("gradient dx", compare(dx_total.host(), gx), tol, false);
+        /* dx covers the whole adapted projection, base term included, so it compares
+           directly against the reference. Reconstructing that term outside the adapter
+           is what this check caught: for DoRA it carries the column factors. */
+        std::vector<double> gx = finite_differences(ref, xd, xd, rows, dyd, eps);
+        report("gradient dx", compare(dx.host(), gx), tol, false);
     }
 
     // --- merge -----------------------------------------------------------------------

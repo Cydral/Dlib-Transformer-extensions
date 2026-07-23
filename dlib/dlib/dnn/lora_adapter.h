@@ -200,10 +200,17 @@ namespace dlib
             tt::scale_columns(y, pre_scale_, col_scale_);
         }
 
-        /* Gradients of the adapter parameters and the adapter's share of the input
-           gradient. dy is the gradient of the adapted output; dx, da, db and dm are
-           accumulated into, never overwritten, so the caller adds the base projection's
-           own contribution before or after in any order. */
+        /* Gradients of the adapter parameters and the input gradient of the whole
+           adapted projection, base term included.
+
+           The base term belongs here rather than to the caller because it is not
+           dy . W' with the frozen weight: DoRA rescales the entire projection output,
+           base part and low-rank part alike, so the gradient that reaches W carries the
+           column factors, which live inside the adapter. A caller applying dy . W' on
+           its own would be wrong by exactly the deviation of those factors from one, a
+           quiet error that trains a slightly wrong model rather than failing.
+
+           Every output is accumulated into, never overwritten. */
         void backward(const tensor& x, const tensor& base_w,
             const tensor& a, const tensor& b, const tensor& m,
             const tensor& dy, tensor& dx, tensor& da, tensor& db, tensor& dm)
@@ -246,6 +253,9 @@ namespace dlib
             dub_.set_size(rows, geom_.rank);
             tt::gemm(0.0f, dub_, 1.0f, *du, false, b, true);
             tt::gemm(1.0f, da, scale_, x, true, dub_, false);
+
+            // dx = du . W' + s.(du.B') . A'
+            tt::gemm(1.0f, dx, 1.0f, *du, false, base_w, true);
             tt::gemm(1.0f, dx, scale_, dub_, false, a, true);
         }
 
