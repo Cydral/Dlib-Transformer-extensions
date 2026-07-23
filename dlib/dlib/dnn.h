@@ -32,6 +32,7 @@
 #include "dnn/utilities.h"
 #include "dnn/validation.h"
 #include "dnn/visitors.h"
+#include "dnn/lora_adapter.h"
 #include "dnn/transformer.h"
 #include "dnn/transformer_config.h"
 #include "dnn/decoder_transformer_config.h"
