@@ -133,11 +133,19 @@ namespace dlib
             scale_ = (rank > 0) ? static_cast<float>(alpha / rank) : 0.0f;
             alpha_ = alpha;
             base_sq_.clear();
+            a_alias_ = alias_tensor();
+            b_alias_ = alias_tensor();
+            m_alias_ = alias_tensor();
             if (geom_.active())
             {
                 a_alias_ = alias_tensor(in_dim, rank);
                 b_alias_ = alias_tensor(out_dim, rank);   // B transposed
-                m_alias_ = alias_tensor(out_dim, 1);
+                /* The magnitude view is empty outside DoRA, matching m_count(). An
+                   alias of the full width would sit past the end of the blob for the
+                   last adapter and, worse, silently overlap the next one for the others,
+                   so every caller can build the three views unconditionally. */
+                if (method == adapter_method::dora)
+                    m_alias_ = alias_tensor(out_dim, 1);
             }
         }
 

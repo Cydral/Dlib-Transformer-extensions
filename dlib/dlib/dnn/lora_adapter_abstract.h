@@ -145,6 +145,11 @@ namespace dlib
             ensures
                 - Return the views of the three blocks, to be applied to the host layer's
                   packed parameter tensor at the offsets given by the geometry.
+                - Each view has the size of its block, so m_view() is empty outside DoRA
+                  and a_view() and b_view() are empty on an inactive adapter. A caller can
+                  therefore build the three views unconditionally: a full-width magnitude
+                  view on a LoRA adapter would sit past the end of the blob when its
+                  adapter is the last one, and silently overlap the next one otherwise.
         !*/
 
         void initialize(
