@@ -6,8 +6,11 @@
 #include "language_model_data_abstract.h"
 
 #include <iostream>
+#include <fstream>
+#include <sstream>
 #include <string>
 #include <vector>
+#include <stdexcept>
 #include "../matrix.h"
 #include "../serialize.h"
 
@@ -1024,6 +1027,131 @@ namespace dlib
         }
     }
 
+    // ---------------------------------------------------------------------------------
+    // Corpus files
+    // ---------------------------------------------------------------------------------
+
+    /* Corpora are exchanged as sentinel-separated UTF-8 text rather than as JSON: the
+       format survives inspection with a pager, a grep and a diff, which is what a corpus
+       is actually looked at with, and it needs no parser beyond a line comparison. A
+       sentinel is recognized only when it is the whole line, so a document quoting one
+       inside a paragraph is kept verbatim. */
+    const char* const corpus_document_sentinel  = "<<<doc>>>";
+    const char* const corpus_record_sentinel    = "<<<record>>>";
+    const char* const corpus_system_sentinel    = "<<<system>>>";
+    const char* const corpus_user_sentinel      = "<<<user>>>";
+    const char* const corpus_assistant_sentinel = "<<<assistant>>>";
+
+    /* One untokenized supervised example, as written by the corpus preparation stage.
+       The system block may be empty, in which case the conversation template emits its
+       own default when it has one. */
+    struct chat_record
+    {
+        std::string system;
+        std::string user;
+        std::string assistant;
+    };
+
+    namespace impl
+    {
+        inline std::string strip_eol(const std::string& line)
+        {
+            // Corpus files are routinely produced on one platform and consumed on
+            // another; a trailing carriage return would otherwise become part of the
+            // text and, worse, of a sentinel comparison.
+            if (!line.empty() && line.back() == '\r') return line.substr(0, line.size() - 1);
+            return line;
+        }
+
+        inline void trim_trailing_blanks(std::string& text)
+        {
+            size_t end = text.size();
+            while (end > 0 && (text[end - 1] == '\n' || text[end - 1] == '\r'
+                || text[end - 1] == ' ' || text[end - 1] == '\t')) --end;
+            text.resize(end);
+        }
+    }
+
+    /* Documents of a plain corpus file, for the knowledge-alignment stage. Anything
+       before the first sentinel is ignored, which lets a file carry a header comment. */
+    inline void load_document_corpus(
+        const std::string& path,
+        std::vector<std::string>& documents)
+    {
+        std::ifstream in(path, std::ios::binary);
+        if (!in) throw std::runtime_error("load_document_corpus: cannot open " + path);
+
+        documents.clear();
+        std::string line, current;
+        bool open = false;
+        while (std::getline(in, line))
+        {
+            line = impl::strip_eol(line);
+            if (line == corpus_document_sentinel)
+            {
+                if (open)
+                {
+                    impl::trim_trailing_blanks(current);
+                    if (!current.empty()) documents.push_back(current);
+                }
+                current.clear();
+                open = true;
+                continue;
+            }
+            if (!open) continue;
+            current += line;
+            current += '\n';
+        }
+        if (open)
+        {
+            impl::trim_trailing_blanks(current);
+            if (!current.empty()) documents.push_back(current);
+        }
+    }
+
+    /* Records of a supervised corpus file, for the task-alignment stage. A record whose
+       user or assistant field is empty is dropped rather than reported: the file is
+       machine-written, and a half-filled record is a truncation of the last line, not
+       something a caller can act on. */
+    inline void load_chat_records(
+        const std::string& path,
+        std::vector<chat_record>& records)
+    {
+        std::ifstream in(path, std::ios::binary);
+        if (!in) throw std::runtime_error("load_chat_records: cannot open " + path);
+
+        records.clear();
+        chat_record current;
+        std::string* field = nullptr;
+        bool open = false;
+
+        auto flush = [&]()
+        {
+            if (!open) return;
+            impl::trim_trailing_blanks(current.system);
+            impl::trim_trailing_blanks(current.user);
+            impl::trim_trailing_blanks(current.assistant);
+            if (!current.user.empty() && !current.assistant.empty())
+                records.push_back(current);
+            current = chat_record();
+            field = nullptr;
+        };
+
+        std::string line;
+        while (std::getline(in, line))
+        {
+            line = impl::strip_eol(line);
+            if (line == corpus_record_sentinel)     { flush(); open = true; continue; }
+            if (!open) continue;
+            if (line == corpus_system_sentinel)     { field = &current.system;    continue; }
+            if (line == corpus_user_sentinel)       { field = &current.user;      continue; }
+            if (line == corpus_assistant_sentinel)  { field = &current.assistant; continue; }
+            if (!field) continue;
+            *field += line;
+            *field += '\n';
+        }
+        flush();
+    }
 
     // ---------------------------------------------------------------------------------
     // Fine-tuning datasets

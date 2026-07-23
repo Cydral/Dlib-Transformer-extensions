@@ -539,6 +539,64 @@ namespace dlib
 
 // ----------------------------------------------------------------------------------------
 
+    const char* const corpus_document_sentinel;
+    const char* const corpus_record_sentinel;
+    const char* const corpus_system_sentinel;
+    const char* const corpus_user_sentinel;
+    const char* const corpus_assistant_sentinel;
+    /*!
+        WHAT THESE CONSTANTS REPRESENT
+            The line markers of the corpus exchange format. Corpora are sentinel
+            separated UTF-8 text rather than JSON: the format survives inspection with a
+            pager, a grep and a diff, which is what a corpus is actually looked at with,
+            and it needs no parser beyond a line comparison.
+
+            A sentinel is recognized only when it is the whole line, so a document
+            quoting one inside a paragraph is kept verbatim.
+    !*/
+
+    struct chat_record
+    {
+        /*!
+            WHAT THIS OBJECT REPRESENTS
+                One untokenized supervised example as written by the corpus preparation
+                stage: a system block, a user message and the reference answer. The
+                system field may be empty, in which case the conversation template emits
+                its own default when it has one.
+        !*/
+    };
+
+    void load_document_corpus(
+        const std::string& path,
+        std::vector<std::string>& documents
+    );
+    /*!
+        ensures
+            - #documents holds the documents of the file, in order, with trailing blank
+              lines trimmed and empty documents dropped.
+            - Anything before the first sentinel is ignored, so a file may carry a header
+              comment.
+        throws
+            - std::runtime_error when the file cannot be opened.
+    !*/
+
+    void load_chat_records(
+        const std::string& path,
+        std::vector<chat_record>& records
+    );
+    /*!
+        ensures
+            - #records holds the records of the file, in order, with trailing blank lines
+              trimmed on every field.
+            - A record whose user or assistant field is empty is dropped rather than
+              reported: the file is machine written, and a half-filled record is a
+              truncation of the last line, not something a caller can act on.
+        throws
+            - std::runtime_error when the file cannot be opened.
+    !*/
+
+// ----------------------------------------------------------------------------------------
+
     struct supervised_example
     {
         /*!

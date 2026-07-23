@@ -38,6 +38,7 @@
 #include "dnn/runtime_transformer.h"
 #include "dnn/decoder_models.h"
 #include "dnn/text_generation.h"
+#include "dnn/finetuning_data.h"
 
 #endif // DLIB_DNn_
 
