@@ -20,6 +20,12 @@ namespace dlib
             rescale, which is why one implementation serves both and why another variant
             of the family costs a branch rather than a rewrite.
 
+            B is stored transposed, as (out_dim, rank). In that layout every use of it
+            lands on an existing tensor operation; in the natural one the same quantities
+            pair a row of one matrix with a column of another and have to be walked on the
+            host, which on a decoder-sized projection is tens of millions of host
+            operations per layer and per optimizer step.
+
             The merged weight is never formed. The output follows from the distributive
             law, and the column norms from an identity built on A'A and W'A, both small
             next to the projection they adapt. The same identity differentiates, so the
@@ -90,7 +96,9 @@ namespace dlib
 
             METHODS
                 active()   - true when the adapter contributes anything
-                a_count(), b_count(), m_count(), total() - block sizes, in floats
+                a_count(), b_count(), m_count() - block sizes, in floats; the B block
+                                 holds out_dim * rank values in transposed layout
+                total()    - size of the whole adapter, in floats
                 a_offset(base), b_offset(base), m_offset(base) - block positions,
                                  relative to the offset of the adapter in the blob
         !*/
@@ -111,8 +119,12 @@ namespace dlib
         );
         /*!
             requires
-                - in_dim > 0 && out_dim > 0 && rank >= 0
+                - rank >= 0
+                - rank == 0 || (in_dim > 0 && out_dim > 0)
             ensures
+                - A rank of zero with zero dimensions describes an adapter that was never
+                  configured, which is what a default-constructed one serializes as and
+                  what a layer carrying none reads back.
                 - #geometry() describes the configured adapter.
                 - #scale() == alpha / rank, zero when rank is zero. The division by the
                   rank keeps the effective step comparable when the rank changes, so a

@@ -26,6 +26,20 @@
 // materialization, so this implementation carries the exact gradient of the magnitude
 // path rather than the detached approximation the reference implementations settle for.
 //
+// B is stored transposed, as (out, rank). Every use of it then lands on an existing
+// tensor operation: the low-rank product becomes a gemm with a transposed right operand,
+// the two norm reductions become dot_prods over rows, and the magnitude gradients become
+// gemms around a scale_rows. In the natural (rank, out) layout those same quantities pair
+// a row of one matrix with a column of another and have to be walked on the host, which
+// on a decoder-sized projection is tens of millions of host operations per layer and per
+// optimizer step. The closing step, turning squared norms into per-column factors, is
+// tt::divide_by_sqrt, so no part of a forward or a backward leaves the device. Only the
+// squared column norms of the frozen base are walked on the host, once per adapter.
+//
+// That closing step is a division and not a multiplication by a reciprocal, because the
+// two are not interchangeable here: x / x is exactly one for every finite non-zero float,
+// x * (1 / x) is not, and the inertness below rests on the first identity.
+//
 // Both methods are inert at step zero: B starts at zero, and m starts at the column
 // norms of W, so c is exactly one. A freshly adapted model reproduces its base bit for
 // bit, which is what makes an adapted run comparable to the run it started from.
@@ -65,9 +79,10 @@ namespace dlib
     }
 
     /* Where the adapter blocks sit in a packed parameter blob and how many floats they
-       take. The layout is [A | B | m], m being absent outside DoRA, so switching methods
-       changes the size of the blob and is a configuration-time decision, not a runtime
-       one. A rank of zero yields an empty layout and an inactive adapter. */
+       take. The layout is [A | B | m], B in its transposed (out, rank) form and m absent
+       outside DoRA, so switching methods changes the size of the blob and is a
+       configuration-time decision, not a runtime one. A rank of zero yields an empty
+       layout and an inactive adapter. */
     struct adapter_geometry
     {
         long in_dim = 0;
@@ -77,7 +92,7 @@ namespace dlib
 
         bool active() const { return rank > 0 && method != adapter_method::none; }
         size_t a_count() const { return active() ? static_cast<size_t>(in_dim) * rank : 0; }
-        size_t b_count() const { return active() ? static_cast<size_t>(rank) * out_dim : 0; }
+        size_t b_count() const { return active() ? static_cast<size_t>(out_dim) * rank : 0; }
         size_t m_count() const
         {
             return (active() && method == adapter_method::dora)
@@ -102,8 +117,12 @@ namespace dlib
     public:
         void configure(long in_dim, long out_dim, long rank, adapter_method method, double alpha)
         {
-            DLIB_CASSERT(in_dim > 0 && out_dim > 0, "adapter dimensions must be positive");
             DLIB_CASSERT(rank >= 0, "adapter rank must be non-negative");
+            /* Zero dimensions describe an adapter that was never configured, which is what
+               a default-constructed one serializes as and what a layer carrying none reads
+               back. Only an active adapter needs a shape. */
+            DLIB_CASSERT(rank == 0 || (in_dim > 0 && out_dim > 0),
+                "an active adapter needs positive dimensions");
             geom_.in_dim = in_dim;
             geom_.out_dim = out_dim;
             geom_.rank = rank;
@@ -113,12 +132,12 @@ namespace dlib
                a learning-rate sweep. */
             scale_ = (rank > 0) ? static_cast<float>(alpha / rank) : 0.0f;
             alpha_ = alpha;
-            base_sqnorm_.clear();
+            base_sq_.clear();
             if (geom_.active())
             {
                 a_alias_ = alias_tensor(in_dim, rank);
-                b_alias_ = alias_tensor(rank, out_dim);
-                m_alias_ = alias_tensor(1, out_dim);
+                b_alias_ = alias_tensor(out_dim, rank);   // B transposed
+                m_alias_ = alias_tensor(out_dim, 1);
             }
         }
 
@@ -153,26 +172,28 @@ namespace dlib
                 DLIB_CASSERT(m.size() == geom_.m_count(),
                     "adapter magnitude view does not match the configured geometry");
                 refresh_base_sqnorm(base_w);
+                const float* sq = base_sq_.host();
                 float* pm = m.host_write_only();
-                for (long j = 0; j < geom_.out_dim; ++j)
-                    pm[j] = std::sqrt(base_sqnorm_[static_cast<size_t>(j)]);
+                for (long j = 0; j < geom_.out_dim; ++j) pm[j] = std::sqrt(sq[j]);
             }
         }
 
-        /* Column norms of the base weight, cached because the base is frozen. Call again
-           after merging an adapter into the base, which is the only event that changes
-           them. */
+        /* Squared column norms of the frozen base. Walked on the host on purpose: the base
+           does not change, so this runs once per adapter and once more after a merge, and
+           a tensor path would cost a full-size temporary to save nothing measurable. */
         void refresh_base_sqnorm(const tensor& base_w)
         {
-            DLIB_CASSERT(base_w.size() == static_cast<size_t>(geom_.in_dim) * geom_.out_dim,
+            const long in = geom_.in_dim, out = geom_.out_dim;
+            DLIB_CASSERT(base_w.size() == static_cast<size_t>(in) * out,
                 "base weight does not match the configured geometry");
-            base_sqnorm_.assign(static_cast<size_t>(geom_.out_dim), 0.0f);
+            base_sq_.set_size(out, 1);
+            float* dst = base_sq_.host_write_only();
+            for (long j = 0; j < out; ++j) dst[j] = 0.0f;
             const float* w = base_w.host();
-            for (long i = 0; i < geom_.in_dim; ++i)
+            for (long i = 0; i < in; ++i)
             {
-                const float* row = w + static_cast<size_t>(i) * geom_.out_dim;
-                for (long j = 0; j < geom_.out_dim; ++j)
-                    base_sqnorm_[static_cast<size_t>(j)] += row[j] * row[j];
+                const float* row = w + static_cast<size_t>(i) * out;
+                for (long j = 0; j < out; ++j) dst[j] += row[j] * row[j];
             }
         }
 
@@ -190,7 +211,7 @@ namespace dlib
 
             xa_.set_size(rows, geom_.rank);
             tt::gemm(0.0f, xa_, 1.0f, x, false, a, false);
-            tt::gemm(1.0f, y, scale_, xa_, false, b, false);
+            tt::gemm(1.0f, y, scale_, xa_, false, b, true);   // B is stored transposed
 
             if (geom_.method != adapter_method::dora) return;
 
@@ -228,33 +249,16 @@ namespace dlib
                 scaled_dy_.copy_size(dy);
                 tt::scale_columns(scaled_dy_, dy, col_scale_);
                 du = &scaled_dy_;
-
-                prod_.copy_size(dy);
-                tt::multiply(false, prod_, dy, pre_scale_);
-                col_grad_.set_size(1, geom_.out_dim);
-                tt::assign_conv_bias_gradient(col_grad_, prod_);
-
-                const float* t = col_grad_.host();
-                const float* pm = m.host();
-                float* pdm = dm.host();
-                k_.assign(static_cast<size_t>(geom_.out_dim), 0.0f);
-                for (long j = 0; j < geom_.out_dim; ++j)
-                {
-                    const size_t u = static_cast<size_t>(j);
-                    const float n = col_norm_[u];
-                    pdm[j] += t[j] / n;
-                    k_[u] = -pm[j] * t[j] / (n * n * n);
-                }
-                accumulate_magnitude_path(base_w, a, b, da, db);
+                accumulate_magnitude_path(base_w, a, b, m, dy, da, db, dm);
             }
 
-            // dB = s.(x.A)' . du     and     dA = s.x' . (du.B')
-            tt::gemm(1.0f, db, scale_, xa_, true, *du, false);
+            // dB' = s.du'.(x.A)   and   dA = s.x'.(du.B')
+            tt::gemm(1.0f, db, scale_, *du, true, xa_, false);
             dub_.set_size(rows, geom_.rank);
-            tt::gemm(0.0f, dub_, 1.0f, *du, false, b, true);
+            tt::gemm(0.0f, dub_, 1.0f, *du, false, b, false);
             tt::gemm(1.0f, da, scale_, x, true, dub_, false);
 
-            // dx = du . W' + s.(du.B') . A'
+            // dx = du.W' + s.(du.B').A'
             tt::gemm(1.0f, dx, 1.0f, *du, false, base_w, true);
             tt::gemm(1.0f, dx, scale_, dub_, false, a, true);
         }
@@ -268,37 +272,19 @@ namespace dlib
         void merge_into_base(const tensor& a, const tensor& b, const tensor& m, tensor& base_w)
         {
             if (!geom_.active()) return;
-            const long in = geom_.in_dim, out = geom_.out_dim, r = geom_.rank;
 
-            const float* pa = a.host();
-            const float* pb = b.host();
-            float* w = base_w.host();
-
-            for (long i = 0; i < in; ++i)
-            {
-                float* row = w + static_cast<size_t>(i) * out;
-                const float* arow = pa + static_cast<size_t>(i) * r;
-                for (long j = 0; j < out; ++j)
-                {
-                    float acc = 0.0f;
-                    for (long q = 0; q < r; ++q) acc += arow[q] * pb[static_cast<size_t>(q) * out + j];
-                    row[j] += scale_ * acc;
-                }
-            }
+            tt::gemm(1.0f, base_w, scale_, a, false, b, true);   // W <- W + s.A.B
 
             if (geom_.method == adapter_method::dora)
             {
                 refresh_base_sqnorm(base_w);
-                const float* pm = m.host();
-                for (long i = 0; i < in; ++i)
-                {
-                    float* row = w + static_cast<size_t>(i) * out;
-                    for (long j = 0; j < out; ++j)
-                    {
-                        const float n = std::sqrt(base_sqnorm_[static_cast<size_t>(j)]);
-                        row[j] *= (n > 0.0f) ? (pm[j] / n) : 1.0f;
-                    }
-                }
+                col_scale_.set_size(geom_.out_dim, 1);
+                tt::divide_by_sqrt(col_scale_, m, base_sq_, norm_floor);
+                /* scale_columns has no aliasing guarantee, so the merged weight is read
+                   from a copy rather than from the tensor being written. */
+                merged_.copy_size(base_w);
+                memcpy(merged_, base_w);
+                tt::scale_columns(base_w, merged_, col_scale_);
             }
             refresh_base_sqnorm(base_w);
         }
@@ -334,111 +320,92 @@ namespace dlib
     private:
 
         /* c_j = m_j / ||v_j||, from the identity that avoids forming the merged weight.
-           The two matrix products run on the device; the reduction over out x rank and
-           the square root run on the host, which costs one readback of that size per
-           adapted projection and per forward. */
+           Everything but the closing square root and division is a tensor operation; what
+           remains is one host pass over out values. */
         void compute_column_scales(const tensor& base_w,
             const tensor& a, const tensor& b, const tensor& m)
         {
             const long out = geom_.out_dim, r = geom_.rank;
-            if (base_sqnorm_.size() != static_cast<size_t>(out)) refresh_base_sqnorm(base_w);
+            if (base_sq_.size() != static_cast<size_t>(out)) refresh_base_sqnorm(base_w);
 
             gram_.set_size(r, r);
             tt::gemm(0.0f, gram_, 1.0f, a, true, a, false);      // A'A
             proj_.set_size(out, r);
             tt::gemm(0.0f, proj_, 1.0f, base_w, true, a, false); // W'A
+            bg_.set_size(out, r);
+            tt::gemm(0.0f, bg_, 1.0f, b, false, gram_, false);   // B'.(A'A)
 
-            const float* pg = gram_.host();
-            const float* pp = proj_.host();
-            const float* pb = b.host();
-            const float* pm = m.host();
+            tt::dot_prods(cross_, proj_, b);                     // <w_j, (AB)_j>
+            tt::dot_prods(quad_, bg_, b);                        // ||(AB)_j||^2
 
-            col_norm_.assign(static_cast<size_t>(out), 0.0f);
-            col_scale_.set_size(1, out);
-            float* pc = col_scale_.host_write_only();
-            std::vector<float> bj(static_cast<size_t>(r));
+            nsq_.set_size(out, 1);
+            tt::affine_transform(nsq_, base_sq_, cross_, quad_,
+                1.0f, 2.0f * scale_, scale_ * scale_);
 
-            for (long j = 0; j < out; ++j)
-            {
-                for (long q = 0; q < r; ++q) bj[static_cast<size_t>(q)] = pb[static_cast<size_t>(q) * out + j];
-
-                float cross = 0.0f;
-                for (long q = 0; q < r; ++q) cross += pp[static_cast<size_t>(j) * r + q] * bj[static_cast<size_t>(q)];
-
-                float quad = 0.0f;
-                for (long q = 0; q < r; ++q)
-                {
-                    float row = 0.0f;
-                    for (long p = 0; p < r; ++p) row += pg[static_cast<size_t>(q) * r + p] * bj[static_cast<size_t>(p)];
-                    quad += bj[static_cast<size_t>(q)] * row;
-                }
-
-                float n2 = base_sqnorm_[static_cast<size_t>(j)] + 2.0f * scale_ * cross
-                    + scale_ * scale_ * quad;
-                if (n2 < 1e-12f) n2 = 1e-12f;
-                const float n = std::sqrt(n2);
-                col_norm_[static_cast<size_t>(j)] = n;
-                pc[j] = pm[j] / n;
-            }
+            /* c = m / ||v||, in one division. Splitting it into a reciprocal and a
+               product would cost the exact one that an untrained adapter must produce. */
+            col_scale_.set_size(out, 1);
+            tt::divide_by_sqrt(col_scale_, m, nsq_, norm_floor);
         }
 
-        /* Contribution of the column norms to dA and dB. Both reduce to products with the
-           already available A'A and W'A, so the exact gradient costs a pair of small
-           matrix products rather than the merged weight the naive derivation asks for. */
+        /* Contribution of the column norms to dA, dB and dm. Both parameter terms reduce
+           to products with the already available A'A and W'A, so the exact gradient costs
+           a pair of small matrix products rather than the merged weight the naive
+           derivation asks for. */
         void accumulate_magnitude_path(const tensor& base_w,
-            const tensor& a, const tensor& b, tensor& da, tensor& db)
+            const tensor& a, const tensor& b, const tensor& m,
+            const tensor& dy, tensor& da, tensor& db, tensor& dm)
         {
-            const long in = geom_.in_dim, out = geom_.out_dim, r = geom_.rank;
-            const float* pb = b.host();
-            const float* pg = gram_.host();
-            const float* pp = proj_.host();
-            const float* w = base_w.host();
-            float* pda = da.host();
-            float* pdb = db.host();
-            const float* pa = a.host();
+            const long out = geom_.out_dim, r = geom_.rank;
 
-            /* dA += s.( W.diag(k).B' + s.A.(B.diag(k).B') ) */
-            bk_.assign(static_cast<size_t>(r) * out, 0.0f);          // B.diag(k), r x out
-            for (long q = 0; q < r; ++q)
-                for (long j = 0; j < out; ++j)
-                    bk_[static_cast<size_t>(q) * out + j] = pb[static_cast<size_t>(q) * out + j] * k_[static_cast<size_t>(j)];
-
-            bkb_.assign(static_cast<size_t>(r) * r, 0.0f);           // B.diag(k).B', r x r
-            for (long q = 0; q < r; ++q)
-                for (long p = 0; p < r; ++p)
-                {
-                    float acc = 0.0f;
-                    for (long j = 0; j < out; ++j)
-                        acc += bk_[static_cast<size_t>(q) * out + j] * pb[static_cast<size_t>(p) * out + j];
-                    bkb_[static_cast<size_t>(q) * r + p] = acc;
-                }
-
-            for (long i = 0; i < in; ++i)
+            prod_.copy_size(dy);
+            tt::multiply(false, prod_, dy, pre_scale_);
+            tsum_.set_size(out, 1);
             {
-                const float* wrow = w + static_cast<size_t>(i) * out;
-                const float* arow = pa + static_cast<size_t>(i) * r;
-                float* drow = pda + static_cast<size_t>(i) * r;
-                for (long q = 0; q < r; ++q)
-                {
-                    float acc = 0.0f;
-                    for (long j = 0; j < out; ++j) acc += wrow[j] * bk_[static_cast<size_t>(q) * out + j];
-                    float second = 0.0f;
-                    for (long p = 0; p < r; ++p) second += arow[p] * bkb_[static_cast<size_t>(p) * r + q];
-                    drow[q] += scale_ * (acc + scale_ * second);
-                }
+                /* assign_conv_bias_gradient sums over samples and wants a (1, out)
+                   destination, which is the same storage seen with the other shape. */
+                auto tsum_row = alias_tensor(1, out)(tsum_, 0);
+                tt::assign_conv_bias_gradient(tsum_row, prod_);
             }
 
-            /* dB += s.( (W'A)' + s.(A'A).B ).diag(k) */
-            for (long q = 0; q < r; ++q)
-                for (long j = 0; j < out; ++j)
-                {
-                    float second = 0.0f;
-                    for (long p = 0; p < r; ++p)
-                        second += pg[static_cast<size_t>(q) * r + p] * pb[static_cast<size_t>(p) * out + j];
-                    const float first = pp[static_cast<size_t>(j) * r + q];
-                    pdb[static_cast<size_t>(q) * out + j] +=
-                        scale_ * (first + scale_ * second) * k_[static_cast<size_t>(j)];
-                }
+            /* Reciprocal norms, obtained from the same primitive with a unit numerator.
+               Nothing downstream of here needs an exact one, so the extra rounding of a
+               reciprocal is harmless in the gradients. */
+            if (ones_.size() != static_cast<size_t>(out))
+            {
+                ones_.set_size(out, 1);
+                ones_ = 1;
+            }
+            inv_norm_.set_size(out, 1);
+            tt::divide_by_sqrt(inv_norm_, ones_, nsq_, norm_floor);
+
+            // dm += t / ||v||
+            tt::multiply(true, dm, tsum_, inv_norm_);
+
+            /* k = -m.t / ||v||^3, written as -(c.t) / ||v||^2 so that the column factors
+               computed in the forward are reused instead of recomputed. */
+            ct_.set_size(out, 1);
+            tt::multiply(false, ct_, col_scale_, tsum_);
+            inv2_.set_size(out, 1);
+            tt::multiply(false, inv2_, inv_norm_, inv_norm_);
+            kvec_.set_size(out, 1);
+            tt::multiply(false, kvec_, ct_, inv2_);
+            tt::affine_transform(kvec_, kvec_, -1.0f, 0.0f);
+
+            // dA += s.( W.(diag(k).B') + s.A.(B.diag(k).B') )
+            bk_.set_size(out, r);
+            tt::scale_rows(bk_, b, kvec_);
+            tt::gemm(1.0f, da, scale_, base_w, false, bk_, false);
+            bkb_.set_size(r, r);
+            tt::gemm(0.0f, bkb_, 1.0f, b, true, bk_, false);
+            tt::gemm(1.0f, da, scale_ * scale_, a, false, bkb_, false);
+
+            // dB' += s.diag(k).( W'A + s.B'.(A'A) )
+            mix_.set_size(out, r);
+            tt::affine_transform(mix_, proj_, bg_, 1.0f, scale_);
+            mixk_.set_size(out, r);
+            tt::scale_rows(mixk_, mix_, kvec_);
+            tt::add(1.0f, db, scale_, mixk_);
         }
 
         adapter_geometry geom_;
@@ -447,10 +414,17 @@ namespace dlib
 
         alias_tensor a_alias_, b_alias_, m_alias_;
 
-        resizable_tensor xa_, dub_, pre_scale_, scaled_dy_, prod_;
-        resizable_tensor gram_, proj_, col_scale_, col_grad_;
+        resizable_tensor xa_, dub_, pre_scale_, scaled_dy_, prod_, merged_;
+        resizable_tensor gram_, proj_, bg_, cross_, quad_, nsq_;
+        /* Lower bound on a squared norm, applied as a clamp rather than as an added term
+           so that a norm already equal to its numerator divides out to exactly one. A
+           plain enumeration-free constant rather than a static constexpr member: the
+           primitive takes it by const reference, which would odr-use the member and
+           require an out-of-class definition under C++14. */
+        double norm_floor = 1e-12;
 
-        std::vector<float> base_sqnorm_, col_norm_, k_, bk_, bkb_;
+        resizable_tensor base_sq_, col_scale_, inv_norm_, inv2_, ct_, ones_;
+        resizable_tensor tsum_, kvec_, bk_, bkb_, mix_, mixk_;
     };
 }
 

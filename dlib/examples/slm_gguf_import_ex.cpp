@@ -93,6 +93,44 @@ string model_display_name(const model_spec& s)
     return cleaned.empty() ? s.arch_name : cleaned;
 }
 
+/* Low-rank adaptation requested on the command line. Applied after the weights are in
+   place, never before: DoRA initializes its magnitudes from the column norms of the base,
+   so an adapter configured on an untrained network would carry the norms of the random
+   initialization instead. */
+struct adapter_request
+{
+    long rank = 0;
+    dlib::adapter_method method = dlib::adapter_method::none;
+    double alpha = 16.0;
+    bool query = true;
+    bool value = true;
+
+    bool wanted() const { return rank > 0 && method != dlib::adapter_method::none; }
+};
+
+/* Configures the adapters and reports what the optimizer would be allowed to move.
+
+   The report is printed whether or not adapters were asked for, because the number it
+   carries is the one thing a training log never says: a parameter-efficient method that
+   silently left the whole network trainable produces a plausible loss curve and an hour of
+   wasted compute. */
+template <typename net_type>
+void apply_adapters(net_type& net, const adapter_request& req)
+{
+    if (!req.wanted()) return;
+
+    const size_t layers = configure_network_adapters(net, req.rank, req.method, req.alpha,
+        req.query, req.value);
+    freeze_all_but_adapters(net);
+
+    const trainable_counts counts = count_trainable_parameters(net);
+    cout << "Adapters            : " << adapter_method_name(req.method)
+         << ", rank " << req.rank << ", alpha " << req.alpha
+         << " on " << (req.query ? "Q" : "") << (req.value ? "V" : "")
+         << " over " << layers << " layers\n"
+         << counts.describe() << "\n";
+}
+
 /* Extract the tokenizer from the GGUF metadata, run a round-trip sanity check, and
    serialize it. The round-trip is the cheap local validation: encode then decode a few
    strings and confirm the text is recovered. For exact parity, compare the token ids
@@ -567,7 +605,8 @@ int chat_loop(generator_type& generator, hf_tokenizer& tok,
 int run_chat(gguf_reader& g, const model_spec& spec, const gguf_load_options& lopt,
     double temperature, size_t top_k, float top_p,
     float min_p, float repeat_penalty, bool deterministic, long ctx_len, bool use_template,
-    const std::string& system_prompt, const std::string& template_override, bool offload_params)
+    const std::string& system_prompt, const std::string& template_override, bool offload_params,
+    const adapter_request& adapters)
 {
     if (!model_matches_header(spec))
     { cerr << "Error: model does not match the compiled-in header. Regenerate and recompile.\n"; return 1; }
@@ -575,6 +614,7 @@ int run_chat(gguf_reader& g, const model_spec& spec, const gguf_load_options& lo
     generator_type generator(multiply_(1.0));
     cout << "Importing weights into the network...\n";
     import_gguf_weights(generator, g, spec, lopt);
+    apply_adapters(generator, adapters);
 
     hf_tokenizer tok;
     tok.load_from_gguf(g);
@@ -625,7 +665,7 @@ int run_chat_dat(const std::string& dat_path,
 /* Print the most probable next tokens for a prompt's last position. Compare these with a
    reference (for example an external GGUF runtime) to validate the weight repacking. */
 int run_probe(gguf_reader& g, const model_spec& spec, const gguf_load_options& lopt,
-    const std::string& prompt)
+    const std::string& prompt, const adapter_request& adapters)
 {
     if (!model_matches_header(spec))
     { cerr << "Error: model does not match the compiled-in header. Regenerate and recompile.\n"; return 1; }
@@ -633,6 +673,7 @@ int run_probe(gguf_reader& g, const model_spec& spec, const gguf_load_options& l
     generator_type generator(multiply_(1.0));
     cout << "Importing weights into the network...\n";
     import_gguf_weights(generator, g, spec, lopt);
+    apply_adapters(generator, adapters);
 
     hf_tokenizer tok;
     tok.load_from_gguf(g);
@@ -692,7 +733,7 @@ int run_probe(gguf_reader& g, const model_spec& spec, const gguf_load_options& l
    behavior for a chosen sequence, for instance to measure the effect of a control token such
    as the eos </s> in the middle of a prompt. The ids must already include BOS if wanted. */
 int run_probe_ids(gguf_reader& g, const model_spec& spec, const gguf_load_options& lopt,
-    const std::string& id_string)
+    const std::string& id_string, const adapter_request& adapters)
 {
     if (!model_matches_header(spec))
     { cerr << "Error: model does not match the compiled-in header. Regenerate and recompile.\n"; return 1; }
@@ -700,6 +741,7 @@ int run_probe_ids(gguf_reader& g, const model_spec& spec, const gguf_load_option
     generator_type generator(multiply_(1.0));
     cout << "Importing weights into the network...\n";
     import_gguf_weights(generator, g, spec, lopt);
+    apply_adapters(generator, adapters);
 
     hf_tokenizer tok;
     tok.load_from_gguf(g);
@@ -824,7 +866,29 @@ int main(int argc, char** argv)
         parser.add_option("offload-params", "Keep supported layer parameters in host memory and materialize them per layer (lowers VRAM)");
         parser.add_option("rope-permute", "Permute Q/K rows from split-half (NeoX) to interleaved RoPE ordering; leave off for llama-family GGUFs, expected for NeoX-convention architectures");
         parser.add_option("swap-gate-up", "Swap ffn_gate / ffn_up assignment (weight-loader knob)");
+        parser.add_option("lora-rank", "Rank of the low-rank adapters; 0 leaves the network untouched (default: 0)", 1);
+        parser.add_option("lora-method", "Adaptation method: lora or dora (default: lora)", 1);
+        parser.add_option("lora-alpha", "Adapter alpha; the effective scale is alpha / rank (default: 16)", 1);
+        parser.add_option("lora-targets", "Projections to adapt: q, v or qv (default: qv)", 1);
         parser.parse(argc, argv);
+
+        /* Adapter request, resolved once and passed to whichever mode runs. Targets are
+           given as one string rather than as two flags so that a sweep script varies one
+           argument instead of a combination. */
+        adapter_request adapters;
+        adapters.rank = get_option(parser, "lora-rank", long(0));
+        adapters.alpha = get_option(parser, "lora-alpha", 16.0);
+        adapters.method = adapter_method_from_name(
+            get_option(parser, "lora-method", std::string("lora")));
+        {
+            const std::string targets = get_option(parser, "lora-targets", std::string("qv"));
+            adapters.query = targets.find('q') != std::string::npos;
+            adapters.value = targets.find('v') != std::string::npos;
+            if (adapters.rank > 0 && !adapters.query && !adapters.value)
+            { cerr << "Error: --lora-targets selects no projection.\n"; return 1; }
+            if (adapters.rank > 0 && adapters.method == adapter_method::none)
+            { cerr << "Error: --lora-method must be lora or dora.\n"; return 1; }
+        }
 
         /* Chat over an already-converted model: no GGUF needed, the .dat archive carries
            both the network weights and the tokenizer. */
@@ -911,16 +975,18 @@ int main(int argc, char** argv)
                     /*use_template=*/!parser.option("raw"),
                     get_option(parser, "system", std::string("You are a helpful assistant.")),
                     get_option(parser, "template", std::string("auto")),
-                parser.option("offload-params"));
+                    parser.option("offload-params"), adapters);
 
             if (parser.option("convert"))
                 return run_convert(g, spec, lopt, prefix + ".dat");
 
             if (parser.option("probe-ids"))
-                return run_probe_ids(g, spec, lopt, parser.option("probe-ids").argument());
+                return run_probe_ids(g, spec, lopt,
+                    parser.option("probe-ids").argument(), adapters);
 
             return run_probe(g, spec, lopt,
-                get_option(parser, "prompt", std::string("The capital of France is")));
+                get_option(parser, "prompt", std::string("The capital of France is")),
+                adapters);
 #else
             cerr << "This build has no model header compiled in.\n"
                  << "Generate it first (run with --out-prefix slm_imported_model), then rebuild\n"

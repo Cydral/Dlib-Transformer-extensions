@@ -16,29 +16,35 @@ namespace dlib
     {
 
     // -----------------------------------------------------------------------------------
+        void divide_by_sqrt(
+            tensor& dest,
+            const tensor& num,
+            const tensor& sqnorm,
+            const double eps
+        );
 
-        void multiply (
+        void multiply(
             bool add_to,
             tensor& dest,
             const tensor& src1,
             const tensor& src2
         );
 
-        void multiply_conv (
+        void multiply_conv(
             bool add_to,
             tensor& dest,
             const tensor& src1,
             const tensor& src2
         );
 
-        void multiply_zero_padded (
+        void multiply_zero_padded(
             bool add_to,
             tensor& dest,
             const tensor& src1,
             const tensor& src2
         );
 
-        void scale_channels (
+        void scale_channels(
             bool add_to,
             tensor& dest,
             const tensor& src,
@@ -52,18 +58,18 @@ namespace dlib
             const tensor& src
         );
 
-        void assign_bias_gradient (
+        void assign_bias_gradient(
             tensor& grad,
             const tensor& gradient_input
         );
 
-        void add (
+        void add(
             tensor& dest,
             const tensor& src1,
             const tensor& src2
         );
 
-        void assign_conv_bias_gradient (
+        void assign_conv_bias_gradient(
             tensor& grad,
             const tensor& gradient_input
         );

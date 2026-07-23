@@ -4,6 +4,7 @@
 #ifdef DLIB_DNN_TRANSFORMER_ABSTRACT_H_
 
 #include "layers_abstract.h"
+#include "lora_adapter_abstract.h"
 
 /*!
     The transformer.h file contains specialized layers and building blocks designed
@@ -372,6 +373,62 @@ namespace dlib
             ensures
                 - Returns the allocated capacity of the KV cache. 0 if the cache
                   has not been allocated yet.
+        !*/
+
+        void configure_adapters(
+            long rank,
+            adapter_method method,
+            double alpha,
+            bool adapt_query = true,
+            bool adapt_value = true
+        );
+        /*!
+            requires
+                - rank >= 0
+                - the layer is allocated, that is at least one forward has run
+            ensures
+                - Attaches a low-rank adapter to the query projection, to the value
+                  projection, or to both, and initializes it. The adapter blocks close the
+                  packed parameter blob, so no offset of the weights before them moves and
+                  a layer without adapters lays out exactly as it did.
+                - The blob is resized in place and the leading weights are preserved, so
+                  this is a live reconfiguration rather than a rebuild.
+                - A rank of zero deactivates the adapters and shrinks the blob back.
+                - Must run once the weights are in place: DoRA initializes its magnitudes
+                  from the column norms of the base, so an adapter configured on an
+                  untrained layer would carry the norms of the random initialization.
+                - The adapters are inert until the first optimizer step: the layer
+                  reproduces its unadapted output bit for bit.
+                - Query and value only, which is where the literature converges and the
+                  cheapest option; key and output would be the same two call sites against
+                  the same layout.
+        !*/
+
+        bool adapters_active() const;
+        /*!
+            ensures
+                - Returns whether either projection carries an active adapter.
+        !*/
+
+        size_t trainable_parameter_count() const;
+        /*!
+            ensures
+                - Returns the number of parameters an optimizer step may move: the size of
+                  the adapter blocks, and zero when nothing is adapted.
+                - The frozen regions of the blob have their gradient zeroed in backward, so
+                  they do not move even though they share a learning-rate multiplier with
+                  the adapters.
+        !*/
+
+        void merge_adapters();
+        /*!
+            ensures
+                - Folds each adapter into the projection it adapts, then deactivates both
+                  and returns the blob to its unadapted layout.
+                - Needed between two stages of a sequential fine-tuning, where resuming on
+                  saved adapters alone would leave the base exactly where the previous
+                  stage left it, and needed again to export an adapted model at no
+                  inference cost.
         !*/
 
         template <typename SUBNET>

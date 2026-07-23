@@ -218,6 +218,98 @@ namespace dlib
     !*/
 
 // ----------------------------------------------------------------------------------------
+// Low-rank adaptation across a network
+// ----------------------------------------------------------------------------------------
+
+    template <typename net_type>
+    size_t configure_network_adapters(
+        net_type& net,
+        long rank,
+        adapter_method method,
+        double alpha,
+        bool adapt_query = true,
+        bool adapt_value = true
+    );
+    /*!
+        requires
+            - rank >= 0
+            - net has been initialized, that is its parameter tensors are allocated
+        ensures
+            - Configures a low-rank adapter on every layer that supports one, leaving every
+              other layer untouched, and returns how many layers were configured.
+            - Support is detected by expression rather than by layer type, so a layer that
+              becomes adaptable joins in by declaring the same members, without any change
+              here.
+            - A rank of zero removes the adapters and returns each layer to its original
+              parameter layout.
+            - Must be called once the weights are in place: DoRA initializes its magnitudes
+              from the column norms of the base, so an adapter configured on an untrained
+              network would carry the norms of the random initialization instead.
+    !*/
+
+    template <typename net_type>
+    size_t merge_network_adapters(
+        net_type& net
+    );
+    /*!
+        ensures
+            - Folds every active adapter into the weights it adapts, deactivates it, and
+              returns how many layers were merged.
+            - Needed between two stages of a sequential fine-tuning, where resuming on
+              saved adapters alone would leave the base exactly where the previous stage
+              left it, and needed again to export an adapted model at no inference cost.
+    !*/
+
+    struct trainable_counts
+    {
+        /*!
+            WHAT THIS OBJECT REPRESENTS
+                What an optimizer step can actually move in a network.
+
+            FIELDS
+                total          - every parameter of the network
+                trainable      - those a step can move
+                adapter        - those belonging to low-rank adapters
+                adapted_layers - how many layers carry an active adapter
+
+            METHODS
+                trainable_fraction() - trainable over total
+                describe()           - human-readable summary
+        !*/
+    };
+
+    template <typename net_type>
+    trainable_counts count_trainable_parameters(
+        const net_type& net
+    );
+    /*!
+        ensures
+            - Returns the trainable breakdown of net, counting for each computational layer
+              its adapter parameters when it carries an active adapter, its whole parameter
+              blob when its learning-rate multiplier is non-zero, and nothing otherwise.
+            - An adapted layer keeps a non-zero multiplier, since that is what lets its
+              adapter blocks move; its frozen regions have their gradient zeroed in the
+              layer's own backward, which is why they do not count as trainable here.
+            - A parameter-efficient method is worth its name only if a small fraction of
+              the network moves, and nothing in a training log says whether the freezing
+              took. Reading this before a run costs nothing; discovering an hour later that
+              the whole model was trainable costs the run.
+    !*/
+
+    template <typename net_type>
+    void freeze_all_but_adapters(
+        net_type& net
+    );
+    /*!
+        ensures
+            - Sets the learning-rate and weight-decay multipliers of every computational
+              layer to zero, except those carrying an active adapter, which keep theirs.
+            - The multiplier applies to a whole layer, so it cannot separate an adapter
+              from the frozen weights sharing its parameter blob; that separation is the
+              layer's own responsibility and happens in its backward.
+    !*/
+
+// ----------------------------------------------------------------------------------------
 
     template <typename layer_type>
     void set_learning_rate(

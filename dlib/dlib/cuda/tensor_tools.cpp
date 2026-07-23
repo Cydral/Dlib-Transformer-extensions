@@ -56,6 +56,37 @@ namespace dlib { namespace tt
 #endif
     }
 
+    void inverse_sqrt(
+        tensor& dest,
+        const tensor& src,
+        const double eps
+    )
+    {
+        DLIB_CASSERT(dest.size() == src.size());
+
+#ifdef DLIB_USE_CUDA
+        cuda::inverse_sqrt(dest, src, eps);
+#else
+        dest = reciprocal(sqrt(mat(src) + eps));
+#endif
+    }
+
+    void divide_by_sqrt(
+        tensor& dest,
+        const tensor& num,
+        const tensor& sqnorm,
+        const double eps
+    )
+    {
+        DLIB_CASSERT(dest.size() == num.size() && dest.size() == sqnorm.size());
+
+#ifdef DLIB_USE_CUDA
+        cuda::divide_by_sqrt(dest, num, sqnorm, eps);
+#else
+        cpu::divide_by_sqrt(dest, num, sqnorm, eps);
+#endif
+    }
+
     void dot_prods (
         resizable_tensor& out,
         const tensor& lhs,

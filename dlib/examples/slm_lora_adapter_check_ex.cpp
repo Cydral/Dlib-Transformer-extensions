@@ -52,6 +52,9 @@ struct reference_adapter
     long in_dim = 0, out_dim = 0, rank = 0;
     bool dora = false;
     double s = 0.0;
+    /* B is held in the same transposed (out_dim, rank) layout as the implementation, so
+       the two can be compared element by element without a reordering step that would
+       itself need checking. */
     std::vector<double> W, A, B, M;
 
     void merged_weight(std::vector<double>& out_w) const
@@ -62,7 +65,7 @@ struct reference_adapter
             {
                 double acc = 0.0;
                 for (long r = 0; r < rank; ++r)
-                    acc += A[static_cast<size_t>(i) * rank + r] * B[static_cast<size_t>(r) * out_dim + j];
+                    acc += A[static_cast<size_t>(i) * rank + r] * B[static_cast<size_t>(j) * rank + r];
                 out_w[static_cast<size_t>(i) * out_dim + j] = W[static_cast<size_t>(i) * out_dim + j] + s * acc;
             }
 

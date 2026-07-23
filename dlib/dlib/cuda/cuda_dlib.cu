@@ -333,6 +333,47 @@ namespace dlib
         }
 
     // ----------------------------------------------------------------------------------------
+ 
+        __global__ void _cuda_inverse_sqrt(float* dest, const float* src, float eps, size_t n)
+        {
+            for (auto i : grid_stride_range(0, n))
+                dest[i] = ::rsqrtf(src[i] + eps);
+        }
+ 
+        void inverse_sqrt (
+            tensor& dest,
+            const tensor& src,
+            const double eps
+        )
+        {
+            DLIB_ASSERT(dest.size() == src.size());
+            launch_kernel(_cuda_inverse_sqrt, max_jobs(src.size()),
+                dest.device(), src.device(), static_cast<float>(eps), src.size());
+        }
+
+    // ----------------------------------------------------------------------------------------
+ 
+        __global__ void _cuda_divide_by_sqrt(float* dest, const float* num,
+            const float* sqnorm, float eps, size_t n)
+        {
+            for (auto i : grid_stride_range(0, n))
+                dest[i] = num[i] / ::sqrtf(::fmaxf(sqnorm[i], eps));
+        }
+ 
+        void divide_by_sqrt (
+            tensor& dest,
+            const tensor& num,
+            const tensor& sqnorm,
+            const double eps
+        )
+        {
+            DLIB_ASSERT(dest.size() == num.size() && dest.size() == sqnorm.size());
+            launch_kernel(_cuda_divide_by_sqrt, max_jobs(dest.size()),
+                dest.device(), num.device(), sqnorm.device(),
+                static_cast<float>(eps), dest.size());
+        }
+
+    // ----------------------------------------------------------------------------------------
 
         __global__ void _cuda_log(float* dest, const float* src, size_t n)
         {

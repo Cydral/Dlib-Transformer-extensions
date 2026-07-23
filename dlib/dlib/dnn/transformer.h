@@ -6,6 +6,7 @@
 #include "transformer_abstract.h"
 #include "network_context.h"
 #include "layers.h"
+#include "lora_adapter.h"
 #include <cstring>
 #include <vector>
 
@@ -190,6 +191,98 @@ namespace dlib
         long get_kv_cache_filled_len() const { return cache_filled_len_; }
         long get_kv_cache_capacity() const { return cache_capacity_; }
 
+        /* Low-rank adaptation of the query and value projections. Call it once the weights
+           are in place: DoRA initializes its magnitudes from the column norms of the base,
+           so an adapter configured on an untrained layer would carry the norms of the
+           random initialization instead.
+
+           The packed blob grows by the size of the requested blocks and the leading
+           weights are preserved, so this is a live reconfiguration rather than a rebuild.
+           A rank of zero deactivates the adapters and shrinks the blob back.
+
+           Query and value only. That is where the literature converges and it is the
+           cheapest option; key and output would be the same two lines against the same
+           layout if a measurement ever asked for them. */
+        void configure_adapters(long rank, adapter_method method, double alpha,
+            bool adapt_query = true, bool adapt_value = true)
+        {
+            DLIB_CASSERT(params.size() > 0,
+                "configure_adapters requires an allocated layer: run one forward first");
+
+            q_adapter_.configure(EMBEDDING_DIM, Q_PROJ_DIM,
+                adapt_query ? rank : 0, method, alpha);
+            v_adapter_.configure(EMBEDDING_DIM, KV_PROJ_DIM,
+                adapt_value ? rank : 0, method, alpha);
+
+            const size_t kept = base_param_count();
+            resizable_tensor previous;
+            previous.copy_size(params);
+            memcpy(previous, params);
+
+            params.set_size(1, static_cast<long>(kept
+                + q_adapter_.parameter_count() + v_adapter_.parameter_count()));
+            params = 0;
+            {
+                alias_tensor head(1, static_cast<long>(kept));
+                auto dst = head(params, 0);
+                auto src = head(previous, 0);
+                memcpy(dst, src);
+            }
+            rebuild_aliases();
+
+            dlib::rand rnd(std::rand());
+            if (q_adapter_.active())
+            {
+                auto wq = wq_alias(params, wq_offset);
+                auto aq = q_adapter_.a_view()(params, q_adapter_.geometry().a_offset(q_adapter_offset));
+                auto bq = q_adapter_.b_view()(params, q_adapter_.geometry().b_offset(q_adapter_offset));
+                auto mq = q_adapter_.m_view()(params, q_adapter_.geometry().m_offset(q_adapter_offset));
+                q_adapter_.initialize(wq, aq, bq, mq, rnd);
+            }
+            if (v_adapter_.active())
+            {
+                auto wv = wv_alias(params, wv_offset);
+                auto av = v_adapter_.a_view()(params, v_adapter_.geometry().a_offset(v_adapter_offset));
+                auto bv = v_adapter_.b_view()(params, v_adapter_.geometry().b_offset(v_adapter_offset));
+                auto mv = v_adapter_.m_view()(params, v_adapter_.geometry().m_offset(v_adapter_offset));
+                v_adapter_.initialize(wv, av, bv, mv, rnd);
+            }
+        }
+
+        bool adapters_active() const { return q_adapter_.active() || v_adapter_.active(); }
+
+        // Number of parameters the optimizer may move. Zero when nothing is adapted, since
+        // the frozen regions have their gradient zeroed in backward.
+        size_t trainable_parameter_count() const
+        {
+            return q_adapter_.parameter_count() + v_adapter_.parameter_count();
+        }
+
+        /* Folds the adapters into the projections they adapt and deactivates them. Needed
+           between two stages of a sequential fine-tuning, where resuming on saved adapters
+           alone would leave the base exactly where the previous stage found it, and needed
+           again to export an adapted model at no inference cost. */
+        void merge_adapters()
+        {
+            if (q_adapter_.active())
+            {
+                auto wq = wq_alias(params, wq_offset);
+                auto aq = q_adapter_.a_view()(params, q_adapter_.geometry().a_offset(q_adapter_offset));
+                auto bq = q_adapter_.b_view()(params, q_adapter_.geometry().b_offset(q_adapter_offset));
+                auto mq = q_adapter_.m_view()(params, q_adapter_.geometry().m_offset(q_adapter_offset));
+                q_adapter_.merge_into_base(aq, bq, mq, wq);
+            }
+            if (v_adapter_.active())
+            {
+                auto wv = wv_alias(params, wv_offset);
+                auto av = v_adapter_.a_view()(params, v_adapter_.geometry().a_offset(v_adapter_offset));
+                auto bv = v_adapter_.b_view()(params, v_adapter_.geometry().b_offset(v_adapter_offset));
+                auto mv = v_adapter_.m_view()(params, v_adapter_.geometry().m_offset(v_adapter_offset));
+                v_adapter_.merge_into_base(av, bv, mv, wv);
+            }
+            configure_adapters(0, adapter_method::none, 0.0, false, false);
+        }
+
         template <typename SUBNET>
         void setup(const SUBNET& sub)
         {
@@ -199,16 +292,13 @@ namespace dlib
                 "gqa_attention input nc()==" << x.nc()
                 << " does not match EMBEDDING_DIM=" << EMBEDDING_DIM);
 
-            const long total_params =
-                EMBEDDING_DIM * Q_PROJ_DIM
-                + EMBEDDING_DIM * KV_PROJ_DIM
-                + EMBEDDING_DIM * KV_PROJ_DIM
-                + Q_PROJ_DIM * EMBEDDING_DIM
-                + (USE_QK_NORM ? 2 * HEAD_DIM : 0)
-                /* Constant-layout QKV bias slots [bq|bk|bv]: ~10 KB per layer, zeroed
-                   and inert for bias-free models, filled and enabled by the loader for
-                   the qwen2 family. A runtime flag avoids any template plumbing. */
-                + Q_PROJ_DIM + 2 * KV_PROJ_DIM;
+            /* Weights, optional QK-Norm gammas, constant-layout QKV bias slots, then the
+               adapter blocks. The bias slots are ~10 KB per layer, zeroed and inert for
+               bias-free models and filled by the loader for the qwen2 family; the adapter
+               blocks are empty until configure_adapters is called. Everything variable
+               sits at the end, so no earlier offset ever moves. */
+            const long total_params = static_cast<long>(base_param_count()
+                + q_adapter_.parameter_count() + v_adapter_.parameter_count());
 
             params.set_size(1, total_params);
 
@@ -230,6 +320,8 @@ namespace dlib
             wv_offset = wk_offset + EMBEDDING_DIM * KV_PROJ_DIM;
             wo_offset = wv_offset + EMBEDDING_DIM * KV_PROJ_DIM;
             setup_bias_offsets();
+            q_adapter_offset = base_param_count();
+            v_adapter_offset = q_adapter_offset + q_adapter_.parameter_count();
             {
                 alias_tensor ball(1, Q_PROJ_DIM + 2 * KV_PROJ_DIM);
                 ball(params, bq_offset) = 0;   // bias slots start inert
@@ -415,13 +507,59 @@ namespace dlib
                 alias_tensor dV_2d(B * N, KV_PROJ_DIM);
                 auto dV_view = dV_2d(dV_flat, 0);
 
-                tt::gemm(1.0f, dx_view, 1.0f, dQ_view, false, wq, true);
-                tt::gemm(1.0f, dx_view, 1.0f, dK_view, false, wk, true);
-                tt::gemm(1.0f, dx_view, 1.0f, dV_view, false, wv, true);
+                /* An adapted projection hands its whole input gradient to the adapter:
+                   with DoRA the base term carries the column factors, which live inside
+                   the adapter and which this layer cannot see. Its base weight is frozen,
+                   so the matching weight gradient is zeroed rather than computed; the
+                   assignments below already use a beta of zero, so nothing is lost. */
+                if (q_adapter_.active())
+                {
+                    auto aq = q_adapter_.a_view()(params, q_adapter_.geometry().a_offset(q_adapter_offset));
+                    auto bq = q_adapter_.b_view()(params, q_adapter_.geometry().b_offset(q_adapter_offset));
+                    auto mq = q_adapter_.m_view()(params, q_adapter_.geometry().m_offset(q_adapter_offset));
+                    auto daq = q_adapter_.a_view()(params_grad, q_adapter_.geometry().a_offset(q_adapter_offset));
+                    auto dbq = q_adapter_.b_view()(params_grad, q_adapter_.geometry().b_offset(q_adapter_offset));
+                    auto dmq = q_adapter_.m_view()(params_grad, q_adapter_.geometry().m_offset(q_adapter_offset));
+                    q_adapter_.backward(x_view, wq, aq, bq, mq, dQ_view, dx_view, daq, dbq, dmq);
+                    dwq = 0;
+                }
+                else
+                {
+                    tt::gemm(1.0f, dx_view, 1.0f, dQ_view, false, wq, true);
+                    tt::gemm(0.0f, dwq, 1.0f, x_view, true, dQ_view, false);
+                }
 
-                tt::gemm(0.0f, dwq, 1.0f, x_view, true, dQ_view, false);
+                tt::gemm(1.0f, dx_view, 1.0f, dK_view, false, wk, true);
                 tt::gemm(0.0f, dwk, 1.0f, x_view, true, dK_view, false);
-                tt::gemm(0.0f, dwv, 1.0f, x_view, true, dV_view, false);
+
+                if (v_adapter_.active())
+                {
+                    auto av = v_adapter_.a_view()(params, v_adapter_.geometry().a_offset(v_adapter_offset));
+                    auto bv = v_adapter_.b_view()(params, v_adapter_.geometry().b_offset(v_adapter_offset));
+                    auto mv = v_adapter_.m_view()(params, v_adapter_.geometry().m_offset(v_adapter_offset));
+                    auto dav = v_adapter_.a_view()(params_grad, v_adapter_.geometry().a_offset(v_adapter_offset));
+                    auto dbv = v_adapter_.b_view()(params_grad, v_adapter_.geometry().b_offset(v_adapter_offset));
+                    auto dmv = v_adapter_.m_view()(params_grad, v_adapter_.geometry().m_offset(v_adapter_offset));
+                    v_adapter_.backward(x_view, wv, av, bv, mv, dV_view, dx_view, dav, dbv, dmv);
+                    dwv = 0;
+                }
+                else
+                {
+                    tt::gemm(1.0f, dx_view, 1.0f, dV_view, false, wv, true);
+                    tt::gemm(0.0f, dwv, 1.0f, x_view, true, dV_view, false);
+                }
+
+                /* With adapters in place the output projection and, for QK-Norm layers,
+                   the head gammas are frozen too: only the adapter blocks move. */
+                if (adapters_active())
+                {
+                    dwo = 0;
+                    if (USE_QK_NORM)
+                    {
+                        gamma_q_alias(params_grad, gamma_q_offset) = 0;
+                        gamma_k_alias(params_grad, gamma_k_offset) = 0;
+                    }
+                }
             }
         }
 
@@ -442,6 +580,8 @@ namespace dlib
             serialize(item.learning_rate_multiplier_, out);
             serialize(item.weight_decay_multiplier_, out);
             serialize(item.has_qkv_bias_, out);
+            serialize(item.q_adapter_, out);
+            serialize(item.v_adapter_, out);
             serialize(item.rope_q_helper_, out);
             serialize(item.rope_k_helper_, out);
             serialize(item.tril_helper_, out);
@@ -462,6 +602,8 @@ namespace dlib
             deserialize(item.learning_rate_multiplier_, in);
             deserialize(item.weight_decay_multiplier_, in);
             deserialize(item.has_qkv_bias_, in);
+            deserialize(item.q_adapter_, in);
+            deserialize(item.v_adapter_, in);
             deserialize(item.rope_q_helper_, in);
             deserialize(item.rope_k_helper_, in);
             deserialize(item.tril_helper_, in);
@@ -485,6 +627,8 @@ namespace dlib
                 << ", kv_heads=" << NUM_KV_HEADS
                 << ", head_dim=" << HEAD_DIM
                 << ", qk_norm=" << (USE_QK_NORM ? "on" : "off") << ")"
+                << " adapters=" << adapter_method_name(item.q_adapter_.geometry().method)
+                << "(rank " << item.q_adapter_.geometry().rank << ")"
                 << " learning_rate_mult=" << item.learning_rate_multiplier_
                 << " weight_decay_mult=" << item.weight_decay_multiplier_;
             return out;
@@ -511,6 +655,10 @@ namespace dlib
         alias_tensor gamma_q_alias, gamma_k_alias;
         size_t gamma_q_offset = 0, gamma_k_offset = 0;
         size_t bq_offset = 0, bk_offset = 0, bv_offset = 0;
+        /* Low-rank adapters of the query and value projections. Their blocks close the
+           packed blob, so a layer without adapters lays out exactly as before. */
+        low_rank_adapter q_adapter_, v_adapter_;
+        size_t q_adapter_offset = 0, v_adapter_offset = 0;
         bool has_qkv_bias_ = false;
         resizable_tensor bias_ones_;
         double qk_norm_eps_ = DEFAULT_RMS_NORM_EPS;
@@ -547,6 +695,30 @@ namespace dlib
            from the shared buffer pool; bind the result once per forward, since the
            pool slot is reused two acquisitions later. Training always reads the
            resident tensor, so the optimizer semantics are untouched. */
+        /* The adapter reads its parameters from the same blob the projection came from,
+           which is the offload buffer when parameter residency is on. */
+        void apply_q_adapter(const tensor& P, const tensor& x_view, tensor& q_view)
+        {
+            if (!q_adapter_.active()) return;
+            tensor& Pm = const_cast<tensor&>(P);
+            auto wq = wq_alias(Pm, wq_offset);
+            auto aq = q_adapter_.a_view()(Pm, q_adapter_.geometry().a_offset(q_adapter_offset));
+            auto bq = q_adapter_.b_view()(Pm, q_adapter_.geometry().b_offset(q_adapter_offset));
+            auto mq = q_adapter_.m_view()(Pm, q_adapter_.geometry().m_offset(q_adapter_offset));
+            q_adapter_.forward(x_view, wq, aq, bq, mq, q_view);
+        }
+
+        void apply_v_adapter(const tensor& P, const tensor& x_view, tensor& v_view)
+        {
+            if (!v_adapter_.active()) return;
+            tensor& Pm = const_cast<tensor&>(P);
+            auto wv = wv_alias(Pm, wv_offset);
+            auto av = v_adapter_.a_view()(Pm, v_adapter_.geometry().a_offset(v_adapter_offset));
+            auto bv = v_adapter_.b_view()(Pm, v_adapter_.geometry().b_offset(v_adapter_offset));
+            auto mv = v_adapter_.m_view()(Pm, v_adapter_.geometry().m_offset(v_adapter_offset));
+            v_adapter_.forward(x_view, wv, av, bv, mv, v_view);
+        }
+
         const tensor& active_params()
         {
             using ctx = network_context;
@@ -609,6 +781,18 @@ namespace dlib
             setup_bias_offsets();
             if (USE_QK_NORM)
                 setup_qk_norm_aliases();
+            q_adapter_offset = base_param_count();
+            v_adapter_offset = q_adapter_offset + q_adapter_.parameter_count();
+        }
+
+        /* Size of the fixed part of the blob: everything but the adapter blocks. */
+        static size_t base_param_count()
+        {
+            return static_cast<size_t>(EMBEDDING_DIM) * Q_PROJ_DIM
+                + 2 * static_cast<size_t>(EMBEDDING_DIM) * KV_PROJ_DIM
+                + static_cast<size_t>(Q_PROJ_DIM) * EMBEDDING_DIM
+                + (USE_QK_NORM ? 2 * static_cast<size_t>(HEAD_DIM) : 0)
+                + static_cast<size_t>(Q_PROJ_DIM) + 2 * static_cast<size_t>(KV_PROJ_DIM);
         }
 
         /* The bias slots sit at the very end of the packed blob, after the QK-Norm
@@ -759,6 +943,7 @@ namespace dlib
                 alias_tensor q_2d(B * N, Q_PROJ_DIM);
                 auto q_view = q_2d(q_flat, 0);
                 tt::gemm(0.0f, q_view, 1.0f, x_view, false, wq, false);
+                apply_q_adapter(P, x_view, q_view);
 
                 alias_tensor k_2d(B * N, KV_PROJ_DIM);
                 auto k_view = k_2d(k_flat, 0);
@@ -767,6 +952,7 @@ namespace dlib
                 alias_tensor v_2d(B * N, KV_PROJ_DIM);
                 auto v_view = v_2d(v_flat, 0);
                 tt::gemm(0.0f, v_view, 1.0f, x_view, false, wv, false);
+                apply_v_adapter(P, x_view, v_view);
 
                 if (has_qkv_bias_)
                 {
@@ -945,6 +1131,7 @@ namespace dlib
                 alias_tensor q_2d(1, Q_PROJ_DIM);
                 auto q_view = q_2d(inc_q, 0);
                 tt::gemm(0.0f, q_view, 1.0f, x_view, false, wq, false);
+                apply_q_adapter(P, x_view, q_view);
 
                 alias_tensor k_2d(1, KV_PROJ_DIM);
                 auto k_view = k_2d(inc_k, 0);
@@ -953,6 +1140,7 @@ namespace dlib
                 alias_tensor v_2d(1, KV_PROJ_DIM);
                 auto v_view = v_2d(inc_v, 0);
                 tt::gemm(0.0f, v_view, 1.0f, x_view, false, wv, false);
+                apply_v_adapter(P, x_view, v_view);
 
                 if (has_qkv_bias_)
                 {

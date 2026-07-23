@@ -8,6 +8,8 @@
 #include "layers.h"
 #include "transformer.h"
 #include "loss.h"
+#include <iomanip>
+#include <sstream>
 
 namespace dlib
 {
@@ -259,6 +261,178 @@ namespace dlib
     {
         ensure_network_initialized(net, seq_len);
         return count_parameters(net);
+    }
+
+// ----------------------------------------------------------------------------------------
+// Low-rank adaptation across a network
+// ----------------------------------------------------------------------------------------
+
+    namespace impl
+    {
+        /* Only the layers that carry adapters expose these methods; every other layer type
+           falls through to the ellipsis overload and is left alone. The detection is by
+           expression rather than by layer type so that a second adaptable layer, a
+           feed-forward projection for instance, joins in by declaring the same members. */
+        template<typename T>
+        auto configure_adapters_impl(T& layer, long rank, adapter_method method, double alpha,
+            bool adapt_query, bool adapt_value, int)
+            -> decltype(layer.configure_adapters(rank, method, alpha, adapt_query, adapt_value),
+                        size_t())
+        {
+            layer.configure_adapters(rank, method, alpha, adapt_query, adapt_value);
+            return 1;
+        }
+
+        template<typename T>
+        size_t configure_adapters_impl(T&, long, adapter_method, double, bool, bool, ...)
+        {
+            return 0;
+        }
+
+        template<typename T>
+        auto merge_adapters_impl(T& layer, int) -> decltype(layer.merge_adapters(), size_t())
+        {
+            const bool had = layer.adapters_active();
+            layer.merge_adapters();
+            return had ? 1 : 0;
+        }
+
+        template<typename T>
+        size_t merge_adapters_impl(T&, ...)
+        {
+            return 0;
+        }
+
+        template<typename T>
+        auto adapter_parameter_count_impl(const T& layer, int)
+            -> decltype(layer.trainable_parameter_count())
+        {
+            return layer.trainable_parameter_count();
+        }
+
+        template<typename T>
+        size_t adapter_parameter_count_impl(const T&, ...)
+        {
+            return 0;
+        }
+
+        template<typename T>
+        auto adapters_active_impl(const T& layer, int) -> decltype(layer.adapters_active())
+        {
+            return layer.adapters_active();
+        }
+
+        template<typename T>
+        bool adapters_active_impl(const T&, ...)
+        {
+            return false;
+        }
+    }
+
+    /* Configures a low-rank adapter on every layer that supports one, and returns how many
+       were configured. Run it once the weights are in place: DoRA initializes its
+       magnitudes from the column norms of the base, so an adapter configured on an
+       untrained network would carry the norms of the random initialization instead.
+
+       A rank of zero removes the adapters and returns each layer to its original layout. */
+    template <typename net_type>
+    size_t configure_network_adapters(net_type& net, long rank, adapter_method method,
+        double alpha, bool adapt_query = true, bool adapt_value = true)
+    {
+        size_t configured = 0;
+        visit_computational_layers(net, [&](auto& layer) {
+            configured += impl::configure_adapters_impl(
+                layer, rank, method, alpha, adapt_query, adapt_value, 0);
+            });
+        return configured;
+    }
+
+    /* Folds every adapter into the weights it adapts and deactivates it. Needed between
+       two stages of a sequential fine-tuning, where resuming on saved adapters alone would
+       leave the base exactly where the previous stage left it, and needed again to export
+       an adapted model at no inference cost. Returns how many layers were merged. */
+    template <typename net_type>
+    size_t merge_network_adapters(net_type& net)
+    {
+        size_t merged = 0;
+        visit_computational_layers(net, [&](auto& layer) {
+            merged += impl::merge_adapters_impl(layer, 0);
+            });
+        return merged;
+    }
+
+    struct trainable_counts
+    {
+        size_t total = 0;           // every parameter of the network
+        size_t trainable = 0;       // those an optimizer step can actually move
+        size_t adapter = 0;         // those belonging to low-rank adapters
+        size_t adapted_layers = 0;
+
+        double trainable_fraction() const
+        {
+            return total ? static_cast<double>(trainable) / total : 0.0;
+        }
+
+        std::string describe() const
+        {
+            std::ostringstream o;
+            o << "parameters    : " << total << " total, " << trainable << " trainable ("
+              << std::fixed << std::setprecision(3) << 100.0 * trainable_fraction() << "%)";
+            if (adapted_layers)
+                o << "\nadapters      : " << adapter << " parameters over "
+                  << adapted_layers << " layers";
+            return o.str();
+        }
+    };
+
+    /* What an optimizer step can move, layer by layer.
+
+       A parameter-efficient method is worth its name only if a small fraction of the
+       network moves, and nothing in a training log says whether the freezing took. Reading
+       this before a run costs nothing; discovering an hour later that the whole model was
+       trainable costs the run. */
+    template <typename net_type>
+    trainable_counts count_trainable_parameters(const net_type& net)
+    {
+        trainable_counts c;
+        visit_computational_layers(net, [&](const auto& layer) {
+            const size_t n = layer.get_layer_params().size();
+            c.total += n;
+            if (impl::adapters_active_impl(layer, 0))
+            {
+                /* An adapted layer keeps a non-zero multiplier, since that is what lets its
+                   adapter blocks move; its frozen regions have their gradient zeroed in the
+                   layer's own backward. */
+                const size_t a = impl::adapter_parameter_count_impl(layer, 0);
+                c.adapter += a;
+                c.trainable += a;
+                c.adapted_layers += 1;
+            }
+            else if (dlib::get_learning_rate_multiplier(layer) != 0)
+            {
+                /* A layer that exposes no multiplier reports one, which is the honest
+                   answer: nothing can freeze it, so whatever parameters it holds do move.
+                   In practice such layers hold none. */
+                c.trainable += n;
+            }
+            });
+        return c;
+    }
+
+    /* Freezes everything but the adapters: every layer gets a zero learning-rate and
+       weight-decay multiplier, except those carrying an active adapter, which keep theirs
+       so that their adapter blocks can move. */
+    template <typename net_type>
+    void freeze_all_but_adapters(net_type& net)
+    {
+        /* The free functions of core.h rather than the members: a computational layer is
+           not required to expose either multiplier, and several here do not, so calling
+           the members directly would fail to compile on the first activation visited. */
+        visit_computational_layers(net, [&](auto& layer) {
+            if (impl::adapters_active_impl(layer, 0)) return;
+            dlib::set_learning_rate_multiplier(layer, 0);
+            dlib::set_weight_decay_multiplier(layer, 0);
+            });
     }
 
 // ----------------------------------------------------------------------------------------

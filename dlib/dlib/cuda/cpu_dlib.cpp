@@ -17,7 +17,28 @@ namespace dlib
 
     // -----------------------------------------------------------------------------------
 
-        void multiply (
+        void divide_by_sqrt(
+            tensor& dest,
+            const tensor& num,
+            const tensor& sqnorm,
+            const double eps
+        )
+        {
+            DLIB_CASSERT(dest.size() == num.size() && dest.size() == sqnorm.size());
+            const float e = static_cast<float>(eps);
+            const auto d = dest.host();
+            const auto n = num.host();
+            const auto s = sqnorm.host();
+            for (size_t i = 0; i < dest.size(); ++i)
+            {
+                const float v = (s[i] > e) ? s[i] : e;
+                d[i] = n[i] / std::sqrt(v);
+            }
+        }
+
+    // -----------------------------------------------------------------------------------
+
+        void multiply(
             bool add_to,
             tensor& dest,
             const tensor& src1,
@@ -79,7 +100,7 @@ namespace dlib
 
     // ------------------------------------------------------------------------------------
 
-        void multiply_conv (
+        void multiply_conv(
             bool add_to,
             tensor& dest,
             const tensor& src1,
@@ -155,7 +176,7 @@ namespace dlib
 
     // ------------------------------------------------------------------------------------
 
-        void scale_channels (
+        void scale_channels(
             bool add_to,
             tensor& dest,
             const tensor& src,
@@ -276,7 +297,7 @@ namespace dlib
 
     // ----------------------------------------------------------------------------------------
 
-        void add (
+        void add(
             tensor& dest,
             const tensor& src1,
             const tensor& src2
@@ -337,7 +358,7 @@ namespace dlib
 
     // ----------------------------------------------------------------------------------------
 
-        void multiply_zero_padded (
+        void multiply_zero_padded(
             bool add_to,
             tensor& dest,
             const tensor& src1,

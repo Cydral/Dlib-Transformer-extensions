@@ -37,6 +37,43 @@ namespace dlib { namespace tt
             - #invnorms == reciprocal(sqrt(sum_cols(squared(mat(data))) + eps))
     !*/
 
+    void inverse_sqrt(
+        tensor& dest,
+        const tensor& src,
+        const double eps
+    );
+    /*!
+        requires
+            - dest.size() == src.size()
+            - src holds non-negative values
+        ensures
+            - #dest == reciprocal(sqrt(mat(src) + eps))
+            - This is the closing step of a normalization whose squared magnitudes were
+              accumulated beforehand, where inverse_norms computes them from the vectors
+              themselves. eps keeps the result finite on a zero entry.
+    !*/
+
+    void divide_by_sqrt(
+        tensor& dest,
+        const tensor& num,
+        const tensor& sqnorm,
+        const double eps
+    );
+    /*!
+        requires
+            - dest.size() == num.size()
+            - dest.size() == sqnorm.size()
+        ensures
+            - #dest == pointwise_divide(mat(num), sqrt(lowerbound(mat(sqnorm), eps)))
+            - Closes a normalization whose squared magnitudes were accumulated
+              beforehand, where inverse_norms computes them from the vectors themselves.
+            - The division is performed as such, not as a multiplication by a reciprocal:
+              num / sqrt(sqnorm) is exactly one wherever sqnorm is the square of num,
+              which a reciprocal followed by a product does not guarantee.
+            - eps is a lower bound on sqnorm rather than a term added to it, so a value
+              already equal to the square of its numerator passes through unchanged.
+    !*/
+
     void dot_prods (
         resizable_tensor& out,
         const tensor& lhs,

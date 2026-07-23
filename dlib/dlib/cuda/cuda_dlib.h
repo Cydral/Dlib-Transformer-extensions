@@ -116,6 +116,19 @@ namespace dlib
             const double eps
         );
 
+        void inverse_sqrt(
+            tensor& dest,
+            const tensor& src,
+            const double eps
+        );
+
+        void divide_by_sqrt(
+            tensor& dest,
+            const tensor& num,
+            const tensor& sqnorm,
+            const double eps
+        );
+
         void dot_prods (
             resizable_tensor& out,
             const tensor& lhs,
