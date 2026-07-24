@@ -27,6 +27,7 @@
 #include <sstream>
 #include <fstream>
 #include <algorithm>
+#include <cmath>
 
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
@@ -46,6 +47,9 @@
 #include <dlib/cmd_line_parser.h>
 #include <dlib/misc_api.h>
 #include <dlib/dnn.h>
+#include <dlib/data_io.h>
+#include <dlib/image_io.h>
+#include <dlib/image_transforms.h>
 #include <dlib/tokenizer/hf_tokenizer.h>
 #include <dlib/tokenizer/chat_template.h>
 #include <dlib/server/server_chat.h>
@@ -95,6 +99,31 @@ static void report_logits(const tensor& logits, const std::vector<int>& toks, hf
         cout << "  " << p << ": " << am << " '" << tok.decode({ static_cast<int>(am) }, false)
              << "' " << (1.0 / sum) << "\n";
     }
+}
+
+/* Range, mean and root mean square of a tensor. Enough to tell a stage that produced
+   nothing, a stage that produced infinities, and a stage whose scale is an order of
+   magnitude away from what the next one expects. */
+static void report_tensor(const std::string& what, const tensor& t)
+{
+    const float* p = t.host();
+    double lo = 0.0, hi = 0.0, sum = 0.0, sq = 0.0;
+    size_t bad = 0;
+    for (size_t i = 0; i < t.size(); ++i)
+    {
+        const double v = p[i];
+        if (!std::isfinite(v)) { ++bad; continue; }
+        if (i == 0 || v < lo) lo = v;
+        if (i == 0 || v > hi) hi = v;
+        sum += v; sq += v * v;
+    }
+    const double n = static_cast<double>(t.size() ? t.size() : 1);
+    cout << what << std::string(what.size() < 19 ? 19 - what.size() : 1, ' ') << ": ["
+         << t.num_samples() << ", " << t.k() << ", " << t.nr() << ", " << t.nc() << "]  "
+         << "min " << lo << ", max " << hi << ", mean " << sum / n
+         << ", rms " << std::sqrt(sq / n);
+    if (bad) cout << "  " << bad << " NON-FINITE VALUES";
+    cout << "\n";
 }
 
 /* Width of the terminal, for the physical-row accounting of the erase sequences. */
@@ -392,6 +421,8 @@ int main(int argc, char** argv)
         parser.add_option("probe-logits", "Run a prefill and report the logits");
         parser.add_option("probe-ids", "Feed explicit token ids (space or comma separated)", 1);
         parser.add_option("show-tokens", "Tokenize the given text, print the ids and the pieces, then exit", 1);
+        parser.add_option("mmproj", "Read a multimodal projector container, report its geometry, then exit", 1);
+        parser.add_option("image", "With --mmproj, encode this image file and report the visual embeddings", 1);
         parser.add_option("with-bos", "Prepend the tokenizer's BOS in --show-tokens");
         parser.add_option("probe-step", "Self-consistency check: last-position logits of a full prefill versus prefill(N-1) + step(last)");
         parser.add_option("prompt", "Prompt for --probe-logits (default: capital of France)", 1);
@@ -408,6 +439,87 @@ int main(int argc, char** argv)
         parser.add_option("think", "Let thinking-capable models produce their reasoning trace (streamed, then hidden)");
         parser.add_option("resident", "Dequantize all weights at load time (fastest forward, full f32 footprint); default keeps them quantized at rest");
         parser.parse(argc, argv);
+
+        /* Geometry of a vision tower, read from the second file a multimodal model ships.
+           Reported before anything is implemented against it, because the three numbers
+           that matter (the patch grid, the reduction factor and the width of the projector)
+           have to agree with each other, and a container where they do not is one this
+           pipeline cannot serve. */
+        if (parser.option("mmproj"))
+        {
+            const string path = parser.option("mmproj").argument();
+            cout << "Reading projector: " << path << "\n";
+            gguf_reader gv(path);
+            const vision_spec vs = detect_vision(gv);
+            cout << describe(vs);
+            const vision_compat_result rep = check_vision_compatibility(vs, gv);
+            for (const string& n : rep.notes) cout << "note: " << n << "\n";
+            for (const string& b : rep.blockers) cerr << "blocker: " << b << "\n";
+            if (!rep.usable())
+            {
+                cout << "The container cannot be served as it stands.\n";
+                return 1;
+            }
+            cout << "The container is consistent with itself and complete.\n";
+            if (!parser.option("image")) return 0;
+
+            /* Encoding of one image, reported rather than consumed. Nothing downstream
+               reads these numbers yet; what they establish is that the tower runs, that
+               it is deterministic, and that two different pictures do not give the same
+               answer, which is the cheapest way to catch a pipeline that has quietly
+               stopped depending on its input. */
+            runtime_vision_encoder enc;
+            cout << "Loading the vision tower...\n";
+            enc.load(gv, vs);
+
+            const string img_path = parser.option("image").argument();
+            matrix<rgb_pixel> img;
+            load_image(img, img_path);
+            cout << "Image              : " << img_path
+                 << " (" << img.nc() << "x" << img.nr() << ")\n";
+
+            resizable_tensor prepared;
+            enc.prepare_image(img, prepared);
+            report_tensor("prepared image", prepared);
+
+            const auto started = std::chrono::steady_clock::now();
+            const tensor& visual = enc.encode(prepared);
+            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - started).count();
+            report_tensor("visual embeddings", visual);
+            cout << "Encoded in         : " << ms << " ms\n";
+
+            /* Determinism, then sensitivity: the same picture twice must agree bit for
+               bit, and a uniform grey must not. */
+            resizable_tensor first;
+            first.copy_size(visual);
+            memcpy(first, visual);
+            const tensor& again = enc.encode(prepared);
+            double drift = 0.0;
+            for (size_t i = 0; i < first.size(); ++i)
+                drift = std::max(drift, std::abs(static_cast<double>(first.host()[i])
+                    - again.host()[i]));
+            cout << "Repeatability      : max difference " << drift
+                 << (drift == 0.0 ? "  [ok ]" : "  [FAIL]") << "\n";
+
+            matrix<rgb_pixel> grey(64, 64);
+            assign_all_pixels(grey, rgb_pixel(128, 128, 128));
+            resizable_tensor flat;
+            enc.prepare_image(grey, flat);
+            const tensor& other = enc.encode(flat);
+            double apart = 0.0;
+            for (size_t i = 0; i < first.size(); ++i)
+                apart = std::max(apart, std::abs(static_cast<double>(first.host()[i])
+                    - other.host()[i]));
+            cout << "Sensitivity        : max difference against a flat grey " << apart
+                 << (apart > 1e-4 ? "  [ok ]" : "  [FAIL]") << "\n";
+
+            cout << "\nFirst visual token, first 8 of " << vs.projection_dim << " values:\n ";
+            for (long i = 0; i < std::min<long>(8, vs.projection_dim); ++i)
+                cout << " " << first.host()[i];
+            cout << "\n";
+            return 0;
+        }
 
         if (!parser.option("input"))
         {

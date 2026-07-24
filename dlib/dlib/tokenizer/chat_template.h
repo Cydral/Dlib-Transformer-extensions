@@ -35,7 +35,19 @@
 
 namespace dlib
 {
-    enum class chat_template_kind { raw, zephyr, chatml, guanaco, granite };
+    enum class chat_template_kind { raw, zephyr, chatml, guanaco, granite, idefics3 };
+
+    /* Markers of the idefics3 family, exposed because a caller assembling a multimodal
+       prompt has to reserve the positions its vision tower will fill and therefore needs
+       to know what stands in for an image. */
+    struct idefics3_markers
+    {
+        static const char* conversation_start() { return "<|im_start|>"; }
+        static const char* end_of_utterance()   { return "<end_of_utterance>"; }
+        static const char* image_boundary()     { return "<fake_token_around_image>"; }
+        static const char* global_image()       { return "<global-img>"; }
+        static const char* image_placeholder()  { return "<image>"; }
+    };
 
     class chat_template_formatter
     {
@@ -85,6 +97,11 @@ namespace dlib
             const std::string& tpl = tok.chat_template();
             if (!tpl.empty())
             {
+                /* The utterance marker is the signature of the idefics3 family, and it is
+                   tested before the others because their template also mentions the ChatML
+                   conversation marker, which would otherwise capture it. */
+                if (tpl.find("<end_of_utterance>") != std::string::npos)
+                    return chat_template_kind::idefics3;
                 if (tpl.find("<|start_of_role|>") != std::string::npos) return chat_template_kind::granite;
                 if (tpl.find("<|im_start|>") != std::string::npos) return chat_template_kind::chatml;
                 if (tpl.find("<|user|>") != std::string::npos)     return chat_template_kind::zephyr;
@@ -138,6 +155,7 @@ namespace dlib
             if (n == "chatml")  return chat_template_kind::chatml;
             if (n == "guanaco") return chat_template_kind::guanaco;
             if (n == "granite") return chat_template_kind::granite;
+            if (n == "idefics3" || n == "smolvlm") return chat_template_kind::idefics3;
             return chat_template_kind::raw;
         }
 
@@ -149,6 +167,7 @@ namespace dlib
             case chat_template_kind::chatml:  return "chatml";
             case chat_template_kind::guanaco: return "guanaco";
             case chat_template_kind::granite: return "granite";
+            case chat_template_kind::idefics3: return "idefics3";
             default:                         return "raw";
             }
         }
@@ -171,6 +190,9 @@ namespace dlib
         // conversations start with BOS; ChatML models (Qwen) use no leading BOS.
         bool add_bos_on_first_turn() const
         {
+            /* idefics3 opens its conversation with a marker of its own rather than with
+               the tokenizer's BOS, even though the two happen to be the same id in the
+               SmolLM2 vocabulary; emitting it as text keeps the two roles apart. */
             return kind_ == chat_template_kind::zephyr
                 || kind_ == chat_template_kind::guanaco;
         }
@@ -201,6 +223,14 @@ namespace dlib
                 return system_prompt.empty() ? std::string()
                     : "<|start_of_role|>system<|end_of_role|>" + system_prompt
                       + "<|end_of_text|>\n";
+            case chat_template_kind::idefics3:
+                /* The conversation marker opens the stream once, whether or not a system
+                   block follows. The reference template capitalizes the role name and
+                   closes every message with the utterance marker and a newline. */
+                return std::string(idefics3_markers::conversation_start())
+                    + (system_prompt.empty() ? std::string()
+                       : "System: " + system_prompt
+                         + idefics3_markers::end_of_utterance() + "\n");
             default:
                 return std::string();
             }
@@ -225,6 +255,12 @@ namespace dlib
                 return system_prefix(system_prompt)
                     + "<|start_of_role|>user<|end_of_role|>" + user_text
                     + "<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>";
+            case chat_template_kind::idefics3:
+                /* No space after the role when the message opens on an image, which is
+                   what the reference template does and what the model was trained on. */
+                return system_prefix(system_prompt)
+                    + "User:" + (opens_on_image(user_text) ? "" : " ") + user_text
+                    + idefics3_markers::end_of_utterance() + "\nAssistant:";
             default:
                 return user_text;
             }
@@ -244,6 +280,9 @@ namespace dlib
                     + assistant_header();
             case chat_template_kind::guanaco:
                 return "\n### Human: " + user_text + "\n### Assistant:";
+            case chat_template_kind::idefics3:
+                return "\nUser:" + std::string(opens_on_image(user_text) ? "" : " ")
+                    + user_text + idefics3_markers::end_of_utterance() + "\nAssistant:";
             case chat_template_kind::granite:
                 return "\n<|start_of_role|>user<|end_of_role|>" + user_text
                     + "<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>";
@@ -291,7 +330,10 @@ namespace dlib
         // section opening on a fresh line stops the turn.
         std::string stop_string() const
         {
-            return kind_ == chat_template_kind::guanaco ? "\n###" : std::string();
+            if (kind_ == chat_template_kind::guanaco) return "\n###";
+            if (kind_ == chat_template_kind::idefics3)
+                return idefics3_markers::end_of_utterance();
+            return std::string();
         }
 
         // Sampling presets matching the model family's published recommendations.
@@ -322,6 +364,15 @@ namespace dlib
             return (thinking_ && !reasoning_)
                 ? "<|im_start|>assistant\n<think>\n\n</think>\n\n"
                 : "<|im_start|>assistant\n";
+        }
+
+        /* A message opening on an image is spelled without the space that follows the
+           role name otherwise. Detected on the rendered text rather than passed in, so
+           that a caller assembling a turn does not have to declare its shape twice. */
+        static bool opens_on_image(const std::string& text)
+        {
+            const std::string mark = idefics3_markers::image_boundary();
+            return text.compare(0, mark.size(), mark) == 0;
         }
 
         chat_template_kind kind_ = chat_template_kind::raw;

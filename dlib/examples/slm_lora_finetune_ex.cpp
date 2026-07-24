@@ -396,6 +396,8 @@ int main(int argc, char** argv)
         parser.add_option("out", "Where to write the fine-tuned model (default: <load>_tuned.dat)", 1);
         parser.add_option("system", "System block forced on every record of the dataset", 1);
         parser.add_option("template", "Chat template override: auto, zephyr, chatml, guanaco, granite", 1);
+        parser.add_option("think", "Train a reasoning-capable model in reasoning mode; "
+            "the reference answers must then carry their own reasoning traces");
         parser.add_option("lora-rank", "Adapter rank (default: 8)", 1);
         parser.add_option("lora-method", "Adaptation method: lora or dora (default: lora)", 1);
         parser.add_option("lora-alpha", "Adapter alpha; the effective scale is alpha / rank (default: 16)", 1);
@@ -534,7 +536,20 @@ int main(int argc, char** argv)
             ? chat_template_formatter::for_tokenizer(tok,
                 chat_template_formatter::from_name(parser.option("template").argument()))
             : chat_template_formatter::for_tokenizer(tok, model_name);
-        cout << "Chat template: " << chat_template_formatter::name(fmt.kind()) << "\n";
+        /* Reasoning off by default, which for a thinking-capable model means the prompt
+           carries the empty think block that its reference template uses to disable the
+           trace. That is the mode the answers of a plain question-and-answer corpus are
+           written in: training with the trace enabled on answers that carry none teaches
+           the model to skip the reasoning it would otherwise produce. */
+        if (parser.option("think"))
+        {
+            if (fmt.supports_reasoning()) fmt.set_reasoning(true);
+            else cout << "note: this model exposes no reasoning mode; --think ignored\n";
+        }
+        cout << "Chat template: " << chat_template_formatter::name(fmt.kind())
+             << (fmt.supports_reasoning()
+                 ? (parser.option("think") ? ", reasoning on" : ", reasoning off")
+                 : "") << "\n";
 
         const std::string system_prompt = parser.option("system")
             ? parser.option("system").argument() : std::string();

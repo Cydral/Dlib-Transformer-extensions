@@ -218,6 +218,30 @@ namespace dlib
 
         // Configure the KV cache for incremental generation: capacity in tokens, and
         // the number of leading positions (attention sinks: BOS and system prompt)
+        /* Supplies embeddings for chosen positions of the next prefill, in place of the
+           table lookup those positions would otherwise get.
+
+           This is how a modality that produces vectors rather than identifiers enters the
+           stream. The caller reserves the positions with placeholder tokens, so the
+           sequence stays a plain sequence of integers and nothing downstream, neither the
+           attention, nor the rotary positions, nor the cache, has to know that some rows
+           came from elsewhere.
+
+           Consumed by the next forward_prefill() and forgotten afterwards, so a second
+           prompt cannot inherit the images of the first. */
+        void set_input_embeddings(const tensor& rows, const std::vector<long>& positions)
+        {
+            DLIB_CASSERT(static_cast<size_t>(rows.num_samples()) == positions.size(),
+                "one position is needed per supplied embedding row");
+            DLIB_CASSERT(rows.size() == positions.size() * static_cast<size_t>(spec_.d_model),
+                "the supplied embeddings do not have the width of this model");
+            injected_rows_.set_size(static_cast<long>(positions.size()), spec_.d_model);
+            memcpy(injected_rows_, rows);
+            injected_ = positions;
+        }
+
+        void clear_input_embeddings() { injected_.clear(); }
+
         // pinned across evictions. Call before forward_prefill(); resets the cache.
         void set_context(long capacity, long keep_length = 0)
         {
@@ -269,7 +293,10 @@ namespace dlib
                attends to the whole cached context. */
             DLIB_CASSERT(cur_len_ == 0, "forward_prefill() requires an empty cache; use step() to extend");
 
-            /* Embedding gather on the host, single upload. */
+            /* Embedding gather on the host, single upload. Rows that were given an
+               embedding directly are written over afterwards rather than looked up: a
+               vision tower produces vectors, not identifiers, and the placeholder tokens
+               standing in for them in the stream carry no meaning of their own. */
             x_.set_size(1, 1, N, d);
             {
                 float* xh = x_.host_write_only();
@@ -278,6 +305,19 @@ namespace dlib
                     const long id = tokens[static_cast<size_t>(t)];
                     DLIB_CASSERT(id >= 0 && id < spec_.vocab_size, "token id out of range");
                     gather_embedding_row(id, xh + t * d);
+                }
+                if (!injected_.empty())
+                {
+                    const float* src = injected_rows_.host();
+                    const long rows = injected_rows_.num_samples();
+                    for (long r = 0; r < rows; ++r)
+                    {
+                        const long t = injected_[static_cast<size_t>(r)];
+                        DLIB_CASSERT(t >= 0 && t < N,
+                            "an injected embedding falls outside the prompt");
+                        std::memcpy(xh + t * d, src + r * d, sizeof(float) * d);
+                    }
+                    injected_.clear();
                 }
             }
             if (spec_.embedding_scale != 1.0)
@@ -1191,6 +1231,10 @@ namespace dlib
         resizable_tensor q_flat_, k_flat_, v_flat_, q4_, k4_, v4_, k_rep_, v_rep_;
         resizable_tensor k_win_, v_win_;
         resizable_tensor scores_, attn_, ctx4_, ctx_flat_, attn_out_;
+        /* Embeddings supplied for chosen positions of the next prefill, and where they go.
+           One shot: cleared as soon as they are consumed. */
+        resizable_tensor injected_rows_;
+        std::vector<long> injected_;
         resizable_tensor gate_, up_, sig_, ffn_out_;
         resizable_tensor cos_cache_, sin_cache_, mask_, logits_;
     };

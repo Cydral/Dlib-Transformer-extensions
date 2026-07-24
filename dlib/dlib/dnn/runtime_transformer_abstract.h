@@ -144,6 +144,33 @@ namespace dlib
                   a pure full forward and step() is unavailable.
         !*/
 
+        void set_input_embeddings(
+            const tensor& rows,
+            const std::vector<long>& positions
+        );
+        /*!
+            requires
+                - rows.num_samples() == positions.size()
+                - rows holds positions.size() * spec().d_model values
+                - every entry of positions is a valid index of the next prompt
+            ensures
+                - The next forward_prefill() takes the embedding of each listed position
+                  from rows instead of from the token table.
+                - This is how a modality that produces vectors rather than identifiers
+                  enters the stream. The caller reserves the positions with placeholder
+                  tokens, so the sequence stays a plain sequence of integers and nothing
+                  downstream, neither the attention, nor the rotary positions, nor the
+                  cache, has to know that some rows came from elsewhere.
+                - One shot: consumed by the next prefill and forgotten, so a second prompt
+                  cannot inherit the images of the first.
+        !*/
+
+        void clear_input_embeddings();
+        /*!
+            ensures
+                - Discards embeddings supplied but not yet consumed.
+        !*/
+
         void reset_cache();
         /*!
             ensures

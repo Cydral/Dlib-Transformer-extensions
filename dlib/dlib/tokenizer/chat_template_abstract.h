@@ -17,7 +17,8 @@ namespace dlib
         zephyr,  // "<|system|>\n...</s>\n<|user|>\n...</s>\n<|assistant|>\n"
         chatml,  // "<|im_start|>role\n...<|im_end|>\n"
         guanaco, // "### Human: ...\n### Assistant: ..."
-        granite  // "<|start_of_role|>role<|end_of_role|>...<|end_of_text|>\n"
+        granite, // "<|start_of_role|>role<|end_of_role|>...<|end_of_text|>\n"
+        idefics3 // "<|im_start|>User: ...<end_of_utterance>\nAssistant: ..."
     };
     /*!
         WHAT THIS OBJECT REPRESENTS
@@ -27,9 +28,37 @@ namespace dlib
             other Zephyr-formatted Llama-family models, chatml covers the Qwen family
             and derivatives such as SmolLM2-Instruct, guanaco covers models fine-tuned
             on the OpenAssistant-Guanaco turn format, granite covers the IBM Granite
-            instruct models (dense and mixture-of-experts), and raw disables any
-            markup for plain completion.
+            instruct models (dense and mixture-of-experts), idefics3 covers the
+            multimodal SmolVLM and Idefics families, and raw disables any markup for
+            plain completion.
+
+            idefics3 differs from the others in one respect: a message may open on an
+            image, and the role name is then followed by no space. The distinction is
+            not cosmetic, it is what the model was trained on.
     !*/
+
+// ----------------------------------------------------------------------------------------
+
+    struct idefics3_markers
+    {
+        /*!
+            WHAT THIS OBJECT REPRESENTS
+                The markers of the idefics3 family, as static accessors.
+
+                They are exposed because a caller assembling a multimodal prompt has to
+                reserve the positions its vision tower will fill, and therefore has to
+                know what stands in for an image. How many positions one image expands
+                into is decided by the model's own preprocessing and is not readable from
+                the container; it has to be taken from there.
+
+            ACCESSORS
+                conversation_start() - opens the stream, once
+                end_of_utterance()   - closes every message, and stops generation
+                image_boundary()     - wraps the run of image placeholders
+                global_image()       - marks the whole-image view
+                image_placeholder()  - stands for one visual position
+        !*/
+    };
 
 // ----------------------------------------------------------------------------------------
 
