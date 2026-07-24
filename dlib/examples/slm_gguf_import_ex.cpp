@@ -97,16 +97,7 @@ string model_display_name(const model_spec& s)
    place, never before: DoRA initializes its magnitudes from the column norms of the base,
    so an adapter configured on an untrained network would carry the norms of the random
    initialization instead. */
-struct adapter_request
-{
-    long rank = 0;
-    dlib::adapter_method method = dlib::adapter_method::none;
-    double alpha = 16.0;
-    bool query = true;
-    bool value = true;
-
-    bool wanted() const { return rank > 0 && method != dlib::adapter_method::none; }
-};
+using adapter_request = dlib::adapter_plan;
 
 /* Configures the adapters and reports what the optimizer would be allowed to move.
 
@@ -117,16 +108,16 @@ struct adapter_request
 template <typename net_type>
 void apply_adapters(net_type& net, const adapter_request& req)
 {
-    if (!req.wanted()) return;
+    if (!req.active()) return;
 
-    const size_t layers = configure_network_adapters(net, req.rank, req.method, req.alpha,
-        req.query, req.value);
+    const size_t layers = configure_network_adapters(net, req);
     freeze_all_but_adapters(net);
 
     const trainable_counts counts = count_trainable_parameters(net);
     cout << "Adapters            : " << adapter_method_name(req.method)
          << ", rank " << req.rank << ", alpha " << req.alpha
-         << " on " << (req.query ? "Q" : "") << (req.value ? "V" : "")
+         << " on " << (req.attention_query ? "Q" : "") << (req.attention_value ? "V" : "")
+         << (req.projection ? "+FFN" : "")
          << " over " << layers << " layers\n"
          << counts.describe() << "\n";
 }
@@ -869,7 +860,8 @@ int main(int argc, char** argv)
         parser.add_option("lora-rank", "Rank of the low-rank adapters; 0 leaves the network untouched (default: 0)", 1);
         parser.add_option("lora-method", "Adaptation method: lora or dora (default: lora)", 1);
         parser.add_option("lora-alpha", "Adapter alpha; the effective scale is alpha / rank (default: 16)", 1);
-        parser.add_option("lora-targets", "Projections to adapt: q, v or qv (default: qv)", 1);
+        parser.add_option("lora-targets", "Projections to adapt, as letters among q, v and f for the feed-forward (default: qv)", 1);
+        parser.add_option("lora-max-width", "Widest projection an adapter may attach to; keeps the vocabulary head out (default: 16384)", 1);
         parser.parse(argc, argv);
 
         /* Adapter request, resolved once and passed to whichever mode runs. Targets are
@@ -882,9 +874,17 @@ int main(int argc, char** argv)
             get_option(parser, "lora-method", std::string("lora")));
         {
             const std::string targets = get_option(parser, "lora-targets", std::string("qv"));
-            adapters.query = targets.find('q') != std::string::npos;
-            adapters.value = targets.find('v') != std::string::npos;
-            if (adapters.rank > 0 && !adapters.query && !adapters.value)
+            adapters.attention_query = targets.find('q') != std::string::npos;
+            adapters.attention_value = targets.find('v') != std::string::npos;
+            adapters.projection = targets.find('f') != std::string::npos;
+            /* The output head projects onto the vocabulary; an adapter there would cost
+               more than every other adapter combined and is rarely what a fine-tune
+               needs, so plain projections are bounded well below it. The bound is a plain
+               width rather than a multiple of the model dimension, since this block runs
+               before any model is known. */
+            adapters.max_width = get_option(parser, "lora-max-width", long(16384));
+            if (adapters.rank > 0 && !adapters.attention_query && !adapters.attention_value
+                && !adapters.projection)
             { cerr << "Error: --lora-targets selects no projection.\n"; return 1; }
             if (adapters.rank > 0 && adapters.method == adapter_method::none)
             { cerr << "Error: --lora-method must be lora or dora.\n"; return 1; }

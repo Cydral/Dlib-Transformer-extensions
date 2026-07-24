@@ -12,6 +12,7 @@
 #include "../rand.h"
 #include "../string.h"
 #include "../cuda/tensor_tools.h"
+#include "lora_adapter.h"
 #include "../vectorstream.h"
 #include "utilities.h"
 #include "../cuda/operation_mode.h"
@@ -2568,7 +2569,9 @@ namespace dlib
             bias_mode(other.bias_mode),
             params(other.params),
             weights(other.weights),
-            biases(other.biases) {
+            biases(other.biases),
+            adapter(other.adapter),
+            adapter_offset(other.adapter_offset) {
         }
 
         linear_& operator=(const linear_& other) {
@@ -2580,6 +2583,8 @@ namespace dlib
                 params = other.params;
                 weights = other.weights;
                 biases = other.biases;
+                adapter = other.adapter;
+                adapter_offset = other.adapter_offset;
             }
             return *this;
         }
@@ -2618,6 +2623,67 @@ namespace dlib
                 biases = alias_tensor(1, num_outputs);
                 biases(params, weights.size()) = 0;
             }
+            adapter_offset = base_param_count();
+        }
+
+        /* Low-rank adaptation of this projection. The adapter block closes the packed
+           parameter blob, after the bias when there is one, so no earlier offset moves and
+           an unadapted layer lays out exactly as before. Call it once the weights are in
+           place: DoRA initializes its magnitudes from the column norms of the base.
+
+           The plan decides whether this layer is in scope, including through its width
+           bound, so a caller applies the same plan to every layer of a network without
+           knowing which ones will take it up. */
+        void configure_adapters(const adapter_plan& plan)
+        {
+            DLIB_CASSERT(params.size() > 0,
+                "configure_adapters requires an allocated layer: run one forward first");
+
+            const bool wanted = plan.projection && plan.covers(static_cast<long>(num_outputs));
+            adapter.configure(static_cast<long>(num_inputs), static_cast<long>(num_outputs),
+                wanted ? plan.rank : 0, plan.method, plan.alpha);
+
+            const size_t kept = base_param_count();
+            resizable_tensor previous;
+            previous.copy_size(params);
+            memcpy(previous, params);
+
+            params.set_size(1, static_cast<long>(kept + adapter.parameter_count()));
+            params = 0;
+            {
+                alias_tensor head(1, static_cast<long>(kept));
+                auto dst = head(params, 0);
+                auto src = head(previous, 0);
+                memcpy(dst, src);
+            }
+            adapter_offset = kept;
+
+            if (adapter.active())
+            {
+                dlib::rand rnd(std::rand());
+                auto w = weights(params, 0);
+                auto a = adapter.a_view()(params, adapter.geometry().a_offset(adapter_offset));
+                auto b = adapter.b_view()(params, adapter.geometry().b_offset(adapter_offset));
+                auto m = adapter.m_view()(params, adapter.geometry().m_offset(adapter_offset));
+                adapter.initialize(w, a, b, m, rnd);
+            }
+        }
+
+        bool adapters_active() const { return adapter.active(); }
+        size_t trainable_parameter_count() const { return adapter.parameter_count(); }
+
+        void merge_adapters()
+        {
+            if (adapter.active())
+            {
+                auto w = weights(params, 0);
+                auto a = adapter.a_view()(params, adapter.geometry().a_offset(adapter_offset));
+                auto b = adapter.b_view()(params, adapter.geometry().b_offset(adapter_offset));
+                auto m = adapter.m_view()(params, adapter.geometry().m_offset(adapter_offset));
+                adapter.merge_into_base(a, b, m, w);
+            }
+            adapter_plan none;
+            configure_adapters(none);
         }
 
         template <typename SUBNET>
@@ -2634,6 +2700,14 @@ namespace dlib
             auto w = weights(params, 0);
             tt::gemm(0, (tensor&)o, 1, so, false, w, false);
 
+            if (adapter.active())
+            {
+                auto a = adapter.a_view()(params, adapter.geometry().a_offset(adapter_offset));
+                auto b = adapter.b_view()(params, adapter.geometry().b_offset(adapter_offset));
+                auto m = adapter.m_view()(params, adapter.geometry().m_offset(adapter_offset));
+                adapter.forward(so, w, a, b, m, (tensor&)o);
+            }
+
             if (bias_mode == LINEAR_HAS_BIAS)
             {
                 auto b = biases(params, weights.size());
@@ -2645,11 +2719,12 @@ namespace dlib
         void backward(const tensor& gradient_input, SUBNET& sub, tensor& params_grad)
         {
             auto gi = alias_tensor(gradient_input.num_samples() * gradient_input.k() * gradient_input.nr(), num_outputs)(gradient_input, 0);
-            if (learning_rate_multiplier != 0)
+            const auto& prev_output = sub.get_output();
+            auto so = alias_tensor(prev_output.num_samples() * prev_output.k() * prev_output.nr(), num_inputs)(prev_output, 0);
+
+            if (learning_rate_multiplier != 0 && !adapter.active())
             {
-                const auto& prev_output = sub.get_output();
                 auto pw = weights(params_grad, 0);
-                auto so = alias_tensor(prev_output.num_samples() * prev_output.k() * prev_output.nr(), num_inputs)(prev_output, 0);
                 tt::gemm(0, pw, learning_rate_multiplier, so, true, gi, false);
 
                 if (bias_mode == LINEAR_HAS_BIAS)
@@ -2658,13 +2733,37 @@ namespace dlib
                     tt::assign_bias_gradient(pb, gi);
                 }
             }
-            
+            else if (adapter.active())
+            {
+                /* The base weight is frozen under adaptation, so its gradient region is
+                   zeroed rather than computed: the optimizer consumes the whole blob and
+                   would otherwise move weights this layer no longer owns. */
+                weights(params_grad, 0) = 0;
+                if (bias_mode == LINEAR_HAS_BIAS) biases(params_grad, weights.size()) = 0;
+            }
+
             //prev_gradient is not const, so that sgi isn't const
             //since sgi is used as a destination for tt::gemm
             auto& prev_gradient = sub.get_gradient_input();
             alias_tensor_instance sgi = alias_tensor(prev_gradient.num_samples() * prev_gradient.k() * prev_gradient.nr(), num_inputs)(prev_gradient, 0);
             auto w = weights(params, 0);
-            tt::gemm(1, sgi, 1, gi, false, w, true);
+
+            if (adapter.active())
+            {
+                /* The adapter owns the whole input gradient of an adapted projection: with
+                   DoRA the base term carries the column factors, which live inside it. */
+                auto a = adapter.a_view()(params, adapter.geometry().a_offset(adapter_offset));
+                auto b = adapter.b_view()(params, adapter.geometry().b_offset(adapter_offset));
+                auto m = adapter.m_view()(params, adapter.geometry().m_offset(adapter_offset));
+                auto da = adapter.a_view()(params_grad, adapter.geometry().a_offset(adapter_offset));
+                auto db = adapter.b_view()(params_grad, adapter.geometry().b_offset(adapter_offset));
+                auto dm = adapter.m_view()(params_grad, adapter.geometry().m_offset(adapter_offset));
+                adapter.backward(so, w, a, b, m, gi, sgi, da, db, dm);
+            }
+            else
+            {
+                tt::gemm(1, sgi, 1, gi, false, w, true);
+            }
         }
 
         alias_tensor_instance get_weights() { return weights(params, 0); }
@@ -2698,6 +2797,7 @@ namespace dlib
             serialize(item.biases, out);
             serialize((int)item.bias_mode, out);
             serialize(item.learning_rate_multiplier, out);
+            serialize(item.adapter, out);
         }
 
         friend void deserialize(linear_& item, std::istream& in)
@@ -2716,6 +2816,8 @@ namespace dlib
                 item.bias_mode = static_cast<linear_bias_mode>(bmode);
                 if (bias_mode_ != item.bias_mode) throw serialization_error("Wrong bias_mode found while deserializing dlib::linear_");
                 deserialize(item.learning_rate_multiplier, in);
+                deserialize(item.adapter, in);
+                item.adapter_offset = item.base_param_count();
             }
             else
             {
@@ -2746,12 +2848,23 @@ namespace dlib
         }
 
     private:
+        // Size of the fixed part of the blob: the weights, and the bias when present.
+        size_t base_param_count() const
+        {
+            return static_cast<size_t>(num_inputs) * num_outputs
+                + (bias_mode == LINEAR_HAS_BIAS ? static_cast<size_t>(num_outputs) : 0);
+        }
+
         unsigned long num_outputs;
         unsigned long num_inputs;        
         double learning_rate_multiplier;
         linear_bias_mode bias_mode;
         resizable_tensor params;
         alias_tensor weights, biases;
+        /* Low-rank adapter of this projection, its block closing the blob. Empty until
+           configure_adapters is called, so an unadapted layer is unchanged. */
+        low_rank_adapter adapter;
+        size_t adapter_offset = 0;
     };
 
     template <

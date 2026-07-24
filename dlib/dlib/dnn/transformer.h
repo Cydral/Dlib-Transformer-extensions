@@ -249,6 +249,17 @@ namespace dlib
             }
         }
 
+        /* Plan-driven form, the one a network-wide visitor calls. The plan carries fields
+           for sites this layer does not adapt yet; it reads the ones it understands and
+           leaves the rest, so adding key or output adaptation later changes nothing at the
+           call sites. */
+        void configure_adapters(const adapter_plan& plan)
+        {
+            const bool q = plan.attention_query && plan.covers(Q_PROJ_DIM);
+            const bool v = plan.attention_value && plan.covers(KV_PROJ_DIM);
+            configure_adapters(plan.rank, plan.method, plan.alpha, q, v);
+        }
+
         bool adapters_active() const { return q_adapter_.active() || v_adapter_.active(); }
 
         // Number of parameters the optimizer may move. Zero when nothing is adapted, since
@@ -262,6 +273,52 @@ namespace dlib
            between two stages of a sequential fine-tuning, where resuming on saved adapters
            alone would leave the base exactly where the previous stage found it, and needed
            again to export an adapted model at no inference cost. */
+        /* Drops every buffer that only exists between a forward and its backward, plus the
+           KV cache. add_layer::clean() calls it, and add_layer::serialize() writes the
+           per-layer work tensors, so an archive written without cleaning carries a full
+           batch of activations and their gradients: on a decoder that is several times the
+           size of the weights themselves. */
+        void clean()
+        {
+            saved_q_pre_rope.clear();
+            saved_k_pre_rope.clear();
+            saved_v_4d.clear();
+            saved_q_normed.clear();
+            saved_k_normed.clear();
+            saved_q_post_rope.clear();
+            saved_k_post_rope.clear();
+            saved_k_repeated.clear();
+            saved_v_repeated.clear();
+            saved_scores.clear();
+            saved_attn.clear();
+            saved_ctx_flat.clear();
+            qk_scale_q.clear();
+            qk_scale_k.clear();
+            bias_ones_.clear();
+
+            inc_q.clear();
+            inc_k.clear();
+            inc_v.clear();
+            inc_q_rope.clear();
+            inc_k_window.clear();
+            inc_k_window_rep.clear();
+            inc_v_window.clear();
+            inc_v_window_rep.clear();
+            inc_scores.clear();
+            inc_attn.clear();
+            inc_ctx.clear();
+            inc_q_normed.clear();
+            inc_k_window_normed.clear();
+            inc_scale_q.clear();
+            inc_scale_k.clear();
+
+            K_cache.clear();
+            V_cache.clear();
+            cache_filled_len_ = 0;
+            cache_capacity_ = 0;
+            cache_batch_size_ = 0;
+        }
+
         void merge_adapters()
         {
             if (q_adapter_.active())

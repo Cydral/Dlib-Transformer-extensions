@@ -108,6 +108,30 @@ namespace dlib
         long   p99_total = 0;
         double mean_prompt = 0.0;
         double mean_response = 0.0;
+        /* Every total length, sorted. Kept rather than summarized so that an arbitrary
+           coverage can be asked for after the fact; a few hundred kilobytes on a corpus
+           of a hundred thousand examples. */
+        std::vector<long> sorted_totals;
+
+        // Shortest window that holds the given fraction of the examples.
+        long quantile(double q) const
+        {
+            if (sorted_totals.empty()) return 0;
+            if (q <= 0.0) return sorted_totals.front();
+            if (q >= 1.0) return sorted_totals.back();
+            const size_t i = static_cast<size_t>(q * (sorted_totals.size() - 1) + 0.5);
+            return sorted_totals[i];
+        }
+
+        // Fraction of the examples a window of the given length would keep whole.
+        double coverage_at(long window_len) const
+        {
+            if (sorted_totals.empty()) return 0.0;
+            const long capacity = window_len + 1;
+            size_t kept = 0;
+            for (long t : sorted_totals) { if (t <= capacity) ++kept; else break; }
+            return static_cast<double>(kept) / sorted_totals.size();
+        }
 
         std::string describe() const
         {
@@ -139,17 +163,43 @@ namespace dlib
             sr += nr;
         }
         std::sort(totals.begin(), totals.end());
-        auto at = [&](double q) {
-            size_t i = static_cast<size_t>(q * (totals.size() - 1) + 0.5);
-            return totals[i];
-        };
-        p.max_total = totals.back();
-        p.p50_total = at(0.50);
-        p.p90_total = at(0.90);
-        p.p99_total = at(0.99);
+        p.sorted_totals = std::move(totals);
+        p.max_total = p.sorted_totals.back();
+        p.p50_total = p.quantile(0.50);
+        p.p90_total = p.quantile(0.90);
+        p.p99_total = p.quantile(0.99);
         p.mean_prompt = sp / examples.size();
         p.mean_response = sr / examples.size();
         return p;
+    }
+
+    /* Shortest window that keeps the requested fraction of the examples whole, rounded up
+       to a multiple of granularity and capped.
+
+       The window length is a property of the fine-tuning data, not of the model: nothing
+       in the architecture ties them, rotary positions extend to any length and the KV
+       cache is sized at inference. Training on short windows and serving on long ones is
+       normal, and it is what keeps a stage affordable, since attention cost grows with the
+       square of the window while almost every example may sit far below the model's
+       capacity.
+
+       A window of L scores L targets, the last of them the token just past it, so L + 1
+       tokens fit. Coverage is a deliberate trade: pushing it to one lets a handful of
+       outliers set the cost of every batch, which is why the default stops at 95 percent
+       and leaves the remainder to the overflow policy. */
+    inline long suggest_window_length(
+        const length_profile& profile,
+        double coverage = 0.95,
+        long granularity = 64,
+        long max_window = 0)
+    {
+        DLIB_CASSERT(granularity > 0, "granularity must be positive");
+        if (profile.sorted_totals.empty()) return granularity;
+
+        const long needed = profile.quantile(coverage) - 1;
+        long window = ((std::max<long>(needed, 1) + granularity - 1) / granularity) * granularity;
+        if (max_window > 0 && window > max_window) window = max_window;
+        return std::max<long>(window, granularity);
     }
 }
 

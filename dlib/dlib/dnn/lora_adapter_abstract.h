@@ -106,6 +106,37 @@ namespace dlib
 
 // ----------------------------------------------------------------------------------------
 
+    struct adapter_plan
+    {
+        /*!
+            WHAT THIS OBJECT REPRESENTS
+                What to adapt across a network, and how.
+
+                Carried as one object rather than as a handful of arguments because the set
+                of adaptable sites grows: a layer that becomes adaptable reads the fields it
+                understands and ignores the rest, and no caller signature changes.
+
+            FIELDS
+                rank, method, alpha - the adapter itself
+                attention_query     - adapt the query projection of an attention layer
+                attention_value     - adapt its value projection
+                projection          - adapt plain linear projections, the feed-forward ones
+                max_width           - leave projections wider than this alone; 0 means no
+                                      bound
+
+                max_width exists because the output head of a language model projects onto
+                the vocabulary. An adapter there costs more than every other adapter of the
+                network combined and is rarely what a fine-tune needs, and no layer knows
+                its own role; a width bound excludes it without one having to.
+
+            METHODS
+                active()      - whether anything is to be adapted at all
+                covers(width) - whether a projection of that output width is in scope
+        !*/
+    };
+
+// ----------------------------------------------------------------------------------------
+
     class low_rank_adapter
     {
     public:

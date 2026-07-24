@@ -274,17 +274,15 @@ namespace dlib
            expression rather than by layer type so that a second adaptable layer, a
            feed-forward projection for instance, joins in by declaring the same members. */
         template<typename T>
-        auto configure_adapters_impl(T& layer, long rank, adapter_method method, double alpha,
-            bool adapt_query, bool adapt_value, int)
-            -> decltype(layer.configure_adapters(rank, method, alpha, adapt_query, adapt_value),
-                        size_t())
+        auto configure_adapters_impl(T& layer, const adapter_plan& plan, int)
+            -> decltype(layer.configure_adapters(plan), size_t())
         {
-            layer.configure_adapters(rank, method, alpha, adapt_query, adapt_value);
-            return 1;
+            layer.configure_adapters(plan);
+            return layer.adapters_active() ? 1 : 0;
         }
 
         template<typename T>
-        size_t configure_adapters_impl(T&, long, adapter_method, double, bool, bool, ...)
+        size_t configure_adapters_impl(T&, const adapter_plan&, ...)
         {
             return 0;
         }
@@ -336,13 +334,11 @@ namespace dlib
 
        A rank of zero removes the adapters and returns each layer to its original layout. */
     template <typename net_type>
-    size_t configure_network_adapters(net_type& net, long rank, adapter_method method,
-        double alpha, bool adapt_query = true, bool adapt_value = true)
+    size_t configure_network_adapters(net_type& net, const adapter_plan& plan)
     {
         size_t configured = 0;
         visit_computational_layers(net, [&](auto& layer) {
-            configured += impl::configure_adapters_impl(
-                layer, rank, method, alpha, adapt_query, adapt_value, 0);
+            configured += impl::configure_adapters_impl(layer, plan, 0);
             });
         return configured;
     }

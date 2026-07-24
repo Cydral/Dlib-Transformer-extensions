@@ -904,6 +904,55 @@ namespace dlib
                 - Returns p, since the linear layer maintains the same spatial dimensions.
         !*/
 
+        void configure_adapters(
+            const adapter_plan& plan
+        );
+        /*!
+            requires
+                - the layer is allocated, that is at least one forward has run
+            ensures
+                - Attaches a low-rank adapter to this projection when the plan covers it,
+                  that is when plan.projection is set and the output width is within
+                  plan.max_width, and removes any existing one otherwise.
+                - The adapter block closes the packed parameter blob, after the bias when
+                  there is one, so no earlier offset moves and an unadapted layer lays out
+                  exactly as it did. A plan that leaves this layer alone leaves the blob
+                  untouched, shape included.
+                - Must run once the weights are in place: DoRA initializes its magnitudes
+                  from the column norms of the base.
+                - The adapter is inert until the first optimizer step: the layer reproduces
+                  its unadapted output bit for bit.
+                - The width bound is what keeps an adapter off the output head of a
+                  language model, which projects onto the vocabulary and would cost more
+                  than every other adapter of the network combined. No layer needs to know
+                  its own role for that to work.
+        !*/
+
+        bool adapters_active(
+        ) const;
+        /*!
+            ensures
+                - Returns whether this projection carries an active adapter.
+        !*/
+
+        size_t trainable_parameter_count(
+        ) const;
+        /*!
+            ensures
+                - Returns the size of the adapter block, and zero when nothing is adapted.
+                - Under adaptation the weight and bias gradients are zeroed in backward, so
+                  they do not move even though they share a learning-rate multiplier with
+                  the adapter.
+        !*/
+
+        void merge_adapters(
+        );
+        /*!
+            ensures
+                - Folds the adapter into the weights and returns the blob to its unadapted
+                  layout.
+        !*/
+
         const tensor& get_layer_params(
         ) const;
         /*!

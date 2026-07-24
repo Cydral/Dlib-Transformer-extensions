@@ -105,6 +105,36 @@ namespace dlib
         size_t m_offset(size_t base) const { return base + a_count() + b_count(); }
     };
 
+    /* What to adapt across a network, and how.
+
+       Carried as one object rather than as a handful of arguments because the set of
+       adaptable sites grows: a layer that becomes adaptable reads the fields it
+       understands and ignores the rest, and no caller signature changes.
+
+       max_width leaves the widest projections alone. The output head of a language model
+       projects onto the vocabulary, so an adapter on it costs more than every other
+       adapter of the network combined and is rarely what a fine-tune needs; a bound
+       excludes it without any layer having to know its own role. Zero means no bound. */
+    struct adapter_plan
+    {
+        long rank = 0;
+        adapter_method method = adapter_method::none;
+        double alpha = 16.0;
+
+        bool attention_query = true;
+        bool attention_value = true;
+        bool projection = false;      // feed-forward and other plain linear projections
+        long max_width = 0;
+
+        bool active() const { return rank > 0 && method != adapter_method::none; }
+
+        // Whether a projection of the given output width is in scope.
+        bool covers(long out_dim) const
+        {
+            return active() && (max_width <= 0 || out_dim <= max_width);
+        }
+    };
+
     /* Adapter of one projection. Holds the geometry, the scale and the scratch buffers of
        the low-rank passes; the parameters themselves live in the host layer's packed blob
        and arrive as aliased views, which is what lets the trainer update them like any

@@ -224,19 +224,17 @@ namespace dlib
     template <typename net_type>
     size_t configure_network_adapters(
         net_type& net,
-        long rank,
-        adapter_method method,
-        double alpha,
-        bool adapt_query = true,
-        bool adapt_value = true
+        const adapter_plan& plan
     );
     /*!
         requires
-            - rank >= 0
             - net has been initialized, that is its parameter tensors are allocated
         ensures
-            - Configures a low-rank adapter on every layer that supports one, leaving every
-              other layer untouched, and returns how many layers were configured.
+            - Applies the plan to every layer that supports adaptation, leaving every other
+              layer untouched, and returns how many layers ended up carrying an adapter.
+            - Each layer reads the fields of the plan it understands, so the same plan can
+              cover attention projections and feed-forward ones at once, and a layer left
+              out of scope by the plan keeps its parameter blob unchanged.
             - Support is detected by expression rather than by layer type, so a layer that
               becomes adaptable joins in by declaring the same members, without any change
               here.

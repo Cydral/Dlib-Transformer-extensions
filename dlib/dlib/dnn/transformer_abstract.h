@@ -404,6 +404,21 @@ namespace dlib
                   the same layout.
         !*/
 
+        void configure_adapters(
+            const adapter_plan& plan
+        );
+        /*!
+            requires
+                - the layer is allocated, that is at least one forward has run
+            ensures
+                - Plan-driven form of the call above, and the one a network-wide visitor
+                  uses: the query and value projections are adapted when the plan asks for
+                  them and their widths are within its bound.
+                - The plan carries fields for sites this layer does not adapt yet; it reads
+                  the ones it understands and leaves the rest, so extending the layer later
+                  changes nothing at the call sites.
+        !*/
+
         bool adapters_active() const;
         /*!
             ensures

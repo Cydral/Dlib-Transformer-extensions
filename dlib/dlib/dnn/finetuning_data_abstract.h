@@ -117,6 +117,33 @@ namespace dlib
         ensures
             - Returns the length statistics of the given examples, with every field zero
               when the set is empty.
+            - #sorted_totals holds every total length in ascending order, so an arbitrary
+              coverage can be asked for after the fact through quantile() and
+              coverage_at().
+    !*/
+
+    long suggest_window_length(
+        const length_profile& profile,
+        double coverage = 0.95,
+        long granularity = 64,
+        long max_window = 0
+    );
+    /*!
+        requires
+            - granularity > 0
+        ensures
+            - Returns the shortest window keeping the requested fraction of the examples
+              whole, rounded up to a multiple of granularity, capped at max_window when
+              that is non-zero, and never below granularity.
+            - The window length is a property of the fine-tuning data, not of the model:
+              nothing in the architecture ties them, rotary positions extend to any length
+              and the KV cache is sized at inference. Training on short windows and serving
+              on long ones is normal, and it is what keeps a stage affordable, since
+              attention cost grows with the square of the window while almost every example
+              may sit far below the model's capacity.
+            - Coverage is a deliberate trade: pushing it to one lets a handful of outliers
+              set the cost of every batch, which is why the default stops short and leaves
+              the remainder to the overflow policy of the dataset builder.
     !*/
 }
 
