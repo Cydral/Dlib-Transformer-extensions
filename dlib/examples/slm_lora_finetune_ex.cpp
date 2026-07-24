@@ -93,6 +93,7 @@ struct stage_settings
     long   batch_size = 4;
     double learning_rate = 2e-5;
     double min_learning_rate = 1e-6;
+    long   valid_batch = 1;       // validation runs one window at a time by default
     long   patience = 0;          // 0 lets the trainer derive one from the set size
     long   limit = 0;             // 0 keeps the whole set
     double weight_decay = 0.0;    // decoupled, and off by default on adapters
@@ -110,12 +111,22 @@ using adapter_settings = adapter_plan;
 /* Positions processed per epoch, which is what an epoch actually costs: the transformer
    spends the same work on a padded position as on a scored one. Printing it lets a run be
    budgeted from a timed subset instead of being discovered. */
-static void report_cost(size_t windows, const stage_settings& st)
+static void report_cost(size_t windows, const stage_settings& st, size_t parameters)
 {
     const double positions = static_cast<double>(windows) * st.window;
     cout << "  cost        : " << static_cast<long long>(positions)
          << " positions per epoch, " << (windows / std::max<long>(1, st.batch_size))
          << " steps\n";
+
+    /* The steady state is what decides whether a run survives, and it is set by the whole
+       parameter blob rather than by the trainable share: the trainer allocates a gradient
+       for every layer, and the optimizer two moments for every layer it may move. Printed
+       because the failure it causes is a process kill with no message of its own. */
+    const double gb = 4.0 / 1e9;
+    cout << "  memory      : about "
+         << static_cast<long>(parameters * gb + 0.5) << " GB of weights, as much again in\n"
+         << "                gradients, and two optimizer moments on the adapted layers,\n"
+         << "                before activations. Lower --window or --batch-size first.\n";
 }
 
 static void report_adapters(train_net& net, const adapter_settings& ad)
@@ -206,11 +217,12 @@ static void run_training(train_net& net,
                for a handful of windows, on top of the weights, their gradients and the two
                optimizer moments. Chunking keeps the peak at the size of a training step. */
             train_net& current = trainer.get_net(force_flush_to_disk::no);
+            const size_t vbatch = static_cast<size_t>(std::max<long>(1, st.valid_batch));
             double total = 0.0;
             size_t counted = 0;
-            for (size_t i = 0; i < VX.size(); i += batch)
+            for (size_t i = 0; i < VX.size(); i += vbatch)
             {
-                const size_t upto = std::min(i + batch, VX.size());
+                const size_t upto = std::min(i + vbatch, VX.size());
                 total += current.compute_loss(VX.begin() + i, VX.begin() + upto,
                     VY.begin() + i) * static_cast<double>(upto - i);
                 counted += upto - i;
@@ -263,7 +275,7 @@ static bool stage_knowledge(train_net& net, const hf_tokenizer& tok,
     cout << "  window      : " << st.window << "\n" << indent(rep.describe()) << "\n";
     if (X.empty()) { cerr << "  no window could be built\n"; return false; }
 
-    report_cost(X.size(), st);
+    report_cost(X.size(), st, count_trainable_parameters(net).total);
     report_adapters(net, ad);
     if (st.dry_run) { cout << "  dry run, no training\n"; return true; }
 
@@ -353,7 +365,7 @@ static bool stage_task(train_net& net, const hf_tokenizer& tok,
         cout << "  validation  : " << VX.size() << " windows, held out from the training set\n";
     }
 
-    report_cost(X.size(), st);
+    report_cost(X.size(), st, count_trainable_parameters(net).total);
     report_adapters(net, ad);
     if (st.dry_run) { cout << "  dry run, no training\n"; return true; }
 
@@ -396,6 +408,7 @@ int main(int argc, char** argv)
         parser.add_option("beta2", "AdamW second moment decay (default: 0.999)", 1);
         parser.add_option("shrink", "Factor the learning rate is multiplied by on a plateau (default: 0.1)", 1);
         parser.add_option("valid-fraction", "Fraction held out for validation when --valid is absent (default: 0.05)", 1);
+        parser.add_option("valid-batch", "Windows per validation forward; 1 keeps the peak lowest (default: 1)", 1);
         parser.add_option("sync", "Trainer synchronization file, for resuming an interrupted stage", 1);
         parser.add_option("keep-adapters", "Write the model with its adapters unmerged");
         parser.add_option("dry-run", "Build the datasets and report, without training");
@@ -456,6 +469,7 @@ int main(int argc, char** argv)
         st.beta2 = number("beta2", 0.999);
         st.shrink = number("shrink", 0.1);
         st.valid_fraction = number("valid-fraction", 0.05);
+        st.valid_batch = static_cast<long>(number("valid-batch", 1));
         st.dry_run = parser.option("dry-run");
 
         const std::string in_path = parser.option("load").argument();
