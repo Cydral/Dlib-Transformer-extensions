@@ -47,6 +47,25 @@ namespace dlib
         static const char* image_boundary()     { return "<fake_token_around_image>"; }
         static const char* global_image()       { return "<global-img>"; }
         static const char* image_placeholder()  { return "<image>"; }
+
+        /* The run of markers standing for one whole-image view: a boundary, the view
+           marker, one placeholder per position the tower will produce, and a closing
+           boundary.
+
+           The count comes from the model's preprocessing rather than from the container,
+           and the wrapping is what the processor emits: verified against it rather than
+           guessed. Splitting an image into crops, which that preprocessing does by
+           default, repeats the same block per crop with a row and column marker in place
+           of the whole-image one and closes the whole run once; a single view is the
+           simple case and the only one this library encodes so far. */
+        static std::string image_block(long positions)
+        {
+            std::string s = image_boundary();
+            s += global_image();
+            for (long i = 0; i < positions; ++i) s += image_placeholder();
+            s += image_boundary();
+            return s;
+        }
     };
 
     class chat_template_formatter

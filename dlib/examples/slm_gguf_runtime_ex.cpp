@@ -422,7 +422,7 @@ int main(int argc, char** argv)
         parser.add_option("probe-ids", "Feed explicit token ids (space or comma separated)", 1);
         parser.add_option("show-tokens", "Tokenize the given text, print the ids and the pieces, then exit", 1);
         parser.add_option("mmproj", "Read a multimodal projector container, report its geometry, then exit", 1);
-        parser.add_option("image", "With --mmproj, encode this image file and report the visual embeddings", 1);
+        parser.add_option("image", "Image file: reported alone with --mmproj, described when --input is also given", 1);
         parser.add_option("with-bos", "Prepend the tokenizer's BOS in --show-tokens");
         parser.add_option("probe-step", "Self-consistency check: last-position logits of a full prefill versus prefill(N-1) + step(last)");
         parser.add_option("prompt", "Prompt for --probe-logits (default: capital of France)", 1);
@@ -445,7 +445,10 @@ int main(int argc, char** argv)
            that matter (the patch grid, the reduction factor and the width of the projector)
            have to agree with each other, and a container where they do not is one this
            pipeline cannot serve. */
-        if (parser.option("mmproj"))
+        /* Reported on its own. When a model and an image are supplied as well, the run
+           is a description rather than an inspection and is handled further down, once
+           the decoder is loaded. */
+        if (parser.option("mmproj") && !(parser.option("input") && parser.option("image")))
         {
             const string path = parser.option("mmproj").argument();
             cout << "Reading projector: " << path << "\n";
@@ -744,6 +747,101 @@ int main(int argc, char** argv)
                 std::vector<int> one{ id };
                 cout << "  " << id << "  '" << tok.decode(one, false) << "'\n";
             }
+            return 0;
+        }
+
+        /* Description of an image, end to end. The prompt reserves one position per
+           vector the tower will produce, the tower produces them, and the engine takes
+           those positions from the vectors instead of from the token table. Nothing else
+           in the stack knows an image went through. */
+        if (parser.option("mmproj") && parser.option("image"))
+        {
+            gguf_reader gv(parser.option("mmproj").argument());
+            const vision_spec vs = detect_vision(gv);
+            const vision_compat_result vrep = check_vision_compatibility(vs, gv);
+            for (const string& b : vrep.blockers) cerr << "blocker: " << b << "\n";
+            if (!vrep.usable()) return 1;
+            if (vs.projection_dim != rt.spec().d_model)
+            {
+                cerr << "The projector emits " << vs.projection_dim
+                     << "-wide vectors and this decoder expects " << rt.spec().d_model
+                     << ": the two files do not belong to the same model.\n";
+                return 1;
+            }
+
+            runtime_vision_encoder enc;
+            cout << "Loading the vision tower...\n";
+            enc.load(gv, vs);
+
+            matrix<rgb_pixel> img;
+            load_image(img, parser.option("image").argument());
+            resizable_tensor prepared;
+            enc.prepare_image(img, prepared);
+            const tensor& visual = enc.encode(prepared);
+            report_tensor("visual embeddings", visual);
+
+            chat_template_formatter fmt = parser.option("template")
+                ? chat_template_formatter::for_tokenizer(tok,
+                    chat_template_formatter::from_name(parser.option("template").argument()))
+                : chat_template_formatter::for_tokenizer(tok, rt.spec().model_name);
+            cout << "Chat template      : " << chat_template_formatter::name(fmt.kind()) << "\n";
+            if (fmt.kind() != chat_template_kind::idefics3)
+                cout << "note: this template has no image markers; the description will "
+                        "likely be poor\n";
+
+            const string question = parser.option("prompt")
+                ? parser.option("prompt").argument()
+                : string("What is in this image?");
+            const string turn = fmt.first_turn(
+                parser.option("system") ? parser.option("system").argument() : string(),
+                idefics3_markers::image_block(vs.tokens_per_image()) + question);
+
+            std::vector<int> ids = tok.encode(turn, fmt.add_bos_on_first_turn(),
+                false, true, false);
+
+            /* The reserved positions are found by scanning for the placeholder rather
+               than by counting characters: the tokenizer decides where they land, and a
+               single token of drift would put the image on the wrong words. */
+            const std::vector<int> mark = tok.encode(
+                idefics3_markers::image_placeholder(), false, false, true, false);
+            if (mark.size() != 1)
+            { cerr << "the image placeholder is not a single token of this vocabulary\n"; return 1; }
+            std::vector<long> positions;
+            for (size_t i = 0; i < ids.size(); ++i)
+                if (ids[i] == mark[0]) positions.push_back(static_cast<long>(i));
+            cout << "Prompt             : " << ids.size() << " tokens, "
+                 << positions.size() << " reserved for the image\n";
+            if (static_cast<long>(positions.size()) != vs.tokens_per_image())
+            { cerr << "the reserved positions do not match what the tower produces\n"; return 1; }
+            if (parser.option("trace-prompt"))
+                cout << "---- prompt ----\n" << tok.decode(ids, false) << "\n---------------\n";
+
+            rt.set_context(ctx, static_cast<long>(ids.size()));
+            rt.set_input_embeddings(visual, positions);
+
+            token_sampler sampler;
+            sampling_params sp;
+            sp.temperature = parser.option("temp")
+                ? std::stod(parser.option("temp").argument()) : fmt.default_temperature();
+            sp.top_k = fmt.default_top_k();
+            sp.top_p = fmt.default_top_p();
+            sp.min_p = fmt.default_min_p();
+            sp.repeat_penalty = fmt.default_repeat_penalty();
+            sp.greedy = parser.option("deterministic") || sp.temperature <= 0.0;
+
+            std::vector<int> recent;
+            generation_options gopt;
+            gopt.max_new_tokens = max_new;
+            std::string shown;
+            gopt.on_token = [&](const generation_event& ev) {
+                if (!ev.clean_delta.empty())
+                { cout << ev.clean_delta << std::flush; shown += ev.clean_delta; }
+            };
+            cout << "\nModel: " << std::flush;
+            const generation_result res = generate_reply(rt, tok, fmt,
+                rt.forward_prefill(ids), sampler, sp, recent, gopt);
+            if (res.text.size() > shown.size()) cout << res.text.substr(shown.size());
+            cout << "\n";
             return 0;
         }
 
