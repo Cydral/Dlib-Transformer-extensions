@@ -27,8 +27,12 @@
 
     The corpora come from the two preparation programs of this series:
 
-      nist_corpus_prepare.py  ->  the plain document corpus read by --corpus
-      cve_qa_prepare.py       ->  the question-and-answer records read by --dataset
+      slm_tools/nist_corpus_prepare.py  ->  the corpus read by --corpus
+      slm_tools/cve_qa_prepare.py       ->  the records read by --dataset
+
+    slm_tools/slm_lora_finetune.py is the Python counterpart of this program, reading the
+    same corpora with the same masking and the same adapter geometry, so that a result
+    obtained here can be checked against the reference ecosystem rather than trusted.
 
     Both write the sentinel-separated format that language_model_data.h reads, and neither
     applies a conversation template: that is done here, with the model's own formatter, so
@@ -181,6 +185,10 @@ static void run_training(train_net& net,
        from the context rather than from the solver. */
     network_context::reset();
     network_context::set_optimizer_params(st.weight_decay, st.beta1, st.beta2);
+    /* Set once, not per step. The layers only read this to answer is_training(), and the
+       trainer runs its steps on a background thread: touching the shared context inside
+       the step loop takes its mutex on every mini-batch and serializes the pipeline for
+       nothing. */
     network_context::set_learning_rate(st.learning_rate);
 
     /* Explicit epochs over shuffled mini-batches rather than trainer.train(), which runs
@@ -196,7 +204,6 @@ static void run_training(train_net& net,
         for (size_t i = 0; i + batch <= X.size(); i += batch)
         {
             trainer.train_one_step(X.begin() + i, X.begin() + i + batch, Y.begin() + i);
-            network_context::set_learning_rate(trainer.get_learning_rate());
             if (trainer.get_learning_rate() < trainer.get_min_learning_rate()) break;
         }
         const double train_loss = trainer.get_average_loss();
@@ -420,7 +427,7 @@ int main(int argc, char** argv)
             cout << "Parameter-efficient fine-tuning of an imported model.\n\n"
                  << "Supply --corpus for the knowledge-alignment stage, --dataset for the\n"
                  << "task-alignment stage, or both to chain them. Corpora are produced by\n"
-                 << "nist_corpus_prepare.py and cve_qa_prepare.py.\n\n";
+                 << "slm_tools/nist_corpus_prepare.py and slm_tools/cve_qa_prepare.py.\n\n";
             parser.print_options();
             return parser.option("h") ? 0 : 1;
         }

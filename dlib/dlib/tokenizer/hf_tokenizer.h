@@ -506,17 +506,39 @@ namespace dlib
         {
             return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
         }
-        static int classify(uint32_t c)
+        static bool is_nl(uint32_t c) { return c == '\n' || c == '\r'; }
+        static bool is_num(uint32_t c) { return c >= '0' && c <= '9'; }
+        /* Approximation of \p{L}: exact for ASCII, and every non-ASCII codepoint is taken
+           for a letter. Enough for Latin scripts, and wrong for CJK punctuation, emoji and
+           symbols, which a proper implementation would separate. Correcting it needs
+           Unicode category tables. */
+        static bool is_alpha(uint32_t c)
         {
-            if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')) return 0;   // letter
-            if (c >= '0' && c <= '9') return 1;                              // digit
-            if (c >= 128) return 0;                                         // non-ASCII -> letter (approx)
-            return 2;                                                       // other
+            if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')) return true;
+            return c >= 128;
         }
+        static uint32_t ascii_lower(uint32_t c) { return (c >= 'A' && c <= 'Z') ? c + 32 : c; }
 
-        /* Approximate GPT-2 pre-tokenizer. Exact for ASCII; non-ASCII codepoints are
-           treated as letters. Exact parity for a specific model needs that model's
-           pre-tokenizer regex (see pretokenizer()). */
+        /* Pre-tokenizer of the GPT-4 family, which Qwen and the other byte-level BPE
+           models of this catalogue use. It is an ordered alternation and the order is the
+           whole point: each rule is tried at the current position and the first that
+           matches consumes its piece.
+
+               (?i:'s|'t|'re|'ve|'m|'ll|'d)
+               [^\r\n\p{L}\p{N}]?\p{L}+          one optional lead char, then letters
+               \p{N}                              one digit at a time
+                ?[^\s\p{L}\p{N}]+[\r\n]*         punctuation, with its trailing newlines
+               \s*[\r\n]+                        a blank run ending on a newline
+               \s+(?!\S)                         a blank run, minus the last one
+               \s+
+
+           The second rule is what attaches a leading space to the word that follows, which
+           is where nearly every merge of a byte-level vocabulary begins: " Vulnerability"
+           is two tokens, "Vulnerability" alone is three. A run of punctuation must
+           therefore stop before that space rather than swallow it, and consecutive
+           newlines must form one piece of their own; getting either wrong inflates a
+           markdown corpus by more than a tenth while leaving plain prose untouched, which
+           is what makes it hard to notice. */
         std::vector<std::string> pretokenize(const std::string& text) const
         {
             struct cp_info { uint32_t cp; size_t off; };
@@ -536,6 +558,7 @@ namespace dlib
                 const size_t be = (b < n) ? cps[b].off : text.size();
                 return text.substr(bs, be - bs);
             };
+            auto at = [&](size_t i) -> uint32_t { return i < n ? cps[i].cp : 0; };
 
             std::vector<std::string> words;
             size_t i = 0;
@@ -543,20 +566,47 @@ namespace dlib
             {
                 const uint32_t c = cps[i].cp;
 
-                if (c == '\'' && i + 1 < n)   // contractions
+                if (c == '\'' && i + 1 < n)                       // contractions
                 {
-                    const uint32_t c1 = cps[i + 1].cp;
-                    if (c1 == 's' || c1 == 't' || c1 == 'm' || c1 == 'd')
+                    const uint32_t a = ascii_lower(at(i + 1));
+                    if (a == 's' || a == 't' || a == 'm' || a == 'd')
                     {
                         words.push_back(slice(i, i + 2)); i += 2; continue;
                     }
                     if (i + 2 < n)
                     {
-                        const uint32_t c2 = cps[i + 2].cp;
-                        if ((c1 == 'r' && c2 == 'e') || (c1 == 'v' && c2 == 'e') || (c1 == 'l' && c2 == 'l'))
+                        const uint32_t b = ascii_lower(at(i + 2));
+                        if ((a == 'r' && b == 'e') || (a == 'v' && b == 'e') ||
+                            (a == 'l' && b == 'l'))
                         {
                             words.push_back(slice(i, i + 3)); i += 3; continue;
                         }
+                    }
+                }
+
+                {                                                // optional lead + letters
+                    size_t start = n + 1;
+                    if (is_alpha(c)) start = i;
+                    else if (!is_nl(c) && !is_num(c) && is_alpha(at(i + 1))) start = i + 1;
+                    if (start <= n)
+                    {
+                        size_t k = start;
+                        while (k < n && is_alpha(cps[k].cp)) ++k;
+                        if (k > start) { words.push_back(slice(i, k)); i = k; continue; }
+                    }
+                }
+
+                if (is_num(c)) { words.push_back(slice(i, i + 1)); ++i; continue; }
+
+                {                                                // punctuation run
+                    const size_t start = (c == ' ') ? i + 1 : i;
+                    size_t k = start;
+                    while (k < n && !is_ws(cps[k].cp) && !is_alpha(cps[k].cp) && !is_num(cps[k].cp))
+                        ++k;
+                    if (k > start)
+                    {
+                        while (k < n && is_nl(cps[k].cp)) ++k;
+                        words.push_back(slice(i, k)); i = k; continue;
                     }
                 }
 
@@ -564,27 +614,20 @@ namespace dlib
                 {
                     size_t j = i;
                     while (j < n && is_ws(cps[j].cp)) ++j;
-                    const bool next_word = (j < n) && !is_ws(cps[j].cp);
-                    if (next_word)
-                    {
-                        if (j - 1 > i) words.push_back(slice(i, j - 1));
-                        const size_t start = j - 1;
-                        const int cl = classify(cps[j].cp);
-                        size_t k = j;
-                        while (k < n && classify(cps[k].cp) == cl) ++k;
-                        words.push_back(slice(start, k));
-                        i = k;
-                    }
-                    else { words.push_back(slice(i, j)); i = j; }
+
+                    /* A blank run ending on a newline is one piece, up to the last one it
+                       contains: that is what makes a paragraph break a single token rather
+                       than two. */
+                    size_t last_nl = n + 1;
+                    for (size_t k = i; k < j; ++k) if (is_nl(cps[k].cp)) last_nl = k;
+                    if (last_nl <= n) { words.push_back(slice(i, last_nl + 1)); i = last_nl + 1; continue; }
+
+                    // Otherwise the last blank is left for the word that follows.
+                    if (j < n && j - 1 > i) { words.push_back(slice(i, j - 1)); i = j - 1; continue; }
+                    words.push_back(slice(i, j)); i = j; continue;
                 }
-                else
-                {
-                    const int cl = classify(c);
-                    size_t k = i;
-                    while (k < n && classify(cps[k].cp) == cl) ++k;
-                    words.push_back(slice(i, k));
-                    i = k;
-                }
+
+                words.push_back(slice(i, i + 1)); ++i;   // unreachable in practice
             }
             return words;
         }

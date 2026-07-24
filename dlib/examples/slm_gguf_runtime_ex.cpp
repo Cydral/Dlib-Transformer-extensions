@@ -15,6 +15,7 @@
     Usage:
       slm_gguf_runtime_ex --input model.gguf --probe-logits --prompt "The capital of France is"
       slm_gguf_runtime_ex --input model.gguf --probe-ids "1 450 7483 310 3444 338"
+      slm_gguf_runtime_ex --input model.gguf --show-tokens "## CVE-2010-3763 Details"
       slm_gguf_runtime_ex --input model.gguf --save-dat model.dat
       slm_gguf_runtime_ex --input model.dat --chat
       slm_gguf_runtime_ex --input a.gguf,b.gguf --serve 5000
@@ -390,6 +391,8 @@ int main(int argc, char** argv)
         parser.add_option("save-dat", "After loading a GGUF, write a self-contained runtime archive (model + tokenizer)", 1);
         parser.add_option("probe-logits", "Run a prefill and report the logits");
         parser.add_option("probe-ids", "Feed explicit token ids (space or comma separated)", 1);
+        parser.add_option("show-tokens", "Tokenize the given text, print the ids and the pieces, then exit", 1);
+        parser.add_option("with-bos", "Prepend the tokenizer's BOS in --show-tokens");
         parser.add_option("probe-step", "Self-consistency check: last-position logits of a full prefill versus prefill(N-1) + step(last)");
         parser.add_option("prompt", "Prompt for --probe-logits (default: capital of France)", 1);
         parser.add_option("rope-permute", "Map split-half (NeoX) Q/K layouts to the interleaved kernel");
@@ -606,6 +609,29 @@ int main(int argc, char** argv)
             cout << "\nShutting down (waiting for in-flight requests)...\n";
             srv.clear();   // shuts connections, waits for handlers, releases the port
             cout << "Server stopped.\n";
+            return 0;
+        }
+
+        /* Tokenization of a plain string, printed id by id with the piece each one
+           stands for. There is no logits pass here: the point is to put our tokenizer
+           side by side with an independent one on the exact same text. A model is
+           pretrained on one segmentation, and feeding it another costs quality before any
+           question of speed, so this is the first thing to check on a new corpus rather
+           than the last. slm_tools/slm_reference_chat.py --show-tokens is the counterpart
+           to compare against. */
+        if (parser.option("show-tokens"))
+        {
+            const string text = parser.option("show-tokens").argument();
+            const std::vector<int> ids =
+                tok.encode(text, parser.option("with-bos"), false, true, false);
+            cout << ids.size() << " tokens:";
+            for (int id : ids) cout << ' ' << id;
+            cout << "\n";
+            for (int id : ids)
+            {
+                std::vector<int> one{ id };
+                cout << "  " << id << "  '" << tok.decode(one, false) << "'\n";
+            }
             return 0;
         }
 
