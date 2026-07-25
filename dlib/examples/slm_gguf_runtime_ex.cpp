@@ -49,6 +49,7 @@
 #include <dlib/dnn.h>
 #include <dlib/data_io.h>
 #include <dlib/image_io.h>
+#include <dlib/base64.h>
 #include <dlib/image_transforms.h>
 #include <dlib/tokenizer/hf_tokenizer.h>
 #include <dlib/tokenizer/chat_template.h>
@@ -259,7 +260,82 @@ struct served_model
     runtime_transformer* rt;
     hf_tokenizer* tok;
     chat_template_formatter fmt;
+    /* Null on a text-only model. Owned elsewhere, like the engine and the tokenizer. */
+    runtime_vision_encoder* vision = nullptr;
+    long visual_tokens = 0;
 };
+
+/* Decodes one data URL into an image.
+
+   The interface sends attachments inline rather than by reference, so an image arrives
+   base64-encoded inside the JSON, twice removed from a picture: once by the transport
+   encoding and once by the file format. Both are undone here.
+
+   Only data URLs are handled. Fetching an http URL would make the server a client of
+   whatever address a request names, which is not a capability a chat endpoint should
+   acquire by accident. */
+static bool decode_data_url(const std::string& url, matrix<rgb_pixel>& img, std::string& why)
+{
+    if (url.compare(0, 5, "data:") != 0)
+    { why = "only inline images are accepted, not remote URLs"; return false; }
+    const size_t comma = url.find(',');
+    if (comma == std::string::npos)
+    { why = "the data URL carries no payload"; return false; }
+    const std::string head = url.substr(0, comma);
+    if (head.find(";base64") == std::string::npos)
+    { why = "the data URL is not base64-encoded"; return false; }
+
+    std::string bytes;
+    try
+    {
+        std::istringstream in(url.substr(comma + 1));
+        std::ostringstream out;
+        dlib::base64().decode(in, out);
+        bytes = out.str();
+    }
+    catch (const std::exception& e) { why = std::string("base64: ") + e.what(); return false; }
+    if (bytes.size() < 8) { why = "the decoded attachment is too short to be an image"; return false; }
+
+    /* The declared media type is a hint from the browser; the magic bytes are what the
+       file actually is. Trusting the first over the second turns a mislabelled upload
+       into an exception rather than a picture. */
+    const unsigned char* p = reinterpret_cast<const unsigned char*>(bytes.data());
+    try
+    {
+        if (p[0] == 0xFF && p[1] == 0xD8)
+        {
+#ifdef DLIB_JPEG_SUPPORT
+            load_jpeg(img, bytes.data(), bytes.size());
+            return true;
+#else
+            why = "this build has no JPEG support; rebuild dlib against libjpeg";
+            return false;
+#endif
+        }
+        if (p[0] == 0x89 && p[1] == 'P' && p[2] == 'N' && p[3] == 'G')
+        {
+#ifdef DLIB_PNG_SUPPORT
+            load_png(img, bytes.data(), bytes.size());
+            return true;
+#else
+            why = "this build has no PNG support; rebuild dlib against libpng";
+            return false;
+#endif
+        }
+        if (p[0] == 'B' && p[1] == 'M')
+        {
+            /* No memory loader for this one, so it goes through a temporary file. Rare
+               enough from a browser not to be worth more. */
+            const std::string path = "/tmp/dlib_chat_upload.bmp";
+            { std::ofstream f(path, std::ios::binary); f.write(bytes.data(), bytes.size()); }
+            load_image(img, path);
+            return true;
+        }
+    }
+    catch (const std::exception& e) { why = std::string("decode: ") + e.what(); return false; }
+    why = "the attachment is not a JPEG, a PNG or a BMP";
+    return false;
+}
 
 /* OpenAI-compatible service over the runtime engine. Each request carries the whole
    conversation, replayed into the token stream the interactive loop would have produced
@@ -321,6 +397,8 @@ private:
            message opens a turn, an assistant message closes the turn before it. */
         std::string sys;
         std::vector<dlib::chat_turn> turns;
+        resizable_tensor visual;
+        bool has_image = false;
         for (const dlib::chat_message& m : req.messages)
         {
             if (m.role == "system")
@@ -332,7 +410,38 @@ private:
             {
                 std::string text = m.content;
                 for (size_t k = 0; k < m.image_urls.size(); ++k)
-                    text += "\n[attached image: not visible to this text-only model]";
+                {
+                    if (!use.vision)
+                    {
+                        text += "\n[attached image: not visible to this text-only model]";
+                        continue;
+                    }
+                    /* Only the last user message may carry images: the engine holds one
+                       set of embeddings for one prefill, and an earlier turn's picture
+                       would have to be re-encoded and re-placed for every follow-up. A
+                       stateless service can say so rather than pretend. */
+                    if (&m != &req.messages.back())
+                    {
+                        text += "\n[image from an earlier turn: not carried over]";
+                        continue;
+                    }
+                    matrix<rgb_pixel> img;
+                    std::string why;
+                    if (!decode_data_url(m.image_urls[k], img, why))
+                    {
+                        text += "\n[attached image ignored: " + why + "]";
+                        continue;
+                    }
+                    resizable_tensor prepared;
+                    use.vision->prepare_image(img, prepared);
+                    const tensor& v = use.vision->encode(prepared);
+                    visual.set_size(v.num_samples(), v.k());
+                    memcpy(visual, v);
+                    /* The block goes ahead of the text, which is the order the reference
+                       template renders and the one the model was trained on. */
+                    text = idefics3_markers::image_block(use.visual_tokens) + text;
+                    has_image = true;
+                }
                 turns.push_back(dlib::chat_turn{ text, std::string() });
             }
             else if (m.role == "assistant" && !turns.empty())
@@ -357,6 +466,23 @@ private:
            mid-answer must drop the same rows on both paths. set_context() reallocates
            only when the geometry changes, so the per-request cost is the cache reset. */
         rt.set_context(ctx_, system_keep_length(tok, fmt, sys));
+
+        /* Reserved positions are located by scanning for the placeholder rather than by
+           counting characters: the tokenizer decides where they land, and a single token
+           of drift would put the image on the wrong words. */
+        if (has_image)
+        {
+            const std::vector<int> mark = tok.encode(
+                idefics3_markers::image_placeholder(), false, false, true, false);
+            std::vector<long> positions;
+            if (mark.size() == 1)
+                for (size_t i = 0; i < ids.size(); ++i)
+                    if (ids[i] == mark[0]) positions.push_back(static_cast<long>(i));
+            if (static_cast<long>(positions.size()) != visual.num_samples())
+                throw std::runtime_error("the reserved image positions do not match what "
+                    "the vision tower produced");
+            rt.set_input_embeddings(visual, positions);
+        }
 
         std::vector<int> recent;
         std::string streamed;
@@ -423,6 +549,7 @@ int main(int argc, char** argv)
         parser.add_option("show-tokens", "Tokenize the given text, print the ids and the pieces, then exit", 1);
         parser.add_option("mmproj", "Read a multimodal projector container, report its geometry, then exit", 1);
         parser.add_option("image", "Image file: reported alone with --mmproj, described when --input is also given", 1);
+        parser.add_option("vision", "Projector container enabling image attachments in --serve mode", 1);
         parser.add_option("with-bos", "Prepend the tokenizer's BOS in --show-tokens");
         parser.add_option("probe-step", "Self-consistency check: last-position logits of a full prefill versus prefill(N-1) + step(last)");
         parser.add_option("prompt", "Prompt for --probe-logits (default: capital of France)", 1);
@@ -664,7 +791,34 @@ int main(int argc, char** argv)
                 stem = clean_model_name(stem);
                 return stem.empty() ? clean_model_name(r.spec().model_name) : stem;
             };
-            models.push_back(served_model{ label(rt, input), &rt, &tok, fmt });
+            /* One vision tower, attached to the first model. Serving several multimodal
+               models at once would need one tower each, which the loop below could do;
+               the single case is the one this example covers. */
+            std::unique_ptr<runtime_vision_encoder> vision;
+            long visual_tokens = 0;
+            if (parser.option("vision"))
+            {
+                gguf_reader gv(parser.option("vision").argument());
+                const vision_spec vs = detect_vision(gv);
+                const vision_compat_result vrep = check_vision_compatibility(vs, gv);
+                for (const string& b : vrep.blockers) cerr << "blocker: " << b << "\n";
+                if (!vrep.usable()) return 1;
+                if (vs.projection_dim != rt.spec().d_model)
+                {
+                    cerr << "The projector emits " << vs.projection_dim
+                         << "-wide vectors and this decoder expects " << rt.spec().d_model
+                         << ": the two files do not belong to the same model.\n";
+                    return 1;
+                }
+                cout << "Loading the vision tower (" << vs.tokens_per_image()
+                     << " positions per image)...\n";
+                vision.reset(new runtime_vision_encoder());
+                vision->load(gv, vs);
+                visual_tokens = vs.tokens_per_image();
+            }
+
+            models.push_back(served_model{ label(rt, input), &rt, &tok, fmt,
+                vision.get(), visual_tokens });
             for (size_t i = 1; i < inputs.size(); ++i)
             {
                 extra_rt.emplace_back(new runtime_transformer());
