@@ -1626,6 +1626,17 @@ namespace dlib
 
         double get_eps() const { return eps; }
 
+        /* Sets the numerical-stability epsilon, as rms_norm_ already allows. Imported
+           open-weight models carry their own value, 1e-6 for the CLIP-family vision towers
+           against a 1e-5 default here, and the difference is large enough to drift a deep
+           stack quietly. The loader pushes the container's value in before the weights are
+           copied.  */
+        void set_eps(double val)
+        {
+            DLIB_CASSERT(val > 0, "layer_norm epsilon must be positive");
+            eps = val;
+        }
+
         double get_learning_rate_multiplier () const  { return learning_rate_multiplier; }
         double get_weight_decay_multiplier () const   { return weight_decay_multiplier; }
         void set_learning_rate_multiplier(double val) { learning_rate_multiplier = val; }
