@@ -114,6 +114,78 @@ namespace dlib
 
     // ----------------------------------------------------------------------------------------
 
+
+// ----------------------------------------------------------------------------------------
+
+    template <
+        long vocab_size, long num_layers, long num_heads, long num_kv_heads,
+        long embedding_dim, long ffn_num, long ffn_den,
+        long image_size, long patch_size, long vision_width, long vision_layers,
+        long vision_heads, long vision_ffn, long shuffle_factor,
+        long head_dim = embedding_dim / num_heads,
+        bool use_qk_norm = false
+        >
+    struct multimodal_transformer_config
+    {
+        /*!
+            WHAT THIS OBJECT REPRESENTS
+                A decoder and a vision tower as one parameterizable model.
+
+                This exists so that the composition is named once, here, rather than
+                assembled by hand wherever a multimodal model is declared. It also makes
+                one class of mistake impossible to express: the projector width is not a
+                parameter, it is embedding_dim, since a tower whose vectors do not have the
+                width of the decoder they feed is not a model but two files that happen to
+                sit in the same directory.
+
+                network_type<is_training> is the decoder's network type with one layer
+                added above the embeddings: the fusion layer holding the tower. An image
+                enters through network_context's vision slot, as prepared pixels rather
+                than as vectors, and the tower runs inside the graph, which is what lets a
+                gradient reach it.
+
+                The two halves remain usable apart. vision_transformer_config is a backbone
+                in its own right, with its own pooling and heads for classification, metric
+                learning or a self-supervised objective; decoder_transformer_config left to
+                its default policy is the text-only model it always was, with the same
+                network type and the same archives. This struct is their composition, not
+                their home.
+
+                VISUAL_TOKENS gives the number of positions a prompt must reserve for one
+                image, which is what the placeholder token stands in for.
+        !*/
+
+        static constexpr long VOCAB_SIZE    = vocab_size;
+        static constexpr long NUM_LAYERS    = num_layers;
+        static constexpr long NUM_HEADS     = num_heads;
+        static constexpr long NUM_KV_HEADS  = num_kv_heads;
+        static constexpr long EMBEDDING_DIM = embedding_dim;
+        static constexpr long HEAD_DIM      = head_dim;
+        static constexpr long FFN_HIDDEN    = embedding_dim * ffn_num / ffn_den;
+        static constexpr long VISUAL_TOKENS = /*!see below!*/;
+
+        using vision_tower = vision_transformer_config<image_size, patch_size, vision_width,
+            vision_layers, vision_heads, vision_ffn, shuffle_factor, embedding_dim>;
+
+        template <typename SUBNET>
+        using vision_modality = /*!see the implementation header!*/;
+
+        using text   = /*!see the implementation header!*/;
+        using subnet = /*!see the implementation header!*/;
+
+        template <bool is_training>
+        using network_type = /*!see the implementation header!*/;
+
+        struct model_info
+        {
+            static std::string describe();
+            /*!
+                ensures
+                    - Returns a human readable summary of both halves.
+            !*/
+        };
+    };
+
 }
 
 #endif // DLIB_DECODER_TRANSFORMER_CONFIG_ABSTRACT_H_

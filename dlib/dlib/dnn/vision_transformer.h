@@ -365,6 +365,107 @@ namespace dlib
 
 // ----------------------------------------------------------------------------------------
 
+    /* Mean over the tokens of each image: [images*TOKENS, width, 1, 1] becomes
+       [images, width, 1, 1], one vector per picture.
+
+       This is the brick a vision-only use needs and that no existing layer provides. In the
+       layout of this tower a token is a sample, so pooling over tokens is pooling over
+       samples, which the pooling layers cannot express: they work inside a sample. With
+       this layer on top, the tower feeds a classification head, a metric loss for face
+       recognition, or a self-supervised objective, exactly like any other Dlib backbone,
+       and none of that involves a decoder. */
+    template <long TOKENS_>
+    class patch_pool_
+    {
+        static_assert(TOKENS_ > 0, "TOKENS must be positive");
+
+    public:
+
+        static constexpr long TOKENS = TOKENS_;
+
+        patch_pool_() {}
+
+        template <typename SUBNET> void setup(const SUBNET& /*sub*/) {}
+
+        template <typename SUBNET>
+        void forward(const SUBNET& sub, resizable_tensor& output)
+        {
+            const tensor& src = sub.get_output();
+            DLIB_CASSERT(src.num_samples() % TOKENS == 0,
+                "patch_pool received " << src.num_samples()
+                << " samples, which is not a whole number of images of " << TOKENS);
+            const long B = src.num_samples() / TOKENS, C = src.k();
+            DLIB_CASSERT(src.nr() == 1 && src.nc() == 1,
+                "patch_pool expects [samples, width, 1, 1]");
+
+            output.set_size(B, C, 1, 1);
+            output = 0;
+            const float* in = src.host();
+            float* out = output.host();
+            const float scale = 1.0f / static_cast<float>(TOKENS);
+            for (long b = 0; b < B; ++b)
+            {
+                float* dst = out + static_cast<size_t>(b) * C;
+                for (long t = 0; t < TOKENS; ++t)
+                {
+                    const float* row = in + (static_cast<size_t>(b) * TOKENS + t) * C;
+                    for (long c = 0; c < C; ++c) dst[c] += row[c] * scale;
+                }
+            }
+        }
+
+        template <typename SUBNET>
+        void backward(const tensor& gradient_input, SUBNET& sub, tensor& /*params_grad*/)
+        {
+            tensor& grad = sub.get_gradient_input();
+            const long B = grad.num_samples() / TOKENS, C = grad.k();
+            const float* g = gradient_input.host();
+            float* dst = grad.host();
+            const float scale = 1.0f / static_cast<float>(TOKENS);
+            for (long b = 0; b < B; ++b)
+            {
+                const float* row = g + static_cast<size_t>(b) * C;
+                for (long t = 0; t < TOKENS; ++t)
+                {
+                    float* d = dst + (static_cast<size_t>(b) * TOKENS + t) * C;
+                    for (long c = 0; c < C; ++c) d[c] += row[c] * scale;
+                }
+            }
+        }
+
+        const tensor& get_layer_params() const { return params; }
+        tensor& get_layer_params() { return params; }
+
+        friend void serialize(const patch_pool_&, std::ostream& out)
+        {
+            serialize("patch_pool_", out);
+        }
+        friend void deserialize(patch_pool_&, std::istream& in)
+        {
+            std::string version;
+            deserialize(version, in);
+            if (version != "patch_pool_")
+                throw serialization_error("Unexpected version found while deserializing dlib::patch_pool_.");
+        }
+        friend std::ostream& operator<<(std::ostream& out, const patch_pool_&)
+        {
+            out << "patch_pool (tokens=" << TOKENS << ")";
+            return out;
+        }
+        friend void to_xml(const patch_pool_&, std::ostream& out)
+        {
+            out << "<patch_pool tokens='" << TOKENS << "'/>\n";
+        }
+
+    private:
+        resizable_tensor params; // unused
+    };
+
+    template <long TOKENS, typename SUBNET>
+    using patch_pool = add_layer<patch_pool_<TOKENS>, SUBNET>;
+
+// ----------------------------------------------------------------------------------------
+
     /* Bidirectional multi-head attention over the patches of an image, with biases on the
        four projections. Input and output are [images * NUM_PATCHES, WIDTH, 1, 1].
 
@@ -711,6 +812,20 @@ namespace dlib
         using network_type = fc<PROJECTION_DIM,
             patch_shuffle<SHUFFLE_FACTOR, GRID_SIDE,
             layer_norm<stack>>>;
+
+        /* Vision-only use. The tower is a backbone in its own right: pooled over the
+           tokens of each image it yields one vector per picture, which any Dlib head can
+           consume. Nothing here involves a decoder, so the same tower serves image
+           classification, metric learning for face recognition, or a self-supervised
+           objective, and a tower trained that way can afterwards be handed to a fusion
+           layer as an already trained encoder.
+
+           image_embedding is the tower plus that pooling; classifier adds a linear head
+           over it. */
+        using image_embedding = patch_pool<NUM_TOKENS, network_type>;
+
+        template <long num_classes>
+        using classifier = fc<num_classes, image_embedding>;
 
         struct model_info
         {

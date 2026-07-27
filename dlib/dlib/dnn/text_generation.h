@@ -30,6 +30,7 @@
 #include <functional>
 #include <random>
 #include <string>
+#include <iostream>
 #include <vector>
 
 #include "runtime_transformer.h"
@@ -156,6 +157,23 @@ namespace dlib
             : tok.encode(fmt.next_turn(user_text), false, false, true, false);
     }
 
+
+    /* --trace-prompt output, identical on every front end: the decoded stream with its
+       special tokens, the ids, and the sampling line actually resolved for the call.
+       Comparing two runs is only conclusive when both print the same thing here, which is
+       why this lives beside the generation core rather than in one of its callers. */
+    inline void trace_stream(const hf_tokenizer& tok, const std::vector<int>& ids,
+        const sampling_params& sp, const std::string& what)
+    {
+        std::cout << "---- " << what << " (" << ids.size() << " tokens) ----\n"
+                  << tok.decode(ids, false) << "\n---- ids:";
+        for (int id : ids) std::cout << ' ' << id;
+        std::cout << "\n---- sampling: temp " << (sp.greedy ? 0.0 : sp.temperature)
+                  << (sp.greedy ? " (greedy)" : "")
+                  << ", top_k " << sp.top_k << ", top_p " << sp.top_p
+                  << ", min_p " << sp.min_p << ", repeat " << sp.repeat_penalty
+                  << " ----" << std::endl;
+    }
     /* Token stream of a whole conversation, in the exact order an interactive loop
        produces it turn by turn: system block and first user turn, then for every past
        exchange the assistant text, the eos that closed it, and the next user turn.
@@ -237,9 +255,17 @@ namespace dlib
        recent is the repetition window; the caller owns it and it must contain generated
        tokens only. The KV cache is extended in place, so the engine holds the prompt and
        the accepted tokens when the call returns; the caller closes the turn (step(eos))
-       when it keeps the cache alive across turns. */
+       when it keeps the cache alive across turns.
+
+       The engine is a template parameter rather than a runtime_transformer because the
+       whole of what this function needs from it is step(int) returning the logits of the
+       position it just consumed. That is enough for the shape-dynamic engine and for a
+       compiled network alike, so the interactive loops, the served endpoints and the two
+       inference paths all run one generation core rather than four that agree by
+       maintenance. */
+    template <typename engine_type>
     inline generation_result generate_reply(
-        runtime_transformer& rt,
+        engine_type& rt,
         const hf_tokenizer& tok,
         const chat_template_formatter& fmt,
         const tensor& prompt_logits,

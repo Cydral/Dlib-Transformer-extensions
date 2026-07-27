@@ -16,6 +16,10 @@
       slm_gguf_import_ex --input model.gguf --probe-logits --prompt "The capital of France is"
       slm_gguf_import_ex --input model.gguf --convert
       slm_gguf_import_ex --load model.dat --chat
+      slm_gguf_import_ex --input model.gguf --mmproj mmproj-model.gguf --out-prefix m
+      slm_gguf_import_ex --input model.gguf --mmproj mmproj-model.gguf --convert
+      slm_gguf_import_ex --load model.dat --image photo.png
+      slm_gguf_import_ex --load model.dat --serve 8080
 
     Two-phase build (resolves the chicken-and-egg of needing the generated header to
     compile the model-using code):
@@ -30,10 +34,30 @@
     The utility headers gguf_reader.h, gguf_dequantize.h, gguf_model_spec.h and
     gguf_weight_loader.h live under dlib/data_io; hf_tokenizer.h and chat_template.h
     live under dlib/tokenizer.
+
+    Images. A multimodal model ships a second container, conventionally named
+    mmproj-*.gguf, holding the vision tower and the projector that brings its output into
+    the decoder's embedding space. Give it with --mmproj when generating the header and the
+    emitted configuration becomes a multimodal_transformer_config: the tower is then part
+    of the network type, its weights are imported like any others, the archive written by
+    --convert carries the whole stack, and a gradient can reach the tower. That is the
+    difference with the runtime engine, which keeps the two files apart and encodes images
+    outside the graph.
+
+    An image then enters through network_context's vision slot, as prepared pixels rather
+    than as vectors, and the prompt reserves one position per vector the tower will produce
+    with a placeholder token. Nothing in the stack below the fusion layer knows an image
+    went through.
+
+    The archive written by --convert is self-contained: decoder, tower, tokenizer and the
+    pixel normalization the tower was trained with. Neither container is needed again, for
+    chatting, describing, serving or training.
 !*/
 
 #include <iostream>
 #include <string>
+#include <thread>
+#include <chrono>
 #include <vector>
 #include <fstream>
 #include <cmath>
@@ -49,9 +73,12 @@
 #endif
 
 #include <dlib/cmd_line_parser.h>
+#include <dlib/image_io.h>
+#include <dlib/image_transforms.h>
 #include <dlib/data_io/gguf_reader.h>
 #include <dlib/data_io/gguf_dequantize.h>
 #include <dlib/data_io/gguf_model_spec.h>
+#include <dlib/data_io/gguf_vision_spec.h>
 #include <dlib/tokenizer/hf_tokenizer.h>
 #include <dlib/tokenizer/chat_template.h>
 
@@ -77,6 +104,8 @@
 #  include <ctime>
 #  include <dlib/dnn.h>
 #  include <dlib/data_io/gguf_weight_loader.h>
+#  include <dlib/data_io/gguf_vision_loader.h>
+#  include <dlib/server/chat_service.h>
 #  include IMPORTED_MODEL_HEADER
 #endif
 
@@ -324,7 +353,95 @@ void validate_weights(gguf_reader& g, const model_spec& spec)
         cout << "Weight inventory does not fully match; repacking should not proceed yet.\n";
 }
 
+/* Reads a projector container and reports its geometry. Depends on no compiled-in model,
+   so this runs in both build phases and is the cheapest way to tell whether a given
+   container is one this pipeline can serve. */
+int report_vision(const std::string& mmproj_path, vision_spec& out)
+{
+    cout << "Reading projector: " << mmproj_path << "\n";
+    gguf_reader gv(mmproj_path);
+    out = detect_vision(gv);
+    cout << describe(out);
+    const vision_compat_result rep = check_vision_compatibility(out, gv);
+    for (const string& n : rep.notes)    cout << "note: "    << n << "\n";
+    for (const string& b : rep.blockers) cerr << "BLOCKER: " << b << "\n";
+    if (!rep.usable())
+    {
+        cout << "This projector cannot be served by the current vision path.\n";
+        return 1;
+    }
+    return 0;
+}
+
 #ifdef WITH_IMPORTED_MODEL
+
+/* Vision operations of a model that has a tower, and their absence for one that has not.
+
+   The selection is a preprocessor one because it has to be. A text-only header does not
+   declare vision_tower or VISUAL_TOKENS, and code naming them cannot be compiled against
+   it at all; a template would not help, those names being non-dependent and therefore
+   resolved where the template is written rather than where it is used. The generated
+   header defines DLIB_IMPORTED_MODEL_HAS_VISION when it carries a tower, and that is what
+   keeps the two worlds apart. */
+struct vision
+{
+#ifdef DLIB_IMPORTED_MODEL_HAS_VISION
+
+    static constexpr bool available = true;
+    static long tokens_per_image() { return imported_model::VISUAL_TOKENS; }
+
+    /* Finds the fusion layer by its type rather than by its index. The index depends on the
+       depth of the stack above it, which is a poor thing to hardcode; the type is exactly
+       what makes the layer the one we want. */
+    template <typename net_type>
+    static void import_tower(net_type& net, gguf_reader& g, const vision_spec& spec)
+    {
+        bool found = false;
+        visit_computational_layers(net, [&](auto& layer) {
+            import_into_fusion(layer, g, spec, found);
+        });
+        if (!found)
+            throw std::runtime_error("no fusion layer was found in the compiled network");
+    }
+
+private:
+
+    template <typename layer_type>
+    static void import_into_fusion(layer_type&, gguf_reader&, const vision_spec&, bool&) {}
+
+    template <typename E, long SLOT, long TK, long W>
+    static void import_into_fusion(modality_fusion_<E, SLOT, TK, W>& l, gguf_reader& g,
+        const vision_spec& spec, bool& found)
+    {
+        import_gguf_vision_weights(l.get_encoder(), g, spec, imported_model::vision_tower());
+        found = true;
+    }
+
+public:
+
+#else
+
+    static constexpr bool available = false;
+    static long tokens_per_image() { return 0; }
+
+    template <typename net_type>
+    static void import_tower(net_type&, gguf_reader&, const vision_spec&)
+    {
+        throw std::runtime_error("this build has no vision tower compiled in; regenerate "
+            "the header with --mmproj and rebuild");
+    }
+
+#endif
+
+    /* The prepared pixels: the tower's own normalization, read from the container rather
+       than assumed. The same function serves the shape-dynamic encoder, so both paths see
+       exactly the same pixels for the same file. */
+    static void prepare(const matrix<rgb_pixel>& img, const vision_spec& spec,
+        resizable_tensor& out)
+    {
+        prepare_vision_image(img, spec, out);
+    }
+};
 
 /* The chat and probe modes use the network type compiled in from the generated header, so
    the GGUF geometry must match that header. Every shape the network type is built from is
@@ -377,6 +494,165 @@ int pick_next(const tensor& probs, const std::vector<int>& recent, bool determin
     float r = rng.get_random_float() * total, cs = 0.0f;
     for (size_t i = 0; i <= cutoff; ++i) { cs += cand[i].second; if (r <= cs) return cand[i].first; }
     return cand.empty() ? 0 : cand[0].first;
+}
+
+/* Engine adapter for the chat service: the compiled network seen through the small
+   interface chat_service.h expects, so that this program and the shape-dynamic one serve
+   the same endpoint from one implementation.
+
+   Two things are worth noting. The generation core wants logits, while the generator built
+   above ends in a softmax for the interactive loop's benefit, so the adapter drives the
+   subnet underneath it instead: the same weights, one layer short of the normalization.
+   And staging an image here means normalizing pixels, not encoding them; the tower is a
+   layer of this network and will run during the prefill, which is exactly what lets a
+   gradient reach it. */
+class static_engine_adapter
+{
+public:
+
+    explicit static_engine_adapter(generator_type& net) : net_(net) {}
+
+    void set_context(long capacity, long keep)
+    {
+        network_context::set_kv_cache_capacity(capacity);
+        network_context::set_kv_cache_keep_length(keep);
+        network_context::request_kv_cache_clear();
+        network_context::clear_padding();
+        network_context::set_inference_mode(network_context::inference_mode::prefill);
+    }
+
+    const tensor& forward_prefill(const std::vector<int>& ids)
+    {
+        matrix<int, 0, 1> pf(static_cast<long>(ids.size()), 1);
+        for (long i = 0; i < static_cast<long>(ids.size()); ++i)
+            pf(i) = ids[static_cast<size_t>(i)];
+        const tensor& out = logits(pf);
+        network_context::clear_kv_cache_request();
+        network_context::set_inference_mode(network_context::inference_mode::incremental);
+        network_context::clear_padding();
+        return out;
+    }
+
+    const tensor& step(int token)
+    {
+        matrix<int, 0, 1> one(1, 1);
+        one(0) = token;
+        return logits(one);
+    }
+
+    bool vision_available() const { return vision::available; }
+    long visual_tokens() const { return vision::tokens_per_image(); }
+
+    void set_vision_spec(const vision_spec& vs) { vspec_ = vs; }
+
+    bool stage_image(const matrix<rgb_pixel>& img, std::string& why)
+    {
+        if (!vision::available) { why = "this build has no vision tower"; return false; }
+        if (vspec_.image_size <= 0)
+        { why = "no pixel normalization is known for this model"; return false; }
+        try
+        {
+            vision::prepare(img, vspec_, staged_);
+            return true;
+        }
+        catch (const std::exception& e)
+        { why = std::string("preparing: ") + e.what(); return false; }
+    }
+
+    void commit_images(const std::vector<long>& positions)
+    {
+        std::vector<modality_input> in(1);
+        in[0].payload = staged_;
+        in[0].positions = positions;
+        in[0].sequence = 0;
+        network_context::set_modality_inputs(modality_slot::vision, std::move(in));
+    }
+
+private:
+
+    const tensor& logits(const matrix<int, 0, 1>& x)
+    {
+        return net_.subnet().subnet()(x);
+    }
+
+    generator_type& net_;
+    vision_spec vspec_;
+    resizable_tensor staged_;
+};
+
+/* Loads the model, and the tower with it when the build has one. Both come from their own
+   container; what makes the result one model rather than two is that the tower ends up
+   inside the network, in the fusion layer, and is written to the archive with everything
+   else. */
+int load_model(generator_type& generator, gguf_reader& g, const model_spec& spec,
+    const gguf_load_options& lopt, const adapter_request& adapters,
+    const std::string& mmproj_path, vision_spec& vspec)
+{
+    if (!model_matches_header(spec))
+    { cerr << "Error: model does not match the compiled-in header. Regenerate and recompile.\n"; return 1; }
+
+    cout << "Importing weights into the network...\n";
+    import_gguf_weights(generator, g, spec, lopt);
+
+    if (vision::available)
+    {
+        if (mmproj_path.empty())
+        { cerr << "Error: this build carries a vision tower and needs --mmproj to fill it.\n"; return 1; }
+        if (report_vision(mmproj_path, vspec) != 0) return 1;
+        gguf_reader gv(mmproj_path);
+        cout << "Importing the vision tower...\n";
+        vision::import_tower(generator, gv, vspec);
+    }
+    else if (!mmproj_path.empty())
+    {
+        cerr << "Error: --mmproj was given but this build has no vision tower; regenerate\n"
+             << "the header with --mmproj and rebuild.\n";
+        return 1;
+    }
+
+    apply_adapters(generator, adapters);
+    return 0;
+}
+
+/* Reads a converted archive. The tower, when there is one, travels inside it: nothing else
+   is needed to serve or to fine-tune the model. */
+int load_archive(generator_type& generator, hf_tokenizer& tok, const std::string& dat_path,
+    std::string& name_out, vision_spec& vspec_out)
+{
+    cout << "Loading converted model from " << dat_path << " ...\n";
+    std::ifstream fin(dat_path, std::ios::binary);
+    if (!fin) { cerr << "Error: cannot open " << dat_path << "\n"; return 1; }
+    std::string tag, model_name;
+    deserialize(tag, fin);
+    if (tag != "gguf_import_model")
+    {
+        cerr << "Error: '" << dat_path << "' is not a model archive produced by --convert; regenerate it.\n";
+        return 1;
+    }
+    deserialize(model_name, fin);
+    deserialize(generator.subnet().subnet(), fin);
+    deserialize(tok, fin);
+
+    bool has_vision = false;
+    deserialize(has_vision, fin);
+    if (has_vision != vision::available)
+    {
+        cerr << "Error: '" << dat_path << "' " << (has_vision ? "carries" : "does not carry")
+             << " a vision tower and this build " << (vision::available ? "expects" : "does not expect")
+             << " one; regenerate the header and the archive together.\n";
+        return 1;
+    }
+    if (has_vision)
+    {
+        deserialize(vspec_out.image_size, fin);
+        deserialize(vspec_out.image_mean, fin);
+        deserialize(vspec_out.image_std, fin);
+    }
+
+    name_out = clean_model_name(model_name);
+    cout << "Model: " << name_out
+         << (has_vision ? " (vision tower included)" : "") << "\n";
+    return 0;
 }
 
 /* Interactive chat loop over an already-loaded generator and tokenizer. The callers
@@ -597,15 +873,11 @@ int run_chat(gguf_reader& g, const model_spec& spec, const gguf_load_options& lo
     double temperature, size_t top_k, float top_p,
     float min_p, float repeat_penalty, bool deterministic, long ctx_len, bool use_template,
     const std::string& system_prompt, const std::string& template_override, bool offload_params,
-    const adapter_request& adapters)
+    const adapter_request& adapters, const std::string& mmproj_path)
 {
-    if (!model_matches_header(spec))
-    { cerr << "Error: model does not match the compiled-in header. Regenerate and recompile.\n"; return 1; }
-
     generator_type generator(multiply_(1.0));
-    cout << "Importing weights into the network...\n";
-    import_gguf_weights(generator, g, spec, lopt);
-    apply_adapters(generator, adapters);
+    vision_spec vspec;
+    if (load_model(generator, g, spec, lopt, adapters, mmproj_path, vspec) != 0) return 1;
 
     hf_tokenizer tok;
     tok.load_from_gguf(g);
@@ -628,29 +900,258 @@ int run_chat_dat(const std::string& dat_path,
     generator_type generator(multiply_(1.0));
     hf_tokenizer tok;
     std::string name_hint;
-    cout << "Loading converted model from " << dat_path << " ...\n";
-    {
-        std::ifstream fin(dat_path, std::ios::binary);
-        if (!fin) { cerr << "Error: cannot open " << dat_path << "\n"; return 1; }
-        std::string tag, model_name;
-        deserialize(tag, fin);
-        if (tag != "gguf_import_model")
-        {
-            cerr << "Error: '" << dat_path << "' is not a model archive produced by --convert; regenerate it.\n";
-            return 1;
-        }
-        deserialize(model_name, fin);
-        deserialize(generator.subnet().subnet(), fin);
-        deserialize(tok, fin);
-        /* Cleaned on read as well, so archives written before the identity was
-           normalized at conversion time display and detect the same way. */
-        model_name = clean_model_name(model_name);
-        cout << "Model: " << model_name << "\n";
-        name_hint = model_name;
-    }
+    vision_spec vspec;
+    if (load_archive(generator, tok, dat_path, name_hint, vspec) != 0) return 1;
     return chat_loop(generator, tok, temperature, top_k, top_p, min_p, repeat_penalty,
         deterministic, ctx_len, use_template, system_prompt, template_override,
         name_hint, offload_params);
+}
+
+/* Describes one image through the compiled network.
+
+   Everything happens inside the graph: the pixels go into the vision slot of the context,
+   the fusion layer runs the tower it owns and writes its vectors over the positions the
+   prompt reserved, and the decoder never learns that an image went through. The tower's
+   weights came from the archive or from the container at import time, like any others. */
+int describe_image(generator_type& generator, hf_tokenizer& tok, const std::string& model_name,
+    const std::string& image_path, const std::string& question, const vision_spec& vspec,
+    double temperature, size_t top_k, float top_p, float min_p, float repeat_penalty,
+    bool deterministic, long ctx_len, const std::string& system_prompt,
+    const std::string& template_override, bool offload_params)
+{
+    if (!vision::available)
+    { cerr << "This build has no vision tower compiled in.\n"; return 1; }
+
+    matrix<rgb_pixel> img;
+    load_image(img, image_path);
+    cout << "Image              : " << image_path
+         << " (" << img.nc() << "x" << img.nr() << ")\n";
+    resizable_tensor pixels;
+    vision::prepare(img, vspec, pixels);
+
+    const chat_template_formatter fmt = (template_override.empty() || template_override == "auto")
+        ? chat_template_formatter::for_tokenizer(tok, model_name)
+        : chat_template_formatter::for_tokenizer(tok,
+              chat_template_formatter::from_name(template_override));
+    cout << "Chat template      : " << chat_template_formatter::name(fmt.kind()) << "\n";
+    if (fmt.kind() != chat_template_kind::idefics3)
+        cout << "note: this template declares no image markers; the description will "
+                "likely be poor\n";
+
+    if (temperature < 0.0)     temperature    = fmt.default_temperature();
+    if (top_k == 0)            top_k          = fmt.default_top_k();
+    if (top_p < 0.0f)          top_p          = fmt.default_top_p();
+    if (min_p < 0.0f)          min_p          = fmt.default_min_p();
+    if (repeat_penalty < 0.0f) repeat_penalty = fmt.default_repeat_penalty();
+
+    const long tokens = vision::tokens_per_image();
+    const string turn = fmt.first_turn(system_prompt,
+        idefics3_markers::image_block(tokens) + question);
+    std::vector<int> ids = tok.encode(turn, fmt.add_bos_on_first_turn(), false, true, false);
+
+    /* The reserved positions are found by scanning for the placeholder rather than by
+       counting characters: the tokenizer decides where they land, and a single token of
+       drift would put the image on the wrong words. */
+    const std::vector<int> mark = tok.encode(idefics3_markers::image_placeholder(),
+        false, false, true, false);
+    if (mark.size() != 1)
+    { cerr << "The image placeholder is not a single token of this vocabulary.\n"; return 1; }
+    std::vector<long> positions;
+    for (size_t i = 0; i < ids.size(); ++i)
+        if (ids[i] == mark[0]) positions.push_back(static_cast<long>(i));
+    cout << "Prompt             : " << ids.size() << " tokens, "
+         << positions.size() << " reserved for the image\n";
+    if (static_cast<long>(positions.size()) != tokens)
+    { cerr << "The reserved positions do not match what the tower produces.\n"; return 1; }
+
+    const float temp = deterministic ? 1.0f : static_cast<float>(temperature);
+    layer<1>(generator).layer_details().set_multiply_value(1.0f / temp);
+
+    network_context::reset();
+    if (offload_params)
+        network_context::set_parameter_residency(network_context::parameter_residency::host_f32);
+    network_context::set_kv_cache_capacity(std::max<long>(ctx_len,
+        static_cast<long>(ids.size()) + 256));
+    /* The whole prompt is pinned: the image occupies most of it, and letting the visual
+       positions slide out of the window mid-description leaves the model answering about a
+       picture it can no longer see. */
+    network_context::set_kv_cache_keep_length(static_cast<long>(ids.size()));
+    network_context::request_kv_cache_clear();
+    network_context::clear_padding();
+    network_context::set_inference_mode(network_context::inference_mode::prefill);
+
+    /* Posted last, after the reset that would otherwise discard it. Consumed by the
+       prefill; the single-token steps that follow see an empty slot. */
+    {
+        std::vector<modality_input> in(1);
+        in[0].payload = pixels;
+        in[0].positions = positions;
+        in[0].sequence = 0;
+        network_context::set_modality_inputs(modality_slot::vision, std::move(in));
+    }
+
+    const int eos = tok.eos_id();
+    dlib::rand rng(std::time(nullptr));
+    std::vector<int> ctx;
+    cout << "\nModel: thinking" << std::flush;
+    try
+    {
+        matrix<int, 0, 1> pf(static_cast<long>(ids.size()), 1);
+        for (long i = 0; i < static_cast<long>(ids.size()); ++i) pf(i) = ids[static_cast<size_t>(i)];
+        int nxt = pick_next(generator(pf), ctx, deterministic, top_k, top_p, min_p,
+            repeat_penalty, rng);
+        network_context::clear_kv_cache_request();
+        ctx.insert(ctx.end(), ids.begin(), ids.end());
+        network_context::set_inference_mode(network_context::inference_mode::incremental);
+        network_context::clear_padding();
+
+        std::vector<int> out_toks;
+        const std::string stop = fmt.stop_string();
+        for (int i = 0; i < 512; ++i)
+        {
+            if (nxt == eos) break;
+            ctx.push_back(nxt);
+            out_toks.push_back(nxt);
+            if (!stop.empty() && tok.decode(out_toks, true).find(stop) != std::string::npos)
+                break;
+            static const char* const dots[] = { ".  ", ".. ", "..." };
+            cout << "\rModel: thinking" << dots[(i / 8) % 3] << std::flush;
+            matrix<int, 0, 1> step(1, 1);
+            step(0) = nxt;
+            nxt = pick_next(generator(step), ctx, deterministic, top_k, top_p, min_p,
+                repeat_penalty, rng);
+        }
+        cout << "\r" << std::string(20, ' ') << "\r";
+        cout << "Model: " << fmt.clean_answer(tok.decode(out_toks, true)) << "\n";
+    }
+    catch (const std::exception& e)
+    {
+        cerr << "\nFATAL during generation: " << e.what() << "\n";
+        network_context::reset();
+        return 1;
+    }
+    network_context::reset();
+    return 0;
+}
+
+/* Description after importing from the containers. */
+int run_describe(gguf_reader& g, const model_spec& spec, const gguf_load_options& lopt,
+    const adapter_request& adapters, const std::string& mmproj_path,
+    const std::string& image_path, const std::string& question,
+    double temperature, size_t top_k, float top_p, float min_p, float repeat_penalty,
+    bool deterministic, long ctx_len, const std::string& system_prompt,
+    const std::string& template_override, bool offload_params)
+{
+    generator_type generator(multiply_(1.0));
+    vision_spec vspec;
+    if (load_model(generator, g, spec, lopt, adapters, mmproj_path, vspec) != 0) return 1;
+
+    hf_tokenizer tok;
+    tok.load_from_gguf(g);
+    return describe_image(generator, tok, spec.model_name, image_path, question, vspec,
+        temperature, top_k, top_p, min_p, repeat_penalty, deterministic, ctx_len,
+        system_prompt, template_override, offload_params);
+}
+
+/* Description over a converted archive. Everything comes from that one file: the decoder,
+   the tower, the tokenizer and the pixel normalization. */
+int run_describe_dat(const std::string& dat_path,
+    const std::string& image_path, const std::string& question,
+    double temperature, size_t top_k, float top_p, float min_p, float repeat_penalty,
+    bool deterministic, long ctx_len, const std::string& system_prompt,
+    const std::string& template_override, bool offload_params)
+{
+    generator_type generator(multiply_(1.0));
+    hf_tokenizer tok;
+    std::string name;
+    vision_spec vspec;
+    if (load_archive(generator, tok, dat_path, name, vspec) != 0) return 1;
+    return describe_image(generator, tok, name, image_path, question, vspec,
+        temperature, top_k, top_p, min_p, repeat_penalty, deterministic, ctx_len,
+        system_prompt, template_override, offload_params);
+}
+
+/* Serves the compiled model over the shared chat endpoint.
+
+   The service, its request handling and its streaming come from dlib/server/chat_service.h,
+   which the shape-dynamic program uses too: the two answer identically because they run one
+   implementation, not because two were kept in step. */
+int run_serve(generator_type& generator, hf_tokenizer& tok, const std::string& name,
+    const vision_spec* vspec, unsigned short port, long ctx_len,
+    double forced_temp, bool temp_forced, bool deterministic, bool trace_prompt,
+    const std::string& template_override, bool offload_params)
+{
+    const chat_template_formatter fmt = (template_override.empty() || template_override == "auto")
+        ? chat_template_formatter::for_tokenizer(tok, name)
+        : chat_template_formatter::for_tokenizer(tok,
+              chat_template_formatter::from_name(template_override));
+
+    network_context::reset();
+    if (offload_params)
+        network_context::set_parameter_residency(network_context::parameter_residency::host_f32);
+    /* The interactive loop scales the logits through the multiply layer; the service
+       resolves temperature inside the sampler, so that layer must be neutral here. */
+    layer<1>(generator).layer_details().set_multiply_value(1.0f);
+
+    static_engine_adapter engine(generator);
+    if (vspec) engine.set_vision_spec(*vspec);
+
+    std::vector<dlib::served_model<static_engine_adapter>> models;
+    models.push_back(dlib::served_model<static_engine_adapter>{ name, &engine, &tok, fmt });
+
+    cout << "Serving 1 model:\n  " << name
+         << "  [template " << chat_template_formatter::name(fmt.kind())
+         << (fmt.supports_reasoning() ? ", reasoning" : "")
+         << (engine.vision_available() ? ", vision" : "") << "]\n";
+
+    dlib::chat_service<static_engine_adapter> srv(std::move(models), ctx_len,
+        forced_temp, temp_forced, deterministic, trace_prompt);
+    srv.set_listening_port(port);
+    cout << "Serving http://localhost:" << port
+         << "  (chat interface on /, API on /v1/chat/completions; Ctrl-C to stop)\n";
+    /* Started asynchronously and polled, exactly as the shape-dynamic program does.
+       start() would block inside the server's own accept loop, where the interrupt has no
+       way to reach us: the handler would set its flag and nothing would read it. */
+    dlib::signal_handler::setup();
+    srv.start_async();
+    while (!dlib::signal_handler::is_triggered() && srv.is_running())
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    cout << "\nShutting down (waiting for in-flight requests)...\n";
+    srv.clear();   // shuts connections, waits for handlers, releases the port
+    cout << "Server stopped.\n";
+    network_context::reset();
+    return 0;
+}
+
+int run_serve_gguf(gguf_reader& g, const model_spec& spec, const gguf_load_options& lopt,
+    const adapter_request& adapters, const std::string& mmproj_path, unsigned short port,
+    long ctx_len, double forced_temp, bool temp_forced, bool deterministic,
+    bool trace_prompt, const std::string& template_override, bool offload_params)
+{
+    generator_type generator(multiply_(1.0));
+    vision_spec vspec;
+    if (load_model(generator, g, spec, lopt, adapters, mmproj_path, vspec) != 0) return 1;
+
+    hf_tokenizer tok;
+    tok.load_from_gguf(g);
+    return run_serve(generator, tok, model_display_name(spec),
+        vision::available ? &vspec : nullptr, port, ctx_len, forced_temp, temp_forced,
+        deterministic, trace_prompt, template_override, offload_params);
+}
+
+int run_serve_dat(const std::string& dat_path,
+    unsigned short port, long ctx_len, double forced_temp, bool temp_forced,
+    bool deterministic, bool trace_prompt, const std::string& template_override,
+    bool offload_params)
+{
+    generator_type generator(multiply_(1.0));
+    hf_tokenizer tok;
+    std::string name;
+    vision_spec vspec;
+    if (load_archive(generator, tok, dat_path, name, vspec) != 0) return 1;
+    return run_serve(generator, tok, name, vision::available ? &vspec : nullptr, port,
+        ctx_len, forced_temp, temp_forced, deterministic, trace_prompt, template_override,
+        offload_params);
 }
 
 /* Print the most probable next tokens for a prompt's last position. Compare these with a
@@ -796,7 +1297,7 @@ int run_probe_ids(gguf_reader& g, const model_spec& spec, const gguf_load_option
    whole network resident in memory: on a CUDA build that is GPU memory (so a model larger
    than VRAM requires a CPU build, which uses system RAM instead). */
 int run_convert(gguf_reader& g, const model_spec& spec, const gguf_load_options& lopt,
-    const std::string& out_path)
+    const std::string& out_path, const std::string& mmproj_path)
 {
     if (!model_matches_header(spec))
     { cerr << "Error: model does not match the compiled-in header. Regenerate and recompile.\n"; return 1; }
@@ -804,6 +1305,20 @@ int run_convert(gguf_reader& g, const model_spec& spec, const gguf_load_options&
     infer_net net;
     cout << "Importing weights into the network...\n";
     import_gguf_weights(net, g, spec, lopt);
+
+    /* The tower joins the archive here. This is the point of the whole static path: what
+       comes out is one file holding the complete model, which Dlib can serve, fine-tune or
+       keep training without a second container anywhere in sight. */
+    vision_spec vspec;
+    if (vision::available)
+    {
+        if (mmproj_path.empty())
+        { cerr << "Error: this build carries a vision tower and needs --mmproj to fill it.\n"; return 1; }
+        if (report_vision(mmproj_path, vspec) != 0) return 1;
+        gguf_reader gv(mmproj_path);
+        cout << "Importing the vision tower...\n";
+        vision::import_tower(net, gv, vspec);
+    }
 
     hf_tokenizer tok;
     tok.load_from_gguf(g);
@@ -814,9 +1329,18 @@ int run_convert(gguf_reader& g, const model_spec& spec, const gguf_load_options&
        generator, so a single copy of the parameters is ever allocated; the alternative of
        serializing the full network would need a temporary at load time, transiently
        doubling the pinned host memory. */
+    /* The pixel normalization travels with the archive. It is geometry rather than
+       weights, but a tower fed pictures centred differently from the ones it was trained
+       on sees other images, so the archive is not self-contained without it. This is what
+       lets --load serve or describe with no projector container anywhere in sight. */
     cout << "Serializing model to " << out_path << " ...\n";
-    serialize(out_path) << std::string("gguf_import_model") << model_display_name(spec)
-                        << net.subnet() << tok;
+    {
+        auto out = serialize(out_path);
+        out << std::string("gguf_import_model") << model_display_name(spec)
+            << net.subnet() << tok << vision::available;
+        if (vision::available)
+            out << vspec.image_size << vspec.image_mean << vspec.image_std;
+    }
     cout << "Done. Wrote " << out_path << "\n";
     return 0;
 }
@@ -840,6 +1364,10 @@ int main(int argc, char** argv)
         parser.add_option("load", "Path to a converted .dat model; with --chat, skips the GGUF import entirely", 1);
         parser.add_option("probe", "Extra string to round-trip through the tokenizer", 1);
         parser.add_option("chat", "Load the model and start an interactive completion session");
+        parser.add_option("mmproj", "Multimodal projector container: makes the generated header carry a vision tower", 1);
+        parser.add_option("image", "Image described through the compiled network; needs a multimodal build", 1);
+        parser.add_option("serve", "Serve the model over HTTP on the given port", 1);
+        parser.add_option("trace-prompt", "Print the token stream handed to each generation");
         parser.add_option("convert", "Load the model and serialize it to <out-prefix>.dat");
         parser.add_option("probe-logits", "Print the most probable next tokens for --prompt (weight validation)");
         parser.add_option("prompt", "Prompt used by --probe-logits (default: 'The capital of France is')", 1);
@@ -890,6 +1418,16 @@ int main(int argc, char** argv)
             { cerr << "Error: --lora-method must be lora or dora.\n"; return 1; }
         }
 
+        /* A projector reported on its own. It depends on no compiled-in model, so this
+           runs in both build phases and is the cheapest way to tell whether a container is
+           one this pipeline can serve. */
+        if (parser.option("mmproj") && !parser.option("image") && !parser.option("input")
+            && !parser.option("load"))
+        {
+            vision_spec vs;
+            return report_vision(parser.option("mmproj").argument(), vs);
+        }
+
         /* Chat over an already-converted model: no GGUF needed, the .dat archive carries
            both the network weights and the tokenizer. */
         if (parser.option("load") && parser.option("chat"))
@@ -910,6 +1448,48 @@ int main(int argc, char** argv)
 #else
             cerr << "This build has no model header compiled in; generate slm_imported_model.h\n"
                  << "(run with --out-prefix slm_imported_model) and rebuild the target.\n";
+            return 1;
+#endif
+        }
+
+        /* Serving an already-converted model. */
+        if (parser.option("load") && parser.option("serve"))
+        {
+#ifdef WITH_IMPORTED_MODEL
+            return run_serve_dat(parser.option("load").argument(),
+                static_cast<unsigned short>(get_option(parser, "serve", 8080)),
+                get_option(parser, "context", long(2048)),
+                get_option(parser, "temperature", 0.0),
+                parser.option("temperature") != 0,
+                parser.option("deterministic"), parser.option("trace-prompt"),
+                get_option(parser, "template", std::string("auto")),
+                parser.option("offload-params"));
+#else
+            cerr << "This build has no model header compiled in.\n";
+            return 1;
+#endif
+        }
+
+        /* An image described through an already-converted model. */
+        if (parser.option("load") && parser.option("image"))
+        {
+#ifdef WITH_IMPORTED_MODEL
+            return run_describe_dat(parser.option("load").argument(),
+                parser.option("image").argument(),
+                get_option(parser, "prompt", std::string("What is in this image?")),
+                get_option(parser, "temperature", -1.0),
+                get_option(parser, "top-k", size_t(0)),
+                get_option(parser, "top-p", -1.0f),
+                get_option(parser, "min-p", -1.0f),
+                get_option(parser, "repeat-penalty", -1.0f),
+                parser.option("deterministic"),
+                get_option(parser, "context", long(512)),
+                get_option(parser, "system", std::string()),
+                get_option(parser, "template", std::string("auto")),
+                parser.option("offload-params"));
+#else
+            cerr << "This build has no model header compiled in; generate slm_imported_model.h\n"
+                 << "(run with --out-prefix slm_imported_model --mmproj ...) and rebuild.\n";
             return 1;
 #endif
         }
@@ -956,7 +1536,8 @@ int main(int argc, char** argv)
             return 1;
         }
 
-        if (parser.option("chat") || parser.option("probe-logits") || parser.option("convert") || parser.option("probe-ids"))
+        if (parser.option("chat") || parser.option("probe-logits") || parser.option("convert")
+            || parser.option("probe-ids") || parser.option("image") || parser.option("serve"))
         {
 #ifdef WITH_IMPORTED_MODEL
             gguf_load_options lopt;
@@ -975,10 +1556,39 @@ int main(int argc, char** argv)
                     /*use_template=*/!parser.option("raw"),
                     get_option(parser, "system", std::string("You are a helpful assistant.")),
                     get_option(parser, "template", std::string("auto")),
-                    parser.option("offload-params"), adapters);
+                    parser.option("offload-params"), adapters,
+                    get_option(parser, "mmproj", std::string()));
+
+            if (parser.option("serve"))
+                return run_serve_gguf(g, spec, lopt, adapters,
+                    get_option(parser, "mmproj", std::string()),
+                    static_cast<unsigned short>(get_option(parser, "serve", 8080)),
+                    get_option(parser, "context", long(2048)),
+                    get_option(parser, "temperature", 0.0),
+                    parser.option("temperature") != 0,
+                    parser.option("deterministic"), parser.option("trace-prompt"),
+                    get_option(parser, "template", std::string("auto")),
+                    parser.option("offload-params"));
+
+            if (parser.option("image"))
+                return run_describe(g, spec, lopt, adapters,
+                    get_option(parser, "mmproj", std::string()),
+                    parser.option("image").argument(),
+                    get_option(parser, "prompt", std::string("What is in this image?")),
+                    get_option(parser, "temperature", -1.0),
+                    get_option(parser, "top-k", size_t(0)),
+                    get_option(parser, "top-p", -1.0f),
+                    get_option(parser, "min-p", -1.0f),
+                    get_option(parser, "repeat-penalty", -1.0f),
+                    parser.option("deterministic"),
+                    get_option(parser, "context", long(512)),
+                    get_option(parser, "system", std::string()),
+                    get_option(parser, "template", std::string("auto")),
+                    parser.option("offload-params"));
 
             if (parser.option("convert"))
-                return run_convert(g, spec, lopt, prefix + ".dat");
+                return run_convert(g, spec, lopt, prefix + ".dat",
+                    get_option(parser, "mmproj", std::string()));
 
             if (parser.option("probe-ids"))
                 return run_probe_ids(g, spec, lopt,
@@ -1001,7 +1611,16 @@ int main(int argc, char** argv)
            model name sanitized into an identifier. Left to itself emit_header derives the
            namespace from the raw general.name, which would drift from the file name
            whenever the cleaner has something to strip. */
-        emit_header(spec, header_path, sanitize_identifier(model_display_name(spec)));
+        vision_spec vspec;
+        const bool with_vision = parser.option("mmproj");
+        if (with_vision && report_vision(parser.option("mmproj").argument(), vspec) != 0)
+            return 1;
+        emit_header(spec, header_path, sanitize_identifier(model_display_name(spec)),
+            with_vision ? &vspec : nullptr);
+        if (with_vision)
+            cout << "The generated header carries the vision tower: the compiled network\n"
+                 << "holds it, the archive written by --convert carries it, and a gradient\n"
+                 << "can reach it.\n";
         cout << "\nGenerated model header: " << header_path << "\n\n";
 
         const string probe = parser.option("probe") ? parser.option("probe").argument() : "";

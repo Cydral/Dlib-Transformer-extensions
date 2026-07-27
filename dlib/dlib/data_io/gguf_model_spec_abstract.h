@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 #include "gguf_reader_abstract.h"
+#include "gguf_vision_spec_abstract.h"
 
 namespace dlib
 {
@@ -277,16 +278,27 @@ namespace dlib
     void emit_header(
         const model_spec& s,
         const std::string& path,
-        const std::string& ns = ""
+        const std::string& ns = "",
+        const vision_spec* vs = nullptr
     );
     /*!
+        requires
+            - if vs != nullptr, then vs->projection_dim == s.d_model
         ensures
             - Writes a self-contained Dlib model header for s at the given path.
             - The generated header defines the model constants (vocabulary, layers,
-              heads, dimensions, FFN ratio), a decoder_transformer_config alias, and
-              a network_type<is_training> alias covering both the inference and the
+              heads, dimensions, FFN ratio), a config alias, and a
+              network_type<is_training> alias covering both the inference and the
               fine-tuning networks; it also lists the GGUF tensor names the weight
               loader consumes.
+            - If vs is null the config is a decoder_transformer_config and the header
+              is exactly what it has always been, network type and archives included.
+            - If vs is given the header also declares the tower's geometry and the
+              config becomes a multimodal_transformer_config, which carries the tower
+              inside the network. VISUAL_TOKENS then gives the number of positions a
+              prompt must reserve for one image.
+            - HAS_VISION is declared either way, so one program can be compiled
+              against either kind of header without its source knowing which.
             - The namespace and the include guard are derived from
               model_identifier(s) unless ns is non-empty, so several generated
               headers can coexist in one program.
@@ -294,7 +306,11 @@ namespace dlib
               generic `imported_model` namespace alias, so single-model programs
               compile unchanged whatever the model-specific namespace is.
         throws
-            - std::runtime_error if the file cannot be created or fully written.
+            - std::runtime_error if the file cannot be created or fully written, or if
+              vs is given and its projector does not emit vectors of the decoder's
+              width. That last check is here rather than at compile time because
+              finding it out after instantiating a whole model is an expensive way to
+              learn that two files do not belong together.
     !*/
 
     // ---------------------------------------------------------------------------------

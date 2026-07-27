@@ -227,6 +227,64 @@ namespace dlib
 // ----------------------------------------------------------------------------------------
 
     template <
+        long TOKENS
+        >
+    class patch_pool_
+    {
+        /*!
+            REQUIREMENTS ON TOKENS
+                TOKENS > 0
+
+            WHAT THIS OBJECT REPRESENTS
+                This is an implementation of the EXAMPLE_COMPUTATIONAL_LAYER_ interface
+                defined in layers_abstract.h.  It averages the tokens of each image:
+                an input of shape [images*TOKENS, width, 1, 1] becomes an output of shape
+                [images, width, 1, 1], one vector per picture.
+
+                This is the brick a vision-only use needs and that no existing layer
+                provides. In the layout of this tower a token is a sample, so pooling over
+                tokens is pooling over samples, which the pooling layers cannot express:
+                they work inside a sample. With this layer on top, the tower feeds a
+                classification head, a metric loss for face recognition, or a
+                self-supervised objective, exactly like any other Dlib backbone.
+
+                This layer has no parameters.
+        !*/
+
+    public:
+
+        patch_pool_(
+        );
+
+        template <typename SUBNET> void setup (const SUBNET& sub);
+        template <typename SUBNET> void forward(const SUBNET& sub, resizable_tensor& output);
+        template <typename SUBNET> void backward(const tensor& gradient_input, SUBNET& sub, tensor& params_grad);
+        const tensor& get_layer_params() const;
+        tensor& get_layer_params();
+        /*!
+            These functions are implemented as described in the
+            EXAMPLE_COMPUTATIONAL_LAYER_ interface.  Note that get_layer_params() always
+            returns an empty tensor.
+
+            forward() requires an input shaped [samples, width, 1, 1] whose sample count is
+            a multiple of TOKENS.
+        !*/
+    };
+
+    template <long TOKENS>
+    void serialize(const patch_pool_<TOKENS>& item, std::ostream& out);
+    template <long TOKENS>
+    void deserialize(patch_pool_<TOKENS>& item, std::istream& in);
+    /*!
+        provides serialization support
+    !*/
+
+    template <long TOKENS, typename SUBNET>
+    using patch_pool = add_layer<patch_pool_<TOKENS>, SUBNET>;
+
+// ----------------------------------------------------------------------------------------
+
+    template <
         long WIDTH,
         long NUM_HEADS,
         long NUM_PATCHES
@@ -414,6 +472,22 @@ namespace dlib
 
         using stack        = /*!see the implementation header!*/;
         using network_type = /*!see the implementation header!*/;
+
+        using image_embedding = /*!see the implementation header!*/;
+        template <long num_classes>
+        using classifier = /*!see the implementation header!*/;
+        /*!
+            WHAT THESE OBJECTS REPRESENT
+                Vision-only use. The tower is a backbone in its own right: pooled over the
+                tokens of each image it yields one vector per picture, which any Dlib head
+                can consume. image_embedding is the tower plus that pooling, producing
+                [images, projection_dim, 1, 1]; classifier adds a linear head over it.
+
+                Nothing here involves a decoder, so the same tower serves image
+                classification, metric learning for face recognition, or a self-supervised
+                objective, and a tower trained that way can afterwards be handed to a
+                fusion layer as an already trained encoder.
+        !*/
 
         struct model_info
         {

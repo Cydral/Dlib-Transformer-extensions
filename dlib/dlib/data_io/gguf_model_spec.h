@@ -13,6 +13,7 @@
 #include "gguf_model_spec_abstract.h"
 
 #include "gguf_reader.h"
+#include "gguf_vision_spec.h"
 #include <string>
 #include <vector>
 #include <sstream>
@@ -311,9 +312,22 @@ namespace dlib
     // gqa_transformer_unified::transformer_stack. The namespace and the include guard are
     // derived from the model identity unless an explicit namespace is given, so several
     // generated headers can coexist in a program embedding a catalog of imported models.
+    /* Passing a vision spec turns the emitted header multimodal: it then also declares the
+       tower's geometry, the fusion policy that carries it, and hands that policy to the
+       decoder configuration. A text-only header is emitted exactly as before, the policy
+       defaulting to the identity alias, so its network type and its archives are unchanged.
+
+       HAS_VISION is always declared so that one program can be compiled against either
+       kind of header without the source having to know which. */
     inline void emit_header(const model_spec& s, const std::string& path,
-        const std::string& ns = "")
+        const std::string& ns = "", const vision_spec* vs = nullptr)
     {
+        if (vs && vs->projection_dim != s.d_model)
+            throw std::runtime_error("emit_header: the projector emits "
+                + std::to_string(vs->projection_dim) + "-wide vectors and the decoder "
+                "expects " + std::to_string(s.d_model)
+                + "; the two files do not belong to the same model");
+
         std::ofstream out(path);
         if (!out) throw std::runtime_error("emit_header: cannot write " + path);
 
@@ -340,9 +354,34 @@ namespace dlib
             << "    static constexpr long FFN_NUM       = " << s.ffn_num
             << ";  // hidden = EMBEDDING_DIM * FFN_NUM / FFN_DEN = " << s.d_ffn << "\n"
             << "    static constexpr long FFN_DEN       = " << s.ffn_den << ";\n\n"
-            << "    using config = dlib::decoder_transformer_config<\n"
-            << "        VOCAB_SIZE, NUM_LAYERS, NUM_HEADS, NUM_KV_HEADS, EMBEDDING_DIM, FFN_NUM, FFN_DEN,\n"
-            << "        HEAD_DIM, USE_QK_NORM>;\n\n"
+            << "    static constexpr bool HAS_VISION    = " << (vs ? "true" : "false") << ";\n\n";
+
+        if (vs)
+        {
+            out << "    // Geometry of the vision tower carried by this model.\n"
+                << "    static constexpr long IMAGE_SIZE    = " << vs->image_size << ";\n"
+                << "    static constexpr long PATCH_SIZE    = " << vs->patch_size << ";\n"
+                << "    static constexpr long VISION_WIDTH  = " << vs->d_model << ";\n"
+                << "    static constexpr long VISION_LAYERS = " << vs->n_layers << ";\n"
+                << "    static constexpr long VISION_HEADS  = " << vs->n_heads << ";\n"
+                << "    static constexpr long VISION_FFN    = " << vs->d_ffn << ";\n"
+                << "    static constexpr long SHUFFLE       = " << vs->scale_factor << ";\n\n"
+                << "    using config = dlib::multimodal_transformer_config<\n"
+                << "        VOCAB_SIZE, NUM_LAYERS, NUM_HEADS, NUM_KV_HEADS, EMBEDDING_DIM, FFN_NUM, FFN_DEN,\n"
+                << "        IMAGE_SIZE, PATCH_SIZE, VISION_WIDTH, VISION_LAYERS, VISION_HEADS, VISION_FFN,\n"
+                << "        SHUFFLE, HEAD_DIM, USE_QK_NORM>;\n\n"
+                << "    // Positions a prompt must reserve for one image.\n"
+                << "    static constexpr long VISUAL_TOKENS = config::VISUAL_TOKENS;\n"
+                << "    using vision_tower = config::vision_tower;\n\n";
+        }
+        else
+        {
+            out << "    using config = dlib::decoder_transformer_config<\n"
+                << "        VOCAB_SIZE, NUM_LAYERS, NUM_HEADS, NUM_KV_HEADS, EMBEDDING_DIM, FFN_NUM, FFN_DEN,\n"
+                << "        HEAD_DIM, USE_QK_NORM>;\n\n";
+        }
+
+        out
             << "    // Strict model definition. network_type<false> is the inference network\n"
             << "    // (generation / chatbot); network_type<true> is the training network used\n"
             << "    // for fine-tuning. The imported weights are loaded into this exact type.\n"
@@ -364,6 +403,11 @@ namespace dlib
             << "#ifndef DLIB_IMPORTED_MODEL_ALIAS_DEFINED\n"
             << "#define DLIB_IMPORTED_MODEL_ALIAS_DEFINED\n"
             << "namespace imported_model = " << id << ";\n"
+            << (vs ? "/* A macro as well as a constant: code that names the tower's types cannot be\n"
+                     "   compiled at all against a text-only header, and the preprocessor is what\n"
+                     "   keeps it out. HAS_VISION serves the runtime tests, this serves the\n"
+                     "   compiler. */\n"
+                     "#define DLIB_IMPORTED_MODEL_HAS_VISION 1\n" : "")
             << "#endif\n"
             << "\n#endif // " << guard << "\n";
 

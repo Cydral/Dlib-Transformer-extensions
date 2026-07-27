@@ -193,6 +193,11 @@ add_example(slm_tok_predictive_compressor_ex)
 add_example(slm_gguf_import_ex)
 if(MSVC)
     target_compile_options(slm_gguf_import_ex PRIVATE /bigobj)
+else()
+    # dlib::layer<i> recurses once per layer, so visiting a network of N layers costs a
+    # template instantiation depth proportional to N. The text-only decoder sat just
+    # under the 900 GCC allows by default; the fusion layer pushed it over.
+    target_compile_options(slm_gguf_import_ex PRIVATE -ftemplate-depth=4096)
 endif()
 add_example(slm_gguf_runtime_ex)
 add_example(slm_lora_adapter_check_ex)

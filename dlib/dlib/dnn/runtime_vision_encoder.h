@@ -48,6 +48,46 @@
 
 namespace dlib
 {
+    /* Pixels prepared for a vision tower: resized to the square the encoder expects and
+       normalized with the statistics the container declares. This depends on the geometry
+       alone and not on a single weight, so it is a free function rather than a member: the
+       shape-dynamic encoder and a compiled tower must see exactly the same pixels for the
+       same file, and the surest way to guarantee that is for them to run one piece of
+       code. */
+    template <typename image_type>
+    void prepare_vision_image(const image_type& img, const vision_spec& spec,
+        resizable_tensor& out)
+    {
+        DLIB_CASSERT(spec.image_size > 0, "the vision spec has no geometry");
+        const long side = spec.image_size;
+
+        /* The source goes in as the image object it is. Wrapping it in mat() would
+           make it a matrix expression, which generic_image does not accept: an image
+           is recognized by its traits, not by being indexable. */
+        matrix<rgb_pixel> resized(side, side);
+        resize_image(img, resized, interpolate_bilinear());
+
+        const float mr = spec.image_mean.size() == 3 ? spec.image_mean[0] : 0.5f;
+        const float mg = spec.image_mean.size() == 3 ? spec.image_mean[1] : 0.5f;
+        const float mb = spec.image_mean.size() == 3 ? spec.image_mean[2] : 0.5f;
+        const float sr = spec.image_std.size() == 3 ? spec.image_std[0] : 0.5f;
+        const float sg = spec.image_std.size() == 3 ? spec.image_std[1] : 0.5f;
+        const float sb = spec.image_std.size() == 3 ? spec.image_std[2] : 0.5f;
+
+        out.set_size(1, 3, side, side);
+        float* p = out.host_write_only();
+        const long plane = side * side;
+        for (long r = 0; r < side; ++r)
+            for (long c = 0; c < side; ++c)
+            {
+                const rgb_pixel& px = resized(r, c);
+                const long i = r * side + c;
+                p[0 * plane + i] = (px.red   / 255.0f - mr) / sr;
+                p[1 * plane + i] = (px.green / 255.0f - mg) / sg;
+                p[2 * plane + i] = (px.blue  / 255.0f - mb) / sb;
+            }
+        }
+
     class runtime_vision_encoder
     {
     public:
@@ -121,34 +161,7 @@ namespace dlib
         template <typename image_type>
         void prepare_image(const image_type& img, resizable_tensor& out) const
         {
-            DLIB_CASSERT(spec_.image_size > 0, "the encoder has no geometry yet");
-            const long side = spec_.image_size;
-
-            /* The source goes in as the image object it is. Wrapping it in mat() would
-               make it a matrix expression, which generic_image does not accept: an image
-               is recognized by its traits, not by being indexable. */
-            matrix<rgb_pixel> resized(side, side);
-            resize_image(img, resized, interpolate_bilinear());
-
-            const float mr = spec_.image_mean.size() == 3 ? spec_.image_mean[0] : 0.5f;
-            const float mg = spec_.image_mean.size() == 3 ? spec_.image_mean[1] : 0.5f;
-            const float mb = spec_.image_mean.size() == 3 ? spec_.image_mean[2] : 0.5f;
-            const float sr = spec_.image_std.size() == 3 ? spec_.image_std[0] : 0.5f;
-            const float sg = spec_.image_std.size() == 3 ? spec_.image_std[1] : 0.5f;
-            const float sb = spec_.image_std.size() == 3 ? spec_.image_std[2] : 0.5f;
-
-            out.set_size(1, 3, side, side);
-            float* p = out.host_write_only();
-            const long plane = side * side;
-            for (long r = 0; r < side; ++r)
-                for (long c = 0; c < side; ++c)
-                {
-                    const rgb_pixel& px = resized(r, c);
-                    const long i = r * side + c;
-                    p[0 * plane + i] = (px.red   / 255.0f - mr) / sr;
-                    p[1 * plane + i] = (px.green / 255.0f - mg) / sg;
-                    p[2 * plane + i] = (px.blue  / 255.0f - mb) / sb;
-                }
+            prepare_vision_image(img, spec_, out);
         }
 
         /* Visual embeddings of one prepared image, as a [tokens, projection_dim] matrix
