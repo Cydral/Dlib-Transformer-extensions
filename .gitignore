@@ -13,3 +13,10 @@ build-cpu/
 nr_logs*/
 *.gguf
 *.dat
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CPackConfig.cmake
+CPackSourceConfig.cmake
+dlib/examples/Makefile
+dlib/examples/dlib/

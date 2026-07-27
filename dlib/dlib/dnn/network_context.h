@@ -11,12 +11,40 @@
 #define DLIB_DNN_NETWORK_CONTEXT_H_
 
 #include "network_context_abstract.h"
+#include <map>
 #include <mutex>
+#include <utility>
 #include <vector>
 #include "../cuda/tensor.h"
 
 namespace dlib
 {
+    /* One payload of a modality other than text, waiting to be consumed by the layer that
+       claims its slot.
+
+       The layout of the data is deliberately not described here: only the layer that reads
+       a given slot knows whether it holds pixels, samples of a waveform, or vectors
+       already projected into the embedding space. What the context does describe is where
+       the payload belongs, which is the one thing every modality has in common and the one
+       thing the enclosing network needs to agree on.  */
+    struct modality_input
+    {
+        resizable_tensor payload;
+        std::vector<long> positions;  // positions of the stream this payload occupies
+        long sequence = 0;            // which sequence of the batch it belongs to
+    };
+
+    /* Slot numbers are plain integers so that a new modality costs nothing to either the
+       context or the existing layers. These are the ones this library uses; anything from
+       first_free upward is available.  */
+    struct modality_slot
+    {
+        static constexpr long vision     = 0;
+        static constexpr long audio      = 1;
+        static constexpr long video      = 2;
+        static constexpr long first_free = 16;
+    };
+
     class network_context
     {
     public:
@@ -300,6 +328,65 @@ namespace dlib
             get_kv_cache_clear_request_() = false;
         }
 
+        /* Modality inputs for the next forward pass.
+
+           The standard input of a network here remains the token stream, and this is how
+           anything else reaches it: an encoder produces vectors for which no identifier
+           exists, the prompt reserves their positions with a placeholder token, and the
+           layer that sits above the embeddings writes them over those positions. A layer
+           whose slot is empty copies its input to its output and is transparent.
+
+           The payloads are consumed by the layer that takes them, so single-token steps
+           following a prefill see nothing and no image is presented twice. Set them
+           immediately before the forward pass that must read them.
+
+           On the pairing between a payload and its batch: with a hand-written training
+           loop or during inference there is nothing to arrange, the two are separated by a
+           single call. Under dnn_trainer, whose pipeline prepares one batch while the
+           previous one computes, call trainer.get_net(force_flush_to_disk::no) first: the
+           barrier costs the overlap of one batch preparation, which is immaterial next to
+           a forward and a backward pass, and without it the payload can reach the wrong
+           batch. Multiple devices split a batch across nets and would need a slot per
+           device, which this does not provide.  */
+        static void set_modality_inputs(long slot, std::vector<modality_input> inputs)
+        {
+            std::lock_guard<std::mutex> lock(get_mutex_());
+            if (inputs.empty()) { get_modality_().erase(slot); return; }
+            get_modality_()[slot] = std::move(inputs);
+            get_is_active_() = true;
+        }
+
+        static bool has_modality_inputs(long slot)
+        {
+            std::lock_guard<std::mutex> lock(get_mutex_());
+            return get_modality_().find(slot) != get_modality_().end();
+        }
+
+        /* Hands the payloads of a slot over and forgets them. Returns an empty vector when
+           the slot holds nothing, which is what makes a layer transparent by default. */
+        static std::vector<modality_input> take_modality_inputs(long slot)
+        {
+            std::lock_guard<std::mutex> lock(get_mutex_());
+            auto it = get_modality_().find(slot);
+            if (it == get_modality_().end()) return std::vector<modality_input>();
+            std::vector<modality_input> out = std::move(it->second);
+            get_modality_().erase(it);
+            return out;
+        }
+
+        static void clear_modality_inputs(long slot)
+        {
+            std::lock_guard<std::mutex> lock(get_mutex_());
+            get_modality_().erase(slot);
+        }
+
+        static void clear_all_modality_inputs()
+        {
+            std::lock_guard<std::mutex> lock(get_mutex_());
+            get_modality_().clear();
+        }
+
+
     private:
 
         static void clear_padding_nolock_()
@@ -320,6 +407,7 @@ namespace dlib
             get_kv_cache_keep_length_() = 0;
             get_parameter_residency_() = parameter_residency::off;
             get_kv_cache_clear_request_() = false;
+            get_modality_().clear();
             clear_padding_nolock_();
         }
 
@@ -370,6 +458,10 @@ namespace dlib
         }
         static parameter_residency& get_parameter_residency_() {
             static parameter_residency v = parameter_residency::off;
+            return v;
+        }
+        static std::map<long, std::vector<modality_input>>& get_modality_() {
+            static std::map<long, std::vector<modality_input>> v;
             return v;
         }
         static bool& get_kv_cache_clear_request_() {

@@ -2107,6 +2107,20 @@ namespace dlib
                   variance to prevent the division from dividing by zero.
         !*/
 
+        void set_eps(
+            double val
+        );
+        /*!
+            requires
+                - val > 0
+            ensures
+                - #get_eps() == val
+                - An imported open-weight model carries the epsilon it was trained with,
+                  which is not always this library's default; a loader pushes that value in
+                  here before copying the weights, since a deep stack normalized at the
+                  wrong epsilon drifts quietly rather than failing.
+        !*/
+
         double get_learning_rate_multiplier(
         ) const;
         /*!

@@ -477,8 +477,14 @@ namespace dlib
             tt::gemm(0.0f, dattn, 1.0f, dctx_4d, false, saved_v_repeated, true, operation_mode::PLANE_WISE);
             tt::gemm(0.0f, dV_repeated, 1.0f, saved_attn, true, dctx_4d, false, operation_mode::PLANE_WISE);
 
-            // Step 7 backward
+            /* Step 7 backward. tt::softmax_gradient adds into its destination whenever
+               that destination is a different object from its input, and a freshly built
+               tensor holds whatever the allocator last released, which in a training loop
+               is the previous pass over these very scores. Left uncleared the gradient
+               diverges within a handful of steps while every forward stays correct, so the
+               failure reads as an unstable optimizer rather than as a bug here.  */
             resizable_tensor dscores_masked(B, NUM_HEADS, N, N);
+            dscores_masked = 0;
             tt::softmax_gradient(dscores_masked, saved_attn, dattn, operation_mode::PLANE_WISE);
 
             // Step 6 backward

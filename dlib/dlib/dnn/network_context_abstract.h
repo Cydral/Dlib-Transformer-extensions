@@ -10,6 +10,45 @@ namespace dlib
 
 // ----------------------------------------------------------------------------------------
 
+    struct modality_input
+    {
+        /*!
+            WHAT THIS OBJECT REPRESENTS
+                One payload of a modality other than text, waiting to be consumed by the
+                layer that claims its slot.
+
+                The layout of payload is deliberately not described: only the layer that
+                reads a given slot knows whether it holds pixels, samples of a waveform, or
+                vectors already projected into the embedding space. What is described here
+                is where the payload belongs, which is the one thing every modality has in
+                common and the one thing the enclosing network must agree on.
+
+                - payload:   the data itself.
+                - positions: the positions of the token stream this payload occupies. The
+                             prompt reserves them with a placeholder token.
+                - sequence:  which sequence of the batch it belongs to.
+        !*/
+
+        resizable_tensor payload;
+        std::vector<long> positions;
+        long sequence = 0;
+    };
+
+    struct modality_slot
+    {
+        /*!
+            WHAT THIS OBJECT REPRESENTS
+                Slot numbers, kept as plain integers so that adding a modality costs
+                nothing to either the context or the existing layers. These are the ones
+                this library uses; anything from first_free upward is available.
+        !*/
+
+        static constexpr long vision     = 0;
+        static constexpr long audio      = 1;
+        static constexpr long video      = 2;
+        static constexpr long first_free = 16;
+    };
+
     class network_context
     {
         /*!
@@ -121,6 +160,7 @@ namespace dlib
                     * #get_kv_cache_keep_length() == 0
                     * #get_parameter_residency() == parameter_residency::off
                     * The internal "clear KV cache" flag is cleared.
+                    * Every modality slot is emptied.
                     * Optimizer hyperparameters revert to their defaults
                       (weight_decay=0.004, beta1=0.9, beta2=0.999).
         !*/
@@ -324,6 +364,68 @@ namespace dlib
             ensures
                 - Clears the cache-clear flag. The generation loop calls this
                   after a forward pass that has consumed the request.
+        !*/
+
+        // Inputs of a modality other than text
+
+        static void set_modality_inputs(
+            long slot,
+            std::vector<modality_input> inputs
+        );
+        /*!
+            ensures
+                - The payloads become available to whichever layer reads this slot on the
+                  next forward pass. Passing an empty vector empties the slot.
+                - #has_modality_inputs(slot) == !inputs.empty()
+                - #is_active() == true if inputs is not empty
+                - The standard input of a network here remains the token stream, and this
+                  is how anything else reaches it: an encoder produces vectors for which no
+                  identifier exists, the prompt reserves their positions with a placeholder
+                  token, and the layer above the embeddings writes them over those
+                  positions.
+                - Set this immediately before the forward pass that must read it.
+
+            ON PAIRING A PAYLOAD WITH ITS BATCH
+
+                During inference, or with a hand-written training loop, a single call
+                separates this from the forward pass that consumes it and there is nothing
+                to arrange.
+
+                Under dnn_trainer, whose pipeline prepares one batch while the previous one
+                computes, call trainer.get_net(force_flush_to_disk::no) before setting the
+                slot. That barrier costs the overlap of one batch preparation, which is
+                immaterial next to a forward and a backward pass; without it a payload can
+                reach the wrong batch.
+
+                A batch split across several devices would need one slot per device, which
+                this does not provide.
+        !*/
+
+        static bool has_modality_inputs(
+            long slot
+        );
+        /*!
+            ensures
+                - Returns true iff slot holds payloads that have not yet been taken.
+        !*/
+
+        static std::vector<modality_input> take_modality_inputs(
+            long slot
+        );
+        /*!
+            ensures
+                - Returns the payloads of slot and empties it, so that the single-token
+                  steps following a prefill see nothing and no payload is presented twice.
+                - Returns an empty vector if the slot holds nothing, which is what lets a
+                  layer be transparent by default.
+                - #has_modality_inputs(slot) == false
+        !*/
+
+        static void clear_modality_inputs(long slot);
+        static void clear_all_modality_inputs();
+        /*!
+            ensures
+                - Discards payloads set and not yet taken, for one slot or for all of them.
         !*/
 
         enum class parameter_residency

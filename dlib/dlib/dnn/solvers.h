@@ -651,6 +651,14 @@ namespace dlib
                 s.copy_size(params_grad);
             }
 
+            /* The step counter drives Adam's bias correction, whose factor is
+               sqrt(1 - momentum2^t) / (1 - momentum1^t). At t == 0 that reads 0/0, so a
+               parameter blob reached through this overload came out entirely NaN on its
+               first update while the generic operator(), which does increment, was fine.
+               Only fc_ and con_ route here, which is why a stack built from linear_ never
+               showed it.  */
+            ++t;
+
             // Step 1: compute adaptive gradient update with decoupled weight decay
             if (l.get_bias_learning_rate_multiplier() == 1)
             {

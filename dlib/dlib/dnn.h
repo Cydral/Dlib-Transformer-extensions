@@ -37,6 +37,7 @@
 #include "dnn/transformer_config.h"
 #include "dnn/decoder_transformer_config.h"
 #include "dnn/vision_transformer.h"
+#include "dnn/modality_fusion.h"
 #include "dnn/runtime_transformer.h"
 #include "dnn/runtime_vision_encoder.h"
 #include "dnn/decoder_models.h"
