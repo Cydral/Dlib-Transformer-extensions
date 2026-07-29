@@ -775,7 +775,8 @@ namespace dlib
         long num_heads,
         long ffn_hidden,
         long shuffle_factor,
-        long projection_dim
+        long projection_dim,
+        typename INPUT = tag10<input_tensor>
     >
     struct vision_transformer_config
     {
@@ -794,6 +795,11 @@ namespace dlib
         static constexpr long NUM_TOKENS   = OUT_SIDE * OUT_SIDE;
         static constexpr long FOLDED_WIDTH = width * shuffle_factor * shuffle_factor;
 
+        /* INPUT is what the tower reads. The default, input_tensor behind a tag, is what a
+           fusion layer drives with a prepared image tensor. Naming input_rgb_image_sized
+           instead turns the same tower into a standalone backbone that takes pictures, for
+           classification or for a self-supervised objective, with no other change. */
+
         static_assert(image_size % patch_size == 0,
             "the image size must be a whole number of patches");
         static_assert(GRID_SIDE % shuffle_factor == 0,
@@ -804,7 +810,7 @@ namespace dlib
             patch_positions<NUM_PATCHES, WIDTH,
             patch_sequence<
             con<WIDTH, PATCH_SIZE, PATCH_SIZE, PATCH_SIZE, PATCH_SIZE,
-            tag10<input_tensor>>>>>;
+            INPUT>>>>;
 
         /* The projector carries a bias in some containers and not in others. The slot is
            always present and left at zero when the file has none, which costs a vector of

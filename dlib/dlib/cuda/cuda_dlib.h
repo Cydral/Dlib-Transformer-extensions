@@ -5,6 +5,7 @@
 
 
 #include "tensor.h"
+#include <vector>
 #include "../geometry/rectangle.h"
 #include "../dnn/utilities.h"
 
@@ -740,16 +741,28 @@ namespace dlib
                 double z_loss_weight
                 ) const
             {
-                const size_t bytes_per_sample = sizeof(unsigned long);
-                buf = device_global_buffer(subnetwork_output.num_samples() * bytes_per_sample + sizeof(float));
+                /* One target per position now, not one per sample: the whole label matrix
+                   travels to the device, laid out sample-major so that the kernel indexes
+                   it as truth[i * seq_len + t]. */
+                const long samples = subnetwork_output.num_samples();
+                const long seq_len = subnetwork_output.nr();
+                const size_t count = static_cast<size_t>(samples) * static_cast<size_t>(seq_len);
+                std::vector<unsigned long> host_truth(count);
+                for (long i = 0; i < samples; ++i, ++truth)
+                {
+                    const auto& labels = *truth;
+                    DLIB_CASSERT(labels.nr() == seq_len,
+                        "The label column must have one entry per sequence position: got "
+                        << labels.nr() << " for a sequence of " << seq_len << ".");
+                    for (long t = 0; t < seq_len; ++t)
+                        host_truth[static_cast<size_t>(i) * seq_len + t] = labels(t);
+                }
+
+                buf = device_global_buffer(count * sizeof(unsigned long) + sizeof(float));
                 cuda_data_ptr<float> loss_buf = static_pointer_cast<float>(buf, 1);
                 buf = buf + sizeof(float);
-                for (long i = 0; i < subnetwork_output.num_samples(); ++i, ++truth)
-                {
-                    const unsigned long t = *truth;
-                    memcpy(buf + i * bytes_per_sample, &t, bytes_per_sample);
-                }
-                auto truth_buf = static_pointer_cast<const unsigned long>(buf, subnetwork_output.num_samples());
+                memcpy(buf, host_truth.data(), count * sizeof(unsigned long));
+                auto truth_buf = static_pointer_cast<const unsigned long>(buf, count);
                 do_work(loss_buf, truth_buf, input_tensor, subnetwork_output, gradient, loss,
                     ignore_index, label_smoothing, pad_index, z_loss_weight);
             }
@@ -794,16 +807,28 @@ namespace dlib
                 double z_loss_weight
                 ) const
             {
-                const size_t bytes_per_sample = sizeof(unsigned long);
-                buf = device_global_buffer(subnetwork_output.num_samples() * bytes_per_sample + sizeof(float));
+                /* One target per position now, not one per sample: the whole label matrix
+                   travels to the device, laid out sample-major so that the kernel indexes
+                   it as truth[i * seq_len + t]. */
+                const long samples = subnetwork_output.num_samples();
+                const long seq_len = subnetwork_output.nr();
+                const size_t count = static_cast<size_t>(samples) * static_cast<size_t>(seq_len);
+                std::vector<unsigned long> host_truth(count);
+                for (long i = 0; i < samples; ++i, ++truth)
+                {
+                    const auto& labels = *truth;
+                    DLIB_CASSERT(labels.nr() == seq_len,
+                        "The label column must have one entry per sequence position: got "
+                        << labels.nr() << " for a sequence of " << seq_len << ".");
+                    for (long t = 0; t < seq_len; ++t)
+                        host_truth[static_cast<size_t>(i) * seq_len + t] = labels(t);
+                }
+
+                buf = device_global_buffer(count * sizeof(unsigned long) + sizeof(float));
                 cuda_data_ptr<float> loss_buf = static_pointer_cast<float>(buf, 1);
                 buf = buf + sizeof(float);
-                for (long i = 0; i < subnetwork_output.num_samples(); ++i, ++truth)
-                {
-                    const unsigned long t = *truth;
-                    memcpy(buf + i * bytes_per_sample, &t, bytes_per_sample);
-                }
-                auto truth_buf = static_pointer_cast<const unsigned long>(buf, subnetwork_output.num_samples());
+                memcpy(buf, host_truth.data(), count * sizeof(unsigned long));
+                auto truth_buf = static_pointer_cast<const unsigned long>(buf, count);
                 do_work(loss_buf, truth_buf, input_tensor, subnetwork_output, gradient, loss,
                     ignore_indices, label_smoothing, pad_index, z_loss_weight);
             }

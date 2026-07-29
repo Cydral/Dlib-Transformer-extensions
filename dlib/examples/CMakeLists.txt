@@ -191,18 +191,28 @@ add_example(slm_cygnus_instruct_ex)
 add_example(slm_predictive_compressor_ex)
 add_example(slm_tok_predictive_compressor_ex)
 add_example(slm_gguf_import_ex)
-if(MSVC)
-    target_compile_options(slm_gguf_import_ex PRIVATE /bigobj)
-else()
-    # dlib::layer<i> recurses once per layer, so visiting a network of N layers costs a
-    # template instantiation depth proportional to N. The text-only decoder sat just
-    # under the 900 GCC allows by default; the fusion layer pushed it over.
-    target_compile_options(slm_gguf_import_ex PRIVATE -ftemplate-depth=4096)
-endif()
 add_example(slm_gguf_runtime_ex)
 add_example(slm_lora_adapter_check_ex)
 add_example(slm_lora_finetune_ex)
 add_example(slm_vision_tower_ex)
+add_example(slm_vit_classify_ex)
+add_example(slm_vit_ssl_ex)
+
+# The examples that compile a whole model in from a generated header.
+#
+# dlib::layer<i> recurses once per layer, so visiting a network of N layers costs a
+# template instantiation depth proportional to N, and every visitor pays it: weight
+# import, adapter configuration, parameter counting. A thirty-layer decoder sat just
+# under the 900 GCC allows by default, and the fusion layer pushed it over. The bound
+# rises with the depth of the model rather than with anything these files do, so it is
+# raised once for both of them instead of being chased target by target.
+foreach(target slm_gguf_import_ex slm_lora_finetune_ex)
+    if(MSVC)
+        target_compile_options(${target} PRIVATE /bigobj)
+    else()
+        target_compile_options(${target} PRIVATE -ftemplate-depth=4096)
+    endif()
+endforeach()
 #add_gui_example(3d_point_cloud_ex)
 #add_example(bayes_net_ex)
 #add_example(bayes_net_from_disk_ex)

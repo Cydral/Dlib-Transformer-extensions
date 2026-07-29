@@ -18,6 +18,7 @@
       slm_gguf_import_ex --load model.dat --chat
       slm_gguf_import_ex --input model.gguf --mmproj mmproj-model.gguf --out-prefix m
       slm_gguf_import_ex --input model.gguf --mmproj mmproj-model.gguf --convert
+      slm_gguf_import_ex --load model.dat --probe-logits
       slm_gguf_import_ex --load model.dat --image photo.png
       slm_gguf_import_ex --load model.dat --serve 8080
 
@@ -105,6 +106,7 @@
 #  include <dlib/dnn.h>
 #  include <dlib/data_io/gguf_weight_loader.h>
 #  include <dlib/data_io/gguf_vision_loader.h>
+#  include <dlib/data_io/model_archive.h>
 #  include <dlib/server/chat_service.h>
 #  include IMPORTED_MODEL_HEADER
 #endif
@@ -620,38 +622,22 @@ int load_archive(generator_type& generator, hf_tokenizer& tok, const std::string
     std::string& name_out, vision_spec& vspec_out)
 {
     cout << "Loading converted model from " << dat_path << " ...\n";
-    std::ifstream fin(dat_path, std::ios::binary);
-    if (!fin) { cerr << "Error: cannot open " << dat_path << "\n"; return 1; }
-    std::string tag, model_name;
-    deserialize(tag, fin);
-    if (tag != "gguf_import_model")
+    model_archive_info info;
+    try
     {
-        cerr << "Error: '" << dat_path << "' is not a model archive produced by --convert; regenerate it.\n";
-        return 1;
+        load_model_archive(dat_path, generator.subnet().subnet(), tok, info,
+            vision::available);
     }
-    deserialize(model_name, fin);
-    deserialize(generator.subnet().subnet(), fin);
-    deserialize(tok, fin);
+    catch (const std::exception& e)
+    { cerr << "Error: " << e.what() << "\n"; return 1; }
 
-    bool has_vision = false;
-    deserialize(has_vision, fin);
-    if (has_vision != vision::available)
-    {
-        cerr << "Error: '" << dat_path << "' " << (has_vision ? "carries" : "does not carry")
-             << " a vision tower and this build " << (vision::available ? "expects" : "does not expect")
-             << " one; regenerate the header and the archive together.\n";
-        return 1;
-    }
-    if (has_vision)
-    {
-        deserialize(vspec_out.image_size, fin);
-        deserialize(vspec_out.image_mean, fin);
-        deserialize(vspec_out.image_std, fin);
-    }
-
-    name_out = clean_model_name(model_name);
+    name_out = clean_model_name(info.model_name);
+    vspec_out = info.vision;
     cout << "Model: " << name_out
-         << (has_vision ? " (vision tower included)" : "") << "\n";
+         << (info.has_vision ? " (vision tower included)" : "") << "\n";
+    if (info.tail_missing)
+        cout << "note: this archive carries no pixel normalization, so it predates that\n"
+                "      block. Text works; images will refuse rather than guess.\n";
     return 0;
 }
 
@@ -1154,22 +1140,14 @@ int run_serve_dat(const std::string& dat_path,
         offload_params);
 }
 
-/* Print the most probable next tokens for a prompt's last position. Compare these with a
-   reference (for example an external GGUF runtime) to validate the weight repacking. */
-int run_probe(gguf_reader& g, const model_spec& spec, const gguf_load_options& lopt,
-    const std::string& prompt, const adapter_request& adapters)
+/* The probe itself, shared by the two ways of getting a loaded network.
+
+   This is the cheapest check there is on a set of weights: five probabilities that can be
+   read against a reference implementation, and a per-position argmax that says where two
+   runs first diverge. Worth having on an archive and not only on a container, since an
+   archive is what a fine-tuning run consumes and produces. */
+int probe_prompt(generator_type& generator, hf_tokenizer& tok, const std::string& prompt)
 {
-    if (!model_matches_header(spec))
-    { cerr << "Error: model does not match the compiled-in header. Regenerate and recompile.\n"; return 1; }
-
-    generator_type generator(multiply_(1.0));
-    cout << "Importing weights into the network...\n";
-    import_gguf_weights(generator, g, spec, lopt);
-    apply_adapters(generator, adapters);
-
-    hf_tokenizer tok;
-    tok.load_from_gguf(g);
-
     /* Tokenize with the model's own declared conventions (tokenizer.ggml.add_bos_token
        and friends). Forcing a BOS is wrong for models that declare none: SmolLM2's id 1
        is <|im_start|>, a chat control token never seen followed by raw text during
@@ -1219,6 +1197,36 @@ int run_probe(gguf_reader& g, const model_spec& spec, const gguf_load_options& l
 
     network_context::reset();
     return 0;
+}
+
+/* Print the most probable next tokens for a prompt's last position. Compare these with a
+   reference (for example an external GGUF runtime) to validate the weight repacking. */
+int run_probe(gguf_reader& g, const model_spec& spec, const gguf_load_options& lopt,
+    const std::string& prompt, const adapter_request& adapters)
+{
+    if (!model_matches_header(spec))
+    { cerr << "Error: model does not match the compiled-in header. Regenerate and recompile.\n"; return 1; }
+
+    generator_type generator(multiply_(1.0));
+    cout << "Importing weights into the network...\n";
+    import_gguf_weights(generator, g, spec, lopt);
+    apply_adapters(generator, adapters);
+
+    hf_tokenizer tok;
+    tok.load_from_gguf(g);
+    return probe_prompt(generator, tok, prompt);
+}
+
+/* Probe over a converted archive, so that the weights a fine-tuning run reads and writes
+   can be checked without going back to the source container. */
+int run_probe_dat(const std::string& dat_path, const std::string& prompt)
+{
+    generator_type generator(multiply_(1.0));
+    hf_tokenizer tok;
+    std::string name;
+    vision_spec vspec;
+    if (load_archive(generator, tok, dat_path, name, vspec) != 0) return 1;
+    return probe_prompt(generator, tok, prompt);
 }
 
 /* Probe on an explicit token-id sequence, bypassing the tokenizer. This isolates forward-pass
@@ -1335,11 +1343,11 @@ int run_convert(gguf_reader& g, const model_spec& spec, const gguf_load_options&
        lets --load serve or describe with no projector container anywhere in sight. */
     cout << "Serializing model to " << out_path << " ...\n";
     {
-        auto out = serialize(out_path);
-        out << std::string("gguf_import_model") << model_display_name(spec)
-            << net.subnet() << tok << vision::available;
-        if (vision::available)
-            out << vspec.image_size << vspec.image_mean << vspec.image_std;
+        model_archive_info info;
+        info.model_name = model_display_name(spec);
+        info.has_vision = vision::available;
+        info.vision = vspec;
+        save_model_archive(out_path, info, net.subnet(), tok);
     }
     cout << "Done. Wrote " << out_path << "\n";
     return 0;
@@ -1464,6 +1472,18 @@ int main(int argc, char** argv)
                 parser.option("deterministic"), parser.option("trace-prompt"),
                 get_option(parser, "template", std::string("auto")),
                 parser.option("offload-params"));
+#else
+            cerr << "This build has no model header compiled in.\n";
+            return 1;
+#endif
+        }
+
+        /* The probe over an archive: same five probabilities, no container needed. */
+        if (parser.option("load") && parser.option("probe-logits"))
+        {
+#ifdef WITH_IMPORTED_MODEL
+            return run_probe_dat(parser.option("load").argument(),
+                get_option(parser, "prompt", std::string("The capital of France is")));
 #else
             cerr << "This build has no model header compiled in.\n";
             return 1;

@@ -145,7 +145,7 @@ void build_sft_samples(
     const std::vector<std::pair<std::string, std::string>>& qa_pairs,
     bpe_tokenizer& tok, const special_ids& sp, long max_seq_len,
     std::vector<matrix<int, 0, 1>>& samples,
-    std::vector<unsigned long>& labels,
+    std::vector<matrix<unsigned long, 0, 1>>& labels,
     size_t& skipped)
 {
     samples.clear();
@@ -163,8 +163,16 @@ void build_sft_samples(
         for (long i = 0; i < pad_n; ++i) window(i) = sp.pad;
         for (long i = 0; i < static_cast<long>(t.size()); ++i) window(pad_n + i) = t[i];
 
+        /* One target per position, which is what the loss reads: inside the window each
+           position is supervised against the token that follows it, and the last one
+           against the padding that closes the sequence. */
+        matrix<unsigned long, 0, 1> target(max_seq_len, 1);
+        for (long i = 0; i + 1 < max_seq_len; ++i)
+            target(i) = static_cast<unsigned long>(window(i + 1));
+        target(max_seq_len - 1) = static_cast<unsigned long>(sp.pad);
+
         samples.push_back(std::move(window));
-        labels.push_back(static_cast<unsigned long>(sp.pad));
+        labels.push_back(std::move(target));
     }
 }
 
@@ -248,7 +256,7 @@ int run_fine_tune(const std::string& model_file, const std::string& tokenizer_fi
     cout << "Loaded " << qa_pairs.size() << " Q/A pairs\n";
 
     std::vector<matrix<int, 0, 1>> samples;
-    std::vector<unsigned long> labels;
+    std::vector<matrix<unsigned long, 0, 1>> labels;
     size_t skipped = 0;
     build_sft_samples(qa_pairs, tokenizer, sp, pipeline_constants::max_seq_len, samples, labels, skipped);
     cout << "Instruct samples: " << samples.size() << " (skipped " << skipped
@@ -285,7 +293,8 @@ int run_fine_tune(const std::string& model_file, const std::string& tokenizer_fi
         {
             size_t batch_end = std::min(i + static_cast<size_t>(batch_size), samples.size());
             std::vector<matrix<int, 0, 1>> batch_X(samples.begin() + i, samples.begin() + batch_end);
-            std::vector<unsigned long> batch_Y(labels.begin() + i, labels.begin() + batch_end);
+            std::vector<matrix<unsigned long, 0, 1>> batch_Y(
+                labels.begin() + i, labels.begin() + batch_end);
 
             /* Left-padded batch: the attention layer needs the per-sample leading padding
                lengths, which forces the synchronization barrier each step; propagating the

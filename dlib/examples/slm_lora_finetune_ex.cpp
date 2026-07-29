@@ -58,6 +58,7 @@
 #include <dlib/dnn.h>
 #include <dlib/tokenizer/hf_tokenizer.h>
 #include <dlib/tokenizer/chat_template.h>
+#include <dlib/data_io/model_archive.h>
 
 #if __has_include("slm_imported_model.h")
 #  include "slm_imported_model.h"
@@ -99,6 +100,8 @@ struct stage_settings
     double min_learning_rate = 1e-6;
     long   valid_batch = 1;       // validation runs one window at a time by default
     long   patience = 0;          // 0 lets the trainer derive one from the set size
+    long   initial_windows = 64;  // validation windows used to measure the starting loss
+    double label_smoothing = 0.1; // 0 makes the loss comparable with a plain cross-entropy
     long   limit = 0;             // 0 keeps the whole set
     double weight_decay = 0.0;    // decoupled, and off by default on adapters
     double beta1 = 0.9;
@@ -133,10 +136,68 @@ static void report_cost(size_t windows, const stage_settings& st, size_t paramet
          << "                before activations. Lower --window or --batch-size first.\n";
 }
 
+/* Answers with the encoder's parameter count on a fusion layer and with zero on anything
+   else. The overloads rather than a runtime test: the fusion layer's type simply does not
+   exist in a text-only build. */
+template <typename layer_type>
+size_t vision_tower_parameters(const layer_type&, long) { return 0; }
+
+
+template <typename E, long SLOT, long TK, long W>
+size_t vision_tower_parameters(const modality_fusion_<E, SLOT, TK, W>& l, int)
+{
+    return l.internal_parameters();
+}
+
+/* Freezes the vision tower, when the compiled network carries one.
+
+   freeze_all_but_adapters already zeroes the fusion layer's multiplier, and the layer
+   declines to touch its encoder at a multiplier of zero, so the tower would stay put
+   anyway. This says it out loud for two reasons. The tower's weights live in a subnetwork
+   and are therefore invisible to count_trainable_parameters, which walks the main chain
+   only: without a word here, a reader would have no way to tell whether ninety-three
+   million parameters are moving. And a future run that means to train the projector will
+   have exactly one line to change. */
+static void report_vision_tower(train_net& net)
+{
+    size_t frozen = 0;
+    visit_computational_layers(net, [&](auto& layer) {
+        frozen += vision_tower_parameters(layer, 0);
+        });
+    if (frozen == 0) return;
+    cout << "  vision      : " << frozen << " parameters, frozen\n";
+}
+
+/* The windows are padded on the left to a fixed length, so a batch of them carries
+   positions that stand for nothing. The attention has to be told where they are.
+
+   Left unsaid, every real position attends over that filler as if it were text: on this
+   dataset a window of 960 holds around 413 tokens of content, so more than half of what
+   each position looks at is noise, and the forward pass is destroyed. The model then reads
+   as if it predicted at random, which is exactly what the loss before training says, and
+   adapters trained in that state learn to compensate for a fault that does not exist at
+   inference time. */
+static long leading_padding(const matrix<int, 0, 1>& window, int pad_token)
+{
+    long n = 0;
+    while (n < window.nr() && window(n) == pad_token) ++n;
+    return n;
+}
+
+template <typename iterator>
+static void announce_padding(iterator begin, iterator end, int pad_token)
+{
+    std::vector<long> lengths;
+    lengths.reserve(static_cast<size_t>(std::distance(begin, end)));
+    for (iterator it = begin; it != end; ++it) lengths.push_back(leading_padding(*it, pad_token));
+    network_context::set_padding_from_lengths(lengths);
+}
+
 static void report_adapters(train_net& net, const adapter_settings& ad)
 {
     const size_t layers = configure_network_adapters(net, ad);
     freeze_all_but_adapters(net);
+    report_vision_tower(net);
 
     const trainable_counts counts = count_trainable_parameters(net);
     cout << "  adapters    : " << adapter_method_name(ad.method)
@@ -157,9 +218,18 @@ static void run_training(train_net& net,
     std::vector<matrix<int, 0, 1>>& VX,
     std::vector<matrix<unsigned long, 0, 1>>& VY,
     const stage_settings& st,
-    const std::string& sync_file)
+    const std::string& sync_file,
+    int pad_token)
 {
     net.loss_details().set_ignore_index(static_cast<long>(IGNORE_LABEL));
+
+    /* Label smoothing spreads a little of each target's probability over the rest of the
+       vocabulary. It regularizes, and it also raises the reported loss by roughly its
+       weight times the mean surprise of the whole vocabulary, which on a vocabulary this
+       size is worth more than a full nat. That matters when the number is read against a
+       reference implementation, which normally uses none: set it to zero to compare, put
+       it back to train. */
+    net.loss_details().set_label_smoothing(st.label_smoothing);
 
     /* AdamW rather than Adam: its weight decay is decoupled from the adaptive step, so the
        decay a layer receives no longer depends on the scale of its gradients. On an
@@ -191,6 +261,43 @@ static void run_training(train_net& net,
        nothing. */
     network_context::set_learning_rate(st.learning_rate);
 
+    /* The loss of the model before a single step.
+
+       Without it there is no way to tell a run that improves a pretrained model from one
+       that first breaks it and then rebuilds it on the training distribution alone: both
+       show a falling curve. Adapters are inert at this point, B being zero, so this is the
+       loaded model's own loss and nothing else.
+
+       Bounded, and announced before it starts. The whole validation set is hundreds of
+       windows whatever --limit says, and a forward pass over all of them on a decoder of
+       this size takes long enough that a silent wait reads as a hung program. A few dozen
+       windows are ample: the question this answers is whether the number is near three or
+       near ten, not what its third decimal is. */
+    if (!VX.empty() && st.initial_windows > 0)
+    {
+        const size_t windows = std::min(VX.size(), static_cast<size_t>(st.initial_windows));
+        cout << "  measuring the loss before training over " << windows
+             << " validation windows, label smoothing " << st.label_smoothing
+             << "..." << std::flush;
+
+        train_net& start = trainer.get_net(force_flush_to_disk::no);
+        const size_t vbatch = static_cast<size_t>(std::max<long>(1, st.valid_batch));
+        double total = 0.0;
+        size_t counted = 0;
+        for (size_t i = 0; i < windows; i += vbatch)
+        {
+            const size_t upto = std::min(i + vbatch, windows);
+            announce_padding(VX.begin() + i, VX.begin() + upto, pad_token);
+            total += start.compute_loss(VX.begin() + i, VX.begin() + upto,
+                VY.begin() + i) * static_cast<double>(upto - i);
+            counted += upto - i;
+        }
+        network_context::clear_padding();
+        cout << "\r  loss before training : " << (counted ? total / counted : 0.0)
+             << "  (the loaded model, adapters inert, over " << windows << " windows)"
+             << std::string(20, ' ') << "\n";
+    }
+
     /* Explicit epochs over shuffled mini-batches rather than trainer.train(), which runs
        until the learning rate bottoms out: a fine-tuning stage is budgeted in passes over
        a known set, and the caller wants to see each pass land. The trainer still lowers
@@ -203,6 +310,12 @@ static void run_training(train_net& net,
         shuffle_training_dataset(X, Y, 1 + static_cast<unsigned long>(epoch));
         for (size_t i = 0; i + batch <= X.size(); i += batch)
         {
+            /* The barrier before touching the context: the trainer prepares one batch
+               while the previous one computes, so without it the mask can reach the wrong
+               batch. It costs the overlap of one batch preparation, which is nothing next
+               to a forward and a backward pass on this decoder. */
+            trainer.get_net(force_flush_to_disk::no);
+            announce_padding(X.begin() + i, X.begin() + i + batch, pad_token);
             trainer.train_one_step(X.begin() + i, X.begin() + i + batch, Y.begin() + i);
             if (trainer.get_learning_rate() < trainer.get_min_learning_rate()) break;
         }
@@ -230,6 +343,7 @@ static void run_training(train_net& net,
             for (size_t i = 0; i < VX.size(); i += vbatch)
             {
                 const size_t upto = std::min(i + vbatch, VX.size());
+                announce_padding(VX.begin() + i, VX.begin() + upto, pad_token);
                 total += current.compute_loss(VX.begin() + i, VX.begin() + upto,
                     VY.begin() + i) * static_cast<double>(upto - i);
                 counted += upto - i;
@@ -288,7 +402,8 @@ static bool stage_knowledge(train_net& net, const hf_tokenizer& tok,
 
     std::vector<matrix<int, 0, 1>> VX;
     std::vector<matrix<unsigned long, 0, 1>> VY;
-    run_training(net, X, Y, VX, VY, st, sync_file);
+    run_training(net, X, Y, VX, VY, st, sync_file,
+        tok.pad_id() >= 0 ? tok.pad_id() : 0);
     return true;
 }
 
@@ -376,7 +491,8 @@ static bool stage_task(train_net& net, const hf_tokenizer& tok,
     report_adapters(net, ad);
     if (st.dry_run) { cout << "  dry run, no training\n"; return true; }
 
-    run_training(net, X, Y, VX, VY, st, sync_file);
+    run_training(net, X, Y, VX, VY, st, sync_file,
+        tok.pad_id() >= 0 ? tok.pad_id() : 0);
     return true;
 }
 
@@ -411,6 +527,8 @@ int main(int argc, char** argv)
         parser.add_option("learning-rate", "Initial learning rate (default: 2e-5)", 1);
         parser.add_option("min-learning-rate", "Learning rate at which a stage stops (default: 1e-6)", 1);
         parser.add_option("patience", "Steps without progress before the rate is lowered; 0 derives one", 1);
+        parser.add_option("initial-windows", "Validation windows used to measure the starting loss; 0 skips it (default: 64)", 1);
+        parser.add_option("label-smoothing", "Label smoothing of the loss; 0 makes it comparable with a reference implementation (default: 0.1)", 1);
         parser.add_option("limit", "Keep only this many records of the dataset; 0 keeps them all", 1);
         parser.add_option("weight-decay", "Decoupled weight decay of AdamW (default: 0, adapters need none)", 1);
         parser.add_option("beta1", "AdamW first moment decay (default: 0.9)", 1);
@@ -471,6 +589,8 @@ int main(int argc, char** argv)
         st.batch_size = static_cast<long>(number("batch-size", 4));
         st.learning_rate = number("learning-rate", 2e-5);
         st.min_learning_rate = number("min-learning-rate", 1e-6);
+        st.initial_windows = get_option(parser, "initial-windows", 64L);
+        st.label_smoothing = number("label-smoothing", 0.1);
         st.patience = static_cast<long>(number("patience", 0));
         st.limit = static_cast<long>(number("limit", 0));
         st.weight_decay = number("weight-decay", 0.0);
@@ -494,43 +614,33 @@ int main(int argc, char** argv)
         const std::string sync_file = parser.option("sync")
             ? parser.option("sync").argument() : std::string();
 
-        /* The archive carries the parameter-bearing subnet and the tokenizer, in the
-           layout the import program writes. */
+        /* Read through the shared archive format, so that what this program writes back
+           stays readable by the converter. The vision block travels with it: the
+           fine-tuner has no use for it and must not lose it. */
         train_net net;
         hf_tokenizer tok;
-        std::string model_name;
+        model_archive_info archive;
         {
             cout << "Loading " << in_path << " ...\n";
-            std::ifstream fin(in_path, std::ios::binary);
-            if (!fin) { cerr << "Cannot open " << in_path << "\n"; return 1; }
-            std::string tag;
-            deserialize(tag, fin);
-            if (tag != "gguf_import_model")
-            { cerr << "Not a converted model archive: " << in_path << "\n"; return 1; }
-            deserialize(model_name, fin);
             try
             {
-                deserialize(net.subnet(), fin);
-                deserialize(tok, fin);
+                load_model_archive(in_path, net.subnet(), tok, archive,
+                    imported_model::HAS_VISION);
             }
-            catch (const serialization_error& e)
+            catch (const std::exception& e)
             {
-                /* The library carries no serialization versioning by design, so a layout
-                   change makes existing archives unreadable rather than silently wrong.
-                   The raw message names a class and says nothing actionable, hence this
-                   one. */
-                cerr << "Cannot read " << in_path << ": " << e.what() << "\n"
-                     << "This archive predates a change in the network layout. Convert it\n"
-                     << "again from the source model:\n"
+                cerr << e.what() << "\n"
+                     << "If the layout changed, convert again from the source model:\n"
                      << "  slm_gguf_import_ex --input <model>.gguf --out-prefix "
                      << "slm_imported_model --probe x\n"
                      << "  (rebuild, then)\n"
                      << "  slm_gguf_import_ex --input <model>.gguf --convert\n";
                 return 1;
             }
-            model_name = clean_model_name(model_name);
-            cout << "Model       : " << model_name << "\n";
+            archive.model_name = clean_model_name(archive.model_name);
+            cout << "Model       : " << archive.model_name << "\n";
         }
+        const std::string model_name = archive.model_name;
 
         chat_template_formatter fmt = parser.option("template")
             ? chat_template_formatter::for_tokenizer(tok,
@@ -591,8 +701,28 @@ int main(int argc, char** argv)
                it. */
             net.clean();
             cout << "Writing " << out_path << " ...\n";
-            serialize(out_path) << std::string("gguf_import_model") << model_name
-                                << net.subnet() << tok;
+            save_model_archive(out_path, archive, net.subnet(), tok);
+
+            /* Read the header back before claiming success. A training run costs hours and
+               an archive that cannot be reopened wastes all of them, which is exactly what
+               happened when this path still wrote the format by hand and drifted from the
+               reader. The check costs a file open. */
+            {
+                train_net probe;
+                hf_tokenizer probe_tok;
+                model_archive_info probe_info;
+                try
+                {
+                    load_model_archive(out_path, probe.subnet(), probe_tok, probe_info,
+                        imported_model::HAS_VISION);
+                }
+                catch (const std::exception& e)
+                {
+                    cerr << "\nThe archive was written but cannot be read back: " << e.what()
+                         << "\nThe file is left in place; do not discard the training run.\n";
+                    return 1;
+                }
+            }
             cout << "Done. The result loads with slm_gguf_import_ex --load "
                  << out_path << " --chat\n";
         }

@@ -1306,6 +1306,59 @@ namespace dlib
         return rep;
     }
 
+
+    /* Expands the single next-token label of build_single_token_prediction_dataset into
+       the column of per-position targets it stands for.
+
+       The loss reads one target per position. A dataset that carries one label per sample
+       means, implicitly, that inside the window each position is supervised against the
+       token that follows it and only the last position needs a label of its own. That was
+       once left to the loss layer, which derived its targets from the input tokens; it is
+       written out here instead, because a loss that invents its own targets cannot express
+       a masked objective and silently scores prompts and padding when handed one. */
+    inline void expand_next_token_labels(
+        const std::vector<matrix<int, 0, 1>>& samples,
+        const std::vector<unsigned long>& labels,
+        std::vector<matrix<unsigned long, 0, 1>>& targets)
+    {
+        DLIB_CASSERT(samples.size() == labels.size(),
+            "There must be exactly one next-token label per sample.");
+        targets.clear();
+        targets.resize(samples.size());
+        for (size_t i = 0; i < samples.size(); ++i)
+        {
+            const long len = samples[i].nr();
+            DLIB_CASSERT(len > 0, "A sample cannot be empty.");
+            targets[i].set_size(len, 1);
+            for (long t = 0; t + 1 < len; ++t)
+                targets[i](t) = static_cast<unsigned long>(samples[i](t + 1));
+            targets[i](len - 1) = labels[i];
+        }
+    }
+
+    /* The causal dataset with its targets already laid out one per position, which is what
+       the loss reads. Callers that also want the single next-token label, for an accuracy
+       report over the last position say, take the scalar overload and expand it themselves.
+
+       Keeping the next-token convention here rather than inside the loss is deliberate.
+       What a label means belongs to the dataset that produced it. A loss that decides for
+       itself what each position should predict cannot express a masked objective, and will
+       quietly score prompts and padding when handed one, which is exactly how the fault
+       this replaces stayed invisible for so long. */
+    inline void build_single_token_prediction_dataset(
+        const std::vector<std::vector<int>>& token_sequences,
+        long window_len,
+        long padding_token,
+        bool use_left_padding,
+        std::vector<matrix<int, 0, 1>>& X,
+        std::vector<matrix<unsigned long, 0, 1>>& Y)
+    {
+        std::vector<unsigned long> next_token;
+        build_single_token_prediction_dataset(token_sequences, window_len, padding_token,
+            use_left_padding, X, next_token);
+        expand_next_token_labels(X, next_token, Y);
+    }
+
     /* Supervised fine-tuning windows, for the task-alignment stage. One window per example,
        prompt then response, with the prompt positions labelled ignore_label so that only the
        answer contributes to the loss. Scoring the prompt as well would teach the model to

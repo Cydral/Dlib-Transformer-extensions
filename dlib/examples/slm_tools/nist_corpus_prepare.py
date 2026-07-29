@@ -157,8 +157,11 @@ def trim_partial_sentences(text):
     if head and head.end() < len(text):
         text = text[head.end():]
     tail = max(text.rfind(". "), text.rfind(".\n"), text.rfind("? "), text.rfind("! "))
-    if tail == -1 and text.endswith("."):
-        tail = len(text) - 2
+    # A chunk already closing on a full stop needs no cut, and the index must be that of
+    # the mark itself: taken one character earlier, the trim below amputates the final
+    # punctuation of every document it touches.
+    if tail == -1 and text.endswith((".", "?", "!")):
+        tail = len(text) - 1
     if tail > 0.5 * len(text):
         text = text[:tail + 1]
     return text.strip()
@@ -175,7 +178,7 @@ def quality(text):
     extraction, where the characters are ordinary but almost no token is a word.
     """
     if not text:
-        return 0.0, 0.0
+        return 0.0, 0.0, 1.0
     letters = sum(1 for c in text if c.isalpha() or c.isspace())
     words = RE_WORD.findall(text.lower())
     diversity = len(set(words)) / len(words) if words else 0.0

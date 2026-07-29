@@ -210,6 +210,13 @@ def main():
     answer_chars = 0
     sample = None
 
+    if args.valid_out and args.valid_fraction <= 0.0:
+        sys.exit("--valid-out was given without --valid-fraction: no record would be "
+                 "routed to it. Pass --valid-fraction 0.05 for a twentieth of the set.")
+    if args.valid_fraction > 0.0 and not args.valid_out:
+        sys.exit("--valid-fraction was given without --valid-out: there is nowhere to "
+                 "write the validation records.")
+
     out = valid = None
     if not args.report_only:
         out = open(args.out, "w", encoding="utf-8")
@@ -243,7 +250,6 @@ def main():
             if cve_id in seen:
                 counts["duplicate"] += 1
                 continue
-            seen.add(cve_id)
 
             answer = normalize(rebuild_answer(answer, dropped_sections))
             if len(answer) < args.min_answer_chars:
@@ -252,6 +258,11 @@ def main():
             if args.max_answer_chars and len(answer) > args.max_answer_chars:
                 counts["too_long"] += 1
                 continue
+
+            # Marked as seen only once the record has been kept. Claiming the identifier
+            # earlier would let a record rejected for its length shadow a later, usable one
+            # carrying the same identifier.
+            seen.add(cve_id)
 
             question = user_in.strip() if args.keep_source_questions else pick_question(cve_id)
 

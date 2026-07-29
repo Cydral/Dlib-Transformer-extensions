@@ -345,7 +345,8 @@ int main(int argc, char** argv)
             // Prepare training sequences (sliding window)
             cout << "Preparing training sequences...\n";
             std::vector<matrix<int, 0, 1>> samples;
-            std::vector<unsigned long> labels;
+            /* One target per position, which is what the loss reads. */
+            std::vector<matrix<unsigned long, 0, 1>> labels;
 
             const int pad_token = tokenizer.get_special_token_id("<pad>");
             build_single_token_prediction_dataset({ full_tokens }, max_seq_len,
@@ -395,7 +396,7 @@ int main(int argc, char** argv)
                     size_t batch_end = std::min(i + batch_size, samples.size());
                     std::vector<matrix<int, 0, 1>> batch_samples(
                         samples.begin() + i, samples.begin() + batch_end);
-                    std::vector<unsigned long> batch_labels(
+                    std::vector<matrix<unsigned long, 0, 1>> batch_labels(
                         labels.begin() + i, labels.begin() + batch_end);
 
                     trainer.train_one_step(batch_samples, batch_labels);

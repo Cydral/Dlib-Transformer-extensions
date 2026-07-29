@@ -876,10 +876,17 @@ namespace dlib
     class compute_loss_cross_entropy_per_token
     {
         /*!
-            Host computation behind loss_cross_entropy_per_token_. Causal language-model
-            cross-entropy over every sequence position: position t is supervised against
-            input[t+1] (teacher forcing) for t < seq_len-1, and against truth for the last
-            position:
+            Host computation behind loss_cross_entropy_per_token_. Cross-entropy over
+            every sequence position, each position supervised against the target the
+            caller supplies for it: truth[i](t) is the target of position t of sample i,
+            and a target equal to ignore_index leaves that position unscored.
+
+            Reading the target from the labels rather than from input[t+1] is what makes
+            supervised fine-tuning possible at all. Teacher forcing from the input is the
+            same thing for causal pretraining, where the target of a position is by
+            construction the next input token, but it silently scores the prompt and the
+            padding of a masked dataset, which is the opposite of what such a dataset
+            asks for.
               - pad_index: query-side mask. A position whose own input token equals
                 pad_index is skipped (its attention output is masked, hence meaningless).
                 pad_index < 0 disables it.
@@ -933,12 +940,7 @@ namespace dlib
                         static_cast<long>(in_data[tensor_index(input_tensor, i, 0, t, 0)]) == pad_index)
                         continue;
 
-                    unsigned long target_class;
-                    if (t < seq_len - 1)
-                        target_class = static_cast<unsigned long>(
-                            in_data[tensor_index(input_tensor, i, 0, t + 1, 0)]);
-                    else
-                        target_class = *(truth + i);
+                    const unsigned long target_class = (*(truth + i))(t);
 
                     if (ignore_index >= 0 && static_cast<long>(target_class) == ignore_index)
                         continue;
@@ -1055,12 +1057,7 @@ namespace dlib
                         static_cast<long>(in_data[tensor_index(input_tensor, i, 0, t, 0)]) == pad_index)
                         continue;
 
-                    unsigned long target_class;
-                    if (t < seq_len - 1)
-                        target_class = static_cast<unsigned long>(
-                            in_data[tensor_index(input_tensor, i, 0, t + 1, 0)]);
-                    else
-                        target_class = *(truth + i);
+                    const unsigned long target_class = (*(truth + i))(t);
 
                     if (is_ignored(static_cast<long>(target_class)))
                         continue;

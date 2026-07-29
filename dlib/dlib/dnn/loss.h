@@ -915,7 +915,15 @@ namespace dlib
     class loss_cross_entropy_per_token_
     {
     public:
-        typedef unsigned long training_label_type;
+        /* One target per position, not one per sample.
+
+           This used to be a scalar, and a caller handing it a column of per-position
+           targets compiled anyway: a dlib matrix converts implicitly to its element type,
+           and the assertion guarding that conversion against a non-1x1 matrix is compiled
+           out of an optimized build. The labels were then silently reduced to their first
+           entry and the targets taken from the input tokens instead. Making the type say
+           what the layer reads turns that into a compilation error. */
+        typedef matrix<unsigned long, 0, 1> training_label_type;
         typedef unsigned long output_label_type;
 
         loss_cross_entropy_per_token_()

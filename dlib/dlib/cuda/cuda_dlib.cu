@@ -3842,11 +3842,11 @@ namespace dlib
                     continue;
                 }
 
-                unsigned long target_class;
-                if (t < seq_len - 1)
-                    target_class = static_cast<unsigned long>(in_data[i * input_seq_len + (t + 1)]);
-                else
-                    target_class = truth[i];
+                // One target per position, supplied by the caller. Deriving it from
+                // in_data[t + 1] instead is teacher forcing, which is right for causal
+                // pretraining and wrong for anything masked: it scores the prompt and the
+                // padding along with the answer.
+                const unsigned long target_class = truth[i * seq_len + t];
 
                 if (ignore_index >= 0 && static_cast<long>(target_class) == ignore_index)
                 {
@@ -3919,11 +3919,11 @@ namespace dlib
                     continue;
                 }
 
-                unsigned long target_class;
-                if (t < seq_len - 1)
-                    target_class = static_cast<unsigned long>(in_data[i * input_seq_len + (t + 1)]);
-                else
-                    target_class = truth[i];
+                // One target per position, supplied by the caller. Deriving it from
+                // in_data[t + 1] instead is teacher forcing, which is right for causal
+                // pretraining and wrong for anything masked: it scores the prompt and the
+                // padding along with the answer.
+                const unsigned long target_class = truth[i * seq_len + t];
 
                 bool ignored = false;
                 const long target_long = static_cast<long>(target_class);
