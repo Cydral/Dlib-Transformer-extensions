@@ -212,7 +212,7 @@ static void report_adapters(train_net& net, const adapter_settings& ad)
 
 /* One training run over an already built dataset. The trainer is configured the same way
    for both stages: what distinguishes them is the labels, not the optimization. */
-static void run_training(train_net& net,
+static double run_training(train_net& net,
     std::vector<matrix<int, 0, 1>>& X,
     std::vector<matrix<unsigned long, 0, 1>>& Y,
     std::vector<matrix<int, 0, 1>>& VX,
@@ -259,7 +259,6 @@ static void run_training(train_net& net,
        trainer runs its steps on a background thread: touching the shared context inside
        the step loop takes its mutex on every mini-batch and serializes the pipeline for
        nothing. */
-    network_context::set_learning_rate(st.learning_rate);
 
     /* The loss of the model before a single step.
 
@@ -304,6 +303,7 @@ static void run_training(train_net& net,
        the rate on plateau and still stops the stage when it reaches the floor. */
     const auto started = std::chrono::steady_clock::now();
     const size_t batch = static_cast<size_t>(std::max<long>(1, st.batch_size));
+    double last_loss = 0.0;
 
     for (long epoch = 0; epoch < st.epochs; ++epoch)
     {
@@ -315,11 +315,17 @@ static void run_training(train_net& net,
                batch. It costs the overlap of one batch preparation, which is nothing next
                to a forward and a backward pass on this decoder. */
             trainer.get_net(force_flush_to_disk::no);
+            /* The rate follows the trainer, which lowers it on plateau. Layers that hold a
+               subnetwork of their own read it here rather than through the solvers, so a
+               value set once before the loop would leave them at the initial rate for the
+               whole run while everything around them decayed. */
+            network_context::set_learning_rate(trainer.get_learning_rate());
             announce_padding(X.begin() + i, X.begin() + i + batch, pad_token);
             trainer.train_one_step(X.begin() + i, X.begin() + i + batch, Y.begin() + i);
             if (trainer.get_learning_rate() < trainer.get_min_learning_rate()) break;
         }
         const double train_loss = trainer.get_average_loss();
+        last_loss = train_loss;
         cout << "  epoch " << (epoch + 1) << "/" << st.epochs
              << "  learning rate " << trainer.get_learning_rate()
              << "  average loss " << train_loss << "\n";
@@ -366,13 +372,14 @@ static void run_training(train_net& net,
 
     trainer.get_net();   // flush the trainer's background thread into the network
     cout << "  trained in  : " << elapsed << " s\n";
+    return last_loss;
 }
 
 // ---------------------------------------------------------------------------------------
 
 static bool stage_knowledge(train_net& net, const hf_tokenizer& tok,
     const std::string& corpus_path, const adapter_settings& ad, stage_settings st,
-    const std::string& sync_file)
+    const std::string& sync_file, double& last_loss)
 {
     cout << "\n=== Knowledge alignment: " << corpus_path << "\n";
 
@@ -402,7 +409,7 @@ static bool stage_knowledge(train_net& net, const hf_tokenizer& tok,
 
     std::vector<matrix<int, 0, 1>> VX;
     std::vector<matrix<unsigned long, 0, 1>> VY;
-    run_training(net, X, Y, VX, VY, st, sync_file,
+    last_loss = run_training(net, X, Y, VX, VY, st, sync_file,
         tok.pad_id() >= 0 ? tok.pad_id() : 0);
     return true;
 }
@@ -410,7 +417,8 @@ static bool stage_knowledge(train_net& net, const hf_tokenizer& tok,
 static bool stage_task(train_net& net, const hf_tokenizer& tok,
     const chat_template_formatter& fmt, const std::string& system_prompt,
     const std::string& dataset_path, const std::string& valid_path,
-    const adapter_settings& ad, stage_settings st, const std::string& sync_file)
+    const adapter_settings& ad, stage_settings st, const std::string& sync_file,
+    double& last_loss)
 {
     cout << "\n=== Task alignment: " << dataset_path << "\n";
 
@@ -491,7 +499,7 @@ static bool stage_task(train_net& net, const hf_tokenizer& tok,
     report_adapters(net, ad);
     if (st.dry_run) { cout << "  dry run, no training\n"; return true; }
 
-    run_training(net, X, Y, VX, VY, st, sync_file,
+    last_loss = run_training(net, X, Y, VX, VY, st, sync_file,
         tok.pad_id() >= 0 ? tok.pad_id() : 0);
     return true;
 }
@@ -664,9 +672,13 @@ int main(int argc, char** argv)
         const std::string system_prompt = parser.option("system")
             ? parser.option("system").argument() : std::string();
 
+        /* The loss the last stage ended on, so that a run that diverged does not
+           overwrite a good archive with weights that are not numbers. */
+        double final_loss = 0.0;
+
         if (!corpus.empty())
         {
-            if (!stage_knowledge(net, tok, corpus, ad, st, sync_file)) return 1;
+            if (!stage_knowledge(net, tok, corpus, ad, st, sync_file, final_loss)) return 1;
             /* Merging is mandatory before a second stage and harmless before none: the
                adapters of a stage have to become part of the weights, or the next stage
                starts from a base that never learned anything. */
@@ -681,7 +693,7 @@ int main(int argc, char** argv)
         {
             if (!stage_task(net, tok, fmt, system_prompt, dataset,
                 parser.option("valid") ? parser.option("valid").argument() : std::string(),
-                ad, st, sync_file)) return 1;
+                ad, st, sync_file, final_loss)) return 1;
         }
 
         if (st.dry_run) { cout << "\nDry run complete; nothing was written.\n"; return 0; }
@@ -700,6 +712,20 @@ int main(int argc, char** argv)
                and the attention layers drop their saved forward state and KV cache with
                it. */
             net.clean();
+            /* A run that ended on a loss that is not a number has produced weights that
+               are not numbers either, and writing them over a good archive would destroy
+               the only usable copy. The check below reads the header back, which catches a
+               malformed file but not a well-formed one full of NaN, so the value itself is
+               examined here. */
+            if (std::isnan(final_loss) || std::isinf(final_loss))
+            {
+                cerr << "\nThe last recorded loss is " << final_loss
+                     << ", so the weights are not usable and nothing was written to "
+                     << out_path << ".\nLower --learning-rate or --batch-size and start "
+                        "again from the untouched archive.\n";
+                return 1;
+            }
+
             cout << "Writing " << out_path << " ...\n";
             save_model_archive(out_path, archive, net.subnet(), tok);
 
