@@ -285,7 +285,8 @@ namespace dlib
         long top_k,
         unsigned long ignore_label,
         distillation_writer& out,
-        const std::function<void(long, long)>& progress = std::function<void(long, long)>())
+        const std::function<void(long, long)>& progress = std::function<void(long, long)>(),
+        const std::function<bool()>& is_cancelled = std::function<bool()>())
     {
         DLIB_CASSERT(X.size() == Y.size(),
             "Every window must carry its hard targets: " << X.size() << " against " << Y.size());
@@ -346,6 +347,9 @@ namespace dlib
 
             out.write(rec);
             if (progress) progress(w + 1, windows);
+            /* Asked after the window is written, so an interrupted pass leaves a file whose
+               last window is whole. Hours of recording are worth keeping. */
+            if (is_cancelled && is_cancelled()) break;
         }
         return out.count();
     }

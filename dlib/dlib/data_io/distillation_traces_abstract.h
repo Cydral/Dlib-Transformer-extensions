@@ -231,7 +231,8 @@ namespace dlib
         long top_k,
         unsigned long ignore_label,
         distillation_writer& out,
-        const std::function<void(long, long)>& progress = std::function<void(long, long)>()
+        const std::function<void(long, long)>& progress = std::function<void(long, long)>(),
+        const std::function<bool()>& is_cancelled = std::function<bool()>()
     );
     /*!
         requires
@@ -253,6 +254,11 @@ namespace dlib
             - Every window is shown to the teacher from a cleared cache, so that it sees
               each one on its own, exactly as the student will.
             - Calls progress(done, total) after each window when it is set.
+            - Stops early when is_cancelled is set and returns true, which is asked only
+              after a window has been written: an interrupted pass therefore leaves a file
+              whose last window is whole, and out.finish() closes it into a shorter but
+              perfectly readable recording. A pass over a real corpus runs for hours, and
+              losing all of it to a keystroke would make the pass an all-or-nothing bet.
             - Returns out.count(). The caller still has to call out.finish().
 
         WHY THE DATASET IS AN ARGUMENT RATHER THAN A CORPUS

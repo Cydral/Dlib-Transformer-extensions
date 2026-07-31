@@ -354,9 +354,17 @@ static int run_record(const std::string& teacher_path, const std::string& corpus
     head.top_k = top_k;
     head.window_len = window;
 
+    /* Interruptible, and the file survives it.
+
+       A recording pass over a real corpus runs for hours. Losing all of it to an interrupt
+       would make the pass an all-or-nothing bet, so the writer is closed properly on the
+       way out: what was recorded stays usable, and the run can be resumed by recording the
+       rest of the corpus into a second file and training on both. */
+    dlib::signal_handler::setup();
     const auto started = std::chrono::steady_clock::now();
     distillation_writer out(out_path, head);
     long last_percent = -1;
+    bool interrupted = false;
     record_distillation_traces(teacher, X, Y, top_k, IGNORE_LABEL, out,
         [&](long done, long total)
         {
@@ -366,13 +374,19 @@ static int run_record(const std::string& teacher_path, const std::string& corpus
                 last_percent = pct;
                 cout << "\r  recording  : " << pct << "%   " << std::flush;
             }
-        });
+            if (dlib::signal_handler::is_triggered()) interrupted = true;
+        }, [&]() { return interrupted; });
     const long written = out.finish();
     const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::steady_clock::now() - started).count();
 
-    cout << "\r  recorded   : " << written << " windows in " << elapsed << " s\n"
+    cout << "\r  recorded   : " << written << " of " << X.size() << " windows in "
+         << elapsed << " s\n"
          << "Written to " << out_path << "\n";
+    if (interrupted)
+        cout << "Interrupted, but the file is complete and usable as far as it goes.\n"
+             << "To cover the rest, record with a larger --limit into a second file and\n"
+             << "train on both: recordings are read side by side, not one after the other.\n";
     return 0;
 }
 
@@ -401,8 +415,8 @@ using train_net = loss_distillation_per_token<student_head>;
 
 /* Step 3: train the student on the recording. */
 static int run_train(const std::vector<std::string>& trace_paths, const std::string& tok_path,
-    const std::string& out_path, long epochs, long batch, double lr, double temperature,
-    double alpha, long patience, const std::string& sync_file)
+    const std::string& out_path, const std::string& load_path, long epochs, long batch,
+    double lr, double temperature, double alpha, long patience, const std::string& sync_file)
 {
     hf_tokenizer tok;
     { std::ifstream fin(tok_path, std::ios::binary);
@@ -456,6 +470,38 @@ static int run_train(const std::vector<std::string>& trace_paths, const std::str
        shape the file holds, but there is nothing to refuse it against. */
 
     train_net net;
+
+    /* A student already raised can be raised further.
+
+       Nothing about distillation makes a second pass destructive in itself: the weights are
+       ordinary parameters and the objective is the same. What is destructive is a second
+       corpus that is narrower than the first, because the student will fit it and forget
+       what it no longer sees. The remedy is the one the mixing of recordings already
+       applies, and it holds across runs too: keep the earlier recordings in the list rather
+       than replacing them.
+
+       The vocabulary cannot change between runs, and the fingerprint carried by every
+       recording is what enforces it. */
+    if (!load_path.empty())
+    {
+        model_archive_info prior;
+        hf_tokenizer prior_tok;
+        try
+        {
+            load_model_archive(load_path, net.subnet(), prior_tok, prior, false);
+        }
+        catch (const std::exception& e)
+        { cerr << "Error: " << e.what() << "\n"; return 1; }
+
+        if (tokenizer_fingerprint(prior_tok) != tokenizer_fingerprint(tok))
+        {
+            cerr << "Error: '" << load_path << "' was raised on another tokenizer than the "
+                    "one given here.\nA student cannot change vocabulary between runs.\n";
+            return 1;
+        }
+        cout << "Resuming    : " << prior.model_name << " from " << load_path << "\n";
+    }
+
     net.loss_details().set_ignore_index(static_cast<long>(IGNORE_LABEL));
     net.loss_details().set_temperature(temperature);
     net.loss_details().set_alpha(alpha);
@@ -473,7 +519,9 @@ static int run_train(const std::vector<std::string>& trace_paths, const std::str
     if (!sync_file.empty())
         trainer.set_synchronization_file(sync_file, std::chrono::minutes(10));
 
+    dlib::signal_handler::setup();
     const auto started = std::chrono::steady_clock::now();
+    bool interrupted = false;
     std::vector<distillation_window> chunk;
     std::vector<matrix<int, 0, 1>> bx;
     std::vector<distillation_target> by;
@@ -508,6 +556,7 @@ static int run_train(const std::vector<std::string>& trace_paths, const std::str
             trainer.train_one_step(bx, by);
             seen += static_cast<long>(chunk.size());
             if (trainer.get_learning_rate() < trainer.get_min_learning_rate()) break;
+            if (dlib::signal_handler::is_triggered()) { interrupted = true; break; }
         }
         trainer.get_net(force_flush_to_disk::no);
         cout << "  epoch " << (e + 1) << "/" << epochs
@@ -515,6 +564,14 @@ static int run_train(const std::vector<std::string>& trace_paths, const std::str
              << "  learning rate " << trainer.get_learning_rate()
              << "  average loss " << trainer.get_average_loss() << "\n";
         trainer.clear_average_loss();
+        if (interrupted)
+        {
+            /* Interrupted, not abandoned. What the student has learned is written out, so
+               that hours of training are not lost to a keystroke, and --load carries on
+               from there. */
+            cout << "  interrupted; the student is written as it stands\n";
+            break;
+        }
         if (trainer.get_learning_rate() < trainer.get_min_learning_rate())
         {
             cout << "  stopped early: the learning rate reached its floor\n";
@@ -580,6 +637,8 @@ int main(int argc, char** argv)
             "forgetting one while it learns the other", 1);
         parser.add_option("tokenizer", "Tokenizer written beside the student header", 1);
         parser.add_option("train", "Train the student on the traces");
+        parser.add_option("load", "Student archive to carry on from, instead of starting "
+            "from an untrained network", 1);
         parser.add_option("out", "Where to write the student (default: student.dat)", 1);
         parser.add_option("epochs", "Passes over the traces (default: 3)", 1);
         parser.add_option("batch-size", "Windows per step (default: 4)", 1);
@@ -652,6 +711,7 @@ int main(int argc, char** argv)
             return run_train(trace_paths,
                 parser.option("tokenizer").argument(),
                 get_option(parser, "out", std::string("student.dat")),
+                get_option(parser, "load", std::string()),
                 get_option(parser, "epochs", 3L),
                 get_option(parser, "batch-size", 4L),
                 get_option(parser, "learning-rate", 3e-4),
