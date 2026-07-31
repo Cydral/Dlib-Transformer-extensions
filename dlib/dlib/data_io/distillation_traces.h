@@ -199,6 +199,37 @@ namespace dlib
             deserialize(head_.top_k, in_);
             deserialize(head_.window_len, in_);
             body_ = in_.tellg();
+
+            /* How many windows the file holds, measured rather than declared.
+
+               Every window occupies the same number of bytes, the shapes being fixed by the
+               header, so reading one and dividing the rest of the file by its size gives an
+               exact count. The count written by finish() sits at the very end and would
+               need a seek there anyway; this way an interrupted recording, which has no
+               trailer at all, is counted just as well.
+
+               A caller needs this to mix several recordings evenly. Without it the only
+               possible schedule is strict alternation, which runs out when the shorter file
+               does and leaves the tail of every epoch made of one corpus alone. That tail
+               shifts the running loss, and a plateau detector reads the shift as
+               divergence. */
+            bool more = false;
+            try { deserialize(more, in_); }
+            catch (const serialization_error&) { more = false; }
+            if (more)
+            {
+                distillation_window probe;
+                deserialize(probe.tokens, in_);
+                deserialize(probe.hard, in_);
+                deserialize(probe.ids, in_);
+                deserialize(probe.logits, in_);
+                const std::streamoff record = in_.tellg() - body_;
+                in_.seekg(0, std::ios::end);
+                const std::streamoff bytes = in_.tellg() - body_;
+                if (record > 0) head_.windows = static_cast<long>(bytes / record);
+            }
+            in_.clear();
+            in_.seekg(body_);
         }
 
         const distillation_header& header() const { return head_; }
@@ -243,6 +274,7 @@ namespace dlib
                 }
                 out.push_back(std::move(w));
             }
+            delivered_ += static_cast<long>(out.size());
             return static_cast<long>(out.size());
         }
 
@@ -250,13 +282,19 @@ namespace dlib
         {
             in_.clear();
             in_.seekg(body_);
+            delivered_ = 0;
         }
+
+        /* Windows not yet handed over in this pass, so that a caller mixing several
+           recordings can always draw from whichever is furthest from being finished. */
+        long remaining() const { return head_.windows - delivered_; }
 
     private:
         std::string path_;
         std::ifstream in_;
         distillation_header head_;
         std::streampos body_;
+        long delivered_ = 0;
     };
 
 // ----------------------------------------------------------------------------------------

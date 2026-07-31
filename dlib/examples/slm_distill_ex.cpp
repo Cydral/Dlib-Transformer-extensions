@@ -441,7 +441,8 @@ static int run_train(const std::vector<std::string>& trace_paths, const std::str
         cout << "Traces      : " << path << "\n"
              << "  teacher   : " << h.teacher_name << "\n"
              << "  vocabulary: " << h.vocab_size << "\n"
-             << "  window    : " << h.window_len << ", top-k " << h.top_k << "\n";
+             << "  window    : " << h.window_len << ", top-k " << h.top_k << "\n"
+             << "  windows   : " << h.windows << "\n";
 
         try { traces.back()->check_tokenizer(tok); }
         catch (const std::exception& e) { cerr << "Error: " << e.what() << "\n"; return 1; }
@@ -529,17 +530,35 @@ static int run_train(const std::vector<std::string>& trace_paths, const std::str
     for (long e = 0; e < epochs; ++e)
     {
         for (auto& r : traces) r->rewind();
-        std::vector<bool> live(traces.size(), true);
-        size_t turn = 0;
         long seen = 0;
         /* Read a batch's worth at a time: a recording of a real corpus does not fit in
            memory, and holding one batch is all the training loop ever needs. */
-        while (std::find(live.begin(), live.end(), true) != live.end())
+        /* Drawn from whichever recording is furthest from being finished, so that all of
+           them run out together.
+
+           Strict alternation was the obvious schedule and the wrong one: the shorter file
+           runs dry first and the tail of every epoch is made of a single corpus. When the
+           two corpora differ in difficulty, and prose and templated records certainly do,
+           that tail shifts the running loss upward at the end of each epoch, and a plateau
+           detector reads the shift as divergence and reloads a checkpoint. The mixture is
+           unchanged; only its spread over the epoch is fixed. */
+        while (true)
         {
-            const size_t who = turn % traces.size();
-            turn++;
-            if (!live[who]) continue;
-            if (traces[who]->read(batch, chunk) == 0) { live[who] = false; continue; }
+            /* The largest remaining *fraction*, not the largest remaining count: the
+               count alone would empty the big file first and leave the small one for the
+               end, which is the same homogeneous stretch moved elsewhere. Compared by
+               cross-multiplication to keep it in integers. */
+            size_t who = traces.size();
+            for (size_t i = 0; i < traces.size(); ++i)
+            {
+                if (traces[i]->remaining() <= 0) continue;
+                if (who == traces.size()) { who = i; continue; }
+                const long ri = traces[i]->remaining(), ti = traces[i]->header().windows;
+                const long rw = traces[who]->remaining(), tw = traces[who]->header().windows;
+                if (ri * tw > rw * ti) who = i;
+            }
+            if (who == traces.size()) break;
+            if (traces[who]->read(batch, chunk) == 0) break;
 
             bx.clear();
             by.clear();

@@ -38,7 +38,9 @@ namespace dlib
                   the student must share.
                 - teacher_name: recorded for the report and never checked.
                 - vocab_size, top_k, window_len: the shape of every window in the file.
-                - windows: how many the file holds, known only after reading it.
+                - windows: how many the file holds, measured when the file is opened rather than
+          read from the trailer, so that an interrupted recording is counted just as
+          well as a finished one.
         !*/
 
         std::string tokenizer_id;
@@ -216,6 +218,23 @@ namespace dlib
         /*!
             ensures
                 - The next read() returns the first window again, for a further epoch.
+                - #remaining() == header().windows
+        !*/
+
+        long remaining (
+        ) const;
+        /*!
+            ensures
+                - Returns how many windows have not yet been handed over in this pass.
+
+            WHY A CALLER NEEDS THIS
+
+                To mix several recordings evenly. Drawing from them in strict turn empties
+                the shortest first and leaves the tail of every epoch made of one corpus
+                alone; when the corpora differ in difficulty, that tail shifts the running
+                loss and a plateau detector reads the shift as divergence. Drawing instead
+                from whichever recording has the largest remaining *fraction* spreads each
+                of them evenly from one end of the pass to the other.
         !*/
     };
 
