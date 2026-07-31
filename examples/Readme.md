@@ -22,10 +22,14 @@
   - [`slm_advanced_train_ex.cpp`](#slm_advanced_train_excpp)
   - [`slm_advanced_gqa_train_ex.cpp`](#slm_advanced_gqa_train_excpp)
   - [`slm_transformer_configs_ex.cpp`](#slm_transformer_configs_excpp)
-  - [`slm_chatbot_ex.cpp`](#slm_chatbot_excpp)
   - [`slm_enwiki_train_ex.cpp`](#slm_enwiki_train_excpp)
   - [`slm_hrm_arc_agi_ex.cpp`](#slm_hrm_arc_agi_excpp)
   - [`slm_predictive_compressor_ex.cpp`](#slm_predictive_compressor_excpp)
+  - [`slm_advanced_gqa_kvc_train_ex.cpp`](#slm_advanced_gqa_kvc_train_excpp)
+  - [`slm_cygnus_foundation_ex.cpp`](#slm_cygnus_foundation_excpp)
+  - [`slm_cygnus_instruct_ex.cpp`](#slm_cygnus_instruct_excpp)
+  - [`slm_lora_adapter_check_ex.cpp`](#slm_lora_adapter_check_excpp)
+  - [`slm_tok_predictive_compressor_ex.cpp`](#slm_tok_predictive_compressor_excpp)
   - [`slm_gguf_runtime_ex.cpp`](#slm_gguf_runtime_excpp)
   - [`slm_gguf_import_ex.cpp`](#slm_gguf_import_excpp)
   - [`slm_lora_finetune_ex.cpp`](#slm_lora_finetune_excpp)
@@ -78,8 +82,8 @@ Across the full example suite, the repository now covers:
    Efficient attention with **GQA** and adaptive FFN computation.
 4. [`slm_transformer_configs_ex.cpp`](#slm_transformer_configs_excpp)  
    Unified pipeline over pre-configured architectures (**MoE / HRM**).
-5. [`slm_chatbot_ex.cpp`](#slm_chatbot_excpp)  
-   Two-stage specialization toward conversational generation.
+5. [`slm_cygnus_foundation_ex.cpp`](#slm_cygnus_foundation_excpp) and [`slm_cygnus_instruct_ex.cpp`](#slm_cygnus_instruct_excpp)  
+   A full **foundation then instruct** pipeline for a compact GQA + MoE model family.
 6. [`slm_enwiki_train_ex.cpp`](#slm_enwiki_train_excpp)  
    Longer-corpus training and context-window management.
 7. [`slm_hrm_arc_agi_ex.cpp`](#slm_hrm_arc_agi_excpp)  
@@ -355,69 +359,6 @@ where only a small selected set of experts $\mathcal{S}(x)$ is active for a give
 
 ---
 
-<a id="slm_chatbot_excpp"></a>
-## `slm_chatbot_ex.cpp`
-
-### Purpose
-A full **instruction-tuning / chatbot specialization** example built on top of a pre-trained Transformer backbone. It demonstrates that the project is not limited to raw language modeling: it also supports **domain adaptation** and **interactive prompting**.
-
-### What the example demonstrates
-- two-stage workflow: base model reuse + conversational specialization
-- formatting of Q/A pairs with explicit structural markers
-- partial freezing through **layer-wise learning-rate multipliers**
-- fine-tuning on domain-specific Q/A datasets
-- interactive prompting mode
-- deterministic and stochastic generation modes
-- advanced decoding controls
-
-### Main technical ideas
-
-#### 1. Structured conversational formatting
-The model is not trained on naked question/answer strings. Instead, data is wrapped with explicit tags such as:
-
-```xml
-<question><text>...</text><answer><text>...</text>
-```
-
-This teaches the model not only the content, but also the **role structure** of the exchange.
-
-#### 2. Partial freezing for stable fine-tuning
-All layers are not updated equally. The example uses **learning-rate multipliers** so that some parts of the network adapt faster than others. This is an important practical pattern when the specialization dataset is much smaller than the original pretraining corpus.
-
-#### 3. Proper sequence-level sampling
-The inference path uses a **per-row softmax** and then applies several generation controls:
-- temperature
-- top-k
-- top-p / nucleus sampling
-- repetition penalty
-- min-p filtering
-- deterministic argmax mode when needed
-
-### Why this example matters
-This is a concrete answer to a very practical question:
-
-> how do I move from a generic compact Transformer to a usable specialized assistant?
-
-The example shows that the answer is not merely “train more”, but rather:
-- structure the supervision,
-- preserve part of the pretrained representation,
-- adapt learning rates,
-- and control decoding carefully at inference time.
-
-### Useful reminders
-Fine-tuning is a tradeoff between **specialization** and **catastrophic forgetting**. Partial freezing and differentiated learning rates are classical ways to preserve useful generic knowledge while allowing the model to shift toward a target behavior.
-
-### What to inspect in the code
-- `append_special_or_text()`
-- Q/A dataset loading and tokenization
-- `set_all_learning_rate_multipliers(...)`
-- the custom sampling routine combining top-k, top-p, min-p, and repetition penalty
-- `inference_context` used as a rolling multi-turn conversation buffer
-
-[⬆ Back to top](#on-this-page)
-
----
-
 <a id="slm_enwiki_train_excpp"></a>
 ## `slm_enwiki_train_ex.cpp`
 
@@ -678,6 +619,85 @@ It is the model factory. The architecture becomes a parameter, the teacher and t
 
 ---
 
+## `slm_advanced_gqa_kvc_train_ex.cpp`
+
+### Purpose
+The same model, the same data and the same command line as `slm_advanced_gqa_train_ex.cpp`, with **one** difference: the fused attention layer carries a **KV cache**.
+
+### What the example teaches
+Autoregressive generation recomputes the whole prefix at every step unless the keys and values of past positions are kept. The cache is held **inside the attention layer** rather than managed by the generation loop, which therefore has nothing to do about it: the same code generates with or without a cache.
+
+### Why this example matters
+It exists to prove that the cached path is **byte-accurate** against the uncached one. A cache is exactly the kind of optimization that produces almost-right output, and almost-right is indistinguishable from right until someone compares.
+
+[⬆ Back to top](#on-this-page)
+
+---
+
+<a id="slm_cygnus_foundation_excpp"></a>
+## `slm_cygnus_foundation_ex.cpp`
+
+### Purpose
+The **foundation pre-training** stage of the Cygnus family: compact small language models built on this library's target architecture, **Grouped Query Attention with a Mixture-of-Experts feed-forward sublayer**.
+
+### What the example teaches
+Sparse routing means only a fraction of the parameters activate per token, so a model can hold capacity it does not pay for at every step. Combined with GQA, which shares key and value heads across query heads, this is the shape most recent open-weight models converge towards.
+
+### Main technical choices
+- **Top-k routing** over independent SwiGLU experts, with the gate trained jointly.
+- A **KV cache** in the fused attention layer, for generation that stays fast as the context grows.
+- Chunked corpus handling, so that pre-training is not bounded by memory.
+
+[⬆ Back to top](#on-this-page)
+
+---
+
+<a id="slm_cygnus_instruct_excpp"></a>
+## `slm_cygnus_instruct_ex.cpp`
+
+### Purpose
+The **instruct** stage that follows the foundation model: specialization on conversational pairs, then an interactive chat mode for immediate testing.
+
+### What the example teaches
+The two stages of the usual recipe, made explicit. A foundation model completes text; an instruct model recognizes a turn, answers it, and stops. The difference is entirely in the data and the formatting, not in the architecture.
+
+### Useful reminders
+The architecture constants **must match the foundation model exactly**. They are compile-time constants on both sides, and a mismatch is a deserialization error rather than a silent degradation — which is the desired behaviour.
+
+[⬆ Back to top](#on-this-page)
+
+---
+
+## `slm_lora_adapter_check_ex.cpp`
+
+### Purpose
+Numerical validation of the **low-rank adaptation core**, against a double-precision reference written straight from the definition.
+
+### What the example teaches
+`low_rank_adapter` is the one piece of the fine-tuning path whose correctness cannot be read off a training run. A wrong gradient does not crash: it produces a loss curve that goes down slowly and a model that is merely disappointing. This program settles the question **before** the core is wired into the attention layer.
+
+### Why this example matters
+It is the pattern worth copying more than the code. Any component whose failure mode is "slightly worse results" deserves a test that compares it to a reference implementation, because no amount of watching the loss will ever reveal the problem.
+
+[⬆ Back to top](#on-this-page)
+
+---
+
+## `slm_tok_predictive_compressor_ex.cpp`
+
+### Purpose
+Lossless compression driven by a Transformer, over **BPE tokens** rather than raw bytes.
+
+### What the example teaches
+A language model is a probability distribution over what comes next, and a good distribution is a good compressor. Working at the token level shortens the sequence the model has to predict, which improves both speed and ratio compared to the byte-level variant.
+
+### Main technical choices
+The pipeline is **argmax-based** rather than arithmetic-coded, and the header says why: GPU floating-point results are not reproducible between runs, so an arithmetic coder that depends on exact probabilities would decompress to something else on another machine. Comparing predictions instead of encoding them makes the scheme robust to that non-determinism.
+
+[⬆ Back to top](#on-this-page)
+
+---
+
 ## `slm_tools/` Python witnesses
 
 ### Purpose
@@ -749,10 +769,14 @@ The repository strikes a useful balance:
 - Move to **`slm_advanced_train_ex.cpp`** if you want a compact practical baseline.
 - Use **`slm_advanced_gqa_train_ex.cpp`** if attention efficiency matters.
 - Use **`slm_transformer_configs_ex.cpp`** if you want a strong reusable application template.
-- Use **`slm_chatbot_ex.cpp`** if your target is instruction tuning or interactive Q/A.
+- Use **`slm_cygnus_foundation_ex.cpp`** then **`slm_cygnus_instruct_ex.cpp`** if your target is a compact model trained end to end, from pre-training to instruction following.
 - Use **`slm_enwiki_train_ex.cpp`** if you work with larger external corpora.
 - Explore **`slm_hrm_arc_agi_ex.cpp`** if you are interested in structured reasoning beyond plain text.
-- Explore **`slm_predictive_compressor_ex.cpp`** if you want to see Transformers used as generic sequence predictors outside classical NLP.
+- Explore **`slm_predictive_compressor_ex.cpp`** or **`slm_tok_predictive_compressor_ex.cpp`** if you want to see Transformers used as generic sequence predictors outside classical NLP.
+- Start with **`slm_gguf_runtime_ex.cpp`** if you already have a model and want to run it today.
+- Use **`slm_gguf_import_ex.cpp`** then **`slm_lora_finetune_ex.cpp`** if you want to specialize an existing open-weight model.
+- Use **`slm_vit_classify_ex.cpp`** or **`slm_vit_ssl_ex.cpp`** if your data is images rather than text.
+- Use **`slm_distill_ex.cpp`** if you want to build a smaller model of your own design from a larger one.
 
 ---
 
