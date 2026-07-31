@@ -927,7 +927,14 @@ namespace dlib
         typedef unsigned long output_label_type;
 
         loss_cross_entropy_per_token_()
-            : ignore_index_(-1), label_smoothing_(0.1), pad_index_(-1), z_loss_weight_(0.0) {
+            /* Smoothing off by default, as everywhere else. PyTorch's CrossEntropyLoss
+               and the Hugging Face trainer both start at zero and let a caller opt in, and
+               a loss that smooths without being asked reports a number that cannot be read
+               against any of them: on a vocabulary of fifty thousand tokens the difference
+               is worth more than one and a half nats, which is larger than the quantity
+               being measured. It regularizes and it remains available; it is simply no
+               longer the default. */
+            : ignore_index_(-1), label_smoothing_(0.0), pad_index_(-1), z_loss_weight_(0.0) {
         }
 
         void set_ignore_index(long idx) { ignore_index_ = idx; }
@@ -3107,6 +3114,276 @@ namespace dlib
 
     template <typename SUBNET>
     using loss_binary_log_per_pixel = add_loss_layer<loss_binary_log_per_pixel_, SUBNET>;
+
+// ----------------------------------------------------------------------------------------
+
+/*
+    Distillation loss: a student regressing on what a teacher predicted.
+    
+    At every position the student is pulled towards two things at once. The hard term is the
+    ordinary cross-entropy against the token the corpus actually contains. The soft term is
+    the cross-entropy against the teacher's distribution, restricted to the entries that were
+    recorded, and it is where the value of distillation lies: a hard label says the next
+    token is X, a distribution says X, but Y was nearly as good, Z was plausible, and the
+    remaining fifty thousand were not. That ordering over the vocabulary is not present in
+    the corpus and no student could derive it from the text alone.
+    
+        L = alpha * T^2 * soft + (1 - alpha) * hard
+    
+    The temperature flattens both distributions so that what the teacher thinks of unlikely
+    tokens becomes visible; without it the soft term degenerates towards the hard one. It
+    also divides the gradient by T, which is why the soft term carries a T^2: one factor
+    undoes that division, the other keeps the two terms comparable as T varies. This is the
+    scaling Hinton's paper introduces and it matters, since without it changing T silently
+    changes the effective learning rate of half the objective.
+    
+    WHAT THIS LAYER READS, AND WHAT IT DOES NOT INVENT
+    
+    Every target comes from the label. The hard target of a position is hard(t), and its soft
+    target is the recorded pairs of that row. A position whose hard target is the ignore index
+    is skipped entirely, soft term included. Nothing is derived from the input tokens: a loss
+    that decides for itself what a position should predict cannot express a masked objective,
+    and will quietly score prompts and padding when handed one.
+    
+    The soft term is computed against the student's full softmax rather than a softmax
+    restricted to the recorded entries. The teacher's mass outside those entries is therefore
+    dropped rather than redistributed, which is the usual approximation and a good one when
+    top_k covers most of the mass; it is also the only choice that keeps the gradient of the
+    two terms sharing one denominator, so a single softmax serves both.
+*/
+
+    struct distillation_target
+    {
+        /*!
+            One window's supervision: the hard target of every position, and the teacher's
+            highest scoring entries there.
+
+            hard is window_len by 1. ids and logits are window_len by top_k, row t holding
+            what the teacher would have predicted at position t. A row whose hard target is
+            the ignore index is not read at all.
+        !*/
+
+        matrix<unsigned long, 0, 1> hard;
+        matrix<unsigned long> ids;
+        matrix<float> logits;
+    };
+
+// ----------------------------------------------------------------------------------------
+
+    class loss_distillation_per_token_
+    {
+    public:
+
+        typedef distillation_target training_label_type;
+        typedef unsigned long output_label_type;
+
+        loss_distillation_per_token_() = default;
+
+        void set_ignore_index(long idx) { ignore_index_ = idx; }
+        long get_ignore_index() const { return ignore_index_; }
+
+        void set_temperature(double t)
+        {
+            DLIB_CASSERT(t > 0.0, "The temperature must be positive, got " << t);
+            temperature_ = t;
+        }
+        double get_temperature() const { return temperature_; }
+
+        void set_alpha(double a)
+        {
+            DLIB_CASSERT(0.0 <= a && a <= 1.0, "alpha must lie in [0,1], got " << a);
+            alpha_ = a;
+        }
+        double get_alpha() const { return alpha_; }
+
+        template <typename SUB_TYPE, typename label_iterator>
+        void to_label(const tensor& input_tensor, const SUB_TYPE& sub,
+            label_iterator iter) const
+        {
+            const tensor& output = sub.get_output();
+            DLIB_CASSERT(output.k() == 1);
+            const long seq_len = output.nr();
+            const long vocab = output.nc();
+            const float* out_data = output.host();
+
+            for (long i = 0; i < output.num_samples(); ++i, ++iter)
+            {
+                const long base = static_cast<long>(
+                    tensor_index(output, i, 0, seq_len - 1, 0));
+                long best = 0;
+                for (long c = 1; c < vocab; ++c)
+                    if (out_data[base + c] > out_data[base + best]) best = c;
+                *iter = static_cast<unsigned long>(best);
+            }
+        }
+
+        template <typename const_label_iterator, typename SUBNET>
+        double compute_loss_value_and_gradient(const tensor& input_tensor,
+            const_label_iterator truth, SUBNET& sub) const
+        {
+            const tensor& output = sub.get_output();
+            tensor& grad = sub.get_gradient_input();
+
+            DLIB_CASSERT(output.k() == 1, "The logits must be laid out as (n, 1, seq, vocab)");
+            DLIB_CASSERT(output.num_samples() == grad.num_samples());
+            DLIB_CASSERT(output.nr() == grad.nr() && output.nc() == grad.nc());
+
+            const long samples = output.num_samples();
+            const long seq_len = output.nr();
+            const long vocab = output.nc();
+
+            const float* out_data = output.host();
+            float* g = grad.host();
+            for (size_t n = 0; n < grad.size(); ++n) g[n] = 0.0f;
+
+            const float T = static_cast<float>(temperature_);
+            const float a = static_cast<float>(alpha_);
+            const float soft_w = a * T * T;
+            const float hard_w = 1.0f - a;
+
+            double loss = 0.0;
+            long valid = 0;
+            std::vector<float> probs(static_cast<size_t>(vocab));
+
+            const_label_iterator it = truth;
+            for (long i = 0; i < samples; ++i, ++it)
+            {
+                const distillation_target& t = *it;
+                DLIB_CASSERT(t.hard.nr() == seq_len,
+                    "The hard targets must have one entry per position: got "
+                    << t.hard.nr() << " for a sequence of " << seq_len);
+                const long top_k = t.ids.nc();
+                DLIB_CASSERT(t.ids.nr() == seq_len && t.logits.nr() == seq_len
+                    && t.logits.nc() == top_k,
+                    "The recorded entries must be one row per position");
+
+                for (long p = 0; p < seq_len; ++p)
+                {
+                    const unsigned long hard = t.hard(p);
+                    if (ignore_index_ >= 0 && static_cast<long>(hard) == ignore_index_)
+                        continue;
+                    DLIB_CASSERT(hard < static_cast<unsigned long>(vocab),
+                        "Target class " << hard << " >= vocab_size " << vocab);
+
+                    const size_t base = tensor_index(output, i, 0, p, 0);
+
+                    /* One softmax at the student's temperature serves both terms; the hard
+                       term needs the same quantities at T = 1, so both are formed here. */
+                    float max_z = out_data[base];
+                    for (long c = 1; c < vocab; ++c)
+                        max_z = std::max(max_z, out_data[base + c]);
+
+                    double sum_hot = 0.0;   // temperature 1, for the hard term
+                    double sum_soft = 0.0;  // temperature T, for the soft term
+                    for (long c = 0; c < vocab; ++c)
+                    {
+                        const float z = out_data[base + c] - max_z;
+                        probs[static_cast<size_t>(c)] = z;
+                        sum_hot += std::exp(z);
+                        sum_soft += std::exp(z / T);
+                    }
+
+                    ++valid;
+
+                    if (hard_w > 0.0f)
+                    {
+                        const double lse = std::log(sum_hot);
+                        loss += hard_w * (lse - probs[static_cast<size_t>(hard)]);
+                        for (long c = 0; c < vocab; ++c)
+                        {
+                            const double p_c = std::exp(probs[static_cast<size_t>(c)]) / sum_hot;
+                            g[base + c] += hard_w * static_cast<float>(p_c);
+                        }
+                        g[base + hard] -= hard_w;
+                    }
+
+                    if (soft_w > 0.0f && top_k > 0)
+                    {
+                        /* The teacher's own softmax over what was recorded. Renormalizing
+                           over the retained entries is what makes the dropped mass a
+                           rescaling rather than a bias. */
+                        float max_t = t.logits(p, 0);
+                        for (long k = 1; k < top_k; ++k)
+                            max_t = std::max(max_t, t.logits(p, k));
+                        double sum_t = 0.0;
+                        for (long k = 0; k < top_k; ++k)
+                            sum_t += std::exp((t.logits(p, k) - max_t) / T);
+                        if (sum_t <= 0.0) continue;
+
+                        const double lse_soft = std::log(sum_soft);
+                        for (long k = 0; k < top_k; ++k)
+                        {
+                            const unsigned long id = t.ids(p, k);
+                            DLIB_CASSERT(id < static_cast<unsigned long>(vocab),
+                                "Recorded id " << id << " >= vocab_size " << vocab);
+                            const double q = std::exp((t.logits(p, k) - max_t) / T) / sum_t;
+                            const double log_p =
+                                probs[static_cast<size_t>(id)] / T - lse_soft;
+                            loss += soft_w * q * (-log_p);
+                            g[base + id] -= soft_w * static_cast<float>(q) / T;
+                        }
+                        for (long c = 0; c < vocab; ++c)
+                        {
+                            const double p_c =
+                                std::exp(probs[static_cast<size_t>(c)] / T) / sum_soft;
+                            g[base + c] += soft_w * static_cast<float>(p_c) / T;
+                        }
+                    }
+                }
+            }
+
+            if (valid > 0)
+            {
+                const float inv = 1.0f / valid;
+                loss *= inv;
+                for (size_t n = 0; n < grad.size(); ++n) g[n] *= inv;
+            }
+            else
+            {
+                loss = 0.0;
+            }
+            return loss;
+        }
+
+        friend void serialize(const loss_distillation_per_token_& item, std::ostream& out)
+        {
+            serialize(item.ignore_index_, out);
+            serialize(item.temperature_, out);
+            serialize(item.alpha_, out);
+        }
+
+        friend void deserialize(loss_distillation_per_token_& item, std::istream& in)
+        {
+            deserialize(item.ignore_index_, in);
+            deserialize(item.temperature_, in);
+            deserialize(item.alpha_, in);
+        }
+
+        friend std::ostream& operator<<(std::ostream& out,
+            const loss_distillation_per_token_& item)
+        {
+            out << "loss_distillation_per_token (ignore_index=" << item.ignore_index_
+                << ", temperature=" << item.temperature_
+                << ", alpha=" << item.alpha_ << ")";
+            return out;
+        }
+
+        friend void to_xml(const loss_distillation_per_token_& item, std::ostream& out)
+        {
+            out << "<loss_distillation_per_token ignore_index='" << item.ignore_index_
+                << "' temperature='" << item.temperature_
+                << "' alpha='" << item.alpha_ << "'/>\n";
+        }
+
+    private:
+        long ignore_index_ = -1;
+        double temperature_ = 2.0;
+        double alpha_ = 0.9;
+    };
+
+    template <typename SUBNET>
+    using loss_distillation_per_token =
+        add_loss_layer<loss_distillation_per_token_, SUBNET>;
 
 // ----------------------------------------------------------------------------------------
 

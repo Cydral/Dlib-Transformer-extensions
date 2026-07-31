@@ -145,6 +145,9 @@ def main():
     parser.add_argument("--device", default="cpu", help="cpu or cuda (default: cpu)")
     parser.add_argument("--dtype", default="float32", choices=["float32", "bfloat16", "float16"],
                         help="weight precision (default: float32, closest to the C++ path)")
+    parser.add_argument("--label-smoothing", type=float, default=0.0,
+                        help="must match the C++ run; both default to 0, and a value here "
+                             "is worth more than a nat on a large vocabulary")
     parser.add_argument("--pad-id", type=int, default=-1,
                         help="padding token; -1 takes the tokenizer's. The C++ side prints "
                              "the value it uses as 'Special ids ... pad=N'")
@@ -224,12 +227,21 @@ def main():
             ids = torch.tensor([w[0] for w in chunk], device=args.device)
             labels = torch.tensor([w[1] for w in chunk], device=args.device)
             mask = torch.tensor([w[2] for w in chunk], device=args.device)
-            out = model(input_ids=ids, attention_mask=mask, labels=labels)
-            n = int((labels != IGNORE).sum().item())
-            total += float(out.loss.item()) * n
+            out = model(input_ids=ids, attention_mask=mask)
+            # Scored here rather than through the model's own labels argument, so that the
+            # smoothing matches the C++ side exactly: the shift is the causal convention,
+            # position t predicting the token at t+1.
+            logits = out.logits[:, :-1, :].contiguous()
+            targets = labels[:, 1:].contiguous()
+            loss_fn = torch.nn.CrossEntropyLoss(
+                ignore_index=IGNORE, label_smoothing=args.label_smoothing, reduction="sum")
+            summed = loss_fn(logits.view(-1, logits.size(-1)), targets.view(-1))
+            n = int((targets != IGNORE).sum().item())
+            total += float(summed.item())
             scored_positions += n
             counted += len(chunk)
 
+    print(f"label smoothing  : {args.label_smoothing}")
     print(f"scored positions : {scored_positions}")
     print(f"reference loss   : {total / max(scored_positions, 1):.5f}")
     print("\nCompare with the 'loss before training' line of slm_lora_finetune_ex, run\n"

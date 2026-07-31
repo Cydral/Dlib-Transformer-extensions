@@ -372,13 +372,16 @@ int main(int argc, char** argv)
             // Prepare training sequences (sliding window)
             cout << "Preparing training sequences...\n";
             std::vector<matrix<int, 0, 1>> samples;
-            std::vector<unsigned long> labels;
+            /* One target per position, which is what the loss reads. The next-token label
+               this dataset is built around lives at the last position of each column. */
+            std::vector<matrix<unsigned long, 0, 1>> labels;
 
             const int pad_token = tokenizer.get_special_token_id("<pad>");
             build_single_token_prediction_dataset({ full_tokens }, max_seq_len,
                 pad_token, false, samples, labels);
             full_tokens.clear();
             cout << "Created " << samples.size() << " training samples\n";
+
 
             // Build and train the network
             using net_type = my_transformer::network_type<true>;
@@ -422,7 +425,7 @@ int main(int argc, char** argv)
                     size_t batch_end = std::min(i + batch_size, samples.size());
                     std::vector<matrix<int, 0, 1>> batch_samples(
                         samples.begin() + i, samples.begin() + batch_end);
-                    std::vector<unsigned long> batch_labels(
+                    std::vector<matrix<unsigned long, 0, 1>> batch_labels(
                         labels.begin() + i, labels.begin() + batch_end);
 
                     std::vector<long> pad_lengths(batch_samples.size());
@@ -481,8 +484,10 @@ int main(int argc, char** argv)
 
                     auto predicted = g_infer(samples);
                     size_t correct = 0;
+                    /* The inference network predicts the token after the window, which is
+                       the last entry of the target column. */
                     for (size_t i = 0; i < labels.size(); ++i)
-                        if (predicted[i] == labels[i]) correct++;
+                        if (predicted[i] == labels[i](labels[i].nr() - 1)) correct++;
                     double accuracy = (double)correct / labels.size();
                     cout << "Training accuracy: " << (accuracy * 100.0) << "%\n";
 

@@ -14,6 +14,8 @@
 #include "data_io/gguf_reader.h"
 #include "data_io/gguf_vision_spec.h"
 #include "data_io/gguf_vision_loader.h"
+#include "data_io/distillation_traces.h"
+#include "data_io/model_archive.h"
 
 #ifndef DLIB_ISO_CPP_ONLY
 #include "data_io/load_image_dataset.h"

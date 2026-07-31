@@ -15,6 +15,7 @@
     Usage:
       slm_gguf_runtime_ex --input model.gguf --probe-logits --prompt "The capital of France is"
       slm_gguf_runtime_ex --input model.gguf --probe-ids "1 450 7483 310 3444 338"
+      slm_gguf_runtime_ex --input model.gguf --show-tokens "## CVE-2010-3763 Details"
       slm_gguf_runtime_ex --input model.gguf --save-dat model.dat
       slm_gguf_runtime_ex --input model.dat --chat
       slm_gguf_runtime_ex --input a.gguf,b.gguf --serve 5000
@@ -26,6 +27,7 @@
 #include <sstream>
 #include <fstream>
 #include <algorithm>
+#include <cmath>
 
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
@@ -45,9 +47,13 @@
 #include <dlib/cmd_line_parser.h>
 #include <dlib/misc_api.h>
 #include <dlib/dnn.h>
+#include <dlib/data_io.h>
+#include <dlib/image_io.h>
+#include <dlib/base64.h>
+#include <dlib/image_transforms.h>
 #include <dlib/tokenizer/hf_tokenizer.h>
 #include <dlib/tokenizer/chat_template.h>
-#include <dlib/server/server_chat.h>
+#include <dlib/server/chat_service.h>
 
 using namespace std;
 using namespace dlib;
@@ -96,6 +102,31 @@ static void report_logits(const tensor& logits, const std::vector<int>& toks, hf
     }
 }
 
+/* Range, mean and root mean square of a tensor. Enough to tell a stage that produced
+   nothing, a stage that produced infinities, and a stage whose scale is an order of
+   magnitude away from what the next one expects. */
+static void report_tensor(const std::string& what, const tensor& t)
+{
+    const float* p = t.host();
+    double lo = 0.0, hi = 0.0, sum = 0.0, sq = 0.0;
+    size_t bad = 0;
+    for (size_t i = 0; i < t.size(); ++i)
+    {
+        const double v = p[i];
+        if (!std::isfinite(v)) { ++bad; continue; }
+        if (i == 0 || v < lo) lo = v;
+        if (i == 0 || v > hi) hi = v;
+        sum += v; sq += v * v;
+    }
+    const double n = static_cast<double>(t.size() ? t.size() : 1);
+    cout << what << std::string(what.size() < 19 ? 19 - what.size() : 1, ' ') << ": ["
+         << t.num_samples() << ", " << t.k() << ", " << t.nr() << ", " << t.nc() << "]  "
+         << "min " << lo << ", max " << hi << ", mean " << sum / n
+         << ", rms " << std::sqrt(sq / n);
+    if (bad) cout << "  " << bad << " NON-FINITE VALUES";
+    cout << "\n";
+}
+
 /* Width of the terminal, for the physical-row accounting of the erase sequences. */
 static long terminal_width()
 {
@@ -109,22 +140,6 @@ static long terminal_width()
         return w.ws_col;
 #endif
     return 80;
-}
-
-/* --trace-prompt output, identical on both front ends: the decoded stream with its
-   special tokens, the ids, and the sampling line actually resolved for the call.
-   Comparing two runs is only conclusive when both print the same thing here. */
-static void trace_stream(const hf_tokenizer& tok, const std::vector<int>& ids,
-    const sampling_params& sp, const std::string& what)
-{
-    cout << "---- " << what << " (" << ids.size() << " tokens) ----\n"
-         << tok.decode(ids, false) << "\n---- ids:";
-    for (int id : ids) cout << ' ' << id;
-    cout << "\n---- sampling: temp " << (sp.greedy ? 0.0 : sp.temperature)
-         << (sp.greedy ? " (greedy)" : "")
-         << ", top_k " << sp.top_k << ", top_p " << sp.top_p
-         << ", min_p " << sp.min_p << ", repeat " << sp.repeat_penalty
-         << " ----" << std::endl;
 }
 
 /* Interactive chat: the first turn goes through the prefill, every later turn is fed
@@ -220,156 +235,57 @@ static int chat_loop(runtime_transformer& rt, hf_tokenizer& tok, const chat_temp
     return 0;
 }
 
-/* One model served by the chat endpoint: the engine, its tokenizer and the chat
-   template detected for it. Several can be loaded side by side; the request's
-   "model" field selects one, the first being the default. */
-struct served_model
-{
-    std::string name;
-    runtime_transformer* rt;
-    hf_tokenizer* tok;
-    chat_template_formatter fmt;
-};
+/* Engine adapter for the chat service: the shape-dynamic engine seen through the small
+   interface chat_service.h expects. Everything it adds is the placement of an image, the
+   rest forwarding straight to the engine.
 
-/* OpenAI-compatible service over the runtime engine. Each request carries the whole
-   conversation, replayed into the token stream the interactive loop would have produced
-   turn by turn, then handed to the same generation core: serving and interactive chat
-   share one numeric path by construction rather than by parallel maintenance. The
-   server is stateless and server_chat serializes the calls, which matches the engine's
-   single-generation-thread assumption. */
-class runtime_chat_server : public dlib::server_chat
+   Staging here means encoding: this engine's tower sits outside the network, so a picture
+   becomes vectors as soon as it arrives, and committing writes those vectors over the
+   reserved positions. */
+class runtime_engine_adapter
 {
 public:
-    runtime_chat_server(std::vector<served_model> models, long ctx,
-        double forced_temp, bool temp_forced, bool deterministic, bool trace_prompt)
-        : models_(std::move(models)), ctx_(ctx), temp_(forced_temp),
-          temp_forced_(temp_forced), det_(deterministic), trace_prompt_(trace_prompt)
+
+    runtime_engine_adapter(runtime_transformer& rt, runtime_vision_encoder* vision,
+        long visual_tokens)
+        : rt_(rt), vision_(vision), visual_tokens_(visual_tokens) {}
+
+    void set_context(long capacity, long keep) { rt_.set_context(capacity, keep); }
+    const tensor& forward_prefill(const std::vector<int>& ids) { return rt_.forward_prefill(ids); }
+    const tensor& step(int token) { return rt_.step(token); }
+
+    bool vision_available() const { return vision_ != nullptr; }
+    long visual_tokens() const { return visual_tokens_; }
+
+    bool stage_image(const matrix<rgb_pixel>& img, std::string& why)
     {
-        std::vector<dlib::chat_model_info> infos;
-        for (const served_model& m : models_)
-            infos.push_back(dlib::chat_model_info{ m.name, m.fmt.supports_reasoning() });
-        set_models(infos);
+        if (!vision_) { why = "this model has no vision tower"; return false; }
+        try
+        {
+            resizable_tensor prepared;
+            vision_->prepare_image(img, prepared);
+            const tensor& v = vision_->encode(prepared);
+            staged_.set_size(v.num_samples(), v.k());
+            memcpy(staged_, v);
+            return true;
+        }
+        catch (const std::exception& e) { why = std::string("encoding: ") + e.what(); return false; }
+    }
+
+    void commit_images(const std::vector<long>& positions)
+    {
+        rt_.set_input_embeddings(staged_, positions);
     }
 
 private:
-    served_model& select(const std::string& id)
-    {
-        for (served_model& m : models_)
-            if (m.name == id) return m;
-        return models_.front();   // first declared model is the default
-    }
-
-    /* Sampling resolved per request against the target model's own presets, never
-       against another served model's; each request override applies on top. Unset
-       overrides arrive negative. */
-    sampling_params resolve_sampling(const dlib::chat_request& req,
-        const chat_template_formatter& fmt) const
-    {
-        sampling_params sp;
-        sp.temperature = req.temperature >= 0.0 ? req.temperature
-            : (temp_forced_ ? temp_ : fmt.default_temperature());
-        sp.top_k = req.top_k >= 0 ? static_cast<size_t>(req.top_k) : fmt.default_top_k();
-        sp.top_p = req.top_p >= 0.0 ? static_cast<float>(req.top_p) : fmt.default_top_p();
-        sp.min_p = req.min_p >= 0.0 ? static_cast<float>(req.min_p) : fmt.default_min_p();
-        sp.repeat_penalty = req.repeat_penalty >= 0.0
-            ? static_cast<float>(req.repeat_penalty) : fmt.default_repeat_penalty();
-        sp.greedy = det_ || sp.temperature <= 0.0;
-        return sp;
-    }
-
-    dlib::chat_result on_chat_completion(const dlib::chat_request& req,
-        const std::function<void(const std::string&)>& emit) override
-    {
-        served_model& use = select(req.model);
-        runtime_transformer& rt = *use.rt;
-        hf_tokenizer& tok = *use.tok;
-        chat_template_formatter fmt = use.fmt;
-        if (req.reasoning >= 0 && fmt.supports_reasoning())
-            fmt.set_reasoning(req.reasoning == 1);
-
-        /* Split the wire messages: every system part joins the system block, a user
-           message opens a turn, an assistant message closes the turn before it. */
-        std::string sys;
-        std::vector<dlib::chat_turn> turns;
-        for (const dlib::chat_message& m : req.messages)
-        {
-            if (m.role == "system")
-            {
-                if (!sys.empty()) sys += "\n";
-                sys += m.content;
-            }
-            else if (m.role == "user")
-            {
-                std::string text = m.content;
-                for (size_t k = 0; k < m.image_urls.size(); ++k)
-                    text += "\n[attached image: not visible to this text-only model]";
-                turns.push_back(dlib::chat_turn{ text, std::string() });
-            }
-            else if (m.role == "assistant" && !turns.empty())
-            {
-                turns.back().assistant = m.content;
-            }
-        }
-        if (turns.empty())
-            throw std::runtime_error("the conversation contains no user message");
-        turns.back().assistant.clear();   // the turn being answered carries no reply yet
-
-        const std::vector<int> ids = encode_conversation(tok, fmt, sys, turns);
-        const long max_new = req.max_tokens > 0 ? req.max_tokens : 512;
-        if (static_cast<long>(ids.size()) + 8 >= ctx_)
-            throw std::runtime_error("prompt exceeds the context capacity; reduce the "
-                "context budget in the interface settings");
-
-        const sampling_params sp = resolve_sampling(req, fmt);
-        if (trace_prompt_) trace_stream(tok, ids, sp, "prompt to " + use.name);
-
-        /* Same capacity and same pinned prefix as the interactive loop: an eviction
-           mid-answer must drop the same rows on both paths. set_context() reallocates
-           only when the geometry changes, so the per-request cost is the cache reset. */
-        rt.set_context(ctx_, system_keep_length(tok, fmt, sys));
-
-        std::vector<int> recent;
-        std::string streamed;
-        generation_options opt;
-        opt.max_new_tokens = max_new;
-        opt.is_cancelled = [&req]() {
-            return dlib::signal_handler::is_triggered()
-                || (req.is_cancelled && req.is_cancelled());
-        };
-        /* Stable suffixes only: the client never receives a fragment of the stop marker
-           nor a trailing blank that the final answer will have trimmed. An open
-           reasoning span still streams raw, so the interface keeps showing the trace
-           live; the server's streaming path buffers any incomplete UTF-8 tail on top. */
-        opt.on_token = [&](const generation_event& ev)
-        {
-            if (!ev.clean_delta.empty()) emit(ev.clean_delta);
-            else if (ev.reasoning_open && ev.answer.size() > streamed.size())
-            {
-                emit(ev.answer.substr(streamed.size()));
-                streamed = ev.answer;
-            }
-        };
-
-        const generation_result gen =
-            generate_reply(rt, tok, fmt, rt.forward_prefill(ids), sampler_, sp, recent, opt);
-
-        dlib::chat_result res;
-        res.prompt_tokens = static_cast<long>(ids.size());
-        res.completion_tokens = static_cast<long>(gen.tokens.size());
-        res.finish_reason = gen.truncated ? "length" : "stop";
-        res.content = gen.text;
-        return res;
-    }
-
-    /* Declaration order follows the constructor's initializer list. */
-    std::vector<served_model> models_;
-    long ctx_;
-    double temp_;
-    bool temp_forced_;
-    bool det_;
-    bool trace_prompt_;
-    token_sampler sampler_;
+    runtime_transformer& rt_;
+    runtime_vision_encoder* vision_;
+    long visual_tokens_;
+    resizable_tensor staged_;
 };
+
+using served = dlib::served_model<runtime_engine_adapter>;
+using chat_server = dlib::chat_service<runtime_engine_adapter>;
 
 int main(int argc, char** argv)
 {
@@ -390,6 +306,11 @@ int main(int argc, char** argv)
         parser.add_option("save-dat", "After loading a GGUF, write a self-contained runtime archive (model + tokenizer)", 1);
         parser.add_option("probe-logits", "Run a prefill and report the logits");
         parser.add_option("probe-ids", "Feed explicit token ids (space or comma separated)", 1);
+        parser.add_option("show-tokens", "Tokenize the given text, print the ids and the pieces, then exit", 1);
+        parser.add_option("mmproj", "Read a multimodal projector container, report its geometry, then exit", 1);
+        parser.add_option("image", "Image file: reported alone with --mmproj, described when --input is also given", 1);
+        parser.add_option("vision", "Projector container enabling image attachments in --serve mode", 1);
+        parser.add_option("with-bos", "Prepend the tokenizer's BOS in --show-tokens");
         parser.add_option("probe-step", "Self-consistency check: last-position logits of a full prefill versus prefill(N-1) + step(last)");
         parser.add_option("prompt", "Prompt for --probe-logits (default: capital of France)", 1);
         parser.add_option("rope-permute", "Map split-half (NeoX) Q/K layouts to the interleaved kernel");
@@ -405,6 +326,90 @@ int main(int argc, char** argv)
         parser.add_option("think", "Let thinking-capable models produce their reasoning trace (streamed, then hidden)");
         parser.add_option("resident", "Dequantize all weights at load time (fastest forward, full f32 footprint); default keeps them quantized at rest");
         parser.parse(argc, argv);
+
+        /* Geometry of a vision tower, read from the second file a multimodal model ships.
+           Reported before anything is implemented against it, because the three numbers
+           that matter (the patch grid, the reduction factor and the width of the projector)
+           have to agree with each other, and a container where they do not is one this
+           pipeline cannot serve. */
+        /* Reported on its own. When a model and an image are supplied as well, the run
+           is a description rather than an inspection and is handled further down, once
+           the decoder is loaded. */
+        if (parser.option("mmproj") && !(parser.option("input") && parser.option("image")))
+        {
+            const string path = parser.option("mmproj").argument();
+            cout << "Reading projector: " << path << "\n";
+            gguf_reader gv(path);
+            const vision_spec vs = detect_vision(gv);
+            cout << describe(vs);
+            const vision_compat_result rep = check_vision_compatibility(vs, gv);
+            for (const string& n : rep.notes) cout << "note: " << n << "\n";
+            for (const string& b : rep.blockers) cerr << "blocker: " << b << "\n";
+            if (!rep.usable())
+            {
+                cout << "The container cannot be served as it stands.\n";
+                return 1;
+            }
+            cout << "The container is consistent with itself and complete.\n";
+            if (!parser.option("image")) return 0;
+
+            /* Encoding of one image, reported rather than consumed. Nothing downstream
+               reads these numbers yet; what they establish is that the tower runs, that
+               it is deterministic, and that two different pictures do not give the same
+               answer, which is the cheapest way to catch a pipeline that has quietly
+               stopped depending on its input. */
+            runtime_vision_encoder enc;
+            cout << "Loading the vision tower...\n";
+            enc.load(gv, vs);
+
+            const string img_path = parser.option("image").argument();
+            matrix<rgb_pixel> img;
+            load_image(img, img_path);
+            cout << "Image              : " << img_path
+                 << " (" << img.nc() << "x" << img.nr() << ")\n";
+
+            resizable_tensor prepared;
+            enc.prepare_image(img, prepared);
+            report_tensor("prepared image", prepared);
+
+            const auto started = std::chrono::steady_clock::now();
+            const tensor& visual = enc.encode(prepared);
+            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - started).count();
+            report_tensor("visual embeddings", visual);
+            cout << "Encoded in         : " << ms << " ms\n";
+
+            /* Determinism, then sensitivity: the same picture twice must agree bit for
+               bit, and a uniform grey must not. */
+            resizable_tensor first;
+            first.copy_size(visual);
+            memcpy(first, visual);
+            const tensor& again = enc.encode(prepared);
+            double drift = 0.0;
+            for (size_t i = 0; i < first.size(); ++i)
+                drift = std::max(drift, std::abs(static_cast<double>(first.host()[i])
+                    - again.host()[i]));
+            cout << "Repeatability      : max difference " << drift
+                 << (drift == 0.0 ? "  [ok ]" : "  [FAIL]") << "\n";
+
+            matrix<rgb_pixel> grey(64, 64);
+            assign_all_pixels(grey, rgb_pixel(128, 128, 128));
+            resizable_tensor flat;
+            enc.prepare_image(grey, flat);
+            const tensor& other = enc.encode(flat);
+            double apart = 0.0;
+            for (size_t i = 0; i < first.size(); ++i)
+                apart = std::max(apart, std::abs(static_cast<double>(first.host()[i])
+                    - other.host()[i]));
+            cout << "Sensitivity        : max difference against a flat grey " << apart
+                 << (apart > 1e-4 ? "  [ok ]" : "  [FAIL]") << "\n";
+
+            cout << "\nFirst visual token, first 8 of " << vs.projection_dim << " values:\n ";
+            for (long i = 0; i < std::min<long>(8, vs.projection_dim); ++i)
+                cout << " " << first.host()[i];
+            cout << "\n";
+            return 0;
+        }
 
         if (!parser.option("input"))
         {
@@ -534,7 +539,7 @@ int main(int argc, char** argv)
                template unless --template forces one for all. */
             std::vector<std::unique_ptr<runtime_transformer>> extra_rt;
             std::vector<std::unique_ptr<hf_tokenizer>> extra_tok;
-            std::vector<served_model> models;
+            std::vector<served> models;
             /* Display identity: the file stem is always descriptive (metadata
                general.name sometimes is not), normalized by the shared cleaner
                which also strips the quantization and container markers. */
@@ -546,7 +551,36 @@ int main(int argc, char** argv)
                 stem = clean_model_name(stem);
                 return stem.empty() ? clean_model_name(r.spec().model_name) : stem;
             };
-            models.push_back(served_model{ label(rt, input), &rt, &tok, fmt });
+            /* One vision tower, attached to the first model. Serving several multimodal
+               models at once would need one tower each, which the loop below could do;
+               the single case is the one this example covers. */
+            std::unique_ptr<runtime_vision_encoder> vision;
+            long visual_tokens = 0;
+            if (parser.option("vision"))
+            {
+                gguf_reader gv(parser.option("vision").argument());
+                const vision_spec vs = detect_vision(gv);
+                const vision_compat_result vrep = check_vision_compatibility(vs, gv);
+                for (const string& b : vrep.blockers) cerr << "blocker: " << b << "\n";
+                if (!vrep.usable()) return 1;
+                if (vs.projection_dim != rt.spec().d_model)
+                {
+                    cerr << "The projector emits " << vs.projection_dim
+                         << "-wide vectors and this decoder expects " << rt.spec().d_model
+                         << ": the two files do not belong to the same model.\n";
+                    return 1;
+                }
+                cout << "Loading the vision tower (" << vs.tokens_per_image()
+                     << " positions per image)...\n";
+                vision.reset(new runtime_vision_encoder());
+                vision->load(gv, vs);
+                visual_tokens = vs.tokens_per_image();
+            }
+
+            /* The adapters outlive the service, which holds them by pointer. */
+            std::vector<std::unique_ptr<runtime_engine_adapter>> engines;
+            engines.emplace_back(new runtime_engine_adapter(rt, vision.get(), visual_tokens));
+            models.push_back(served{ label(rt, input), engines.back().get(), &tok, fmt });
             for (size_t i = 1; i < inputs.size(); ++i)
             {
                 extra_rt.emplace_back(new runtime_transformer());
@@ -583,16 +617,17 @@ int main(int argc, char** argv)
                     ? chat_template_formatter::for_tokenizer(t,
                         chat_template_formatter::from_name(parser.option("template").argument()))
                     : chat_template_formatter::for_tokenizer(t, r.spec().model_name);
-                models.push_back(served_model{ label(r, path), &r, &t, f2 });
+                engines.emplace_back(new runtime_engine_adapter(r, nullptr, 0));
+                models.push_back(served{ label(r, path), engines.back().get(), &t, f2 });
             }
 
             cout << "Serving " << models.size() << " model(s):\n";
-            for (const served_model& m : models)
+            for (const served& m : models)
                 cout << "  " << m.name
                      << "  [template " << chat_template_formatter::name(m.fmt.kind())
                      << (m.fmt.supports_reasoning() ? ", reasoning" : "") << "]\n";
 
-            runtime_chat_server srv(std::move(models), ctx,
+            chat_server srv(std::move(models), ctx,
                 parser.option("temp") ? std::stod(parser.option("temp").argument()) : 0.0,
                 parser.option("temp") != 0,
                 parser.option("deterministic"), parser.option("trace-prompt"));
@@ -606,6 +641,124 @@ int main(int argc, char** argv)
             cout << "\nShutting down (waiting for in-flight requests)...\n";
             srv.clear();   // shuts connections, waits for handlers, releases the port
             cout << "Server stopped.\n";
+            return 0;
+        }
+
+        /* Tokenization of a plain string, printed id by id with the piece each one
+           stands for. There is no logits pass here: the point is to put our tokenizer
+           side by side with an independent one on the exact same text. A model is
+           pretrained on one segmentation, and feeding it another costs quality before any
+           question of speed, so this is the first thing to check on a new corpus rather
+           than the last. slm_tools/slm_reference_chat.py --show-tokens is the counterpart
+           to compare against. */
+        if (parser.option("show-tokens"))
+        {
+            const string text = parser.option("show-tokens").argument();
+            const std::vector<int> ids =
+                tok.encode(text, parser.option("with-bos"), false, true, false);
+            cout << ids.size() << " tokens:";
+            for (int id : ids) cout << ' ' << id;
+            cout << "\n";
+            for (int id : ids)
+            {
+                std::vector<int> one{ id };
+                cout << "  " << id << "  '" << tok.decode(one, false) << "'\n";
+            }
+            return 0;
+        }
+
+        /* Description of an image, end to end. The prompt reserves one position per
+           vector the tower will produce, the tower produces them, and the engine takes
+           those positions from the vectors instead of from the token table. Nothing else
+           in the stack knows an image went through. */
+        if (parser.option("mmproj") && parser.option("image"))
+        {
+            gguf_reader gv(parser.option("mmproj").argument());
+            const vision_spec vs = detect_vision(gv);
+            const vision_compat_result vrep = check_vision_compatibility(vs, gv);
+            for (const string& b : vrep.blockers) cerr << "blocker: " << b << "\n";
+            if (!vrep.usable()) return 1;
+            if (vs.projection_dim != rt.spec().d_model)
+            {
+                cerr << "The projector emits " << vs.projection_dim
+                     << "-wide vectors and this decoder expects " << rt.spec().d_model
+                     << ": the two files do not belong to the same model.\n";
+                return 1;
+            }
+
+            runtime_vision_encoder enc;
+            cout << "Loading the vision tower...\n";
+            enc.load(gv, vs);
+
+            matrix<rgb_pixel> img;
+            load_image(img, parser.option("image").argument());
+            resizable_tensor prepared;
+            enc.prepare_image(img, prepared);
+            const tensor& visual = enc.encode(prepared);
+            report_tensor("visual embeddings", visual);
+
+            chat_template_formatter fmt = parser.option("template")
+                ? chat_template_formatter::for_tokenizer(tok,
+                    chat_template_formatter::from_name(parser.option("template").argument()))
+                : chat_template_formatter::for_tokenizer(tok, rt.spec().model_name);
+            cout << "Chat template      : " << chat_template_formatter::name(fmt.kind()) << "\n";
+            if (fmt.kind() != chat_template_kind::idefics3)
+                cout << "note: this template has no image markers; the description will "
+                        "likely be poor\n";
+
+            const string question = parser.option("prompt")
+                ? parser.option("prompt").argument()
+                : string("What is in this image?");
+            const string turn = fmt.first_turn(
+                parser.option("system") ? parser.option("system").argument() : string(),
+                idefics3_markers::image_block(vs.tokens_per_image()) + question);
+
+            std::vector<int> ids = tok.encode(turn, fmt.add_bos_on_first_turn(),
+                false, true, false);
+
+            /* The reserved positions are found by scanning for the placeholder rather
+               than by counting characters: the tokenizer decides where they land, and a
+               single token of drift would put the image on the wrong words. */
+            const std::vector<int> mark = tok.encode(
+                idefics3_markers::image_placeholder(), false, false, true, false);
+            if (mark.size() != 1)
+            { cerr << "the image placeholder is not a single token of this vocabulary\n"; return 1; }
+            std::vector<long> positions;
+            for (size_t i = 0; i < ids.size(); ++i)
+                if (ids[i] == mark[0]) positions.push_back(static_cast<long>(i));
+            cout << "Prompt             : " << ids.size() << " tokens, "
+                 << positions.size() << " reserved for the image\n";
+            if (static_cast<long>(positions.size()) != vs.tokens_per_image())
+            { cerr << "the reserved positions do not match what the tower produces\n"; return 1; }
+            if (parser.option("trace-prompt"))
+                cout << "---- prompt ----\n" << tok.decode(ids, false) << "\n---------------\n";
+
+            rt.set_context(ctx, static_cast<long>(ids.size()));
+            rt.set_input_embeddings(visual, positions);
+
+            token_sampler sampler;
+            sampling_params sp;
+            sp.temperature = parser.option("temp")
+                ? std::stod(parser.option("temp").argument()) : fmt.default_temperature();
+            sp.top_k = fmt.default_top_k();
+            sp.top_p = fmt.default_top_p();
+            sp.min_p = fmt.default_min_p();
+            sp.repeat_penalty = fmt.default_repeat_penalty();
+            sp.greedy = parser.option("deterministic") || sp.temperature <= 0.0;
+
+            std::vector<int> recent;
+            generation_options gopt;
+            gopt.max_new_tokens = max_new;
+            std::string shown;
+            gopt.on_token = [&](const generation_event& ev) {
+                if (!ev.clean_delta.empty())
+                { cout << ev.clean_delta << std::flush; shown += ev.clean_delta; }
+            };
+            cout << "\nModel: " << std::flush;
+            const generation_result res = generate_reply(rt, tok, fmt,
+                rt.forward_prefill(ids), sampler, sp, recent, gopt);
+            if (res.text.size() > shown.size()) cout << res.text.substr(shown.size());
+            cout << "\n";
             return 0;
         }
 

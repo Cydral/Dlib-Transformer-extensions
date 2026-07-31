@@ -197,6 +197,7 @@ add_example(slm_lora_finetune_ex)
 add_example(slm_vision_tower_ex)
 add_example(slm_vit_classify_ex)
 add_example(slm_vit_ssl_ex)
+add_example(slm_distill_ex)
 
 # The examples that compile a whole model in from a generated header.
 #
@@ -206,7 +207,7 @@ add_example(slm_vit_ssl_ex)
 # under the 900 GCC allows by default, and the fusion layer pushed it over. The bound
 # rises with the depth of the model rather than with anything these files do, so it is
 # raised once for both of them instead of being chased target by target.
-foreach(target slm_gguf_import_ex slm_lora_finetune_ex)
+foreach(target slm_gguf_import_ex slm_lora_finetune_ex slm_distill_ex)
     if(MSVC)
         target_compile_options(${target} PRIVATE /bigobj)
     else()

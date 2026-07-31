@@ -333,7 +333,7 @@ bool verify_match(const std::string& original, const std::string& generated) {
     // Helper function to display context around a position
     auto show_context = [&](size_t pos, size_t context_size) {
         size_t start = (pos >= context_size) ? pos - context_size : 0;
-        size_t end = __min(original.size(), pos + context_size + 1);
+        size_t end = std::min(original.size(), pos + context_size + 1);
 
         std::string orig_context, gen_context;
         std::string orig_highlight, gen_highlight;
@@ -478,7 +478,7 @@ public:
         matrix<int, 0, 1> input_sequence(desired_length, 1);
 
         // Determine how many tokens we'll copy from context
-        size_t tokens_to_copy = __min(current_context_.size(), desired_length);
+        size_t tokens_to_copy = std::min(current_context_.size(), desired_length);
         size_t start_pos = current_context_.size() > desired_length ?
             current_context_.size() - desired_length : 0;
 

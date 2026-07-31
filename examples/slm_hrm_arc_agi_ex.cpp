@@ -180,7 +180,10 @@ struct generation_state
     }
 };
 
-struct generation_result
+/* Named apart from dlib::generation_result, which text_generation.h brings in through
+   dnn.h: the two describe different things, a decoded grid here and a decoded reply
+   there, and under a using-directive the compiler cannot choose between them. */
+struct arc_generation_result
 {
     arc_grid_t grid;
     long context_size;
@@ -188,7 +191,7 @@ struct generation_result
     bool context_fits;
     long tokens_truncated;
 
-    generation_result(long ctx_size, long win_size)
+    arc_generation_result(long ctx_size, long win_size)
         : context_size(ctx_size),
         window_size(win_size),
         context_fits(ctx_size <= win_size),
@@ -217,7 +220,7 @@ long compute_context_size(const TASK_TYPE& task, const PAIR_TYPE& test_pair)
         - Returns the predicted output grid if successful
 !*/
 template <typename NET_TYPE>
-generation_result generate_output_for_test_pair_with_info(
+arc_generation_result generate_output_for_test_pair_with_info(
     NET_TYPE& net,
     const arc_task& task,
     const arc_task_pair& test_pair,
@@ -228,7 +231,7 @@ generation_result generate_output_for_test_pair_with_info(
     const long actual_context_size = input_context.size();
     const long inference_window_size = actual_context_size;
 
-    generation_result result(actual_context_size, WINDOW_LEN);
+    arc_generation_result result(actual_context_size, WINDOW_LEN);
     result.context_fits = true;
     result.tokens_truncated = 0;
 
@@ -453,7 +456,8 @@ int main(int argc, char** argv)
             // Prepare training data from all tasks
             cout << "Preparing training data...\n";
             std::vector<arc_token_sequence_t> all_X;
-            std::vector<unsigned long> all_Y;
+            /* One target per position, which is what the loss reads. */
+            std::vector<matrix<unsigned long, 0, 1>> all_Y;
 
             for (size_t task_idx = 0; task_idx < data_mgr.num_training_tasks(); ++task_idx)
             {
@@ -472,9 +476,17 @@ int main(int argc, char** argv)
 
                 all_X.insert(all_X.end(), task_X.begin(), task_X.end());
 
-                // Convert long to unsigned long for dlib classification
-                for (auto y : task_Y)
-                    all_Y.push_back(static_cast<unsigned long>(y));
+                /* The target of a position is the token that follows it inside the
+                   window, and the label of this dataset for the last one. */
+                for (size_t k = 0; k < task_Y.size(); ++k)
+                {
+                    const matrix<int, 0, 1>& window = task_X[k];
+                    matrix<unsigned long, 0, 1> target(window.nr(), 1);
+                    for (long t = 0; t + 1 < window.nr(); ++t)
+                        target(t) = static_cast<unsigned long>(window(t + 1));
+                    target(window.nr() - 1) = static_cast<unsigned long>(task_Y[k]);
+                    all_Y.push_back(std::move(target));
+                }
 
                 if ((task_idx + 1) % 10 == 0) {
                     cout << "Processed " << (task_idx + 1) << "/"
@@ -494,13 +506,10 @@ int main(int argc, char** argv)
                 deserialize(model_file) >> net;
             }
             layer<0>(net).loss_details().set_ignore_index(TOKEN_PADDING);
-            // Disable label smoothing during initial training. With the
-            // expected uniform-softmax baseline at init (~log(17) = 2.83 for
-            // a 17-token vocabulary), a clean cross-entropy loss is easier
-            // to monitor than the smoothed variant whose interactions with
-            // the floor in the loss kernel can mask early convergence
-            // issues. Re-enable (set to 0.1) once convergence is solid.
-            layer<0>(net).loss_details().set_label_smoothing(0.0);
+            // Label smoothing is off by default, so nothing is set here. It is worth
+            // leaving off for this task anyway: at initialization the loss should sit near
+            // log(17) = 2.83 for a seventeen-token vocabulary, and a smoothed loss carries
+            // a floor that hides how far from that baseline a run actually starts.
             /* Enable YaRN before the first forward so the serialized model carries the
                extended-context RoPE configuration, whatever the library default. */
             enable_yarn_context_extension(net);
@@ -540,7 +549,7 @@ int main(int argc, char** argv)
                 for (size_t i = 0; i < all_X.size() && !signal_handler::is_triggered(); i += batch_size)
                 {
                     std::vector<matrix<int, 0, 1>> batch_X;
-                    std::vector<unsigned long> batch_Y;
+                    std::vector<matrix<unsigned long, 0, 1>> batch_Y;
                     batch_X.reserve(batch_size);
                     batch_Y.reserve(batch_size);
 
@@ -672,7 +681,7 @@ int main(int argc, char** argv)
                     long context_size = compute_context_size(task, test_pair);
 
                     // Now attempt generation
-                    generation_result gen_result(context_size, WINDOW_LEN);
+                    arc_generation_result gen_result(context_size, WINDOW_LEN);
                     bool generation_failed = false;
 
                     try {

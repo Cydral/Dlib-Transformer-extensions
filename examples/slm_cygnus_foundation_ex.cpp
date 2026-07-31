@@ -340,7 +340,7 @@ void build_flat_samples_from_segments(
     const std::vector<std::vector<int>>& segments,
     long max_seq_len, int pad_token,
     std::vector<matrix<int, 0, 1>>& out_samples,
-    std::vector<unsigned long>& out_labels)
+    std::vector<matrix<unsigned long, 0, 1>>& out_labels)
 {
     std::vector<std::vector<int>> flat_corpus(1);
     size_t flat_total = 0;
@@ -497,7 +497,8 @@ int run_pipeline(bool do_train, const double learning_rate, const size_t batch_s
         }
 
         std::vector<matrix<int, 0, 1>> samples;
-        std::vector<unsigned long> labels;
+        /* One target per position, which is what the loss reads. */
+        std::vector<matrix<unsigned long, 0, 1>> labels;
         const int pad_token = static_cast<int>(tokenizer.get_special_token_id("<pad>"));
         std::unique_ptr<chunked_tokens_reader> stream_reader;
 
@@ -551,7 +552,7 @@ int run_pipeline(bool do_train, const double learning_rate, const size_t batch_s
         double ctx_lr = -1.0;
 
         auto run_one_step = [&](std::vector<matrix<int, 0, 1>>& batch_X,
-            std::vector<unsigned long>& batch_Y,
+            std::vector<matrix<unsigned long, 0, 1>>& batch_Y,
             double& total_loss, size_t& batches_seen, size_t& samples_seen,
             std::chrono::high_resolution_clock::time_point epoch_start)
             {
@@ -591,7 +592,7 @@ int run_pipeline(bool do_train, const double learning_rate, const size_t batch_s
             };
 
         auto run_one_dataset_pass = [&](std::vector<matrix<int, 0, 1>>& X,
-            std::vector<unsigned long>& Y,
+            std::vector<matrix<unsigned long, 0, 1>>& Y,
             double& total_loss, size_t& batches_seen, size_t& samples_seen,
             std::chrono::high_resolution_clock::time_point epoch_start)
             {
@@ -599,7 +600,8 @@ int run_pipeline(bool do_train, const double learning_rate, const size_t batch_s
                 for (size_t i = 0; i < X.size() && !signal_handler::is_triggered(); i += batch_size) {
                     size_t batch_end = std::min(i + batch_size, X.size());
                     std::vector<matrix<int, 0, 1>> batch_X(X.begin() + i, X.begin() + batch_end);
-                    std::vector<unsigned long> batch_Y(Y.begin() + i, Y.begin() + batch_end);
+                    std::vector<matrix<unsigned long, 0, 1>> batch_Y(
+                        Y.begin() + i, Y.begin() + batch_end);
                     run_one_step(batch_X, batch_Y, total_loss, batches_seen, samples_seen, epoch_start);
                 }
             };
@@ -644,14 +646,14 @@ int run_pipeline(bool do_train, const double learning_rate, const size_t batch_s
                     const auto& chunk_segments = stream_reader->get_chunk(chunk_idx);
 
                     std::vector<matrix<int, 0, 1>> chunk_samples;
-                    std::vector<unsigned long> chunk_labels;
+                    std::vector<matrix<unsigned long, 0, 1>> chunk_labels;
                     build_flat_samples_from_segments(chunk_segments, MAX_SEQ_LEN, pad_token, chunk_samples, chunk_labels);
 
                     run_one_dataset_pass(chunk_samples, chunk_labels,
                         total_loss, batches_seen, samples_seen, epoch_start);
 
                     std::vector<matrix<int, 0, 1>>().swap(chunk_samples);
-                    std::vector<unsigned long>().swap(chunk_labels);
+                    std::vector<matrix<unsigned long, 0, 1>>().swap(chunk_labels);
                 }
                 epoch++;
             }

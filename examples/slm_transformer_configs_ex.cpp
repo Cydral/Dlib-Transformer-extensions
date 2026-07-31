@@ -408,7 +408,8 @@ int run_pipeline(
         // Main pre-training samples from the flat corpus
         cout << "Preparing training sequences (window=" << max_seq_len << ")...\n";
         std::vector<matrix<int, 0, 1>> samples;
-        std::vector<unsigned long> labels;
+        /* One target per position, which is what the loss reads. */
+        std::vector<matrix<unsigned long, 0, 1>> labels;
         const int pad_token = static_cast<int>(tokenizer.get_special_token_id("<pad>"));
         build_single_token_prediction_dataset(flat_corpus, max_seq_len, pad_token, false, samples, labels);
         const size_t main_size = samples.size();
@@ -416,7 +417,7 @@ int run_pipeline(
 
         // Auxiliary cold-start samples with progressive left padding
         std::vector<matrix<int, 0, 1>> aux_samples;
-        std::vector<unsigned long> aux_labels;
+        std::vector<matrix<unsigned long, 0, 1>> aux_labels;
         build_single_token_prediction_dataset(per_segment_tokens, max_seq_len, pad_token, true, aux_samples, aux_labels);
 
         // Keep only the genuinely left-padded samples. Non-padded sliding windows from
@@ -424,7 +425,7 @@ int run_pipeline(
         // corpus, so dropping them avoids skewing the training distribution.
         {
             std::vector<matrix<int, 0, 1>> filtered_X;
-            std::vector<unsigned long> filtered_Y;
+            std::vector<matrix<unsigned long, 0, 1>> filtered_Y;
             filtered_X.reserve(aux_samples.size());
             filtered_Y.reserve(aux_samples.size());
             for (size_t i = 0; i < aux_samples.size(); ++i)
@@ -515,7 +516,8 @@ int run_pipeline(
             {
                 size_t batch_end = std::min(i + batch_size, samples.size());
                 std::vector<matrix<int, 0, 1>> batch_X(samples.begin() + i, samples.begin() + batch_end);
-                std::vector<unsigned long> batch_Y(labels.begin() + i, labels.begin() + batch_end);
+                std::vector<matrix<unsigned long, 0, 1>> batch_Y(
+                    labels.begin() + i, labels.begin() + batch_end);
 
                 std::vector<long> pad_lengths(batch_X.size());
                 for (size_t j = 0; j < batch_X.size(); ++j)

@@ -817,18 +817,22 @@ namespace dlib
             WHAT THIS OBJECT REPRESENTS
                 This object implements the loss layer interface defined above by
                 EXAMPLE_LOSS_LAYER_.  It computes a per-position cross-entropy loss for
-                autoregressive (causal) language modeling: it uses the same scalar label per
-                sample (training_label_type == unsigned long) and reports the same
-                next-token argmax at the last position (see to_label()).
+                autoregressive (causal) language modeling and reports the next-token argmax
+                at the last position (see to_label()).
 
                 The output tensor is interpreted as a (batch_size, 1, seq_len, vocab_size)
                 tensor, each (b, 0, t, :) slice being the logit distribution for the token
-                at position t of sample b. Targets are obtained by teacher forcing: every
-                position t in [0, seq_len-2] is supervised against the input token at
-                position t+1 (read from input_tensor), and the last position is supervised
-                against the externally provided label. Thus every position contributes a
-                gradient; contexts of every length from 1 to seq_len are seen within each
-                window.
+                at position t of sample b. The target of position t is truth[i](t), one
+                entry per position, and a target equal to the ignore index leaves that
+                position unscored.
+
+                The targets are read and never inferred. Deriving them from the input, as
+                teacher forcing does, is right for causal pretraining, where the target of
+                a position is by construction the next input token, and wrong for anything
+                masked: it scores the prompt and the padding of a supervised dataset along
+                with the answer, which is the opposite of what such a dataset asks for. A
+                caller that wants teacher forcing writes it into the labels, and
+                dlib::expand_next_token_labels does exactly that.
 
                 QUERY-SIDE PADDING MASK
                 A position whose own input token equals the pad index is excluded from
@@ -851,7 +855,11 @@ namespace dlib
         !*/
 
     public:
-        typedef unsigned long training_label_type;
+        // One target per sequence position, not one per sample. A scalar here used to
+        // compile through the implicit conversion a dlib matrix offers to its element
+        // type, whose 1x1 assertion is compiled out of an optimized build, and the
+        // labels were then silently reduced to their first entry.
+        typedef matrix<unsigned long, 0, 1> training_label_type;
         typedef unsigned long output_label_type;
 
         loss_cross_entropy_per_token_(
@@ -860,7 +868,10 @@ namespace dlib
             ensures
                 - #get_ignore_index() == -1
                 - #get_ignore_indices().empty() == true
-                - #get_label_smoothing() == 0.1
+                - #get_label_smoothing() == 0.0
+                  (off by default, as in PyTorch and the Hugging Face trainer: a loss that
+                  smooths without being asked reports a number no other implementation
+                  produces)
                 - #get_pad_index() == -1
                 - #get_z_loss_weight() == 0.0
         !*/
@@ -1013,10 +1024,9 @@ namespace dlib
                 - input_tensor is the token-id tensor fed to the network, laid out as
                   (num_samples, 1, seq_len, 1).
             ensures
-                - Computes per-position cross-entropy with teacher-forced targets (input
-                  shifted by one, last position from truth), optional label smoothing,
-                  optional target masking, optional query-side padding mask, and optional
-                  z-loss regularization.
+                - Computes per-position cross-entropy against truth, one target per
+                  position, with optional label smoothing, optional target masking,
+                  optional query-side padding mask, and optional z-loss regularization.
                 - Writes the gradient w.r.t. the logits into sub.get_gradient_input().
                 - Returns the loss averaged over all non-masked positions in the batch.
         !*/
@@ -1897,6 +1907,177 @@ namespace dlib
 
     template <typename SUBNET>
     using loss_binary_log_per_pixel = add_loss_layer<loss_binary_log_per_pixel_, SUBNET>;
+
+// ----------------------------------------------------------------------------------------
+
+    struct distillation_target
+    {
+        /*!
+            WHAT THIS OBJECT REPRESENTS
+                One window's supervision for loss_distillation_per_token_: the hard target
+                of every position, and the highest scoring entries a teacher recorded there.
+
+                - hard is window_len by 1. hard(t) is the token position t should predict,
+                  or the ignore index to leave that position unscored.
+                - ids and logits are window_len by top_k. Row t holds the token ids the
+                  teacher ranked highest at position t and their raw logits.
+
+                Raw logits rather than probabilities, so that a temperature can still be
+                chosen when training; probabilities would have frozen that choice when the
+                teacher ran.
+        !*/
+
+        matrix<unsigned long, 0, 1> hard;
+        matrix<unsigned long> ids;
+        matrix<float> logits;
+    };
+
+// ----------------------------------------------------------------------------------------
+
+    class loss_distillation_per_token_
+    {
+        /*!
+            WHAT THIS OBJECT REPRESENTS
+                A loss that pulls a student towards a teacher and towards the corpus at the
+                same time, position by position over a sequence.
+
+                    L = alpha * T^2 * soft + (1 - alpha) * hard
+
+                The hard term is the ordinary cross-entropy against the token the corpus
+                contains. The soft term is the cross-entropy against the teacher's
+                distribution, restricted to the entries that were recorded, and it is where
+                the value of distillation lies: a hard label says the next token is X, a
+                distribution says X, but Y was nearly as good, Z was plausible, and the
+                remaining fifty thousand were not. That ordering over the vocabulary is not
+                present in the corpus and no student could derive it from the text alone.
+
+                THE TEMPERATURE, AND WHY THE SOFT TERM CARRIES T^2
+
+                    T flattens both distributions so that what the teacher thinks of
+                    unlikely tokens becomes visible; without it the soft term degenerates
+                    towards the hard one. It also divides the gradient by T. The T^2 undoes
+                    that division once and keeps the two terms comparable as T varies:
+                    without it, changing the temperature would silently change the effective
+                    learning rate of half the objective.
+
+                WHAT IS READ, AND WHAT IS NOT INFERRED
+
+                    Every target comes from the label. The hard target of a position is
+                    hard(t) and its soft target is that row of ids and logits. A position
+                    whose hard target is the ignore index is skipped entirely, soft term
+                    included. Nothing is derived from the input tokens: a loss that decides
+                    for itself what a position should predict cannot express a masked
+                    objective, and will quietly score prompts and padding when handed one.
+
+                THE APPROXIMATION THIS MAKES
+
+                    The soft term is computed against the student's full softmax rather than
+                    one restricted to the recorded entries, so the teacher's mass outside
+                    them is dropped rather than redistributed. That is the usual choice and
+                    a good one when top_k covers most of the mass; it is also what lets one
+                    softmax serve both terms.
+
+                It is meant to be used with dlib::distillation_reader, which produces the
+                labels this loss consumes.
+        !*/
+
+    public:
+
+        typedef distillation_target training_label_type;
+        typedef unsigned long output_label_type;
+
+        loss_distillation_per_token_(
+        );
+        /*!
+            ensures
+                - #get_ignore_index() == -1
+                - #get_temperature() == 2.0
+                - #get_alpha() == 0.9
+        !*/
+
+        void set_ignore_index(
+            long idx
+        );
+        /*!
+            ensures
+                - #get_ignore_index() == idx
+                - A position whose hard target equals idx contributes neither loss nor
+                  gradient. A negative value scores every position.
+        !*/
+
+        long get_ignore_index(
+        ) const;
+
+        void set_temperature(
+            double t
+        );
+        /*!
+            requires
+                - t > 0
+            ensures
+                - #get_temperature() == t
+        !*/
+
+        double get_temperature(
+        ) const;
+
+        void set_alpha(
+            double a
+        );
+        /*!
+            requires
+                - 0 <= a <= 1
+            ensures
+                - #get_alpha() == a
+                - a == 1 keeps the soft term alone, a == 0 the hard term alone. At a == 0,
+                  or with a single recorded entry sitting on the hard target at T == 1, this
+                  loss reduces exactly to loss_cross_entropy_per_token_ without smoothing.
+        !*/
+
+        double get_alpha(
+        ) const;
+
+        template <
+            typename SUB_TYPE,
+            typename label_iterator
+            >
+        void to_label (
+            const tensor& input_tensor,
+            const SUB_TYPE& sub,
+            label_iterator iter
+        ) const;
+        /*!
+            ensures
+                - Writes the argmax of the last position of every sample, which is the token
+                  a caller would append when generating.
+        !*/
+
+        template <
+            typename const_label_iterator,
+            typename SUBNET
+            >
+        double compute_loss_value_and_gradient (
+            const tensor& input_tensor,
+            const_label_iterator truth,
+            SUBNET& sub
+        ) const;
+        /*!
+            requires
+                - sub.get_output().k() == 1, the logits being laid out as
+                  (num_samples, 1, seq_len, vocab_size).
+                - Every truth entry has hard.nr() == seq_len, and ids and logits of
+                  seq_len rows.
+                - Every recorded id and every hard target is below vocab_size.
+            ensures
+                - Writes the gradient w.r.t. the logits into sub.get_gradient_input().
+                - Returns the loss averaged over the positions that were scored, ignored
+                  ones counting in neither the sum nor the divisor.
+                - Returns 0 when no position was scored.
+        !*/
+    };
+
+    template <typename SUBNET>
+    using loss_distillation_per_token = add_loss_layer<loss_distillation_per_token_, SUBNET>;
 
 // ----------------------------------------------------------------------------------------
 

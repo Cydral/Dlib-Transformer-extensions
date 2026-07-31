@@ -506,13 +506,10 @@ int main(int argc, char** argv)
                 deserialize(model_file) >> net;
             }
             layer<0>(net).loss_details().set_ignore_index(TOKEN_PADDING);
-            // Disable label smoothing during initial training. With the
-            // expected uniform-softmax baseline at init (~log(17) = 2.83 for
-            // a 17-token vocabulary), a clean cross-entropy loss is easier
-            // to monitor than the smoothed variant whose interactions with
-            // the floor in the loss kernel can mask early convergence
-            // issues. Re-enable (set to 0.1) once convergence is solid.
-            layer<0>(net).loss_details().set_label_smoothing(0.0);
+            // Label smoothing is off by default, so nothing is set here. It is worth
+            // leaving off for this task anyway: at initialization the loss should sit near
+            // log(17) = 2.83 for a seventeen-token vocabulary, and a smoothed loss carries
+            // a floor that hides how far from that baseline a run actually starts.
             /* Enable YaRN before the first forward so the serialized model carries the
                extended-context RoPE configuration, whatever the library default. */
             enable_yarn_context_extension(net);
