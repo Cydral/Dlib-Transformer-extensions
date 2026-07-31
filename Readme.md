@@ -2,6 +2,8 @@
 
 > [!IMPORTANT]
 > **Dlib Transformer Extensions** brings modern **Transformer-oriented modeling** into the **Dlib** ecosystem through reusable architectural components, language-model utilities, training helpers, progressive examples, and reusable checkpoints — all designed for practical use in standard **C++14**.
+>
+> The project now covers a complete lifecycle: **load an open-weight model from a GGUF container**, run it, **convert it into a native Dlib network**, **continue training it**, **specialize it by SFT and LoRA**, or **distill it into a smaller student of a different architecture** — without leaving C++ and without a Python runtime in the loop.
 
 > [!NOTE]
 > This repository is documented through two complementary entry points:
@@ -64,7 +66,10 @@ Many repositories are either too low-level to use easily or too high-level to te
 
 That makes the project useful not only for experimentation, but also for reproducibility, adaptation, and eventual deployment.
 
-### 5. It creates a foundation for sovereign and specialized model stacks in C++
+### 5. It closes the loop between consuming a model and owning one
+Most tooling around open-weight models stops at inference. This project deliberately goes further: a container read from disk becomes a **native Dlib network whose weights are ordinary trainable parameters**. From there the usual Dlib machinery applies — optimizers, visitors, serialization, fine-tuning — which turns a downloaded artifact into a starting point rather than an endpoint.
+
+### 6. It creates a foundation for sovereign and specialized model stacks in C++
 One of the strongest strategic dimensions of the project is that it supports an approach where organizations can build **specialized**, **inspectable**, and potentially **sovereign** model stacks without leaving the C++ / Dlib ecosystem. That is particularly compelling when teams need stronger control over model behavior, runtime integration, training artifacts, or deployment boundaries.
 
 ---
@@ -121,36 +126,67 @@ In other words, the project is not only about adding Transformers to Dlib. It is
 
 ## What the project currently covers
 
-At this stage, the repository is centered primarily on **language and sequence-oriented Transformer workflows**, while already opening the door to more structured and broader model classes.
+The project has grown from a set of Transformer building blocks into a **model lifecycle**, from an existing open-weight artifact to a specialized model of your own design.
 
-### Core architectural support
-The project includes Transformer-oriented support and language-modeling utilities designed to integrate naturally with Dlib-style workflows.
+### Interoperability with the open-weight ecosystem
 
-### Operational support layers
-The project now spans several technical layers beyond a single network definition, including abstractions related to:
+**GGUF containers are read directly.** The reader parses the metadata, detects the architecture family, and reports what it found before touching a single weight. Detection currently spans the **llama, mistral, mixtral, gemma, gemma2, qwen2, qwen3 and granitemoe** families, which together account for the large majority of open-weight decoder models published today.
 
-- **layers**
-- **losses**
-- **language-model data**
-- **inputs**
-- **trainer support**
-- **learning-rate scheduling**
+**Quantized weights are dequantized on the fly.** The legacy block formats (**Q4_0, Q4_1, Q5_0, Q5_1, Q8_0**), the whole **k-quant** range (**Q2_K** through **Q6_K**) and **IQ4_NL** are supported. The grid-based i-quants (**IQ1, IQ2, IQ3**) are not, and the loader says so rather than producing plausible noise.
 
-These elements show that the project has grown into a broader ecosystem for model construction and execution rather than remaining limited to one demonstration path.
+**Compatibility is reported, not assumed.** Before any import, a compatibility pass lists what is supported, what is merely noted, and what blocks. Mixture-of-experts containers, for instance, are served by the runtime engine but explicitly refused by the static path, because the compiled network has no expert packing. An honest refusal is worth more than a silent approximation.
 
-### Progressive workflows and reusable artifacts
-The repository structure also makes the project practical to learn from and reuse:
+### Two execution paths, one behaviour
 
-- [`examples/`](examples) provides the progressive workflows and runnable demonstrations.
-- [`models/`](models) acts as the artifact and checkpoint layer.
+The project deliberately maintains **two ways of running a model**, and holds them to bit-level agreement:
+
+- a **shape-dynamic runtime engine**, compiled once, that adapts to whatever container it is given;
+- a **statically compiled network**, generated as a C++ header from the model's own geometry, where every dimension is a compile-time constant.
+
+The dynamic path is what you use to explore a new model. The static path is what you use to **train** it, since it is an ordinary Dlib network. Both are driven through a shared chat endpoint, so a discrepancy between them is a bug rather than a matter of interpretation.
+
+### Vision and multimodality
+
+**Vision Transformers are first-class.** A `vision_transformer_config` assembles the patch embedding, a learned position table, **bidirectional** attention blocks — image patches have no reading order — and the pooling that turns a bag of patch vectors into one image vector. The same configuration serves as a **standalone image backbone** for classification or self-supervised pretraining, or as the **encoder of a multimodal model**, by naming an image input instead of a tensor input.
+
+**Multimodal fusion is a layer.** A fusion layer holds the vision tower as a subnetwork and writes its output over the positions a chat template reserved for an image. Because the tower lives inside the network rather than beside it, **a gradient reaches it**: the vision path is trainable, not merely pluggable.
+
+### An interactive interface for the models you build
+
+A built-in **web chat interface** and an **OpenAI-compatible endpoint** (`/v1/chat/completions`) let you exercise a model as soon as it exists, with streaming, sampling controls, multi-model selection, and **inline image attachments** when the model carries a vision tower. Serving is shared code between the two execution paths, so what you observe in the browser is what the library computes.
+
+### Training, specialization, and distillation
+
+**Continued training from a converted model.** A GGUF container converted to a native archive holds the decoder, the vision tower when there is one, the tokenizer, and the pixel normalization. Nothing external is needed afterwards.
+
+**Supervised fine-tuning with prompt masking.** Question-and-answer records are rendered through the model's own chat template, and only the answer positions are scored — the standard SFT objective, with the padding hidden from attention rather than merely ignored by the loss.
+
+**Parameter-efficient adaptation.** **LoRA** and **DoRA** adapters attach to the attention projections and the feed-forward path, with the base weights frozen and the adapters merged back into the weights when training ends. Host-resident parameters (`--offload-params`) already provide half of what **QLoRA** needs; the quantized base is the remaining step.
+
+**Knowledge distillation, teacher to student.** A teacher is recorded once over a corpus — its top-k logits at every position — into a reusable trace file. Students are then raised on that recording without the teacher ever running again. Because the transfer happens **at the logits**, the student's internals are unconstrained: a **dense** teacher can raise a **mixture-of-experts** student, wider, deeper, or narrower. The only thing both models must share is the tokenizer, and a fingerprint in the trace file makes any disagreement impossible to miss.
+
+### Python utilities, used as witnesses
+
+A small set of Python tools lives beside the examples, and their role is verification rather than production:
+
+- **reference evaluation through `llama-cpp-python`**, so that the C++ import can be checked against the implementation everyone else uses;
+- **reference vision encoding**, for the same reason on the image side;
+- **reference loss measurement** against Hugging Face weights, which is how a training pipeline is proven to measure what it claims;
+- **corpus preparation** for knowledge-alignment and task-alignment datasets.
+
+A pipeline that nothing contradicts is a pipeline nobody has verified.
 
 ### Current project emphasis
+
 Today, the project is especially strong as a platform for:
 
-- Transformer-oriented language modeling in Dlib
-- progressive experimentation in C++
-- specialization through documented examples and artifacts
-- structured sequence workflows beyond plain text
+- importing, inspecting and running open-weight decoder models in C++
+- converting them into trainable Dlib networks
+- specializing them by supervised fine-tuning and low-rank adaptation
+- raising smaller models by distillation, across architecture boundaries
+- text, image, and text-with-image workflows in a single codebase
+
+---
 
 ---
 
@@ -187,26 +223,27 @@ A practical rule of thumb is:
 
 ## Future directions
 
-The long-term evolution of a repository like this naturally points beyond the current language-first emphasis.
+Several of the directions listed in earlier revisions of this page — image-oriented workflows and multimodal modeling — have since been implemented. The horizon has moved accordingly.
 
-### Stronger encoder-decoder coverage
-The original Transformer was introduced in an encoder-decoder form, and that family remains essential for translation, conditional generation, and structured sequence transduction.[^vaswani2017][^google-transformers] A natural future step is therefore to make encoder-decoder workflows more explicit and more complete within the repository.
+### Completing QLoRA
+Host-resident parameters and per-layer materialization already exist. What remains is keeping the frozen base **quantized** in memory and dequantizing it per layer inside the forward and backward passes. The dequantization routines are already present for the import path; the work is to call them on the fly, and to split the parameter block so that the adapters stay in floating point while the base does not.
 
-### Image-oriented Transformer workflows
-Transformers are no longer limited to text. Survey literature explicitly describes their importance in computer vision and other non-text domains, which makes image-oriented support a very natural next step for this project.[^islam2023]
+### Preference optimization
+**DPO** replaces the heavy RLHF loop with a comparison between a preferred and a rejected answer. It normally requires a second frozen reference model, which doubles the memory. With LoRA that reference is free: the same network with its adapters neutralized. That makes preference optimization markedly cheaper here than in a general setting.
 
-### Multimodal modeling
-Transformer-based multimodal learning is now a major research and application area. Dedicated survey work explicitly treats multimodal Transformers as an important and growing field, which makes multimodal expansion — for example text + image — a highly coherent future path for this repository.[^xu2023]
+### Mixture-of-experts on the static path
+The runtime engine already serves MoE containers. Giving the statically compiled network an expert-packing path would make those models trainable and convertible like any other, and would let a distilled MoE student be served by the same tooling as a dense one.
+
+### Tied embeddings
+On a large vocabulary, the embedding table and the output projection dominate a small model: a 40-million-parameter student built on a 152k-token vocabulary spends four fifths of its parameters there. Sharing the two matrices, as several open-weight models do, would change what a small student can be.
 
 ### Broader reusable ecosystem
 Additional future progress can also happen around:
 
 - richer loaders and preprocessing paths
 - broader checkpoint availability
-- stronger fine-tuning workflows
+- stronger encoder-decoder coverage, which remains essential for translation and conditional generation[^vaswani2017][^google-transformers]
 - clearer bridges between core layers, examples, and reusable artifacts
-
-In other words, this project already looks like a strong foundation for a much broader Transformer ecosystem inside Dlib.
 
 ---
 

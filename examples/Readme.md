@@ -6,7 +6,9 @@
 > The objective is not only to provide runnable programs, but also to document the **design patterns**, **training utilities**, **specialized losses**, **tokenization strategies**, and **inference helpers** that make advanced Transformer systems easier to build in modern **C++**.
 
 > [!NOTE]
-> The examples are intentionally ordered from the most accessible foundations to more specialized and research-oriented pipelines. Taken together, they form a coherent path from **minimal next-token prediction** to **compact modern Transformer training**, **runtime-selectable model topologies**, **instruction tuning**, **large-text memorization**, **structured reasoning**, and even **predictive compression**.
+> The examples are intentionally ordered from the most accessible foundations to more specialized and research-oriented pipelines. Taken together, they form a coherent path from **minimal next-token prediction** to **compact modern Transformer training**, **runtime-selectable model topologies**, **instruction tuning**, **large-text memorization**, **structured reasoning**, and **predictive compression**.
+>
+> A second family of examples then opens the door outwards: **importing open-weight GGUF models**, **serving them through a built-in chat interface**, **converting them into trainable Dlib networks**, **specializing them by SFT and LoRA**, **training Vision Transformers**, and **raising a new model by distillation from a larger teacher**.
 
 ---
 
@@ -24,6 +26,13 @@
   - [`slm_enwiki_train_ex.cpp`](#slm_enwiki_train_excpp)
   - [`slm_hrm_arc_agi_ex.cpp`](#slm_hrm_arc_agi_excpp)
   - [`slm_predictive_compressor_ex.cpp`](#slm_predictive_compressor_excpp)
+  - [`slm_gguf_runtime_ex.cpp`](#slm_gguf_runtime_excpp)
+  - [`slm_gguf_import_ex.cpp`](#slm_gguf_import_excpp)
+  - [`slm_lora_finetune_ex.cpp`](#slm_lora_finetune_excpp)
+  - [`slm_vision_tower_ex.cpp`](#slm_vision_tower_excpp)
+  - [`slm_vit_classify_ex.cpp` and `slm_vit_ssl_ex.cpp`](#slm_vit_classify_excpp-and-slm_vit_ssl_excpp)
+  - [`slm_distill_ex.cpp`](#slm_distill_excpp)
+  - [`slm_tools/` Python witnesses](#slm_tools-python-witnesses)
   - [`slm_data.h`](#slm_datah-shared-data-layer)
 - [Cross-cutting concepts worth noticing](#cross-cutting-concepts-worth-noticing)
 - [Which example should I start with?](#which-example-should-i-start-with)
@@ -46,6 +55,13 @@ Across the full example suite, the repository now covers:
 - **runtime selection of pre-configured architectures** such as **MoE** and **HRM**
 - **structured autoregressive generation** for text, grid reasoning, and byte-level prediction
 - **non-standard Transformer applications**, including ARC-like symbolic reasoning and predictive compression
+- **GGUF interoperability**: architecture detection, on-the-fly dequantization of legacy and k-quant formats, and a compatibility report that refuses rather than approximates
+- **two execution paths held to bit-level agreement**: a shape-dynamic runtime engine and a statically compiled network generated from the model's own geometry
+- **a built-in web chat interface** and an OpenAI-compatible endpoint, with streaming, sampling controls and inline images when the model carries a vision tower
+- **Vision Transformers** as standalone backbones, for supervised classification and self-supervised pretraining
+- **multimodal fusion** where the vision tower lives inside the network and receives a gradient
+- **supervised fine-tuning and low-rank adaptation** (LoRA, DoRA) over an imported model
+- **knowledge distillation** from a teacher container into a student of a freely chosen architecture, dense or mixture-of-experts
 
 > [!TIP]
 > Read this directory not as a loose collection of demos, but as a **progressive design reference** for building Transformer-based applications with Dlib.
@@ -71,7 +87,22 @@ Across the full example suite, the repository now covers:
 8. [`slm_predictive_compressor_ex.cpp`](#slm_predictive_compressor_excpp)  
    Transformer as a **byte-level predictive model** for compression.
 
-A shared support layer, [`slm_data.h`](#slm_datah-shared-data-layer), provides embedded datasets and utilities used throughout the examples.
+Then the interoperability and specialization track, which can be read independently:
+
+9. `slm_gguf_runtime_ex.cpp`  
+   Run **any supported GGUF container** through the shape-dynamic engine: chat, serve, describe an image.
+10. `slm_gguf_import_ex.cpp`  
+   Turn a container into a **statically compiled Dlib network**, then convert it into a native archive.
+11. `slm_lora_finetune_ex.cpp`  
+   **SFT and LoRA** over an imported model, in two chainable stages.
+12. `slm_vision_tower_ex.cpp`  
+   Validate a **Vision Transformer** against the reference encoder, weight by weight.
+13. `slm_vit_classify_ex.cpp` and `slm_vit_ssl_ex.cpp`  
+   Train a Vision Transformer **from scratch**, with labels and without.
+14. `slm_distill_ex.cpp`  
+   Raise a new model by **distillation**, in three steps.
+
+A shared support layer, [`slm_data.h`](#slm_datah-shared-data-layer), provides embedded datasets and utilities used throughout the examples, and [`slm_tools/`](slm_tools) holds the Python witnesses used to verify the C++ paths against reference implementations.
 
 ---
 
@@ -494,6 +525,172 @@ If the model assigns high probability to the next byte, an entropy-coding stage 
 - `compress_file(...)`
 - `decompress_file(...)`
 - the compact GQA configuration used uniformly for training and inference
+
+[⬆ Back to top](#on-this-page)
+
+---
+
+## Interoperability and specialization track
+
+The examples above build models from nothing. The ones below start from **models that already exist** and take them somewhere: run them, convert them, specialize them, or use them to raise smaller ones.
+
+---
+
+## `slm_gguf_runtime_ex.cpp`
+
+### Purpose
+Run **any supported GGUF container** without recompiling anything.
+
+### What the example teaches
+The engine reads the container's metadata, detects the architecture, allocates its own structures at run time, and dequantizes weights as it loads them. Nothing about the model is a compile-time constant, which is what makes this the right tool for **exploring** a model you have never seen.
+
+### Main technical choices
+- **Architecture detection** across the llama, mistral, mixtral, gemma, gemma2, qwen2, qwen3 and granitemoe families.
+- **On-the-fly dequantization** of the legacy block formats (Q4_0, Q4_1, Q5_0, Q5_1, Q8_0), the k-quant range (Q2_K to Q6_K) and IQ4_NL. Grid-based i-quants are refused explicitly.
+- **Mixture-of-experts routing** — softmax over router logits, top-k selection, renormalization of the selected weights — which the static path does not implement.
+- A **KV cache** with a pinned prefix, so a system prompt survives eviction.
+
+### Why this example matters
+It is the **reference behaviour** the rest of the project is measured against. When the statically compiled network and this engine disagree, one of them is wrong, and the disagreement is a bug rather than a matter of interpretation.
+
+### What to inspect in the code
+- `--probe-logits`, which prints the five most probable continuations and a per-position argmax: the cheapest possible check on a set of weights
+- the serving path, shared with the compiled network through `chat_service`
+
+[⬆ Back to top](#on-this-page)
+
+---
+
+## `slm_gguf_import_ex.cpp`
+
+### Purpose
+Turn a GGUF container into a **native Dlib network** whose weights are ordinary trainable parameters.
+
+### What the example teaches
+The program runs in **two phases**, and the reason is instructive: a Dlib network is a C++ type, so a model's geometry has to be known at compile time. Phase one reads the container and **generates a header** describing it. After a rebuild, phase two repacks the weights into that exact network and serializes the result.
+
+### Main technical choices
+- A **compatibility report** before any import, separating notes from blockers.
+- **Weight repacking** rather than reinterpretation: matrices are transposed where the conventions differ, the attention prescale is folded into the stored query weights, and the result is checked against the reference implementation.
+- A **self-contained archive**: decoder, vision tower when present, tokenizer, and the pixel normalization the tower was trained with. Nothing external is needed afterwards.
+- **Chat, serve, describe, and probe** commands over either a container or an archive.
+
+### Why this example matters
+This is where a downloaded artifact stops being a black box. Once the weights sit in a Dlib network, the whole library applies: optimizers, visitors, serialization, fine-tuning.
+
+### Useful reminders
+A program compiled for one geometry reads archives of that geometry only. Serving a different model — a distilled student, for instance — means rebuilding against **its** header. That is a property of static compilation, not a limitation of the format.
+
+[⬆ Back to top](#on-this-page)
+
+---
+
+## `slm_lora_finetune_ex.cpp`
+
+### Purpose
+Specialize an imported model by **supervised fine-tuning** and **low-rank adaptation**.
+
+### What the example teaches
+Two chainable stages: **knowledge alignment** over a plain corpus, and **task alignment** over question-and-answer records. The second is the standard SFT objective — the prompt is masked, only the answer is scored — with the chat template rendered by the model's own formatter.
+
+### Main technical choices
+- **LoRA and DoRA** adapters on the query, value and feed-forward projections, with a configurable rank, scale and width ceiling that keeps the vocabulary head out.
+- The base weights are **frozen**, and a vision tower, when present, is frozen and reported as such.
+- **Padding is hidden from attention**, not merely ignored by the loss: a window is padded to a fixed length, and without a mask every real position would attend to filler.
+- A **loss measured before the first step**, so that a run improving a pretrained model can be told from one that first breaks it and then rebuilds it.
+- Adapters are **merged into the weights** at the end, producing an archive indistinguishable from an imported one.
+
+### Why this example matters
+It is the difference between consuming a model and owning one. It also carries a hard-won instrument: without the loss measured before training, a falling curve says nothing about whether the model is getting better or merely recovering.
+
+[⬆ Back to top](#on-this-page)
+
+---
+
+## `slm_vision_tower_ex.cpp`
+
+### Purpose
+Validate a **Vision Transformer** built as a Dlib network against the shape-dynamic encoder, weight by weight.
+
+### What the example teaches
+Two implementations of the same tower, fed the same image, must agree to the bit. Anything less means one of them has a convention wrong — a transposed matrix, a normalization on the wrong axis, a position table off by one.
+
+### Main technical choices
+- A **patch-per-sample layout**, which is what makes `layer_norm` and `fc` exact on a patch sequence without rewriting them.
+- **Bidirectional** attention: an image has no reading order, and a causal mask would halve the receptive field of every patch.
+- A **pixel shuffle** that folds neighbouring patches together before the projector, shortening the visual sequence a decoder has to read.
+
+[⬆ Back to top](#on-this-page)
+
+---
+
+## `slm_vit_classify_ex.cpp` and `slm_vit_ssl_ex.cpp`
+
+### Purpose
+Train a Vision Transformer **from scratch**, with labels and without.
+
+### What these examples teach
+The tower built for multimodal work is a backbone in its own right. Naming an image input instead of a tensor input turns it into a standalone network, and the whole model then fits in two lines:
+
+```cpp
+using tower = dlib::vision_transformer_config<
+    32, 4, 128, 6, 4, 512, 1, 128, dlib::input_rgb_image_sized<32>>;
+using net_type = dlib::loss_multiclass_log<tower::classifier<10>>;
+```
+
+**`slm_vit_classify_ex`** trains that on CIFAR-10 and explains the three settings that are easy to get wrong on small images: patches of 4 rather than 16, the pixel shuffle disabled, and a projector as wide as the tower.
+
+**`slm_vit_ssl_ex`** trains the same tower **without labels**, by Barlow Twins: two augmented views of one image go through the tower, a projector maps both to a wider space, and the loss drives the cross-correlation matrix towards the identity. Agreement teaches invariance, decorrelation prevents collapse. The representation is then measured by nearest neighbours — the labels appear only in the measurement.
+
+### Why they matter
+A tower pretrained this way can be handed to a fusion layer as an **already-trained encoder**, which is the first stage of the usual multimodal recipe, learned without a single caption.
+
+[⬆ Back to top](#on-this-page)
+
+---
+
+## `slm_distill_ex.cpp`
+
+### Purpose
+Raise a **new model** by distillation: a student of a shape you choose, trained on what a larger teacher predicts over a corpus of your own.
+
+### What the example teaches
+A hard label says the next token is X. A teacher's distribution says X, but Y was nearly as good, Z was plausible, and the remaining fifty thousand were not. **That ordering over the vocabulary is not present in the corpus**, and no student could derive it from the text alone — which is why a student learns from a teacher far faster than from the same corpus on its own.
+
+The transfer is bounded by the corpus, and the example says so plainly: the teacher is only ever asked what it would predict at the positions the corpus contains. What survives is the intersection of what the teacher knows and what the corpus probes.
+
+### Three steps, and why there are three
+1. **Emit the student's header.** Its geometry is yours; its vocabulary is the teacher's, which is not a choice.
+2. **Record the teacher.** Its top-k logits at every position go into a trace file. This pass is the expensive one, and it is paid **once per corpus rather than once per student**: several students of different shapes can be raised on the same recording.
+3. **Train the student.** Neither the teacher nor the corpus is needed again.
+
+### Main technical choices
+- The loss mixes both terms, $\mathcal{L} = \alpha T^2 \cdot \mathrm{soft} + (1-\alpha) \cdot \mathrm{hard}$. The temperature flattens both distributions so that what the teacher thinks of unlikely tokens becomes visible; the $T^2$ keeps the two terms comparable as $T$ varies.
+- **Raw logits** are stored rather than probabilities, so a temperature can still be chosen at training time.
+- A **tokenizer fingerprint** travels in the trace header. A student built on another tokenizer would read the recorded ids as perfectly valid integers standing for other words, and would train on nonsense without a single error being raised.
+- **Several recordings are interleaved** within an epoch rather than chained, because a student raised on prose and then on conversation forgets the prose while it learns the conversation.
+- The student may be **dense or a mixture of experts**, independently of the teacher: distilling on logits constrains the vocabulary and nothing else.
+
+### Why this example matters
+It is the model factory. The architecture becomes a parameter, the teacher and the corpus become inputs, and the recording becomes a reusable asset.
+
+[⬆ Back to top](#on-this-page)
+
+---
+
+## `slm_tools/` Python witnesses
+
+### Purpose
+Verify the C++ paths against the implementations everyone else uses.
+
+### What lives here
+- **`slm_reference_chat.py`** and **`slm_reference_vision.py`** evaluate a GGUF model through `llama-cpp-python`, so that an import can be checked against the reference rather than against itself.
+- **`slm_eval_loss.py`** measures the loss of a source model on a prepared dataset through Hugging Face weights, with the same masking, windowing and label smoothing as the C++ run. It is how a training pipeline is proven to measure what it claims.
+- **`nist_corpus_prepare.py`** and **`cve_qa_prepare.py`** build knowledge-alignment and task-alignment corpora in the sentinel format the C++ side reads.
+- **`slm_lora_finetune.py`** performs the same fine-tuning in PyTorch, as a comparison point for the training curve.
+
+### Why this matters
+An import pipeline that nothing contradicts is a pipeline nobody has verified. These tools exist so that a number produced in C++ can be put next to a number produced elsewhere, on the same data, with the same conventions.
 
 [⬆ Back to top](#on-this-page)
 
