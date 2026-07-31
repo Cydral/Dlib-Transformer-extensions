@@ -91,8 +91,10 @@ namespace dlib
                makes existing archives unreadable rather than silently wrong. The raw
                message names a class and says nothing actionable, hence this one. */
             throw std::runtime_error("cannot read " + path + ": " + e.what()
-                + "\nThis archive was written by a build whose network layout differs from "
-                "this one. Regenerate it with --convert.");
+                + "\nThe weights in this archive do not fit the network this program was "
+                "compiled for. Either the archive belongs to another model, or the header "
+                "this program was built against has changed since it was written. Build "
+                "against the header that produced it, or regenerate the archive.");
         }
 
         /* An archive that ends right after the tokenizer predates the trailing block. It
