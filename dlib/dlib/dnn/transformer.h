@@ -436,6 +436,15 @@ namespace dlib
             auto wv = wv_alias(params, wv_offset);
             auto wo = wo_alias(params, wo_offset);
 
+            /* The whole gradient blob is cleared before anything writes into it.
+
+               Each region below is assigned rather than accumulated, so clearing looks
+               redundant, and it is not: a region that no branch happens to cover keeps
+               whatever the allocator last left there. The optimizer consumes the blob
+               whole and turns that residue into a parameter update, which is how one
+               unwritten sub-range poisons a layer on its very first step. */
+            params_grad = 0;
+
             auto dwq = wq_alias(params_grad, wq_offset);
             auto dwk = wk_alias(params_grad, wk_offset);
             auto dwv = wv_alias(params_grad, wv_offset);
