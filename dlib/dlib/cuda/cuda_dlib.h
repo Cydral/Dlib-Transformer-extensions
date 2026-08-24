@@ -758,11 +758,20 @@ namespace dlib
                         host_truth[static_cast<size_t>(i) * seq_len + t] = labels(t);
                 }
 
+                /* The targets come first in the buffer, the scalar loss after them.
+
+                   The other order looks harmless and is not: a float takes the first four
+                   bytes, so an array of eight-byte targets placed behind it starts on a
+                   four-byte boundary, and the kernel reading it performs a misaligned
+                   eight-byte load. The device reports "misaligned address", then every
+                   later CUDA call echoes the same sticky error, which is why the failure
+                   surfaces far from its cause. Targets first, and every offset that
+                   follows is a multiple of eight. */
                 buf = device_global_buffer(count * sizeof(unsigned long) + sizeof(float));
-                cuda_data_ptr<float> loss_buf = static_pointer_cast<float>(buf, 1);
-                buf = buf + sizeof(float);
                 memcpy(buf, host_truth.data(), count * sizeof(unsigned long));
                 auto truth_buf = static_pointer_cast<const unsigned long>(buf, count);
+                cuda_data_ptr<float> loss_buf = static_pointer_cast<float>(
+                    buf + count * sizeof(unsigned long), 1);
                 do_work(loss_buf, truth_buf, input_tensor, subnetwork_output, gradient, loss,
                     ignore_index, label_smoothing, pad_index, z_loss_weight);
             }
@@ -824,11 +833,20 @@ namespace dlib
                         host_truth[static_cast<size_t>(i) * seq_len + t] = labels(t);
                 }
 
+                /* The targets come first in the buffer, the scalar loss after them.
+
+                   The other order looks harmless and is not: a float takes the first four
+                   bytes, so an array of eight-byte targets placed behind it starts on a
+                   four-byte boundary, and the kernel reading it performs a misaligned
+                   eight-byte load. The device reports "misaligned address", then every
+                   later CUDA call echoes the same sticky error, which is why the failure
+                   surfaces far from its cause. Targets first, and every offset that
+                   follows is a multiple of eight. */
                 buf = device_global_buffer(count * sizeof(unsigned long) + sizeof(float));
-                cuda_data_ptr<float> loss_buf = static_pointer_cast<float>(buf, 1);
-                buf = buf + sizeof(float);
                 memcpy(buf, host_truth.data(), count * sizeof(unsigned long));
                 auto truth_buf = static_pointer_cast<const unsigned long>(buf, count);
+                cuda_data_ptr<float> loss_buf = static_pointer_cast<float>(
+                    buf + count * sizeof(unsigned long), 1);
                 do_work(loss_buf, truth_buf, input_tensor, subnetwork_output, gradient, loss,
                     ignore_indices, label_smoothing, pad_index, z_loss_weight);
             }
