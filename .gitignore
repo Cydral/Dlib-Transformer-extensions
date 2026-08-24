@@ -20,3 +20,6 @@ CPackConfig.cmake
 CPackSourceConfig.cmake
 dlib/examples/Makefile
 dlib/examples/dlib/
+
+# Generated artifacts of the distillation example
+dlib/examples/slm_student_model*.h

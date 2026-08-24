@@ -456,6 +456,20 @@ namespace dlib
             return logits_;
         }
 
+        /* The hidden states of the last forward, after the final normalization and before
+           the vocabulary projection.
+
+           This is what an embedding model produces. Such a container carries no
+           output.weight at all: the vocabulary projection was removed when the task
+           adapter was merged, and what remains ends at output_norm. The logits computed
+           above are then meaningless, being a projection through the tied embedding table,
+           and are simply not read.
+
+           Laid out as (1, 1, seq_len, embedding_dim), row t holding the state of position
+           t. Which row to take is the pooling question, and the container answers it:
+           see model_spec::pooling. */
+        const tensor& hidden_states() const { return xn_; }
+
         // One-token incremental forward. Requires a prior forward_prefill() with a
         // context capacity set. Appends the token to the KV cache, evicting a middle
         // block first when the cache is full, and returns the [1, 1, 1, vocab] logits.

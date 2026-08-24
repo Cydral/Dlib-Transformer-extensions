@@ -61,6 +61,19 @@ namespace dlib
         double rope_scaling_factor = 0.0;       // position scaling factor when declared
         long rope_orig_ctx = 0;                 // original context length when declared
         bool tied_embeddings = false;           // no separate output.weight tensor
+
+        /* How a sequence becomes one vector, when the container is an embedding model.
+
+           An embedding container declares <arch>.pooling_type, following the convention
+           llama.cpp established: 0 none, 1 mean, 2 the first token, 3 the last token. The
+           value matters: a decoder trained with a causal mask has only one position that
+           has seen the whole text, the last one, and averaging over positions that each saw
+           a prefix would produce a different vector than the model was trained to produce.
+
+           embedding_model is set when the container has no output.weight and declares a
+           pooling type, which together mean the vocabulary projection was removed. */
+        long pooling_type = -1;
+        bool embedding_model = false;
         bool quantized = false;                 // at least one tensor is neither F32 nor F16
         bool qk_norm = false;                   // per-head RMSNorm on Q and K (Qwen3)
     };
@@ -183,6 +196,8 @@ namespace dlib
         }
 
         s.tied_embeddings = (g.find_tensor("output.weight") == nullptr);
+        s.pooling_type = static_cast<long>(g.get_int(p + ".pooling_type", -1));
+        s.embedding_model = s.tied_embeddings && s.pooling_type >= 0;
         s.qk_norm = (g.find_tensor("blk.0.attn_q_norm.weight") != nullptr);
         for (const auto& t : g.tensors()) if (t.is_quantized()) { s.quantized = true; break; }
         return s;
@@ -246,6 +261,13 @@ namespace dlib
               << ", logit " << s.logit_scale << "\n";
         o << "QK-Norm            : " << (s.qk_norm ? "yes" : "no") << "\n"
           << "Tied embeddings    : " << (s.tied_embeddings ? "yes" : "no") << "\n"
+          << (s.embedding_model
+                 ? "Embedding model    : yes (pooling "
+                       + std::string(s.pooling_type == 1 ? "mean"
+                                   : s.pooling_type == 2 ? "first token"
+                                   : s.pooling_type == 3 ? "last token" : "none")
+                       + ", " + std::to_string(s.d_model) + " dimensions)\n"
+                 : std::string())
           << "Quantized weights  : " << (s.quantized ? "yes" : "no") << "\n";
         return o.str();
     }
