@@ -57,6 +57,7 @@ import math
 import os
 import shutil
 import sys
+import time
 
 try:
     import torch
@@ -333,6 +334,29 @@ def main():
     device = args.device
     dtype = getattr(torch, args.dtype)
 
+    # Said out loud, because the alternative is an hour of silence.
+    #
+    # Falling back to the processor when no accelerator answers is the right behaviour and
+    # the wrong thing to keep quiet about: the run still works, a hundred times slower, and
+    # nothing on screen distinguishes that from a hang. The most common cause is a torch
+    # built against a CUDA version older than the card requires, which reports no device at
+    # all rather than complaining.
+    if device.startswith("cuda"):
+        if not torch.cuda.is_available():
+            print("WARNING: --device asked for cuda and torch reports no CUDA device.")
+            print(f"         torch {torch.__version__}, built against CUDA "
+                  f"{torch.version.cuda}. Falling back to the processor, which will be")
+            print("         roughly two orders of magnitude slower for this work.")
+            device = "cpu"
+        else:
+            name = torch.cuda.get_device_name(0)
+            cap = ".".join(str(x) for x in torch.cuda.get_device_capability(0))
+            total = torch.cuda.get_device_properties(0).total_memory / 1e9
+            print(f"device       : {name}, compute {cap}, {total:.1f} GB, "
+                  f"torch {torch.__version__} on CUDA {torch.version.cuda}")
+    else:
+        print(f"device       : {device} (torch {torch.__version__})")
+
     print(f"teacher      : {args.teacher}")
     tokenizer = AutoTokenizer.from_pretrained(args.teacher)
     if tokenizer.pad_token_id is None:
@@ -380,6 +404,8 @@ def main():
     before = evaluate(student, teacher, held, device, args.temperature)
     print(f"divergence before recovery : {before:.5f} nats per token")
 
+    print(f"training     : {len(train)} batches of {args.batch_size} x {args.seq_len} "
+          f"tokens on {device}")
     opt = torch.optim.AdamW(student.parameters(), lr=args.lr, weight_decay=0.01)
     # The schedule counts optimizer steps, not batches.
     #
@@ -392,6 +418,7 @@ def main():
     student.train()
 
     running = 0.0
+    t0 = time.time()
     for step, batch in enumerate(train, 1):
         ids = batch.to(device)
         with torch.no_grad():
@@ -410,10 +437,23 @@ def main():
             opt.zero_grad(set_to_none=True)
             sched.step()
 
-        if step % 25 == 0 or step == len(train):
-            print(f"  step {step:>5}/{len(train)}  loss {running / 25:.4f}"
-                  f"  kl {kl:.4f}  hidden {hid:.4f}  lr {sched.get_last_lr()[0]:.2e}")
-            running = 0.0
+        # The first few steps are reported one by one, then every twenty-five.
+        #
+        # A run whose first message arrives after twenty-five steps looks identical to a run
+        # that is stuck, and the difference matters most exactly when the steps are slow.
+        # Announcing the first one tells a caller within seconds whether anything is moving,
+        # and at what pace.
+        report = step <= 3 or step % 25 == 0 or step == len(train)
+        if report:
+            window = 1 if step <= 3 else min(25, step)
+            elapsed = time.time() - t0
+            print(f"  step {step:>5}/{len(train)}  loss {running / window:.4f}"
+                  f"  kl {kl:.4f}  hidden {hid:.4f}  lr {sched.get_last_lr()[0]:.2e}"
+                  f"  {elapsed / step:.2f} s/step", flush=True)
+            if step > 3:
+                running = 0.0
+            else:
+                running = 0.0
 
     student.eval()
     after = evaluate(student, teacher, held, device, args.temperature)
