@@ -64,6 +64,8 @@
 #include <vector>
 
 #include <dlib/cmd_line_parser.h>
+#include <dlib/graph_utils.h>
+#include <dlib/lsh.h>
 #include <dlib/data_io.h>
 #include <dlib/dir_nav.h>
 #include <dlib/dnn.h>
@@ -80,6 +82,7 @@ struct passage
     long ordinal = 0;        // its rank within that file
     std::string text;        // the passage itself, returned to the user
     matrix<float, 0, 1> vec; // unit-length embedding
+    hash_similar_angles_256::result_type sketch;  // 256-bit angular hash, for the shortlist
 };
 
 inline void serialize(const passage& item, std::ostream& out)
@@ -88,6 +91,10 @@ inline void serialize(const passage& item, std::ostream& out)
     dlib::serialize(item.ordinal, out);
     dlib::serialize(item.text, out);
     dlib::serialize(item.vec, out);
+    dlib::serialize(item.sketch.first.first, out);
+    dlib::serialize(item.sketch.first.second, out);
+    dlib::serialize(item.sketch.second.first, out);
+    dlib::serialize(item.sketch.second.second, out);
 }
 
 inline void deserialize(passage& item, std::istream& in)
@@ -96,6 +103,10 @@ inline void deserialize(passage& item, std::istream& in)
     dlib::deserialize(item.ordinal, in);
     dlib::deserialize(item.text, in);
     dlib::deserialize(item.vec, in);
+    dlib::deserialize(item.sketch.first.first, in);
+    dlib::deserialize(item.sketch.first.second, in);
+    dlib::deserialize(item.sketch.second.first, in);
+    dlib::deserialize(item.sketch.second.second, in);
 }
 
 /* The index.
@@ -110,8 +121,21 @@ struct embedding_index
     std::string model_name;
     std::string tokenizer_id;
     long dimensions = 0;
+    uint64 sketch_seed = 1;   // the hasher that produced the passage sketches
     std::vector<passage> passages;
 };
+
+/* Above this many passages the search shortlists before it ranks.
+
+   A linear scan compares the question with every vector, which is exact and costs a few
+   milliseconds per ten thousand passages. It stays the right answer until it does not: past
+   a hundred thousand it becomes the slowest part of answering, and past a million it is the
+   only part anyone notices.
+
+   The threshold is the program's business rather than the caller's. Nobody indexing a
+   directory knows how many passages it will yield, and asking them to choose a search
+   strategy afterwards is asking them to know what this file knows. */
+const size_t LINEAR_SCAN_LIMIT = 50000;
 
 inline void serialize(const embedding_index& item, std::ostream& out)
 {
@@ -119,6 +143,7 @@ inline void serialize(const embedding_index& item, std::ostream& out)
     dlib::serialize(item.model_name, out);
     dlib::serialize(item.tokenizer_id, out);
     dlib::serialize(item.dimensions, out);
+    dlib::serialize(item.sketch_seed, out);
     dlib::serialize(item.passages, out);
 }
 
@@ -131,6 +156,7 @@ inline void deserialize(embedding_index& item, std::istream& in)
     dlib::deserialize(item.model_name, in);
     dlib::deserialize(item.tokenizer_id, in);
     dlib::deserialize(item.dimensions, in);
+    dlib::deserialize(item.sketch_seed, in);
     dlib::deserialize(item.passages, in);
 }
 
@@ -142,7 +168,7 @@ inline void deserialize(embedding_index& item, std::istream& in)
    compromise is to fill up to the target size and then extend to the next sentence end,
    which keeps a chunk readable when it is returned as an answer. */
 static std::vector<std::string> chunk_text(const std::string& text, size_t target_chars,
-    size_t overlap_chars)
+    size_t overlap_chars, size_t min_chars)
 {
     std::vector<std::string> out;
     if (text.empty()) return out;
@@ -169,7 +195,21 @@ static std::vector<std::string> chunk_text(const std::string& text, size_t targe
         const size_t first = piece.find_first_not_of(" \t\r\n");
         const size_t last = piece.find_last_not_of(" \t\r\n");
         if (first != std::string::npos)
-            out.push_back(piece.substr(first, last - first + 1));
+        {
+            /* Fragments shorter than min_chars are dropped rather than embedded.
+
+               A vector summarizes what it is given, and given three words it summarizes
+               three words: the result is a point that sits close to a great many unrelated
+               things and pollutes a ranking. Trailing fragments of a file are the usual
+               source, and they are never the passage anyone wanted.
+
+               The threshold belongs to indexing and not to questioning. "What is a CVE?"
+               is fourteen characters and a perfectly good question, so a caller encoding a
+               question passes zero here. Applying the same floor to both would discard the
+               shortest questions, which are the ones users actually type. */
+            const std::string kept = piece.substr(first, last - first + 1);
+            if (kept.size() >= min_chars) out.push_back(kept);
+        }
 
         if (end >= text.size()) break;
         pos = end > overlap_chars ? end - overlap_chars : end;
@@ -198,7 +238,7 @@ static std::string read_file(const std::string& path)
    coordinates carry most of the information, so keeping a prefix and renormalizing gives a
    shorter vector that still works. Truncating happens before normalizing, as the reference
    implementation does; the other order gives a vector that is not unit length. */
-static matrix<float, 0, 1> encode(runtime_transformer& model, const hf_tokenizer& tok,
+static matrix<float, 0, 1> encode_one(runtime_transformer& model, const hf_tokenizer& tok,
     const model_spec& spec, const std::string& text, bool as_query, long truncate_dim,
     long max_tokens)
 {
@@ -240,6 +280,29 @@ static matrix<float, 0, 1> encode(runtime_transformer& model, const hf_tokenizer
     return v;
 }
 
+/* Encodes a text of any length, as one vector per piece.
+
+   A question is not necessarily short. A pasted paragraph, a log extract or a specification
+   clause can exceed what one forward pass reads, and truncating it silently is the worst of
+   the available answers: the discarded half may be the half that mattered, and nothing in
+   the output says so.
+
+   The text is therefore cut with the same chunker the corpus uses, and each piece becomes a
+   vector. What the caller does with several vectors is a scoring question, answered below.
+   A short text yields exactly one, so the ordinary case costs nothing. */
+static std::vector<matrix<float, 0, 1>> encode_text(runtime_transformer& model,
+    const hf_tokenizer& tok, const model_spec& spec, const std::string& text, bool as_query,
+    long truncate_dim, long max_tokens, size_t chunk_chars, size_t overlap_chars)
+{
+    std::vector<matrix<float, 0, 1>> out;
+    /* No floor: whatever the caller hands over is encoded, however short. */
+    std::vector<std::string> pieces = chunk_text(text, chunk_chars, overlap_chars, 0);
+    if (pieces.empty()) pieces.push_back(text);
+    for (const std::string& piece : pieces)
+        out.push_back(encode_one(model, tok, spec, piece, as_query, truncate_dim, max_tokens));
+    return out;
+}
+
 // ---------------------------------------------------------------------------------------
 
 static std::vector<std::string> list_inputs(const std::string& path)
@@ -270,7 +333,7 @@ static std::vector<std::string> list_inputs(const std::string& path)
 
 static int run_index(const std::string& model_path, const std::string& input,
     const std::string& out_path, size_t chunk_chars, size_t overlap_chars,
-    long truncate_dim, long max_tokens)
+    size_t min_chunk, long truncate_dim, long max_tokens)
 {
     cout << "Reading model: " << model_path << "\n";
     gguf_reader g(model_path);
@@ -296,6 +359,20 @@ static int run_index(const std::string& model_path, const std::string& input,
     index.tokenizer_id = tokenizer_fingerprint(tok);
     index.dimensions = truncate_dim > 0 ? std::min(truncate_dim, spec.d_model) : spec.d_model;
 
+    /* Every passage carries a 128-bit angular sketch alongside its vector.
+
+       Two unit vectors that point the same way agree on nearly every bit of this sketch,
+       and comparing two of them is four exclusive-ors and a population count rather than a
+       thousand multiplications. That is what lets a large index be narrowed to a few hundred
+       candidates before anything expensive happens.
+
+       Two hundred and fifty-six bits rather than a hundred and twenty-eight. On plainly
+       similar passages both are perfect, but where the similarity is moderate, around a
+       cosine of one half, the shorter sketch starts losing genuine neighbours out of a
+       shortlist while the longer one keeps all of them. The difference is sixteen bytes per
+       passage, against four thousand for the vector it accompanies. */
+    const hash_similar_angles_256 hasher(index.sketch_seed);
+
     dlib::signal_handler::setup();
     const auto started = std::chrono::steady_clock::now();
     size_t chunks_total = 0;
@@ -303,14 +380,15 @@ static int run_index(const std::string& model_path, const std::string& input,
     for (const std::string& path : files)
     {
         const std::vector<std::string> chunks =
-            chunk_text(read_file(path), chunk_chars, overlap_chars);
+            chunk_text(read_file(path), chunk_chars, overlap_chars, min_chunk);
         for (size_t i = 0; i < chunks.size(); ++i)
         {
             passage p;
             p.source = path;
             p.ordinal = static_cast<long>(i);
             p.text = chunks[i];
-            p.vec = encode(model, tok, spec, chunks[i], false, truncate_dim, max_tokens);
+            p.vec = encode_one(model, tok, spec, chunks[i], false, truncate_dim, max_tokens);
+            p.sketch = hasher(p.vec);
             index.passages.push_back(std::move(p));
             ++chunks_total;
             if (chunks_total % 10 == 0)
@@ -338,7 +416,8 @@ static int run_index(const std::string& model_path, const std::string& input,
 // ---------------------------------------------------------------------------------------
 
 static int run_query(const std::string& model_path, const std::string& index_path,
-    const std::string& question, long top, long truncate_dim, long max_tokens)
+    const std::string& question, long top, long truncate_dim, long max_tokens,
+    size_t chunk_chars, size_t overlap_chars)
 {
     embedding_index index;
     { std::ifstream fin(index_path, std::ios::binary);
@@ -364,14 +443,76 @@ static int run_query(const std::string& model_path, const std::string& index_pat
     runtime_transformer model;
     model.load(g, spec, gguf_load_options());
 
-    const matrix<float, 0, 1> q =
-        encode(model, tok, spec, question, true, index.dimensions, max_tokens);
+    const std::vector<matrix<float, 0, 1>> qs = encode_text(model, tok, spec, question,
+        true, index.dimensions, max_tokens, chunk_chars, overlap_chars);
+    if (qs.size() > 1)
+        cout << "note: the question was cut into " << qs.size()
+             << " pieces; a passage scores on its best match.\n";
 
-    /* Both sides are unit length, so the dot product is the cosine. */
+    /* Scored with dlib's own cosine distance rather than a dot product written here.
+
+       Both sides are unit length, so the two agree, and the library's functor is the one
+       its nearest-neighbour machinery already takes: keeping it means the linear scan below
+       can be swapped for find_k_nearest_neighbors_lsh on a large index without changing
+       what "close" means.
+
+       A question cut into several pieces scores a passage on its best piece rather than on
+       an average. A long question usually asks several things, and a passage answering one
+       of them is relevant; averaging would dilute that match into the pieces it does not
+       answer. */
+    const cosine_distance distance;
+
+    /* Which passages are worth comparing exactly, and how that is decided.
+
+       Below the threshold every passage is compared: exact, simple, and fast enough. Above
+       it, the sketches shortlist first. The question is hashed, the Hamming distance to
+       every passage sketch is computed, and only the closest few hundred are then ranked by
+       the real cosine.
+
+       The shortlist is deliberately far larger than what is returned. Angular hashing is a
+       probabilistic filter: a genuinely close passage occasionally lands a few bits away by
+       chance, and asking for fifty times the requested count makes that accident harmless
+       while still discarding almost everything. What comes out is ranked exactly, so the
+       approximation affects which passages were considered and never the order of those
+       that were. */
+    std::vector<size_t> candidates;
+    const bool shortlist = index.passages.size() > LINEAR_SCAN_LIMIT;
+
+    if (shortlist)
+    {
+        const hash_similar_angles_256 hasher(index.sketch_seed);
+        std::vector<std::pair<unsigned int, size_t>> by_bits;
+        by_bits.reserve(index.passages.size());
+        for (size_t i = 0; i < index.passages.size(); ++i)
+        {
+            unsigned int nearest = 257;
+            for (const matrix<float, 0, 1>& q : qs)
+                nearest = std::min(nearest, hasher.distance(hasher(q), index.passages[i].sketch));
+            by_bits.emplace_back(nearest, i);
+        }
+        const size_t take = std::min(index.passages.size(),
+            std::max<size_t>(static_cast<size_t>(top) * 50, 500));
+        std::partial_sort(by_bits.begin(), by_bits.begin() + take, by_bits.end());
+        candidates.reserve(take);
+        for (size_t i = 0; i < take; ++i) candidates.push_back(by_bits[i].second);
+        cout << "search      : " << index.passages.size() << " passages, shortlisted to "
+             << take << " by angular sketch, then ranked exactly\n";
+    }
+    else
+    {
+        candidates.resize(index.passages.size());
+        for (size_t i = 0; i < candidates.size(); ++i) candidates[i] = i;
+    }
+
     std::vector<std::pair<float, size_t>> scored;
-    scored.reserve(index.passages.size());
-    for (size_t i = 0; i < index.passages.size(); ++i)
-        scored.emplace_back(dot(q, index.passages[i].vec), i);
+    scored.reserve(candidates.size());
+    for (size_t i : candidates)
+    {
+        double best = -1.0;
+        for (const matrix<float, 0, 1>& q : qs)
+            best = std::max(best, 1.0 - distance(q, index.passages[i].vec));
+        scored.emplace_back(static_cast<float>(best), i);
+    }
     std::partial_sort(scored.begin(),
         scored.begin() + std::min<size_t>(top, scored.size()), scored.end(),
         [](const std::pair<float, size_t>& a, const std::pair<float, size_t>& b)
@@ -410,7 +551,11 @@ static int run_embed(const std::string& model_path, const std::vector<std::strin
     std::vector<matrix<float, 0, 1>> vecs;
     for (const std::string& t : texts)
     {
-        vecs.push_back(encode(model, tok, spec, t, as_query, truncate_dim, max_tokens));
+        const std::vector<matrix<float, 0, 1>> parts = encode_text(model, tok, spec, t,
+            as_query, truncate_dim, max_tokens, 1200, 240);
+        if (parts.size() > 1)
+            cout << "  (cut into " << parts.size() << " pieces; the first is shown)\n";
+        vecs.push_back(parts.front());
         cout << "\"" << (t.size() > 48 ? t.substr(0, 48) + "..." : t) << "\"\n"
              << "  " << vecs.back().size() << " dimensions, norm " << length(vecs.back())
              << ", first five:";
@@ -451,6 +596,7 @@ int main(int argc, char** argv)
         parser.add_option("top", "Passages returned by --query (default: 3)", 1);
         parser.add_option("chunk", "Characters per passage (default: 1200)", 1);
         parser.add_option("overlap", "Characters shared by consecutive passages (default: 240)", 1);
+        parser.add_option("min-chunk", "Shortest passage worth indexing; questions are never subject to it (default: 40)", 1);
         parser.add_option("dimensions", "Truncate embeddings to this width; 0 keeps them whole", 1);
         parser.add_option("max-tokens", "Tokens read per passage (default: 1024)", 1);
         parser.add_option("h", "Display this help message");
@@ -476,6 +622,7 @@ int main(int argc, char** argv)
                 get_option(parser, "out", std::string("embeddings.dat")),
                 static_cast<size_t>(get_option(parser, "chunk", 1200L)),
                 static_cast<size_t>(get_option(parser, "overlap", 240L)),
+                static_cast<size_t>(get_option(parser, "min-chunk", 40L)),
                 truncate_dim, max_tokens);
 
         if (parser.option("query"))
@@ -484,7 +631,9 @@ int main(int argc, char** argv)
             { cerr << "Error: --query needs --load to name an index.\n"; return 1; }
             return run_query(model_path, parser.option("load").argument(),
                 parser.option("query").argument(), get_option(parser, "top", 3L),
-                truncate_dim, max_tokens);
+                truncate_dim, max_tokens,
+                static_cast<size_t>(get_option(parser, "chunk", 1200L)),
+                static_cast<size_t>(get_option(parser, "overlap", 240L)));
         }
 
         if (parser.option("embed"))
