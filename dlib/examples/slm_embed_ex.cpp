@@ -121,6 +121,7 @@ struct embedding_index
 {
     std::string model_name;
     std::string tokenizer_id;
+    matrix<float, 0, 1> probe;  // what this model makes of a fixed sentence
     long dimensions = 0;
     uint64 sketch_seed = 1;   // the hasher that produced the passage sketches
     std::vector<passage> passages;
@@ -138,11 +139,27 @@ struct embedding_index
    strategy afterwards is asking them to know what this file knows. */
 const size_t LINEAR_SCAN_LIMIT = 50000;
 
+/* A fixed sentence, embedded once when the index is built and again when it is searched.
+
+   Comparing tokenizers is not enough, and the case that proves it is not exotic: an
+   embedding model is often a decoder with its vocabulary projection removed, so it inherits
+   the tokenizer of the model it was built from. jina-embeddings-v5-text-small comes from
+   Qwen3-0.6B and shares its vocabulary exactly, which means an index built with one and
+   searched with the other passes every check on identifiers and returns confident nonsense.
+
+   What differs between two models is not what they read but what they produce. Embedding
+   one known sentence and keeping the result gives a behavioural signature: the same model
+   reproduces it to within arithmetic, and any other model lands somewhere else entirely. */
+const char* const PROBE_SENTENCE =
+    "A fixed sentence used to identify which model built this index.";
+const double PROBE_TOLERANCE = 0.999;
+
 inline void serialize(const embedding_index& item, std::ostream& out)
 {
     dlib::serialize(std::string("dlib_embedding_index"), out);
     dlib::serialize(item.model_name, out);
     dlib::serialize(item.tokenizer_id, out);
+    dlib::serialize(item.probe, out);
     dlib::serialize(item.dimensions, out);
     dlib::serialize(item.sketch_seed, out);
     dlib::serialize(item.passages, out);
@@ -156,6 +173,7 @@ inline void deserialize(embedding_index& item, std::istream& in)
         throw std::runtime_error("this file is not an embedding index");
     dlib::deserialize(item.model_name, in);
     dlib::deserialize(item.tokenizer_id, in);
+    dlib::deserialize(item.probe, in);
     dlib::deserialize(item.dimensions, in);
     dlib::deserialize(item.sketch_seed, in);
     dlib::deserialize(item.passages, in);
@@ -366,7 +384,19 @@ static int run_index(const std::string& model_path, const std::string& input,
     hf_tokenizer tok;
     tok.load_from_gguf(g);
     runtime_transformer model;
-    cout << "\nLoading weights...\n";
+
+    /* Weights dequantized once, not once per passage.
+
+       The engine keeps quantized bytes in memory by default and expands each matrix just in
+       time, which halves the footprint of a model that will answer one question. Indexing
+       is the opposite situation: the same matrices are used thousands of times, and paying
+       the expansion at every use makes that work dominate everything else, on the processor
+       and on the card alike since the expansion happens before either does any arithmetic.
+
+       Resident costs about four times the file on a Q8 container, which is a few gigabytes
+       here and worth every one of them. */
+    model.set_quantized_at_rest(false);
+    cout << "\nLoading weights (resident, dequantized once)...\n";
     model.load(g, spec, gguf_load_options());
 
     const std::vector<std::string> files = list_inputs(input);
@@ -377,6 +407,8 @@ static int run_index(const std::string& model_path, const std::string& input,
     index.model_name = spec.model_name;
     index.tokenizer_id = tokenizer_fingerprint(tok);
     index.dimensions = truncate_dim > 0 ? std::min(truncate_dim, spec.d_model) : spec.d_model;
+    index.probe = encode_one(model, tok, spec, PROBE_SENTENCE, false, truncate_dim,
+                             max_tokens);
 
     /* Every passage carries a 128-bit angular sketch alongside its vector.
 
@@ -453,14 +485,37 @@ static int run_query(const std::string& model_path, const std::string& index_pat
        right shape and mean something else entirely. The fingerprint makes that a refusal. */
     if (tokenizer_fingerprint(tok) != index.tokenizer_id)
     {
-        cerr << "Error: '" << index_path << "' was built with another model ("
-             << index.model_name << ").\nAn index and a query must come from the same one; "
-                "the vectors are otherwise\nthe right shape and unrelated.\n";
+        cerr << "Error: '" << index_path << "' was built with another tokenizer than the "
+                "model given here.\nIt was built with " << index.model_name << ".\n";
         return 1;
     }
 
     runtime_transformer model;
+    model.set_quantized_at_rest(false);
     model.load(g, spec, gguf_load_options());
+
+    /* Then the behavioural check, which the identifier check cannot replace.
+
+       A model built from another by removing its vocabulary projection keeps that model's
+       tokenizer, so the fingerprints match while the vectors mean entirely different
+       things. Re-embedding the sentinel and comparing is what catches it. */
+    {
+        const matrix<float, 0, 1> here = encode_one(model, tok, spec, PROBE_SENTENCE,
+            false, index.dimensions, max_tokens);
+        const double agreement = (here.size() == index.probe.size() && index.probe.size() > 0)
+            ? dot(here, index.probe) : -1.0;
+        if (agreement < PROBE_TOLERANCE)
+        {
+            cerr << "Error: '" << index_path << "' was built with a different model.\n"
+                 << "  the index says : " << index.model_name << "\n"
+                 << "  this model is  : " << spec.model_name << "\n"
+                 << "  they agree on a fixed sentence to " << agreement
+                 << ", where the same model would agree to 1.\n"
+                 << "The vectors would be the right shape and unrelated, so the search "
+                    "would\nreturn plausible rankings of the wrong thing.\n";
+            return 1;
+        }
+    }
 
     const std::vector<matrix<float, 0, 1>> qs = encode_text(model, tok, spec, question,
         true, index.dimensions, max_tokens, chunk_chars, overlap_chars);
@@ -565,6 +620,7 @@ static int run_embed(const std::string& model_path, const std::vector<std::strin
     hf_tokenizer tok;
     tok.load_from_gguf(g);
     runtime_transformer model;
+    model.set_quantized_at_rest(false);
     model.load(g, spec, gguf_load_options());
 
     std::vector<matrix<float, 0, 1>> vecs;
