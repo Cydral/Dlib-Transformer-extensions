@@ -76,6 +76,14 @@ except ImportError:
     sys.exit("this script needs datasets: pip install datasets")
 
 
+# Dataset samples skipped per batch reserved, to keep the regions of the stream apart.
+#
+# Not every sample yields a usable sequence: blanks and short entries are dropped, so a
+# batch consumes more samples than it holds. Skipping generously is cheap on a streaming
+# corpus and is what keeps the evaluation from meeting the training text.
+OVERSHOOT = 8
+
+
 def block_list(model):
     """The decoder blocks, wherever this architecture keeps them.
 
@@ -97,11 +105,25 @@ def block_list(model):
 
 def stream_batches(tokenizer, dataset_name, config_name, split, batch_size, seq_len,
                    count, skip=0):
-    """Tokenized batches from a streaming corpus, so nothing is downloaded whole."""
+    """Batches of tokens with their attention masks, yielded as they are produced.
+
+    Two things here are not incidental.
+
+    The mask travels with the batch. A sequence shorter than the window is padded, and a
+    model given no mask attends over that padding as if it were text. Both models would do
+    so identically, so the divergence between them stays small and says nothing: the loss
+    would be measured largely on positions that carry no text at all, and on this corpus
+    that is up to three quarters of them.
+
+    And batches are yielded rather than accumulated. Tokenizing forty thousand of them
+    before the first step is several minutes of silence, and holding them is several hundred
+    megabytes that the training loop never needs more than one of.
+    """
     ds = load_dataset(dataset_name, config_name, split=split, streaming=True)
     if skip:
         ds = ds.skip(skip)
-    buf, out = [], []
+    pad = tokenizer.pad_token_id
+    ids_buf, mask_buf, made = [], [], 0
     for sample in ds:
         text = sample.get("text") or sample.get("content") or ""
         if not text.strip():
@@ -109,14 +131,16 @@ def stream_batches(tokenizer, dataset_name, config_name, split, batch_size, seq_
         ids = tokenizer(text, truncation=True, max_length=seq_len)["input_ids"]
         if len(ids) < seq_len // 4:
             continue
-        ids = ids + [tokenizer.pad_token_id] * (seq_len - len(ids))
-        buf.append(ids[:seq_len])
-        if len(buf) == batch_size:
-            out.append(torch.tensor(buf))
-            buf = []
-            if len(out) >= count:
-                break
-    return out
+        real = len(ids)
+        ids = ids[:seq_len] + [pad] * (seq_len - real)
+        ids_buf.append(ids)
+        mask_buf.append([1] * min(real, seq_len) + [0] * (seq_len - real))
+        if len(ids_buf) == batch_size:
+            yield torch.tensor(ids_buf), torch.tensor(mask_buf)
+            ids_buf, mask_buf = [], []
+            made += 1
+            if made >= count:
+                return
 
 
 @torch.no_grad()
@@ -133,9 +157,10 @@ def measure_block_influence(model, batches, device):
     influence = [0.0] * n
     seen = 0
 
-    for batch in batches:
-        ids = batch.to(device)
-        out = model(input_ids=ids, output_hidden_states=True, return_dict=True)
+    for ids, mask in batches:
+        ids, mask = ids.to(device), mask.to(device)
+        out = model(input_ids=ids, attention_mask=mask,
+                    output_hidden_states=True, return_dict=True)
         hs = out.hidden_states          # n + 1 entries: the embedding, then each block
         for i in range(n):
             a = hs[i].float().flatten(0, 1)
@@ -220,63 +245,96 @@ def build_student(teacher_name, kept, device, dtype):
     return student.to(device), carried
 
 
-def save_tokenizer(tokenizer, out_dir):
-    """Writes the tokenizer, then repairs what the round trip breaks.
+def save_tokenizer(tokenizer, teacher_name, out_dir):
+    """Copies the teacher's tokenizer files rather than re-serializing them.
 
-    save_pretrained does not always produce a directory from_pretrained can read back.
-    extra_special_tokens is written as an empty list and expected as a mapping, so a model
-    saved this way fails to reload with an error about a list having no keys, far from
-    anything a caller did. The converter hits it before it ever looks at a weight.
+    save_pretrained rebuilds tokenizer.json from the loaded objects, and the rebuilt file is
+    not always byte-identical to the published one: transformers rewrites the pre-tokenizer
+    regex in a form its own loader then flags as incorrect, quoting a discussion about a
+    Mistral model because that is where the pattern was first reported. The warning names a
+    company that has nothing to do with the model at hand, which is why it reads as noise
+    and is worth taking seriously anyway: a rewritten regex is a rewritten tokenizer.
 
-    The field is normalized here rather than left to whoever meets it next, and the result
-    is reloaded to prove the directory is usable before the run reports success.
+    A student inherits its teacher's vocabulary unchanged, so there is nothing to rebuild.
+    The files are copied as they were published, and the result is byte-identical
+    tokenization by construction rather than by hope.
     """
-    tokenizer.save_pretrained(out_dir)
+    os.makedirs(out_dir, exist_ok=True)
+    wanted = ["tokenizer.json", "tokenizer_config.json", "vocab.json", "merges.txt",
+              "special_tokens_map.json", "added_tokens.json", "tokenizer.model",
+              "chat_template.jinja"]
+    copied = []
 
-    path = os.path.join(out_dir, "tokenizer_config.json")
-    if os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as fin:
-            cfg = json.load(fin)
-        changed = False
-        value = cfg.get("extra_special_tokens")
-        if isinstance(value, list):
-            cfg["extra_special_tokens"] = {}
-            changed = True
-        if changed:
-            with open(path, "w", encoding="utf-8") as fout:
-                json.dump(cfg, fout, indent=2, ensure_ascii=False)
+    if os.path.isdir(teacher_name):
+        for name in wanted:
+            src = os.path.join(teacher_name, name)
+            if os.path.exists(src):
+                shutil.copy2(src, os.path.join(out_dir, name))
+                copied.append(name)
+    else:
+        try:
+            from huggingface_hub import hf_hub_download
+        except ImportError:
+            hf_hub_download = None
+        if hf_hub_download is not None:
+            for name in wanted:
+                try:
+                    src = hf_hub_download(repo_id=teacher_name, filename=name)
+                    shutil.copy2(src, os.path.join(out_dir, name))
+                    copied.append(name)
+                except Exception:                                # noqa: BLE001
+                    continue      # the file simply does not exist for this model
 
+    if not copied:
+        print("  note: the teacher's tokenizer files could not be copied; falling back to")
+        print("        re-serializing them, which may alter the pre-tokenizer regex.")
+        tokenizer.save_pretrained(out_dir)
+
+    # Whichever path was taken, prove the directory reloads before reporting success.
     try:
         AutoTokenizer.from_pretrained(out_dir)
-    except Exception as e:                                   # noqa: BLE001
+        print(f"  tokenizer    : {len(copied)} files copied verbatim from the teacher"
+              if copied else "  tokenizer    : re-serialized")
+    except Exception as e:                                       # noqa: BLE001
         print(f"  warning: the saved tokenizer does not reload ({e}).")
         print("  The conversion to GGUF will fail until this is resolved.")
 
 
-def distillation_loss(s_out, t_out, mapping, temperature, alpha):
+def masked_kl(s_logits, t_logits, mask, temperature):
+    """Divergence over the positions that carry text, per token.
+
+    Padding is excluded rather than tolerated. Both models agree trivially on filler, so
+    including it drags the average towards zero and hides how far apart they are where it
+    matters; it also spends gradient on teaching a student to imitate a teacher's opinion
+    about nothing.
+    """
+    T = temperature
+    per_pos = F.kl_div(
+        F.log_softmax(s_logits / T, dim=-1),
+        F.log_softmax(t_logits / T, dim=-1),
+        reduction="none", log_target=True).sum(dim=-1)
+    m = mask.to(per_pos.dtype)
+    return (per_pos * m).sum() / m.sum().clamp(min=1) * (T * T)
+
+
+def distillation_loss(s_out, t_out, mask, mapping, temperature, alpha):
     """The two terms, and the T^2 that keeps them comparable."""
     T = temperature
-    # Divided by the sequence length as well as the batch.
-    #
-    # batchmean divides by the first dimension only, so on a (batch, positions, vocabulary)
-    # tensor it yields a divergence per sequence: a number in the hundreds that varies with
-    # the window and compares with nothing. Per token, it reads in nats like every other
-    # loss in this project, and a value near one means the student is one nat of surprise
-    # away from its teacher.
-    tokens = s_out.logits.shape[1]
-    kl = F.kl_div(
-        F.log_softmax(s_out.logits / T, dim=-1),
-        F.log_softmax(t_out.logits / T, dim=-1),
-        reduction="batchmean",
-        log_target=True,
-    ) * (T * T) / tokens
+    kl = masked_kl(s_out.logits, t_out.logits, mask, T)
 
     hidden = torch.zeros((), device=s_out.logits.device)
     if alpha < 1.0 and mapping:
+        # Averaged over the real positions and over the width, which is what makes this
+        # a mean squared error rather than a sum. Dividing by anything else leaves the
+        # term scaled by the hidden dimension, and at a width of a thousand it then
+        # dwarfs the divergence it is meant to accompany.
+        m = mask.to(torch.float32).unsqueeze(-1)
+        width = s_out.hidden_states[0].shape[-1]
+        denom = (m.sum() * width).clamp(min=1)
         for s_i, t_i in mapping.items():
-            hidden = hidden + F.mse_loss(
-                s_out.hidden_states[s_i + 1].float(),
-                t_out.hidden_states[t_i + 1].float())
+            diff = (s_out.hidden_states[s_i + 1].float()
+                    - t_out.hidden_states[t_i + 1].float())
+            hidden = hidden + ((diff * diff) * m).sum() / denom
         hidden = hidden / len(mapping)
 
     return alpha * kl + (1.0 - alpha) * hidden, kl.item(), hidden.detach().item()
@@ -290,17 +348,18 @@ def evaluate(student, teacher, batches, device, temperature):
     logit and produce the same distribution, and that constant would dominate a squared
     error while meaning nothing.
     """
-    total = 0.0
-    for batch in batches:
-        ids = batch.to(device)
-        t_out = teacher(input_ids=ids, return_dict=True)
-        s_out = student(input_ids=ids, return_dict=True)
-        total += (F.kl_div(
-            F.log_softmax(s_out.logits / temperature, dim=-1),
-            F.log_softmax(t_out.logits / temperature, dim=-1),
-            reduction="batchmean", log_target=True)
-            * temperature ** 2 / s_out.logits.shape[1]).item()
-    return total / max(len(batches), 1)
+    was_training = student.training
+    student.eval()
+    total, seen = 0.0, 0
+    for ids, mask in batches:
+        ids, mask = ids.to(device), mask.to(device)
+        t_out = teacher(input_ids=ids, attention_mask=mask, return_dict=True)
+        s_out = student(input_ids=ids, attention_mask=mask, return_dict=True)
+        total += masked_kl(s_out.logits, t_out.logits, mask, temperature).item()
+        seen += 1
+    if was_training:
+        student.train()
+    return total / max(seen, 1)
 
 
 def main():
@@ -369,18 +428,28 @@ def main():
     n_total = len(t_blocks)
     print(f"blocks       : {n_total} -> {args.keep}")
 
+    # The held-out batches come first in the stream, then the probe, then training.
+    #
+    # A held-out set taken after the training set has to skip past it, and the skip counts
+    # dataset samples while the training loop counts batches: samples too short are dropped,
+    # so the two never line up and the evaluation ends up measuring text the student was
+    # trained on. Taking the evaluation from the head of the stream makes the boundary exact
+    # in the only direction that matters, and OVERSHOOT keeps a wide margin between the
+    # regions so the filtering cannot close it.
+    def make(count, skip):
+        return stream_batches(tokenizer, args.dataset, args.dataset_config, args.split,
+                              args.batch_size, args.seq_len, count, skip=skip)
+
+    held_skip = 0
+    probe_skip = args.eval_batches * args.batch_size * OVERSHOOT
+    train_skip = probe_skip + args.probe_batches * args.batch_size * OVERSHOOT
+
     print("reading the corpus...")
-    probe = stream_batches(tokenizer, args.dataset, args.dataset_config, args.split,
-                           args.batch_size, args.seq_len, args.probe_batches)
-    train = stream_batches(tokenizer, args.dataset, args.dataset_config, args.split,
-                           args.batch_size, args.seq_len, args.steps,
-                           skip=args.probe_batches * args.batch_size)
-    held = stream_batches(tokenizer, args.dataset, args.dataset_config, args.split,
-                          args.batch_size, args.seq_len, args.eval_batches,
-                          skip=(args.probe_batches + args.steps) * args.batch_size)
-    if not train:
-        sys.exit("the corpus yielded no training batch")
-    print(f"batches      : {len(train)} training, {len(held)} held out")
+    held = list(make(args.eval_batches, held_skip))
+    probe = list(make(args.probe_batches, probe_skip))
+    if not held:
+        sys.exit("the corpus yielded no held-out batch")
+    print(f"batches      : {args.steps} training (streamed), {len(held)} held out")
 
     influence = [1.0] * n_total
     if args.selection == "importance":
@@ -404,7 +473,7 @@ def main():
     before = evaluate(student, teacher, held, device, args.temperature)
     print(f"divergence before recovery : {before:.5f} nats per token")
 
-    print(f"training     : {len(train)} batches of {args.batch_size} x {args.seq_len} "
+    print(f"training     : {args.steps} batches of {args.batch_size} x {args.seq_len} "
           f"tokens on {device}")
     opt = torch.optim.AdamW(student.parameters(), lr=args.lr, weight_decay=0.01)
     # The schedule counts optimizer steps, not batches.
@@ -413,20 +482,22 @@ def main():
     # cosine period sized on the number of batches traverses only that fraction of itself
     # and the rate never anneals. The symptom is a run that ends at nearly its starting
     # rate, still bouncing around a plateau it would have settled below.
-    updates = max(len(train) // max(args.grad_accum, 1), 1)
+    updates = max(args.steps // max(args.grad_accum, 1), 1)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=updates)
     student.train()
 
     running = 0.0
     t0 = time.time()
-    for step, batch in enumerate(train, 1):
-        ids = batch.to(device)
+    train = make(args.steps, train_skip)
+    for step, (ids, mask) in enumerate(train, 1):
+        ids, mask = ids.to(device), mask.to(device)
         with torch.no_grad():
-            t_out = teacher(input_ids=ids, output_hidden_states=(args.alpha < 1.0),
-                            return_dict=True)
-        s_out = student(input_ids=ids, output_hidden_states=(args.alpha < 1.0),
-                        return_dict=True)
-        loss, kl, hid = distillation_loss(s_out, t_out, mapping if args.alpha < 1.0 else {},
+            t_out = teacher(input_ids=ids, attention_mask=mask,
+                            output_hidden_states=(args.alpha < 1.0), return_dict=True)
+        s_out = student(input_ids=ids, attention_mask=mask,
+                        output_hidden_states=(args.alpha < 1.0), return_dict=True)
+        loss, kl, hid = distillation_loss(s_out, t_out, mask,
+                                          mapping if args.alpha < 1.0 else {},
                                           args.temperature, args.alpha)
         (loss / args.grad_accum).backward()
         running += loss.item()
@@ -443,11 +514,11 @@ def main():
         # that is stuck, and the difference matters most exactly when the steps are slow.
         # Announcing the first one tells a caller within seconds whether anything is moving,
         # and at what pace.
-        report = step <= 3 or step % 25 == 0 or step == len(train)
+        report = step <= 3 or step % 25 == 0 or step == args.steps
         if report:
             window = 1 if step <= 3 else min(25, step)
             elapsed = time.time() - t0
-            print(f"  step {step:>5}/{len(train)}  loss {running / window:.4f}"
+            print(f"  step {step:>5}/{args.steps}  loss {running / window:.4f}"
                   f"  kl {kl:.4f}  hidden {hid:.4f}  lr {sched.get_last_lr()[0]:.2e}"
                   f"  {elapsed / step:.2f} s/step", flush=True)
             if step > 3:
@@ -462,13 +533,13 @@ def main():
 
     os.makedirs(args.out, exist_ok=True)
     student.save_pretrained(args.out, safe_serialization=True)
-    save_tokenizer(tokenizer, args.out)
+    save_tokenizer(tokenizer, args.teacher, args.out)
 
     with open(os.path.join(args.out, "pruning.json"), "w", encoding="utf-8") as fout:
         json.dump({"teacher": args.teacher, "kept_blocks": kept,
                    "selection": args.selection, "influence": influence,
                    "divergence_before": before, "divergence_after": after,
-                   "steps": len(train), "alpha": args.alpha,
+                   "steps": args.steps, "alpha": args.alpha,
                    "temperature": args.temperature}, fout, indent=2)
 
     print(f"\nwritten to {args.out}")
