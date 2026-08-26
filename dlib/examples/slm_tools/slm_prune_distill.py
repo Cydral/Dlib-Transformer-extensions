@@ -367,7 +367,12 @@ def main():
         description="Prune a causal model in depth and distil the survivors back into shape.")
     p.add_argument("--teacher", required=True, help="model repository or local directory")
     p.add_argument("--keep", type=int, required=True, help="blocks the student retains")
-    p.add_argument("--out", required=True, help="directory for the student, in HF layout")
+    p.add_argument("--out", help="directory for the student; derived from the naming "
+                   "convention when omitted")
+    p.add_argument("--model-name", help="name written inside the model, and used to derive "
+                   "the directory. Defaults to the convention below")
+    p.add_argument("--family", default="Dlib-SLM",
+                   help="first element of the name (default: Dlib-SLM)")
     p.add_argument("--selection", choices=["importance", "uniform"], default="importance",
                    help="how the surviving blocks are chosen (default: importance)")
 
@@ -425,6 +430,7 @@ def main():
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    teacher_cfg = AutoConfig.from_pretrained(args.teacher)
     teacher = AutoModelForCausalLM.from_pretrained(args.teacher, dtype=dtype).to(device).eval()
     for prm in teacher.parameters():
         prm.requires_grad_(False)
@@ -466,7 +472,26 @@ def main():
     kept = choose_blocks(n_total, args.keep, influence, args.selection)
     print(f"keeping      : {kept}")
 
+    # The name, and the directory derived from it.
+    #
+    # A model that circulates is identified by what it is, not by the folder it happened to
+    # be written into. The convention below states the family, the width, the depth and the
+    # lineage, which is what someone holding the file a year from now needs in order to know
+    # what they have: Dlib-SLM-1024x20-from-Qwen3-0.6B.
+    #
+    # The same string goes into config.json, so the name travels into the GGUF container and
+    # shows up in every report this library prints. A file renamed on disk still says what
+    # it is.
+    short = args.teacher.split("/")[-1]
+    name = args.model_name or f"{args.family}-{teacher_cfg.hidden_size}x{len(kept)}-from-{short}"
+    out_dir = args.out or os.path.join(os.path.expanduser("~/models"), name.lower())
+    print(f"name         : {name}")
+    print(f"directory    : {out_dir}")
+
     student, carried = build_student(args.teacher, kept, device, dtype)
+    student.config.name_or_path = name
+    if hasattr(student.config, "_name_or_path"):
+        student.config._name_or_path = name
     mapping = {new_i: old_i for new_i, old_i in enumerate(kept)}
     print(f"inherited    : {carried} tensors outside the blocks, plus {len(kept)} blocks")
 
@@ -544,11 +569,11 @@ def main():
     print(f"divergence after recovery  : {after:.5f} nats per token  "
           f"({100.0 * (before - after) / max(before, 1e-9):.1f}% closer)")
 
-    os.makedirs(args.out, exist_ok=True)
-    student.save_pretrained(args.out, safe_serialization=True)
-    save_tokenizer(tokenizer, args.teacher, args.out)
+    os.makedirs(out_dir, exist_ok=True)
+    student.save_pretrained(out_dir, safe_serialization=True)
+    save_tokenizer(tokenizer, args.teacher, out_dir)
 
-    with open(os.path.join(args.out, "pruning.json"), "w", encoding="utf-8") as fout:
+    with open(os.path.join(out_dir, "pruning.json"), "w", encoding="utf-8") as fout:
         json.dump({"teacher": args.teacher, "kept_blocks": kept,
                    "selection": args.selection, "influence": influence,
                    "divergence_before": before, "divergence_after": after,
@@ -556,10 +581,10 @@ def main():
                    "interrupted": interrupted, "seed": args.seed, "alpha": args.alpha,
                    "temperature": args.temperature}, fout, indent=2)
 
-    print(f"\nwritten to {args.out}")
+    print(f"\nwritten to {out_dir}")
     print("\nThe student is an ordinary model of its family with fewer blocks, so the")
     print("standard converter produces a container this library reads:")
-    print(f"  python3 convert_hf_to_gguf.py {args.out} --outtype f16 --outfile student.gguf")
+    print(f"  python3 convert_hf_to_gguf.py {out_dir} --outtype f16 --outfile student.gguf")
     print("\nThen, from the build directory:")
     print("  ./slm_gguf_runtime_ex --input student.gguf --probe-logits")
     print("  ./slm_gguf_import_ex  --input student.gguf --out-prefix slm_imported_model")
