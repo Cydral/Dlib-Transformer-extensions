@@ -475,15 +475,19 @@ def main():
     # The name, and the directory derived from it.
     #
     # A model that circulates is identified by what it is, not by the folder it happened to
-    # be written into. The convention below states the family, the width, the depth and the
-    # lineage, which is what someone holding the file a year from now needs in order to know
-    # what they have: Dlib-SLM-1024x20-from-Qwen3-0.6B.
+    # be written into. The convention states the family, the width and the depth:
+    # Dlib-SLM-1024x24.
+    #
+    # The teacher is deliberately absent from it. The geometry already implies the lineage
+    # for anyone who looks, the model is meant to stand on its own rather than as a derived
+    # work, and a name that carries a provenance ages badly the moment the same shape is
+    # reached another way. What produced it stays recorded in pruning.json beside the
+    # weights, where it belongs.
     #
     # The same string goes into config.json, so the name travels into the GGUF container and
     # shows up in every report this library prints. A file renamed on disk still says what
     # it is.
-    short = args.teacher.split("/")[-1]
-    name = args.model_name or f"{args.family}-{teacher_cfg.hidden_size}x{len(kept)}-from-{short}"
+    name = args.model_name or f"{args.family}-{teacher_cfg.hidden_size}x{len(kept)}"
     out_dir = args.out or os.path.join(os.path.expanduser("~/models"), name.lower())
     print(f"name         : {name}")
     print(f"directory    : {out_dir}")
