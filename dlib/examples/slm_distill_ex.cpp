@@ -118,7 +118,12 @@ static model_spec spec_for_student(const student_shape& s, const model_spec& tea
 {
     model_spec out;
     out.arch_name = "llama";
-    out.model_name = "Distilled " + std::to_string(s.width) + "x" + std::to_string(s.layers);
+    /* Named after its own geometry, as the pruning tool names its students.
+
+       The teacher is deliberately absent: the shape already implies the lineage for anyone
+       who looks, and a name carrying a provenance ages badly the moment the same shape is
+       reached another way. What produced it belongs beside the weights, not in the name. */
+    out.model_name = "Dlib-SLM-" + std::to_string(s.width) + "x" + std::to_string(s.layers);
     out.n_layers = s.layers;
     out.n_heads = s.heads;
     out.n_kv_heads = s.kv_heads > 0 ? s.kv_heads : s.heads;
@@ -344,7 +349,15 @@ static int run_record(const std::string& teacher_path, const std::string& corpus
          << "  file size  : about " << (bytes / (1024.0 * 1024.0)) << " MB\n";
 
     cout << "\nLoading the teacher's weights...\n";
+    /* Weights dequantized once, not once per window.
+
+       The engine keeps quantized bytes in memory by default, expanding each matrix just in
+       time, which is the right trade for a model answering one question. A recording pass
+       is the opposite: the same matrices serve thousands of windows, and paying the
+       expansion at every use makes that work dominate the pass on any device, since it
+       happens before the arithmetic does. */
     runtime_transformer teacher;
+    teacher.set_quantized_at_rest(false);
     teacher.load(g, spec, gguf_load_options());
 
     distillation_header head;
@@ -416,7 +429,8 @@ using train_net = loss_distillation_per_token<student_head>;
 /* Step 3: train the student on the recording. */
 static int run_train(const std::vector<std::string>& trace_paths, const std::string& tok_path,
     const std::string& out_path, const std::string& load_path, long epochs, long batch,
-    double lr, double temperature, double alpha, long patience, const std::string& sync_file)
+    double lr, double temperature, double alpha, long patience, long valid_windows,
+    const std::string& sync_file)
 {
     hf_tokenizer tok;
     { std::ifstream fin(tok_path, std::ios::binary);
@@ -520,6 +534,42 @@ static int run_train(const std::vector<std::string>& trace_paths, const std::str
     if (!sync_file.empty())
         trainer.set_synchronization_file(sync_file, std::chrono::minutes(10));
 
+    /* A slice of the recording is held back and never trained on.
+
+       Without it the only number a run reports is its own training loss, which falls
+       whether the student is learning the corpus or memorizing it, and which cannot be
+       compared between two runs on different mixtures. Measured before the first step, it
+       also gives the baseline the final number means nothing without: a student that starts
+       at four and ends at two has done something, one that starts at two has not. */
+    std::vector<distillation_window> held;
+    traces.front()->read(valid_windows, held);
+    cout << "  held out  : " << held.size() << " windows, never trained on\n";
+
+    auto measure = [&](train_net& net) {
+        if (held.empty()) return 0.0;
+        double total = 0.0;
+        std::vector<matrix<int, 0, 1>> bx;
+        std::vector<distillation_target> by;
+        for (size_t i = 0; i < held.size(); i += static_cast<size_t>(batch))
+        {
+            const size_t upto = std::min(i + static_cast<size_t>(batch), held.size());
+            bx.clear(); by.clear();
+            for (size_t k = i; k < upto; ++k)
+            {
+                bx.push_back(held[k].tokens);
+                distillation_target t;
+                t.hard = held[k].hard; t.ids = held[k].ids; t.logits = held[k].logits;
+                by.push_back(std::move(t));
+            }
+            total += net.compute_loss(bx.begin(), bx.end(), by.begin())
+                   * static_cast<double>(upto - i);
+        }
+        return total / static_cast<double>(held.size());
+    };
+
+    cout << "  loss before training : " << measure(trainer.get_net(force_flush_to_disk::no))
+         << "  (on the held-out windows)\n";
+
     dlib::signal_handler::setup();
     const auto started = std::chrono::steady_clock::now();
     bool interrupted = false;
@@ -577,11 +627,12 @@ static int run_train(const std::vector<std::string>& trace_paths, const std::str
             if (trainer.get_learning_rate() < trainer.get_min_learning_rate()) break;
             if (dlib::signal_handler::is_triggered()) { interrupted = true; break; }
         }
-        trainer.get_net(force_flush_to_disk::no);
+        train_net& current = trainer.get_net(force_flush_to_disk::no);
         cout << "  epoch " << (e + 1) << "/" << epochs
              << "  windows " << seen
              << "  learning rate " << trainer.get_learning_rate()
-             << "  average loss " << trainer.get_average_loss() << "\n";
+             << "  average loss " << trainer.get_average_loss()
+             << "  held-out " << measure(current) << "\n";
         trainer.clear_average_loss();
         if (interrupted)
         {
@@ -605,7 +656,7 @@ static int run_train(const std::vector<std::string>& trace_paths, const std::str
     cout << "  trained in  : " << elapsed << " s\n";
 
     model_archive_info info;
-    info.model_name = std::string("Distilled from ") + head.teacher_name;
+    info.model_name = student_model::MODEL_NAME;
     info.has_vision = false;
     save_model_archive(out_path, info, net.subnet(), tok);
     cout << "\nWritten to " << out_path << "\n";
@@ -665,6 +716,8 @@ int main(int argc, char** argv)
         parser.add_option("temperature", "Softens both distributions (default: 2)", 1);
         parser.add_option("alpha", "Weight of the teacher against the corpus (default: 0.9)", 1);
         parser.add_option("patience", "Steps without progress before the rate is lowered (default: 2000)", 1);
+        parser.add_option("valid-windows", "Windows held back from the first recording and "
+            "never trained on; 0 disables the measure (default: 64)", 1);
         parser.add_option("sync", "Trainer synchronization file", 1);
         parser.add_option("h", "Display this help message");
         parser.parse(argc, argv);
@@ -737,6 +790,7 @@ int main(int argc, char** argv)
                 get_option(parser, "temperature", 2.0),
                 get_option(parser, "alpha", 0.9),
                 get_option(parser, "patience", 2000L),
+                get_option(parser, "valid-windows", 64L),
                 get_option(parser, "sync", std::string()));
 #else
             cerr << "This build has no student header compiled in.\n"
