@@ -56,6 +56,7 @@ import json
 import math
 import os
 import shutil
+import signal
 import sys
 import time
 
@@ -82,6 +83,122 @@ except ImportError:
 # batch consumes more samples than it holds. Skipping generously is cheap on a streaming
 # corpus and is what keeps the evaluation from meeting the training text.
 OVERSHOOT = 8
+
+
+class Interruption:
+    """Turns Ctrl-C into a request rather than an exception.
+
+    An exception arrives wherever the interpreter happens to be, which during training is
+    usually in the middle of a backward pass: half the gradients are computed, the optimizer
+    may or may not have run, and what gets written afterwards is a model in a state no run
+    ever produced. Setting a flag instead lets the loop finish the step it started and stop
+    at a boundary where the weights mean something.
+
+    The second Ctrl-C is left to the interpreter. Someone pressing it twice wants out now,
+    not a graceful shutdown, and refusing that is how a tool earns a reputation for being
+    hard to kill.
+    """
+
+    def __init__(self):
+        self.asked = False
+        self._previous = None
+
+    def __enter__(self):
+        self._previous = signal.getsignal(signal.SIGINT)
+        signal.signal(signal.SIGINT, self._handle)
+        return self
+
+    def __exit__(self, *exc):
+        signal.signal(signal.SIGINT, self._previous or signal.SIG_DFL)
+        return False
+
+    def _handle(self, signum, frame):
+        self.asked = True
+        signal.signal(signal.SIGINT, self._previous or signal.SIG_DFL)
+        print("\n  stopping at the end of this step; press Ctrl-C again to abort now",
+              flush=True)
+
+
+# A default mixture for a multilingual teacher.
+#
+# Distilling a multilingual model on an English corpus teaches it to be an English model:
+# the languages the teacher knows are simply never asked about, and what is never asked is
+# what fades first. The shares below keep English dominant, since the highest-quality
+# filtered data exists there, while giving the other languages enough presence to survive.
+#
+# FineWeb-2 is the companion of FineWeb-Edu from the same pipeline, covering more than a
+# thousand languages. Its quality per token is lower, which is the trade being made: a
+# weaker signal in nine languages beats a strong signal in one when the model is meant to
+# answer in all of them.
+#
+# Two conversational corpora open the list, for a reason that has nothing to do with
+# language. An instruction-following teacher owes that behaviour to the shape of its
+# training data, and web prose contains none of it: no turn markers, no question followed by
+# an answer, no place where a reply ends. Distilling on prose alone therefore teaches the
+# student to continue text, which is a different model from the one being copied.
+#
+# smoltalk is preferred over the larger instruction mixtures because of how it is laid out.
+# Its rows arrive interleaved across sources, so a stream read in order sees rewriting,
+# summarizing, mathematics, reasoning under constraints and tool calls from the first
+# batches. Corpora stored source by source hand out ten thousand consecutive examples of one
+# task, which over a short run means the student sees one task and not the others.
+#
+# aya carries human-written instructions in sixty-five languages, which is the piece
+# neither web prose nor an English instruction set provides: knowing how to answer, in a
+# language other than English.
+MULTILINGUAL_MIX = [
+    ("HuggingFaceTB/smoltalk", "all", 4),
+    ("CohereLabs/aya_dataset", "default", 2),
+    ("HuggingFaceFW/fineweb-edu", "sample-10BT", 8),
+    ("HuggingFaceFW/fineweb-2", "fra_Latn", 2),
+    ("HuggingFaceFW/fineweb-2", "deu_Latn", 2),
+    ("HuggingFaceFW/fineweb-2", "spa_Latn", 2),
+    ("HuggingFaceFW/fineweb-2", "ita_Latn", 1),
+    ("HuggingFaceFW/fineweb-2", "por_Latn", 1),
+    ("HuggingFaceFW/fineweb-2", "rus_Cyrl", 1),
+    ("HuggingFaceFW/fineweb-2", "cmn_Hani", 1),
+    ("HuggingFaceFW/fineweb-2", "jpn_Jpan", 1),
+]
+
+
+def parse_mix(args):
+    """The corpora to draw from, as (repo, config, weight)."""
+    if args.mix:
+        out = []
+        for spec in args.mix:
+            parts = spec.split(":")
+            if len(parts) < 2:
+                sys.exit(f"--mix wants REPO:CONFIG[:WEIGHT], got '{spec}'")
+            weight = float(parts[2]) if len(parts) > 2 else 1.0
+            out.append((parts[0], parts[1], weight))
+        return out
+    if args.multilingual:
+        return list(MULTILINGUAL_MIX)
+    return [(args.dataset, args.dataset_config, 1.0)]
+
+
+def interleave(streams, weights):
+    """Draws from several streams in proportion to their weights.
+
+    Round-robin over shares rather than a random draw, so that a run is reproducible and
+    every corpus appears from the first batches rather than whenever chance allows. A stream
+    that runs dry is dropped and its share redistributed over the rest.
+    """
+    live = list(range(len(streams)))
+    credit = [0.0] * len(streams)
+    while live:
+        total = sum(weights[i] for i in live)
+        for i in live:
+            credit[i] += weights[i]
+        best = max(live, key=lambda i: credit[i])
+        # The winner gives back the whole round, not the largest single share. Subtracting
+        # less starves the small sources: they accumulate credit for hundreds of draws and
+        # then arrive in a clump at the end, which is the opposite of a mixture.
+        credit[best] -= total
+        try:
+            yield next(streams[best])
+        except StopIteration:
+            live.remove(best)
 
 
 def block_list(model):
@@ -126,6 +243,29 @@ def stream_batches(tokenizer, dataset_name, config_name, split, batch_size, seq_
     ids_buf, mask_buf, made = [], [], 0
     for sample in ds:
         text = sample.get("text") or sample.get("content") or ""
+
+        # An instruction pair that is not already a conversation becomes one.
+        #
+        # Corpora disagree on how they store an exchange: some carry a list of messages,
+        # others a bare input and its expected output. Normalizing here rather than adding a
+        # reader per corpus keeps the choice of corpora open, which matters because what
+        # this mixture needs is variety of task, not variety of schema.
+        if not text and sample.get("inputs") and sample.get("targets"):
+            sample = {"messages": [{"role": "user", "content": sample["inputs"]},
+                                   {"role": "assistant", "content": sample["targets"]}]}
+
+        if not text and sample.get("messages"):
+            # A conversation, rendered through the teacher's own chat template.
+            #
+            # Distilling an instruction-following model on prose alone teaches it prose.
+            # The turn markers never appear, so the student never sees its teacher predict
+            # them, and the behaviour that nothing reinforces is the behaviour that fades.
+            # Rendering the exchange and treating it as text puts those markers back into
+            # the stream, where the teacher predicts them like anything else.
+            try:
+                text = tokenizer.apply_chat_template(sample["messages"], tokenize=False)
+            except Exception:                                    # noqa: BLE001
+                text = ""
         if not text.strip():
             continue
         ids = tokenizer(text, truncation=True, max_length=seq_len)["input_ids"]
@@ -378,6 +518,13 @@ def main():
 
     p.add_argument("--dataset", default="HuggingFaceFW/fineweb-edu")
     p.add_argument("--dataset-config", default="sample-10BT")
+    p.add_argument("--mix", action="append", metavar="REPO:CONFIG:WEIGHT",
+                   help="a corpus and its share of the batches; repeat for several. "
+                        "Overrides --dataset. Weights need not sum to anything. "
+                        "Example: HuggingFaceFW/fineweb-edu:sample-10BT:6")
+    p.add_argument("--multilingual", action="store_true",
+                   help="shorthand for an English-heavy mix over eight other languages, "
+                        "for a teacher that was not trained on English alone")
     p.add_argument("--split", default="train")
     p.add_argument("--seq-len", type=int, default=512)
     p.add_argument("--batch-size", type=int, default=2)
@@ -446,14 +593,36 @@ def main():
     # trained on. Taking the evaluation from the head of the stream makes the boundary exact
     # in the only direction that matters, and OVERSHOOT keeps a wide margin between the
     # regions so the filtering cannot close it.
+    mix = parse_mix(args)
+    total_weight = sum(w for _, _, w in mix)
+
     def make(count, skip):
-        return stream_batches(tokenizer, args.dataset, args.dataset_config, args.split,
-                              args.batch_size, args.seq_len, count, skip=skip)
+        """One stream per corpus, interleaved in proportion to the declared shares.
+
+        Each corpus is asked for its share of the batches plus a margin, since a stream that
+        runs dry ends the interleaving early."""
+        if len(mix) == 1:
+            repo, cfg, _ = mix[0]
+            return stream_batches(tokenizer, repo, cfg, args.split,
+                                  args.batch_size, args.seq_len, count, skip=skip)
+        streams, weights = [], []
+        for repo, cfg, w in mix:
+            share = int(count * w / total_weight) + 16
+            streams.append(stream_batches(tokenizer, repo, cfg, args.split,
+                                          args.batch_size, args.seq_len, share, skip=skip))
+            weights.append(w)
+        return interleave(streams, weights)
 
     held_skip = 0
     probe_skip = args.eval_batches * args.batch_size * OVERSHOOT
     train_skip = probe_skip + args.probe_batches * args.batch_size * OVERSHOOT
 
+    if len(mix) == 1:
+        print(f"corpus       : {mix[0][0]} ({mix[0][1]})")
+    else:
+        print("corpus       : a mixture of " + str(len(mix)) + " sources")
+        for repo, cfg, w in mix:
+            print(f"               {100.0 * w / total_weight:5.1f}%  {repo} ({cfg})")
     print("reading the corpus...")
     held = list(make(args.eval_batches, held_skip))
     probe = list(make(args.probe_batches, probe_skip))
@@ -524,7 +693,7 @@ def main():
     train = make(args.steps, train_skip)
     interrupted = False
     step = 0
-    try:
+    with Interruption() as stop:
       for step, (ids, mask) in enumerate(train, 1):
           ids, mask = ids.to(device), mask.to(device)
           with torch.no_grad():
@@ -562,11 +731,13 @@ def main():
               else:
                   running = 0.0
 
-    except KeyboardInterrupt:
-        # Interrupted, not abandoned: what the student has learned is measured and
-        # written, so hours of recovery are not lost to a keystroke.
-        interrupted = True
-        print(f"\n  interrupted at step {step}; the student is kept as it stands")
+          if stop.asked:
+              # Interrupted, not abandoned: the step just finished, so the weights are
+              # coherent, and what the student has learned is measured and written.
+              interrupted = True
+              print(f"  stopped at step {step} of {args.steps}; "
+                    f"the student is kept as it stands")
+              break
 
     student.eval()
     after = evaluate(student, teacher, held, device, args.temperature)
@@ -578,7 +749,9 @@ def main():
     save_tokenizer(tokenizer, args.teacher, out_dir)
 
     with open(os.path.join(out_dir, "pruning.json"), "w", encoding="utf-8") as fout:
-        json.dump({"teacher": args.teacher, "kept_blocks": kept,
+        json.dump({"teacher": args.teacher, "name": name,
+                   "corpus": [{"repo": r, "config": c, "weight": w} for r, c, w in mix],
+                   "kept_blocks": kept,
                    "selection": args.selection, "influence": influence,
                    "divergence_before": before, "divergence_after": after,
                    "steps": step, "steps_requested": args.steps,
@@ -595,4 +768,13 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        # Reached only when the interruption lands outside the training loop: while the
+        # corpus is being read, while block influence is measured, or while the result is
+        # being written. None of those has anything worth keeping half-done, so the run
+        # simply stops and says where it was.
+        print("\ninterrupted before the run could produce anything; nothing was written.",
+              file=sys.stderr)
+        sys.exit(130)
