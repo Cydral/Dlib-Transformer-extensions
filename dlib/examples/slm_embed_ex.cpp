@@ -57,6 +57,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <cmath>
 #include <fstream>
 #include <iostream>
@@ -190,7 +191,25 @@ static std::vector<std::string> chunk_text(const std::string& text, size_t targe
             if (cut < limit) end = cut + 1;
         }
 
-        std::string piece = text.substr(pos, end - pos);
+        /* A chunk starts on a word, never in the middle of one.
+
+           The overlap makes every chunk after the first begin wherever the previous one
+           happened to stop, which is usually mid-word: a passage returned to a reader then
+           opens with "nse Incident Responder" and reads as damaged even when it answers the
+           question. Advancing to the next boundary costs a few characters of overlap and
+           removes the impression entirely. */
+        size_t begin = pos;
+        if (begin > 0)
+        {
+            const size_t limit = std::min(begin + 200, text.size());
+            while (begin < limit && !std::isspace(static_cast<unsigned char>(text[begin])))
+                ++begin;
+            while (begin < limit && std::isspace(static_cast<unsigned char>(text[begin])))
+                ++begin;
+        }
+        if (begin >= end) { if (end >= text.size()) break; pos = end; continue; }
+
+        std::string piece = text.substr(begin, end - begin);
         // Trim, since a chunk starting on a newline reads badly when returned.
         const size_t first = piece.find_first_not_of(" \t\r\n");
         const size_t last = piece.find_last_not_of(" \t\r\n");
