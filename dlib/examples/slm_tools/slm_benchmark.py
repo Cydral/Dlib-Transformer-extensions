@@ -148,14 +148,32 @@ def run_benchmarks(model_path, tasks, limit, batch_size, device, shots_override)
         raise
 
     results = {}
-    lm = HFLM(pretrained=model_path, batch_size=batch_size, device=device)
+    if str(batch_size) == "auto":
+        print("\n  note: --batch-size auto probes for the largest batch the card will take,")
+        print("        which fails outright if anything else is using it. A fixed size is")
+        print("        slower and survives sharing the card with a training run.")
+    try:
+        lm = HFLM(pretrained=model_path, batch_size=batch_size, device=device)
+    except Exception as e:                                        # noqa: BLE001
+        sys.exit(f"could not load the model: {e}")
 
     for task in tasks:
         shots = shots_override if shots_override is not None else TASK_SHOTS.get(task, 0)
         print(f"\n  {task} ({shots}-shot"
               f"{f', {limit} samples' if limit else ''})...", flush=True)
-        out = lm_eval.simple_evaluate(model=lm, tasks=[task], num_fewshot=shots,
-                                      limit=limit, verbosity="ERROR")
+        try:
+            out = lm_eval.simple_evaluate(model=lm, tasks=[task], num_fewshot=shots,
+                                          limit=limit, verbosity="ERROR")
+        except Exception as e:                                    # noqa: BLE001
+            # Out of memory is the common failure and says nothing useful on its own:
+            # the card is usually shared with a training run, or the batch is too large
+            # for what is left of it.
+            if "out of memory" in str(e).lower():
+                print(f"    out of memory on {task}. The card may be shared with another")
+                print( "    process; try --batch-size 1, or --device cpu, or wait.")
+                continue
+            print(f"    {task} failed: {e}")
+            continue
         row = out["results"].get(task, {})
         metric = TASK_METRIC.get(task, "acc")
         value = None
@@ -219,7 +237,10 @@ def main():
     p.add_argument("--shots", type=int, default=None,
                    help="override the few-shot count; the defaults match how each task is "
                         "normally reported")
-    p.add_argument("--batch-size", default="auto")
+    p.add_argument("--batch-size", default="4",
+                   help="requests per forward pass. 'auto' lets lm-eval probe for the "
+                        "largest that fits, which allocates aggressively and fails on a "
+                        "card another process is already using (default: 4)")
     p.add_argument("--device", default=None, help="cuda or cpu; detected when omitted")
     p.add_argument("--compare", default=os.path.join(here, REFERENCE_FILE))
     p.add_argument("--show-reference", action="store_true",

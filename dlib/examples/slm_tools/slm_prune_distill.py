@@ -388,10 +388,14 @@ def main():
     p.add_argument("--grad-accum", type=int, default=1)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--dtype", default="bfloat16", choices=["float32", "bfloat16", "float16"])
+    p.add_argument("--seed", type=int, default=1234,
+                   help="fixes the initialization of what the student does not inherit, so "
+                        "two runs of the same command can be compared (default: 1234)")
     args = p.parse_args()
 
     device = args.device
     dtype = getattr(torch, args.dtype)
+    torch.manual_seed(args.seed)
 
     # Said out loud, because the alternative is an hour of silence.
     #
@@ -489,42 +493,51 @@ def main():
     running = 0.0
     t0 = time.time()
     train = make(args.steps, train_skip)
-    for step, (ids, mask) in enumerate(train, 1):
-        ids, mask = ids.to(device), mask.to(device)
-        with torch.no_grad():
-            t_out = teacher(input_ids=ids, attention_mask=mask,
-                            output_hidden_states=(args.alpha < 1.0), return_dict=True)
-        s_out = student(input_ids=ids, attention_mask=mask,
-                        output_hidden_states=(args.alpha < 1.0), return_dict=True)
-        loss, kl, hid = distillation_loss(s_out, t_out, mask,
-                                          mapping if args.alpha < 1.0 else {},
-                                          args.temperature, args.alpha)
-        (loss / args.grad_accum).backward()
-        running += loss.item()
+    interrupted = False
+    step = 0
+    try:
+      for step, (ids, mask) in enumerate(train, 1):
+          ids, mask = ids.to(device), mask.to(device)
+          with torch.no_grad():
+              t_out = teacher(input_ids=ids, attention_mask=mask,
+                              output_hidden_states=(args.alpha < 1.0), return_dict=True)
+          s_out = student(input_ids=ids, attention_mask=mask,
+                          output_hidden_states=(args.alpha < 1.0), return_dict=True)
+          loss, kl, hid = distillation_loss(s_out, t_out, mask,
+                                            mapping if args.alpha < 1.0 else {},
+                                            args.temperature, args.alpha)
+          (loss / args.grad_accum).backward()
+          running += loss.item()
 
-        if step % args.grad_accum == 0:
-            torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
-            opt.step()
-            opt.zero_grad(set_to_none=True)
-            sched.step()
+          if step % args.grad_accum == 0:
+              torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
+              opt.step()
+              opt.zero_grad(set_to_none=True)
+              sched.step()
 
-        # The first few steps are reported one by one, then every twenty-five.
-        #
-        # A run whose first message arrives after twenty-five steps looks identical to a run
-        # that is stuck, and the difference matters most exactly when the steps are slow.
-        # Announcing the first one tells a caller within seconds whether anything is moving,
-        # and at what pace.
-        report = step <= 3 or step % 25 == 0 or step == args.steps
-        if report:
-            window = 1 if step <= 3 else min(25, step)
-            elapsed = time.time() - t0
-            print(f"  step {step:>5}/{args.steps}  loss {running / window:.4f}"
-                  f"  kl {kl:.4f}  hidden {hid:.4f}  lr {sched.get_last_lr()[0]:.2e}"
-                  f"  {elapsed / step:.2f} s/step", flush=True)
-            if step > 3:
-                running = 0.0
-            else:
-                running = 0.0
+          # The first few steps are reported one by one, then every twenty-five.
+          #
+          # A run whose first message arrives after twenty-five steps looks identical to a run
+          # that is stuck, and the difference matters most exactly when the steps are slow.
+          # Announcing the first one tells a caller within seconds whether anything is moving,
+          # and at what pace.
+          report = step <= 3 or step % 25 == 0 or step == args.steps
+          if report:
+              window = 1 if step <= 3 else min(25, step)
+              elapsed = time.time() - t0
+              print(f"  step {step:>5}/{args.steps}  loss {running / window:.4f}"
+                    f"  kl {kl:.4f}  hidden {hid:.4f}  lr {sched.get_last_lr()[0]:.2e}"
+                    f"  {elapsed / step:.2f} s/step", flush=True)
+              if step > 3:
+                  running = 0.0
+              else:
+                  running = 0.0
+
+    except KeyboardInterrupt:
+        # Interrupted, not abandoned: what the student has learned is measured and
+        # written, so hours of recovery are not lost to a keystroke.
+        interrupted = True
+        print(f"\n  interrupted at step {step}; the student is kept as it stands")
 
     student.eval()
     after = evaluate(student, teacher, held, device, args.temperature)
@@ -539,7 +552,8 @@ def main():
         json.dump({"teacher": args.teacher, "kept_blocks": kept,
                    "selection": args.selection, "influence": influence,
                    "divergence_before": before, "divergence_after": after,
-                   "steps": args.steps, "alpha": args.alpha,
+                   "steps": step, "steps_requested": args.steps,
+                   "interrupted": interrupted, "seed": args.seed, "alpha": args.alpha,
                    "temperature": args.temperature}, fout, indent=2)
 
     print(f"\nwritten to {args.out}")
