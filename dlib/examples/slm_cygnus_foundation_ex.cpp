@@ -62,17 +62,47 @@ using namespace dlib;
    (fine-tuning, serving) should be pointed to these same default names. */
 constexpr char SERIES_NAME[] = "Cygnus";
 
-/* Static architecture parameters: the Cygnus target topology. These are compile-time
-   template arguments for the network type and must match the tokenizer vocabulary
-   size. To define a different size in the series, edit these constants and recompile. */
-constexpr long NUM_TOKENS    = 5850;
-constexpr long NUM_LAYERS    = 4;
-constexpr long NUM_HEADS     = 6;
+/* The Cygnus-M target topology.
+
+   Chosen rather than inherited, which is the one advantage a project that builds its own
+   tokenizer has over a project that adopts someone else's. A published small model carries
+   a vocabulary sized for the largest member of its family: Qwen3-0.6B spends 32% of its
+   parameters on a table of 151,936 entries it barely needs. Sizing the vocabulary to the
+   model instead puts that share back into the blocks, where it does work.
+
+   Every number below follows from three constraints.
+
+   HEAD DIMENSION OF 64. Not a convention but an alignment: attention kernels are tiled for
+   it, and a head of 38, as the previous topology had, leaves performance on the table at
+   every product. The width is therefore a multiple of the head count times 64.
+
+   NARROW AND DEEP. The width-to-depth ratio here is 35, against 19 for SmolLM2-135M and 37
+   for Qwen3-0.6B; the previous topology sat at 57, wide and flat. At equal parameter count
+   depth buys composition that width does not, and the block-influence measurements this
+   project ran on Qwen3 show why: the first and last blocks do work of a different nature
+   from the middle ones, and four blocks leave no room for that division of labour.
+
+   A VOCABULARY THAT STAYS A MINORITY. At 24,576 entries the table is 17% of the dense
+   parameter count. Smaller would fragment text, and non-Latin scripts first, where a
+   shrinking vocabulary turns characters back into several tokens each.
+
+   THE MIXTURE. Four experts routed two at a time store 269M parameters and activate 151M.
+   That is the point of the arrangement: capacity is paid for once in memory and never again
+   at inference. Routing one expert at a time would activate exactly the 92M of the dense
+   variant, for three times its capacity, at the cost of a routing signal that is harder to
+   train. Two is the safer default and remains cheaper than a dense model of the same
+   capacity.
+
+   Dense equivalent, for reference: 92.4M parameters, of which 15.7M in the embedding table.
+*/
+constexpr long NUM_TOKENS    = 24576;
+constexpr long NUM_LAYERS    = 18;
+constexpr long NUM_HEADS     = 10;
 constexpr long NUM_KV_HEADS  = 2;
-constexpr long EMBEDDING_DIM = 228;
+constexpr long EMBEDDING_DIM = 640;
 constexpr long NUM_EXPERTS   = 4;
 constexpr long TOP_K         = 2;
-constexpr long MAX_SEQ_LEN   = 300;
+constexpr long MAX_SEQ_LEN   = 1024;
 
 /* z-loss weight added at every supervised position by loss_cross_entropy_per_token.
    0 disables it. A small value stabilizes foundation training without distorting the

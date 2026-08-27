@@ -59,17 +59,22 @@
 using namespace std;
 using namespace dlib;
 
-/* Single source of truth for the architecture. MUST match slm_cygnus_foundation_ex.cpp. */
+/* The Cygnus-M target topology. MUST match slm_cygnus_foundation_ex.cpp exactly.
+
+   A mismatch is a deserialization error rather than a silent degradation, which is the
+   behaviour to want: the two programs share weights, and a foundation model loaded into a
+   differently shaped network would fail loudly rather than train on nonsense. See the
+   foundation example for why each number is what it is. */
 struct pipeline_constants
 {
-    static constexpr long num_tokens = 5850;
-    static constexpr long num_layers = 4;
-    static constexpr long num_heads = 6;
+    static constexpr long num_tokens = 24576;
+    static constexpr long num_layers = 18;
+    static constexpr long num_heads = 10;
     static constexpr long num_kv_heads = 2;
-    static constexpr long embedding_dim = 228;
+    static constexpr long embedding_dim = 640;
     static constexpr long num_experts = 4;
     static constexpr long top_k = 2;
-    static constexpr long max_seq_len = 300;
+    static constexpr long max_seq_len = 1024;
 };
 
 constexpr double Z_LOSS_WEIGHT = 1e-4;
