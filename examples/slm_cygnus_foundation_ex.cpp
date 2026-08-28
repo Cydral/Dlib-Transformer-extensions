@@ -33,6 +33,16 @@
       Pre-train       : slm_cygnus_foundation_ex --train --external-data corpus.txt
 !*/
 
+#ifdef _WIN32
+// For the console code page, so that non-Latin output is not reinterpreted byte by byte.
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <windows.h>
+#endif
 #include <iostream>
 #include <string>
 #include <vector>
@@ -62,17 +72,47 @@ using namespace dlib;
    (fine-tuning, serving) should be pointed to these same default names. */
 constexpr char SERIES_NAME[] = "Cygnus";
 
-/* Static architecture parameters: the Cygnus target topology. These are compile-time
-   template arguments for the network type and must match the tokenizer vocabulary
-   size. To define a different size in the series, edit these constants and recompile. */
-constexpr long NUM_TOKENS    = 5850;
-constexpr long NUM_LAYERS    = 4;
-constexpr long NUM_HEADS     = 6;
+/* The Cygnus-M target topology.
+
+   Chosen rather than inherited, which is the one advantage a project that builds its own
+   tokenizer has over a project that adopts someone else's. A published small model carries
+   a vocabulary sized for the largest member of its family: Qwen3-0.6B spends 32% of its
+   parameters on a table of 151,936 entries it barely needs. Sizing the vocabulary to the
+   model instead puts that share back into the blocks, where it does work.
+
+   Every number below follows from three constraints.
+
+   HEAD DIMENSION OF 64. Not a convention but an alignment: attention kernels are tiled for
+   it, and a head of 38, as the previous topology had, leaves performance on the table at
+   every product. The width is therefore a multiple of the head count times 64.
+
+   NARROW AND DEEP. The width-to-depth ratio here is 35, against 19 for SmolLM2-135M and 37
+   for Qwen3-0.6B; the previous topology sat at 57, wide and flat. At equal parameter count
+   depth buys composition that width does not, and the block-influence measurements this
+   project ran on Qwen3 show why: the first and last blocks do work of a different nature
+   from the middle ones, and four blocks leave no room for that division of labour.
+
+   A VOCABULARY THAT STAYS A MINORITY. At 24,576 entries the table is 17% of the dense
+   parameter count. Smaller would fragment text, and non-Latin scripts first, where a
+   shrinking vocabulary turns characters back into several tokens each.
+
+   THE MIXTURE. Four experts routed two at a time store 269M parameters and activate 151M.
+   That is the point of the arrangement: capacity is paid for once in memory and never again
+   at inference. Routing one expert at a time would activate exactly the 92M of the dense
+   variant, for three times its capacity, at the cost of a routing signal that is harder to
+   train. Two is the safer default and remains cheaper than a dense model of the same
+   capacity.
+
+   Dense equivalent, for reference: 92.4M parameters, of which 15.7M in the embedding table.
+*/
+constexpr long NUM_TOKENS    = 24576;
+constexpr long NUM_LAYERS    = 18;
+constexpr long NUM_HEADS     = 10;
 constexpr long NUM_KV_HEADS  = 2;
-constexpr long EMBEDDING_DIM = 228;
+constexpr long EMBEDDING_DIM = 640;
 constexpr long NUM_EXPERTS   = 4;
 constexpr long TOP_K         = 2;
-constexpr long MAX_SEQ_LEN   = 300;
+constexpr long MAX_SEQ_LEN   = 1024;
 
 /* z-loss weight added at every supervised position by loss_cross_entropy_per_token.
    0 disables it. A small value stabilizes foundation training without distorting the
@@ -350,6 +390,116 @@ void build_flat_samples_from_segments(
         flat_corpus[0].insert(flat_corpus[0].end(), seg.begin(), seg.end());
 
     build_single_token_prediction_dataset(flat_corpus, max_seq_len, pad_token, false, out_samples, out_labels);
+}
+
+/* What a tokenizer costs, language by language.
+
+   A vocabulary is a fixed budget shared between writing systems that share nothing with each
+   other. Latin scripts pool their subwords, so four European languages cost little more than
+   one; every other script starts from the raw bytes, and UTF-8 spells a Han character in
+   three of them. A budget spent badly leaves one language segmented almost byte by byte, and
+   the model then pays for that language for the rest of its life: three times the sequence
+   length to say the same thing, three times the attention, three times the memory.
+
+   Nothing in a training run reveals this. The loss falls, the samples look plausible, and
+   the only symptom is that answers in one language are inexplicably shorter and worse. It is
+   measured here instead, before a single step is taken, on one sentence per language saying
+   roughly the same thing.
+
+   The figure to read is bytes per token. Around four means the language is well served. Near
+   one means it is being spelled out, and the vocabulary needs redistributing or enlarging.
+
+   Every literal below is written as \u escapes rather than as the characters themselves,
+   so the file stays pure ASCII. A source file carrying Cyrillic and Han directly compiles
+   under GCC and Clang and needs /utf-8 under MSVC, which this project does not pass; the
+   escapes remove the question rather than answer it. */
+int run_check_tokenizer(const std::string& tokenizer_file)
+{
+    bpe_tokenizer tokenizer;
+    try
+    {
+        deserialize(tokenizer_file) >> tokenizer;
+    }
+    catch (const std::exception& e)
+    {
+        cerr << "Error: cannot read " << tokenizer_file << ": " << e.what() << "\n";
+        return 1;
+    }
+
+    cout << "=== TOKENIZER REPORT ===\n"
+         << "File             : " << tokenizer_file << "\n"
+         << "Vocabulary size  : " << tokenizer.get_vocab_size()
+         << " (target " << NUM_TOKENS << ")\n\n";
+
+    /* The same statement in every language, so that what is compared is the writing system
+       and not what happens to be said. Two other registers follow, because a model that
+       answers questions spends its life producing lists and code rather than prose. */
+    const std::vector<std::pair<std::string, std::string>> samples = {
+        {"English", "The cryptographic module must be validated against the standard that "
+                    "applies to the system before it is deployed in production."},
+        {"French",  "Le module cryptographique doit \u00eatre valid\u00e9 selon la norme "
+                    "applicable au syst\u00e8me avant sa mise en production."},
+        {"German",  "Das kryptografische Modul muss vor der Inbetriebnahme nach der f\u00fcr "
+                    "das System geltenden Norm validiert werden."},
+        {"Spanish", "El m\u00f3dulo criptogr\u00e1fico debe validarse conforme a la norma "
+                    "aplicable al sistema antes de su puesta en producci\u00f3n."},
+        {"Russian", "\u041a\u0440\u0438\u043f\u0442\u043e\u0433\u0440\u0430\u0444"
+                    "\u0438\u0447\u0435\u0441\u043a\u0438\u0439 \u043c\u043e\u0434"
+                    "\u0443\u043b\u044c \u0434\u043e\u043b\u0436\u0435\u043d "
+                    "\u0431\u044b\u0442\u044c \u043f\u0440\u043e\u0432\u0435\u0440"
+                    "\u0435\u043d \u0434\u043e \u0432\u0432\u043e\u0434\u0430 "
+                    "\u0432 \u044d\u043a\u0441\u043f\u043b\u0443\u0430\u0442"
+                    "\u0430\u0446\u0438\u044e."},
+        {"Chinese", "\u5bc6\u7801\u6a21\u5757\u5728\u6295\u5165\u751f\u4ea7\u4e4b"
+                    "\u524d\u5fc5\u987b\u6839\u636e\u9002\u7528\u4e8e\u8be5\u7cfb"
+                    "\u7edf\u7684\u6807\u51c6\u8fdb\u884c\u9a8c\u8bc1\u3002"},
+        {"Japanese","\u6697\u53f7\u30e2\u30b8\u30e5\u30fc\u30eb\u306f\u3001\u30b7"
+                    "\u30b9\u30c6\u30e0\u306b\u9069\u7528\u3055\u308c\u308b\u898f"
+                    "\u683c\u306b\u5f93\u3063\u3066\u691c\u8a3c\u3055\u308c\u306a"
+                    "\u3051\u308c\u3070\u306a\u3089\u306a\u3044\u3002"},
+        {"Code",    "for (long i = 0; i < n; ++i) { total += weights[i] * values[i]; }"},
+        {"Markdown","## Findings\n\n- **Severity**: High\n- **CVSS**: 9.8\n"
+                    "1. Patch the service\n2. Rotate the credentials\n"},
+    };
+
+    cout << "  language     chars   bytes  tokens  bytes/token  verdict\n"
+         << "  ----------------------------------------------------------\n";
+
+    for (const auto& sample : samples)
+    {
+        const std::vector<int> ids = tokenizer.encode(sample.second);
+        const size_t bytes = sample.second.size();
+
+        /* Characters rather than bytes, counted by skipping UTF-8 continuation bytes, so
+           that a Han character weighs one and not three. */
+        size_t chars = 0;
+        for (unsigned char c : sample.second)
+            if ((c & 0xC0) != 0x80) ++chars;
+
+        const double per_token = ids.empty() ? 0.0
+            : static_cast<double>(bytes) / static_cast<double>(ids.size());
+        const char* verdict = per_token >= 3.0 ? "well served"
+                            : per_token >= 2.0 ? "adequate"
+                                               : "SPELLED OUT";
+
+        cout << "  " << std::left << std::setw(12) << sample.first << std::right
+             << std::setw(6) << chars << std::setw(8) << bytes << std::setw(8) << ids.size()
+             << std::setw(13) << std::fixed << std::setprecision(2) << per_token
+             << "  " << verdict << "\n";
+    }
+
+    cout << "\nBytes per token is the figure that matters. Four and above means the language\n"
+            "is genuinely covered; near one means it is spelled out byte by byte, and every\n"
+            "sentence in it will cost the model several times what it should.\n";
+
+    /* A round trip, because a tokenizer that segments well and decodes badly is worse than
+       one that does neither: the damage would appear only in generated text. */
+    const std::string probe = samples[0].second + " " + samples[5].second;
+    const std::string back = tokenizer.decode(tokenizer.encode(probe), false);
+    cout << "\nRound trip      : "
+         << (back == probe ? "exact" : "DIFFERS, the tokenizer does not restore its input")
+         << "\n";
+    return 0;
 }
 
 int run_build_tokenizer(const std::string& external_path, const std::string& tokenizer_file, size_t max_tokenizer_bytes)
@@ -670,14 +820,64 @@ int run_pipeline(bool do_train, const double learning_rate, const size_t batch_s
     return 0;
 }
 
+// ----------------------------------------------------------------------------------------
+
+/* Makes the console able to show what the model actually produces.
+
+   A model trained on seven writing systems will sooner or later print Cyrillic or Japanese,
+   and where that lands depends entirely on the terminal. Linux terminals have used UTF-8 for
+   twenty years and need nothing. A Windows console still starts in a legacy code page,
+   commonly 850 or 437, in which every byte above 127 is reinterpreted as a different
+   character: the output is not merely ugly, it is a different text, and anyone reading it
+   would conclude the model is broken rather than the console.
+
+   Both ends are set. The output page decides how bytes written are interpreted; the input
+   page decides how typed characters are delivered, which matters as soon as someone asks a
+   question with an accent in it. The previous pages are restored on the way out, because a
+   program that leaves a shell in a different state than it found it is a nuisance.
+
+   Nothing here is conditional on the model or the language: a console that can show UTF-8
+   shows ASCII correctly too, so the safe thing is to do it always. */
+class console_utf8
+{
+public:
+    console_utf8()
+    {
+#ifdef _WIN32
+        previous_out = GetConsoleOutputCP();
+        previous_in = GetConsoleCP();
+        SetConsoleOutputCP(CP_UTF8);
+        SetConsoleCP(CP_UTF8);
+#endif
+    }
+
+    ~console_utf8()
+    {
+#ifdef _WIN32
+        if (previous_out) SetConsoleOutputCP(previous_out);
+        if (previous_in) SetConsoleCP(previous_in);
+#endif
+    }
+
+private:
+#ifdef _WIN32
+    unsigned int previous_out = 0;
+    unsigned int previous_in = 0;
+#endif
+};
+
 int main(int argc, char** argv)
 {
+    // Restored when this object goes out of scope, at the end of main.
+    const console_utf8 console;
+
     try
     {
         signal_handler::setup();
         command_line_parser parser;
 
         parser.add_option("build-tokenizer", "Train the BPE tokenizer on the corpus and exit");
+        parser.add_option("check-tokenizer", "Report what the tokenizer costs per language and exit");
         parser.add_option("train", "Pre-train the model (requires a previously built tokenizer)");
 
         parser.add_option("external-data", "Path to external corpus file", 1);
@@ -721,6 +921,9 @@ int main(int argc, char** argv)
         const size_t max_tok_bytes = max_tok_mb * 1024 * 1024;
 
         const std::string tokenizer_file = get_option(parser, "tokenizer-file", std::string("cygnus_tokenizer.vocab"));
+
+        // Reported before anything else, since it needs only the tokenizer.
+        if (parser.option("check-tokenizer")) return run_check_tokenizer(tokenizer_file);
         const std::string model_file = get_option(parser, "model-file", std::string("cygnus_model.dat"));
         const std::string external_path = parser.option("external-data") ? parser.option("external-data").argument() : "";
 

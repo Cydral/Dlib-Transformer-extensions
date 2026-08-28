@@ -82,6 +82,11 @@
 #include <dlib/data_io/gguf_vision_spec.h>
 #include <dlib/tokenizer/hf_tokenizer.h>
 #include <dlib/tokenizer/chat_template.h>
+/* The library's umbrella header sits outside the guard below, although only the compiled
+   model needs most of it. The adapter plan, the parameter counters and the visitors are
+   named by code that runs in both phases, so a phase-one build without it fails on names
+   it never mentions itself. Phase one pays a little compile time for it, once. */
+#include <dlib/dnn.h>
 
 /* The model-dependent half of this program (probes, conversion, chat) compiles only
    when the generated model header is present. __has_include acts as the build switch:
@@ -103,7 +108,6 @@
 #ifdef WITH_IMPORTED_MODEL
 #  include <random>
 #  include <ctime>
-#  include <dlib/dnn.h>
 #  include <dlib/data_io/gguf_weight_loader.h>
 #  include <dlib/data_io/gguf_vision_loader.h>
 #  include <dlib/data_io/model_archive.h>

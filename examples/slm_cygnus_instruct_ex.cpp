@@ -36,6 +36,16 @@
     deserialization fails or silently produces wrong results.
 !*/
 
+#ifdef _WIN32
+// For the console code page, so that non-Latin output is not reinterpreted byte by byte.
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <windows.h>
+#endif
 #include <iostream>
 #include <iomanip>
 #include <sstream>
@@ -59,17 +69,22 @@
 using namespace std;
 using namespace dlib;
 
-/* Single source of truth for the architecture. MUST match slm_cygnus_foundation_ex.cpp. */
+/* The Cygnus-M target topology. MUST match slm_cygnus_foundation_ex.cpp exactly.
+
+   A mismatch is a deserialization error rather than a silent degradation, which is the
+   behaviour to want: the two programs share weights, and a foundation model loaded into a
+   differently shaped network would fail loudly rather than train on nonsense. See the
+   foundation example for why each number is what it is. */
 struct pipeline_constants
 {
-    static constexpr long num_tokens = 5850;
-    static constexpr long num_layers = 4;
-    static constexpr long num_heads = 6;
+    static constexpr long num_tokens = 24576;
+    static constexpr long num_layers = 18;
+    static constexpr long num_heads = 10;
     static constexpr long num_kv_heads = 2;
-    static constexpr long embedding_dim = 228;
+    static constexpr long embedding_dim = 640;
     static constexpr long num_experts = 4;
     static constexpr long top_k = 2;
-    static constexpr long max_seq_len = 300;
+    static constexpr long max_seq_len = 1024;
 };
 
 constexpr double Z_LOSS_WEIGHT = 1e-4;
@@ -520,8 +535,57 @@ int run_chat(const std::string& model_file, double temperature, size_t top_k, fl
     return 0;
 }
 
+// ----------------------------------------------------------------------------------------
+
+/* Makes the console able to show what the model actually produces.
+
+   A model trained on seven writing systems will sooner or later print Cyrillic or Japanese,
+   and where that lands depends entirely on the terminal. Linux terminals have used UTF-8 for
+   twenty years and need nothing. A Windows console still starts in a legacy code page,
+   commonly 850 or 437, in which every byte above 127 is reinterpreted as a different
+   character: the output is not merely ugly, it is a different text, and anyone reading it
+   would conclude the model is broken rather than the console.
+
+   Both ends are set. The output page decides how bytes written are interpreted; the input
+   page decides how typed characters are delivered, which matters as soon as someone asks a
+   question with an accent in it. The previous pages are restored on the way out, because a
+   program that leaves a shell in a different state than it found it is a nuisance.
+
+   Nothing here is conditional on the model or the language: a console that can show UTF-8
+   shows ASCII correctly too, so the safe thing is to do it always. */
+class console_utf8
+{
+public:
+    console_utf8()
+    {
+#ifdef _WIN32
+        previous_out = GetConsoleOutputCP();
+        previous_in = GetConsoleCP();
+        SetConsoleOutputCP(CP_UTF8);
+        SetConsoleCP(CP_UTF8);
+#endif
+    }
+
+    ~console_utf8()
+    {
+#ifdef _WIN32
+        if (previous_out) SetConsoleOutputCP(previous_out);
+        if (previous_in) SetConsoleCP(previous_in);
+#endif
+    }
+
+private:
+#ifdef _WIN32
+    unsigned int previous_out = 0;
+    unsigned int previous_in = 0;
+#endif
+};
+
 int main(int argc, char** argv)
 {
+    // Restored when this object goes out of scope, at the end of main.
+    const console_utf8 console;
+
     try
     {
         signal_handler::setup();

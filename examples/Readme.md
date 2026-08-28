@@ -36,6 +36,7 @@
   - [`slm_vision_tower_ex.cpp`](#slm_vision_tower_excpp)
   - [`slm_vit_classify_ex.cpp` and `slm_vit_ssl_ex.cpp`](#slm_vit_classify_excpp-and-slm_vit_ssl_excpp)
   - [`slm_distill_ex.cpp`](#slm_distill_excpp)
+  - [`slm_embed_ex.cpp`](#slm_embed_excpp)
   - [`slm_tools/` Python witnesses](#slm_tools-python-witnesses)
   - [`slm_data.h`](#slm_datah-shared-data-layer)
 - [Cross-cutting concepts worth noticing](#cross-cutting-concepts-worth-noticing)
@@ -619,6 +620,35 @@ It is the model factory. The architecture becomes a parameter, the teacher and t
 
 ---
 
+## `slm_embed_ex.cpp`
+
+### Purpose
+Turn text into vectors, index a directory of it, and answer a question with the passage that best matches — the retrieval half of a retrieval-augmented system, with no generation involved.
+
+### What the example teaches
+An embedding model is the decoder you already know **with its last step removed**. An ordinary language model ends by projecting the final hidden state onto the vocabulary; an embedding model stops one step earlier and returns that state. The container reflects this literally: `jina-embeddings-v5-text-small-retrieval` declares itself a `qwen3`, carries `token_embd`, twenty-eight blocks and `output_norm`, and has no `output.weight` at all.
+
+Nothing else in the stack changes. The attention stays causal, the rotary encoding stays as it is, the tokenizer is the model's own.
+
+### Which position becomes the vector
+A causal decoder has exactly one position that has seen the whole text: the last one. Averaging would mix a vector that saw everything with vectors that each saw a prefix, and would produce something the model was never trained to produce. **The container states its own convention** in `<arch>.pooling_type`, and the example follows it rather than assuming.
+
+### Main technical choices
+- **Asymmetry is not optional.** A retrieval model is trained on question-and-passage pairs, so the two sides are encoded into different regions of the space on purpose. The prefixes `Query:` and `Document:` are applied accordingly, and using the wrong one degrades results without raising anything.
+- **Chunking cuts on sentence boundaries and starts on a word.** Overlap otherwise opens every passage mid-syllable, and a passage returned to a reader as `nse Incident Responder` reads as damaged even when it answers the question.
+- **A long question is cut, not truncated.** A passage then scores on its **best** matching piece rather than on an average: a long question usually asks several things, and a passage answering one of them is relevant.
+- **Matryoshka truncation** keeps a prefix of the vector and renormalizes. At 256 dimensions instead of 1024 the ordering is preserved and the index is a quarter of the size.
+- **The search strategy is the program's business.** Below fifty thousand passages every vector is compared, which is exact and costs milliseconds. Above it, a 256-bit angular sketch shortlists a few hundred candidates that are then ranked exactly, so the approximation decides what was *considered* and never the order of what was.
+- **An index knows which model built it**, by keeping what that model made of a fixed sentence. Comparing tokenizers is not enough: an embedding model built from a decoder inherits its vocabulary, so an index built with one and searched with the other passes every check on identifiers and returns confident nonsense.
+- **Weights are dequantized once.** Indexing uses the same matrices thousands of times, and paying the expansion at every use made that work dominate the pass — it was the difference between four hours and four minutes on the same corpus.
+
+### Why this example matters
+It closes the loop that a generative model alone cannot: answering from documents the model never saw during training, with the passage shown rather than paraphrased.
+
+[⬆ Back to top](#on-this-page)
+
+---
+
 ## `slm_advanced_gqa_kvc_train_ex.cpp`
 
 ### Purpose
@@ -647,6 +677,15 @@ Sparse routing means only a fraction of the parameters activate per token, so a 
 - **Top-k routing** over independent SwiGLU experts, with the gate trained jointly.
 - A **KV cache** in the fused attention layer, for generation that stays fast as the context grows.
 - Chunked corpus handling, so that pre-training is not bounded by memory.
+- A **topology sized for its own vocabulary**, which is the one advantage a project that builds its own tokenizer has over a project that adopts someone else's. A published small model carries a vocabulary dimensioned for the largest member of its family, and spends a third of its parameters on entries it barely needs. Every number here follows from that freedom: a head dimension of 64 because attention kernels are tiled for it, a width-to-depth ratio near the narrow-and-deep end where recent small models sit, and a vocabulary held to a sixth of the parameter count.
+- Four experts routed two at a time **store three times what they activate**. Capacity is paid for once in memory and never again at inference, which is the whole argument for the arrangement.
+
+### What `--check-tokenizer` is for
+A vocabulary is a fixed budget shared between writing systems that share nothing with each other. Latin scripts pool their subwords, so four European languages cost little more than one; every other script starts from the raw bytes, and UTF-8 spells a Han character in three of them.
+
+**A budget spent badly leaves one language segmented almost byte by byte**, and the model then pays for that language for the rest of its life: several times the sequence length to say the same thing, and the attention and memory that go with it. Nothing in a training run reveals this. The loss falls, the samples look plausible, and the only symptom is that answers in one language are inexplicably shorter and worse.
+
+The option measures it before a single step is taken, on one sentence per language saying roughly the same thing, plus a code sample and a Markdown answer since those are what a chat model produces all day. The figure to read is **bytes per token**: four and above means the language is covered, near one means it is being spelled out.
 
 [⬆ Back to top](#on-this-page)
 
@@ -663,6 +702,8 @@ The two stages of the usual recipe, made explicit. A foundation model completes 
 
 ### Useful reminders
 The architecture constants **must match the foundation model exactly**. They are compile-time constants on both sides, and a mismatch is a deserialization error rather than a silent degradation — which is the desired behaviour.
+
+The console is set to UTF-8 on entry and restored on exit. A model trained on seven writing systems will print Cyrillic or Japanese sooner or later, and a Windows console still starts in a legacy code page where every byte above 127 becomes a different character: the output is not merely ugly, it is a different text, and a reader would conclude the model is broken rather than the console.
 
 [⬆ Back to top](#on-this-page)
 
@@ -708,6 +749,9 @@ Verify the C++ paths against the implementations everyone else uses.
 - **`slm_eval_loss.py`** measures the loss of a source model on a prepared dataset through Hugging Face weights, with the same masking, windowing and label smoothing as the C++ run. It is how a training pipeline is proven to measure what it claims.
 - **`nist_corpus_prepare.py`** and **`cve_qa_prepare.py`** build knowledge-alignment and task-alignment corpora in the sentinel format the C++ side reads.
 - **`slm_lora_finetune.py`** performs the same fine-tuning in PyTorch, as a comparison point for the training curve.
+- **`slm_prune_distill.py`** removes blocks from a published model and distils the survivors back into shape. Which blocks go is measured rather than guessed: a few forward passes record how far each block moves what passes through it, and the ones whose output stays closest to their input are the ones to drop. The survivors keep the teacher's weights, so the run repairs what the missing blocks did rather than learning the language again. What comes out is an ordinary model of its family with fewer blocks, so the standard converter produces a container this library reads.
+- **`slm_benchmark.py`** places a model against published small models on the usual tasks, each at the few-shot count under which it is normally reported — a detail that decides whether a table means anything, since five-shot and zero-shot MMLU differ by several points on the same model. The comparison figures are read from a file carrying each one's source and date, not fetched: a number quoted without its evaluation settings compares nothing.
+- **`slm_bpe_corpus.py`** collects a corpus for training a tokenizer, from encyclopaedic prose, news archives, filtered web text, multilingual web text and instruction data. The last of these is the one people leave out, and it cannot be recovered afterwards: a tokenizer trained on prose alone cuts numbered lists, code blocks and tabular answers into far more tokens than it needs, and those are what a chat model produces all day. It also reduces a corpus to a much smaller one that yields **the same merge table**, since BPE merges depend on pre-token frequencies and nothing else.
 
 ### Why this matters
 An import pipeline that nothing contradicts is a pipeline nobody has verified. These tools exist so that a number produced in C++ can be put next to a number produced elsewhere, on the same data, with the same conventions.
