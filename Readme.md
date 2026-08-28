@@ -69,7 +69,13 @@ That makes the project useful not only for experimentation, but also for reprodu
 ### 5. It closes the loop between consuming a model and owning one
 Most tooling around open-weight models stops at inference. This project deliberately goes further: a container read from disk becomes a **native Dlib network whose weights are ordinary trainable parameters**. From there the usual Dlib machinery applies — optimizers, visitors, serialization, fine-tuning — which turns a downloaded artifact into a starting point rather than an endpoint.
 
-### 6. It creates a foundation for sovereign and specialized model stacks in C++
+### 6. It turns the vocabulary into a decision rather than an inheritance
+
+A published small model carries a tokenizer sized for the largest member of its family, and spends a third of its parameters on entries it barely needs. A project that builds its own tokenizer does not: it can size the vocabulary to the model, hold the embedding table to a sixth of the parameter count, and put the difference back into the blocks where it does work.
+
+That freedom has to be used carefully, because a vocabulary is a fixed budget shared between writing systems that share nothing with each other, and one spent badly leaves a language segmented almost byte by byte — a defect no training curve reveals. The library measures it before a run starts rather than after.
+
+### 7. It creates a foundation for sovereign and specialized model stacks in C++
 One of the strongest strategic dimensions of the project is that it supports an approach where organizations can build **specialized**, **inspectable**, and potentially **sovereign** model stacks without leaving the C++ / Dlib ecosystem. That is particularly compelling when teams need stronger control over model behavior, runtime integration, training artifacts, or deployment boundaries.
 
 ---
@@ -165,6 +171,18 @@ A built-in **web chat interface** and an **OpenAI-compatible endpoint** (`/v1/ch
 
 **Knowledge distillation, teacher to student.** A teacher is recorded once over a corpus — its top-k logits at every position — into a reusable trace file. Students are then raised on that recording without the teacher ever running again. Because the transfer happens **at the logits**, the student's internals are unconstrained: a **dense** teacher can raise a **mixture-of-experts** student, wider, deeper, or narrower. The only thing both models must share is the tokenizer, and a fingerprint in the trace file makes any disagreement impossible to miss.
 
+**Depth pruning, as the other way to make a model smaller.** Rather than raising a student from nothing, whole blocks are removed from a published model and the survivors are distilled back into shape. Which blocks go is measured rather than guessed: a few forward passes record how far each one moves what passes through it, and those whose output stays closest to their input are the cheapest to lose. Since the survivors keep the teacher's weights, the run repairs what the missing blocks did instead of learning the language again — and what comes out is an ordinary model of its family with fewer blocks, which the standard converter turns into a container this library reads.
+
+The two methods trade the same thing in opposite directions. Pruning starts from the teacher's weights and cannot change the architecture; logit distillation starts from nothing and can change everything. At an equal budget the first wins, which is exactly why the second exists.
+
+### Retrieval, for answering from documents
+
+An embedding model is the decoder already covered here **with its last step removed**: instead of projecting the final hidden state onto the vocabulary, it returns that state. Containers say so themselves — one such model declares itself a `qwen3`, carries the usual blocks and final normalization, and has no output projection at all — so the same loader reads them with no special case.
+
+From there the library indexes a directory of text and answers a question with the passage that best matches it. The parts that decide whether this works are the unglamorous ones: cutting passages on sentence boundaries and starting them on a word, encoding questions and documents differently because retrieval models are trained on pairs of the two, and shortlisting by angular sketch once an index outgrows an exact scan. An index also records **what the model that built it makes of a fixed sentence**, because comparing tokenizers is not enough: an embedding model built from a decoder inherits its vocabulary, and an index searched with the wrong one would return a plausible ranking of the wrong thing.
+
+This closes a loop a generative model cannot close alone — answering from documents it never saw during training, with the passage shown rather than paraphrased.
+
 ### Python utilities, used as witnesses
 
 A small set of Python tools lives beside the examples, and their role is verification rather than production:
@@ -172,7 +190,9 @@ A small set of Python tools lives beside the examples, and their role is verific
 - **reference evaluation through `llama-cpp-python`**, so that the C++ import can be checked against the implementation everyone else uses;
 - **reference vision encoding**, for the same reason on the image side;
 - **reference loss measurement** against Hugging Face weights, which is how a training pipeline is proven to measure what it claims;
-- **corpus preparation** for knowledge-alignment and task-alignment datasets.
+- **corpus preparation** for knowledge-alignment and task-alignment datasets;
+- **corpus collection for a tokenizer**, drawing on encyclopaedic prose, news archives, filtered and multilingual web text, and instruction data — the last of these being the one people leave out, and the one that cannot be recovered afterwards;
+- **benchmarking against published models**, each task run at the few-shot count under which it is normally reported, since a table built without that detail compares nothing.
 
 A pipeline that nothing contradicts is a pipeline nobody has verified.
 
@@ -184,6 +204,8 @@ Today, the project is especially strong as a platform for:
 - converting them into trainable Dlib networks
 - specializing them by supervised fine-tuning and low-rank adaptation
 - raising smaller models by distillation, across architecture boundaries
+- shrinking published models by depth pruning, into containers the ecosystem still reads
+- indexing and searching a document collection with an embedding model
 - text, image, and text-with-image workflows in a single codebase
 
 ---
@@ -202,6 +224,8 @@ This directory contains the practical entry points: training programs, inference
 
 ### 3. Reusable artifacts: [`models/`](models)
 This directory acts as the checkpoint and artifact layer.
+
+The examples appear twice on purpose. [`examples/`](examples) is what a visitor reads: this project's files and the guide that explains them, with none of the upstream library's own examples in the way. `dlib/examples/` is what CMake builds: upstream's tree with this project's files added to it. Nothing connects the two, so `sync_examples.sh` at the repository root reports any drift between them and copies one over the other on request — the divergence being silent by construction, since both copies compile and both look complete.
 
 ---
 
@@ -236,6 +260,9 @@ The runtime engine already serves MoE containers. Giving the statically compiled
 
 ### Tied embeddings
 On a large vocabulary, the embedding table and the output projection dominate a small model: a 40-million-parameter student built on a 152k-token vocabulary spends four fifths of its parameters there. Sharing the two matrices, as several open-weight models do, would change what a small student can be.
+
+### A model of this library's own
+Everything above serves one end: a small language model built here rather than borrowed, on a topology sized for a vocabulary this project chooses, with a mixture of experts that pays its capacity once in memory and adaptive computation that spends depth where the text is difficult. The tooling is in place — corpus collection, tokenizer training and measurement, pre-training, instruction tuning, benchmarking. What separates that from a finished model is compute, and the honest figure is billions of tokens rather than millions.
 
 ### Broader reusable ecosystem
 Additional future progress can also happen around:
