@@ -1,8 +1,6 @@
-[Cover image: a single laptop on a desk, GPU fan visible, or a close-up of a compiler build log scrolling]
-
 # A Small Language Model Stack, Built in C++ on One Machine
 
-## Notes on assembling a full pipeline from corpus to served model, without a cluster, and on the judgement that decides how small is small enough.
+*Notes on assembling a full pipeline from corpus to served model, without a cluster, and on the judgement that decides how small is small enough.*
 
 The interesting question about small language models is not how to make one. It is how small a model can get before it stops being worth running, and that boundary moves depending on what you ask of it. A model that answers general knowledge questions badly at 500M parameters may summarise documents perfectly well at the same size. Finding where the line sits for a given task is an exercise in judgement, and judgement needs a pipeline you can turn quickly.
 
@@ -153,3 +151,7 @@ The general direction the field is moving, towards models that run on ordinary h
 ---
 
 If you have pushed a model further down in size than seemed reasonable and it still did the job, or found the point where it stopped, I would like to hear where that line fell and what the task was. That boundary is the whole subject, and it is not one anybody can map alone. The repository is open, and the articles that follow will take the parts of this pipeline one at a time.
+
+---
+
+[Back to the article index](Readme.md)

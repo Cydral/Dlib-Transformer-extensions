@@ -12,15 +12,13 @@ Every article is published in two places. The Markdown version here is the refer
 
 - [Published](#published)
 - [Planned](#planned)
-- [How these articles are written](#how-these-articles-are-written)
 
 ---
 
 ## Published
 
-| Article | Subject |
-|---|---|
-| [Building a Small Language Model Stack in C++](01-introduction.md) | What the project is, what it covers today, and why a C++ library for this exists at all |
+**[A Small Language Model Stack, Built in C++ on One Machine](01-introduction.md)**  
+What the project covers, the trade between model size and usefulness, and why the work runs on one machine rather than a cluster.
 
 ---
 
@@ -32,7 +30,7 @@ The order below is the order in which they are being written, which follows the 
 
 **Deriving a model from another.** Distillation on logits, distillation on sequences, and depth pruning, treated as three answers to one question. Which to use depends on whether the architecture is allowed to change and on how much compute is available, and the article gives the measurements behind that choice rather than a recommendation.
 
-**Running open-weight models from GGUF.** The container format, the two paths this library offers for it, and the reason there are two. A shape-dynamic engine that reads any supported container at runtime, and a code generator that emits a statically typed network which trains and serializes like any other Dlib model.
+**Running open-weight models from GGUF.** The container format, the two paths Dlib-Transformer offers for it, and the reason there are two. A shape-dynamic engine that reads any supported container at runtime, and a code generator that emits a statically typed network which trains and serializes like any other Dlib model.
 
 **Retrieval, and answering from documents.** What an embedding model is, why it is the same decoder with its last step removed, and what actually decides whether retrieval works: chunk boundaries, the asymmetry between a question and a passage, and knowing which model built an index.
 
@@ -43,15 +41,3 @@ The order below is the order in which they are being written, which follows the 
 **Transformers for images, and models that read both.** Vision transformers for classification and for self-supervised training, then the vision tower that lets a decoder take an image alongside text.
 
 Other subjects will be added as the work reaches them.
-
----
-
-## How these articles are written
-
-Three rules, stated here so that a reader can hold the articles to them.
-
-**Numbers come from runs, not from memory.** Every measurement quoted was produced by the code in this repository, and the command that produced it is given so the reader can obtain their own. Where a figure comes from published work, it is cited.
-
-**Failures are reported.** Several of these articles exist because something did not work, and the diagnosis was more instructive than the fix. A guide that only shows the path that worked teaches very little about the terrain.
-
-**Nothing is claimed to be settled that is not.** Where a design is a bet rather than a conclusion, the article says so and names what would change the answer.
