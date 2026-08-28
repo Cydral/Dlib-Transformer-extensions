@@ -225,6 +225,9 @@ This directory contains the practical entry points: training programs, inference
 ### 3. Reusable artifacts: [`models/`](models)
 This directory acts as the checkpoint and artifact layer.
 
+### 4. Written material: [`docs/`](docs)
+Longer-form articles, one subject at a time: what a design costs, where it breaks, and how to reproduce a result. The examples guide says what each program does; these say why.
+
 The examples appear twice on purpose. [`examples/`](examples) is what a visitor reads: this project's files and the guide that explains them, with none of the upstream library's own examples in the way. `dlib/examples/` is what CMake builds: upstream's tree with this project's files added to it. Nothing connects the two, so `sync_examples.sh` at the repository root reports any drift between them and copies one over the other on request — the divergence being silent by construction, since both copies compile and both look complete.
 
 ---
@@ -234,6 +237,7 @@ The examples appear twice on purpose. [`examples/`](examples) is what a visitor 
 A simple strategy is:
 
 - start with the **main README** if you want the global picture
+- move to [`docs/`](docs) if you want a subject treated at length
 - move to [`examples/`](examples) if you want the workflow details
 - move to [`models/`](models) if you want reusable trained artifacts
 
