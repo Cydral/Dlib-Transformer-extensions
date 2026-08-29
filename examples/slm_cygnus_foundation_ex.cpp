@@ -406,8 +406,16 @@ void build_flat_samples_from_segments(
    measured here instead, before a single step is taken, on one sentence per language saying
    roughly the same thing.
 
-   The figure to read is bytes per token. Around four means the language is well served. Near
-   one means it is being spelled out, and the vocabulary needs redistributing or enlarging.
+   The figure to read is characters per token, and the distinction from bytes per token
+   matters more than it looks. UTF-8 spells a Latin letter in one byte, a Cyrillic one in
+   two and a Han one in three, so a byte-based ratio flatters the heavier scripts
+   mechanically: a tokenizer cutting Japanese two characters at a time scores seven bytes
+   per token and looks twice as good as one cutting English two characters at a time, when
+   both are doing exactly the same work. Characters per token compares like with like.
+
+   Three and above means the language is well served. Below two means most tokens are one
+   or two characters, which is close to spelling the text out, and every sentence in that
+   language will cost the model several times what it should.
 
    Every literal below is written as \u escapes rather than as the characters themselves,
    so the file stays pure ASCII. A source file carrying Cyrillic and Han directly compiles
@@ -462,8 +470,8 @@ int run_check_tokenizer(const std::string& tokenizer_file)
                     "1. Patch the service\n2. Rotate the credentials\n"},
     };
 
-    cout << "  language     chars   bytes  tokens  bytes/token  verdict\n"
-         << "  ----------------------------------------------------------\n";
+    cout << "  language     chars   bytes  tokens  chars/token  bytes/token  verdict\n"
+         << "  ---------------------------------------------------------------------\n";
 
     for (const auto& sample : samples)
     {
@@ -477,20 +485,26 @@ int run_check_tokenizer(const std::string& tokenizer_file)
             if ((c & 0xC0) != 0x80) ++chars;
 
         const double per_token = ids.empty() ? 0.0
+            : static_cast<double>(chars) / static_cast<double>(ids.size());
+        const double bytes_per_token = ids.empty() ? 0.0
             : static_cast<double>(bytes) / static_cast<double>(ids.size());
         const char* verdict = per_token >= 3.0 ? "well served"
                             : per_token >= 2.0 ? "adequate"
-                                               : "SPELLED OUT";
+                                               : "UNDER-SERVED";
 
         cout << "  " << std::left << std::setw(12) << sample.first << std::right
              << std::setw(6) << chars << std::setw(8) << bytes << std::setw(8) << ids.size()
              << std::setw(13) << std::fixed << std::setprecision(2) << per_token
+             << std::setw(13) << bytes_per_token
              << "  " << verdict << "\n";
     }
 
-    cout << "\nBytes per token is the figure that matters. Four and above means the language\n"
-            "is genuinely covered; near one means it is spelled out byte by byte, and every\n"
-            "sentence in it will cost the model several times what it should.\n";
+    cout << "\nCharacters per token is the figure that matters, not bytes per token: UTF-8\n"
+            "spells a Han character in three bytes and a Latin one in one, so a byte ratio\n"
+            "flatters the heavier scripts without them doing any more work. Three characters\n"
+            "per token and above means the language is covered; below two means most tokens\n"
+            "are one or two characters, and every sentence in it costs several times what it\n"
+            "should.\n";
 
     /* A round trip, because a tokenizer that segments well and decodes badly is worse than
        one that does neither: the damage would appear only in generated text. */
@@ -897,6 +911,13 @@ int main(int argc, char** argv)
 
         parser.parse(argc, argv);
 
+        /* The tokenizer report needs nothing but the tokenizer, so it runs before the
+           checks below decide that a run without --build-tokenizer or --train has
+           nothing to do and prints the help instead. */
+        if (parser.option("check-tokenizer"))
+            return run_check_tokenizer(get_option(parser, "tokenizer-file",
+                std::string("cygnus_tokenizer.vocab")));
+
         const bool do_build_tok = parser.option("build-tokenizer");
         const bool do_train = parser.option("train");
 
@@ -905,7 +926,8 @@ int main(int argc, char** argv)
             cout << "\n" << SERIES_NAME << " foundation pre-training\n"
                 << "Example usage:\n"
                 << "  Build tokenizer : " << argv[0] << " --build-tokenizer --external-data corpus.txt\n"
-                << "  Pre-train       : " << argv[0] << " --train --external-data corpus.txt\n";
+                << "  Pre-train       : " << argv[0] << " --train --external-data corpus.txt\n"
+                << "  Check tokenizer : " << argv[0] << " --check-tokenizer\n";
             return 0;
         }
 
@@ -922,8 +944,6 @@ int main(int argc, char** argv)
 
         const std::string tokenizer_file = get_option(parser, "tokenizer-file", std::string("cygnus_tokenizer.vocab"));
 
-        // Reported before anything else, since it needs only the tokenizer.
-        if (parser.option("check-tokenizer")) return run_check_tokenizer(tokenizer_file);
         const std::string model_file = get_option(parser, "model-file", std::string("cygnus_model.dat"));
         const std::string external_path = parser.option("external-data") ? parser.option("external-data").argument() : "";
 
