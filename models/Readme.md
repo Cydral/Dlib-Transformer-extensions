@@ -109,6 +109,31 @@ Two things are worth understanding about this checkpoint. It carries **its own t
 
 ---
 
+### `dlib_lm_tokens_gqa_model.dat`
+
+| | |
+|---|---|
+| Produced by | [`slm_advanced_gqa_train_ex`](../examples/slm_advanced_gqa_train_ex.cpp) |
+| Architecture | Grouped query attention, 3 layers, 6 query heads over 2 KV heads, width 228, head dim 38, window 200 |
+| Vocabulary | Shares `dlib_lm_tokenizer.vocab` with the model above |
+| Parameters | 738,755 |
+| Training | Same 8,066-byte article, 2,976 sequences, 600 epochs |
+| Final state | Loss 0.047, next-token accuracy 100%, reconstruction exact |
+
+**What it does.** The same thing as the model above, on a quarter of the parameters and twice the window. It reproduces the corpus byte for byte, verified.
+
+That comparison is the reason this checkpoint is worth keeping beside the other. **3.8 times fewer parameters, a window twice as long, and the same exact reconstruction.** Some of that comes from having one layer fewer, but the shape of the attention is what makes the trade possible: six query heads share two key-value heads, so the projections that dominate a small attention block are cut without reducing the number of ways the model can attend.
+
+The saving that matters at inference is elsewhere again. A key-value cache holds one entry per KV head per position, so three query heads sharing one KV head divide that cache by three. On a long context, that is usually what limits how much can be served at once.
+
+```
+./slm_advanced_gqa_train_ex --generate --verify
+```
+
+**Use it with the tokenizer beside it.** This model and the one above share `dlib_lm_tokenizer.vocab`, trained on a composite corpus rather than on the article alone. Pairing either model with a different vocabulary produces confident nonsense and raises nothing.
+
+---
+
 ## Recommended usage workflow
 
 If you are downloading a model from this directory, the most robust workflow is usually:

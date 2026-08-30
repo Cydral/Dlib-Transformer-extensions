@@ -305,7 +305,28 @@ def from_chat(sink, budget, min_chars):
 # ---------------------------------------------------------------------------------------
 # Reduction to a corpus that trains the same tokenizer, far faster.
 
-PRETOKEN = re.compile(r"'s|'t|'re|'ve|'m|'ll|'d| ?\w+| ?[^\s\w]+|\s+", re.UNICODE)
+# How the corpus is cut before frequencies are counted.
+#
+# The obvious rule, a run of word characters, is wrong on scripts that do not separate
+# words. \w+ swallows an entire Chinese sentence as one pre-token: twenty-nine characters
+# become one unit that occurs exactly once in the whole corpus. Millions of such units
+# appeared in a seven-language corpus, and each is useless twice over. It carries no
+# frequent merge, since it is seen once. And it survives the reduction below, which keeps
+# every distinct pre-token at least once, so it inflates the reduced corpus and the training
+# time that follows without contributing a single merge.
+#
+# Dense scripts are therefore cut per character, and that alternative comes first: Unicode
+# classifies a Han character as a letter, so any general letter rule placed ahead of it would
+# swallow the run before the specific one could see it. Cutting per character is what the
+# merges rebuild from anyway, and it is what makes those frequencies countable at all.
+PRETOKEN = re.compile(
+    r"'s|'t|'re|'ve|'m|'ll|'d"
+    r"| ?[\u3040-\u30ff\u3400-\u9fff\uf900-\ufaff]"  # kana and Han, one at a time
+    r"| ?[^\W\d_]+"                                   # letters of any other script
+    r"| ?\d+"
+    r"| ?[^\s\w]+"
+    r"|\s+",
+    re.UNICODE)
 
 
 def distil(source, target, keep_bytes, seed):
@@ -319,6 +340,13 @@ def distil(source, target, keep_bytes, seed):
     The proportions are preserved rather than the ranking: keeping only the commonest
     pre-tokens would drop the long tail that decides how unusual words are split, which is
     most of what a tokenizer is for.
+
+    Two things to know before relying on the output. Keeping every distinct pre-token at
+    least once puts a floor under the result, so a corpus with millions of rare pre-tokens
+    reduces less than the requested size suggests. And the proportions come out close rather
+    than exact: measured on a synthetic corpus, frequent Latin pre-tokens land within a
+    point of their source share, while single CJK characters have shown larger deviation
+    that is not yet explained. It is worth measuring on your own corpus before a long run.
     """
     counts = Counter()
     total = 0
