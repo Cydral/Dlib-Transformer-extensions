@@ -593,7 +593,11 @@ int run_pipeline(
 
             size_t correct = 0;
             for (size_t i = 0; i < labels.size(); ++i)
-                if (predicted[i] == labels[i]) correct++;
+                /* The last position only. A label carries one target per position of the
+                   window, while inference returns the argmax at the last position; what
+                   autoregressive reconstruction needs is precisely that one. */
+                if (labels[i].size() > 0 &&
+                    predicted[i] == labels[i](labels[i].size() - 1)) correct++;
 
             double accuracy = static_cast<double>(correct) / labels.size();
             cout << "Training accuracy: " << (accuracy * 100.0) << "%\n";

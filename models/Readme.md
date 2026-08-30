@@ -57,6 +57,58 @@ The important point is not to memorize every architectural detail from this page
 
 ---
 
+## Available checkpoints
+
+Each entry names the program that produced the file, the shape of the network, and what the artifact actually does when loaded. That last column matters more than the others: a checkpoint trained on a small corpus behaves in ways a size and a loss value do not convey.
+
+### `dlib_lm_chars_model.dat`
+
+| | |
+|---|---|
+| Produced by | [`slm_basic_train_ex`](../examples/slm_basic_train_ex.cpp) |
+| Architecture | Fused transformer, 3 layers, 4 heads, width 64, window 50 |
+| Vocabulary | 257 entries, one per byte value plus padding. No tokenizer file needed |
+| Parameters | 4,798,593 |
+| Training | Built-in Shakespeare extract, 14,590 sequences, 93 epochs |
+| Final state | Loss 0.047, accuracy 0.999 on the training sample |
+
+**What it does.** It reproduces its corpus. At an accuracy of 0.999 on five million parameters against a text of that size, the model has memorized rather than generalized, and a prompt drawn from the extract continues with the lines that actually follow it in the play.
+
+That is the correct outcome for this example and worth stating plainly, because the output looks better than the model is. Someone seeing fluent Shakespeare might conclude the network learned English; it learned this text. The point of the checkpoint is to demonstrate that the machinery works end to end, on a corpus small enough to train in minutes and a vocabulary that needs no preparation.
+
+Load it, generate from it, and treat the fluency as a property of the corpus rather than of the model.
+
+```
+./slm_basic_train_ex --generate
+```
+
+The program reads and writes the checkpoint in the current directory, and in training mode it continues from an existing file rather than starting over. Move or rename it first if a fresh run is what you want.
+
+---
+
+### `dlib_lm_tokens_model.dat` and `dlib_lm_tokenizer.vocab`
+
+| | |
+|---|---|
+| Produced by | [`slm_advanced_train_ex`](../examples/slm_advanced_train_ex.cpp) |
+| Architecture | Canonical transformer, 4 layers, 6 heads, width 228, window 100 |
+| Vocabulary | 1,400 BPE entries, trained by the same program on the same corpus |
+| Parameters | 2,822,444 |
+| Training | Built-in article, 8,066 bytes, 3,076 sequences, 400 epochs |
+| Final state | Loss 0.066, byte-for-byte reconstruction exact |
+
+**What it does.** It reproduces its corpus exactly. Running the program with `--generate --verify` regenerates all 8,066 bytes and confirms they are identical to the original.
+
+Two things are worth understanding about this checkpoint. It carries **its own tokenizer**, trained alongside it on the same text, so the pair must be used together: the vocabulary is specific to this corpus and means nothing elsewhere. And its reconstruction is memorization, as with the character-level model, but here demonstrated rather than inferred, since the program verifies it byte by byte.
+
+```
+./slm_advanced_train_ex --generate --verify
+```
+
+**On the accuracy figure.** The program reports a next-token accuracy that a reader should not confuse with the reconstruction. Generation feeds the model its own output and asks only for the token that follows, so a window whose earlier positions are wrong still reproduces the text as long as the last one is right. The verification pass is the authoritative check; the accuracy figure is an indication.
+
+---
+
 ## Recommended usage workflow
 
 If you are downloading a model from this directory, the most robust workflow is usually:

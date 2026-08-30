@@ -435,16 +435,31 @@ int main(int argc, char** argv)
                     cout << "Evaluating model accuracy...\n";
                     my_transformer::network_type<false> g_infer;
                     deserialize(model_file) >> g_infer >> tokenizer;
+                    /* The network predicts one token, the label carries one per position.
+
+                       The loss layer scores every position of a window, so a label is a
+                       vector of targets, while inference returns the argmax at the last
+                       position only. Comparing the two directly was meaningful when a label
+                       was a single token and stopped being so when the loss layer began
+                       reading its targets properly; the figure it produced afterwards was
+                       neither a token accuracy nor a sequence accuracy.
+
+                       What reconstruction needs is the last position, and only that:
+                       generation feeds the model its own output and asks for the next token,
+                       so a window whose earlier positions are wrong reproduces the text
+                       exactly as long as its last one is right. That is the number compared
+                       against the threshold below. */
                     auto predicted = g_infer(samples);
                     size_t correct = 0;
                     for (size_t i = 0; i < labels.size(); ++i)
-                        if (predicted[i] == labels[i]) correct++;
-                    double accuracy = (double)correct / labels.size();
-                    cout << "Training accuracy: " << (accuracy * 100.0) << "%\n";
+                        if (labels[i].size() > 0 &&
+                            predicted[i] == labels[i](labels[i].size() - 1)) correct++;
+                    const double accuracy = (double)correct / labels.size();
+                    cout << "Next-token accuracy: " << (accuracy * 100.0) << "%\n";
 
                     // We need perfect accuracy to reconstruct the internal dataset
                     if (accuracy < 0.999) {
-                        cout << "WARNING: Model accuracy is less than 99.90%. The model may not "
+                        cout << "WARNING: accuracy is below 99.90%. The model may not "
                             << "perfectly reconstruct the input text.\n";
                     }
                 }
