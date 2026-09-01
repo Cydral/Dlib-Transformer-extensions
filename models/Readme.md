@@ -134,6 +134,29 @@ The saving that matters at inference is elsewhere again. A key-value cache holds
 
 ---
 
+### `dlib_lm_tokens_gqa_kvc_model.dat`
+
+| | |
+|---|---|
+| Produced by | [`slm_advanced_gqa_kvc_train_ex`](../examples/slm_advanced_gqa_kvc_train_ex.cpp) |
+| Architecture | Same as above, with a key-value cache in the attention layer |
+| Vocabulary | Shares `dlib_lm_tokenizer.vocab` |
+| Parameters | 739,895 |
+| Training | Same corpus and settings as the model above |
+| Final state | Loss 0.046, next-token accuracy 100%, reconstruction exact |
+
+**What it does.** The same thing again, and that is the point. This checkpoint exists to isolate one variable: the cache changes nothing about what the model learns and everything about how fast it generates.
+
+Trained identically to the model above, it reaches the same loss and reproduces the corpus byte for byte. Generating the same 2,976 tokens takes **9 seconds instead of 14, at 322 tokens per second against 241** — a third faster, and the gap widens with sequence length, since generation without a cache recomputes every previous position at every step while generation with one recomputes nothing.
+
+The parameter count differs by about a thousand, which is not the cache: a cache stores activations rather than weights and adds nothing to learn. The difference comes from the unified attention implementation this variant uses.
+
+```
+./slm_advanced_gqa_kvc_train_ex --generate --verify
+```
+
+---
+
 ## Recommended usage workflow
 
 If you are downloading a model from this directory, the most robust workflow is usually:

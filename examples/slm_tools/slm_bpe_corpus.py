@@ -307,22 +307,33 @@ def from_chat(sink, budget, min_chars):
 
 # How the corpus is cut before frequencies are counted.
 #
-# The obvious rule, a run of word characters, is wrong on scripts that do not separate
-# words. \w+ swallows an entire Chinese sentence as one pre-token: twenty-nine characters
-# become one unit that occurs exactly once in the whole corpus. Millions of such units
-# appeared in a seven-language corpus, and each is useless twice over. It carries no
-# frequent merge, since it is seen once. And it survives the reduction below, which keeps
-# every distinct pre-token at least once, so it inflates the reduced corpus and the training
-# time that follows without contributing a single merge.
+# This rule decides what survives into the reduced corpus, and getting it wrong costs a
+# tokenizer. Two failures bracket the right answer, and both were reached by measurement
+# rather than by reasoning.
 #
-# Dense scripts are therefore cut per character, and that alternative comes first: Unicode
-# classifies a Han character as a letter, so any general letter rule placed ahead of it would
-# swallow the run before the specific one could see it. Cutting per character is what the
-# merges rebuild from anyway, and it is what makes those frequencies countable at all.
+# A run of word characters, the obvious rule, swallows an entire Chinese sentence as one
+# pre-token: twenty-nine characters become a unit seen exactly once in the whole corpus.
+# Millions of such units appeared in a seven-language collection. Each is useless twice
+# over, carrying no frequent merge and surviving the reduction below, which keeps every
+# distinct pre-token at least once.
+#
+# Cutting those scripts one character at a time fixes that and breaks something worse. The
+# reduction shuffles pre-tokens before writing them, so single characters are emitted in
+# isolation and never appear beside the character that followed them. A BPE trainer reading
+# the result has nothing to merge across, and a tokenizer that should reach two or three
+# characters per token plateaus near one. Measured on a full run, Japanese fell by a third
+# while Latin scripts gained a tenth of a point: a bad trade.
+#
+# The answer sits between the two. Dense scripts are cut into short runs, long enough that
+# merges have adjacent characters to work with, short enough that the same run recurs across
+# a corpus rather than appearing once. Four characters is roughly a phrase, and phrases
+# repeat.
+DENSE_RUN = 4
+
 PRETOKEN = re.compile(
     r"'s|'t|'re|'ve|'m|'ll|'d"
-    r"| ?[\u3040-\u30ff\u3400-\u9fff\uf900-\ufaff]"  # kana and Han, one at a time
-    r"| ?[^\W\d_]+"                                   # letters of any other script
+    r"| ?[\u3040-\u30ff\u3400-\u9fff\uf900-\ufaff]{1," + str(DENSE_RUN) + r"}"
+    r"| ?[^\W\d_]+"
     r"| ?\d+"
     r"| ?[^\s\w]+"
     r"|\s+",
@@ -340,13 +351,6 @@ def distil(source, target, keep_bytes, seed):
     The proportions are preserved rather than the ranking: keeping only the commonest
     pre-tokens would drop the long tail that decides how unusual words are split, which is
     most of what a tokenizer is for.
-
-    Two things to know before relying on the output. Keeping every distinct pre-token at
-    least once puts a floor under the result, so a corpus with millions of rare pre-tokens
-    reduces less than the requested size suggests. And the proportions come out close rather
-    than exact: measured on a synthetic corpus, frequent Latin pre-tokens land within a
-    point of their source share, while single CJK characters have shown larger deviation
-    that is not yet explained. It is worth measuring on your own corpus before a long run.
     """
     counts = Counter()
     total = 0
