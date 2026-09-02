@@ -213,6 +213,7 @@ namespace dlib
         unsigned    hot_window           = 64;
         unsigned    lookahead            = 24;
         bool        fingerprint          = true;
+        std::size_t fingerprint_min_bytes = 0;
         unsigned    advise_horizon       = 96;
         unsigned    idle_release_ms      = 0;
         double      idle_release_keep    = 0.5;
@@ -244,6 +245,8 @@ namespace dlib
         unsigned long long host_pull_bytes   = 0;
         std::size_t        largest_block     = 0;
         std::size_t        immovable_bytes   = 0;
+        std::size_t        hash_threshold    = 0;
+        std::size_t        hash_count        = 0;
         // Where the wall clock goes inside the subsystem, in seconds.
         double             sync_seconds      = 0;
         std::size_t        sync_count        = 0;

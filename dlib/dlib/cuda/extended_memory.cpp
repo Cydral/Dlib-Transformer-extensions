@@ -1199,6 +1199,8 @@ namespace xmem
             s.host_pull_bytes   = host_pull_bytes;
             s.largest_block     = largest_block;
             s.immovable_bytes   = immovable_bytes;
+            s.hash_threshold    = fingerprint_threshold();
+            s.hash_count        = hash_count;
             s.sync_seconds      = sync_seconds;
             s.sync_count        = sync_count;
             s.wait_seconds      = wait_seconds;
@@ -1355,6 +1357,38 @@ namespace xmem
             throw cuda_error(m.str());
         }
 
+        /*
+            Smallest block worth hashing, from what the run has measured about itself.
+
+            A fingerprint costs a kernel launch, the same handful of microseconds whatever
+            the block holds; moving the block costs its size divided by the link. The two
+            cross at one launch worth of bandwidth, and nothing about that figure can be
+            guessed in advance: it depends on the card, on the driver and on where the store
+            sits. Both terms are already counted here, so the threshold is read off them
+            rather than chosen, and until there is enough to read it defaults to the size
+            below which a block is not evicted at all.
+
+            Guessing it once cost a run twice the traffic it needed, which is the argument
+            for not guessing it again.
+        */
+        std::size_t fingerprint_threshold () const
+        {
+            if (opt.fingerprint_min_bytes != 0)
+                return opt.fingerprint_min_bytes;
+            if (hash_count < 32 || hash_seconds <= 0 || wait_seconds <= 0 || wait_bytes == 0)
+                return opt.min_block_bytes;
+
+            const double per_hash = hash_seconds / (double)hash_count;
+            const double bytes_per_second = (double)wait_bytes / wait_seconds;
+            const double breakeven = per_hash * bytes_per_second;
+
+            const std::size_t lo = 256ul * 1024ul;
+            const std::size_t hi = 64ul * 1024ul * 1024ul;
+            if (breakeven < (double)lo) return lo;
+            if (breakeven > (double)hi) return hi;
+            return (std::size_t)breakeven;
+        }
+
         // Everything the budget has to cover: managed blocks plus workspaces.
         std::size_t resident_locked () const
         {
@@ -1463,9 +1497,17 @@ namespace xmem
                    settles it: hashing where the data already sits costs a read of device
                    memory, some fifty times less than moving the same bytes over the bus to
                    find out they did not change. */
+                /* Only where the answer is worth the question. Hashing a block costs a
+                   kernel launch, which is the same handful of microseconds whatever the
+                   block holds, while transferring it costs its size divided by the link.
+                   Below a few megabytes the transfer is cheaper than the enquiry, and
+                   asking anyway turns a saving into a tax: a run whose evictions are mostly
+                   small activations spends a tenth of itself hashing blocks it would have
+                   been quicker to move. */
                 unsigned long long hx = 0, ha = 0;
                 bool hashed = false;
-                if (!store_current && opt.fingerprint && r->slot_written)
+                if (!store_current && opt.fingerprint && r->slot_written &&
+                    r->bytes >= fingerprint_threshold())
                 {
                     try
                     {
@@ -1474,6 +1516,7 @@ namespace xmem
                                                           hx, ha, xstream);
                         hash_seconds += std::chrono::duration<double>(
                                             std::chrono::steady_clock::now() - t0).count();
+                        ++hash_count;
                         hashed = true;
                     }
                     catch (...)
@@ -2199,6 +2242,7 @@ namespace xmem
         unsigned long long wait_bytes  = 0;
         unsigned long long ahead_bytes = 0;
         double      hash_seconds    = 0;
+        std::size_t hash_count      = 0;
         std::size_t store_reads     = 0;
         std::size_t pages_advised   = 0;
         std::size_t idle_releases   = 0;
@@ -2454,7 +2498,9 @@ namespace xmem
                                     << " MiB, "
                                     << (s.ahead_seconds > 0 ? (s.ahead_bytes/mib/1024.0)/s.ahead_seconds : 0.0)
                                     << " GiB/s\n"
-            << "  time hashing    " << s.hash_seconds     << " s\n"
+            << "  time hashing    " << s.hash_seconds << " s over " << s.hash_count
+                                    << " fingerprints, above " << (s.hash_threshold/1024)
+                                    << " KiB\n"
             << "  time stalled    " << s.sync_seconds     << " s over " << s.sync_count
                                     << " device synchronisations\n"
             << "  access cycle    ";

@@ -173,6 +173,7 @@ int main(int argc, char** argv)
         parser.add_option("idle-purge", "ms of inactivity after which the card is handed back", 1);
         parser.add_option("no-predict", "evict by least recent use instead of by next use");
         parser.add_option("no-fingerprint", "read every block back instead of hashing it on the card");
+        parser.add_option("fingerprint-min", "smallest block worth hashing in KiB, 0 to measure it", 1);
         parser.add_option("blocks", "list the managed blocks by size at the end of the run");
         parser.add_option("paranoid", "fill every released device block with NaN");
         parser.add_option("steps", "number of steps to run", 1);
@@ -205,6 +206,7 @@ int main(int argc, char** argv)
             opts.idle_purge_ms     = (unsigned)get_option(parser, "idle-purge", 0);
             opts.predictive      = !parser.option("no-predict");
             opts.fingerprint     = !parser.option("no-fingerprint");
+            opts.fingerprint_min_bytes = (size_t)get_option(parser, "fingerprint-min", 0) * 1024;
             opts.paranoid        = parser.option("paranoid");
             opts.verbose         = true;
 
