@@ -1,4 +1,4 @@
-// Copyright (C) 2015  Davis E. King (davis@dlib.net)
+// Copyright (C) 2026 Cydral Technology (cydraltechnology@gmail.com)
 // License: Boost Software License   See LICENSE.txt for the full license.
 #ifndef DLIB_GPU_DaTA_CPP_
 #define DLIB_GPU_DaTA_CPP_
@@ -54,6 +54,12 @@ namespace dlib
         }
         else
         {
+            /* Both operands are pinned for the duration of the copy.  Without this, a
+               large destination can push its own source out of the device between the two
+               accessor calls below, since the second call is what triggers the eviction
+               and the first has already handed out its pointer. */
+            device_scope keep_both{&dest, &src};
+
             // if we write to the entire thing then we can use device_write_only()
             if (dest_offset == 0 && num == dest.size())
             {
@@ -132,6 +138,15 @@ namespace dlib
     {
         if (!host_current)
         {
+            /* The host mirror can be absent when the extended memory subsystem has pushed
+               this block down to the file tier.  Callers reach this function through the
+               accessors, which reinstate the mirror first, so a null here means the block
+               has no content anywhere and there is nothing to bring back. */
+            if (!data_host || !data_device)
+            {
+                host_current = true;
+                return;
+            }
             wait_for_transfer_to_finish();
             CHECK_CUDA(cudaMemcpy(data_host.get(), data_device.get(), data_size*sizeof(float), cudaMemcpyDeviceToHost));
             host_current = true;
@@ -149,16 +164,33 @@ namespace dlib
     {
         if (!device_current)
         {
-            if (device_in_use)
+            if (!data_device)
             {
-                // Wait for any possible CUDA kernels that might be using our memory block to
-                // complete before we overwrite the memory.
-                synchronize_stream(0);
-                device_in_use = false;
+                /* The trainer calls this to overlap the next batch with the current step,
+                   so the block is wanted even though nothing has read it yet.  Bring it
+                   back rather than silently skipping the prefetch that was asked for. */
+                if (xrec)
+                    xmem::restore_device(xrec, true);
+
+                if (!data_device)
+                    return;
             }
-            CHECK_CUDA(cudaMemcpyAsync(data_device.get(), data_host.get(), data_size*sizeof(float), cudaMemcpyHostToDevice, (cudaStream_t)cuda_stream.get()));
-            have_active_transfer = true;
-            device_current = true;
+
+            // The restore may have satisfied the request on its own, which happens when
+            // the content came straight from the file tier into the device buffer.
+            if (!device_current)
+            {
+                if (device_in_use)
+                {
+                    // Wait for any possible CUDA kernels that might be using our memory block to
+                    // complete before we overwrite the memory.
+                    synchronize_stream(0);
+                    device_in_use = false;
+                }
+                CHECK_CUDA(cudaMemcpyAsync(data_device.get(), data_host.get(), data_size*sizeof(float), cudaMemcpyHostToDevice, (cudaStream_t)cuda_stream.get()));
+                have_active_transfer = true;
+                device_current = true;
+            }
         }
     }
 
@@ -177,6 +209,11 @@ namespace dlib
                 device_in_use = false;
             }
             wait_for_transfer_to_finish();
+            if (xrec)
+            {
+                xmem::unregister_block(xrec);
+                xrec = nullptr;
+            }
             data_size = 0;
             host_current = true;
             device_current = true;
@@ -194,10 +231,16 @@ namespace dlib
                 device_in_use = false;
             }
             wait_for_transfer_to_finish();
+            if (xrec)
+            {
+                xmem::unregister_block(xrec);
+                xrec = nullptr;
+            }
             data_size = new_size;
             host_current = true;
             device_current = true;
             device_in_use = false;
+            xmem::note_block_created();
 
             try
             {
@@ -208,22 +251,59 @@ namespace dlib
                 data_device.reset();
 
                 void* data;
-                CHECK_CUDA(cudaMallocHost(&data, new_size*sizeof(float)));
-                // Note that we don't throw exceptions since the free calls are invariably
-                // called in destructors.  They also shouldn't fail anyway unless someone
-                // is resetting the GPU card in the middle of their program.
-                data_host.reset((float*)data, [](float* ptr){
-                    auto err = cudaFreeHost(ptr);
-                    if(err!=cudaSuccess)
-                        std::cerr << "cudaFreeHost() failed. Reason: " << cudaGetErrorString(err) << std::endl;
-                });
+                const bool managed = xmem::active();
 
-                CHECK_CUDA(cudaMalloc(&data, new_size*sizeof(float)));
-                data_device.reset((float*)data, [](float* ptr){
-                    auto err = cudaFree(ptr);
-                    if(err!=cudaSuccess)
-                        std::cerr << "cudaFree() failed. Reason: " << cudaGetErrorString(err) << std::endl;
-                });
+                /* With a store configured, a large block gets no pinned mirror at all: its
+                   host copy is a window onto the mapping, so writing it for the first time
+                   goes straight to the store and the pinned memory this costs stays bounded
+                   by the staging buffer.  Without a store, the mirror is allocated exactly
+                   as it always was. */
+                if (!managed || !xmem::store_backed(new_size*sizeof(float)))
+                {
+                    CHECK_CUDA(cudaMallocHost(&data, new_size*sizeof(float)));
+                    // Note that we don't throw exceptions since the free calls are invariably
+                    // called in destructors.  They also shouldn't fail anyway unless someone
+                    // is resetting the GPU card in the middle of their program.
+                    data_host.reset((float*)data, [](float* ptr){
+                        auto err = cudaFreeHost(ptr);
+                        if(err!=cudaSuccess)
+                            std::cerr << "cudaFreeHost() failed. Reason: " << cudaGetErrorString(err) << std::endl;
+                    });
+                }
+
+                if (managed)
+                {
+                    /* No device buffer is allocated here.  The block starts off the device
+                       and the first device access brings it in under the budget, which is
+                       the whole point: a graph can now describe more memory than the card
+                       holds, because describing it no longer occupies it. */
+                    xrec = xmem::register_block(this, new_size*sizeof(float), the_device_id);
+                    if (xrec)
+                    {
+                        device_current = false;
+                        if (!data_host)
+                            host_current = false;
+                    }
+                }
+
+                if (!xrec)
+                {
+                    if (!data_host)
+                    {
+                        CHECK_CUDA(cudaMallocHost(&data, new_size*sizeof(float)));
+                        data_host.reset((float*)data, [](float* ptr){
+                            auto err = cudaFreeHost(ptr);
+                            if(err!=cudaSuccess)
+                                std::cerr << "cudaFreeHost() failed. Reason: " << cudaGetErrorString(err) << std::endl;
+                        });
+                    }
+                    CHECK_CUDA(cudaMalloc(&data, new_size*sizeof(float)));
+                    data_device.reset((float*)data, [](float* ptr){
+                        auto err = cudaFree(ptr);
+                        if(err!=cudaSuccess)
+                            std::cerr << "cudaFree() failed. Reason: " << cudaGetErrorString(err) << std::endl;
+                    });
+                }
 
                 if (!cuda_stream)
                 {

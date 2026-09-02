@@ -1,4 +1,4 @@
-// Copyright (C) 2015  Davis E. King (davis@dlib.net)
+// Copyright (C) 2026 Cydral Technology (cydraltechnology@gmail.com)
 // License: Boost Software License   See LICENSE.txt for the full license.
 #ifndef DLIB_GPU_DaTA_H_
 #define DLIB_GPU_DaTA_H_
@@ -7,6 +7,7 @@
 #include <memory>
 #include <cstring>
 #include "cuda_errors.h"
+#include "extended_memory.h"
 #include "../serialize.h"
 
 namespace dlib
@@ -19,7 +20,9 @@ namespace dlib
         /*!
             CONVENTION
                 - if (size() != 0) then
-                    - data_host == a pointer to size() floats in CPU memory.
+                    - data_host == a pointer to size() floats in CPU memory, unless the
+                      extended memory subsystem has released the host mirror, in which case
+                      data_host == nullptr and host_current == false.
                 - if (data_device) then 
                     - data_device == a pointer to size() floats in device memory.
 
@@ -36,12 +39,26 @@ namespace dlib
                   executed.  So if device_in_use==true then there might be a CUDA kernel
                   executing that is using the device memory block contained in this object.
 
+                - if (xrec != nullptr) then
+                    - this block is managed by the extended memory subsystem and xrec
+                      points at its record there.  Both buffers may then be released and
+                      reinstated behind the accessors, which is why every accessor consults
+                      the subsystem before touching a pointer.  data_host may in that case
+                      be a window onto the subsystem's mapped store rather than a pinned
+                      buffer of its own.  When xrec == nullptr the object behaves exactly
+                      as it does in stock dlib.
         !*/
     public:
 
         gpu_data(
-        ) : data_size(0), host_current(true), device_current(true),have_active_transfer(false),device_in_use(false), the_device_id(0)
+        ) : data_size(0), host_current(true), device_current(true),have_active_transfer(false),device_in_use(false), the_device_id(0), xrec(nullptr)
         {
+        }
+
+        ~gpu_data()
+        {
+            if (xrec)
+                xmem::unregister_block(xrec);
         }
 
         // Not copyable
@@ -86,12 +103,14 @@ namespace dlib
 
         const float* host() const 
         { 
+            enter_host(true, false);
             copy_to_host();
             return data_host.get(); 
         }
 
         float* host() 
         {
+            enter_host(true, true);
             copy_to_host();
             device_current = false;
             return data_host.get(); 
@@ -99,6 +118,7 @@ namespace dlib
 
         float* host_write_only() 
         {
+            enter_host(false, true);
             host_current = true;
             device_current = false;
             return data_host.get(); 
@@ -109,6 +129,7 @@ namespace dlib
 #ifndef DLIB_USE_CUDA
             DLIB_CASSERT(false, "CUDA NOT ENABLED");
 #endif
+            enter_device(true, false);
             copy_to_device();
             device_in_use = true;
             return data_device.get(); 
@@ -119,6 +140,7 @@ namespace dlib
 #ifndef DLIB_USE_CUDA
             DLIB_CASSERT(false, "CUDA NOT ENABLED");
 #endif
+            enter_device(true, true);
             copy_to_device();
             host_current = false;
             device_in_use = true;
@@ -130,6 +152,7 @@ namespace dlib
 #ifndef DLIB_USE_CUDA
             DLIB_CASSERT(false, "CUDA NOT ENABLED");
 #endif
+            enter_device(false, true);
             wait_for_transfer_to_finish();
             host_current = false;
             device_current = true;
@@ -147,6 +170,13 @@ namespace dlib
 
         void swap (gpu_data& item)
         {
+            /* The subsystem tracks a block through a pointer back to the object holding it,
+               and a swap moves the buffers and the records in two separate steps. Held
+               across both, this keeps the observation thread from reading a record whose
+               owner has come apart from its memory. It costs nothing when neither block is
+               managed. */
+            xmem::registry_guard guard(xrec != nullptr || item.xrec != nullptr);
+
             std::swap(data_size, item.data_size);
             std::swap(host_current, item.host_current);
             std::swap(device_current, item.device_current);
@@ -155,6 +185,10 @@ namespace dlib
             std::swap(data_device, item.data_device);
             std::swap(cuda_stream, item.cuda_stream);
             std::swap(the_device_id, item.the_device_id);
+            std::swap(xrec, item.xrec);
+            // Both records have to learn where their block went before the guard lets go.
+            if (xrec)       xrec->owner = this;
+            if (item.xrec)  item.xrec->owner = &item;
         }
 
     private:
@@ -163,12 +197,27 @@ namespace dlib
         void copy_to_device() const;
         void copy_to_host() const;
         void wait_for_transfer_to_finish() const;
+
+        void enter_device(bool need_content, bool writes) const
+        {
+            if (xrec)
+                xmem::before_device(xrec, need_content, writes);
+        }
+
+        void enter_host(bool need_content, bool writes) const
+        {
+            if (xrec)
+                xmem::before_host(xrec, need_content, writes);
+        }
 #else
         void copy_to_device() const{}
         void copy_to_host() const{}
         void wait_for_transfer_to_finish() const{}
+        void enter_device(bool,bool) const{}
+        void enter_host(bool,bool) const{}
 #endif
 
+        friend class xmem::manager;
 
         size_t data_size;
         mutable bool host_current;
@@ -176,10 +225,13 @@ namespace dlib
         mutable bool have_active_transfer;
         mutable bool device_in_use;
 
-        std::shared_ptr<float> data_host;
-        std::shared_ptr<float> data_device;
+        mutable std::shared_ptr<float> data_host;
+        mutable std::shared_ptr<float> data_device;
         std::shared_ptr<void> cuda_stream;
         int the_device_id;
+
+        // Null unless the extended memory subsystem manages this block.
+        mutable xmem::block_record* xrec;
     };
 
     inline void serialize(const gpu_data& item, std::ostream& out)

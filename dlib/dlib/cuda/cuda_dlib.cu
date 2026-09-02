@@ -482,9 +482,12 @@ namespace dlib
                 return;
 
             const size_t max_size = std::max(std::max(dest.size(),src1.size()),src2.size());
-            const auto d = dest.host();
-            const auto s1 = src1.host();
-            const auto s2 = src2.host();
+            /* The three host() calls that stood here were left over from the CPU version of
+               this function and their results were never read. They were not free: host() on
+               dest is the non-const overload, so it pulled the block back over the bus and
+               then marked the device copy stale, and the device() calls below pushed the
+               same bytes straight back. Every call to this function therefore moved dest
+               down and up again, and src1 and src2 down, for nothing. */
             if (dest.size() == src1.size() && src1.size() == src2.size())
             {
                 if (add_to)

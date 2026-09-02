@@ -199,6 +199,7 @@ add_example(slm_vit_classify_ex)
 add_example(slm_vit_ssl_ex)
 add_example(slm_distill_ex)
 add_example(slm_embed_ex)
+add_example(slm_extended_memory_ex)
 
 # The examples that compile a whole model in from a generated header.
 #

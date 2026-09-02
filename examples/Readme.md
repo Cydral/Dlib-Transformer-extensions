@@ -37,6 +37,7 @@
   - [`slm_vit_classify_ex.cpp` and `slm_vit_ssl_ex.cpp`](#slm_vit_classify_excpp-and-slm_vit_ssl_excpp)
   - [`slm_distill_ex.cpp`](#slm_distill_excpp)
   - [`slm_embed_ex.cpp`](#slm_embed_excpp)
+  - [`slm_extended_memory_ex.cpp`](#slm_extended_memory_excpp)
   - [`slm_tools/` Python witnesses](#slm_tools-python-witnesses)
   - [`slm_data.h`](#slm_datah-shared-data-layer)
 - [Cross-cutting concepts worth noticing](#cross-cutting-concepts-worth-noticing)
@@ -67,6 +68,7 @@ Across the full example suite, the repository now covers:
 - **multimodal fusion** where the vision tower lives inside the network and receives a gradient
 - **supervised fine-tuning and low-rank adaptation** (LoRA, DoRA) over an imported model
 - **knowledge distillation** from a teacher container into a student of a freely chosen architecture, dense or mixture-of-experts
+- **software-extended device memory**: a residency layer that lets a network occupy more than the card holds, driven by the access schedule the run reveals about itself
 
 > [!TIP]
 > Read this directory not as a loose collection of demos, but as a **progressive design reference** for building Transformer-based applications with Dlib.
@@ -106,6 +108,8 @@ Then the interoperability and specialization track, which can be read independen
    Train a Vision Transformer **from scratch**, with labels and without.
 14. `slm_distill_ex.cpp`  
    Raise a new model by **distillation**, in three steps.
+15. `slm_extended_memory_ex.cpp`  
+   Run a model **larger than the card**, by making device residency a scheduling problem.
 
 A shared support layer, [`slm_data.h`](#slm_datah-shared-data-layer), provides embedded datasets and utilities used throughout the examples, and [`slm_tools/`](slm_tools) holds the Python witnesses used to verify the C++ paths against reference implementations.
 
@@ -649,6 +653,54 @@ It closes the loop that a generative model alone cannot: answering from document
 
 ---
 
+<a id="slm_extended_memory_excpp"></a>
+## `slm_extended_memory_ex.cpp`
+
+### Purpose
+Run a network whose tensors do not all fit in VRAM at once, without changing a line of the network, the trainer, or the generation loop.
+
+### The problem it addresses
+A Dlib network holds every tensor it contains on the device from the moment that tensor is sized until the network is destroyed. The footprint of a run is therefore the **sum of the whole graph**, which is why a model that would stream comfortably refuses to start on a smaller card. Nothing in that arrangement is required by the computation: at any instant a kernel reads a handful of tensors and ignores the rest.
+
+The example switches on a residency layer that makes this explicit. A managed block lives on the device, in a pinned host mirror, or in a mapped store on disk, and moves between the three under a budget. Every pointer the program obtains is the same pointer it obtained before, through the same call.
+
+### What the example teaches
+**Prefetching needs a schedule, and a network hands you one for free.** The usual way to overflow device memory is to let a pager fault pages in as the GPU touches them, through unified memory or a mapped file. That gives transparency and not performance, because a pager learns a page is needed at the instant it is too late to fetch it. What rescues the idea is that the access pattern of a network is **periodic**: training and inference walk the same blocks in the same order on every step, and the order is a property of the graph rather than of the data.
+
+An observation thread reads the access trace, finds its period, confirms the candidate over two full repetitions before adopting it, and follows the cursor from then on. Three things become possible at once:
+
+- **prefetch**, because the schedule says which block is next,
+- **eviction by furthest next use**, which is the optimal replacement policy and is unavailable to anything that cannot see forward,
+- **page-cache warming** on a deeper horizon still, so that a block's pages are in memory before the transfer that reads them starts.
+
+If the pattern changes, for instance when the program switches from training to generation, verification fails, the schedule is dropped and the search restarts. Until one exists the policy is least recently used. A wrong guess therefore costs a slower step and never a wrong result.
+
+### Main technical choices
+- **The store is a mapping, not a file being read and written.** Its pages are page cache: while there is host memory they stay resident and the tier runs at memory speed, and when there is not the kernel writes them back and reclaims them. The same tier is a RAM cache on a machine with room and a disk overflow on a machine without, with no threshold to pick. A buffer the program holds cannot behave this way, because it is memory the kernel may not reclaim.
+- **A stored block costs nothing to read on the host.** `host()` returns a pointer straight into the mapping, so deserializing a model writes **through** to the store instead of into pinned buffers that would then have to be spilled. This is what makes it possible to load a model larger than host memory: at no point does the whole thing have to exist in RAM.
+- **Transfers go through a small pinned buffer, in halves.** A mapping cannot feed a DMA engine well, since its pages are pageable and a fault in the middle of a transfer stalls it. Every store-to-device move is chunked, with the host copy of one chunk overlapping the transfer of the one before it. That buffer is the only pinned allocation whose size does not follow the model.
+- **Read-only weights are written once.** A block carries a flag saying whether the store copy still matches, cleared only by an accessor that lets the caller write to the device. In generation nothing writes the weights, so after the first eviction each later one is free: the device buffer is dropped and nothing is transferred.
+- **Only a compute thread lowers a block's tier; the observation thread only raises it,** and only into headroom the budget already allows. That single invariant is what lets the common case run **without taking a lock**: a resident block costs a stamp and two ring writes.
+- **A device pool sits under the whole thing,** because `cudaFree` synchronizes the device and an eviction that paid for that would cost more than it saves.
+
+### Useful reminders
+**Activation belongs in the first statements of `main`, and there is no way back.** A block settles where its host copy lives when it is sized, so a network built before the call would keep pinned mirrors for the rest of the run and quietly lose most of the benefit; `enable_extended_memory()` therefore refuses to start once any tensor exists, rather than letting that become a mystery about memory that never drops. There is deliberately no counterpart to switch it off: doing so means bringing every block back to VRAM at once, which is the thing the subsystem exists because you cannot do.
+
+**Run new code with `--paranoid` once.** `device()` hands out a raw pointer and the caller holds it across the kernel launch. The subsystem protects the last `hot_window` pointers handed out, which covers every operation in Dlib and anything written in the same style, and `device_scope` pins an explicit set for code that gathers many pointers before launching. Paranoid mode fills every released device block with NaN, so a violation of that rule shows up on the first step instead of drifting.
+
+**Raise `--hot-window` when training.** `dnn_trainer` runs a worker thread of its own, so two threads hand out device pointers on the same card and share the window.
+
+**This buys capacity, not speed.** A small model has a low arithmetic intensity, so with residency streamed across the bus the run becomes limited by PCIe long before it is limited by the card. The point is to let something run at all that otherwise would not, and to make the cost of doing so predictable.
+
+### What to inspect in the output
+The line reporting the **access cycle** is the one that matters: until it appears, victims are chosen by age and the prefetcher has nothing to work from. Once the period is reported, restores should start being counted as anticipated, and the ratio between those two numbers is the honest measure of whether the schedule is being followed.
+
+The **pinned mirrors** line is the other one. With a store it should stay small whatever the size of the model, because only tensors below `--min-block` keep a buffer of their own. That number staying flat as the model grows is the whole argument for mapping the store rather than reading and writing it.
+
+[⬆ Back to top](#on-this-page)
+
+---
+
 ## `slm_advanced_gqa_kvc_train_ex.cpp`
 
 ### Purpose
@@ -821,6 +873,7 @@ The repository strikes a useful balance:
 - Use **`slm_gguf_import_ex.cpp`** then **`slm_lora_finetune_ex.cpp`** if you want to specialize an existing open-weight model.
 - Use **`slm_vit_classify_ex.cpp`** or **`slm_vit_ssl_ex.cpp`** if your data is images rather than text.
 - Use **`slm_distill_ex.cpp`** if you want to build a smaller model of your own design from a larger one.
+- Read **`slm_extended_memory_ex.cpp`** if a model you want to run does not fit in your VRAM, or if you want to understand why prefetching needs a schedule rather than a heuristic.
 
 ---
 

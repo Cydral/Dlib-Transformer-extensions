@@ -1,4 +1,4 @@
-// Copyright (C) 2015  Davis E. King (davis@dlib.net)
+// Copyright (C) 2026 Cydral Technology (cydraltechnology@gmail.com)
 // License: Boost Software License   See LICENSE.txt for the full license.
 #ifndef DLIB_DNn_TENSOR_H_
 #define DLIB_DNn_TENSOR_H_
@@ -196,6 +196,8 @@ namespace dlib
     protected:
 
         friend class alias_tensor;
+        // Needs data() to pin a tensor's block while a raw device pointer is live.
+        friend class device_scope;
 
         virtual gpu_data& data() = 0;
         virtual const gpu_data& data() const = 0;

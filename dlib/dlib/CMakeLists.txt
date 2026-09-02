@@ -318,6 +318,7 @@ if (NOT TARGET dlib)
          stack_trace.cpp
          cuda/cpu_dlib.cpp
          cuda/tensor_tools.cpp
+         cuda/extended_memory.cpp
          data_io/image_dataset_metadata.cpp
          data_io/mnist.cpp
          data_io/cifar.cpp
@@ -689,6 +690,7 @@ if (NOT TARGET dlib)
                   cuda/curand_dlibapi.cpp
                   cuda/cuda_data_ptr.cpp
                   cuda/gpu_data.cpp
+                  cuda/extended_memory_kernels.cu
                   )
                list (APPEND dlib_needed_private_libraries CUDA::cublas)
                list (APPEND dlib_needed_private_libraries ${CUDNN_LIBRARY_PATH})

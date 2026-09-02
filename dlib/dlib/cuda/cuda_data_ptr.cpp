@@ -1,4 +1,4 @@
-// Copyright (C) 2017  Davis E. King (davis@dlib.net)
+// Copyright (C) 2026 Cydral Technology (cydraltechnology@gmail.com)
 // License: Boost Software License   See LICENSE.txt for the full license.
 #ifndef DLIB_DNN_CuDA_DATA_PTR_CPP_
 #define DLIB_DNN_CuDA_DATA_PTR_CPP_
@@ -7,6 +7,7 @@
 
 #include "cuda_data_ptr.h"
 #include "cuda_utils.h"
+#include "extended_memory.h"
 
 namespace dlib
 {
@@ -51,6 +52,16 @@ namespace dlib
         ) : num(n)
         {
             if (n == 0)
+                return;
+
+            /* Workspaces are the only device memory in dlib that does not pass through
+               gpu_data, so when the extended memory subsystem is running they would
+               otherwise sit outside its budget entirely. That is not merely an accounting
+               gap: a cuDNN workspace asked for here can fail while the subsystem is holding
+               gigabytes of weights it would gladly have evicted to make room. Offering it
+               the allocation first closes both. */
+            pdata = xmem::acquire_scratch(n);
+            if (pdata)
                 return;
 
             void* data = nullptr;

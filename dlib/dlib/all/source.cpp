@@ -83,6 +83,7 @@
 
 #include "../cuda/cpu_dlib.cpp"
 #include "../cuda/tensor_tools.cpp"
+#include "../cuda/extended_memory.cpp"
 #include "../data_io/image_dataset_metadata.cpp"
 #include "../data_io/mnist.cpp"
 #include "../data_io/cifar.cpp"
