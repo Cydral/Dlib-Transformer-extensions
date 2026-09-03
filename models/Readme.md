@@ -69,14 +69,16 @@ Each entry names the program that produced the file, the shape of the network, a
 | Architecture | Fused transformer, 3 layers, 4 heads, width 64, window 50 |
 | Vocabulary | 257 entries, one per byte value plus padding. No tokenizer file needed |
 | Parameters | 4,798,593 |
-| Training | Built-in Shakespeare extract, 14,590 sequences, 93 epochs |
-| Final state | Loss 0.047, accuracy 0.999 on the training sample |
+| Training | Built-in Shakespeare extract, 14,590 sequences, around ninety epochs |
+| Final state | Loss below 0.05, accuracy 0.999 on the training sample |
 
 **What it does.** It reproduces its corpus. At an accuracy of 0.999 on five million parameters against a text of that size, the model has memorized rather than generalized, and a prompt drawn from the extract continues with the lines that actually follow it in the play.
 
 That is the correct outcome for this example and worth stating plainly, because the output looks better than the model is. Someone seeing fluent Shakespeare might conclude the network learned English; it learned this text. The point of the checkpoint is to demonstrate that the machinery works end to end, on a corpus small enough to train in minutes and a vocabulary that needs no preparation.
 
 Load it, generate from it, and treat the fluency as a property of the corpus rather than of the model.
+
+**On the figures above.** The epoch count and the final loss are given loosely on purpose. Reproducing this run gives the same loss to five decimals for the first few epochs, and then diverges: the training curve crosses several sharp rises, up to 0.44 late in the run, and where it happens to stop depends on the order in which floating-point reductions land on a given device. Two runs of the same command reached 0.999109 after 93 epochs and 0.998835 after 95, a difference of four sequences out of 14,590. Quoting an exact epoch count would suggest a precision the process does not have.
 
 ```
 ./slm_basic_train_ex --generate
