@@ -186,6 +186,28 @@ That is a deliberate trade, not a defect. The example exists to show the constru
 
 ---
 
+### `dlib_lm_moe_model.dat`
+
+| | |
+|---|---|
+| Produced by | [`slm_transformer_configs_ex --arch moe`](../examples/slm_transformer_configs_ex.cpp) |
+| Architecture | Grouped query attention, 3 layers, 6 query heads over 2 KV heads, width 228, window 200, with 3 experts routed one at a time |
+| Vocabulary | Shares `dlib_lm_tokenizer.vocab` |
+| Parameters | 4,495,421 stored, 1,991,525 active |
+| Training | 828 segments, 93,085 tokens, 97,529 sequences |
+
+**What it demonstrates.** That routed sparsity works, and what it costs. This checkpoint holds 4.5 million parameters and runs 2.0 million of them per token: the remaining 56% sit in memory and are never touched unless a token is routed to them. That is the whole argument for a mixture of experts, and it is the reason this checkpoint sits beside the dense ones rather than replacing them.
+
+The number that says whether the arrangement actually works is not the loss. It is the balance of the router, which the program reports at the end of training. Three experts under top-1 routing received 0.3296, 0.3346 and 0.3358 of the traffic against an ideal third each, a coefficient of variation of 0.008. **Expert collapse did not occur** — the failure where two experts absorb everything while a third stays idle, which the training loss never reveals because the model converges perfectly well while it happens.
+
+```
+./slm_transformer_configs_ex --generate --arch moe
+```
+
+**On the training budget.** Reproduction is partial: some segments come back exactly, others diverge. The run would benefit from more epochs, and the internal sizing is very likely not optimal either — this checkpoint is here to show the architecture rather than to be the best model the architecture allows. Compare it with the dense and grouped-query checkpoints above, which share the same corpus and tokenizer: that comparison is what it is for.
+
+---
+
 ## Recommended usage workflow
 
 If you are downloading a model from this directory, the most robust workflow is usually:
