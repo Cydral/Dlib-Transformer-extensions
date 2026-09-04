@@ -159,6 +159,33 @@ The parameter count differs by about a thousand, which is not the cache: a cache
 
 ---
 
+### `dlib_lm_enwiki_model.dat`
+
+| | |
+|---|---|
+| Produced by | [`slm_enwiki_train_ex`](../examples/slm_enwiki_train_ex.cpp) |
+| Architecture | 2 layers, 6 heads, width 180, head dim 30, window 100, with a two-expert mixture built from elementary layers |
+| Vocabulary | 800 BPE entries, in `enwiki_tokenizer.vocab` |
+| Parameters | 15,239,868 |
+| Training | 23,373 bytes of encyclopaedic text, 10,292 sequences, 400 epochs |
+| Final state | Loss 0.218, next-token accuracy 100%, reconstruction exact |
+
+**What it does.** It reproduces its corpus byte for byte, verified over all 23,373 bytes.
+
+What distinguishes this checkpoint from the others is how its mixture of experts is built. Elsewhere in this project the routing goes through the optimized `moe_` layer, which activates only the experts a token is routed to. Here the two experts are ordinary subnetworks, both traversed on every token, and their outputs combined by a learned router into a weighted sum. Adaptive computation wraps each of them, applying the same expert up to six times depending on how hard the position is.
+
+That construction is the point: it shows a mixture assembled from elementary layers, with nothing hidden inside a fused implementation. It also explains why this model carries fifteen million parameters where the grouped-query checkpoints above hold three quarters of a million. Two experts held whole, each wrapped in up to six adaptive steps, cost what a routed mixture is designed to avoid — and every token pays for both of them, where the `moe_` layer would pay for one.
+
+That is a deliberate trade, not a defect. The example exists to show the construction rather than to be efficient at it.
+
+```
+./slm_enwiki_train_ex --generate --verify
+```
+
+**On the size.** The width was narrowed from 228 to 180 and the vocabulary from 1,000 to 800, bringing the serialized model from 207 MB to 61 MB. The earlier file had to be split across two archives to be published; this one travels whole. Nothing the example demonstrates depended on the larger size.
+
+---
+
 ## Recommended usage workflow
 
 If you are downloading a model from this directory, the most robust workflow is usually:
@@ -199,6 +226,12 @@ For best results, keep aligned:
 - the **corresponding example source file**
 - the **expected tokenizer / vocabulary artifacts**, when relevant
 - the **same model configuration family**
+
+Two hazards deserve naming, because both fail silently.
+
+**A checkpoint and its tokenizer belong together.** Several programs here train their own vocabulary alongside the model, and a checkpoint paired with a different one produces confident nonsense rather than an error: the token identifiers are all valid, they simply mean something else. Where an entry above names a tokenizer, take both files or neither.
+
+**Caches survive a change of configuration.** Programs that pre-tokenize a corpus write the token stream to disk and reload it on the next run to save time. Changing the vocabulary size does not invalidate that file, so a run can train a new architecture on tokens produced by a vocabulary that no longer exists. Deleting the cached tokens along with the tokenizer is the safe habit whenever a configuration changes.
 - the **same prompt or input formatting conventions**
 
 If you plan to publish additional checkpoints later, it is often enough to keep the naming consistent with the associated example so that users can immediately infer the intended workflow.
