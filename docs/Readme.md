@@ -6,6 +6,8 @@ The [examples guide](../examples/Readme.md) explains what each program does. The
 
 Every article is published in two places. The Markdown version here is the reference and travels with the code it describes. A companion version is posted on Medium, which is where most readers will find it.
 
+One item in this directory is not an article. The research report on buffer-level residency is a technical paper with its own measurements and references, kept here in PDF because the format is the point: it is meant to be read, printed and cited as a whole rather than browsed a section at a time.
+
 ---
 
 ## On this page
@@ -19,6 +21,9 @@ Every article is published in two places. The Markdown version here is the refer
 
 **[A Small Language Model Stack, Built in C++ on One Machine](01-introduction.md)**  
 What the project covers, the trade between model size and usefulness, and why the work runs on one machine rather than a cluster.
+
+**[Buffer-Level Residency Management for GPU Memory Extension](buffer-level-residency.pdf)** (PDF)  
+A research report on the extended device memory of this fork: how a model larger than the card is streamed through it without any network being told, why the usual place for such a mechanism is one level higher in the stack, and what it costs measured against keeping everything resident. Written in the format of a conference paper rather than an article, with the prior art it sits beside, the measurements, and the limitations stated as such.
 
 ---
 

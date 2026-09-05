@@ -1,5 +1,3 @@
-build-cpu/
-build-cuda/
 *:Zone.Identifier
 *:sec.endpointdlp
 # Generated artifacts of the GGUF import examples
@@ -8,8 +6,12 @@ dlib/examples/*_tokenizer.dat
 
 # Windows metadata carried over Explorer/sshfs copies
 *Zone.Identifier
-# Local build trees and validation artifacts
-build-cpu/
+# Local build trees and validation artifacts. Matched by pattern rather than listed one
+# at a time, since a tree is created per configuration under test and the list was already
+# out of date twice over. The hyphen keeps the pattern from swallowing a directory that
+# merely starts with the same letters.
+build/
+build-*/
 nr_logs*/
 *.gguf
 *.dat

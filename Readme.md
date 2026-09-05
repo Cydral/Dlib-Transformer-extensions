@@ -196,6 +196,14 @@ A small set of Python tools lives beside the examples, and their role is verific
 
 A pipeline that nothing contradicts is a pipeline nobody has verified.
 
+### Running a model larger than the card
+
+A device holds what it holds, and a model that fits at one context length or one batch size stops fitting when either is raised. This fork can extend device memory in software: blocks are streamed between the card, host memory and a memory-mapped store under a budget, guided by the access sequence the run reveals about itself, with no change to any network, layer or training loop. It is a runtime option, and when it is off the cost is one predicted branch per tensor access.
+
+The mechanism, what it costs, and what it does not do are treated at length in [Buffer-Level Residency Management for GPU Memory Extension](docs/buffer-level-residency.pdf), a research report kept in [`docs/`](docs).
+
+---
+
 ### Current project emphasis
 
 Today, the project is especially strong as a platform for:
@@ -207,6 +215,7 @@ Today, the project is especially strong as a platform for:
 - shrinking published models by depth pruning, into containers the ecosystem still reads
 - indexing and searching a document collection with an embedding model
 - text, image, and text-with-image workflows in a single codebase
+- training and running models whose working set exceeds the device, on a laptop-class card
 
 ---
 
@@ -226,7 +235,7 @@ This directory contains the practical entry points: training programs, inference
 This directory acts as the checkpoint and artifact layer.
 
 ### 4. Written material: [`docs/`](docs)
-Longer-form articles, one subject at a time: what a design costs, where it breaks, and how to reproduce a result. The examples guide says what each program does; these say why.
+Longer-form articles, one subject at a time: what a design costs, where it breaks, and how to reproduce a result. The examples guide says what each program does; these say why. The directory also holds the research report on buffer-level residency, which is a paper rather than an article and is kept as a PDF for that reason.
 
 The examples appear twice on purpose. [`examples/`](examples) is what a visitor reads: this project's files and the guide that explains them, with none of the upstream library's own examples in the way. `dlib/examples/` is what CMake builds: upstream's tree with this project's files added to it. Nothing connects the two, so `sync_examples.sh` at the repository root reports any drift between them and copies one over the other on request — the divergence being silent by construction, since both copies compile and both look complete.
 
