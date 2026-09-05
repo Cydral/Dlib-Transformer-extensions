@@ -312,6 +312,7 @@ namespace xmem
 
         char*       base () const { return mapping; }
         std::size_t capacity () const { return cap; }
+        long        throughput_mib_per_s () const { return measured_mib_per_s; }
         std::size_t bytes_in_use () const { return used; }
 
         std::int64_t allocate (std::size_t bytes)
@@ -394,9 +395,11 @@ namespace xmem
                                  "occupies RAM rather than relieving it.\n";
             }
 #endif
-            if (!verbose)
-                return;
-
+            /* The probe runs whether or not the run is verbose, because its result decides
+               whether starting at all makes sense. A store slower than the floor cannot
+               serve the traffic the mechanism generates: the device goes idle waiting for
+               the volume, which saturates and stays that way, and the only visible symptom
+               is a training run that does not advance. */
             const std::size_t n = 8ul << 20;
             if (cap < 2*n || !mapping)
                 return;
@@ -411,10 +414,16 @@ namespace xmem
 #endif
             const double dt = std::chrono::duration<double>(
                                   std::chrono::steady_clock::now() - t0).count();
-            if (dt > 0)
+            if (dt <= 0)
+                return;
+
+            measured_mib_per_s = (long)((double)(n >> 20) / dt);
+            if (verbose)
                 std::cerr << "extended memory: the store writes at about "
-                          << (long)((double)(n >> 20) / dt) << " MiB/s\n";
+                          << measured_mib_per_s << " MiB/s\n";
         }
+
+
 
         static std::size_t round_up (std::size_t bytes)
         {
@@ -423,6 +432,8 @@ namespace xmem
         }
 
         char*        mapping = nullptr;
+
+        mutable long measured_mib_per_s = 0;
         std::size_t  cap     = 0;
         std::int64_t next    = 0;
         std::size_t  used    = 0;
@@ -1249,6 +1260,7 @@ namespace xmem
             once the layers have stopped agreeing with the arithmetic on paper.
         */
         std::size_t store_capacity () const { return arena ? arena->capacity() : 0; }
+        long store_throughput_mib_per_s () const { return arena ? arena->throughput_mib_per_s() : 0; }
 
         void report_blocks (std::ostream& out, std::size_t max_rows) const
         {
@@ -2523,6 +2535,27 @@ namespace xmem
 
         xmem::manager*& m = xmem::manager::singleton();
         m = new xmem::manager(o, dev, o.vram_budget);
+
+        /* A store slower than the floor is worse than no store at all: the mechanism moves
+           several times the budget per step, so a volume that cannot keep up leaves the
+           device idle while it saturates, for as long as the run is allowed to continue.
+           Refusing here costs the caller a message; proceeding costs it an afternoon. */
+        const long rate = m->store_throughput_mib_per_s();
+        if (o.min_store_mib_per_s > 0 && rate > 0 && rate < o.min_store_mib_per_s)
+        {
+            const long seconds = (long)((o.vram_budget >> 20) / std::max(rate, 1L));
+            std::cerr << "extended memory: the store in " << o.store_path << " writes at "
+                      << rate << " MiB/s, below the " << o.min_store_mib_per_s
+                      << " MiB/s needed to keep up. One budget of blocks would take "
+                      << seconds << " seconds to move, and a step moves several. Point the "
+                         "store at a faster volume, lower the batch or the window so the run "
+                         "fits without it, or set min_store_mib_per_s to zero to proceed "
+                         "anyway. Not enabled.\n";
+            delete m;
+            m = nullptr;
+            return false;
+        }
+
         xmem::g::active.store(true, std::memory_order_release);
         m->start_worker();
         std::atexit(&xmem::stop_worker_at_exit);

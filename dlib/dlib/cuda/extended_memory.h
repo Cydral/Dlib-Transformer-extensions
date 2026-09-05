@@ -221,6 +221,12 @@ namespace dlib
            a run without a usable store gets about twice the card and no more, and one with
            a store never comes near the ceiling because only small blocks keep mirrors. */
         std::size_t max_pinned_bytes      = 0;
+        /* Floor on what the store's volume must sustain, in MiB per second, below which
+           starting is refused. The mechanism trades bandwidth for capacity, so a store
+           slower than this does not extend a run, it stalls it: the device sits idle while
+           the volume saturates, for hours, and nothing in the output says why. Set to zero
+           to proceed regardless. */
+        long        min_store_mib_per_s   = 100;
         unsigned    advise_horizon       = 96;
         unsigned    idle_release_ms      = 0;
         double      idle_release_keep    = 0.5;
