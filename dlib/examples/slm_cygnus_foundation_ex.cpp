@@ -828,6 +828,17 @@ int run_pipeline(bool do_train, const double learning_rate, const size_t batch_s
         net.clean();
         serialize(model_file) << net << tokenizer;
         cout << "Model saved to " << model_file << "\n";
+
+        /* What the run actually needed, printed here rather than at the end of main because
+           the network is still alive and the block inventory therefore still means
+           something. A sizing pass is a minute of training and a Ctrl-C. */
+        if (extended_memory_enabled())
+        {
+            cout << "\n";
+            print_extended_memory_stats(cout);
+            cout << "\n";
+            print_extended_memory_blocks(cout);
+        }
         network_context::reset();
     }
 
@@ -915,8 +926,12 @@ int main(int argc, char** argv)
         parser.add_option("extended-memory", "Stream tensors through the device under a budget "
             "when the working set does not fit");
         parser.add_option("vram-budget", "Device memory the extension may use, in MiB (default: 8192)", 1);
-        parser.add_option("vram-store", "Directory holding the store, on a real volume rather than a memory filesystem "
-            "(default: DLIB_XMEM_STORE, else the temp dir)", 1);
+        parser.add_option("vram-store", "Directory holding the store, or \"none\" to keep evicted blocks "
+            "in host memory only (default: DLIB_XMEM_STORE, else the temp dir)", 1);
+        parser.add_option("host-limit", "Pinned host memory the extension may take for evicted "
+            "blocks, in MiB. Gigabytes of overflow belong in a store instead: its pages are "
+            "ordinary memory the system can reclaim (default: the same as the budget)", 1);
+        parser.add_option("blocks", "list the managed blocks by size when the run ends");
 
         parser.parse(argc, argv);
 
@@ -928,7 +943,15 @@ int main(int argc, char** argv)
         {
             extended_memory_options xopts;
             xopts.vram_budget = (size_t)get_option(parser, "vram-budget", 8192) << 20;
+            /* The store is the tier that carries the overflow. Its pages are ordinary
+               memory the system can reclaim, which is what makes it the right place for
+               gigabytes; pinned host memory cannot be paged out and is bounded for that
+               reason. Point it at a volume with room. */
             xopts.store_path  = get_option(parser, "vram-store", default_extended_memory_store_path());
+            if (xopts.store_path == "none")
+                xopts.store_path.clear();
+            xopts.max_pinned_bytes = (size_t)get_option(parser, "host-limit",
+                                        (unsigned long)(xopts.vram_budget >> 20)) << 20;
             xopts.verbose     = true;
 
             if (!enable_extended_memory(xopts))
@@ -955,9 +978,9 @@ int main(int argc, char** argv)
                 << "  Check tokenizer : " << argv[0] << " --check-tokenizer\n"
                 << "\n  Add --extended-memory to any of the above when the batch or the window\n"
                    "  no longer fits the card. --vram-budget sets what the extension may use,\n"
-                   "  in MiB, and defaults to 8192. Keep --vram-store on a real volume: a memory\n"
-                   "  filesystem would spend the host memory the store exists to spare.\n";
-            return 0;
+                   "  in MiB, and defaults to 8192. Raise it until the working set fits and the\n"
+                   "  extension goes quiet; that is the regime it is meant to run in.\n";
+        return 0;
         }
 
         const double learning_rate = get_option(parser, "learning-rate", 1e-4);

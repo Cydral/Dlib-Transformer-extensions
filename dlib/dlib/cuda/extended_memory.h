@@ -227,6 +227,13 @@ namespace dlib
            the volume saturates, for hours, and nothing in the output says why. Set to zero
            to proceed regardless. */
         long        min_store_mib_per_s   = 100;
+        /* Largest share of the budget the buffer pool may hold for reuse. The pool exists
+           to spare the driver an allocation on every eviction, but a buffer waiting in it is
+           budget the live data cannot have, and a run whose block sizes vary will fill it
+           until the working set no longer fits in what remains. A quarter keeps the reuse
+           worth having without letting the cache crowd out what it is caching for. */
+        double      max_pool_fraction      = 0.25;
+        std::size_t max_pool_bytes         = 512ul * 1024ul * 1024ul;
         unsigned    advise_horizon       = 96;
         unsigned    idle_release_ms      = 0;
         double      idle_release_keep    = 0.5;
@@ -258,6 +265,10 @@ namespace dlib
         unsigned long long host_pull_bytes   = 0;
         std::size_t        largest_block     = 0;
         std::size_t        immovable_bytes   = 0;
+        // Buffers the pool holds for reuse: allocated on the card, not in any live block.
+        std::size_t        pooled_bytes      = 0;
+        // What the driver reports free on the device, which the budget cannot exceed.
+        std::size_t        device_free_bytes = 0;
         std::size_t        hash_threshold    = 0;
         std::size_t        hash_count        = 0;
         // How the access trace is fed: total threads, and the busiest one's share.
@@ -351,6 +362,9 @@ namespace dlib
             // fast path by any accessor that lets the caller write to the device.
             std::atomic<bool>          store_valid {false};
             std::int64_t               slot        = -1;
+            // What the arena actually reserved, which may exceed bytes and is what the slot
+            // must be given back as.
+            std::size_t                slot_bytes  = 0;
             int                        device_id   = 0;
             bool                       evictable   = false;
             // Whether the slot has ever held this block, and how many evictions in a row

@@ -253,12 +253,14 @@ namespace dlib
                 void* data;
                 const bool managed = xmem::active();
 
-                /* With a store configured, a large block gets no pinned mirror at all: its
-                   host copy is a window onto the mapping, so writing it for the first time
-                   goes straight to the store and the pinned memory this costs stays bounded
-                   by the staging buffer.  Without a store, the mirror is allocated exactly
-                   as it always was. */
-                if (!managed || !xmem::store_backed(new_size*sizeof(float)))
+                /* Under the manager no host buffer is allocated here at all. A block that
+                   is only ever read by a kernel never needs one, and a block that does gets
+                   it on its first host access or when it is evicted: a window onto the
+                   store where there is one, a pinned mirror otherwise, and in that case
+                   bounded by the ceiling the manager keeps. Allocating it eagerly put the
+                   whole graph into pinned host memory before a single tensor was used, which
+                   is not something any ceiling can bound after the fact. */
+                if (!managed)
                 {
                     CHECK_CUDA(cudaMallocHost(&data, new_size*sizeof(float)));
                     // Note that we don't throw exceptions since the free calls are invariably

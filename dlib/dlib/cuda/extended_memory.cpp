@@ -315,34 +315,51 @@ namespace xmem
         long        throughput_mib_per_s () const { return measured_mib_per_s; }
         std::size_t bytes_in_use () const { return used; }
 
-        std::int64_t allocate (std::size_t bytes)
-        {
-            const std::size_t slot = round_up(bytes);
+        /*
+            Hands out a slot, reporting the size it actually reserved.
 
-            auto it = free_slots.find(slot);
-            if (it != free_slots.end() && !it->second.empty())
+            A free list per size and a cursor that only ever advances is enough while the
+            sizes repeat, and wrong as soon as they vary: space freed by a block of one size
+            can never serve a request of another, so the cursor marches to the end of the
+            arena while most of it sits in lists nobody asks for. The capacity then has to
+            cover the variety of sizes rather than the working set, which is how a store of
+            ten gigabytes reported itself full holding six.
+
+            A free slot at least as large as the request is therefore accepted, the smallest
+            such, and up to twice the request so the waste stays bounded. The caller keeps
+            the reserved size and gives it back on release, which is what puts the slot into
+            the list it came from.
+        */
+        std::int64_t allocate (std::size_t bytes, std::size_t& reserved)
+        {
+            const std::size_t want = round_up(bytes);
+
+            for (auto it = free_slots.lower_bound(want);
+                 it != free_slots.end() && it->first <= 2*want; ++it)
             {
+                if (it->second.empty()) continue;
                 const std::int64_t off = it->second.back();
                 it->second.pop_back();
-                used += slot;
+                used += it->first;
+                reserved = it->first;
                 return off;
             }
 
-            if ((std::size_t)next + slot > cap)
+            if ((std::size_t)next + want > cap)
                 return -1;
 
             const std::int64_t off = next;
-            next += (std::int64_t)slot;
-            used += slot;
+            next += (std::int64_t)want;
+            used += want;
+            reserved = want;
             return off;
         }
 
-        void release (std::int64_t off, std::size_t bytes)
+        void release (std::int64_t off, std::size_t reserved)
         {
             if (off < 0) return;
-            const std::size_t slot = round_up(bytes);
-            free_slots[slot].push_back(off);
-            used -= std::min(used, slot);
+            free_slots[reserved].push_back(off);
+            used -= std::min(used, reserved);
         }
 
         /*
@@ -391,8 +408,13 @@ namespace xmem
                     std::cerr << "extended memory: the store is on a network filesystem. "
                                  "Put it on a local volume.\n";
                 else if (t == 0x01021994L)
-                    std::cerr << "extended memory: the store is on a memory filesystem, so it "
-                                 "occupies RAM rather than relieving it.\n";
+                {
+                    on_memory_fs = true;
+                    std::cerr << "extended memory: the store is on a memory filesystem. Its "
+                                 "pages are host memory and reach the disk only through swap, "
+                                 "which is right when the working set fits in RAM and wrong "
+                                 "when it does not.\n";
+                }
             }
 #endif
             /* The probe runs whether or not the run is verbose, because its result decides
@@ -419,8 +441,19 @@ namespace xmem
 
             measured_mib_per_s = (long)((double)(n >> 20) / dt);
             if (verbose)
+            {
                 std::cerr << "extended memory: the store writes at about "
-                          << measured_mib_per_s << " MiB/s\n";
+                          << measured_mib_per_s << " MiB/s";
+                if (!on_memory_fs)
+                    std::cerr << ". That is what a training step can hand the volume before "
+                                 "it waits, so a run that overflows the budget by more than "
+                                 "this per step will be bound by the store rather than by the "
+                                 "link. Raising the budget until the working set fits is the "
+                                 "remedy; a memory filesystem is not, since its pages are the "
+                                 "host memory the store exists to spare and it reaches the "
+                                 "disk through swap instead";
+                std::cerr << "\n";
+            }
         }
 
 
@@ -434,6 +467,7 @@ namespace xmem
         char*        mapping = nullptr;
 
         mutable long measured_mib_per_s = 0;
+        mutable bool on_memory_fs = false;
         std::size_t  cap     = 0;
         std::int64_t next    = 0;
         std::size_t  used    = 0;
@@ -495,10 +529,26 @@ namespace xmem
             return (float*)p;
         }
 
+        void set_capacity (std::size_t bytes) { std::lock_guard<std::mutex> lk(mu); cap_bytes = bytes; }
+
         void release (float* p, std::size_t bytes)
         {
             if (!p) return;
             std::lock_guard<std::mutex> lk(mu);
+
+            /* Past the ceiling the buffer goes back to the driver rather than into a bin.
+               Keeping it would be budget the live data cannot have, and a run whose block
+               sizes vary fills the bins with sizes it will not ask for again until the
+               working set no longer fits in what is left. */
+            if (cap_bytes && cached + bytes > cap_bytes)
+            {
+                const cudaError_t err = cudaFree(p);
+                if (err != cudaSuccess)
+                    std::cerr << "extended memory: cudaFree() failed. Reason: "
+                              << cudaGetErrorString(err) << std::endl;
+                return;
+            }
+
             bins[bytes].push_back(p);
             cached += bytes;
         }
@@ -507,6 +557,41 @@ namespace xmem
         {
             std::lock_guard<std::mutex> lk(mu);
             trim_locked();
+        }
+
+        std::size_t cached_bytes () const
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            return cached;
+        }
+
+        /*
+            Returns at least `needed` bytes to the driver, or everything held if that is
+            less. Buffers waiting in a bin are allocated as far as the card is concerned,
+            so under budget pressure they have to go before any live block is moved: giving
+            one back costs a cudaFree, evicting a block costs a transfer.
+        */
+        std::size_t trim_to_free (std::size_t needed)
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            std::size_t freed = 0;
+            for (auto it = bins.begin(); it != bins.end() && freed < needed; )
+            {
+                auto& v = it->second;
+                while (!v.empty() && freed < needed)
+                {
+                    const cudaError_t err = cudaFree(v.back());
+                    if (err != cudaSuccess)
+                        std::cerr << "extended memory: cudaFree() failed. Reason: "
+                                  << cudaGetErrorString(err) << std::endl;
+                    v.pop_back();
+                    freed  += it->first;
+                    cached -= std::min(cached, it->first);
+                }
+                if (v.empty()) it = bins.erase(it);
+                else           ++it;
+            }
+            return freed;
         }
 
     private:
@@ -530,6 +615,7 @@ namespace xmem
 
         mutable std::mutex mu;
         std::size_t cached = 0;
+        std::size_t cap_bytes = 0;
         std::unordered_map<std::size_t, std::vector<float*> > bins;
     };
 
@@ -841,6 +927,12 @@ namespace xmem
             std::size_t free_b = 0;
             CHECK_CUDA(cudaMemGetInfo(&free_b, &total_device_bytes));
             pool = std::make_shared<device_pool>();
+            /* A pool of a few hundred megabytes spares the driver every allocation it was
+               ever going to spare. Beyond that it is budget held idle, and on a working set
+               close to the budget that is the difference between a run that never evicts and
+               one that evicts constantly. */
+            pool->set_capacity(std::min((std::size_t)((double)vram_budget * opt.max_pool_fraction),
+                                        opt.max_pool_bytes));
             CHECK_CUDA(cudaStreamCreateWithFlags(&xstream, cudaStreamNonBlocking));
             engine.reset(new transfer_engine(opt.staging_bytes, xstream));
             if (!opt.store_path.empty())
@@ -928,7 +1020,7 @@ namespace xmem
                    for the first time, which is what loading a model does, goes straight to
                    the store instead of through a pinned buffer that would then have to be
                    spilled. The slot holds nothing yet, hence store_valid false. */
-                r->slot = arena->allocate(bytes);
+                r->slot = arena->allocate(bytes, r->slot_bytes);
                 if (r->slot >= 0)
                 {
                     r->slot_written = false;
@@ -990,7 +1082,7 @@ namespace xmem
             if (r->owner && r->owner->data_host && r->slot < 0)
                 pinned_bytes -= std::min(pinned_bytes, r->bytes);
             if (arena && r->slot >= 0)
-                arena->release(r->slot, r->bytes);
+                arena->release(r->slot, r->slot_bytes);
             if (!r->evictable)
                 immovable_bytes -= std::min(immovable_bytes, r->bytes);
 
@@ -1176,7 +1268,8 @@ namespace xmem
             if (g.data_host)
                 return;
 
-            allocate_pinned_mirror_locked(g, r);
+            if (!allocate_pinned_mirror_locked(g, r))
+                throw std::bad_alloc();
             if (r->state.load(std::memory_order_relaxed) == tier_device)
                 g.host_current = false;         // copy_to_host() picks it up on return
             else
@@ -1213,6 +1306,12 @@ namespace xmem
             s.host_pull_bytes   = host_pull_bytes;
             s.largest_block     = largest_block;
             s.immovable_bytes   = immovable_bytes;
+            s.pooled_bytes      = pool ? pool->cached_bytes() : 0;
+            {
+                std::size_t f = 0, t = 0;
+                if (cudaMemGetInfo(&f, &t) == cudaSuccess)
+                    s.device_free_bytes = f;
+            }
             s.hash_threshold    = fingerprint_threshold();
             s.hash_count        = hash_count;
 
@@ -1323,6 +1422,13 @@ namespace xmem
             {
                 while (resident_locked() + bytes > vram_budget)
                 {
+                    /* Buffers waiting in the pool are the cheapest thing to give up: no
+                       transfer, no store write, only a cudaFree. They go before any live
+                       block is considered. */
+                    const std::size_t over = resident_locked() + bytes - vram_budget;
+                    if (pool && pool->cached_bytes() > 0 && pool->trim_to_free(over) > 0)
+                        continue;
+
                     if (!evict_one_locked())
                     {
                         /* Nothing left that may be moved. A budget below what the blocks
@@ -1417,6 +1523,20 @@ namespace xmem
             std::cerr << "extended memory: the budget of " << (vram_budget/mib)
                       << " MiB cannot be met for a request of " << (wanted/mib) << " MiB. ";
 
+            /* When eviction has already stopped at the pinned ceiling, that is the answer,
+               and the categories below merely describe what happens to be resident. Saying
+               one of those instead would send the reader to a knob that changes nothing. */
+            if (pinned_ceiling_reported)
+            {
+                std::cerr << "Eviction stopped earlier at the host ceiling of "
+                          << (pinned_bytes/mib) << " MiB, so nothing more can leave the "
+                             "device. Give the extension a store: its pages are ordinary "
+                             "memory the system can reclaim, where pinned memory is not, "
+                             "and gigabytes of overflow belong there rather than in "
+                             "cudaMallocHost.\n";
+                return;
+            }
+
             /* Whichever holds the most is what the reader should act on, and the three call
                for opposite remedies: a block below the threshold never moves, a pinned one
                is being used right now, and one inside the hot window is merely too recent to
@@ -1475,9 +1595,16 @@ namespace xmem
         }
 
         // Everything the budget has to cover: managed blocks plus workspaces.
+        /*
+            What the card has given out, which is what the budget is for. Live blocks are
+            only part of it: a buffer released into the pool is still allocated as far as
+            the driver is concerned, and counting only the live ones lets a run whose block
+            sizes vary, as training does, drift far above the figure its caller set.
+        */
         std::size_t resident_locked () const
         {
-            return device_bytes + scratch_bytes.load(std::memory_order_relaxed);
+            return device_bytes + scratch_bytes.load(std::memory_order_relaxed)
+                 + (pool ? pool->cached_bytes() : 0);
         }
 
         void quiesce_locked ()
@@ -1660,7 +1787,8 @@ namespace xmem
                         }
                         return false;
                     }
-                    allocate_pinned_mirror_locked(g, r);
+                    if (!allocate_pinned_mirror_locked(g, r))
+                        return false;
                 }
                 if (!g.host_current)
                 {
@@ -1701,16 +1829,40 @@ namespace xmem
             return pinned_bytes + bytes <= cap;
         }
 
-        void allocate_pinned_mirror_locked (gpu_data& g, block_record* r)
+        /*
+            Returns false rather than throwing when the host has nothing left. An eviction
+            that cannot find host memory is a request the manager can decline: the block
+            stays on the device and the budget is exceeded, which the run survives. Throwing
+            from here unwinds through every destructor at once, each of which calls into a
+            driver that is already out of memory, and the failure that actually mattered is
+            then lost in several hundred lines of cudaFreeHost complaining.
+        */
+        bool allocate_pinned_mirror_locked (gpu_data& g, block_record* r)
         {
             void* p = nullptr;
-            CHECK_CUDA(cudaMallocHost(&p, r->bytes));
+            const cudaError_t err = cudaMallocHost(&p, r->bytes);
+            if (err != cudaSuccess)
+            {
+                if (!host_exhausted_reported)
+                {
+                    host_exhausted_reported = true;
+                    const double mib = 1024.0*1024.0;
+                    std::cerr << "extended memory: the host refused " << (r->bytes/mib)
+                              << " MiB of pinned memory (" << cudaGetErrorString(err)
+                              << ") with " << (pinned_bytes/mib) << " MiB already held. "
+                                 "Eviction stops here. Pinned memory cannot be paged out, so "
+                                 "an overflow of this size belongs in a store, whose pages "
+                                 "the system can reclaim.\n";
+                }
+                return false;
+            }
             g.data_host.reset((float*)p, [](float* q) {
-                const cudaError_t err = cudaFreeHost(q);
-                if (err != cudaSuccess)
-                    std::cerr << "cudaFreeHost() failed. Reason: " << cudaGetErrorString(err) << std::endl;
+                const cudaError_t e = cudaFreeHost(q);
+                if (e != cudaSuccess)
+                    std::cerr << "cudaFreeHost() failed. Reason: " << cudaGetErrorString(e) << std::endl;
             });
             pinned_bytes += r->bytes;
+            return true;
         }
 
         /*
@@ -2354,6 +2506,7 @@ namespace xmem
         std::size_t immovable_bytes = 0;
         bool        floor_reported  = false;
         bool        pinned_ceiling_reported = false;
+        bool        host_exhausted_reported  = false;
         unsigned long long host_pull_bytes = 0;
         double      sync_seconds    = 0;
         std::size_t sync_count      = 0;
@@ -2509,6 +2662,26 @@ namespace xmem
         extended_memory_options o = opts;
         if (o.vram_budget == 0)
             o.vram_budget = (std::size_t)((double)free_bytes * o.vram_budget_fraction);
+
+        /* A budget above what the device reports free is not a budget, it is a request the
+           driver will meet somewhere else. On a display driver that pages, cudaMalloc keeps
+           succeeding past the physical memory by spilling into host memory, so the manager
+           evicts to make room the card never lacked while the host fills up behind its back.
+           Nothing here can see that spill: allocation returns success either way. Saying so
+           at the outset is the only warning the mechanism can give. */
+        {
+            const double mib = 1024.0*1024.0;
+            const std::size_t safe = (std::size_t)((double)free_bytes * 0.9);
+            if (o.vram_budget > safe)
+            {
+                std::cerr << "extended memory: a budget of " << (o.vram_budget/mib)
+                          << " MiB is above the " << (free_bytes/mib) << " MiB the device "
+                             "reports free, of " << (total_bytes/mib) << " MiB total. The "
+                             "context and the libraries live outside the budget, and a driver "
+                             "that pages will meet the excess in host memory instead of "
+                             "failing. Lower it to about " << (safe/mib) << " MiB or less.\n";
+            }
+        }
         if (o.store_bytes == 0)
         {
             /* The store is a sparse file, so its declared size costs nothing until pages
@@ -2619,6 +2792,8 @@ namespace xmem
             << "  budget          " << (s.vram_budget/mib)       << " MiB\n"
             << "  on device       " << (s.device_bytes/mib)      << " MiB (peak "
                                     << (s.device_peak_bytes/mib) << " MiB)\n"
+            << "  device reports  " << (s.device_free_bytes/mib) << " MiB still free\n"
+            << "  pooled for reuse" << (s.pooled_bytes/mib)     << " MiB\n"
             << "  workspaces      " << (s.scratch_bytes/mib)     << " MiB\n"
             << "  pinned mirrors  " << (s.pinned_bytes/mib)      << " MiB\n"
             << "  in the store    " << (s.store_bytes/mib)       << " MiB of "
