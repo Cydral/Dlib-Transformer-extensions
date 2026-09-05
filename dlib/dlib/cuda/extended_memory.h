@@ -247,6 +247,9 @@ namespace dlib
         std::size_t        immovable_bytes   = 0;
         std::size_t        hash_threshold    = 0;
         std::size_t        hash_count        = 0;
+        // How the access trace is fed: total threads, and the busiest one's share.
+        unsigned           trace_threads     = 0;
+        double             trace_busiest     = 0;
         // Where the wall clock goes inside the subsystem, in seconds.
         double             sync_seconds      = 0;
         std::size_t        sync_count        = 0;
@@ -372,6 +375,9 @@ namespace dlib
             static std::uint32_t*             trace_ring;
             static std::uint64_t              trace_mask;
             static std::atomic<std::uint64_t> hot_head;
+            // One counter per thread that has ever fed the trace, plus how many are in use.
+            static std::atomic<std::uint64_t> thread_hits[8];
+            static std::atomic<unsigned>      thread_count;
             static std::uint32_t*             hot_ring;
             static std::uint64_t              hot_mask;
         };
@@ -383,6 +389,8 @@ namespace dlib
         template <typename tag> std::uint32_t*             globals<tag>::trace_ring     = nullptr;
         template <typename tag> std::uint64_t              globals<tag>::trace_mask     = 0;
         template <typename tag> std::atomic<std::uint64_t> globals<tag>::hot_head       {0};
+        template <typename tag> std::atomic<std::uint64_t> globals<tag>::thread_hits[8] {};
+        template <typename tag> std::atomic<unsigned>      globals<tag>::thread_count   {0};
         template <typename tag> std::uint32_t*             globals<tag>::hot_ring       = nullptr;
         template <typename tag> std::uint64_t              globals<tag>::hot_mask       = 0;
 
@@ -397,6 +405,34 @@ namespace dlib
         */
         inline void note_block_created () { g::blocks_created.fetch_add(1, std::memory_order_relaxed); }
 
+        /*
+            Which thread an access came from, assigned once and then read from a register.
+
+            The period search reads one trace, and a trace fed by more than one thread is
+            the interleaving of their sequences rather than any one of them. Two threads
+            that each repeat perfectly produce a merge order that varies from step to step,
+            so a period that exists in each is absent from the whole. Counting the accesses
+            per thread costs one relaxed increment and says whether that is what a run is
+            up against, which no other statistic here reveals.
+        */
+        const unsigned max_traced_threads = 8;
+
+        struct thread_slot
+        {
+            thread_slot()
+            {
+                const unsigned n = g::thread_count.fetch_add(1, std::memory_order_relaxed);
+                index = n < max_traced_threads ? n : max_traced_threads - 1;
+            }
+            unsigned index;
+        };
+
+        inline unsigned my_thread_slot ()
+        {
+            static thread_local thread_slot slot;
+            return slot.index;
+        }
+
         inline void trace_and_stamp (block_record* r)
         {
             r->stamp.store(g::clock.fetch_add(1, std::memory_order_relaxed), std::memory_order_relaxed);
@@ -406,6 +442,8 @@ namespace dlib
 
             const std::uint64_t h = g::hot_head.fetch_add(1, std::memory_order_relaxed);
             g::hot_ring[h & g::hot_mask] = r->id;
+
+            g::thread_hits[my_thread_slot()].fetch_add(1, std::memory_order_relaxed);
         }
 
         // Out of line: everything below is either rare or already dominated by a transfer.

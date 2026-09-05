@@ -979,7 +979,23 @@ namespace dlib
     
 // ----------------------------------------------------------------------------------------
 
-    template <long k_, long nr_, long nc_>
+    /*!
+        How a reshape_to_ layer relates its input's element order to its output's.
+
+        A reshape reinterprets one buffer with different dimensions and leaves the order of
+        the elements alone; splitting or merging attention heads moves them. The two cannot
+        be told apart from the shapes, because the shapes of an innocent reshape can coincide
+        exactly with those of a head split, and a layer that guesses will silently permute a
+        tensor its caller only meant to reinterpret. The intent is therefore declared.
+    !*/
+    enum reshape_mode
+    {
+        RESHAPE_FLAT = 0,     // reinterpret the buffer, element order preserved
+        RESHAPE_SPLIT_HEADS,  // [B, 1, N, H*D] -> [B, H, N, D], a permutation
+        RESHAPE_MERGE_HEADS   // [B, H, N, D] -> [B, 1, N, H*D], its inverse
+    };
+
+    template <long k_, long nr_, long nc_, reshape_mode mode_ = RESHAPE_FLAT>
     class reshape_to_
     {
     public:
@@ -994,8 +1010,6 @@ namespace dlib
 
             input_k = input_nr = input_nc = 0;
             needs_rescale = false;
-            is_head_split = false;
-            is_head_merge = false;
         }
 
         // Getters for dimensions
@@ -1033,7 +1047,9 @@ namespace dlib
             const long input_elements = input_k * input_nr * input_nc;
             const long output_elements = output_k * output_nr * output_nc;
 
-            // Spatial rescale: same channel count but different element count
+            /* A differing element count cannot be a reshape under any reading, so the only
+               interpretation left is a spatial rescale, and it is taken without ambiguity.
+               Everything else follows the mode the caller declared. */
             needs_rescale = (input_elements != output_elements && input_k == output_k);
 
             DLIB_CASSERT(input_elements == output_elements || needs_rescale,
@@ -1041,25 +1057,24 @@ namespace dlib
                 " elements into shape with " << output_elements << " elements. " <<
                 "For spatial rescaling, the channel dimension (k) must remain constant.");
 
-            // Detect head split / merge. These match the multi-head attention
-            // patterns and require physical reordering rather than a flat
-            // memcpy on an alias_tensor.
-            is_head_split = false;
-            is_head_merge = false;
-            if (!needs_rescale)
+            DLIB_CASSERT(!needs_rescale || mode_ == RESHAPE_FLAT,
+                "A head split or merge cannot change the number of elements.");
+
+            if (mode_ == RESHAPE_SPLIT_HEADS)
             {
-                if (input_k == 1 && output_k > 1 &&
-                    input_nr == output_nr &&
-                    input_nc == output_k * output_nc)
-                {
-                    is_head_split = true;
-                }
-                else if (input_k > 1 && output_k == 1 &&
-                    input_nr == output_nr &&
-                    output_nc == input_k * input_nc)
-                {
-                    is_head_merge = true;
-                }
+                DLIB_CASSERT(input_k == 1 && output_k > 1 &&
+                    input_nr == output_nr && input_nc == output_k * output_nc,
+                    "split_heads_to expects [B, 1, N, H*D] to [B, H, N, D], but was given ["
+                    << input_k << ", " << input_nr << ", " << input_nc << "] to ["
+                    << output_k << ", " << output_nr << ", " << output_nc << "].");
+            }
+            else if (mode_ == RESHAPE_MERGE_HEADS)
+            {
+                DLIB_CASSERT(input_k > 1 && output_k == 1 &&
+                    input_nr == output_nr && output_nc == input_k * input_nc,
+                    "merge_heads_to expects [B, H, N, D] to [B, 1, N, H*D], but was given ["
+                    << input_k << ", " << input_nr << ", " << input_nc << "] to ["
+                    << output_k << ", " << output_nr << ", " << output_nc << "].");
             }
         }
 
@@ -1073,12 +1088,12 @@ namespace dlib
             {
                 tt::resize_bilinear(output, input);
             }
-            else if (is_head_split)
+            else if (mode_ == RESHAPE_SPLIT_HEADS)
             {
                 // dst[b, h, n, j] = src[b, 0, n, h*HDIM + j]
                 tt::split_heads(false, output, input);
             }
-            else if (is_head_merge)
+            else if (mode_ == RESHAPE_MERGE_HEADS)
             {
                 // dst[b, 0, n, h*HDIM + j] = src[b, h, n, j]
                 tt::merge_heads(false, output, input);
@@ -1101,13 +1116,13 @@ namespace dlib
             {
                 tt::resize_bilinear_gradient(grad, gradient_input);
             }
-            else if (is_head_split)
+            else if (mode_ == RESHAPE_SPLIT_HEADS)
             {
                 // Gradient of split_heads gathers heads back into the [B, 1, N, H*HDIM]
                 // upstream gradient, accumulating onto whatever is already there.
                 tt::merge_heads(true, grad, gradient_input);
             }
-            else if (is_head_merge)
+            else if (mode_ == RESHAPE_MERGE_HEADS)
             {
                 // Gradient of merge_heads scatters back into the [B, H, N, HDIM]
                 // upstream gradient.
@@ -1146,8 +1161,6 @@ namespace dlib
             serialize(item.output_nr, out);
             serialize(item.output_nc, out);
             serialize(item.needs_rescale, out);
-            serialize(item.is_head_split, out);
-            serialize(item.is_head_merge, out);
         }
 
         friend void deserialize(reshape_to_& item, std::istream& in)
@@ -1163,16 +1176,14 @@ namespace dlib
             deserialize(item.output_nr, in);
             deserialize(item.output_nc, in);
             deserialize(item.needs_rescale, in);
-            deserialize(item.is_head_split, in);
-            deserialize(item.is_head_merge, in);
         }
 
         friend std::ostream& operator<<(std::ostream& out, const reshape_to_& item)
         {
-            const char* mode = "pure_reshape";
-            if (item.needs_rescale)      mode = "spatial_rescale";
-            else if (item.is_head_split) mode = "head_split";
-            else if (item.is_head_merge) mode = "head_merge";
+            const char* mode = item.needs_rescale ? "spatial_rescale"
+                             : mode_ == RESHAPE_SPLIT_HEADS ? "head_split"
+                             : mode_ == RESHAPE_MERGE_HEADS ? "head_merge"
+                             : "pure_reshape";
 
             out << "reshape_to (";
             out << "k=" << std::to_string(item.output_k);
@@ -1185,10 +1196,10 @@ namespace dlib
 
         friend void to_xml(const reshape_to_& item, std::ostream& out)
         {
-            const char* mode = "pure_reshape";
-            if (item.needs_rescale)      mode = "spatial_rescale";
-            else if (item.is_head_split) mode = "head_split";
-            else if (item.is_head_merge) mode = "head_merge";
+            const char* mode = item.needs_rescale ? "spatial_rescale"
+                             : mode_ == RESHAPE_SPLIT_HEADS ? "head_split"
+                             : mode_ == RESHAPE_MERGE_HEADS ? "head_merge"
+                             : "pure_reshape";
 
             out << "<reshape_to"
                 << " k='" << item.output_k << "'"
@@ -1202,16 +1213,25 @@ namespace dlib
         long input_k, input_nr, input_nc;       // Input dimensions
         long output_k, output_nr, output_nc;    // Output dimensions
         bool needs_rescale;                     // Spatial rescaling mode (resize_bilinear)
-        bool is_head_split;                     // [B, 1, N, H*D'] -> [B, H, N, D']
-        bool is_head_merge;                     // [B, H, N, D'] -> [B, 1, N, H*D']
         resizable_tensor params;                // No trainable parameters
     };
 
+    // Reinterprets the buffer with new dimensions. The element order is preserved, so a
+    // reshape followed by its inverse is the identity.
     template <long k, long nr, long nc, typename SUBNET>
-    using reshape_to = add_layer<reshape_to_<k, nr, nc>, SUBNET>;
+    using reshape_to = add_layer<reshape_to_<k, nr, nc, RESHAPE_FLAT>, SUBNET>;
 
     template <long k, long nr, long nc, typename SUBNET>
-    using flatten = add_layer<reshape_to_<k * nr * nc, 1, 1>, SUBNET>;
+    using flatten = add_layer<reshape_to_<k * nr * nc, 1, 1, RESHAPE_FLAT>, SUBNET>;
+
+    // Distributes a width across attention heads: [B, 1, N, H*D] to [B, H, N, D]. This
+    // moves elements, which is why it is named rather than deduced from the shapes.
+    template <long heads, long nr, long head_dim, typename SUBNET>
+    using split_heads_to = add_layer<reshape_to_<heads, nr, head_dim, RESHAPE_SPLIT_HEADS>, SUBNET>;
+
+    // Gathers the heads back into one width: [B, H, N, D] to [B, 1, N, H*D].
+    template <long nr, long width, typename SUBNET>
+    using merge_heads_to = add_layer<reshape_to_<1, nr, width, RESHAPE_MERGE_HEADS>, SUBNET>;
 
 // ----------------------------------------------------------------------------------------
 
@@ -6301,102 +6321,59 @@ namespace dlib
             tt::copy_tensor(false, input_cache_, 0, input, 0, input.k());
             output = 0;
 
-            const long total_positions = batch_size_ * seq_len_;
-            float* cum_halt = cumulative_halting_.host();
-            float* remainders = remainders_.host();
-            float* n_steps = n_steps_.host();
+            /* Everything the halting machine needs starts on the device and stays there.
+               These are device assignments, not host loops: the point of the rewrite is
+               that no per-position quantity crosses the bus. */
+            cumulative_halting_ = 0;
+            remainders_ = 1.0f;
+            n_steps_ = 0;
 
-            for (long i = 0; i < total_positions; ++i) {
-                cum_halt[i] = 0.0f;
-                remainders[i] = 1.0f;
-                n_steps[i] = 0.0f;
-            }
-
-            // Initialize per-step storage
-            for (long step = 0; step < max_steps_; ++step) {
+            /* Cleared for every step, including the ones the loop may not reach: the
+               backward pass reads a mask of zeros as "this step did not run". */
+            for (long step = 0; step < max_steps_; ++step)
+            {
                 step_halt_probs_[step] = 0;
                 step_logits_[step] = 0;
                 step_weights_[step] = 0;
                 active_mask_[step] = 0;
-                step_states_[step] = 0;
             }
-
-            // Get halting parameter pointers
-            const float* W_halt = halt_params_.host();
-            const float b_halt = halt_params_.host()[feature_dim_];
 
             // Initialize current state with input
             current_state_.copy_size(input);
             tt::copy_tensor(false, current_state_, 0, input, 0, input.k());
 
-            // Main ACT loop
-            for (long step = 0; step < max_steps_; ++step) {
-                float* halt_ptr = step_halt_probs_[step].host();
-                float* logit_ptr = step_logits_[step].host();
-                float* mask_ptr = active_mask_[step].host();
-                float* weight_ptr = step_weights_[step].host();
+            steps_taken_ = 0;
 
+            // Main ACT loop
+            for (long step = 0; step < max_steps_; ++step)
+            {
                 // Store current state for backward pass
                 tt::copy_tensor(false, step_states_[step], 0, current_state_, 0, current_state_.k());
 
-                // Reset mask for this step
-                for (long i = 0; i < batch_size_ * seq_len_; ++i)
-                    mask_ptr[i] = 0.0f;
+                tt::act_mark_active(active_mask_[step], active_count_,
+                    cumulative_halting_, halt_threshold_);
 
-                // Determine active positions for this step
-                bool any_active = false;
-                for (long b = 0; b < batch_size_; ++b) {
-                    for (long s = 0; s < seq_len_; ++s) {
-                        const long pos = b * seq_len_ + s;
-                        if (cum_halt[pos] < halt_threshold_) {
-                            any_active = true;
-                            mask_ptr[pos] = 1.0f;
-                        }
-                    }
-                }
+                /* The one place the host waits for the device in this pass. Four bytes,
+                   against the two full transfers of per-position state that reading the
+                   halting probabilities used to cost at every step. */
+                if (active_count_.host()[0] < 0.5f) break;
 
-                if (!any_active) break;
-
-                // Compute halt logits and probabilities using optimized function
                 tt::compute_halt_logits(step_logits_[step], step_halt_probs_[step],
                     current_state_, halt_params_, active_mask_[step],
                     batch_size_, seq_len_, num_channels_, feature_dim_);
-                step_logits_[step].host(); // This explicit sync is mandatory
-                step_halt_probs_[step].host();
 
-                // Update halting state and compute weights
-                for (long b = 0; b < batch_size_; ++b) {
-                    for (long s = 0; s < seq_len_; ++s) {
-                        const long pos = b * seq_len_ + s;
+                tt::act_update_halting(cumulative_halting_, remainders_, n_steps_,
+                    step_weights_[step], step_halt_probs_[step], active_mask_[step],
+                    step, max_steps_, halt_threshold_);
 
-                        if (mask_ptr[pos] < 0.5f) continue;
-
-                        const float h = halt_ptr[pos];
-                        float p_n;
-                        const float new_cum = cum_halt[pos] + h;
-
-                        if (new_cum >= halt_threshold_ || step == max_steps_ - 1) {
-                            p_n = remainders[pos];
-                            n_steps[pos] = static_cast<float>(step + 1);
-                            cum_halt[pos] = halt_threshold_;
-                        }
-                        else {
-                            p_n = h;
-                            cum_halt[pos] = new_cum;
-                            remainders[pos] -= h;
-                        }
-
-                        weight_ptr[pos] = p_n;
-                    }
-                }
-
-                // Accumulate weighted state
                 tt::accumulate_weighted_state(output, current_state_, step_weights_[step],
                     active_mask_[step], batch_size_, seq_len_, num_channels_, feature_dim_);
 
+                steps_taken_ = step + 1;
+
                 // Apply transition network for next step
-                if (step < max_steps_ - 1) {
-                    // Forward through transition network
+                if (step < max_steps_ - 1)
+                {
                     transition_net_(current_state_);
                     const tensor& trans_out = transition_net_.get_output();
 
@@ -6405,7 +6382,9 @@ namespace dlib
                 }
             }
 
-            compute_ponder_stats();
+            /* The ponder figures are read by reporting code, not by the loss, so they are
+               computed when someone asks rather than by pulling n_steps_ down every pass. */
+            stats_dirty_ = true;
         }
 
         template <typename SUBNET>
@@ -6414,100 +6393,80 @@ namespace dlib
             tensor& input_grad = sub.get_gradient_input();
             const long total_positions = batch_size_ * seq_len_;
 
-            // Initialize halting parameter gradients
             params_grad = 0;
 
-            // Gradient accumulator for state
-            resizable_tensor grad_state;
-            grad_state.copy_size(current_state_);
-            grad_state = 0;
+            grad_state_.copy_size(current_state_);
+            grad_state_ = 0;
 
-            // Precompute final states for each position (needed for halt gradient)
-            // We need step_states_[N_t - 1] for each position, but N_t varies
-            // For simplicity, we'll use step_states_[max computed step] as approximation
-            // or iterate and build final_state tensor
-
-            // Build final_state tensor based on n_steps
-            resizable_tensor final_state;
-            final_state.copy_size(current_state_);
-            const float* n_steps_data = n_steps_.host();
-
-            for (long b = 0; b < batch_size_; ++b) {
-                for (long s = 0; s < seq_len_; ++s) {
-                    const long pos = b * seq_len_ + s;
-                    const long N_t = static_cast<long>(n_steps_data[pos]);
-                    if (N_t > 0 && N_t <= max_steps_) {
-                        const float* src = step_states_[N_t - 1].host();
-                        float* dst = final_state.host();
-                        for (long c = 0; c < num_channels_; ++c) {
-                            for (long f = 0; f < feature_dim_; ++f) {
-                                const long idx = ((b * num_channels_ + c) * seq_len_ + s) * feature_dim_ + f;
-                                dst[idx] = src[idx];
-                            }
-                        }
-                    }
-                }
+            /* The state each position ended on, assembled one step at a time. A position
+               contributes at the step where it halted, so a pass per executed step settles
+               it without any position index reaching the host. */
+            final_state_.copy_size(current_state_);
+            final_state_ = 0;
+            for (long step = 0; step < steps_taken_; ++step)
+            {
+                tt::act_gather_final_state(final_state_, step_states_[step], n_steps_, step,
+                    batch_size_, seq_len_, num_channels_, feature_dim_);
             }
 
-            // Backward through steps (reverse order)
-            for (long step = max_steps_ - 1; step >= 0; --step) {
-                const float* weight_ptr = step_weights_[step].host();
+            reset_transition_gradient_accumulator();
 
-                // Part 1: gradient from weighted output
-                for (long pos = 0; pos < total_positions; ++pos) {
-                    if (active_mask_[step].host()[pos] < 0.5f) continue;
+            /* Only the steps the forward pass ran. Walking the others would backpropagate
+               through transitions that were never applied. */
+            for (long step = steps_taken_ - 1; step >= 0; --step)
+            {
+                // Part 1: gradient from the weighted output
+                tt::act_accumulate_output_grad(grad_state_, gradient_input,
+                    step_weights_[step], active_mask_[step], n_steps_, step,
+                    batch_size_, seq_len_, num_channels_, feature_dim_);
 
-                    const long N_t = static_cast<long>(n_steps_data[pos]);
-                    if (step >= N_t) continue;
-
-                    const long b = pos / seq_len_;
-                    const long s = pos % seq_len_;
-                    const float p_n = weight_ptr[pos];
-
-                    for (long c = 0; c < num_channels_; ++c) {
-                        for (long f = 0; f < feature_dim_; ++f) {
-                            const long idx = ((b * num_channels_ + c) * seq_len_ + s) * feature_dim_ + f;
-                            grad_state.host()[idx] += p_n * gradient_input.host()[idx];
-                        }
-                    }
-                }
-
-                // Part 2: gradient w.r.t. halting probability using optimized function
-                tt::compute_halt_gradient(params_grad, grad_state, gradient_input,
+                // Part 2: gradient with respect to the halting probability
+                tt::compute_halt_gradient(params_grad, grad_state_, gradient_input,
                     step_states_[step], step_halt_probs_[step], halt_params_,
-                    active_mask_[step], n_steps_, final_state, step,
+                    active_mask_[step], n_steps_, final_state_, step,
                     batch_size_, seq_len_, num_channels_, feature_dim_,
                     ponder_penalty_, gradient_check_mode_);
 
-                // Part 3: backprop through transition that created this step's state
-                if (step > 0) {
+                // Part 3: back through the transition that produced this step's state
+                if (step > 0)
+                {
                     transition_net_.forward(step_states_[step - 1]);
-                    transition_net_.back_propagate_error(step_states_[step - 1], grad_state);
+                    transition_net_.back_propagate_error(step_states_[step - 1], grad_state_);
                     const tensor& trans_grad = transition_net_.get_final_data_gradient();
-                    tt::add(1.0f, grad_state, 1.0f, trans_grad);
+
+                    /* One network is applied at several steps, so its parameter gradient is
+                       the sum over those steps. dlib's back_propagate_error assigns into a
+                       layer's parameter gradient rather than adding to it, so each call
+                       erases the one before; without this the transition network would be
+                       trained on a single step. */
+                    accumulate_transition_gradients();
+
+                    /* Residual: s_{n+1} = s_n + T(s_n), so the gradient with respect to s_n
+                       is the one with respect to s_{n+1} plus what comes back through T. */
+                    tt::add(1.0f, grad_state_, 1.0f, trans_grad);
                 }
             }
 
-            // Part 4: gradient to input
-            float* grad_out = input_grad.host();
-            for (long i = 0; i < input_grad.size(); ++i)
-                grad_out[i] += grad_state.host()[i];
+            restore_transition_gradients();
 
-            // Apply learning rate multiplier to halt_params gradients
-            if (learning_rate_multiplier_ != 1.0) {
-                const float mult = static_cast<float>(learning_rate_multiplier_);
-                for (long i = 0; i < params_grad.size(); ++i)
-                    params_grad.host()[i] *= mult;
-            }
+            // Part 4: gradient to the input, accumulated as dlib expects of a layer
+            tt::add(1.0f, input_grad, 1.0f, grad_state_);
 
-            // Apply normalization and depth scaling (only in training mode)
             const bool in_training = !network_context::is_active() || network_context::is_training();
-            if (!gradient_check_mode_ && in_training) {
-                const float inv_total = 1.0f / static_cast<float>(total_positions);
-                for (long i = 0; i < params_grad.size(); ++i)
-                    params_grad.host()[i] *= inv_total;
 
-                if (enable_depth_scaling_) {
+            // Both scalings folded into a single pass over the halting parameters.
+            float scale = 1.0f;
+            if (learning_rate_multiplier_ != 1.0)
+                scale *= static_cast<float>(learning_rate_multiplier_);
+            if (!gradient_check_mode_ && in_training && total_positions > 0)
+                scale *= 1.0f / static_cast<float>(total_positions);
+            if (scale != 1.0f)
+                tt::affine_transform(params_grad, params_grad, scale, 0.0f);
+
+            if (!gradient_check_mode_ && in_training)
+            {
+                if (enable_depth_scaling_)
+                {
                     tt::apply_act_depth_scaling(input_grad, n_steps_, batch_size_,
                         seq_len_, num_channels_, feature_dim_, max_steps_);
                 }
@@ -6537,9 +6496,9 @@ namespace dlib
         void set_halt_threshold(float t) { if (t > 0 && t <= 1) halt_threshold_ = t; }
         void set_ponder_penalty(float p) { if (p >= 0) ponder_penalty_ = p; }
 
-        float get_ponder_cost() const { return ponder_cost_; }
-        float get_average_steps() const { return avg_steps_; }
-        float get_regularization_loss() const { return ponder_penalty_ * ponder_cost_; }
+        float get_ponder_cost() const { refresh_stats(); return ponder_cost_; }
+        float get_average_steps() const { refresh_stats(); return avg_steps_; }
+        float get_regularization_loss() const { refresh_stats(); return ponder_penalty_ * ponder_cost_; }
 
         void enable_gradient_check_mode() { gradient_check_mode_ = true; }
         void disable_gradient_check_mode() { gradient_check_mode_ = false; }
@@ -6651,16 +6610,76 @@ namespace dlib
 
             input_cache_.set_size(batch_size_, num_channels_, seq_len_, feature_dim_);
             current_state_.set_size(batch_size_, num_channels_, seq_len_, feature_dim_);
+            active_count_.set_size(1, 1, 1, 1);
         }
 
-        void compute_ponder_stats()
+        /*
+            The ponder figures are reporting, not part of the loss, so pulling the step
+            counts down on every forward pass would buy a transfer for a number nobody
+            looked at. They are computed the first time one is asked for after a pass.
+        */
+        void refresh_stats() const
         {
+            if (!stats_dirty_ || n_steps_.size() == 0) return;
+
             const float* steps = n_steps_.host();
             const long total = batch_size_ * seq_len_;
             float sum = 0.0f;
             for (long i = 0; i < total; ++i) sum += steps[i];
-            avg_steps_ = sum / total;
+            avg_steps_ = total > 0 ? sum / total : 0.0f;
             ponder_cost_ = avg_steps_;
+            stats_dirty_ = false;
+        }
+
+        /*
+            One network applied at several steps has, for parameter gradient, the sum of
+            what each step contributes. dlib's back_propagate_error assigns into a layer's
+            parameter gradient rather than adding to it, so consecutive calls erase one
+            another. These carry the sum across the loop and put it back before the solver
+            runs.
+        */
+        struct gradient_accumulator
+        {
+            std::vector<resizable_tensor>* store;
+            size_t index;
+            bool accumulate;
+
+            template <typename layer_type>
+            auto operator()(layer_type& l) -> decltype(l.get_parameter_gradient(), void())
+            {
+                tensor& g = l.get_parameter_gradient();
+                if (g.size() == 0) return;
+                if (store->size() <= index) store->resize(index + 1);
+                resizable_tensor& acc = (*store)[index];
+                if (accumulate)
+                {
+                    if (acc.size() != g.size()) { acc.copy_size(g); acc = 0; }
+                    tt::add(1.0f, acc, 1.0f, g);
+                }
+                else if (acc.size() == g.size())
+                {
+                    tt::copy_tensor(false, g, 0, acc, 0, acc.k());
+                }
+                ++index;
+            }
+        };
+
+        void reset_transition_gradient_accumulator()
+        {
+            for (auto& a : transition_grad_accum_) a = 0;
+        }
+
+        void accumulate_transition_gradients()
+        {
+            gradient_accumulator v{&transition_grad_accum_, 0, true};
+            visit_layers(transition_net_, v);
+        }
+
+        void restore_transition_gradients()
+        {
+            if (transition_grad_accum_.empty()) return;
+            gradient_accumulator v{&transition_grad_accum_, 0, false};
+            visit_layers(transition_net_, v);
         }
 
         void update_transition_parameters()
@@ -6706,8 +6725,10 @@ namespace dlib
 
         double learning_rate_multiplier_;
         double current_learning_rate_;
-        float ponder_cost_;
-        float avg_steps_;
+        mutable float ponder_cost_;
+        mutable float avg_steps_;
+        mutable bool stats_dirty_ = true;
+        long steps_taken_ = 0;
 
         resizable_tensor halt_params_;
         transition_net_type transition_net_;
@@ -6724,6 +6745,10 @@ namespace dlib
 
         resizable_tensor input_cache_;
         resizable_tensor current_state_;
+        resizable_tensor active_count_;
+        resizable_tensor grad_state_;
+        resizable_tensor final_state_;
+        std::vector<resizable_tensor> transition_grad_accum_;
 
         std::vector<adamw> transition_solvers_;
         bool transition_solvers_initialized_;

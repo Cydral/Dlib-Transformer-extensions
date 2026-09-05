@@ -3624,6 +3624,213 @@ namespace dlib
             }
         }
 
+    // ----------------------------------------------------------------------------------------
+
+        __global__ void _cuda_act_mark_active(
+            float* active_mask,
+            float* active_count,
+            const float* cumulative_halting,
+            float halt_threshold,
+            size_t total_positions
+        )
+        {
+            for (auto pos : grid_stride_range(0, total_positions))
+            {
+                const bool still_running = cumulative_halting[pos] < halt_threshold;
+                active_mask[pos] = still_running ? 1.0f : 0.0f;
+                if (still_running) atomicAdd(active_count, 1.0f);
+            }
+        }
+
+        void act_mark_active(
+            tensor& active_mask,
+            tensor& active_count,
+            const tensor& cumulative_halting,
+            float halt_threshold
+        )
+        {
+            const size_t total_positions = cumulative_halting.size();
+            float* counter = active_count.device_write_only();
+            CHECK_CUDA(cudaMemsetAsync(counter, 0, sizeof(float)));
+
+            launch_kernel(_cuda_act_mark_active,
+                max_jobs(total_positions),
+                active_mask.device_write_only(),
+                counter,
+                cumulative_halting.device(),
+                halt_threshold,
+                total_positions);
+        }
+
+        __global__ void _cuda_act_update_halting(
+            float* cumulative_halting,
+            float* remainders,
+            float* n_steps,
+            float* step_weights,
+            const float* halt_probs,
+            const float* active_mask,
+            long step,
+            long max_steps,
+            float halt_threshold,
+            size_t total_positions
+        )
+        {
+            for (auto pos : grid_stride_range(0, total_positions))
+            {
+                if (active_mask[pos] < 0.5f) continue;
+
+                const float h = halt_probs[pos];
+                const float new_cum = cumulative_halting[pos] + h;
+
+                if (new_cum >= halt_threshold || step == max_steps - 1)
+                {
+                    step_weights[pos] = remainders[pos];
+                    n_steps[pos] = static_cast<float>(step + 1);
+                    cumulative_halting[pos] = halt_threshold;
+                }
+                else
+                {
+                    step_weights[pos] = h;
+                    cumulative_halting[pos] = new_cum;
+                    remainders[pos] = remainders[pos] - h;
+                }
+            }
+        }
+
+        void act_update_halting(
+            tensor& cumulative_halting,
+            tensor& remainders,
+            tensor& n_steps,
+            tensor& step_weights,
+            const tensor& halt_probs,
+            const tensor& active_mask,
+            long step,
+            long max_steps,
+            float halt_threshold
+        )
+        {
+            const size_t total_positions = cumulative_halting.size();
+
+            launch_kernel(_cuda_act_update_halting,
+                max_jobs(total_positions),
+                cumulative_halting.device(),
+                remainders.device(),
+                n_steps.device(),
+                step_weights.device(),
+                halt_probs.device(),
+                active_mask.device(),
+                step,
+                max_steps,
+                halt_threshold,
+                total_positions);
+        }
+
+        __global__ void _cuda_act_gather_final_state(
+            float* final_state,
+            const float* step_state,
+            const float* n_steps,
+            long step,
+            size_t seq_len,
+            size_t num_channels,
+            size_t feature_dim,
+            size_t total_elements
+        )
+        {
+            for (auto idx : grid_stride_range(0, total_elements))
+            {
+                const size_t f = idx % feature_dim;
+                const size_t rest = idx / feature_dim;
+                const size_t s = rest % seq_len;
+                const size_t b = (rest / seq_len) / num_channels;
+                const size_t pos = b * seq_len + s;
+                (void)f;
+
+                if (static_cast<long>(n_steps[pos]) == step + 1)
+                    final_state[idx] = step_state[idx];
+            }
+        }
+
+        void act_gather_final_state(
+            tensor& final_state,
+            const tensor& step_state,
+            const tensor& n_steps,
+            long step,
+            long batch_size,
+            long seq_len,
+            long num_channels,
+            long feature_dim
+        )
+        {
+            const size_t total_elements = (size_t)batch_size * num_channels * seq_len * feature_dim;
+
+            launch_kernel(_cuda_act_gather_final_state,
+                max_jobs(total_elements),
+                final_state.device(),
+                step_state.device(),
+                n_steps.device(),
+                step,
+                seq_len,
+                num_channels,
+                feature_dim,
+                total_elements);
+        }
+
+        __global__ void _cuda_act_accumulate_output_grad(
+            float* grad_state,
+            const float* gradient_input,
+            const float* step_weights,
+            const float* active_mask,
+            const float* n_steps,
+            long step,
+            size_t seq_len,
+            size_t num_channels,
+            size_t feature_dim,
+            size_t total_elements
+        )
+        {
+            for (auto idx : grid_stride_range(0, total_elements))
+            {
+                const size_t rest = idx / feature_dim;
+                const size_t s = rest % seq_len;
+                const size_t b = (rest / seq_len) / num_channels;
+                const size_t pos = b * seq_len + s;
+
+                if (active_mask[pos] < 0.5f) continue;
+                if (step >= static_cast<long>(n_steps[pos])) continue;
+
+                grad_state[idx] += step_weights[pos] * gradient_input[idx];
+            }
+        }
+
+        void act_accumulate_output_grad(
+            tensor& grad_state,
+            const tensor& gradient_input,
+            const tensor& step_weights,
+            const tensor& active_mask,
+            const tensor& n_steps,
+            long step,
+            long batch_size,
+            long seq_len,
+            long num_channels,
+            long feature_dim
+        )
+        {
+            const size_t total_elements = (size_t)batch_size * num_channels * seq_len * feature_dim;
+
+            launch_kernel(_cuda_act_accumulate_output_grad,
+                max_jobs(total_elements),
+                grad_state.device(),
+                gradient_input.device(),
+                step_weights.device(),
+                active_mask.device(),
+                n_steps.device(),
+                step,
+                seq_len,
+                num_channels,
+                feature_dim,
+                total_elements);
+        }
+
         void apply_rotary_positional_embedding(
             bool is_backward,
             tensor& data,

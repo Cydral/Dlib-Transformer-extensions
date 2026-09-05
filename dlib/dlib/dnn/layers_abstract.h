@@ -1693,6 +1693,33 @@ namespace dlib
     
 // ----------------------------------------------------------------------------------------
 
+    enum reshape_mode
+    {
+        RESHAPE_FLAT = 0,
+        RESHAPE_SPLIT_HEADS,
+        RESHAPE_MERGE_HEADS
+    };
+    /*!
+        WHAT THIS OBJECT REPRESENTS
+            How a reshape_to_ layer relates the element order of its input to that of its
+            output.
+
+            RESHAPE_FLAT reinterprets one buffer with different dimensions and leaves the
+            order of the elements alone, so a reshape followed by its inverse is the
+            identity.
+
+            RESHAPE_SPLIT_HEADS distributes a width across attention heads, taking
+            [B, 1, N, H*D] to [B, H, N, D] such that out[b, h, n, j] == in[b, 0, n, h*D + j].
+            This moves elements.
+
+            RESHAPE_MERGE_HEADS is its inverse, taking [B, H, N, D] to [B, 1, N, H*D].
+
+            The mode is a template parameter rather than something the layer deduces,
+            because the shapes of a head split can coincide exactly with those of an
+            innocent reshape, and a layer that guesses will silently permute a tensor its
+            caller only meant to reinterpret.
+    !*/
+
     template <long k_ = -1, long nr_ = -1, long nc_ = -1>
     class reshape_to_
     {
@@ -1905,10 +1932,35 @@ namespace dlib
     };
 
     template <long k, long nr, long nc, typename SUBNET>
-    using reshape_to = add_layer<reshape_to_<k, nr, nc>, SUBNET>;
+    using reshape_to = add_layer<reshape_to_<k, nr, nc, RESHAPE_FLAT>, SUBNET>;
 
     template <long k, long nr, long nc, typename SUBNET>
-    using flatten = add_layer<reshape_to_<k* nr* nc, 1, 1>, SUBNET>;
+    using flatten = add_layer<reshape_to_<k* nr* nc, 1, 1, RESHAPE_FLAT>, SUBNET>;
+
+// ----------------------------------------------------------------------------------------
+
+    template <long heads, long nr, long head_dim, typename SUBNET>
+    using split_heads_to = add_layer<reshape_to_<heads, nr, head_dim, RESHAPE_SPLIT_HEADS>, SUBNET>;
+    /*!
+        REQUIREMENTS ON THE INPUT
+            - The input has one channel and its last dimension is heads*head_dim.
+        WHAT THIS OBJECT REPRESENTS
+            Distributes a width across attention heads: [B, 1, N, heads*head_dim] becomes
+            [B, heads, N, head_dim], with out[b, h, n, j] == in[b, 0, n, h*head_dim + j].
+            Use merge_heads_to to undo it.
+    !*/
+
+// ----------------------------------------------------------------------------------------
+
+    template <long nr, long width, typename SUBNET>
+    using merge_heads_to = add_layer<reshape_to_<1, nr, width, RESHAPE_MERGE_HEADS>, SUBNET>;
+    /*!
+        REQUIREMENTS ON THE INPUT
+            - The input has more than one channel and width == input.k()*input.nc().
+        WHAT THIS OBJECT REPRESENTS
+            Gathers attention heads back into a single width: [B, H, N, D] becomes
+            [B, 1, N, H*D]. The inverse of split_heads_to.
+    !*/
 
 // ----------------------------------------------------------------------------------------
 

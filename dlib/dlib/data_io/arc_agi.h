@@ -236,7 +236,7 @@ namespace dlib
         // ------------------------------------------------------------------------------------
 
         inline std::string::const_iterator find_key_value_start(
-            const std::string& content,
+            const std::string& /*content*/,
             const std::string& key,
             std::string::const_iterator start_it,
             std::string::const_iterator end_it)

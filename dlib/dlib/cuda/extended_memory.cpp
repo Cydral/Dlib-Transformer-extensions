@@ -1201,6 +1201,22 @@ namespace xmem
             s.immovable_bytes   = immovable_bytes;
             s.hash_threshold    = fingerprint_threshold();
             s.hash_count        = hash_count;
+
+            /* How the trace is fed. A period search reads one sequence, so a trace shared
+               by several threads is the interleaving of theirs and may have no period even
+               when each of them repeats exactly. */
+            std::uint64_t total = 0, busiest = 0;
+            unsigned threads = 0;
+            for (unsigned i = 0; i < xmem::max_traced_threads; ++i)
+            {
+                const std::uint64_t h = xmem::g::thread_hits[i].load(std::memory_order_relaxed);
+                if (h == 0) continue;
+                ++threads;
+                total += h;
+                busiest = std::max(busiest, h);
+            }
+            s.trace_threads = threads;
+            s.trace_busiest = total > 0 ? 100.0 * (double)busiest / (double)total : 0.0;
             s.sync_seconds      = sync_seconds;
             s.sync_count        = sync_count;
             s.wait_seconds      = wait_seconds;
@@ -1300,11 +1316,7 @@ namespace xmem
                         if (!floor_reported && resident_locked() + bytes > vram_budget)
                         {
                             floor_reported = true;
-                            const double mib = 1024.0*1024.0;
-                            std::cerr << "extended memory: the budget of " << (vram_budget/mib)
-                                      << " MiB cannot be met. " << (immovable_bytes/mib)
-                                      << " MiB sits in blocks below min_block_bytes and never "
-                                         "moves. Raise the budget or lower min_block_bytes.\n";
+                            report_budget_shortfall(bytes);
                         }
                         break;
                     }
@@ -1355,6 +1367,62 @@ namespace xmem
                  "Lower vram_budget or min_block_bytes if the resident set is the problem; if "
                  "the block itself is close to the size of the card, no budget can help.";
             throw cuda_error(m.str());
+        }
+
+        /*
+            Says why the budget could not be met, which is not the same question every time.
+
+            A block that never moves because it is smaller than the threshold is one thing,
+            and raising the budget or lowering the threshold answers it. A block that is
+            merely pinned at this instant, because a thread is looking at it or a transfer
+            is in flight, is another: the budget is reachable and the run has simply asked
+            for more at once than the window allows. Naming the wrong one sends the reader
+            to the wrong knob, so both are counted before anything is said.
+        */
+        void report_budget_shortfall (std::size_t wanted)
+        {
+            std::unordered_set<std::uint32_t> hot;
+            collect_hot_locked(hot);
+
+            std::size_t immovable = 0, pinned = 0, in_flight = 0, recent = 0;
+            for (block_record* r : by_id)
+            {
+                if (!r) continue;
+                const unsigned char st = r->state.load(std::memory_order_relaxed);
+                if (st == tier_transit)   { in_flight += r->bytes; continue; }
+                if (st != tier_device)    continue;
+                if (!r->evictable)                                    immovable += r->bytes;
+                else if (r->pins.load(std::memory_order_relaxed) > 0) pinned    += r->bytes;
+                else if (hot.count(r->id))                            recent    += r->bytes;
+            }
+
+            const double mib = 1024.0*1024.0;
+            std::cerr << "extended memory: the budget of " << (vram_budget/mib)
+                      << " MiB cannot be met for a request of " << (wanted/mib) << " MiB. ";
+
+            /* Whichever holds the most is what the reader should act on, and the three call
+               for opposite remedies: a block below the threshold never moves, a pinned one
+               is being used right now, and one inside the hot window is merely too recent to
+               be taken. Naming the wrong one sends the reader to the wrong knob. */
+            if (recent >= pinned && recent >= immovable && recent > 0)
+            {
+                std::cerr << (recent/mib) << " MiB was accessed too recently to be evicted: "
+                             "the hot window of " << opt.hot_window << " blocks covers most of "
+                             "what is resident. Lower hot_window, or raise the budget.\n";
+            }
+            else if (pinned >= immovable && pinned > 0)
+            {
+                std::cerr << (pinned/mib) << " MiB is pinned by threads currently using it";
+                if (in_flight > 0)
+                    std::cerr << " and " << (in_flight/mib) << " MiB is in transit";
+                std::cerr << ", so the budget is reachable but not at this instant. Raise the "
+                             "budget if two threads work at once.\n";
+            }
+            else
+            {
+                std::cerr << (immovable/mib) << " MiB sits in blocks below min_block_bytes "
+                             "and never moves. Raise the budget or lower min_block_bytes.\n";
+            }
         }
 
         /*
@@ -1883,15 +1951,23 @@ namespace xmem
             if (s->positions.size() < 8)
                 return;
 
-            /* Nor is a period claiming dozens of accesses per block. A step reads each of
-               the tensors it touches a few times, so a candidate far above that is a
-               coincidence the trace happened to confirm over the window, and adopting it
-               buys a plan that will be dropped again shortly, after the prefetcher has
-               spent itself against a cursor pointing nowhere. This is what a network whose
-               depth depends on its input looks like from here: it has no step to find, and
-               saying so early is better than finding one that is not there. */
-            if (period > 8 * s->positions.size())
+            /* Nor is a period claiming an implausible number of accesses per block. The
+               bound has to admit a training step, which touches each of its tensors far
+               more often than a forward pass does: the forward reads a weight, the backward
+               reads it again and writes its gradient, and the solver then reads that
+               gradient and writes the weight and its optimizer moments. A dozen or so per
+               block is ordinary there against about five in inference, so two dozen is
+               generous for anything real while still rejecting a coincidence the trace
+               happened to confirm over the window, which runs to several dozen. */
+            const std::size_t per_block = period / std::max<std::size_t>(s->positions.size(), 1);
+            if (per_block > 24)
+            {
+                if (opt.verbose)
+                    std::cerr << "extended memory: a period of " << period << " over "
+                              << s->positions.size() << " blocks is " << per_block
+                              << " accesses each, too many to be one step; not adopted\n";
                 return;
+            }
 
             std::lock_guard<std::mutex> lk(mu);
             plan        = s;
@@ -2390,7 +2466,15 @@ namespace xmem
         if (o.vram_budget == 0)
             o.vram_budget = (std::size_t)((double)free_bytes * o.vram_budget_fraction);
         if (o.store_bytes == 0)
-            o.store_bytes = o.vram_budget * 8;
+        {
+            /* The store is a sparse file, so its declared size costs nothing until pages
+               are written to it, and the only thing a small default buys is the risk of
+               filling up mid run and falling back to pinned mirrors. Training holds
+               gradients and optimizer states on top of the weights, several times what a
+               budget sized for inference would suggest, so the default is generous and the
+               cap below is what actually bounds it. */
+            o.store_bytes = o.vram_budget * 64;
+        }
 
         if (!xmem::g::trace_ring)
         {
@@ -2503,6 +2587,9 @@ namespace xmem
                                     << " KiB\n"
             << "  time stalled    " << s.sync_seconds     << " s over " << s.sync_count
                                     << " device synchronisations\n"
+            << "  access trace    " << s.trace_threads << " thread"
+                                    << (s.trace_threads == 1 ? "" : "s") << " feeding it, busiest "
+                                    << s.trace_busiest << " %\n"
             << "  access cycle    ";
         if (s.cycle_locked)
             out << "identified, period " << s.cycle_period << "\n";

@@ -144,23 +144,29 @@ namespace dlib
         // Dispatcher: selects the appropriate transformer_stack alias based on
         // the requested attention_impl. Specialized per enum value below
         template <attention_impl Impl, long num_layers, long d_model,
-            long num_heads, long num_kv_heads, typename SUBNET>
+            long num_heads, long num_kv_heads, typename SUBNET, bool UseAct = true>
         struct gqa_stack_selector;
 
-        template <long num_layers, long d_model, long num_heads, long num_kv_heads, typename SUBNET>
-        struct gqa_stack_selector<attention_impl::chained, num_layers, d_model, num_heads, num_kv_heads, SUBNET>
+        template <long num_layers, long d_model, long num_heads, long num_kv_heads,
+            typename SUBNET, bool UseAct>
+        struct gqa_stack_selector<attention_impl::chained, num_layers, d_model, num_heads,
+            num_kv_heads, SUBNET, UseAct>
         {
+            /* The chained stack has no adaptive feed-forward to switch, so the flag is
+               accepted and ignored rather than silently changing which stack is built. */
             using type = gqa_transformer::transformer_stack<
                 num_layers, d_model, num_heads, num_kv_heads, SUBNET>;
             static const char* name() { return "chained"; }
         };
 
-        template <long num_layers, long d_model, long num_heads, long num_kv_heads, typename SUBNET>
-        struct gqa_stack_selector<attention_impl::unified, num_layers, d_model, num_heads, num_kv_heads, SUBNET>
+        template <long num_layers, long d_model, long num_heads, long num_kv_heads,
+            typename SUBNET, bool UseAct>
+        struct gqa_stack_selector<attention_impl::unified, num_layers, d_model, num_heads,
+            num_kv_heads, SUBNET, UseAct>
         {
             using type = gqa_transformer_unified::transformer_stack<
-                num_layers, d_model, num_heads, num_kv_heads, SUBNET>;
-            static const char* name() { return "unified"; }
+                num_layers, d_model, num_heads, num_kv_heads, SUBNET, UseAct>;
+            static const char* name() { return UseAct ? "unified" : "unified, no ACT"; }
         };
 
         template <attention_impl Impl, long num_layers,
@@ -196,7 +202,12 @@ namespace dlib
         long num_heads = 6,
         long num_kv_heads = 2,
         long embedding_dim = 228,
-        attention_impl impl = attention_impl::chained
+        attention_impl impl = attention_impl::chained,
+        /* The unified stack wraps its feed-forward in adaptive computation by default, so
+           the default here preserves that. It is exposed because a configuration that
+           recurs at a higher level, or one being measured against itself, needs to be able
+           to turn it off without editing the stack. */
+        bool use_act = true
     >
     struct gqa_transformer_config
     {
@@ -207,6 +218,7 @@ namespace dlib
         static constexpr long NUM_KV_HEADS = num_kv_heads;
         static constexpr long EMBEDDING_DIM = embedding_dim;
         static constexpr attention_impl IMPL = impl;
+        static constexpr bool USE_ACT = use_act;
 
         // Compile-time validation of model configuration
         struct validation
@@ -230,7 +242,7 @@ namespace dlib
         using network_type =
             classification_head<VOCAB_SIZE,
             typename impl::gqa_stack_selector<IMPL, NUM_LAYERS, EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS,
-            embeddings<VOCAB_SIZE, EMBEDDING_DIM, input<matrix<int, 0, 1>>>>::type>;
+            embeddings<VOCAB_SIZE, EMBEDDING_DIM, input<matrix<int, 0, 1>>>, USE_ACT>::type>;
 
         struct model_info
         {
@@ -245,7 +257,7 @@ namespace dlib
                     << "- embedding dim    : " << EMBEDDING_DIM << "\n"
                     << "- head dim         : " << (EMBEDDING_DIM / NUM_HEADS) << "\n"
                     << "- attention impl   : " << impl::gqa_stack_selector<
-                        IMPL, NUM_LAYERS, EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS, void>::name();
+                        IMPL, NUM_LAYERS, EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS, void, USE_ACT>::name();
                 return ss.str();
             }
         };

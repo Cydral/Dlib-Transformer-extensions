@@ -1605,6 +1605,105 @@ namespace dlib { namespace tt
     
 // ----------------------------------------------------------------------------------------
 
+// ----------------------------------------------------------------------------------------
+
+    void act_mark_active(
+        tensor& active_mask,
+        tensor& active_count,
+        const tensor& cumulative_halting,
+        float halt_threshold
+    )
+    {
+        DLIB_CASSERT(active_mask.size() == cumulative_halting.size());
+        DLIB_CASSERT(active_count.size() == 1);
+#ifdef DLIB_USE_CUDA
+        cuda::act_mark_active(active_mask, active_count, cumulative_halting, halt_threshold);
+#else
+        cpu::act_mark_active(active_mask, active_count, cumulative_halting, halt_threshold);
+#endif
+    }
+
+// ----------------------------------------------------------------------------------------
+
+    void act_update_halting(
+        tensor& cumulative_halting,
+        tensor& remainders,
+        tensor& n_steps,
+        tensor& step_weights,
+        const tensor& halt_probs,
+        const tensor& active_mask,
+        long step,
+        long max_steps,
+        float halt_threshold
+    )
+    {
+        DLIB_CASSERT(cumulative_halting.size() == remainders.size());
+        DLIB_CASSERT(cumulative_halting.size() == n_steps.size());
+        DLIB_CASSERT(cumulative_halting.size() == step_weights.size());
+        DLIB_CASSERT(cumulative_halting.size() == halt_probs.size());
+        DLIB_CASSERT(cumulative_halting.size() == active_mask.size());
+        DLIB_CASSERT(step >= 0 && step < max_steps);
+#ifdef DLIB_USE_CUDA
+        cuda::act_update_halting(cumulative_halting, remainders, n_steps, step_weights,
+            halt_probs, active_mask, step, max_steps, halt_threshold);
+#else
+        cpu::act_update_halting(cumulative_halting, remainders, n_steps, step_weights,
+            halt_probs, active_mask, step, max_steps, halt_threshold);
+#endif
+    }
+
+// ----------------------------------------------------------------------------------------
+
+    void act_gather_final_state(
+        tensor& final_state,
+        const tensor& step_state,
+        const tensor& n_steps,
+        long step,
+        long batch_size,
+        long seq_len,
+        long num_channels,
+        long feature_dim
+    )
+    {
+        DLIB_CASSERT(have_same_dimensions(final_state, step_state));
+        DLIB_CASSERT(n_steps.size() == (size_t)(batch_size * seq_len));
+#ifdef DLIB_USE_CUDA
+        cuda::act_gather_final_state(final_state, step_state, n_steps, step,
+            batch_size, seq_len, num_channels, feature_dim);
+#else
+        cpu::act_gather_final_state(final_state, step_state, n_steps, step,
+            batch_size, seq_len, num_channels, feature_dim);
+#endif
+    }
+
+// ----------------------------------------------------------------------------------------
+
+    void act_accumulate_output_grad(
+        tensor& grad_state,
+        const tensor& gradient_input,
+        const tensor& step_weights,
+        const tensor& active_mask,
+        const tensor& n_steps,
+        long step,
+        long batch_size,
+        long seq_len,
+        long num_channels,
+        long feature_dim
+    )
+    {
+        DLIB_CASSERT(have_same_dimensions(grad_state, gradient_input));
+        DLIB_CASSERT(step_weights.size() == (size_t)(batch_size * seq_len));
+        DLIB_CASSERT(active_mask.size() == step_weights.size());
+        DLIB_CASSERT(n_steps.size() == step_weights.size());
+#ifdef DLIB_USE_CUDA
+        cuda::act_accumulate_output_grad(grad_state, gradient_input, step_weights,
+            active_mask, n_steps, step, batch_size, seq_len, num_channels, feature_dim);
+#else
+        cpu::act_accumulate_output_grad(grad_state, gradient_input, step_weights,
+            active_mask, n_steps, step, batch_size, seq_len, num_channels, feature_dim);
+#endif
+    }
+
     void apply_rotary_positional_embedding(
         bool is_backward,
         resizable_tensor& data,

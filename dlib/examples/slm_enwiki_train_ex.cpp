@@ -73,13 +73,13 @@ namespace dlib_extensions
 
     // Attention mechanism component extractors
     template <long seq_len, long d_model, long num_heads, typename SUBNET>
-    using query = reshape_to<num_heads, seq_len, d_model / num_heads, linear_no_bias<d_model, SUBNET>>;
+    using query = split_heads_to<num_heads, seq_len, d_model / num_heads, linear_no_bias<d_model, SUBNET>>;
 
     template <long seq_len, long d_model, long num_heads, typename SUBNET>
-    using key = reshape_to<num_heads, seq_len, d_model / num_heads, linear_no_bias<d_model, SUBNET>>;
+    using key = split_heads_to<num_heads, seq_len, d_model / num_heads, linear_no_bias<d_model, SUBNET>>;
 
     template <long seq_len, long d_model, long num_heads, typename SUBNET>
-    using value = reshape_to<num_heads, seq_len, d_model / num_heads, linear_no_bias<d_model, SUBNET>>;
+    using value = split_heads_to<num_heads, seq_len, d_model / num_heads, linear_no_bias<d_model, SUBNET>>;
 
     /*!
         This layer implements multi-head self-attention.
@@ -92,7 +92,7 @@ namespace dlib_extensions
         typename SUBNET>
     using multihead_attention =
         add_prev1<
-        linear_no_bias<d_model, reshape_to<1, seq_len, d_model,
+        linear_no_bias<d_model, merge_heads_to<seq_len, d_model,
         multm_prev3<softmaxm<tril_mask<
         scale_weights<d_model / num_heads,
         multm_prev4<
@@ -569,36 +569,14 @@ int main(int argc, char** argv)
         const std::string model_file = get_option(parser, "model-file", "dlib_lm_enwiki_model.dat");
         const std::string output_file = get_option(parser, "output-file", "enwiki_generated.txt");
         const std::string enwiki_path = get_option(parser, "enwiki", "enwiki.txt");
-        /* Narrowed from 228, which produced a model too large to publish as one file.
-
-           Width enters the attention projections and the experts squared, so it is the
-           only lever with real leverage here: 228 serialized to 207 MB and had to be
-           split across two archives, while 180 lands near 89 MB and travels whole.
-           Nothing this example demonstrates depends on the size. The point is that a
-           mixture of experts can be assembled from elementary layers, with a learned
-           router and a weighted sum, rather than through the optimized moe_ layer used
-           elsewhere, and that construction reads the same at any width.
-
-           Width and head count must divide, and the quotient must be even for the
-           rotary encoding; the configuration enforces both at compile time. 180 over 6
-           gives 30, which satisfies them. It is not the 32 that attention kernels are
-           tiled for, and that is the price of fitting under the limit: 192 would give
-           32 and about 102 MB, just over. The previous 228 over 6 gave 38, which was
-           neither aligned nor small.
-
-           Vocabulary carries almost none of the weight, scaling linearly rather than
-           squared: the table and the output projection together are about one percent
-           of the file, so 800 entries instead of 1000 saves a third of a megabyte. It
-           is kept because it costs nothing on a corpus this size, not because it
-           helps. */
         const long max_seq_len = 100;
         const long num_layers = 2;
         const long num_heads = 6;
-        const long embedding_dim = 180;
+        const long embedding_dim = 228;
         const std::string tokenizer_path = get_option(parser, "tokenizer", "enwiki_tokenizer.vocab");
         // Default number of prompt tokens = input sequence length
         const bool force_tokenize = parser.option("force-tokenize");
-        const long num_tokens = 800;
+        const long num_tokens = 1000;
 
         // Calculate max bytes to process
         size_t max_bytes = 0, max_tokens = 0;

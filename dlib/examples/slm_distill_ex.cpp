@@ -475,7 +475,6 @@ static int run_train(const std::vector<std::string>& trace_paths, const std::str
             return 1;
         }
     }
-    const distillation_header& head = traces.front()->header();
     /* No window check here, and it is worth saying why rather than leaving a silence.
 
        Neither configuration carries a compile-time context length: the positional tables

@@ -692,6 +692,51 @@ namespace dlib
             long max_steps
         );
 
+    // -----------------------------------------------------------------------------------
+
+        void act_mark_active(
+            tensor& active_mask,
+            tensor& active_count,
+            const tensor& cumulative_halting,
+            float halt_threshold
+        );
+
+        void act_update_halting(
+            tensor& cumulative_halting,
+            tensor& remainders,
+            tensor& n_steps,
+            tensor& step_weights,
+            const tensor& halt_probs,
+            const tensor& active_mask,
+            long step,
+            long max_steps,
+            float halt_threshold
+        );
+
+        void act_gather_final_state(
+            tensor& final_state,
+            const tensor& step_state,
+            const tensor& n_steps,
+            long step,
+            long batch_size,
+            long seq_len,
+            long num_channels,
+            long feature_dim
+        );
+
+        void act_accumulate_output_grad(
+            tensor& grad_state,
+            const tensor& gradient_input,
+            const tensor& step_weights,
+            const tensor& active_mask,
+            const tensor& n_steps,
+            long step,
+            long batch_size,
+            long seq_len,
+            long num_channels,
+            long feature_dim
+        );
+
     // ----------------------------------------------------------------------------------------
 
         void apply_rotary_positional_embedding(

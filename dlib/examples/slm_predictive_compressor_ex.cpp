@@ -493,9 +493,8 @@ void compress_file(const std::string& input_path, const std::string& output_path
     size_t final_size = static_cast<size_t>(final_pos);
     out_file.close();
 
-    // Compute sizes for summary
-    // Header = magic(4) + original_size(8) + crc(4) + flags(1) = 17 bytes
-    const size_t header_size = 17;
+    // Compute sizes for summary. The header is magic(4) + original_size(8) + crc(4) +
+    // flags(1) = 17 bytes, and is counted inside model_size_in_file below.
     size_t data_payload_size = final_size - model_size_in_file;
 
     cout << "\n=== COMPRESSION SUMMARY ===" << endl;

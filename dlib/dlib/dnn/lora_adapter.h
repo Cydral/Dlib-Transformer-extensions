@@ -391,7 +391,7 @@ namespace dlib
            a pair of small matrix products rather than the merged weight the naive
            derivation asks for. */
         void accumulate_magnitude_path(const tensor& base_w,
-            const tensor& a, const tensor& b, const tensor& m,
+            const tensor& a, const tensor& b, const tensor& /*m*/,
             const tensor& dy, tensor& da, tensor& db, tensor& dm)
         {
             const long out = geom_.out_dim, r = geom_.rank;

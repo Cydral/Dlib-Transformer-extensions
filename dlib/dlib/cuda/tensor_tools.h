@@ -2678,6 +2678,103 @@ namespace dlib { namespace tt
 
 // ----------------------------------------------------------------------------------------
 
+// ----------------------------------------------------------------------------------------
+
+    void act_mark_active(
+        tensor& active_mask,
+        tensor& active_count,
+        const tensor& cumulative_halting,
+        float halt_threshold
+    );
+    /*!
+        requires
+            - active_mask.size() == cumulative_halting.size()
+            - active_count.size() == 1
+            - 0 < halt_threshold <= 1
+        ensures
+            - For each position pos, #active_mask.host()[pos] == 1 when the position has not
+              yet reached the halting threshold, and 0 otherwise.
+            - #active_count.host()[0] == the number of positions still running.
+            - The count is what lets the caller leave the step loop early. Reading it is the
+              only place in an ACT forward pass where the host has to wait for the device,
+              and it moves four bytes rather than a step's worth of state.
+    !*/
+
+    void act_update_halting(
+        tensor& cumulative_halting,
+        tensor& remainders,
+        tensor& n_steps,
+        tensor& step_weights,
+        const tensor& halt_probs,
+        const tensor& active_mask,
+        long step,
+        long max_steps,
+        float halt_threshold
+    );
+    /*!
+        requires
+            - cumulative_halting, remainders, n_steps, step_weights, halt_probs and
+              active_mask all have the same size
+            - 0 <= step < max_steps
+            - 0 < halt_threshold <= 1
+        ensures
+            - Advances the halting state machine of Graves (2016) by one step, for every
+              position independently, leaving positions that have already halted untouched.
+            - For an active position with halting probability h:
+                - if the accumulated probability would reach the threshold, or this is the
+                  last step, the position halts: it takes the remainder as its weight, its
+                  step count is recorded, and its accumulation is pinned at the threshold,
+                - otherwise it continues: h becomes its weight, the accumulation grows by h
+                  and the remainder shrinks by h.
+            - This is the whole of the ACT control logic. It is a per-position update with
+              no dependency between positions, which is why it belongs on the device rather
+              than in a host loop reading a tensor the device has just written.
+    !*/
+
+    void act_gather_final_state(
+        tensor& final_state,
+        const tensor& step_state,
+        const tensor& n_steps,
+        long step,
+        long batch_size,
+        long seq_len,
+        long num_channels,
+        long feature_dim
+    );
+    /*!
+        requires
+            - final_state and step_state have identical dimensions
+            - n_steps.size() == batch_size * seq_len
+        ensures
+            - Copies into final_state the slice of step_state belonging to every position
+              that halted at this step, and leaves the other positions alone.
+            - Called once per step, it assembles the state each position ended on without
+              any position index ever reaching the host.
+    !*/
+
+    void act_accumulate_output_grad(
+        tensor& grad_state,
+        const tensor& gradient_input,
+        const tensor& step_weights,
+        const tensor& active_mask,
+        const tensor& n_steps,
+        long step,
+        long batch_size,
+        long seq_len,
+        long num_channels,
+        long feature_dim
+    );
+    /*!
+        requires
+            - grad_state and gradient_input have identical dimensions
+            - step_weights, active_mask and n_steps have size batch_size * seq_len
+        ensures
+            - For every position that was active at this step and had not yet halted,
+              accumulates the halting weight times the incoming gradient into grad_state.
+            - This is the term by which the weighted output of ACT reaches the state of a
+              given step.
+    !*/
+
     void apply_rotary_positional_embedding(
         bool is_backward,
         resizable_tensor& data,

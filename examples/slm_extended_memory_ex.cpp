@@ -83,11 +83,24 @@ const long EMBEDDING_DIM = 512;
 const long MAX_SEQ_LEN   = 64;
 const int  PAD_TOKEN     = 0;
 
-using transformer_config = gqa_transformer_config<VOCAB_SIZE, NUM_LAYERS, NUM_HEADS,
-                                                 NUM_KV_HEADS, EMBEDDING_DIM,
-                                                 attention_impl::unified>;
-using train_net_type     = transformer_config::network_type<true>;
-using infer_net_type     = transformer_config::network_type<false>;
+/* Two configurations of one topology, differing only in whether the feed-forward is wrapped
+   in adaptive computation. The layer is worth isolating here because its halting logic reads
+   results the device has just produced, and a host access that finds the device ahead pulls
+   the block back over the link whatever the budget is. That is the one pattern no residency
+   manager can help with, so being able to measure the same network with and without it says
+   how much of a run's link traffic the manager is responsible for and how much it is not. */
+using act_config = gqa_transformer_config<VOCAB_SIZE, NUM_LAYERS, NUM_HEADS,
+                                          NUM_KV_HEADS, EMBEDDING_DIM,
+                                          attention_impl::unified, true>;
+using flat_config = gqa_transformer_config<VOCAB_SIZE, NUM_LAYERS, NUM_HEADS,
+                                           NUM_KV_HEADS, EMBEDDING_DIM,
+                                           attention_impl::unified, false>;
+
+using transformer_config = act_config;
+using train_net_type     = act_config::network_type<true>;
+using infer_net_type     = act_config::network_type<false>;
+using flat_train_net_type = flat_config::network_type<true>;
+using flat_infer_net_type = flat_config::network_type<false>;
 
 // ----------------------------------------------------------------------------------------
 
@@ -151,6 +164,94 @@ void report(const std::string& label, double setup, double seconds, bool per_blo
 
 // ----------------------------------------------------------------------------------------
 
+template <typename net_type>
+void run_training(
+    const command_line_parser& parser,
+    size_t steps,
+    size_t batch_size,
+    const std::chrono::steady_clock::time_point& started
+)
+{
+        /* The trainer runs a worker thread of its own, so two threads hand out device
+           pointers on the same card. The hot window is shared between them, which is
+           why --hot-window is worth raising here even though the default is ample for
+           single threaded inference. */
+        cout << "=== TRAINING ===\n";
+
+        std::vector<matrix<int, 0, 1> > samples;
+        std::vector<matrix<unsigned long, 0, 1> > labels;
+        build_synthetic_dataset(steps * batch_size, samples, labels);
+
+        net_type net;
+        dnn_trainer<net_type, adam> trainer(net, adam(1e-4, 0.9, 0.999));
+        const auto built = std::chrono::steady_clock::now();
+        trainer.set_learning_rate(1e-4);
+        trainer.set_mini_batch_size(batch_size);
+        trainer.be_verbose();
+
+        for (size_t i = 0; i < steps; ++i)
+        {
+            std::vector<matrix<int, 0, 1> > batch(samples.begin() + i*batch_size,
+                                                  samples.begin() + (i+1)*batch_size);
+            std::vector<matrix<unsigned long, 0, 1> > batch_labels(
+                labels.begin() + i*batch_size, labels.begin() + (i+1)*batch_size);
+            trainer.train_one_step(batch, batch_labels);
+        }
+        trainer.get_net();
+
+        const auto now = std::chrono::steady_clock::now();
+        report("training",
+               std::chrono::duration<double>(built - started).count(),
+               std::chrono::duration<double>(now - built).count(),
+               parser.option("blocks"));
+}
+
+template <typename net_type>
+void run_generation(
+    const command_line_parser& parser,
+    size_t steps,
+    size_t batch_size,
+    const std::chrono::steady_clock::time_point& started
+)
+{
+        /* Inference is where the subsystem is at its most comfortable. The weights are
+           read and never written, so once a block has been written to the store that
+           copy stays valid and every later eviction is free: the device buffer is simply
+           dropped and read back when its turn comes round again. */
+        cout << "=== GENERATION ===\n";
+
+        net_type net;
+        /* This runs a forward pass, so it is what actually sizes and allocates every
+           tensor in the graph. It belongs to setup, not to the loop below. */
+        cout << "Model parameters: " << count_network_parameters(net, MAX_SEQ_LEN) << "\n";
+        const auto built = std::chrono::steady_clock::now();
+
+        std::vector<matrix<int, 0, 1> > samples;
+        std::vector<matrix<unsigned long, 0, 1> > labels;
+        build_synthetic_dataset(1, samples, labels);
+
+        inference_context ctx(MAX_SEQ_LEN, 1, PAD_TOKEN);
+        std::vector<int> prompt;
+        for (long j = 0; j < MAX_SEQ_LEN; ++j)
+            prompt.push_back(samples[0](j, 0));
+        ctx.add_tokens(prompt);
+
+        for (size_t i = 0; i < steps; ++i)
+        {
+            auto window = ctx.get_input_window();
+            const unsigned long next = (unsigned long)net(window);
+            ctx.add_token(next);
+            if ((i + 1) % 10 == 0)
+                cout << "  " << (i + 1) << " tokens\n";
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        report("generation",
+               std::chrono::duration<double>(built - started).count(),
+               std::chrono::duration<double>(now - built).count(),
+               parser.option("blocks"));
+}
+
 int main(int argc, char** argv)
 {
     try
@@ -175,6 +276,7 @@ int main(int argc, char** argv)
         parser.add_option("no-fingerprint", "read every block back instead of hashing it on the card");
         parser.add_option("fingerprint-min", "smallest block worth hashing in KiB, 0 to measure it", 1);
         parser.add_option("blocks", "list the managed blocks by size at the end of the run");
+        parser.add_option("no-act", "build the feed-forward without adaptive computation");
         parser.add_option("paranoid", "fill every released device block with NaN");
         parser.add_option("steps", "number of steps to run", 1);
         parser.add_option("batch", "mini batch size for the training loop", 1);
@@ -226,7 +328,8 @@ int main(int argc, char** argv)
         const size_t steps      = get_option(parser, "steps", 20);
         const size_t batch_size = get_option(parser, "batch", 8);
 
-        cout << transformer_config::model_info::describe() << "\n"
+        cout << (parser.option("no-act") ? flat_config::model_info::describe()
+                                        : act_config::model_info::describe()) << "\n"
              << "- maximum sequence length: " << MAX_SEQ_LEN << "\n\n";
 
         steps_run = steps;
@@ -234,78 +337,18 @@ int main(int argc, char** argv)
 
         if (parser.option("train"))
         {
-            /* The trainer runs a worker thread of its own, so two threads hand out device
-               pointers on the same card. The hot window is shared between them, which is
-               why --hot-window is worth raising here even though the default is ample for
-               single threaded inference. */
-            cout << "=== TRAINING ===\n";
-
-            std::vector<matrix<int, 0, 1> > samples;
-            std::vector<matrix<unsigned long, 0, 1> > labels;
-            build_synthetic_dataset(steps * batch_size, samples, labels);
-
-            train_net_type net;
-            dnn_trainer<train_net_type, adam> trainer(net, adam(1e-4, 0.9, 0.999));
-            const auto built = std::chrono::steady_clock::now();
-            trainer.set_learning_rate(1e-4);
-            trainer.set_mini_batch_size(batch_size);
-            trainer.be_verbose();
-
-            for (size_t i = 0; i < steps; ++i)
-            {
-                std::vector<matrix<int, 0, 1> > batch(samples.begin() + i*batch_size,
-                                                      samples.begin() + (i+1)*batch_size);
-                std::vector<matrix<unsigned long, 0, 1> > batch_labels(
-                    labels.begin() + i*batch_size, labels.begin() + (i+1)*batch_size);
-                trainer.train_one_step(batch, batch_labels);
-            }
-            trainer.get_net();
-
-            const auto now = std::chrono::steady_clock::now();
-            report("training",
-                   std::chrono::duration<double>(built - started).count(),
-                   std::chrono::duration<double>(now - built).count(),
-                   parser.option("blocks"));
+            if (parser.option("no-act"))
+                run_training<flat_train_net_type>(parser, steps, batch_size, started);
+            else
+                run_training<train_net_type>(parser, steps, batch_size, started);
         }
 
         if (parser.option("infer"))
         {
-            /* Inference is where the subsystem is at its most comfortable. The weights are
-               read and never written, so once a block has been written to the store that
-               copy stays valid and every later eviction is free: the device buffer is simply
-               dropped and read back when its turn comes round again. */
-            cout << "=== GENERATION ===\n";
-
-            infer_net_type net;
-            /* This runs a forward pass, so it is what actually sizes and allocates every
-               tensor in the graph. It belongs to setup, not to the loop below. */
-            cout << "Model parameters: " << count_network_parameters(net, MAX_SEQ_LEN) << "\n";
-            const auto built = std::chrono::steady_clock::now();
-
-            std::vector<matrix<int, 0, 1> > samples;
-            std::vector<matrix<unsigned long, 0, 1> > labels;
-            build_synthetic_dataset(1, samples, labels);
-
-            inference_context ctx(MAX_SEQ_LEN, 1, PAD_TOKEN);
-            std::vector<int> prompt;
-            for (long j = 0; j < MAX_SEQ_LEN; ++j)
-                prompt.push_back(samples[0](j, 0));
-            ctx.add_tokens(prompt);
-
-            for (size_t i = 0; i < steps; ++i)
-            {
-                auto window = ctx.get_input_window();
-                const unsigned long next = (unsigned long)net(window);
-                ctx.add_token(next);
-                if ((i + 1) % 10 == 0)
-                    cout << "  " << (i + 1) << " tokens\n";
-            }
-
-            const auto now = std::chrono::steady_clock::now();
-            report("generation",
-                   std::chrono::duration<double>(built - started).count(),
-                   std::chrono::duration<double>(now - built).count(),
-                   parser.option("blocks"));
+            if (parser.option("no-act"))
+                run_generation<flat_infer_net_type>(parser, steps, batch_size, started);
+            else
+                run_generation<infer_net_type>(parser, steps, batch_size, started);
         }
 
         return 0;

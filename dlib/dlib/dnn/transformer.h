@@ -1380,24 +1380,24 @@ namespace dlib
     {
         // Query projection: projects to d_model then reshapes to (num_heads, seq_len, head_dim)
         template <long d_model, long num_heads, typename SUBNET>
-        using query = reshape_to<num_heads, -1, d_model / num_heads,
+        using query = split_heads_to<num_heads, -1, d_model / num_heads,
             linear_no_bias<d_model, SUBNET>>;
 
         // Key projection for GQA: uses fewer heads (num_kv_heads) than queries
         template <long num_kv_heads, long head_dim, typename SUBNET>
-        using key = reshape_to<num_kv_heads, -1, head_dim,
+        using key = split_heads_to<num_kv_heads, -1, head_dim,
             linear_no_bias<num_kv_heads* head_dim, SUBNET>>;
 
         // Value projection for GQA: same head count as keys
         template <long num_kv_heads, long head_dim, typename SUBNET>
-        using value = reshape_to<num_kv_heads, -1, head_dim,
+        using value = split_heads_to<num_kv_heads, -1, head_dim,
             linear_no_bias<num_kv_heads* head_dim, SUBNET>>;
 
         // Grouped Query Attention: K/V heads are repeated to match Q head count
         // Reduces memory bandwidth while maintaining model quality
         template <long d_model, long num_heads, long num_kv_heads, typename SUBNET>
         using multihead_attention_gqa =
-            linear_no_bias<d_model, reshape_to<1, -1, d_model,
+            linear_no_bias<d_model, merge_heads_to<-1, d_model,
             multm_prev3<softmaxm<tril_mask<
             scale_weights<d_model / num_heads,
             multm_prev4<
@@ -1530,21 +1530,21 @@ namespace dlib
     {
 
         template <long d_model, long num_heads, typename SUBNET>
-        using query = reshape_to<num_heads, -1, d_model / num_heads,
+        using query = split_heads_to<num_heads, -1, d_model / num_heads,
             linear_no_bias<d_model, SUBNET>>;
 
         template <long d_model, long num_heads, typename SUBNET>
-        using key = reshape_to<num_heads, -1, d_model / num_heads,
+        using key = split_heads_to<num_heads, -1, d_model / num_heads,
             linear_no_bias<d_model, SUBNET>>;
 
         template <long d_model, long num_heads, typename SUBNET>
-        using value = reshape_to<num_heads, -1, d_model / num_heads,
+        using value = split_heads_to<num_heads, -1, d_model / num_heads,
             linear_no_bias<d_model, SUBNET>>;
 
         template <template <typename> class DO,
             long d_model, long num_heads, typename SUBNET>
         using multihead_attention =
-            DO<linear_no_bias<d_model, reshape_to<1, -1, d_model,
+            DO<linear_no_bias<d_model, merge_heads_to<-1, d_model,
             multm_prev3<softmaxm<tril_mask<
             scale_weights<d_model / num_heads,
             multm_prev4<

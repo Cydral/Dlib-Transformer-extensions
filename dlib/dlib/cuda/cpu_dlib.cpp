@@ -3616,6 +3616,146 @@ namespace dlib
 
     // ------------------------------------------------------------------------------------
     
+// -----------------------------------------------------------------------------------
+
+        void act_mark_active(
+            tensor& active_mask,
+            tensor& active_count,
+            const tensor& cumulative_halting,
+            float halt_threshold
+        )
+        {
+            const long total_positions = cumulative_halting.size();
+            float* mask = active_mask.host_write_only();
+            const float* cum = cumulative_halting.host();
+
+            long active = 0;
+            for (long pos = 0; pos < total_positions; ++pos)
+            {
+                const bool still_running = cum[pos] < halt_threshold;
+                mask[pos] = still_running ? 1.0f : 0.0f;
+                if (still_running) ++active;
+            }
+            active_count.host_write_only()[0] = static_cast<float>(active);
+        }
+
+        void act_update_halting(
+            tensor& cumulative_halting,
+            tensor& remainders,
+            tensor& n_steps,
+            tensor& step_weights,
+            const tensor& halt_probs,
+            const tensor& active_mask,
+            long step,
+            long max_steps,
+            float halt_threshold
+        )
+        {
+            const long total_positions = cumulative_halting.size();
+
+            float* cum = cumulative_halting.host();
+            float* rem = remainders.host();
+            float* steps = n_steps.host();
+            float* weights = step_weights.host();
+            const float* probs = halt_probs.host();
+            const float* mask = active_mask.host();
+
+            for (long pos = 0; pos < total_positions; ++pos)
+            {
+                if (mask[pos] < 0.5f) continue;
+
+                const float h = probs[pos];
+                const float new_cum = cum[pos] + h;
+
+                if (new_cum >= halt_threshold || step == max_steps - 1)
+                {
+                    weights[pos] = rem[pos];
+                    steps[pos] = static_cast<float>(step + 1);
+                    cum[pos] = halt_threshold;
+                }
+                else
+                {
+                    weights[pos] = h;
+                    cum[pos] = new_cum;
+                    rem[pos] -= h;
+                }
+            }
+        }
+
+        void act_gather_final_state(
+            tensor& final_state,
+            const tensor& step_state,
+            const tensor& n_steps,
+            long step,
+            long batch_size,
+            long seq_len,
+            long num_channels,
+            long feature_dim
+        )
+        {
+            float* dst = final_state.host();
+            const float* src = step_state.host();
+            const float* steps = n_steps.host();
+
+            for (long b = 0; b < batch_size; ++b)
+            {
+                for (long s = 0; s < seq_len; ++s)
+                {
+                    const long pos = b * seq_len + s;
+                    if (static_cast<long>(steps[pos]) != step + 1) continue;
+
+                    for (long c = 0; c < num_channels; ++c)
+                    {
+                        for (long f = 0; f < feature_dim; ++f)
+                        {
+                            const long idx = ((b * num_channels + c) * seq_len + s) * feature_dim + f;
+                            dst[idx] = src[idx];
+                        }
+                    }
+                }
+            }
+        }
+
+        void act_accumulate_output_grad(
+            tensor& grad_state,
+            const tensor& gradient_input,
+            const tensor& step_weights,
+            const tensor& active_mask,
+            const tensor& n_steps,
+            long step,
+            long batch_size,
+            long seq_len,
+            long num_channels,
+            long feature_dim
+        )
+        {
+            float* grad = grad_state.host();
+            const float* g_in = gradient_input.host();
+            const float* weights = step_weights.host();
+            const float* mask = active_mask.host();
+            const float* steps = n_steps.host();
+
+            for (long b = 0; b < batch_size; ++b)
+            {
+                for (long s = 0; s < seq_len; ++s)
+                {
+                    const long pos = b * seq_len + s;
+                    if (mask[pos] < 0.5f) continue;
+                    if (step >= static_cast<long>(steps[pos])) continue;
+
+                    const float p_n = weights[pos];
+                    for (long c = 0; c < num_channels; ++c)
+                    {
+                        for (long f = 0; f < feature_dim; ++f)
+                        {
+                            const long idx = ((b * num_channels + c) * seq_len + s) * feature_dim + f;
+                            grad[idx] += p_n * g_in[idx];
+                        }
+                    }
+                }
+            }
+        }
+
         void apply_rotary_positional_embedding(
             bool is_backward,
             resizable_tensor& data,

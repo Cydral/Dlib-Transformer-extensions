@@ -841,7 +841,7 @@ namespace dlib
         }
 
         void load_matrix(gguf_reader& g, const std::string& name, long in_dim, long out_dim,
-            stored_matrix& dst, const gguf_load_options& opt)
+            stored_matrix& dst, const gguf_load_options& /*opt*/)
         {
             const gguf_tensor_info* t = g.find_tensor(name);
             if (!t) throw std::runtime_error("runtime_transformer: missing tensor " + name);

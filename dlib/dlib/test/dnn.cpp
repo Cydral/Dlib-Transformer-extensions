@@ -175,7 +175,7 @@ namespace
         // Initialization
         dlib::rand rnd(std::rand());
         const long nr = 2, nc = 3;
-        const int n_samples = 3, k = 1;
+        const int n_samples = 3;
         std::vector<matrix<float>> x(n_samples);
         matrix<float> xtmp(nr, nc);
         for (int ii = 0; ii < n_samples; ++ii) {
@@ -751,7 +751,7 @@ namespace
         const long emb_dim = axis_is_nc ? x.nc() : x.k();
         resizable_tensor gamma(1, 1, 1, emb_dim);
         // Use a non-trivial gamma so multiplication by gamma is actually exercised.
-        for (long i = 0; i < gamma.size(); ++i)
+        for (size_t i = 0; i < gamma.size(); ++i)
             gamma.host()[i] = 1.0f + 0.1f * static_cast<float>(i);
 
         const float eps = 1e-5f;
@@ -899,7 +899,7 @@ namespace
         bool numerical_error = false;
         for (long pos : positions_to_check)
         {
-            if (pos < 0 || pos >= x.size()) continue;
+            if (pos < 0 || static_cast<size_t>(pos) >= x.size()) continue;
             const float orig = x.host()[pos];
 
             x.host()[pos] = orig + h;
@@ -913,7 +913,7 @@ namespace
             x.host()[pos] = orig;
 
             double slope = 0.0;
-            for (long i = 0; i < y_plus.size(); ++i)
+            for (size_t i = 0; i < y_plus.size(); ++i)
                 slope += static_cast<double>(p_grad_in[i])
                 * (y_plus.host()[i] - y_minus.host()[i]);
             slope /= (2.0 * h);
@@ -1007,8 +1007,8 @@ namespace
 
         matrix<float> expected_output(sequence_dim, embedding_dim);
         const float n = 10000.0f;
-        for (long r = 0; r < sequence_dim; ++r) {
-            for (long c = 0; c < embedding_dim; ++c) {
+        for (unsigned long r = 0; r < sequence_dim; ++r) {
+            for (unsigned long c = 0; c < embedding_dim; ++c) {
                 float theta = static_cast<float>(r) / std::pow(n, static_cast<float>(c) / embedding_dim);
                 expected_output(r, c) = (c % 2 == 0) ? std::sin(theta) : std::cos(theta);
             }
@@ -1743,14 +1743,24 @@ namespace
             conv1.get_gradient_for_data(true, gi, filters, data_gradient1);
             conv2.get_gradient_for_data(true, gi, filters, data_gradient2);
 
+            /* The tolerance follows the magnitude of what is being compared, as the forward
+               checks above already do. These tensors are randomly sized on every iteration
+               and the two backends do not sum in the same order, so a fixed absolute bound
+               passes or fails on the scale of the draw rather than on the agreement of the
+               two implementations. The floor keeps a near-zero gradient from demanding
+               exactness no floating point arithmetic can offer. */
+            double dg_eps = std::max(1e-3, 1e-3 * max(abs(mat(data_gradient1))));
             dlog << LINFO << "data gradient error: "<< max(abs(mat(data_gradient1)-mat(data_gradient2)));
-            DLIB_TEST(max(abs(mat(data_gradient1)-mat(data_gradient2))) < 1e-3);
+            DLIB_TEST_MSG(max(abs(mat(data_gradient1)-mat(data_gradient2))) < dg_eps,
+                max(abs(mat(data_gradient1)-mat(data_gradient2))) << "\n\t tolerance: " << dg_eps);
 
             conv1.get_gradient_for_data(false, gi, filters, data_gradient1);
             conv2.get_gradient_for_data(false, gi, filters, data_gradient2);
 
+            dg_eps = std::max(2e-3, 2e-3 * max(abs(mat(data_gradient1))));
             dlog << LINFO << "data gradient error: "<< max(abs(mat(data_gradient1)-mat(data_gradient2)));
-            DLIB_TEST(max(abs(mat(data_gradient1)-mat(data_gradient2))) < 2e-3);
+            DLIB_TEST_MSG(max(abs(mat(data_gradient1)-mat(data_gradient2))) < dg_eps,
+                max(abs(mat(data_gradient1)-mat(data_gradient2))) << "\n\t tolerance: " << dg_eps);
 
 
             resizable_tensor filter_gradient1, filter_gradient2;
@@ -1766,14 +1776,22 @@ namespace
             conv2.get_gradient_for_filters(false, gi, data, filter_gradient2);
 
             dlog << LINFO << "filter gradient error: "<< max(abs(mat(filter_gradient1)-mat(filter_gradient2)));
-            DLIB_TEST_MSG(max(abs(mat(filter_gradient1)-mat(filter_gradient2))) < 2e-3, max(abs(mat(filter_gradient1)-mat(filter_gradient2))));
+            {
+                const double fg_eps = std::max(2e-3, 2e-3 * max(abs(mat(filter_gradient1))));
+                DLIB_TEST_MSG(max(abs(mat(filter_gradient1)-mat(filter_gradient2))) < fg_eps,
+                    max(abs(mat(filter_gradient1)-mat(filter_gradient2))) << "\n\t tolerance: " << fg_eps);
+            }
 
 
             conv1.get_gradient_for_filters(true, gi, data, filter_gradient1);
             conv2.get_gradient_for_filters(true, gi, data, filter_gradient2);
 
             dlog << LINFO << "filter gradient error: "<< max(abs(mat(filter_gradient1)-mat(filter_gradient2)));
-            DLIB_TEST_MSG(max(abs(mat(filter_gradient1)-mat(filter_gradient2))) < 2e-3, max(abs(mat(filter_gradient1)-mat(filter_gradient2))));
+            {
+                const double fg_eps = std::max(2e-3, 2e-3 * max(abs(mat(filter_gradient1))));
+                DLIB_TEST_MSG(max(abs(mat(filter_gradient1)-mat(filter_gradient2))) < fg_eps,
+                    max(abs(mat(filter_gradient1)-mat(filter_gradient2))) << "\n\t tolerance: " << fg_eps);
+            }
         }
     }
 
@@ -3833,7 +3851,7 @@ void test_multm_prev()
         net_type net;
 
         // Input tensor
-        const int n_samples = 3, k = 1;
+        const int n_samples = 3;
         std::vector<matrix<float>> x(n_samples);
         matrix<float> xtmp(2, 4);
         xtmp = 1.0f, 2.0f, 3.0f, 4.0f,
@@ -4813,77 +4831,79 @@ void test_multm_prev()
 
 // ----------------------------------------------------------------------------------------
 
-    void test_loss_cross_entropy_per_logit_cpu_vs_cuda()
+    void test_loss_cross_entropy_per_token_cpu_vs_cuda()
     {
-        print_spinner();
-
 #ifdef DLIB_USE_CUDA
         constexpr long vocab_size = 16;
         constexpr long seq_len = 8;
         constexpr long batch_size = 4;
-        constexpr unsigned long PAD_TOKEN = 0;
+        constexpr long IGNORE_INDEX = 0;
+        constexpr long PAD_INDEX = 0;
         constexpr double label_smoothing = 0.1;
+        constexpr double z_loss_weight = 1e-4;
 
         dlib::rand rnd(789);
 
-        // Create input tensor [batch_size, 1, seq_len, 1]
+        /* One target per position, which is what this loss supervises: truth[i](t) is the
+           target of position t of sample i. Both backends are given the same tensors rather
+           than two draws from a re-seeded generator, so the comparison cannot be defeated by
+           a difference in the order the values were produced. */
         resizable_tensor input_tensor;
         input_tensor.set_size(batch_size, 1, seq_len, 1);
         float* in_data = input_tensor.host();
         for (long i = 0; i < batch_size * seq_len; ++i)
             in_data[i] = static_cast<float>(rnd.get_integer_in_range(1, vocab_size));
 
-        // Create output tensor (logits) [batch_size, 1, seq_len, vocab_size]
         resizable_tensor output_tensor;
         output_tensor.set_size(batch_size, 1, seq_len, vocab_size);
         float* out_data = output_tensor.host();
-        for (long i = 0; i < output_tensor.size(); ++i)
+        for (size_t i = 0; i < output_tensor.size(); ++i)
             out_data[i] = rnd.get_random_gaussian() * 0.5f;
 
-        // Create truth labels
-        std::vector<unsigned long> truth(batch_size);
+        std::vector<matrix<unsigned long, 0, 1>> truth(batch_size);
         for (long i = 0; i < batch_size; ++i)
-            truth[i] = rnd.get_integer_in_range(1, vocab_size);
+        {
+            truth[i].set_size(seq_len);
+            for (long t = 0; t < seq_len; ++t)
+            {
+                // A few positions carry the ignore index, so the masked path is exercised.
+                truth[i](t) = (t % 4 == 3) ? static_cast<unsigned long>(IGNORE_INDEX)
+                                           : static_cast<unsigned long>(rnd.get_integer_in_range(1, vocab_size));
+            }
+        }
 
-        // Compute CPU first
-        resizable_tensor cpu_grad;
+        resizable_tensor cpu_grad, cuda_grad;
         cpu_grad.copy_size(output_tensor);
-        cpu::compute_loss_cross_entropy_per_logit cpu_compute;
-        double cpu_loss;
+        cuda_grad.copy_size(output_tensor);
+        cpu_grad = 0;
+        cuda_grad = 0;
+
+        double cpu_loss = 0, cuda_loss = 0;
+
+        cpu::compute_loss_cross_entropy_per_token cpu_compute;
         cpu_compute(truth.begin(), input_tensor, output_tensor, cpu_grad, cpu_loss,
-            static_cast<long>(PAD_TOKEN), label_smoothing);
+            IGNORE_INDEX, label_smoothing, PAD_INDEX, z_loss_weight);
 
-        // Recreate tensors for CUDA
-        rnd = dlib::rand(789);
-        resizable_tensor input_tensor_cuda;
-        input_tensor_cuda.set_size(batch_size, 1, seq_len, 1);
-        float* in_data_cuda = input_tensor_cuda.host();
-        for (long i = 0; i < batch_size * seq_len; ++i)
-            in_data_cuda[i] = static_cast<float>(rnd.get_integer_in_range(1, vocab_size));
+        cuda::compute_loss_cross_entropy_per_token cuda_compute;
+        cuda_compute(truth.begin(), input_tensor, output_tensor, cuda_grad, cuda_loss,
+            IGNORE_INDEX, label_smoothing, PAD_INDEX, z_loss_weight);
 
-        resizable_tensor output_tensor_cuda;
-        output_tensor_cuda.set_size(batch_size, 1, seq_len, vocab_size);
-        float* out_data_cuda = output_tensor_cuda.host();
-        for (long i = 0; i < output_tensor_cuda.size(); ++i)
-            out_data_cuda[i] = rnd.get_random_gaussian() * 0.5f;
-
-        std::vector<unsigned long> truth_cuda(batch_size);
-        for (long i = 0; i < batch_size; ++i)
-            truth_cuda[i] = rnd.get_integer_in_range(1, vocab_size);
-
-        resizable_tensor cuda_grad;
-        cuda_grad.copy_size(output_tensor_cuda);
-        cuda::compute_loss_cross_entropy_per_logit cuda_compute;
-        double cuda_loss;
-        cuda_compute(truth_cuda.begin(), input_tensor_cuda, output_tensor_cuda, cuda_grad, cuda_loss,
-            static_cast<long>(PAD_TOKEN), label_smoothing);
-
-        // Compare losses
         const double loss_diff = std::abs(cuda_loss - cpu_loss);
         const double loss_rel_err = (cpu_loss != 0) ? loss_diff / std::abs(cpu_loss) : loss_diff;
         DLIB_TEST_MSG(loss_rel_err < 1e-5,
             "CPU vs CUDA loss mismatch: cpu=" << cpu_loss << ", cuda=" << cuda_loss
             << ", rel_err=" << loss_rel_err);
+
+        /* The gradient matters as much as the loss and the previous version of this test
+           did not look at it: a backend can agree on a scalar and still send the network
+           the wrong way. */
+        const float* gc = cpu_grad.host();
+        const float* gg = cuda_grad.host();
+        float max_abs_diff = 0;
+        for (size_t i = 0; i < cpu_grad.size(); ++i)
+            max_abs_diff = std::max(max_abs_diff, std::abs(gc[i] - gg[i]));
+        DLIB_TEST_MSG(max_abs_diff < 1e-5,
+            "CPU vs CUDA gradient mismatch: largest absolute difference " << max_abs_diff);
 #endif
     }
 
@@ -5474,7 +5494,7 @@ void test_multm_prev()
         // Input tensor
         dlib::rand rnd;
         const int nr = 2, nc = 3;
-        constexpr int n_samples = 3, k = 1;
+        constexpr int n_samples = 3;
         std::vector<matrix<float>> x(n_samples);
         matrix<float> xtmp(nr, nc);
         for (int ii = 0; ii < n_samples; ++ii) {
@@ -5619,7 +5639,7 @@ void test_multm_prev()
             test_loss_multiclass_per_pixel_weighted();
             test_loss_multiclass_log_weighted();
             test_loss_multibinary_log();
-            test_loss_cross_entropy_per_logit_cpu_vs_cuda();
+            test_loss_cross_entropy_per_token_cpu_vs_cuda();
             test_serialization();
             test_loss_dot();
             test_loss_multimulticlass_log();
