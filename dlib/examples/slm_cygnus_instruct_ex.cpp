@@ -608,14 +608,43 @@ int main(int argc, char** argv)
         parser.add_option("repeat-penalty", "Repetition penalty (default: 1.2)", 1);
         parser.add_option("min-p", "Relative min-p threshold (default: 0.05)", 1);
         parser.add_option("deterministic", "Deterministic decoding (strict argmax)");
+        /* Extended device memory. Off unless asked for, so a run that does not mention it
+           behaves exactly as before, and inert in a build without CUDA, where enabling it
+           returns false and nothing else changes. */
+        parser.add_option("extended-memory", "Stream tensors through the device under a budget "
+            "when the working set does not fit");
+        parser.add_option("vram-budget", "Device memory the extension may use, in MiB (default: 8192)", 1);
+        parser.add_option("vram-store", "Directory holding the store, on a real volume rather than a memory filesystem "
+            "(default: DLIB_XMEM_STORE, else the temp dir)", 1);
+
         parser.parse(argc, argv);
+
+        /* Before any tensor exists, which is why this sits at the top of main rather than
+           beside the code that builds a network. The subsystem cannot be switched on later
+           and cannot be switched off at all: turning it off would mean bringing every block
+           back at once, which is the operation it exists because one cannot perform. */
+        if (parser.option("extended-memory"))
+        {
+            extended_memory_options xopts;
+            xopts.vram_budget = (size_t)get_option(parser, "vram-budget", 8192) << 20;
+            xopts.store_path  = get_option(parser, "vram-store", default_extended_memory_store_path());
+            xopts.verbose     = true;
+
+            if (!enable_extended_memory(xopts))
+                cout << "Extended memory was requested but is unavailable in this build; "
+                        "continuing without it.\n";
+        }
 
         if (!parser.option("fine-tune") && !parser.option("chat")) {
             cout << "Cygnus instruct fine-tuning and chat\n\n";
             parser.print_options();
             cout << "\nExample usage:\n"
                 << "  Fine-tune : " << argv[0] << " --fine-tune\n"
-                << "  Chat      : " << argv[0] << " --chat\n";
+                << "  Chat      : " << argv[0] << " --chat\n"
+                << "\n  Add --extended-memory to any of the above when the batch or the window\n"
+                   "  no longer fits the card. --vram-budget sets what the extension may use,\n"
+                   "  in MiB, and defaults to 8192. Keep --vram-store on a real volume: a memory\n"
+                   "  filesystem would spend the host memory the store exists to spare.\n";
             return 0;
         }
 

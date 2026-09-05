@@ -909,7 +909,32 @@ int main(int argc, char** argv)
         parser.add_option("model-file", "Model file path (default: cygnus_model.dat)", 1);
         parser.add_option("tokenizer-file", "Tokenizer file path (default: cygnus_tokenizer.vocab)", 1);
 
+        /* Extended device memory. Off unless asked for, so a run that does not mention it
+           behaves exactly as before, and inert in a build without CUDA, where enabling it
+           returns false and nothing else changes. */
+        parser.add_option("extended-memory", "Stream tensors through the device under a budget "
+            "when the working set does not fit");
+        parser.add_option("vram-budget", "Device memory the extension may use, in MiB (default: 8192)", 1);
+        parser.add_option("vram-store", "Directory holding the store, on a real volume rather than a memory filesystem "
+            "(default: DLIB_XMEM_STORE, else the temp dir)", 1);
+
         parser.parse(argc, argv);
+
+        /* Before any tensor exists, which is why this sits at the top of main rather than
+           beside the code that builds a network. The subsystem cannot be switched on later
+           and cannot be switched off at all: turning it off would mean bringing every block
+           back at once, which is the operation it exists because one cannot perform. */
+        if (parser.option("extended-memory"))
+        {
+            extended_memory_options xopts;
+            xopts.vram_budget = (size_t)get_option(parser, "vram-budget", 8192) << 20;
+            xopts.store_path  = get_option(parser, "vram-store", default_extended_memory_store_path());
+            xopts.verbose     = true;
+
+            if (!enable_extended_memory(xopts))
+                cout << "Extended memory was requested but is unavailable in this build; "
+                        "continuing without it.\n";
+        }
 
         /* The tokenizer report needs nothing but the tokenizer, so it runs before the
            checks below decide that a run without --build-tokenizer or --train has
@@ -927,7 +952,11 @@ int main(int argc, char** argv)
                 << "Example usage:\n"
                 << "  Build tokenizer : " << argv[0] << " --build-tokenizer --external-data corpus.txt\n"
                 << "  Pre-train       : " << argv[0] << " --train --external-data corpus.txt\n"
-                << "  Check tokenizer : " << argv[0] << " --check-tokenizer\n";
+                << "  Check tokenizer : " << argv[0] << " --check-tokenizer\n"
+                << "\n  Add --extended-memory to any of the above when the batch or the window\n"
+                   "  no longer fits the card. --vram-budget sets what the extension may use,\n"
+                   "  in MiB, and defaults to 8192. Keep --vram-store on a real volume: a memory\n"
+                   "  filesystem would spend the host memory the store exists to spare.\n";
             return 0;
         }
 

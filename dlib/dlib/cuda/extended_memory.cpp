@@ -931,8 +931,11 @@ namespace xmem
                 if (opt.verbose && !arena_full_reported)
                 {
                     arena_full_reported = true;
-                    std::cerr << "extended memory: the store is full, later blocks keep "
-                                 "pinned mirrors\n";
+                    std::cerr << "extended memory: the store is full. Later blocks fall back "
+                                 "to pinned host memory, which is bounded and will stop "
+                                 "eviction when it runs out. Point the store at a volume with "
+                                 "room, and not at a memory filesystem, whose pages are the "
+                                 "host memory the store exists to spare.\n";
                 }
             }
 
@@ -1245,6 +1248,8 @@ namespace xmem
             in a topology, and they are the only place a graph's real footprint can be seen
             once the layers have stopped agreeing with the arithmetic on paper.
         */
+        std::size_t store_capacity () const { return arena ? arena->capacity() : 0; }
+
         void report_blocks (std::ostream& out, std::size_t max_rows) const
         {
             std::lock_guard<std::mutex> lk(mu);
@@ -1624,7 +1629,27 @@ namespace xmem
             else
             {
                 if (!g.data_host)
+                {
+                    /* Refusing the eviction leaves the block on the device and the budget
+                       overrun, which the caller can survive. Pinning past the ceiling does
+                       not: host memory runs out, and every CUDA call in the process starts
+                       failing at once, including the ones trying to report the problem. */
+                    if (!pinned_headroom(r->bytes))
+                    {
+                        if (!pinned_ceiling_reported)
+                        {
+                            pinned_ceiling_reported = true;
+                            const double mib = 1024.0*1024.0;
+                            std::cerr << "extended memory: " << (pinned_bytes/mib)
+                                      << " MiB of host memory is pinned holding evicted blocks "
+                                         "and no more will be taken. Eviction stops here, so the "
+                                         "budget will be exceeded rather than the host exhausted. "
+                                         "Give the store a volume with room.\n";
+                        }
+                        return false;
+                    }
                     allocate_pinned_mirror_locked(g, r);
+                }
                 if (!g.host_current)
                 {
                     CHECK_CUDA(cudaMemcpy(g.data_host.get(), g.data_device.get(),
@@ -1656,6 +1681,12 @@ namespace xmem
             if (err != cudaSuccess)
                 std::cerr << "extended memory: cudaMemset() failed. Reason: "
                           << cudaGetErrorString(err) << std::endl;
+        }
+
+        bool pinned_headroom (std::size_t bytes) const
+        {
+            const std::size_t cap = opt.max_pinned_bytes ? opt.max_pinned_bytes : vram_budget;
+            return pinned_bytes + bytes <= cap;
         }
 
         void allocate_pinned_mirror_locked (gpu_data& g, block_record* r)
@@ -2310,6 +2341,7 @@ namespace xmem
         std::size_t largest_block   = 0;
         std::size_t immovable_bytes = 0;
         bool        floor_reported  = false;
+        bool        pinned_ceiling_reported = false;
         unsigned long long host_pull_bytes = 0;
         double      sync_seconds    = 0;
         std::size_t sync_count      = 0;
@@ -2500,7 +2532,7 @@ namespace xmem
             std::cerr << "extended memory: enabled on device " << dev
                       << " with a budget of " << (o.vram_budget >> 20) << " MiB";
             if (m->has_arena())
-                std::cerr << ", store of " << (o.store_bytes >> 20) << " MiB mapped in "
+                std::cerr << ", store of " << (m->store_capacity() >> 20) << " MiB mapped in "
                           << o.store_path;
             else
                 std::cerr << ", no store, evicted blocks stay in pinned host memory";

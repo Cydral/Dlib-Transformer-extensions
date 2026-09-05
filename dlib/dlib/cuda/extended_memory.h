@@ -214,6 +214,13 @@ namespace dlib
         unsigned    lookahead            = 24;
         bool        fingerprint          = true;
         std::size_t fingerprint_min_bytes = 0;
+        /* Ceiling on host memory pinned for evicted blocks. Reaching it stops eviction
+           rather than pinning more: an unbounded pinned allocation exhausts the host and
+           takes every other CUDA call down with it, which is a far worse failure than a
+           budget the manager admits it cannot meet. Zero means the budget itself, so that
+           a run without a usable store gets about twice the card and no more, and one with
+           a store never comes near the ceiling because only small blocks keep mirrors. */
+        std::size_t max_pinned_bytes      = 0;
         unsigned    advise_horizon       = 96;
         unsigned    idle_release_ms      = 0;
         double      idle_release_keep    = 0.5;
@@ -291,6 +298,10 @@ namespace dlib
     void print_extended_memory_blocks (std::ostream& out, std::size_t max_rows = 12);
 
 #else
+
+    /* Declared in both branches so a program can name a store location without knowing how
+       it was compiled. The helper only reads the environment and the filesystem. */
+    std::string default_extended_memory_store_path ();
 
     inline bool enable_extended_memory (const extended_memory_options& = extended_memory_options()) { return false; }
     inline bool extended_memory_enabled () { return false; }
