@@ -208,6 +208,39 @@ The number that says whether the arrangement actually works is not the loss. It 
 
 ---
 
+### `cygnus_tokenizer.vocab`
+
+| | |
+|---|---|
+| Produced by | [`slm_cygnus_foundation_ex --build-tokenizer`](../examples/slm_cygnus_foundation_ex.cpp) |
+| Type | Byte-level BPE: 256 byte values, 24,292 merges, 28 special tokens |
+| Vocabulary | 24,576 entries |
+| Corpus | Seven languages — English, French, German, Spanish, Russian, Chinese, Japanese — drawn from encyclopaedic prose, news archives, filtered and multilingual web text, and instruction data |
+
+**What it costs, per writing system.** The figure that matters is characters per token, which `--check-tokenizer` reports:
+
+| | chars/token |
+|---|---|
+| French | 2.57 |
+| English | 2.54 |
+| German | 2.44 |
+| Japanese | 2.38 |
+| Spanish | 2.31 |
+| Russian | 2.12 |
+| Markdown | 1.90 |
+| Chinese | 1.53 |
+| Code | 1.44 |
+
+Around 2.5 on the Latin scripts is modest for a vocabulary of this size — 50,000 entries would reach 3.5 on English — and that is the price of holding the embedding table to a sixth of a small model's parameters rather than a third.
+
+Chinese and code are the weak points. Code has nothing to do with the tokenizer: it reflects how little of it the corpus contains, and no segmentation rule changes that. Chinese is genuinely under-served, and three different segmentation rules were measured before settling here.
+
+**On those three.** The corpus reducer cuts text into pre-tokens before counting frequencies, and that rule decides what survives into the reduced corpus. Cutting dense scripts one character at a time isolates them, leaving a BPE trainer nothing to merge across: Japanese fell to 1.52. Cutting them into runs of four recovered part of it, reaching 1.81. Neither matched the naive rule, which lets merges span whole sequences. The averages across nine categories came out at 2.14, 2.13 and 2.13 — the budget is fixed, and each rule moves it between writing systems rather than creating any.
+
+**It travels with the model as well.** Training serializes the tokenizer alongside the network, so a Cygnus checkpoint carries its own vocabulary. This file is here for the cases that need it without the model: tokenizing a corpus, measuring a segmentation, or resuming a run without paying the twenty-odd hours the merges cost.
+
+---
+
 ## Recommended usage workflow
 
 If you are downloading a model from this directory, the most robust workflow is usually:

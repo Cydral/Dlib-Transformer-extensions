@@ -307,37 +307,32 @@ def from_chat(sink, budget, min_chars):
 
 # How the corpus is cut before frequencies are counted.
 #
-# This rule decides what survives into the reduced corpus, and getting it wrong costs a
-# tokenizer. Two failures bracket the right answer, and both were reached by measurement
-# rather than by reasoning.
+# The rule below is the one that produced the published tokenizer, and it is deliberately
+# the naive one: a run of word characters, whatever the script. Two attempts to improve it
+# were measured against it and both lost, which is worth recording because the reasoning
+# behind them was sound and the results were not.
 #
-# A run of word characters, the obvious rule, swallows an entire Chinese sentence as one
-# pre-token: twenty-nine characters become a unit seen exactly once in the whole corpus.
-# Millions of such units appeared in a seven-language collection. Each is useless twice
-# over, carrying no frequent merge and surviving the reduction below, which keeps every
+# The complaint against this rule is real. A run of word characters swallows an entire
+# Chinese sentence as one pre-token, so twenty-nine characters become a unit seen once in
+# the whole corpus, and a seven-language collection produced twenty million such units. Each
+# carries no frequent merge, and each survives the reduction below, which keeps every
 # distinct pre-token at least once.
 #
-# Cutting those scripts one character at a time fixes that and breaks something worse. The
-# reduction shuffles pre-tokens before writing them, so single characters are emitted in
-# isolation and never appear beside the character that followed them. A BPE trainer reading
-# the result has nothing to merge across, and a tokenizer that should reach two or three
-# characters per token plateaus near one. Measured on a full run, Japanese fell by a third
-# while Latin scripts gained a tenth of a point: a bad trade.
+# Cutting those scripts one character at a time removed that waste and cost far more. The
+# reduction shuffles pre-tokens before writing them, so single characters end up isolated
+# and never appear beside the character that followed them; a BPE trainer reading the result
+# has nothing to merge across. Japanese fell from 2.38 characters per token to 1.52, against
+# a gain of a tenth of a point on the Latin scripts.
 #
-# The answer sits between the two. Dense scripts are cut into short runs, long enough that
-# merges have adjacent characters to work with, short enough that the same run recurs across
-# a corpus rather than appearing once. Four characters is roughly a phrase, and phrases
-# repeat.
-DENSE_RUN = 4
-
-PRETOKEN = re.compile(
-    r"'s|'t|'re|'ve|'m|'ll|'d"
-    r"| ?[\u3040-\u30ff\u3400-\u9fff\uf900-\ufaff]{1," + str(DENSE_RUN) + r"}"
-    r"| ?[^\W\d_]+"
-    r"| ?\d+"
-    r"| ?[^\s\w]+"
-    r"|\s+",
-    re.UNICODE)
+# Runs of four characters, the obvious compromise, recovered part of it: Japanese returned
+# to 1.81 and Latin held most of its gain. Still below the naive rule.
+#
+# The three measured averages across nine categories were 2.14, 2.13 and 2.13. The budget is
+# fixed, and each rule redistributes it between writing systems rather than creating any.
+# Sentence-length pre-tokens let merges span sequences that neither of the alternatives can
+# reach, and on a multilingual model that is worth more than seven percent on languages
+# already served.
+PRETOKEN = re.compile(r"'s|'t|'re|'ve|'m|'ll|'d| ?\w+| ?[^\s\w]+|\s+", re.UNICODE)
 
 
 def distil(source, target, keep_bytes, seed):
