@@ -332,14 +332,23 @@ int run (const arc_dataset& train, const arc_dataset& eval_set, const run_option
 
                 if (o.halting == halting_mode::external)
                 {
-                    /* Each segment resumes where the last left off, and the step that
-                       produced the answer is the one the gradient flows through: the
-                       earlier segments are context, not part of the credit. */
-                    reset_state(net);
-                    set_carry(net, true);
-                    for (long s = 0; s < o.max_steps; ++s)
-                        trainer.train_one_step(xs, ys);
-                    set_carry(net, false);
+                    /* Only the segment that produced the answer carries the gradient. The
+                       earlier ones advance the state and nothing else, which is the
+                       one-step approximation the recurrence is built around: running a
+                       training step per segment would ask the trainer to back-propagate
+                       through a forward whose starting state its own previous step had
+                       already overwritten. */
+                    net_type& live = trainer.get_net(force_flush_to_disk::no);
+                    reset_state(live);
+                    set_carry(live, true);
+
+                    resizable_tensor batch;
+                    live.to_tensor(xs.begin(), xs.end(), batch);
+                    for (long s = 0; s + 1 < o.max_steps; ++s)
+                        live.subnet().forward(batch);
+
+                    trainer.train_one_step(xs, ys);
+                    set_carry(live, false);
                 }
                 else
                 {
