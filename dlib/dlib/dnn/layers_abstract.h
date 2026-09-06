@@ -5079,11 +5079,24 @@ namespace dlib
                 - transition network parameters are managed by the network itself
         !*/
 
+        size_t internal_parameters() const;
+        /*!
+            ensures
+                - returns the number of parameters held in the transition network, which
+                  are the layer's own weights and are not visible through
+                  get_layer_params().
+                - This is the name count_parameters() looks for when it asks a layer what
+                  it encapsulates. A layer that spells it otherwise is taken to encapsulate
+                  nothing, and every network built from it is understated by that amount.
+                - There is no separate active count for this layer: the transition network
+                  runs at every step taken, so all of its parameters are always in use.
+        !*/
+
         size_t num_internal_parameters() const;
         /*!
             ensures
-                - returns the total number of parameters contained in the internal
-                  transition network.
+                - returns internal_parameters(). Kept for callers written against the
+                  earlier name.
         !*/
 
         const transition_net_type& get_transition_net() const;

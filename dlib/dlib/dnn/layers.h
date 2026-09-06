@@ -6478,7 +6478,19 @@ namespace dlib
         const tensor& get_layer_params() const { return halt_params_; }
         tensor& get_layer_params() { return halt_params_; }
 
-        size_t num_internal_parameters() const { return count_parameters(transition_net_); }
+        /* The name matters: count_parameters finds a layer's encapsulated weights by
+           looking for internal_parameters(), and anything else is silently taken to mean
+           the layer has none. Under the old name the transition network was never
+           counted, which understated every network using this layer by exactly the part
+           that replaces the block it stands in for.
+
+           There is no separate active count. The transition network runs at every step
+           the layer takes, so all of its weights are always in use, unlike a mixture of
+           experts where only the chosen few are. */
+        size_t internal_parameters() const { return count_parameters(transition_net_); }
+
+        // Kept for callers written against the earlier name.
+        size_t num_internal_parameters() const { return internal_parameters(); }
 
         void set_learning_rate(double lr) {
             current_learning_rate_ = lr;
