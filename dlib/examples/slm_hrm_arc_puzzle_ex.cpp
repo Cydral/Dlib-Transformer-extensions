@@ -108,54 +108,46 @@ using arc_config = hrm_transformer_config<
 
 // ----------------------------------------------------------------------------------------
 
-enum class halting_mode { external, internal, none };
+enum class halting_mode { external, internal, both, none };
+
+/* The two mechanisms are not alternatives. The adaptive layer decides, per position and
+   inside a module, how many refinement steps that position needs; the outer loop decides
+   how many whole segments the recurrence runs. Nothing makes them exclusive, so the pair
+   is a fourth arrangement and not a contradiction. */
+inline bool uses_act  (halting_mode m)
+{ return m == halting_mode::internal || m == halting_mode::both; }
+inline bool uses_loop (halting_mode m)
+{ return m == halting_mode::external || m == halting_mode::both; }
 
 inline std::string describe (halting_mode m)
 {
     switch (m)
     {
-        case halting_mode::external: return "external, a value head trained by Q-learning";
-        case halting_mode::internal: return "internal, an adaptive layer trained by a ponder cost";
-        default:                     return "none, a fixed number of passes";
+        case halting_mode::external:
+            return "external, a value head trained by Q-learning around whole segments";
+        case halting_mode::internal:
+            return "internal, an adaptive layer trained by a ponder cost";
+        case halting_mode::both:
+            return "both, the adaptive layer inside the modules and the outer loop around them";
+        default:
+            return "none, a single pass and no decision";
     }
 }
 
 // ----------------------------------------------------------------------------------------
 
 /*
-    The value head of the external branch.
-
-    It reads the state the recurrence has reached and predicts two numbers: what halting
-    now is worth, and what continuing is worth. Training it needs no gradient through the
-    network being judged, so it is a small standalone network fed the pooled state, which
-    keeps the branches comparable: the recurrent core is identical in all three.
+    Whether a predicted window matches the one that was asked for. This is the reward the
+    halting controller is trained against, and it is the part a library cannot supply:
+    only the caller knows what a right answer looks like.
 */
-using q_head_type = loss_mean_squared_multioutput<
-    fc<2, relu<fc<64, input<matrix<float, 0, 1>>>>>>;
-
-struct q_decision
+inline float grid_reward (const std::vector<unsigned long>& predicted,
+                          const matrix<unsigned long, 0, 1>& label)
 {
-    float halt = 0;
-    float go_on = 0;
-    bool  stop () const { return halt >= go_on; }
-};
-
-/*
-    Pools the recurrent state into the vector the value head reads. Averaging over
-    positions is enough: the head only has to tell a state that has settled from one
-    still moving, and a per-position summary would make it as large as the model.
-*/
-inline matrix<float, 0, 1> pool_state (const tensor& t)
-{
-    matrix<float, 0, 1> v(t.k() * t.nc() > 0 ? std::min<long>(t.nc(), 64) : 1);
-    v = 0;
-    const float* p = t.host();
-    const long   n = (long)t.size();
-    const long   d = v.size();
+    const long n = std::min<long>((long)predicted.size(), label.size());
     for (long i = 0; i < n; ++i)
-        v(i % d) += p[i];
-    if (n > 0) v /= (float)(n / d + 1);
-    return v;
+        if (predicted[(size_t)i] != label(i)) return 0.0f;
+    return 1.0f;
 }
 
 // ----------------------------------------------------------------------------------------
@@ -227,13 +219,13 @@ double evaluate (net_type& net, const arc_dataset& d, const run_options& o)
                                    : (int)d.puzzle_of(i);
         const auto seq = arc_make_input(d, i, pid);
 
-        /* The external branch is the only one that runs the network more than once, and
-           the only one whose state has to survive between those runs. */
+        /* Only the arrangements that compose segments run the network more than once,
+           and only they need the state to survive between those runs. */
         std::vector<matrix<int, 0, 1>> one(1, seq);
         resizable_tensor batch;
         net.to_tensor(one.begin(), one.end(), batch);
 
-        if (o.halting == halting_mode::external)
+        if (uses_loop(o.halting))
         {
             /* Only this branch runs the network more than once, and only this branch
                needs the state to survive between those runs. */
@@ -287,7 +279,11 @@ int run (const arc_dataset& train, const arc_dataset& eval_set, const run_option
          bool do_train, bool do_eval)
 {
     net_type net;
-    q_head_type q_head;
+    q_halting_options qopt;
+    qopt.max_steps   = o.max_steps;
+    qopt.min_steps   = 1;
+    qopt.summary_dim = 64;
+    q_halting_controller halting(qopt);
 
     if (file_exists(o.model_file))
     {
@@ -303,11 +299,6 @@ int run (const arc_dataset& train, const arc_dataset& eval_set, const run_option
         trainer.set_mini_batch_size((size_t)o.batch_size);
         trainer.set_synchronization_file("chkpt-" + o.model_file, std::chrono::minutes(15));
         trainer.be_quiet();
-
-        dnn_trainer<q_head_type, adam> q_trainer(q_head, adam(1e-4, 0.9, 0.999));
-        q_trainer.set_learning_rate(1e-3);
-        q_trainer.set_mini_batch_size(32);
-        q_trainer.be_quiet();
 
         std::vector<long> order((size_t)train.num_examples());
         std::iota(order.begin(), order.end(), 0);
@@ -330,7 +321,7 @@ int run (const arc_dataset& train, const arc_dataset& eval_set, const run_option
 
                 if ((long)xs.size() < o.batch_size) continue;
 
-                if (o.halting == halting_mode::external)
+                if (uses_loop(o.halting))
                 {
                     /* Only the segment that produced the answer carries the gradient. The
                        earlier ones advance the state and nothing else, which is the
@@ -344,11 +335,30 @@ int run (const arc_dataset& train, const arc_dataset& eval_set, const run_option
 
                     resizable_tensor batch;
                     live.to_tensor(xs.begin(), xs.end(), batch);
+
+                    halting.begin_episode();
+                    long taken = 1;
                     for (long s = 0; s + 1 < o.max_steps; ++s)
+                    {
                         live.subnet().forward(batch);
+                        ++taken;
+                        if (halting.decide(summarise_state(live.subnet().get_output(),
+                                                           qopt.summary_dim), s))
+                            break;
+                    }
 
                     trainer.train_one_step(xs, ys);
+
+                    /* The reward is what the last pass actually produced, judged on the
+                       first example of the batch: the head learns whether stopping where
+                       it did was worth it. */
+                    const tensor& out = trainer.get_net(force_flush_to_disk::no)
+                                            .subnet().get_output();
+                    const auto got = arc_predict_sequence(out.host(), out.nc(),
+                                                          SEQ_LEN, COLOUR_VOCAB);
+                    halting.finish(grid_reward(got, ys.front()));
                     set_carry(live, false);
+                    (void)taken;
                 }
                 else
                 {
@@ -360,8 +370,14 @@ int run (const arc_dataset& train, const arc_dataset& eval_set, const run_option
 
             cout << "epoch " << (epoch + 1) << "/" << o.max_epochs
                  << "  average loss " << trainer.get_average_loss()
-                 << "  lr " << trainer.get_learning_rate() << "\n";
+                 << "  lr " << trainer.get_learning_rate();
+            if (uses_loop(o.halting))
+                cout << "  |  segments " << halting.average_steps()
+                     << "  reward " << halting.average_reward()
+                     << "  head loss " << halting.head_loss();
+            cout << "\n";
             trainer.clear_average_loss();
+            halting.clear_average();
 
             if (trainer.get_learning_rate() < 1e-7) break;
         }
@@ -429,7 +445,9 @@ int main(int argc, char** argv)
                                   "(default: arc-data)", 1);
         parser.add_option("model-file", "Model file path (default: hrm_arc_model.dat)", 1);
         parser.add_option("halting", "Where the decision to stop is taken: external, "
-                                     "internal or none (default: none)", 1);
+                                     "internal, both or none. The two are not alternatives: "
+                                     "one works per position inside a module, the other over "
+                                     "whole segments (default: none)", 1);
         parser.add_option("max-steps", "Segments the external loop may run (default: 8)", 1);
         parser.add_option("batch-size", "Mini-batch size (default: 8)", 1);
         parser.add_option("max-epochs", "Maximum number of epochs (default: 50)", 1);
@@ -499,9 +517,10 @@ int main(int argc, char** argv)
                     "--data-dir arc-agi --out-dir arc-data --protocol reference\n"
                  << "  Train    : " << argv[0] << " --train --data arc-data --halting external\n"
                  << "  Evaluate : " << argv[0] << " --eval --data arc-data --halting external\n"
-                 << "\n  --halting external is the published arrangement, internal is the "
-                    "adaptive layer\n  inside the modules, none is the baseline neither can "
-                    "be credited against until\n  it is known.\n"
+                 << "\n  --halting internal places the adaptive layer inside the modules, "
+                    "external composes\n  whole segments around them, both does the two at "
+                    "once since they are not\n  alternatives, and none is the baseline no "
+                    "other can be credited against until\n  it is known.\n"
                  << "\n  Add --extended-memory when the batch or the table no longer fits "
                     "the card.\n";
             return 0;
@@ -538,7 +557,7 @@ int main(int argc, char** argv)
         /* The adaptive layer is present or absent, not merely switched off, so the two
            cases are different network types and each driver has to be instantiated for
            the one it will build. */
-        return o.halting == halting_mode::internal
+        return uses_act(o.halting)
             ? dispatch_table<true >(train, eval_set, o, do_train, do_eval)
             : dispatch_table<false>(train, eval_set, o, do_train, do_eval);
     }
