@@ -1607,6 +1607,20 @@ namespace dlib { namespace tt
 
 // ----------------------------------------------------------------------------------------
 
+    void broadcast_row (
+        tensor& dest,
+        const tensor& row
+    )
+    {
+#ifdef DLIB_USE_CUDA
+        cuda::broadcast_row(dest, row);
+#else
+        cpu::broadcast_row(dest, row);
+#endif
+    }
+
+// ----------------------------------------------------------------------------------------
+
     void act_mark_active(
         tensor& active_mask,
         tensor& active_count,

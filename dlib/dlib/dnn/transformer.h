@@ -1731,34 +1731,36 @@ namespace dlib
          *   z_H = f_H(z_H + z_L)
          *   output = z_H
          */
+        /* Whether the next forward continues the recurrence or restarts it, and a way to
+           drop the carried state so the next pass starts clean whatever the flag says. */
+        bool get_carry_state () const { return carry_state_; }
+        void set_carry_state (bool v) { carry_state_ = v; }
+        void reset_state () { z_h_current.set_size(0); z_l_current.set_size(0); }
+
         template <typename SUBNET>
         void forward(const SUBNET& sub, resizable_tensor& output)
         {
             const tensor& x = sub.get_output();
-            const long batch_size = x.num_samples();
-            const long k = x.k();
-            const long seq_len = x.nr();
 
-            // Initialize z_H and z_L from their init vectors (broadcast to batch)
-            z_h_current.copy_size(x);
-            z_l_current.copy_size(x);
+            /* The state either starts from the learned init vectors or continues from
+               where the previous forward left it. Continuing is what an external halting
+               loop needs: a segment that resumes the recurrence rather than restarting it,
+               so that several forwards compose into one longer chain of reasoning. The
+               reset is the default, so a network that never asks for a carry behaves as
+               it always did.
+
+               Either way the write happens where the state already lives. Filling it from
+               the host would bring the whole state back over the link and leave the device
+               copy stale once per forward, which on a sequence of any length costs more
+               than the recurrence it is preparing. */
+            const bool resume = carry_state_ && z_h_current.size() == x.size()
+                                             && z_l_current.size() == x.size();
+            if (!resume)
             {
-                auto* z_h_ptr = z_h_current.host();
-                auto* z_l_ptr = z_l_current.host();
-                const auto* h_init_ptr = z_h_init.host();
-                const auto* l_init_ptr = z_l_init.host();
-
-                for (long n = 0; n < batch_size; ++n) {
-                    for (long kk = 0; kk < k; ++kk) {
-                        for (long r = 0; r < seq_len; ++r) {
-                            for (long c = 0; c < hidden_dim; ++c) {
-                                const long idx = ((n * k + kk) * seq_len + r) * hidden_dim + c;
-                                z_h_ptr[idx] = h_init_ptr[c];
-                                z_l_ptr[idx] = l_init_ptr[c];
-                            }
-                        }
-                    }
-                }
+                z_h_current.copy_size(x);
+                z_l_current.copy_size(x);
+                tt::broadcast_row(z_h_current, z_h_init);
+                tt::broadcast_row(z_l_current, z_l_init);
             }
 
             // Recurrent iterations without gradient tracking (all except final L+H)
@@ -2023,6 +2025,11 @@ namespace dlib
         std::vector<adamw> h_solvers_;
         std::vector<adamw> l_solvers_;
         bool solvers_initialized_;
+
+        /* When set, forward() resumes from the state the previous call left rather than
+           resetting it. Not serialized: it says how the caller is driving the layer for
+           the current pass, not what the layer has learned. */
+        bool carry_state_ = false;
 
         // Temporary computation tensors (forward pass)
         resizable_tensor z_h_current;

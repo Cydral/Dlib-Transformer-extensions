@@ -3618,6 +3618,24 @@ namespace dlib
     
 // -----------------------------------------------------------------------------------
 
+        void broadcast_row (
+            tensor& dest,
+            const tensor& row
+        )
+        {
+            DLIB_CASSERT(row.size() == (size_t)dest.nc());
+            if (dest.size() == 0) return;
+
+            const float* r = row.host();
+            float* d = dest.host_write_only();
+            const long nc = dest.nc();
+            const long rows = (long)(dest.size() / (size_t)nc);
+            for (long i = 0; i < rows; ++i)
+                std::memcpy(d + i*nc, r, (size_t)nc*sizeof(float));
+        }
+
+    // -----------------------------------------------------------------------------------
+
         void act_mark_active(
             tensor& active_mask,
             tensor& active_count,

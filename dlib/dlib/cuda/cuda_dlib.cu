@@ -3642,6 +3642,27 @@ namespace dlib
             }
         }
 
+        __global__ void _cuda_broadcast_row(
+            float* dest, const float* row, size_t n, long nc)
+        {
+            for (auto i : dlib::cuda::grid_stride_range(0, n))
+                dest[i] = row[i % nc];
+        }
+
+        void broadcast_row (
+            tensor& dest,
+            const tensor& row
+        )
+        {
+            DLIB_CASSERT(row.size() == (size_t)dest.nc());
+            if (dest.size() == 0) return;
+
+            launch_kernel(_cuda_broadcast_row, max_jobs(dest.size()),
+                          dest.device_write_only(), row.device(), dest.size(), dest.nc());
+        }
+
+    // -----------------------------------------------------------------------------------
+
         void act_mark_active(
             tensor& active_mask,
             tensor& active_count,

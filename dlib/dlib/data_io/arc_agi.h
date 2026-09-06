@@ -10,6 +10,7 @@
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
+#include <cstdint>
 #include <algorithm>
 #include <iostream>
 #include <random>
@@ -1385,6 +1386,265 @@ namespace dlib
             return grid;
         }
     };
+
+// ----------------------------------------------------------------------------------------
+
+    /*!
+        THE PREPARED ARC DATASET
+
+        Reads what build_arc_dataset.py writes: every grid already flattened into a fixed
+        window, and the two index arrays that say which examples belong to which puzzle
+        and which puzzles belong to which task.
+
+        The conditioning deserves a word, because it is what the layout is built around.
+        A model trained on this data is shown one input grid and no worked examples of
+        the same task. What tells it which transformation to apply is the puzzle
+        identifier, carried as the first token of the sequence and looked up in the same
+        embedding table as the colours. Reserving the identifiers above the colours is
+        what makes that possible without a second embedding layer, and it comes out right
+        for free: the embedding updates only the rows a batch touched, and keeps no
+        optimizer state per row, which is what a table of several hundred thousand
+        puzzles needs.
+
+        The price is stated plainly. An identifier the model never trained on carries no
+        meaning, so a puzzle absent from training cannot be solved by naming it. Passing
+        blank_puzzle_id asks the model to work without being told, which is the honest
+        setting and the harder one.
+    !*/
+
+    struct arc_dataset
+    {
+        long seq_len = 0;               // cells per grid, 900 for a 30 by 30 window
+        long colour_vocab = 0;          // pad plus the ten colours
+
+        std::vector<std::vector<int>> inputs;
+        std::vector<std::vector<int>> labels;
+
+        std::vector<int> puzzle_identifiers;
+        std::vector<int> puzzle_indices; // first example of each puzzle, plus the end
+        std::vector<int> group_indices;  // first puzzle of each group, plus the end
+
+        long num_puzzles () const { return (long)puzzle_identifiers.size(); }
+        long num_groups  () const { return (long)group_indices.size() - 1; }
+        long num_examples() const { return (long)inputs.size(); }
+
+        /*!
+            Size of the embedding table a network reading this dataset needs: the colours
+            and every identifier, since both are looked up in the same table.
+        !*/
+        long vocabulary () const { return colour_vocab + num_puzzles(); }
+
+        /*!
+            Length of the sequence the network sees: the identifier token and the window.
+        !*/
+        long sequence_length () const { return seq_len + 1; }
+
+        /*!
+            Which puzzle an example belongs to, by binary search over the index array.
+        !*/
+        long puzzle_of (long example) const
+        {
+            const auto it = std::upper_bound(puzzle_indices.begin(), puzzle_indices.end(),
+                                             (int)example);
+            return (long)(it - puzzle_indices.begin());
+        }
+    };
+
+// ----------------------------------------------------------------------------------------
+
+    inline arc_dataset load_arc_dataset (
+        const std::string& filename
+    )
+    {
+        std::ifstream in(filename, std::ios::binary);
+        if (!in)
+            throw std::runtime_error("arc dataset: cannot open " + filename);
+
+        char magic[4] = {0, 0, 0, 0};
+        in.read(magic, 4);
+        if (std::string(magic, 4) != "ARCD")
+            throw std::runtime_error("arc dataset: " + filename +
+                                     " is not a prepared ARC file");
+
+        auto read_i32 = [&in]() -> int {
+            unsigned char b[4];
+            in.read((char*)b, 4);
+            return (int)((std::uint32_t)b[0] | ((std::uint32_t)b[1] << 8) |
+                         ((std::uint32_t)b[2] << 16) | ((std::uint32_t)b[3] << 24));
+        };
+        auto read_vec = [&](long n) {
+            std::vector<int> v((size_t)n);
+            for (long i = 0; i < n; ++i) v[(size_t)i] = read_i32();
+            return v;
+        };
+
+        const int version = read_i32();
+        if (version != 1)
+            throw std::runtime_error("arc dataset: " + filename + " has version " +
+                                     std::to_string(version) + ", expected 1");
+
+        arc_dataset d;
+        d.seq_len      = read_i32();
+        d.colour_vocab = read_i32();
+        const long n_examples = read_i32();
+        const long n_ids      = read_i32();
+        const long n_pidx     = read_i32();
+        const long n_gidx     = read_i32();
+
+        DLIB_CASSERT(d.seq_len > 0 && d.colour_vocab > 0 && n_examples >= 0,
+            "arc dataset: header of " << filename << " is not sensible");
+
+        d.inputs.resize((size_t)n_examples);
+        for (long i = 0; i < n_examples; ++i) d.inputs[(size_t)i] = read_vec(d.seq_len);
+        d.labels.resize((size_t)n_examples);
+        for (long i = 0; i < n_examples; ++i) d.labels[(size_t)i] = read_vec(d.seq_len);
+
+        d.puzzle_identifiers = read_vec(n_ids);
+        d.puzzle_indices     = read_vec(n_pidx);
+        d.group_indices      = read_vec(n_gidx);
+
+        if (!in)
+            throw std::runtime_error("arc dataset: " + filename + " ended early");
+
+        DLIB_CASSERT(!d.puzzle_indices.empty() &&
+                     d.puzzle_indices.back() == (int)n_examples,
+            "arc dataset: the puzzle index of " << filename << " does not end on the "
+            "example count, so the file is inconsistent");
+        DLIB_CASSERT(!d.group_indices.empty() &&
+                     d.group_indices.back() == (int)(n_pidx - 1),
+            "arc dataset: the group index of " << filename << " does not end on the "
+            "puzzle count, so the file is inconsistent");
+
+        return d;
+    }
+
+// ----------------------------------------------------------------------------------------
+
+    /*!
+        Builds the sequence the network reads: the identifier token, then the window.
+
+        Passing arc_blank_puzzle_id withholds the identifier, which is how a model is
+        asked to solve a puzzle it was never told the name of.
+    !*/
+    constexpr int arc_blank_puzzle_id = 0;
+
+    inline matrix<int, 0, 1> arc_make_input (
+        const arc_dataset& d,
+        long example,
+        int puzzle_id
+    )
+    {
+        DLIB_CASSERT(example >= 0 && example < d.num_examples());
+        DLIB_CASSERT(puzzle_id >= 0 && puzzle_id < d.num_puzzles(),
+            "arc dataset: identifier " << puzzle_id << " is outside the table the "
+            "network was sized for, so it has no embedding to look up");
+
+        const std::vector<int>& cells = d.inputs[(size_t)example];
+        matrix<int, 0, 1> seq(d.sequence_length());
+
+        // The identifier lives above the colours in the same table, which is what lets
+        // one embedding layer serve both.
+        seq(0) = d.colour_vocab + puzzle_id;
+        for (long i = 0; i < d.seq_len; ++i)
+            seq(i + 1) = cells[(size_t)i];
+        return seq;
+    }
+
+    /*!
+        The labels for that sequence. The first position carries the identifier, which is
+        given rather than predicted, so it is labelled with the pad and the loss is asked
+        to ignore it.
+    !*/
+    inline matrix<unsigned long, 0, 1> arc_make_label (
+        const arc_dataset& d,
+        long example
+    )
+    {
+        DLIB_CASSERT(example >= 0 && example < d.num_examples());
+
+        const std::vector<int>& cells = d.labels[(size_t)example];
+        matrix<unsigned long, 0, 1> seq(d.sequence_length());
+        seq(0) = 0;
+        for (long i = 0; i < d.seq_len; ++i)
+            seq(i + 1) = (unsigned long)cells[(size_t)i];
+        return seq;
+    }
+
+// ----------------------------------------------------------------------------------------
+
+    /*!
+        Reads a whole grid out of the network in one pass, by taking the most likely
+        colour at each position of the output.
+
+        The alternative would be to generate the window token by token, which for nine
+        hundred positions would be nine hundred forward passes to answer one puzzle. The
+        loss is per position, so every position already has its logits after a single
+        pass and there is nothing to gain by asking again.
+    !*/
+    inline std::vector<unsigned long> arc_predict_sequence (
+        const float* logits,
+        long row_stride,
+        long sequence_length,
+        long vocabulary
+    )
+    {
+        DLIB_CASSERT(logits != nullptr && row_stride >= vocabulary && vocabulary > 0,
+            "arc dataset: a row of " << row_stride << " cannot hold " << vocabulary
+            << " colours");
+
+        std::vector<unsigned long> out((size_t)sequence_length, 0);
+        for (long i = 0; i < sequence_length; ++i)
+        {
+            const float* row = logits + i * row_stride;
+            long best = 0;
+            for (long c = 1; c < vocabulary; ++c)
+                if (row[c] > row[best]) best = c;
+            out[(size_t)i] = (unsigned long)best;
+        }
+        return out;
+    }
+
+// ----------------------------------------------------------------------------------------
+
+    /*!
+        Turns a predicted sequence back into a grid, by finding where the padding starts.
+
+        The window is square and the padding surrounds the answer, so the extent is the
+        largest row and column that carry a colour. A prediction that leaves the window
+        entirely blank yields an empty grid rather than an error, since an empty answer
+        is a wrong answer and not a malformed one.
+    !*/
+    inline arc_grid_t arc_decode_grid (
+        const std::vector<unsigned long>& predicted,
+        long seq_len,
+        long grid_side
+    )
+    {
+        DLIB_CASSERT(grid_side > 0 && seq_len == grid_side * grid_side);
+        const long offset = (long)predicted.size() - seq_len;   // skip the identifier
+        DLIB_CASSERT(offset >= 0, "arc dataset: the prediction is shorter than a window");
+
+        long rows = 0, cols = 0;
+        for (long i = 0; i < seq_len; ++i)
+        {
+            if (predicted[(size_t)(offset + i)] == 0) continue;
+            rows = std::max(rows, i / grid_side + 1);
+            cols = std::max(cols, i % grid_side + 1);
+        }
+        if (rows == 0 || cols == 0)
+            return arc_grid_t();
+
+        arc_grid_t g(rows, cols);
+        for (long r = 0; r < rows; ++r)
+            for (long c = 0; c < cols; ++c)
+            {
+                const unsigned long t = predicted[(size_t)(offset + r * grid_side + c)];
+                g(r, c) = t == 0 ? 0 : (int)t - 1;      // undo the shift past the pad
+            }
+        return g;
+    }
+
+// ----------------------------------------------------------------------------------------
 
 } // namespace dlib
 

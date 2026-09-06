@@ -23,7 +23,7 @@
   - [`slm_advanced_gqa_train_ex.cpp`](#slm_advanced_gqa_train_excpp)
   - [`slm_transformer_configs_ex.cpp`](#slm_transformer_configs_excpp)
   - [`slm_enwiki_train_ex.cpp`](#slm_enwiki_train_excpp)
-  - [`slm_hrm_arc_agi_ex.cpp`](#slm_hrm_arc_agi_excpp)
+  - [`slm_hrm_arc_puzzle_ex.cpp`](#slm_hrm_arc_puzzle_excpp)
   - [`slm_predictive_compressor_ex.cpp`](#slm_predictive_compressor_excpp)
   - [`slm_advanced_gqa_kvc_train_ex.cpp`](#slm_advanced_gqa_kvc_train_excpp)
   - [`slm_cygnus_foundation_ex.cpp`](#slm_cygnus_foundation_excpp)
@@ -89,8 +89,8 @@ Across the full example suite, the repository now covers:
    A full **foundation then instruct** pipeline for a compact GQA + MoE model family.
 6. [`slm_enwiki_train_ex.cpp`](#slm_enwiki_train_excpp)  
    Longer-corpus training and context-window management.
-7. [`slm_hrm_arc_agi_ex.cpp`](#slm_hrm_arc_agi_excpp)  
-   Structured reasoning over ARC-style grid outputs.
+7. [`slm_hrm_arc_puzzle_ex.cpp`](#slm_hrm_arc_puzzle_excpp)  
+   Hierarchical reasoning on ARC-AGI, and three ways of deciding when to stop.
 8. [`slm_predictive_compressor_ex.cpp`](#slm_predictive_compressor_excpp)  
    Transformer as a **byte-level predictive model** for compression.
 
@@ -397,40 +397,34 @@ The `context_manager` abstraction is especially helpful because it makes explici
 
 ---
 
-<a id="slm_hrm_arc_agi_excpp"></a>
-## `slm_hrm_arc_agi_ex.cpp`
+<a id="slm_hrm_arc_puzzle_excpp"></a>
+## `slm_hrm_arc_puzzle_ex.cpp`
 
 ### Purpose
-A specialized example showing how Transformer-like machinery can be applied to **structured reasoning tasks** inspired by **ARC-style grid transformations**.
+Trains a hierarchical reasoning network on ARC-AGI and puts three ways of deciding when to stop thinking in competition on the same data, the same architecture and the same budget.
 
-### What makes this example stand out
-This is not ordinary text generation. The model autoregressively predicts a **structured output grid**, while the program actively validates the generated structure during decoding.
+### The question it asks
+A recurrent core can be run for a variable number of passes, and there is more than one place to decide how many. The published work puts that decision outside the network, driven by a value head trained by Q-learning. The adaptive computation layer puts it inside the graph, per position, trained by a ponder cost. Which is better is open, and the two differ as much in the signal that trains them as in where they sit.
+
+- `--halting external` drives the recurrence from outside, each segment resuming the state the last one left,
+- `--halting internal` places the adaptive layer inside the modules the recurrence encapsulates,
+- `--halting none` is the baseline neither can be credited against until it is known.
+
+### The conditioning, and what it costs
+The model sees one input grid and no worked examples of the same task. What tells it which transformation to apply is an identifier carried as the first token and looked up in the same embedding table as the colours. An identifier never trained on therefore means nothing, and a puzzle can only be asked about by name if it was named during training. `--blank-puzzle-id` withholds it, which is the harder setting and the honest one.
 
 ### Main ideas demonstrated
-- conversion of ARC-style input context into tokens
-- bounded grid constraints (rows, columns, output length)
-- generation-state tracking during decoding
-- early stopping when invalid patterns are detected
-- row-consistency monitoring
-- explicit failure handling when the generated output becomes structurally invalid
+- one embedding table serving both the symbols and a large set of learned identifiers, with no optimizer state over it,
+- an output head deliberately narrower than that table, since an identifier is never predicted,
+- a recurrent layer whose state can be carried across forward passes, so a caller can drive the recurrence from outside,
+- the whole grid read in a single pass rather than nine hundred autoregressive steps,
+- the same network type selected at compile time by whether the adaptive layer is present.
 
-### Why this is interesting pedagogically
-This file highlights a key strength of autoregressive modeling:
-
-> a Transformer can be used on much more than plain prose, provided the task can be encoded as a sequence and the decoding process is constrained appropriately.
-
-The code also shows that for structured outputs, **post-token validation** is often just as important as the neural model itself.
+### Preparing the data
+`slm_tools/build_arc_dataset.py` turns the ARC JSON into the flat arrays this program reads, in the layout the reference implementation uses, so a dataset built here can feed either codebase. Augmentation is optional, and `--protocol reference` reproduces the published arrangement while `--protocol held-out` is the setting that does not learn at test time.
 
 ### Useful reminders
-Many symbolic reasoning tasks can be recast as sequence generation, but raw generation alone is rarely sufficient. Constraints, termination conditions, and structural validation frequently play a decisive role.
-
-### What to inspect in the code
-- `generation_state`
-- `generate_output_for_test_pair_with_info(...)`
-- context-size computation from ARC input/task pairs
-- the stop criteria based on end-of-output token, invalid row structure, and output-length limits
-
-[⬆ Back to top](#on-this-page)
+Add `--extended-memory` when the batch or the identifier table no longer fits the card.
 
 ---
 
@@ -867,7 +861,7 @@ The repository strikes a useful balance:
 - Use **`slm_transformer_configs_ex.cpp`** if you want a strong reusable application template.
 - Use **`slm_cygnus_foundation_ex.cpp`** then **`slm_cygnus_instruct_ex.cpp`** if your target is a compact model trained end to end, from pre-training to instruction following.
 - Use **`slm_enwiki_train_ex.cpp`** if you work with larger external corpora.
-- Explore **`slm_hrm_arc_agi_ex.cpp`** if you are interested in structured reasoning beyond plain text.
+- Explore **`slm_hrm_arc_puzzle_ex.cpp`** if you are interested in structured reasoning beyond plain text, and in where adaptive computation belongs.
 - Explore **`slm_predictive_compressor_ex.cpp`** or **`slm_tok_predictive_compressor_ex.cpp`** if you want to see Transformers used as generic sequence predictors outside classical NLP.
 - Start with **`slm_gguf_runtime_ex.cpp`** if you already have a model and want to run it today.
 - Use **`slm_gguf_import_ex.cpp`** then **`slm_lora_finetune_ex.cpp`** if you want to specialize an existing open-weight model.

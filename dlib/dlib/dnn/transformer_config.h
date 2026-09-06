@@ -278,7 +278,15 @@ namespace dlib
         template <typename> class dropout_policy = dropout_10,
         attention_impl impl = attention_impl::chained,
         long num_kv_heads = 2,
-        bool use_act = false        // HRM recurs at the module level; ACT off by default
+        bool use_act = false,       // HRM recurs at the module level; ACT off by default
+        /* Width of the output layer, when it should be narrower than the embedding
+           table. A model conditioned by a learned identifier looks that identifier up
+           in the same table as its symbols, so the table has to hold both; but it is
+           never asked to predict an identifier, and a head sized for the whole table
+           would carry a weight column and an optimizer state for every one of them.
+           Zero keeps the head as wide as the table, which is what a model without such
+           identifiers wants. */
+        long output_vocab_size = 0
     >
     struct hrm_transformer_config {
         // Core model parameters
@@ -288,6 +296,8 @@ namespace dlib
         static constexpr long NUM_HEADS = num_heads;
         static constexpr long NUM_KV_HEADS = num_kv_heads;
         static constexpr bool USE_ACT = use_act;
+        static constexpr long OUTPUT_VOCAB_SIZE =
+            output_vocab_size > 0 ? output_vocab_size : vocab_size;
         static constexpr long EMBEDDING_DIM = embedding_dim;
         static constexpr long HRM_N = hrm_N;
         static constexpr long HRM_T = hrm_T;
@@ -326,10 +336,10 @@ namespace dlib
         // Network definition selector based on training mode
         template<bool is_training>
         using network_type = std::conditional_t<is_training,
-            classification_head<VOCAB_SIZE,
+            classification_head<OUTPUT_VOCAB_SIZE,
             hrm<train_h_net_type, train_l_net_type, HRM_N, HRM_T,
             embeddings<VOCAB_SIZE, EMBEDDING_DIM, input<matrix<int, 0, 1>>>>>,
-            classification_head<VOCAB_SIZE,
+            classification_head<OUTPUT_VOCAB_SIZE,
             hrm<infer_h_net_type, infer_l_net_type, HRM_N, HRM_T,
             embeddings<VOCAB_SIZE, EMBEDDING_DIM, input<matrix<int, 0, 1>>>>>>;
 

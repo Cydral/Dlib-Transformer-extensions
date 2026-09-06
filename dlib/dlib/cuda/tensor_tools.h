@@ -2680,6 +2680,25 @@ namespace dlib { namespace tt
 
 // ----------------------------------------------------------------------------------------
 
+    void broadcast_row (
+        tensor& dest,
+        const tensor& row
+    );
+    /*!
+        requires
+            - row.size() == dest.nc()
+            - dest.size() % dest.nc() == 0
+        ensures
+            - Writes row across every position of dest, so that for every sample n,
+              channel k, and row r: dest(n,k,r,c) == row(c) for all c.
+            - Performs the write where dest already lives. A recurrent layer that resets
+              its state at every forward would otherwise pull the whole state back to the
+              host, write it there and leave the device copy stale, which costs the link
+              a full state tensor per step and says nothing about the model.
+    !*/
+
+// ----------------------------------------------------------------------------------------
+
     void act_mark_active(
         tensor& active_mask,
         tensor& active_count,

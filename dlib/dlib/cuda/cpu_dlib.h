@@ -614,6 +614,11 @@ namespace dlib
 
     // -----------------------------------------------------------------------------------
 
+        void broadcast_row (
+            tensor& dest,
+            const tensor& row
+        );
+
         void act_mark_active(
             tensor& active_mask,
             tensor& active_count,

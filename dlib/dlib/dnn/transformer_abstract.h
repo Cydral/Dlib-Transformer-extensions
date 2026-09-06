@@ -1032,6 +1032,37 @@ namespace dlib
                 - Internal networks (h_net, l_net) are default-constructed
         !*/
 
+        bool get_carry_state (
+        ) const;
+        /*!
+            ensures
+                - returns whether the next forward() will continue the recurrence from the
+                  state the previous call left, rather than resetting it.
+        !*/
+
+        void set_carry_state (
+            bool v
+        );
+        /*!
+            ensures
+                - #get_carry_state() == v
+                - When set, and provided the input keeps the same shape, the next forward()
+                  resumes from the state the previous one left. This lets a caller drive the
+                  recurrence from outside the network, so that several forwards compose into
+                  one longer chain rather than repeating the same short one, which is what an
+                  external halting loop needs.
+                - The flag is not serialized: it describes how a caller is driving the layer
+                  for the pass in hand, not anything the layer has learned.
+        !*/
+
+        void reset_state (
+        );
+        /*!
+            ensures
+                - Drops any carried state, so the next forward() starts from the learned
+                  initial vectors whatever get_carry_state() returns.
+        !*/
+
         hrm_(const hrm_& other);
         /*!
             ensures
