@@ -333,6 +333,113 @@ namespace dlib
         !*/
     };
 
+
+// ----------------------------------------------------------------------------------------
+
+    struct arc_dataset
+    {
+        /*!
+            WHAT THIS OBJECT REPRESENTS
+                A prepared ARC dataset: every grid already flattened into a fixed window,
+                and the index arrays saying which examples belong to which puzzle and which
+                puzzles belong to which group.
+
+                A model reading this data sees one input grid and no worked examples of the
+                same task. What tells it which transformation to apply is the puzzle
+                identifier, carried as the first token and looked up in the same embedding
+                table as the colours. An identifier the model never trained on therefore
+                carries no meaning, and a puzzle can only be asked about by name if it was
+                named during training.
+        !*/
+
+        long puzzle_of (long example) const;
+        /*!
+            ensures
+                - returns where in this split the example's puzzle sits.
+                - This is a position, not a name. Use identifier_of() to name a puzzle.
+        !*/
+
+        int identifier_of (long example) const;
+        /*!
+            requires
+                - 0 <= example < num_examples()
+            ensures
+                - returns the identifier of the puzzle the example belongs to, which is the
+                  number a network looks up.
+                - This is not puzzle_of(). A split built under the reference protocol stores
+                  identifiers assigned while the training split was built, so an evaluation
+                  puzzle sitting at position three may be named twenty. Passing the position
+                  names a different puzzle, silently, and only on the protocol where the
+                  comparison is meant to happen.
+        !*/
+
+        int largest_identifier () const;
+        /*!
+            ensures
+                - returns the largest identifier this split can name, which is what an
+                  embedding table has to reach for the split to be usable at all.
+        !*/
+
+        long vocabulary      () const;
+        long sequence_length () const;
+        /*!
+            ensures
+                - vocabulary() is the colours plus this split's own puzzle count, a lower
+                  bound on the table a network needs. Under the reference protocol the
+                  bound that matters is colour_vocab + largest_identifier() + 1.
+                - sequence_length() is the window plus the one identifier token.
+        !*/
+    };
+
+// ----------------------------------------------------------------------------------------
+
+    arc_dataset load_arc_dataset (const std::string& filename);
+    /*!
+        ensures
+            - reads a file written by slm_tools/build_arc_dataset.py.
+        throws
+            - std::runtime_error if the file is missing, is not a prepared ARC file, has a
+              version this build does not know, or ends early.
+    !*/
+
+    matrix<int, 0, 1>           arc_make_input (const arc_dataset& d, long example, int puzzle_id);
+    matrix<unsigned long, 0, 1> arc_make_label (const arc_dataset& d, long example);
+    /*!
+        requires
+            - 0 <= example < d.num_examples() and puzzle_id >= 0
+        ensures
+            - arc_make_input returns the identifier token followed by the window.
+            - arc_make_label returns the answer, its first position labelled with the pad
+              since the identifier is given rather than predicted.
+            - passing arc_blank_puzzle_id withholds the identifier, which asks the model to
+              work without being told which rule applies.
+    !*/
+
+    std::vector<unsigned long> arc_predict_sequence (const float* logits, long row_stride,
+                                                     long sequence_length, long vocabulary);
+    /*!
+        requires
+            - logits points at sequence_length rows of row_stride floats
+            - row_stride >= vocabulary > 0
+        ensures
+            - returns the most likely colour at each position, read in one pass. Generating
+              the window token by token would be nine hundred forward passes to answer one
+              puzzle, and the loss is per position, so every position already has its
+              logits after a single pass.
+    !*/
+
+    arc_grid_t arc_decode_grid (const std::vector<unsigned long>& predicted,
+                                long seq_len, long grid_side);
+    /*!
+        requires
+            - grid_side > 0, seq_len == grid_side * grid_side, predicted.size() >= seq_len
+        ensures
+            - returns the grid the prediction describes, its extent taken from the largest
+              row and column carrying a colour.
+            - returns an empty grid when the window is entirely padding: an empty answer is
+              a wrong answer rather than a malformed one.
+    !*/
+
 } // namespace dlib
 
 #endif // DLIB_ARC_AGI_ABSTRACT_H_

@@ -1440,13 +1440,41 @@ namespace dlib
         long sequence_length () const { return seq_len + 1; }
 
         /*!
-            Which puzzle an example belongs to, by binary search over the index array.
+            Where in this split an example's puzzle sits. This is a position, not a name.
         !*/
         long puzzle_of (long example) const
         {
             const auto it = std::upper_bound(puzzle_indices.begin(), puzzle_indices.end(),
                                              (int)example);
             return (long)(it - puzzle_indices.begin());
+        }
+
+        /*!
+            The identifier of the puzzle an example belongs to.
+
+            This is the number the network looks up, and it is not the position above. A
+            split built under the reference protocol stores identifiers assigned while the
+            training split was built, so an evaluation puzzle sitting at position three may
+            be named twenty. Passing the position would name a different puzzle, silently,
+            and only on the protocol where the comparison is meant to happen: under the
+            other one the two coincide and nothing looks wrong.
+        !*/
+        int identifier_of (long example) const
+        {
+            const long p = puzzle_of(example);
+            DLIB_CASSERT(p >= 0 && p < (long)puzzle_identifiers.size(),
+                "arc dataset: example " << example << " falls outside the puzzle index");
+            return puzzle_identifiers[(size_t)p];
+        }
+
+        /*!
+            The largest identifier this split can name, which is what an embedding table
+            has to reach for the split to be usable at all.
+        !*/
+        int largest_identifier () const
+        {
+            return puzzle_identifiers.empty() ? 0
+                 : *std::max_element(puzzle_identifiers.begin(), puzzle_identifiers.end());
         }
     };
 
@@ -1535,9 +1563,8 @@ namespace dlib
     )
     {
         DLIB_CASSERT(example >= 0 && example < d.num_examples());
-        DLIB_CASSERT(puzzle_id >= 0 && puzzle_id < d.num_puzzles(),
-            "arc dataset: identifier " << puzzle_id << " is outside the table the "
-            "network was sized for, so it has no embedding to look up");
+        DLIB_CASSERT(puzzle_id >= 0,
+            "arc dataset: identifier " << puzzle_id << " is not a name");
 
         const std::vector<int>& cells = d.inputs[(size_t)example];
         matrix<int, 0, 1> seq(d.sequence_length());
