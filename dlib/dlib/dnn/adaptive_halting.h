@@ -135,6 +135,9 @@ namespace dlib
     {
         DLIB_CASSERT(!predicted.empty());
         DLIB_CASSERT(stopped_at >= 0 && stopped_at < (long)predicted.size());
+        for (const auto& q : predicted)
+            DLIB_CASSERT(q.size() == 2,
+                "q_halting: a step holds " << q.size() << " values, expected two");
 
         std::vector<matrix<float, 0, 1>> targets = predicted;
         const long last = (long)predicted.size() - 1;

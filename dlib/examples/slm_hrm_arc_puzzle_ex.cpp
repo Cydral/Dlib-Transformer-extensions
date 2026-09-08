@@ -136,18 +136,39 @@ inline std::string describe (halting_mode m)
 
 // ----------------------------------------------------------------------------------------
 
+enum class reward_kind { exact, cells };
+
 /*
-    Whether a predicted window matches the one that was asked for. This is the reward the
-    halting controller is trained against, and it is the part a library cannot supply:
-    only the caller knows what a right answer looks like.
+    What a predicted window was worth. This is the reward the halting controller is trained
+    against, and it is the part a library cannot supply: only the caller knows what a right
+    answer looks like.
+
+    Two ways of saying it, and the choice is not cosmetic. The published work scores a grid
+    exactly right or not at all, which is the measure anyone reporting ARC results has to
+    use. But a reward that is zero on every episode teaches a value head nothing: every
+    target becomes zero, the head converges on zero, and its two outputs then differ only
+    by noise, so the decision to stop becomes a coin flip. That is what happens here at the
+    start, when no grid is yet exact.
+
+    Scoring the fraction of cells that came out right gives the head a gradient from the
+    first episode. It is not the published measure and no reported number should be built
+    on it; it is what makes the mechanism trainable at all before the model is good enough
+    for the published one to say anything.
 */
 inline float grid_reward (const std::vector<unsigned long>& predicted,
-                          const matrix<unsigned long, 0, 1>& label)
+                          const matrix<unsigned long, 0, 1>& label,
+                          reward_kind kind)
 {
     const long n = std::min<long>((long)predicted.size(), label.size());
+    if (n <= 0) return 0.0f;
+
+    long right = 0;
     for (long i = 0; i < n; ++i)
-        if (predicted[(size_t)i] != label(i)) return 0.0f;
-    return 1.0f;
+        if (predicted[(size_t)i] == label(i)) ++right;
+
+    if (kind == reward_kind::exact)
+        return right == n ? 1.0f : 0.0f;
+    return (float)right / (float)n;
 }
 
 // ----------------------------------------------------------------------------------------
@@ -203,20 +224,22 @@ struct run_options
     double       learning_rate = 1e-4;
     double       ponder_cost = 0.01;
     bool         blank_id    = false;
+    long         summary_dim = 64;
+    reward_kind  reward      = reward_kind::cells;
     bool         verbose     = false;
 };
 
 // ----------------------------------------------------------------------------------------
 
 template <typename net_type>
-double evaluate (net_type& net, const arc_dataset& d, const run_options& o)
+double evaluate (net_type& net, const arc_dataset& d, const run_options& o,
+                 q_halting_controller* halting)
 {
     long exact = 0, cells_right = 0, cells_total = 0;
 
     for (long i = 0; i < d.num_examples() && !signal_handler::is_triggered(); ++i)
     {
-        const int pid = o.blank_id ? arc_blank_puzzle_id
-                                   : (int)d.puzzle_of(i);
+        const int pid = o.blank_id ? arc_blank_puzzle_id : d.identifier_of(i);
         const auto seq = arc_make_input(d, i, pid);
 
         /* Only the arrangements that compose segments run the network more than once,
@@ -227,11 +250,20 @@ double evaluate (net_type& net, const arc_dataset& d, const run_options& o)
 
         if (uses_loop(o.halting))
         {
-            /* Only this branch runs the network more than once, and only this branch
-               needs the state to survive between those runs. */
+            /* The head decides here too. Running a fixed number of segments would measure
+               the budget rather than the decision, and the thing that was trained would
+               never be used. A null controller falls back to the budget, which is all an
+               evaluation of a model loaded from disk with no head beside it can do. */
             reset_state(net);
             set_carry(net, true);
-            for (long s = 0; s < o.max_steps; ++s) net.subnet().forward(batch);
+            if (halting) halting->begin_episode();
+            for (long s = 0; s < o.max_steps; ++s)
+            {
+                net.subnet().forward(batch);
+                if (halting && halting->decide(
+                        summarise_state(net.subnet().get_output(), o.summary_dim), s))
+                    break;
+            }
             set_carry(net, false);
         }
         else
@@ -282,7 +314,7 @@ int run (const arc_dataset& train, const arc_dataset& eval_set, const run_option
     q_halting_options qopt;
     qopt.max_steps   = o.max_steps;
     qopt.min_steps   = 1;
-    qopt.summary_dim = 64;
+    qopt.summary_dim = o.summary_dim;
     q_halting_controller halting(qopt);
 
     if (file_exists(o.model_file))
@@ -315,7 +347,7 @@ int run (const arc_dataset& train, const arc_dataset& eval_set, const run_option
             for (size_t k = 0; k < order.size() && !signal_handler::is_triggered(); ++k)
             {
                 const long i = order[k];
-                const int pid = o.blank_id ? arc_blank_puzzle_id : (int)train.puzzle_of(i);
+                const int pid = o.blank_id ? arc_blank_puzzle_id : train.identifier_of(i);
                 xs.push_back(arc_make_input(train, i, pid));
                 ys.push_back(arc_make_label(train, i));
 
@@ -336,29 +368,34 @@ int run (const arc_dataset& train, const arc_dataset& eval_set, const run_option
                     resizable_tensor batch;
                     live.to_tensor(xs.begin(), xs.end(), batch);
 
+                    /* The reward is read from the pass the decision was taken on, not
+                       from the training step that follows. The trainer runs its own copy
+                       of the network on its own thread and cleans its tensors when it
+                       pleases, so what it holds after a step is not something a caller
+                       may read: asking anyway returns an output of width zero. The
+                       question the head is being asked is in any case about the state it
+                       decided on, before the extra pass. */
                     halting.begin_episode();
-                    long taken = 1;
+                    std::vector<unsigned long> got;
+                    bool decided = false;
+
                     for (long s = 0; s + 1 < o.max_steps; ++s)
                     {
                         live.subnet().forward(batch);
-                        ++taken;
-                        if (halting.decide(summarise_state(live.subnet().get_output(),
-                                                           qopt.summary_dim), s))
+                        const tensor& out = live.subnet().get_output();
+                        if (out.nc() >= COLOUR_VOCAB && out.size() > 0)
+                            got = arc_predict_sequence(out.host(), out.nc(),
+                                                       SEQ_LEN, COLOUR_VOCAB);
+                        decided = true;
+                        if (halting.decide(summarise_state(out, qopt.summary_dim), s))
                             break;
                     }
 
                     trainer.train_one_step(xs, ys);
 
-                    /* The reward is what the last pass actually produced, judged on the
-                       first example of the batch: the head learns whether stopping where
-                       it did was worth it. */
-                    const tensor& out = trainer.get_net(force_flush_to_disk::no)
-                                            .subnet().get_output();
-                    const auto got = arc_predict_sequence(out.host(), out.nc(),
-                                                          SEQ_LEN, COLOUR_VOCAB);
-                    halting.finish(grid_reward(got, ys.front()));
+                    if (decided && !got.empty())
+                        halting.finish(grid_reward(got, ys.front(), o.reward));
                     set_carry(live, false);
-                    (void)taken;
                 }
                 else
                 {
@@ -398,7 +435,10 @@ int run (const arc_dataset& train, const arc_dataset& eval_set, const run_option
     {
         cout << "\nEvaluating on " << eval_set.num_examples() << " held-out examples, "
              << (o.blank_id ? "without the identifier" : "with the identifier") << "\n";
-        evaluate(net, eval_set, o);
+        evaluate(net, eval_set, o, uses_loop(o.halting) ? &halting : nullptr);
+        if (uses_loop(o.halting))
+            cout << "  segments used : " << halting.average_steps() << " of "
+                 << o.max_steps << "\n";
     }
     return 0;
 }
@@ -414,7 +454,10 @@ template <bool USE_ACT>
 int dispatch_table (const arc_dataset& train, const arc_dataset& eval_set,
                     const run_options& o, bool do_train, bool do_eval)
 {
-    const long need = train.vocabulary();
+    const long need = std::max(train.colour_vocab + train.largest_identifier() + 1,
+                               eval_set.num_examples() > 0
+                                   ? eval_set.colour_vocab + eval_set.largest_identifier() + 1
+                                   : 0L);
     if (need <= TABLE_SMALL)
         return run<typename arc_config<TABLE_SMALL, USE_ACT>::template network_type<true>>(
             train, eval_set, o, do_train, do_eval);
@@ -454,6 +497,12 @@ int main(int argc, char** argv)
         parser.add_option("learning-rate", "Base learning rate (default: 1e-4)", 1);
         parser.add_option("ponder-cost", "What the internal layer pays per step "
                                          "(default: 0.01)", 1);
+        parser.add_option("reward", "What an episode is worth to the halting head: exact, "
+                                    "the published measure, one when the whole grid is "
+                                    "right and zero otherwise; or cells, the fraction of "
+                                    "positions that came out right, which is what gives "
+                                    "the head anything to learn from before any grid is "
+                                    "exact (default: cells)", 1);
         parser.add_option("blank-puzzle-id", "Withhold the identifier, so the model is "
                                              "asked to work without being told the rule");
         parser.add_option("verbose", "Report more as the run goes");
@@ -497,13 +546,27 @@ int main(int argc, char** argv)
         o.learning_rate = get_option(parser, "learning-rate", 1e-4);
         o.ponder_cost   = get_option(parser, "ponder-cost", 0.01);
         o.blank_id      = parser.option("blank-puzzle-id");
+        const std::string rw = get_option(parser, "reward", "cells");
+        if      (rw == "exact") o.reward = reward_kind::exact;
+        else if (rw == "cells") o.reward = reward_kind::cells;
+        else
+        {
+            cout << "Unknown reward: " << rw << "\nExpected one of: exact, cells\n";
+            return 1;
+        }
         o.verbose       = parser.option("verbose");
 
         const std::string h = get_option(parser, "halting", "none");
         if      (h == "external") o.halting = halting_mode::external;
         else if (h == "internal") o.halting = halting_mode::internal;
+        else if (h == "both")     o.halting = halting_mode::both;
         else if (h == "none")     o.halting = halting_mode::none;
-        else { cout << "Unknown halting mode: " << h << "\n"; return 1; }
+        else
+        {
+            cout << "Unknown halting mode: " << h
+                 << "\nExpected one of: none, internal, external, both\n";
+            return 1;
+        }
 
         const bool do_train = parser.option("train");
         const bool do_eval  = parser.option("eval");
@@ -545,7 +608,10 @@ int main(int argc, char** argv)
              << "  puzzles       : " << train.num_puzzles() << "\n"
              << "  examples      : " << train.num_examples()
              << " in " << train.num_groups() << " groups\n"
-             << "  identifier    : " << (o.blank_id ? "withheld" : "given") << "\n\n";
+             << "  identifier    : " << (o.blank_id ? "withheld" : "given") << "\n"
+             << "  reward        : " << (o.reward == reward_kind::exact
+                                             ? "exact grids, the published measure"
+                                             : "fraction of cells right") << "\n\n";
 
         if (train.colour_vocab != COLOUR_VOCAB)
         {
