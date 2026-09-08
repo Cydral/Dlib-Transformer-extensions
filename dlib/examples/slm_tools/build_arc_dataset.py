@@ -60,6 +60,8 @@
 #   build_arc_dataset.py --data-dir arc-agi --out-dir arc-data --augmentations 300
 #   build_arc_dataset.py --data-dir arc-agi --out-dir arc-data --augmentations 0
 #   build_arc_dataset.py --data-dir arc-agi --out-dir arc-data --protocol reference
+#   build_arc_dataset.py --data-dir arc-agi --extra-corpus ConceptARC/corpus \
+#       --out-dir arc-data --protocol reference --augmentations 300
 #   build_arc_dataset.py --download --out-dir arc-data --augmentations 1000
 
 import argparse
@@ -97,16 +99,102 @@ ARC1_URL = "https://raw.githubusercontent.com/fchollet/ARC-AGI/master/data"
 # Reading the source data
 
 
-def read_task_directory(path: str) -> Dict[str, dict]:
-    """Reads one directory of ARC task files, keyed by the task name."""
+def read_task_directory(path: str, recursive: bool = False) -> Dict[str, dict]:
+    """Reads a directory of ARC task files, keyed by the task name.
+
+    ConceptARC and similar corpora file their tasks under one directory per concept, so
+    the recursive form walks the tree and prefixes each name with the directory it came
+    from. The prefix keeps two tasks that happen to share a filename apart, which matters
+    because the name is what an augmentation draw is tied to.
+    """
     tasks = {}
     if not os.path.isdir(path):
         return tasks
-    for name in sorted(os.listdir(path)):
-        if not name.endswith(".json"):
+
+    if not recursive:
+        for name in sorted(os.listdir(path)):
+            if name.endswith(".json"):
+                with open(os.path.join(path, name), "r", encoding="utf-8") as f:
+                    tasks[os.path.splitext(name)[0]] = json.load(f)
+        return tasks
+
+    for root, _, files in os.walk(path):
+        for name in sorted(files):
+            if not name.endswith(".json"):
+                continue
+            rel = os.path.relpath(os.path.join(root, name), path)
+            key = os.path.splitext(rel)[0].replace(os.sep, "/")
+            with open(os.path.join(root, name), "r", encoding="utf-8") as f:
+                try:
+                    task = json.load(f)
+                except json.JSONDecodeError:
+                    continue
+            if isinstance(task, dict) and ("train" in task or "test" in task):
+                tasks[key] = task
+    return tasks
+
+
+def task_fingerprint(task: dict) -> str:
+    """Identifies a task by its demonstration pairs rather than by its filename.
+
+    Names travel between releases and so do tasks, but neither reliably: a task may be
+    renamed, and two corpora may name different things alike. What does not change is the
+    grids, so the pairs are what a duplicate is decided on.
+    """
+    demo = task.get("train", [])
+    payload = json.dumps([[p.get("input"), p.get("output")] for p in demo],
+                         sort_keys=True, separators=(",", ":"))
+    return hashlib.sha1(payload.encode()).hexdigest()
+
+
+def drop_overlap(extra: Dict[str, dict], evaluation: Dict[str, dict]) -> Tuple[Dict[str, dict], int]:
+    """Removes from a corpus anything that is also in the evaluation split.
+
+    This matters as soon as a corpus is drawn from a later release of the same benchmark.
+    A release carries its predecessor's tasks forward, evaluation ones included, so adding
+    its training set wholesale would inject through those tasks the answers the run is
+    about to be graded on. The score would rise and would collapse against any set the
+    model had not seen; declaring the protocol does not repair that, because a leak is a
+    measurement error rather than a protocol choice.
+
+    Matching is by name and by the fingerprint of the demonstration pairs, since either
+    alone can miss.
+    """
+    if not evaluation:
+        return extra, 0
+
+    names = {n.rsplit("/", 1)[-1] for n in evaluation}
+    prints = {task_fingerprint(t) for t in evaluation.values()}
+
+    kept, dropped = {}, 0
+    for name, task in extra.items():
+        base = name.rsplit("/", 1)[-1]
+        if base in names or task_fingerprint(task) in prints:
+            dropped += 1
             continue
-        with open(os.path.join(path, name), "r", encoding="utf-8") as f:
-            tasks[os.path.splitext(name)[0]] = json.load(f)
+        kept[name] = task
+    return kept, dropped
+
+
+def load_extra_corpus(path: str) -> Dict[str, dict]:
+    """Reads a corpus of ARC-format tasks from wherever they happen to sit.
+
+    The reference work trains on 960 tasks: the 400 of the ARC-AGI-1 training set, the
+    400 of its evaluation set through their demonstration pairs alone, and 160 from
+    ConceptARC. Only the first two come from the ARC-AGI tree, so the third has to be
+    named separately. Anything holding tasks in the same JSON shape can be added the same
+    way, including the training split of a later ARC release.
+    """
+    tasks = read_task_directory(path, recursive=True)
+    if tasks:
+        return tasks
+
+    # a challenges and solutions pair, the layout of the later releases
+    for base in ("training", "evaluation", "test"):
+        ch = os.path.join(path, f"arc-agi_{base}_challenges.json")
+        if os.path.exists(ch):
+            tasks.update(read_challenge_file(
+                ch, os.path.join(path, f"arc-agi_{base}_solutions.json")))
     return tasks
 
 
@@ -310,7 +398,8 @@ def build_split(tasks: Dict[str, dict], augmentations: int, seed: int,
 
 
 def build_reference_protocol(train_tasks: Dict[str, dict], eval_tasks: Dict[str, dict],
-                             augmentations: int, seed: int, allow_translate: bool
+                             augmentations: int, seed: int, allow_translate: bool,
+                             extra_tasks: Dict[str, dict] = None
                              ) -> Tuple[Builder, Builder]:
     """Builds both splits over one shared identifier space.
 
@@ -338,6 +427,16 @@ def build_reference_protocol(train_tasks: Dict[str, dict], eval_tasks: Dict[str,
             builder.add_puzzle(f"{name}#{a}",
                                [augment_pair(p, rng, allow_translate) for p in pairs])
         builder.close_group()
+
+    # A complementary corpus contributes everything it has and is never asked again. It is
+    # emitted first so that its identifiers stay put when the ARC tasks change, which lets
+    # two datasets built from the same corpora share a model.
+    for name in sorted(extra_tasks or {}):
+        pairs = [(p["input"], p["output"]) for p in (extra_tasks[name].get("train", []) +
+                                                     extra_tasks[name].get("test", []))
+                 if "output" in p]
+        if pairs:
+            emit(tr, "extra/" + name, pairs, "extra/" + name)
 
     # The training tasks contribute everything they have and are never asked again.
     for name in sorted(train_tasks):
@@ -414,6 +513,9 @@ def write_bin(out_dir: str, split: str, b: Builder) -> str:
     return path
 
 
+OVERLAP_DROPPED = 0
+
+
 def write_metadata(out_dir: str, split: str, b: Builder, args) -> None:
     meta = {
         "split": split,
@@ -426,6 +528,8 @@ def write_metadata(out_dir: str, split: str, b: Builder, args) -> None:
         "num_puzzles": len(b.puzzle_identifiers) - 1,
         "num_groups": len(b.group_indices) - 1,
         "protocol": args.protocol,
+        "extra_corpora": args.extra_corpus,
+        "extra_tasks_dropped_as_overlap": OVERLAP_DROPPED,
         "augmentations_per_task": args.augmentations,
         "translations": bool(args.translations),
         "test_pairs_included": bool(args.include_test_pairs),
@@ -464,6 +568,15 @@ def main():
     p.add_argument("--include-test-pairs", action="store_true",
                    help="under held-out only, add each task's held-out pairs to its own "
                         "training examples")
+    p.add_argument("--extra-corpus", action="append", default=[], metavar="DIR",
+                   help="a further corpus of ARC-format tasks, added to the training split "
+                        "and never evaluated on. Repeatable. The reference work trains on "
+                        "960 tasks: the 400 of the ARC-AGI-1 training set, the 400 of its "
+                        "evaluation set through their demonstration pairs alone, and 160 "
+                        "from ConceptARC, which is what this option is for. A corpus drawn "
+                        "from a later release of the same benchmark carries the earlier "
+                        "tasks forward, so anything also present in the evaluation split is "
+                        "dropped and the count reported")
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--format", choices=("npy", "bin", "both"), default="both")
     args = p.parse_args()
@@ -477,15 +590,32 @@ def main():
 
     train_tasks = load_split(args.data_dir, "training")
     eval_tasks = load_split(args.data_dir, "evaluation")
-    if not train_tasks and not eval_tasks:
+
+    extra_tasks = {}
+    for path in args.extra_corpus:
+        found = load_extra_corpus(path)
+        if not found:
+            print(f"extra corpus: nothing found in {path}")
+        else:
+            print(f"extra corpus: {len(found)} tasks in {path}")
+        for k, v in found.items():
+            extra_tasks[f"{os.path.basename(os.path.normpath(path))}/{k}"] = v
+
+    if not train_tasks and not eval_tasks and not extra_tasks:
         print(f"nothing found in {args.data_dir}")
         return 1
 
+    extra_tasks, dropped = drop_overlap(extra_tasks, eval_tasks)
+    if dropped:
+        print(f"extra corpus: {dropped} tasks dropped, they are in the evaluation split")
+    global OVERLAP_DROPPED
+    OVERLAP_DROPPED = dropped
+
     if args.protocol == "reference":
         tr, ev = build_reference_protocol(train_tasks, eval_tasks, args.augmentations,
-                                          args.seed, args.translations)
+                                          args.seed, args.translations, extra_tasks)
         built = {"training": tr, "evaluation": ev}
-        counts = {"training": len(train_tasks) + len(eval_tasks),
+        counts = {"training": len(train_tasks) + len(eval_tasks) + len(extra_tasks),
                   "evaluation": len(eval_tasks)}
     else:
         built, counts = {}, {}
@@ -493,9 +623,12 @@ def main():
             if not tasks:
                 continue
             use_test = args.include_test_pairs and split == "training"
-            built[split] = build_split(tasks, args.augmentations, args.seed, use_test,
+            merged = dict(tasks)
+            if split == "training":
+                merged.update(extra_tasks)   # a complementary corpus is training data only
+            built[split] = build_split(merged, args.augmentations, args.seed, use_test,
                                        args.translations)
-            counts[split] = len(tasks)
+            counts[split] = len(merged)
 
     for split, b in built.items():
         if args.format in ("npy", "both"):
