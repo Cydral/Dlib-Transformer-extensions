@@ -445,13 +445,8 @@ namespace xmem
                 std::cerr << "extended memory: the store writes at about "
                           << measured_mib_per_s << " MiB/s";
                 if (!on_memory_fs)
-                    std::cerr << ". That is what a training step can hand the volume before "
-                                 "it waits, so a run that overflows the budget by more than "
-                                 "this per step will be bound by the store rather than by the "
-                                 "link. Raising the budget until the working set fits is the "
-                                 "remedy; a memory filesystem is not, since its pages are the "
-                                 "host memory the store exists to spare and it reaches the "
-                                 "disk through swap instead";
+                    std::cerr << ", which bounds what a step may overflow the budget by "
+                                 "before the volume rather than the link sets the pace";
                 std::cerr << "\n";
             }
         }
