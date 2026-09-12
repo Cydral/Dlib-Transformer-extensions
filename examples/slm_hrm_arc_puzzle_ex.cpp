@@ -93,11 +93,20 @@ const long TABLE_SMALL = 131072;     // up to about 320 augmentations of 400 tas
 const long TABLE_LARGE = 524288;     // the reference corpus at 300 to 500 augmentations
 
 /*
-    The network follows the reference configuration: four layers in each of the two
-    modules, two cycles of each, eight query heads over a width of 512, and a feed-forward
-    expansion of four. The one departure is grouped-query attention with two key-value
-    heads, which is what brings the count to 22.1 million against the 27 million reported
-    there. Comparing at slightly fewer parameters is deliberate.
+    The network follows the reference configuration in its shape: four layers in each of
+    the two modules, two cycles of each, eight query heads, and a feed-forward expansion of
+    four. Two things depart from it, both deliberately.
+
+    Attention is grouped-query with two key-value heads rather than eight. And the width is
+    320 rather than 512, which takes the count from 22.1 million to 8.6 million against the
+    27 million reported there.
+
+    The width is where the reasoning happens and it costs the square, so cutting it is what
+    makes a four-way comparison affordable: the step runs 2.6 times faster. What it does
+    not cut is the capacity to hold a puzzle, which lives in the identifier table, 320 wide
+    by half a million rows and outside the parameter count entirely. Whether reasoning
+    survives the cut better than memorisation would is the assumption this configuration
+    rests on, and the comparison against the published figure is what tests it.
 
     The table sizes are template parameters, so every one of them costs an instantiation of
     a network this size. Two are provided rather than four: an oversized table occupies
@@ -108,7 +117,7 @@ const long NUM_H_LAYERS = 4;
 const long NUM_L_LAYERS = 4;
 const long NUM_HEADS    = 8;
 const long NUM_KV_HEADS = 2;
-const long EMBED_DIM    = 512;
+const long EMBED_DIM    = 320;
 const long HRM_N        = 2;
 const long HRM_T        = 2;
 
@@ -239,6 +248,8 @@ struct run_options
     long         eval_every  = 5;
     long         eval_samples = 2000;
     long         patience    = 1000000;
+    long         report_every = 200;
+    long         steps_per_epoch = 0;
     bool         all_examples = false;
     reward_kind  reward      = reward_kind::cells;
     bool         verbose     = false;
@@ -355,8 +366,24 @@ int run (const arc_dataset& train, const arc_dataset& eval_set, const run_option
 
     if (file_exists(o.model_file))
     {
+        /* A checkpoint carries the shape it was trained at. Loading one written by a
+           different width leaves the weights mismatched and the failure surfaces deep
+           inside an attention layer, where nothing names the cause. Saying it here costs
+           one try block. */
         cout << "Loading " << o.model_file << "\n";
-        deserialize(o.model_file) >> net;
+        try
+        {
+            deserialize(o.model_file) >> net;
+        }
+        catch (const std::exception& e)
+        {
+            cout << "\n" << o.model_file << " does not fit this network. It was most likely "
+                    "written by a\nrun of a different width or depth; the current one is "
+                 << NUM_H_LAYERS << " and " << NUM_L_LAYERS << " layers at width "
+                 << EMBED_DIM << ".\nRemove it, or point --model-file elsewhere.\n\n  "
+                 << e.what() << "\n";
+            return 1;
+        }
     }
     cout << "Parameters: " << count_network_parameters(net, SEQ_LEN) << "\n";
 
@@ -412,6 +439,13 @@ int run (const arc_dataset& train, const arc_dataset& eval_set, const run_option
                 }
             }
             std::shuffle(order.begin(), order.end(), rng);
+
+            /* An epoch is the unit on which the rate, the held-out measurement and the
+               best model all hang. On a corpus this size it runs to fifty thousand steps,
+               which puts all three out of reach for a day, so the caller may cut it. */
+            const size_t cap = (size_t)o.steps_per_epoch * (size_t)o.batch_size;
+            if (o.steps_per_epoch > 0 && order.size() > cap)
+                order.resize(cap);
         };
 
         std::vector<long> order;
@@ -420,6 +454,9 @@ int run (const arc_dataset& train, const arc_dataset& eval_set, const run_option
         for (long epoch = 0; epoch < o.max_epochs && !signal_handler::is_triggered(); ++epoch)
         {
             draw_epoch(order);
+            long steps_done = 0;
+            const long steps_this_epoch = (long)(order.size() / (size_t)o.batch_size);
+            auto last_report = std::chrono::steady_clock::now();
             std::shuffle(order.begin(), order.end(), rng);
 
             std::vector<matrix<int, 0, 1>>           xs;
@@ -484,6 +521,27 @@ int run (const arc_dataset& train, const arc_dataset& eval_set, const run_option
                 }
 
                 xs.clear(); ys.clear();
+                ++steps_done;
+
+                /* A line every so often, because an epoch on an augmented corpus is tens
+                   of thousands of steps and a program that says nothing for ten hours
+                   cannot be told from one that has hung. The rate is measured over the
+                   interval rather than the run, so it reflects what the machine is doing
+                   now. */
+                if (o.report_every > 0 && steps_done % o.report_every == 0)
+                {
+                    const auto now = std::chrono::steady_clock::now();
+                    const double dt = std::chrono::duration<double>(now - last_report).count();
+                    const double per = dt > 0 ? o.report_every / dt : 0;
+                    const long   left = steps_this_epoch - steps_done;
+                    cout << "  step " << steps_done << "/" << steps_this_epoch
+                         << "  loss " << trainer.get_average_loss()
+                         << "  " << per << " steps/s";
+                    if (per > 0 && left > 0)
+                        cout << "  " << (long)(left / per / 60) << " min left in the epoch";
+                    cout << "\n" << std::flush;
+                    last_report = now;
+                }
             }
 
             cout << "epoch " << (epoch + 1) << "/" << o.max_epochs
@@ -616,6 +674,14 @@ int main(int argc, char** argv)
                                     "exact (default: cells)", 1);
         parser.add_option("blank-puzzle-id", "Withhold the identifier, so the model is "
                                              "asked to work without being told the rule");
+        parser.add_option("steps-per-epoch", "Cut an epoch to N steps, so that the rate "
+                                             "schedule, the held-out measurement and the "
+                                             "best model come round at a reachable "
+                                             "interval, 0 for the whole draw (default: 0)", 1);
+        parser.add_option("report-every", "Print a line every N steps, 0 to print only at "
+                                          "the end of an epoch. An epoch on an augmented "
+                                          "corpus runs to tens of thousands of steps "
+                                          "(default: 200)", 1);
         parser.add_option("patience", "Steps the trainer will accept without apparent "
                                       "progress before lowering its rate. The default is "
                                       "large because an epoch here draws a different "
@@ -634,10 +700,11 @@ int main(int argc, char** argv)
 
         /* Extended device memory. Off unless asked for, so a run that does not mention it
            behaves exactly as before, and inert in a build without CUDA. */
-        parser.add_option("extended-memory", "Stream tensors through the device under a "
-                                             "budget when the working set does not fit");
+        parser.add_option("no-extended-memory", "Do not stream tensors through the device; "
+                                                "every allocation then has to fit at once");
         parser.add_option("vram-budget", "Device memory the extension may use, in MiB "
-                                         "(default: 8192)", 1);
+                                         "(default: what the device reports free at "
+                                         "startup, less fifteen percent)", 1);
         parser.add_option("vram-store", "Directory holding the store, or \"none\" to keep "
                                         "evicted blocks in host memory only", 1);
         parser.add_option("host-limit", "Pinned host memory the extension may take for "
@@ -646,10 +713,15 @@ int main(int argc, char** argv)
         parser.parse(argc, argv);
 
         /* Before any tensor exists, which is why this sits at the top of main. */
-        if (parser.option("extended-memory"))
+        /* On unless refused. A budget left unset is taken from what the device reports
+           free at startup, less the share the context and the libraries occupy outside it,
+           so a run that says nothing about memory still gets the extension sized for the
+           card it is on. */
+        if (!parser.option("no-extended-memory"))
         {
             extended_memory_options xopts;
-            xopts.vram_budget = (size_t)get_option(parser, "vram-budget", 8192) << 20;
+            if (parser.option("vram-budget"))
+                xopts.vram_budget = (size_t)get_option(parser, "vram-budget", 0) << 20;
             xopts.store_path  = get_option(parser, "vram-store",
                                            default_extended_memory_store_path());
             if (xopts.store_path == "none")
@@ -675,6 +747,8 @@ int main(int argc, char** argv)
         o.all_examples  = parser.option("all-examples");
         o.eval_samples  = get_option(parser, "eval-samples", 2000);
         o.patience      = get_option(parser, "patience", 1000000);
+        o.report_every  = get_option(parser, "report-every", 200);
+        o.steps_per_epoch = get_option(parser, "steps-per-epoch", 0);
         const std::string rw = get_option(parser, "reward", "cells");
         if      (rw == "exact") o.reward = reward_kind::exact;
         else if (rw == "cells") o.reward = reward_kind::cells;
@@ -734,10 +808,12 @@ int main(int argc, char** argv)
              << "  halting       : " << describe(o.halting) << "\n"
              << "  window        : " << SEQ_LEN << " (" << WINDOW << " cells and one identifier)\n"
              << "  colours       : " << COLOUR_VOCAB << "\n"
-             << "  network       : " << NUM_H_LAYERS << " H layers, " << NUM_L_LAYERS
-             << " L layers, " << NUM_HEADS << " heads over " << NUM_KV_HEADS
-             << " key-value, width " << EMBED_DIM << ", cycles "
-             << HRM_N << " by " << HRM_T << "\n"
+             << "  network       : width " << EMBED_DIM << ", " << NUM_HEADS
+             << " query heads over " << NUM_KV_HEADS << " key-value\n"
+             << "  H module      : " << NUM_H_LAYERS << " blocks, run " << HRM_N
+             << " times per pass\n"
+             << "  L module      : " << NUM_L_LAYERS << " blocks, run " << HRM_T
+             << " times per H cycle, so " << (HRM_N * HRM_T) << " times per pass\n"
              << "  puzzles       : " << train.num_puzzles() << "\n"
              << "  examples      : " << train.num_examples()
              << " in " << train.num_groups() << " groups\n"
