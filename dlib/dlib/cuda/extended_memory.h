@@ -205,7 +205,10 @@ namespace dlib
     struct extended_memory_options
     {
         std::size_t vram_budget          = 0;
-        double      vram_budget_fraction = 0.90;
+        /* Share of the memory the device reports free at startup, used when vram_budget
+           is left at zero. Fifteen percent is held back for the context, the libraries and
+           whatever the display is already keeping there, none of which the budget covers. */
+        double      vram_budget_fraction = 0.85;
         std::string store_path;
         std::size_t store_bytes          = 0;
         std::size_t staging_bytes        = 64ul * 1024ul * 1024ul;
@@ -267,6 +270,10 @@ namespace dlib
         std::size_t        immovable_bytes   = 0;
         // Buffers the pool holds for reuse: allocated on the card, not in any live block.
         std::size_t        pooled_bytes      = 0;
+        // Where the restores came from, and how many carried nothing.
+        std::size_t        restores_from_store = 0;
+        std::size_t        restores_from_host  = 0;
+        std::size_t        restores_of_unsaved = 0;
         // What the driver reports free on the device, which the budget cannot exceed.
         std::size_t        device_free_bytes = 0;
         std::size_t        hash_threshold    = 0;
@@ -365,6 +372,9 @@ namespace dlib
             // What the arena actually reserved, which may exceed bytes and is what the slot
             // must be given back as.
             std::size_t                slot_bytes  = 0;
+            // Whether anything was ever written to this block's store slot or mirror. A
+            // restore of a block that was never saved moves bytes that mean nothing.
+            bool                       ever_saved  = false;
             int                        device_id   = 0;
             bool                       evictable   = false;
             // Whether the slot has ever held this block, and how many evictions in a row

@@ -1181,6 +1181,19 @@ namespace xmem
                 }
                 else
                 {
+                    /* store_valid is the only thing that may gate this read.
+
+                       An attempt to gate it on the block having been saved through the
+                       eviction path as well removed three hundred gigabytes of transfers
+                       and cost four points of training loss over two hundred steps: a
+                       block whose host copy is a window onto the mapping receives its
+                       content when the program writes through that window, which the
+                       eviction path never sees. Withholding the restore then loses the
+                       content silently.
+
+                       The wasteful case is real and the counters below still measure it:
+                       a slot reserved at allocation is read before anything fills it. The
+                       remedy belongs where the flag is set, not here. */
                     const bool have = r->slot >= 0 &&
                                   (r->store_valid.load(std::memory_order_relaxed) ||
                                    (g.data_host && g.host_current));
@@ -1206,6 +1219,14 @@ namespace xmem
             r->state.store(tier_device, std::memory_order_release);
             unpin_block(r);
             ++restores;
+
+            /* Where the block came from, and whether it had ever been written. A restore
+               of a block that was never saved is a transfer of nothing: it happens when a
+               buffer is created straight into the store tier and then read on the device
+               before anything has put content there. Counting the two apart is the only
+               way to tell a manager doing its job from one moving empty bytes. */
+            if (from == tier_store) ++restores_from_store; else ++restores_from_host;
+            if (!r->ever_saved)     ++restores_of_unsaved;
         }
 
         void before_host (block_record* r, bool need_content, bool writes)
@@ -1292,6 +1313,9 @@ namespace xmem
             s.managed_blocks    = managed_blocks;
             s.evictions         = evictions;
             s.restores          = restores;
+            s.restores_from_store = restores_from_store;
+            s.restores_from_host  = restores_from_host;
+            s.restores_of_unsaved = restores_of_unsaved;
             s.prefetch_hits     = prefetch_hits;
             s.prefetch_issued   = prefetch_issued;
             s.store_writes      = store_writes;
@@ -1857,6 +1881,7 @@ namespace xmem
                     std::cerr << "cudaFreeHost() failed. Reason: " << cudaGetErrorString(e) << std::endl;
             });
             pinned_bytes += r->bytes;
+            r->ever_saved = true;
             return true;
         }
 
@@ -1908,6 +1933,7 @@ namespace xmem
 
             const bool compare = r->slot_written && r->store_diffs < 2;
             const auto t0 = std::chrono::steady_clock::now();
+            r->ever_saved = true;
             const bool wrote = engine->from_device(arena->base() + r->slot, g.data_device.get(),
                                                    r->bytes, compare);
             wait_seconds += std::chrono::duration<double>(
@@ -2491,6 +2517,9 @@ namespace xmem
 
         std::size_t evictions       = 0;
         std::size_t restores        = 0;
+        std::size_t restores_from_store = 0;
+        std::size_t restores_from_host  = 0;
+        std::size_t restores_of_unsaved = 0;
         std::size_t prefetch_hits   = 0;
         std::size_t prefetch_issued = 0;
         std::size_t store_writes    = 0;
@@ -2797,6 +2826,9 @@ namespace xmem
                                     << (s.largest_block/mib)     << " MiB, immovable "
                                     << (s.immovable_bytes/mib)   << " MiB\n"
             << "  evictions       " << s.evictions               << "\n"
+            << "  restores by     " << s.restores_from_store << " from the store, "
+                                    << s.restores_from_host << " from a mirror, "
+                                    << s.restores_of_unsaved << " of blocks never saved\n"
             << "  restores        " << s.restores                << " of which anticipated "
                                     << s.prefetch_hits           << "\n"
             << "  prefetched      " << s.prefetch_issued         << ", pages advised "
