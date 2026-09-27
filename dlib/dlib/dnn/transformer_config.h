@@ -323,15 +323,33 @@ namespace dlib
         };
 
         // H and L sub-network types dispatched by the attention implementation
-        using train_h_net_type = typename impl::hrm_stack_selector<IMPL, NUM_H_LAYERS,
-            EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS, activation_func, dropout_policy, input_tensor, USE_ACT>::type;
-        using train_l_net_type = typename impl::hrm_stack_selector<IMPL, NUM_L_LAYERS,
-            EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS, activation_func, dropout_policy, input_tensor, USE_ACT>::type;
+        /*
+            Each module ends in a normalisation, and the recurrence depends on it.
 
-        using infer_h_net_type = typename impl::hrm_stack_selector<IMPL, NUM_H_LAYERS,
-            EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS, activation_func, multiply, input_tensor, USE_ACT>::type;
-        using infer_l_net_type = typename impl::hrm_stack_selector<IMPL, NUM_L_LAYERS,
-            EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS, activation_func, multiply, input_tensor, USE_ACT>::type;
+            The blocks are pre-norm: a block returns its residual stream unnormalised, which
+            is the standard choice for a single pass and the reason a straight stack of them
+            trains well. Inside this recurrence the module's output is fed back as the next
+            input, so each pass adds its sublayer contributions to a state nothing
+            renormalises. Measured on the carried state, the RMS goes 2.0, 15, 147, 1479 and
+            320989 as the cycles go 1, 2, 3, 4 and 6: it grows by an order of magnitude a
+            cycle. The norm that follows the layer hides this from the output, so the logits
+            look sane, while the one-step gradient runs through a state far out of scale and
+            the earlier passes keep enlarging what the final one receives.
+
+            The reference avoids it with post-norm blocks, whose output always has unit RMS.
+            Normalising each module's output gives the same invariant, a carried state that
+            stays bounded however many passes there are, without changing the block shared
+            by every other model in the library.
+        */
+        using train_h_net_type = rms_norm<typename impl::hrm_stack_selector<IMPL, NUM_H_LAYERS,
+            EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS, activation_func, dropout_policy, input_tensor, USE_ACT>::type>;
+        using train_l_net_type = rms_norm<typename impl::hrm_stack_selector<IMPL, NUM_L_LAYERS,
+            EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS, activation_func, dropout_policy, input_tensor, USE_ACT>::type>;
+
+        using infer_h_net_type = rms_norm<typename impl::hrm_stack_selector<IMPL, NUM_H_LAYERS,
+            EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS, activation_func, multiply, input_tensor, USE_ACT>::type>;
+        using infer_l_net_type = rms_norm<typename impl::hrm_stack_selector<IMPL, NUM_L_LAYERS,
+            EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS, activation_func, multiply, input_tensor, USE_ACT>::type>;
 
         // Network definition selector based on training mode
         template<bool is_training>
