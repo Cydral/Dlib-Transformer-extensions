@@ -185,6 +185,7 @@
 #include "extended_memory_abstract.h"
 
 #include <atomic>
+#include <cstdio>
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
@@ -412,6 +413,7 @@ namespace dlib
             static std::atomic<bool>          active;
             static std::atomic<std::uint64_t> clock;
             static std::atomic<std::uint64_t> blocks_created;
+            static std::atomic<std::uint64_t> orphaned_refreshes;
             static std::atomic<std::uint64_t> trace_head;
             static std::uint32_t*             trace_ring;
             static std::uint64_t              trace_mask;
@@ -426,6 +428,7 @@ namespace dlib
         template <typename tag> std::atomic<bool>          globals<tag>::active         {false};
         template <typename tag> std::atomic<std::uint64_t> globals<tag>::clock          {1};
         template <typename tag> std::atomic<std::uint64_t> globals<tag>::blocks_created {0};
+        template <typename tag> std::atomic<std::uint64_t> globals<tag>::orphaned_refreshes {0};
         template <typename tag> std::atomic<std::uint64_t> globals<tag>::trace_head     {0};
         template <typename tag> std::uint32_t*             globals<tag>::trace_ring     = nullptr;
         template <typename tag> std::uint64_t              globals<tag>::trace_mask     = 0;
@@ -445,6 +448,22 @@ namespace dlib
             its host copy lives.
         */
         inline void note_block_created () { g::blocks_created.fetch_add(1, std::memory_order_relaxed); }
+        /* A block asked to refresh its device copy from a host buffer it does not have.
+
+           The copy is skipped, which is what prevents the crash, but the state itself is
+           not supposed to exist: a device copy only goes stale through a host write, and a
+           host write allocates the host buffer. Reaching it means that buffer was released
+           after a write without being pushed back, in which case no valid copy remains
+           anywhere. That is said once, on the first occurrence, so that a lost block cannot
+           pass unnoticed behind the guard that stops the crash. */
+        inline void note_orphaned_refresh ()
+        {
+            if (g::orphaned_refreshes.fetch_add(1, std::memory_order_relaxed) == 0)
+                std::fprintf(stderr, "extended memory: a device copy was stale with no host "
+                                     "copy to refresh it from; kept as it was. If this "
+                                     "recurs, a block lost its content and the run's "
+                                     "figures should not be trusted\n");
+        }
 
         /*
             Which thread an access came from, assigned once and then read from a register.
@@ -548,6 +567,7 @@ namespace dlib
 
         inline bool active () { return false; }
         inline void note_block_created () {}
+        inline void note_orphaned_refresh () {}
         inline void before_device (block_record*, bool, bool) {}
         inline void before_host (block_record*, bool, bool) {}
         inline void unregister_block (block_record*) {}

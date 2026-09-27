@@ -410,6 +410,7 @@ namespace xmem
                 else if (t == 0x01021994L)
                 {
                     on_memory_fs = true;
+                    if (!verbose) return;
                     std::cerr << "extended memory: the store is on a memory filesystem. Its "
                                  "pages are host memory and reach the disk only through swap, "
                                  "which is right when the working set fits in RAM and wrong "
@@ -2133,6 +2134,19 @@ namespace xmem
                         {
                             plan.reset();
                             drift = 0;
+
+                            /* A sequence that is periodic between two decisions and not
+                               across them will be found and lost over and over: on one run
+                               the same period of 11266 accesses was adopted 467 times, each
+                               adoption preceded by a full search over the window. Backing
+                               off after a few losses turns that into a handful of searches
+                               and leaves the eviction policy where it already was. The
+                               count is not reset by a later success, so a run that never
+                               settles stops paying for the attempt. */
+                            if (++losses >= 4)
+                                search_after = g::clock.load(std::memory_order_relaxed)
+                                             + (std::uint64_t)losses * 200000;
+
                             if (opt.verbose)
                                 std::cerr << "extended memory: access cycle lost, "
                                              "falling back on least recently used\n";
@@ -2146,6 +2160,12 @@ namespace xmem
                         return;
                 }
             }
+
+            /* Nothing is searched for while the back-off runs. A sequence that keeps
+               losing its period costs a full pass over the window each time it is looked
+               for, and the eviction policy is no worse without one. */
+            if (search_after > g::clock.load(std::memory_order_relaxed))
+                return;
 
             const std::size_t L = (std::size_t)std::min<std::uint64_t>(head, trace_capacity);
             snapshot.resize(L);
@@ -2520,6 +2540,9 @@ namespace xmem
         std::size_t restores_from_store = 0;
         std::size_t restores_from_host  = 0;
         std::size_t restores_of_unsaved = 0;
+        // How often a schedule was adopted and then lost, and when to try again.
+        std::size_t   losses       = 0;
+        std::uint64_t search_after = 0;
         std::size_t prefetch_hits   = 0;
         std::size_t prefetch_issued = 0;
         std::size_t store_writes    = 0;

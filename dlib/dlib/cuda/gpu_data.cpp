@@ -180,16 +180,38 @@ namespace dlib
             // the content came straight from the file tier into the device buffer.
             if (!device_current)
             {
-                if (device_in_use)
+                /* There is nothing to copy from when the host holds no buffer.
+
+                   Under the manager a block gets no host buffer at allocation; it gets one on
+                   its first host access or when it is evicted. A block can therefore reach
+                   this point stale on the device with no host buffer to refresh it from, and
+                   copying from a null source is what CUDA reports as an invalid argument.
+                   The manager is asked first, since it knows whether the content sits in the
+                   store; if it still cannot supply a host buffer, there is no content newer
+                   than the device's, so the device copy is kept as it is rather than
+                   overwritten from nowhere. */
+                if (!data_host && xrec)
+                    xmem::restore_device(xrec, true);
+
+                if (!device_current)
                 {
-                    // Wait for any possible CUDA kernels that might be using our memory block to
-                    // complete before we overwrite the memory.
-                    synchronize_stream(0);
-                    device_in_use = false;
+                    if (!data_host)
+                    {
+                        xmem::note_orphaned_refresh();
+                        device_current = true;
+                        return;
+                    }
+                    if (device_in_use)
+                    {
+                        // Wait for any possible CUDA kernels that might be using our memory block to
+                        // complete before we overwrite the memory.
+                        synchronize_stream(0);
+                        device_in_use = false;
+                    }
+                    CHECK_CUDA(cudaMemcpyAsync(data_device.get(), data_host.get(), data_size*sizeof(float), cudaMemcpyHostToDevice, (cudaStream_t)cuda_stream.get()));
+                    have_active_transfer = true;
+                    device_current = true;
                 }
-                CHECK_CUDA(cudaMemcpyAsync(data_device.get(), data_host.get(), data_size*sizeof(float), cudaMemcpyHostToDevice, (cudaStream_t)cuda_stream.get()));
-                have_active_transfer = true;
-                device_current = true;
             }
         }
     }
