@@ -89,8 +89,14 @@ const long COLOUR_VOCAB = 11;
     provided and the program picks the smallest that fits, refusing rather than
     truncating if none does. Raising the ceiling is a matter of adding one line here.
 */
-const long TABLE_SMALL = 131072;     // up to about 320 augmentations of 400 tasks
-const long TABLE_LARGE = 524288;     // the reference corpus at 300 to 500 augmentations
+/*
+    One table size rather than two. Each is a template parameter and therefore a whole
+    instantiation of the network, and the dense control doubles those already. An oversized
+    table occupies device memory but no optimizer state and no arithmetic, since the
+    embedding updates only the rows a batch touched, so the waste is bounded where the
+    build time would not have been.
+*/
+const long TABLE_ROWS = 262144;
 
 /*
     The network follows the reference configuration in its shape: four layers in each of
@@ -126,7 +132,44 @@ using arc_config = hrm_transformer_config<
     TABLE, NUM_H_LAYERS, NUM_L_LAYERS, NUM_HEADS, EMBED_DIM, HRM_N, HRM_T,
     gelu, dropout_10, attention_impl::unified, NUM_KV_HEADS, USE_ACT, COLOUR_VOCAB>;
 
+/*
+    The control: the same blocks, stacked, with nothing of the hierarchical layer.
+
+    Three things separate the two networks and only a straight stack removes all three.
+    The recurrent layer starts its state from vectors it has learned, combines its inputs
+    by addition rather than by stacking, and carries gradient through its last pass alone,
+    which is the one-step approximation the architecture rests on. Shortening the
+    recurrence leaves all three in place, so a run that plateaus with it and also without
+    it says nothing.
+
+    This stack holds eight blocks, four and four as the two modules do, at the same width
+    and over the same embedding table, and the gradient reaches every one of them. If it
+    learns where the recurrent network stops, the recurrence is what to look at; if it
+    stops in the same place, the cause is elsewhere and an expensive avenue is closed.
+*/
+template <long TABLE, bool USE_ACT>
+using dense_stack = typename impl::hrm_stack_selector<
+    attention_impl::unified, NUM_H_LAYERS + NUM_L_LAYERS, EMBED_DIM, NUM_HEADS,
+    NUM_KV_HEADS, gelu, dropout_10,
+    embeddings<TABLE, EMBED_DIM, input<matrix<int, 0, 1>>>, USE_ACT>::type;
+
+template <long TABLE, bool USE_ACT>
+using dense_net = classification_head<COLOUR_VOCAB, dense_stack<TABLE, USE_ACT>>;
+
 // ----------------------------------------------------------------------------------------
+
+/* Raises the rate of an embedding layer and leaves every other layer alone. */
+template <typename layer_type>
+auto set_embedding_rate (layer_type& l, double m, int)
+    -> decltype(l.get_scale_by_freq(), void())
+{
+    l.set_learning_rate_multiplier(m);
+}
+template <typename layer_type>
+void set_embedding_rate (layer_type&, double, long) {}
+
+template <typename layer_type>
+void set_embedding_rate (layer_type& l, double m) { set_embedding_rate(l, m, 0); }
 
 enum class halting_mode { external, internal, both, none };
 
@@ -248,6 +291,9 @@ struct run_options
     long         eval_every  = 5;
     long         eval_samples = 2000;
     long         patience    = 1000000;
+    bool         anneal      = false;
+    double       embedding_rate = 100.0;
+    bool         dense       = false;
     long         report_every = 200;
     long         steps_per_epoch = 0;
     bool         all_examples = false;
@@ -395,6 +441,11 @@ int run (const arc_dataset& train, const arc_dataset& eval_set, const run_option
         trainer.set_synchronization_file("chkpt-" + o.model_file, std::chrono::minutes(15));
         trainer.be_quiet();
 
+        /* The synchronization file carries the trainer's state, the learning rate among it,
+           and restoring it overwrites the rate set above. A run resumed after the rate had
+           been lowered would otherwise continue at the lowered one, silently. */
+        trainer.set_learning_rate(o.learning_rate);
+
         /* The trainer lowers its rate when the loss stops falling, which assumes the loss
            is measured on the same thing from one step to the next. Here an epoch draws a
            different variant of each task, so the loss jumps whenever the draw changes and
@@ -403,6 +454,30 @@ int run (const arc_dataset& train, const arc_dataset& eval_set, const run_option
            explicit, held flat and stepped down by the caller. */
         trainer.set_iterations_without_progress_threshold(o.patience);
         trainer.set_min_learning_rate(o.learning_rate * 1e-3);
+
+        /* Raising the patience was not enough: the rate still fell at the third epoch,
+           after five thousand steps against a threshold of two hundred thousand, so
+           something other than that counter lowered it. Rather than guess which, the
+           shrink itself is neutralised. A factor of one leaves the multiplication that
+           performs it without effect, whichever counter calls for it.
+
+           This is the right default here for a reason beyond the bug. The loss of one
+           epoch is measured on a different draw from the loss of the next, so a schedule
+           that reads a plateau in it is reading noise. --anneal restores the usual
+           behaviour for a run whose draw is fixed. */
+        if (!o.anneal)
+            trainer.set_learning_rate_shrink_factor(1);
+
+        /* The identifier embedding needs a rate of its own.
+
+           It receives gradient through one position of nine hundred and one, and only by
+           way of attention from the rest, so at the network's rate it barely moves. The
+           reference gives the puzzle embedding a rate a hundred times the base one, which
+           is not incidental: it is what makes the conditioning learnable at all. Here the
+           colours share the table, and the layer already scales each row's update by how
+           often it was seen, which keeps the frequent rows from running away. */
+        visit_computational_layers(trainer.get_net(force_flush_to_disk::no),
+                                   [&](auto& l) { set_embedding_rate(l, o.embedding_rate); });
 
         std::mt19937 rng(1);
 
@@ -564,8 +639,15 @@ int run (const arc_dataset& train, const arc_dataset& eval_set, const run_option
             if (eval_set.num_examples() > 0 && o.eval_every > 0 &&
                 (epoch + 1) % o.eval_every == 0)
             {
-                net_type& live = trainer.get_net(force_flush_to_disk::no);
-                const double acc = evaluate(live, eval_set, o, quiet,
+                /* The measurement runs on a copy. Running it on the trainer's own
+                   network resized that network's tensors from the training batch to a
+                   single example and back, and cleaned a network still being trained;
+                   under the memory extension that churn left a block stale on the device
+                   with no host copy to refresh it from, and the next prefetch failed
+                   inside the copy. A copy costs the parameters and the embedding table
+                   once per measurement and leaves the trainer's state untouched. */
+                net_type probe = trainer.get_net(force_flush_to_disk::no);
+                const double acc = evaluate(probe, eval_set, o, quiet,
                                             uses_loop(o.halting) ? &halting : nullptr,
                                             o.eval_samples);
                 cout << "         held out " << acc << " % of cells";
@@ -573,8 +655,8 @@ int run (const arc_dataset& train, const arc_dataset& eval_set, const run_option
                 {
                     best_accuracy = acc;
                     best_epoch    = epoch + 1;
-                    live.clean();
-                    serialize(o.model_file + ".best") << live;
+                    probe.clean();
+                    serialize(o.model_file + ".best") << probe;
                     cout << ", best so far";
                 }
                 cout << "\n";
@@ -588,7 +670,10 @@ int run (const arc_dataset& train, const arc_dataset& eval_set, const run_option
         serialize(o.model_file) << net;
         cout << "Model saved to " << o.model_file << "\n";
 
-        if (extended_memory_enabled())
+        /* The memory report belongs to a run that is measuring the extension, not to one
+           that is training a model. It was added while the working set of this example was
+           being sized and it has no business in a training trace. */
+        if (o.verbose && extended_memory_enabled())
         {
             cout << "\n";
             print_extended_memory_stats(cout);
@@ -628,18 +713,17 @@ int dispatch_table (const arc_dataset& train, const arc_dataset& eval_set,
                                eval_set.num_examples() > 0
                                    ? eval_set.colour_vocab + eval_set.largest_identifier() + 1
                                    : 0L);
-    if (need <= TABLE_SMALL)
-        return run<typename arc_config<TABLE_SMALL, USE_ACT>::template network_type<true>>(
-            train, eval_set, o, do_train, do_eval);
-    if (need <= TABLE_LARGE)
-        return run<typename arc_config<TABLE_LARGE, USE_ACT>::template network_type<true>>(
-            train, eval_set, o, do_train, do_eval);
-
-    cout << "The dataset needs an embedding table of " << need << " rows, above the "
-         << TABLE_LARGE << " this program is built for.\nRebuild the dataset with fewer "
-            "augmentations, or add a larger size to the table list, at the cost of one more "
-            "instantiation of a 22 million parameter network.\n";
-    return 1;
+    if (need > TABLE_ROWS)
+    {
+        cout << "The dataset needs an embedding table of " << need << " rows, above the "
+             << TABLE_ROWS << " this program is built for.\nRebuild the dataset with fewer "
+                "augmentations, or raise TABLE_ROWS and rebuild.\n";
+        return 1;
+    }
+    return o.dense
+        ? run<dense_net<TABLE_ROWS, USE_ACT>>(train, eval_set, o, do_train, do_eval)
+        : run<typename arc_config<TABLE_ROWS, USE_ACT>::template network_type<true>>(
+              train, eval_set, o, do_train, do_eval);
 }
 
 // ----------------------------------------------------------------------------------------
@@ -682,6 +766,18 @@ int main(int argc, char** argv)
                                           "the end of an epoch. An epoch on an augmented "
                                           "corpus runs to tens of thousands of steps "
                                           "(default: 200)", 1);
+        parser.add_option("dense", "Replace the hierarchical layer by a straight stack of "
+                                   "the same blocks, at the same width and over the same "
+                                   "embedding table, with gradient reaching all of them");
+        parser.add_option("embedding-rate", "Learning rate multiplier for the identifier "
+                                            "embedding, which receives gradient through one "
+                                            "position of nine hundred and one. The reference "
+                                            "gives it a hundred times the base rate "
+                                            "(default: 100)", 1);
+        parser.add_option("anneal", "Let the trainer lower its rate when it reads a plateau. "
+                                    "Off by default: an epoch here draws a different variant "
+                                    "of each task, so the loss is not comparable from one to "
+                                    "the next and a plateau in it is noise");
         parser.add_option("patience", "Steps the trainer will accept without apparent "
                                       "progress before lowering its rate. The default is "
                                       "large because an epoch here draws a different "
@@ -696,7 +792,8 @@ int main(int argc, char** argv)
         parser.add_option("eval-every", "Measure on the held-out split every N epochs and "
                                         "keep the model that scores best, 0 to switch off "
                                         "(default: 5)", 1);
-        parser.add_option("verbose", "Report more as the run goes");
+        parser.add_option("verbose", "Report more as the run goes, including what the "
+                                     "memory extension is doing");
 
         /* Extended device memory. Off unless asked for, so a run that does not mention it
            behaves exactly as before, and inert in a build without CUDA. */
@@ -728,7 +825,11 @@ int main(int argc, char** argv)
                 xopts.store_path.clear();
             xopts.max_pinned_bytes = (size_t)get_option(parser, "host-limit",
                                         (unsigned long)(xopts.vram_budget >> 20)) << 20;
-            xopts.verbose = true;
+            /* Silent unless asked. What the extension does is not the subject of a run,
+               and its startup notes crowd out the figures that are. Failures and the
+               warnings that precede a bad run are printed either way, since those are
+               not commentary. */
+            xopts.verbose = parser.option("verbose");
             if (!enable_extended_memory(xopts))
                 cout << "Extended memory was requested but is unavailable in this build; "
                         "continuing without it.\n";
@@ -747,6 +848,9 @@ int main(int argc, char** argv)
         o.all_examples  = parser.option("all-examples");
         o.eval_samples  = get_option(parser, "eval-samples", 2000);
         o.patience      = get_option(parser, "patience", 1000000);
+        o.anneal        = parser.option("anneal");
+        o.embedding_rate = get_option(parser, "embedding-rate", 100.0);
+        o.dense         = parser.option("dense");
         o.report_every  = get_option(parser, "report-every", 200);
         o.steps_per_epoch = get_option(parser, "steps-per-epoch", 0);
         const std::string rw = get_option(parser, "reward", "cells");
@@ -810,10 +914,15 @@ int main(int argc, char** argv)
              << "  colours       : " << COLOUR_VOCAB << "\n"
              << "  network       : width " << EMBED_DIM << ", " << NUM_HEADS
              << " query heads over " << NUM_KV_HEADS << " key-value\n"
-             << "  H module      : " << NUM_H_LAYERS << " blocks, run " << HRM_N
-             << " times per pass\n"
-             << "  L module      : " << NUM_L_LAYERS << " blocks, run " << HRM_T
-             << " times per H cycle, so " << (HRM_N * HRM_T) << " times per pass\n"
+             << (parser.option("dense")
+                 ? "  structure     : a straight stack of "
+                   + std::to_string(NUM_H_LAYERS + NUM_L_LAYERS)
+                   + " blocks, gradient through all of them\n"
+                 : "  H module      : " + std::to_string(NUM_H_LAYERS) + " blocks, run "
+                   + std::to_string(HRM_N) + " times per pass\n"
+                   "  L module      : " + std::to_string(NUM_L_LAYERS) + " blocks, run "
+                   + std::to_string(HRM_T) + " times per H cycle, so "
+                   + std::to_string(HRM_N * HRM_T) + " times per pass\n")
              << "  puzzles       : " << train.num_puzzles() << "\n"
              << "  examples      : " << train.num_examples()
              << " in " << train.num_groups() << " groups\n"
