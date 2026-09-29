@@ -5485,6 +5485,57 @@ void test_multm_prev()
 
 // ----------------------------------------------------------------------------------------
 
+    void test_gqa_attention_causality()
+    {
+        /* Two things the attention layer must guarantee and that nothing else here checks.
+
+           The causal switch has to reach the whole stack and not stop at one layer: a
+           recursion that forgot to relay it would leave some blocks causal without any
+           compile error. Changing only the last position must leave the first unmoved
+           when causal, and move it when not.
+
+           And each variant must read back what it writes, and refuse what another
+           variant wrote. The tag was once written as a single byte through a pointer that
+           serialize() took for a bool, which made every checkpoint unreadable; a round
+           trip catches that. The checkpoint also records its shape and switches, so a
+           causal one cannot pass for a bidirectional one, nor one width for another. */
+        print_spinner();
+        namespace u = gqa_transformer_unified;
+
+        auto first_moves = [](auto net) {
+            resizable_tensor x(1, 1, 6, 32);
+            tt::tensor_rand rnd(3); rnd.fill_gaussian(x);
+            std::vector<resizable_tensor> one(1, x); resizable_tensor staged;
+            net.to_tensor(one.begin(), one.end(), staged);
+            net.forward(x);
+            resizable_tensor a; a = net.get_output();
+            x.host()[5*32] += 3.0f;
+            net.forward(x);
+            const tensor& b = net.get_output();
+            double d = 0;
+            for (long c = 0; c < b.nc(); ++c) d += std::abs(a.host()[c] - b.host()[c]);
+            return d;
+        };
+        using stack_c = u::transformer_stack<4, 32, 4, 2, input_tensor, false, 8, 3, linear, 8, false, true>;
+        using stack_b = u::transformer_stack<4, 32, 4, 2, input_tensor, false, 8, 3, linear, 8, false, false>;
+        DLIB_TEST(first_moves(stack_c()) < 1e-6);
+        DLIB_TEST(first_moves(stack_b()) > 1e-6);
+
+        auto loads = [](auto& from, auto& to) {
+            std::ostringstream o; serialize(from, o);
+            std::istringstream i(o.str());
+            try { deserialize(to, i); return true; } catch (serialization_error&) { return false; }
+        };
+        gqa_attention_<16, 2, 1, 8, false, true>  c1, c2;
+        gqa_attention_<16, 2, 1, 8, false, false> b1, b2;
+        gqa_attention_<32, 4, 1, 8, false, true>  wide;
+        DLIB_TEST(loads(c1, c2));
+        DLIB_TEST(loads(b1, b2));
+        DLIB_TEST(!loads(c1, b2));
+        DLIB_TEST(!loads(b1, c2));
+        DLIB_TEST(!loads(c1, wide));
+    }
+
     void test_tril()
     {
         print_spinner();        
@@ -5541,6 +5592,7 @@ void test_multm_prev()
             // make the tests repeatable
             srand(1234);
 
+            test_gqa_attention_causality();
             test_tagging();
 #ifdef DLIB_USE_CUDA
             test_affine_rect();

@@ -107,7 +107,7 @@ namespace dlib
     // ------------------------------------------------------------------------------------
 
     template <long EMBEDDING_DIM_, long NUM_HEADS_, long NUM_KV_HEADS_, long HEAD_DIM_,
-        bool USE_QK_NORM_ = false>
+        bool USE_QK_NORM_ = false, bool CAUSAL_ = true>
     class gqa_attention_
     {
     public:
@@ -498,7 +498,10 @@ namespace dlib
 
             // Step 6 backward
             resizable_tensor dscores;
-            tril_helper_.backward(dscores_masked, saved_scores, dscores);
+            if (CAUSAL_)
+                tril_helper_.backward(dscores_masked, saved_scores, dscores);
+            else
+                dscores = dscores_masked;    // no mask, so the gradient passes unchanged
 
             // Step 5 backward
             resizable_tensor dQ(B, NUM_HEADS, N, HEAD_DIM);
@@ -645,9 +648,38 @@ namespace dlib
         void set_qkv_bias_enabled(bool enabled) { has_qkv_bias_ = enabled; }
         bool qkv_bias_enabled() const { return has_qkv_bias_; }
 
+        /* One format for every variant, which states the configuration it was written
+           with and is checked against the type that reads it.
+
+           The layer's shape and switches are template parameters, so two variants can hold
+           weights of identical size and still compute different things: a causal and a
+           bidirectional layer, or two widths whose parameter counts happen to coincide. A
+           checkpoint therefore records its dimensions and its switches, and loading refuses
+           any that do not match, naming which one differs. Without that, a checkpoint of
+           the wrong width loaded quietly and failed later inside the forward pass, far from
+           the cause.
+
+           The tag names the layer and is not versioned. Keeping older checkpoints readable
+           is not a goal: when the layout changes, the models are retrained. Earlier layouts
+           varied the tag, or wrote a field for some variants only, to stay readable, and
+           that is what once turned the tag into a single byte. A checkpoint in an earlier
+           layout carries the same tag, so it passes this check and is refused at the first
+           field that no longer matches, usually a dimension read from what was the start
+           of the weights; the message then names that field rather than the layout. */
+        static constexpr const char* serialization_version = "gqa_attention_";
+
         friend void serialize(const gqa_attention_& item, std::ostream& out)
         {
-            serialize("gqa_attention_", out);
+            serialize(std::string(serialization_version), out);
+
+            // Copies, not the static members themselves: binding a static constexpr to the
+            // reference serialize() takes would require it to be defined out of the class.
+            const long dims[4] = { EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM };
+            for (long d : dims) serialize(d, out);
+            const bool qk_norm = USE_QK_NORM, causal = CAUSAL_;
+            serialize(qk_norm, out);
+            serialize(causal, out);
+
             serialize(item.params, out);
             serialize(item.learning_rate_multiplier_, out);
             serialize(item.weight_decay_multiplier_, out);
@@ -657,19 +689,46 @@ namespace dlib
             serialize(item.rope_q_helper_, out);
             serialize(item.rope_k_helper_, out);
             serialize(item.tril_helper_, out);
-            // qk_norm_eps_ is part of the stream only for QK-Norm layers, so every other
-            // model keeps the exact same serialized format.
-            if (USE_QK_NORM)
-                serialize(item.qk_norm_eps_, out);
+            serialize(item.qk_norm_eps_, out);
         }
 
         friend void deserialize(gqa_attention_& item, std::istream& in)
         {
             std::string version;
             deserialize(version, in);
-            if (version != "gqa_attention_")
+            if (version != serialization_version)
                 throw serialization_error(
-                    "Unexpected version found while deserializing dlib::gqa_attention_. ");
+                    "dlib::gqa_attention_: expected the tag '" + std::string(serialization_version)
+                    + "', found '" + version + "'. The stream does not hold this layer at "
+                    "this position.");
+
+            const char* names[4] = { "embedding dimension", "number of heads",
+                                     "number of key-value heads", "head dimension" };
+            const long expected[4] = { EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM };
+            for (int i = 0; i < 4; ++i)
+            {
+                long found = 0;
+                deserialize(found, in);
+                if (found != expected[i])
+                    throw serialization_error(
+                        std::string("dlib::gqa_attention_: the checkpoint has ") + names[i]
+                        + " " + std::to_string(found) + ", this network expects "
+                        + std::to_string(expected[i]) + ".");
+            }
+
+            bool qk_norm = false, causal = false;
+            deserialize(qk_norm, in);
+            deserialize(causal, in);
+            if (qk_norm != USE_QK_NORM)
+                throw serialization_error(std::string("dlib::gqa_attention_: the checkpoint ")
+                    + (qk_norm ? "uses" : "does not use") + " QK normalisation, this network "
+                    + (USE_QK_NORM ? "does." : "does not."));
+            if (causal != CAUSAL_)
+                throw serialization_error(std::string("dlib::gqa_attention_: the checkpoint is ")
+                    + (causal ? "causal" : "bidirectional") + ", this network is "
+                    + (CAUSAL_ ? "causal" : "bidirectional") + ". The weights have the same "
+                    "shape but the two do not compute the same thing.");
+
             deserialize(item.params, in);
             deserialize(item.learning_rate_multiplier_, in);
             deserialize(item.weight_decay_multiplier_, in);
@@ -679,8 +738,7 @@ namespace dlib
             deserialize(item.rope_q_helper_, in);
             deserialize(item.rope_k_helper_, in);
             deserialize(item.tril_helper_, in);
-            if (USE_QK_NORM)
-                deserialize(item.qk_norm_eps_, in);
+            deserialize(item.qk_norm_eps_, in);
             item.rebuild_aliases();
 
             // KV cache state is runtime-only.
@@ -1130,9 +1188,21 @@ namespace dlib
                 operation_mode::PLANE_WISE);
 
             // Step 6: causal mask
+            /* Causal attention masks every position above the diagonal so that a token sees
+               only what precedes it, which is what next-token prediction requires. A model
+               that answers a whole grid at once needs the opposite: a cell of the output
+               depends on cells of the input that follow it in reading order, and under the
+               mask it could never see them. */
             resizable_tensor scores_masked;
-            scores_masked.copy_size(saved_scores);
-            tril_helper_.forward(saved_scores, scores_masked);
+            if (CAUSAL_)
+            {
+                scores_masked.copy_size(saved_scores);
+                tril_helper_.forward(saved_scores, scores_masked);
+            }
+            else
+            {
+                scores_masked = saved_scores;
+            }
 
             // Step 7: softmax
             saved_attn.copy_size(scores_masked);
@@ -1370,9 +1440,9 @@ namespace dlib
     };
 
     template <long EMBEDDING_DIM, long NUM_HEADS, long NUM_KV_HEADS, long HEAD_DIM, typename SUBNET,
-        bool USE_QK_NORM = false>
+        bool USE_QK_NORM = false, bool CAUSAL = true>
     using gqa_attention = add_layer<
-        gqa_attention_<EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, USE_QK_NORM>, SUBNET>;
+        gqa_attention_<EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, USE_QK_NORM, CAUSAL>, SUBNET>;
 
     // ----------------------------------------------------------------------------------------
 
@@ -1446,9 +1516,9 @@ namespace dlib
     namespace gqa_transformer_unified
     {        
         template<long d_model, long num_heads, long num_kv_heads, typename SUBNET,
-            long head_dim = d_model / num_heads, bool use_qk_norm = false>
+            long head_dim = d_model / num_heads, bool use_qk_norm = false, bool causal = true>
         using multihead_attention_gqa = gqa_attention<d_model, num_heads, num_kv_heads,
-            head_dim, SUBNET, use_qk_norm>;
+            head_dim, SUBNET, use_qk_norm, causal>;
 
         // Transformer block with pre-norm architecture, identical in topology to
         // the chained version: attention sublayer with residual connection,
@@ -1486,28 +1556,29 @@ namespace dlib
         template<bool UseAct, long d_model, long num_heads, long num_kv_heads,
             long hidden_num, long hidden_den, typename SUBNET,
             template <unsigned long, typename> class LINEAR = linear,
-            long head_dim = d_model / num_heads, bool use_qk_norm = false>
+            long head_dim = d_model / num_heads, bool use_qk_norm = false, bool causal = true>
         using transformer_block =
             add_prev5<ffn_sublayer<UseAct, d_model, hidden_num, hidden_den, 4, rms_norm<tag5<
             add_prev1<multihead_attention_gqa<d_model, num_heads, num_kv_heads, rms_norm<tag1<
-            SUBNET>>, head_dim, use_qk_norm>>>>, LINEAR >> ;
+            SUBNET>>, head_dim, use_qk_norm, causal>>>>, LINEAR >> ;
 
         template<long remaining_layers, bool UseAct, long d_model, long num_heads, long num_kv_heads,
             long hidden_num, long hidden_den, typename SUBNET,
             template <unsigned long, typename> class LINEAR = linear,
-            long head_dim = d_model / num_heads, bool use_qk_norm = false, typename enabled = void>
+            long head_dim = d_model / num_heads, bool use_qk_norm = false, bool causal = true,
+            typename enabled = void>
         struct transformer_stack_impl
         {
             using type = transformer_block<UseAct, d_model, num_heads, num_kv_heads, hidden_num, hidden_den,
                 typename transformer_stack_impl<remaining_layers - 1, UseAct, d_model, num_heads,
-                num_kv_heads, hidden_num, hidden_den, SUBNET, LINEAR, head_dim, use_qk_norm>::type,
-                LINEAR, head_dim, use_qk_norm>;
+                num_kv_heads, hidden_num, hidden_den, SUBNET, LINEAR, head_dim, use_qk_norm, causal>::type,
+                LINEAR, head_dim, use_qk_norm, causal>;
         };
         template<bool UseAct, long d_model, long num_heads, long num_kv_heads,
             long hidden_num, long hidden_den, typename SUBNET,
-            template <unsigned long, typename> class LINEAR, long head_dim, bool use_qk_norm>
+            template <unsigned long, typename> class LINEAR, long head_dim, bool use_qk_norm, bool causal>
         struct transformer_stack_impl<0, UseAct, d_model, num_heads, num_kv_heads,
-            hidden_num, hidden_den, SUBNET, LINEAR, head_dim, use_qk_norm, void>
+            hidden_num, hidden_den, SUBNET, LINEAR, head_dim, use_qk_norm, causal, void>
         {
             using type = tag10<SUBNET>;
         };
@@ -1517,9 +1588,10 @@ namespace dlib
         template<long num_layers, long d_model, long num_heads, long num_kv_heads, typename SUBNET,
             bool UseAct = true, long hidden_num = 8, long hidden_den = 3,
             template <unsigned long, typename> class LINEAR = linear,
-            long head_dim = d_model / num_heads, bool use_qk_norm = false>
+            long head_dim = d_model / num_heads, bool use_qk_norm = false, bool causal = true>
         using transformer_stack = typename transformer_stack_impl<num_layers, UseAct, d_model,
-            num_heads, num_kv_heads, hidden_num, hidden_den, SUBNET, LINEAR, head_dim, use_qk_norm>::type;
+            num_heads, num_kv_heads, hidden_num, hidden_den, SUBNET, LINEAR, head_dim, use_qk_norm,
+            causal>::type;
 
     } // namespace gqa_transformer_unified
 

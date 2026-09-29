@@ -172,13 +172,14 @@ namespace dlib
         template <attention_impl Impl, long num_layers,
             long d_model, long num_heads, long num_kv_heads,
             template <typename> class ACT, template <typename> class DO,
-            typename SUBNET, bool UseAct = false>
+            typename SUBNET, bool UseAct = false, bool Causal = true>
         struct hrm_stack_selector;
 
         template <long num_layers, long d_model, long num_heads, long num_kv_heads,
-            template <typename> class ACT, template <typename> class DO, typename SUBNET, bool UseAct>
+            template <typename> class ACT, template <typename> class DO, typename SUBNET, bool UseAct,
+            bool Causal>
         struct hrm_stack_selector<attention_impl::chained, num_layers,
-            d_model, num_heads, num_kv_heads, ACT, DO, SUBNET, UseAct>
+            d_model, num_heads, num_kv_heads, ACT, DO, SUBNET, UseAct, Causal>
         {
             using type = canonical_transformer::transformer_stack<
                 num_layers, ACT, DO, d_model, num_heads, SUBNET> ;
@@ -186,12 +187,16 @@ namespace dlib
         };
 
         template <long num_layers, long d_model, long num_heads, long num_kv_heads,
-            template <typename> class ACT, template <typename> class DO, typename SUBNET, bool UseAct>
+            template <typename> class ACT, template <typename> class DO, typename SUBNET, bool UseAct,
+            bool Causal>
         struct hrm_stack_selector<attention_impl::unified, num_layers,
-            d_model, num_heads, num_kv_heads, ACT, DO, SUBNET, UseAct>
+            d_model, num_heads, num_kv_heads, ACT, DO, SUBNET, UseAct, Causal>
         {
+            // The defaults up to the causality switch are spelled out because a template
+            // argument cannot be passed past ones left to default.
             using type = gqa_transformer_unified::transformer_stack<
-                num_layers, d_model, num_heads, num_kv_heads, SUBNET, UseAct>;
+                num_layers, d_model, num_heads, num_kv_heads, SUBNET, UseAct,
+                8, 3, linear, d_model / num_heads, false, Causal>;
             static const char* name() { return "unified (gqa_attention_)"; }
         };
     }
@@ -286,7 +291,13 @@ namespace dlib
            would carry a weight column and an optimizer state for every one of them.
            Zero keeps the head as wide as the table, which is what a model without such
            identifiers wants. */
-        long output_vocab_size = 0
+        long output_vocab_size = 0,
+        /* Whether each position attends only to those before it. On by default, since
+           every language model in the library predicts the next token and depends on it.
+           A model that answers a whole grid in one pass needs it off: a cell of the output
+           can depend on any cell of the input, including those that follow it in reading
+           order. Only the unified attention honours the switch. */
+        bool causal = true
     >
     struct hrm_transformer_config {
         // Core model parameters
@@ -342,14 +353,14 @@ namespace dlib
             by every other model in the library.
         */
         using train_h_net_type = rms_norm<typename impl::hrm_stack_selector<IMPL, NUM_H_LAYERS,
-            EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS, activation_func, dropout_policy, input_tensor, USE_ACT>::type>;
+            EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS, activation_func, dropout_policy, input_tensor, USE_ACT, causal>::type>;
         using train_l_net_type = rms_norm<typename impl::hrm_stack_selector<IMPL, NUM_L_LAYERS,
-            EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS, activation_func, dropout_policy, input_tensor, USE_ACT>::type>;
+            EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS, activation_func, dropout_policy, input_tensor, USE_ACT, causal>::type>;
 
         using infer_h_net_type = rms_norm<typename impl::hrm_stack_selector<IMPL, NUM_H_LAYERS,
-            EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS, activation_func, multiply, input_tensor, USE_ACT>::type>;
+            EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS, activation_func, multiply, input_tensor, USE_ACT, causal>::type>;
         using infer_l_net_type = rms_norm<typename impl::hrm_stack_selector<IMPL, NUM_L_LAYERS,
-            EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS, activation_func, multiply, input_tensor, USE_ACT>::type>;
+            EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS, activation_func, multiply, input_tensor, USE_ACT, causal>::type>;
 
         // Network definition selector based on training mode
         template<bool is_training>
