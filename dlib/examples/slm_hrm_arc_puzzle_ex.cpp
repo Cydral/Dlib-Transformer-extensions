@@ -127,10 +127,20 @@ const long EMBED_DIM    = 320;
 const long HRM_N        = 2;
 const long HRM_T        = 2;
 
+/*
+    Attention is bidirectional. The model answers a whole grid in one pass, and a cell of
+    the answer can depend on any cell of the question, including those after it in reading
+    order: a vertical flip needs the top-left cell to see the bottom-left one. Under the
+    causal mask the library uses for next-token prediction, every such transformation was
+    out of reach, for this network and for the dense control alike.
+*/
+const bool ATTENTION_CAUSAL = false;
+
 template <long TABLE, bool USE_ACT>
 using arc_config = hrm_transformer_config<
     TABLE, NUM_H_LAYERS, NUM_L_LAYERS, NUM_HEADS, EMBED_DIM, HRM_N, HRM_T,
-    gelu, dropout_10, attention_impl::unified, NUM_KV_HEADS, USE_ACT, COLOUR_VOCAB>;
+    gelu, dropout_10, attention_impl::unified, NUM_KV_HEADS, USE_ACT, COLOUR_VOCAB,
+    ATTENTION_CAUSAL>;
 
 /*
     The control: the same blocks, stacked, with nothing of the hierarchical layer.
@@ -151,7 +161,7 @@ template <long TABLE, bool USE_ACT>
 using dense_stack = typename impl::hrm_stack_selector<
     attention_impl::unified, NUM_H_LAYERS + NUM_L_LAYERS, EMBED_DIM, NUM_HEADS,
     NUM_KV_HEADS, gelu, dropout_10,
-    embeddings<TABLE, EMBED_DIM, input<matrix<int, 0, 1>>>, USE_ACT>::type;
+    embeddings<TABLE, EMBED_DIM, input<matrix<int, 0, 1>>>, USE_ACT, ATTENTION_CAUSAL>::type;
 
 template <long TABLE, bool USE_ACT>
 using dense_net = classification_head<COLOUR_VOCAB, dense_stack<TABLE, USE_ACT>>;
@@ -913,7 +923,8 @@ int main(int argc, char** argv)
              << "  window        : " << SEQ_LEN << " (" << WINDOW << " cells and one identifier)\n"
              << "  colours       : " << COLOUR_VOCAB << "\n"
              << "  network       : width " << EMBED_DIM << ", " << NUM_HEADS
-             << " query heads over " << NUM_KV_HEADS << " key-value\n"
+             << " query heads over " << NUM_KV_HEADS << " key-value, attention "
+             << (ATTENTION_CAUSAL ? "causal" : "bidirectional") << "\n"
              << (parser.option("dense")
                  ? "  structure     : a straight stack of "
                    + std::to_string(NUM_H_LAYERS + NUM_L_LAYERS)
