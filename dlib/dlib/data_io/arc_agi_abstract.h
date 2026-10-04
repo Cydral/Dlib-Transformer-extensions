@@ -409,8 +409,10 @@ namespace dlib
             - 0 <= example < d.num_examples() and puzzle_id >= 0
         ensures
             - arc_make_input returns the identifier token followed by the window.
-            - arc_make_label returns the answer, its first position labelled with the pad
-              since the identifier is given rather than predicted.
+            - arc_make_label returns the answer to be scored. Its cells carry their colour
+              plus arc_colour_offset and its end markers carry arc_eos_token; the
+              identifier position and all padding carry arc_ignore_label, so that a loss
+              set to ignore that value scores the answer and nothing else.
             - passing arc_blank_puzzle_id withholds the identifier, which asks the model to
               work without being told which rule applies.
     !*/
@@ -434,10 +436,36 @@ namespace dlib
         requires
             - grid_side > 0, seq_len == grid_side * grid_side, predicted.size() >= seq_len
         ensures
-            - returns the grid the prediction describes, its extent taken from the largest
-              row and column carrying a colour.
-            - returns an empty grid when the window is entirely padding: an empty answer is
+            - returns the grid the sequence describes. Its width is how far the first row
+              runs before an end marker and its height how far the first column does; a
+              30 by 30 grid has no room for a marker and fills the window.
+            - only the ten colour tokens count as cells, so a label, which holds
+              arc_ignore_label where the padding was, decodes as well as a prediction. A
+              cell inside the extent holding no colour is returned as -1.
+            - returns an empty grid when the first cell is not a colour: an empty answer is
               a wrong answer rather than a malformed one.
+    !*/
+
+
+// ----------------------------------------------------------------------------------------
+
+    constexpr unsigned long arc_pad_token     = 0;
+    constexpr unsigned long arc_eos_token     = 1;
+    constexpr unsigned long arc_colour_offset = 2;
+    constexpr unsigned long arc_num_colours   = 10;
+    /*!
+        The tokens a prepared grid is written in. Padding fills the window outside the
+        grid; an end marker sits on the row below it and on the column to its right, which
+        is what writes the grid's size into the sequence; the ten colours follow as
+        arc_colour_offset to arc_colour_offset + 9.
+    !*/
+
+    constexpr unsigned long arc_ignore_label = 1ul << 30;
+    /*!
+        The label of a position that is not to be scored: the identifier and all padding.
+        It lies beyond every token an input can hold, identifiers included, so that a loss
+        whose padding index falls back to it never skips a position because the question
+        was empty there.
     !*/
 
 } // namespace dlib

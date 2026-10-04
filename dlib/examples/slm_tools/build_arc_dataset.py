@@ -84,9 +84,15 @@ SEQ_LEN = GRID_SIDE * GRID_SIDE
 
 # Token 0 is the pad, colours 0 to 9 become tokens 1 to 10. Keeping the pad at zero
 # means an unwritten cell is already correct and the fill costs nothing.
+# Token 0 is the padding outside the grid, token 1 marks where the grid ends, and the ten
+# colours follow as 2 to 11. The end marker is what lets a model say how large its answer
+# is: without it, a window of 900 cells carries no sign of where a 3 by 3 grid stops, and
+# an answer can only be read back by guessing its extent from where colours happen to be.
 PAD_TOKEN = 0
+EOS_TOKEN = 1
+COLOUR_OFFSET = 2
 NUM_COLOURS = 10
-VOCAB_SIZE = NUM_COLOURS + 1
+VOCAB_SIZE = NUM_COLOURS + COLOUR_OFFSET
 
 # Identifier 0 is reserved for "no puzzle", which is what an evaluation run uses when
 # it wants to ask the model to work without being told which rule to apply.
@@ -266,12 +272,27 @@ Grid = List[List[int]]
 
 
 def encode_grid(grid: Grid) -> List[int]:
-    """Flattens a grid into the fixed window, padding what the grid does not reach."""
+    """Flattens a grid into the fixed window and marks where it ends.
+
+    The cells take their colour shifted past the two reserved tokens. The row just below
+    the grid and the column just to its right are filled with the end marker, as far as
+    the window allows, so that the grid's extent is written into the sequence rather than
+    left to be inferred. Everything else is padding, and padding is what the loss ignores.
+    """
     out = [PAD_TOKEN] * SEQ_LEN
-    for r, row in enumerate(grid[:GRID_SIDE]):
+    rows = min(len(grid), GRID_SIDE)
+    cols = min(len(grid[0]) if grid else 0, GRID_SIDE)
+    for r in range(rows):
         base = r * GRID_SIDE
-        for c, v in enumerate(row[:GRID_SIDE]):
-            out[base + c] = v + 1                     # colour 0 must not collide with pad
+        for c in range(cols):
+            out[base + c] = grid[r][c] + COLOUR_OFFSET
+    if rows < GRID_SIDE:                              # the row below the grid
+        base = rows * GRID_SIDE
+        for c in range(cols):
+            out[base + c] = EOS_TOKEN
+    if cols < GRID_SIDE:                              # the column to its right
+        for r in range(rows):
+            out[r * GRID_SIDE + cols] = EOS_TOKEN
     return out
 
 
@@ -523,6 +544,8 @@ def write_metadata(out_dir: str, split: str, b: Builder, args) -> None:
         "grid_side": GRID_SIDE,
         "vocab_size": VOCAB_SIZE,
         "pad_token": PAD_TOKEN,
+        "eos_token": EOS_TOKEN,
+        "colour_offset": COLOUR_OFFSET,
         "blank_puzzle_id": BLANK_PUZZLE_ID,
         "num_examples": len(b.inputs),
         "num_puzzles": len(b.puzzle_identifiers) - 1,

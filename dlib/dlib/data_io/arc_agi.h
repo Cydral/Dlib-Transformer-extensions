@@ -1556,6 +1556,33 @@ namespace dlib
     !*/
     constexpr int arc_blank_puzzle_id = 0;
 
+    /*!
+        The tokens a prepared grid is written in: padding outside the grid, an end marker
+        on the row below it and the column to its right, and the ten colours after those.
+    !*/
+    constexpr unsigned long arc_pad_token     = 0;
+    constexpr unsigned long arc_eos_token     = 1;
+    constexpr unsigned long arc_colour_offset = 2;
+    constexpr unsigned long arc_num_colours   = 10;
+
+    /*!
+        The label a position carries when it is not to be scored.
+
+        Padding is most of the window: a 10 by 10 answer leaves eight hundred of its nine
+        hundred cells empty. Scoring them taught a model to predict emptiness well and
+        counted that as accuracy, which is how cell accuracy reached seventy percent with
+        not one grid right. The padding and the identifier are therefore labelled with
+        this value and ignored by the loss.
+
+        It sits beyond every token an input can hold, identifiers included, on purpose.
+        The loss also masks a position whose own input token equals its padding index,
+        and unless told otherwise that index falls back to this one. A value no input
+        ever takes keeps that mask inert, so that a cell is scored by what it should be
+        and never skipped because the question was empty there, as it is wherever the
+        answer is larger than the question.
+    !*/
+    constexpr unsigned long arc_ignore_label = 1ul << 30;
+
     inline matrix<int, 0, 1> arc_make_input (
         const arc_dataset& d,
         long example,
@@ -1591,9 +1618,12 @@ namespace dlib
 
         const std::vector<int>& cells = d.labels[(size_t)example];
         matrix<unsigned long, 0, 1> seq(d.sequence_length());
-        seq(0) = 0;
+        seq(0) = arc_ignore_label;                 // the identifier is given, not predicted
         for (long i = 0; i < d.seq_len; ++i)
-            seq(i + 1) = (unsigned long)cells[(size_t)i];
+        {
+            const unsigned long tok = (unsigned long)cells[(size_t)i];
+            seq(i + 1) = tok == arc_pad_token ? arc_ignore_label : tok;
+        }
         return seq;
     }
 
@@ -1651,13 +1681,21 @@ namespace dlib
         const long offset = (long)predicted.size() - seq_len;   // skip the identifier
         DLIB_CASSERT(offset >= 0, "arc dataset: the prediction is shorter than a window");
 
-        long rows = 0, cols = 0;
-        for (long i = 0; i < seq_len; ++i)
-        {
-            if (predicted[(size_t)(offset + i)] == 0) continue;
-            rows = std::max(rows, i / grid_side + 1);
-            cols = std::max(cols, i % grid_side + 1);
-        }
+        /* The extent is read from the end markers rather than guessed from where colours
+           happen to fall: the width is how far the first row runs before its marker, the
+           height how far the first column does. A 30 by 30 grid has no room for a marker
+           and simply fills the window. Only the ten colour tokens count as cells, so a
+           label, which holds the ignored value where the padding was, decodes as well as a
+           prediction does. A cell inside the extent that holds no colour is returned as
+           -1, which compares unequal to any colour. */
+        auto at = [&](long r, long c) { return predicted[(size_t)(offset + r * grid_side + c)]; };
+        auto is_colour = [](unsigned long tok) {
+            return tok >= arc_colour_offset && tok < arc_colour_offset + arc_num_colours; };
+
+        long cols = 0;
+        while (cols < grid_side && is_colour(at(0, cols))) ++cols;
+        long rows = 0;
+        while (rows < grid_side && is_colour(at(rows, 0))) ++rows;
         if (rows == 0 || cols == 0)
             return arc_grid_t();
 
@@ -1665,8 +1703,8 @@ namespace dlib
         for (long r = 0; r < rows; ++r)
             for (long c = 0; c < cols; ++c)
             {
-                const unsigned long t = predicted[(size_t)(offset + r * grid_side + c)];
-                g(r, c) = t == 0 ? 0 : (int)t - 1;      // undo the shift past the pad
+                const unsigned long tok = at(r, c);
+                g(r, c) = is_colour(tok) ? (int)(tok - arc_colour_offset) : -1;
             }
         return g;
     }
