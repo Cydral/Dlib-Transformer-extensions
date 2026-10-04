@@ -81,7 +81,9 @@ using std::endl;
 const long GRID_SIDE   = 30;
 const long WINDOW      = GRID_SIDE * GRID_SIDE;
 const long SEQ_LEN     = WINDOW + 1;
-const long COLOUR_VOCAB = 11;
+// Padding, the end marker and the ten colours. The output layer predicts all twelve: the
+// marker has to be predicted too, since it is what says how large the answer is.
+const long COLOUR_VOCAB = 12;
 
 /*
     The embedding table has to hold every identifier, so its size is a property of the
@@ -235,13 +237,20 @@ inline float grid_reward (const std::vector<unsigned long>& predicted,
     const long n = std::min<long>((long)predicted.size(), label.size());
     if (n <= 0) return 0.0f;
 
-    long right = 0;
+    // Only the positions the loss scores count, the cells of the answer and its end
+    // markers. Rewarding a correct guess of padding would reward emptiness.
+    long scored = 0, right = 0;
     for (long i = 0; i < n; ++i)
+    {
+        if (label(i) == arc_ignore_label) continue;
+        ++scored;
         if (predicted[(size_t)i] == label(i)) ++right;
+    }
+    if (scored == 0) return 0.0f;
 
     if (kind == reward_kind::exact)
-        return right == n ? 1.0f : 0.0f;
-    return (float)right / (float)n;
+        return right == scored ? 1.0f : 0.0f;
+    return (float)right / (float)scored;
 }
 
 // ----------------------------------------------------------------------------------------
@@ -369,26 +378,21 @@ double evaluate (net_type& net, const arc_dataset& d, const run_options& o,
         const auto pred = arc_predict_sequence(logits.host(), logits.nc(),
                                                SEQ_LEN, COLOUR_VOCAB);
 
+        /* Scored over the positions the loss scores: the cells of the expected answer
+           and its end markers, never the padding around it. An answer is exact only if
+           every one of them is right, its size included, since the markers are among
+           them. This is the measure the reference reports. */
         const auto lab = arc_make_label(d, i);
-        std::vector<unsigned long> want_seq(lab.begin(), lab.end());
-        const auto got  = arc_decode_grid(pred, WINDOW, GRID_SIDE);
-        const auto want = arc_decode_grid(want_seq, WINDOW, GRID_SIDE);
-
-        if (got.nr() == want.nr() && got.nc() == want.nc())
+        long scored = 0, right = 0;
+        for (long j = 0; j < SEQ_LEN && j < (long)pred.size(); ++j)
         {
-            long wrong = 0;
-            for (long r = 0; r < got.nr(); ++r)
-                for (long c = 0; c < got.nc(); ++c)
-                {
-                    ++cells_total;
-                    if (got(r, c) == want(r, c)) ++cells_right; else ++wrong;
-                }
-            if (wrong == 0) ++exact;
+            if (lab(j) == arc_ignore_label) continue;
+            ++scored;
+            if (pred[(size_t)j] == lab(j)) ++right;
         }
-        else
-        {
-            cells_total += want.nr() * want.nc();
-        }
+        cells_total += scored;
+        cells_right += right;
+        if (scored > 0 && right == scored) ++exact;
     }
 
     const double grids = n ? 100.0 * exact / n : 0.0;
@@ -445,6 +449,18 @@ int run (const arc_dataset& train, const arc_dataset& eval_set, const run_option
 
     if (do_train)
     {
+        /* The loss scores the answer and nothing else. Positions labelled with the ignored
+           value, the padding and the identifier, are left out.
+
+           The padding index is set to the same value explicitly. The loss also skips a
+           position whose own input token equals that index, and left unset it would fall
+           back to the ignored value anyway; naming it makes the intent survive a change
+           to that fallback. No input ever holds this value, so the mask stays inert and a
+           cell is never skipped merely because the question was empty there, which is
+           the case for every cell an answer has beyond the size of its question. */
+        net.loss_details().set_ignore_index((long)arc_ignore_label);
+        net.loss_details().set_pad_index((long)arc_ignore_label);
+
         dnn_trainer<net_type, adam> trainer(net, adam(1e-4, 0.9, 0.999));
         trainer.set_learning_rate(o.learning_rate);
         trainer.set_mini_batch_size((size_t)o.batch_size);
