@@ -197,7 +197,7 @@ namespace dlib
                 {
                     if (!data_host)
                     {
-                        xmem::note_orphaned_refresh();
+                        xmem::note_orphaned_refresh(xrec, host_current);
                         device_current = true;
                         return;
                     }

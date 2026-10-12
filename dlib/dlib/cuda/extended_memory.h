@@ -275,6 +275,9 @@ namespace dlib
         std::size_t        restores_from_store = 0;
         std::size_t        restores_from_host  = 0;
         std::size_t        restores_of_unsaved = 0;
+        // Device copies found stale with no host copy to refresh them from: zero on a
+        // healthy run, and the count to quote if it is not.
+        std::size_t        orphaned_refreshes  = 0;
         // What the driver reports free on the device, which the budget cannot exceed.
         std::size_t        device_free_bytes = 0;
         std::size_t        hash_threshold    = 0;
@@ -456,13 +459,36 @@ namespace dlib
            after a write without being pushed back, in which case no valid copy remains
            anywhere. That is said once, on the first occurrence, so that a lost block cannot
            pass unnoticed behind the guard that stops the crash. */
-        inline void note_orphaned_refresh ()
+        /* A device copy was found stale with no host copy to refresh it from. The copy is
+           skipped, which prevents the crash, but the state is not supposed to exist and a
+           review of every path that stales a device copy or releases a host buffer found
+           none that produces it on its own. Until the sequence that does is known, each
+           occurrence describes its block in full, up to a ceiling, so that the next run
+           says which tensor lost its copy and in what state. The size alone separates the
+           likely candidates: an input batch is a few kilobytes, a weight far more. */
+        inline void note_orphaned_refresh (const block_record* r, bool host_current)
         {
-            if (g::orphaned_refreshes.fetch_add(1, std::memory_order_relaxed) == 0)
-                std::fprintf(stderr, "extended memory: a device copy was stale with no host "
-                                     "copy to refresh it from; kept as it was. If this "
-                                     "recurs, a block lost its content and the run's "
-                                     "figures should not be trusted\n");
+            const std::uint64_t n = g::orphaned_refreshes.fetch_add(1, std::memory_order_relaxed);
+            if (n >= 8) return;
+            if (n == 0)
+                std::fprintf(stderr, "extended memory: a device copy was stale with no host copy "
+                                     "to refresh it from; kept as it was. If this recurs, a block "
+                                     "lost its content and the run's figures should not be "
+                                     "trusted. Details follow for the first eight.\n");
+            if (!r)
+            {
+                std::fprintf(stderr, "  orphan %llu: unmanaged block\n", (unsigned long long)n + 1);
+                return;
+            }
+            static const char* tiers[] = { "device", "host", "store" };
+            const unsigned tier = r->state.load(std::memory_order_relaxed);
+            std::fprintf(stderr,
+                "  orphan %llu: block %u, %zu bytes, tier %s, host_current %d, slot %lld, "
+                "store_valid %d, ever_saved %d, evictable %d, pins %u\n",
+                (unsigned long long)n + 1, (unsigned)r->id, r->bytes,
+                tier < 3 ? tiers[tier] : "?", (int)host_current, (long long)r->slot,
+                (int)r->store_valid.load(std::memory_order_relaxed), (int)r->ever_saved,
+                (int)r->evictable, (unsigned)r->pins.load(std::memory_order_relaxed));
         }
 
         /*
@@ -567,7 +593,7 @@ namespace dlib
 
         inline bool active () { return false; }
         inline void note_block_created () {}
-        inline void note_orphaned_refresh () {}
+        inline void note_orphaned_refresh (const block_record*, bool) {}
         inline void before_device (block_record*, bool, bool) {}
         inline void before_host (block_record*, bool, bool) {}
         inline void unregister_block (block_record*) {}

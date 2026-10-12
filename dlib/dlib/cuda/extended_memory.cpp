@@ -1317,6 +1317,7 @@ namespace xmem
             s.restores_from_store = restores_from_store;
             s.restores_from_host  = restores_from_host;
             s.restores_of_unsaved = restores_of_unsaved;
+            s.orphaned_refreshes  = (std::size_t)xmem::g::orphaned_refreshes.load(std::memory_order_relaxed);
             s.prefetch_hits     = prefetch_hits;
             s.prefetch_issued   = prefetch_issued;
             s.store_writes      = store_writes;
@@ -2849,6 +2850,8 @@ namespace xmem
                                     << (s.largest_block/mib)     << " MiB, immovable "
                                     << (s.immovable_bytes/mib)   << " MiB\n"
             << "  evictions       " << s.evictions               << "\n"
+            << "  orphaned        " << s.orphaned_refreshes
+                                    << " device copies stale with no host copy\n"
             << "  restores by     " << s.restores_from_store << " from the store, "
                                     << s.restores_from_host << " from a mirror, "
                                     << s.restores_of_unsaved << " of blocks never saved\n"

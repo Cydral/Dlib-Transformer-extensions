@@ -704,6 +704,16 @@ int run (const arc_dataset& train, const arc_dataset& eval_set, const run_option
             cout << "\n";
             print_extended_memory_stats(cout);
         }
+        else if (extended_memory_enabled())
+        {
+            /* Quiet otherwise, except for the one figure that says whether the run can be
+               trusted: a device copy found stale with no host copy means a block may have
+               lost its content. Zero is the healthy value and is not printed. */
+            const auto st = get_extended_memory_stats();
+            if (st.orphaned_refreshes > 0)
+                cout << "\nmemory: " << st.orphaned_refreshes << " device copies were found "
+                        "stale with no host copy; treat this run's figures with caution\n";
+        }
     }
 
     if (do_eval && eval_set.num_examples() > 0)
