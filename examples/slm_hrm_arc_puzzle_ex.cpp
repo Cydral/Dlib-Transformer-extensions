@@ -327,6 +327,8 @@ double evaluate (net_type& net, const arc_dataset& d, const run_options& o,
                  bool quiet, q_halting_controller* halting, long limit = 0)
 {
     long exact = 0, cells_right = 0, cells_total = 0;
+    long near90 = 0, near95 = 0, near99 = 0;
+    long miss_marker = 0, miss_colour = 0;
 
     /*
         A periodic measurement reads a sample, the final one reads everything.
@@ -383,22 +385,49 @@ double evaluate (net_type& net, const arc_dataset& d, const run_options& o,
            every one of them is right, its size included, since the markers are among
            them. This is the measure the reference reports. */
         const auto lab = arc_make_label(d, i);
-        long scored = 0, right = 0;
+        long scored = 0, right = 0, wrong_marker = 0, wrong_colour = 0;
         for (long j = 0; j < SEQ_LEN && j < (long)pred.size(); ++j)
         {
             if (lab(j) == arc_ignore_label) continue;
             ++scored;
             if (pred[(size_t)j] == lab(j)) ++right;
+            else if (lab(j) == arc_eos_token) ++wrong_marker;
+            else ++wrong_colour;
         }
         cells_total += scored;
         cells_right += right;
         if (scored > 0 && right == scored) ++exact;
+
+        /* How close each answer came. An exact grid needs every cell right, so at eighty
+           five percent per cell the exact count stays at zero long after the model starts
+           to approach it; these thresholds show the approach while the exact count cannot. */
+        if (scored > 0)
+        {
+            const double frac = (double)right / (double)scored;
+            if (frac >= 0.90) ++near90;
+            if (frac >= 0.95) ++near95;
+            if (frac >= 0.99)
+            {
+                ++near99;
+                /* For the answers that came within one percent and still missed, which kind
+                   of position was wrong. A wrong end marker means the size was misjudged by
+                   a row or a column, a matter of structure; a wrong colour means a cell was
+                   misjudged, a matter of precision that a decaying rate can address. */
+                miss_marker += wrong_marker;
+                miss_colour += wrong_colour;
+            }
+        }
     }
 
     const double grids = n ? 100.0 * exact / n : 0.0;
     const double cells = cells_total ? 100.0 * cells_right / cells_total : 0.0;
     if (!quiet)
     {
+        cout << "  grids right at 90, 95 and 99 % of their cells : "
+             << near90 << ", " << near95 << ", " << near99 << " of " << n << "\n";
+        if (near99 > 0)
+            cout << "  within 1 %, positions still wrong : " << miss_marker << " end markers, "
+                 << miss_colour << " colours\n";
         cout << "  exact grids   : " << exact << " of " << n
              << "  (" << grids << " %)\n";
         cout << "  cells correct : " << cells << " %\n";
