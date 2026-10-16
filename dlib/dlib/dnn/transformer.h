@@ -506,9 +506,8 @@ namespace dlib
             // Step 5 backward
             resizable_tensor dQ(B, NUM_HEADS, N, HEAD_DIM);
             resizable_tensor dK_repeated(B, NUM_HEADS, N, HEAD_DIM);
-            /* S = qk_scale * Q @ K^T, so both branches carry the factor. It used to sit in
-               the Q projection, which made the K branch alpha-free because the saved Q
-               already held it. */
+            /* S = qk_scale * Q @ K^T, so both branches carry the factor: the saved Q does not
+               hold it. */
             tt::gemm(0.0f, dQ, qk_scale, dscores, false, saved_k_repeated, false, operation_mode::PLANE_WISE);
             tt::gemm(0.0f, dK_repeated, qk_scale, dscores, true, saved_q_post_rope, false, operation_mode::PLANE_WISE);
 
@@ -1790,6 +1789,12 @@ namespace dlib
             init_hidden_states();
         }
 
+        /* Whether the next forward continues the recurrence or restarts it, and a way to
+           drop the carried state so the next pass starts clean whatever the flag says. */
+        bool get_carry_state () const { return carry_state_; }
+        void set_carry_state (bool v) { carry_state_ = v; }
+        void reset_state () { z_h_current.set_size(0); z_l_current.set_size(0); }
+
         /* FORWARD: Hierarchical recurrence with 1 - step gradient approximation
          *
          * From the paper (Section 2, Figure 4):
@@ -1803,12 +1808,6 @@ namespace dlib
          *   z_H = f_H(z_H + z_L)
          *   output = z_H
          */
-        /* Whether the next forward continues the recurrence or restarts it, and a way to
-           drop the carried state so the next pass starts clean whatever the flag says. */
-        bool get_carry_state () const { return carry_state_; }
-        void set_carry_state (bool v) { carry_state_ = v; }
-        void reset_state () { z_h_current.set_size(0); z_l_current.set_size(0); }
-
         template <typename SUBNET>
         void forward(const SUBNET& sub, resizable_tensor& output)
         {
@@ -1885,6 +1884,15 @@ namespace dlib
 
             h_net.forward(last_h_input);
             const tensor& h_final = h_net.get_output();
+
+            /* The carried state is the one the answer came from, the final L and H updates
+               included, as in the reference: the next segment starts from the state after
+               the step that carried the gradient. Without them a segment would resume one L
+               update and one H update behind its own answer, its first L update repeating
+               the last one of the segment before. The backward reads the inputs saved
+               above, so overwriting the state here leaves it untouched. */
+            tt::copy_tensor(false, z_l_current, 0, l_final, 0, l_final.k());
+            tt::copy_tensor(false, z_h_current, 0, h_final, 0, h_final.k());
 
             // Output is the final H state
             output.copy_size(h_final);

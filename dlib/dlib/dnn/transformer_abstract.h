@@ -1047,10 +1047,15 @@ namespace dlib
             ensures
                 - #get_carry_state() == v
                 - When set, and provided the input keeps the same shape, the next forward()
-                  resumes from the state the previous one left. This lets a caller drive the
+                  resumes from the state the previous one left, which includes the final L
+                  and H updates that produced its output. This lets a caller drive the
                   recurrence from outside the network, so that several forwards compose into
-                  one longer chain rather than repeating the same short one, which is what an
-                  external halting loop needs.
+                  one longer chain rather than repeating the same short one. An external
+                  halting loop needs that, and so does deep supervision, where each segment
+                  is a training step of its own resuming the one before.
+                - forward() reads the flag when it starts. A caller that hands the network
+                  to a trainer running on another thread must leave the flag alone until
+                  that trainer is idle.
                 - The flag is not serialized: it describes how a caller is driving the layer
                   for the pass in hand, not anything the layer has learned.
         !*/

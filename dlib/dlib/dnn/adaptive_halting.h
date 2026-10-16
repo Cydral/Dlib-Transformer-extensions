@@ -61,12 +61,13 @@ namespace dlib
 
         AN INVARIANT THE CALLER MUST KEEP
 
-        The passes before the last are context, not credit. A model whose recurrence
-        carries state from one pass to the next cannot be trained on every pass: the
-        gradient of pass n would run through a forward whose starting state pass n-1 has
-        already overwritten. Advance with a plain forward and train on the final pass
-        alone. This object cannot enforce that, since it never touches the model, but
-        getting it wrong is the first thing to check when a run fails oddly.
+        A pass can only be trained right after its own forward. A recurrent layer keeps
+        the inputs of its last forward for the backward, so a backward that comes after
+        later passes runs through their inputs instead. Either advance with plain forwards
+        and train the final pass, as above, or train every pass in a step of its own, which
+        is deep supervision; never forward several passes and train an earlier one. This
+        object cannot enforce that, since it never touches the model, but getting it wrong
+        is the first thing to check when a run fails oddly.
     !*/
 
     struct q_halting_options
@@ -249,12 +250,18 @@ namespace dlib
             reward_sum  += reward;
         }
 
-        // What the runs have looked like so far, for a caller that wants to report it.
+        // What the episodes since the last clear_average() have looked like.
         long   episodes_run   () const { return episodes; }
         double average_steps  () const { return episodes ? (double)steps_taken / episodes : 0; }
         double average_reward () const { return episodes ? reward_sum / episodes : 0; }
         double head_loss      () const { return trainer.get_average_loss(); }
-        void   clear_average  ()       { trainer.clear_average_loss(); }
+        void   clear_average  ()
+        {
+            trainer.clear_average_loss();
+            episodes    = 0;
+            steps_taken = 0;
+            reward_sum  = 0;
+        }
 
         const q_halting_head_type& get_head () const { return head; }
         q_halting_head_type&       get_head ()       { return head; }

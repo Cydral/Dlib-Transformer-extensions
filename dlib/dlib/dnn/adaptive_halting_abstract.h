@@ -146,11 +146,12 @@ namespace dlib
                 }
 
             AN INVARIANT THE CALLER MUST KEEP
-                The passes before the last are context, not credit. A model whose
-                recurrence carries state from one pass to the next cannot be trained on
-                every pass: the gradient of pass n would run through a forward whose
-                starting state pass n-1 has already overwritten. Advance with a plain
-                forward and train on the final pass alone.
+                A pass can only be trained right after its own forward. A recurrent layer
+                keeps the inputs of its last forward for the backward, so a backward that
+                comes after later passes runs through their inputs instead. Either advance
+                with plain forwards and train the final pass, as above, or train every pass
+                in a step of its own, which is deep supervision; never forward several
+                passes and train an earlier one.
 
                 This object cannot enforce that, since it never touches the model. It is
                 the first thing to check when a run behaves oddly.
@@ -226,9 +227,14 @@ namespace dlib
         void   clear_average  ();
         /*!
             ensures
-                - report what the episodes have looked like so far. average_steps() is the
+                - report what the episodes finished since the last clear_average() have
+                  looked like, and clear_average() starts a new count, so that a caller
+                  reporting once per epoch reports that epoch. average_steps() is the
                   figure that says whether the head has learned anything: a head that never
-                  stops early sits at max_steps().
+                  stops early sits at the most passes the caller lets an episode take.
+                - episodes_run(), average_steps() and average_reward() count finished
+                  episodes only, so an evaluation that calls decide() without finish()
+                  leaves them unchanged.
         !*/
 
         const q_halting_head_type& get_head () const;

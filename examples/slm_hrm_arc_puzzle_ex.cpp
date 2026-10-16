@@ -14,8 +14,9 @@
             state the previous one left, so several forward passes compose into one
             longer chain of reasoning, and a small head predicts the value of halting
             against the value of continuing. That head is trained by Q-learning, its
-            target built from whether the answer came out right. This is the arrangement
-            the published work uses.
+            target built from whether the answer came out right. The segments before the
+            decision only advance the state; the training step that follows runs one more
+            and is the only one supervised.
 
         --halting internal
             The adaptive computation layer is placed inside the modules the recurrence
@@ -31,6 +32,18 @@
     The comparison is between two complete devices, not between two placements: the
     signal that trains them differs as much as the place they sit. That is deliberate
     and it is what the results should be read as saying.
+
+    DEEP SUPERVISION
+
+        --segments N
+            Each batch runs through N segments, every one a training step of its own that
+            resumes the recurrence where the previous one left it. Every segment is then
+            supervised, so the network learns to improve an answer from any point of the
+            recurrence, which is how the published work trains; the external loop above
+            supervises only its last segment. Evaluation runs as many segments, and the
+            final one is also reported after a single segment, to separate what the
+            training brought from what the extra passes bring. Applies to --halting none
+            and internal, and only to the hierarchical network.
 
     THE CONDITIONING
 
@@ -50,6 +63,7 @@
         ./slm_hrm_arc_puzzle_ex --train --data arc-data --halting external
         ./slm_hrm_arc_puzzle_ex --train --data arc-data --halting internal
         ./slm_hrm_arc_puzzle_ex --train --data arc-data --halting none
+        ./slm_hrm_arc_puzzle_ex --train --data arc-data --halting none --segments 4
         ./slm_hrm_arc_puzzle_ex --eval  --data arc-data --halting external
 */
 
@@ -87,16 +101,12 @@ const long COLOUR_VOCAB = 12;
 
 /*
     The embedding table has to hold every identifier, so its size is a property of the
-    dataset rather than of the model. C++ needs it at compile time, so a few sizes are
-    provided and the program picks the smallest that fits, refusing rather than
-    truncating if none does. Raising the ceiling is a matter of adding one line here.
-*/
-/*
-    One table size rather than two. Each is a template parameter and therefore a whole
-    instantiation of the network, and the dense control doubles those already. An oversized
-    table occupies device memory but no optimizer state and no arithmetic, since the
-    embedding updates only the rows a batch touched, so the waste is bounded where the
-    build time would not have been.
+    dataset rather than of the model, and C++ needs it at compile time. Each size is a
+    template parameter and therefore a whole instantiation of the network, which the dense
+    control doubles already, so one size serves every dataset and the program refuses a
+    dataset that exceeds it rather than truncating. An oversized table occupies device
+    memory but no optimizer state and no arithmetic, since the embedding updates only the
+    rows a batch touched.
 */
 const long TABLE_ROWS = 262144;
 
@@ -106,20 +116,13 @@ const long TABLE_ROWS = 262144;
     four. Two things depart from it, both deliberately.
 
     Attention is grouped-query with two key-value heads rather than eight. And the width is
-    320 rather than 512, which takes the count from 22.1 million to 8.6 million against the
-    27 million reported there.
+    320 rather than 512.
 
     The width is where the reasoning happens and it costs the square, so cutting it is what
-    makes a four-way comparison affordable: the step runs 2.6 times faster. What it does
-    not cut is the capacity to hold a puzzle, which lives in the identifier table, 320 wide
-    by half a million rows and outside the parameter count entirely. Whether reasoning
+    makes a four-way comparison affordable. The capacity to hold a puzzle lives in the
+    identifier table, outside the parameter count, and keeps its size. Whether reasoning
     survives the cut better than memorisation would is the assumption this configuration
     rests on, and the comparison against the published figure is what tests it.
-
-    The table sizes are template parameters, so every one of them costs an instantiation of
-    a network this size. Two are provided rather than four: an oversized table occupies
-    device memory but no optimizer state and no arithmetic, since the embedding updates
-    only the rows a batch touched, so the waste is bounded and the build time is not.
 */
 const long NUM_H_LAYERS = 4;
 const long NUM_L_LAYERS = 4;
@@ -182,6 +185,36 @@ void set_embedding_rate (layer_type&, double, long) {}
 
 template <typename layer_type>
 void set_embedding_rate (layer_type& l, double m) { set_embedding_rate(l, m, 0); }
+
+/*
+    Sets what every adaptive layer pays per step, wherever it sits: in the stack of the
+    dense control, or inside the two modules of the hierarchical layer, which are networks
+    of their own that the outer visitor does not enter. The fallback comes first so the
+    visitors below find it.
+*/
+template <typename layer_type>
+void set_ponder_if_adaptive (layer_type&, float, ...) {}
+
+template <typename layer_type>
+auto set_ponder_if_adaptive (layer_type& l, float c, int)
+    -> decltype(l.layer_details().set_ponder_penalty(c), void())
+{
+    l.layer_details().set_ponder_penalty(c);
+}
+
+template <typename layer_type>
+auto set_ponder_if_adaptive (layer_type& l, float c, long)
+    -> decltype(l.layer_details().get_h_net(), void())
+{
+    visit_layers(l.layer_details().get_h_net(), [c](size_t, auto& m) { set_ponder_if_adaptive(m, c, 0); });
+    visit_layers(l.layer_details().get_l_net(), [c](size_t, auto& m) { set_ponder_if_adaptive(m, c, 0); });
+}
+
+template <typename net_type>
+void set_ponder_cost (net_type& net, float c)
+{
+    visit_layers(net, [c](size_t, auto& l) { set_ponder_if_adaptive(l, c, 0); });
+}
 
 enum class halting_mode { external, internal, both, none };
 
@@ -256,13 +289,11 @@ inline float grid_reward (const std::vector<unsigned long>& predicted,
 // ----------------------------------------------------------------------------------------
 
 /*
-    Finds the hierarchical layer inside a network so the external loop can tell it to
-    resume rather than restart. The index is a property of the network type and is
-    resolved at compile time by the layer visitor.
+    Reaches the hierarchical layer inside a network so the external loop can tell it to
+    resume rather than restart. The overloads are declared before the visitor that calls
+    them: the layer types live in dlib and these functions do not, so argument-dependent
+    lookup would not find them from inside it.
 */
-/* The overloads have to be declared before the visitor that calls them, since a name
-   found only by argument-dependent lookup would not be found here: the layer types live
-   in dlib and these functions do not. */
 template <typename layer_type>
 auto set_carry_if_hierarchical (layer_type& l, bool on, int)
     -> decltype(l.layer_details().set_carry_state(on), void())
@@ -301,6 +332,7 @@ struct run_options
     std::string  model_file;
     halting_mode halting     = halting_mode::none;
     long         max_steps   = 16;
+    long         segments    = 1;
     long         batch_size  = 8;
     long         max_epochs  = 50;
     double       learning_rate = 1e-4;
@@ -322,22 +354,29 @@ struct run_options
 
 // ----------------------------------------------------------------------------------------
 
+/*
+    Runs the held-out split and scores it. segments is how many segments a network trained
+    with deep supervision runs before its answer is read; the external loop decides its own
+    number and reports how many it used, through segments_used when the caller asks.
+*/
 template <typename net_type>
 double evaluate (net_type& net, const arc_dataset& d, const run_options& o,
-                 bool quiet, q_halting_controller* halting, long limit = 0)
+                 bool quiet, q_halting_controller* halting, long limit = 0,
+                 long segments = 1, double* segments_used = nullptr)
 {
     long exact = 0, cells_right = 0, cells_total = 0;
     long near90 = 0, near95 = 0, near99 = 0;
     long miss_marker = 0, miss_colour = 0;
+    long segments_run = 0;
 
     /*
         A periodic measurement reads a sample, the final one reads everything.
 
-        The held-out split holds twenty thousand examples and an arrangement that composes
-        sixteen segments runs the network sixteen times for each of them, which is two
-        hours per measurement. Taken every ten epochs that is more time spent measuring
-        than training. A few thousand examples settle a cell accuracy to well within the
-        differences being looked for, and the figure that gets reported is the full one.
+        A held-out split of augmented puzzles can hold tens of thousands of examples, and
+        an arrangement that composes sixteen segments runs the network sixteen times for
+        each of them. Taken every few epochs that can cost more than the training. A few
+        thousand examples settle a cell accuracy to well within the differences being
+        looked for, and the figure that gets reported is the full one.
     */
     const long n = (limit > 0 && limit < d.num_examples()) ? limit : d.num_examples();
     const long stride = std::max(1L, d.num_examples() / std::max(1L, n));
@@ -366,15 +405,26 @@ double evaluate (net_type& net, const arc_dataset& d, const run_options& o,
             for (long s = 0; s < o.max_steps; ++s)
             {
                 net.subnet().forward(batch);
+                ++segments_run;
                 if (halting && halting->decide(
                         summarise_state(net.subnet().get_output(), o.summary_dim), s))
                     break;
             }
             set_carry(net, false);
         }
+        else if (segments > 1)
+        {
+            reset_state(net);
+            set_carry(net, true);
+            for (long s = 0; s < segments; ++s)
+                net.subnet().forward(batch);
+            segments_run += segments;
+            set_carry(net, false);
+        }
         else
         {
             net.subnet().forward(batch);
+            ++segments_run;
         }
         const tensor& logits = net.subnet().get_output();
         const auto pred = arc_predict_sequence(logits.host(), logits.nc(),
@@ -412,7 +462,7 @@ double evaluate (net_type& net, const arc_dataset& d, const run_options& o,
                 /* For the answers that came within one percent and still missed, which kind
                    of position was wrong. A wrong end marker means the size was misjudged by
                    a row or a column, a matter of structure; a wrong colour means a cell was
-                   misjudged, a matter of precision that a decaying rate can address. */
+                   misjudged, a matter of precision. */
                 miss_marker += wrong_marker;
                 miss_colour += wrong_colour;
             }
@@ -421,6 +471,9 @@ double evaluate (net_type& net, const arc_dataset& d, const run_options& o,
 
     const double grids = n ? 100.0 * exact / n : 0.0;
     const double cells = cells_total ? 100.0 * cells_right / cells_total : 0.0;
+    const double per_example = n ? (double)segments_run / (double)n : 0.0;
+    if (segments_used)
+        *segments_used = per_example;
     if (!quiet)
     {
         cout << "  grids right at 90, 95 and 99 % of their cells : "
@@ -431,6 +484,8 @@ double evaluate (net_type& net, const arc_dataset& d, const run_options& o,
         cout << "  exact grids   : " << exact << " of " << n
              << "  (" << grids << " %)\n";
         cout << "  cells correct : " << cells << " %\n";
+        if (uses_loop(o.halting))
+            cout << "  segments used : " << per_example << " of " << o.max_steps << "\n";
     }
     /* Cells rather than grids, because on a model that has yet to produce one exact grid
        the grid count is zero for every arrangement and orders nothing. */
@@ -510,16 +565,15 @@ int run (const arc_dataset& train, const arc_dataset& eval_set, const run_option
         trainer.set_iterations_without_progress_threshold(o.patience);
         trainer.set_min_learning_rate(o.learning_rate * 1e-3);
 
-        /* Raising the patience was not enough: the rate still fell at the third epoch,
-           after five thousand steps against a threshold of two hundred thousand, so
-           something other than that counter lowered it. Rather than guess which, the
-           shrink itself is neutralised. A factor of one leaves the multiplication that
-           performs it without effect, whichever counter calls for it.
+        /* With a synchronization file the rate has a second way down: the trainer reverts
+           to its last saved state when the losses recorded since that save trend upward,
+           and after repeated reverts it lowers the rate as well, and a draw that changes
+           between epochs produces exactly that reading. A factor of one leaves every such
+           reduction without effect, whichever path calls for it.
 
-           This is the right default here for a reason beyond the bug. The loss of one
-           epoch is measured on a different draw from the loss of the next, so a schedule
-           that reads a plateau in it is reading noise. --anneal restores the usual
-           behaviour for a run whose draw is fixed. */
+           The loss of one epoch is measured on a different draw from the loss of the next,
+           so a schedule that reads a plateau in it is reading noise. --anneal restores the
+           usual behaviour for a run whose draw is fixed. */
         if (!o.anneal)
             trainer.set_learning_rate_shrink_factor(1);
 
@@ -533,6 +587,7 @@ int run (const arc_dataset& train, const arc_dataset& eval_set, const run_option
            often it was seen, which keeps the frequent rows from running away. */
         visit_computational_layers(trainer.get_net(force_flush_to_disk::no),
                                    [&](auto& l) { set_embedding_rate(l, o.embedding_rate); });
+        set_ponder_cost(trainer.get_net(force_flush_to_disk::no), (float)o.ponder_cost);
 
         std::mt19937 rng(1);
 
@@ -603,12 +658,9 @@ int run (const arc_dataset& train, const arc_dataset& eval_set, const run_option
 
                 if (uses_loop(o.halting))
                 {
-                    /* Only the segment that produced the answer carries the gradient. The
-                       earlier ones advance the state and nothing else, which is the
-                       one-step approximation the recurrence is built around: running a
-                       training step per segment would ask the trainer to back-propagate
-                       through a forward whose starting state its own previous step had
-                       already overwritten. */
+                    /* The segments before the decision advance the state with plain
+                       forwards, and the training step that follows runs one more from
+                       there and is the only one supervised. */
                     net_type& live = trainer.get_net(force_flush_to_disk::no);
                     reset_state(live);
                     set_carry(live, true);
@@ -617,33 +669,65 @@ int run (const arc_dataset& train, const arc_dataset& eval_set, const run_option
                     live.to_tensor(xs.begin(), xs.end(), batch);
 
                     /* The reward is read from the pass the decision was taken on, not
-                       from the training step that follows. The trainer runs its own copy
-                       of the network on its own thread and cleans its tensors when it
-                       pleases, so what it holds after a step is not something a caller
-                       may read: asking anyway returns an output of width zero. The
-                       question the head is being asked is in any case about the state it
-                       decided on, before the extra pass. */
+                       from the training step that follows. The trainer runs the network on
+                       its own thread and cleans its tensors when it pleases, so what it
+                       holds after a step is not something a caller may read: asking anyway
+                       returns an output of width zero. The question the head is being asked
+                       is in any case about the state it decided on, before the extra pass.
+
+                       The decision covers the whole batch, so the reward is the batch's:
+                       every example is scored, where the first alone would train the head
+                       on part of what it decided about. */
                     halting.begin_episode();
-                    std::vector<unsigned long> got;
+                    std::vector<std::vector<unsigned long>> got;
                     bool decided = false;
 
                     for (long s = 0; s + 1 < o.max_steps; ++s)
                     {
                         live.subnet().forward(batch);
                         const tensor& out = live.subnet().get_output();
-                        if (out.nc() >= COLOUR_VOCAB && out.size() > 0)
-                            got = arc_predict_sequence(out.host(), out.nc(),
-                                                       SEQ_LEN, COLOUR_VOCAB);
+                        got.clear();
+                        if (out.nc() >= COLOUR_VOCAB && out.size() > 0 && out.num_samples() > 0)
+                        {
+                            const size_t per_sample = out.size() / (size_t)out.num_samples();
+                            for (long b = 0; b < out.num_samples(); ++b)
+                                got.push_back(arc_predict_sequence(out.host() + b * per_sample,
+                                                                   out.nc(), SEQ_LEN, COLOUR_VOCAB));
+                        }
                         decided = true;
                         if (halting.decide(summarise_state(out, qopt.summary_dim), s))
                             break;
                     }
 
+                    /* The carry flag stays set. The trainer reads it when its forward starts,
+                       on its own thread, after this call has returned; cleared here, it would
+                       race that read, and the supervised segment would restart the recurrence
+                       instead of resuming it. The next batch resets the state, with the
+                       trainer idle, before anything runs. */
                     trainer.train_one_step(xs, ys);
 
-                    if (decided && !got.empty())
-                        halting.finish(grid_reward(got, ys.front(), o.reward));
-                    set_carry(live, false);
+                    if (decided && got.size() == ys.size())
+                    {
+                        float reward = 0;
+                        for (size_t b = 0; b < ys.size(); ++b)
+                            reward += grid_reward(got[b], ys[b], o.reward);
+                        halting.finish(reward / (float)ys.size());
+                    }
+                }
+                else if (o.segments > 1)
+                {
+                    /* Deep supervision. The batch runs through several segments, each a
+                       training step of its own that resumes the recurrence where the step
+                       before left it, so every segment is supervised and the network learns
+                       to improve an answer from any point of the recurrence. Each step
+                       back-propagates through the pass it has just run, which is the only
+                       one a backward may go through. The state is reset between batches,
+                       with the trainer idle; the flag, once set, stays set. */
+                    net_type& live = trainer.get_net(force_flush_to_disk::no);
+                    reset_state(live);
+                    set_carry(live, true);
+                    for (long m = 0; m < o.segments; ++m)
+                        trainer.train_one_step(xs, ys);
                 }
                 else
                 {
@@ -694,18 +778,19 @@ int run (const arc_dataset& train, const arc_dataset& eval_set, const run_option
             if (eval_set.num_examples() > 0 && o.eval_every > 0 &&
                 (epoch + 1) % o.eval_every == 0)
             {
-                /* The measurement runs on a copy. Running it on the trainer's own
-                   network resized that network's tensors from the training batch to a
-                   single example and back, and cleaned a network still being trained;
-                   under the memory extension that churn left a block stale on the device
-                   with no host copy to refresh it from, and the next prefetch failed
-                   inside the copy. A copy costs the parameters and the embedding table
-                   once per measurement and leaves the trainer's state untouched. */
+                /* The measurement runs on a copy. Run on the trainer's own network, it
+                   would resize that network's tensors from the training batch to a single
+                   example and back, and clean a network still being trained. A copy costs
+                   the parameters and the embedding table once per measurement and leaves
+                   the trainer's state untouched. */
                 net_type probe = trainer.get_net(force_flush_to_disk::no);
+                double used = 0;
                 const double acc = evaluate(probe, eval_set, o, quiet,
                                             uses_loop(o.halting) ? &halting : nullptr,
-                                            o.eval_samples);
+                                            o.eval_samples, o.segments, &used);
                 cout << "         held out " << acc << " % of cells";
+                if (uses_loop(o.halting))
+                    cout << " in " << used << " segments";
                 if (acc > best_accuracy)
                 {
                     best_accuracy = acc;
@@ -721,27 +806,16 @@ int run (const arc_dataset& train, const arc_dataset& eval_set, const run_option
         }
 
         trainer.get_net();
+        set_carry(net, false);
         net.clean();
         serialize(o.model_file) << net;
         cout << "Model saved to " << o.model_file << "\n";
 
-        /* The memory report belongs to a run that is measuring the extension, not to one
-           that is training a model. It was added while the working set of this example was
-           being sized and it has no business in a training trace. */
+        // The memory report describes the extension rather than the model: --verbose only.
         if (o.verbose && extended_memory_enabled())
         {
             cout << "\n";
             print_extended_memory_stats(cout);
-        }
-        else if (extended_memory_enabled())
-        {
-            /* Quiet otherwise, except for the one figure that says whether the run can be
-               trusted: a device copy found stale with no host copy means a block may have
-               lost its content. Zero is the healthy value and is not printed. */
-            const auto st = get_extended_memory_stats();
-            if (st.orphaned_refreshes > 0)
-                cout << "\nmemory: " << st.orphaned_refreshes << " device copies were found "
-                        "stale with no host copy; treat this run's figures with caution\n";
         }
     }
 
@@ -755,10 +829,18 @@ int run (const arc_dataset& train, const arc_dataset& eval_set, const run_option
                  << ", which scored best while training\n";
             deserialize(o.model_file + ".best") >> net;
         }
-        evaluate(net, eval_set, o, false, uses_loop(o.halting) ? &halting : nullptr);
-        if (uses_loop(o.halting))
-            cout << "  segments used : " << halting.average_steps() << " of "
-                 << o.max_steps << "\n";
+        if (o.segments > 1)
+            cout << "  after " << o.segments << " segments\n";
+        evaluate(net, eval_set, o, false, uses_loop(o.halting) ? &halting : nullptr,
+                 0, o.segments);
+        if (o.segments > 1)
+        {
+            /* The same network read after one segment. Against the line above it says how
+               much the extra passes add at inference; against a network trained on single
+               passes, how much training on several segments changed the first one. */
+            cout << "  after a single segment\n";
+            evaluate(net, eval_set, o, false, nullptr, 0, 1);
+        }
     }
     return 0;
 }
@@ -766,8 +848,8 @@ int run (const arc_dataset& train, const arc_dataset& eval_set, const run_option
 // ----------------------------------------------------------------------------------------
 
 /*
-    Picks the smallest embedding table that holds the dataset's identifiers, and refuses
-    rather than truncating when none does: a puzzle whose identifier does not fit would
+    Checks that the embedding table holds the dataset's identifiers, and refuses rather
+    than truncating when it does not: a puzzle whose identifier does not fit would
     silently collide with another one's embedding.
 */
 template <bool USE_ACT>
@@ -810,6 +892,11 @@ int main(int argc, char** argv)
                                      "whole segments (default: none)", 1);
         parser.add_option("max-steps", "Segments the external loop may run, which the "
                                        "reference sets to sixteen (default: 16)", 1);
+        parser.add_option("segments", "Run each batch through N segments, each a training "
+                                      "step resuming the recurrence where the previous one "
+                                      "left it, so that every segment is supervised; "
+                                      "evaluation runs as many. With --halting none or "
+                                      "internal, on the hierarchical network (default: 1)", 1);
         parser.add_option("batch-size", "Mini-batch size (default: 8)", 1);
         parser.add_option("max-epochs", "Maximum number of epochs (default: 50)", 1);
         parser.add_option("learning-rate", "Base learning rate (default: 1e-4)", 1);
@@ -860,8 +947,7 @@ int main(int argc, char** argv)
         parser.add_option("verbose", "Report more as the run goes, including what the "
                                      "memory extension is doing");
 
-        /* Extended device memory. Off unless asked for, so a run that does not mention it
-           behaves exactly as before, and inert in a build without CUDA. */
+        /* Extended device memory. On unless refused, and inert in a build without CUDA. */
         parser.add_option("no-extended-memory", "Do not stream tensors through the device; "
                                                 "every allocation then has to fit at once");
         parser.add_option("vram-budget", "Device memory the extension may use, in MiB "
@@ -874,11 +960,10 @@ int main(int argc, char** argv)
 
         parser.parse(argc, argv);
 
-        /* Before any tensor exists, which is why this sits at the top of main. */
-        /* On unless refused. A budget left unset is taken from what the device reports
-           free at startup, less the share the context and the libraries occupy outside it,
-           so a run that says nothing about memory still gets the extension sized for the
-           card it is on. */
+        /* Before any tensor exists, which is why this sits at the top of main. A budget left
+           unset is taken from what the device reports free at startup, less the share the
+           context and the libraries occupy outside it, so a run that says nothing about
+           memory still gets the extension sized for the card it is on. */
         if (!parser.option("no-extended-memory"))
         {
             extended_memory_options xopts;
@@ -904,6 +989,7 @@ int main(int argc, char** argv)
         o.data_dir      = get_option(parser, "data", "arc-data");
         o.model_file    = get_option(parser, "model-file", "hrm_arc_model.dat");
         o.max_steps     = get_option(parser, "max-steps", 16);
+        o.segments      = get_option(parser, "segments", 1);
         o.batch_size    = get_option(parser, "batch-size", 8);
         o.max_epochs    = get_option(parser, "max-epochs", 50);
         o.learning_rate = get_option(parser, "learning-rate", 1e-4);
@@ -940,6 +1026,27 @@ int main(int argc, char** argv)
             return 1;
         }
 
+        /* Deep supervision drives the recurrence itself, segment by segment. The external
+           loop drives it too and supervises only its last segment, so the two cannot be
+           combined, and the dense control carries no state between passes. */
+        if (o.segments < 1)
+        {
+            cout << "--segments must be at least 1\n";
+            return 1;
+        }
+        if (o.segments > 1 && uses_loop(o.halting))
+        {
+            cout << "--segments applies to --halting none and internal; the external loop "
+                    "decides its own segments.\n";
+            return 1;
+        }
+        if (o.segments > 1 && parser.option("dense"))
+        {
+            cout << "--segments needs the hierarchical network; the dense control carries "
+                    "no state from one pass to the next.\n";
+            return 1;
+        }
+
         const bool do_train = parser.option("train");
         const bool do_eval  = parser.option("eval");
 
@@ -956,8 +1063,8 @@ int main(int argc, char** argv)
                     "external composes\n  whole segments around them, both does the two at "
                     "once since they are not\n  alternatives, and none is the baseline no "
                     "other can be credited against until\n  it is known.\n"
-                 << "\n  Add --extended-memory when the batch or the table no longer fits "
-                    "the card.\n";
+                 << "\n  The memory extension lets the batch and the table exceed the card; "
+                    "--no-extended-memory\n  turns it off.\n";
             return 0;
         }
 
@@ -975,6 +1082,10 @@ int main(int argc, char** argv)
         cout << "=== ARC-AGI hierarchical reasoning ===\n"
              << "  data          : " << o.data_dir << "\n"
              << "  halting       : " << describe(o.halting) << "\n"
+             << (o.segments > 1
+                 ? "  segments      : " + std::to_string(o.segments)
+                   + " per batch, each a supervised training step\n"
+                 : std::string())
              << "  window        : " << SEQ_LEN << " (" << WINDOW << " cells and one identifier)\n"
              << "  colours       : " << COLOUR_VOCAB << "\n"
              << "  network       : width " << EMBED_DIM << ", " << NUM_HEADS
