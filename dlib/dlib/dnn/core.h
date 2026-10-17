@@ -3226,6 +3226,28 @@ namespace dlib
                 data[i] = rnd.get_random_gaussian()*sigma;
         }
 
+        inline float central_difference_step (
+            float value,
+            float base_eps
+        )
+        {
+            /*
+                The step is proportional to the value it perturbs, so that it stays small
+                next to it. Near zero the proportion would make it vanish, and the change it
+                causes in the layer's output would sink below the rounding error of the single
+                precision forward pass that computes it. A correct layer would then fail the
+                check. A value closer to zero than min_scale therefore takes the step of a
+                value at min_scale.
+
+                A value of exactly zero is most often a bias at its initial value, on which
+                the output depends linearly, and it keeps the step of a value at one.
+            */
+            if (value == 0)
+                return base_eps;
+            const float min_scale = 0.01f;
+            return base_eps*std::max(std::abs(value), min_scale);
+        }
+
         struct test_layer_params
         {
             /*!
@@ -3475,10 +3497,8 @@ namespace dlib
             {
                 layer_details_type l1(l);
 
-                float eps = l1.get_layer_params().host()[i]*base_eps;
-                if (eps == 0)
-                    eps = base_eps;
                 const float oldval = l1.get_layer_params().host()[i];
+                const float eps = central_difference_step(oldval, base_eps);
                 l1.get_layer_params().host()[i] = oldval+eps;
                 impl::call_layer_forward(l1, subnetwork, out2);
                 l1.get_layer_params().host()[i] = oldval-eps;
@@ -3511,9 +3531,7 @@ namespace dlib
             for (unsigned long i = 0; i < num_data_inputs; ++i)
             {
                 const float oldval = subnetwork.get_output_element(i);
-                float eps = oldval*base_eps;
-                if (eps == 0)
-                    eps = base_eps;
+                const float eps = central_difference_step(oldval, base_eps);
                 subnetwork.get_output_element(i) = oldval+eps;
                 impl::call_layer_forward(l, subnetwork, out2);
                 subnetwork.get_output_element(i) = oldval-eps;

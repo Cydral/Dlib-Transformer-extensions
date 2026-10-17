@@ -5485,6 +5485,30 @@ void test_multm_prev()
 
 // ----------------------------------------------------------------------------------------
 
+    void test_gradient_check_near_zero()
+    {
+        /* test_layer() perturbs each value by a step proportional to it. The inputs it
+           draws include values very close to zero, and a step proportional to one of those
+           is too small for single precision: the check then fails a correct layer, or
+           passes it, depending on the parameters std::rand happened to give it and on how
+           the matrix product rounds. A fully connected layer has an exact gradient, so the
+           check has to pass it under every random state.
+
+           This runs last because it reseeds std::rand, which every layer's setup() draws
+           from. It runs in the CPU build only: the harness is the same in both builds, and
+           on a device each of its forward passes also pays two transfers. */
+        print_spinner();
+        for (unsigned int seed = 0; seed < 100; ++seed)
+        {
+            srand(seed);
+            fc_<5,FC_HAS_BIAS> l;
+            auto res = test_layer(l);
+            DLIB_TEST_MSG(res, "std::rand seeded with " << seed << "\n" << res);
+        }
+    }
+
+// ----------------------------------------------------------------------------------------
+
     void test_gqa_attention_causality()
     {
         /* Two things the attention layer must guarantee and that nothing else here checks.
@@ -5703,6 +5727,9 @@ void test_multm_prev()
             test_fuse_layers();
             test_reorg();
             test_input_tensor();
+#ifndef DLIB_USE_CUDA
+            test_gradient_check_near_zero();
+#endif
         }
 
         void perform_test()
