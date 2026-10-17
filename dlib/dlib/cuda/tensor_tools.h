@@ -673,6 +673,55 @@ namespace dlib { namespace tt
 
 // ----------------------------------------------------------------------------------------
 
+    void compute_adam_atan2_update (
+        size_t begin,
+        size_t end,
+        tensor& s,
+        tensor& m,
+        tensor& v,
+        const float t,
+        const float learning_rate,
+        const float weight_decay,
+        const float momentum1,
+        const float momentum2,
+        const tensor& params,
+        const tensor& params_grad
+    );
+    /*!
+        requires
+            - s.size() == m.size() = v.size() == params.size() == params_grad.size()
+            - t > 0
+            - learning_rate > 0
+            - weight_decay >= 0
+            - 0 <= momentum1 < 1
+            - 0 <= momentum2 < 1
+            - begin <= end <= params.size()
+        ensures
+            - This function implements the Adam-atan2 parameter update described in the
+              paper:
+                Everett, Katie, et al. "Scaling Exponents Across Parameterizations and
+                Optimizers." International Conference on Machine Learning. 2024.
+              ADAM divides the first moment by the square root of the second plus an
+              epsilon. Adam-atan2 takes the arctangent of the two instead, which bounds
+              every step by pi/2 times the step size, needs no epsilon, and leaves the
+              update unchanged when the gradient is scaled by any positive factor.
+            - For every i in [begin,end):
+                - #m(i) == momentum1*m(i) + (1-momentum1)*params_grad(i)
+                - #v(i) == momentum2*v(i) + (1-momentum2)*params_grad(i)^2
+                - #s(i) == -learning_rate*weight_decay*params(i)
+                           - learning_rate/(1-momentum1^t) * atan2(#m(i), sqrt(#v(i)/(1-momentum2^t)))
+              The first moment enters the arctangent as it is and its bias correction
+              scales the step, as in the reference implementation the hierarchical
+              reasoning model is trained with. The weight decay is decoupled, as in AdamW:
+              it shrinks the parameters and never enters the moments.
+            - #s is the update vector that should be added to the parameters.
+            - The function only operates in the half open range [begin,end) of the memory
+              blocks of each tensor.  E.g. to make this function run on the entire tensor
+              set begin to 0 and end to params.size().
+    !*/
+
+// ----------------------------------------------------------------------------------------
+
     void batch_normalize_inference (
         const double eps,
         resizable_tensor& dest,

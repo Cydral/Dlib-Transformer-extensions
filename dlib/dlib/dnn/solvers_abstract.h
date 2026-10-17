@@ -274,6 +274,164 @@ namespace dlib
 
 // ----------------------------------------------------------------------------------------
 
+    class adam_atan2
+    {
+        /*!
+            WHAT THIS OBJECT REPRESENTS
+                This object implements the EXAMPLE_SOLVER interface defined above. In
+                particular, it implements the Adam-atan2 parameter update method described
+                in the paper:
+                    Everett, Katie, et al. "Scaling Exponents Across Parameterizations and
+                    Optimizers." International Conference on Machine Learning. 2024.
+
+                Adam divides the first moment by the square root of the second plus an
+                epsilon, whose right value depends on the scale of the gradients. Adam-atan2
+                takes the arctangent of the two instead. It needs no epsilon, it bounds
+                every step by pi/2 times the step size, and it leaves the update unchanged
+                when the gradient is scaled by any positive factor. Where the quotient is
+                small the arctangent is close to it, and so is the update to Adam's.
+
+                The update is computed as:
+                    m_t = momentum1*m_{t-1} + (1-momentum1)*params_grad
+                    v_t = momentum2*v_{t-1} + (1-momentum2)*(params_grad^2)
+                    V = -learning_rate*weight_decay*l.get_layer_params()
+                        - learning_rate/(1-momentum1^t) * atan2(m_t, sqrt(v_t/(1-momentum2^t)))
+                The weight decay is decoupled, as in adamw. The bias correction of the first
+                moment scales the step and stays out of the arctangent, which is how the
+                Hierarchical Reasoning Model (Wang et al., 2025) is trained.
+
+                Note that the actual learning rate and weight decay used by the solver are
+                multiplied by the per layer multipliers. That is, the solver will call
+                get_learning_rate_multiplier(l) and get_weight_decay_multiplier(l) and
+                multiply these values with the nominal learning rate and weight decay,
+                respectively, to determine the values it will use during each step. It is
+                also overloaded to allow additional learning rate and weight decay
+                multipliers to be applied to the bias parameters of fc_, con_, cont_ and
+                bn_.
+        !*/
+
+    public:
+
+        adam_atan2(
+        );
+        /*!
+            ensures
+                - #get_weight_decay()  == 0.01
+                - #get_momentum1()     == 0.9
+                - #get_momentum2()     == 0.999
+        !*/
+
+        explicit adam_atan2(
+            float weight_decay,
+            float momentum1 = 0.9,
+            float momentum2 = 0.999
+        );
+        /*!
+            requires
+                - weight_decay >= 0
+                - 0 <= momentum1 < 1
+                - 0 <= momentum2 < 1
+            ensures
+                - #get_weight_decay()  == weight_decay
+                - #get_momentum1()     == momentum1
+                - #get_momentum2()     == momentum2
+        !*/
+
+        float get_weight_decay() const;
+        float get_momentum1() const;
+        float get_momentum2() const;
+    };
+
+    void serialize(const adam_atan2& item, std::ostream& out);
+    void deserialize(adam_atan2& item, std::istream& in);
+    /*!
+        provides serialization support
+    !*/
+
+    std::ostream& operator<< (std::ostream& out, const adam_atan2& item);
+    /*!
+        Prints the solver's name and parameters to out.
+    !*/
+
+// ----------------------------------------------------------------------------------------
+
+    class subnet_solver
+    {
+        /*!
+            WHAT THIS OBJECT REPRESENTS
+                This object implements the EXAMPLE_SOLVER interface defined above. It is the
+                solver a layer uses for a sub-network whose parameters it updates itself,
+                as hrm_, moe_ and the modality fusion layer do inside their backward pass.
+
+                The trainer's solver never reaches those sub-networks, so the trainer's
+                algorithm and settings reach them through network_context, and this object
+                applies the algorithm it was constructed with, adamw or adam_atan2.
+
+                It serializes exactly as the solver it applies. A vector of subnet_solver
+                objects applying AdamW writes what a vector of adamw objects writes, and
+                deserializes what such a vector wrote, so a model saved before the choice
+                of algorithm existed loads unchanged.
+        !*/
+
+    public:
+
+        subnet_solver(
+        );
+        /*!
+            ensures
+                - #get_type() == network_context::optimizer_type::adamw, with the
+                  default settings of adamw.
+        !*/
+
+        subnet_solver(
+            network_context::optimizer_type type,
+            float weight_decay,
+            float momentum1,
+            float momentum2
+        );
+        /*!
+            requires
+                - weight_decay >= 0
+                - 0 <= momentum1 < 1
+                - 0 <= momentum2 < 1
+            ensures
+                - #get_type() == type
+                - The solver applies adamw(weight_decay, momentum1, momentum2) or
+                  adam_atan2(weight_decay, momentum1, momentum2), as type says.
+        !*/
+
+        static network_context::optimizer_type requested_type(
+        );
+        /*!
+            ensures
+                - returns network_context::get_optimizer_type() if
+                  network_context::is_active(), and network_context::optimizer_type::adamw
+                  otherwise. This is the algorithm a layer owning sub-networks builds its
+                  solvers with.
+        !*/
+
+        network_context::optimizer_type get_type(
+        ) const;
+        /*!
+            ensures
+                - returns the algorithm this solver applies.
+        !*/
+    };
+
+    void serialize(const subnet_solver& item, std::ostream& out);
+    void deserialize(subnet_solver& item, std::istream& in);
+    /*!
+        provides serialization support. The serialized form is that of the adamw or
+        adam_atan2 object applied, and deserialize() reads either.
+    !*/
+
+    std::ostream& operator<< (std::ostream& out, const subnet_solver& item);
+    /*!
+        Prints the name and parameters of the solver applied to out.
+    !*/
+
+// ----------------------------------------------------------------------------------------
+
 }
 
 #endif // DLIB_DNn_SOLVERS_ABSTRACT_H_

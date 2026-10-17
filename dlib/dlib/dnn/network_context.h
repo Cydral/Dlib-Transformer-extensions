@@ -49,6 +49,15 @@ namespace dlib
     {
     public:
 
+        /* The algorithm the solvers of internally updated sub-networks apply. A layer that
+           updates its own sub-networks, such as hrm_, cannot see the trainer's solver, so
+           the trainer's choice reaches it through here along with the settings. */
+        enum class optimizer_type
+        {
+            adamw,
+            adam_atan2
+        };
+
         enum class inference_mode
         {
             // No inference-time state management. Used during training and for
@@ -173,13 +182,21 @@ namespace dlib
             return get_is_padding_set_();
         }
 
-        static void set_optimizer_params(double weight_decay, double beta1, double beta2)
+        static void set_optimizer_params(double weight_decay, double beta1, double beta2,
+            optimizer_type type = optimizer_type::adamw)
         {
             std::lock_guard<std::mutex> lock(get_mutex_());
             get_optimizer_weight_decay_() = weight_decay;
             get_optimizer_beta1_() = beta1;
             get_optimizer_beta2_() = beta2;
+            get_optimizer_type_() = type;
             get_is_active_() = true;
+        }
+
+        static optimizer_type get_optimizer_type()
+        {
+            std::lock_guard<std::mutex> lock(get_mutex_());
+            return get_optimizer_type_();
         }
 
         static double get_optimizer_weight_decay()
@@ -402,6 +419,7 @@ namespace dlib
             get_optimizer_weight_decay_() = 0.004;
             get_optimizer_beta1_() = 0.9;
             get_optimizer_beta2_() = 0.999;
+            get_optimizer_type_() = optimizer_type::adamw;
             get_inference_mode_() = inference_mode::training;
             get_kv_cache_capacity_() = 0;
             get_kv_cache_keep_length_() = 0;
@@ -441,6 +459,10 @@ namespace dlib
         }
         static double& get_optimizer_beta2_() {
             static double v = 0.999;
+            return v;
+        }
+        static optimizer_type& get_optimizer_type_() {
+            static optimizer_type v = optimizer_type::adamw;
             return v;
         }
 

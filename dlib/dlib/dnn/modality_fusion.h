@@ -22,7 +22,8 @@
 //
 // The design follows hrm_ and moe_, which already hold subnetworks: the encoder is driven
 // by hand through back_propagate_error and get_final_data_gradient, and updated through
-// its own AdamW solvers fed from network_context.
+// solvers of its own, which apply the trainer's algorithm and settings as network_context
+// names them.
 
 #ifndef DLIB_DNN_MODALITY_FUSION_H_
 #define DLIB_DNN_MODALITY_FUSION_H_
@@ -296,7 +297,9 @@ namespace dlib
 
             const double effective_lr = current_learning_rate_ * learning_rate_multiplier_;
 
-            if (!solvers_initialized_)
+            // The trainer's algorithm, with fresh solvers when it changes, as in hrm_.
+            const auto type = subnet_solver::requested_type();
+            if (!solvers_initialized_ || solvers_.empty() || solvers_.front().get_type() != type)
             {
                 const double wd = network_context::is_active()
                     ? network_context::get_optimizer_weight_decay() : solver_weight_decay_;
@@ -304,7 +307,7 @@ namespace dlib
                     ? network_context::get_optimizer_beta1() : solver_beta1_;
                 const double b2 = network_context::is_active()
                     ? network_context::get_optimizer_beta2() : solver_beta2_;
-                solvers_.assign(ENCODER_NET::num_computational_layers, adamw(wd, b1, b2));
+                solvers_.assign(ENCODER_NET::num_computational_layers, subnet_solver(type, wd, b1, b2));
                 solvers_initialized_ = true;
             }
 
@@ -323,7 +326,7 @@ namespace dlib
         double learning_rate_multiplier_;
         double current_learning_rate_;
         double solver_weight_decay_, solver_beta1_, solver_beta2_;
-        std::vector<adamw> solvers_;
+        std::vector<subnet_solver> solvers_;
         bool solvers_initialized_;
 
         std::vector<placement> injected_;

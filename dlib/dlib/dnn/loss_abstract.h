@@ -1037,6 +1037,264 @@ namespace dlib
 
 // ----------------------------------------------------------------------------------------
 
+    class loss_stablemax_cross_entropy_per_token_
+    {
+        /*!
+            WHAT THIS OBJECT REPRESENTS
+                This object implements the loss layer interface defined above by
+                EXAMPLE_LOSS_LAYER_. It is loss_cross_entropy_per_token_ with the softmax
+                replaced by the stablemax normalizer of:
+                    Prieto, Barsbey, Mediano and Birdal. "Grokking at the Edge of Numerical
+                    Stability." International Conference on Learning Representations. 2025.
+
+                Each logit x is mapped through s(x) = x + 1 for x >= 0 and s(x) = 1/(1 - x)
+                below zero, and the probability of class c is s(x_c) / sum_k s(x_k). s
+                grows linearly where the exponential grows exponentially, so a confident
+                prediction does not round its probability to exactly one. Under softmax
+                that rounding zeroes the gradient of the examples already classified, the
+                failure the paper calls softmax collapse. The Hierarchical Reasoning Model
+                is trained with this loss.
+
+                The targets, the ignore indices, the query-side padding mask and the label
+                smoothing behave as in loss_cross_entropy_per_token_. There is no z-loss,
+                which regularizes the softmax normalizer and has no counterpart here. The
+                loss is computed in double precision, as the reference implementation
+                does, and averaged over the positions scored.
+
+                Since s is increasing, the most likely class is the largest logit, exactly
+                as under softmax, and to_label() reports it at the last position.
+        !*/
+
+    public:
+        typedef matrix<unsigned long, 0, 1> training_label_type;
+        typedef unsigned long output_label_type;
+
+        loss_stablemax_cross_entropy_per_token_(
+        );
+        /*!
+            ensures
+                - #get_ignore_index() == -1
+                - #get_ignore_indices().empty() == true
+                - #get_label_smoothing() == 0.0
+                - #get_pad_index() == -1
+        !*/
+
+        void set_ignore_index(long idx);
+        long get_ignore_index() const;
+        void set_ignore_indices(const std::vector<long>& indices);
+        const std::vector<long>& get_ignore_indices() const;
+        void add_ignore_index(long idx);
+        void clear_ignore_indices();
+        void set_label_smoothing(double eps);
+        double get_label_smoothing() const;
+        void set_pad_index(long idx);
+        long get_pad_index() const;
+        /*!
+            These behave exactly as the functions of the same name in
+            loss_cross_entropy_per_token_.
+        !*/
+
+        template <typename SUB_TYPE, typename label_iterator>
+        void to_label(
+            const tensor& input_tensor,
+            const SUB_TYPE& sub,
+            label_iterator iter
+        ) const;
+        /*!
+            requires
+                - sub.sample_expansion_factor() == 1
+                - sub.get_output().k() == 1
+                - input_tensor.num_samples() == sub.get_output().num_samples()
+            ensures
+                - For each sample b, *(iter + b) is set to the index of the maximum logit
+                  at the last sequence position.
+        !*/
+
+        template <typename const_label_iterator, typename SUBNET>
+        double compute_loss_value_and_gradient(
+            const tensor& input_tensor,
+            const_label_iterator truth,
+            SUBNET& sub
+        ) const;
+        /*!
+            requires
+                - sub.sample_expansion_factor() == 1
+                - input_tensor.num_samples() != 0
+                - input_tensor.num_samples() == sub.get_output().num_samples()
+                - input_tensor.num_samples() == sub.get_gradient_input().num_samples()
+                - input_tensor is the token-id tensor fed to the network, laid out as
+                  (num_samples, 1, seq_len, 1).
+                - Every target that is not ignored is < sub.get_output().nc().
+            ensures
+                - With S = sum_k s(x_k) and q the target distribution (one-hot, or
+                  smoothed), each scored position contributes
+                      log S - sum_c q_c log s(x_c)
+                  and its gradient with respect to x_c is
+                      s'(x_c) * (1/S - q_c/s(x_c)).
+                - Writes the gradient w.r.t. the logits into sub.get_gradient_input().
+                - Returns the loss averaged over all scored positions in the batch.
+        !*/
+    };
+
+    template <typename SUBNET>
+    using loss_stablemax_cross_entropy_per_token = add_loss_layer<loss_stablemax_cross_entropy_per_token_, SUBNET>;
+
+// ----------------------------------------------------------------------------------------
+
+    enum class token_normalization
+    {
+        /*!
+            The normalizer that turns token logits into probabilities.
+        !*/
+        softmax,
+        stablemax
+    };
+
+    class loss_halting_cross_entropy_per_token_
+    {
+        /*!
+            WHAT THIS OBJECT REPRESENTS
+                This object implements the loss layer interface defined above by
+                EXAMPLE_LOSS_LAYER_. It trains a network that answers a whole sequence at
+                once together with a halting head that says whether that answer is right,
+                as the Hierarchical Reasoning Model does:
+                    Wang et al. "Hierarchical Reasoning Model." arXiv:2506.21734. 2025.
+
+                The output is interpreted as a (batch_size, 1, seq_len, vocab_size + 1)
+                tensor. At every position the first vocab_size channels are the token
+                logits and the last one is a halting logit. The projection that feeds this
+                loss is therefore one channel wider than the vocabulary.
+
+                Every position except get_halting_position() is scored against its target,
+                under softmax or stablemax as get_normalization() says, unless its target
+                equals get_ignore_index(). The token loss of a sample is the mean over its
+                scored positions, and the token loss of the batch is the mean over samples,
+                which weighs every sample equally whatever its number of scored positions.
+
+                A sample is exact when the largest token logit of every scored position is
+                at its target. The halting logit h read at get_halting_position() is trained
+                towards exactness by binary cross-entropy, softplus(h) - exact*h, averaged
+                over samples. The halting logits of the other positions are not read and
+                receive no gradient.
+
+                Only a loss layer sees the labels, and whether an answer is exact is a
+                question about the labels, so this is where the halting head is trained:
+                a layer placed before the loss could not know what to train it towards.
+                The halting head learns jointly with the rest of the network, its gradient
+                reaching the representation at the halting position.
+
+                After each call to compute_loss_value_and_gradient(), get_halting_logits()
+                and get_exact() hold, for every sample of the batch, the halting logit read
+                and whether the answer was exact. A training loop that halts sequences one
+                by one, as the reference implementation does, reads its decisions there.
+        !*/
+
+    public:
+        typedef matrix<unsigned long, 0, 1> training_label_type;
+        typedef matrix<unsigned long, 0, 1> output_label_type;
+
+        loss_halting_cross_entropy_per_token_(
+        );
+        /*!
+            ensures
+                - #get_ignore_index() == -1
+                - #get_normalization() == token_normalization::softmax
+                - #get_halting_position() == 0
+                - #get_halting_weight() == 0.5
+                - #get_halting_logits().empty() == true
+                - #get_exact().empty() == true
+        !*/
+
+        void set_ignore_index(long idx);
+        long get_ignore_index() const;
+        /*!
+            Positions whose target equals the ignore index are not scored. A negative
+            value scores every position but the halting one.
+        !*/
+
+        void set_normalization(token_normalization n);
+        token_normalization get_normalization() const;
+
+        void set_halting_position(long pos);
+        long get_halting_position() const;
+        /*!
+            requires
+                - pos >= 0
+            The position whose last channel is the halting logit. That position is never
+            scored as a token, whatever its target.
+        !*/
+
+        void set_halting_weight(double w);
+        double get_halting_weight() const;
+        /*!
+            requires
+                - w >= 0
+            The weight of the halting term in the loss. The reference weighs its halting
+            terms by one half.
+        !*/
+
+        const std::vector<float>& get_halting_logits() const;
+        const std::vector<unsigned char>& get_exact() const;
+        const std::vector<float>& get_token_accuracy() const;
+        double get_token_loss() const;
+        double get_halting_loss() const;
+        /*!
+            ensures
+                - Return what the last call to compute_loss_value_and_gradient() found. Per
+                  sample, these are the halting logit, whether the answer was exact (1) or
+                  not (0), and the fraction of its scored positions whose largest token
+                  logit is at the target. Over the batch, they are the token loss and the
+                  unweighted halting loss.
+        !*/
+
+        template <typename SUB_TYPE, typename label_iterator>
+        void to_label(
+            const tensor& input_tensor,
+            const SUB_TYPE& sub,
+            label_iterator iter
+        ) const;
+        /*!
+            requires
+                - sub.sample_expansion_factor() == 1
+                - sub.get_output().k() == 1
+                - sub.get_output().nc() >= 2
+                - input_tensor.num_samples() == sub.get_output().num_samples()
+            ensures
+                - For each sample b, *(iter + b) is a column of sub.get_output().nr()
+                  entries, entry t being the index of the largest token logit at
+                  position t.
+        !*/
+
+        template <typename const_label_iterator, typename SUBNET>
+        double compute_loss_value_and_gradient(
+            const tensor& input_tensor,
+            const_label_iterator truth,
+            SUBNET& sub
+        ) const;
+        /*!
+            requires
+                - sub.sample_expansion_factor() == 1
+                - input_tensor.num_samples() != 0
+                - input_tensor.num_samples() == sub.get_output().num_samples()
+                - have_same_dimensions(sub.get_output(), sub.get_gradient_input())
+                - sub.get_output().k() == 1 and sub.get_output().nc() >= 2
+                - get_halting_position() < sub.get_output().nr()
+                - truth points to one column of sub.get_output().nr() targets per sample,
+                  each scored target < sub.get_output().nc() - 1.
+            ensures
+                - Writes the gradient w.r.t. the token and halting logits into
+                  sub.get_gradient_input().
+                - Updates get_halting_logits(), get_exact(), get_token_accuracy(),
+                  get_token_loss() and get_halting_loss().
+                - Returns get_token_loss() + get_halting_weight()*get_halting_loss().
+        !*/
+    };
+
+    template <typename SUBNET>
+    using loss_halting_cross_entropy_per_token = add_loss_layer<loss_halting_cross_entropy_per_token_, SUBNET>;
+
+// ----------------------------------------------------------------------------------------
+
     class loss_multibinary_log_
     {
         /*!

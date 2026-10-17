@@ -1161,6 +1161,388 @@ namespace dlib
 
 // ----------------------------------------------------------------------------------------
 
+    class loss_stablemax_cross_entropy_per_token_
+    {
+    public:
+        /* The counterpart of loss_cross_entropy_per_token_ under the stablemax normalizer:
+           the same targets, masks and smoothing, and the logits mapped through
+           s(x) = x + 1 above zero and 1 / (1 - x) below it in place of the exponential.
+           There is no z-loss, since it regularizes the softmax normalizer and this loss
+           has none. */
+        typedef matrix<unsigned long, 0, 1> training_label_type;
+        typedef unsigned long output_label_type;
+
+        loss_stablemax_cross_entropy_per_token_()
+            : ignore_index_(-1), label_smoothing_(0.0), pad_index_(-1) {
+        }
+
+        void set_ignore_index(long idx) { ignore_index_ = idx; }
+        long get_ignore_index() const { return ignore_index_; }
+
+        void set_ignore_indices(const std::vector<long>& indices)
+        {
+            ignore_indices_ = indices;
+            ignore_index_ = indices.empty() ? -1 : indices.front();
+        }
+        const std::vector<long>& get_ignore_indices() const { return ignore_indices_; }
+
+        void add_ignore_index(long idx)
+        {
+            if (std::find(ignore_indices_.begin(), ignore_indices_.end(), idx) == ignore_indices_.end())
+                ignore_indices_.push_back(idx);
+            if (ignore_index_ == -1) ignore_index_ = idx;
+        }
+
+        void clear_ignore_indices()
+        {
+            ignore_indices_.clear();
+            ignore_index_ = -1;
+        }
+
+        void set_label_smoothing(double eps)
+        {
+            DLIB_CASSERT(eps >= 0.0 && eps < 1.0, "Label smoothing must be in [0, 1)");
+            label_smoothing_ = eps;
+        }
+        double get_label_smoothing() const { return label_smoothing_; }
+
+        void set_pad_index(long idx) { pad_index_ = idx; }
+        long get_pad_index() const { return pad_index_; }
+
+        template <typename SUB_TYPE, typename label_iterator>
+        void to_label(
+            const tensor& input_tensor,
+            const SUB_TYPE& sub,
+            label_iterator iter
+        ) const
+        {
+            /* s is increasing, so the most likely token is the largest logit, exactly as
+               under softmax. */
+            const tensor& output_tensor = sub.get_output();
+            DLIB_CASSERT(sub.sample_expansion_factor() == 1);
+            DLIB_CASSERT(output_tensor.k() == 1);
+            DLIB_CASSERT(input_tensor.num_samples() == output_tensor.num_samples());
+
+            const long batch_size = output_tensor.num_samples();
+            const long seq_len = output_tensor.nr();
+            const long vocab_size = output_tensor.nc();
+            const float* out_data = output_tensor.host();
+
+            for (long i = 0; i < batch_size; ++i, ++iter)
+            {
+                long max_idx = 0;
+                float max_val = out_data[tensor_index(output_tensor, i, 0, seq_len - 1, 0)];
+                for (long c = 1; c < vocab_size; ++c)
+                {
+                    const float val = out_data[tensor_index(output_tensor, i, 0, seq_len - 1, c)];
+                    if (val > max_val) { max_val = val; max_idx = c; }
+                }
+                *iter = static_cast<unsigned long>(max_idx);
+            }
+        }
+
+        template <typename const_label_iterator, typename SUBNET>
+        double compute_loss_value_and_gradient(
+            const tensor& input_tensor,
+            const_label_iterator truth,
+            SUBNET& sub
+        ) const
+        {
+            const tensor& output_tensor = sub.get_output();
+            tensor& grad = sub.get_gradient_input();
+
+            DLIB_CASSERT(sub.sample_expansion_factor() == 1);
+            DLIB_CASSERT(input_tensor.num_samples() != 0);
+            DLIB_CASSERT(input_tensor.num_samples() == grad.num_samples());
+            DLIB_CASSERT(input_tensor.num_samples() == output_tensor.num_samples());
+            DLIB_CASSERT(output_tensor.nr() == grad.nr() &&
+                output_tensor.nc() == grad.nc() &&
+                output_tensor.k() == grad.k());
+
+            /* One list covers both modes, holding the set when one is given and the
+               single index otherwise. The query mask follows the rule of the softmax loss. */
+            std::vector<long> ignored = ignore_indices_;
+            if (ignored.empty() && ignore_index_ >= 0)
+                ignored.push_back(ignore_index_);
+            const long effective_pad = ignore_indices_.empty()
+                ? (pad_index_ >= 0 ? pad_index_ : ignore_index_)
+                : pad_index_;
+
+            double loss = 0.0;
+#ifdef DLIB_USE_CUDA
+            cuda_compute(truth, input_tensor, output_tensor, grad, loss,
+                ignored, label_smoothing_, effective_pad);
+#else
+            cpu_compute(truth, input_tensor, output_tensor, grad, loss,
+                ignored, label_smoothing_, effective_pad);
+#endif
+            return loss;
+        }
+
+        friend void serialize(const loss_stablemax_cross_entropy_per_token_& item, std::ostream& out)
+        {
+            serialize("loss_stablemax_cross_entropy_per_token_", out);
+            serialize(item.ignore_index_, out);
+            serialize(item.label_smoothing_, out);
+            serialize(item.ignore_indices_, out);
+            serialize(item.pad_index_, out);
+        }
+
+        friend void deserialize(loss_stablemax_cross_entropy_per_token_& item, std::istream& in)
+        {
+            std::string version;
+            deserialize(version, in);
+            if (version != "loss_stablemax_cross_entropy_per_token_")
+                throw serialization_error("Unexpected version found while deserializing dlib::loss_stablemax_cross_entropy_per_token_.");
+            deserialize(item.ignore_index_, in);
+            deserialize(item.label_smoothing_, in);
+            deserialize(item.ignore_indices_, in);
+            deserialize(item.pad_index_, in);
+        }
+
+        friend std::ostream& operator<<(std::ostream& out, const loss_stablemax_cross_entropy_per_token_& item)
+        {
+            out << "loss_stablemax_cross_entropy_per_token";
+            if (!item.ignore_indices_.empty())
+            {
+                out << " (ignore_indices=[";
+                for (size_t i = 0; i < item.ignore_indices_.size(); ++i)
+                {
+                    if (i > 0) out << ",";
+                    out << item.ignore_indices_[i];
+                }
+                out << "]";
+            }
+            else
+            {
+                out << " (ignore_index=" << item.ignore_index_;
+            }
+            out << ", pad_index=" << item.pad_index_
+                << ", label_smoothing=" << item.label_smoothing_ << ")";
+            return out;
+        }
+
+        friend void to_xml(const loss_stablemax_cross_entropy_per_token_& item, std::ostream& out)
+        {
+            out << "<loss_stablemax_cross_entropy_per_token"
+                << " ignore_index='" << item.ignore_index_ << "'"
+                << " pad_index='" << item.pad_index_ << "'"
+                << " label_smoothing='" << item.label_smoothing_ << "'";
+            if (!item.ignore_indices_.empty())
+            {
+                out << " ignore_indices='";
+                for (size_t i = 0; i < item.ignore_indices_.size(); ++i)
+                {
+                    if (i > 0) out << ",";
+                    out << item.ignore_indices_[i];
+                }
+                out << "'";
+            }
+            out << "/>\n";
+        }
+
+    private:
+        long ignore_index_;
+        std::vector<long> ignore_indices_;
+        double label_smoothing_;
+        long pad_index_;
+#ifdef DLIB_USE_CUDA
+        cuda::compute_loss_stablemax_cross_entropy_per_token cuda_compute;
+#else
+        cpu::compute_loss_stablemax_cross_entropy_per_token cpu_compute;
+#endif
+    };
+
+    template <typename SUBNET>
+    using loss_stablemax_cross_entropy_per_token = add_loss_layer<loss_stablemax_cross_entropy_per_token_, SUBNET>;
+
+// ----------------------------------------------------------------------------------------
+
+    /* The normalizer that turns the token logits into probabilities. */
+    enum class token_normalization
+    {
+        softmax,
+        stablemax
+    };
+
+    class loss_halting_cross_entropy_per_token_
+    {
+    public:
+        /* Per-position cross-entropy over the answer, and a halting logit trained jointly
+           to say whether the whole answer came out right.
+
+           The last channel of the output is the halting logit and the others are the token
+           logits, so the projection feeding this loss is one wider than the vocabulary.
+           Only the loss sees the labels, and whether an answer is exact is a question
+           about the labels, which is why the halting head is trained here. A layer placed
+           before the loss could not know what to train it towards. */
+        typedef matrix<unsigned long, 0, 1> training_label_type;
+        typedef matrix<unsigned long, 0, 1> output_label_type;
+
+        loss_halting_cross_entropy_per_token_()
+            : ignore_index_(-1), normalization_(token_normalization::softmax),
+              halting_position_(0), halting_weight_(0.5) {
+        }
+
+        void set_ignore_index(long idx) { ignore_index_ = idx; }
+        long get_ignore_index() const { return ignore_index_; }
+
+        void set_normalization(token_normalization n) { normalization_ = n; }
+        token_normalization get_normalization() const { return normalization_; }
+
+        void set_halting_position(long pos)
+        {
+            DLIB_CASSERT(pos >= 0, "The halting position must be a position of the sequence");
+            halting_position_ = pos;
+        }
+        long get_halting_position() const { return halting_position_; }
+
+        void set_halting_weight(double w)
+        {
+            DLIB_CASSERT(w >= 0.0, "The halting weight must be non-negative");
+            halting_weight_ = w;
+        }
+        double get_halting_weight() const { return halting_weight_; }
+
+        /* What the last call to compute_loss_value_and_gradient() found for each sample,
+           the halting logit it read, whether the answer was exact, and the share of its
+           scored positions predicted right. A training loop that halts sequences one by
+           one reads its decisions from here. */
+        const std::vector<float>& get_halting_logits() const { return halting_logits_; }
+        const std::vector<unsigned char>& get_exact() const { return exact_; }
+        const std::vector<float>& get_token_accuracy() const { return token_accuracy_; }
+        double get_token_loss() const { return token_loss_; }
+        double get_halting_loss() const { return halting_loss_; }
+
+        template <typename SUB_TYPE, typename label_iterator>
+        void to_label(
+            const tensor& input_tensor,
+            const SUB_TYPE& sub,
+            label_iterator iter
+        ) const
+        {
+            const tensor& output_tensor = sub.get_output();
+            DLIB_CASSERT(sub.sample_expansion_factor() == 1);
+            DLIB_CASSERT(output_tensor.k() == 1 && output_tensor.nc() >= 2);
+            DLIB_CASSERT(input_tensor.num_samples() == output_tensor.num_samples());
+
+            const long seq_len = output_tensor.nr();
+            const long vocab_size = output_tensor.nc() - 1;
+            const float* out_data = output_tensor.host();
+
+            for (long i = 0; i < output_tensor.num_samples(); ++i, ++iter)
+            {
+                iter->set_size(seq_len);
+                for (long t = 0; t < seq_len; ++t)
+                {
+                    const float* row = out_data + tensor_index(output_tensor, i, 0, t, 0);
+                    long best = 0;
+                    for (long c = 1; c < vocab_size; ++c)
+                        if (row[c] > row[best]) best = c;
+                    (*iter)(t) = static_cast<unsigned long>(best);
+                }
+            }
+        }
+
+        template <typename const_label_iterator, typename SUBNET>
+        double compute_loss_value_and_gradient(
+            const tensor& input_tensor,
+            const_label_iterator truth,
+            SUBNET& sub
+        ) const
+        {
+            const tensor& output_tensor = sub.get_output();
+            tensor& grad = sub.get_gradient_input();
+
+            DLIB_CASSERT(sub.sample_expansion_factor() == 1);
+            DLIB_CASSERT(input_tensor.num_samples() != 0);
+            DLIB_CASSERT(input_tensor.num_samples() == output_tensor.num_samples());
+            DLIB_CASSERT(have_same_dimensions(output_tensor, grad));
+            DLIB_CASSERT(output_tensor.k() == 1 && output_tensor.nc() >= 2,
+                "The output needs the token logits and one halting logit per position");
+            DLIB_CASSERT(halting_position_ < output_tensor.nr(),
+                "The halting position " << halting_position_ << " lies outside a sequence of "
+                << output_tensor.nr());
+
+            const bool stablemax = normalization_ == token_normalization::stablemax;
+#ifdef DLIB_USE_CUDA
+            cuda_compute(truth, output_tensor, grad, ignore_index_, stablemax,
+                halting_position_, halting_weight_, token_loss_, halting_loss_,
+                halting_logits_, exact_, token_accuracy_);
+#else
+            cpu_compute(truth, output_tensor, grad, ignore_index_, stablemax,
+                halting_position_, halting_weight_, token_loss_, halting_loss_,
+                halting_logits_, exact_, token_accuracy_);
+#endif
+            return token_loss_ + halting_weight_ * halting_loss_;
+        }
+
+        friend void serialize(const loss_halting_cross_entropy_per_token_& item, std::ostream& out)
+        {
+            serialize("loss_halting_cross_entropy_per_token_", out);
+            serialize(item.ignore_index_, out);
+            serialize(static_cast<int>(item.normalization_), out);
+            serialize(item.halting_position_, out);
+            serialize(item.halting_weight_, out);
+        }
+
+        friend void deserialize(loss_halting_cross_entropy_per_token_& item, std::istream& in)
+        {
+            std::string version;
+            deserialize(version, in);
+            if (version != "loss_halting_cross_entropy_per_token_")
+                throw serialization_error("Unexpected version found while deserializing dlib::loss_halting_cross_entropy_per_token_.");
+            int normalization = 0;
+            deserialize(item.ignore_index_, in);
+            deserialize(normalization, in);
+            item.normalization_ = static_cast<token_normalization>(normalization);
+            deserialize(item.halting_position_, in);
+            deserialize(item.halting_weight_, in);
+        }
+
+        friend std::ostream& operator<<(std::ostream& out, const loss_halting_cross_entropy_per_token_& item)
+        {
+            out << "loss_halting_cross_entropy_per_token ("
+                << (item.normalization_ == token_normalization::stablemax ? "stablemax" : "softmax")
+                << ", ignore_index=" << item.ignore_index_
+                << ", halting_position=" << item.halting_position_
+                << ", halting_weight=" << item.halting_weight_ << ")";
+            return out;
+        }
+
+        friend void to_xml(const loss_halting_cross_entropy_per_token_& item, std::ostream& out)
+        {
+            out << "<loss_halting_cross_entropy_per_token"
+                << " normalization='"
+                << (item.normalization_ == token_normalization::stablemax ? "stablemax" : "softmax") << "'"
+                << " ignore_index='" << item.ignore_index_ << "'"
+                << " halting_position='" << item.halting_position_ << "'"
+                << " halting_weight='" << item.halting_weight_ << "'/>\n";
+        }
+
+    private:
+        long ignore_index_;
+        token_normalization normalization_;
+        long halting_position_;
+        double halting_weight_;
+
+        mutable std::vector<float> halting_logits_;
+        mutable std::vector<unsigned char> exact_;
+        mutable std::vector<float> token_accuracy_;
+        mutable double token_loss_ = 0;
+        mutable double halting_loss_ = 0;
+#ifdef DLIB_USE_CUDA
+        cuda::compute_loss_halting_cross_entropy_per_token cuda_compute;
+#else
+        cpu::compute_loss_halting_cross_entropy_per_token cpu_compute;
+#endif
+    };
+
+    template <typename SUBNET>
+    using loss_halting_cross_entropy_per_token = add_loss_layer<loss_halting_cross_entropy_per_token_, SUBNET>;
+
+// ----------------------------------------------------------------------------------------
+
     enum class use_image_pyramid : uint8_t
     {
         no,

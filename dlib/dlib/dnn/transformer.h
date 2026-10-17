@@ -7,13 +7,12 @@
 #include "network_context.h"
 #include "layers.h"
 #include "lora_adapter.h"
+#include "solvers.h"
 #include <cstring>
 #include <vector>
 
 namespace dlib
 {
-    class adamw; // Forward declaration
-
     // ----------------------------------------------------------------------------------------
 
 
@@ -1795,6 +1794,30 @@ namespace dlib
         void set_carry_state (bool v) { carry_state_ = v; }
         void reset_state () { z_h_current.set_size(0); z_l_current.set_size(0); }
 
+        /* Restarts the recurrence of some samples and lets the others resume. The state of
+           every sample flagged in restart goes back to the initial vectors, and the state
+           of the others is kept. A training loop that halts sequences one at a time needs
+           exactly this, since a halted sequence's place in the batch takes a new example,
+           which has to start from the beginning while its neighbours are still being
+           refined. A state that is not being carried for a batch of this size is left as
+           it is, since the next forward starts every sample from the initial vectors. */
+        void reset_state (const std::vector<bool>& restart)
+        {
+            const long n = static_cast<long>(restart.size());
+            if (z_h_current.size() == 0 || z_h_current.num_samples() != n ||
+                z_l_current.num_samples() != n)
+                return;
+
+            keep_rows_.set_size(n);
+            float* keep = keep_rows_.host();
+            for (long i = 0; i < n; ++i)
+                keep[i] = restart[static_cast<size_t>(i)] ? 0.0f : 1.0f;
+
+            // z = init + keep * (z - init), sample by sample, where the state lives.
+            restart_rows(z_h_current, z_h_init);
+            restart_rows(z_l_current, z_l_init);
+        }
+
         /* FORWARD: Hierarchical recurrence with 1 - step gradient approximation
          *
          * From the paper (Section 2, Figure 4):
@@ -2041,7 +2064,10 @@ namespace dlib
 
     private:
 
-        // Update both H and L network parameters using internal AdamW solvers
+        /* Updates both modules with solvers of their own, which apply the algorithm the
+           trainer uses as network_context names it. A change of algorithm, such as a run
+           resumed with another solver, starts them afresh, since the state of one
+           algorithm means nothing to the other. */
         void update_subnet_parameters()
         {
             if (network_context::is_active())
@@ -2050,20 +2076,30 @@ namespace dlib
 
             const double effective_lr = current_learning_rate_ * learning_rate_multiplier;
 
-            if (!solvers_initialized_) {
+            const auto type = subnet_solver::requested_type();
+            if (!solvers_initialized_ || h_solvers_.empty() || h_solvers_.front().get_type() != type) {
                 const double wd = network_context::is_active()
                     ? network_context::get_optimizer_weight_decay() : solver_weight_decay_;
                 const double b1 = network_context::is_active()
                     ? network_context::get_optimizer_beta1() : solver_beta1_;
                 const double b2 = network_context::is_active()
                     ? network_context::get_optimizer_beta2() : solver_beta2_;
-                h_solvers_.assign(h_net.num_computational_layers, adamw(wd, b1, b2));
-                l_solvers_.assign(l_net.num_computational_layers, adamw(wd, b1, b2));
+                h_solvers_.assign(h_net.num_computational_layers, subnet_solver(type, wd, b1, b2));
+                l_solvers_.assign(l_net.num_computational_layers, subnet_solver(type, wd, b1, b2));
                 solvers_initialized_ = true;
             }
 
             h_net.update_parameters(h_solvers_, effective_lr);
             l_net.update_parameters(l_solvers_, effective_lr);
+        }
+
+        void restart_rows(resizable_tensor& z, const tensor& init)
+        {
+            init_rows_.copy_size(z);
+            tt::broadcast_row(init_rows_, init);
+            tt::add(1.0f, z, -1.0f, init_rows_);
+            tt::scale_rows(z, z, keep_rows_);
+            tt::add(1.0f, z, 1.0f, init_rows_);
         }
 
         void init_hidden_states()
@@ -2102,8 +2138,8 @@ namespace dlib
         double solver_beta2_ = 0.999;
 
         // Internal solvers for sub-network parameter updates
-        std::vector<adamw> h_solvers_;
-        std::vector<adamw> l_solvers_;
+        std::vector<subnet_solver> h_solvers_;
+        std::vector<subnet_solver> l_solvers_;
         bool solvers_initialized_;
 
         /* When set, forward() resumes from the state the previous call left rather than
@@ -2116,6 +2152,10 @@ namespace dlib
         resizable_tensor z_l_current;
         resizable_tensor h_input;
         resizable_tensor l_input;
+
+        // Scratch for restarting some samples of a carried state
+        resizable_tensor keep_rows_;
+        resizable_tensor init_rows_;
 
         // Saved inputs for backward pass (final step only, O(1) memory)
         resizable_tensor last_h_input;
@@ -2801,7 +2841,9 @@ namespace dlib
 
             const double effective_lr = current_learning_rate_ * learning_rate_multiplier;
 
-            if (!solvers_initialized_) {
+            // The trainer's algorithm, with fresh solvers when it changes, as in hrm_.
+            const auto type = subnet_solver::requested_type();
+            if (!solvers_initialized_ || gate_solvers_.empty() || gate_solvers_.front().get_type() != type) {
                 const double wd = network_context::is_active()
                     ? network_context::get_optimizer_weight_decay() : solver_weight_decay_;
                 const double b1 = network_context::is_active()
@@ -2810,8 +2852,8 @@ namespace dlib
                     ? network_context::get_optimizer_beta2() : solver_beta2_;
                 expert_solvers_.resize(n_experts);
                 for (long e = 0; e < n_experts; ++e)
-                    expert_solvers_[e].assign(experts[e].num_computational_layers, adamw(wd, b1, b2));
-                gate_solvers_.assign(gate_net.num_computational_layers, adamw(wd, b1, b2));
+                    expert_solvers_[e].assign(experts[e].num_computational_layers, subnet_solver(type, wd, b1, b2));
+                gate_solvers_.assign(gate_net.num_computational_layers, subnet_solver(type, wd, b1, b2));
                 solvers_initialized_ = true;
             }
 
@@ -2854,9 +2896,9 @@ namespace dlib
         std::vector<resizable_tensor> cached_expert_inputs_;
         std::vector<resizable_tensor> cached_expert_outputs_;
 
-        // Internal AdamW solvers
-        std::vector<std::vector<adamw>> expert_solvers_;
-        std::vector<adamw> gate_solvers_;
+        // Internal solvers, applying the trainer's algorithm as network_context names it
+        std::vector<std::vector<subnet_solver>> expert_solvers_;
+        std::vector<subnet_solver> gate_solvers_;
         bool solvers_initialized_;
         double solver_weight_decay_ = 0.004;
         double solver_beta1_ = 0.9;

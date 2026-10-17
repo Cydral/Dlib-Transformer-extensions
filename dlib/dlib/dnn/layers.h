@@ -2799,15 +2799,18 @@ namespace dlib
 
         alias_tensor_instance get_weights() { return weights(params, 0); }
         alias_tensor_const_instance get_weights() const { return weights(params, 0); }
+        /* The assertion reads the template parameter. The member of the same meaning is
+           not a constant expression, and asserting on it made these two fail to compile
+           wherever they were used. */
         alias_tensor_instance get_biases()
         {
-            static_assert(bias_mode == LINEAR_HAS_BIAS, "This linear_ layer doesn't have a bias vector "
+            static_assert(bias_mode_ == LINEAR_HAS_BIAS, "This linear_ layer doesn't have a bias vector "
                 "to be retrieved, as per template parameter 'bias_mode'.");
             return biases(params, weights.size());
         }
         alias_tensor_const_instance get_biases() const
         {
-            static_assert(bias_mode == LINEAR_HAS_BIAS, "This linear_ layer doesn't have a bias vector "
+            static_assert(bias_mode_ == LINEAR_HAS_BIAS, "This linear_ layer doesn't have a bias vector "
                 "to be retrieved, as per template parameter 'bias_mode'.");
             return biases(params, weights.size());
         }

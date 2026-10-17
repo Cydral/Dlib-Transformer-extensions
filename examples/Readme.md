@@ -24,6 +24,7 @@
   - [`slm_transformer_configs_ex.cpp`](#slm_transformer_configs_excpp)
   - [`slm_enwiki_train_ex.cpp`](#slm_enwiki_train_excpp)
   - [`slm_hrm_arc_puzzle_ex.cpp`](#slm_hrm_arc_puzzle_excpp)
+  - [`slm_hrm_sudoku_ex.cpp`](#slm_hrm_sudoku_excpp)
   - [`slm_predictive_compressor_ex.cpp`](#slm_predictive_compressor_excpp)
   - [`slm_advanced_gqa_kvc_train_ex.cpp`](#slm_advanced_gqa_kvc_train_excpp)
   - [`slm_cygnus_foundation_ex.cpp`](#slm_cygnus_foundation_excpp)
@@ -89,8 +90,8 @@ Across the full example suite, the repository now covers:
    A full **foundation then instruct** pipeline for a compact GQA + MoE model family.
 6. [`slm_enwiki_train_ex.cpp`](#slm_enwiki_train_excpp)  
    Longer-corpus training and context-window management.
-7. [`slm_hrm_arc_puzzle_ex.cpp`](#slm_hrm_arc_puzzle_excpp)  
-   Hierarchical reasoning on ARC-AGI, and three ways of deciding when to stop.
+7. [`slm_hrm_arc_puzzle_ex.cpp`](#slm_hrm_arc_puzzle_excpp) and [`slm_hrm_sudoku_ex.cpp`](#slm_hrm_sudoku_excpp)  
+   Hierarchical reasoning on ARC-AGI, and three ways of deciding when to stop; then on Sudoku-Extreme, trained the way the published work trains it.
 8. [`slm_predictive_compressor_ex.cpp`](#slm_predictive_compressor_excpp)  
    Transformer as a **byte-level predictive model** for compression.
 
@@ -425,6 +426,33 @@ The model sees one input grid and no worked examples of the same task. What tell
 
 ### Useful reminders
 Add `--extended-memory` when the batch or the identifier table no longer fits the card.
+
+---
+
+<a id="slm_hrm_sudoku_excpp"></a>
+## `slm_hrm_sudoku_ex.cpp`
+
+### Purpose
+Reproduces, on Sudoku-Extreme, the training procedure of the published hierarchical reasoning model. A thousand training puzzles are each augmented a thousand times, the network shape, the halting, the loss and the optimizer are those of the published configuration, and the result is measured on the 423 thousand puzzles of the test split. The published work trains this setting on a single laptop GPU, where its ARC run needs eight GPUs for a day, which makes Sudoku the place to test whether the reproduction holds.
+
+### How a batch is trained
+A batch is a set of slots, each holding one puzzle and the recurrent state the network has reached on it. Every training step runs one pass of the recurrence on every slot, resuming from the state the previous step left, and supervises all of them, whatever pass each one is at. After the step, each slot decides whether it is done. A slot that halts takes a new puzzle and restarts from the initial state while its neighbours continue, which the hierarchical layer supports through `reset_state` on a per-sample mask.
+
+### The halting head
+The output projection is one channel wider than the vocabulary, and that channel, read at the first position, is a halting logit. `loss_halting_cross_entropy_per_token` scores the cells and trains the halting logit towards whether the whole answer came out exact. The loss is where this belongs, since only the loss sees the labels and exactness is a question about them. A slot halts when the logit is positive or when it reaches the maximum number of passes, and one time in ten it is held to a random minimum first, so that the head also sees the passes it would have skipped. The published work also trains a "continue" logit from one more pass of the network; this program trains the halting logit alone, as the tiny recursive model that followed it does, which removes that pass.
+
+### Main ideas demonstrated
+- a halting head trained jointly with the network, through a loss layer that splits the token logits from the halting logit,
+- a recurrent state restarted sample by sample, so that halted sequences are replaced one at a time,
+- stablemax cross-entropy and the Adam-atan2 solver, both as the published configuration uses them,
+- the solver's algorithm and settings handed to the modules the hierarchical layer updates itself, through `network_context`,
+- an embedding written as a projection of scaled one-hot rows, so that the solver trains it like every other parameter.
+
+### Preparing the data
+`slm_tools/build_sudoku_dataset.py` downloads Sudoku-Extreme, draws the training puzzles and applies the symmetries of the game, a digit permutation, a transposition and permutations of bands, rows, stacks and columns, to the puzzle and its solution together. It writes the `.bin` layout `build_arc_dataset.py` writes, read by the same loader, and the `.npy` layout of the reference implementation.
+
+### Useful reminders
+Evaluation runs every test puzzle through the full number of passes and counts a puzzle only when all 81 cells are right, and `--eval-samples 0` reads the whole split. At the published batch of 384 the working set is large in single precision. The memory extension, on unless `--no-extended-memory` is given, carries what does not fit the card, and a smaller `--batch-size` is the other way, the number of steps following from `--epochs` so that the amount of data stays the same.
 
 ---
 
@@ -797,6 +825,7 @@ Verify the C++ paths against the implementations everyone else uses.
 - **`slm_lora_finetune.py`** performs the same fine-tuning in PyTorch, as a comparison point for the training curve.
 - **`slm_prune_distill.py`** removes blocks from a published model and distils the survivors back into shape. Which blocks go is measured rather than guessed: a few forward passes record how far each block moves what passes through it, and the ones whose output stays closest to their input are the ones to drop. The survivors keep the teacher's weights, so the run repairs what the missing blocks did rather than learning the language again. What comes out is an ordinary model of its family with fewer blocks, so the standard converter produces a container this library reads.
 - **`slm_benchmark.py`** places a model against published small models on the usual tasks, each at the few-shot count under which it is normally reported — a detail that decides whether a table means anything, since five-shot and zero-shot MMLU differ by several points on the same model. The comparison figures are read from a file carrying each one's source and date, not fetched: a number quoted without its evaluation settings compares nothing.
+- **`build_arc_dataset.py`** and **`build_sudoku_dataset.py`** prepare ARC-AGI and Sudoku-Extreme for the hierarchical reasoning examples, in the layout of the reference implementation as well as in the one the C++ loader reads, so that the same data can feed either codebase.
 - **`slm_bpe_corpus.py`** collects a corpus for training a tokenizer, from encyclopaedic prose, news archives, filtered web text, multilingual web text and instruction data. The last of these is the one people leave out, and it cannot be recovered afterwards: a tokenizer trained on prose alone cuts numbered lists, code blocks and tabular answers into far more tokens than it needs, and those are what a chat model produces all day. It also reduces a corpus to a much smaller one that yields **the same merge table**, since BPE merges depend on pre-token frequencies and nothing else.
 
 ### Why this matters

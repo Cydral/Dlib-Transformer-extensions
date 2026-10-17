@@ -5509,6 +5509,472 @@ void test_multm_prev()
 
 // ----------------------------------------------------------------------------------------
 
+    void test_adam_atan2()
+    {
+        /* Two steps of the solver on an fc_ whose biases carry multipliers of their own,
+           against the update computed here in double precision, then the properties the
+           arctangent buys and the serialized forms. */
+        print_spinner();
+        using net_type = loss_mean_squared_multioutput<fc<3, input<matrix<float>>>>;
+        net_type net;
+        dlib::rand rnd(11);
+        std::vector<matrix<float>> samples(2, matrix<float>(4, 1));
+        for (auto& m : samples)
+            for (long r = 0; r < m.nr(); ++r)
+                m(r) = static_cast<float>(rnd.get_random_gaussian());
+        resizable_tensor x;
+        net.to_tensor(samples.begin(), samples.end(), x);
+        net.forward(x);
+
+        auto& l = layer<1>(net).layer_details();
+        l.set_bias_learning_rate_multiplier(2);
+        l.set_bias_weight_decay_multiplier(0);
+        const tensor& params = l.get_layer_params();
+        resizable_tensor grad;
+        grad.copy_size(params);
+        for (size_t i = 0; i < grad.size(); ++i)
+            grad.host()[i] = static_cast<float>(rnd.get_random_gaussian());
+
+        const std::vector<float> p0(params.host(), params.host() + params.size());
+        const std::vector<float> g(grad.host(), grad.host() + grad.size());
+        const size_t bias_offset = params.size() - 3;
+        const double lr = 0.01, wd = 0.1, b1 = 0.9, b2 = 0.95;
+
+        adam_atan2 solver(wd, b1, b2);
+        std::vector<double> m(params.size(), 0), v(params.size(), 0);
+        std::vector<float> second_step;
+        for (int t = 1; t <= 2; ++t)
+        {
+            const tensor& s = solver(lr, l, grad);
+            const float* ps = s.host();
+            double max_err = 0;
+            for (size_t i = 0; i < params.size(); ++i)
+            {
+                const bool bias = i >= bias_offset;
+                const double lri = lr * (bias ? 2 : 1);
+                const double wdi = wd * (bias ? 0 : 1);
+                m[i] = b1 * m[i] + (1 - b1) * g[i];
+                v[i] = b2 * v[i] + (1 - b2) * g[i] * g[i];
+                const double expected = -lri * wdi * p0[i] - lri / (1 - std::pow(b1, t)) *
+                    std::atan2(m[i], std::sqrt(v[i] / (1 - std::pow(b2, t))));
+                max_err = std::max(max_err, std::abs(expected - ps[i]));
+            }
+            DLIB_TEST_MSG(max_err < 1e-6, "adam_atan2 step " << t << " off by " << max_err);
+            if (t == 2)
+                second_step.assign(ps, ps + s.size());
+        }
+
+        // No step exceeds pi/2 times the step size, and the gradient's scale is irrelevant.
+        {
+            adam_atan2 plain(0, b1, b2), scaled(0, b1, b2);
+            resizable_tensor big;
+            big.copy_size(grad);
+            for (size_t i = 0; i < big.size(); ++i)
+                big.host()[i] = 1000 * g[i];
+            const tensor& s1 = plain(lr, l, grad);
+            const std::vector<float> a(s1.host(), s1.host() + s1.size());
+            const tensor& s2 = scaled(lr, l, big);
+            double max_diff = 0, max_step = 0;
+            for (size_t i = 0; i < a.size(); ++i)
+            {
+                max_diff = std::max(max_diff, (double)std::abs(a[i] - s2.host()[i]));
+                max_step = std::max(max_step, (double)std::abs(a[i]));
+            }
+            DLIB_TEST_MSG(max_diff < 1e-7, "adam_atan2 depends on the scale of the gradient: " << max_diff);
+            DLIB_TEST(max_step <= 2 * lr / (1 - b1) * 1.5708);
+        }
+
+        // A solver read back takes the step the original takes.
+        {
+            adam_atan2 original(wd, b1, b2);
+            original(lr, l, grad);
+            std::vector<char> buf;
+            serialize(buf) << original;
+            adam_atan2 restored;
+            deserialize(buf) >> restored;
+            const tensor& s1 = original(lr, l, grad);
+            const std::vector<float> a(s1.host(), s1.host() + s1.size());
+            const tensor& s2 = restored(lr, l, grad);
+            double max_diff = 0;
+            for (size_t i = 0; i < a.size(); ++i)
+                max_diff = std::max(max_diff, (double)std::abs(a[i] - s2.host()[i]));
+            DLIB_TEST_MSG(max_diff == 0, "a deserialized adam_atan2 steps differently: " << max_diff);
+            DLIB_TEST(restored.get_weight_decay() == (float)wd);
+        }
+
+        /* A vector of subnet_solver objects applying AdamW reads what a vector of adamw
+           wrote and writes it back byte for byte, so the solvers serialized inside existing
+           models keep loading. One applying Adam-atan2 reads back as itself. */
+        {
+            std::vector<adamw> written(3, adamw(0.02f, 0.8f, 0.9f));
+            std::vector<char> buf;
+            serialize(buf) << written;
+            std::vector<subnet_solver> read;
+            deserialize(buf) >> read;
+            std::vector<char> again;
+            serialize(again) << read;
+            DLIB_TEST(buf == again);
+            DLIB_TEST(read[0].get_type() == network_context::optimizer_type::adamw);
+
+            std::vector<subnet_solver> atan2_solvers(2,
+                subnet_solver(network_context::optimizer_type::adam_atan2, 0.1f, 0.9f, 0.95f));
+            buf.clear();
+            serialize(buf) << atan2_solvers;
+            std::vector<subnet_solver> back;
+            deserialize(buf) >> back;
+            DLIB_TEST(back.size() == 2 && back[1].get_type() == network_context::optimizer_type::adam_atan2);
+            std::vector<adam_atan2> as_solver;
+            deserialize(buf) >> as_solver;
+            DLIB_TEST(as_solver.size() == 2 && as_solver[0].get_momentum2() == 0.95f);
+        }
+    }
+
+// ----------------------------------------------------------------------------------------
+
+    struct token_loss_probe
+    {
+        // The two things a per-token loss reads from the network, and nothing else.
+        resizable_tensor out, grad;
+        const tensor& get_output() const { return out; }
+        tensor& get_gradient_input() { return grad; }
+        unsigned int sample_expansion_factor() const { return 1; }
+    };
+
+    /*
+        Largest gap between the gradient a loss writes and the central difference of the
+        value it returns. accept() can refuse a coordinate whose perturbation changes
+        something the loss is not differentiable in, such as which answer is exact.
+    */
+    template <typename loss_type, typename accept_type>
+    double token_loss_gradient_error (
+        const loss_type& loss,
+        token_loss_probe& probe,
+        const resizable_tensor& input,
+        const std::vector<matrix<unsigned long, 0, 1>>& truth,
+        double eps,
+        accept_type accept
+    )
+    {
+        probe.grad.copy_size(probe.out);
+        loss.compute_loss_value_and_gradient(input, truth.begin(), probe);
+        const resizable_tensor analytic = probe.grad;
+        double max_err = 0;
+        float* o = probe.out.host();
+        for (size_t j = 0; j < probe.out.size(); ++j)
+        {
+            const float old = o[j];
+            o[j] = static_cast<float>(old + eps);
+            const double plus = loss.compute_loss_value_and_gradient(input, truth.begin(), probe);
+            bool kept = accept();
+            o = probe.out.host();
+            o[j] = static_cast<float>(old - eps);
+            const double minus = loss.compute_loss_value_and_gradient(input, truth.begin(), probe);
+            kept = kept && accept();
+            o = probe.out.host();
+            o[j] = old;
+            if (!kept)
+                continue;
+            const double numeric = (plus - minus) / (2 * eps);
+            max_err = std::max(max_err, std::abs(numeric - analytic.host()[j]));
+        }
+        return max_err;
+    }
+
+    void test_loss_stablemax_cross_entropy_per_token()
+    {
+        print_spinner();
+        const long batch = 3, seq_len = 6, vocab = 5;
+        const long ignored = 99, pad = 0;
+        dlib::rand rnd(5);
+
+        token_loss_probe probe;
+        probe.out.set_size(batch, 1, seq_len, vocab);
+        for (size_t i = 0; i < probe.out.size(); ++i)
+            probe.out.host()[i] = static_cast<float>(2 * rnd.get_random_gaussian());
+        resizable_tensor input(batch, 1, seq_len, 1);
+        for (size_t i = 0; i < input.size(); ++i)
+            input.host()[i] = static_cast<float>(rnd.get_integer_in_range(1, vocab));
+        input.host()[2] = pad;
+        std::vector<matrix<unsigned long, 0, 1>> truth(batch, matrix<unsigned long, 0, 1>(seq_len));
+        for (long i = 0; i < batch; ++i)
+            for (long t = 0; t < seq_len; ++t)
+                truth[i](t) = rnd.get_integer_in_range(0, vocab);
+        truth[1](3) = ignored;
+
+        loss_stablemax_cross_entropy_per_token_ loss;
+        loss.set_ignore_index(ignored);
+        loss.set_pad_index(pad);
+        loss.set_label_smoothing(0.1);
+        const double err = token_loss_gradient_error(loss, probe, input, truth, 1e-2, [] { return true; });
+        DLIB_TEST_MSG(err < 5e-4, "stablemax cross-entropy gradient off by " << err);
+
+        // The value, against the definition evaluated here.
+        loss.set_label_smoothing(0);
+        loss.set_pad_index(-1);
+        probe.grad.copy_size(probe.out);
+        const double value = loss.compute_loss_value_and_gradient(input, truth.begin(), probe);
+        auto s = [](double x) { return x >= 0 ? x + 1 : 1 / (1 - x); };
+        double expected = 0;
+        long scored = 0;
+        for (long i = 0; i < batch; ++i)
+            for (long t = 0; t < seq_len; ++t)
+            {
+                if ((long)truth[i](t) == ignored)
+                    continue;
+                const float* row = probe.out.host() + (i * seq_len + t) * vocab;
+                double sum = 0;
+                for (long c = 0; c < vocab; ++c)
+                    sum += s(row[c]);
+                expected -= std::log(s(row[truth[i](t)]) / sum);
+                ++scored;
+            }
+        expected /= scored;
+        DLIB_TEST_MSG(std::abs(value - expected) < 1e-5 * expected,
+            "stablemax cross-entropy: " << value << " where " << expected << " is expected");
+
+        std::vector<char> buf;
+        serialize(buf) << loss;
+        loss_stablemax_cross_entropy_per_token_ back;
+        deserialize(buf) >> back;
+        DLIB_TEST(back.get_ignore_index() == ignored && back.get_pad_index() == -1);
+    }
+
+    void test_loss_halting_cross_entropy_per_token()
+    {
+        print_spinner();
+        const long batch = 3, seq_len = 6, vocab = 5;
+        const long ignored = 99;
+        dlib::rand rnd(9);
+
+        for (int normalization = 0; normalization < 2; ++normalization)
+        {
+            token_loss_probe probe;
+            probe.out.set_size(batch, 1, seq_len, vocab + 1);
+            for (size_t i = 0; i < probe.out.size(); ++i)
+                probe.out.host()[i] = static_cast<float>(1.5 * rnd.get_random_gaussian());
+            resizable_tensor input(batch, 1, seq_len, 1);
+            input = 0;
+
+            // The targets of the last sample are where its logits peak, so it is exact.
+            std::vector<matrix<unsigned long, 0, 1>> truth(batch, matrix<unsigned long, 0, 1>(seq_len));
+            for (long i = 0; i < batch; ++i)
+                for (long t = 0; t < seq_len; ++t)
+                {
+                    const float* row = probe.out.host() + (i * seq_len + t) * (vocab + 1);
+                    long best = 0;
+                    for (long c = 1; c < vocab; ++c)
+                        if (row[c] > row[best]) best = c;
+                    truth[i](t) = i == batch - 1 ? best : (best + 1) % vocab;
+                }
+            truth[0](4) = ignored;
+
+            loss_halting_cross_entropy_per_token_ loss;
+            loss.set_ignore_index(ignored);
+            loss.set_normalization(normalization ? token_normalization::stablemax
+                                                 : token_normalization::softmax);
+            loss.set_halting_position(0);
+            loss.set_halting_weight(0.5);
+
+            probe.grad.copy_size(probe.out);
+            loss.compute_loss_value_and_gradient(input, truth.begin(), probe);
+            const std::vector<unsigned char> exact = loss.get_exact();
+            DLIB_TEST(exact.size() == (size_t)batch);
+            DLIB_TEST(exact[0] == 0 && exact[1] == 0 && exact[batch - 1] == 1);
+            DLIB_TEST(loss.get_token_accuracy()[0] == 0 && loss.get_token_accuracy()[batch - 1] == 1);
+            DLIB_TEST(loss.get_halting_logits()[1] == probe.out.host()[(1 * seq_len + 0) * (vocab + 1) + vocab]);
+
+            // Where a perturbation moves a peak, exactness changes and there is no gradient.
+            const double err = token_loss_gradient_error(loss, probe, input, truth, 1e-2,
+                [&] { return loss.get_exact() == exact; });
+            DLIB_TEST_MSG(err < 5e-4, "halting cross-entropy gradient off by " << err
+                << (normalization ? " under stablemax" : " under softmax"));
+
+            // Only the halting position carries a gradient on the halting channel.
+            probe.grad.copy_size(probe.out);
+            loss.compute_loss_value_and_gradient(input, truth.begin(), probe);
+            for (long i = 0; i < batch; ++i)
+                for (long t = 1; t < seq_len; ++t)
+                    DLIB_TEST(probe.grad.host()[(i * seq_len + t) * (vocab + 1) + vocab] == 0);
+        }
+
+        loss_halting_cross_entropy_per_token_ loss;
+        loss.set_normalization(token_normalization::stablemax);
+        loss.set_halting_position(2);
+        loss.set_halting_weight(0.25);
+        std::vector<char> buf;
+        serialize(buf) << loss;
+        loss_halting_cross_entropy_per_token_ back;
+        deserialize(buf) >> back;
+        DLIB_TEST(back.get_normalization() == token_normalization::stablemax);
+        DLIB_TEST(back.get_halting_position() == 2 && back.get_halting_weight() == 0.25);
+    }
+
+// ----------------------------------------------------------------------------------------
+
+    void test_hrm_restarts_and_solvers()
+    {
+        /* A hierarchical layer driven segment by segment, as a training loop that halts
+           sequences one at a time drives it. The samples flagged start afresh and the others
+           resume, so the answer of a restarted sample must be the answer of a fresh pass, and
+           the answer of a resumed one that of an uninterrupted chain. */
+        print_spinner();
+        using module = rms_norm<linear<8, tag10<input_tensor>>>;
+        using net_type = loss_halting_cross_entropy_per_token<linear<5,
+            hrm<module, module, 2, 2, embeddings<12, 8, input<matrix<int, 0, 1>>>>>>;
+
+        net_type net;
+        dlib::rand rnd(3);
+        std::vector<matrix<int, 0, 1>> xs(2, matrix<int, 0, 1>(5));
+        std::vector<matrix<unsigned long, 0, 1>> ys(2, matrix<unsigned long, 0, 1>(5));
+        for (long i = 0; i < 2; ++i)
+            for (long t = 0; t < 5; ++t)
+            {
+                xs[i](t) = rnd.get_integer_in_range(0, 12);
+                ys[i](t) = t == 0 ? 1000 : rnd.get_integer_in_range(0, 4);
+            }
+        net.loss_details().set_ignore_index(1000);
+        resizable_tensor x;
+        net.to_tensor(xs.begin(), xs.end(), x);
+
+        auto& recurrence = layer<2>(net).layer_details();
+        auto answer = [&]() {
+            const tensor& out = net.subnet().get_output();
+            return std::vector<float>(out.host(), out.host() + out.size());
+        };
+
+        recurrence.reset_state();
+        recurrence.set_carry_state(true);
+        net.forward(x);
+        const std::vector<float> fresh = answer();
+        net.forward(x);
+        net.forward(x);
+        const std::vector<float> chained = answer();
+
+        recurrence.reset_state();
+        net.forward(x);
+        net.forward(x);
+        recurrence.reset_state(std::vector<bool>{true, false});
+        net.forward(x);
+        const std::vector<float> mixed = answer();
+
+        const size_t per_sample = fresh.size() / 2;
+        double first = 0, second = 0;
+        for (size_t j = 0; j < per_sample; ++j)
+        {
+            first = std::max(first, (double)std::abs(mixed[j] - fresh[j]));
+            second = std::max(second, (double)std::abs(mixed[per_sample + j] - chained[per_sample + j]));
+        }
+        DLIB_TEST_MSG(first < 1e-5, "a restarted sample does not answer as a fresh one: " << first);
+        DLIB_TEST_MSG(second < 1e-5, "a resumed sample does not answer as the chain does: " << second);
+
+        // A batch of another size is left alone, since the next forward starts afresh.
+        recurrence.reset_state(std::vector<bool>{true, false, true});
+        recurrence.set_carry_state(false);
+
+        /* The modules follow the algorithm network_context names, and a change of
+           algorithm rebuilds their solvers. */
+        auto holds = [&](const std::string& tag) {
+            std::vector<char> buf;
+            serialize(buf) << net;
+            return std::search(buf.begin(), buf.end(), tag.begin(), tag.end()) != buf.end();
+        };
+        network_context::set_optimizer_params(0.1, 0.9, 0.95, network_context::optimizer_type::adam_atan2);
+        network_context::set_learning_rate(1e-3);
+        net.compute_parameter_gradients(x, ys.begin());
+        DLIB_TEST(holds("adam_atan2"));
+        network_context::set_optimizer_params(0.1, 0.9, 0.95, network_context::optimizer_type::adamw);
+        net.compute_parameter_gradients(x, ys.begin());
+        DLIB_TEST(!holds("adam_atan2") && holds("adamw"));
+        network_context::reset();
+    }
+
+#ifdef DLIB_USE_CUDA
+    void compare_adam_atan2()
+    {
+        print_spinner();
+        tt::tensor_rand rnd;
+        resizable_tensor s, m, v, params, params_grad;
+        s.set_size(8, 9, 11, 13);
+        m.copy_size(s);
+        v.copy_size(s);
+        params.copy_size(s);
+        params_grad.copy_size(s);
+        rnd.fill_gaussian(m);
+        rnd.fill_uniform(v);
+        rnd.fill_gaussian(params);
+        rnd.fill_gaussian(params_grad);
+
+        resizable_tensor mm(m), vv(v);
+        cpu::compute_adam_atan2_update(0, params.size(), s, mm, vv, 3, 0.01f, 0.1f, 0.9f, 0.95f, params, params_grad);
+        const matrix<float> s1 = mat(s);
+        s = 0;
+        cuda::compute_adam_atan2_update(0, params.size(), s, m, v, 3, 0.01f, 0.1f, 0.9f, 0.95f, params, params_grad);
+        const matrix<float> s2 = mat(s);
+
+        DLIB_TEST_MSG(max(abs(s1 - s2)) < 1e-6, max(abs(s1 - s2)));
+        DLIB_TEST_MSG(max(abs(mat(m) - mat(mm))) < 1e-6, max(abs(mat(m) - mat(mm))));
+        DLIB_TEST_MSG(max(abs(mat(v) - mat(vv))) < 1e-6, max(abs(mat(v) - mat(vv))));
+    }
+
+    void compare_token_losses_cpu_vs_cuda()
+    {
+        print_spinner();
+        const long batch = 4, seq_len = 9, vocab = 7;
+        dlib::rand rnd(21);
+
+        resizable_tensor input(batch, 1, seq_len, 1);
+        for (size_t i = 0; i < input.size(); ++i)
+            input.host()[i] = static_cast<float>(rnd.get_integer_in_range(0, vocab));
+        std::vector<matrix<unsigned long, 0, 1>> truth(batch, matrix<unsigned long, 0, 1>(seq_len));
+        for (long i = 0; i < batch; ++i)
+            for (long t = 0; t < seq_len; ++t)
+                truth[i](t) = (t % 4 == 1) ? 50 : rnd.get_integer_in_range(0, vocab);
+
+        auto max_diff = [](const tensor& a, const tensor& b) {
+            double d = 0;
+            for (size_t i = 0; i < a.size(); ++i)
+                d = std::max(d, (double)std::abs(a.host()[i] - b.host()[i]));
+            return d;
+        };
+
+        {
+            resizable_tensor out(batch, 1, seq_len, vocab), g1, g2;
+            for (size_t i = 0; i < out.size(); ++i)
+                out.host()[i] = static_cast<float>(3 * rnd.get_random_gaussian());
+            g1.copy_size(out);
+            g2.copy_size(out);
+            double l1 = 0, l2 = 0;
+            const std::vector<long> ignore = {50};
+            cpu::compute_loss_stablemax_cross_entropy_per_token()(truth.begin(), input, out, g1, l1, ignore, 0.1, 0);
+            cuda::compute_loss_stablemax_cross_entropy_per_token()(truth.begin(), input, out, g2, l2, ignore, 0.1, 0);
+            DLIB_TEST_MSG(std::abs(l1 - l2) < 1e-5 * std::abs(l1), "stablemax loss: cpu " << l1 << ", cuda " << l2);
+            DLIB_TEST_MSG(max_diff(g1, g2) < 1e-6, "stablemax gradient differs by " << max_diff(g1, g2));
+        }
+
+        for (int stablemax = 0; stablemax < 2; ++stablemax)
+        {
+            resizable_tensor out(batch, 1, seq_len, vocab + 1), g1, g2;
+            for (size_t i = 0; i < out.size(); ++i)
+                out.host()[i] = static_cast<float>(3 * rnd.get_random_gaussian());
+            g1.copy_size(out);
+            g2.copy_size(out);
+            double t1 = 0, h1 = 0, t2 = 0, h2 = 0;
+            std::vector<float> q1, q2, a1, a2;
+            std::vector<unsigned char> e1, e2;
+            cpu::compute_loss_halting_cross_entropy_per_token()(truth.begin(), out, g1, 50,
+                stablemax != 0, 0, 0.5, t1, h1, q1, e1, a1);
+            cuda::compute_loss_halting_cross_entropy_per_token()(truth.begin(), out, g2, 50,
+                stablemax != 0, 0, 0.5, t2, h2, q2, e2, a2);
+            DLIB_TEST_MSG(std::abs(t1 - t2) < 1e-5 * std::abs(t1), "halting token loss: cpu " << t1 << ", cuda " << t2);
+            DLIB_TEST_MSG(std::abs(h1 - h2) < 1e-5 * std::abs(h1), "halting loss: cpu " << h1 << ", cuda " << h2);
+            DLIB_TEST(q1 == q2 && e1 == e2 && a1 == a2);
+            DLIB_TEST_MSG(max_diff(g1, g2) < 1e-6, "halting gradient differs by " << max_diff(g1, g2));
+        }
+    }
+#endif
+
+// ----------------------------------------------------------------------------------------
+
     void test_gqa_attention_causality()
     {
         /* Two things the attention layer must guarantee and that nothing else here checks.
@@ -5729,6 +6195,16 @@ void test_multm_prev()
             test_input_tensor();
 #ifndef DLIB_USE_CUDA
             test_gradient_check_near_zero();
+#endif
+            /* Last, since building their networks draws from std::rand and every test above
+               depends on the state it leaves. */
+            test_adam_atan2();
+            test_loss_stablemax_cross_entropy_per_token();
+            test_loss_halting_cross_entropy_per_token();
+            test_hrm_restarts_and_solvers();
+#ifdef DLIB_USE_CUDA
+            compare_adam_atan2();
+            compare_token_losses_cpu_vs_cuda();
 #endif
         }
 

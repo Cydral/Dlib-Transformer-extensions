@@ -735,6 +735,51 @@ namespace dlib
 
     // -----------------------------------------------------------------------------------
 
+        void compute_adam_atan2_update (
+            size_t begin,
+            size_t end,
+            tensor& s,
+            tensor& m,
+            tensor& v,
+            const float t,
+            const float learning_rate,
+            const float weight_decay,
+            const float momentum1,
+            const float momentum2,
+            const tensor& params,
+            const tensor& params_grad
+        )
+        {
+            DLIB_CASSERT(s.size() == m.size() &&
+                         s.size() == v.size() &&
+                         s.size() == params.size() &&
+                         s.size() == params_grad.size());
+            DLIB_CASSERT(begin <= end && end <= params.size());
+
+            // The bias corrections are taken in double: 1 - momentum^t loses most of its
+            // digits in single precision once momentum^t is close to one, early in a run.
+            const double bias1 = 1 - std::pow((double)momentum1, (double)t);
+            const double bias2 = 1 - std::pow((double)momentum2, (double)t);
+            const float step = static_cast<float>(learning_rate/bias1);
+            const float inv_sqrt_bias2 = static_cast<float>(1/std::sqrt(bias2));
+            const float decay = learning_rate*weight_decay;
+
+            auto pm = m.host();
+            auto pv = v.host();
+            auto ps = s.host_write_only();
+            auto pparams = params.host();
+            auto ppgrad = params_grad.host();
+            for (size_t i = begin; i < end; ++i)
+            {
+                const float g = ppgrad[i];
+                pm[i] = momentum1*pm[i] + (1-momentum1)*g;
+                pv[i] = momentum2*pv[i] + (1-momentum2)*g*g;
+                ps[i] = -decay*pparams[i] - step*std::atan2(pm[i], std::sqrt(pv[i])*inv_sqrt_bias2);
+            }
+        }
+
+    // -----------------------------------------------------------------------------------
+
         void batch_normalize_inference (
             const double eps,
             resizable_tensor& dest,

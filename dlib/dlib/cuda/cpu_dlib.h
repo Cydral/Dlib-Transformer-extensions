@@ -163,6 +163,21 @@ namespace dlib
             const tensor& params_grad
         );
 
+        void compute_adam_atan2_update (
+            size_t begin,
+            size_t end,
+            tensor& s,
+            tensor& m,
+            tensor& v,
+            const float t,
+            const float learning_rate,
+            const float weight_decay,
+            const float momentum1,
+            const float momentum2,
+            const tensor& params,
+            const tensor& params_grad
+        );
+
     // -----------------------------------------------------------------------------------
 
         void batch_normalize_inference (
@@ -1164,6 +1179,275 @@ namespace dlib
             {
                 loss = 0.0;
             }
+        }
+    };
+
+    // -----------------------------------------------------------------------------------
+
+    /*!
+        The stablemax normalizer of Prieto et al., "Grokking at the Edge of Numerical
+        Stability" (2025). Each logit x is mapped through s(x) = x + 1 for x >= 0 and
+        s(x) = 1/(1 - x) below zero, and the probabilities are s(x_c) / sum_k s(x_k).
+
+        s is positive, increasing and continuously differentiable, with s(0) = 1 and
+        s'(0) = 1 on both sides. It grows linearly where the exponential grows
+        exponentially, so a confident prediction does not round its probability to exactly
+        one in floating point, the failure the paper calls softmax collapse. Being
+        increasing, it leaves the most likely class where the logits put it.
+    !*/
+    inline double stablemax_value (double x) { return x >= 0 ? x + 1 : 1 / (1 - x); }
+    inline double stablemax_slope (double x) { return x >= 0 ? 1 : 1 / ((1 - x) * (1 - x)); }
+
+    class compute_loss_stablemax_cross_entropy_per_token
+    {
+        /*!
+            Host computation behind loss_stablemax_cross_entropy_per_token_, a per-position
+            cross-entropy under the stablemax normalizer, each position supervised against
+            the target the caller supplies for it, truth[i](t).
+
+            With target distribution q (one-hot, or smoothed: 1 - label_smoothing on the
+            target and label_smoothing / (vocab_size - 1) elsewhere) and S = sum_k s(x_k):
+                loss(t) = log S - sum_c q_c log s(x_c)
+                dloss/dx_c = s'(x_c) * (1/S - q_c / s(x_c))
+            computed in double precision, as the reference implementation does.
+
+              - ignore_indices: a position whose target appears here is unscored.
+              - pad_index: query-side mask. A position whose own input token equals
+                pad_index is skipped. pad_index < 0 disables it.
+
+            The loss and the gradient are averaged over the positions scored.
+
+            input  : [N, 1, seq_len, 1] token ids as floats.
+            output : [N, 1, seq_len, vocab_size] logits.
+        !*/
+    public:
+        compute_loss_stablemax_cross_entropy_per_token() {}
+
+        template <typename const_label_iterator>
+        void operator()(
+            const_label_iterator truth,
+            const tensor& input_tensor,
+            const tensor& output_tensor,
+            tensor& grad,
+            double& loss,
+            const std::vector<long>& ignore_indices,
+            double label_smoothing,
+            long pad_index
+            ) const
+        {
+            DLIB_CASSERT(output_tensor.k() == 1);
+            DLIB_CASSERT(input_tensor.k() == 1);
+            DLIB_CASSERT(input_tensor.nc() == 1);
+
+            const long batch_size = output_tensor.num_samples();
+            const long seq_len = output_tensor.nr();
+            const long vocab_size = output_tensor.nc();
+
+            const float* out_data = output_tensor.host();
+            const float* in_data = input_tensor.host();
+            float* g = grad.host();
+
+            const double smooth_target = label_smoothing > 0 ? 1.0 - label_smoothing : 1.0;
+            const double smooth_other = label_smoothing > 0 ? label_smoothing / (vocab_size - 1) : 0.0;
+
+            auto is_ignored = [&](long target) {
+                return std::find(ignore_indices.begin(), ignore_indices.end(), target) != ignore_indices.end();
+            };
+
+            long valid_tokens = 0;
+            double total = 0.0;
+
+            for (long i = 0; i < batch_size; ++i)
+            {
+                for (long t = 0; t < seq_len; ++t)
+                {
+                    const unsigned long base = tensor_index(output_tensor, i, 0, t, 0);
+                    const unsigned long target_class = (*(truth + i))(t);
+
+                    const bool skipped = (pad_index >= 0 &&
+                        static_cast<long>(in_data[tensor_index(input_tensor, i, 0, t, 0)]) == pad_index) ||
+                        is_ignored(static_cast<long>(target_class));
+                    if (skipped)
+                    {
+                        for (long c = 0; c < vocab_size; ++c) g[base + c] = 0;
+                        continue;
+                    }
+
+                    DLIB_CASSERT(target_class < static_cast<unsigned long>(vocab_size),
+                        "Target class " << target_class << " >= vocab_size " << vocab_size);
+                    ++valid_tokens;
+
+                    double sum = 0;
+                    for (long c = 0; c < vocab_size; ++c)
+                        sum += stablemax_value(out_data[base + c]);
+                    const double inv_sum = 1 / sum;
+
+                    double pos_loss = std::log(sum);
+                    for (long c = 0; c < vocab_size; ++c)
+                    {
+                        const double x = out_data[base + c];
+                        const double sx = stablemax_value(x);
+                        const double q = static_cast<unsigned long>(c) == target_class ? smooth_target : smooth_other;
+                        if (q > 0)
+                            pos_loss -= q * std::log(sx);
+                        g[base + c] = static_cast<float>(stablemax_slope(x) * (inv_sum - q / sx));
+                    }
+                    total += pos_loss;
+                }
+            }
+
+            if (valid_tokens > 0)
+            {
+                const double inv_valid = 1.0 / valid_tokens;
+                loss = total * inv_valid;
+                for (size_t n = 0; n < grad.size(); ++n)
+                    g[n] = static_cast<float>(g[n] * inv_valid);
+            }
+            else
+            {
+                loss = 0.0;
+            }
+        }
+    };
+
+    // -----------------------------------------------------------------------------------
+
+    class compute_loss_halting_cross_entropy_per_token
+    {
+        /*!
+            Host computation behind loss_halting_cross_entropy_per_token_.
+
+            The output holds vocab_size = nc - 1 token logits per position followed by one
+            halting logit. Every position except halting_position is scored against its
+            target, under softmax or stablemax, unless the target equals ignore_index
+            (ignore_index < 0 scores every target). The token loss of a sample is the mean
+            over its scored positions, and the batch's is the mean over samples.
+
+            A sample is exact when the largest token logit of every scored position is at
+            its target. The halting logit h read at halting_position is trained by binary
+            cross-entropy towards exactness, softplus(h) - exact * h, averaged over samples
+            and weighted by halting_weight.
+
+            On return, halting_logits[i], exact[i] and token_accuracy[i] hold, for each
+            sample, the halting logit read, whether the sample was exact, and the fraction
+            of its scored positions whose largest logit is at the target.
+        !*/
+    public:
+        compute_loss_halting_cross_entropy_per_token() {}
+
+        template <typename const_label_iterator>
+        void operator()(
+            const_label_iterator truth,
+            const tensor& output_tensor,
+            tensor& grad,
+            long ignore_index,
+            bool stablemax,
+            long halting_position,
+            double halting_weight,
+            double& token_loss,
+            double& halting_loss,
+            std::vector<float>& halting_logits,
+            std::vector<unsigned char>& exact,
+            std::vector<float>& token_accuracy
+            ) const
+        {
+            DLIB_CASSERT(output_tensor.k() == 1 && output_tensor.nc() >= 2);
+            DLIB_CASSERT(0 <= halting_position && halting_position < output_tensor.nr());
+
+            const long batch_size = output_tensor.num_samples();
+            const long seq_len = output_tensor.nr();
+            const long channels = output_tensor.nc();
+            const long vocab_size = channels - 1;
+
+            const float* out_data = output_tensor.host();
+            float* g = grad.host();
+
+            halting_logits.assign(batch_size, 0.0f);
+            exact.assign(batch_size, 0);
+            token_accuracy.assign(batch_size, 0.0f);
+            token_loss = 0;
+            halting_loss = 0;
+
+            std::vector<double> probs(vocab_size);
+            for (long i = 0; i < batch_size; ++i)
+            {
+                long scored = 0, right = 0;
+                double sample_loss = 0;
+                for (long t = 0; t < seq_len; ++t)
+                {
+                    const unsigned long base = tensor_index(output_tensor, i, 0, t, 0);
+                    const unsigned long target_class = (*(truth + i))(t);
+                    for (long c = 0; c < channels; ++c) g[base + c] = 0;
+
+                    if (t == halting_position ||
+                        (ignore_index >= 0 && static_cast<long>(target_class) == ignore_index))
+                        continue;
+
+                    DLIB_CASSERT(target_class < static_cast<unsigned long>(vocab_size),
+                        "Target class " << target_class << " >= vocab_size " << vocab_size);
+                    ++scored;
+
+                    long best = 0;
+                    for (long c = 1; c < vocab_size; ++c)
+                        if (out_data[base + c] > out_data[base + best]) best = c;
+                    if (static_cast<unsigned long>(best) == target_class) ++right;
+
+                    if (stablemax)
+                    {
+                        double sum = 0;
+                        for (long c = 0; c < vocab_size; ++c)
+                            sum += stablemax_value(out_data[base + c]);
+                        const double inv_sum = 1 / sum;
+                        sample_loss += std::log(sum) - std::log(stablemax_value(out_data[base + target_class]));
+                        for (long c = 0; c < vocab_size; ++c)
+                        {
+                            const double x = out_data[base + c];
+                            const double q = static_cast<unsigned long>(c) == target_class ? 1.0 : 0.0;
+                            g[base + c] = static_cast<float>(stablemax_slope(x) * (inv_sum - q / stablemax_value(x)));
+                        }
+                    }
+                    else
+                    {
+                        const double max_val = out_data[base + best];
+                        double sum = 0;
+                        for (long c = 0; c < vocab_size; ++c)
+                        {
+                            probs[c] = std::exp(out_data[base + c] - max_val);
+                            sum += probs[c];
+                        }
+                        sample_loss += max_val + std::log(sum) - out_data[base + target_class];
+                        for (long c = 0; c < vocab_size; ++c)
+                        {
+                            const double q = static_cast<unsigned long>(c) == target_class ? 1.0 : 0.0;
+                            g[base + c] = static_cast<float>(probs[c] / sum - q);
+                        }
+                    }
+                }
+
+                // The token gradient of this sample takes the sample's mean and the batch's.
+                const double token_scale = 1.0 / (std::max(scored, 1L) * (double)batch_size);
+                for (long t = 0; t < seq_len; ++t)
+                {
+                    const unsigned long base = tensor_index(output_tensor, i, 0, t, 0);
+                    for (long c = 0; c < vocab_size; ++c)
+                        g[base + c] = static_cast<float>(g[base + c] * token_scale);
+                }
+                token_loss += sample_loss / std::max(scored, 1L);
+
+                const bool is_exact = right == scored;
+                const unsigned long hidx = tensor_index(output_tensor, i, 0, halting_position, vocab_size);
+                const double h = out_data[hidx];
+                const double y = is_exact ? 1.0 : 0.0;
+                halting_loss += std::max(h, 0.0) - h * y + std::log1p(std::exp(-std::abs(h)));
+                g[hidx] = static_cast<float>(halting_weight * (1 / (1 + std::exp(-h)) - y) / batch_size);
+
+                halting_logits[i] = static_cast<float>(h);
+                exact[i] = is_exact ? 1 : 0;
+                token_accuracy[i] = scored > 0 ? static_cast<float>(right) / scored : 1.0f;
+            }
+
+            token_loss /= batch_size;
+            halting_loss /= batch_size;
         }
     };
 

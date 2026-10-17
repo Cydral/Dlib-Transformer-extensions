@@ -162,7 +162,8 @@ namespace dlib
                     * The internal "clear KV cache" flag is cleared.
                     * Every modality slot is emptied.
                     * Optimizer hyperparameters revert to their defaults
-                      (weight_decay=0.004, beta1=0.9, beta2=0.999).
+                      (weight_decay=0.004, beta1=0.9, beta2=0.999), and the
+                      optimizer algorithm to optimizer_type::adamw.
         !*/
 
         // Learning rate and training mode
@@ -247,17 +248,32 @@ namespace dlib
                 - Returns true iff padding lengths have been stored and not yet cleared.
         !*/
 
-        // Optimizer hyperparameters (read by AdamW-style internal solvers in
-        // sub-network layers such as hrm_ and moe_)
+        // Optimizer algorithm and hyperparameters (read by the subnet_solver objects of
+        // sub-network layers such as hrm_, moe_ and the modality fusion layer)
 
-        static void set_optimizer_params(double weight_decay, double beta1, double beta2);
+        enum class optimizer_type
+        {
+            adamw,      // dlib::adamw
+            adam_atan2  // dlib::adam_atan2
+        };
+
+        static void set_optimizer_params(
+            double weight_decay,
+            double beta1,
+            double beta2,
+            optimizer_type type = optimizer_type::adamw
+        );
         /*!
             ensures
-                - Stores the optimizer hyperparameters used by internally managed
-                  sub-networks (hrm_, moe_, ...).
+                - Stores the optimizer algorithm and hyperparameters used by internally
+                  managed sub-networks (hrm_, moe_, ...). A program training such a
+                  network passes the settings of its trainer's solver here, and the
+                  algorithm of that solver as type, so that the sub-networks train the
+                  way the rest of the network does.
                 - #get_optimizer_weight_decay() == weight_decay
                 - #get_optimizer_beta1()        == beta1
                 - #get_optimizer_beta2()        == beta2
+                - #get_optimizer_type()         == type
                 - #is_active()                  == true
         !*/
 
@@ -268,6 +284,12 @@ namespace dlib
             ensures
                 - Return the stored optimizer hyperparameters (defaults:
                   weight_decay=0.004, beta1=0.9, beta2=0.999).
+        !*/
+
+        static optimizer_type get_optimizer_type();
+        /*!
+            ensures
+                - Returns the stored optimizer algorithm (default: optimizer_type::adamw).
         !*/
 
         // Inference mode and KV cache configuration

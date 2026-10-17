@@ -962,7 +962,7 @@ namespace dlib
                 scales for multi-level sequence processing.
 
                 The model consists of two interdependent recurrent modules managed as
-                internal sub-networks with their own AdamW solvers:
+                internal sub-networks with solvers of their own (see subnet_solver):
                     - High-level module (H_NET): executes N slow cycles for abstract
                       planning and global reasoning
                     - Low-level module (L_NET): executes T fast iterations per H-cycle
@@ -1004,17 +1004,19 @@ namespace dlib
 
                 Parameter management:
                     H_NET and L_NET are internal sub-networks invisible to the main
-                    trainer's solver. Their parameters are updated via dedicated AdamW
-                    solvers inside update_subnet_parameters(), called at the end of
-                    backward(). The learning rate and the optimizer settings are taken
-                    from network_context when it is active. When it is not, the layer
-                    uses its own: the rate given to set_learning_rate(), 0.001 by
-                    default, and the settings given to configure_solvers(). No trainer's
-                    rate or schedule reaches them in that case, so a program training
-                    this layer with dnn_trainer passes the trainer's settings through
-                    network_context::set_optimizer_params() and
+                    trainer's solver. Their parameters are updated via dedicated
+                    subnet_solver objects inside update_subnet_parameters(), called at
+                    the end of backward(). The learning rate, the optimizer algorithm
+                    (AdamW or Adam-atan2) and its settings are taken from
+                    network_context when it is active. When it is not, the layer uses
+                    its own: the rate given to set_learning_rate(), 0.001 by default,
+                    and AdamW with the settings given to configure_solvers(). No
+                    trainer's rate or schedule reaches them in that case, so a program
+                    training this layer with dnn_trainer passes the trainer's algorithm
+                    and settings through network_context::set_optimizer_params() and
                     network_context::set_learning_rate(), and calls the latter again
-                    whenever the trainer's rate changes. The layer itself has no direct
+                    whenever the trainer's rate changes. A change of algorithm between
+                    two updates starts the solvers afresh. The layer itself has no direct
                     trainable parameters (get_layer_params() returns an empty tensor);
                     use internal_parameters() to obtain the total parameter count of
                     both H_NET and L_NET combined.
@@ -1073,6 +1075,23 @@ namespace dlib
             ensures
                 - Drops any carried state, so the next forward() starts from the initial
                   vectors whatever get_carry_state() returns.
+        !*/
+
+        void reset_state (
+            const std::vector<bool>& restart
+        );
+        /*!
+            ensures
+                - If a state is being carried for a batch of restart.size() samples, the
+                  state of every sample i with restart[i] == true goes back to the initial
+                  vectors, and the state of every other sample is left unchanged. The next
+                  forward() then starts the flagged samples afresh and resumes the others,
+                  provided get_carry_state() is true.
+                - Otherwise nothing changes, since the next forward() starts every sample
+                  from the initial vectors in any case.
+                - A training loop that halts sequences one at a time needs this. The place
+                  of a halted sequence in the batch takes a new example, which must start
+                  from the beginning while the others continue.
         !*/
 
         hrm_(const hrm_& other);
@@ -1143,7 +1162,7 @@ namespace dlib
                   sub.get_gradient_input() via tt::add
                 - If in training mode (network_context::is_training() or context inactive):
                     calls update_subnet_parameters() to update H and L network
-                    parameters via their internal AdamW solvers
+                    parameters via their internal solvers
                 - Memory complexity: O(1) instead of O(N*T) for full BPTT
         !*/
 
@@ -1296,8 +1315,8 @@ namespace dlib
                 increased model capacity without proportional computational cost.
 
                 Both the gate network and the expert networks are managed as internal
-                sub-networks with their own AdamW solvers, following the same pattern
-                as hrm_. They are invisible to the main trainer's solver; their
+                sub-networks with solvers of their own (see subnet_solver), following
+                the same pattern as hrm_. They are invisible to the main trainer's solver; their
                 parameters are updated inside backward() via update_subnet_parameters().
                 The layer itself has no direct trainable parameters (get_layer_params()
                 returns an empty tensor); use internal_parameters() for the total count
@@ -1457,7 +1476,7 @@ namespace dlib
                       gate data gradient NOT propagated to main network)
                 - Phase 3 (if training):
                     * Calls update_subnet_parameters() to update active experts
-                      and gate via internal AdamW solvers
+                      and gate via internal solvers
                     * Decays load_balance_weight toward load_balance_floor_
         !*/
 

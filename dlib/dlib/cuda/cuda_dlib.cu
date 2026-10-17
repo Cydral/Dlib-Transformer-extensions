@@ -1213,6 +1213,68 @@ namespace dlib
                     momentum1, momentum2, params.device(), params_grad.device());
         }
 
+    // ----------------------------------------------------------------------------------------
+
+        __global__ void _cuda_compute_adam_atan2_update(
+            size_t begin,
+            size_t end,
+            float* s,
+            float* m,
+            float* v,
+            const float step,
+            const float inv_sqrt_bias2,
+            const float decay,
+            const float momentum1,
+            const float momentum2,
+            const float* params,
+            const float* params_grad
+        )
+        {
+            for (auto i : grid_stride_range(begin, end))
+            {
+                const float g = params_grad[i];
+                m[i] = momentum1*m[i] + (1-momentum1)*g;
+                v[i] = momentum2*v[i] + (1-momentum2)*g*g;
+                s[i] = -decay*params[i] - step*::atan2f(m[i], ::sqrtf(v[i])*inv_sqrt_bias2);
+            }
+        }
+
+        void compute_adam_atan2_update (
+            size_t begin,
+            size_t end,
+            tensor& s,
+            tensor& m,
+            tensor& v,
+            const float t,
+            const float learning_rate,
+            const float weight_decay,
+            const float momentum1,
+            const float momentum2,
+            const tensor& params,
+            const tensor& params_grad
+        )
+        {
+            DLIB_CASSERT(s.size() == m.size() &&
+                         s.size() == v.size() &&
+                         s.size() == params.size() &&
+                         s.size() == params_grad.size());
+            DLIB_CASSERT(begin <= end && end <= params.size());
+            if (begin == end)
+                return;
+
+            // In double, as on the host: 1 - momentum^t loses its digits in single
+            // precision while momentum^t is close to one.
+            const double bias1 = 1 - std::pow((double)momentum1, (double)t);
+            const double bias2 = 1 - std::pow((double)momentum2, (double)t);
+            const float step = static_cast<float>(learning_rate/bias1);
+            const float inv_sqrt_bias2 = static_cast<float>(1/std::sqrt(bias2));
+            const float decay = learning_rate*weight_decay;
+
+            launch_kernel(_cuda_compute_adam_atan2_update, max_jobs(end-begin),
+                    begin, end, s.device(), m.device(), v.device(), step, inv_sqrt_bias2,
+                    decay, momentum1, momentum2, params.device(), params_grad.device());
+        }
+
     // -----------------------------------------------------------------------------------
 
         __global__ void _cuda_affine_transform_conv(float* d, const float* s, size_t n, const float* A, const float* B, size_t bs, size_t ks)
@@ -4363,6 +4425,383 @@ namespace dlib
             {
                 loss = 0.0;
             }
+        }
+
+    // ----------------------------------------------------------------------------------------
+
+        // The stablemax normalizer; see cpu::stablemax_value() for its definition.
+        __device__ inline double cuda_stablemax_value (double x) { return x >= 0 ? x + 1 : 1 / (1 - x); }
+        __device__ inline double cuda_stablemax_slope (double x) { return x >= 0 ? 1 : 1 / ((1 - x) * (1 - x)); }
+
+        /*
+            The cross-entropy of one position over the first vocab_size channels of row,
+            against the distribution that puts q_target on target_class and q_other
+            elsewhere, its gradient written to grad_row unscaled. Double precision, as the
+            host computes it.
+        */
+        __device__ double cuda_token_cross_entropy (
+            const float* row,
+            float* grad_row,
+            long vocab_size,
+            unsigned long target_class,
+            bool stablemax,
+            double q_target,
+            double q_other
+        )
+        {
+            double loss = 0;
+            if (stablemax)
+            {
+                double sum = 0;
+                for (long c = 0; c < vocab_size; ++c)
+                    sum += cuda_stablemax_value(row[c]);
+                const double inv_sum = 1 / sum;
+                loss = ::log(sum);
+                for (long c = 0; c < vocab_size; ++c)
+                {
+                    const double x = row[c];
+                    const double sx = cuda_stablemax_value(x);
+                    const double q = static_cast<unsigned long>(c) == target_class ? q_target : q_other;
+                    if (q > 0)
+                        loss -= q * ::log(sx);
+                    grad_row[c] = static_cast<float>(cuda_stablemax_slope(x) * (inv_sum - q / sx));
+                }
+            }
+            else
+            {
+                double max_val = row[0];
+                for (long c = 1; c < vocab_size; ++c)
+                    max_val = ::fmax(max_val, (double)row[c]);
+                double sum = 0;
+                for (long c = 0; c < vocab_size; ++c)
+                    sum += ::exp(row[c] - max_val);
+                const double log_sum = max_val + ::log(sum);
+                for (long c = 0; c < vocab_size; ++c)
+                {
+                    const double q = static_cast<unsigned long>(c) == target_class ? q_target : q_other;
+                    if (q > 0)
+                        loss -= q * (row[c] - log_sum);
+                    grad_row[c] = static_cast<float>(::exp(row[c] - log_sum) - q);
+                }
+            }
+            return loss;
+        }
+
+        __global__ void _cuda_stablemax_cross_entropy_token(
+            float* grad,
+            float* position_losses,
+            unsigned long long* valid_mask,
+            const float* out_data,
+            const float* in_data,
+            const unsigned long* truth,
+            long batch_size,
+            long seq_len,
+            long vocab_size,
+            long input_seq_len,
+            const long* ignore_indices,
+            long num_ignore,
+            long pad_index,
+            double smooth_target,
+            double smooth_other
+        )
+        {
+            for (auto idx : grid_stride_range(0, batch_size * seq_len))
+            {
+                const long i = idx / seq_len;
+                const long t = idx % seq_len;
+                const long base = idx * vocab_size;
+                const unsigned long target_class = truth[idx];
+
+                bool skipped = pad_index >= 0 &&
+                    static_cast<long>(in_data[i * input_seq_len + t]) == pad_index;
+                for (long k = 0; k < num_ignore && !skipped; ++k)
+                    skipped = ignore_indices[k] == static_cast<long>(target_class);
+                if (skipped)
+                {
+                    valid_mask[idx] = 0ULL;
+                    position_losses[idx] = 0.0f;
+                    for (long c = 0; c < vocab_size; ++c) grad[base + c] = 0.0f;
+                    continue;
+                }
+
+                valid_mask[idx] = 1ULL;
+                position_losses[idx] = static_cast<float>(cuda_token_cross_entropy(
+                    out_data + base, grad + base, vocab_size, target_class, true,
+                    smooth_target, smooth_other));
+            }
+        }
+
+        void compute_loss_stablemax_cross_entropy_per_token::do_work(
+            cuda_data_void_ptr& buf,
+            const std::vector<unsigned long>& host_truth,
+            const tensor& input_tensor,
+            const tensor& output_tensor,
+            tensor& grad,
+            double& loss,
+            const std::vector<long>& ignore_indices,
+            double label_smoothing,
+            long pad_index
+        )
+        {
+            DLIB_CASSERT(output_tensor.k() == 1);
+            DLIB_CASSERT(input_tensor.k() == 1);
+            DLIB_CASSERT(input_tensor.nc() == 1);
+
+            const long batch_size = output_tensor.num_samples();
+            const long seq_len = output_tensor.nr();
+            const long vocab_size = output_tensor.nc();
+            const long input_seq_len = input_tensor.nr();
+            const size_t num_positions = static_cast<size_t>(batch_size) * seq_len;
+            const long num_ignore = static_cast<long>(ignore_indices.size());
+
+            /* A target beyond the vocabulary would match no channel on the device and be
+               scored as nothing in particular, so it is refused here, as the host refuses
+               it. */
+            for (const unsigned long target : host_truth)
+                DLIB_CASSERT(target < static_cast<unsigned long>(vocab_size) ||
+                    std::find(ignore_indices.begin(), ignore_indices.end(), static_cast<long>(target)) != ignore_indices.end(),
+                    "Target class " << target << " >= vocab_size " << vocab_size);
+
+            const double smooth_target = label_smoothing > 0 ? 1.0 - label_smoothing : 1.0;
+            const double smooth_other = label_smoothing > 0 ? label_smoothing / (vocab_size - 1) : 0.0;
+
+            // The eight-byte areas first, so that every one of them starts on an eight-byte
+            // boundary, and the four-byte areas after them.
+            const size_t truth_off  = 0;
+            const size_t mask_off   = truth_off + num_positions * sizeof(unsigned long);
+            const size_t ignore_off = mask_off + num_positions * sizeof(unsigned long long);
+            const size_t count_off  = ignore_off + num_ignore * sizeof(long);
+            const size_t losses_off = count_off + sizeof(unsigned long long);
+            const size_t total_off  = losses_off + num_positions * sizeof(float);
+            buf = device_global_buffer(total_off + sizeof(float));
+
+            memcpy(buf + truth_off, host_truth.data(), num_positions * sizeof(unsigned long));
+            if (num_ignore > 0)
+                memcpy(buf + ignore_off, ignore_indices.data(), num_ignore * sizeof(long));
+
+            auto truth = static_pointer_cast<const unsigned long>(buf + truth_off, num_positions);
+            auto valid_mask = static_pointer_cast<unsigned long long>(buf + mask_off, num_positions);
+            auto ignore_dev = static_pointer_cast<long>(buf + ignore_off, num_ignore);
+            auto total_valid = static_pointer_cast<unsigned long long>(buf + count_off, 1);
+            auto position_losses = static_pointer_cast<float>(buf + losses_off, num_positions);
+            auto total_loss = static_pointer_cast<float>(buf + total_off, 1);
+
+            CHECK_CUDA(cudaMemsetAsync(total_loss.data(), 0, sizeof(float)));
+            CHECK_CUDA(cudaMemsetAsync(total_valid.data(), 0, sizeof(unsigned long long)));
+
+            launch_kernel(_cuda_stablemax_cross_entropy_token, max_jobs(num_positions),
+                grad.device(), position_losses.data(), valid_mask.data(),
+                output_tensor.device(), input_tensor.device(), truth.data(),
+                batch_size, seq_len, vocab_size, input_seq_len,
+                ignore_dev.data(), num_ignore, pad_index, smooth_target, smooth_other);
+
+            launch_kernel(_cuda_cross_entropy_sum_loss_and_count, max_jobs(num_positions),
+                total_loss.data(), total_valid.data(), position_losses.data(), valid_mask.data(),
+                static_cast<long>(num_positions));
+
+            unsigned long long h_total_valid = 0ULL;
+            CHECK_CUDA(cudaMemcpy(&h_total_valid, total_valid.data(), sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+
+            if (h_total_valid > 0)
+            {
+                const float inv_valid = 1.0f / static_cast<float>(h_total_valid);
+                float h_loss = 0.0f;
+                CHECK_CUDA(cudaMemcpy(&h_loss, total_loss.data(), sizeof(float), cudaMemcpyDeviceToHost));
+                loss = static_cast<double>(h_loss) * inv_valid;
+                launch_kernel(_cuda_cross_entropy_normalize_gradient, max_jobs(grad.size()),
+                    grad.device(), grad.size(), inv_valid);
+            }
+            else
+            {
+                loss = 0.0;
+            }
+        }
+
+    // ----------------------------------------------------------------------------------------
+
+        __global__ void _cuda_halting_token_pass(
+            float* grad,
+            float* position_losses,
+            unsigned char* position_scored,
+            unsigned char* position_right,
+            const float* out_data,
+            const unsigned long* truth,
+            long batch_size,
+            long seq_len,
+            long channels,
+            long halting_position,
+            long ignore_index,
+            int stablemax
+        )
+        {
+            const long vocab_size = channels - 1;
+            for (auto idx : grid_stride_range(0, batch_size * seq_len))
+            {
+                const long t = idx % seq_len;
+                const long base = idx * channels;
+                const unsigned long target_class = truth[idx];
+
+                for (long c = 0; c < channels; ++c) grad[base + c] = 0.0f;
+                position_losses[idx] = 0.0f;
+                position_scored[idx] = 0;
+                position_right[idx] = 0;
+                if (t == halting_position ||
+                    (ignore_index >= 0 && static_cast<long>(target_class) == ignore_index))
+                    continue;
+
+                position_scored[idx] = 1;
+                long best = 0;
+                for (long c = 1; c < vocab_size; ++c)
+                    if (out_data[base + c] > out_data[base + best]) best = c;
+                position_right[idx] = static_cast<unsigned long>(best) == target_class ? 1 : 0;
+
+                position_losses[idx] = static_cast<float>(cuda_token_cross_entropy(
+                    out_data + base, grad + base, vocab_size, target_class, stablemax != 0, 1.0, 0.0));
+            }
+        }
+
+        __global__ void _cuda_halting_sample_pass(
+            float* grad,
+            float* sample_results,
+            float* token_scale,
+            const float* position_losses,
+            const unsigned char* position_scored,
+            const unsigned char* position_right,
+            const float* out_data,
+            long batch_size,
+            long seq_len,
+            long channels,
+            long halting_position,
+            double halting_weight
+        )
+        {
+            for (auto i : grid_stride_range(0, batch_size))
+            {
+                long scored = 0, right = 0;
+                double loss = 0;
+                for (long t = 0; t < seq_len; ++t)
+                {
+                    const size_t idx = i * seq_len + t;
+                    scored += position_scored[idx];
+                    right += position_right[idx];
+                    loss += position_losses[idx];
+                }
+                const long denom = scored > 0 ? scored : 1;
+                const bool is_exact = right == scored;
+
+                const size_t hidx = (i * seq_len + halting_position) * channels + (channels - 1);
+                const double h = out_data[hidx];
+                const double y = is_exact ? 1.0 : 0.0;
+                grad[hidx] = static_cast<float>(halting_weight * (1 / (1 + ::exp(-h)) - y) / batch_size);
+                token_scale[i] = static_cast<float>(1.0 / (static_cast<double>(denom) * batch_size));
+
+                sample_results[5 * i + 0] = static_cast<float>(loss / denom);
+                sample_results[5 * i + 1] = static_cast<float>(::fmax(h, 0.0) - h * y + ::log1p(::exp(-::fabs(h))));
+                sample_results[5 * i + 2] = is_exact ? 1.0f : 0.0f;
+                sample_results[5 * i + 3] = static_cast<float>(h);
+                sample_results[5 * i + 4] = scored > 0 ? static_cast<float>(right) / scored : 1.0f;
+            }
+        }
+
+        __global__ void _cuda_halting_scale_tokens(
+            float* grad,
+            const float* token_scale,
+            long batch_size,
+            long seq_len,
+            long channels
+        )
+        {
+            for (auto idx : grid_stride_range(0, batch_size * seq_len * channels))
+            {
+                // The halting channel carries its own scale, set by the sample pass.
+                if (static_cast<long>(idx % channels) == channels - 1)
+                    continue;
+                grad[idx] *= token_scale[idx / (seq_len * channels)];
+            }
+        }
+
+        void compute_loss_halting_cross_entropy_per_token::do_work(
+            cuda_data_void_ptr& buf,
+            const std::vector<unsigned long>& host_truth,
+            const tensor& output_tensor,
+            tensor& grad,
+            long ignore_index,
+            bool stablemax,
+            long halting_position,
+            double halting_weight,
+            double& token_loss,
+            double& halting_loss,
+            std::vector<float>& halting_logits,
+            std::vector<unsigned char>& exact,
+            std::vector<float>& token_accuracy
+        )
+        {
+            DLIB_CASSERT(output_tensor.k() == 1 && output_tensor.nc() >= 2);
+            DLIB_CASSERT(0 <= halting_position && halting_position < output_tensor.nr());
+
+            const long batch_size = output_tensor.num_samples();
+            const long seq_len = output_tensor.nr();
+            const long channels = output_tensor.nc();
+            const size_t num_positions = static_cast<size_t>(batch_size) * seq_len;
+
+            for (size_t idx = 0; idx < host_truth.size(); ++idx)
+            {
+                const long t = static_cast<long>(idx % seq_len);
+                const unsigned long target = host_truth[idx];
+                DLIB_CASSERT(t == halting_position || target < static_cast<unsigned long>(channels - 1) ||
+                    (ignore_index >= 0 && static_cast<long>(target) == ignore_index),
+                    "Target class " << target << " >= vocab_size " << channels - 1);
+            }
+
+            // Eight-byte targets first, then the four-byte areas, then the bytes.
+            const size_t truth_off   = 0;
+            const size_t losses_off  = truth_off + num_positions * sizeof(unsigned long);
+            const size_t results_off = losses_off + num_positions * sizeof(float);
+            const size_t scale_off   = results_off + 5 * batch_size * sizeof(float);
+            const size_t scored_off  = scale_off + batch_size * sizeof(float);
+            const size_t right_off   = scored_off + num_positions;
+            buf = device_global_buffer(right_off + num_positions);
+
+            memcpy(buf + truth_off, host_truth.data(), num_positions * sizeof(unsigned long));
+            auto truth = static_pointer_cast<const unsigned long>(buf + truth_off, num_positions);
+            auto position_losses = static_pointer_cast<float>(buf + losses_off, num_positions);
+            auto sample_results = static_pointer_cast<float>(buf + results_off, 5 * batch_size);
+            auto token_scale = static_pointer_cast<float>(buf + scale_off, batch_size);
+            auto position_scored = static_pointer_cast<unsigned char>(buf + scored_off, num_positions);
+            auto position_right = static_pointer_cast<unsigned char>(buf + right_off, num_positions);
+
+            launch_kernel(_cuda_halting_token_pass, max_jobs(num_positions),
+                grad.device(), position_losses.data(), position_scored.data(), position_right.data(),
+                output_tensor.device(), truth.data(), batch_size, seq_len, channels,
+                halting_position, ignore_index, stablemax ? 1 : 0);
+
+            launch_kernel(_cuda_halting_sample_pass, max_jobs(batch_size),
+                grad.device(), sample_results.data(), token_scale.data(),
+                position_losses.data(), position_scored.data(), position_right.data(),
+                output_tensor.device(), batch_size, seq_len, channels, halting_position,
+                halting_weight);
+
+            launch_kernel(_cuda_halting_scale_tokens, max_jobs(grad.size()),
+                grad.device(), token_scale.data(), batch_size, seq_len, channels);
+
+            std::vector<float> results(5 * batch_size);
+            memcpy(results, sample_results);
+
+            halting_logits.assign(batch_size, 0.0f);
+            exact.assign(batch_size, 0);
+            token_accuracy.assign(batch_size, 0.0f);
+            token_loss = 0;
+            halting_loss = 0;
+            for (long i = 0; i < batch_size; ++i)
+            {
+                token_loss += results[5 * i + 0];
+                halting_loss += results[5 * i + 1];
+                exact[i] = results[5 * i + 2] > 0.5f ? 1 : 0;
+                halting_logits[i] = results[5 * i + 3];
+                token_accuracy[i] = results[5 * i + 4];
+            }
+            token_loss /= batch_size;
+            halting_loss /= batch_size;
         }
 
     // ----------------------------------------------------------------------------------------

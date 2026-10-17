@@ -343,6 +343,21 @@ namespace dlib
             const tensor& params_grad
         );
 
+        void compute_adam_atan2_update (
+            size_t begin,
+            size_t end,
+            tensor& s,
+            tensor& m,
+            tensor& v,
+            const float t,
+            const float learning_rate,
+            const float weight_decay,
+            const float momentum1,
+            const float momentum2,
+            const tensor& params,
+            const tensor& params_grad
+        );
+
     // -----------------------------------------------------------------------------------
 
         void assign_bias_gradient (
@@ -913,6 +928,128 @@ namespace dlib
                 double label_smoothing,
                 long pad_index,
                 double z_loss_weight
+            );
+            mutable cuda_data_void_ptr buf;
+        };
+
+    // ----------------------------------------------------------------------------------------
+
+        /*
+            Lays the per-position targets out on the host, sample-major, so that a kernel
+            reads the target of position t of sample i as truth[i * seq_len + t].
+        */
+        template <typename const_label_iterator>
+        std::vector<unsigned long> gather_token_targets (
+            const_label_iterator truth,
+            long samples,
+            long seq_len
+        )
+        {
+            std::vector<unsigned long> host_truth(static_cast<size_t>(samples) * static_cast<size_t>(seq_len));
+            for (long i = 0; i < samples; ++i, ++truth)
+            {
+                const auto& labels = *truth;
+                DLIB_CASSERT(labels.nr() == seq_len,
+                    "The label column must have one entry per sequence position: got "
+                    << labels.nr() << " for a sequence of " << seq_len << ".");
+                for (long t = 0; t < seq_len; ++t)
+                    host_truth[static_cast<size_t>(i) * seq_len + t] = labels(t);
+            }
+            return host_truth;
+        }
+
+        class compute_loss_stablemax_cross_entropy_per_token
+        {
+            /*!
+                CUDA computation behind loss_stablemax_cross_entropy_per_token_, with the
+                semantics of cpu::compute_loss_stablemax_cross_entropy_per_token.
+            !*/
+        public:
+            compute_loss_stablemax_cross_entropy_per_token() {}
+
+            template <typename const_label_iterator>
+            void operator() (
+                const_label_iterator truth,
+                const tensor& input_tensor,
+                const tensor& subnetwork_output,
+                tensor& gradient,
+                double& loss,
+                const std::vector<long>& ignore_indices,
+                double label_smoothing,
+                long pad_index
+                ) const
+            {
+                const auto host_truth = gather_token_targets(truth,
+                    subnetwork_output.num_samples(), subnetwork_output.nr());
+                do_work(buf, host_truth, input_tensor, subnetwork_output, gradient, loss,
+                    ignore_indices, label_smoothing, pad_index);
+            }
+
+        private:
+            /* One device buffer carries the targets and every scratch area, so that no
+               second request to the shared buffer can be handed the memory the targets
+               occupy. Holding it across calls also keeps it from being reallocated. */
+            static void do_work(
+                cuda_data_void_ptr& buf,
+                const std::vector<unsigned long>& host_truth,
+                const tensor& input_tensor,
+                const tensor& subnetwork_output,
+                tensor& gradient,
+                double& loss,
+                const std::vector<long>& ignore_indices,
+                double label_smoothing,
+                long pad_index
+            );
+            mutable cuda_data_void_ptr buf;
+        };
+
+        class compute_loss_halting_cross_entropy_per_token
+        {
+            /*!
+                CUDA computation behind loss_halting_cross_entropy_per_token_, with the
+                semantics of cpu::compute_loss_halting_cross_entropy_per_token.
+            !*/
+        public:
+            compute_loss_halting_cross_entropy_per_token() {}
+
+            template <typename const_label_iterator>
+            void operator() (
+                const_label_iterator truth,
+                const tensor& subnetwork_output,
+                tensor& gradient,
+                long ignore_index,
+                bool stablemax,
+                long halting_position,
+                double halting_weight,
+                double& token_loss,
+                double& halting_loss,
+                std::vector<float>& halting_logits,
+                std::vector<unsigned char>& exact,
+                std::vector<float>& token_accuracy
+                ) const
+            {
+                const auto host_truth = gather_token_targets(truth,
+                    subnetwork_output.num_samples(), subnetwork_output.nr());
+                do_work(buf, host_truth, subnetwork_output, gradient, ignore_index, stablemax,
+                    halting_position, halting_weight, token_loss, halting_loss,
+                    halting_logits, exact, token_accuracy);
+            }
+
+        private:
+            static void do_work(
+                cuda_data_void_ptr& buf,
+                const std::vector<unsigned long>& host_truth,
+                const tensor& subnetwork_output,
+                tensor& gradient,
+                long ignore_index,
+                bool stablemax,
+                long halting_position,
+                double halting_weight,
+                double& token_loss,
+                double& halting_loss,
+                std::vector<float>& halting_logits,
+                std::vector<unsigned char>& exact,
+                std::vector<float>& token_accuracy
             );
             mutable cuda_data_void_ptr buf;
         };

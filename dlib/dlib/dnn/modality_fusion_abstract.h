@@ -72,8 +72,9 @@ namespace dlib
 
                 The encoder is driven by hand, as hrm_ and moe_ drive their own
                 subnetworks: back_propagate_error on the batch built during the forward
-                pass, then update_parameters through AdamW solvers fed from
-                network_context. get_layer_params() stays empty, the encoder's weights
+                pass, then update_parameters through solvers of its own (see
+                subnet_solver), which apply the algorithm and settings network_context
+                names. get_layer_params() stays empty, the encoder's weights
                 being its own, which is what keeps an enclosing network's weight import
                 untouched by the presence of this layer.
 
@@ -107,9 +108,9 @@ namespace dlib
         void configure_solvers(double weight_decay, double beta1, double beta2);
         /*!
             ensures
-                - Sets the hyperparameters of the internal AdamW solvers, used when
-                  network_context is not active. The solvers are rebuilt on the next
-                  update.
+                - Sets the hyperparameters of the internal solvers, used with AdamW
+                  when network_context is not active. The solvers are rebuilt on the
+                  next update.
         !*/
 
         ENCODER_NET& get_encoder();
