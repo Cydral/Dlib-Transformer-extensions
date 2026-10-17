@@ -356,16 +356,18 @@ double rate_at (const run_options& o, long step, long total)
 }
 
 /*
-    A checkpoint holds the network, the solvers and the step. The slots are not kept, so a
-    resumed run starts every slot on a new puzzle, which costs the puzzles in flight and
-    nothing else.
+    A checkpoint holds the network, the solvers, the step and the best held-out rate
+    measured so far. The rate lets a resumed run keep the best model it already saved,
+    since its first measurement then replaces that model only by doing better. The slots
+    are not kept, so a resumed run starts every slot on a new puzzle, which costs the
+    puzzles in flight and nothing else.
 
     The network is cleaned first, since a serialized network carries its activations
     otherwise. The next step allocates them again, and the recurrent state the slots carry
     is kept, as cleaning leaves it alone.
 */
 void save_checkpoint (const std::string& file, net_type& net,
-                      const std::vector<adam_atan2>& solvers, long step)
+                      const std::vector<adam_atan2>& solvers, long step, double best)
 {
     net.clean();
     const std::string tmp = file + "_";
@@ -374,6 +376,7 @@ void save_checkpoint (const std::string& file, net_type& net,
         serialize(net, out);
         serialize(solvers, out);
         serialize(step, out);
+        serialize(best, out);
         if (!out)
             throw std::runtime_error("unable to write " + tmp);
     }
@@ -381,7 +384,7 @@ void save_checkpoint (const std::string& file, net_type& net,
 }
 
 bool load_checkpoint (const std::string& file, net_type& net,
-                      std::vector<adam_atan2>& solvers, long& step)
+                      std::vector<adam_atan2>& solvers, long& step, double& best)
 {
     if (!file_exists(file))
         return false;
@@ -389,6 +392,7 @@ bool load_checkpoint (const std::string& file, net_type& net,
     deserialize(net, in);
     deserialize(solvers, in);
     deserialize(step, in);
+    deserialize(best, in);
     return true;
 }
 
@@ -412,10 +416,16 @@ int train (const arc_dataset& train_set, const arc_dataset& test, const run_opti
     std::vector<adam_atan2> solvers(net_type::num_computational_layers,
                                     adam_atan2(o.weight_decay, o.beta1, o.beta2));
     long step = 0;
+    double best_exact = -1;
     const std::string checkpoint = "chkpt-" + o.model_file;
-    const bool resumed = load_checkpoint(checkpoint, net, solvers, step);
+    const bool resumed = load_checkpoint(checkpoint, net, solvers, step, best_exact);
     if (resumed)
-        cout << "Resuming from " << checkpoint << " at step " << step << "\n";
+    {
+        cout << "Resuming from " << checkpoint << " at step " << step;
+        if (best_exact >= 0)
+            cout << ", best held-out rate so far " << 100.0 * best_exact << " %";
+        cout << "\n";
+    }
 
     /* The modules of the recurrence are updated by the layer itself, out of the solvers'
        reach. The context hands it the algorithm, the settings and, every step, the rate,
@@ -458,7 +468,6 @@ int train (const arc_dataset& train_set, const arc_dataset& test, const run_opti
     long   halted = 0, halted_exact = 0, halted_passes = 0, head_right = 0;
     double halted_cells = 0, token_loss = 0, halting_loss = 0;
     long   steps_reported = 0;
-    double best_exact = -1;
     auto last_report = std::chrono::steady_clock::now();
     auto last_save   = std::chrono::steady_clock::now();
 
@@ -546,7 +555,7 @@ int train (const arc_dataset& train_set, const arc_dataset& test, const run_opti
 
         if (std::chrono::steady_clock::now() - last_save > std::chrono::minutes(15))
         {
-            save_checkpoint(checkpoint, net, solvers, step);
+            save_checkpoint(checkpoint, net, solvers, step, best_exact);
             last_save = std::chrono::steady_clock::now();
         }
 
@@ -581,7 +590,7 @@ int train (const arc_dataset& train_set, const arc_dataset& test, const run_opti
         cout << "\n";
     }
 
-    save_checkpoint(checkpoint, net, solvers, step);
+    save_checkpoint(checkpoint, net, solvers, step, best_exact);
     core.set_carry_state(false);
     core.reset_state();
     net.clean();
