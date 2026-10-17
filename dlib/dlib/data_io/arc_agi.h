@@ -1123,7 +1123,7 @@ namespace dlib
                         << "  L_full=" << L_full << "\n";
 
                     long preview_end = std::min(30L, L_in - 1);
-                    print_sequence("input_context (début)", S, 0, preview_end);
+                    print_sequence("input_context (start)", S, 0, preview_end);
 
                     long gs_pos = -1;
                     for (long i = 0; i < L_full; ++i)
@@ -1133,11 +1133,11 @@ namespace dlib
                     {
                         long jct_from = std::max(0L, gs_pos - 5);
                         long jct_to = std::min(L_full - 1, gs_pos + 15);
-                        print_sequence("jonction GEN_START", S, jct_from, jct_to);
+                        print_sequence("around GEN_START", S, jct_from, jct_to);
                     }
 
                     long tail_from = std::max(0L, L_full - 20);
-                    print_sequence("fin de séquence", S, tail_from, L_full - 1);
+                    print_sequence("end of sequence", S, tail_from, L_full - 1);
                 }
 
                 long gen_start_pos = -1;
@@ -1149,7 +1149,7 @@ namespace dlib
                 if (debug)
                     std::cout << "  gen_start_pos=" << gen_start_pos << "\n";
 
-                if (gen_start_pos < 0) { if (debug) std::cout << "  !! GEN_START non trouvé, skip\n"; continue; }
+                if (gen_start_pos < 0) { if (debug) std::cout << "  !! GEN_START not found, skipped\n"; continue; }
 
                 const long first_predict_pos = gen_start_pos + 1;
                 const long last_predict_pos = L_full - 2;
@@ -1165,7 +1165,7 @@ namespace dlib
 
                 if (last_predict_pos < first_predict_pos)
                 {
-                    if (debug) std::cout << "  !! Zone de prédiction vide, skip\n";
+                    if (debug) std::cout << "  !! Empty prediction range, skipped\n";
                     continue;
                 }
 
@@ -1183,14 +1183,14 @@ namespace dlib
 
                 if (debug)
                 {
-                    std::cout << "  Positions candidates: " << candidate_positions.size()
+                    std::cout << "  Candidate positions: " << candidate_positions.size()
                         << " / " << (last_predict_pos - first_predict_pos + 1) << "\n";
 
                     std::map<std::string, int> target_dist;
                     for (long pos : candidate_positions)
                         target_dist[token_to_string(S[pos + 1])]++;
 
-                    std::cout << "  Distribution des cibles:\n";
+                    std::cout << "  Target distribution:\n";
                     for (const auto& kv : target_dist)
                         std::cout << "    " << kv.first << " : " << kv.second << "\n";
                 }
@@ -1246,14 +1246,14 @@ namespace dlib
 
                 if (debug)
                 {
-                    std::cout << "  Samples retenus: " << samples_added
-                        << "  |  Samples rejetés (padding): " << samples_dropped << "\n";
+                    std::cout << "  Samples kept: " << samples_added
+                        << "  |  Samples dropped (padding): " << samples_dropped << "\n";
                 }
             }
 
             if (debug)
             {
-                std::cout << "\n--- Bilan total ---\n";
+                std::cout << "\n--- Totals ---\n";
                 std::cout << "  X.size()=" << training_X_batch.size()
                     << "  Y.size()=" << training_Y_batch.size() << "\n";
 
@@ -1262,7 +1262,7 @@ namespace dlib
                     std::map<std::string, int> global_dist;
                     for (long y : training_Y_batch)
                         global_dist[token_to_string(static_cast<int>(y))]++;
-                    std::cout << "  Distribution globale des cibles:\n";
+                    std::cout << "  Overall target distribution:\n";
                     for (const auto& kv : global_dist)
                         std::cout << "    " << kv.first << " : " << kv.second << "\n";
                 }
