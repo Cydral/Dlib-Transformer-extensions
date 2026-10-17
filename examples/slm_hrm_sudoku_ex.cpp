@@ -248,6 +248,9 @@ struct measurement
     double cells   = 0;
 };
 
+// The longest a run stays silent, during training as during a measurement.
+const auto REPORT_PERIOD = std::chrono::minutes(5);
+
 /*
     Runs test puzzles through the full number of passes from the initial state and scores
     the last answer. A limit reads that many puzzles spread evenly across the split, the
@@ -268,6 +271,8 @@ measurement evaluate (net_type& net, const arc_dataset& test, const run_options&
     std::vector<long> ids;
     resizable_tensor x;
     long cells_right = 0, cells_total = 0;
+    const auto started = std::chrono::steady_clock::now();
+    auto last_line = started;
 
     for (long k = 0; k < n && !signal_handler::is_triggered(); )
     {
@@ -307,6 +312,17 @@ measurement evaluate (net_type& net, const arc_dataset& test, const run_options&
             cells_total += scored;
             ++m.puzzles;
             if (scored > 0 && right == scored) ++m.exact;
+        }
+
+        // A measurement over the whole split runs for hours, so it says where it stands.
+        const auto now = std::chrono::steady_clock::now();
+        if (k < n && now - last_line >= REPORT_PERIOD)
+        {
+            const double elapsed = std::chrono::duration<double>(now - started).count();
+            cout << "  measuring: " << m.puzzles << " of " << n << " puzzles, "
+                 << 100.0 * m.exact / m.puzzles << " % exact so far, "
+                 << (long)(elapsed * (n - m.puzzles) / m.puzzles / 60) << " min left\n" << std::flush;
+            last_line = now;
         }
     }
     core.reset_state();
@@ -501,9 +517,11 @@ int train (const arc_dataset& train_set, const arc_dataset& test, const run_opti
             }
         }
 
-        if (o.report_every > 0 && step % o.report_every == 0)
+        /* A line every report_every steps, and at the latest every few minutes, so that a
+           configuration whose steps are slow still shows its pace early. */
+        const auto now = std::chrono::steady_clock::now();
+        if (o.report_every > 0 && (step % o.report_every == 0 || now - last_report >= REPORT_PERIOD))
         {
-            const auto now = std::chrono::steady_clock::now();
             const double dt = std::chrono::duration<double>(now - last_report).count();
             const double per = dt > 0 ? steps_reported / dt : 0;
             cout << "step " << step << "/" << total_steps
@@ -534,6 +552,7 @@ int train (const arc_dataset& train_set, const arc_dataset& test, const run_opti
 
         if (test.num_examples() > 0 && (step % eval_every == 0 || step == total_steps))
         {
+            const auto measured_at = std::chrono::steady_clock::now();
             const measurement m = evaluate(net, test, o, o.eval_samples);
             report(m, "held out");
             const double rate = m.puzzles ? (double)m.exact / m.puzzles : 0;
@@ -546,8 +565,20 @@ int train (const arc_dataset& train_set, const arc_dataset& test, const run_opti
             }
             // The measurement replaced the carried state, so every slot starts a new puzzle.
             std::fill(slot_restart.begin(), slot_restart.end(), true);
-            last_report = std::chrono::steady_clock::now();
+            // Its time is left out of the training pace the next line reports.
+            last_report += std::chrono::steady_clock::now() - measured_at;
         }
+    }
+
+    /* The memory report describes the extension, so it comes with --verbose only. It is
+       printed before the network is cleaned, while the activations of the last step are
+       still allocated, so that what the device reports free is what a larger budget could
+       still take. */
+    if (o.verbose && extended_memory_enabled())
+    {
+        cout << "\n";
+        print_extended_memory_stats(cout);
+        cout << "\n";
     }
 
     save_checkpoint(checkpoint, net, solvers, step);
@@ -593,9 +624,11 @@ int main(int argc, char** argv)
         parser.add_option("fixed-passes", "No learned halting: every puzzle runs the maximum "
                                           "number of passes, each one supervised");
         parser.add_option("softmax", "Score the cells under softmax, where the reference uses stablemax");
-        parser.add_option("report-every", "Print a line every N steps (default: 100)", 1);
+        parser.add_option("report-every", "Print a line every N steps, and at least every five "
+                                          "minutes (default: 100)", 1);
         parser.add_option("seed", "Seed of the draws (default: 0)", 1);
-        parser.add_option("verbose", "Report what the memory extension is doing");
+        parser.add_option("verbose", "Report what the memory extension is doing, and its figures "
+                                     "when training stops");
         parser.add_option("no-extended-memory", "Do not stream tensors through the device; "
                                                 "every allocation then has to fit at once");
         parser.add_option("vram-budget", "Device memory the extension may use, in MiB", 1);

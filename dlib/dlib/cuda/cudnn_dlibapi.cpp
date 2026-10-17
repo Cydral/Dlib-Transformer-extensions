@@ -8,9 +8,11 @@
 #include "cudnn_dlibapi.h"
 #include "tensor.h"
 #include <cudnn.h>
+#include <algorithm>
 #include <tuple>
 #include <map>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <vector>
 #include "cuda_utils.h"
@@ -1539,6 +1541,16 @@ namespace dlib
 
     // ------------------------------------------------------------------------------------
 
+        /* Rows of the given width one descriptor may hold. A cuDNN descriptor has int
+           dimensions and at most 2^31 elements, so a longer stack of rows is cut into blocks
+           of that size, each holding at least one row. */
+        static size_t max_rows_per_call (
+            size_t cols
+        )
+        {
+            return std::max<size_t>(1, (size_t)std::numeric_limits<int>::max() / cols);
+        }
+
         void softmax(
             tensor& dest,
             const tensor& src,
@@ -1565,29 +1577,30 @@ namespace dlib
             }
             else if (mode == operation_mode::PLANE_WISE)
             {
-                const long num_samples = src.num_samples();
-                const long num_channels = src.k();
-                const size_t plane_size = src.nr() * src.nc();
-
-                for (long s = 0; s < num_samples; ++s)
+                /* Each row of each plane is normalised over its columns, and the planes lie
+                   one after the other, so the whole tensor is a single stack of rows. One
+                   call normalises all of them, each row taken as a sample whose columns are
+                   its channels, where a call per plane would cost the number of samples
+                   times the number of heads in attention. */
+                const float* src_data = src.device();
+                float* dest_data = dest.device();
+                const size_t cols = src.nc();
+                const size_t rows = src.size() / cols;
+                for (size_t first = 0; first < rows; )
                 {
-                    for (long k = 0; k < num_channels; ++k)
-                    {
-                        auto src_slice = src.device() + (s * num_channels + k) * plane_size;
-                        auto dest_slice = dest.device() + (s * num_channels + k) * plane_size;
-                        auto a_src_slice = alias_tensor(src.nr(), src.nc())(src, (s * num_channels + k) * plane_size);
-                        auto a_dest_slice = alias_tensor(dest.nr(), dest.nc())(dest, (s * num_channels + k) * plane_size);
-
-                        CHECK_CUDNN(cudnnSoftmaxForward(context(),
-                            CUDNN_SOFTMAX_ACCURATE,
-                            CUDNN_SOFTMAX_MODE_CHANNEL,
-                            &alpha,
-                            descriptor(a_src_slice),
-                            src_slice,
-                            &beta,
-                            descriptor(a_dest_slice),
-                            dest_slice));
-                    }
+                    const size_t count = std::min(rows - first, max_rows_per_call(cols));
+                    tensor_descriptor block;
+                    block.set_size((int)count, (int)cols, 1, 1);
+                    CHECK_CUDNN(cudnnSoftmaxForward(context(),
+                        CUDNN_SOFTMAX_ACCURATE,
+                        CUDNN_SOFTMAX_MODE_CHANNEL,
+                        &alpha,
+                        descriptor(block),
+                        src_data + first * cols,
+                        &beta,
+                        descriptor(block),
+                        dest_data + first * cols));
+                    first += count;
                 }
             }
         }
@@ -1623,33 +1636,29 @@ namespace dlib
             }
             else if (mode == operation_mode::PLANE_WISE)
             {
-                const long num_samples = dest.num_samples();
-                const long num_channels = dest.k();
-                const size_t plane_size = dest.nr() * dest.nc();
-
-                for (long s = 0; s < num_samples; ++s)
+                // The same stack of rows as the forward pass, in one call.
+                const float* dest_data = dest.device();
+                const float* gi_data = gradient_input.device();
+                float* grad_data = grad.device();
+                const size_t cols = dest.nc();
+                const size_t rows = dest.size() / cols;
+                for (size_t first = 0; first < rows; )
                 {
-                    for (long k = 0; k < num_channels; ++k)
-                    {
-                        auto dest_slice = dest.device() + (s * num_channels + k) * plane_size;
-                        auto gi_slice = gradient_input.device() + (s * num_channels + k) * plane_size;
-                        auto grad_slice = grad.device() + (s * num_channels + k) * plane_size;
-                        auto a_dest_slice = alias_tensor(dest.nr(), dest.nc())(dest, (s * num_channels + k) * plane_size);
-                        auto a_gi_slice = alias_tensor(gradient_input.nr(), gradient_input.nc())(gradient_input, (s * num_channels + k) * plane_size);
-                        auto a_grad_slice = alias_tensor(grad.nr(), grad.nc())(grad, (s * num_channels + k) * plane_size);
-
-                        CHECK_CUDNN(cudnnSoftmaxBackward(context(),
-                            CUDNN_SOFTMAX_ACCURATE,
-                            CUDNN_SOFTMAX_MODE_CHANNEL,
-                            &alpha,
-                            descriptor(a_dest_slice),
-                            dest_slice,
-                            descriptor(a_gi_slice),
-                            gi_slice,
-                            &beta,
-                            descriptor(a_grad_slice),
-                            grad_slice));
-                    }
+                    const size_t count = std::min(rows - first, max_rows_per_call(cols));
+                    tensor_descriptor block;
+                    block.set_size((int)count, (int)cols, 1, 1);
+                    CHECK_CUDNN(cudnnSoftmaxBackward(context(),
+                        CUDNN_SOFTMAX_ACCURATE,
+                        CUDNN_SOFTMAX_MODE_CHANNEL,
+                        &alpha,
+                        descriptor(block),
+                        dest_data + first * cols,
+                        descriptor(block),
+                        gi_data + first * cols,
+                        &beta,
+                        descriptor(block),
+                        grad_data + first * cols));
+                    first += count;
                 }
             }
         }

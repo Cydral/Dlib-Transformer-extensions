@@ -9,6 +9,7 @@
 #include "cuda_utils.h"
 
 #include <cublas_v2.h>
+#include <algorithm>
 #include <vector>
 
 static const char* cublas_get_error_string(cublasStatus_t s)
@@ -203,26 +204,56 @@ namespace dlib
                     dest_cols = dest.k();
                 }
 
-                const size_t lhs_plane_size = lhs_rows * lhs_cols;
-                const size_t rhs_plane_size = rhs_rows * rhs_cols;
-                const size_t dest_plane_size = dest_rows * dest_cols;
+                const long long lhs_plane_size = (long long)(lhs_rows * lhs_cols);
+                const long long rhs_plane_size = (long long)(rhs_rows * rhs_cols);
+                const long long dest_plane_size = (long long)(dest_rows * dest_cols);
+                const long long planes = (long long)num_samples * num_channels;
+                const int k = trans_rhs ? rhs_cols : rhs_rows;
 
-                for (long b = 0; b < num_samples; ++b)
+                /* The pointers are resolved once for the whole product. Each device() call
+                   is an access the memory extension records, so resolving them per plane
+                   would record the same three blocks thousands of times. */
+                const float* lhs_data = lhs.device();
+                const float* rhs_data = rhs.device();
+                float* dest_data = dest.device();
+
+                if (dest_is_matrix && planes > 1)
                 {
-                    for (long c = 0; c < num_channels; ++c)
+                    /* Every plane writes the same matrix and reads what the previous one left
+                       there through beta, so the planes keep their order, one call each. */
+                    for (long long p = 0; p < planes; ++p)
                     {
-                        auto lhs_slice = lhs_is_matrix ? lhs.device() :
-                            lhs.device() + (b * num_channels + c) * lhs_plane_size;
-                        auto rhs_slice = rhs_is_matrix ? rhs.device() :
-                            rhs.device() + (b * num_channels + c) * rhs_plane_size;
-                        auto dest_slice = dest_is_matrix ? dest.device() :
-                            dest.device() + (b * num_channels + c) * dest_plane_size;
-                        const int k = trans_rhs ? rhs_cols : rhs_rows;
-
+                        const float* lhs_slice = lhs_is_matrix ? lhs_data : lhs_data + p * lhs_plane_size;
+                        const float* rhs_slice = rhs_is_matrix ? rhs_data : rhs_data + p * rhs_plane_size;
                         CHECK_CUBLAS(cublasSgemm(
                             context(), transb, transa, dest_cols, dest_rows, k,
                             &alpha, rhs_slice, rhs_cols, lhs_slice, lhs_cols,
-                            &beta, dest_slice, dest_cols
+                            &beta, dest_data, dest_cols
+                        ));
+                    }
+                }
+                else
+                {
+                    /* The planes are independent products at a fixed stride, which a strided
+                       batched call computes in one launch where a loop would issue one per
+                       plane, the number of samples times the number of heads in attention. A
+                       matrix shared by every plane is passed with a stride of zero. Batches
+                       above 65535 planes go in several calls, since some batched kernels index
+                       the batch on the third grid dimension, which stops there. */
+                    const long long lhs_stride = lhs_is_matrix ? 0 : lhs_plane_size;
+                    const long long rhs_stride = rhs_is_matrix ? 0 : rhs_plane_size;
+                    const long long max_batch = 65535;
+                    for (long long first = 0; first < planes; first += max_batch)
+                    {
+                        const int count = (int)std::min(max_batch, planes - first);
+                        CHECK_CUBLAS(cublasSgemmStridedBatched(
+                            context(), transb, transa, dest_cols, dest_rows, k,
+                            &alpha,
+                            rhs_data + first * rhs_stride, rhs_cols, rhs_stride,
+                            lhs_data + first * lhs_stride, lhs_cols, lhs_stride,
+                            &beta,
+                            dest_data + first * dest_plane_size, dest_cols, dest_plane_size,
+                            count
                         ));
                     }
                 }

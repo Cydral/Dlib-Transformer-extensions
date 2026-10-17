@@ -192,7 +192,7 @@ namespace dlib
         /*!
             ensures
                 - #vram_budget == 0
-                - #vram_budget_fraction == 0.9
+                - #vram_budget_fraction == 0.85
                 - #store_path == ""
                 - #store_bytes == 0
                 - #staging_bytes == 64 MiB

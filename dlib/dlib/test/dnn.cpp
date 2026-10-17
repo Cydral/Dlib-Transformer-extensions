@@ -239,7 +239,7 @@ namespace
         cuda_grad.copy_size(input_tensor);
         cuda_grad = 0;
         cuda::softmax(output_tensor, input_tensor, operation_mode::PLANE_WISE);
-        cpu::softmax_gradient(cuda_grad, output_tensor, gradient_input, operation_mode::PLANE_WISE);
+        cuda::softmax_gradient(cuda_grad, output_tensor, gradient_input, operation_mode::PLANE_WISE);
         DLIB_TEST(max(abs(mat(output_tensor) - mat(expected_output))) < 1e-5);
         DLIB_TEST(max(abs(mat(cuda_grad) - mat(cpu_grad))) < 1e-5);
 #endif
@@ -5971,6 +5971,105 @@ void test_multm_prev()
             DLIB_TEST_MSG(max_diff(g1, g2) < 1e-6, "halting gradient differs by " << max_diff(g1, g2));
         }
     }
+
+    void compare_plane_wise_cpu_vs_cuda()
+    {
+        /* The device computes the plane-wise products and softmax in batched calls. They are
+           checked against a host reference over several samples and channels, both
+           transpositions, a nonzero beta, a matrix shared by every plane, and a batch large
+           enough to be split across calls. */
+        print_spinner();
+        dlib::rand rnd(7);
+        auto fill = [&](tensor& t) {
+            float* p = t.host_write_only();
+            for (size_t i = 0; i < t.size(); ++i)
+                p[i] = static_cast<float>(rnd.get_random_gaussian());
+        };
+
+        // One plane on the host, row-major as tensors store it.
+        auto reference = [](const float* lhs, bool tl, const float* rhs, bool tr, float* dest,
+                            long rows, long inner, long cols, float alpha, float beta) {
+            for (long i = 0; i < rows; ++i)
+            {
+                for (long j = 0; j < cols; ++j)
+                {
+                    double sum = 0;
+                    for (long l = 0; l < inner; ++l)
+                    {
+                        const float a = tl ? lhs[l * rows + i] : lhs[i * inner + l];
+                        const float b = tr ? rhs[j * inner + l] : rhs[l * cols + j];
+                        sum += static_cast<double>(a) * b;
+                    }
+                    dest[i * cols + j] = static_cast<float>(alpha * sum + beta * dest[i * cols + j]);
+                }
+            }
+        };
+
+        // shared: 0 when every operand is batched, 1 when lhs is one matrix, 2 when rhs is.
+        auto check_product = [&](long n, long k, long rows, long inner, long cols,
+                                 bool tl, bool tr, int shared, float alpha, float beta) {
+            resizable_tensor lhs, rhs, dest(n, k, rows, cols), expected;
+            if (shared == 1)
+                lhs.set_size(tl ? inner : rows, tl ? rows : inner);
+            else
+                lhs.set_size(n, k, tl ? inner : rows, tl ? rows : inner);
+            if (shared == 2)
+                rhs.set_size(tr ? cols : inner, tr ? inner : cols);
+            else
+                rhs.set_size(n, k, tr ? cols : inner, tr ? inner : cols);
+            fill(lhs);
+            fill(rhs);
+            fill(dest);
+            expected = dest;
+
+            for (long p = 0; p < n * k; ++p)
+                reference(lhs.host() + (shared == 1 ? 0 : p * rows * inner), tl,
+                          rhs.host() + (shared == 2 ? 0 : p * inner * cols), tr,
+                          expected.host() + p * rows * cols, rows, inner, cols, alpha, beta);
+            cuda::gemm(beta, dest, alpha, lhs, tl, rhs, tr, operation_mode::PLANE_WISE);
+
+            const float err = max(abs(mat(dest) - mat(expected)));
+            DLIB_TEST_MSG(err < 1e-4, "plane-wise product of " << n << "x" << k << " planes, transposed "
+                          << tl << tr << ", shared " << shared << ", beta " << beta << ": error " << err);
+        };
+
+        for (int t = 0; t < 4; ++t)
+        {
+            const bool tl = (t & 1) != 0, tr = (t & 2) != 0;
+            for (int shared = 0; shared < 3; ++shared)
+                check_product(3, 4, 5, 6, 7, tl, tr, shared, 1.5f, 0.5f);
+            check_product(3, 4, 5, 6, 7, tl, tr, 0, 1.0f, 0.0f);
+        }
+        check_product(70000, 1, 2, 2, 2, false, false, 0, 1.0f, 0.5f);
+
+        resizable_tensor src(3, 4, 5, 7), out_cpu, out_cuda;
+        fill(src);
+        out_cpu.copy_size(src);
+        out_cuda.copy_size(src);
+        cpu::softmax(out_cpu, src, operation_mode::PLANE_WISE);
+        cuda::softmax(out_cuda, src, operation_mode::PLANE_WISE);
+        DLIB_TEST_MSG(max(abs(mat(out_cpu) - mat(out_cuda))) < 1e-6,
+                      "plane-wise softmax differs by " << max(abs(mat(out_cpu) - mat(out_cuda))));
+
+        // Into a separate gradient the result accumulates; in place it replaces the input.
+        resizable_tensor gi, g_cpu, g_cuda;
+        gi.copy_size(src);
+        g_cpu.copy_size(src);
+        fill(gi);
+        fill(g_cpu);
+        g_cuda = g_cpu;
+        cpu::softmax_gradient(g_cpu, out_cpu, gi, operation_mode::PLANE_WISE);
+        cuda::softmax_gradient(g_cuda, out_cpu, gi, operation_mode::PLANE_WISE);
+        DLIB_TEST_MSG(max(abs(mat(g_cpu) - mat(g_cuda))) < 1e-5,
+                      "plane-wise softmax gradient differs by " << max(abs(mat(g_cpu) - mat(g_cuda))));
+
+        resizable_tensor in_place_cpu(gi), in_place_cuda(gi);
+        cpu::softmax_gradient(in_place_cpu, out_cpu, in_place_cpu, operation_mode::PLANE_WISE);
+        cuda::softmax_gradient(in_place_cuda, out_cpu, in_place_cuda, operation_mode::PLANE_WISE);
+        DLIB_TEST_MSG(max(abs(mat(in_place_cpu) - mat(in_place_cuda))) < 1e-5,
+                      "in-place plane-wise softmax gradient differs by "
+                      << max(abs(mat(in_place_cpu) - mat(in_place_cuda))));
+    }
 #endif
 
 // ----------------------------------------------------------------------------------------
@@ -6205,6 +6304,7 @@ void test_multm_prev()
 #ifdef DLIB_USE_CUDA
             compare_adam_atan2();
             compare_token_losses_cpu_vs_cuda();
+            compare_plane_wise_cpu_vs_cuda();
 #endif
         }
 
