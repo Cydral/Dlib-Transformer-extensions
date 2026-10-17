@@ -82,7 +82,15 @@ namespace dlib
             // the GPU.  So unless you seem to be actively working with the host side's
             // data then we do this initialization on the device side since this avoids a
             // host to device transfer that would likely immediately follow.
-            if (data().device_ready())
+            /* Under the memory extension a new block has no device buffer until its first
+               device access, so device_ready() is false for it, and the host branch would
+               write the value through the host copy and send the whole block across the bus
+               on its next use. A tensor that spans its whole block and whose host copy is not
+               current holds nothing the assignment has to keep, so it is set on the device as
+               well. Without the extension a host copy that is not current means the device
+               copy is ready, so the added test never changes the branch taken. */
+            const gpu_data& g = data();
+            if (g.device_ready() || (!g.host_ready() && size() == g.size()))
             {
                 cuda::set_tensor(*this, val);
                 return *this;
