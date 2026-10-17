@@ -321,9 +321,8 @@ namespace xmem
             A free list per size and a cursor that only ever advances is enough while the
             sizes repeat, and wrong as soon as they vary: space freed by a block of one size
             can never serve a request of another, so the cursor marches to the end of the
-            arena while most of it sits in lists nobody asks for. The capacity then has to
-            cover the variety of sizes rather than the working set, which is how a store of
-            ten gigabytes reported itself full holding six.
+            arena while most of it sits in lists that are never asked for. The capacity then
+            has to cover the variety of sizes rather than the working set.
 
             A free slot at least as large as the request is therefore accepted, the smallest
             such, and up to twice the request so the waste stays bounded. The caller keeps
@@ -451,8 +450,6 @@ namespace xmem
                 std::cerr << "\n";
             }
         }
-
-
 
         static std::size_t round_up (std::size_t bytes)
         {
@@ -657,13 +654,12 @@ namespace xmem
         transfer_engine& operator=(const transfer_engine&) = delete;
 
         /*
-            Chunk size for one transfer. Sizing it off the staging buffer rather than off
-            the block was a mistake worth naming: a block smaller than a staging half then
-            moves as a single chunk, the memcpy and the DMA run one after the other, and the
-            pipeline this class exists for never engages. Most blocks in a decoder are a few
-            megabytes, so that was most of them. Four chunks is enough to hide the copy
-            behind the transfer, and a floor of two megabytes keeps the per-chunk event from
-            costing more than the chunk carries.
+            Chunk size for one transfer, taken from the block. Taken from the staging buffer,
+            a block smaller than a staging half would move as a single chunk, the memcpy and
+            the DMA would run one after the other, and the pipeline this class exists for
+            would never engage. Four chunks are enough to hide the copy behind the transfer,
+            and a floor of two megabytes keeps the per-chunk event from costing more than the
+            chunk carries.
         */
         std::size_t chunk_for (std::size_t bytes) const
         {
@@ -700,11 +696,11 @@ namespace xmem
             synchronize_stream(stream);
         }
 
-        // Device to host. Lagged by one chunk so the copy out of the staging half runs
-        // while the next chunk is still being fetched.
         /*
-            Device to host, optionally writing only the chunks that differ from what the
-            destination already holds. Returns true when anything was written.
+            Device to host, lagged by one chunk so the copy out of the staging half runs
+            while the next chunk is still being fetched, and optionally writing only the
+            chunks that differ from what the destination already holds. Returns true when
+            anything was written.
         */
         bool from_device (void* dst_host, const void* src_dev, std::size_t bytes,
                           bool only_if_different = false)
@@ -989,6 +985,15 @@ namespace xmem
 
             std::lock_guard<std::mutex> lk(mu);
 
+            /* The owner's flags are set here, under the lock that publishes the record.
+               Once the record is in by_id the observation thread may act on it, and set_size()
+               writing them after this call returned could overwrite what that thread had just
+               done: a device buffer installed and declared current, then declared stale again
+               with no host copy behind it, which is the state a later copy_to_device() cannot
+               recover from. Neither buffer exists yet, so neither copy holds anything. */
+            owner->device_current = false;
+            owner->host_current   = owner->data_host != nullptr;
+
             block_record* r = new block_record();
             r->owner     = owner;
             r->bytes     = bytes;
@@ -1054,13 +1059,13 @@ namespace xmem
                a buffer could not be recycled under a kernel that was still reading it. The
                pool does not synchronize, so a tensor destroyed while its last kernel is in
                flight would hand a live buffer straight to the next allocation. One
-               synchronization clears the flag on every block at once, so tearing down a
-               network costs one and not one per tensor.
+               synchronization clears the flag on every block outside the hot window, so
+               tearing down a network costs a handful and not one per tensor.
 
                Failures are swallowed: this also runs during static destruction, where the
                CUDA runtime may already be gone, and throwing out of a destructor would end
                the process over something that no longer protects anything. */
-            if (r->owner && r->owner->device_in_use &&
+            if (r->owner && r->owner->device_in_use.load(std::memory_order_relaxed) &&
                 r->state.load(std::memory_order_relaxed) == tier_device)
             {
                 try
@@ -1094,11 +1099,6 @@ namespace xmem
         void lock_registry ()   { mu.lock(); }
         void unlock_registry () { mu.unlock(); }
 
-        bool store_backed (std::size_t bytes) const
-        {
-            return arena != nullptr && bytes >= opt.min_block_bytes;
-        }
-
         /*
             Workspaces are the one part of dlib's device memory that never passes through
             gpu_data. Left outside, they do not merely go unaccounted: a cuDNN workspace can
@@ -1108,24 +1108,30 @@ namespace xmem
         */
         std::shared_ptr<void> acquire_scratch (std::size_t bytes)
         {
-            std::shared_ptr<float> block;
+            float* p = nullptr;
             {
                 std::lock_guard<std::mutex> lk(mu);
-                block = acquire_locked(bytes, true);
+                p = allocate_locked(bytes, true);
             }
             scratch_bytes.fetch_add(bytes, std::memory_order_relaxed);
 
-            /* The deleter carries the block itself, so releasing the void pointer returns
-               the memory to the pool, and it touches only an atomic, so it is safe to run
-               from a destructor while any lock is held. */
+            /* A released workspace is returned to the driver directly. Its owner releases
+               it as soon as the next call needs a larger one, possibly while the kernel that
+               used it still runs, and a workspace carries no in-use flag such as
+               device_in_use. Back in the pool, it could become the destination of a restore
+               on the transfer stream, which does not wait for the compute stream, while that
+               kernel still writes it. cudaFree waits for the device first, as stock dlib
+               relied on. */
             return std::shared_ptr<void>(
-                (void*)block.get(),
-                [block, bytes](void*) mutable
+                (void*)p,
+                [bytes](void* q)
                 {
                     manager* m = manager::singleton();
                     if (m)
                         m->scratch_bytes.fetch_sub(bytes, std::memory_order_relaxed);
-                    block.reset();
+                    const cudaError_t err = cudaFree(q);
+                    if (err != cudaSuccess)
+                        std::cerr << "cudaFree() failed. Reason: " << cudaGetErrorString(err) << std::endl;
                 });
         }
 
@@ -1138,7 +1144,82 @@ namespace xmem
         {
             std::unique_lock<std::mutex> lk(mu);
             wait_out_transit(lk, r);
+            restore_device_locked(r, need_content, true);
+        }
 
+        /*
+            Brings the device copy of a block up to date with its host copy, which is what
+            async_copy_to_device() and copy_to_device() amount to for a managed block.
+
+            The work is done under the lock, flags included, because the caller need not be
+            the thread computing. dnn_trainer fills the next batch and calls this from the
+            thread that called train_one_step() while the step runs on its own thread, and
+            that step may evict the batch at any moment; a flag written outside the lock on
+            one side would be overwritten by the other. The copy completes before the lock is
+            released for the same reason, so no transfer of a managed block is ever left in
+            flight on its owner's stream for an eviction to reason about.
+
+            A caller that may not evict, which is every caller of async_copy_to_device(),
+            brings the block onto the device only into headroom, and otherwise leaves it
+            where it is for the computing thread to restore on first use. Evicting from here
+            would move blocks the computing thread is using, whose accessors write their
+            flags without the lock: that is sound only while the computing thread is the one
+            moving its blocks.
+        */
+        void refresh_device (block_record* r, bool may_evict)
+        {
+            std::unique_lock<std::mutex> lk(mu);
+            wait_out_transit(lk, r);
+
+            gpu_data& g = *r->owner;
+
+            if (r->state.load(std::memory_order_relaxed) != tier_device || !g.data_device)
+            {
+                if (!may_evict && resident_locked() + r->bytes > vram_budget)
+                    return;
+                try
+                {
+                    restore_device_locked(r, true, may_evict);
+                }
+                catch (...)
+                {
+                    if (may_evict)
+                        throw;
+                    return;
+                }
+            }
+
+            if (g.device_current)
+                return;
+
+            /* A device copy is only ever stale because the host copy moved ahead of it, so
+               there is a host copy to refresh it from. */
+            DLIB_CASSERT(g.data_host, "extended memory: a device copy is stale with no host copy to refresh it from");
+
+            if (g.device_in_use.load(std::memory_order_relaxed))
+            {
+                // Kernels queued on the block may still read what is about to be replaced.
+                synchronize_stream(0);
+                g.device_in_use.store(false, std::memory_order_relaxed);
+            }
+            g.wait_for_transfer_to_finish();
+
+            if (r->slot >= 0)
+            {
+                // The host copy is the window, pageable memory: through the staging buffer.
+                std::lock_guard<std::mutex> sg(engine->mu);
+                engine->to_device(g.data_device.get(), g.data_host.get(), r->bytes);
+            }
+            else
+            {
+                CHECK_CUDA(cudaMemcpy(g.data_device.get(), g.data_host.get(), r->bytes,
+                                      cudaMemcpyHostToDevice));
+            }
+            g.device_current = true;
+        }
+
+        void restore_device_locked (block_record* r, bool need_content, bool allow_evict)
+        {
             gpu_data& g = *r->owner;
 
             if (r->state.load(std::memory_order_relaxed) == tier_device && g.data_device)
@@ -1150,7 +1231,7 @@ namespace xmem
             std::shared_ptr<float> buf;
             try
             {
-                buf = acquire_locked(r->bytes, true);
+                buf = acquire_locked(r->bytes, allow_evict);
             }
             catch (...)
             {
@@ -1171,9 +1252,9 @@ namespace xmem
             {
                 if (from == tier_host)
                 {
-                    /* The pinned mirror is current, so the transfer is left to gpu_data
-                       itself: the accessor that called us runs copy_to_device() next, on
-                       its own stream and with its own completion bookkeeping. */
+                    /* The pinned mirror is current, and the device copy is left stale for
+                       refresh_device() to fill: the accessor that called us goes through it
+                       next, or it is the caller. */
                     if (!need_content)
                     {
                         g.device_current = true;
@@ -1182,19 +1263,9 @@ namespace xmem
                 }
                 else
                 {
-                    /* store_valid is the only thing that may gate this read.
-
-                       An attempt to gate it on the block having been saved through the
-                       eviction path as well removed three hundred gigabytes of transfers
-                       and cost four points of training loss over two hundred steps: a
-                       block whose host copy is a window onto the mapping receives its
-                       content when the program writes through that window, which the
-                       eviction path never sees. Withholding the restore then loses the
-                       content silently.
-
-                       The wasteful case is real and the counters below still measure it:
-                       a slot reserved at allocation is read before anything fills it. The
-                       remedy belongs where the flag is set, not here. */
+                    /* store_valid says the slot holds the block's content; a current
+                       window says the same for a block written through the mapping, which
+                       the eviction path never sees and which no other flag records. */
                     const bool have = r->slot >= 0 &&
                                   (r->store_valid.load(std::memory_order_relaxed) ||
                                    (g.data_host && g.host_current));
@@ -1218,18 +1289,19 @@ namespace xmem
             }
 
             r->state.store(tier_device, std::memory_order_release);
+            r->evicted = false;
             unpin_block(r);
             ++restores;
-
-            /* Where the block came from, and whether it had ever been written. A restore
-               of a block that was never saved is a transfer of nothing: it happens when a
-               buffer is created straight into the store tier and then read on the device
-               before anything has put content there. Counting the two apart is the only
-               way to tell a manager doing its job from one moving empty bytes. */
-            if (from == tier_store) ++restores_from_store; else ++restores_from_host;
-            if (!r->ever_saved)     ++restores_of_unsaved;
         }
 
+        /*
+            Everything a host accessor does to a managed block: the host buffer, the copy
+            back when the device is ahead, and the flags. The accessor returns data_host
+            straight after and writes nothing itself, so the flags of a managed block only
+            ever change under the lock on this side. The thread filling a tensor here is
+            often not the one computing, and the computing thread may evict the same block
+            at any moment.
+        */
         void before_host (block_record* r, bool need_content, bool writes)
         {
             r->stamp.store(g::clock.fetch_add(1, std::memory_order_relaxed), std::memory_order_relaxed);
@@ -1238,28 +1310,16 @@ namespace xmem
             wait_out_transit(lk, r);
 
             gpu_data& g = *r->owner;
-
-            /* A host access that finds the device ahead forces the block back over the bus,
-               and the non-const overload then marks the device copy stale so the next kernel
-               pushes it up again. That round trip is invisible from outside and no amount of
-               residency management can remove it, so the only useful thing to do is count it:
-               a program moving tensors through host memory between kernels shows up here as
-               a large number, and nowhere else. */
-            if (!g.host_current && g.data_device)
-            {
-                ++host_pulls;
-                host_pull_bytes += r->bytes;
-            }
+            const unsigned char st = r->state.load(std::memory_order_relaxed);
 
             if (r->slot >= 0)
             {
                 /* The host copy of this block is the mapping, so there is nothing to
-                   allocate and nothing to transfer: install the window once and every later
-                   host access is free. */
+                   allocate: install the window once and every later host access is free. */
                 if (!g.data_host)
                     install_store_window_locked(g, r);
 
-                if (r->state.load(std::memory_order_relaxed) == tier_store)
+                if (st == tier_store)
                 {
                     /* Nothing on the device, so the mapping is by definition current. A
                        block that has never been written reads as whatever the sparse file
@@ -1267,34 +1327,72 @@ namespace xmem
                     g.host_current = true;
                     r->store_valid.store(true, std::memory_order_relaxed);
                 }
-                /* A write through the window changes the store behind the device's back, so
-                   the fingerprint recorded for it stops describing anything. */
-                if (writes)
-                    r->hash_valid = false;
-                /* When the device is ahead it is copy_to_host() that brings the window up to
-                   date, on the way out of this call. Claiming here that the mapping is
-                   current would be a promise about a copy that has not happened and might
-                   still fail, and a block whose write back was then skipped on that promise
-                   would be silently wrong. host_current says the same thing afterwards, and
-                   says it only once it is true. */
-                (void)need_content;
-                (void)writes;
-                return;
             }
-
-            if (g.data_host)
-                return;
-
-            if (!allocate_pinned_mirror_locked(g, r))
-                throw std::bad_alloc();
-            if (r->state.load(std::memory_order_relaxed) == tier_device)
-                g.host_current = false;         // copy_to_host() picks it up on return
-            else
+            else if (!g.data_host)
             {
-                g.host_current   = true;
-                g.device_current = false;
-                r->state.store(tier_host, std::memory_order_release);
+                if (!allocate_pinned_mirror_locked(g, r))
+                    throw std::bad_alloc();
+                if (st == tier_device)
+                    g.host_current = false;
+                else
+                {
+                    g.host_current   = true;
+                    g.device_current = false;
+                    r->state.store(tier_host, std::memory_order_release);
+                }
             }
+
+            if (!need_content)
+                g.host_current = true;
+            else if (!g.host_current)
+                device_to_host_locked(r, g);
+
+            if (writes)
+            {
+                g.device_current = false;
+                /* The observation thread brings back only blocks that left the device
+                   current. A block written here may still be under that write when it is
+                   evicted, and a prefetch would copy half of it and declare it current. */
+                r->evicted = false;
+                // A write through the window changes the store: the fingerprint is stale.
+                if (r->slot >= 0)
+                    r->hash_valid = false;
+            }
+        }
+
+        /*
+            The device copy of a block brought back to its host buffer. For a block in the
+            store that buffer is the window, so the copy rewrites the slot, and the
+            fingerprint recorded for the slot no longer describes it: left valid, an eviction
+            whose device copy happened to match the older content would skip the write and
+            leave the newer content in place of the device's.
+        */
+        void device_to_host_locked (block_record* r, gpu_data& g)
+        {
+            if (!g.data_device)
+            {
+                // Nothing on the device: the block has no content anywhere yet.
+                g.host_current = true;
+                return;
+            }
+
+            /* A host access that finds the device ahead forces the block back over the bus,
+               and the non-const overload then marks the device copy stale so the next kernel
+               pushes it up again. That round trip is invisible from outside and no amount of
+               residency management can remove it, so the only useful thing to do is count it:
+               a program moving tensors through host memory between kernels shows up here as
+               a large number, and nowhere else. */
+            ++host_pulls;
+            host_pull_bytes += r->bytes;
+
+            g.wait_for_transfer_to_finish();
+            CHECK_CUDA(cudaMemcpy(g.data_host.get(), g.data_device.get(), r->bytes,
+                                  cudaMemcpyDeviceToHost));
+            g.host_current = true;
+            // cudaMemcpy has waited for every kernel queued before it.
+            g.device_in_use.store(false, std::memory_order_relaxed);
+            if (r->slot >= 0)
+                r->hash_valid = false;
         }
 
         // ----------------------------------------------------------------------- stats
@@ -1314,10 +1412,6 @@ namespace xmem
             s.managed_blocks    = managed_blocks;
             s.evictions         = evictions;
             s.restores          = restores;
-            s.restores_from_store = restores_from_store;
-            s.restores_from_host  = restores_from_host;
-            s.restores_of_unsaved = restores_of_unsaved;
-            s.orphaned_refreshes  = (std::size_t)xmem::g::orphaned_refreshes.load(std::memory_order_relaxed);
             s.prefetch_hits     = prefetch_hits;
             s.prefetch_issued   = prefetch_issued;
             s.store_writes      = store_writes;
@@ -1336,21 +1430,6 @@ namespace xmem
             s.hash_threshold    = fingerprint_threshold();
             s.hash_count        = hash_count;
 
-            /* How the trace is fed. A period search reads one sequence, so a trace shared
-               by several threads is the interleaving of theirs and may have no period even
-               when each of them repeats exactly. */
-            std::uint64_t total = 0, busiest = 0;
-            unsigned threads = 0;
-            for (unsigned i = 0; i < xmem::max_traced_threads; ++i)
-            {
-                const std::uint64_t h = xmem::g::thread_hits[i].load(std::memory_order_relaxed);
-                if (h == 0) continue;
-                ++threads;
-                total += h;
-                busiest = std::max(busiest, h);
-            }
-            s.trace_threads = threads;
-            s.trace_busiest = total > 0 ? 100.0 * (double)busiest / (double)total : 0.0;
             s.sync_seconds      = sync_seconds;
             s.sync_count        = sync_count;
             s.wait_seconds      = wait_seconds;
@@ -1372,6 +1451,9 @@ namespace xmem
             return s;
         }
 
+        std::size_t store_capacity () const { return arena ? arena->capacity() : 0; }
+        long store_throughput_mib_per_s () const { return arena ? arena->throughput_mib_per_s() : 0; }
+
         /*
             Sizes and tiers of the managed blocks, largest first, with how many times each
             appears in the detected cycle. The subsystem does not know what a block is called,
@@ -1379,9 +1461,6 @@ namespace xmem
             in a topology, and they are the only place a graph's real footprint can be seen
             once the layers have stopped agreeing with the arithmetic on paper.
         */
-        std::size_t store_capacity () const { return arena ? arena->capacity() : 0; }
-        long store_throughput_mib_per_s () const { return arena ? arena->throughput_mib_per_s() : 0; }
-
         void report_blocks (std::ostream& out, std::size_t max_rows) const
         {
             std::lock_guard<std::mutex> lk(mu);
@@ -1435,7 +1514,15 @@ namespace xmem
 
         // ------------------------------------------------------------------- allocation
 
+        // A device buffer for a block, returned to the pool when the block lets go of it.
         std::shared_ptr<float> acquire_locked (std::size_t bytes, bool allow_evict)
+        {
+            float* p = allocate_locked(bytes, allow_evict);
+            std::shared_ptr<device_pool> keep = pool;
+            return std::shared_ptr<float>(p, [keep, bytes](float* q) { keep->release(q, bytes); });
+        }
+
+        float* allocate_locked (std::size_t bytes, bool allow_evict)
         {
             quiesced = false;
 
@@ -1467,13 +1554,11 @@ namespace xmem
                 }
             }
 
-            std::shared_ptr<device_pool> keep = pool;
             for (int attempt = 0; ; ++attempt)
             {
                 try
                 {
-                    float* p = keep->allocate(bytes);
-                    return std::shared_ptr<float>(p, [keep, bytes](float* q) { keep->release(q, bytes); });
+                    return pool->allocate(bytes);
                 }
                 catch (cuda_error&)
                 {
@@ -1484,7 +1569,7 @@ namespace xmem
                     bool freed = false;
                     while (evict_one_locked())
                         freed = true;
-                    keep->trim();
+                    pool->trim();
                     if (!freed)
                         report_placement_failure(bytes);
                 }
@@ -1593,9 +1678,6 @@ namespace xmem
             sits. Both terms are already counted here, so the threshold is read off them
             rather than chosen, and until there is enough to read it defaults to the size
             below which a block is not evicted at all.
-
-            Guessing it once cost a run twice the traffic it needed, which is the argument
-            for not guessing it again.
         */
         std::size_t fingerprint_threshold () const
         {
@@ -1615,12 +1697,12 @@ namespace xmem
             return (std::size_t)breakeven;
         }
 
-        // Everything the budget has to cover: managed blocks plus workspaces.
         /*
-            What the card has given out, which is what the budget is for. Live blocks are
-            only part of it: a buffer released into the pool is still allocated as far as
-            the driver is concerned, and counting only the live ones lets a run whose block
-            sizes vary, as training does, drift far above the figure its caller set.
+            What the card has given out, which is what the budget is for: managed blocks,
+            workspaces and the pool. A buffer released into the pool is still allocated as
+            far as the driver is concerned, and counting only the live ones would let a run
+            whose block sizes vary, as training does, drift far above the figure its caller
+            set.
         */
         std::size_t resident_locked () const
         {
@@ -1643,10 +1725,18 @@ namespace xmem
             sync_seconds += std::chrono::duration<double>(
                                 std::chrono::steady_clock::now() - t0).count();
             ++sync_count;
+
+            /* Every kernel launched so far has finished, so the flag can come off every
+               block whose pointer is no longer live. A block in the hot window may still have
+               a kernel to come, launched after this point with a pointer taken before it, and
+               keeps the flag: cleared, it would let the block's buffer go back to the pool
+               while that kernel runs. */
+            std::unordered_set<std::uint32_t> hot;
+            collect_hot_locked(hot);
             for (block_record* r : by_id)
             {
-                if (r && r->owner)
-                    r->owner->device_in_use = false;
+                if (r && r->owner && !hot.count(r->id))
+                    r->owner->device_in_use.store(false, std::memory_order_relaxed);
             }
             quiesced = true;
         }
@@ -1658,7 +1748,7 @@ namespace xmem
             const std::uint64_t n    = std::min<std::uint64_t>(
                                            head, std::min<std::uint64_t>(opt.hot_window, g::hot_mask + 1));
             for (std::uint64_t i = 0; i < n; ++i)
-                hot.insert(g::hot_ring[(head - 1 - i) & g::hot_mask]);
+                hot.insert(g::hot_ring[(head - 1 - i) & g::hot_mask].load(std::memory_order_relaxed));
         }
 
         block_record* choose_victim_locked ()
@@ -1707,13 +1797,13 @@ namespace xmem
             quiesce_locked();
             g.wait_for_transfer_to_finish();
 
+            /* Whether the device held the current copy as the block left. If it did not,
+               the block was written on the host after its last use on the device, maybe by a
+               thread still writing, and the observation thread must not bring it back. */
+            const bool left_current = g.device_current;
+
             if (r->slot >= 0)
             {
-                /* The window is the mapping, so a current host copy is a current store
-                   copy. Both flags have to be consulted: store_valid covers blocks the
-                   program has never read on the host, host_current covers those it has, and
-                   the second is the one that is only set once the copy behind it really
-                   happened. */
                 /* The window is the mapping, so a current host copy is a current store
                    copy. Both flags have to be consulted: store_valid covers blocks the
                    program has never read on the host, host_current covers those it has, and
@@ -1735,8 +1825,8 @@ namespace xmem
                    block holds, while transferring it costs its size divided by the link.
                    Below a few megabytes the transfer is cheaper than the enquiry, and
                    asking anyway turns a saving into a tax: a run whose evictions are mostly
-                   small activations spends a tenth of itself hashing blocks it would have
-                   been quicker to move. */
+                   small activations then spends much of its time hashing blocks it would
+                   have been quicker to move. */
                 unsigned long long hx = 0, ha = 0;
                 bool hashed = false;
                 if (!store_current && opt.fingerprint && r->slot_written &&
@@ -1826,7 +1916,8 @@ namespace xmem
 
             g.data_device.reset();
             g.device_current = false;
-            g.device_in_use  = false;
+            g.device_in_use.store(false, std::memory_order_relaxed);
+            r->evicted = left_current;
             device_bytes -= std::min(device_bytes, r->bytes);
             ++evictions;
             return true;
@@ -1883,7 +1974,6 @@ namespace xmem
                     std::cerr << "cudaFreeHost() failed. Reason: " << cudaGetErrorString(e) << std::endl;
             });
             pinned_bytes += r->bytes;
-            r->ever_saved = true;
             return true;
         }
 
@@ -1935,7 +2025,6 @@ namespace xmem
 
             const bool compare = r->slot_written && r->store_diffs < 2;
             const auto t0 = std::chrono::steady_clock::now();
-            r->ever_saved = true;
             const bool wrote = engine->from_device(arena->base() + r->slot, g.data_device.get(),
                                                    r->bytes, compare);
             wait_seconds += std::chrono::duration<double>(
@@ -2129,7 +2218,7 @@ namespace xmem
                     const std::size_t c = (anchor_pos + (std::size_t)((head - 1 - anchor_head) % P)) % P;
                     cursor.store(c, std::memory_order_relaxed);
 
-                    if (g::trace_ring[(head - 1) & g::trace_mask] != plan->cycle[c])
+                    if (g::trace_ring[(head - 1) & g::trace_mask].load(std::memory_order_relaxed) != plan->cycle[c])
                     {
                         if (++drift >= 8)
                         {
@@ -2137,13 +2226,12 @@ namespace xmem
                             drift = 0;
 
                             /* A sequence that is periodic between two decisions and not
-                               across them will be found and lost over and over: on one run
-                               the same period of 11266 accesses was adopted 467 times, each
-                               adoption preceded by a full search over the window. Backing
-                               off after a few losses turns that into a handful of searches
-                               and leaves the eviction policy where it already was. The
-                               count is not reset by a later success, so a run that never
-                               settles stops paying for the attempt. */
+                               across them is found and lost over and over, each adoption
+                               preceded by a full search over the window. Backing off after
+                               a few losses turns that into a handful of searches and leaves
+                               the eviction policy where it already was. The count is not
+                               reset by a later success, so a run that never settles stops
+                               paying for the attempt. */
                             if (++losses >= 4)
                                 search_after = g::clock.load(std::memory_order_relaxed)
                                              + (std::uint64_t)losses * 200000;
@@ -2171,7 +2259,7 @@ namespace xmem
             const std::size_t L = (std::size_t)std::min<std::uint64_t>(head, trace_capacity);
             snapshot.resize(L);
             for (std::size_t i = 0; i < L; ++i)
-                snapshot[i] = g::trace_ring[(head - L + i) & g::trace_mask];
+                snapshot[i] = g::trace_ring[(head - L + i) & g::trace_mask].load(std::memory_order_relaxed);
 
             std::size_t period = 0;
             if (!find_period(snapshot, period))
@@ -2264,28 +2352,6 @@ namespace xmem
             }
         }
 
-        /*
-            Hands the card back when the program stops using it.
-
-            This is the one place where a thread other than a compute thread lowers the tier
-            of a block, and the condition that makes it safe is the same condition that makes
-            it useful: nothing has been accessed for idle_release_ms. A device nobody is
-            touching has no kernel in flight, so the synchronization that has to precede a
-            recycle is free rather than a stall injected into a running workload, and the
-            cudaFree that actually returns the memory to the driver costs nothing either.
-
-            The hot window is respected here as everywhere else, and during idleness that
-            protection is at its strongest: no access has occurred, so the ring has not
-            moved, and every block a stalled thread might still hold a pointer to is exactly
-            the set the window covers. The last blocks touched are therefore kept, which is
-            a bounded amount of memory and the price of not having to reason about what a
-            blocked thread is holding.
-
-            Evicting is not enough on its own. A released buffer goes back to the pool, where
-            nvidia-smi still counts it against the process, so the pool is trimmed once the
-            sweep runs out of victims. That call is what another process on the same card
-            actually sees.
-        */
         /*
             Hands memory back when the program stops using it, in two steps.
 
@@ -2394,6 +2460,8 @@ namespace xmem
                 const unsigned char st = r->state.load(std::memory_order_acquire);
                 if (st != tier_host && st != tier_store)
                     continue;
+                if (!r->evicted)
+                    continue;
 
                 /* The observation thread never evicts. It fills the room the budget already
                    leaves: making residency smaller is the compute thread's business alone,
@@ -2481,8 +2549,8 @@ namespace xmem
             lk.lock();
             /* This one runs on the observation thread, alongside the computation rather than
                in front of it, so it belongs in a different column: a second spent here is a
-               second the program did not wait for. Adding it to the same total was what made
-               the figure exceed the wall clock. */
+               second the program did not wait for, and added to the waits the total would
+               exceed the wall clock. */
             ahead_seconds += std::chrono::duration<double>(
                                  std::chrono::steady_clock::now() - t0).count();
             ahead_bytes += nbytes;
@@ -2499,6 +2567,7 @@ namespace xmem
                 if (from != tier_host)
                     owner.host_current = (owner.data_host != nullptr) && owner.host_current;
                 r->state.store(tier_device, std::memory_order_release);
+                r->evicted = false;
             }
             else
             {
@@ -2538,9 +2607,6 @@ namespace xmem
 
         std::size_t evictions       = 0;
         std::size_t restores        = 0;
-        std::size_t restores_from_store = 0;
-        std::size_t restores_from_host  = 0;
-        std::size_t restores_of_unsaved = 0;
         // How often a schedule was adopted and then lost, and when to try again.
         std::size_t   losses       = 0;
         std::uint64_t search_after = 0;
@@ -2628,6 +2694,12 @@ namespace xmem
         if (m) m->restore_device(r, need_content);
     }
 
+    void refresh_device (block_record* r, bool may_evict)
+    {
+        manager* m = manager::singleton();
+        if (m) m->refresh_device(r, may_evict);
+    }
+
     void before_host (block_record* r, bool need_content, bool writes)
     {
         manager* m = manager::singleton();
@@ -2644,12 +2716,6 @@ namespace xmem
     {
         manager* m = manager::singleton();
         if (m) m->unpin_block(r);
-    }
-
-    bool store_backed (std::size_t bytes)
-    {
-        manager* m = manager::singleton();
-        return m && g::active.load(std::memory_order_relaxed) && m->store_backed(bytes);
     }
 
     std::shared_ptr<void> acquire_scratch (std::size_t bytes)
@@ -2743,15 +2809,17 @@ namespace xmem
 
         if (!xmem::g::trace_ring)
         {
-            xmem::g::trace_ring = new std::uint32_t[xmem::trace_capacity];
+            xmem::g::trace_ring = new std::atomic<std::uint32_t>[xmem::trace_capacity];
             xmem::g::trace_mask = xmem::trace_capacity - 1;
-            std::fill(xmem::g::trace_ring, xmem::g::trace_ring + xmem::trace_capacity, xmem::no_block);
+            for (std::size_t i = 0; i < xmem::trace_capacity; ++i)
+                xmem::g::trace_ring[i].store(xmem::no_block, std::memory_order_relaxed);
         }
         if (!xmem::g::hot_ring)
         {
-            xmem::g::hot_ring = new std::uint32_t[xmem::hot_capacity];
+            xmem::g::hot_ring = new std::atomic<std::uint32_t>[xmem::hot_capacity];
             xmem::g::hot_mask = xmem::hot_capacity - 1;
-            std::fill(xmem::g::hot_ring, xmem::g::hot_ring + xmem::hot_capacity, xmem::no_block);
+            for (std::size_t i = 0; i < xmem::hot_capacity; ++i)
+                xmem::g::hot_ring[i].store(xmem::no_block, std::memory_order_relaxed);
         }
 
         xmem::manager*& m = xmem::manager::singleton();
@@ -2850,11 +2918,6 @@ namespace xmem
                                     << (s.largest_block/mib)     << " MiB, immovable "
                                     << (s.immovable_bytes/mib)   << " MiB\n"
             << "  evictions       " << s.evictions               << "\n"
-            << "  orphaned        " << s.orphaned_refreshes
-                                    << " device copies stale with no host copy\n"
-            << "  restores by     " << s.restores_from_store << " from the store, "
-                                    << s.restores_from_host << " from a mirror, "
-                                    << s.restores_of_unsaved << " of blocks never saved\n"
             << "  restores        " << s.restores                << " of which anticipated "
                                     << s.prefetch_hits           << "\n"
             << "  prefetched      " << s.prefetch_issued         << ", pages advised "
@@ -2880,9 +2943,6 @@ namespace xmem
                                     << " KiB\n"
             << "  time stalled    " << s.sync_seconds     << " s over " << s.sync_count
                                     << " device synchronisations\n"
-            << "  access trace    " << s.trace_threads << " thread"
-                                    << (s.trace_threads == 1 ? "" : "s") << " feeding it, busiest "
-                                    << s.trace_busiest << " %\n"
             << "  access cycle    ";
         if (s.cycle_locked)
             out << "identified, period " << s.cycle_period << "\n";

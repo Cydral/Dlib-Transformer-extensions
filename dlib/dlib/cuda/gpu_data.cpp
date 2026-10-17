@@ -127,6 +127,14 @@ namespace dlib
     void gpu_data::
     copy_to_device() const
     {
+        if (xrec)
+        {
+            // device() has just placed the block on the device through before_device().
+            if (!device_current)
+                xmem::refresh_device(xrec, true);
+            return;
+        }
+
         // We want transfers to the device to always be concurrent with any device
         // computation.  So we use our non-default stream to do the transfer.
         async_copy_to_device();
@@ -138,21 +146,12 @@ namespace dlib
     {
         if (!host_current)
         {
-            /* The host mirror can be absent when the extended memory subsystem has pushed
-               this block down to the file tier.  Callers reach this function through the
-               accessors, which reinstate the mirror first, so a null here means the block
-               has no content anywhere and there is nothing to bring back. */
-            if (!data_host || !data_device)
-            {
-                host_current = true;
-                return;
-            }
             wait_for_transfer_to_finish();
             CHECK_CUDA(cudaMemcpy(data_host.get(), data_device.get(), data_size*sizeof(float), cudaMemcpyDeviceToHost));
             host_current = true;
             // At this point we know our RAM block isn't in use because cudaMemcpy()
             // implicitly syncs with the device. 
-            device_in_use = false;
+            device_in_use.store(false, std::memory_order_relaxed);
             // Check for errors.  These calls to cudaGetLastError() are what help us find
             // out if our kernel launches have been failing.
             CHECK_CUDA(cudaGetLastError());
@@ -162,57 +161,27 @@ namespace dlib
     void gpu_data::
     async_copy_to_device() const
     {
+        if (xrec)
+        {
+            /* Carried out by the subsystem, under its lock and to completion. dnn_trainer
+               calls this from the thread filling the next batch while the step runs on
+               another, which may evict the batch at any moment; see refresh_device(). */
+            xmem::refresh_device(xrec, false);
+            return;
+        }
+
         if (!device_current)
         {
-            if (!data_device)
+            if (device_in_use.load(std::memory_order_relaxed))
             {
-                /* The trainer calls this to overlap the next batch with the current step,
-                   so the block is wanted even though nothing has read it yet.  Bring it
-                   back rather than silently skipping the prefetch that was asked for. */
-                if (xrec)
-                    xmem::restore_device(xrec, true);
-
-                if (!data_device)
-                    return;
+                // Wait for any possible CUDA kernels that might be using our memory block to
+                // complete before we overwrite the memory.
+                synchronize_stream(0);
+                device_in_use.store(false, std::memory_order_relaxed);
             }
-
-            // The restore may have satisfied the request on its own, which happens when
-            // the content came straight from the file tier into the device buffer.
-            if (!device_current)
-            {
-                /* There is nothing to copy from when the host holds no buffer.
-
-                   Under the manager a block gets no host buffer at allocation; it gets one on
-                   its first host access or when it is evicted. A block can therefore reach
-                   this point stale on the device with no host buffer to refresh it from, and
-                   copying from a null source is what CUDA reports as an invalid argument.
-                   The manager is asked first, since it knows whether the content sits in the
-                   store; if it still cannot supply a host buffer, there is no content newer
-                   than the device's, so the device copy is kept as it is rather than
-                   overwritten from nowhere. */
-                if (!data_host && xrec)
-                    xmem::restore_device(xrec, true);
-
-                if (!device_current)
-                {
-                    if (!data_host)
-                    {
-                        xmem::note_orphaned_refresh(xrec, host_current);
-                        device_current = true;
-                        return;
-                    }
-                    if (device_in_use)
-                    {
-                        // Wait for any possible CUDA kernels that might be using our memory block to
-                        // complete before we overwrite the memory.
-                        synchronize_stream(0);
-                        device_in_use = false;
-                    }
-                    CHECK_CUDA(cudaMemcpyAsync(data_device.get(), data_host.get(), data_size*sizeof(float), cudaMemcpyHostToDevice, (cudaStream_t)cuda_stream.get()));
-                    have_active_transfer = true;
-                    device_current = true;
-                }
-            }
+            CHECK_CUDA(cudaMemcpyAsync(data_device.get(), data_host.get(), data_size*sizeof(float), cudaMemcpyHostToDevice, (cudaStream_t)cuda_stream.get()));
+            have_active_transfer = true;
+            device_current = true;
         }
     }
 
@@ -223,12 +192,12 @@ namespace dlib
     {
         if (new_size == 0)
         {
-            if (device_in_use)
+            if (device_in_use.load(std::memory_order_relaxed))
             {
                 // Wait for any possible CUDA kernels that might be using our memory block to
                 // complete before we free the memory.
                 synchronize_stream(0);
-                device_in_use = false;
+                device_in_use.store(false, std::memory_order_relaxed);
             }
             wait_for_transfer_to_finish();
             if (xrec)
@@ -239,18 +208,18 @@ namespace dlib
             data_size = 0;
             host_current = true;
             device_current = true;
-            device_in_use = false;
+            device_in_use.store(false, std::memory_order_relaxed);
             data_host.reset();
             data_device.reset();
         }
         else if (new_size != data_size)
         {
-            if (device_in_use)
+            if (device_in_use.load(std::memory_order_relaxed))
             {
                 // Wait for any possible CUDA kernels that might be using our memory block to
                 // complete before we free the memory.
                 synchronize_stream(0);
-                device_in_use = false;
+                device_in_use.store(false, std::memory_order_relaxed);
             }
             wait_for_transfer_to_finish();
             if (xrec)
@@ -261,7 +230,7 @@ namespace dlib
             data_size = new_size;
             host_current = true;
             device_current = true;
-            device_in_use = false;
+            device_in_use.store(false, std::memory_order_relaxed);
             xmem::note_block_created();
 
             try
@@ -301,13 +270,9 @@ namespace dlib
                        and the first device access brings it in under the budget, which is
                        the whole point: a graph can now describe more memory than the card
                        holds, because describing it no longer occupies it. */
+                    // The flags are set by register_block() itself, under the lock that
+                    // publishes the record; see the comment there.
                     xrec = xmem::register_block(this, new_size*sizeof(float), the_device_id);
-                    if (xrec)
-                    {
-                        device_current = false;
-                        if (!data_host)
-                            host_current = false;
-                    }
                 }
 
                 if (!xrec)

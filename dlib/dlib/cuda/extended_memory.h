@@ -152,6 +152,13 @@
 // taking a lock at all: the accessor traces the access, stamps the block and returns. Only
 // a block that is not on the device costs a lock.
 //
+// A compute thread is one that takes device pointers. A thread that only works on the host
+// side of its tensors, as the one filling batches for dnn_trainer does while the step runs
+// on another, lowers nothing: host() and async_copy_to_device() run entirely under the
+// lock, flags included, and the latter places a block only into headroom. The computing
+// thread may then evict a batch in the middle of being filled, and each side finds the
+// flags exactly as the other left them.
+//
 // idle_release_ms is the single exception, and it is allowed because the condition that
 // triggers it is the condition that makes it safe. Nothing has been accessed for the
 // configured interval, so no kernel is in flight and the hot window has not moved; the
@@ -271,20 +278,10 @@ namespace dlib
         std::size_t        immovable_bytes   = 0;
         // Buffers the pool holds for reuse: allocated on the card, not in any live block.
         std::size_t        pooled_bytes      = 0;
-        // Where the restores came from, and how many carried nothing.
-        std::size_t        restores_from_store = 0;
-        std::size_t        restores_from_host  = 0;
-        std::size_t        restores_of_unsaved = 0;
-        // Device copies found stale with no host copy to refresh them from: zero on a
-        // healthy run, and the count to quote if it is not.
-        std::size_t        orphaned_refreshes  = 0;
         // What the driver reports free on the device, which the budget cannot exceed.
         std::size_t        device_free_bytes = 0;
         std::size_t        hash_threshold    = 0;
         std::size_t        hash_count        = 0;
-        // How the access trace is fed: total threads, and the busiest one's share.
-        unsigned           trace_threads     = 0;
-        double             trace_busiest     = 0;
         // Where the wall clock goes inside the subsystem, in seconds.
         double             sync_seconds      = 0;
         std::size_t        sync_count        = 0;
@@ -376,9 +373,13 @@ namespace dlib
             // What the arena actually reserved, which may exceed bytes and is what the slot
             // must be given back as.
             std::size_t                slot_bytes  = 0;
-            // Whether anything was ever written to this block's store slot or mirror. A
-            // restore of a block that was never saved moves bytes that mean nothing.
-            bool                       ever_saved  = false;
+            /* Set when the manager moved this block off the device while the device held its
+               current copy, cleared by a host access that may write and by the block's return
+               to the device. It is what the observation thread may prefetch. A block fresh
+               from set_size() has no content worth fetching, and one written on the host
+               since its last use on the device may still be under that write, which a
+               prefetch would copy half of and then declare current. */
+            bool                       evicted     = false;
             int                        device_id   = 0;
             bool                       evictable   = false;
             // Whether the slot has ever held this block, and how many evictions in a row
@@ -416,29 +417,22 @@ namespace dlib
             static std::atomic<bool>          active;
             static std::atomic<std::uint64_t> clock;
             static std::atomic<std::uint64_t> blocks_created;
-            static std::atomic<std::uint64_t> orphaned_refreshes;
             static std::atomic<std::uint64_t> trace_head;
-            static std::uint32_t*             trace_ring;
+            static std::atomic<std::uint32_t>* trace_ring;
             static std::uint64_t              trace_mask;
             static std::atomic<std::uint64_t> hot_head;
-            // One counter per thread that has ever fed the trace, plus how many are in use.
-            static std::atomic<std::uint64_t> thread_hits[8];
-            static std::atomic<unsigned>      thread_count;
-            static std::uint32_t*             hot_ring;
+            static std::atomic<std::uint32_t>* hot_ring;
             static std::uint64_t              hot_mask;
         };
 
         template <typename tag> std::atomic<bool>          globals<tag>::active         {false};
         template <typename tag> std::atomic<std::uint64_t> globals<tag>::clock          {1};
         template <typename tag> std::atomic<std::uint64_t> globals<tag>::blocks_created {0};
-        template <typename tag> std::atomic<std::uint64_t> globals<tag>::orphaned_refreshes {0};
         template <typename tag> std::atomic<std::uint64_t> globals<tag>::trace_head     {0};
-        template <typename tag> std::uint32_t*             globals<tag>::trace_ring     = nullptr;
+        template <typename tag> std::atomic<std::uint32_t>* globals<tag>::trace_ring    = nullptr;
         template <typename tag> std::uint64_t              globals<tag>::trace_mask     = 0;
         template <typename tag> std::atomic<std::uint64_t> globals<tag>::hot_head       {0};
-        template <typename tag> std::atomic<std::uint64_t> globals<tag>::thread_hits[8] {};
-        template <typename tag> std::atomic<unsigned>      globals<tag>::thread_count   {0};
-        template <typename tag> std::uint32_t*             globals<tag>::hot_ring       = nullptr;
+        template <typename tag> std::atomic<std::uint32_t>* globals<tag>::hot_ring      = nullptr;
         template <typename tag> std::uint64_t              globals<tag>::hot_mask       = 0;
 
         typedef globals<void> g;
@@ -451,92 +445,25 @@ namespace dlib
             its host copy lives.
         */
         inline void note_block_created () { g::blocks_created.fetch_add(1, std::memory_order_relaxed); }
-        /* A block asked to refresh its device copy from a host buffer it does not have.
-
-           The copy is skipped, which is what prevents the crash, but the state itself is
-           not supposed to exist: a device copy only goes stale through a host write, and a
-           host write allocates the host buffer. Reaching it means that buffer was released
-           after a write without being pushed back, in which case no valid copy remains
-           anywhere. That is said once, on the first occurrence, so that a lost block cannot
-           pass unnoticed behind the guard that stops the crash. */
-        /* A device copy was found stale with no host copy to refresh it from. The copy is
-           skipped, which prevents the crash, but the state is not supposed to exist and a
-           review of every path that stales a device copy or releases a host buffer found
-           none that produces it on its own. Until the sequence that does is known, each
-           occurrence describes its block in full, up to a ceiling, so that the next run
-           says which tensor lost its copy and in what state. The size alone separates the
-           likely candidates: an input batch is a few kilobytes, a weight far more. */
-        inline void note_orphaned_refresh (const block_record* r, bool host_current)
-        {
-            const std::uint64_t n = g::orphaned_refreshes.fetch_add(1, std::memory_order_relaxed);
-            if (n >= 8) return;
-            if (n == 0)
-                std::fprintf(stderr, "extended memory: a device copy was stale with no host copy "
-                                     "to refresh it from; kept as it was. If this recurs, a block "
-                                     "lost its content and the run's figures should not be "
-                                     "trusted. Details follow for the first eight.\n");
-            if (!r)
-            {
-                std::fprintf(stderr, "  orphan %llu: unmanaged block\n", (unsigned long long)n + 1);
-                return;
-            }
-            static const char* tiers[] = { "device", "host", "store" };
-            const unsigned tier = r->state.load(std::memory_order_relaxed);
-            std::fprintf(stderr,
-                "  orphan %llu: block %u, %zu bytes, tier %s, host_current %d, slot %lld, "
-                "store_valid %d, ever_saved %d, evictable %d, pins %u\n",
-                (unsigned long long)n + 1, (unsigned)r->id, r->bytes,
-                tier < 3 ? tiers[tier] : "?", (int)host_current, (long long)r->slot,
-                (int)r->store_valid.load(std::memory_order_relaxed), (int)r->ever_saved,
-                (int)r->evictable, (unsigned)r->pins.load(std::memory_order_relaxed));
-        }
-
-        /*
-            Which thread an access came from, assigned once and then read from a register.
-
-            The period search reads one trace, and a trace fed by more than one thread is
-            the interleaving of their sequences rather than any one of them. Two threads
-            that each repeat perfectly produce a merge order that varies from step to step,
-            so a period that exists in each is absent from the whole. Counting the accesses
-            per thread costs one relaxed increment and says whether that is what a run is
-            up against, which no other statistic here reveals.
-        */
-        const unsigned max_traced_threads = 8;
-
-        struct thread_slot
-        {
-            thread_slot()
-            {
-                const unsigned n = g::thread_count.fetch_add(1, std::memory_order_relaxed);
-                index = n < max_traced_threads ? n : max_traced_threads - 1;
-            }
-            unsigned index;
-        };
-
-        inline unsigned my_thread_slot ()
-        {
-            static thread_local thread_slot slot;
-            return slot.index;
-        }
 
         inline void trace_and_stamp (block_record* r)
         {
             r->stamp.store(g::clock.fetch_add(1, std::memory_order_relaxed), std::memory_order_relaxed);
 
             const std::uint64_t t = g::trace_head.fetch_add(1, std::memory_order_relaxed);
-            g::trace_ring[t & g::trace_mask] = r->id;
+            /* The rings are read by the observation thread while compute threads write them.
+               Relaxed atomics make that defined at no cost: a plain load and store. */
+            g::trace_ring[t & g::trace_mask].store(r->id, std::memory_order_relaxed);
 
             const std::uint64_t h = g::hot_head.fetch_add(1, std::memory_order_relaxed);
-            g::hot_ring[h & g::hot_mask] = r->id;
-
-            g::thread_hits[my_thread_slot()].fetch_add(1, std::memory_order_relaxed);
+            g::hot_ring[h & g::hot_mask].store(r->id, std::memory_order_relaxed);
         }
 
         // Out of line: everything below is either rare or already dominated by a transfer.
         block_record* register_block   (gpu_data* owner, std::size_t bytes, int device_id);
         void          unregister_block (block_record* r);
-        void          retarget_block   (block_record* r, gpu_data* owner);
         void          restore_device   (block_record* r, bool need_content);
+        void          refresh_device   (block_record* r, bool may_evict);
         void          before_host      (block_record* r, bool need_content, bool writes);
         void          pin_block        (block_record* r);
         void          unpin_block      (block_record* r);
@@ -560,14 +487,6 @@ namespace dlib
         };
 
         /*
-            True when set_size() should leave the pinned host mirror unallocated because the
-            block is large enough to be streamed and an arena is available to hold it. The
-            block's host copy then lives in the mapping, which is what keeps pinned memory
-            bounded by the staging buffer rather than by the size of the model.
-        */
-        bool          store_backed (std::size_t bytes);
-
-        /*
             Device memory for something that is not a gpu_data block: cuDNN convolution
             workspaces, cuSOLVER scratch, the loss kernels' temporaries. The contents never
             have to survive a call, so these never move between tiers, but they do have to be
@@ -583,21 +502,25 @@ namespace dlib
         inline void before_device (block_record* r, bool need_content, bool writes)
         {
             trace_and_stamp(r);
-            if (writes)
-                r->store_valid.store(false, std::memory_order_relaxed);
+            /* The restore comes first. It decides from store_valid whether the store holds
+               the block's content, so clearing the flag beforehand, as a write access must,
+               would bring every block a kernel reads and rewrites in place back from the
+               store without its content: accumulated gradients, carried states. Cleared
+               once the block is resident, the flag says what it means: the caller now holds
+               a pointer through which the device copy may change. */
             if (r->state.load(std::memory_order_acquire) != tier_device)
                 restore_device(r, need_content);
+            if (writes)
+                r->store_valid.store(false, std::memory_order_relaxed);
         }
 
 #else // DLIB_USE_CUDA
 
         inline bool active () { return false; }
         inline void note_block_created () {}
-        inline void note_orphaned_refresh (const block_record*, bool) {}
         inline void before_device (block_record*, bool, bool) {}
         inline void before_host (block_record*, bool, bool) {}
         inline void unregister_block (block_record*) {}
-        inline void retarget_block (block_record*, gpu_data*) {}
 
         class registry_guard
         {
@@ -607,7 +530,6 @@ namespace dlib
             registry_guard(const registry_guard&) = delete;
             registry_guard& operator=(const registry_guard&) = delete;
         };
-        inline bool store_backed (std::size_t) { return false; }
         inline std::shared_ptr<void> acquire_scratch (std::size_t) { return std::shared_ptr<void>(); }
 
 #endif // DLIB_USE_CUDA

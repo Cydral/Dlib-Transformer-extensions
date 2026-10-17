@@ -1415,7 +1415,7 @@ namespace dlib
     struct arc_dataset
     {
         long seq_len = 0;               // cells per grid, 900 for a 30 by 30 window
-        long colour_vocab = 0;          // pad plus the ten colours
+        long colour_vocab = 0;          // padding, the end marker and the ten colours
 
         std::vector<std::vector<int>> inputs;
         std::vector<std::vector<int>> labels;
@@ -1549,10 +1549,8 @@ namespace dlib
 // ----------------------------------------------------------------------------------------
 
     /*!
-        Builds the sequence the network reads: the identifier token, then the window.
-
-        Passing arc_blank_puzzle_id withholds the identifier, which is how a model is
-        asked to solve a puzzle it was never told the name of.
+        Passed to arc_make_input() in place of an identifier, this withholds it, which is
+        how a model is asked to solve a puzzle it was never told the name of.
     !*/
     constexpr int arc_blank_puzzle_id = 0;
 
@@ -1569,9 +1567,8 @@ namespace dlib
         The label a position carries when it is not to be scored.
 
         Padding is most of the window: a 10 by 10 answer leaves eight hundred of its nine
-        hundred cells empty. Scoring them taught a model to predict emptiness well and
-        counted that as accuracy, which is how cell accuracy reached seventy percent with
-        not one grid right. The padding and the identifier are therefore labelled with
+        hundred cells empty, and scoring them would train a model to predict emptiness and
+        count it as accuracy. The padding and the identifier are therefore labelled with
         this value and ignored by the loss.
 
         It sits beyond every token an input can hold, identifiers included, on purpose.
@@ -1583,6 +1580,9 @@ namespace dlib
     !*/
     constexpr unsigned long arc_ignore_label = 1ul << 30;
 
+    /*!
+        Builds the sequence the network reads: the identifier token, then the window.
+    !*/
     inline matrix<int, 0, 1> arc_make_input (
         const arc_dataset& d,
         long example,
@@ -1606,8 +1606,8 @@ namespace dlib
 
     /*!
         The labels for that sequence. The first position carries the identifier, which is
-        given rather than predicted, so it is labelled with the pad and the loss is asked
-        to ignore it.
+        given rather than predicted, and the padding carries no answer, so both are
+        labelled with arc_ignore_label and the loss ignores them.
     !*/
     inline matrix<unsigned long, 0, 1> arc_make_label (
         const arc_dataset& d,
@@ -1664,12 +1664,11 @@ namespace dlib
 // ----------------------------------------------------------------------------------------
 
     /*!
-        Turns a predicted sequence back into a grid, by finding where the padding starts.
+        Turns a predicted sequence back into a grid.
 
-        The window is square and the padding surrounds the answer, so the extent is the
-        largest row and column that carry a colour. A prediction that leaves the window
-        entirely blank yields an empty grid rather than an error, since an empty answer
-        is a wrong answer and not a malformed one.
+        The extent is read from the end markers: the width is how far the first row runs
+        before its marker, the height how far the first column does. A prediction whose
+        first cell holds no colour yields an empty grid, which scores as a wrong answer.
     !*/
     inline arc_grid_t arc_decode_grid (
         const std::vector<unsigned long>& predicted,
@@ -1681,13 +1680,10 @@ namespace dlib
         const long offset = (long)predicted.size() - seq_len;   // skip the identifier
         DLIB_CASSERT(offset >= 0, "arc dataset: the prediction is shorter than a window");
 
-        /* The extent is read from the end markers rather than guessed from where colours
-           happen to fall: the width is how far the first row runs before its marker, the
-           height how far the first column does. A 30 by 30 grid has no room for a marker
-           and simply fills the window. Only the ten colour tokens count as cells, so a
-           label, which holds the ignored value where the padding was, decodes as well as a
-           prediction does. A cell inside the extent that holds no colour is returned as
-           -1, which compares unequal to any colour. */
+        /* A 30 by 30 grid has no room for a marker and simply fills the window. Only the
+           ten colour tokens count as cells, so a label, which holds the ignored value where
+           the padding was, decodes as well as a prediction does. A cell inside the extent
+           that holds no colour is returned as -1, which compares unequal to any colour. */
         auto at = [&](long r, long c) { return predicted[(size_t)(offset + r * grid_side + c)]; };
         auto is_colour = [](unsigned long tok) {
             return tok >= arc_colour_offset && tok < arc_colour_offset + arc_num_colours; };

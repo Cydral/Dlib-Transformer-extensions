@@ -4,6 +4,7 @@
 #define DLIB_GPU_DaTA_H_
 
 #include "gpu_data_abstract.h"
+#include <atomic>
 #include <memory>
 #include <cstring>
 #include "cuda_errors.h"
@@ -85,7 +86,7 @@ namespace dlib
                 data_size = 0;
                 host_current = true;
                 device_current = true;
-                device_in_use = false;
+                device_in_use.store(false, std::memory_order_relaxed);
                 data_host.reset();
                 data_device.reset();
             }
@@ -94,7 +95,7 @@ namespace dlib
                 data_size = new_size;
                 host_current = true;
                 device_current = true;
-                device_in_use = false;
+                device_in_use.store(false, std::memory_order_relaxed);
                 data_host.reset(new float[new_size], std::default_delete<float[]>());
                 data_device.reset();
             }
@@ -103,24 +104,28 @@ namespace dlib
 
         const float* host() const 
         { 
-            enter_host(true, false);
-            copy_to_host();
+            if (!enter_host(true, false))
+                copy_to_host();
             return data_host.get(); 
         }
 
         float* host() 
         {
-            enter_host(true, true);
-            copy_to_host();
-            device_current = false;
+            if (!enter_host(true, true))
+            {
+                copy_to_host();
+                device_current = false;
+            }
             return data_host.get(); 
         }
 
         float* host_write_only() 
         {
-            enter_host(false, true);
-            host_current = true;
-            device_current = false;
+            if (!enter_host(false, true))
+            {
+                host_current = true;
+                device_current = false;
+            }
             return data_host.get(); 
         }
 
@@ -131,7 +136,7 @@ namespace dlib
 #endif
             enter_device(true, false);
             copy_to_device();
-            device_in_use = true;
+            device_in_use.store(true, std::memory_order_relaxed);
             return data_device.get(); 
         }
 
@@ -143,7 +148,7 @@ namespace dlib
             enter_device(true, true);
             copy_to_device();
             host_current = false;
-            device_in_use = true;
+            device_in_use.store(true, std::memory_order_relaxed);
             return data_device.get(); 
         }
 
@@ -156,7 +161,7 @@ namespace dlib
             wait_for_transfer_to_finish();
             host_current = false;
             device_current = true;
-            device_in_use = true;
+            device_in_use.store(true, std::memory_order_relaxed);
             return data_device.get(); 
         }
 
@@ -181,6 +186,12 @@ namespace dlib
             std::swap(host_current, item.host_current);
             std::swap(device_current, item.device_current);
             std::swap(have_active_transfer, item.have_active_transfer);
+            /* The flag describes the device buffer, so it moves with it. Left behind, a
+               buffer a kernel is still using would be released without the synchronization
+               the flag exists to trigger. */
+            const bool in_use = device_in_use.load(std::memory_order_relaxed);
+            device_in_use.store(item.device_in_use.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            item.device_in_use.store(in_use, std::memory_order_relaxed);
             std::swap(data_host, item.data_host);
             std::swap(data_device, item.data_device);
             std::swap(cuda_stream, item.cuda_stream);
@@ -204,17 +215,26 @@ namespace dlib
                 xmem::before_device(xrec, need_content, writes);
         }
 
-        void enter_host(bool need_content, bool writes) const
+        /*
+            True when the subsystem has carried out the whole host access itself: the host
+            buffer, the copy back from the device and the flags, all under its lock. The
+            accessor then writes no flag of its own, because the thread filling a tensor on
+            the host is not necessarily the one computing, and the computing thread may move
+            the same block at any moment.
+        */
+        bool enter_host(bool need_content, bool writes) const
         {
-            if (xrec)
-                xmem::before_host(xrec, need_content, writes);
+            if (!xrec)
+                return false;
+            xmem::before_host(xrec, need_content, writes);
+            return true;
         }
 #else
         void copy_to_device() const{}
         void copy_to_host() const{}
         void wait_for_transfer_to_finish() const{}
         void enter_device(bool,bool) const{}
-        void enter_host(bool,bool) const{}
+        bool enter_host(bool,bool) const{ return false; }
 #endif
 
         friend class xmem::manager;
@@ -223,7 +243,9 @@ namespace dlib
         mutable bool host_current;
         mutable bool device_current;
         mutable bool have_active_transfer;
-        mutable bool device_in_use;
+        /* Atomic because the manager clears it on many blocks at once, from whichever
+           thread synchronised the device, while the owner's thread may be reading it. */
+        mutable std::atomic<bool> device_in_use;
 
         mutable std::shared_ptr<float> data_host;
         mutable std::shared_ptr<float> data_device;
