@@ -114,6 +114,7 @@ SRC += parallel_for.cpp
 SRC += parse.cpp
 SRC += pipe.cpp
 SRC += pixel.cpp
+SRC += privacy.cpp
 SRC += probabilistic.cpp
 SRC += pyramid_down.cpp
 SRC += queue.cpp

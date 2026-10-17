@@ -39,6 +39,7 @@
   - [`slm_distill_ex.cpp`](#slm_distill_excpp)
   - [`slm_embed_ex.cpp`](#slm_embed_excpp)
   - [`slm_extended_memory_ex.cpp`](#slm_extended_memory_excpp)
+  - [`slm_document_anonymizer_ex.cpp`](#slm_document_anonymizer_excpp)
   - [`slm_tools/` Python witnesses](#slm_tools-python-witnesses)
   - [`slm_data.h`](#slm_datah-shared-data-layer)
 - [Cross-cutting concepts worth noticing](#cross-cutting-concepts-worth-noticing)
@@ -70,6 +71,7 @@ Across the full example suite, the repository now covers:
 - **supervised fine-tuning and low-rank adaptation** (LoRA, DoRA) over an imported model
 - **knowledge distillation** from a teacher container into a student of a freely chosen architecture, dense or mixture-of-experts
 - **software-extended device memory**: a residency layer that lets a network occupy more than the card holds, driven by the access schedule the run reveals about itself
+- **privacy-preserving document processing**: reversible pseudonymization of Word, Excel, PowerPoint, PDF and text files, with a byte-level Transformer encoder and a structural SVM sequence labeler that learn, from synthetic data, where a name, a place or an organisation starts and ends
 
 > [!TIP]
 > Read this directory not as a loose collection of demos, but as a **progressive design reference** for building Transformer-based applications with Dlib.
@@ -111,6 +113,8 @@ Then the interoperability and specialization track, which can be read independen
    Raise a new model by **distillation**, in three steps.
 15. `slm_extended_memory_ex.cpp`  
    Run a model **larger than the card**, by making device residency a scheduling problem.
+16. [`slm_document_anonymizer_ex.cpp`](#slm_document_anonymizer_excpp)  
+   Protect the **personal data** of documents with reversible tags, and train a small **span tagger** that says, for any string, what is personal and where it starts and ends.
 
 A shared support layer, [`slm_data.h`](#slm_datah-shared-data-layer), provides embedded datasets and utilities used throughout the examples, and [`slm_tools/`](slm_tools) holds the Python witnesses used to verify the C++ paths against reference implementations.
 
@@ -813,6 +817,41 @@ The pipeline is **argmax-based** rather than arithmetic-coded, and the header sa
 
 ---
 
+<a id="slm_document_anonymizer_excpp"></a>
+## `slm_document_anonymizer_ex.cpp`
+
+### Purpose
+Protect the personal data of documents before they leave the organisation that owns them, or before they are sent to a language model, and restore them afterwards: Word, Excel, PowerPoint, PDF and every kind of text file, in French and English.
+
+### What the example teaches
+**A tag can carry its value.** Each personal value is replaced by a tag such as `[[PERSON:Xoydoeh Nuggwdfsorn#EKR]]`, whose body is the value encrypted with format-preserving encryption (FF1 over AES-256) and whose last characters authenticate it. No correspondence table is written: the key alone restores a protected document, or any text derived from it, such as the summary a language model wrote. The codes are chosen per type so that protected data stays usable: the same name gets the same code everywhere, a protected IBAN still passes its checksum, every date moves by the same secret number of weeks.
+
+**Four channels find the data.** Validated scanners find what has a structure and a check digit (e-mails, phones, IBAN, cards, social security and foreign national numbers, IMEI, VIN, UUID, GPS coordinates). Linguistic rules read civilities, field labels, legal forms, the names of companies and public bodies, and lexicons of given names, nationalities and places. Regular expressions and term lists add what is specific to an organisation. Two learned recognizers find, from the context in which they appear, the names, places, addresses and organisations the rules miss.
+
+**The model answers with spans of its input.** `pii_span_model` is an encoder that gives each byte of its input a BIO class, and a constrained Viterbi pass turns the classes into spans. Every span it returns is a substring of its input with exact offsets, so the answer to "is there personal data here, where, and what is it" always points into the text.
+
+### Main technical choices
+- **Byte input.** The span model reads UTF-8 bytes: no tokenizer to train, no unknown word, and OCR accidents such as `JeanDupont` or `rn` read as `m` are just other byte sequences. Offsets come out exact, and span limits move to word limits after decoding, so that no end of a word stays readable.
+- **Bidirectional attention.** The fused `gqa_attention_` layer runs with its causal mask switched off, since whether `Rose` is a person depends on the words that follow as much as on those before.
+- **No padding.** Training windows are cut from the examples laid end to end, at lengths drawn from 32 to 256 bytes (32 to 128 for the tiny model), so attention never sees a padded position and the model reads a table cell as well as a paragraph. Long texts are read through overlapping windows; each byte keeps the prediction of the window where it is most central.
+- **A classical learner beside the Transformer.** `pii_sequence_tagger` is `dlib::sequence_labeler` trained as a structural SVM over hashed lexical, shape and context features, and trains in minutes. Its word features also fire on capitalized words that are not personal data, so when both models are loaded the detector follows the span model and takes from the tagger, where the span model found nothing, its confident spans (`--tagger-min-confidence`) and the name parts that complete a name already found, so that the given name and the family name of a person are replaced together.
+- **Fine labels, coarse replacement.** The models learn `GIVEN_NAME`, `FAMILY_NAME`, `USERNAME`, `STREET_ADDRESS`, `POSTAL_CODE`, `CITY` and `ORGANIZATION`; the detector merges a given name and a family name side by side into one `PERSON`, a postal code and its city into one `LOCATION`, and replaces them as the rules would.
+- **Synthetic data, held-out values.** `slm_tools/build_pii_dataset.py` writes the training sets from templates and lexicons, and reserves part of every lexicon for a `test_unseen` split, which scores the detection of names, streets, cities and organisations absent from training.
+
+### Useful reminders
+- `detect` reads a text on standard input and prints `found: yes` or `found: no`, then one line per span with its byte offsets, its type, its confidence and its value; with recognizers loaded, it also prints what each of them finds on its own, with fine labels.
+- `evaluate` scores the rules alone, each recognizer alone and the whole detector on the same test set, at the level of the fine labels and at the level at which values are replaced.
+- `embed` writes `slm_document_anonymizer_ex.h`, which compiles the trained recognizers into the program: the executable then travels alone and uses them by default, `--tagger` and `--model` each replace one of them by a model file, and `train-model --init embedded` continues the training of the compiled span model on new data. The repository provides this header with trained recognizers; `embed` rewrites it after a new training.
+- `train-model --optimizer adam-atan2` trains the span model with `dlib::adam_atan2`, whose step needs no epsilon and stays bounded; AdamW remains the default, the two reaching the same scores on this task.
+- The output is **pseudonymized** data in the sense of the GDPR: whoever holds the key can restore it. `--irreversible` drops the key.
+
+### Why this example matters
+It puts the Transformer stack of this repository to work on a task whose result can be measured, and shows a pattern for extraction tasks whose answer must come from the input: a small encoder, byte-level input, constrained decoding, and test sets built around the errors to watch (unseen values, OCR noise, texts without personal data, whole documents).
+
+[⬆ Back to top](#on-this-page)
+
+---
+
 ## `slm_tools/` Python witnesses
 
 ### Purpose
@@ -826,6 +865,7 @@ Verify the C++ paths against the implementations everyone else uses.
 - **`slm_prune_distill.py`** removes blocks from a published model and distils the survivors back into shape. Which blocks go is measured rather than guessed: a few forward passes record how far each block moves what passes through it, and the ones whose output stays closest to their input are the ones to drop. The survivors keep the teacher's weights, so the run repairs what the missing blocks did rather than learning the language again. What comes out is an ordinary model of its family with fewer blocks, so the standard converter produces a container this library reads.
 - **`slm_benchmark.py`** places a model against published small models on the usual tasks, each at the few-shot count under which it is normally reported — a detail that decides whether a table means anything, since five-shot and zero-shot MMLU differ by several points on the same model. The comparison figures are read from a file carrying each one's source and date, not fetched: a number quoted without its evaluation settings compares nothing.
 - **`build_arc_dataset.py`** and **`build_sudoku_dataset.py`** prepare ARC-AGI and Sudoku-Extreme for the hierarchical reasoning examples, in the layout of the reference implementation as well as in the one the C++ loader reads, so that the same data can feed either codebase.
+- **`build_pii_dataset.py`** writes the synthetic French and English training and test sets of the personal data recognizers: templates by document genre, names drawn by origin or synthesized from naming traditions, OCR and casing noise applied to labelled fragments so that every offset stays exact, and a held-out share of every lexicon for the test of unseen values. The lexicons and templates of a resource directory (`--resources`) replace the built-in ones of the same name.
 - **`slm_bpe_corpus.py`** collects a corpus for training a tokenizer, from encyclopaedic prose, news archives, filtered web text, multilingual web text and instruction data. The last of these is the one people leave out, and it cannot be recovered afterwards: a tokenizer trained on prose alone cuts numbered lists, code blocks and tabular answers into far more tokens than it needs, and those are what a chat model produces all day. It also reduces a corpus to a much smaller one that yields **the same merge table**, since BPE merges depend on pre-token frequencies and nothing else.
 
 ### Why this matters
@@ -897,6 +937,7 @@ The repository strikes a useful balance:
 - Use **`slm_vit_classify_ex.cpp`** or **`slm_vit_ssl_ex.cpp`** if your data is images rather than text.
 - Use **`slm_distill_ex.cpp`** if you want to build a smaller model of your own design from a larger one.
 - Read **`slm_extended_memory_ex.cpp`** if a model you want to run does not fit in your VRAM, or if you want to understand why prefetching needs a schedule rather than a heuristic.
+- Use **`slm_document_anonymizer_ex.cpp`** if documents must leave your organisation without their personal data, or if you want a template for a small, grounded extraction model.
 
 ---
 

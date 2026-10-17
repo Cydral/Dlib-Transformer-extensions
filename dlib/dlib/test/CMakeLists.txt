@@ -112,6 +112,7 @@ add_executable(${target_name} main.cpp tester.cpp
    parse.cpp
    pipe.cpp
    pixel.cpp
+   privacy.cpp
    probabilistic.cpp
    pyramid_down.cpp
    queue.cpp
