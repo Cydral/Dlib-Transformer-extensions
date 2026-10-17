@@ -178,7 +178,9 @@ namespace dlib
 
         long max_steps () const { return opt.max_steps; }
 
-        void begin_episode ()
+        void begin_episode (
+            bool explore = true
+        )
         {
             summaries.clear();
             predicted.clear();
@@ -187,9 +189,11 @@ namespace dlib
             /* Exploration is a floor on the number of passes, not a random action. A head
                that has learned nothing predicts nearly the same value for both choices, and
                the tie would resolve the same way every time; forcing a longer episode now
-               and then is what gives it anything to learn from. */
+               and then is what gives it anything to learn from. A measurement turns it off,
+               since a floor drawn at random would make some of the decisions it records. */
             forced_min = opt.min_steps;
-            if (opt.exploration > 0 && rnd.get_double_in_range(0, 1) < opt.exploration)
+            if (explore && opt.exploration > 0 &&
+                rnd.get_double_in_range(0, 1) < opt.exploration)
                 forced_min = (long)rnd.get_integer_in_range(opt.min_steps, opt.max_steps);
         }
 

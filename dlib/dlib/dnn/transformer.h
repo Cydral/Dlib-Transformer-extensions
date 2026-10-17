@@ -2088,7 +2088,7 @@ namespace dlib
         h_net_type h_net;
         l_net_type l_net;
 
-        // Initial hidden states (truncated normal, kept fixed during training)
+        // Initial hidden states: zero, and fixed, since the one-step gradient never reaches them
         resizable_tensor z_h_init;
         resizable_tensor z_l_init;
 

@@ -987,7 +987,7 @@ namespace dlib
 
                 where:
                     - x is the input tensor from the subnet
-                    - z_H and z_L are hidden states initialized from learned vectors
+                    - z_H and z_L are hidden states starting from fixed initial vectors
                     - f_H and f_L are the recurrent transformations (H_NET and L_NET)
                     - The + operator denotes element-wise addition (via tt::add)
 
@@ -1006,11 +1006,18 @@ namespace dlib
                     H_NET and L_NET are internal sub-networks invisible to the main
                     trainer's solver. Their parameters are updated via dedicated AdamW
                     solvers inside update_subnet_parameters(), called at the end of
-                    backward(). The learning rate is synchronized from network_context
-                    when active. The layer itself has no direct trainable parameters
-                    (get_layer_params() returns an empty tensor); use
-                    internal_parameters() to obtain the total parameter count of both
-                    H_NET and L_NET combined.
+                    backward(). The learning rate and the optimizer settings are taken
+                    from network_context when it is active. When it is not, the layer
+                    uses its own: the rate given to set_learning_rate(), 0.001 by
+                    default, and the settings given to configure_solvers(). No trainer's
+                    rate or schedule reaches them in that case, so a program training
+                    this layer with dnn_trainer passes the trainer's settings through
+                    network_context::set_optimizer_params() and
+                    network_context::set_learning_rate(), and calls the latter again
+                    whenever the trainer's rate changes. The layer itself has no direct
+                    trainable parameters (get_layer_params() returns an empty tensor);
+                    use internal_parameters() to obtain the total parameter count of
+                    both H_NET and L_NET combined.
 
                 References:
                     - Wang et al., "Hierarchical Reasoning Model", arXiv:2506.21734
@@ -1064,8 +1071,8 @@ namespace dlib
         );
         /*!
             ensures
-                - Drops any carried state, so the next forward() starts from the learned
-                  initial vectors whatever get_carry_state() returns.
+                - Drops any carried state, so the next forward() starts from the initial
+                  vectors whatever get_carry_state() returns.
         !*/
 
         hrm_(const hrm_& other);
@@ -1090,10 +1097,9 @@ namespace dlib
                 - sub.get_output() is a valid tensor
             ensures
                 - #hidden_dim == sub.get_output().nc()
-                - Initializes z_h_init and z_l_init as 1x1x1xhidden_dim tensors
-                  with truncated normal distribution (std=1, truncated at +/-2)
-                - Uses an atomic seed counter for reproducible but distinct
-                  initialization across multiple hrm_ instances
+                - Initializes z_h_init and z_l_init as 1x1x1xhidden_dim tensors of zeros.
+                  They stay fixed: the one-step gradient treats the states as constants
+                  and never reaches them.
         !*/
 
         template <typename SUBNET>

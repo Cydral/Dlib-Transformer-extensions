@@ -183,12 +183,15 @@ namespace dlib
         !*/
 
         void begin_episode (
+            bool explore = true
         );
         /*!
             ensures
                 - discards anything left from a previous episode and draws this one's floor
-                  on the number of passes, which is min_steps, or a longer draw with
-                  probability exploration.
+                  on the number of passes, which is min_steps, or, when explore is true, a
+                  longer draw with probability exploration.
+                - a measurement passes explore == false, so that every decision it records
+                  is the head's own.
         !*/
 
         bool decide (

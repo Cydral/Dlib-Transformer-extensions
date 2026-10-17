@@ -74,6 +74,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <fstream>
 #include <iostream>
 #include <numeric>
 #include <random>
@@ -151,8 +152,8 @@ using arc_config = hrm_transformer_config<
     The control: the same blocks, stacked, with nothing of the hierarchical layer.
 
     Three things separate the two networks and only a straight stack removes all three.
-    The recurrent layer starts its state from vectors it has learned, combines its inputs
-    by addition rather than by stacking, and carries gradient through its last pass alone,
+    The recurrent layer starts its state from fixed vectors, combines its inputs by
+    addition rather than by stacking, and carries gradient through its last pass alone,
     which is the one-step approximation the architecture rests on. Shortening the
     recurrence leaves all three in place, so a run that plateaus with it and also without
     it says nothing.
@@ -162,14 +163,22 @@ using arc_config = hrm_transformer_config<
     learns where the recurrent network stops, the recurrence is what to look at; if it
     stops in the same place, the cause is elsewhere and an expensive avenue is closed.
 */
-template <long TABLE, bool USE_ACT>
+template <long TABLE, bool USE_ACT, template <typename> class DO>
 using dense_stack = typename impl::hrm_stack_selector<
     attention_impl::unified, NUM_H_LAYERS + NUM_L_LAYERS, EMBED_DIM, NUM_HEADS,
-    NUM_KV_HEADS, gelu, dropout_10,
+    NUM_KV_HEADS, gelu, DO,
     embeddings<TABLE, EMBED_DIM, input<matrix<int, 0, 1>>>, USE_ACT, ATTENTION_CAUSAL>::type;
 
+/*
+    Each network comes in two types, as every network with dropout does in dlib: the one
+    trained, and the one measured, where each dropout becomes the scaling it stands for.
+    The measured type is obtained by deserializing the trained one into it.
+*/
 template <long TABLE, bool USE_ACT>
-using dense_net = classification_head<COLOUR_VOCAB, dense_stack<TABLE, USE_ACT>>;
+using dense_net = classification_head<COLOUR_VOCAB, dense_stack<TABLE, USE_ACT, dropout_10>>;
+
+template <long TABLE, bool USE_ACT>
+using dense_infer_net = classification_head<COLOUR_VOCAB, dense_stack<TABLE, USE_ACT, multiply>>;
 
 // ----------------------------------------------------------------------------------------
 
@@ -324,6 +333,29 @@ void reset_state (net_type& net)
     visit_layers(net, [](size_t, auto& l) { reset_if_hierarchical(l, 0); });
 }
 
+/*
+    The rate the hierarchical layer last updated its two modules at, or a negative value
+    for a network without one. It is read from the layer rather than from the trainer:
+    the layer updates the modules itself, so a rate that fails to reach them shows here
+    and nowhere else.
+*/
+template <typename layer_type>
+auto read_rate_if_hierarchical (layer_type& l, double& rate, int)
+    -> decltype(l.layer_details().get_carry_state(), l.layer_details().get_learning_rate(), void())
+{
+    rate = l.layer_details().get_learning_rate();
+}
+template <typename layer_type>
+void read_rate_if_hierarchical (layer_type&, double&, long) {}
+
+template <typename net_type>
+double module_rate (net_type& net)
+{
+    double rate = -1;
+    visit_layers(net, [&rate](size_t, auto& l) { read_rate_if_hierarchical(l, rate, 0); });
+    return rate;
+}
+
 // ----------------------------------------------------------------------------------------
 
 struct run_options
@@ -401,7 +433,7 @@ double evaluate (net_type& net, const arc_dataset& d, const run_options& o,
                evaluation of a model loaded from disk with no head beside it can do. */
             reset_state(net);
             set_carry(net, true);
-            if (halting) halting->begin_episode();
+            if (halting) halting->begin_episode(false);
             for (long s = 0; s < o.max_steps; ++s)
             {
                 net.subnet().forward(batch);
@@ -494,7 +526,42 @@ double evaluate (net_type& net, const arc_dataset& d, const run_options& o,
 
 // ----------------------------------------------------------------------------------------
 
-template <typename net_type>
+/*
+    A checkpoint carries the shape it was trained at. Loading one written by a different
+    width leaves the weights mismatched and the failure surfaces deep inside an attention
+    layer, where nothing names the cause. Saying it here costs one try block.
+*/
+template <typename network>
+bool load_model (network& net, const std::string& file)
+{
+    try
+    {
+        deserialize(file) >> net;
+        return true;
+    }
+    catch (const std::exception& e)
+    {
+        cout << "\n" << file << " does not fit this network. It was most likely written "
+                "by a\nrun of a different width or depth; the current one is "
+             << NUM_H_LAYERS << " and " << NUM_L_LAYERS << " layers at width "
+             << EMBED_DIM << ".\nRemove it, or point --model-file elsewhere.\n\n  "
+             << e.what() << "\n";
+        return false;
+    }
+}
+
+/*
+    net_type is the network trained, infer_type the one measured.
+
+    Every measurement runs on infer_type. dlib's dropout draws a fresh mask on every
+    forward, at evaluation as well, so the trained type answers with a random share of its
+    activations removed at every dropout site, a different share each time. The recurrent
+    network crosses those sites at every cycle of each module, several times as often per
+    pass as the dense control does, and again with every segment, so a measurement taken
+    on the trained type penalizes it more the more it recurs. infer_type replaces each
+    dropout by the scaling it stands for, and its answers no longer depend on a draw.
+*/
+template <typename net_type, typename infer_type>
 int run (const arc_dataset& train, const arc_dataset& eval_set, const run_options& o,
          bool do_train, bool do_eval)
 {
@@ -508,26 +575,12 @@ int run (const arc_dataset& train, const arc_dataset& eval_set, const run_option
     qopt.summary_dim = o.summary_dim;
     q_halting_controller halting(qopt);
 
-    if (file_exists(o.model_file))
+    // A run that only evaluates reads the file into infer_type, further down.
+    if (do_train && file_exists(o.model_file))
     {
-        /* A checkpoint carries the shape it was trained at. Loading one written by a
-           different width leaves the weights mismatched and the failure surfaces deep
-           inside an attention layer, where nothing names the cause. Saying it here costs
-           one try block. */
         cout << "Loading " << o.model_file << "\n";
-        try
-        {
-            deserialize(o.model_file) >> net;
-        }
-        catch (const std::exception& e)
-        {
-            cout << "\n" << o.model_file << " does not fit this network. It was most likely "
-                    "written by a\nrun of a different width or depth; the current one is "
-                 << NUM_H_LAYERS << " and " << NUM_L_LAYERS << " layers at width "
-                 << EMBED_DIM << ".\nRemove it, or point --model-file elsewhere.\n\n  "
-                 << e.what() << "\n";
+        if (!load_model(net, o.model_file))
             return 1;
-        }
     }
     cout << "Parameters: " << count_network_parameters(net, SEQ_LEN) << "\n";
 
@@ -545,7 +598,10 @@ int run (const arc_dataset& train, const arc_dataset& eval_set, const run_option
         net.loss_details().set_ignore_index((long)arc_ignore_label);
         net.loss_details().set_pad_index((long)arc_ignore_label);
 
-        dnn_trainer<net_type, adam> trainer(net, adam(1e-4, 0.9, 0.999));
+        /* The trainer's optimizer settings, named once because the context below hands them
+           to the hierarchical layer as well, which updates its two modules itself. */
+        const double weight_decay = 1e-4, beta1 = 0.9, beta2 = 0.999;
+        dnn_trainer<net_type, adam> trainer(net, adam(weight_decay, beta1, beta2));
         trainer.set_learning_rate(o.learning_rate);
         trainer.set_mini_batch_size((size_t)o.batch_size);
         trainer.set_synchronization_file("chkpt-" + o.model_file, std::chrono::minutes(15));
@@ -559,9 +615,8 @@ int run (const arc_dataset& train, const arc_dataset& eval_set, const run_option
         /* The trainer lowers its rate when the loss stops falling, which assumes the loss
            is measured on the same thing from one step to the next. Here an epoch draws a
            different variant of each task, so the loss jumps whenever the draw changes and
-           the heuristic reads that as a plateau: the rate reached one in a million by the
-           fourth epoch on a corpus it had barely begun to learn. The schedule is therefore
-           explicit, held flat and stepped down by the caller. */
+           the heuristic reads that as a plateau long before the corpus is learned. The
+           patience is therefore the caller's, and large by default. */
         trainer.set_iterations_without_progress_threshold(o.patience);
         trainer.set_min_learning_rate(o.learning_rate * 1e-3);
 
@@ -576,6 +631,17 @@ int run (const arc_dataset& train, const arc_dataset& eval_set, const run_option
            usual behaviour for a run whose draw is fixed. */
         if (!o.anneal)
             trainer.set_learning_rate_shrink_factor(1);
+
+        /* The recurrent modules sit inside the hierarchical layer, and the transition
+           networks inside the adaptive layer, and both layers update those inner networks
+           with solvers of their own, out of the trainer's reach. Left alone, they train at
+           the rate those layers default to, whatever --learning-rate says, and no schedule
+           reaches them. The context hands both layers the trainer's rate, and the
+           hierarchical layer its optimizer settings too, so that its modules train at the
+           rate, and with the settings, the trainer applies to the dense control's blocks. */
+        network_context::set_optimizer_params(weight_decay, beta1, beta2);
+        double context_rate = trainer.get_learning_rate();
+        network_context::set_learning_rate(context_rate);
 
         /* The identifier embedding needs a rate of its own.
 
@@ -655,6 +721,17 @@ int run (const arc_dataset& train, const arc_dataset& eval_set, const run_option
                 ys.push_back(arc_make_label(train, i));
 
                 if ((long)xs.size() < o.batch_size) continue;
+
+                /* The trainer changes its rate on its own thread, when it reads a plateau or
+                   reloads its synchronization file. The context follows at a barrier, taken
+                   only when the rate has moved, since the barrier keeps the trainer from
+                   overlapping the next batch with the current step. */
+                if (trainer.get_learning_rate() != context_rate)
+                {
+                    trainer.get_net(force_flush_to_disk::no);
+                    context_rate = trainer.get_learning_rate();
+                    network_context::set_learning_rate(context_rate);
+                }
 
                 if (uses_loop(o.halting))
                 {
@@ -761,6 +838,9 @@ int run (const arc_dataset& train, const arc_dataset& eval_set, const run_option
             cout << "epoch " << (epoch + 1) << "/" << o.max_epochs
                  << "  average loss " << trainer.get_average_loss()
                  << "  lr " << trainer.get_learning_rate();
+            const double modules = module_rate(trainer.get_net(force_flush_to_disk::no));
+            if (modules >= 0)
+                cout << ", modules " << modules;
             if (uses_loop(o.halting))
                 cout << "  |  segments " << halting.average_steps()
                      << "  reward " << halting.average_reward()
@@ -778,14 +858,24 @@ int run (const arc_dataset& train, const arc_dataset& eval_set, const run_option
             if (eval_set.num_examples() > 0 && o.eval_every > 0 &&
                 (epoch + 1) % o.eval_every == 0)
             {
-                /* The measurement runs on a copy. Run on the trainer's own network, it
+                /* The measurement runs on a snapshot. Run on the trainer's own network, it
                    would resize that network's tensors from the training batch to a single
-                   example and back, and clean a network still being trained. A copy costs
-                   the parameters and the embedding table once per measurement and leaves
-                   the trainer's state untouched. */
-                net_type probe = trainer.get_net(force_flush_to_disk::no);
+                   example and back, and clean a network still being trained. The snapshot
+                   is the trained network serialized, which is also the form in which it is
+                   read into the measured type, and the form saved when the measurement is
+                   the best so far. The copy it is taken from is released before the
+                   measured network is built. */
+                std::vector<char> snapshot;
+                {
+                    net_type copy = trainer.get_net(force_flush_to_disk::no);
+                    copy.clean();
+                    serialize(snapshot) << copy;
+                }
+                infer_type measured;
+                deserialize(snapshot) >> measured;
+
                 double used = 0;
-                const double acc = evaluate(probe, eval_set, o, quiet,
+                const double acc = evaluate(measured, eval_set, o, quiet,
                                             uses_loop(o.halting) ? &halting : nullptr,
                                             o.eval_samples, o.segments, &used);
                 cout << "         held out " << acc << " % of cells";
@@ -795,8 +885,10 @@ int run (const arc_dataset& train, const arc_dataset& eval_set, const run_option
                 {
                     best_accuracy = acc;
                     best_epoch    = epoch + 1;
-                    probe.clean();
-                    serialize(o.model_file + ".best") << probe;
+                    std::ofstream best(o.model_file + ".best", std::ios::binary);
+                    best.write(snapshot.data(), (std::streamsize)snapshot.size());
+                    if (!best)
+                        throw std::runtime_error("unable to write " + o.model_file + ".best");
                     cout << ", best so far";
                 }
                 cout << "\n";
@@ -807,6 +899,7 @@ int run (const arc_dataset& train, const arc_dataset& eval_set, const run_option
 
         trainer.get_net();
         set_carry(net, false);
+        network_context::reset();
         net.clean();
         serialize(o.model_file) << net;
         cout << "Model saved to " << o.model_file << "\n";
@@ -823,23 +916,38 @@ int run (const arc_dataset& train, const arc_dataset& eval_set, const run_option
     {
         cout << "\nEvaluating on " << eval_set.num_examples() << " held-out examples, "
              << (o.blank_id ? "without the identifier" : "with the identifier") << "\n";
+
+        /* The model is read from the file the run wrote, the best one when the run kept
+           one, or from the file named when there was no training. */
+        std::string source = o.model_file;
         if (best_accuracy >= 0 && file_exists(o.model_file + ".best"))
         {
             cout << "  using the model of epoch " << best_epoch
                  << ", which scored best while training\n";
-            deserialize(o.model_file + ".best") >> net;
+            source = o.model_file + ".best";
         }
+        if (!file_exists(source))
+        {
+            cout << "  there is no model to evaluate at " << source << "\n";
+            return 1;
+        }
+        infer_type measured;
+        if (!load_model(measured, source))
+            return 1;
+
+        /* The head is not saved with the model, so a run that only evaluates has none
+           trained beside it and runs the budget. */
         if (o.segments > 1)
             cout << "  after " << o.segments << " segments\n";
-        evaluate(net, eval_set, o, false, uses_loop(o.halting) ? &halting : nullptr,
-                 0, o.segments);
+        evaluate(measured, eval_set, o, false,
+                 uses_loop(o.halting) && do_train ? &halting : nullptr, 0, o.segments);
         if (o.segments > 1)
         {
             /* The same network read after one segment. Against the line above it says how
                much the extra passes add at inference; against a network trained on single
                passes, how much training on several segments changed the first one. */
             cout << "  after a single segment\n";
-            evaluate(net, eval_set, o, false, nullptr, 0, 1);
+            evaluate(measured, eval_set, o, false, nullptr, 0, 1);
         }
     }
     return 0;
@@ -868,8 +976,10 @@ int dispatch_table (const arc_dataset& train, const arc_dataset& eval_set,
         return 1;
     }
     return o.dense
-        ? run<dense_net<TABLE_ROWS, USE_ACT>>(train, eval_set, o, do_train, do_eval)
-        : run<typename arc_config<TABLE_ROWS, USE_ACT>::template network_type<true>>(
+        ? run<dense_net<TABLE_ROWS, USE_ACT>, dense_infer_net<TABLE_ROWS, USE_ACT>>(
+              train, eval_set, o, do_train, do_eval)
+        : run<typename arc_config<TABLE_ROWS, USE_ACT>::template network_type<true>,
+              typename arc_config<TABLE_ROWS, USE_ACT>::template network_type<false>>(
               train, eval_set, o, do_train, do_eval);
 }
 
