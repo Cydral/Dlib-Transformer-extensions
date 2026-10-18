@@ -377,6 +377,13 @@ int main(int argc, char** argv)
             trainer.set_synchronization_file("chkpt-" + model_file, std::chrono::minutes(10));
             trainer.be_quiet();
 
+            /* Every block wraps its feed-forward in an adaptive computation layer, which
+               updates its transition network with solvers of its own, out of the trainer's
+               reach. The context hands those solvers the trainer's settings here, and its
+               rate at every step below, so that those weights train as the rest of the
+               network does. */
+            network_context::set_optimizer_params(alpha, beta1, beta2);
+
             cout << "Number of model parameters: " << count_network_parameters(net, max_seq_len) << endl;
             cout << "Starting training...\n";
 

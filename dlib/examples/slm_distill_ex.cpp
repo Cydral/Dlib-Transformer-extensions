@@ -164,6 +164,7 @@ static void emit_moe_student_header(const model_spec& s, const std::string& path
         << "#include <dlib/dnn.h>\n\n"
         << "#define DLIB_STUDENT_IS_MOE 1\n\n"
         << "namespace " << ns << "\n{\n"
+        << "    static const char* const MODEL_NAME = \"" << s.model_name << "\";\n\n"
         << "    constexpr long VOCAB_SIZE    = " << s.vocab_size << ";\n"
         << "    constexpr long NUM_LAYERS    = " << s.n_layers << ";\n"
         << "    constexpr long NUM_HEADS     = " << s.n_heads << ";\n"
@@ -523,7 +524,8 @@ static int run_train(const std::vector<std::string>& trace_paths, const std::str
     cout << "\nStudent     : " << student_model::config::model_info::describe() << "\n"
          << "  soft/hard : alpha " << alpha << ", temperature " << temperature << "\n";
 
-    dnn_trainer<train_net, adamw> trainer(net, adamw(0.01f, 0.9f, 0.95f));
+    const float weight_decay = 0.01f, beta1 = 0.9f, beta2 = 0.95f;
+    dnn_trainer<train_net, adamw> trainer(net, adamw(weight_decay, beta1, beta2));
     trainer.set_learning_rate(lr);
     trainer.set_min_learning_rate(lr * 1e-3);
     trainer.set_mini_batch_size(static_cast<unsigned long>(batch));
@@ -532,6 +534,13 @@ static int run_train(const std::vector<std::string>& trace_paths, const std::str
     trainer.be_verbose();
     if (!sync_file.empty())
         trainer.set_synchronization_file(sync_file, std::chrono::minutes(10));
+
+    /* The experts and the gate of a mixture-of-experts student, like the transition
+       networks of an adaptive computation layer, are updated by their layers with
+       solvers of their own, out of the trainer's reach. The context hands those solvers
+       the trainer's settings here, and its rate at every step, so that they train as
+       the rest of the network does. */
+    network_context::set_optimizer_params(weight_decay, beta1, beta2);
 
     /* A slice of the recording is held back and never trained on.
 
