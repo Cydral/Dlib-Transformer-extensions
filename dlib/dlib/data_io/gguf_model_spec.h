@@ -281,16 +281,16 @@ namespace dlib
 
     inline compat_result check_compatibility(const model_spec& s, bool fused_attention_path = true)
     {
-        /* fused_attention_path distinguishes the two consumers: the template network
-           packs [wq|wk|wv|wo] with no bias slots, so the QKV biases of the qwen2
-           family are not representable there; the runtime engine loads and applies
-           them and passes false. */
+        /* fused_attention_path distinguishes the two consumers, the template network
+           and the runtime engine, which passes false. Both hold the QKV biases of the
+           qwen2 family, so no check depends on it at present. */
         compat_result r;
         if (s.family == arch_family::gemma || s.family == arch_family::gemma2)
             r.blockers.push_back("Gemma family needs (1+w) RMSNorm, embedding scaling and GeGLU, not available yet");
-        /* qwen2 QKV biases are held by the constant-layout bias slots of the fused
-           attention packing; the first support tranche applies them in the inference
-           forwards and freezes them during training (their gradients are zeroed). */
+        /* qwen2 QKV biases are held by the bias slots the fused attention packing
+           allocates for the families that carry them; the first support tranche applies
+           them in the inference forwards and freezes them during training (their
+           gradients are zeroed). */
         (void)fused_attention_path;
         if (s.n_experts > 0)
         {

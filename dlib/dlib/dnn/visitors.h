@@ -1101,7 +1101,15 @@ namespace dlib
                 start_node(i, "rms_norm");
                 end_node();
                 update(i);
-            }            
+            }
+
+            template <typename U, typename E>
+            void operator()(size_t i, const add_layer<unit_rms_norm_, U, E>&)
+            {
+                start_node(i, "unit_rms_norm");
+                end_node();
+                update(i);
+            }
 
             template <layer_mode MODE, typename U, typename E>
             void operator()(size_t i, const add_layer<bn_<MODE>, U, E>&)
@@ -1428,8 +1436,9 @@ namespace dlib
                 update(i);
             }
 
-            template <typename H_NET, typename L_NET, int N, int T, typename U, typename E>
-            void operator()(size_t i, const add_layer<hrm_<H_NET, L_NET, N, T>, U, E>& l)
+            template <typename H_NET, typename L_NET, int N, int T, hrm_init INIT,
+                typename U, typename E>
+            void operator()(size_t i, const add_layer<hrm_<H_NET, L_NET, N, T, INIT>, U, E>& l)
             {
                 start_node(i, "hrm");
                 out << " | {H_cycles|{" << N << "}}";

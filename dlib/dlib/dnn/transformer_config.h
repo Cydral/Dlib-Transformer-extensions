@@ -139,6 +139,24 @@ namespace dlib
         unified
     };
 
+    /* The structure the two modules of an HRM configuration take.
+
+         pre_norm   The library's pre-norm blocks, with learned RMS gains and a SwiGLU of
+                    8/3 of the width whose projections carry biases. Each module's output
+                    goes through an rms_norm with a learned gain, and the recurrence starts
+                    from zero states.
+         reference  The structure of the reference implementation, with post-norm blocks
+                    normalized without a gain, a bias-free SwiGLU of 8/3 of the width
+                    rounded up to a multiple of 256, no normalization beyond the blocks,
+                    and the initialization of hrm_init::reference. Built on the unified
+                    attention only.
+    */
+    enum class hrm_structure
+    {
+        pre_norm,
+        reference
+    };
+
     namespace impl
     {
         // Dispatcher: selects the appropriate transformer_stack alias based on
@@ -172,32 +190,94 @@ namespace dlib
         template <attention_impl Impl, long num_layers,
             long d_model, long num_heads, long num_kv_heads,
             template <typename> class ACT, template <typename> class DO,
-            typename SUBNET, bool UseAct = false, bool Causal = true>
+            typename SUBNET, bool UseAct = false, bool Causal = true,
+            hrm_structure Structure = hrm_structure::pre_norm>
         struct hrm_stack_selector;
 
         template <long num_layers, long d_model, long num_heads, long num_kv_heads,
             template <typename> class ACT, template <typename> class DO, typename SUBNET, bool UseAct,
-            bool Causal>
+            bool Causal, hrm_structure Structure>
         struct hrm_stack_selector<attention_impl::chained, num_layers,
-            d_model, num_heads, num_kv_heads, ACT, DO, SUBNET, UseAct, Causal>
+            d_model, num_heads, num_kv_heads, ACT, DO, SUBNET, UseAct, Causal, Structure>
         {
+            static_assert(Structure == hrm_structure::pre_norm,
+                "the reference HRM structure is built on the unified attention only");
             using type = canonical_transformer::transformer_stack<
                 num_layers, ACT, DO, d_model, num_heads, SUBNET> ;
             static const char* name() { return "canonical (multi-head)"; }
         };
 
-        template <long num_layers, long d_model, long num_heads, long num_kv_heads,
-            template <typename> class ACT, template <typename> class DO, typename SUBNET, bool UseAct,
-            bool Causal>
-        struct hrm_stack_selector<attention_impl::unified, num_layers,
-            d_model, num_heads, num_kv_heads, ACT, DO, SUBNET, UseAct, Causal>
+        // Width of the reference SwiGLU: 8/3 of the model width, rounded to the nearest
+        // integer, then up to a multiple of 256.
+        constexpr long hrm_reference_ffn_width(long d_model)
         {
-            // The defaults up to the causality switch are spelled out because a template
-            // argument cannot be passed past ones left to default.
+            return ((8 * d_model + 1) / 3 + 255) / 256 * 256;
+        }
+
+        // The unified stack in either structure. The defaults up to the last argument
+        // passed are spelled out, since a template argument cannot be passed past ones
+        // left to default.
+        template <hrm_structure Structure, long num_layers, long d_model, long num_heads,
+            long num_kv_heads, typename SUBNET, bool UseAct, bool Causal>
+        struct hrm_unified_stack
+        {
             using type = gqa_transformer_unified::transformer_stack<
                 num_layers, d_model, num_heads, num_kv_heads, SUBNET, UseAct,
                 8, 3, linear, d_model / num_heads, false, Causal>;
+        };
+
+        template <long num_layers, long d_model, long num_heads, long num_kv_heads,
+            typename SUBNET, bool UseAct, bool Causal>
+        struct hrm_unified_stack<hrm_structure::reference, num_layers, d_model, num_heads,
+            num_kv_heads, SUBNET, UseAct, Causal>
+        {
+            // The hidden width is hidden_num * d_model / hidden_den, so hidden_den = d_model
+            // sets it exactly.
+            using type = gqa_transformer_unified::transformer_stack<
+                num_layers, d_model, num_heads, num_kv_heads, SUBNET, UseAct,
+                hrm_reference_ffn_width(d_model), d_model, linear_no_bias, d_model / num_heads,
+                false, Causal, norm_placement::post>;
+        };
+
+        template <long num_layers, long d_model, long num_heads, long num_kv_heads,
+            template <typename> class ACT, template <typename> class DO, typename SUBNET, bool UseAct,
+            bool Causal, hrm_structure Structure>
+        struct hrm_stack_selector<attention_impl::unified, num_layers,
+            d_model, num_heads, num_kv_heads, ACT, DO, SUBNET, UseAct, Causal, Structure>
+        {
+            using type = typename hrm_unified_stack<Structure, num_layers, d_model, num_heads,
+                num_kv_heads, SUBNET, UseAct, Causal>::type;
             static const char* name() { return "unified (gqa_attention_)"; }
+        };
+
+        /* A module of the recurrence. A pre-norm stack returns its residual stream
+           unnormalized, and the module adds the normalization the recurrence depends on;
+           a post-norm stack already ends in one. */
+        template <hrm_structure Structure, typename STACK>
+        struct hrm_module
+        {
+            using type = rms_norm<STACK>;
+        };
+
+        template <typename STACK>
+        struct hrm_module<hrm_structure::reference, STACK>
+        {
+            using type = STACK;
+        };
+
+        /* The language-model head over the recurrence. The pre-norm structure normalizes
+           the H state once more under a biased projection; the reference reads the state
+           as its last block left it, through a bias-free projection. */
+        template <hrm_structure Structure, long num_logits, typename SUBNET>
+        struct hrm_head
+        {
+            using type = classification_head<num_logits, SUBNET>;
+        };
+
+        template <long num_logits, typename SUBNET>
+        struct hrm_head<hrm_structure::reference, num_logits, SUBNET>
+        {
+            using type = loss_cross_entropy_per_token<linear_no_bias<num_logits, SUBNET>>;
         };
     }
 
@@ -297,7 +377,12 @@ namespace dlib
            A model that answers a whole grid in one pass needs it off: a cell of the output
            can depend on any cell of the input, including those that follow it in reading
            order. Only the unified attention honours the switch. */
-        bool causal = true
+        bool causal = true,
+        /* The structure of the modules, the library's pre-norm one by default. The
+           reference structure reproduces the blocks, the normalization and the
+           initialization of the reference implementation, for the experiments that
+           compare against it. */
+        hrm_structure structure = hrm_structure::pre_norm
     >
     struct hrm_transformer_config {
         // Core model parameters
@@ -313,6 +398,9 @@ namespace dlib
         static constexpr long HRM_N = hrm_N;
         static constexpr long HRM_T = hrm_T;
         static constexpr attention_impl IMPL = impl;
+        static constexpr hrm_structure STRUCTURE = structure;
+        static constexpr hrm_init INIT =
+            structure == hrm_structure::reference ? hrm_init::reference : hrm_init::library;
 
         // Compile-time validation
         struct validation {
@@ -331,46 +419,53 @@ namespace dlib
                 "num_heads must be divisible by num_kv_heads when using unified attention");
             static_assert(IMPL != attention_impl::unified || (EMBEDDING_DIM / NUM_HEADS) % 2 == 0,
                 "head_dim must be even (RoPE constraint) when using unified attention");
+            static_assert(STRUCTURE != hrm_structure::reference || IMPL == attention_impl::unified,
+                "the reference structure is built on the unified attention only");
         };
 
         // H and L sub-network types dispatched by the attention implementation
         /*
             Each module ends in a normalisation, and the recurrence depends on it.
 
-            The blocks are pre-norm: a block returns its residual stream unnormalised, which
-            is the standard choice for a single pass and the reason a straight stack of them
-            trains well. Inside this recurrence the module's output is fed back as the next
-            input, so each pass adds its sublayer contributions to a state nothing
-            renormalises. Measured on the carried state, the RMS goes 2.0, 15, 147, 1479 and
-            320989 as the cycles go 1, 2, 3, 4 and 6: it grows by an order of magnitude a
-            cycle. The norm that follows the layer hides this from the output, so the logits
-            look sane, while the one-step gradient runs through a state far out of scale and
-            the earlier passes keep enlarging what the final one receives.
+            Inside the recurrence a module's output is fed back as its next input. Pre-norm
+            blocks return their residual stream unnormalised, so each pass would add its
+            sublayer contributions to a state nothing renormalises, and the carried state
+            grows by about an order of magnitude a cycle. The norm under the head hides the
+            growth from the logits, while the one-step gradient runs through a state far out
+            of scale.
 
-            The reference avoids it with post-norm blocks, whose output always has unit RMS.
-            Normalising each module's output gives the same invariant, a carried state that
-            stays bounded however many passes there are, without changing the block shared
-            by every other model in the library.
+            The pre-norm structure therefore ends each module in an rms_norm, which keeps
+            the carried state bounded however many passes there are. The reference structure
+            needs nothing more, since its post-norm blocks always return unit RMS.
         */
-        using train_h_net_type = rms_norm<typename impl::hrm_stack_selector<IMPL, NUM_H_LAYERS,
-            EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS, activation_func, dropout_policy, input_tensor, USE_ACT, causal>::type>;
-        using train_l_net_type = rms_norm<typename impl::hrm_stack_selector<IMPL, NUM_L_LAYERS,
-            EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS, activation_func, dropout_policy, input_tensor, USE_ACT, causal>::type>;
+        using train_h_net_type = typename impl::hrm_module<STRUCTURE, typename impl::hrm_stack_selector<
+            IMPL, NUM_H_LAYERS, EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS, activation_func, dropout_policy,
+            input_tensor, USE_ACT, causal, STRUCTURE>::type>::type;
+        using train_l_net_type = typename impl::hrm_module<STRUCTURE, typename impl::hrm_stack_selector<
+            IMPL, NUM_L_LAYERS, EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS, activation_func, dropout_policy,
+            input_tensor, USE_ACT, causal, STRUCTURE>::type>::type;
 
-        using infer_h_net_type = rms_norm<typename impl::hrm_stack_selector<IMPL, NUM_H_LAYERS,
-            EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS, activation_func, multiply, input_tensor, USE_ACT, causal>::type>;
-        using infer_l_net_type = rms_norm<typename impl::hrm_stack_selector<IMPL, NUM_L_LAYERS,
-            EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS, activation_func, multiply, input_tensor, USE_ACT, causal>::type>;
+        using infer_h_net_type = typename impl::hrm_module<STRUCTURE, typename impl::hrm_stack_selector<
+            IMPL, NUM_H_LAYERS, EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS, activation_func, multiply,
+            input_tensor, USE_ACT, causal, STRUCTURE>::type>::type;
+        using infer_l_net_type = typename impl::hrm_module<STRUCTURE, typename impl::hrm_stack_selector<
+            IMPL, NUM_L_LAYERS, EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS, activation_func, multiply,
+            input_tensor, USE_ACT, causal, STRUCTURE>::type>::type;
+
+        /* The recurrence over the two modules, fed by SUBNET, initialized as the structure
+           calls for. Programs that put their own head or input around the recurrence build
+           it from these, so that the initialization stays matched to the blocks. */
+        template <typename SUBNET>
+        using train_hrm = hrm<train_h_net_type, train_l_net_type, HRM_N, HRM_T, SUBNET, INIT>;
+        template <typename SUBNET>
+        using infer_hrm = hrm<infer_h_net_type, infer_l_net_type, HRM_N, HRM_T, SUBNET, INIT>;
 
         // Network definition selector based on training mode
         template<bool is_training>
-        using network_type = std::conditional_t<is_training,
-            classification_head<OUTPUT_VOCAB_SIZE,
-            hrm<train_h_net_type, train_l_net_type, HRM_N, HRM_T,
-            embeddings<VOCAB_SIZE, EMBEDDING_DIM, input<matrix<int, 0, 1>>>>>,
-            classification_head<OUTPUT_VOCAB_SIZE,
-            hrm<infer_h_net_type, infer_l_net_type, HRM_N, HRM_T,
-            embeddings<VOCAB_SIZE, EMBEDDING_DIM, input<matrix<int, 0, 1>>>>>>;
+        using network_type = typename impl::hrm_head<STRUCTURE, OUTPUT_VOCAB_SIZE,
+            std::conditional_t<is_training,
+            train_hrm<embeddings<VOCAB_SIZE, EMBEDDING_DIM, input<matrix<int, 0, 1>>>>,
+            infer_hrm<embeddings<VOCAB_SIZE, EMBEDDING_DIM, input<matrix<int, 0, 1>>>>>>::type;
 
         struct model_info {
             static std::string describe() {
@@ -389,7 +484,9 @@ namespace dlib
                 ss << "- Embedding dim    : " << EMBEDDING_DIM << "\n"
                     << "- Attention impl   : " << impl::hrm_stack_selector<IMPL, 1,
                     EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS,
-                    activation_func, dropout_policy, void>::name() << "\n"
+                    activation_func, dropout_policy, void, USE_ACT, causal, STRUCTURE>::name() << "\n"
+                    << "- Block structure  : " << (STRUCTURE == hrm_structure::reference
+                        ? "reference (post-norm, no gain)" : "pre-norm") << "\n"
                     << "- HRM cycles       : N=" << HRM_N << " (high-level), T=" << HRM_T << " (low-level)\n"
                     << "- Total reasoning  : " << (HRM_N * HRM_T) << " iterations";
                 return ss.str();

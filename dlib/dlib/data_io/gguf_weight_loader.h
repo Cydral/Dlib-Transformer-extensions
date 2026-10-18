@@ -285,9 +285,10 @@ namespace dlib
                 const size_t nq = static_cast<size_t>(d) * qd;
                 const size_t nkv = static_cast<size_t>(d) * kv;
                 const size_t ng = spec.qk_norm ? static_cast<size_t>(hd) : 0;
-                /* Constant-layout bias slots [bq|bk|bv] close the packed blob; they
-                   stay zero for bias-free families. */
-                const size_t nb = static_cast<size_t>(qd) + 2 * static_cast<size_t>(kv);
+                /* The bias slots [bq|bk|bv] close the packed blob of the families that
+                   carry QKV biases; a bias-free layer holds none. */
+                const size_t nb = has_qkv_bias
+                    ? static_cast<size_t>(qd) + 2 * static_cast<size_t>(kv) : 0;
                 std::vector<float> fused(2 * nq + 2 * nkv + 2 * ng + nb, 0.0f);
                 std::vector<float> sq = fetch(g, p + "attn_q.weight");
                 std::vector<float> sk = fetch(g, p + "attn_k.weight");
@@ -331,7 +332,7 @@ namespace dlib
                         dst_gk[ri] = gk[static_cast<size_t>(r)];
                     }
                 }
-                if (g.find_tensor(p + "attn_q.bias"))
+                if (has_qkv_bias)
                 {
                     /* QKV biases (qwen2 family). The Q and K vectors live in the same
                        output space as the permuted projection rows, so the NeoX layout

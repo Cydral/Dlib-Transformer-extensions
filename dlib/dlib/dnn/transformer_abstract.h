@@ -40,6 +40,8 @@
          dot-product, causal mask, output projection, and KV cache)
        - Supports prefill / incremental inference modes via network_context
        - Drop-in replacement for gqa_transformer in any topology
+       - Builds pre-norm blocks by default, and post-norm blocks normalized
+         without a gain on request (norm_placement::post)
 
     Auxiliary classes:
        - network_context  : thread-safe singleton sharing learning rate,
@@ -256,13 +258,12 @@ namespace dlib
 
                 The parameter tensor stores, contiguously in a single
                 resizable_tensor with alias_tensor views over each part:
-                    [ W_Q | W_K | W_V | W_O (| gamma_q | gamma_k) | b_q | b_k | b_v ]
+                    [ W_Q | W_K | W_V | W_O (| gamma_q | gamma_k) (| b_q | b_k | b_v) ]
                 W_Q maps EMBEDDING_DIM to Q_PROJ_DIM, W_K and W_V map
                 EMBEDDING_DIM to KV_PROJ_DIM, and W_O maps Q_PROJ_DIM back to
                 EMBEDDING_DIM. The gamma slots exist only when USE_QK_NORM is
-                true. The bias slots are always present (constant layout across
-                families) and stay zero-initialized and inert unless the
-                QKV-bias mode is enabled. When host-resident inference is
+                true, the bias slots only when the QKV-bias mode is enabled, so
+                a bias-free layer stores, trains and serializes no bias. When host-resident inference is
                 selected via network_context::set_parameter_residency(), the
                 tensor is captured by an internal param_offload_store and
                 materialized just in time at each forward. The KV cache state
@@ -340,16 +341,31 @@ namespace dlib
                 - Only meaningful when USE_QK_NORM is true; ignored otherwise.
         !*/
 
+        void set_weight_init(weight_init val);
+        weight_init get_weight_init() const;
+        /*!
+            ensures
+                - Sets / returns how setup() draws the Q, K, V and O projections,
+                  weight_init::glorot_uniform by default. With
+                  weight_init::truncated_lecun_normal each projection takes the
+                  deviation of one over the square root of its input width.
+                - The setting is read by setup() only, and it is not serialized.
+        !*/
+
         void set_qkv_bias_enabled(bool enabled);
         bool qkv_bias_enabled() const;
         /*!
             ensures
-                - Enables / disables the addition of the b_q/b_k/b_v bias slots
-                  after the Q/K/V projections (used by families such as Qwen2
-                  that carry QKV projection biases).
-                - The slots exist in the parameter layout either way; disabled,
-                  they stay zero and cost nothing numerically. The flag is
-                  serialized with the layer.
+                - Enables / disables the b_q/b_k/b_v biases added after the Q/K/V
+                  projections (used by families such as Qwen2 that carry QKV
+                  projection biases). The flag is serialized with the layer.
+                - The bias slots exist in the parameter tensor only while the flag
+                  is set. Set before the first forward, it decides the layout
+                  setup() allocates. On a layer already set up, the tensor is laid
+                  out again: the weights, the gammas and the adapter blocks are
+                  kept, and the slots are added at zero or removed. Call it before
+                  training starts, since a solver holds state shaped like the
+                  tensor.
         !*/
 
         void reset_kv_cache();
@@ -457,8 +473,8 @@ namespace dlib
                   the four weight matrices W_Q, W_K, W_V, W_O (each with Glorot
                   scaling derived from its own row+column count); when
                   USE_QK_NORM is true the gamma_q/gamma_k slots are initialized
-                  to 1; the b_q/b_k/b_v bias slots are zeroed (inert until
-                  enabled).
+                  to 1; when the QKV-bias mode is enabled the b_q/b_k/b_v slots
+                  are allocated and zeroed, for a loader to fill.
                 - Probes the embedded RoPE helpers with q_probe and k_probe of
                   the input's sequence length so their trigonometric caches are
                   pre-allocated.
@@ -621,6 +637,22 @@ namespace dlib
 
     // ----------------------------------------------------------------------------------------
 
+    enum class norm_placement { pre, post };
+    /*!
+        WHAT THIS ENUM REPRESENTS
+            Where a transformer block of gqa_transformer_unified normalizes its
+            residual stream.
+
+            - pre:  each sublayer reads an rms_norm of the stream and adds its
+                    output to the stream itself, so a block returns the stream
+                    unnormalized. The language models of the library and the
+                    open-weight models it imports use these blocks.
+            - post: each sublayer reads the stream and adds its output to it, and
+                    the sum goes through a unit_rms_norm, so a block always
+                    returns unit RMS. The blocks of the Hierarchical Reasoning
+                    Model use this placement.
+    !*/
+
     namespace gqa_transformer_unified
     {
         /*!
@@ -643,13 +675,16 @@ namespace dlib
         !*/
 
         template<long d_model, long num_heads, long num_kv_heads, typename SUBNET,
-            long head_dim = d_model / num_heads, bool use_qk_norm = false>
+            long head_dim = d_model / num_heads, bool use_qk_norm = false,
+            bool causal = true>
         using multihead_attention_gqa = some_template_expression;
         /*!
             ensures
                 - Alias for gqa_attention<d_model, num_heads, num_kv_heads,
-                  head_dim, SUBNET, use_qk_norm>. The trailing defaults keep
-                  every pre-existing instantiation unchanged.
+                  head_dim, SUBNET, use_qk_norm, causal>. The trailing defaults
+                  keep every pre-existing instantiation unchanged.
+                - causal == false lets every position attend to every other one,
+                  which a model answering a whole sequence in one pass needs.
         !*/
 
         template<bool UseAct, long d_model, long hidden_num, long hidden_den,
@@ -673,7 +708,8 @@ namespace dlib
         template<bool UseAct, long d_model, long num_heads, long num_kv_heads,
             long hidden_num, long hidden_den, typename SUBNET,
             template <unsigned long, typename> class LINEAR = linear,
-            long head_dim = d_model / num_heads, bool use_qk_norm = false>
+            long head_dim = d_model / num_heads, bool use_qk_norm = false,
+            bool causal = true>
         using transformer_block = some_template_expression;
         /*!
             ensures
@@ -684,23 +720,42 @@ namespace dlib
                   rms_norm -> ffn_sublayer -> residual.
         !*/
 
+        template<bool UseAct, long d_model, long num_heads, long num_kv_heads,
+            long hidden_num, long hidden_den, typename SUBNET,
+            template <unsigned long, typename> class LINEAR = linear,
+            long head_dim = d_model / num_heads, bool use_qk_norm = false,
+            bool causal = true>
+        using post_norm_transformer_block = some_template_expression;
+        /*!
+            ensures
+                - The post-norm counterpart of transformer_block, with the same
+                  sublayers and parameters:
+                  gqa_attention -> residual -> unit_rms_norm, then
+                  ffn_sublayer -> residual -> unit_rms_norm.
+                - The block holds no normalization parameter, and its output has
+                  unit RMS at every position.
+        !*/
+
         template<long num_layers, long d_model, long num_heads, long num_kv_heads,
             typename SUBNET, bool UseAct = true,
             long hidden_num = 8, long hidden_den = 3,
             template <unsigned long, typename> class LINEAR = linear,
-            long head_dim = d_model / num_heads, bool use_qk_norm = false>
+            long head_dim = d_model / num_heads, bool use_qk_norm = false,
+            bool causal = true, norm_placement placement = norm_placement::pre>
         using transformer_stack = some_template_expression;
         /*!
             ensures
-                - Stacks num_layers fused-attention transformer_block units with
-                  a tag10<> sentinel at the bottom of the stack.
+                - Stacks num_layers fused-attention blocks with a tag10<> sentinel
+                  at the bottom of the stack: transformer_block units when
+                  placement == norm_placement::pre, post_norm_transformer_block
+                  units when placement == norm_placement::post.
                 - The trailing parameters default to the historical behavior
                   (ACT-wrapped feed-forward, 8/3 hidden ratio, biased linears,
-                  standard head_dim, no QK-Norm) so existing dense
-                  configurations that omit them are unchanged. Decoder imports
-                  (decoder_transformer_config) pass UseAct == false, the exact
-                  model ratio, linear_no_bias, and the model's head_dim /
-                  qk_norm.
+                  standard head_dim, no QK-Norm, causal attention, pre-norm
+                  blocks) so existing dense configurations that omit them are
+                  unchanged. Decoder imports (decoder_transformer_config) pass
+                  UseAct == false, the exact model ratio, linear_no_bias, and the
+                  model's head_dim / qk_norm, and keep the pre-norm blocks.
         !*/
 
     } // namespace gqa_transformer_unified
@@ -939,11 +994,31 @@ namespace dlib
 
     // ----------------------------------------------------------------------------------------
 
+    enum class hrm_init { library, reference };
+    /*!
+        WHAT THIS ENUM REPRESENTS
+            How hrm_ initializes the recurrence and the two modules.
+
+            - library:   both modules start from zero vectors, and the layers of the
+                         modules draw their weights as they do by default.
+            - reference: as the reference implementation. Each module starts from its
+                         own vector, drawn once in setup() from a normal law of unit
+                         deviation truncated at two deviations; a module ending in
+                         post-norm blocks returns unit RMS, and these vectors start the
+                         state at that scale. Every linear_ and gqa_attention_ layer of
+                         the two modules, those inside their adaptive layers included,
+                         draws its weights with weight_init::truncated_lecun_normal.
+
+            In both cases the initial vectors stay fixed, since the one-step gradient
+            never reaches them, and they are serialized with the layer.
+    !*/
+
     template<
         typename H_NET,
         typename L_NET,
         int N,
-        int T
+        int T,
+        hrm_init INIT = hrm_init::library
     >
     class hrm_
     {
@@ -955,6 +1030,7 @@ namespace dlib
                 - L_NET must be a valid dlib network type with the same constraints.
                 - N > 0 (number of high-level cycles)
                 - T > 0 (number of low-level steps per high-level cycle)
+                - INIT selects the initialization, see hrm_init.
 
             WHAT THIS OBJECT REPRESENTS
                 This object implements a Hierarchical Reasoning Model (HRM) layer, a
@@ -1116,9 +1192,14 @@ namespace dlib
                 - sub.get_output() is a valid tensor
             ensures
                 - #hidden_dim == sub.get_output().nc()
-                - Initializes z_h_init and z_l_init as 1x1x1xhidden_dim tensors of zeros.
-                  They stay fixed: the one-step gradient treats the states as constants
-                  and never reaches them.
+                - Initializes z_h_init and z_l_init as 1x1x1xhidden_dim tensors, of zeros
+                  when INIT == hrm_init::library, and drawn from a normal law of unit
+                  deviation truncated at two deviations when INIT == hrm_init::reference.
+                  They stay fixed, since the one-step gradient treats the states as
+                  constants and never reaches them.
+                - When INIT == hrm_init::reference, asks every projection of h_net and
+                  l_net to draw its weights with weight_init::truncated_lecun_normal when
+                  the modules set up their layers, on the first forward().
         !*/
 
         template <typename SUBNET>
@@ -1234,6 +1315,26 @@ namespace dlib
                 - Returns a reference to the low-level (L) network module
         !*/
 
+        long get_hidden_dim() const;
+        /*!
+            ensures
+                - Returns the width of the states, set by setup(), 0 before it.
+        !*/
+
+        static constexpr hrm_init get_init();
+        /*!
+            ensures
+                - Returns INIT.
+        !*/
+
+        const tensor& get_h_init() const;
+        const tensor& get_l_init() const;
+        /*!
+            ensures
+                - Return the initial vectors of the H and L modules, 1x1x1xhidden_dim
+                  tensors once setup() has run, empty before it.
+        !*/
+
         const tensor& get_layer_params() const;
         tensor& get_layer_params();
         /*!
@@ -1265,19 +1366,21 @@ namespace dlib
         friend std::ostream& operator<<(std::ostream& out, const hrm_& item);
         /*!
             ensures
-                - Prints "hrm (N=<N>, T=<T>) learning_rate_mult=<val>"
+                - Prints "hrm (N=<N>, T=<T>, <library|reference> initialization)
+                  learning_rate_mult=<val>"
         !*/
 
         friend void to_xml(const hrm_& item, std::ostream& out);
         /*!
             ensures
-                - Writes XML representation including N, T,
+                - Writes XML representation including N, T, the initialization,
                   learning_rate_multiplier, and nested XML for h_net and l_net
         !*/
     };
 
-    template<typename H_NET, typename L_NET, int N, int T, typename SUBNET>
-    using hrm = add_layer<hrm_<H_NET, L_NET, N, T>, SUBNET>;
+    template<typename H_NET, typename L_NET, int N, int T, typename SUBNET,
+        hrm_init INIT = hrm_init::library>
+    using hrm = add_layer<hrm_<H_NET, L_NET, N, T, INIT>, SUBNET>;
 
     // ----------------------------------------------------------------------------------------
 

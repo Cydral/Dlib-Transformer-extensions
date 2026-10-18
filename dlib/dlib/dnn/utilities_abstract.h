@@ -39,6 +39,37 @@ namespace dlib
               layer that uses params as its parameters.
     !*/
 
+    void randomize_parameters_truncated_normal (
+        tensor& params,
+        double deviation,
+        dlib::rand& rnd
+    );
+    /*!
+        requires
+            - deviation >= 0
+        ensures
+            - Assigns to every element of params a value drawn from a normal law of mean
+              zero truncated at two deviations, scaled so that the values have the given
+              deviation. This is the truncated normal initialization of JAX and Flax,
+              which the reference implementation of the Hierarchical Reasoning Model uses.
+    !*/
+
+    enum class weight_init
+    {
+        glorot_uniform,
+        truncated_lecun_normal
+    };
+    /*!
+        WHAT THIS ENUM REPRESENTS
+            How a projection layer draws its weights when it is set up.
+              - glorot_uniform:         randomize_parameters(), the default of the
+                                        library.
+              - truncated_lecun_normal: randomize_parameters_truncated_normal() with a
+                                        deviation of one over the square root of the
+                                        input width.
+            Biases start at zero in both cases.
+    !*/
+
 // ----------------------------------------------------------------------------------------
 
     template <typename LayerType>

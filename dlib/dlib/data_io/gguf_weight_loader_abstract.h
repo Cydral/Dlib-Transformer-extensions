@@ -25,8 +25,8 @@ namespace dlib
               shape [d_model, q_dim], wo of shape [q_dim, d_model] and wk, wv of
               shape [d_model, kv_dim], where q_dim = n_heads * head_dim and
               kv_dim = n_kv_heads * head_dim. The gamma slots exist only for
-              QK-Norm models; the constant-layout bias slots stay zero for
-              bias-free families and receive the QKV biases of the qwen2 family.
+              QK-Norm models, the bias slots only for the families that carry
+              QKV biases, the qwen2 family among them.
             - The SwiGLU feed-forward is three separate linear layers (gate, up,
               down).
             - Block RMSNorm gammas and the embedding table are copied directly,

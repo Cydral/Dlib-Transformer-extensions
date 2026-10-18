@@ -77,6 +77,35 @@ namespace dlib
 
     // ----------------------------------------------------------------------------------------
 
+    enum class hrm_structure
+    {
+        pre_norm,
+        reference
+    };
+    /*!
+        WHAT THIS ENUM REPRESENTS
+            The structure the two modules of an hrm_transformer_config take.
+              - pre_norm  : the blocks of the library's language models,
+                            pre-norm with learned RMS gains and a SwiGLU of 8/3
+                            of the width with biased projections. Each module
+                            ends in an rms_norm with a learned gain, which keeps
+                            the carried state bounded, and the recurrence starts
+                            from zero states.
+              - reference : the structure of the reference implementation of the
+                            Hierarchical Reasoning Model. Post-norm blocks
+                            normalized by unit_rms_norm, a bias-free SwiGLU whose
+                            width is 8/3 of the model's rounded up to a multiple
+                            of 256 (1536 for a width of 512), no normalization
+                            beyond the blocks, and the initialization of the
+                            reference (hrm_init::reference): initial states drawn
+                            once from a normal law truncated at two deviations,
+                            and projections drawn with
+                            weight_init::truncated_lecun_normal. Requires the
+                            unified attention.
+    !*/
+
+    // ----------------------------------------------------------------------------------------
+
     template <
         long vocab_size = 2000,
         long num_layers = 4,
@@ -211,7 +240,10 @@ namespace dlib
         template <typename> class dropout_policy = dropout_10,
         attention_impl impl = attention_impl::chained,
         long num_kv_heads = 2,
-        bool use_act = false
+        bool use_act = false,
+        long output_vocab_size = 0,
+        bool causal = true,
+        hrm_structure structure = hrm_structure::pre_norm
     >
     struct hrm_transformer_config
     {
@@ -223,6 +255,8 @@ namespace dlib
                 - When impl == attention_impl::unified:
                     * num_kv_heads > 0 and num_heads is a multiple of it,
                     * embedding_dim / num_heads is even (RoPE constraint).
+                - structure == hrm_structure::reference requires
+                  impl == attention_impl::unified.
 
             WHAT THIS OBJECT REPRESENTS
                 Configuration of the Hierarchical Reasoning Model: two
@@ -240,15 +274,41 @@ namespace dlib
                 false because HRM already recurs at the module level; enabling
                 ACT would nest two recurrence mechanisms.
 
+                output_vocab_size, when positive, narrows the output layer below
+                the embedding table, for models whose table also holds
+                identifiers they never predict. causal == false lets every
+                position attend to every other one (unified attention only),
+                which a model answering a whole grid in one pass needs.
+
+                structure selects the blocks, the normalization around the
+                modules and the initialization, as hrm_structure describes. The
+                default keeps the library's pre-norm structure; the reference
+                structure reproduces the reference implementation for the
+                experiments that compare against it.
+
             EXPORTED CONSTANTS
                 - VOCAB_SIZE, NUM_H_LAYERS, NUM_L_LAYERS, NUM_HEADS,
-                  NUM_KV_HEADS, USE_ACT, EMBEDDING_DIM, HRM_N, HRM_T, IMPL
+                  NUM_KV_HEADS, USE_ACT, OUTPUT_VOCAB_SIZE, EMBEDDING_DIM,
+                  HRM_N, HRM_T, IMPL, STRUCTURE
+                - INIT : hrm_init::reference for the reference structure,
+                  hrm_init::library otherwise.
 
             EXPORTED TYPES
                 - train_h_net_type / train_l_net_type,
-                  infer_h_net_type / infer_l_net_type : the H and L sub-stacks
-                  with the training or inference dropout policy.
-                - network_type<is_training> : the full HRM network.
+                  infer_h_net_type / infer_l_net_type : the H and L modules
+                  with the training or inference dropout policy. A pre-norm
+                  module is rms_norm<stack>, a reference module the post-norm
+                  stack itself.
+                - train_hrm<SUBNET> / infer_hrm<SUBNET> : the hrm layer over the
+                  two modules, fed by SUBNET, with INIT. A program that puts
+                  its own input or head around the recurrence builds it from
+                  these, which keeps the initialization matched to the
+                  blocks.
+                - network_type<is_training> : the full HRM network over token
+                  embeddings. Under the pre-norm structure the head is
+                  classification_head; under the reference structure it is a
+                  bias-free linear projection of the H state, with no
+                  normalization before it, under loss_cross_entropy_per_token.
 
             MEMBERS
                 - model_info::describe() : human-readable summary including the

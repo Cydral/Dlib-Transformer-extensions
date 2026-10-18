@@ -796,6 +796,24 @@ namespace dlib
                   I.e. returns bias_mode.
         !*/
 
+        weight_init get_weight_init(
+        ) const;
+        /*!
+            ensures
+                - Returns how setup() draws the weights, weight_init::glorot_uniform for a
+                  default-constructed layer.
+        !*/
+
+        void set_weight_init(
+            weight_init val
+        );
+        /*!
+            ensures
+                - #get_weight_init() == val
+                - The setting is read by setup() only, so it changes nothing in a layer
+                  already set up. It is copied with the layer and not serialized.
+        !*/
+
         template <typename SUBNET>
         void setup(
             const SUBNET& sub
@@ -2444,6 +2462,82 @@ namespace dlib
 
     template <typename SUBNET>
     using rms_norm = add_layer<rms_norm_, SUBNET>;
+
+// ----------------------------------------------------------------------------------------
+
+    class unit_rms_norm_
+    {
+        /*!
+            WHAT THIS OBJECT REPRESENTS
+                This object implements the EXAMPLE_COMPUTATIONAL_LAYER_ interface
+                defined above, specifically defining a root mean square (RMS)
+                normalization with a unit gain and no learnable parameter.
+
+                Each vector along the embedding axis is divided by its root mean
+                square, the axis being detected as rms_norm_ detects it: nc when
+                the input has k() == 1, k otherwise. The output therefore has unit
+                RMS along that axis, whatever the scale of the input.
+
+                Post-norm transformer blocks normalize their residual stream this
+                way after each sublayer, as the blocks of the Hierarchical Reasoning
+                Model do. The layer computes what rms_norm_ computes with its gain
+                fixed at one, without a parameter for the solver to keep.
+        !*/
+
+    public:
+        explicit unit_rms_norm_(
+            double eps_ = DEFAULT_RMS_NORM_EPS
+        );
+        /*!
+            requires
+                - eps_ > 0
+            ensures
+                - #get_eps() == eps_
+        !*/
+
+        double get_eps(
+        ) const;
+        /*!
+            ensures
+                - returns the value added to the mean square before its square root
+                  is taken, which keeps a zero vector from dividing by zero.
+        !*/
+
+        void set_eps(
+            double val
+        );
+        /*!
+            requires
+                - val > 0
+            ensures
+                - #get_eps() == val
+        !*/
+
+        template <typename SUBNET> void setup(const SUBNET& sub);
+        /*!
+            requires
+                - SUBNET implements the SUBNET interface defined at the top of
+                  this file.
+            ensures
+                - Selects the embedding axis from sub.get_output().k(), as
+                  rms_norm_::setup() does. The axis is serialized with the layer.
+        !*/
+
+        template <typename SUBNET> void forward(const SUBNET& sub, resizable_tensor& output);
+        template <typename SUBNET> void backward(const tensor& gradient_input, SUBNET& sub, tensor& params_grad);
+        dpoint map_input_to_output(dpoint p) const;
+        dpoint map_output_to_input(dpoint p) const;
+        const tensor& get_layer_params() const;
+        tensor& get_layer_params();
+        /*!
+            These functions are implemented as described in the
+            EXAMPLE_COMPUTATIONAL_LAYER_ interface. get_layer_params() always
+            returns an empty tensor.
+        !*/
+    };
+
+    template <typename SUBNET>
+    using unit_rms_norm = add_layer<unit_rms_norm_, SUBNET>;
 
 // ----------------------------------------------------------------------------------------
 
@@ -5272,8 +5366,10 @@ namespace dlib
                   decay and the two moment decays it names, as the solvers of hrm_ do, and
                   they are built afresh when that algorithm changes. Otherwise they apply
                   AdamW with a weight decay of 0.0005 and moment decays of 0.9 and 0.999.
-                - Their state is not serialized, so a deserialized layer starts them
-                  afresh.
+                - Their state is serialized with the layer, so a run resumed from a
+                  checkpoint continues with the moments it had. A copy of the layer leaves
+                  it out and starts them afresh, which is how a program writes a model
+                  without its training state.
         !*/
 
         long get_max_steps() const;

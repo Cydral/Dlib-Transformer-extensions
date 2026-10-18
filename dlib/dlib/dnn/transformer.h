@@ -161,6 +161,12 @@ namespace dlib
         void set_qk_norm_eps(double eps) { qk_norm_eps_ = eps; }
         double get_qk_norm_eps() const { return qk_norm_eps_; }
 
+        // How setup() draws the four projections, Glorot's uniform law unless asked
+        // otherwise. The setting only matters before the layer is set up, so it is not
+        // serialized.
+        weight_init get_weight_init() const { return init_; }
+        void set_weight_init(weight_init val) { init_ = val; }
+
         // RoPE frequency base (theta). Set it to the model's value (e.g. 1000000 for Qwen3,
         // 500000 for Llama 3) before the first forward pass, since the trig caches are built
         // then and are not recomputed on a later base change.
@@ -348,11 +354,11 @@ namespace dlib
                 "gqa_attention input nc()==" << x.nc()
                 << " does not match EMBEDDING_DIM=" << EMBEDDING_DIM);
 
-            /* Weights, optional QK-Norm gammas, constant-layout QKV bias slots, then the
-               adapter blocks. The bias slots are ~10 KB per layer, zeroed and inert for
-               bias-free models and filled by the loader for the qwen2 family; the adapter
-               blocks are empty until configure_adapters is called. Everything variable
-               sits at the end, so no earlier offset ever moves. */
+            /* Weights, optional QK-Norm gammas, the QKV bias slots when the layer carries
+               biases, then the adapter blocks. The slots exist for the families that carry
+               QKV biases, the qwen2 family among them, and the loader fills them; the
+               adapter blocks are empty until configure_adapters is called. The weights and
+               the gammas never move. */
             const long total_params = static_cast<long>(base_param_count()
                 + q_adapter_.parameter_count() + v_adapter_.parameter_count());
 
@@ -378,9 +384,10 @@ namespace dlib
             setup_bias_offsets();
             q_adapter_offset = base_param_count();
             v_adapter_offset = q_adapter_offset + q_adapter_.parameter_count();
+            if (has_qkv_bias_)
             {
-                alias_tensor ball(1, Q_PROJ_DIM + 2 * KV_PROJ_DIM);
-                ball(params, bq_offset) = 0;   // bias slots start inert
+                alias_tensor ball(1, bias_param_count());
+                ball(params, bq_offset) = 0;   // until the loader fills them
             }
 
             if (USE_QK_NORM)
@@ -452,8 +459,9 @@ namespace dlib
             /* Bias support, first tranche: biases stay frozen at their imported
                values; the optimizer consumes the whole params_grad blob, so their
                gradient region must be explicitly zeroed. */
+            if (has_qkv_bias_)
             {
-                alias_tensor ball(1, Q_PROJ_DIM + 2 * KV_PROJ_DIM);
+                alias_tensor ball(1, bias_param_count());
                 ball(params_grad, bq_offset) = 0;
             }
 
@@ -639,11 +647,48 @@ namespace dlib
         const tensor& get_layer_params() const { return params; }
         tensor& get_layer_params() { return params; }
 
-        // QKV projection biases (qwen2 family). The slots always exist in the packed
-        // parameters; this flag arms their application in the inference forwards. The
-        // first support tranche freezes them during training: their gradient region
-        // is zeroed, pending the training-forward application and bias gradients.
-        void set_qkv_bias_enabled(bool enabled) { has_qkv_bias_ = enabled; }
+        /* QKV projection biases (qwen2 family). The flag decides whether the packed
+           parameters hold the bias slots, and arms their application in the inference
+           forwards. Set before the first forward, it shapes the blob setup() allocates;
+           on a layer already set up, the blob is laid out again, the weights, the gammas
+           and the adapter blocks kept, the slots added at zero or removed. The first
+           support tranche freezes the biases during training: their gradient region is
+           zeroed, pending the training-forward application and bias gradients. */
+        void set_qkv_bias_enabled(bool enabled)
+        {
+            if (enabled == has_qkv_bias_)
+                return;
+            if (params.size() == 0)
+            {
+                has_qkv_bias_ = enabled;
+                return;
+            }
+            DLIB_CASSERT(!offload_.active(),
+                "set_qkv_bias_enabled cannot lay out parameters held in host residency");
+
+            const size_t kept = weight_param_count();
+            const size_t adapters = q_adapter_.parameter_count() + v_adapter_.parameter_count();
+            const size_t old_adapter_offset = base_param_count();
+            resizable_tensor previous;
+            previous.copy_size(params);
+            memcpy(previous, params);
+
+            has_qkv_bias_ = enabled;
+            params.set_size(1, static_cast<long>(base_param_count() + adapters));
+            params = 0;
+            {
+                alias_tensor head(1, static_cast<long>(kept));
+                auto dst = head(params, 0);
+                memcpy(dst, head(previous, 0));
+            }
+            if (adapters > 0)
+            {
+                alias_tensor tail(1, static_cast<long>(adapters));
+                auto dst = tail(params, base_param_count());
+                memcpy(dst, tail(previous, old_adapter_offset));
+            }
+            rebuild_aliases();
+        }
         bool qkv_bias_enabled() const { return has_qkv_bias_; }
 
         /* One format for every variant, which states the configuration it was written
@@ -737,6 +782,16 @@ namespace dlib
             deserialize(item.rope_k_helper_, in);
             deserialize(item.tril_helper_, in);
             deserialize(item.qk_norm_eps_, in);
+
+            // A layer never set up holds no parameters, and reads back as such.
+            const size_t expected_params = item.base_param_count()
+                + item.q_adapter_.parameter_count() + item.v_adapter_.parameter_count();
+            if (item.params.size() != 0 && item.params.size() != expected_params)
+                throw serialization_error("dlib::gqa_attention_: the checkpoint holds "
+                    + std::to_string(item.params.size()) + " parameters where its switches call "
+                    "for " + std::to_string(expected_params) + ", QKV biases "
+                    + (item.has_qkv_bias_ ? "included" : "excluded") + ". It was written with "
+                    "another parameter layout.");
             item.rebuild_aliases();
 
             // KV cache state is runtime-only.
@@ -790,6 +845,7 @@ namespace dlib
         bool has_qkv_bias_ = false;
         resizable_tensor bias_ones_;
         double qk_norm_eps_ = DEFAULT_RMS_NORM_EPS;
+        weight_init init_ = weight_init::glorot_uniform;
 
         // Forward state saved for backward (training only)
         resizable_tensor saved_q_pre_rope;
@@ -913,18 +969,28 @@ namespace dlib
             v_adapter_offset = q_adapter_offset + q_adapter_.parameter_count();
         }
 
-        /* Size of the fixed part of the blob: everything but the adapter blocks. */
-        static size_t base_param_count()
+        /* The four projections and the QK-Norm gammas, which open the blob. */
+        static size_t weight_param_count()
         {
             return static_cast<size_t>(EMBEDDING_DIM) * Q_PROJ_DIM
                 + 2 * static_cast<size_t>(EMBEDDING_DIM) * KV_PROJ_DIM
                 + static_cast<size_t>(Q_PROJ_DIM) * EMBEDDING_DIM
-                + (USE_QK_NORM ? 2 * static_cast<size_t>(HEAD_DIM) : 0)
-                + static_cast<size_t>(Q_PROJ_DIM) + 2 * static_cast<size_t>(KV_PROJ_DIM);
+                + (USE_QK_NORM ? 2 * static_cast<size_t>(HEAD_DIM) : 0);
         }
 
-        /* The bias slots sit at the very end of the packed blob, after the QK-Norm
-           gammas when present, so every prior offset is unchanged. */
+        static size_t bias_param_count()
+        {
+            return static_cast<size_t>(Q_PROJ_DIM) + 2 * static_cast<size_t>(KV_PROJ_DIM);
+        }
+
+        /* Size of the fixed part of the blob: everything but the adapter blocks. */
+        size_t base_param_count() const
+        {
+            return weight_param_count() + (has_qkv_bias_ ? bias_param_count() : 0);
+        }
+
+        /* The bias slots follow the QK-Norm gammas when present, so the offsets before
+           them never depend on the bias flag. */
         void setup_bias_offsets()
         {
             bq_offset = wo_offset + static_cast<size_t>(Q_PROJ_DIM) * EMBEDDING_DIM
@@ -954,8 +1020,12 @@ namespace dlib
             long rows, long cols,
             tensor& dest, size_t offset)
         {
+            // A block maps rows inputs to cols outputs.
             resizable_tensor tmp(rows, cols);
-            randomize_parameters(tmp, rows + cols, rnd);
+            if (init_ == weight_init::truncated_lecun_normal)
+                randomize_parameters_truncated_normal(tmp, 1.0 / std::sqrt(static_cast<double>(rows)), rnd);
+            else
+                randomize_parameters(tmp, rows + cols, rnd);
 
             alias_tensor dest_view(rows, cols);
             auto view = dest_view(dest, offset);
@@ -1510,6 +1580,18 @@ namespace dlib
 
     // ----------------------------------------------------------------------------------------
 
+    /* Where a transformer block normalizes its residual stream.
+
+         pre   Each sublayer reads a normalized copy of the stream and adds its output to
+               the stream itself, so the block returns the stream unnormalized. The
+               language models of the library and the open-weight models it imports are
+               built this way.
+         post  Each sublayer reads the stream and adds its output to it, and the sum is
+               normalized without a gain, so the block always returns unit RMS. The blocks
+               of the Hierarchical Reasoning Model are built this way.
+    */
+    enum class norm_placement { pre, post };
+
     // Multi-head Grouped Query Attention, fused into a single layer
     namespace gqa_transformer_unified
     {        
@@ -1560,36 +1642,74 @@ namespace dlib
             add_prev1<multihead_attention_gqa<d_model, num_heads, num_kv_heads, rms_norm<tag1<
             SUBNET>>, head_dim, use_qk_norm, causal>>>>, LINEAR >> ;
 
+        // Transformer block with post-norm architecture. Each sublayer reads the residual
+        // stream and adds its output to it, and the sum is normalized without a gain, so
+        // the block returns unit RMS whatever it was given.
+        template<bool UseAct, long d_model, long num_heads, long num_kv_heads,
+            long hidden_num, long hidden_den, typename SUBNET,
+            template <unsigned long, typename> class LINEAR = linear,
+            long head_dim = d_model / num_heads, bool use_qk_norm = false, bool causal = true>
+        using post_norm_transformer_block =
+            unit_rms_norm<add_prev5<ffn_sublayer<UseAct, d_model, hidden_num, hidden_den, 4, tag5<
+            unit_rms_norm<add_prev1<multihead_attention_gqa<d_model, num_heads, num_kv_heads, tag1<
+            SUBNET>, head_dim, use_qk_norm, causal>>>>, LINEAR>>>;
+
+        // Block selector by norm placement.
+        template<norm_placement placement, bool UseAct, long d_model, long num_heads,
+            long num_kv_heads, long hidden_num, long hidden_den, typename SUBNET,
+            template <unsigned long, typename> class LINEAR, long head_dim, bool use_qk_norm,
+            bool causal>
+        struct block_selector
+        {
+            using type = transformer_block<UseAct, d_model, num_heads, num_kv_heads, hidden_num,
+                hidden_den, SUBNET, LINEAR, head_dim, use_qk_norm, causal>;
+        };
+        template<bool UseAct, long d_model, long num_heads, long num_kv_heads,
+            long hidden_num, long hidden_den, typename SUBNET,
+            template <unsigned long, typename> class LINEAR, long head_dim, bool use_qk_norm,
+            bool causal>
+        struct block_selector<norm_placement::post, UseAct, d_model, num_heads, num_kv_heads,
+            hidden_num, hidden_den, SUBNET, LINEAR, head_dim, use_qk_norm, causal>
+        {
+            using type = post_norm_transformer_block<UseAct, d_model, num_heads, num_kv_heads,
+                hidden_num, hidden_den, SUBNET, LINEAR, head_dim, use_qk_norm, causal>;
+        };
+
         template<long remaining_layers, bool UseAct, long d_model, long num_heads, long num_kv_heads,
             long hidden_num, long hidden_den, typename SUBNET,
             template <unsigned long, typename> class LINEAR = linear,
             long head_dim = d_model / num_heads, bool use_qk_norm = false, bool causal = true,
-            typename enabled = void>
+            norm_placement placement = norm_placement::pre, typename enabled = void>
         struct transformer_stack_impl
         {
-            using type = transformer_block<UseAct, d_model, num_heads, num_kv_heads, hidden_num, hidden_den,
+            using type = typename block_selector<placement, UseAct, d_model, num_heads,
+                num_kv_heads, hidden_num, hidden_den,
                 typename transformer_stack_impl<remaining_layers - 1, UseAct, d_model, num_heads,
-                num_kv_heads, hidden_num, hidden_den, SUBNET, LINEAR, head_dim, use_qk_norm, causal>::type,
-                LINEAR, head_dim, use_qk_norm, causal>;
+                num_kv_heads, hidden_num, hidden_den, SUBNET, LINEAR, head_dim, use_qk_norm, causal,
+                placement>::type,
+                LINEAR, head_dim, use_qk_norm, causal>::type;
         };
         template<bool UseAct, long d_model, long num_heads, long num_kv_heads,
             long hidden_num, long hidden_den, typename SUBNET,
-            template <unsigned long, typename> class LINEAR, long head_dim, bool use_qk_norm, bool causal>
+            template <unsigned long, typename> class LINEAR, long head_dim, bool use_qk_norm, bool causal,
+            norm_placement placement>
         struct transformer_stack_impl<0, UseAct, d_model, num_heads, num_kv_heads,
-            hidden_num, hidden_den, SUBNET, LINEAR, head_dim, use_qk_norm, causal, void>
+            hidden_num, hidden_den, SUBNET, LINEAR, head_dim, use_qk_norm, causal, placement, void>
         {
             using type = tag10<SUBNET>;
         };
 
         // UseAct trails with a default of true so existing dense configurations that omit it
-        // keep their ACT feed-forward unchanged.
+        // keep their ACT feed-forward unchanged. The placement trails all the others, its
+        // default building the pre-norm blocks every imported model expects.
         template<long num_layers, long d_model, long num_heads, long num_kv_heads, typename SUBNET,
             bool UseAct = true, long hidden_num = 8, long hidden_den = 3,
             template <unsigned long, typename> class LINEAR = linear,
-            long head_dim = d_model / num_heads, bool use_qk_norm = false, bool causal = true>
+            long head_dim = d_model / num_heads, bool use_qk_norm = false, bool causal = true,
+            norm_placement placement = norm_placement::pre>
         using transformer_stack = typename transformer_stack_impl<num_layers, UseAct, d_model,
             num_heads, num_kv_heads, hidden_num, hidden_den, SUBNET, LINEAR, head_dim, use_qk_norm,
-            causal>::type;
+            causal, placement>::type;
 
     } // namespace gqa_transformer_unified
 
@@ -1729,12 +1849,63 @@ namespace dlib
      * Gradient path (1-step approximation):
      *   loss -> output -> final H-module -> final L-module -> input embedding
      */
-     
+
+    /* How hrm_ initializes the recurrence and the two modules.
+
+         library    Both modules start from zero vectors, and their layers draw their
+                    weights as they do by default.
+         reference  As the reference implementation. Each module starts from its own
+                    vector, drawn once from a normal law of unit deviation truncated at two
+                    deviations and fixed afterwards; a module ending in a post-norm block
+                    returns unit RMS, and these vectors start the state at that scale. The
+                    projections of both modules, those of their adaptive layers included,
+                    draw their weights from a normal law truncated at two deviations, of
+                    deviation one over the square root of their input width.
+    */
+    enum class hrm_init { library, reference };
+
+    namespace impl
+    {
+        template <typename NET>
+        void request_weight_init (NET& net, weight_init w);
+
+        template <typename LAYER>
+        auto set_weight_init_if_any (LAYER& l, weight_init w, int)
+            -> decltype(l.set_weight_init(w), void())
+        {
+            l.set_weight_init(w);
+        }
+        template <typename LAYER>
+        void set_weight_init_if_any (LAYER&, weight_init, long) {}
+
+        // An adaptive layer holds a transition network of its own.
+        template <typename LAYER>
+        auto request_nested_weight_init (LAYER& l, weight_init w, int)
+            -> decltype(l.get_transition_net(), void())
+        {
+            request_weight_init(l.get_transition_net(), w);
+        }
+        template <typename LAYER>
+        void request_nested_weight_init (LAYER&, weight_init, long) {}
+
+        /* Asks every projection of a network that is not set up yet to draw its weights
+           as w says, when its layers are set up. */
+        template <typename NET>
+        void request_weight_init (NET& net, weight_init w)
+        {
+            visit_computational_layers(net, [w](auto& l) {
+                set_weight_init_if_any(l, w, 0);
+                request_nested_weight_init(l, w, 0);
+            });
+        }
+    }
+
     template<
         typename H_NET,
         typename L_NET,
         int N,
-        int T
+        int T,
+        hrm_init INIT = hrm_init::library
     >
     class hrm_
     {
@@ -1786,6 +1957,13 @@ namespace dlib
             const tensor& input = sub.get_output();
             hidden_dim = input.nc();
             init_hidden_states();
+
+            // The modules set up their layers on their first forward, which follows.
+            if (INIT == hrm_init::reference)
+            {
+                impl::request_weight_init(h_net, weight_init::truncated_lecun_normal);
+                impl::request_weight_init(l_net, weight_init::truncated_lecun_normal);
+            }
         }
 
         /* Whether the next forward continues the recurrence or restarts it, and a way to
@@ -1836,7 +2014,7 @@ namespace dlib
         {
             const tensor& x = sub.get_output();
 
-            /* The state either starts from the learned init vectors or continues from
+            /* The state either starts from the initial vectors or continues from
                where the previous forward left it. Continuing is what an external halting
                loop needs: a segment that resumes the recurrence rather than restarting it,
                so that several forwards compose into one longer chain of reasoning. The
@@ -2001,6 +2179,11 @@ namespace dlib
         h_net_type& get_h_net() { return h_net; }
         l_net_type& get_l_net() { return l_net; }
 
+        long get_hidden_dim() const { return hidden_dim; }
+        static constexpr hrm_init get_init() { return INIT; }
+        const tensor& get_h_init() const { return z_h_init; }
+        const tensor& get_l_init() const { return z_l_init; }
+
         const tensor& get_layer_params() const { return params; }
         tensor& get_layer_params() { return params; }
 
@@ -2041,7 +2224,8 @@ namespace dlib
 
         friend std::ostream& operator<<(std::ostream& out, const hrm_& item)
         {
-            out << "hrm (N=" << N << ", T=" << T << ")"
+            out << "hrm (N=" << N << ", T=" << T << ", "
+                << (INIT == hrm_init::library ? "library" : "reference") << " initialization)"
                 << " learning_rate_mult=" << item.learning_rate_multiplier;
             return out;
         }
@@ -2051,6 +2235,7 @@ namespace dlib
             out << "<hrm"
                 << " N='" << N << "'"
                 << " T='" << T << "'"
+                << " init='" << (INIT == hrm_init::library ? "library" : "reference") << "'"
                 << " learning_rate_mult='" << item.learning_rate_multiplier << "'"
                 << ">\n";
             out << "  <h_module>\n";
@@ -2106,13 +2291,15 @@ namespace dlib
         {
             z_h_init.set_size(1, 1, 1, hidden_dim);
             z_l_init.set_size(1, 1, 1, hidden_dim);
-
-            auto* h_ptr = z_h_init.host();
-            auto* l_ptr = z_l_init.host();
-            for (long c = 0; c < hidden_dim; ++c) {
-                h_ptr[c] = 0.0f;
-                l_ptr[c] = 0.0f;
+            if (INIT == hrm_init::library)
+            {
+                z_h_init = 0;
+                z_l_init = 0;
+                return;
             }
+            dlib::rand rnd(std::rand());
+            randomize_parameters_truncated_normal(z_h_init, 1.0, rnd);
+            randomize_parameters_truncated_normal(z_l_init, 1.0, rnd);
         }
 
         template<typename NET>
@@ -2124,7 +2311,7 @@ namespace dlib
         h_net_type h_net;
         l_net_type l_net;
 
-        // Initial hidden states: zero, and fixed, since the one-step gradient never reaches them
+        // Initial hidden states, fixed, since the one-step gradient never reaches them
         resizable_tensor z_h_init;
         resizable_tensor z_l_init;
 
@@ -2164,8 +2351,9 @@ namespace dlib
         resizable_tensor params;  // Unused
     };
 
-    template<typename H_NET, typename L_NET, int N, int T, typename SUBNET>
-    using hrm = add_layer<hrm_<H_NET, L_NET, N, T>, SUBNET>;
+    template<typename H_NET, typename L_NET, int N, int T, typename SUBNET,
+        hrm_init INIT = hrm_init::library>
+    using hrm = add_layer<hrm_<H_NET, L_NET, N, T, INIT>, SUBNET>;
 
     // ----------------------------------------------------------------------------------------
 

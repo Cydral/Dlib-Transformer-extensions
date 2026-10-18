@@ -2600,6 +2600,12 @@ namespace
         }         
         {
             print_spinner();
+            unit_rms_norm_ l;
+            auto res = test_layer(l);
+            DLIB_TEST_MSG(res, res);
+        }
+        {
+            print_spinner();
             cont_<3,3,3,2,2,0,0> l;
             auto res = test_layer(l);
             DLIB_TEST_MSG(res, res);
@@ -5890,6 +5896,163 @@ void test_multm_prev()
 
 // ----------------------------------------------------------------------------------------
 
+    /* The deviation of the weights of a bias-free projection against the one its input
+       width calls for under weight_init::truncated_lecun_normal. */
+    template <unsigned long N>
+    void lecun_deviation(const linear_<N, LINEAR_NO_BIAS>& l, double& worst, long& count)
+    {
+        const matrix<float> w = mat(l.get_weights());
+        const double expected = 1.0 / std::sqrt((double)l.get_num_inputs());
+        worst = std::max(worst, std::abs(std::sqrt(mean(squared(w))) / expected - 1));
+        worst = std::max(worst, max(abs(w)) / (2 * 1.1368472343385565 * expected) - 1);
+        ++count;
+    }
+    template <long E, long H, long KV, long HD, bool QK, bool C>
+    void lecun_deviation(const gqa_attention_<E, H, KV, HD, QK, C>& l, double& worst, long& count)
+    {
+        // The four projections are square here, so their deviation is one over sqrt(E).
+        const matrix<float> p = mat(l.get_layer_params());
+        const matrix<float> w = colm(p, range(0, 4 * E * E - 1));
+        const double expected = 1.0 / std::sqrt((double)E);
+        worst = std::max(worst, std::abs(std::sqrt(mean(squared(w))) / expected - 1));
+        ++count;
+    }
+    template <typename T>
+    void lecun_deviation(const T&, double&, long&) {}
+
+    template <typename T>
+    auto draw_requested(const T& l, long& lecun, long& other, int)
+        -> decltype(l.get_weight_init(), void())
+    {
+        if (l.get_weight_init() == weight_init::truncated_lecun_normal) ++lecun; else ++other;
+    }
+    template <typename T>
+    void draw_requested(const T&, long&, long&, long) {}
+
+    void test_hrm_reference_structure()
+    {
+        /* The reference structure of hrm_transformer_config: post-norm blocks without a gain,
+           a bias-free SwiGLU of the reference width, no normalization around the modules, and
+           fixed initial states drawn from a truncated normal law. The default structure stays
+           the library's. */
+        print_spinner();
+        static_assert(impl::hrm_reference_ffn_width(512) == 1536, "reference SwiGLU width");
+        static_assert(impl::hrm_reference_ffn_width(384) == 1024, "reference SwiGLU width");
+        static_assert(impl::hrm_reference_ffn_width(256) == 768, "reference SwiGLU width");
+
+        const long D = 32, H = 4, V = 10, L = 6, B = 3;
+        const long hidden = impl::hrm_reference_ffn_width(D);
+        using config = hrm_transformer_config<V, 2, 2, H, D, 2, 2, gelu, dropout_10,
+            attention_impl::unified, H, false, 0, false, hrm_structure::reference>;
+        using library = hrm_transformer_config<V, 2, 2, H, D, 2, 2, gelu, dropout_10,
+            attention_impl::unified, H, false, 0, false>;
+        static_assert(std::is_same<config::train_h_net_type,
+            gqa_transformer_unified::transformer_stack<2, D, H, H, input_tensor, false, hidden, D,
+            linear_no_bias, D / H, false, false, norm_placement::post>>::value,
+            "a reference module is a bare post-norm stack");
+        static_assert(std::is_same<library::train_h_net_type, rms_norm<
+            gqa_transformer_unified::transformer_stack<2, D, H, H, input_tensor, false, 8, 3,
+            linear, D / H, false, false>>>::value,
+            "a library module is a pre-norm stack under an rms_norm");
+        static_assert(config::INIT == hrm_init::reference && library::INIT == hrm_init::library,
+            "initialization by structure");
+
+        using net_type = config::network_type<true>;
+        net_type net;
+        dlib::rand rnd(5);
+        std::vector<matrix<int, 0, 1>> xs(B, matrix<int, 0, 1>(L));
+        std::vector<matrix<unsigned long, 0, 1>> ys(B, matrix<unsigned long, 0, 1>(L));
+        for (long i = 0; i < B; ++i)
+            for (long t = 0; t < L; ++t)
+            {
+                xs[i](t) = rnd.get_integer_in_range(0, V);
+                ys[i](t) = (xs[i](t) + t) % V;
+            }
+        resizable_tensor x;
+        net.to_tensor(xs.begin(), xs.end(), x);
+        net.forward(x);
+
+        // The H state the head reads has unit RMS at every position.
+        const matrix<float> z = reshape(mat(layer<2>(net).get_output()), B * L, D);
+        const matrix<float> rms = sqrt(sum_cols(squared(z)) / D);
+        DLIB_TEST_MSG(max(abs(rms - 1)) < 1e-4, "post-norm output RMS off by " << max(abs(rms - 1)));
+
+        auto& recurrence = layer<2>(net).layer_details();
+        const matrix<float> h0 = mat(recurrence.get_h_init()), l0 = mat(recurrence.get_l_init());
+        DLIB_TEST(h0.size() == D && l0.size() == D);
+        DLIB_TEST(max(abs(h0)) > 0 && max(abs(h0 - l0)) > 0);
+        DLIB_TEST(max(abs(h0)) <= 2 * 1.1368472343385565 + 1e-6);
+        DLIB_TEST(max(abs(l0)) <= 2 * 1.1368472343385565 + 1e-6);
+
+        // Every projection of the modules is drawn as the reference draws it.
+        {
+            double worst = 0;
+            long count = 0;
+            auto check = [&](const auto& l) { lecun_deviation(l, worst, count); };
+            visit_computational_layers(recurrence.get_h_net(), check);
+            visit_computational_layers(recurrence.get_l_net(), check);
+            DLIB_TEST_MSG(count == 4 * 4, "visited " << count << " projections");
+            DLIB_TEST_MSG(worst < 0.06, "projection deviation off by " << worst);
+        }
+
+        /* The request reaches the transition networks of the adaptive layers, which set up
+           their layers on a later forward. */
+        {
+            using act_config = hrm_transformer_config<V, 2, 2, H, D, 2, 2, gelu, dropout_10,
+                attention_impl::unified, H, true, 0, false, hrm_structure::reference>;
+            act_config::train_h_net_type module;
+            impl::request_weight_init(module, weight_init::truncated_lecun_normal);
+            long lecun = 0, other = 0, nested = 0;
+            visit_computational_layers(module, [&](auto& l) {
+                draw_requested(l, lecun, other, 0);
+                call_if_valid([&](auto& a) -> decltype(a.get_transition_net(), void()) {
+                    ++nested;
+                    visit_computational_layers(a.get_transition_net(), [&](auto& t) {
+                        draw_requested(t, lecun, other, 0); });
+                }, l);
+            });
+            DLIB_TEST_MSG(nested == 2 && lecun == 2 + 2 * 3 && other == 0,
+                "the draw reached " << lecun << " projections and missed " << other
+                << ", through " << nested << " adaptive layers");
+        }
+
+        // Bias-free projections only, and no gain anywhere.
+        const size_t per_block = 4 * D * D + 3 * D * hidden;
+        DLIB_TEST_MSG(count_parameters(recurrence.get_h_net()) == 2 * per_block,
+            "a reference module holds " << count_parameters(recurrence.get_h_net())
+            << " parameters instead of " << 2 * per_block);
+
+        // The states and the weights come back from serialization, and so does the answer.
+        {
+            std::vector<char> buf;
+            serialize(buf) << net;
+            net_type back;
+            deserialize(buf) >> back;
+            back.forward(x);
+            const auto& ra = layer<2>(back).layer_details();
+            DLIB_TEST(max(abs(mat(ra.get_h_init()) - h0)) == 0);
+            DLIB_TEST(max(abs(mat(layer<1>(back).get_output()) - mat(layer<1>(net).get_output()))) < 1e-5);
+        }
+
+        // The gradient runs through the post-norm blocks: a few steps fit the batch.
+        network_context::set_optimizer_params(0.0, 0.9, 0.99, network_context::optimizer_type::adamw);
+        network_context::set_learning_rate(3e-3);
+        std::vector<adamw> solvers(net_type::num_computational_layers, adamw(0.0, 0.9, 0.99));
+        double first = 0, last = 0;
+        for (int step = 0; step < 40; ++step)
+        {
+            const double loss = net.compute_parameter_gradients(x, ys.begin());
+            if (step == 0) first = loss;
+            last = loss;
+            net.update_parameters(solvers, 3e-3);
+        }
+        network_context::reset();
+        DLIB_TEST_MSG(std::isfinite(last) && last < 0.5 * first,
+            "the reference structure does not train: loss " << first << " then " << last);
+    }
+
+// ----------------------------------------------------------------------------------------
+
     void test_act_solvers_follow_context()
     {
         /* The transition network of the adaptive layer trains with the algorithm
@@ -5938,6 +6101,17 @@ void test_multm_prev()
         net.compute_parameter_gradients(x, ys.begin());
         DLIB_TEST(all_are(network_context::optimizer_type::adamw));
         network_context::reset();
+
+        // The solvers go with a serialized network and stay out of a copy.
+        std::vector<char> buf;
+        serialize(buf) << net;
+        net_type back;
+        deserialize(buf) >> back;
+        const auto& restored = layer<2>(back).layer_details().get_transition_solvers();
+        DLIB_TEST(restored.size() == transition_net::num_computational_layers);
+        DLIB_TEST(restored.front().get_type() == network_context::optimizer_type::adamw);
+        const net_type copy(net);
+        DLIB_TEST(layer<2>(copy).layer_details().get_transition_solvers().empty());
     }
 
 // ----------------------------------------------------------------------------------------
@@ -6358,6 +6532,67 @@ void test_multm_prev()
         DLIB_TEST(!loads(c1, wide));
     }
 
+    void test_gqa_attention_bias_slots()
+    {
+        /* The QKV bias slots exist only in a layer that carries biases. Enabling them on a
+           layer already set up lays the parameters out again, the weights and the adapter
+           blocks kept and the slots added at zero, and disabling them restores the layout. */
+        print_spinner();
+        using net_type = gqa_attention<16, 2, 1, 8, input_tensor>;
+        const long weights = 16 * 16 + 2 * 16 * 8 + 16 * 16;   // wq, wk, wv, wo
+        const long slots = 16 + 2 * 8;
+        resizable_tensor x(1, 1, 5, 16), staged;
+        tt::tensor_rand rnd(7);
+        rnd.fill_gaussian(x);
+        const std::vector<resizable_tensor> one(1, x);
+
+        net_type plain;
+        plain.to_tensor(one.begin(), one.end(), staged);
+        plain.forward(x);
+        auto& pl = plain.layer_details();
+        DLIB_TEST(pl.get_layer_params().size() == (size_t)weights);
+
+        net_type biased;
+        biased.layer_details().set_qkv_bias_enabled(true);
+        biased.to_tensor(one.begin(), one.end(), staged);
+        biased.forward(x);
+        DLIB_TEST(biased.layer_details().get_layer_params().size() == (size_t)(weights + slots));
+
+        // Slots added at zero leave the weights and the answer as they were.
+        const matrix<float> answer = mat(plain.get_output());
+        const matrix<float> base = mat(pl.get_layer_params());
+        pl.set_qkv_bias_enabled(true);
+        const matrix<float> grown = mat(pl.get_layer_params());
+        DLIB_TEST(grown.size() == weights + slots);
+        DLIB_TEST(max(abs(colm(grown, range(0, weights - 1)) - base)) == 0);
+        DLIB_TEST(max(abs(colm(grown, range(weights, weights + slots - 1)))) == 0);
+        plain.forward(x);
+        DLIB_TEST(max(abs(mat(plain.get_output()) - answer)) < 1e-6);
+        pl.set_qkv_bias_enabled(false);
+        DLIB_TEST(max(abs(mat(pl.get_layer_params()) - base)) == 0);
+
+        // The adapter blocks follow the slots.
+        pl.configure_adapters(2, adapter_method::lora, 4.0);
+        const matrix<float> adapted = mat(pl.get_layer_params());
+        const long adapters = adapted.size() - weights;
+        DLIB_TEST(adapters > 0);
+        pl.set_qkv_bias_enabled(true);
+        const matrix<float> moved = mat(pl.get_layer_params());
+        DLIB_TEST(moved.size() == weights + slots + adapters);
+        DLIB_TEST(max(abs(colm(moved, range(weights + slots, moved.size() - 1))
+            - colm(adapted, range(weights, adapted.size() - 1)))) == 0);
+        DLIB_TEST(max(abs(colm(moved, range(0, weights - 1)) - colm(adapted, range(0, weights - 1)))) == 0);
+
+        // Each layout reads back as written.
+        std::ostringstream o;
+        serialize(biased, o);
+        std::istringstream i(o.str());
+        net_type back;
+        deserialize(back, i);
+        DLIB_TEST(back.layer_details().qkv_bias_enabled());
+        DLIB_TEST(back.layer_details().get_layer_params().size() == (size_t)(weights + slots));
+    }
+
     void test_tril()
     {
         print_spinner();        
@@ -6536,6 +6771,8 @@ void test_multm_prev()
             test_hrm_restarts_and_solvers();
             test_act_solvers_follow_context();
             test_puzzle_embeddings();
+            test_hrm_reference_structure();
+            test_gqa_attention_bias_slots();
 #ifdef DLIB_USE_CUDA
             compare_adam_atan2();
             compare_token_losses_cpu_vs_cuda();

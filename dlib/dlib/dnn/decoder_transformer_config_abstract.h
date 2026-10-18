@@ -51,9 +51,9 @@ namespace dlib
                 Adaptive computation time is disabled and there is no mixture of
                 experts. The feed-forward and the output projection use
                 linear_no_bias, matching the Llama family, which carries no bias
-                on any of those projections. The attention layer's constant-layout
-                QKV bias slots remain available for the families that need them
-                (e.g. Qwen2); they are inert unless enabled at run time.
+                on any of those projections. The attention layer holds QKV bias
+                slots for the families that need them (e.g. Qwen2), once enabled
+                at run time; a bias-free model holds none.
 
                 The feed-forward hidden size is given as the exact rational
                 ffn_num/ffn_den of the model dimension, so that arbitrary

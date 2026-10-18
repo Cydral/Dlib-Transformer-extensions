@@ -6,10 +6,17 @@
     The reference work reports its ARC result from a model conditioned on a puzzle
     identifier and trained on the demonstration pairs of every task, evaluation tasks
     included, each task augmented a thousand times. This program trains that model in
-    dlib with the procedure the Sudoku example reproduces: the same network shape, the
-    same supervision of every pass, the same halting head trained jointly with the
-    network, the same loss and the same optimizer, and the sparse sign descent the
-    reference applies to the identifier embedding.
+    dlib with the procedure the Sudoku example reproduces: the network of the reference
+    implementation, block for block, the same supervision of every pass, the same halting
+    head trained jointly with the network, the same loss and the same optimizer, and the
+    sparse sign descent the reference applies to the identifier embedding.
+
+    The network is the one of the Sudoku example. Two modules of four post-norm blocks
+    normalized without a gain, a bias-free SwiGLU of width 1536, bidirectional attention
+    with rotary positions, initial states drawn once from a truncated normal law,
+    projections drawn as the reference draws them, and an output layer reading the H
+    state as the last block leaves it. This is the reference structure of
+    hrm_transformer_config.
 
     HOW A BATCH IS TRAINED
 
@@ -71,10 +78,10 @@
 
     WHAT DIFFERS FROM THE REFERENCE
 
-    The blocks are pre-norm, and each module's output is normalised, which bounds the
-    carried state as the reference's post-norm blocks do. The initial states are zero,
-    where the reference draws them once at random. The computation is in single
-    precision. Whether these matter is for the results to say.
+    The halting head trains the halting logit alone, as described above. One linear layer
+    carries the cell logits and the halting logit, so the cell logits have a bias where
+    the reference's output layer has none. The computation is in single precision, where
+    the reference runs its forward pass in bfloat16.
 
     Prepare the data first:
         slm_tools/build_arc_dataset.py --download --data-dir arc-agi --out-dir arc-data \
@@ -84,12 +91,18 @@
         ./slm_hrm_arc_puzzle_ex --train --data arc-data
         ./slm_hrm_arc_puzzle_ex --eval  --data arc-data --eval-samples 0
 
-    The reference trains with a batch of 768. A slot here holds eleven times the
-    positions of a Sudoku slot, and the attention of every block grows with the square of
-    that number. The memory extension, on unless --no-extended-memory is given, carries
-    what does not fit the card at a cost in speed. A smaller --batch-size is the other
-    way, and the number of steps follows from --epochs, so the amount of data seen stays
-    the same.
+    The reference trains with a batch of 768, the batch every default of this program is
+    set for. A run with another --batch-size gets the settings the square-root rule of
+    Malladi et al. (2022) derives for adaptive optimizers, as in the Sudoku example. With
+    kappa the ratio of the two batches, the rates are multiplied by sqrt(kappa), each
+    moment decay becomes 1 - kappa * (1 - beta), the decoupled decays are multiplied by
+    sqrt(kappa), and the warmup is divided by kappa. The number of steps follows from
+    --epochs, so the amount of data seen stays the same. A setting given on the command
+    line is taken as it is, and --no-batch-scaling turns the rule off.
+
+    A slot here holds eleven times the positions of a Sudoku slot, and the attention of
+    every block grows with the square of that number. The memory extension, on unless
+    --no-extended-memory is given, carries what does not fit the card at a cost in speed.
 */
 
 #include <dlib/cmd_line_parser.h>
@@ -149,7 +162,7 @@ template <bool USE_ACT>
 using arc_config = hrm_transformer_config<
     COLOUR_VOCAB, NUM_H_LAYERS, NUM_L_LAYERS, NUM_HEADS, EMBED_DIM, HRM_N, HRM_T,
     gelu, dropout_10, attention_impl::unified, NUM_KV_HEADS, USE_ACT, COLOUR_VOCAB,
-    ATTENTION_CAUSAL>;
+    ATTENTION_CAUSAL, hrm_structure::reference>;
 
 /*
     The input holds one index per position, the identifier and then the window. The
@@ -161,17 +174,18 @@ using arc_config = hrm_transformer_config<
     The unified blocks carry no dropout, as the reference has none, so one network type
     serves training and measurement. USE_ACT places the adaptive computation layer around
     the feed-forward of every block of the two modules, which makes it a different type.
+    The output layer reads the H state with no normalization before it, since the last
+    block of the module has just normalized it.
 */
 template <bool USE_ACT>
-using arc_net = loss_halting_cross_entropy_per_token<linear<OUTPUTS, rms_norm<
-    hrm<typename arc_config<USE_ACT>::train_h_net_type,
-        typename arc_config<USE_ACT>::train_l_net_type, HRM_N, HRM_T,
-    puzzle_embeddings<COLOUR_VOCAB, EMBED_DIM, input<matrix<int, 0, 1>>>>>>>;
+using arc_net = loss_halting_cross_entropy_per_token<linear<OUTPUTS,
+    typename arc_config<USE_ACT>::template train_hrm<
+    puzzle_embeddings<COLOUR_VOCAB, EMBED_DIM, input<matrix<int, 0, 1>>>>>>;
 
 // The layers the program reaches into, counted from the loss.
 template <typename net> auto& halting_head (net& n) { return layer<1>(n).layer_details(); }
-template <typename net> auto& recurrence (net& n) { return layer<3>(n).layer_details(); }
-template <typename net> auto& identifier_table (net& n) { return layer<4>(n).layer_details(); }
+template <typename net> auto& recurrence (net& n) { return layer<2>(n).layer_details(); }
+template <typename net> auto& identifier_table (net& n) { return layer<3>(n).layer_details(); }
 
 // ----------------------------------------------------------------------------------------
 
@@ -191,12 +205,18 @@ inline std::string describe (halting_mode m)
     }
 }
 
+/*
+    The defaults are the reference's settings for its batch of 768: the rates, the
+    decays, the moments and the warmup.
+*/
+const long REFERENCE_BATCH = 768;
+
 struct run_options
 {
     std::string   data_dir            = "arc-data";
     std::string   model_file          = "hrm_arc_model.dat";
     halting_mode  halting             = halting_mode::external;
-    long          batch_size          = 768;
+    long          batch_size          = REFERENCE_BATCH;
     long          epochs              = 100000;
     long          eval_interval       = 10000;
     long          eval_samples        = 2000;
@@ -208,6 +228,7 @@ struct run_options
     double        beta2               = 0.95;
     double        puzzle_rate         = 1e-2;
     double        puzzle_weight_decay = 0.1;
+    bool          transposed          = false;
     long          max_passes          = 16;
     double        exploration         = 0.1;
     double        halting_weight      = 0.5;
@@ -218,6 +239,27 @@ struct run_options
     unsigned long seed                = 0;
     bool          verbose             = false;
 };
+
+/*
+    Carries the reference's settings over to the batch of this run by the square-root
+    rule, leaving alone every setting the command line gives.
+*/
+void transpose_to_batch (run_options& o, const command_line_parser& parser)
+{
+    if (o.batch_size == REFERENCE_BATCH || parser.option("no-batch-scaling"))
+        return;
+    const double kappa = (double)o.batch_size / (double)REFERENCE_BATCH;
+    const double root = std::sqrt(kappa);
+    auto moment = [kappa](double beta) { return std::max(0.0, 1 - kappa * (1 - beta)); };
+    if (!parser.option("learning-rate"))       o.learning_rate *= root;
+    if (!parser.option("puzzle-rate"))         o.puzzle_rate *= root;
+    if (!parser.option("weight-decay"))        o.weight_decay *= root;
+    if (!parser.option("puzzle-weight-decay")) o.puzzle_weight_decay *= root;
+    if (!parser.option("beta1"))               o.beta1 = moment(o.beta1);
+    if (!parser.option("beta2"))               o.beta2 = moment(o.beta2);
+    if (!parser.option("warmup-steps"))        o.warmup_steps = std::lround(o.warmup_steps / kappa);
+    o.transposed = true;
+}
 
 // ----------------------------------------------------------------------------------------
 
@@ -494,11 +536,14 @@ double rate_at (const run_options& o, long step, long total)
 }
 
 /*
-    A checkpoint holds the network, the identifier table with it, the solvers, the step
-    and the best held-out rate measured so far. The rate lets a resumed run keep the best
-    model it already saved, since its first measurement then replaces that model only by
-    doing better. The slots are not kept, so a resumed run starts every slot on a new
-    example, which costs the examples in flight and nothing else.
+    A checkpoint holds the network, the identifier table with it, the solvers, the step,
+    the best held-out rate measured so far and the batch. The rate lets a resumed run keep
+    the best model it already saved, since its first measurement then replaces that model
+    only by doing better. The slots are not kept, so a resumed run starts every slot on a
+    new example, which costs the examples in flight and nothing else.
+
+    The solvers keep the moment decays and the weight decay they were built with, and a
+    step means a batch of examples, so a run resumes at the batch it was written with.
 
     The network is cleaned first, since a serialized network carries its activations
     otherwise. The next step allocates them again, and the recurrent state the slots carry
@@ -506,7 +551,7 @@ double rate_at (const run_options& o, long step, long total)
 */
 template <typename network>
 void save_checkpoint (const std::string& file, network& net,
-                      const std::vector<adam_atan2>& solvers, long step, double best)
+                      const std::vector<adam_atan2>& solvers, long step, double best, long batch)
 {
     net.clean();
     const std::string tmp = file + "_";
@@ -516,6 +561,7 @@ void save_checkpoint (const std::string& file, network& net,
         serialize(solvers, out);
         serialize(step, out);
         serialize(best, out);
+        serialize(batch, out);
         if (!out)
             throw std::runtime_error("unable to write " + tmp);
     }
@@ -524,7 +570,7 @@ void save_checkpoint (const std::string& file, network& net,
 
 template <typename network>
 bool load_checkpoint (const std::string& file, network& net,
-                      std::vector<adam_atan2>& solvers, long& step, double& best)
+                      std::vector<adam_atan2>& solvers, long& step, double& best, long& batch)
 {
     if (!file_exists(file))
         return false;
@@ -533,10 +579,26 @@ bool load_checkpoint (const std::string& file, network& net,
     deserialize(solvers, in);
     deserialize(step, in);
     deserialize(best, in);
+    deserialize(batch, in);
     return true;
 }
 
-/* A file written by a run of another arrangement holds another network type. */
+/*
+    The model files hold what a measurement reads. The recurrent layer, and the adaptive
+    layers inside it, keep the state of the solvers that train their networks, three times
+    the size of those weights, which a copy of the network leaves out and the checkpoint
+    keeps.
+*/
+template <typename network>
+void save_model (const std::string& file, network& net)
+{
+    net.clean();
+    const network copy(net);
+    serialize(file) << copy;
+}
+
+/* A file written for another network type, or by a run of another arrangement, does not
+   read into this network. */
 void explain_mismatch (const std::string& file, const run_options& o, const std::exception& e)
 {
     cout << "\n" << file << " does not fit this network. The adaptive layer of --halting "
@@ -563,13 +625,13 @@ int train (const arc_dataset& train_set, const arc_dataset& test, long table_row
 
     std::vector<adam_atan2> solvers(network::num_computational_layers,
                                     adam_atan2(o.weight_decay, o.beta1, o.beta2));
-    long step = 0;
+    long step = 0, written_batch = o.batch_size;
     double best_exact = -1;
     const std::string checkpoint = "chkpt-" + o.model_file;
     bool resumed = false;
     try
     {
-        resumed = load_checkpoint(checkpoint, net, solvers, step, best_exact);
+        resumed = load_checkpoint(checkpoint, net, solvers, step, best_exact, written_batch);
     }
     catch (const std::exception& e)
     {
@@ -578,6 +640,13 @@ int train (const arc_dataset& train_set, const arc_dataset& test, long table_row
     }
     if (resumed)
     {
+        if (written_batch != o.batch_size)
+        {
+            cout << checkpoint << " was written by a run of batch " << written_batch
+                 << ", and this one asks for " << o.batch_size << ".\nResume with --batch-size "
+                 << written_batch << ", or remove the file to start afresh.\n";
+            return 1;
+        }
         cout << "Resuming from " << checkpoint << " at step " << step;
         if (best_exact >= 0)
             cout << ", best held-out rate so far " << 100.0 * best_exact << " %";
@@ -633,9 +702,12 @@ int train (const arc_dataset& train_set, const arc_dataset& test, long table_row
     auto& core = recurrence(net);
     core.set_carry_state(true);
 
-    // The halting head is set before the first step, once the layers have their parameters.
+    /* The layers draw their parameters on the first forward. The output layer draws its
+       weights as the reference draws its own, from a truncated normal law of deviation one
+       over the square root of the width, and the halting head is set right after. */
     if (!resumed)
     {
+        halting_head(net).set_weight_init(weight_init::truncated_lecun_normal);
         for (long b = 0; b < B; ++b)
             xs[b] = make_input(train_set, stream.next(), o);
         net.to_tensor(xs.begin(), xs.end(), x);
@@ -744,7 +816,7 @@ int train (const arc_dataset& train_set, const arc_dataset& test, long table_row
 
         if (std::chrono::steady_clock::now() - last_save > std::chrono::minutes(15))
         {
-            save_checkpoint(checkpoint, net, solvers, step, best_exact);
+            save_checkpoint(checkpoint, net, solvers, step, best_exact, B);
             last_save = std::chrono::steady_clock::now();
         }
 
@@ -757,8 +829,7 @@ int train (const arc_dataset& train_set, const arc_dataset& test, long table_row
             if (rate > best_exact)
             {
                 best_exact = rate;
-                net.clean();
-                serialize(o.model_file + ".best") << net;
+                save_model(o.model_file + ".best", net);
                 cout << "  best so far, saved to " << o.model_file << ".best\n";
             }
             // The measurement replaced the carried state, so every slot starts a new example.
@@ -779,11 +850,10 @@ int train (const arc_dataset& train_set, const arc_dataset& test, long table_row
         cout << "\n";
     }
 
-    save_checkpoint(checkpoint, net, solvers, step, best_exact);
+    save_checkpoint(checkpoint, net, solvers, step, best_exact, B);
     core.set_carry_state(false);
     core.reset_state();
-    net.clean();
-    serialize(o.model_file) << net;
+    save_model(o.model_file, net);
     cout << "Model saved to " << o.model_file << "\n";
     network_context::reset();
     return 0;
@@ -850,24 +920,28 @@ int main(int argc, char** argv)
                                      "so; none, after --max-passes passes; internal, as none "
                                      "with the adaptive layer inside the modules; both, the "
                                      "adaptive layer and the halting head (default: external)", 1);
-        parser.add_option("batch-size", "Slots trained together (default: 768, the reference's)", 1);
+        parser.add_option("batch-size", "Slots trained together; the defaults are the reference's "
+                                        "settings at 768 and follow another batch by the "
+                                        "square-root rule (default: 768)", 1);
         parser.add_option("epochs", "Passes over the training groups, in the reference's "
                                     "accounting (default: 100000)", 1);
         parser.add_option("eval-interval", "Measure every N epochs (default: 10000)", 1);
         parser.add_option("eval-samples", "Held-out examples read by a measurement, spread "
                                           "across the split, 0 for all of them (default: 2000)", 1);
-        parser.add_option("learning-rate", "Base learning rate (default: 1e-4)", 1);
-        parser.add_option("warmup-steps", "Steps of linear warmup (default: 2000)", 1);
+        parser.add_option("learning-rate", "Base learning rate (default: 1e-4 at a batch of 768)", 1);
+        parser.add_option("warmup-steps", "Steps of linear warmup (default: 2000 at a batch of 768)", 1);
         parser.add_option("lr-min-ratio", "Where the cosine ends, as a fraction of the base rate; "
                                           "1 keeps the rate constant after the warmup (default: 1)", 1);
-        parser.add_option("weight-decay", "Decoupled weight decay (default: 0.1)", 1);
-        parser.add_option("beta1", "First moment decay (default: 0.9)", 1);
-        parser.add_option("beta2", "Second moment decay (default: 0.95)", 1);
+        parser.add_option("weight-decay", "Decoupled weight decay (default: 0.1 at a batch of 768)", 1);
+        parser.add_option("beta1", "First moment decay (default: 0.9 at a batch of 768)", 1);
+        parser.add_option("beta2", "Second moment decay (default: 0.95 at a batch of 768)", 1);
         parser.add_option("puzzle-rate", "Rate of the sign descent that trains the identifier "
                                          "table, following the schedule of the base rate "
-                                         "(default: 1e-2)", 1);
+                                         "(default: 1e-2 at a batch of 768)", 1);
         parser.add_option("puzzle-weight-decay", "Decoupled decay of the identifier rows a "
-                                                 "batch names (default: 0.1)", 1);
+                                                 "batch names (default: 0.1 at a batch of 768)", 1);
+        parser.add_option("no-batch-scaling", "Take the defaults as they are at any batch, "
+                                              "without the square-root rule");
         parser.add_option("max-passes", "Passes an example may run, and the passes a measurement "
                                         "runs (default: 16)", 1);
         parser.add_option("exploration", "Probability that a slot is held to a random minimum "
@@ -967,6 +1041,7 @@ int main(int argc, char** argv)
                     "at least 0\n";
             return 1;
         }
+        transpose_to_batch(o, parser);
 
         signal_handler::setup();
 
@@ -1019,11 +1094,19 @@ int main(int argc, char** argv)
              << NUM_H_LAYERS << " and " << NUM_L_LAYERS << " blocks, " << HRM_N << " cycles of "
              << HRM_T << " steps per pass, attention "
              << (ATTENTION_CAUSAL ? "causal" : "bidirectional") << "\n"
+             << "  structure     : post-norm blocks without gain, SwiGLU of "
+             << impl::hrm_reference_ffn_width(EMBED_DIM) << ", initial states drawn once\n"
              << "  identifier    : " << (o.blank_id ? "withheld" : "given") << "\n"
              << "  loss          : " << (o.softmax ? "softmax" : "stablemax") << " cross-entropy"
              << (uses_head(o.halting) ? ", and the halting head" : "") << "\n"
+             << "  batch         : " << o.batch_size << " slots";
+        if (o.transposed)
+            cout << ", the reference's settings at " << REFERENCE_BATCH
+                 << " carried over by the square-root rule";
+        cout << "\n"
              << "  optimizer     : Adam-atan2, rate " << o.learning_rate << ", decay "
-             << o.weight_decay << ", betas " << o.beta1 << " and " << o.beta2 << "\n"
+             << o.weight_decay << ", betas " << o.beta1 << " and " << o.beta2
+             << ", warmup " << o.warmup_steps << " steps\n"
              << "  identifiers   : sign descent, rate " << o.puzzle_rate << ", decay "
              << o.puzzle_weight_decay << "\n"
              << "  halting       : " << describe(o.halting) << "\n"

@@ -1928,6 +1928,109 @@ namespace dlib
 
 // ----------------------------------------------------------------------------------------
 
+    // RMS normalization with a unit gain and no learnable parameter. Each vector along the
+    // embedding axis, found as rms_norm_ finds it, is divided by its root mean square and
+    // nothing else, so the output always has unit RMS. Post-norm blocks normalize their
+    // residual stream this way, the Hierarchical Reasoning Model among them.
+    class unit_rms_norm_
+    {
+    public:
+        explicit unit_rms_norm_(double eps_ = DEFAULT_RMS_NORM_EPS)
+            : eps(eps_),
+            axis_is_nc(true)
+        {
+        }
+
+        double get_eps() const { return eps; }
+        void set_eps(double val)
+        {
+            DLIB_CASSERT(val > 0, "unit_rms_norm epsilon must be positive");
+            eps = val;
+        }
+
+        inline dpoint map_input_to_output(const dpoint& p) const { return p; }
+        inline dpoint map_output_to_input(const dpoint& p) const { return p; }
+
+        template <typename SUBNET>
+        void setup(const SUBNET& sub)
+        {
+            axis_is_nc = (sub.get_output().k() == 1);
+        }
+
+        template <typename SUBNET>
+        void forward(const SUBNET& sub, resizable_tensor& output)
+        {
+            const tensor& x = sub.get_output();
+            const long emb_dim = axis_is_nc ? x.nc() : x.k();
+            if (gain.nc() != emb_dim)
+            {
+                gain.set_size(1, 1, 1, emb_dim);
+                gain = 1;
+            }
+            tt::rms_normalize(eps, output, scale, x, gain, axis_is_nc);
+        }
+
+        template <typename SUBNET>
+        void backward(const tensor& gradient_input, SUBNET& sub, tensor& /*params_grad*/)
+        {
+            // The kernel also reduces the gradient of the gain, which is dropped.
+            gain_grad.copy_size(gain);
+            tt::rms_normalize_gradient(gradient_input, scale, sub.get_output(), gain,
+                sub.get_gradient_input(), gain_grad, dscale, axis_is_nc);
+        }
+
+        const tensor& get_layer_params() const { return params; }
+        tensor& get_layer_params() { return params; }
+
+        friend void serialize(const unit_rms_norm_& item, std::ostream& out)
+        {
+            serialize("unit_rms_norm_", out);
+            serialize(item.eps, out);
+            serialize(item.axis_is_nc, out);
+        }
+
+        friend void deserialize(unit_rms_norm_& item, std::istream& in)
+        {
+            std::string version;
+            deserialize(version, in);
+            if (version != "unit_rms_norm_")
+                throw serialization_error("Unexpected version '" + version
+                    + "' found while deserializing dlib::unit_rms_norm_.");
+            deserialize(item.eps, in);
+            deserialize(item.axis_is_nc, in);
+        }
+
+        friend std::ostream& operator<<(std::ostream& out, const unit_rms_norm_& item)
+        {
+            out << "unit_rms_norm";
+            out << " (eps=" << item.eps;
+            out << ", axis=" << (item.axis_is_nc ? "nc" : "k") << ")";
+            return out;
+        }
+
+        friend void to_xml(const unit_rms_norm_& item, std::ostream& out)
+        {
+            out << "<unit_rms_norm";
+            out << " eps='" << item.eps << "'";
+            out << " axis='" << (item.axis_is_nc ? "nc" : "k") << "'";
+            out << "/>\n";
+        }
+
+    private:
+        resizable_tensor params;     // always empty
+        resizable_tensor gain;       // ones, rebuilt from the input width
+        resizable_tensor gain_grad;  // scratch for the kernel
+        resizable_tensor scale;
+        resizable_tensor dscale;
+        double eps;
+        bool axis_is_nc;
+    };
+
+    template <typename SUBNET>
+    using unit_rms_norm = add_layer<unit_rms_norm_, SUBNET>;
+
+// ----------------------------------------------------------------------------------------
+
     // Per-head RMS normalization. Unlike rms_norm_, which auto-detects the embedding axis and
     // would normalize over k() for a head-split tensor, this layer always normalizes over the
     // last dimension nc(). It is meant for tensors shaped (batch, num_heads, seq, head_dim):
@@ -2602,7 +2705,8 @@ namespace dlib
             weights(other.weights),
             biases(other.biases),
             adapter(other.adapter),
-            adapter_offset(other.adapter_offset) {
+            adapter_offset(other.adapter_offset),
+            init(other.init) {
         }
 
         linear_& operator=(const linear_& other) {
@@ -2616,9 +2720,15 @@ namespace dlib
                 biases = other.biases;
                 adapter = other.adapter;
                 adapter_offset = other.adapter_offset;
+                init = other.init;
             }
             return *this;
         }
+
+        /* How setup() draws the weights, Glorot's uniform law unless asked otherwise. The
+           setting only matters before the layer is set up, so it is not serialized. */
+        weight_init get_weight_init() const { return init; }
+        void set_weight_init(weight_init val) { init = val; }
 
         double get_learning_rate_multiplier() const { return learning_rate_multiplier; }
         void set_learning_rate_multiplier(double val) { learning_rate_multiplier = val; }
@@ -2649,6 +2759,11 @@ namespace dlib
             dlib::rand rnd(std::rand());
             randomize_parameters(params, num_inputs + num_outputs, rnd);
             weights = alias_tensor(num_inputs, num_outputs);
+            if (init == weight_init::truncated_lecun_normal)
+            {
+                auto w = weights(params, 0);
+                randomize_parameters_truncated_normal(w, 1.0 / std::sqrt(static_cast<double>(num_inputs)), rnd);
+            }
 
             if (bias_mode == LINEAR_HAS_BIAS) {
                 biases = alias_tensor(1, num_outputs);
@@ -2899,6 +3014,7 @@ namespace dlib
            configure_adapters is called, so an unadapted layer is unchanged. */
         low_rank_adapter adapter;
         size_t adapter_offset = 0;
+        weight_init init = weight_init::glorot_uniform;
     };
 
     template <
@@ -6009,20 +6125,11 @@ namespace dlib
         {
             /* The token rows are drawn from a normal law truncated at two deviations, scaled
                so that their deviation is one over the square root of the width. Read through
-               a factor of that square root, they enter the network at unit scale. The
-               constant is the inverse of the deviation the truncation leaves to a unit
-               normal law. */
+               a factor of that square root, they enter the network at unit scale. */
             params.set_size(num_tokens_, embedding_dim_);
             dlib::rand rnd(std::rand());
-            const double deviation = 1.1368472343385565 / std::sqrt(static_cast<double>(embedding_dim_));
-            float* p = params.host_write_only();
-            for (size_t i = 0; i < params.size(); ++i)
-            {
-                double v = rnd.get_random_gaussian();
-                while (std::abs(v) > 2)
-                    v = rnd.get_random_gaussian();
-                p[i] = static_cast<float>(v * deviation);
-            }
+            randomize_parameters_truncated_normal(params,
+                1.0 / std::sqrt(static_cast<double>(embedding_dim_)), rnd);
         }
 
         template <typename SUBNET>
@@ -6740,6 +6847,11 @@ namespace dlib
             serialize(item.learning_rate_multiplier_, out);
             serialize(item.halt_params_, out);
             serialize(item.transition_net_, out);
+            /* The solvers go with the network they train, so that a run resumed from a
+               checkpoint continues with the moments it had, as hrm_ does. A copy of the
+               layer leaves them out. */
+            serialize(item.transition_solvers_, out);
+            serialize(item.transition_solvers_initialized_, out);
         }
 
         friend void deserialize(adaptive_computation_time_& item, std::istream& in)
@@ -6761,6 +6873,8 @@ namespace dlib
             deserialize(item.learning_rate_multiplier_, in);
             deserialize(item.halt_params_, in);
             deserialize(item.transition_net_, in);
+            deserialize(item.transition_solvers_, in);
+            deserialize(item.transition_solvers_initialized_, in);
 
             item.allocate_workspace();
         }

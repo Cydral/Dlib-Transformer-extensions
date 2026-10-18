@@ -71,7 +71,7 @@ Across the full example suite, the repository now covers:
 - **supervised fine-tuning and low-rank adaptation** (LoRA, DoRA) over an imported model
 - **knowledge distillation** from a teacher container into a student of a freely chosen architecture, dense or mixture-of-experts
 - **software-extended device memory**: a residency layer that lets a network occupy more than the card holds, driven by the access schedule the run reveals about itself
-- **privacy-preserving document processing**: reversible pseudonymization of Word, Excel, PowerPoint, PDF and text files, with a byte-level Transformer encoder and a structural SVM sequence labeler that learn, from synthetic data, where a name, a place or an organisation starts and ends, for people, addresses and organisations of many countries
+- **privacy-preserving document processing**: reversible pseudonymization of Word, Excel, PowerPoint, PDF and text files, with a byte-level Transformer encoder and a structural SVM sequence labeler that learn, from synthetic data, where a name, a place or an organisation starts and ends
 
 > [!TIP]
 > Read this directory not as a loose collection of demos, but as a **progressive design reference** for building Transformer-based applications with Dlib.
@@ -93,7 +93,7 @@ Across the full example suite, the repository now covers:
 6. [`slm_enwiki_train_ex.cpp`](#slm_enwiki_train_excpp)  
    Longer-corpus training and context-window management.
 7. [`slm_hrm_arc_puzzle_ex.cpp`](#slm_hrm_arc_puzzle_excpp) and [`slm_hrm_sudoku_ex.cpp`](#slm_hrm_sudoku_excpp)  
-   Hierarchical reasoning on ARC-AGI, and three ways of deciding when to stop; then on Sudoku-Extreme, trained the way the published work trains it.
+   Hierarchical reasoning with the published network, on ARC-AGI with four ways of deciding when to stop, then on Sudoku-Extreme, trained the way the published work trains it.
 8. [`slm_predictive_compressor_ex.cpp`](#slm_predictive_compressor_excpp)  
    Transformer as a **byte-level predictive model** for compression.
 
@@ -406,30 +406,34 @@ The `context_manager` abstraction is especially helpful because it makes explici
 ## `slm_hrm_arc_puzzle_ex.cpp`
 
 ### Purpose
-Trains a hierarchical reasoning network on ARC-AGI and puts three ways of deciding when to stop thinking in competition on the same data, the same architecture and the same budget.
+Trains the hierarchical reasoning model on ARC-AGI the way the published work trains it, conditioned on a puzzle identifier, and puts the ways of deciding when to stop thinking side by side on the same data, the same network and the same budget.
 
-### The question it asks
-A recurrent core can be run for a variable number of passes, and there is more than one place to decide how many. The published work puts that decision outside the network, driven by a value head trained by Q-learning. The adaptive computation layer puts it inside the graph, per position, trained by a ponder cost. Which is better is open, and the two differ as much in the signal that trains them as in where they sit.
+### The network
+The two modules take the reference structure of `hrm_transformer_config`, selected by its `hrm_structure::reference` argument. Their blocks are post-norm and normalized by `unit_rms_norm`, without a gain, so the state carried from pass to pass always has unit RMS. The feed-forward is a bias-free SwiGLU of width 1536, the attention is bidirectional with rotary positions, and the recurrence starts from two vectors drawn once from a truncated normal law. Every projection draws its weights from a truncated normal law of deviation one over the square root of its input width, as the reference draws them, and the output layer reads the H state as the last block leaves it.
 
-- `--halting external` drives the recurrence from outside, each segment resuming the state the last one left,
-- `--halting internal` places the adaptive layer inside the modules the recurrence encapsulates,
-- `--halting none` is the baseline neither can be credited against until it is known.
+### When a slot is done
+- `--halting external` is the published arrangement and the default, a halting logit read at the identifier position and trained by the loss towards whether the answer is exact,
+- `--halting none` runs every example through `--max-passes` passes, each one supervised,
+- `--halting internal` places the adaptive computation layer around the feed-forward of every block, trained by a ponder cost,
+- `--halting both` combines the adaptive layer inside the modules with the halting head outside them.
 
-### The conditioning, and what it costs
-The model sees one input grid and no worked examples of the same task. What tells it which transformation to apply is an identifier carried as the first token and looked up in the same embedding table as the colours. An identifier never trained on therefore means nothing, and a puzzle can only be asked about by name if it was named during training. `--blank-puzzle-id` withholds it, which is the harder setting and the honest one.
+### The conditioning
+The model sees one input grid and no worked example of the same task. What tells it which transformation to apply is the identifier at the first position, which `puzzle_embeddings` looks up in a table of its own, one row per puzzle, zero at first and trained by sparse sign descent on the rows a batch names, as the reference trains its puzzle embedding. An identifier never trained on keeps its zero row, so a puzzle can only be asked about by name if it was named during training. `--blank-puzzle-id` withholds it, which is the harder setting.
+
+### The batch
+The defaults are the published settings at a batch of 768. Another `--batch-size` carries them over by the square-root rule for adaptive optimizers (Malladi et al., 2022). The rates and the decoupled decays are multiplied by the square root of the batch ratio, each moment decay keeps its horizon in examples, and the warmup is divided by the ratio. A setting given on the command line is kept as given, and `--no-batch-scaling` turns the rule off.
 
 ### Main ideas demonstrated
-- one embedding table serving both the symbols and a large set of learned identifiers, with no optimizer state over it,
-- an output head deliberately narrower than that table, since an identifier is never predicted,
-- a recurrent layer whose state can be carried across forward passes, so a caller can drive the recurrence from outside,
-- the whole grid read in a single pass rather than nine hundred autoregressive steps,
-- the same network type selected at compile time by whether the adaptive layer is present.
+- the reference structure of `hrm_transformer_config`, one template argument away from the library's pre-norm structure,
+- an identifier table trained by sparse sign descent beside a token table trained by the solver, in `puzzle_embeddings`,
+- a recurrent layer whose state is carried across forward passes and restarted sample by sample,
+- the network type selected at compile time by whether the adaptive layer is present.
 
 ### Preparing the data
 `slm_tools/build_arc_dataset.py` turns the ARC JSON into the flat arrays this program reads, in the layout the reference implementation uses, so a dataset built here can feed either codebase. Augmentation is optional, and `--protocol reference` reproduces the published arrangement while `--protocol held-out` is the setting that does not learn at test time.
 
 ### Useful reminders
-Add `--extended-memory` when the batch or the identifier table no longer fits the card.
+The memory extension is on unless `--no-extended-memory` is given, and carries what does not fit the card at a cost in speed. A checkpoint resumes at the batch it was written with.
 
 ---
 
@@ -437,7 +441,10 @@ Add `--extended-memory` when the batch or the identifier table no longer fits th
 ## `slm_hrm_sudoku_ex.cpp`
 
 ### Purpose
-Reproduces, on Sudoku-Extreme, the training procedure of the published hierarchical reasoning model. A thousand training puzzles are each augmented a thousand times, the network shape, the halting, the loss and the optimizer are those of the published configuration, and the result is measured on the 423 thousand puzzles of the test split. The published work trains this setting on a single laptop GPU, where its ARC run needs eight GPUs for a day, which makes Sudoku the place to test whether the reproduction holds.
+Reproduces, on Sudoku-Extreme, the published hierarchical reasoning model and its training procedure. A thousand training puzzles are each augmented a thousand times, the network, the halting, the loss and the optimizer are those of the published configuration, and the result is measured on the 423 thousand puzzles of the test split. The published work reports this setting from eight GPUs in minutes and gives a single-GPU recipe for a laptop card, which makes Sudoku the place to test whether the reproduction holds.
+
+### The network
+The network of the ARC example, with the reference structure of `hrm_transformer_config`: post-norm blocks without a gain, a bias-free SwiGLU of width 1536, bidirectional attention with rotary positions, initial states drawn once from a truncated normal law and projections drawn as the reference draws them. The cells are embedded through the token table of `puzzle_embeddings`, and every puzzle carries the same identifier, as in the reference, so its table holds one row trained by sign descent.
 
 ### How a batch is trained
 A batch is a set of slots, each holding one puzzle and the recurrent state the network has reached on it. Every training step runs one pass of the recurrence on every slot, resuming from the state the previous step left, and supervises all of them, whatever pass each one is at. After the step, each slot decides whether it is done. A slot that halts takes a new puzzle and restarts from the initial state while its neighbours continue, which the hierarchical layer supports through `reset_state` on a per-sample mask.
@@ -445,18 +452,21 @@ A batch is a set of slots, each holding one puzzle and the recurrent state the n
 ### The halting head
 The output projection is one channel wider than the vocabulary, and that channel, read at the first position, is a halting logit. `loss_halting_cross_entropy_per_token` scores the cells and trains the halting logit towards whether the whole answer came out exact. The loss is where this belongs, since only the loss sees the labels and exactness is a question about them. A slot halts when the logit is positive or when it reaches the maximum number of passes, and one time in ten it is held to a random minimum first, so that the head also sees the passes it would have skipped. The published work also trains a "continue" logit from one more pass of the network; this program trains the halting logit alone, as the tiny recursive model that followed it does, which removes that pass.
 
+### The batch
+The settings are the published ones at a batch of 768, the one behind the reported result. The default batch of 128 receives them by the square-root rule for adaptive optimizers, as in the ARC example, and the program prints the settings it derived; `--batch-size 768` runs the published setting as it is. The published single-GPU recipe, a batch of 384 at a rate of 7e-5, applies the same rule to the rate alone.
+
 ### Main ideas demonstrated
+- the reference structure of `hrm_transformer_config`, with the parameter-free `unit_rms_norm`,
 - a halting head trained jointly with the network, through a loss layer that splits the token logits from the halting logit,
 - a recurrent state restarted sample by sample, so that halted sequences are replaced one at a time,
 - stablemax cross-entropy and the Adam-atan2 solver, both as the published configuration uses them,
-- the solver's algorithm and settings handed to the modules the hierarchical layer updates itself, through `network_context`,
-- an embedding written as a projection of scaled one-hot rows, so that the solver trains it like every other parameter.
+- the solver's algorithm and settings handed to the modules the hierarchical layer updates itself, through `network_context`.
 
 ### Preparing the data
 `slm_tools/build_sudoku_dataset.py` downloads Sudoku-Extreme, draws the training puzzles and applies the symmetries of the game, a digit permutation, a transposition and permutations of bands, rows, stacks and columns, to the puzzle and its solution together. It writes the `.bin` layout `build_arc_dataset.py` writes, read by the same loader, and the `.npy` layout of the reference implementation.
 
 ### Useful reminders
-Evaluation runs every test puzzle through the full number of passes and counts a puzzle only when all 81 cells are right, and `--eval-samples 0` reads the whole split. At the published batch of 384 the working set is large in single precision. The memory extension, on unless `--no-extended-memory` is given, carries what does not fit the card, and a smaller `--batch-size` is the other way, the number of steps following from `--epochs` so that the amount of data stays the same.
+Evaluation runs every test puzzle through the full number of passes and counts a puzzle only when all 81 cells are right, and `--eval-samples 0` reads the whole split. A batch larger than the default of 128 can rely on the memory extension, on unless `--no-extended-memory` is given, which carries what does not fit the card. A checkpoint resumes at the batch it was written with.
 
 ---
 
@@ -826,36 +836,9 @@ Protect the personal data of documents before they leave the organisation that o
 ### What the example teaches
 **A tag can carry its value.** Each personal value is replaced by a tag such as `[[PERSON:Xoydoeh Nuggwdfsorn#EKR]]`, whose body is the value encrypted with format-preserving encryption (FF1 over AES-256) and whose last characters authenticate it. No correspondence table is written: the key alone restores a protected document, or any text derived from it, such as the summary a language model wrote. The codes are chosen per type so that protected data stays usable: the same name gets the same code everywhere, a protected IBAN still passes its checksum, every date moves by the same secret number of weeks.
 
-**Four channels find the data.** Validated scanners find what has a structure and a check digit (e-mails, phones, IBAN, cards, social security and foreign national numbers, IMEI, VIN, UUID, GPS coordinates). Linguistic rules read civilities, field labels, legal forms, the names of companies and public bodies, nicknames announced by their cue ("dit « Jojo »", "a.k.a."), the postal codes of other countries in their own layout ("00-238 Warszawa", "Tel Aviv 6688116"), and lexicons of given names from every region of the world, nicknames and stage names included, of about two thousand organisations of all countries known by their own name, of nationalities and of places. Regular expressions and term lists add what is specific to an organisation. Two learned recognizers find, from the context in which they appear, the names, places, addresses and organisations the rules miss.
+**Four channels find the data.** Validated scanners find what has a structure and a check digit (e-mails, phones, IBAN, cards, social security and foreign national numbers, IMEI, VIN, UUID, GPS coordinates). Linguistic rules read civilities, field labels, legal forms, the names of companies and public bodies, and lexicons of given names, nationalities and places. Regular expressions and term lists add what is specific to an organisation. Two learned recognizers find, from the context in which they appear, the names, places, addresses and organisations the rules miss.
 
 **The model answers with spans of its input.** `pii_span_model` is an encoder that gives each byte of its input a BIO class, and a constrained Viterbi pass turns the classes into spans. Every span it returns is a substring of its input with exact offsets, so the answer to "is there personal data here, where, and what is it" always points into the text.
-
-### Quick start
-Protecting a Word file and restoring it, with the recognizers compiled into the program:
-
-```bash
-./slm_document_anonymizer_ex keygen --key demo.key
-./slm_document_anonymizer_ex scan contract.docx                       # lists what was found, writes nothing
-./slm_document_anonymizer_ex anonymize --key demo.key --report contract.docx
-                                                                      # writes contract.anon.docx and its JSON report
-./slm_document_anonymizer_ex restore --key demo.key contract.anon.docx
-                                                                      # writes contract.restored.docx
-./slm_document_anonymizer_ex text < prompt.txt > protected.txt        # the same on text, for a language model
-./slm_document_anonymizer_ex text --restore < answer.txt
-```
-
-Using models of your own, then training and evaluating them on the synthetic data:
-
-```bash
-./slm_document_anonymizer_ex anonymize --model pii_span.dat contract.docx
-./slm_document_anonymizer_ex anonymize --tagger pii_tagger.dat --model pii_span.dat contract.docx
-python3 slm_tools/build_pii_dataset.py --out-dir pii-data --train 100000
-./slm_document_anonymizer_ex train-tagger pii-data/train.tsv --dev pii-data/dev.tsv --examples 100000 --out pii_tagger.dat
-./slm_document_anonymizer_ex train-model pii-data/train.tsv --dev pii-data/dev.tsv --init embedded --lr 0.0005 \
-    --steps 10000 --out pii_span.dat
-./slm_document_anonymizer_ex evaluate pii-data/test.tsv --tagger pii_tagger.dat --model pii_span.dat
-./slm_document_anonymizer_ex embed --tagger pii_tagger.dat --model pii_span.dat --out slm_document_anonymizer_ex.h
-```
 
 ### Main technical choices
 - **Byte input.** The span model reads UTF-8 bytes: no tokenizer to train, no unknown word, and OCR accidents such as `JeanDupont` or `rn` read as `m` are just other byte sequences. Offsets come out exact, and span limits move to word limits after decoding, so that no end of a word stays readable.
@@ -864,19 +847,18 @@ python3 slm_tools/build_pii_dataset.py --out-dir pii-data --train 100000
 - **A classical learner beside the Transformer.** `pii_sequence_tagger` is `dlib::sequence_labeler` trained as a structural SVM over hashed lexical, shape and context features, and trains in minutes. Its word features also fire on capitalized words that are not personal data, so when both models are loaded the detector follows the span model and takes from the tagger, where the span model found nothing, its confident spans (`--tagger-min-confidence`) and the name parts that complete a name already found, so that the given name and the family name of a person are replaced together.
 - **Fine labels, coarse replacement.** The models learn `GIVEN_NAME`, `FAMILY_NAME`, `USERNAME`, `STREET_ADDRESS`, `POSTAL_CODE`, `CITY` and `ORGANIZATION`; the detector merges a given name and a family name side by side into one `PERSON`, a postal code and its city into one `LOCATION`, and replaces them as the rules would.
 - **Learned spans judged as a whole.** The pieces a recognizer cuts inside a word or a name (`E` and `sch-sur-Alzette`, `Inès`, `de` and `Brunet`) are merged before anything is judged. A span that names nothing is then dropped: a greeting or a field label alone, function words alone, a common word in lower case, a capitalized word joined to lower case words (`Le projet`), a login inside a file name.
-- **Synthetic data, held-out values.** `slm_tools/build_pii_dataset.py` writes the training sets from templates and lexicons, and reserves part of every lexicon for a `test_unseen` split, which scores the detection of names, streets, cities and organisations absent from training. The texts span about forty document genres, from forms, letters and contracts to booking confirmations, incident tickets, shipping labels, utility bills, social media posts and CVs, and a share of their places and organisations lies in one of about fifty other countries, written the way that country writes them ("ul. Długa 5, 00-238 Warszawa", "Toronto, ON M5H 2N2"). On test sets written by the generator and held out from training, the rules with the compiled recognizers reach an F1 of 0.975 over every category, 0.947 under heavy OCR noise and 0.956 when every place, organisation, phone number and IBAN belongs to another country.
+- **Synthetic data, held-out values.** `slm_tools/build_pii_dataset.py` writes the training sets from templates and lexicons, and reserves part of every lexicon for a `test_unseen` split, which scores the detection of names, streets, cities and organisations absent from training.
 
 ### Useful reminders
 - `detect` reads a text on standard input and prints `found: yes` or `found: no`, then one line per span with its byte offsets, its type, its confidence and its value; with recognizers loaded, it also prints what each of them finds on its own, with fine labels.
 - `evaluate` scores the rules alone, each recognizer alone and the whole detector on the same test set, at the level of the fine labels and at the level at which values are replaced.
 - `embed` writes `slm_document_anonymizer_ex.h`, which compiles the trained recognizers into the program: the executable then travels alone and uses them by default, `--tagger` and `--model` each replace one of them by a model file, and `train-model --init embedded` continues the training of the compiled span model on new data. The repository provides this header with trained recognizers; `embed` rewrites it after a new training.
-- `train-tagger --cache 5` lets the SVM solver keep five labelings per example: the training runs about three times faster and needs about six times the memory (about 15 kB per example of 50 tokens without cache).
 - `train-model --optimizer adam-atan2` trains the span model with `dlib::adam_atan2`, whose step needs no epsilon and stays bounded; AdamW remains the default, the two reaching the same scores on this task.
 - `train-model` prints every 200 steps the mean loss of those steps, and every 2000 steps the loss on the same windows of the development set with the span F1. With `--init`, it prints them before its first step too: the point the complementary training starts from.
 - The output is **pseudonymized** data in the sense of the GDPR: whoever holds the key can restore it. `--irreversible` drops the key.
 
 ### Why this example matters
-It puts the Transformer stack of this repository to work on a task whose result can be measured, and shows a pattern for extraction tasks whose answer must come from the input: a small encoder, byte-level input, constrained decoding, and test sets built around the errors to watch (unseen values, OCR noise, texts without personal data, whole documents, places abroad).
+It puts the Transformer stack of this repository to work on a task whose result can be measured, and shows a pattern for extraction tasks whose answer must come from the input: a small encoder, byte-level input, constrained decoding, and test sets built around the errors to watch (unseen values, OCR noise, texts without personal data, whole documents).
 
 [⬆ Back to top](#on-this-page)
 
@@ -895,7 +877,7 @@ Verify the C++ paths against the implementations everyone else uses.
 - **`slm_prune_distill.py`** removes blocks from a published model and distils the survivors back into shape. Which blocks go is measured rather than guessed: a few forward passes record how far each block moves what passes through it, and the ones whose output stays closest to their input are the ones to drop. The survivors keep the teacher's weights, so the run repairs what the missing blocks did rather than learning the language again. What comes out is an ordinary model of its family with fewer blocks, so the standard converter produces a container this library reads.
 - **`slm_benchmark.py`** places a model against published small models on the usual tasks, each at the few-shot count under which it is normally reported — a detail that decides whether a table means anything, since five-shot and zero-shot MMLU differ by several points on the same model. The comparison figures are read from a file carrying each one's source and date, not fetched: a number quoted without its evaluation settings compares nothing.
 - **`build_arc_dataset.py`** and **`build_sudoku_dataset.py`** prepare ARC-AGI and Sudoku-Extreme for the hierarchical reasoning examples, in the layout of the reference implementation as well as in the one the C++ loader reads, so that the same data can feed either codebase.
-- **`build_pii_dataset.py`** writes the synthetic French and English training and test sets of the personal data recognizers: templates by document genre, names drawn by origin or synthesized from about twenty naming traditions, places and organisations abroad with the address layouts, legal forms, phone numbers and IBANs of their country (`--abroad-share`), nicknames and stage names, OCR and casing noise applied to labelled fragments so that every offset stays exact, and a held-out share of every lexicon for the test of unseen values. Sentences without personal data surround a share of the examples and make examples of their own, the evaluation splits hold no text of the training set, and French and English examples come in equal numbers unless `--fr-share` says otherwise. The lexicons, templates and sentences of a resource directory (`--resources`) replace the built-in ones of the same name.
+- **`build_pii_dataset.py`** writes the synthetic French and English training and test sets of the personal data recognizers: templates by document genre, names drawn by origin or synthesized from naming traditions, OCR and casing noise applied to labelled fragments so that every offset stays exact, and a held-out share of every lexicon for the test of unseen values. Sentences without personal data surround a share of the examples and make examples of their own, the evaluation splits hold no text of the training set, and French and English examples come in equal numbers unless `--fr-share` says otherwise. The lexicons, templates and sentences of a resource directory (`--resources`) replace the built-in ones of the same name.
 - **`slm_bpe_corpus.py`** collects a corpus for training a tokenizer, from encyclopaedic prose, news archives, filtered web text, multilingual web text and instruction data. The last of these is the one people leave out, and it cannot be recovered afterwards: a tokenizer trained on prose alone cuts numbered lists, code blocks and tabular answers into far more tokens than it needs, and those are what a chat model produces all day. It also reduces a corpus to a much smaller one that yields **the same merge table**, since BPE merges depend on pre-token frequencies and nothing else.
 
 ### Why this matters

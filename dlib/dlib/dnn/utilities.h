@@ -6,6 +6,7 @@
 #include "../cuda/tensor.h"
 #include "utilities_abstract.h"
 #include "../geometry.h"
+#include <cmath>
 #include <fstream>
 
 namespace dlib
@@ -28,6 +29,33 @@ namespace dlib
             val *= std::sqrt(6.0/(num_inputs_and_outputs));
         }
     }
+
+// ----------------------------------------------------------------------------------------
+
+    inline void randomize_parameters_truncated_normal (
+        tensor& params,
+        double deviation,
+        dlib::rand& rnd
+    )
+    {
+        // A unit normal law truncated at two deviations keeps a deviation of 0.8796; the
+        // draw is scaled by its inverse, so the values have the deviation asked for.
+        const double scale = 1.1368472343385565 * deviation;
+        for (auto& val : params)
+        {
+            double v = rnd.get_random_gaussian();
+            while (std::abs(v) > 2)
+                v = rnd.get_random_gaussian();
+            val = static_cast<float>(scale * v);
+        }
+    }
+
+    // How a projection draws its weights when it is set up.
+    enum class weight_init
+    {
+        glorot_uniform,
+        truncated_lecun_normal
+    };
 
 // ----------------------------------------------------------------------------------------
 
