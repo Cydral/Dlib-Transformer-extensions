@@ -609,6 +609,24 @@ namespace dlib
             bool scale
         );
 
+        void puzzle_embeddings(
+            resizable_tensor& dest,
+            const tensor& tokens,
+            const tensor& token_table,
+            const tensor& puzzle_table,
+            float scale
+        );
+
+        void puzzle_embeddings_gradient(
+            const tensor& tokens,
+            const tensor& gradient_input,
+            tensor& token_grad,
+            tensor& puzzle_table,
+            float scale,
+            float puzzle_rate,
+            float puzzle_decay
+        );
+
     // -----------------------------------------------------------------------------------
 
         void repeat_channels(

@@ -346,10 +346,12 @@ namespace dlib
 
                 A model reading this data sees one input grid and no worked examples of the
                 same task. What tells it which transformation to apply is the puzzle
-                identifier, carried as the first token and looked up in the same embedding
-                table as the colours. An identifier the model never trained on therefore
-                carries no meaning, and a puzzle can only be asked about by name if it was
-                named during training.
+                identifier, carried as the first token. The identifiers are numbered above
+                the colours, so that one index per position addresses both, and a
+                puzzle_embeddings layer reads the colours from its token table and an
+                identifier from its puzzle table. An identifier the model never trained on
+                keeps the row it started with and carries no meaning, so a puzzle can only
+                be asked about by name if it was named during training.
         !*/
 
         long puzzle_of (long example) const;
@@ -385,8 +387,8 @@ namespace dlib
         /*!
             ensures
                 - vocabulary() is the colours plus this split's own puzzle count, a lower
-                  bound on the table a network needs. Under the reference protocol the
-                  bound that matters is colour_vocab + largest_identifier() + 1.
+                  bound on the indices a network has to map. Under the reference protocol
+                  the bound that matters is colour_vocab + largest_identifier() + 1.
                 - sequence_length() is the window plus the one identifier token.
         !*/
     };

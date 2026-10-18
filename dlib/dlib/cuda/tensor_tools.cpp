@@ -1487,6 +1487,42 @@ namespace dlib { namespace tt
 
 // ----------------------------------------------------------------------------------------
 
+    void puzzle_embeddings(
+        resizable_tensor& dest,
+        const tensor& tokens,
+        const tensor& token_table,
+        const tensor& puzzle_table,
+        float scale
+    )
+    {
+#ifdef DLIB_USE_CUDA
+        cuda::puzzle_embeddings(dest, tokens, token_table, puzzle_table, scale);
+#else
+        cpu::puzzle_embeddings(dest, tokens, token_table, puzzle_table, scale);
+#endif
+    }
+
+    void puzzle_embeddings_gradient(
+        const tensor& tokens,
+        const tensor& gradient_input,
+        tensor& token_grad,
+        tensor& puzzle_table,
+        float scale,
+        float puzzle_rate,
+        float puzzle_decay
+    )
+    {
+#ifdef DLIB_USE_CUDA
+        cuda::puzzle_embeddings_gradient(tokens, gradient_input, token_grad, puzzle_table,
+                                         scale, puzzle_rate, puzzle_decay);
+#else
+        cpu::puzzle_embeddings_gradient(tokens, gradient_input, token_grad, puzzle_table,
+                                        scale, puzzle_rate, puzzle_decay);
+#endif
+    }
+
+// ----------------------------------------------------------------------------------------
+
     void repeat_channels(
         tensor& dest,
         const tensor& src,

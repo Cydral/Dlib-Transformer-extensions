@@ -2283,6 +2283,72 @@ namespace dlib { namespace tt
 
 // ----------------------------------------------------------------------------------------
 
+    void puzzle_embeddings(
+        resizable_tensor& dest,
+        const tensor& tokens,
+        const tensor& token_table,
+        const tensor& puzzle_table,
+        float scale
+    );
+    /*!
+        requires
+            - tokens.nc() == 1
+            - token_table.num_samples() > 0
+            - token_table.nr() == 1 && token_table.nc() == 1
+            - puzzle_table.size() == 0 or (puzzle_table.k() == token_table.k() and
+              puzzle_table.nr() == 1 and puzzle_table.nc() == 1)
+            - dest.num_samples() == tokens.num_samples()
+            - dest.k() == tokens.k()
+            - dest.nr() == tokens.nr()
+            - dest.nc() == token_table.k()
+        ensures
+            - Let V == token_table.num_samples() and P == puzzle_table.num_samples(), or 0
+              when puzzle_table is empty.
+            - Every position of tokens holds an index t into two tables laid end to end: the
+              tokens below V, and the puzzle identifiers from V on. For each position:
+                - if t < V, its row of dest is scale * token_table(t)
+                - if V <= t < V + P, its row of dest is scale * puzzle_table(t - V)
+                - otherwise its row of dest is zero.
+    !*/
+
+    void puzzle_embeddings_gradient(
+        const tensor& tokens,
+        const tensor& gradient_input,
+        tensor& token_grad,
+        tensor& puzzle_table,
+        float scale,
+        float puzzle_rate,
+        float puzzle_decay
+    );
+    /*!
+        requires
+            - tokens.nc() == 1
+            - gradient_input.num_samples() == tokens.num_samples()
+            - gradient_input.k() == tokens.k()
+            - gradient_input.nr() == tokens.nr()
+            - gradient_input.nc() == token_grad.k()
+            - token_grad.num_samples() > 0
+            - token_grad.nr() == 1 && token_grad.nc() == 1
+            - puzzle_table.size() == 0 or puzzle_table.k() == token_grad.k()
+            - puzzle_rate >= 0 && puzzle_decay >= 0
+        ensures
+            - With V and P as in puzzle_embeddings(), and the gradient of each position read
+              from the matching row of gradient_input:
+            - #token_grad(r) == scale times the sum of the gradients of the positions
+              holding r, for every r < V, and zero for a row no position holds.
+            - Every puzzle row p some position names, V + p, is updated in place by sign
+              descent with decoupled decay:
+                #puzzle_table(p) == puzzle_table(p) * (1 - puzzle_rate * puzzle_decay)
+                                    - puzzle_rate * sign(g)
+              where g is the sum of the gradients of every position naming p, and sign(0)
+              is 0. Several positions naming the same row contribute one step, taken on
+              their summed gradient.
+            - Rows no position names are left unchanged, decay included.
+            - No gradient is produced for tokens itself.
+    !*/
+
+// ----------------------------------------------------------------------------------------
+
     void repeat_channels(
         tensor& dest,
         const tensor& src,

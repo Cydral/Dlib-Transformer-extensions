@@ -4762,6 +4762,162 @@ namespace dlib
 
 // ----------------------------------------------------------------------------------------
 
+    template <
+        long num_tokens_,
+        long embedding_dim_
+        >
+    class puzzle_embeddings_
+    {
+        /*!
+            REQUIREMENTS ON TEMPLATE ARGUMENTS
+                - num_tokens_ > 0
+                - embedding_dim_ > 0
+
+            WHAT THIS OBJECT REPRESENTS
+                This is an input embedding for models conditioned on a learned identifier,
+                such as the puzzle identifier of the hierarchical reasoning model trained
+                on ARC-AGI. Its input is one index per position, read from an
+                input<matrix<int,0,1>> layer, into two tables laid end to end:
+                    - an index t below num_tokens_ names row t of the token table, which
+                      holds the vocabulary of the sequence;
+                    - an index t from num_tokens_ on names row t - num_tokens_ of the
+                      puzzle table, which holds one row per identifier;
+                    - an index beyond both tables gives a zero row.
+                The output has the shape of the input with embedding_dim_ columns, each
+                row multiplied by get_scale(), the square root of embedding_dim_.
+
+                The two tables are trained differently, as the reference trains them. The
+                token table is an ordinary parameter, returned by get_layer_params() and
+                updated by the solver with the rest of the network. It starts from a
+                normal law truncated at two deviations, of deviation one over the square
+                root of embedding_dim_, so that its rows enter the network at unit scale.
+
+                The puzzle table can hold hundreds of thousands of rows, of which a batch
+                touches a few, so it carries no solver state. backward() updates the rows
+                the batch named, and only those, by sign descent with decoupled decay:
+                    row = row * (1 - rate * get_puzzle_weight_decay()) - rate * sign(g)
+                where g is the summed gradient of the positions naming the row, and rate
+                is get_puzzle_rate_multiplier() times the learning rate network_context
+                holds. A network trained without an active network_context leaves the
+                puzzle table unchanged. The table starts at zero, so an identifier the
+                model never trained on contributes nothing.
+
+                Reference: G. Wang et al. "Hierarchical Reasoning Model", 2025.
+
+            CONVENTION
+                - get_num_tokens() == num_tokens_
+                - get_embedding_dim() == embedding_dim_
+                - get_layer_params() is the token table, of shape
+                  [num_tokens_, embedding_dim_, 1, 1].
+                - get_puzzle_table() is the puzzle table, of shape
+                  [get_num_puzzles(), embedding_dim_, 1, 1] once the layer has run.
+        !*/
+
+    public:
+
+        puzzle_embeddings_(
+        );
+        /*!
+            ensures
+                - #get_num_puzzles() == 0
+                - #get_learning_rate_multiplier() == 1
+                - #get_weight_decay_multiplier() == 1
+                - #get_puzzle_rate_multiplier() == 1
+                - #get_puzzle_weight_decay() == 0
+        !*/
+
+        long get_num_tokens() const;
+        long get_embedding_dim() const;
+        float get_scale() const;
+        /*!
+            ensures
+                - returns sqrt(embedding_dim_)
+        !*/
+
+        long get_num_puzzles() const;
+        void set_num_puzzles(
+            long n
+        );
+        /*!
+            requires
+                - n >= 0
+                - get_puzzle_table().size() == 0 or n == get_num_puzzles()
+            ensures
+                - #get_num_puzzles() == n
+                - The puzzle table is allocated at the next forward pass, filled with
+                  zeros. Set the number before the network first runs; once allocated,
+                  the table keeps its size, which deserialization restores.
+        !*/
+
+        double get_learning_rate_multiplier() const;
+        void set_learning_rate_multiplier(double val);
+        double get_weight_decay_multiplier() const;
+        void set_weight_decay_multiplier(double val);
+        /*!
+            ensures
+                - These apply to the token table, through the solver.
+        !*/
+
+        double get_puzzle_rate_multiplier() const;
+        void set_puzzle_rate_multiplier(
+            double val
+        );
+        /*!
+            requires
+                - val >= 0
+            ensures
+                - #get_puzzle_rate_multiplier() == val
+                - The puzzle table moves at val times the learning rate network_context
+                  holds. A run whose puzzle rate is meant to be r while its base rate is
+                  lr sets val to r / lr, and the puzzle rate then follows the schedule of
+                  the base rate.
+        !*/
+
+        double get_puzzle_weight_decay() const;
+        void set_puzzle_weight_decay(
+            double val
+        );
+        /*!
+            requires
+                - val >= 0
+            ensures
+                - #get_puzzle_weight_decay() == val
+        !*/
+
+        const tensor& get_puzzle_table() const;
+        tensor& get_puzzle_table();
+
+        template <typename SUBNET> void setup(const SUBNET& sub);
+        template <typename SUBNET> void forward(const SUBNET& sub, resizable_tensor& output);
+        template <typename SUBNET> void backward(const tensor& gradient_input, SUBNET& sub, tensor& params_grad);
+        const tensor& get_layer_params() const;
+        tensor& get_layer_params();
+        /*!
+            These functions are implemented as described in the EXAMPLE_COMPUTATIONAL_LAYER_
+            interface. backward() also updates the puzzle table as described above, and
+            computes no gradient for its input, which holds indices.
+        !*/
+
+        friend void serialize(const puzzle_embeddings_& item, std::ostream& out);
+        friend void deserialize(puzzle_embeddings_& item, std::istream& in);
+        /*!
+            Both tables are serialized with the settings. Deserializing into a layer of
+            another number of tokens or another width throws serialization_error.
+        !*/
+
+        friend std::ostream& operator<<(std::ostream& out, const puzzle_embeddings_& item);
+        friend void to_xml(const puzzle_embeddings_& item, std::ostream& out);
+    };
+
+    template <
+        long num_tokens,
+        long embedding_dim,
+        typename SUBNET
+        >
+    using puzzle_embeddings = add_layer<puzzle_embeddings_<num_tokens, embedding_dim>, SUBNET>;
+
+// ----------------------------------------------------------------------------------------
+
     struct neg_infinity_tag {};
     struct zero_tag {};
 
@@ -5104,6 +5260,20 @@ namespace dlib
         /*!
             ensures
                 - returns reference to the internal transition network
+        !*/
+
+        const std::vector<subnet_solver>& get_transition_solvers() const;
+        /*!
+            ensures
+                - returns the solvers backward() updates the transition network with, one
+                  per computational layer of it, or an empty vector before the first
+                  update.
+                - While network_context is active, they apply the algorithm, the weight
+                  decay and the two moment decays it names, as the solvers of hrm_ do, and
+                  they are built afresh when that algorithm changes. Otherwise they apply
+                  AdamW with a weight decay of 0.0005 and moment decays of 0.9 and 0.999.
+                - Their state is not serialized, so a deserialized layer starts them
+                  afresh.
         !*/
 
         long get_max_steps() const;

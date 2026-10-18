@@ -5,6 +5,9 @@
 #include "cuda_dlib.h"
 #include "cudnn_dlibapi.h"
 #include <math_constants.h>
+#include <algorithm>
+#include <utility>
+#include <vector>
 
 
 namespace dlib 
@@ -2321,6 +2324,192 @@ namespace dlib
             launch_kernel(_cuda_embeddings_gradient, gradient_input.size(), sk, sr, sc,
                 prev.device(), gradient_input.device(), grads.device(), freqs.device(),
                 learning_rate, scale, grads.num_samples());
+        }
+
+    // ----------------------------------------------------------------------------------------
+
+        __global__ void _cuda_puzzle_embeddings(
+            float* dest,
+            const float* tokens,
+            const float* token_table,
+            const float* puzzle_table,
+            size_t positions,
+            long dim,
+            long vocab,
+            long puzzles,
+            float scale
+        )
+        {
+            for (auto i : grid_stride_range(0, positions * dim))
+            {
+                const size_t p = i / dim;
+                const long c = (long)(i % dim);
+                const long tok = (long)tokens[p];
+                float v = 0.0f;
+                if (tok >= 0 && tok < vocab)
+                    v = token_table[tok * dim + c];
+                else if (tok >= vocab && tok - vocab < puzzles)
+                    v = puzzle_table[(tok - vocab) * dim + c];
+                dest[i] = scale * v;
+            }
+        }
+
+        void puzzle_embeddings(
+            resizable_tensor& dest,
+            const tensor& tokens,
+            const tensor& token_table,
+            const tensor& puzzle_table,
+            float scale
+        )
+        {
+            DLIB_CASSERT(tokens.nc() == 1 && token_table.num_samples() > 0 &&
+                         token_table.nr() == 1 && token_table.nc() == 1);
+            DLIB_CASSERT(puzzle_table.size() == 0 || (puzzle_table.k() == token_table.k() &&
+                         puzzle_table.nr() == 1 && puzzle_table.nc() == 1));
+            DLIB_CASSERT(dest.num_samples() == tokens.num_samples() && dest.k() == tokens.k() &&
+                         dest.nr() == tokens.nr() && dest.nc() == token_table.k());
+
+            const long puzzles = puzzle_table.size() != 0 ? puzzle_table.num_samples() : 0;
+            launch_kernel(_cuda_puzzle_embeddings, max_jobs(dest.size()),
+                dest.device_write_only(), tokens.device(), token_table.device(),
+                puzzles > 0 ? puzzle_table.device() : nullptr,
+                tokens.size(), token_table.k(), token_table.num_samples(), puzzles, scale);
+        }
+
+        /*
+            One thread per entry of the token table, each summing the gradient of the
+            positions holding its token. The table is a few rows wide and the batch a few
+            thousand positions long, so the sum runs over the positions inside the thread,
+            where an atomic per position would put every one of them on the same few rows.
+        */
+        __global__ void _cuda_puzzle_embeddings_token_gradient(
+            float* token_grad,
+            const float* tokens,
+            const float* gradient_input,
+            size_t positions,
+            long dim,
+            long vocab,
+            float scale
+        )
+        {
+            for (auto i : grid_stride_range(0, vocab * dim))
+            {
+                const long r = (long)(i / dim);
+                const long c = (long)(i % dim);
+                float sum = 0.0f;
+                for (size_t p = 0; p < positions; ++p)
+                {
+                    if ((long)tokens[p] == r)
+                        sum += gradient_input[p * dim + c];
+                }
+                token_grad[i] = scale * sum;
+            }
+        }
+
+        /*
+            One thread per entry of each puzzle row the batch names. rows lists the rows,
+            and the positions naming rows[u] are positions[offsets[u]] to
+            positions[offsets[u+1]-1].
+        */
+        __global__ void _cuda_puzzle_embeddings_sign_update(
+            float* puzzle_table,
+            const float* gradient_input,
+            const int* rows,
+            const int* offsets,
+            const int* positions,
+            long num_rows,
+            long dim,
+            float rate,
+            float keep
+        )
+        {
+            for (auto i : grid_stride_range(0, num_rows * dim))
+            {
+                const long u = (long)(i / dim);
+                const long c = (long)(i % dim);
+                float sum = 0.0f;
+                for (int k = offsets[u]; k < offsets[u + 1]; ++k)
+                    sum += gradient_input[(size_t)positions[k] * dim + c];
+                const float sign = (sum > 0) ? 1.0f : (sum < 0 ? -1.0f : 0.0f);
+                float& w = puzzle_table[(size_t)rows[u] * dim + c];
+                w = w * keep - rate * sign;
+            }
+        }
+
+        void puzzle_embeddings_gradient(
+            const tensor& tokens,
+            const tensor& gradient_input,
+            tensor& token_grad,
+            tensor& puzzle_table,
+            float scale,
+            float puzzle_rate,
+            float puzzle_decay
+        )
+        {
+            DLIB_CASSERT(tokens.nc() == 1 && gradient_input.num_samples() == tokens.num_samples() &&
+                         gradient_input.k() == tokens.k() && gradient_input.nr() == tokens.nr() &&
+                         gradient_input.nc() == token_grad.k());
+            DLIB_CASSERT(token_grad.num_samples() > 0 && token_grad.nr() == 1 && token_grad.nc() == 1);
+            DLIB_CASSERT(puzzle_table.size() == 0 || puzzle_table.k() == token_grad.k());
+            DLIB_CASSERT(puzzle_rate >= 0 && puzzle_decay >= 0);
+
+            const long vocab = token_grad.num_samples();
+            const long puzzles = puzzle_table.size() != 0 ? puzzle_table.num_samples() : 0;
+            const long dim = token_grad.k();
+            const size_t positions = tokens.size();
+
+            launch_kernel(_cuda_puzzle_embeddings_token_gradient, max_jobs(token_grad.size()),
+                token_grad.device_write_only(), tokens.device(), gradient_input.device(),
+                positions, dim, vocab, scale);
+
+            if (puzzles == 0 || puzzle_rate == 0)
+                return;
+
+            /* The rows a batch names are found on the host, where the tokens were written,
+               and grouped so that several positions naming one row take a single step on
+               their summed gradient. */
+            const float* t = tokens.host();
+            std::vector<std::pair<int, int>> named;
+            for (size_t p = 0; p < positions; ++p)
+            {
+                const long tok = (long)t[p];
+                if (tok >= vocab && tok - vocab < puzzles)
+                    named.emplace_back((int)(tok - vocab), (int)p);
+            }
+            if (named.empty())
+                return;
+            std::sort(named.begin(), named.end());
+
+            std::vector<int> index;
+            std::vector<int> rows, offsets;
+            for (size_t k = 0; k < named.size(); ++k)
+            {
+                if (k == 0 || named[k].first != named[k - 1].first)
+                {
+                    rows.push_back(named[k].first);
+                    offsets.push_back((int)k);
+                }
+            }
+            offsets.push_back((int)named.size());
+            index.reserve(rows.size() + offsets.size() + named.size());
+            index.insert(index.end(), rows.begin(), rows.end());
+            index.insert(index.end(), offsets.begin(), offsets.end());
+            for (const auto& n : named)
+                index.push_back(n.second);
+
+            cuda_data_void_ptr buf = device_global_buffer(index.size() * sizeof(int));
+            memcpy(buf, index.data(), index.size() * sizeof(int));
+            const size_t rows_off = 0;
+            const size_t offsets_off = rows_off + rows.size() * sizeof(int);
+            const size_t positions_off = offsets_off + offsets.size() * sizeof(int);
+            auto rows_dev = static_pointer_cast<int>(buf + rows_off, rows.size());
+            auto offsets_dev = static_pointer_cast<int>(buf + offsets_off, offsets.size());
+            auto positions_dev = static_pointer_cast<int>(buf + positions_off, named.size());
+
+            launch_kernel(_cuda_puzzle_embeddings_sign_update, max_jobs(rows.size() * dim),
+                puzzle_table.device(), gradient_input.device(),
+                rows_dev.data(), offsets_dev.data(), positions_dev.data(),
+                (long)rows.size(), dim, puzzle_rate, 1 - puzzle_rate * puzzle_decay);
         }
 
     // ----------------------------------------------------------------------------------------

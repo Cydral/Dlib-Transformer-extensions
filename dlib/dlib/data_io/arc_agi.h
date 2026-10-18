@@ -1399,12 +1399,11 @@ namespace dlib
         The conditioning deserves a word, because it is what the layout is built around.
         A model trained on this data is shown one input grid and no worked examples of
         the same task. What tells it which transformation to apply is the puzzle
-        identifier, carried as the first token of the sequence and looked up in the same
-        embedding table as the colours. Reserving the identifiers above the colours is
-        what makes that possible without a second embedding layer, and it comes out right
-        for free: the embedding updates only the rows a batch touched, and keeps no
-        optimizer state per row, which is what a table of several hundred thousand
-        puzzles needs.
+        identifier, carried as the first token of the sequence. The identifiers are
+        numbered above the colours, so that one index per position addresses both, and a
+        puzzle_embeddings layer reads the colours from its token table and an identifier
+        from its puzzle table. That table keeps no optimizer state and moves only the rows
+        a batch names, which is what a table of several hundred thousand puzzles needs.
 
         The price is stated plainly. An identifier the model never trained on carries no
         meaning, so a puzzle absent from training cannot be solved by naming it. Passing
@@ -1429,8 +1428,8 @@ namespace dlib
         long num_examples() const { return (long)inputs.size(); }
 
         /*!
-            Size of the embedding table a network reading this dataset needs: the colours
-            and every identifier, since both are looked up in the same table.
+            The number of indices an input of this split can hold: the colours, then one
+            per puzzle of the split.
         !*/
         long vocabulary () const { return colour_vocab + num_puzzles(); }
 
@@ -1596,8 +1595,7 @@ namespace dlib
         const std::vector<int>& cells = d.inputs[(size_t)example];
         matrix<int, 0, 1> seq(d.sequence_length());
 
-        // The identifier lives above the colours in the same table, which is what lets
-        // one embedding layer serve both.
+        // The identifier is numbered above the colours, so that one index addresses both.
         seq(0) = d.colour_vocab + puzzle_id;
         for (long i = 0; i < d.seq_len; ++i)
             seq(i + 1) = cells[(size_t)i];

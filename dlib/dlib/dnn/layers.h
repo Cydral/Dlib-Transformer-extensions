@@ -5955,6 +5955,189 @@ namespace dlib
     using embeddings = add_layer<embeddings_<nb_embeddings, embedding_length>, SUBNET>;
 
 // ----------------------------------------------------------------------------------------
+
+    template <
+        long num_tokens_,
+        long embedding_dim_
+        >
+    class puzzle_embeddings_
+    {
+        static_assert(num_tokens_ > 0, "puzzle_embeddings_ needs at least one token");
+        static_assert(embedding_dim_ > 0, "puzzle_embeddings_ needs a positive width");
+
+    public:
+        puzzle_embeddings_() = default;
+
+        long get_num_tokens () const { return num_tokens_; }
+        long get_embedding_dim () const { return embedding_dim_; }
+
+        long get_num_puzzles () const { return num_puzzles; }
+        void set_num_puzzles (long n)
+        {
+            DLIB_CASSERT(n >= 0, "puzzle_embeddings_: a negative number of puzzles");
+            DLIB_CASSERT(puzzles.size() == 0 || n == num_puzzles,
+                "puzzle_embeddings_: the puzzle table already holds " << num_puzzles
+                << " rows and cannot be resized to " << n);
+            num_puzzles = n;
+        }
+
+        double get_learning_rate_multiplier () const { return learning_rate_multiplier; }
+        void set_learning_rate_multiplier (double val) { learning_rate_multiplier = val; }
+        double get_weight_decay_multiplier () const { return weight_decay_multiplier; }
+        void set_weight_decay_multiplier (double val) { weight_decay_multiplier = val; }
+
+        double get_puzzle_rate_multiplier () const { return puzzle_rate_multiplier; }
+        void set_puzzle_rate_multiplier (double val)
+        {
+            DLIB_CASSERT(val >= 0);
+            puzzle_rate_multiplier = val;
+        }
+        double get_puzzle_weight_decay () const { return puzzle_weight_decay; }
+        void set_puzzle_weight_decay (double val)
+        {
+            DLIB_CASSERT(val >= 0);
+            puzzle_weight_decay = val;
+        }
+
+        float get_scale () const { return std::sqrt(static_cast<float>(embedding_dim_)); }
+
+        const tensor& get_puzzle_table () const { return puzzles; }
+        tensor& get_puzzle_table () { return puzzles; }
+
+        template <typename SUBNET>
+        void setup (const SUBNET& /*sub*/)
+        {
+            /* The token rows are drawn from a normal law truncated at two deviations, scaled
+               so that their deviation is one over the square root of the width. Read through
+               a factor of that square root, they enter the network at unit scale. The
+               constant is the inverse of the deviation the truncation leaves to a unit
+               normal law. */
+            params.set_size(num_tokens_, embedding_dim_);
+            dlib::rand rnd(std::rand());
+            const double deviation = 1.1368472343385565 / std::sqrt(static_cast<double>(embedding_dim_));
+            float* p = params.host_write_only();
+            for (size_t i = 0; i < params.size(); ++i)
+            {
+                double v = rnd.get_random_gaussian();
+                while (std::abs(v) > 2)
+                    v = rnd.get_random_gaussian();
+                p[i] = static_cast<float>(v * deviation);
+            }
+        }
+
+        template <typename SUBNET>
+        void forward (const SUBNET& sub, resizable_tensor& output)
+        {
+            const tensor& tokens = sub.get_output();
+            DLIB_CASSERT(tokens.nc() == 1, "puzzle_embeddings_ reads one token per position, "
+                "and its input has " << tokens.nc() << " columns");
+
+            // The puzzle rows start at zero, once their number is known.
+            if (num_puzzles > 0 && puzzles.size() == 0)
+            {
+                puzzles.set_size(num_puzzles, embedding_dim_);
+                puzzles = 0;
+            }
+
+            output.set_size(tokens.num_samples(), tokens.k(), tokens.nr(), embedding_dim_);
+            tt::puzzle_embeddings(output, tokens, params, puzzles, get_scale());
+        }
+
+        template <typename SUBNET>
+        void backward (const tensor& gradient_input, SUBNET& sub, tensor& params_grad)
+        {
+            /* The token rows receive their gradient for the solver; the puzzle rows are
+               moved here, at a rate tied to the one the context carries, so that they follow
+               the same schedule as the rest of the network. The layer sits on the input, so
+               no gradient goes further down. */
+            const double rate = (puzzles.size() != 0 && network_context::is_active())
+                ? puzzle_rate_multiplier * network_context::get_learning_rate() : 0.0;
+            tt::puzzle_embeddings_gradient(sub.get_output(), gradient_input, params_grad, puzzles,
+                get_scale(), static_cast<float>(rate), static_cast<float>(puzzle_weight_decay));
+        }
+
+        const tensor& get_layer_params () const { return params; }
+        tensor& get_layer_params () { return params; }
+
+        friend void serialize (const puzzle_embeddings_& item, std::ostream& out)
+        {
+            serialize("puzzle_embeddings_", out);
+            serialize(num_tokens_, out);
+            serialize(embedding_dim_, out);
+            serialize(item.num_puzzles, out);
+            serialize(item.params, out);
+            serialize(item.puzzles, out);
+            serialize(item.learning_rate_multiplier, out);
+            serialize(item.weight_decay_multiplier, out);
+            serialize(item.puzzle_rate_multiplier, out);
+            serialize(item.puzzle_weight_decay, out);
+        }
+
+        friend void deserialize (puzzle_embeddings_& item, std::istream& in)
+        {
+            std::string version;
+            deserialize(version, in);
+            if (version != "puzzle_embeddings_")
+                throw serialization_error("Unexpected version '" + version +
+                    "' found while deserializing dlib::puzzle_embeddings_.");
+            long tokens = 0, dim = 0;
+            deserialize(tokens, in);
+            deserialize(dim, in);
+            if (tokens != num_tokens_ || dim != embedding_dim_)
+                throw serialization_error("puzzle_embeddings_ was written for " +
+                    std::to_string(tokens) + " tokens of width " + std::to_string(dim) +
+                    " and is read into one of " + std::to_string(num_tokens_) +
+                    " tokens of width " + std::to_string(embedding_dim_) + ".");
+            deserialize(item.num_puzzles, in);
+            deserialize(item.params, in);
+            deserialize(item.puzzles, in);
+            deserialize(item.learning_rate_multiplier, in);
+            deserialize(item.weight_decay_multiplier, in);
+            deserialize(item.puzzle_rate_multiplier, in);
+            deserialize(item.puzzle_weight_decay, in);
+        }
+
+        friend std::ostream& operator<< (std::ostream& out, const puzzle_embeddings_& item)
+        {
+            out << "puzzle_embeddings (tokens=" << num_tokens_
+                << ", puzzles=" << item.num_puzzles
+                << ", embedding_dim=" << embedding_dim_
+                << ") learning_rate_mult=" << item.learning_rate_multiplier
+                << " puzzle_rate_mult=" << item.puzzle_rate_multiplier
+                << " puzzle_weight_decay=" << item.puzzle_weight_decay;
+            return out;
+        }
+
+        friend void to_xml (const puzzle_embeddings_& item, std::ostream& out)
+        {
+            out << "<puzzle_embeddings tokens='" << num_tokens_
+                << "' puzzles='" << item.num_puzzles
+                << "' embedding_dim='" << embedding_dim_
+                << "' learning_rate_mult='" << item.learning_rate_multiplier
+                << "' puzzle_rate_mult='" << item.puzzle_rate_multiplier
+                << "' puzzle_weight_decay='" << item.puzzle_weight_decay << "'>\n";
+            out << mat(item.params);
+            out << "</puzzle_embeddings>\n";
+        }
+
+    private:
+        resizable_tensor params;     // the token rows, trained by the solver
+        resizable_tensor puzzles;    // the puzzle rows, moved by backward()
+        long   num_puzzles = 0;
+        double learning_rate_multiplier = 1;
+        double weight_decay_multiplier = 1;
+        double puzzle_rate_multiplier = 1;
+        double puzzle_weight_decay = 0;
+    };
+
+    template <
+        long num_tokens,
+        long embedding_dim,
+        typename SUBNET
+        >
+    using puzzle_embeddings = add_layer<puzzle_embeddings_<num_tokens, embedding_dim>, SUBNET>;
+
+// ----------------------------------------------------------------------------------------
   
     struct neg_infinity_tag {};
     struct zero_tag {};
@@ -6197,12 +6380,17 @@ namespace dlib
     //   TRANSITION_NET: network type for state transition (e.g., ffn_act_block)
     //   max_steps_: maximum number of computation steps per position
 
-    class adamw; // Forward declaration
+    class subnet_solver; // Defined in solvers.h, which includes this file
     template <typename TRANSITION_NET, long max_steps_ = 8>
     class adaptive_computation_time_
     {
     public:
         using transition_net_type = TRANSITION_NET;
+
+        /* The solver type, named through the transition network so that it is looked up
+           when the layer is instantiated, by which time solvers.h has defined it. */
+        using transition_solver_type =
+            typename std::conditional<true, subnet_solver, TRANSITION_NET>::type;
 
         adaptive_computation_time_() :
             halt_threshold_(0.99f),
@@ -6504,6 +6692,9 @@ namespace dlib
         const transition_net_type& get_transition_net() const { return transition_net_; }
         transition_net_type& get_transition_net() { return transition_net_; }
 
+        /* The solvers of the transition network, empty until its first update. */
+        const std::vector<transition_solver_type>& get_transition_solvers() const { return transition_solvers_; }
+
         long get_max_steps() const { return max_steps_; }
         float get_halt_threshold() const { return halt_threshold_; }
         float get_ponder_penalty() const { return ponder_penalty_; }
@@ -6711,11 +6902,21 @@ namespace dlib
             // Sync internal value for consistency (e.g. serialization, get_learning_rate())
             current_learning_rate_ = base_lr;
 
-            if (!transition_solvers_initialized_) {
-                transition_solvers_.resize(
-                    transition_net_.num_computational_layers,
-                    adamw(0.0005, 0.9, 0.999)
-                );
+            /* The transition network trains with the algorithm and settings network_context
+               names, as the modules of hrm_ do, and with AdamW at the layer's own settings
+               otherwise. A change of algorithm starts the solvers afresh, since the state
+               of one algorithm means nothing to the other. */
+            const auto type = transition_solver_type::requested_type();
+            if (!transition_solvers_initialized_ || transition_solvers_.empty() ||
+                transition_solvers_.front().get_type() != type)
+            {
+                const bool from_context = network_context::is_active();
+                const double wd = from_context ? network_context::get_optimizer_weight_decay() : 0.0005;
+                const double b1 = from_context ? network_context::get_optimizer_beta1() : 0.9;
+                const double b2 = from_context ? network_context::get_optimizer_beta2() : 0.999;
+                transition_solvers_.assign(transition_net_.num_computational_layers,
+                    transition_solver_type(type, static_cast<float>(wd),
+                                           static_cast<float>(b1), static_cast<float>(b2)));
                 transition_solvers_initialized_ = true;
             }
 
@@ -6765,7 +6966,7 @@ namespace dlib
         resizable_tensor final_state_;
         std::vector<resizable_tensor> transition_grad_accum_;
 
-        std::vector<adamw> transition_solvers_;
+        std::vector<transition_solver_type> transition_solvers_;
         bool transition_solvers_initialized_;
     };
 

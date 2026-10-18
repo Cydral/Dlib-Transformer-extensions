@@ -5888,6 +5888,205 @@ void test_multm_prev()
         network_context::reset();
     }
 
+// ----------------------------------------------------------------------------------------
+
+    void test_act_solvers_follow_context()
+    {
+        /* The transition network of the adaptive layer trains with the algorithm
+           network_context names, as the modules of hrm_ do, and with AdamW without one. */
+        print_spinner();
+        using transition_net = ffn<gelu, 8, 2, input_tensor>;
+        using net_type = loss_mean_squared_multioutput<fc<2, act_steps<transition_net, 3,
+            input<matrix<float>>>>>;
+
+        net_type net;
+        dlib::rand rnd(5);
+        std::vector<matrix<float>> xs(3, matrix<float>(4, 8));
+        std::vector<matrix<float>> ys(3, matrix<float>(2, 1));
+        for (auto& m : xs)
+            for (long r = 0; r < m.nr(); ++r)
+                for (long c = 0; c < m.nc(); ++c)
+                    m(r, c) = static_cast<float>(rnd.get_random_gaussian());
+        for (auto& m : ys)
+            for (long r = 0; r < m.nr(); ++r)
+                m(r) = static_cast<float>(rnd.get_random_gaussian());
+        resizable_tensor x;
+        net.to_tensor(xs.begin(), xs.end(), x);
+
+        const auto& adaptive = layer<2>(net).layer_details();
+        auto all_are = [&](network_context::optimizer_type type) {
+            const auto& solvers = adaptive.get_transition_solvers();
+            if (solvers.size() != transition_net::num_computational_layers)
+                return false;
+            for (const auto& s : solvers)
+                if (s.get_type() != type)
+                    return false;
+            return true;
+        };
+
+        network_context::reset();
+        DLIB_TEST(adaptive.get_transition_solvers().empty());
+        net.compute_parameter_gradients(x, ys.begin());
+        DLIB_TEST(all_are(network_context::optimizer_type::adamw));
+
+        network_context::set_optimizer_params(0.1, 0.9, 0.95, network_context::optimizer_type::adam_atan2);
+        network_context::set_learning_rate(1e-3);
+        net.compute_parameter_gradients(x, ys.begin());
+        DLIB_TEST(all_are(network_context::optimizer_type::adam_atan2));
+
+        network_context::set_optimizer_params(0.1, 0.9, 0.95, network_context::optimizer_type::adamw);
+        net.compute_parameter_gradients(x, ys.begin());
+        DLIB_TEST(all_are(network_context::optimizer_type::adamw));
+        network_context::reset();
+    }
+
+// ----------------------------------------------------------------------------------------
+
+    void test_puzzle_embeddings()
+    {
+        print_spinner();
+
+        /* The two lookups and the two updates, on positions that name the token table, the
+           puzzle table, a puzzle row several times over, and nothing at all. */
+        {
+            const long V = 4, P = 4, D = 6;
+            const float scale = 2.5f, rate = 0.01f, decay = 0.1f;
+            const float toks[] = {0, 3, 4, 6, 9, 4,
+                                  1, 5, 4, 2, 6, 8};
+            resizable_tensor tokens(2, 1, 6, 1);
+            std::copy(toks, toks + 12, tokens.host());
+
+            resizable_tensor token_table(V, D), puzzle_table(P, D), gradient(2, 1, 6, D);
+            tt::tensor_rand trnd(7);
+            trnd.fill_gaussian(token_table);
+            trnd.fill_gaussian(puzzle_table);
+            trnd.fill_gaussian(gradient);
+            // The one position naming puzzle row 1 sends no gradient through column 0.
+            gradient.host()[7 * D + 0] = 0;
+
+            const matrix<float> tokens_before = mat(token_table);
+            const matrix<float> puzzles_before = mat(puzzle_table);
+            const matrix<float> g = reshape(mat(gradient), 12, D);
+
+            resizable_tensor out(2, 1, 6, D);
+            tt::puzzle_embeddings(out, tokens, token_table, puzzle_table, scale);
+            const matrix<float> o = reshape(mat(out), 12, D);
+            double lookup_error = 0;
+            for (long p = 0; p < 12; ++p)
+            {
+                const long t = (long)toks[p];
+                for (long c = 0; c < D; ++c)
+                {
+                    const float expected = t < V ? scale * tokens_before(t, c)
+                                         : t < V + P ? scale * puzzles_before(t - V, c) : 0.0f;
+                    lookup_error = std::max(lookup_error, (double)std::abs(o(p, c) - expected));
+                }
+            }
+            DLIB_TEST_MSG(lookup_error < 1e-6, "puzzle_embeddings looks up the wrong rows: " << lookup_error);
+
+            resizable_tensor token_grad(V, D);
+            tt::puzzle_embeddings_gradient(tokens, gradient, token_grad, puzzle_table, scale, rate, decay);
+
+            matrix<float> expected_grad = zeros_matrix<float>(V, D);
+            matrix<float> named_sum = zeros_matrix<float>(P, D);
+            std::vector<bool> named(P, false);
+            for (long p = 0; p < 12; ++p)
+            {
+                const long t = (long)toks[p];
+                if (t < V)
+                    set_rowm(expected_grad, t) = rowm(expected_grad, t) + scale * rowm(g, p);
+                else if (t < V + P)
+                {
+                    set_rowm(named_sum, t - V) = rowm(named_sum, t - V) + rowm(g, p);
+                    named[t - V] = true;
+                }
+            }
+            DLIB_TEST_MSG(max(abs(mat(token_grad) - expected_grad)) < 1e-5,
+                "token gradient off by " << max(abs(mat(token_grad) - expected_grad)));
+
+            const matrix<float> after = mat(puzzle_table);
+            double update_error = 0;
+            for (long r = 0; r < P; ++r)
+                for (long c = 0; c < D; ++c)
+                {
+                    const float s = named_sum(r, c);
+                    const float sign = s > 0 ? 1.0f : (s < 0 ? -1.0f : 0.0f);
+                    const float expected = named[r]
+                        ? puzzles_before(r, c) * (1 - rate * decay) - rate * sign
+                        : puzzles_before(r, c);
+                    update_error = std::max(update_error, (double)std::abs(after(r, c) - expected));
+                }
+            DLIB_TEST_MSG(update_error < 1e-6, "puzzle rows updated wrongly: " << update_error);
+            DLIB_TEST(!named[3] && max(abs(rowm(after, 3) - rowm(puzzles_before, 3))) == 0);
+            DLIB_TEST(std::abs(after(1, 0) - puzzles_before(1, 0) * (1 - rate * decay)) < 1e-7);
+        }
+
+        /* The layer in a network: the puzzle table follows the context, the token table goes
+           to the solver, and both survive serialization. */
+        {
+            using net_type = loss_halting_cross_entropy_per_token<linear<5,
+                puzzle_embeddings<4, 8, input<matrix<int, 0, 1>>>>>;
+            net_type net;
+            auto& emb = layer<2>(net).layer_details();
+            emb.set_num_puzzles(3);
+            emb.set_puzzle_rate_multiplier(10);
+            emb.set_puzzle_weight_decay(0.1);
+            DLIB_TEST(emb.get_num_tokens() == 4 && emb.get_embedding_dim() == 8);
+            DLIB_TEST(std::abs(emb.get_scale() - std::sqrt(8.0f)) < 1e-6);
+
+            // The first sample names puzzle 0, the second puzzle 2 and, at its last
+            // position, an index beyond both tables. Token 0 appears nowhere.
+            std::vector<matrix<int, 0, 1>> xs(2, matrix<int, 0, 1>(4));
+            std::vector<matrix<unsigned long, 0, 1>> ys(2, matrix<unsigned long, 0, 1>(4));
+            xs[0] = 4, 1, 2, 3;
+            xs[1] = 6, 2, 1, 9;
+            ys[0] = 1000, 1, 3, 2;
+            ys[1] = 1000, 2, 0, 1;
+            net.loss_details().set_ignore_index(1000);
+            resizable_tensor x;
+            net.to_tensor(xs.begin(), xs.end(), x);
+
+            network_context::reset();
+            net.compute_parameter_gradients(x, ys.begin());
+            const tensor& table = emb.get_puzzle_table();
+            DLIB_TEST(table.num_samples() == 3 && table.k() == 8 && table.nr() == 1 && table.nc() == 1);
+            DLIB_TEST_MSG(max(abs(mat(table))) == 0, "the puzzle table moved without a context");
+
+            const matrix<float> e = reshape(mat(layer<2>(net).get_output()), 8, 8);
+            DLIB_TEST(max(abs(rowm(e, 7))) == 0);
+            const matrix<float> token_grad = mat(layer<2>(net).get_parameter_gradient());
+            DLIB_TEST(max(abs(rowm(token_grad, 0))) == 0);
+            DLIB_TEST(min(sum_cols(abs(rowm(token_grad, range(1, 3))))) > 0);
+
+            network_context::set_learning_rate(1e-3);
+            net.compute_parameter_gradients(x, ys.begin());
+            const matrix<float> moved = mat(table);
+            DLIB_TEST_MSG(max(abs(abs(rowm(moved, 0)) - 0.01f)) < 1e-9, rowm(moved, 0));
+            DLIB_TEST_MSG(max(abs(abs(rowm(moved, 2)) - 0.01f)) < 1e-9, rowm(moved, 2));
+            DLIB_TEST(max(abs(rowm(moved, 1))) == 0);
+            network_context::reset();
+
+            std::vector<char> buf;
+            serialize(buf) << net;
+            net_type back;
+            deserialize(buf) >> back;
+            const auto& b = layer<2>(back).layer_details();
+            DLIB_TEST(b.get_num_puzzles() == 3);
+            DLIB_TEST(b.get_puzzle_rate_multiplier() == 10 && b.get_puzzle_weight_decay() == 0.1);
+            DLIB_TEST(max(abs(mat(b.get_puzzle_table()) - moved)) == 0);
+            DLIB_TEST(max(abs(mat(b.get_layer_params()) - mat(emb.get_layer_params()))) == 0);
+
+            std::ostringstream sout;
+            serialize(emb, sout);
+            std::istringstream sin(sout.str());
+            puzzle_embeddings_<5, 8> wider;
+            bool refused = false;
+            try { deserialize(wider, sin); }
+            catch (const serialization_error&) { refused = true; }
+            DLIB_TEST(refused);
+        }
+    }
+
 #ifdef DLIB_USE_CUDA
     void compare_adam_atan2()
     {
@@ -5970,6 +6169,40 @@ void test_multm_prev()
             DLIB_TEST(q1 == q2 && e1 == e2 && a1 == a2);
             DLIB_TEST_MSG(max_diff(g1, g2) < 1e-6, "halting gradient differs by " << max_diff(g1, g2));
         }
+    }
+
+    void compare_puzzle_embeddings_cpu_vs_cuda()
+    {
+        print_spinner();
+        const long V = 12, P = 20, D = 64, N = 3, L = 50;
+        const float scale = 1.5f, rate = 0.01f, decay = 0.1f;
+        dlib::rand rnd(11);
+
+        // Indices over both tables and a few beyond them, so that puzzle rows repeat.
+        resizable_tensor tokens(N, 1, L, 1);
+        for (size_t i = 0; i < tokens.size(); ++i)
+            tokens.host()[i] = static_cast<float>(rnd.get_integer_in_range(0, V + P + 3));
+
+        resizable_tensor token_table(V, D), puzzle_table(P, D), gradient(N, 1, L, D);
+        tt::tensor_rand trnd(5);
+        trnd.fill_gaussian(token_table);
+        trnd.fill_gaussian(puzzle_table);
+        trnd.fill_gaussian(gradient);
+
+        resizable_tensor out1(N, 1, L, D), out2(N, 1, L, D);
+        cpu::puzzle_embeddings(out1, tokens, token_table, puzzle_table, scale);
+        cuda::puzzle_embeddings(out2, tokens, token_table, puzzle_table, scale);
+        DLIB_TEST_MSG(max(abs(mat(out1) - mat(out2))) == 0,
+            "puzzle_embeddings: cpu and cuda differ by " << max(abs(mat(out1) - mat(out2))));
+
+        resizable_tensor grad1(V, D), grad2(V, D), table1(puzzle_table), table2(puzzle_table);
+        cpu::puzzle_embeddings_gradient(tokens, gradient, grad1, table1, scale, rate, decay);
+        cuda::puzzle_embeddings_gradient(tokens, gradient, grad2, table2, scale, rate, decay);
+        DLIB_TEST_MSG(max(abs(mat(grad1) - mat(grad2))) < 1e-4,
+            "puzzle_embeddings_gradient: token gradients differ by " << max(abs(mat(grad1) - mat(grad2))));
+        DLIB_TEST_MSG(max(abs(mat(table1) - mat(table2))) < 1e-6,
+            "puzzle_embeddings_gradient: puzzle rows differ by " << max(abs(mat(table1) - mat(table2))));
+        DLIB_TEST(max(abs(mat(table1) - mat(puzzle_table))) > 0);
     }
 
     void compare_plane_wise_cpu_vs_cuda()
@@ -6301,10 +6534,13 @@ void test_multm_prev()
             test_loss_stablemax_cross_entropy_per_token();
             test_loss_halting_cross_entropy_per_token();
             test_hrm_restarts_and_solvers();
+            test_act_solvers_follow_context();
+            test_puzzle_embeddings();
 #ifdef DLIB_USE_CUDA
             compare_adam_atan2();
             compare_token_losses_cpu_vs_cuda();
             compare_plane_wise_cpu_vs_cuda();
+            compare_puzzle_embeddings_cpu_vs_cuda();
 #endif
         }
 

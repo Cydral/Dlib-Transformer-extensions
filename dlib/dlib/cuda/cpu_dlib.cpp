@@ -9,6 +9,8 @@
 #include "tensor_tools.h"
 #include "../image_transforms/interpolation.h"
 #include "../threads.h"
+#include <algorithm>
+#include <utility>
 
 namespace dlib
 {
@@ -2719,6 +2721,123 @@ namespace dlib
                         }
                     }
                 });
+        }
+
+    // ------------------------------------------------------------------------------------
+
+        void puzzle_embeddings(
+            resizable_tensor& dest,
+            const tensor& tokens,
+            const tensor& token_table,
+            const tensor& puzzle_table,
+            float scale
+        )
+        {
+            DLIB_CASSERT(tokens.nc() == 1 && token_table.num_samples() > 0 &&
+                         token_table.nr() == 1 && token_table.nc() == 1);
+            DLIB_CASSERT(puzzle_table.size() == 0 || (puzzle_table.k() == token_table.k() &&
+                         puzzle_table.nr() == 1 && puzzle_table.nc() == 1));
+            DLIB_CASSERT(dest.num_samples() == tokens.num_samples() && dest.k() == tokens.k() &&
+                         dest.nr() == tokens.nr() && dest.nc() == token_table.k());
+
+            const long vocab = token_table.num_samples();
+            const long puzzles = puzzle_table.size() != 0 ? puzzle_table.num_samples() : 0;
+            const long dim = token_table.k();
+            const long positions = (long)tokens.size();
+
+            const float* t = tokens.host();
+            const float* w = token_table.host();
+            const float* q = puzzles > 0 ? puzzle_table.host() : nullptr;
+            float* d = dest.host_write_only();
+
+            for (long p = 0; p < positions; ++p)
+            {
+                const long tok = (long)t[p];
+                const float* row = nullptr;
+                if (tok >= 0 && tok < vocab)
+                    row = w + tok * dim;
+                else if (tok >= vocab && tok - vocab < puzzles)
+                    row = q + (tok - vocab) * dim;
+
+                float* out = d + p * dim;
+                for (long c = 0; c < dim; ++c)
+                    out[c] = row ? scale * row[c] : 0.0f;
+            }
+        }
+
+        void puzzle_embeddings_gradient(
+            const tensor& tokens,
+            const tensor& gradient_input,
+            tensor& token_grad,
+            tensor& puzzle_table,
+            float scale,
+            float puzzle_rate,
+            float puzzle_decay
+        )
+        {
+            DLIB_CASSERT(tokens.nc() == 1 && gradient_input.num_samples() == tokens.num_samples() &&
+                         gradient_input.k() == tokens.k() && gradient_input.nr() == tokens.nr() &&
+                         gradient_input.nc() == token_grad.k());
+            DLIB_CASSERT(token_grad.num_samples() > 0 && token_grad.nr() == 1 && token_grad.nc() == 1);
+            DLIB_CASSERT(puzzle_table.size() == 0 || puzzle_table.k() == token_grad.k());
+            DLIB_CASSERT(puzzle_rate >= 0 && puzzle_decay >= 0);
+
+            const long vocab = token_grad.num_samples();
+            const long puzzles = puzzle_table.size() != 0 ? puzzle_table.num_samples() : 0;
+            const long dim = token_grad.k();
+            const long positions = (long)tokens.size();
+
+            const float* t = tokens.host();
+            const float* g = gradient_input.host();
+            float* tg = token_grad.host_write_only();
+            std::fill(tg, tg + token_grad.size(), 0.0f);
+
+            // The positions naming a puzzle, as (row, position) pairs to group by row.
+            std::vector<std::pair<long, long>> named;
+            for (long p = 0; p < positions; ++p)
+            {
+                const long tok = (long)t[p];
+                if (tok >= 0 && tok < vocab)
+                {
+                    float* row = tg + tok * dim;
+                    const float* grad = g + p * dim;
+                    for (long c = 0; c < dim; ++c)
+                        row[c] += scale * grad[c];
+                }
+                else if (tok >= vocab && tok - vocab < puzzles)
+                {
+                    named.emplace_back(tok - vocab, p);
+                }
+            }
+
+            if (named.empty() || puzzle_rate == 0)
+                return;
+
+            std::sort(named.begin(), named.end());
+            float* q = puzzle_table.host();
+            const float keep = 1 - puzzle_rate * puzzle_decay;
+            std::vector<float> sum((size_t)dim);
+            for (size_t first = 0; first < named.size(); )
+            {
+                size_t last = first;
+                std::fill(sum.begin(), sum.end(), 0.0f);
+                while (last < named.size() && named[last].first == named[first].first)
+                {
+                    const float* grad = g + named[last].second * dim;
+                    for (long c = 0; c < dim; ++c)
+                        sum[(size_t)c] += grad[c];
+                    ++last;
+                }
+
+                float* row = q + named[first].first * dim;
+                for (long c = 0; c < dim; ++c)
+                {
+                    const float s = sum[(size_t)c];
+                    const float sign = (s > 0) ? 1.0f : (s < 0 ? -1.0f : 0.0f);
+                    row[c] = row[c] * keep - puzzle_rate * sign;
+                }
+                first = last;
+            }
         }
 
     // ------------------------------------------------------------------------------------
