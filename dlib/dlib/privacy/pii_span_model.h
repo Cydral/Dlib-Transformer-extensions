@@ -55,10 +55,12 @@ namespace dlib
 
     namespace privacy_impl
     {
+        /* The bytes of a training example and their BIO classes, one byte each, so that a
+           corpus stays in memory at about twice the size of its text. */
         struct byte_example
         {
-            std::vector<int> bytes;
-            std::vector<unsigned long> classes;
+            std::vector<unsigned char> bytes;
+            std::vector<unsigned char> classes;
         };
 
         inline byte_example to_byte_example(const pii_example& ex)
@@ -66,12 +68,19 @@ namespace dlib
             byte_example b;
             std::vector<std::pair<std::size_t, std::size_t>> units;
             units.reserve(ex.text.size());
+            b.bytes.reserve(ex.text.size());
             for (std::size_t i = 0; i < ex.text.size(); ++i)
             {
                 units.push_back(std::make_pair(i, i + 1));
                 b.bytes.push_back(static_cast<unsigned char>(ex.text[i]));
             }
-            b.classes = pii_spans_to_bio(units, ex.spans);
+            const std::vector<unsigned long> classes = pii_spans_to_bio(units, ex.spans);
+            b.classes.reserve(classes.size());
+            for (unsigned long c : classes)
+            {
+                DLIB_ASSERT(c < 256);
+                b.classes.push_back(static_cast<unsigned char>(c));
+            }
             return b;
         }
 

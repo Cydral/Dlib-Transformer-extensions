@@ -165,6 +165,8 @@ namespace dlib
                   on windows that cover its first options.evaluate_examples examples once,
                   the same windows each time, and the exact span F1 on those examples; a
                   complementary training writes them before its first step too.
+                - Besides training_set, the training keeps two bytes per byte of its texts:
+                  each byte and its class.
                 - #is_trained() == true
                 - #window() == the longest of options.window_lengths
         !*/

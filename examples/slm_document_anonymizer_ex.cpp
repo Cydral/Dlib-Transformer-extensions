@@ -38,14 +38,16 @@
 
     Four channels work together. Validated scanners find what has a structure: e-mail
     and IP addresses, phone numbers, IBAN, card, social security, SIRET, passport and
-    the national numbers of about thirty countries, IMEI, VIN, UUID, GPS coordinates,
+    the national numbers of about forty countries, IMEI, VIN, UUID, GPS coordinates,
     plates and dates, each accepted only when its check digits verify or a cue announces
     it. Linguistic rules find names, places, addresses and organisations, public bodies
-    included, from titles, field labels, legal forms and lexicons, and the civility, sex
-    and nationality of a person from their labels and cues. Regular expressions given
-    with --patterns add what is specific to an organisation. And two learned
-    recognizers, trained here on synthetic data, find the names, places, addresses and
-    organisations that the rules miss:
+    included, from titles, field labels, legal forms, nickname cues, the postal codes of
+    other countries in their own layout and lexicons (given names of every region of the
+    world, nicknames and stage names, organisations of all countries known by their own
+    name), and the civility, sex and nationality of a person from their labels and cues.
+    Regular expressions given with --patterns add what is specific to an organisation.
+    And two learned recognizers, trained here on synthetic data, find the names, places,
+    addresses and organisations that the rules miss:
 
         - a structural SVM sequence labeler (dlib::sequence_labeler) over word tokens and
           their lexical, shape and context features;
@@ -66,41 +68,70 @@
     replace the compiled model of their kind by a model file, independently of each other,
     and --no-tagger and --no-model leave one out.
 
-    Typical use:
+    TRYING IT ON A WORD FILE
 
-        ./slm_document_anonymizer_ex anonymize contract.docx payroll.xlsx scan.pdf notes.txt
-            writes contract.anon.docx, payroll.anon.xlsx... and, on the first run, a key
-            file in the user configuration directory (~/.config/dlib/privacy.key).
-        ./slm_document_anonymizer_ex restore contract.anon.docx
-            writes contract.restored.docx.
-        ./slm_document_anonymizer_ex scan folder
-            reports the personal data of every file of a folder, without writing.
+        ./slm_document_anonymizer_ex keygen --key demo.key
+            creates a key of your own; without --key, the first anonymize run creates
+            ~/.config/dlib/privacy.key and every command uses it.
+        ./slm_document_anonymizer_ex scan contract.docx
+            lists the personal data found, by type, and writes nothing.
+        ./slm_document_anonymizer_ex anonymize --key demo.key --report contract.docx
+            writes contract.anon.docx with the recognizers compiled into the program,
+            and contract.anon.docx.report.json: the counts by type and the removed
+            content, never a personal value.
+        ./slm_document_anonymizer_ex restore --key demo.key contract.anon.docx
+            writes contract.restored.docx, every tag replaced by its value again.
+
+    Other uses:
+
+        ./slm_document_anonymizer_ex anonymize payroll.xlsx slides.pptx scan.pdf folder
+            protects several files, and every file of a folder, in one run.
         ./slm_document_anonymizer_ex text < prompt.txt > protected.txt
         ./slm_document_anonymizer_ex text --restore < answer.txt
             protect text on its way to a language model, and restore the answer.
-        ./slm_document_anonymizer_ex detect --model pii_span.dat < sample.txt
+        ./slm_document_anonymizer_ex detect < sample.txt
             prints whether the text holds personal data and the spans found: offsets,
-            type and, for the learned recognizers, the fine label.
+            type and, for each learned recognizer, the fine label.
 
-    Training and evaluating the recognizers, on data made by
-    slm_tools/build_pii_dataset.py (one example per line, read by load_pii_dataset()):
+    USING MODELS OF YOUR OWN
 
+        ./slm_document_anonymizer_ex anonymize --model pii_span.dat contract.docx
+            the span model of the file with the tagger compiled into the program.
+        ./slm_document_anonymizer_ex anonymize --tagger pii_tagger.dat
+            --model pii_span.dat contract.docx
+            both recognizers read from files.
+        ./slm_document_anonymizer_ex anonymize --no-tagger --model pii_span.dat
+            contract.docx
+            the span model of the file alone; --no-tagger --no-model leaves the rules
+            alone.
+        ./slm_document_anonymizer_ex embed --tagger pii_tagger.dat --model pii_span.dat
+            --out slm_document_anonymizer_ex.h
+            writes the header that compiles both recognizers into the program at the
+            next build.
+
+    TRAINING AND EVALUATING THE RECOGNIZERS
+
+    The data comes from slm_tools/build_pii_dataset.py, one example per line, read by
+    load_pii_dataset():
+
+        python3 slm_tools/build_pii_dataset.py --out-dir pii-data --train 100000
+            writes the splits; --abroad-share sets the share of places, organisations,
+            phone numbers and IBANs of other countries.
         ./slm_document_anonymizer_ex train-tagger pii-data/train.tsv --dev pii-data/dev.tsv
-            --out pii_tagger.dat --examples 20000
+            --examples 100000 --threads 4 --out pii_tagger.dat
+            trains the tagger afresh, in minutes; --cache 5 trains about three times
+            faster with about six times the memory.
         ./slm_document_anonymizer_ex train-model pii-data/train.tsv --dev pii-data/dev.tsv
-            --out pii_span.dat --size small --steps 30000
+            --init embedded --lr 0.0005 --steps 10000 --out pii_span.dat
+            continues the training of the span model compiled into the program; mix
+            the new examples with data like the one it learned from, so that it keeps
+            what it knows.
+        ./slm_document_anonymizer_ex train-model pii-data/train.tsv --dev pii-data/dev.tsv
+            --size small --steps 30000 --out pii_span_small.dat
+            trains a small span model from scratch, best on a GPU.
         ./slm_document_anonymizer_ex evaluate pii-data/test.tsv --tagger pii_tagger.dat
             --model pii_span.dat
             scores the rules alone, each recognizer alone and the whole detector.
-        ./slm_document_anonymizer_ex anonymize --tagger pii_tagger.dat --model pii_span.dat
-            report.docx
-        ./slm_document_anonymizer_ex embed --tagger pii_tagger.dat --model pii_span.dat
-            --out slm_document_anonymizer_ex.h
-            writes the header that compiles both recognizers into the program.
-        ./slm_document_anonymizer_ex train-model mixed.tsv --init embedded --lr 0.0003
-            --steps 5000 --out pii_span.dat
-            continues the training of the compiled span model, on new data mixed with
-            the corpus it learned from; the tagger is always trained afresh.
 
     In the terms of the GDPR, the output is pseudonymized data: whoever holds the key can
     restore it, and it remains personal data for that party. With --irreversible the key
@@ -854,7 +885,7 @@ namespace
         if (parser.number_of_arguments() != 2 || !parser.option("out"))
         {
             cerr << "Usage: train-tagger train.tsv --out tagger.dat [--dev dev.tsv] [--examples N] [--c C] "
-                 << "[--iterations N] [--threads N]\n";
+                 << "[--iterations N] [--threads N] [--cache N]\n";
             return 1;
         }
         const unsigned long seed = get_option(parser, "seed", 1UL);
@@ -862,6 +893,7 @@ namespace
         options.c = get_option(parser, "c", 10.0);
         options.max_iterations = get_option(parser, "iterations", 400UL);
         options.num_threads = get_option(parser, "threads", 2UL);
+        options.max_cache_size = get_option(parser, "cache", 0UL);
         options.verbose = parser.option("verbose");
         if (options.c <= 0 || options.max_iterations == 0 || options.num_threads == 0)
         {
@@ -1200,6 +1232,8 @@ int main(int argc, char** argv)
         parser.add_option("c", "Tagger: SVM C. Default: 10.", 1);
         parser.add_option("iterations", "Tagger: cutting plane iterations. Default: 400.", 1);
         parser.add_option("threads", "Tagger: threads. Default: 2.", 1);
+        parser.add_option("cache", "Tagger: labelings the solver keeps per example; 5 trains about three times "
+                          "faster with about six times the memory. Default: 0.", 1);
         parser.add_option("size", "Span model size: tiny or small. Default: small.", 1);
         parser.add_option("steps", "Span model: optimizer steps. Default: 20000.", 1);
         parser.add_option("batch", "Span model: windows per step. Default: 32.", 1);
@@ -1219,8 +1253,8 @@ int main(int argc, char** argv)
                                  "patterns",
                                  "tagger", "model", "min-confidence", "tagger-min-confidence", "dates", "date-order",
                                  "out-dir", "out", "dev",
-                                 "examples", "seed", "c", "iterations", "threads", "size", "steps", "batch", "lr",
-                                 "optimizer", "init", "evaluate-every" };
+                                 "examples", "seed", "c", "iterations", "threads", "cache", "size", "steps", "batch",
+                                 "lr", "optimizer", "init", "evaluate-every" };
         parser.check_one_time_options(single);
         const char* key_sources[] = { "key", "passphrase-env", "irreversible" };
         parser.check_incompatible_options(key_sources);

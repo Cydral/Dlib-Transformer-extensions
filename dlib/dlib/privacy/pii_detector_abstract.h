@@ -32,9 +32,11 @@ namespace dlib
                                     that a link to a public page keeps working. When
                                     false, every web address is reported.
                 public_bodies     - when true, administrations, courts, social security
-                                    bodies and regulators are reported as organisations:
-                                    acronyms ("la CAF", "HMRC", "DGFiP"), names of their
-                                    own ("France Travail", "Home Office"), a head noun with
+                                    bodies and regulators of France and of many other
+                                    countries are reported as organisations: acronyms ("la
+                                    CAF", "HMRC", "DGFiP", "BAMF"), names of their own
+                                    ("France Travail", "Home Office", "Agenzia delle
+                                    Entrate", "Bundesagentur für Arbeit"), a head noun with
                                     what the body does or where it sits ("Tribunal
                                     judiciaire de Rennes", "Sous-préfecture de Brest",
                                     "Leeds Crown Court", "Town of Vancouver"), and the
@@ -128,7 +130,7 @@ namespace dlib
                    coordinates (decimal or degrees, minutes and seconds), IMEI, ICCID
                    and IMSI numbers, UUIDs, vehicle identification numbers, French bank
                    details (RIB key), tax and passport numbers, and the national numbers
-                   of about thirty countries: Belgium, Spain (DNI, NIE), Italy (codice
+                   of about forty countries: Belgium, Spain (DNI, NIE), Italy (codice
                    fiscale), the United Kingdom (NINO, NHS), the United States (SSN,
                    ITIN), Switzerland (AVS), Luxembourg, the Netherlands (BSN), Germany
                    (Steuer-IdNr), Austria, Poland (PESEL), Portugal (NIF), Czechia,
@@ -137,10 +139,11 @@ namespace dlib
                    (SIN), Quebec (RAMQ), Brazil (CPF), Argentina, Chile, Mexico (CURP),
                    India (Aadhaar), China, Japan, Korea, Turkey, Israel, South Africa,
                    Australia (TFN) and the Maghreb (CIN, NIN). Each value is accepted
-                   only when its check digits verify; a number whose check leaves one
-                   chance in ten or eleven also needs the label that announces it
-                   ("BSN", "PESEL", "CPR-nr."), as do phone numbers outside the French
-                   and international layouts, social handles, pre-2009 French plates
+                   only when its check digits verify, or after the label that announces
+                   it for the numbers that have none (RAMQ, CIN, NIN); a number whose
+                   check leaves one chance in ten or eleven also needs its label ("BSN",
+                   "PESEL", "CPR-nr."), as do phone numbers outside the French and
+                   international layouts, social handles, pre-2009 French plates
                    and the references of files, customers, contracts, claims, invoices,
                    requests, applications, permits or asset tags ("dossier n° 2024-00123",
                    reference "B4694342", "Ref: 2476486"), a file name excepted. A cue is a
@@ -151,19 +154,37 @@ namespace dlib
 
                 2. Linguistic evidence. Person names are scored from civilities and
                    titles (M., Mme, Dr), field labels ("Nom :", "Signé par"), the
-                   first-name lexicon, shape (Jean DUPONT), surrounding cues ("né le",
-                   "épouse") and the document lexicon; particles ("M. Le Goff", "M. de La
-                   Guen") and apostrophe forms ("N'Diaye", "O'Connor") belong to the name,
-                   a professional title (Dr, Maître) does not. Organisations come from
-                   legal forms before or after the name ("SAS Iroise", "Dupont Conseil
-                   SAS"), head nouns ("Cabinet Martin"), sector words after a name
-                   ("Zorvane Finance"), partners ("Martin et Fils") and public body names;
-                   "la société" introduces a name and stays outside it. Addresses come
+                   first-name lexicon (given names from all regions of the world, their
+                   short forms, nicknames and stage names), shape (Jean DUPONT, Amadou BA),
+                   surrounding cues ("né le", "épouse", "je soussigné") and the document
+                   lexicon; particles ("M. Le Goff", "M. de La Guen") and apostrophe forms
+                   ("N'Diaye", "O'Connor") belong to the name, a professional title (Dr,
+                   Maître) and a greeting ("Salut Murat") do not. A nickname, a stage name
+                   or a pen name announced by its cue is a person too ("Jean Dupont, dit
+                   « Jojo »", "surnommée Mimi", "a.k.a. 'Smithy'", "sous le pseudonyme de
+                   Vernon Sullivan"), while reported speech stays readable ("Il a dit
+                   « bonjour »"). Organisations come from legal forms before or after the
+                   name ("SAS Iroise", "Dupont Conseil SAS"), head nouns ("Cabinet Martin",
+                   "Universidad de Sevilla"), sector words after a name ("Zorvane Finance",
+                   "Ulmeo Seguros"), partners ("Martin et Fils"), public body names, and
+                   about two thousand organisations of all countries known by their own
+                   name ("Airbus", "Johnson & Johnson", "La Banque postale"), with a legal
+                   form, a trade or a country after them ("AXA France"); such a name
+                   followed by another capitalized word is a product or a longer name and
+                   is left to the other channels ("Microsoft Teams", "Airbus A320").
+                   Products, applications and the intergovernmental organisations of the
+                   United Nations system are left out of that table. "La société"
+                   introduces a name and stays outside it. Addresses come
                    from street types, places from postal codes ("CEDEX" stays readable),
-                   from "City, ST 90012" and British postcodes, from "né à", "domicilié
-                   à", "originaire de", and from the place before the date of a letter
-                   ("Rennes, le 12 mars 2024"). User names come from logs and chats
-                   ("user=jdupont", "[10:42] jdupont:", "opened by jdupont").
+                   from "City, ST 90012" and British postcodes, from the postal codes of
+                   other countries written before or after their town, after a street,
+                   before a country or alone on their line, as in a paragraph of a letter
+                   ("8004 Zurich", "00-238 Warszawa", "1015 CJ Amsterdam", "Tel Aviv
+                   6688116", "Tokyo 153-0063", "Dublin D02 X285"),
+                   from "né à", "domicilié à", "originaire de", and from the place before
+                   the date of a letter ("Rennes, le 12 mars 2024"). User names come from
+                   logs and chats ("user=jdupont", "[10:42] jdupont:", "opened by
+                   jdupont").
 
                    A civility before a name is reported as title, since it tells the sex
                    of the person: "M. Dupont", "M. et Mme Martin", "Titulaire : Mme
@@ -198,7 +219,11 @@ namespace dlib
                    join the candidates above the linguistic rules and below the
                    validated scanners; a given name and a family name side by side
                    become one person, a postal code and its city one place, and a
-                   confident full name feeds the propagation of channel 3.
+                   confident full name feeds the propagation of channel 3. A piece they
+                   read inside an organisation known by its own name, or inside a postal
+                   code of another country with its town, leaves that value whole ("Bahn"
+                   in "Deutsche Bahn", "Tokyo 153" in "Tokyo 153-0063"); a span that goes
+                   beyond it keeps its own boundaries.
 
                 The detector is a recall-oriented filter. Its output is meant to be
                 pseudonymized, and a residual-risk audit of the protected document is
@@ -289,9 +314,12 @@ namespace dlib
                   common word in lower case ("commande"), an organisation opened by an
                   article and a word in lower case ("Le logiciel Excel"), a person or a
                   place that joins capitalized words to words in lower case other than
-                  particles ("Le projet", while "Jean de La Fontaine" is kept), and a word
-                  in lower case, other than a first name, in a text that capitalizes its
-                  words.
+                  particles ("Le projet", while "Jean de La Fontaine" is kept), a word in
+                  lower case, other than a first name, in a text that capitalizes its
+                  words, a country alone read as an organisation ("Pologne"), the civility
+                  "M." before a name ("avec M. Martin", while "Monsieur M. Denis" keeps
+                  its initial), and a participle that opens a line before "à" ("Fait à
+                  Lyon").
                 - The calls are serialized and their results cached, keyed by the
                   SHA-256 digest of the text, until the next begin_document(): learn() and
                   detect() see the same texts and models are seldom reentrant, so

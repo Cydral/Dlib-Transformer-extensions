@@ -3,6 +3,7 @@
 #undef DLIB_PII_SEQUENCE_TAGGER_ABSTRACT_H_
 #ifdef DLIB_PII_SEQUENCE_TAGGER_ABSTRACT_H_
 
+#include <cstdint>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -65,9 +66,9 @@ namespace dlib
                 opens or closes a line, follows a tab or a colon; and, after a field
                 label such as "Nom :" or "Ville", the type that label announces.
 
-                Each feature is hashed from its name, a separator byte and its value, then
-                mixed with the label into one of 2^hash_bits weights, which keeps the
-                model size independent of the vocabulary.
+                Each feature is hashed from its name, a separator byte and its value into
+                32 bits, then mixed with the label into one of 2^hash_bits weights, which
+                keeps the model size independent of the vocabulary.
 
             THREAD SAFETY
                 Instances are immutable once constructed and may be used concurrently.
@@ -75,8 +76,8 @@ namespace dlib
     public:
         struct unit
         {
-            std::vector<unsigned long long> features;   // hashed base features of a token
-            bool opens_segment;                         // first token of a line or a cell
+            std::vector<std::uint32_t> features;    // hashed base features of a token
+            bool opens_segment;                     // first token of a line or a cell
         };
         typedef std::vector<unit> sequence_type;
 
@@ -127,7 +128,7 @@ namespace dlib
                 - Returns pii_bio_class_count().
         !*/
 
-        unsigned long emission_index(unsigned long long feature, unsigned long label) const;
+        unsigned long emission_index(std::uint32_t feature, unsigned long label) const;
         /*!
             requires
                 - label < num_labels()
@@ -186,6 +187,7 @@ namespace dlib
         unsigned long num_threads = 2;
         unsigned long hash_bits = 20;       // in [10, 26]
         double entity_loss = 2;             // cost of a wrong label on a span unit, O counting 1
+        unsigned long max_cache_size = 0;   // labelings the solver keeps per example
         bool verbose = false;
     };
 
@@ -229,6 +231,11 @@ namespace dlib
             ensures
                 - Trains the model on the spans of examples whose label is a fine label;
                   the other spans are ignored.
+                - The memory used grows with the examples, by about 15 kB for an example
+                  of 50 tokens, and by about as much again per example for each labeling
+                  options.max_cache_size lets the solver keep: a cache of 5 makes the
+                  training about three times faster and needs about six times the
+                  memory.
                 - #is_trained() == true
                 - #misaligned_spans() == the number of training spans that do not start
                   and end on token boundaries

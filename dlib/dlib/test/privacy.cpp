@@ -1048,6 +1048,118 @@ namespace
 
 // ----------------------------------------------------------------------------------------
 
+    void test_known_names()
+    {
+        pii_detector detector;
+        auto entities = [&](const string& text) {
+            detector.begin_document();
+            detector.learn(text);
+            return detector.detect(text);
+        };
+        // Organisations known by their own name, from any country.
+        string text = "Il travaille chez Airbus depuis 2010, après Johnson & Johnson et AG2R La Mondiale.";
+        std::vector<pii_entity> e = entities(text);
+        DLIB_TEST(found(e, text, pii_type::organization, "Airbus"));
+        DLIB_TEST(found(e, text, pii_type::organization, "Johnson & Johnson"));
+        DLIB_TEST(found(e, text, pii_type::organization, "AG2R La Mondiale"));
+        text = "Son compte est à La Banque postale ; AXA France assure le logement de Chiamaka Okafor.";
+        e = entities(text);
+        DLIB_TEST(found(e, text, pii_type::organization, "La Banque postale"));
+        DLIB_TEST(found(e, text, pii_type::organization, "AXA France"));
+        DLIB_TEST(found(e, text, pii_type::person, "Chiamaka Okafor"));
+        // Given names of any origin, a family name of two letters, a greeting outside the name.
+        text = "Je soussigné Moussa BA, demeurant à Dakar. Bonjour Murat, merci.";
+        e = entities(text);
+        DLIB_TEST(found(e, text, pii_type::person, "Moussa BA"));
+        DLIB_TEST(found(e, text, pii_type::person, "Murat") && !covered(e, text, "Bonjour"));
+        // A common phrase, a product, a person and a domain stay what they are.
+        text = "L'équipe a gagné. The economist said so. Microsoft Teams ne démarre pas dans l'Airbus A320.";
+        e = entities(text);
+        DLIB_TEST(!covered(e, text, "équipe") && !covered(e, text, "economist"));
+        DLIB_TEST(!covered(e, text, "Microsoft") && !covered(e, text, "Airbus"));
+        text = "John Harvard a écrit à contact@airbus.com.";
+        e = entities(text);
+        DLIB_TEST(found(e, text, pii_type::person, "John Harvard"));
+        DLIB_TEST(found(e, text, pii_type::email, "contact@airbus.com"));
+        // Known organisations are no public bodies; names of public bodies may hold commas.
+        pii_detector_options no_bodies;
+        no_bodies.public_bodies = false;
+        const pii_detector without(no_bodies);
+        text = "Il est employé par L'Oréal.";
+        DLIB_TEST(found(without.detect(text), text, pii_type::organization, "L'Oréal"));
+        text = "A letter from the Foreign, Commonwealth & Development Office.";
+        DLIB_TEST(found(entities(text), text, pii_type::organization, "Foreign, Commonwealth & Development Office"));
+        /* The pieces a recognizer reads inside a known organisation leave it whole, while a
+           span that goes beyond it keeps its own boundaries. */
+        pii_detector pieces;
+        pieces.add_recognizer([](const string& t) {
+            std::vector<pii_span> spans;
+            auto add = [&](const string& value, const char* label) {
+                const size_t p = t.find(value);
+                if (p == string::npos) return;
+                pii_span s;
+                s.begin = p; s.end = p + value.size(); s.label = label; s.confidence = 0.95;
+                spans.push_back(s);
+            };
+            add("Banco", "ORGANIZATION");
+            add("Santander", "CITY");
+            add("Bahn", "ORGANIZATION");
+            add("Projet Atlas Airbus", "ORGANIZATION");
+            return spans;
+        });
+        text = "Virement chez Banco Santander pour Deutsche Bahn, au titre du Projet Atlas Airbus.";
+        e = pieces.detect(text);
+        DLIB_TEST(found(e, text, pii_type::organization, "Banco Santander"));
+        DLIB_TEST(found(e, text, pii_type::organization, "Deutsche Bahn"));
+        DLIB_TEST(found(e, text, pii_type::organization, "Projet Atlas Airbus"));
+        /* Learned spans that name nothing: a country read as an organisation, the civility
+           "M." read as a given name, a participle before "à"; a postal code of another country
+           read in part keeps the boundaries of its layout. */
+        pii_detector guarded;
+        guarded.add_recognizer([](const string& t) {
+            std::vector<pii_span> spans;
+            auto add = [&](const string& value, const char* label) {
+                const size_t p = t.find(value);
+                if (p == string::npos) return;
+                pii_span s;
+                s.begin = p; s.end = p + value.size(); s.label = label; s.confidence = 0.95;
+                spans.push_back(s);
+            };
+            add("Pologne", "ORGANIZATION");
+            add("M", "GIVEN_NAME");
+            add("Takeshi", "GIVEN_NAME");
+            add("Yamamoto", "FAMILY_NAME");
+            add("Fait", "ORGANIZATION");
+            add("Tokyo", "CITY");
+            add("153", "POSTAL_CODE");
+            return spans;
+        });
+        text = "Pologne";
+        DLIB_TEST(!covered(guarded.detect(text), text, "Pologne"));
+        text = "Suite à notre échange avec M. Takeshi Yamamoto, 2-11-3 Meguro, Tokyo 153-0063.";
+        e = guarded.detect(text);
+        DLIB_TEST(found(e, text, pii_type::title, "M."));
+        DLIB_TEST(found(e, text, pii_type::person, "Takeshi Yamamoto"));
+        DLIB_TEST(found(e, text, pii_type::location, "Tokyo 153-0063"));
+        text = "Fait à Lyon, le 12 mars 2026.";
+        e = guarded.detect(text);
+        DLIB_TEST(!covered(e, text, "Fait") && covered(e, text, "Lyon"));
+
+        // Nicknames, stage names and pen names after their cue; reported speech stays readable.
+        text = "Jean Dupont, dit « Jojo », a vu Marie Martin, surnommée Mimi. John Smith a.k.a. \"Smithy\" fled.";
+        e = entities(text);
+        DLIB_TEST(found(e, text, pii_type::person, "Jojo"));
+        DLIB_TEST(found(e, text, pii_type::person, "Mimi"));
+        DLIB_TEST(found(e, text, pii_type::person, "Smithy"));
+        text = "Il a publié sous le pseudonyme de Vernon Sullivan.";
+        DLIB_TEST(found(entities(text), text, pii_type::person, "Vernon Sullivan"));
+        text = "Il a dit « bonjour » en entrant. Jean Dupont dit « Je viens » et sort.";
+        e = entities(text);
+        DLIB_TEST(!covered(e, text, "bonjour") && !covered(e, text, "Je viens"));
+    }
+
+// ----------------------------------------------------------------------------------------
+
     void test_attribute_coverage()
     {
         pii_detector detector;
@@ -1165,6 +1277,42 @@ namespace
     }
 
 // ----------------------------------------------------------------------------------------
+
+    void test_foreign_postcodes()
+    {
+        pii_detector detector;
+        auto place = [&](const string& text, const string& value, bool present) {
+            const bool hit = found(detector.detect(text), text, pii_type::location, value);
+            if (hit != present) dlog << LINFO << (present ? "missed " : "false positive ") << value << " in " << text;
+            DLIB_TEST(hit == present);
+        };
+        // The postal code before the town, after the street line or before a country.
+        place("Rue de Lausanne 1, 1400 Yverdon-les-Bains, Switzerland", "1400 Yverdon-les-Bains", true);
+        place("ul. Długa 5\n00-238 Warszawa\nPologne", "00-238 Warszawa", true);
+        place("00-238 Warszawa", "00-238 Warszawa", true);
+        place("1000 Bruxelles", "1000 Bruxelles", true);
+        place("Damrak 34, 1015 CJ Amsterdam", "1015 CJ Amsterdam", true);
+        place("Tyršova 123, 779 00 Olomouc", "779 00 Olomouc", true);
+        place("Rua Augusta 40, 1100-053 Lisboa", "1100-053 Lisboa", true);
+        place("24 Grand-Rue, L-9201 Diekirch", "L-9201 Diekirch", true);
+        place("Freie Strasse 98, 9000 St. Gallen", "9000 St. Gallen", true);
+        place("Nádražní 80, 360 01 Karlovy Vary, République tchèque", "360 01 Karlovy Vary", true);
+        // The postal code after the town.
+        place("38 Herzl Street, Tel Aviv 6688116, Israël", "Tel Aviv 6688116", true);
+        place("10 Oxford Road\nEast London 5201\nSouth Africa", "East London 5201", true);
+        place("2-11-3 Meguro, Tokyo 153-0063", "Tokyo 153-0063", true);
+        place("130 Dame Street, Dublin D02 X285", "Dublin D02 X285", true);
+        place("164 Barrington Street, Gatineau (Québec) J8X 3X7", "J8X 3X7", true);
+        place("164 Barrington Street, Gatineau (Québec) J8X 3X7", "Gatineau", true);
+        place("Rua Bahia, 151, Rio de Janeiro - RJ, 22021-001", "Rio de Janeiro", true);
+        place("Rua Bahia, 151, Rio de Janeiro - RJ, 22021-001", "22021-001", true);
+        place("9 Bourke Street, Newcastle NSW 2300", "2300", true);
+        // Without a street before or a country after, or with a year, a number stays a number.
+        place("Toronto M4W 1A8", "M4W 1A8", false);
+        place("12 rue des Lilas, BP 5405, 35000 Rennes", "BP 5405", false);
+        place("Véhicule : 2 portes, 2018 Toyota Corolla", "2018 Toyota Corolla", false);
+        place("Inscrits le 12 mars, 1500 Participants au total", "1500 Participants", false);
+    }
 
     void test_foreign_identifiers()
     {
@@ -1710,7 +1858,11 @@ namespace
             print_spinner();
             test_attributes_and_public_bodies();
             print_spinner();
+            test_known_names();
+            print_spinner();
             test_attribute_coverage();
+            print_spinner();
+            test_foreign_postcodes();
             print_spinner();
             test_foreign_identifiers();
             print_spinner();

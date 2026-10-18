@@ -183,6 +183,14 @@ From there the library indexes a directory of text and answers a question with t
 
 This closes a loop a generative model cannot close alone — answering from documents it never saw during training, with the passage shown rather than paraphrased.
 
+### Protecting the personal data of documents
+
+**A document leaves with tags instead of personal data.** The `dlib/privacy` components find the personal data of Word, Excel, PowerPoint, PDF and text files, French and English first, and replace each value with a tag that carries it, encrypted with format-preserving encryption (FF1 over AES-256). No correspondence table is kept: the key alone restores the document, or any text derived from it, such as the summary a language model wrote.
+
+**Rules and small learned recognizers share the work.** Validated scanners find what has a structure and a check digit, the national numbers of about forty countries among them. Linguistic rules read civilities, field labels, legal forms and public bodies, given names from every region of the world with their nicknames and stage names, and about two thousand organisations of all countries known by their own name. Two recognizers, a byte-level Transformer encoder and a structural SVM sequence labeler, find from context the names, places, addresses and organisations the rules miss.
+
+**Trained on synthetic data only.** The recognizers learn from annotated texts that a generator writes from templates and lexicons: about forty document genres, places and organisations of about fifty countries written the way each country writes them, OCR and casing noise, and held-out values that score what training never showed. The trained models are compiled into [`slm_document_anonymizer_ex.cpp`](examples/slm_document_anonymizer_ex.cpp), which runs with no file beside it.
+
 ### Python utilities, used as witnesses
 
 A small set of Python tools lives beside the examples, and their role is verification rather than production:
@@ -192,7 +200,8 @@ A small set of Python tools lives beside the examples, and their role is verific
 - **reference loss measurement** against Hugging Face weights, which is how a training pipeline is proven to measure what it claims;
 - **corpus preparation** for knowledge-alignment and task-alignment datasets;
 - **corpus collection for a tokenizer**, drawing on encyclopaedic prose, news archives, filtered and multilingual web text, and instruction data — the last of these being the one people leave out, and the one that cannot be recovered afterwards;
-- **benchmarking against published models**, each task run at the few-shot count under which it is normally reported, since a table built without that detail compares nothing.
+- **benchmarking against published models**, each task run at the few-shot count under which it is normally reported, since a table built without that detail compares nothing;
+- **synthetic data for the personal data recognizers**, labelled to the byte, with a held-out share of every lexicon for the test of unseen values.
 
 A pipeline that nothing contradicts is a pipeline nobody has verified.
 
@@ -214,6 +223,7 @@ Today, the project is especially strong as a platform for:
 - raising smaller models by distillation, across architecture boundaries
 - shrinking published models by depth pruning, into containers the ecosystem still reads
 - indexing and searching a document collection with an embedding model
+- finding and reversibly pseudonymizing the personal data of documents, with rules and small learned recognizers
 - text, image, and text-with-image workflows in a single codebase
 - training and running models whose working set exceeds the device, on a laptop-class card
 

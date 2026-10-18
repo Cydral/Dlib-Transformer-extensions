@@ -72,13 +72,32 @@
 # kind (company, law, public, council, prefecture, court, police), and {ART#2}, or
 # {Art#2} capitalized, writes the article of a public body: "{ART#2}{ORG:council#2}"
 # gives "la Mairie de Brest". {INSTITUTION} draws a reference to a public body from its
-# lexicon, the name between brackets being labelled: "la [CAF]", "the [NHS]".
+# lexicon, the name between brackets being labelled: "la [CAF]", "the [NHS]". {NICK#1}
+# writes the nickname of person 1 ("Jojo", "Smithy") and {NICK:stage#1} a stage name ("DJ
+# Kerlys"), both labelled GIVEN_NAME; the variant abroad of the place slots, {CITY:abroad#2}
+# or {ADDRESS:abroad#2}, puts place 2 in another country.
 #
 # Names are drawn from lexicons by origin and gender, or synthesized from the
-# morphology of French, Breton, Alsatian, Occitan, Italian, Iberian, Polish and English
-# family names, so that a model learns what a name looks like and where it appears
-# rather than memorizing a list. Places and organisation names follow the same two
-# routes; streets come from their lexicon.
+# morphology of the family names of about twenty naming traditions (French, Breton,
+# Alsatian, Occitan, Italian, Iberian, Polish, English, Gaelic, German, Dutch, Nordic,
+# East Slavic, Greek, Turkish, Arabic, Persian, Armenian, South Asian, Japanese and
+# Nigerian), so that a model learns what a name looks like and where it appears rather
+# than memorizing a list. Places and organisation names follow the same two routes;
+# streets come from their lexicon. Some organisations are known by their own name: a
+# share of the companies, banks, universities, hospitals and associations is drawn from
+# known_orgs.txt ("BNP Paribas", "Siemens Healthineers"), while the names of products and
+# applications stay unlabelled (products.txt).
+#
+# PLACES ABROAD
+#
+# A share of the places (--abroad-share) lies in another country, about fifty of them, with
+# the street line, postal code and city line of that country: "Hauptstraße 12, 10115
+# Berlin", "ul. Długa 5, 00-238 Warszawa", "Toronto, ON M5H 2N2", "2-11-3 Meguro, Tokyo
+# 153-0063". The country written after the city stays unlabelled, like a region. The
+# organisations of such a place take the legal forms and the names of that country
+# ("Kerlys GmbH", "Ayuntamiento de Sevilla", "Novexa Pvt. Ltd."), and the same share of
+# telephone numbers and IBANs belongs to other countries. A person whose name comes from
+# another tradition often has an e-mail address at a provider of that country.
 #
 # NOISE
 #
@@ -97,9 +116,10 @@
 # part only. test draws from both; test_unseen from the held-out part only, which
 # measures how the models read names, places and organisations they never saw during
 # training. test_noisy applies heavy noise, test_negatives holds texts full of
-# capitalized words that are not personal data, and test_documents longer texts of
-# several paragraphs. No evaluation split repeats a text of train: an example drawn again
-# is replaced by another.
+# capitalized words that are not personal data, test_documents longer texts of several
+# paragraphs, and test_abroad texts whose places, organisations, phone numbers and IBANs
+# all belong to other countries (--abroad-share 1 for that split). No evaluation split
+# repeats a text of train: an example drawn again is replaced by another.
 #
 # CONTEXT
 #
@@ -126,6 +146,15 @@
 #   <lang>/negatives.txt                             phrase <TAB> category [<TAB> weight]
 #   <lang>/sentences.txt                             sentence [<TAB> weight], no personal data
 #   <lang>/templates.txt                             genre <TAB> weight <TAB> template
+#   <lang>/world_cities.txt                          city <TAB> postal code <TAB> country code
+#                                                    [<TAB> weight], the state or province first
+#                                                    in Canada, Australia, Brazil, Mexico and the US
+#   <lang>/world_streets.txt                         street <TAB> country code [<TAB> weight]
+#   <lang>/known_orgs.txt                            name <TAB> category [<TAB> weight]: company,
+#                                                    retail, bank, insurer, media, airline,
+#                                                    transport, telecom, energy, university,
+#                                                    hospital, ngo, club
+#   <lang>/nicknames.txt                             nickname <TAB> f, m or x [<TAB> weight]
 #
 # Usage:
 #   build_pii_dataset.py --out-dir pii-data
@@ -134,6 +163,7 @@
 #   build_pii_dataset.py --sample 5            print five examples with their spans
 
 import argparse
+import bisect
 import hashlib
 import json
 import os
@@ -180,6 +210,201 @@ LABEL_DESCRIPTIONS = {
 #
 # A small set, enough to exercise every slot and every genre. The values are common first
 # names, family names and places; the organisation words are made up.
+
+# The built-in places abroad: a few cities and streets of each country of WORLD, with the
+# layout of their postal codes.
+WORLD_CITIES_BUILTIN = """
+Berlin	10115	de
+München	80331	de
+Hamburg	20095	de
+Wien	1010	at
+Graz	8010	at
+Zürich	8001	ch
+Genève	1204	ch
+Luxembourg	L-1611	lu
+Bruxelles	1000	be
+Liège	4000	be
+Gent	9000	be
+Amsterdam	1015 CJ	nl
+Rotterdam	3011 AD	nl
+Madrid	28013	es
+Sevilla	41004	es
+Barcelona	08002	es
+Lisboa	1100-053	pt
+Porto	4000-322	pt
+Roma	00184	it
+Milano	20121	it
+Napoli	80134	it
+Warszawa	00-238	pl
+Kraków	31-008	pl
+Praha	110 00	cz
+Brno	602 00	cz
+Stockholm	111 51	se
+Göteborg	411 06	se
+København	1050	dk
+Oslo	0154	no
+Helsinki	00100	fi
+Dublin	D02 X285	ie
+Cork	T12 W8KV	ie
+Athina	105 57	gr
+Thessaloniki	546 24	gr
+București	010061	ro
+Cluj-Napoca	400001	ro
+Budapest	1061	hu
+Casablanca	20000	ma
+Rabat	10000	ma
+Marrakech	40000	ma
+Alger	16000	dz
+Oran	31000	dz
+Tunis	1000	tn
+Sfax	3000	tn
+Dakar		sn
+Abidjan		ci
+Douala		cm
+Montréal	QC H2X 1Z5	ca
+Toronto	ON M5H 2N2	ca
+Vancouver	BC V6B 1A1	ca
+New York	NY 10001	us
+San Francisco	CA 94103	us
+London	SW1A 1AA	gb
+Manchester	M1 1AE	gb
+Sydney	NSW 2000	au
+Melbourne	VIC 3000	au
+Auckland	1010	nz
+Mumbai	400001	in
+Bengaluru	560001	in
+Tokyo	150-0002	jp
+Osaka	530-0001	jp
+Shanghai	200001	cn
+Beijing	100006	cn
+Seoul	04524	kr
+Singapore	049315	sg
+São Paulo	SP 01001-000	br
+Rio de Janeiro	RJ 20040-002	br
+Ciudad de México	CDMX 06600	mx
+Guadalajara	JAL 44100	mx
+Buenos Aires	C1043	ar
+İstanbul	34430	tr
+Ankara	06420	tr
+Tel Aviv	6473921	il
+Dubai		ae
+Beyrouth		lb
+Cairo	11511	eg
+Lagos	101233	ng
+Nairobi	00100	ke
+Johannesburg	2196	za
+Cape Town	8001	za
+Moskva	125009	ru
+Kyiv	01001	ua
+"""
+
+WORLD_STREETS_BUILTIN = """
+Hauptstraße	de
+Bahnhofstraße	de
+Mariahilfer Straße	at
+Bahnhofstrasse	ch
+Rue du Rhône	ch
+Avenue de la Liberté	lu
+Rue de la Loi	be
+Kerkstraat	be
+Keizersgracht	nl
+Calle Mayor	es
+Gran Vía	es
+Rua Augusta	pt
+Via Roma	it
+Via Garibaldi	it
+ul. Marszałkowska	pl
+Václavské náměstí	cz
+Drottninggatan	se
+Vesterbrogade	dk
+Karl Johans gate	no
+Mannerheimintie	fi
+O'Connell Street	ie
+Ermou	gr
+Calea Victoriei	ro
+Andrássy út	hu
+boulevard Zerktouni	ma
+rue Mohammed V	ma
+rue Didouche Mourad	dz
+avenue Habib Bourguiba	tn
+avenue Cheikh Anta Diop	sn
+boulevard Latrille	ci
+boulevard de la Liberté	cm
+rue Sainte-Catherine	ca
+Yonge Street	ca
+Main Street	us
+Broadway	us
+High Street	gb
+George Street	au
+Queen Street	nz
+MG Road	in
+Shibuya	jp
+Nanjing Road	cn
+Teheran-ro	kr
+Orchard Road	sg
+Avenida Paulista	br
+Paseo de la Reforma	mx
+Avenida Corrientes	ar
+İstiklal Caddesi	tr
+Dizengoff Street	il
+Sheikh Zayed Road	ae
+rue Hamra	lb
+Tahrir Street	eg
+Awolowo Road	ng
+Kenyatta Avenue	ke
+Long Street	za
+Tverskaya ulitsa	ru
+vulytsia Khreshchatyk	ua
+"""
+
+KNOWN_ORGS_BUILTIN = """
+BNP Paribas	bank
+Crédit Agricole	bank
+Deutsche Bank	bank
+AXA	insurer
+Allianz	insurer
+Airbus	company
+Siemens Healthineers	company
+Capgemini	company
+Air France	airline
+Lufthansa	airline
+SNCF	transport
+Vodafone	telecom
+EDF	energy
+Reuters	media
+Carrefour Market	retail
+Universidad de Salamanca	university
+Imperial College London	university
+Institut Curie	hospital
+Médecins sans frontières	ngo
+Croix-Rouge française	ngo
+Real Madrid	club
+"""
+
+NICKNAMES_BUILTIN = {"fr": """
+Jojo	x
+Mimi	f
+Lulu	x
+Titi	x
+Pierrot	m
+Dédé	m
+Fanfan	x
+Nono	m
+Zizou	m
+Loulou	x
+""", "en": """
+Smithy	m
+Jonno	m
+Ginger	x
+Lofty	m
+Dusty	x
+Sully	m
+Bunny	f
+Trixie	f
+Buddy	m
+Red	x
+"""}
+
 
 BUILTIN = {
     "fr/given_female.txt": """
@@ -372,6 +597,14 @@ log	2	{DATE:iso} {TIME} INFO session started user={USERNAME#1} ip={IP}
 narrative	2	{PERSON#1}, {AGE}, of {CITY#1}, joined {ORG#1} in {YEAR} and now works with {PERSON#2}.
 negative	2	{NEGATIVE} approved the budget on {DATE}. The next review with {INSTITUTION} is planned in {REGION}.
 """,
+    "fr/world_cities.txt": WORLD_CITIES_BUILTIN,
+    "en/world_cities.txt": WORLD_CITIES_BUILTIN,
+    "fr/world_streets.txt": WORLD_STREETS_BUILTIN,
+    "en/world_streets.txt": WORLD_STREETS_BUILTIN,
+    "fr/known_orgs.txt": KNOWN_ORGS_BUILTIN,
+    "en/known_orgs.txt": KNOWN_ORGS_BUILTIN,
+    "fr/nicknames.txt": NICKNAMES_BUILTIN["fr"],
+    "en/nicknames.txt": NICKNAMES_BUILTIN["en"],
 }
 
 
@@ -431,26 +664,37 @@ class Lexicon:
         self.entries = entries
         self.seen = [e for e in entries if not held_out(e[0][0], unseen_percent)]
         self.unseen = [e for e in entries if held_out(e[0][0], unseen_percent)]
+        # The cumulative weights of the parts, and of the parts filtered under a key.
+        self.cache = {}
 
     def __len__(self):
         return len(self.entries)
 
-    def pick(self, rng: random.Random, pool: str, where=None) -> Optional[Tuple[str, ...]]:
-        part = self.entries if pool == "all" else (self.unseen if pool == "unseen" else self.seen)
-        if not part:
-            part = self.entries
-        source = part
-        if where is not None:
-            source = [e for e in part if where(e[0])] or part
-        if not source:
-            return None
-        total = sum(w for _, w in source)
-        x = rng.random() * total
-        for fields, w in source:
-            x -= w
-            if x <= 0:
-                return fields
-        return source[-1][0]
+    def pick(self, rng: random.Random, pool: str, where=None, key=None) -> Optional[Tuple[str, ...]]:
+        """An entry drawn by weight. A condition given with a key keeps its filtered pool, so
+        that drawing again under the same key costs a binary search."""
+        cached = self.cache.get((pool, key)) if where is None or key is not None else None
+        if cached is None:
+            part = self.entries if pool == "all" else (self.unseen if pool == "unseen" else self.seen)
+            if not part:
+                part = self.entries
+            source = part
+            if where is not None:
+                source = [e for e in part if where(e[0])] or part
+            if not source:
+                return None
+            cumulative, total = [], 0.0
+            for _, w in source:
+                total += w
+                cumulative.append(total)
+            cached = (source, cumulative)
+            if where is None or key is not None:
+                self.cache[(pool, key)] = cached
+        source, cumulative = cached
+        if not source or cumulative[-1] <= 0:
+            return source[-1][0] if source else None
+        k = bisect.bisect_left(cumulative, rng.random() * cumulative[-1])
+        return source[min(k, len(source) - 1)][0]
 
 
 def parse_lexicon(text: str, data_fields: int = 1) -> List[Tuple[Tuple[str, ...], float]]:
@@ -488,7 +732,11 @@ class Resources:
 
     NAMES = ["given_female.txt", "given_male.txt", "family.txt", "cities.txt", "streets.txt", "street_types.txt",
              "org_words.txt", "institutions.txt", "jobs.txt", "regions.txt", "countries.txt", "negatives.txt",
-             "products.txt", "sentences.txt", "templates.txt"]
+             "products.txt", "sentences.txt", "templates.txt", "world_cities.txt", "world_streets.txt",
+             "known_orgs.txt", "nicknames.txt"]
+    # The number of data fields of each lexicon, the fields after them being a weight.
+    FIELDS = {"given_female.txt": 2, "given_male.txt": 2, "family.txt": 2, "cities.txt": 2, "negatives.txt": 2,
+              "world_cities.txt": 3, "world_streets.txt": 2, "known_orgs.txt": 2, "nicknames.txt": 2}
 
     def __init__(self, directory: Optional[str], languages: List[str], unseen_percent: int):
         self.lex: Dict[str, Dict[str, Lexicon]] = {}
@@ -521,9 +769,7 @@ class Resources:
                 elif name == "sentences.txt":
                     self.sentences[lang] = parse_sentences(text, lang + "/" + name)
                 else:
-                    fields = 2 if name in ("given_female.txt", "given_male.txt", "family.txt", "cities.txt",
-                                           "negatives.txt") else 1
-                    self.lex[lang][name[:-4]] = Lexicon(parse_lexicon(text, fields), unseen_percent)
+                    self.lex[lang][name[:-4]] = Lexicon(parse_lexicon(text, self.FIELDS.get(name, 1)), unseen_percent)
 
 
 # ----------------------------------------------------------------------------------
@@ -676,7 +922,7 @@ SLOT_NAMES = {
     "POSTAL", "CITYLINE", "STREET", "COMPLEMENT", "ADDRESS", "ADDRESS_BLOCK", "ORG", "DOMAIN", "SIRET", "SIREN",
     "DATE", "TIME", "YEAR", "AGE", "AMOUNT", "IBAN", "CARD", "IP", "IPV6", "MAC", "PLATE", "GEO", "REF", "NINO",
     "SSN", "PASSPORT", "IMEI", "UUID", "VIN", "NEGATIVE", "JOB", "INSTITUTION", "REGION", "COUNTRY", "PRODUCT",
-    "SEX", "NATIONALITY", "NATID", "ART", "Art",
+    "SEX", "NATIONALITY", "NATID", "ART", "Art", "NICK",
 }
 
 
@@ -726,6 +972,9 @@ class Person:
         self.nir = None
         self.country = None
         self.natid = None
+        self.origin = None      # the naming tradition of the given name
+        self.nick = None
+        self.stage = None
 
 
 class Place:
@@ -736,6 +985,7 @@ class Place:
         self.complement = None
         self.flat_first = False
         self.cedex = False
+        self.country = None     # a code of WORLD for a place abroad, None at home
 
 
 class Org:
@@ -781,6 +1031,44 @@ SURNAME_PARTS = {
     "anglo": (["Ash", "Brad", "Hart", "Whit", "Craw", "Pres", "Ather", "Black", "Wood", "Ever", "Hamp", "Thorn",
                "Ald", "Fair", "Lang", "Mor"],
               ["ford", "ley", "ton", "well", "ridge", "wood", "by", "son", "field", "worth", "more", "dale"]),
+    "gaelic": (["O'", "Mac", "Mc", "Fitz", "O'", "Mac"],
+               ["Brien", "Connor", "Sullivan", "Neill", "Carthy", "Donnell", "Kenna", "Gerald", "Mahon", "Grath",
+                "Bride", "Gowan", "Laughlin", "Kinnon", "Leod", "Farlane", "Intyre", "Rory"]),
+    "germanic": (["Schm", "Müll", "Schn", "Fisch", "Web", "Mey", "Wag", "Beck", "Hoff", "Kön", "Rich", "Klein",
+                  "Neum", "Zimm", "Hart", "Lang", "Brau", "Krü", "Wern", "Stein"],
+                 ["idt", "er", "eider", "mann", "inger", "berg", "hardt", "ner", "hold", "bach", "feld", "ke"]),
+    "dutch": (["van ", "de ", "van der ", "van den ", "", "", ""],
+              ["Berg", "Vries", "Dijk", "Bakker", "Jansen", "Visser", "Smit", "Meijer", "Mulder", "Bos", "Vos",
+               "Hendriks", "Dekker", "Brouwer", "Wit", "Leeuwen", "Graaf", "Heuvel", "Linden", "Velde"]),
+    "nordic": (["Lars", "Ander", "Eriks", "Johans", "Nils", "Svens", "Berg", "Lind", "Sjö", "Holm", "Dahl", "Lund",
+                "Strand", "Ny", "Fors"],
+               ["son", "sen", "ström", "gren", "qvist", "lund", "blad", "berg", "man"]),
+    "slavic_east": (["Ivan", "Petr", "Smirn", "Kuzn", "Sokol", "Lebed", "Kozl", "Novik", "Moroz", "Shevch",
+                     "Kovalen", "Bondar", "Tkach", "Kravch", "Melnych", "Volk"],
+                    ["ov", "ova", "enko", "uk", "chuk", "sky", "in", "ina", "ich", "ets"]),
+    "greek": (["Papad", "Georgi", "Kon", "Nikol", "Dimitr", "Ioann", "Vasil", "Christ", "Pappa", "Karam", "Alex",
+               "Stavr", "Mich"],
+              ["opoulos", "ou", "akis", "idis", "iou", "atos", "anis", "elis"]),
+    "turkish": (["Yıl", "Kay", "Dem", "Çel", "Şah", "Yıld", "Yüc", "Aks", "Öz", "Kar", "Ars", "Doğ", "Kılı",
+                 "Ay"],
+                ["maz", "a", "ir", "ik", "in", "ız", "el", "oy", "türk", "oğlu", "can", "kaya", "dın"]),
+    "arabic": (["Ben ", "Bou", "El ", "Ait ", "Abdel", "Ben ", "Kh", "Mans", "Ham", "Ch", "Belk", "Mez", "Al-"],
+               ["Ali", "aziz", "kader", "ouri", "idi", "zaoui", "hadji", "rif", "souri", "laoui", "Kacem", "medi",
+                "Amrani", "Idrissi", "Haddad"]),
+    "persian": (["Moham", "Ahm", "Hoss", "Rez", "Kar", "Jaf", "Rah", "Sad", "Naz", "Far", "Tehr", "Shir", "Esf"],
+                ["adi", "ani", "eini", "aei", "imi", "ari", "zadeh", "pour", "i", "ian", "nejad", "far"]),
+    "armenian": (["Hov", "Sarg", "Grig", "Pet", "Avet", "Khach", "Hakob", "Mart", "Bagd", "Gev", "Ter-Ab"],
+                 ["hannisyan", "sian", "oryan", "rosyan", "isyan", "atryan", "yan", "asaryan", "orgian", "ian"]),
+    "south_asia": (["Shar", "Ver", "Gup", "Pat", "Red", "Nai", "Iye", "Kum", "Sin", "Chau", "Desh", "Agar", "Mehr",
+                    "Kap", "Bhat", "Josh", "Kul", "Ran"],
+                   ["ma", "ta", "el", "dy", "r", "ar", "gh", "han", "pande", "wal", "ra", "oor", "t", "i", "karni"]),
+    "japan": (["Ta", "Yama", "Naka", "Ko", "Wata", "Ishi", "Ka", "Sa", "Matsu", "Ino", "Kimu", "Hayashi", "Shimi",
+               "Yoshi", "Mori", "Ike", "Hashi", "Fuji", "Oka", "Kiku"],
+              ["naka", "moto", "mura", "bayashi", "nabe", "kawa", "ta", "da", "ra", "zu", "no", "uchi", "ki", "hara",
+               "shita", "saki"]),
+    "nigeria": (["Ok", "Ad", "Ol", "Ob", "Ez", "Nw", "Ib", "Ak", "Ogun", "Chukw", "On", "Uch", "Bab", "Fol"],
+                ["afor", "eyemi", "uwole", "i", "eh", "abueze", "onkwo", "eke", "ade", "uma", "emi", "ike", "ola",
+                 "ayo"]),
 }
 
 PROCEDURAL_CITY = {
@@ -814,6 +1102,271 @@ ORG_SECTORS = {"fr": ["Conseil", "Services", "Immobilier", "Transports", "Indust
                "en": ["Consulting", "Services", "Logistics", "Engineering", "Solutions", "Systems", "Holdings",
                       "Partners", "Analytics", "Healthcare", "Properties", "Capital", "Technologies", "Media"]}
 
+
+
+# ----------------------------------------------------------------------------------
+# Places abroad
+#
+# For each country: its names in French and in English, its weights in French and in
+# English texts, the order of the street line ("before": "12 rue X", "after": "X 12",
+# "comma": "X, 12", "no": "X No: 12", "nr": "X nr. 12", "block": "2-11-3 X"), the city line
+# ("pc": postal code first, "cp": city first, "state": the state or province held at the
+# start of the postal field), the telephone prefix and layouts ('#' a digit), the layout
+# of the IBAN ("n" digits, "a" capitals, with counts: "4a14n"), the top-level domain, the
+# naming tradition of its people and the names of its organisations by kind ({w} a made up
+# word, {f} and {f2} family names, {g} a given name, {c} the city, {s} a trade, {F} a legal
+# form).
+
+WORLD = {
+    "de": dict(fr="Allemagne", en="Germany", w=(6, 5), street="after", line="pc",
+               phone=("+49", ["30 ########", "151 ########", "89 #######", "40 ########"]), iban="18n", tld="de",
+               origin="germanic", forms=["GmbH", "AG", "GmbH & Co. KG", "KG"],
+               sectors=["Immobilien", "Logistik", "Bau", "Beratung", "Versicherungen", "Elektrotechnik"],
+               orgs={"company": ["{w} {F}", "{f} {s} {F}", "{f} & Söhne", "{w} {s}", "{f} & {f2} {F}"],
+                     "public": ["Stadt {c}", "Landratsamt {c}", "Amtsgericht {c}", "Jobcenter {c}"],
+                     "school": ["Universität {c}", "Technische Universität {c}", "Hochschule {c}"],
+                     "health": ["Klinikum {c}", "Universitätsklinikum {c}", "Praxis Dr. {f}"],
+                     "bank": ["Sparkasse {c}", "Volksbank {c}", "{w} Bank"],
+                     "association": ["{w} e.V.", "Sportverein {c}"]}),
+    "at": dict(fr="Autriche", en="Austria", w=(1.5, 1), street="after", line="pc",
+               phone=("+43", ["664 #######", "1 ### ####"]), iban="16n", tld="at", origin="germanic",
+               forms=["GmbH", "AG", "KG"], sectors=["Immobilien", "Bau", "Beratung"],
+               orgs={"company": ["{w} {F}", "{f} {s} {F}"], "public": ["Magistrat der Stadt {c}", "Stadt {c}"],
+                     "school": ["Universität {c}"], "health": ["Landesklinikum {c}"], "bank": ["Raiffeisenbank {c}"]}),
+    "ch": dict(fr="Suisse", en="Switzerland", w=(6, 2), street="after", line="pc",
+               phone=("+41", ["79 ### ## ##", "22 ### ## ##", "44 ### ## ##"]), iban="17n", tld="ch",
+               origin="germanic", forms=["AG", "SA", "GmbH", "Sàrl"], sectors=["Immobilien", "Conseil", "Services"],
+               orgs={"company": ["{w} {F}", "{f} {s} {F}", "{f} & Cie"], "public": ["Commune de {c}", "Gemeinde {c}"],
+                     "school": ["Université de {c}", "Universität {c}"], "health": ["Hôpital de {c}"],
+                     "bank": ["Banque {w}", "{w} Privatbank"]}),
+    "lu": dict(fr="Luxembourg", en="Luxembourg", w=(2, 0.5), street="before", line="pc",
+               phone=("+352", ["621 ### ###", "26 ## ## ##"]), iban="16n", tld="lu", origin=None,
+               forms=["S.A.", "S.à r.l.", "SARL"], sectors=["Services", "Conseil", "Finance"],
+               orgs={"company": ["{w} {F}", "{f} {s} {F}"], "public": ["Commune de {c}"], "bank": ["Banque {w}"]}),
+    "be": dict(fr="Belgique", en="Belgium", w=(7, 2), street="after", line="pc",
+               phone=("+32", ["470 ## ## ##", "2 ### ## ##", "4## ## ## ##"]), iban="12n", tld="be", origin=None,
+               forms=["SRL", "SA", "BV", "NV", "ASBL"], sectors=["Services", "Conseil", "Bouw", "Logistiek"],
+               orgs={"company": ["{w} {F}", "{f} {s} {F}", "{f} & Fils"], "public": ["Commune de {c}", "Ville de {c}",
+                                                                                    "Gemeente {c}"],
+                     "school": ["Université de {c}", "Haute École de {c}"], "health": ["CHU de {c}"],
+                     "bank": ["Banque {w}"], "association": ["{w} ASBL"]}),
+    "nl": dict(fr="Pays-Bas", en="Netherlands", w=(3, 3), street="after", line="pc",
+               phone=("+31", ["6 ########", "20 ### ####"]), iban="4a10n", tld="nl", origin="dutch",
+               forms=["B.V.", "N.V.", "V.O.F."], sectors=["Bouw", "Logistiek", "Advies", "Vastgoed", "Diensten"],
+               orgs={"company": ["{w} {F}", "{f} {s} {F}", "{w} {s}"], "public": ["Gemeente {c}"],
+                     "school": ["Hogeschool {c}"], "health": ["Ziekenhuis {w}"]}),
+    "es": dict(fr="Espagne", en="Spain", w=(6, 4), street="comma", line="pc",
+               phone=("+34", ["6## ## ## ##", "91 ### ## ##", "93 ### ## ##"]), iban="20n", tld="es",
+               origin="iberia", forms=["S.L.", "S.A.", "S.L.U."],
+               sectors=["Servicios", "Inmobiliaria", "Construcciones", "Consultores", "Seguros", "Transportes"],
+               orgs={"company": ["{w} {F}", "{s} {f} {F}", "{f} y Asociados", "{w} {s} {F}"],
+                     "public": ["Ayuntamiento de {c}", "Juzgado de Primera Instancia de {c}"],
+                     "school": ["Universidad de {c}", "Instituto {g} {f}"],
+                     "health": ["Hospital Universitario de {c}", "Clínica {w}"], "bank": ["Banco {w}", "Caja {w}"],
+                     "association": ["Asociación {w}", "Club Deportivo {c}"]}),
+    "pt": dict(fr="Portugal", en="Portugal", w=(5, 2), street="comma", line="pc",
+               phone=("+351", ["9## ### ###", "21 ### ####"]), iban="21n", tld="pt", origin="portugal",
+               forms=["Lda.", "S.A.", "Unipessoal Lda."],
+               sectors=["Construções", "Serviços", "Imobiliária", "Transportes"],
+               orgs={"company": ["{w} {F}", "{f} & Filhos, Lda.", "{s} {f} {F}"],
+                     "public": ["Câmara Municipal de {c}", "Junta de Freguesia de {c}"],
+                     "school": ["Universidade de {c}"], "health": ["Hospital de {c}"], "bank": ["Banco {w}"]}),
+    "it": dict(fr="Italie", en="Italy", w=(5, 4), street="after", line="pc",
+               phone=("+39", ["3## ### ####", "06 #### ####", "02 #### ####"]), iban="1a22n", tld="it",
+               origin="italy", forms=["S.r.l.", "S.p.A.", "S.n.c.", "S.a.s."],
+               sectors=["Costruzioni", "Servizi", "Trasporti", "Immobiliare", "Assicurazioni"],
+               orgs={"company": ["{w} {F}", "{f} {s} {F}", "{f} & C. S.n.c.", "{s} {f} {F}"],
+                     "public": ["Comune di {c}", "Tribunale di {c}"],
+                     "school": ["Università degli Studi di {c}", "Liceo {g} {f}"],
+                     "health": ["Azienda Ospedaliera di {c}", "Policlinico {w}"], "bank": ["Banca {w}"],
+                     "association": ["Associazione {w}"]}),
+    "pl": dict(fr="Pologne", en="Poland", w=(2, 3), street="after", line="pc",
+               phone=("+48", ["5## ### ###", "22 ### ## ##"]), iban="24n", tld="pl", origin="poland",
+               forms=["Sp. z o.o.", "S.A.", "sp.j."], sectors=["Budownictwo", "Logistyka", "Usługi"],
+               orgs={"company": ["{w} {F}", "{f} i Wspólnicy {F}", "{w} {s} {F}"], "school": ["Politechnika {w}"],
+                     "bank": ["Bank {w}"]}),
+    "cz": dict(fr="République tchèque", en="Czech Republic", w=(1, 1), street="after", line="pc",
+               phone=("+420", ["6## ### ###", "2## ### ###"]), iban="20n", tld="cz", origin="poland",
+               forms=["s.r.o.", "a.s."], sectors=["Stavby", "Služby"],
+               orgs={"company": ["{w} {F}", "{f} {s} {F}"]}),
+    "se": dict(fr="Suède", en="Sweden", w=(1, 1.5), street="after", line="pc",
+               phone=("+46", ["7# ### ## ##", "8 ### ### ##"]), iban="20n", tld="se", origin="nordic",
+               forms=["AB", "HB"], sectors=["Bygg", "Konsult", "Fastigheter"],
+               orgs={"company": ["{w} {F}", "{f} {s} {F}"], "public": ["{c} kommun"]}),
+    "dk": dict(fr="Danemark", en="Denmark", w=(1, 1), street="after", line="pc",
+               phone=("+45", ["## ## ## ##"]), iban="14n", tld="dk", origin="nordic", forms=["A/S", "ApS"],
+               sectors=["Byg", "Rådgivning"], orgs={"company": ["{w} {F}", "{f} {s} {F}"], "public": ["{c} Kommune"]}),
+    "no": dict(fr="Norvège", en="Norway", w=(0.8, 1), street="after", line="pc",
+               phone=("+47", ["4## ## ###", "9## ## ###"]), iban="11n", tld="no", origin="nordic", forms=["AS", "ASA"],
+               sectors=["Bygg", "Eiendom"], orgs={"company": ["{w} {F}", "{f} {s} {F}"], "public": ["{c} kommune"]}),
+    "fi": dict(fr="Finlande", en="Finland", w=(0.6, 0.8), street="after", line="pc",
+               phone=("+358", ["4# ### ####", "9 #### ####"]), iban="14n", tld="fi", origin="nordic",
+               forms=["Oy", "Oyj"], sectors=["Rakennus", "Palvelut"], orgs={"company": ["{w} {F}", "{f} {s} {F}"]}),
+    "ie": dict(fr="Irlande", en="Ireland", w=(1, 5), street="before", line="cp",
+               phone=("+353", ["8# ### ####", "1 ### ####"]), iban="4a14n", tld="ie", origin="irish",
+               forms=["Ltd", "DAC"], sectors=["Consulting", "Services", "Construction"],
+               orgs={"company": ["{w} {F}", "{f} & Sons {F}", "{f} {s}"], "public": ["{c} City Council"],
+                     "school": ["University of {c}"], "health": ["{c} University Hospital"]}),
+    "gr": dict(fr="Grèce", en="Greece", w=(1, 1), street="after", line="pc",
+               phone=("+30", ["69# ### ####", "21# ### ####"]), iban="7n16n", tld="gr", origin="balkan",
+               forms=["A.E.", "E.P.E.", "I.K.E."], sectors=["Techniki", "Emporiki"], orgs={"company": ["{w} {F}"]}),
+    "ro": dict(fr="Roumanie", en="Romania", w=(1.5, 1.5), street="nr", line="pc",
+               phone=("+40", ["7## ### ###", "21 ### ####"]), iban="4a16n", tld="ro", origin="balkan",
+               forms=["S.R.L.", "S.A."], sectors=["Construcții", "Servicii"],
+               orgs={"company": ["SC {w} {F}", "{w} {s} {F}"], "public": ["Primăria {c}"]}),
+    "hu": dict(fr="Hongrie", en="Hungary", w=(0.8, 0.8), street="after", line="pc",
+               phone=("+36", ["20 ### ####", "1 ### ####"]), iban="24n", tld="hu", origin="balkan",
+               forms=["Kft.", "Zrt.", "Bt."], sectors=["Építő", "Szolgáltató"],
+               orgs={"company": ["{w} {F}", "{w} {s} {F}"]}),
+    "ma": dict(fr="Maroc", en="Morocco", w=(6, 1), street="before", line="pc",
+               phone=("+212", ["6 ## ## ## ##", "5 ## ## ## ##"]), iban="24n", tld="ma", origin="maghreb",
+               forms=["SARL", "SA", "SARL AU"], sectors=["Services", "Immobilier", "Transport", "Négoce"],
+               orgs={"company": ["{w} {F}", "Société {w} {F}", "Groupe {w}", "{w} {s}"], "public": ["Commune de {c}"],
+                     "school": ["Université de {c}", "École {w}"], "health": ["Clinique {w}", "CHU de {c}"],
+                     "bank": ["Banque {w}"]}),
+    "dz": dict(fr="Algérie", en="Algeria", w=(4, 0.5), street="before", line="pc",
+               phone=("+213", ["5## ## ## ##", "6## ## ## ##"]), iban=None, tld="dz", origin="maghreb",
+               forms=["SARL", "EURL", "SPA"], sectors=["Services", "Travaux", "Distribution"],
+               orgs={"company": ["{w} {F}", "Entreprise {f}", "{w} {s} {F}"], "public": ["APC de {c}"],
+                     "school": ["Université de {c}"], "health": ["Clinique {w}"]}),
+    "tn": dict(fr="Tunisie", en="Tunisia", w=(3, 0.5), street="before", line="pc",
+               phone=("+216", ["2# ### ###", "9# ### ###"]), iban="20n", tld="tn", origin="maghreb",
+               forms=["SARL", "SA", "SUARL"], sectors=["Services", "Industrie", "Commerce"],
+               orgs={"company": ["{w} {F}", "Société {w} {F}"], "public": ["Municipalité de {c}"],
+                     "school": ["Université de {c}"]}),
+    "sn": dict(fr="Sénégal", en="Senegal", w=(2, 0.3), street="before", line="pc",
+               phone=("+221", ["77 ### ## ##", "78 ### ## ##"]), iban=None, tld="sn", origin="west_africa",
+               forms=["SARL", "SA", "SUARL"], sectors=["Services", "Négoce", "BTP"],
+               orgs={"company": ["{w} {F}", "Société {w} {F}"], "public": ["Mairie de {c}"]}),
+    "ci": dict(fr="Côte d'Ivoire", en="Ivory Coast", w=(2, 0.3), street="before", line="pc",
+               phone=("+225", ["07 ## ## ## ##", "05 ## ## ## ##"]), iban=None, tld="ci", origin="west_africa",
+               forms=["SARL", "SA"], sectors=["Services", "Négoce", "BTP"],
+               orgs={"company": ["{w} {F}", "Société {w} {F}"]}),
+    "cm": dict(fr="Cameroun", en="Cameroon", w=(1.5, 0.5), street="before", line="pc",
+               phone=("+237", ["6 ## ## ## ##"]), iban=None, tld="cm", origin="west_africa",
+               forms=["SARL", "SA"], sectors=["Services", "Négoce"], orgs={"company": ["{w} {F}"]}),
+    "ca": dict(fr="Canada", en="Canada", w=(4, 6), street="before", line="state",
+               phone=("+1", ["514 ### ####", "416 ### ####", "604 ### ####", "418 ### ####"]), iban=None, tld="ca",
+               origin=None, forms=["inc.", "ltée", "Inc.", "Ltd."], sectors=["Services", "Conseil", "Solutions"],
+               orgs={"company": ["{w} {F}", "{f} {s} {F}"], "public": ["Ville de {c}", "City of {c}"],
+                     "school": ["Université de {c}", "University of {c}"]}),
+    "us": dict(fr="États-Unis", en="United States", w=(3, 0), street="before", line="state",
+               phone=("+1", ["212 ### ####", "415 ### ####", "617 ### ####"]), iban=None, tld="com", origin=None,
+               forms=["Inc.", "LLC", "Corp."], sectors=["Consulting", "Holdings", "Technologies"],
+               orgs={"company": ["{w} {F}", "{f} {s} {F}"], "public": ["City of {c}"]}),
+    "gb": dict(fr="Royaume-Uni", en="United Kingdom", w=(3, 0), street="before", line="cp",
+               phone=("+44", ["20 #### ####", "7### ######"]), iban="4a14n", tld="co.uk", origin=None,
+               forms=["Ltd", "plc", "LLP"], sectors=["Consulting", "Services", "Properties"],
+               orgs={"company": ["{w} {F}", "{f} & Sons {F}"], "public": ["{c} City Council"]}),
+    "au": dict(fr="Australie", en="Australia", w=(0.8, 3), street="before", line="state",
+               phone=("+61", ["4## ### ###", "2 #### ####"]), iban=None, tld="com.au", origin=None,
+               forms=["Pty Ltd", "Ltd"], sectors=["Consulting", "Services", "Mining"],
+               orgs={"company": ["{w} {F}", "{f} {s} {F}"], "public": ["City of {c} Council"],
+                     "school": ["University of {c}"]}),
+    "nz": dict(fr="Nouvelle-Zélande", en="New Zealand", w=(0.3, 1.5), street="before", line="cp",
+               phone=("+64", ["21 ### ####", "9 ### ####"]), iban=None, tld="co.nz", origin=None,
+               forms=["Limited", "Ltd"], sectors=["Services", "Farming"], orgs={"company": ["{w} {F}"],
+                                                                                "public": ["{c} City Council"]}),
+    "in": dict(fr="Inde", en="India", w=(1, 5), street="before", line="cp",
+               phone=("+91", ["9#### #####", "22 #### ####", "80 #### ####"]), iban=None, tld="in",
+               origin="south_asia", forms=["Pvt. Ltd.", "Private Limited", "LLP", "Ltd."],
+               sectors=["Technologies", "Exports", "Infotech", "Pharma"],
+               orgs={"company": ["{w} {F}", "{f} & Sons {F}", "{w} {s} {F}"],
+                     "public": ["{c} Municipal Corporation"], "school": ["{w} Institute of Technology"],
+                     "health": ["{w} Hospital"], "bank": ["{w} Bank"]}),
+    "jp": dict(fr="Japon", en="Japan", w=(1, 2), street="block", line="cp",
+               phone=("+81", ["90-####-####", "3-####-####"]), iban=None, tld="co.jp", origin="japan",
+               forms=["K.K.", "Co., Ltd.", "Inc."], sectors=["Trading", "Electronics", "Industries"],
+               orgs={"company": ["{w} {F}", "{f} {s} {F}"], "school": ["{c} University"]}),
+    "cn": dict(fr="Chine", en="China", w=(1, 2), street="before", line="cp",
+               phone=("+86", ["13# #### ####", "10 #### ####"]), iban=None, tld="cn", origin="china",
+               forms=["Co., Ltd."], sectors=["Trading", "Technology", "Manufacturing"],
+               orgs={"company": ["{c} {w} {s} {F}", "{w} {F}"], "school": ["{c} University"]}),
+    "kr": dict(fr="Corée du Sud", en="South Korea", w=(0.5, 1), street="before", line="cp",
+               phone=("+82", ["10-####-####", "2-###-####"]), iban=None, tld="co.kr", origin="korea",
+               forms=["Co., Ltd.", "Corp."], sectors=["Electronics", "Industries"], orgs={"company": ["{w} {F}"]}),
+    "sg": dict(fr="Singapour", en="Singapore", w=(0.3, 1.5), street="before", line="cp",
+               phone=("+65", ["9### ####", "6### ####"]), iban=None, tld="com.sg", origin="china",
+               forms=["Pte. Ltd."], sectors=["Holdings", "Trading", "Logistics"], orgs={"company": ["{w} {s} {F}",
+                                                                                                    "{w} {F}"]}),
+    "br": dict(fr="Brésil", en="Brazil", w=(1.5, 2), street="comma", line="state",
+               phone=("+55", ["11 9####-####", "21 9####-####"]), iban="23n1a1n", tld="com.br", origin="portugal",
+               forms=["Ltda.", "S.A."], sectors=["Serviços", "Comércio", "Engenharia"],
+               orgs={"company": ["{w} {F}", "{s} {f} {F}"], "public": ["Prefeitura de {c}"],
+                     "school": ["Universidade Federal de {c}"]}),
+    "mx": dict(fr="Mexique", en="Mexico", w=(1, 2), street="after", line="state",
+               phone=("+52", ["55 #### ####", "33 #### ####"]), iban=None, tld="com.mx", origin="latam",
+               forms=["S.A. de C.V.", "S. de R.L. de C.V."], sectors=["Servicios", "Construcciones", "Comercial"],
+               orgs={"company": ["{w} {F}", "{s} {f} {F}"], "public": ["Municipio de {c}"]}),
+    "ar": dict(fr="Argentine", en="Argentina", w=(0.6, 0.8), street="after", line="pc",
+               phone=("+54", ["9 11 ####-####"]), iban=None, tld="com.ar", origin="latam", forms=["S.A.", "S.R.L."],
+               sectors=["Servicios", "Agropecuaria"], orgs={"company": ["{w} {F}", "{s} {f} {F}"]}),
+    "tr": dict(fr="Turquie", en="Turkey", w=(1.5, 1.5), street="no", line="pc",
+               phone=("+90", ["5## ### ## ##", "212 ### ## ##"]), iban="22n", tld="com.tr", origin="turkey",
+               forms=["A.Ş.", "Ltd. Şti."], sectors=["İnşaat", "Ticaret", "Lojistik"],
+               orgs={"company": ["{w} {s} {F}", "{w} {F}"], "public": ["{c} Belediyesi"]}),
+    "il": dict(fr="Israël", en="Israel", w=(0.5, 1), street="before", line="cp",
+               phone=("+972", ["5#-###-####", "3-###-####"]), iban="19n", tld="co.il", origin="hebrew",
+               forms=["Ltd."], sectors=["Technologies", "Systems"], orgs={"company": ["{w} {s} {F}", "{w} {F}"]}),
+    "ae": dict(fr="Émirats arabes unis", en="United Arab Emirates", w=(0.8, 2), street="before", line="cp",
+               phone=("+971", ["5# ### ####", "4 ### ####"]), iban="19n", tld="ae", origin="arabic",
+               forms=["LLC", "FZE", "FZ-LLC"], sectors=["Trading", "General Trading", "Contracting"],
+               orgs={"company": ["{w} {s} {F}", "{w} {F}"]}),
+    "lb": dict(fr="Liban", en="Lebanon", w=(1, 0.5), street="before", line="cp",
+               phone=("+961", ["3 ### ###", "1 ### ###"]), iban="4n20n", tld="com.lb", origin="arabic",
+               forms=["SAL", "SARL"], sectors=["Trading", "Services"], orgs={"company": ["{w} {F}"]}),
+    "eg": dict(fr="Égypte", en="Egypt", w=(0.6, 1), street="before", line="cp",
+               phone=("+20", ["10 #### ####", "2 #### ####"]), iban="25n", tld="com.eg", origin="arabic",
+               forms=["S.A.E.", "LLC"], sectors=["Trading", "Contracting"], orgs={"company": ["{w} {F}"]}),
+    "ng": dict(fr="Nigeria", en="Nigeria", w=(0.5, 3), street="before", line="cp",
+               phone=("+234", ["80# ### ####", "70# ### ####"]), iban=None, tld="com.ng", origin="africa",
+               forms=["Ltd", "Plc", "Nigeria Limited"], sectors=["Ventures", "Oil and Gas", "Logistics"],
+               orgs={"company": ["{w} {s} {F}", "{w} {F}", "{f} and Sons {F}"],
+                     "school": ["University of {c}"]}),
+    "ke": dict(fr="Kenya", en="Kenya", w=(0.3, 1.5), street="before", line="cp",
+               phone=("+254", ["7## ### ###"]), iban=None, tld="co.ke", origin="africa",
+               forms=["Ltd", "Kenya Limited"], sectors=["Enterprises", "Logistics"], orgs={"company": ["{w} {F}"]}),
+    "za": dict(fr="Afrique du Sud", en="South Africa", w=(0.5, 2), street="before", line="cp",
+               phone=("+27", ["8# ### ####", "11 ### ####"]), iban=None, tld="co.za", origin=None,
+               forms=["(Pty) Ltd", "Ltd"], sectors=["Holdings", "Mining", "Services"],
+               orgs={"company": ["{w} {F}", "{w} {s} {F}"], "public": ["City of {c}"]}),
+    "ru": dict(fr="Russie", en="Russia", w=(0.5, 0.8), street="comma", line="pc",
+               phone=("+7", ["9## ###-##-##", "495 ###-##-##"]), iban=None, tld="ru", origin="east_slavic",
+               forms=["OOO", "AO"], sectors=["Trade", "Stroy"], orgs={"company": ["{F} {w}"]}),
+    "ua": dict(fr="Ukraine", en="Ukraine", w=(1, 1.5), street="comma", line="pc",
+               phone=("+380", ["67 ### ## ##", "44 ### ## ##"]), iban="6n19n", tld="ua", origin="east_slavic",
+               forms=["TOV", "PrAT"], sectors=["Trade", "Agro"], orgs={"company": ["{F} {w}"]}),
+}
+
+# The provinces of Canada in French, for "Montréal (Québec) H2X 1Z5".
+CANADA_PROVINCES_FR = {"QC": "Québec", "ON": "Ontario", "BC": "Colombie-Britannique", "AB": "Alberta",
+                       "MB": "Manitoba", "NB": "Nouveau-Brunswick", "NS": "Nouvelle-Écosse", "SK": "Saskatchewan"}
+
+# E-mail providers by naming tradition, for the persons whose name comes from it.
+ORIGIN_MAIL = {
+    "germanic": ["gmx.de", "web.de", "t-online.de", "gmx.at", "bluewin.ch"],
+    "dutch": ["ziggo.nl", "kpnmail.nl", "telenet.be"],
+    "nordic": ["telia.com", "online.no", "jubii.dk"],
+    "italy": ["libero.it", "virgilio.it", "tiscali.it"],
+    "iberia": ["yahoo.es", "telefonica.net", "hotmail.es"],
+    "portugal": ["sapo.pt", "uol.com.br", "terra.com.br"],
+    "latam": ["hotmail.com", "yahoo.com.mx", "prodigy.net.mx"],
+    "poland": ["wp.pl", "onet.pl", "o2.pl", "seznam.cz"],
+    "east_slavic": ["mail.ru", "yandex.ru", "ukr.net"],
+    "balkan": ["yahoo.gr", "freemail.hu", "yahoo.ro"],
+    "turkey": ["mynet.com", "hotmail.com.tr"],
+    "maghreb": ["menara.ma", "yahoo.fr", "topnet.tn"],
+    "arabic": ["hotmail.com", "yahoo.com"],
+    "persian": ["yahoo.com", "chmail.ir"],
+    "hebrew": ["walla.co.il", "gmail.com"],
+    "south_asia": ["rediffmail.com", "yahoo.co.in"],
+    "china": ["qq.com", "163.com", "126.com"],
+    "japan": ["yahoo.co.jp", "docomo.ne.jp"],
+    "korea": ["naver.com", "daum.net"],
+    "vietnam": ["yahoo.com.vn", "gmail.com"],
+    "africa": ["yahoo.com", "gmail.com"],
+    "west_africa": ["yahoo.fr", "orange.sn"],
+}
 
 
 # ----------------------------------------------------------------------------------
@@ -1131,8 +1684,9 @@ SEX_VALUES = {"fr": {"f": ["F", "F", "Féminin", "Femme"], "m": ["M", "M", "Masc
 
 class Generator:
     def __init__(self, res: Resources, lang: str, rng: random.Random, pool: str, procedural: float,
-                 noise: float):
+                 noise: float, abroad: float = 0.0):
         self.res = res
+        self.abroad = abroad
         self.lang = lang
         self.lex = res.lex[lang]
         self.rng = rng
@@ -1144,6 +1698,7 @@ class Generator:
         self.orgs: Dict[str, Org] = {}
         self.genders: Dict[str, str] = {}
         self.org_kinds: Dict[str, str] = {}
+        self.abroad_places = set()
         self.style = {}
 
     # -- document style ---------------------------------------------------------------
@@ -1151,6 +1706,7 @@ class Generator:
     def new_document(self, genre: str):
         r = self.rng
         self.people, self.places, self.orgs, self.genders, self.org_kinds = {}, {}, {}, {}, {}
+        self.abroad_places = set()
         formal = genre in ("form", "letter", "hr", "legal", "medical", "table", "banking", "real_estate", "admin")
         self.style = {
             "upper_family": r.random() < (0.45 if formal else 0.12) and self.lang == "fr",
@@ -1174,18 +1730,20 @@ class Generator:
                 self.genders.setdefault(node[3], node[2])
             elif node[0] == "slot" and node[1] == "ORG" and node[2] and node[3]:
                 self.org_kinds.setdefault(node[3], node[2])
+            elif node[0] == "slot" and node[2] == "abroad" and node[3]:
+                self.abroad_places.add(node[3])
             elif node[0] == "choice":
                 for alternative in node[1]:
                     self.constrain(alternative)
 
     # -- lexicon access ---------------------------------------------------------------
 
-    def pick(self, name: str, where=None) -> str:
-        fields = self.lex[name].pick(self.rng, self.pool, where)
+    def pick(self, name: str, where=None, key=None) -> str:
+        fields = self.lex[name].pick(self.rng, self.pool, where, key)
         return fields[0] if fields else ""
 
-    def pick_fields(self, name: str, where=None) -> Tuple[str, ...]:
-        return self.lex[name].pick(self.rng, self.pool, where) or ("",)
+    def pick_fields(self, name: str, where=None, key=None) -> Tuple[str, ...]:
+        return self.lex[name].pick(self.rng, self.pool, where, key) or ("",)
 
     def in_split(self, value: str) -> bool:
         """Whether a procedural value belongs to the part of the current split: the hash
@@ -1209,17 +1767,26 @@ class Generator:
         parts = SURNAME_PARTS.get(tradition) or SURNAME_PARTS["fr"]
 
         def make():
-            name = self.rng.choice(parts[0]) + self.rng.choice(parts[1])
-            if name.startswith("Le ") and len(name) > 3:
-                name = "Le " + name[3:4].upper() + name[4:]
-            return name
+            prefix, suffix = self.rng.choice(parts[0]), self.rng.choice(parts[1])
+            # "Ben Kacem", "O'Brien", "Al-Haddad": after a particle the name takes a capital; "Bouzaoui"
+            # and "Le Bihan" are written in one word, "MacDonald" keeps both capitals.
+            if prefix[-1:] in (" ", "'", "-"):
+                suffix = suffix[:1].upper() + suffix[1:]
+            elif prefix and tradition != "gaelic":
+                suffix = suffix[:1].lower() + suffix[1:]
+            return prefix + suffix
         return self.split_value(make)
 
     # Origins whose family names the procedural generator can imitate.
     TRADITIONS = {"fr": ["fr", "fr", "breton", "alsace", "occitan"], "breton": ["breton"], "alsace": ["alsace"],
                   "occitan": ["occitan"], "italy": ["italy"], "iberia": ["iberia"], "portugal": ["iberia"],
-                  "poland": ["poland"], "east_europe": ["poland"], "anglo": ["anglo"], "irish": ["anglo"],
-                  "scottish": ["anglo"]}
+                  "latam": ["iberia"], "hispanic": ["iberia"], "poland": ["poland"], "east_europe": ["poland"],
+                  "anglo": ["anglo"], "irish": ["gaelic", "anglo"], "scottish": ["gaelic", "anglo"],
+                  "germanic": ["germanic"], "dutch": ["dutch"], "nordic": ["nordic"], "east_slavic": ["slavic_east"],
+                  "balkan": ["greek"], "turkey": ["turkish"], "maghreb": ["arabic"], "arabic": ["arabic"],
+                  "middle_east": ["arabic"], "persian": ["persian"], "armenia": ["armenian"],
+                  "caucasus": ["armenian"], "south_asia": ["south_asia"], "japan": ["japan"],
+                  "africa": ["nigeria"]}
 
     def make_family(self, origin: Optional[str] = None) -> str:
         """A family name, of the same origin as the given name most of the time: mixed
@@ -1231,20 +1798,23 @@ class Generator:
             if origin:
                 tradition = r.choice(self.TRADITIONS[origin])
             elif self.lang == "fr":
-                tradition = r.choices(["fr", "breton", "alsace", "occitan", "italy", "iberia", "poland", "anglo"],
-                                      [40, 15, 8, 8, 8, 8, 5, 3])[0]
+                tradition = r.choices(["fr", "breton", "alsace", "occitan", "italy", "iberia", "poland", "anglo",
+                                       "arabic", "germanic", "turkish", "slavic_east", "greek", "nigeria"],
+                                      [36, 13, 7, 7, 7, 7, 4, 3, 6, 3, 2, 2, 2, 1])[0]
             else:
-                tradition = r.choices(["anglo", "fr", "italy", "iberia", "poland"], [70, 8, 8, 8, 6])[0]
+                tradition = r.choices(["anglo", "gaelic", "fr", "italy", "iberia", "poland", "germanic", "nordic",
+                                       "south_asia", "nigeria", "slavic_east", "japan", "dutch"],
+                                      [55, 6, 5, 6, 6, 4, 3, 2, 5, 3, 2, 1, 2])[0]
             name = self.procedural_family(tradition)
         else:
             where = (lambda f: len(f) > 1 and f[1] == origin) if origin else None
-            name = self.pick("family", where)
+            name = self.pick("family", where, ("origin", origin) if origin else None)
         x = r.random()
         if x < 0.03:
             other = self.pick("family")
             if other and other != name and " " not in other:
                 name = name + "-" + other
-        elif x < 0.06 and self.lang == "fr" and " " not in name and "'" not in name and \
+        elif x < 0.06 and self.lang == "fr" and origin in (None, "fr") and " " not in name and "'" not in name and \
                 name[:2].lower() not in ("le", "la", "de", "du"):
             if name[0] in "AEIOUYÉ":
                 name = "d'" + name
@@ -1258,7 +1828,7 @@ class Generator:
         fields = self.pick_fields(lex)
         name, origin = fields[0], (fields[1] if len(fields) > 1 else None)
         if self.lang == "fr" and origin == "fr" and r.random() < 0.05 and "-" not in name:
-            other = self.pick(lex, lambda f: len(f) > 1 and f[1] == "fr")
+            other = self.pick(lex, lambda f: len(f) > 1 and f[1] == "fr", ("origin", "fr"))
             if other and other != name and "-" not in other:
                 name = name + "-" + other
         return (name, origin) if with_origin else name
@@ -1270,6 +1840,7 @@ class Generator:
             p.gender = "f" if self.rng.random() < 0.5 else "m"
             p.gender = self.genders.get(key, p.gender)
             p.given, origin = self.make_given(p.gender, True)
+            p.origin = origin
             p.family = self.make_family(origin)
             if p.gender == "f" and self.rng.random() < 0.3:
                 p.birth_name = self.make_family()
@@ -1323,9 +1894,47 @@ class Generator:
             ff = ascii_fold(p.family).lower().replace(" ", "").replace("'", "")
             local = r.choice([gf + "." + ff, gf[:1] + "." + ff, gf[:1] + ff, ff + "." + gf, gf + ff,
                               gf + "." + ff + str(r.randint(1, 99)), gf + "_" + ff])
-            domain = org.domain if org else r.choice(FREE_MAIL[self.lang])
+            if org:
+                domain = org.domain
+            elif p.origin in ORIGIN_MAIL and r.random() < 0.45:
+                domain = r.choice(ORIGIN_MAIL[p.origin])
+            else:
+                domain = r.choice(FREE_MAIL[self.lang])
             p.email[key] = local + "@" + domain
         return p.email[key]
+
+    def nickname(self, p: Person) -> str:
+        """A nickname, drawn once: from the lexicon, or made from the name: the first
+        syllable doubled ("Juju", "Lulu"), a short form ("Nico", "Fred"), the family name
+        with -y ("Smithy")."""
+        if p.nick is None:
+            r = self.rng
+            given = p.given.split("-")[0].split(" ")[0]
+            family = p.family.split(" ")[-1].split("-")[0]
+            x = r.random()
+            value = ""
+            if x < 0.65 and len(self.lex["nicknames"]):
+                value = self.pick("nicknames", lambda f: len(f) < 2 or f[1] in (p.gender, "x"), ("gender", p.gender))
+            elif x < 0.8 and self.lang == "fr":
+                vowels = "aeiouyàâäéèêëîïôöùûü"
+                m = re.match(r"([^%s]{1,2}[%s])" % (vowels, vowels), given.lower())
+                if m and len(given) > len(m.group(1)) + 1:
+                    value = m.group(1).capitalize() + m.group(1)
+            elif x < 0.9 and len(given) >= 6:
+                value = given[:4] if given[3].lower() not in "aeiouy" else given[:3]
+            elif self.lang == "en" and family[-1:].lower() not in "aeiouy" and " " not in family:
+                value = family + "y"
+            p.nick = value or self.pick("nicknames") or given
+        return p.nick
+
+    def stage_name(self, p: Person) -> str:
+        """A stage name, drawn once: "DJ Kerlys", "Lady Nova", "MC Zentiq", "Lil Momo"."""
+        if p.stage is None:
+            r = self.rng
+            base = self.invented_word() if r.random() < 0.6 else self.nickname(p)
+            p.stage = r.choice(["DJ ", "MC ", "Lil ", "Big ", "Lady " if p.gender == "f" else "King ",
+                                "Miss " if p.gender == "f" else "Young ", "", "", ""]) + base
+        return p.stage
 
     def country(self, p: Person) -> str:
         """The country of a person, drawn once with the weights of the language of the text."""
@@ -1396,10 +2005,30 @@ class Generator:
             name += r.choice(PROCEDURAL_CITY["fr_saint"][1])
         return name
 
-    def place(self, ident: Optional[str]) -> Place:
+    def world_country(self) -> str:
+        """A country of WORLD other than the home country of the language, by weight."""
+        codes = [c for c in WORLD if WORLD[c]["w"][0 if self.lang == "fr" else 1] > 0]
+        weights = [WORLD[c]["w"][0 if self.lang == "fr" else 1] for c in codes]
+        return self.rng.choices(codes, weights)[0]
+
+    def place(self, ident: Optional[str], abroad: Optional[bool] = None) -> Place:
+        """Place ident, drawn once: abroad when a slot asked for it or for the share of places
+        abroad, at home when abroad is False."""
         key = ident or "_%d" % len(self.places)
         if key not in self.places:
             pl = Place()
+            if abroad is None:
+                abroad = key in self.abroad_places or (self.rng.random() < self.abroad and
+                                                       len(self.lex["world_cities"]) > 0)
+            if abroad and len(self.lex["world_cities"]) > 0:
+                country = self.world_country()
+                fields = self.pick_fields("world_cities", lambda f: len(f) > 2 and f[2] == country,
+                                          ("country", country))
+                pl.city = fields[0]
+                pl.postal = fields[1] if len(fields) > 1 else ""
+                pl.country = fields[2] if len(fields) > 2 and fields[2] in WORLD else country
+                self.places[key] = pl
+                return pl
             if self.rng.random() < self.procedural:
                 pl.city = self.procedural_city()
                 if self.lang == "fr":
@@ -1420,6 +2049,62 @@ class Generator:
     def city_text(self, pl: Place) -> str:
         return pl.city.upper() if self.style["upper_city"] else pl.city
 
+    def country_name(self, pl: Place) -> str:
+        return WORLD[pl.country]["fr" if self.lang == "fr" else "en"]
+
+    def world_city_line(self, pl: Place, country_separator: Optional[str]) -> list:
+        """The city line of a place abroad, in the layout of its country, and the name of the
+        country after country_separator, unlabelled; no country when it is None."""
+        w = WORLD[pl.country]
+        city = (self.city_text(pl), "CITY")
+        postal = pl.postal
+        if not postal:
+            out = [city]
+        elif w["line"] == "pc":
+            out = [(postal, "POSTAL_CODE"), (" ", None), city]
+        elif w["line"] == "cp":
+            out = [city, (" ", None), (postal, "POSTAL_CODE")]
+        else:
+            # The state or province first: "QC H2X 1Z5", "NSW 2000", "SP 01001-000", "CDMX 06600".
+            head, _, tail = postal.partition(" ")
+            if not tail:
+                out = [city, (" ", None), (postal, "POSTAL_CODE")]
+            elif pl.country == "au":
+                out = [city, (" " + head + " ", None), (tail, "POSTAL_CODE")]
+            elif pl.country == "br":
+                out = [city, (" - " + head + ", ", None), (tail, "POSTAL_CODE")]
+            elif pl.country == "mx":
+                out = [(tail, "POSTAL_CODE"), (" ", None), city, (", " + head, None)]
+            elif pl.country == "ca" and self.lang == "fr":
+                out = [city, (" (" + CANADA_PROVINCES_FR.get(head, head) + ") ", None), (tail, "POSTAL_CODE")]
+            else:
+                out = [city, (", " + head + " ", None), (tail, "POSTAL_CODE")]
+        if country_separator is not None:
+            out.append((country_separator + self.country_name(pl), None))
+        return out
+
+    def world_street(self, pl: Place) -> str:
+        """The street line of a place abroad: "Hauptstraße 12", "Calle Mayor, 5", "12 rue
+        Mohammed V", "2-11-3 Meguro"."""
+        r = self.rng
+        name = self.pick("world_streets", lambda f: len(f) > 1 and f[1] == pl.country,
+                         ("country", pl.country)) or "Main Street"
+        order = WORLD[pl.country]["street"]
+        number = str(r.choice([r.randint(1, 40), r.randint(1, 180)]))
+        if order == "block":
+            return "%d-%d-%d %s" % (r.randint(1, 5), r.randint(1, 30), r.randint(1, 20), name)
+        if order == "after":
+            return name + " " + number
+        if order == "comma":
+            return name + ", " + number
+        if order == "no":
+            return name + r.choice([" No: ", " No:", " No. "]) + number
+        if order == "nr":
+            return name + r.choice([" nr. ", " nr "]) + number
+        # "12, rue Mohammed V": the comma of the French-speaking countries.
+        comma = pl.country in ("lu", "ma", "dz", "tn", "sn", "ci", "cm") or (pl.country == "ca" and self.lang == "fr")
+        return number + (", " if comma and r.random() < 0.3 else " ") + name
+
     def english_city_line(self, pl: Place, separator: str) -> list:
         """Boston, MA 02108 for a ZIP code; London SW1A 1AA or the postcode on its own
         line for a British one."""
@@ -1438,6 +2123,8 @@ class Generator:
     def street(self, pl: Place, numbered: bool = False) -> str:
         """The street line of a place, drawn once; numbered guarantees a house number, for
         the templates that write "au {STREET:numbered#1}"."""
+        if pl.street is None and pl.country:
+            pl.street = self.world_street(pl)
         if pl.street is None:
             r = self.rng
             name = self.pick("streets")
@@ -1462,7 +2149,7 @@ class Generator:
                     pl.complement = r.choice(["Flat %d" % r.randint(1, 30), "Apt %d" % r.randint(1, 30),
                                               "Unit %d" % r.randint(1, 12)])
                     pl.flat_first = True
-        elif numbered and self.lang == "fr" and not pl.street[:1].isdigit():
+        elif numbered and self.lang == "fr" and not pl.country and not pl.street[:1].isdigit():
             pl.street = str(self.rng.randint(1, 40)) + " " + pl.street[:1].lower() + pl.street[1:]
         return pl.street
 
@@ -1498,14 +2185,56 @@ class Generator:
             word = self.split_value(lambda: r.choice(onsets) + r.choice(codas))
         return word
 
+    # The categories of known_orgs.txt drawn for each kind of organisation, and how often.
+    KNOWN_KINDS = {"company": (("company", "retail", "media", "airline", "transport", "telecom", "energy",
+                                "insurer"), 0.1),
+                   "shop": (("retail",), 0.15), "bank": (("bank", "insurer"), 0.3), "school": (("university",), 0.12),
+                   "health": (("hospital",), 0.08), "association": (("ngo", "club"), 0.12)}
+
+    def known_org(self, kind: str) -> Optional[Tuple[str, str]]:
+        """An organisation known by its own name, for a share of the organisations of a
+        kind: the name and the word of its domain."""
+        r = self.rng
+        categories, share = self.KNOWN_KINDS.get(kind, ((), 0))
+        if not categories or not len(self.lex["known_orgs"]) or r.random() >= share:
+            return None
+        name = self.pick("known_orgs", lambda f: len(f) > 1 and f[1] in categories, ("categories", categories))
+        if not name:
+            return None
+        return name, re.sub(r"[^a-z0-9]", "", ascii_fold(name).lower())
+
+    def world_org_name(self, kind: str, pl: Place) -> Optional[str]:
+        """The name of an organisation of a place abroad, in the forms of its country."""
+        w = WORLD[pl.country]
+        group = {"court": "public", "police": "public", "council": "public", "prefecture": "public",
+                 "law": "company", "shop": "company"}.get(kind, kind)
+        patterns = w["orgs"].get(group) or (w["orgs"]["company"] if group not in ("public",) else None)
+        if not patterns:
+            return None
+        r = self.rng
+        origin = w["origin"]
+        return r.choice(patterns).format(
+            w=self.invented_word(), f=self.make_family(origin), f2=self.make_family(origin), c=pl.city,
+            g=self.make_given(r.choice("fm")), s=r.choice(w["sectors"]), F=r.choice(w["forms"]))
+
     def org_name(self, kind: str, key: str) -> Tuple[str, str]:
         """The name of an organisation of the given kind, and the word its domain is
         made from."""
         r = self.rng
+        known = self.known_org(kind)
+        if known:
+            return known
+        # French bodies (prefectures, courts, police) stay at home; the others may lie abroad.
+        pl = self.place("_org" + key, False if kind in ("court", "police", "council", "prefecture") else None)
+        if pl.country:
+            name = self.world_org_name(kind, pl)
+            if name:
+                return name, re.sub(r"[^a-z0-9]", "", ascii_fold(name.split(" ")[0]).lower()) or "org"
+            pl = self.place("_org_home" + key, False)
         fam = self.make_family()
         fam2 = self.make_family()
         word = self.invented_word()
-        city = self.place("_org" + key).city
+        city = pl.city
         of_city = french_de(city)
         forms, sectors = ORG_FORMS[self.lang], ORG_SECTORS[self.lang]
         if self.lang == "fr":
@@ -1605,8 +2334,12 @@ class Generator:
             o.name, base = self.org_name(kind or "company", key)
             o.article = self.article(o.name) if kind in ("public", "court", "police", "council", "prefecture") else ""
             base = ascii_fold(base).lower().replace(" ", "").replace("'", "")
-            o.domain = base + "." + r.choice(["fr", "fr", "com", "eu", "net"] if self.lang == "fr"
-                                              else ["com", "co.uk", "com", "io", "net"])
+            pl = self.places.get("_org" + key)
+            if pl is not None and pl.country and r.random() < 0.7:
+                o.domain = base + "." + WORLD[pl.country]["tld"]
+            else:
+                o.domain = base + "." + r.choice(["fr", "fr", "com", "eu", "net"] if self.lang == "fr"
+                                                  else ["com", "co.uk", "com", "io", "net"])
             siren = "".join(str(r.randint(0, 9)) for _ in range(8))
             siren += str(luhn_digit(siren))
             nic = "".join(str(r.randint(0, 9)) for _ in range(4))
@@ -1631,8 +2364,30 @@ class Generator:
             return r.choice(["%s %d, %d" % (EN_MONTHS[m - 1], d, y), "%d %s %d" % (d, EN_MONTHS[m - 1], y)])
         return "%d %s %d" % (d, EN_MONTHS[m - 1], y)
 
+    def world_phone(self) -> str:
+        """A telephone number of another country in its international form: "+49 30 12345678"."""
+        r = self.rng
+        prefix, layouts = WORLD[self.world_country()]["phone"]
+        number = "".join(str(r.randint(0, 9)) if ch == "#" else ch for ch in r.choice(layouts))
+        return prefix + " " + number
+
+    def world_iban(self) -> str:
+        """The IBAN of another country, with valid check digits."""
+        r = self.rng
+        codes = [c for c in WORLD if WORLD[c]["iban"] and WORLD[c]["w"][0 if self.lang == "fr" else 1] > 0]
+        code = r.choices(codes, [WORLD[c]["w"][0 if self.lang == "fr" else 1] for c in codes])[0]
+        bban = ""
+        for count, kind in re.findall(r"(\d+)([an])", WORLD[code]["iban"]):
+            alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ" if kind == "a" else "0123456789"
+            bban += "".join(r.choice(alphabet) for _ in range(int(count)))
+        cc = code.upper()
+        iban = cc + "%02d" % (98 - mod97(bban + cc + "00")) + bban
+        return " ".join(iban[i:i + 4] for i in range(0, len(iban), 4)) if r.random() < 0.7 else iban
+
     def phone_text(self) -> str:
         r = self.rng
+        if self.abroad and r.random() < self.abroad * 0.6:
+            return self.world_phone()
         if self.lang == "fr":
             first = r.choice(["06", "07", "06", "02", "01", "03", "04", "05", "09"])
             digits = first + "".join("%02d" % r.randint(0, 99) for _ in range(4))
@@ -1653,6 +2408,8 @@ class Generator:
 
     def iban_text(self) -> str:
         r = self.rng
+        if self.abroad and r.random() < self.abroad * 0.5:
+            return self.world_iban()
         if self.lang == "en" and r.random() < 0.8:
             bban = "".join(r.choice("ABCDEFGHIJKLMNOPQRSTUVWXYZ") for _ in range(4)) + "%06d%08d" % (
                 r.randint(0, 999999), r.randint(0, 99999999))
@@ -1792,6 +2549,9 @@ class Generator:
             return [(self.email(p, o), "EMAIL")]
         if name == "USERNAME":
             return [(self.username(self.person(ident)), "USERNAME")]
+        if name == "NICK":
+            p = self.person(ident)
+            return [(self.stage_name(p) if variant == "stage" else self.nickname(p), "GIVEN_NAME")]
         if name == "HANDLE":
             p = self.person(ident)
             if p.handle is None:
@@ -1818,9 +2578,15 @@ class Generator:
             pl = self.place(ident)
             return [(pl.city.upper() if variant == "upper" else self.city_text(pl), "CITY")]
         if name == "POSTAL":
-            return [(self.place(ident).postal, "POSTAL_CODE")]
+            pl = self.place(ident)
+            postal = pl.postal
+            if pl.country and WORLD[pl.country]["line"] == "state" and " " in postal:
+                postal = postal.partition(" ")[2]
+            return [(postal, "POSTAL_CODE")]
         if name == "CITYLINE":
             pl = self.place(ident)
+            if pl.country:
+                return self.world_city_line(pl, r.choice(["\n", ", ", None]))
             if fr:
                 out = [(pl.postal, "POSTAL_CODE"), (" ", None)] if pl.postal else []
                 out.append((pl.city.upper() if r.random() < 0.6 else self.city_text(pl), "CITY"))
@@ -1838,6 +2604,8 @@ class Generator:
         if name == "ADDRESS":
             pl = self.place(ident)
             out = self.street_fragments(pl) + [(", ", None)]
+            if pl.country:
+                return out + self.world_city_line(pl, ", " if r.random() < 0.6 else None)
             if fr:
                 if pl.postal:
                     out += [(pl.postal, "POSTAL_CODE"), (" ", None)]
@@ -1850,6 +2618,8 @@ class Generator:
                 if pl.complement is None:
                     pl.complement = self.complement()
                 out += [(pl.complement, "STREET_ADDRESS"), ("\n", None)]
+            if pl.country:
+                return out + self.world_city_line(pl, "\n" if r.random() < 0.7 else None)
             return out + self.slot(("slot", "CITYLINE", None, ident, None))
         if name == "ORG":
             return [(self.org(ident, variant).name, "ORGANIZATION")]
@@ -1877,7 +2647,17 @@ class Generator:
             return [(str(r.randint(19, 88)), None)]
         if name == "AMOUNT":
             v = r.randint(10, 99999) + r.randint(0, 99) / 100
-            return [(("%.2f" % v).replace(".", ",") + " €" if fr else "£%.2f" % v, None)]
+            x = r.random()
+            if fr:
+                unit = " €" if x < 0.88 else r.choice([" CHF", " $ CA", " MAD", " DA", " FCFA", " $"])
+                return [(("%.2f" % v).replace(".", ",") + unit, None)]
+            if x < 0.55:
+                return [("£%.2f" % v, None)]
+            if x < 0.8:
+                return [("$%.2f" % v, None)]
+            if x < 0.92:
+                return [("€%.2f" % v, None)]
+            return [(r.choice(["CA$", "A$", "₹", "R", "¥"]) + "%.2f" % v, None)]
         if name == "IBAN":
             return [(self.iban_text(), "IBAN")]
         if name == "CARD":
@@ -2186,7 +2966,10 @@ SPLITS = [
     ("test_noisy", 2000, "all", 0.25, 6.0, None),
     ("test_negatives", 2000, "all", 0.25, 1.0, {"negative", "prose"}),
     ("test_documents", 1000, "all", 0.25, 1.0, "documents"),
+    ("test_abroad", 4000, "all", 0.25, 1.0, None),
 ]
+# The splits whose places all lie abroad, whatever --abroad-share says.
+ABROAD_SPLITS = {"test_abroad"}
 
 
 def choose_template(res: Resources, lang: str, rng: random.Random, genres) -> Tuple[str, list]:
@@ -2248,7 +3031,7 @@ def with_context(gen, res: Resources, lang: str, rng: random.Random, fragments: 
 
 def build_split(res: Resources, name: str, count: int, pool: str, procedural: float, noise: float, genres,
                 seed: int, languages: List[str], fr_share: float, stats: dict, context_rate: float = 0.0,
-                prose_share: float = 0.0, exclude: Optional[set] = None) -> List[str]:
+                prose_share: float = 0.0, exclude: Optional[set] = None, abroad: float = 0.0) -> List[str]:
     """count examples; with exclude, the texts it holds are drawn again, a few times at
     most, so that an evaluation split repeats no training text."""
     rng = random.Random("%s|%d" % (name, seed))
@@ -2257,7 +3040,7 @@ def build_split(res: Resources, name: str, count: int, pool: str, procedural: fl
     for _ in range(count):
         for attempt in range(30):
             lang = languages[0] if len(languages) == 1 else ("fr" if rng.random() < fr_share else "en")
-            gen = Generator(res, lang, rng, pool, procedural, noise)
+            gen = Generator(res, lang, rng, pool, procedural, noise, abroad)
             prose_genre = genres is not None and genres != "documents" and "prose" in genres
             if genres == "documents":
                 genre, parts = "documents", []
@@ -2340,6 +3123,8 @@ def main():
                                                                    "plain sentences without personal data")
     p.add_argument("--prose-share", type=float, default=0.06, help="share of the examples made of such "
                                                                    "sentences alone")
+    p.add_argument("--abroad-share", type=float, default=0.15, help="share of the places, organisations, "
+                                                                     "telephone numbers and IBANs of other countries")
     p.add_argument("--sample", type=int, default=0, help="print this many examples with their spans and exit")
     for name, count, _, _, _, _ in SPLITS:
         p.add_argument("--" + name.replace("_", "-"), type=int, default=count,
@@ -2357,8 +3142,8 @@ def main():
             sys.exit("error: unsupported language: %s (fr and en are supported)" % lang)
     if not 0 <= args.fr_share <= 1:
         sys.exit("error: --fr-share lies between 0 and 1")
-    if not 0 <= args.context_rate <= 1 or not 0 <= args.prose_share <= 1:
-        sys.exit("error: --context-rate and --prose-share lie between 0 and 1")
+    if not 0 <= args.context_rate <= 1 or not 0 <= args.prose_share <= 1 or not 0 <= args.abroad_share <= 1:
+        sys.exit("error: --context-rate, --prose-share and --abroad-share lie between 0 and 1")
     if not 0 <= args.unseen_percent <= 100:
         sys.exit("error: --unseen-percent lies between 0 and 100")
     for name, _, _, _, _, _ in SPLITS:
@@ -2369,7 +3154,7 @@ def main():
     if args.sample:
         stats = {}
         lines = build_split(res, "sample", args.sample, "all", 0.25, 1.0, None, args.seed, languages,
-                            args.fr_share, stats, args.context_rate, args.prose_share)
+                            args.fr_share, stats, args.context_rate, args.prose_share, None, args.abroad_share)
         for line in lines:
             text, _, spans = line.rpartition("\t")
             raw = unescape(text)
@@ -2391,7 +3176,8 @@ def main():
             continue
         lines = build_split(res, name, count, pool, procedural, noise, genres, args.seed, languages,
                             args.fr_share, stats, args.context_rate, args.prose_share,
-                            None if name == "train" else train_texts)
+                            None if name == "train" else train_texts,
+                            1.0 if name in ABROAD_SPLITS else args.abroad_share)
         if name == "train":
             train_texts = set(unescape(line.rpartition("\t")[0]) for line in lines)
         with open(os.path.join(args.out_dir, name + ".tsv"), "w", encoding="utf-8", newline="\n") as f:

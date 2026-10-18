@@ -6,6 +6,7 @@
 #include "pii_sequence_tagger_abstract.h"
 
 #include <cmath>
+#include <cstdint>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -178,8 +179,8 @@ namespace dlib
     public:
         struct unit
         {
-            std::vector<unsigned long long> features;   // hashed, before the conjunction with a label
-            bool opens_segment = false;                 // first token of a line or of a cell
+            std::vector<std::uint32_t> features;    // hashed, before the conjunction with a label
+            bool opens_segment = false;             // first token of a line or of a cell
         };
         typedef std::vector<unit> sequence_type;
 
@@ -200,7 +201,7 @@ namespace dlib
             return (1UL << bits_) + l * l + l;
         }
 
-        unsigned long emission_index(unsigned long long feature, unsigned long label) const
+        unsigned long emission_index(std::uint32_t feature, unsigned long label) const
         {
             return static_cast<unsigned long>(privacy_impl::mix_label(feature, label) & ((1ULL << bits_) - 1));
         }
@@ -227,7 +228,7 @@ namespace dlib
         ) const
         {
             const unsigned long label = y(0);
-            for (unsigned long long f : x[position].features)
+            for (std::uint32_t f : x[position].features)
                 set_feature(emission_index(f, label));
             const unsigned long l = num_labels();
             const unsigned long base = 1UL << bits_;
@@ -320,9 +321,11 @@ namespace dlib
             };
             for (std::size_t i = 0; i < n; ++i)
             {
-                std::vector<unsigned long long>& f = seq[i].features;
+                std::vector<std::uint32_t>& f = seq[i].features;
+                // Both halves of the hash folded into the 32 bits kept for each feature.
                 auto add = [&](const char* name, const std::string& value) {
-                    f.push_back(feature_hash(name, value));
+                    const unsigned long long h = feature_hash(name, value);
+                    f.push_back(static_cast<std::uint32_t>(h ^ (h >> 32)));
                 };
                 const long k = static_cast<long>(i);
                 add("b", "");
@@ -397,6 +400,7 @@ namespace dlib
         unsigned long num_threads = 2;
         unsigned long hash_bits = 20;
         double entity_loss = 2;
+        unsigned long max_cache_size = 0;
         bool verbose = false;
     };
 
@@ -434,6 +438,7 @@ namespace dlib
             trainer.set_epsilon(options.epsilon);
             trainer.set_max_iterations(options.max_iterations);
             trainer.set_num_threads(options.num_threads);
+            trainer.set_max_cache_size(options.max_cache_size);
             for (unsigned long label = 1; label < fe.num_labels(); ++label)
                 trainer.set_loss(label, options.entity_loss);
             if (options.verbose) trainer.be_verbose();
@@ -463,7 +468,7 @@ namespace dlib
                 units.push_back(std::make_pair(tokens[i].begin, tokens[i].end));
                 if (classes[i] == 0) continue;
                 double margin = 0;
-                for (unsigned long long f : x[i].features)
+                for (std::uint32_t f : x[i].features)
                     margin += w(fe.emission_index(f, classes[i])) - w(fe.emission_index(f, 0));
                 confidence[i] = 1.0 / (1.0 + std::exp(-margin));
             }
