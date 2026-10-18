@@ -2780,7 +2780,8 @@ namespace dlib
                 "beneficiaire assure assuree permis cni compte ticket booking order invoice customer member "
                 "account policy claim student licence license case affaire requete pv proces-verbal plainte "
                 "contravention avis reclamation reclamations remboursement resiliation demande colis parcel "
-                "package envoi shipment tracking decision mrn sejour");
+                "package envoi shipment tracking decision mrn sejour file request application permit ref "
+                "reference tag company");
             static const std::unordered_set<std::string> fillers = make_word_set(
                 "n no nº num numero number nr de du d des ref reference id identifiant code est is le la votre "
                 "your vos the of our notre");
@@ -2795,8 +2796,9 @@ namespace dlib
                 while (p < n && p - words[k].e <= 30)
                 {
                     const char32_t ch = t.cps[p];
+                    // An opening quote too: reference "B4694342".
                     if (ch == ' ' || ch == ':' || ch == '#' || ch == 0xB0 || ch == 0xBA || ch == '.' || ch == '\'' ||
-                        ch == 0x2019 || ch == '-' || ch == 0xA0)
+                        ch == 0x2019 || ch == '-' || ch == 0xA0 || ch == '"' || ch == 0xAB || ch == 0x201C)
                     { ++p; continue; }
                     if (w < words.size() && words[w].b == p && fillers.count(words[w].key) && skipped < 4 &&
                         !(is_ascii_digit(t.at(words[w].e))))
@@ -2821,6 +2823,17 @@ namespace dlib
                 }
                 if (alnum < 4 || alnum > 32 || digits < 2 || is_word_char(t.at(e))) continue;
                 if (alnum == 4 && digits == 4 && (t.cps[p] == '1' || t.cps[p] == '2') && e == p + 4) continue;   // a year
+                // "the file export_2010.csv": a file name.
+                {
+                    std::size_t dot = e;
+                    while (dot > p && t.cps[dot - 1] != '.') --dot;
+                    if (dot > p)
+                    {
+                        std::string extension;
+                        for (std::size_t q = dot; q < e; ++q) utf8_append(extension, to_lower(t.cps[q]));
+                        if (file_extensions().count(extension)) continue;
+                    }
+                }
                 // "facture de 47370,72 €": an amount.
                 if (digits == alnum && t.at(e) == ',' && is_ascii_digit(t.at(e + 1))) continue;
                 {
@@ -2943,12 +2956,166 @@ namespace dlib
             }
         }
 
+        // The words of t in [b, e): letters and digits, with the hyphens and apostrophes inside them.
+        static std::vector<std::pair<std::size_t, std::size_t>> span_words(const utf8_text& t, std::size_t b,
+                                                                           std::size_t e)
+        {
+            using namespace privacy_impl;
+            std::vector<std::pair<std::size_t, std::size_t>> words;
+            for (std::size_t i = b; i < e;)
+            {
+                while (i < e && !is_word_char(t.cps[i])) ++i;
+                std::size_t j = i;
+                while (j < e && (is_word_char(t.cps[j]) ||
+                                 ((t.cps[j] == '-' || t.cps[j] == '\'' || t.cps[j] == 0x2019) && j + 1 < e &&
+                                  is_word_char(t.cps[j + 1]))))
+                    ++j;
+                if (j > i) words.push_back(std::make_pair(i, j));
+                i = j;
+            }
+            return words;
+        }
+
+        // A capital letter alone, or a letter followed by a period, is an initial: "A. Ferguson".
+        static bool initial_word(const utf8_text& t, const std::pair<std::size_t, std::size_t>& w)
+        {
+            return w.second == w.first + 1 && (privacy_impl::is_upper(t.cps[w.first]) || t.at(w.second) == '.');
+        }
+
+        // The first letter of the name in a word: after an elision, the one after the apostrophe ("d'Arras").
+        static char32_t name_letter(const utf8_text& t, const std::pair<std::size_t, std::size_t>& w)
+        {
+            std::size_t first = w.first;
+            for (std::size_t q = w.first + 1; q < w.second && q <= w.first + 2; ++q)
+                if ((t.cps[q] == '\'' || t.cps[q] == 0x2019) && q + 1 < w.second) first = q + 1;
+            return t.cps[first];
+        }
+
+        // The small words that belong to the name of a person ("de", "Le") or of a place ("sur", "les").
+        static bool name_particle(pii_type type, const std::string& key)
+        {
+            using namespace privacy_impl;
+            static const std::unordered_set<std::string> place_words = make_word_set("of upon on in by the et");
+            if (type == pii_type::person) return person_particles().count(key) != 0;
+            if (type == pii_type::location) return location_kept_words().count(key) || place_words.count(key);
+            return false;
+        }
+
+        /* A piece of a learned recognizer that names nothing and would spoil the name it is
+           merged with, made of whole words: a greeting alone ("Bonsoir" in "Bonsoir Maëlys"), a
+           field label alone unless it ends the name of a place ("City" in "Quebec City", after a
+           piece of the same type), function words that are no particle of a name ("Votre") and
+           a common word in lower case ("commande"). Pieces of words, particles and logins are
+           judged once merged by spurious_learned_span(). */
+        bool spurious_learned_piece(const std::string& text, const utf8_text& t, std::size_t b, std::size_t e,
+                                    pii_type type, bool after_same_type) const
+        {
+            using namespace privacy_impl;
+            if (type != pii_type::person && type != pii_type::location && type != pii_type::organization)
+                return false;
+            if ((b > 0 && is_letter(t.cps[b - 1]) && is_letter(t.cps[b])) ||
+                (e < t.size() && is_letter(t.cps[e - 1]) && is_letter(t.cps[e])))
+                return false;
+            const std::vector<std::pair<std::size_t, std::size_t>> words = span_words(t, b, e);
+            if (words.empty()) return true;
+            bool all_function = true, all_particles = true;
+            for (const auto& w : words)
+            {
+                const std::string key = fold_key(cp_substr(t, text, w.first, w.second));
+                if (initial_word(t, w) || !function_words().count(key)) all_function = false;
+                if (!name_particle(type, key)) all_particles = false;
+            }
+            if (all_particles) return false;
+            if (all_function) return true;
+            if (words.size() > 1 || initial_word(t, words[0])) return false;
+            const std::string key = fold_key(cp_substr(t, text, words[0].first, words[0].second));
+            const char32_t c = name_letter(t, words[0]);
+            if (greeting_words().count(key)) return true;
+            if (field_labels().count(key) && !(after_same_type && is_upper(c))) return true;
+            return type != pii_type::location && is_letter(c) && !is_upper(c) && common_words().count(key);
+        }
+
+        /* A span of a learned recognizer, its pieces merged, where the text holds no personal
+           data. A login inside a longer token, a file name ("final.docx" in
+           "rapport_final.docx"), a single character, or a common or function word in lower case
+           ("month", "for", "<note>"). A person, place or organisation that is a piece of a word
+           ("Rem" in "Remplacez"), function words alone ("Le"), a greeting or a field label alone
+           ("Nom"), a common word in lower case ("commande"), a name or place that joins a
+           capitalized word to lower case words ("Le projet", "Ajoutez la b"), or a word in lower
+           case, other than a first name, in a text that capitalizes its words ("de congés"). */
+        bool spurious_learned_span(const std::string& text, const utf8_text& t, std::size_t b, std::size_t e,
+                                   pii_type type, bool capitalized_text) const
+        {
+            using namespace privacy_impl;
+            const std::size_t n = t.size();
+            if (type == pii_type::identifier)
+            {
+                if (b > 0 && (is_word_char(t.cps[b - 1]) || t.cps[b - 1] == '_')) return true;
+                if (e == b + 1) return true;
+                const std::string key = fold_key(cp_substr(t, text, b, e));
+                const std::size_t dot = key.rfind('.');
+                if (dot != std::string::npos && file_extensions().count(key.substr(dot + 1))) return true;
+                bool lower_letters = true;
+                for (std::size_t q = b; q < e && lower_letters; ++q)
+                    if (!is_letter(t.cps[q]) || is_upper(t.cps[q])) lower_letters = false;
+                return lower_letters && (common_words().count(key) || function_words().count(key) ||
+                                         field_labels().count(key) || greeting_words().count(key));
+            }
+            if (type != pii_type::person && type != pii_type::location && type != pii_type::organization)
+                return false;
+            if (b > 0 && is_letter(t.cps[b - 1]) && is_letter(t.cps[b]) && !is_upper(t.cps[b])) return true;
+            if (e < n && is_letter(t.cps[e - 1]) && is_letter(t.cps[e]) && !is_upper(t.cps[e])) return true;
+            const std::vector<std::pair<std::size_t, std::size_t>> words = span_words(t, b, e);
+            if (words.empty()) return true;
+            std::vector<std::string> keys;
+            bool all_function = true;
+            for (const auto& w : words)
+            {
+                keys.push_back(fold_key(cp_substr(t, text, w.first, w.second)));
+                if (initial_word(t, w) || !function_words().count(keys.back())) all_function = false;
+            }
+            if (all_function) return true;
+            if (words.size() == 1 && !initial_word(t, words[0]))
+            {
+                // A common word in lower case is no name ("commande"); capitalized, it can be
+                // one ("Paris", "West", "Page").
+                const std::string& key = keys[0];
+                const char32_t c = name_letter(t, words[0]);
+                const bool lower = is_letter(c) && !is_upper(c);
+                if (greeting_words().count(key) || field_labels().count(key)) return true;
+                if (type != pii_type::location && lower && common_words().count(key)) return true;
+                // "lrisJohnson", glued, keeps a capital.
+                bool all_lower = lower;
+                for (std::size_t q = words[0].first; q < words[0].second && all_lower; ++q)
+                    if (is_upper(t.cps[q])) all_lower = false;
+                if (type != pii_type::organization && capitalized_text && all_lower &&
+                    !(type == pii_type::person && first_names().count(key) && !ambiguous_first_names().count(key)))
+                    return true;
+            }
+            if (type == pii_type::organization)
+            {
+                // "Le logiciel Excel": an article and a lower case word open no name.
+                return words.size() >= 2 && function_words().count(keys[0]) && !is_upper(t.cps[words[1].first]) &&
+                       is_letter(t.cps[words[1].first]);
+            }
+            bool capital = false, lower = false;
+            for (std::size_t k = 0; k < words.size(); ++k)
+            {
+                if (initial_word(t, words[k])) continue;
+                const char32_t c = name_letter(t, words[k]);
+                if (!is_letter(c)) continue;
+                if (is_upper(c)) capital = true;
+                else if (!name_particle(type, keys[k])) lower = true;
+            }
+            return capital && lower;
+        }
+
         void add_recognized(const std::string& text, const utf8_text& t, const std::vector<pii_span>& spans,
                             double min_confidence, std::vector<candidate>& out) const
         {
             using namespace privacy_impl;
             struct piece { std::size_t b, e; pii_type type; double confidence; int parts; };
-            std::vector<piece> pieces;
+            std::vector<piece> found;
             const std::size_t bytes = t.offsets.back();
             for (const pii_span& s : spans)
             {
@@ -2961,26 +3128,34 @@ namespace dlib
                 const std::size_t e = static_cast<std::size_t>(
                     std::lower_bound(t.offsets.begin(), t.offsets.end(), s.end) - t.offsets.begin());
                 if (e <= b || e > t.size()) continue;
-                // A greeting read as a name or a place: "Bonsoir, merci pour votre retour."
-                if ((type == pii_type::person || type == pii_type::location || type == pii_type::organization) &&
-                    greeting_words().count(fold_key(cp_substr(t, text, b, e))))
-                    continue;
-                pieces.push_back(piece{ b, e, type, s.confidence, 1 });
+                found.push_back(piece{ b, e, type, s.confidence, 1 });
             }
-            std::sort(pieces.begin(), pieces.end(), [](const piece& x, const piece& y) { return x.b < y.b; });
+            std::sort(found.begin(), found.end(), [](const piece& x, const piece& y) { return x.b < y.b; });
+            /* The gap between two pieces of one name: spaces and hyphens, at most two; the
+               pieces of a login meet ("v" and "wojcikski"). */
+            auto name_gap = [&](const piece& m, const piece& p) {
+                if (m.type == pii_type::identifier && p.type == pii_type::identifier) return p.b == m.e;
+                bool gap = m.type == p.type && (p.type == pii_type::person || p.type == pii_type::location) &&
+                           p.b >= m.e && p.b - m.e <= 2;
+                for (std::size_t k = m.e; k < p.b && gap; ++k)
+                    if (!(t.cps[k] == ' ' || is_hyphen(t.cps[k]))) gap = false;
+                return gap;
+            };
+            std::vector<piece> pieces;
+            for (std::size_t k = 0; k < found.size(); ++k)
+                if (!spurious_learned_piece(text, t, found[k].b, found[k].e, found[k].type,
+                                            k > 0 && name_gap(found[k - 1], found[k])))
+                    pieces.push_back(found[k]);
             /* A given name next to a family name is one person, a postal code next to its
-               city one place: they are replaced as a whole, like the rules do. */
-            std::vector<piece> merged;
+               city one place, and the pieces of a word one word: they are replaced as a
+               whole, like the rules do. */
+            std::vector<piece> joined;
             for (const piece& p : pieces)
             {
-                if (!merged.empty())
+                if (!joined.empty())
                 {
-                    piece& m = merged.back();
-                    bool gap = m.type == p.type && (p.type == pii_type::person || p.type == pii_type::location) &&
-                               p.b >= m.e && p.b - m.e <= 2;
-                    for (std::size_t k = m.e; k < p.b && gap; ++k)
-                        if (!(t.cps[k] == ' ' || is_hyphen(t.cps[k]))) gap = false;
-                    if (gap)
+                    piece& m = joined.back();
+                    if (name_gap(m, p))
                     {
                         m.e = p.e;
                         m.confidence = std::min(m.confidence, p.confidence);
@@ -2988,7 +3163,20 @@ namespace dlib
                         continue;
                     }
                 }
-                merged.push_back(p);
+                joined.push_back(p);
+            }
+            // Two capitalized words after the first one: the text capitalizes its names too.
+            std::size_t capitals = 0;
+            for (std::size_t i = 1; i < t.size() && capitals < 2; ++i)
+                if (is_upper(t.cps[i]) && !is_word_char(t.cps[i - 1])) ++capitals;
+            std::vector<piece> merged;
+            for (piece p : joined)
+            {
+                // The at sign of a handle belongs to it: "@hpetit38".
+                if (p.type == pii_type::identifier && p.b > 0 && t.cps[p.b - 1] == '@' &&
+                    (p.b == 1 || !is_word_char(t.cps[p.b - 2])))
+                    --p.b;
+                if (!spurious_learned_span(text, t, p.b, p.e, p.type, capitals >= 2)) merged.push_back(p);
             }
             /* A confident recognizer outranks the heuristics of the rules for the same
                categories, whose boundaries follow no annotation guideline, and stays below
@@ -3278,7 +3466,9 @@ namespace dlib
                              j + 1 < e && is_ascii_alnum_cp(t.cps[j + 1]) &&
                              (t.cps[j] != ' ' || is_ascii_digit(t.cps[j + 1])))))
                         ++j;
-                    if (j - k >= 3)
+                    // "Username: <username>": a placeholder names no account.
+                    const std::string key = fold_key(cp_substr(t, text, k, j));
+                    if (j - k >= 3 && !field_labels().count(key) && !common_words().count(key))
                         add(out, k, j, pii_type::identifier, 0.85, 4);
                     return;
                 }
@@ -3586,6 +3776,14 @@ namespace dlib
                     start = q;
                     number = true;
                 }
+                /* "le mail de Federica Marino" is an email, "à la place de Jean Martin" a
+                   replacement: in lower case and without a number, the word "mail", or a type
+                   followed by "de" and a first name, names no street. */
+                if (!number && w.shape == 0 &&
+                    (w.key == "mail" ||
+                     (k + 2 < words.size() && (words[k + 1].key == "de" || words[k + 1].key == "d") &&
+                      words[k + 2].shape == 1 && first_names().count(words[k + 2].key))))
+                    continue;
                 // Street name after the type.
                 std::size_t end = w.e, cursor = w.e;
                 std::size_t j = k + 1;

@@ -123,7 +123,9 @@ namespace dlib
                 encoding any more (the reports note it). In markup, everything outside the
                 replaced values keeps its exact bytes; a restored value is written with
                 plain characters, and a value that spanned several inline elements comes
-                back in the first of them.
+                back in the first of them. A tag never forms "]]>" with the text after it:
+                in character data its last bracket is written &#93;, and a CDATA section is
+                cut in two after it, then joined again by the restoration.
 
             THREAD SAFETY
                 One object processes one document at a time.

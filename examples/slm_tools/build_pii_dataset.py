@@ -7,7 +7,8 @@
 #
 # Writes annotated French and English texts in the format read by load_pii_dataset():
 # one example per line, the text with \\, \t, \n and \r escaped, a tab, then the spans
-# as begin:end:LABEL items, byte offsets into the UTF-8 text.
+# as begin:end:LABEL items, byte offsets into the UTF-8 text. The two languages come in
+# equal numbers unless --fr-share sets the share of French.
 #
 # WHY SYNTHETIC DATA
 #
@@ -97,7 +98,16 @@
 # measures how the models read names, places and organisations they never saw during
 # training. test_noisy applies heavy noise, test_negatives holds texts full of
 # capitalized words that are not personal data, and test_documents longer texts of
-# several paragraphs.
+# several paragraphs. No evaluation split repeats a text of train: an example drawn again
+# is replaced by another.
+#
+# CONTEXT
+#
+# Real paragraphs open with "Le dossier", "La réunion" or "Bonjour," far more often than
+# with a name. Plain sentences without personal data (sentences.txt) are written around a
+# share of the examples (--context-rate), before or after them, and form examples of their
+# own (--prose-share), so that the models do not read every capitalized word that opens a
+# text as a name. The sentences may use the filler slots and the choices of templates.
 #
 # RESOURCES
 #
@@ -114,6 +124,7 @@
 #   <lang>/institutions.txt                          one per line [<TAB> weight], the name of a
 #                                                    named body between brackets: "la [CAF]"
 #   <lang>/negatives.txt                             phrase <TAB> category [<TAB> weight]
+#   <lang>/sentences.txt                             sentence [<TAB> weight], no personal data
 #   <lang>/templates.txt                             genre <TAB> weight <TAB> template
 #
 # Usage:
@@ -237,6 +248,33 @@ le Président\nle Journal officiel\nla Saint-Valentin
     "fr/products.txt": """
 Excel\nWord\nWindows\nOutlook\nTeams\nSAP\nSalesforce\nLinux\nAndroid\niPhone
 """,
+    "fr/sentences.txt": r"""
+Le dossier est complet et sera transmis au service concerné.
+La réunion de suivi est reportée à {?jeudi|vendredi|la semaine prochaine}.
+Merci de compléter le formulaire avant la date limite.
+Veuillez trouver ci-joint le compte rendu de la réunion.
+Les congés sont validés par le responsable du service.
+Votre commande a été expédiée et sera livrée sous 48 heures.
+Il a été convenu de revoir le planning en fin de mois.
+Nous vous remercions pour votre retour rapide.
+Le logiciel {PRODUCT} doit être mis à jour sur tous les postes.
+Le projet « {?Horizon|Atlas|Phénix|Boréal} » entre dans sa deuxième phase.
+Remplacez <Nom> et <Prénom> par vos informations avant l'envoi.
+Le champ <adresse> est obligatoire.
+Le fichier {?rapport_final|compte_rendu|planning_v2|devis_2024}.{?docx|xlsx|pdf} est joint à ce message.
+Bonjour, je reviens vers vous au sujet de votre demande.
+Bonsoir, merci pour ces précisions.
+Cordialement,
+Bien à vous,
+Pour toute question, contactez le support.
+La procédure est décrite dans le guide « Bonnes pratiques ».
+Selon la note de service, l'accès au bâtiment est limité.
+Ce document est strictement confidentiel.
+Point d'étape : les tests sont terminés, la recette commence lundi.
+À noter : la mise en production est prévue en {?mars|juin|octobre}.
+Il faut prévoir une marge sur le budget.
+Les résultats seront présentés en comité.
+""",
     "fr/templates.txt": r"""
 form	4	Nom : {FAMILY#1}\nPrénom : {GIVEN#1}\nDate de naissance : {BIRTHDATE#1}\nLieu de naissance : {CITY#2}\nAdresse : {STREET#3}\n{CITYLINE#3}\nTéléphone : {PHONE#1}\nCourriel : {EMAIL#1}
 form	2	{TITLE#1} {PERSON#1}, {g#1:né|née} le {BIRTHDATE#1} à {CITY#2}, {g#1:domicilié|domiciliée} {ADDRESS#3}.
@@ -299,6 +337,27 @@ Independence Day
 """,
     "en/products.txt": """
 Excel\nWord\nWindows\nOutlook\nSlack\nJira\nSalesforce\nAndroid
+""",
+    "en/sentences.txt": r"""
+The file is complete and will be sent to the relevant team.
+The follow-up meeting has been moved to {?Thursday|Friday|next week}.
+Please fill in the form before the deadline.
+Please find attached the minutes of the meeting.
+Your order has been shipped and should arrive within two days.
+We agreed to review the schedule at the end of the month.
+Thank you for your quick reply.
+The {PRODUCT} software must be updated on every workstation.
+The "{?Phoenix|Atlas|Horizon|Northstar}" project enters its second phase.
+Replace <Name> and <Address> with your details before sending.
+The file {?final_report|meeting_notes|budget_v2}.{?docx|xlsx|pdf} is attached.
+Hi, just following up on your request.
+Hello, thanks for the update.
+Best regards,
+Kind regards,
+For any question, please contact support.
+This document is strictly confidential.
+Status: testing is complete and acceptance starts on Monday.
+The results will be presented to the committee.
 """,
     "en/templates.txt": r"""
 email	3	From: {PERSON:signature#1} <{EMAIL#1@1}>\nTo: {PERSON:signature#2} <{EMAIL#2@1}>\nSubject: {?project update|meeting notes|your request}\n\nHi {GIVEN#2},\n\nCould you send the file to {TITLE#3} {FAMILY#3} by {?Thursday|Friday|the end of the week}?\n\nBest regards,\n{PERSON:signature#1}\n{JOB}, {ORG#1}\nPhone: {PHONE#1}
@@ -429,11 +488,12 @@ class Resources:
 
     NAMES = ["given_female.txt", "given_male.txt", "family.txt", "cities.txt", "streets.txt", "street_types.txt",
              "org_words.txt", "institutions.txt", "jobs.txt", "regions.txt", "countries.txt", "negatives.txt",
-             "products.txt", "templates.txt"]
+             "products.txt", "sentences.txt", "templates.txt"]
 
     def __init__(self, directory: Optional[str], languages: List[str], unseen_percent: int):
         self.lex: Dict[str, Dict[str, Lexicon]] = {}
         self.templates: Dict[str, List[Tuple[str, float, list]]] = {}
+        self.sentences: Dict[str, List[Tuple[float, list]]] = {}
         self.origin = {}
         self.unseen_percent = unseen_percent
         if directory and not os.path.isdir(directory):
@@ -458,6 +518,8 @@ class Resources:
                     self.templates[lang] = parse_templates(text, lang + "/" + name)
                     if not self.templates[lang]:
                         raise ValueError("%s/%s holds no template" % (lang, name))
+                elif name == "sentences.txt":
+                    self.sentences[lang] = parse_sentences(text, lang + "/" + name)
                 else:
                     fields = 2 if name in ("given_female.txt", "given_male.txt", "family.txt", "cities.txt",
                                            "negatives.txt") else 1
@@ -505,6 +567,43 @@ def parse_templates(text: str, origin: str) -> List[Tuple[str, float, list]]:
                                                                                        kinds[ident], kind))
         out.append((genre.strip(), weight, nodes))
     return out
+
+
+def parse_sentences(text: str, origin: str) -> List[Tuple[float, list]]:
+    """One sentence per line, an optional weight after a tab. A sentence holds no value
+    of the learned categories; it may use the filler slots and the choices of templates."""
+    out = []
+    for number, raw in enumerate(text.splitlines(), 1):
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        body, _, weight = raw.partition("\t")
+        try:
+            weight = float(weight) if weight.strip() else 1.0
+        except ValueError:
+            raise ValueError("%s:%d: bad weight %r" % (origin, number, weight))
+        if weight < 0:
+            raise ValueError("%s:%d: negative weight" % (origin, number))
+        try:
+            nodes, end = parse_nodes(body.strip().replace("\\n", "\n"), 0, "")
+        except (ValueError, IndexError) as e:
+            raise ValueError("%s:%d: %s" % (origin, number, e))
+        if end != len(body.strip().replace("\\n", "\n")):
+            raise ValueError("%s:%d: unbalanced braces" % (origin, number))
+        if any(n[0] == "slot" and n[1] not in FILLER_SLOTS for n in flatten_nodes(nodes)):
+            raise ValueError("%s:%d: a sentence uses filler slots only (%s)" % (origin, number,
+                                                                                ", ".join(sorted(FILLER_SLOTS))))
+        out.append((weight, nodes))
+    return out
+
+
+def flatten_nodes(nodes):
+    for node in nodes:
+        if node[0] == "choice":
+            for alternative in node[1]:
+                for n in flatten_nodes(alternative):
+                    yield n
+        else:
+            yield node
 
 
 def org_kinds(nodes):
@@ -579,6 +678,12 @@ SLOT_NAMES = {
     "SSN", "PASSPORT", "IMEI", "UUID", "VIN", "NEGATIVE", "JOB", "INSTITUTION", "REGION", "COUNTRY", "PRODUCT",
     "SEX", "NATIONALITY", "NATID", "ART", "Art",
 }
+
+
+# The slots that write no personal data, or only data that the rules find: the ones a
+# context sentence may use.
+FILLER_SLOTS = {"DATE", "TIME", "YEAR", "AGE", "AMOUNT", "JOB", "INSTITUTION", "REGION", "COUNTRY", "PRODUCT",
+                "NEGATIVE", "REF"}
 
 
 def parse_slot(spec: str):
@@ -2079,7 +2184,7 @@ SPLITS = [
     ("test", 4000, "all", 0.25, 1.0, None),
     ("test_unseen", 3000, "unseen", 0.5, 1.0, None),
     ("test_noisy", 2000, "all", 0.25, 6.0, None),
-    ("test_negatives", 2000, "all", 0.25, 1.0, {"negative"}),
+    ("test_negatives", 2000, "all", 0.25, 1.0, {"negative", "prose"}),
     ("test_documents", 1000, "all", 0.25, 1.0, "documents"),
 ]
 
@@ -2097,34 +2202,99 @@ def choose_template(res: Resources, lang: str, rng: random.Random, genres) -> Tu
     return pool[-1][0], pool[-1][2]
 
 
+def choose_sentence(res: Resources, lang: str, rng: random.Random) -> Optional[list]:
+    pool = res.sentences.get(lang) or []
+    if not pool:
+        return None
+    total = sum(w for w, _ in pool)
+    x = rng.random() * total
+    for w, nodes in pool:
+        x -= w
+        if x <= 0:
+            return nodes
+    return pool[-1][1]
+
+
+def prose_fragments(gen, res: Resources, lang: str, rng: random.Random, low: int, high: int) -> list:
+    """low to high context sentences, joined by a space or a line break."""
+    fragments = []
+    for k in range(rng.randint(low, high)):
+        nodes = choose_sentence(res, lang, rng)
+        if nodes is None:
+            break
+        if fragments:
+            fragments.append((rng.choice([" ", " ", "\n"]), None))
+        fragments.extend(gen.render(nodes))
+    return fragments
+
+
+def with_context(gen, res: Resources, lang: str, rng: random.Random, fragments: list) -> list:
+    """The example with a context sentence before it, after it, or both."""
+    before, after = rng.random() < 0.6, rng.random() < 0.6
+    if not before and not after:
+        before = True
+    out = []
+    if before:
+        lead = prose_fragments(gen, res, lang, rng, 1, 2)
+        if lead:
+            out = lead + [(rng.choice([" ", "\n", "\n\n"]), None)]
+    out.extend(fragments)
+    if after:
+        tail = prose_fragments(gen, res, lang, rng, 1, 2)
+        if tail:
+            out += [(rng.choice([" ", "\n", "\n\n"]), None)] + tail
+    return out
+
+
 def build_split(res: Resources, name: str, count: int, pool: str, procedural: float, noise: float, genres,
-                seed: int, languages: List[str], fr_share: float, stats: dict) -> List[str]:
+                seed: int, languages: List[str], fr_share: float, stats: dict, context_rate: float = 0.0,
+                prose_share: float = 0.0, exclude: Optional[set] = None) -> List[str]:
+    """count examples; with exclude, the texts it holds are drawn again, a few times at
+    most, so that an evaluation split repeats no training text."""
     rng = random.Random("%s|%d" % (name, seed))
     lines = []
-    split_stats = {"examples": 0, "spans": {}, "genres": {}, "languages": {}}
+    split_stats = {"examples": 0, "spans": {}, "genres": {}, "languages": {}, "redrawn": 0}
     for _ in range(count):
-        lang = languages[0] if len(languages) == 1 else ("fr" if rng.random() < fr_share else "en")
-        gen = Generator(res, lang, rng, pool, procedural, noise)
-        if genres == "documents":
-            genre, parts = "documents", []
-            for k in range(rng.randint(3, 6)):
-                g, nodes = choose_template(res, lang, rng, None)
-                parts.append(nodes)
-            gen.new_document("letter")
-            for nodes in parts:
+        for attempt in range(30):
+            lang = languages[0] if len(languages) == 1 else ("fr" if rng.random() < fr_share else "en")
+            gen = Generator(res, lang, rng, pool, procedural, noise)
+            prose_genre = genres is not None and genres != "documents" and "prose" in genres
+            if genres == "documents":
+                genre, parts = "documents", []
+                for k in range(rng.randint(3, 6)):
+                    g, nodes = choose_template(res, lang, rng, None)
+                    parts.append(nodes)
+                gen.new_document("letter")
+                for nodes in parts:
+                    gen.constrain(nodes)
+                fragments = []
+                for k, nodes in enumerate(parts):
+                    if k:
+                        fragments.append(("\n\n", None))
+                        # A paragraph without personal data between two parts, now and then.
+                        if rng.random() < context_rate:
+                            fragments.extend(prose_fragments(gen, res, lang, rng, 1, 3))
+                            fragments.append(("\n\n", None))
+                    fragments.extend(gen.render(nodes))
+            elif res.sentences.get(lang) and ((genres is None and rng.random() < prose_share) or
+                                              (prose_genre and rng.random() < 0.5)):
+                genre = "prose"
+                gen.new_document("prose")
+                fragments = prose_fragments(gen, res, lang, rng, 1, 4)
+            else:
+                genre, nodes = choose_template(res, lang, rng, genres)
+                gen.new_document(genre)
                 gen.constrain(nodes)
-            fragments = []
-            for k, nodes in enumerate(parts):
-                if k:
-                    fragments.append(("\n\n", None))
-                fragments.extend(gen.render(nodes))
+                fragments = gen.render(nodes)
+                if rng.random() < context_rate:
+                    fragments = with_context(gen, res, lang, rng, fragments)
+            fragments = apply_style(apply_articles(settle_titles(fragments), lang), gen.style, rng)
+            text, spans = assemble(fragments)
+            if exclude is None or text not in exclude:
+                break
+            split_stats["redrawn"] += 1
         else:
-            genre, nodes = choose_template(res, lang, rng, genres)
-            gen.new_document(genre)
-            gen.constrain(nodes)
-            fragments = gen.render(nodes)
-        fragments = apply_style(apply_articles(settle_titles(fragments), lang), gen.style, rng)
-        text, spans = assemble(fragments)
+            continue
         check_example(text, spans)
         lines.append(format_example(text, spans))
         split_stats["examples"] += 1
@@ -2161,11 +2331,15 @@ def main():
     p.add_argument("--resources", default=None, help="directory of lexicons and templates replacing the built-in "
                                                        "ones (<lang>/<file>.txt)")
     p.add_argument("--languages", default="fr,en", help="comma separated languages among fr and en")
-    p.add_argument("--fr-share", type=float, default=0.75, help="share of French examples when both languages "
-                                                                 "are generated")
+    p.add_argument("--fr-share", type=float, default=0.5, help="share of French examples when both languages "
+                                                                "are generated")
     p.add_argument("--unseen-percent", type=int, default=15, help="percent of each lexicon held out for "
                                                                    "test_unseen")
     p.add_argument("--seed", type=int, default=1, help="random seed")
+    p.add_argument("--context-rate", type=float, default=0.3, help="share of the examples written between "
+                                                                   "plain sentences without personal data")
+    p.add_argument("--prose-share", type=float, default=0.06, help="share of the examples made of such "
+                                                                   "sentences alone")
     p.add_argument("--sample", type=int, default=0, help="print this many examples with their spans and exit")
     for name, count, _, _, _, _ in SPLITS:
         p.add_argument("--" + name.replace("_", "-"), type=int, default=count,
@@ -2183,6 +2357,8 @@ def main():
             sys.exit("error: unsupported language: %s (fr and en are supported)" % lang)
     if not 0 <= args.fr_share <= 1:
         sys.exit("error: --fr-share lies between 0 and 1")
+    if not 0 <= args.context_rate <= 1 or not 0 <= args.prose_share <= 1:
+        sys.exit("error: --context-rate and --prose-share lie between 0 and 1")
     if not 0 <= args.unseen_percent <= 100:
         sys.exit("error: --unseen-percent lies between 0 and 100")
     for name, _, _, _, _, _ in SPLITS:
@@ -2193,7 +2369,7 @@ def main():
     if args.sample:
         stats = {}
         lines = build_split(res, "sample", args.sample, "all", 0.25, 1.0, None, args.seed, languages,
-                            args.fr_share, stats)
+                            args.fr_share, stats, args.context_rate, args.prose_share)
         for line in lines:
             text, _, spans = line.rpartition("\t")
             raw = unescape(text)
@@ -2207,12 +2383,17 @@ def main():
 
     os.makedirs(args.out_dir, exist_ok=True)
     stats = {}
+    # The texts of train, which no evaluation split repeats.
+    train_texts = set()
     for name, _, pool, procedural, noise, genres in SPLITS:
         count = getattr(args, name)
         if count <= 0:
             continue
         lines = build_split(res, name, count, pool, procedural, noise, genres, args.seed, languages,
-                            args.fr_share, stats)
+                            args.fr_share, stats, args.context_rate, args.prose_share,
+                            None if name == "train" else train_texts)
+        if name == "train":
+            train_texts = set(unescape(line.rpartition("\t")[0]) for line in lines)
         with open(os.path.join(args.out_dir, name + ".tsv"), "w", encoding="utf-8", newline="\n") as f:
             f.write("# dlib pii dataset: text<TAB>begin:end:LABEL,... (byte offsets)\n")
             for line in lines:

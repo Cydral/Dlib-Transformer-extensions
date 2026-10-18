@@ -368,12 +368,12 @@ namespace dlib
             if (options.optimizer == pii_span_optimizer::adam_atan2)
             {
                 dnn_trainer<net_type, adam_atan2> trainer(net_, adam_atan2(decay, 0.9f, 0.98f), options.gpus);
-                run_training(trainer, data, dev_set, options, log);
+                run_training(trainer, data, dev_set, options, resume, log);
             }
             else
             {
                 dnn_trainer<net_type, adamw> trainer(net_, adamw(decay, 0.9f, 0.98f), options.gpus);
-                run_training(trainer, data, dev_set, options, log);
+                run_training(trainer, data, dev_set, options, resume, log);
             }
             net_.clean();
             trained_ = true;
@@ -402,6 +402,7 @@ namespace dlib
             const std::vector<privacy_impl::byte_example>& data,
             const std::vector<pii_example>& dev_set,
             const pii_span_model_training_options& options,
+            bool resumed,
             std::ostream* log
         )
         {
@@ -434,6 +435,53 @@ namespace dlib
                                                                 options.window_weights.end());
             std::vector<matrix<int,0,1>> x(options.batch_size);
             std::vector<matrix<unsigned long,0,1>> y(options.batch_size);
+
+            /* The evaluations on dev: the loss on windows that cover its first examples
+               once, drawn the same way at every evaluation so that two values compare, and
+               the exact span F1 on those examples. */
+            std::vector<privacy_impl::byte_example> dev_data;
+            for (std::size_t i = 0; i < dev_set.size() && i < options.evaluate_examples; ++i)
+                if (!dev_set[i].text.empty()) dev_data.push_back(privacy_impl::to_byte_example(dev_set[i]));
+            auto evaluate_dev = [&](unsigned long step) {
+                trainer.get_net(force_flush_to_disk::no);
+                double bytes = 0, mean_length = 0, weights = 0;
+                for (const privacy_impl::byte_example& ex : dev_data) bytes += ex.bytes.size() + 1;
+                for (std::size_t k = 0; k < options.window_lengths.size(); ++k)
+                {
+                    mean_length += options.window_weights[k] * options.window_lengths[k];
+                    weights += options.window_weights[k];
+                }
+                mean_length /= weights;
+                const unsigned long batches = std::max<unsigned long>(1, static_cast<unsigned long>(
+                    std::ceil(bytes / (static_cast<double>(options.batch_size) * mean_length))));
+                std::mt19937 dev_rng(static_cast<std::mt19937::result_type>(options.seed + 1));
+                privacy_impl::window_sampler dev_sampler(dev_data, dev_rng);
+                std::discrete_distribution<std::size_t> dev_length(options.window_weights.begin(),
+                                                                   options.window_weights.end());
+                std::vector<matrix<int,0,1>> dx(options.batch_size);
+                std::vector<matrix<unsigned long,0,1>> dy(options.batch_size);
+                running_stats<double> loss;
+                for (unsigned long b = 0; b < batches; ++b)
+                {
+                    const long length = options.window_lengths[dev_length(dev_rng)];
+                    for (std::size_t k = 0; k < dx.size(); ++k)
+                        dev_sampler.next(length, dx[k], dy[k]);
+                    loss.add(net_.compute_loss(dx.begin(), dx.end(), dy.begin()));
+                }
+                std::vector<std::vector<pii_span>> truth, predicted;
+                for (std::size_t i = 0; i < dev_set.size() && i < options.evaluate_examples; ++i)
+                {
+                    truth.push_back(dev_set[i].spans);
+                    predicted.push_back(find_unlocked(dev_set[i].text));
+                }
+                const pii_evaluation ev = evaluate_pii_spans(truth, predicted, span_match::exact, pii_fine_labels());
+                *log << "step " << step << "  dev loss " << loss.mean() << "  precision " << ev.overall.precision()
+                     << "  recall " << ev.overall.recall() << "  f1 " << ev.overall.f1() << std::endl;
+            };
+            const bool evaluations = log && !dev_data.empty() && options.evaluate_every;
+            // The starting point of a complementary training.
+            if (evaluations && resumed) evaluate_dev(0);
+
             const auto start = std::chrono::steady_clock::now();
             for (unsigned long s = 0; s < steps; ++s)
             {
@@ -441,29 +489,18 @@ namespace dlib
                 for (std::size_t k = 0; k < x.size(); ++k)
                     sampler.next(length, x[k], y[k]);
                 trainer.train_one_step(x, y);
-                const bool report = log && options.report_every && (s + 1) % options.report_every == 0;
-                const bool evaluate = log && !dev_set.empty() && options.evaluate_every &&
-                                      ((s + 1) % options.evaluate_every == 0 || s + 1 == steps);
-                if (report)
+                if (log && options.report_every && (s + 1) % options.report_every == 0)
                 {
-                    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+                    // The mean loss of the steps since the previous line.
+                    const double seconds =
+                        std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
                     *log << "step " << (s + 1) << "/" << steps << "  loss " << trainer.get_average_loss()
                          << "  lr " << trainer.get_learning_rate() << "  " << static_cast<long>(seconds) << " s"
                          << std::endl;
+                    trainer.clear_average_loss();
                 }
-                if (evaluate)
-                {
-                    trainer.get_net(force_flush_to_disk::no);
-                    std::vector<std::vector<pii_span>> truth, predicted;
-                    for (std::size_t i = 0; i < dev_set.size() && i < options.evaluate_examples; ++i)
-                    {
-                        truth.push_back(dev_set[i].spans);
-                        predicted.push_back(find_unlocked(dev_set[i].text));
-                    }
-                    const pii_evaluation ev = evaluate_pii_spans(truth, predicted, span_match::exact, pii_fine_labels());
-                    *log << "step " << (s + 1) << "  dev precision " << ev.overall.precision() << "  recall "
-                         << ev.overall.recall() << "  f1 " << ev.overall.f1() << std::endl;
-                }
+                if (evaluations && ((s + 1) % options.evaluate_every == 0 || s + 1 == steps))
+                    evaluate_dev(s + 1);
             }
             trainer.get_net();
         }

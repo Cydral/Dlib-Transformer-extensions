@@ -159,9 +159,12 @@ namespace dlib
                 - Otherwise seeds std::rand() with options.seed, since the layers draw their
                   initial weights from it; with the same data, options and device, two
                   trainings give the same model.
-                - When log is not null, writes the loss every options.report_every steps
-                  and, when dev_set is not empty, the exact span F1 on its first
-                  options.evaluate_examples examples every options.evaluate_every steps.
+                - When log is not null, writes every options.report_every steps the mean
+                  loss of the steps since the previous line. When dev_set is not empty, it
+                  also writes every options.evaluate_every steps and at the end the loss
+                  on windows that cover its first options.evaluate_examples examples once,
+                  the same windows each time, and the exact span F1 on those examples; a
+                  complementary training writes them before its first step too.
                 - #is_trained() == true
                 - #window() == the longest of options.window_lengths
         !*/

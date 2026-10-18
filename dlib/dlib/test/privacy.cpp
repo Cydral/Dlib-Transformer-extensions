@@ -481,6 +481,25 @@ namespace
         DLIB_TEST(xml_restored.find("Jean Dupont") != string::npos &&
                   xml_restored.find("Hélène Le Goff") != string::npos);
         DLIB_TEST(xml_restored.find("email=\"jean.dupont@acme-conseil.fr\"") != string::npos);
+
+        /* A tag followed by a '>' neither closes a CDATA section early nor writes "]]>" in
+           character data, and the restoration gives back the original bytes. */
+        const string mail =
+            "<?xml version=\"1.0\"?><mail><from>Jean Dupont &lt;jean.dupont@acme-conseil.fr></from>"
+            "<body><![CDATA[Voir <jean.dupont@acme-conseil.fr> et <urgent>]]></body></mail>";
+        document_report mail_report;
+        const string mail_out = a.anonymize(mail, document_format::markup, mail_report);
+        DLIB_TEST(mail_out.find("jean.dupont") == string::npos);
+        auto count_of = [](const string& s, const string& what) {
+            size_t n = 0;
+            for (size_t at = s.find(what); at != string::npos; at = s.find(what, at + 1)) ++n;
+            return n;
+        };
+        DLIB_TEST(count_of(mail_out, "]]>") == count_of(mail_out, "<![CDATA["));
+        DLIB_TEST(count_of(mail_out, "<![CDATA[") == 2);
+        document_report mail_back;
+        DLIB_TEST(a.restore(mail_out, document_format::markup, mail_back) == mail);
+        DLIB_TEST(mail_back.tags_rejected == 0);
     }
 
 // ----------------------------------------------------------------------------------------
@@ -720,6 +739,23 @@ namespace
         e = entities(text);
         DLIB_TEST(found(e, text, pii_type::address, "12 rue des Lilas"));
         DLIB_TEST(found(e, text, pii_type::location, "35000 Rennes"));
+        // Without a number, "le mail de" someone is an email and "la place de" someone a replacement.
+        text = "Tu as vu le mail de Federica Marino ? Marie signe à la place de Jean Martin. "
+               "Il habite 12 mail François Mitterrand.";
+        e = entities(text);
+        DLIB_TEST(!covered(e, text, "mail de Federica") && !covered(e, text, "place de Jean"));
+        DLIB_TEST(found(e, text, pii_type::person, "Federica Marino"));
+        DLIB_TEST(found(e, text, pii_type::address, "12 mail François Mitterrand"));
+        // References announced by the noun they number, and a file name that is none.
+        text = "Following up on file c4837928, your request 2022-73789 and reference \"A4435122\". Ref: 2476486. "
+               "Helys Systems, company number 2192507. Asset tag: 1109797. The file export_2010.csv is attached.";
+        e = entities(text);
+        for (const char* value : { "c4837928", "2022-73789", "A4435122", "2476486", "2192507", "1109797" })
+            DLIB_TEST(found(e, text, pii_type::identifier, value));
+        DLIB_TEST(!covered(e, text, "export_2010"));
+        text = "Username: <username>\nPassword: <password>";
+        e = entities(text);
+        DLIB_TEST(!covered(e, text, "username>"));
         // Organisation labels.
         text = "Raison sociale : TAVELIS SAS\nEmployeur : Novexa (Rennes)";
         e = entities(text);
@@ -842,6 +878,112 @@ namespace
         DLIB_TEST(!covered(g, note, "Bonsoir"));
         DLIB_TEST(!covered(g, note, "Hello"));
         DLIB_TEST(found(g, note, pii_type::person, "Maëlys"));
+
+        /* Neither function words, nor a common word, nor pieces of words, nor a capitalized
+           word joined to lower case words make a name; a file name holds no login. */
+        pii_detector guarded;
+        guarded.add_recognizer([](const string& t) {
+            std::vector<pii_span> spans;
+            auto add = [&](const string& value, const string& label) {
+                const size_t p = t.find(value);
+                if (p == string::npos) return;
+                pii_span s;
+                s.begin = p;
+                s.end = p + value.size();
+                s.label = label;
+                s.confidence = 0.95;
+                spans.push_back(s);
+            };
+            add("Le projet", "FAMILY_NAME");
+            add("Votre", "GIVEN_NAME");
+            add("Rem", "FAMILY_NAME");
+            add("commande", "FAMILY_NAME");
+            add("final.docx", "USERNAME");
+            add("Le logiciel Excel", "ORGANIZATION");
+            add("Jean", "GIVEN_NAME");
+            add("d'Arras", "FAMILY_NAME");
+            add("Le Goff", "FAMILY_NAME");
+            add("Saint-Aubin-sur-Oust", "CITY");
+            return spans;
+        });
+        const string memo = "Le projet avance. Votre commande part. Remplacez rapport_final.docx dans "
+                            "Le logiciel Excel. Jean d'Arras et Hélène Le Goff sont à Saint-Aubin-sur-Oust.";
+        guarded.begin_document();
+        guarded.learn(memo);
+        const std::vector<pii_entity> gm = guarded.detect(memo);
+        DLIB_TEST(!covered(gm, memo, "Le projet") && !covered(gm, memo, "Votre"));
+        DLIB_TEST(!covered(gm, memo, "Rem") && !covered(gm, memo, "commande"));
+        DLIB_TEST(!covered(gm, memo, "final.docx") && !covered(gm, memo, "logiciel"));
+        DLIB_TEST(found(gm, memo, pii_type::person, "Jean d'Arras"));
+        DLIB_TEST(covered(gm, memo, "Le Goff"));
+        DLIB_TEST(found(gm, memo, pii_type::location, "Saint-Aubin-sur-Oust"));
+
+        /* The pieces a recognizer cuts inside a word or a name are judged once merged: the
+           pieces of "Esch-sur-Alzette" and of "christina", the particle of "Inès de Brunet",
+           and "City" after "Quebec" belong to the name. */
+        pii_detector pieced;
+        pieced.add_recognizer([](const string& t) {
+            std::vector<pii_span> spans;
+            auto add = [&](const string& word, size_t offset, size_t length, const string& label) {
+                const size_t p = t.find(word);
+                if (p == string::npos) return;
+                pii_span s;
+                s.begin = p + offset;
+                s.end = p + offset + (length == string::npos ? word.size() - offset : length);
+                s.label = label;
+                s.confidence = 0.95;
+                spans.push_back(s);
+            };
+            add("4002 ", 0, 4, "POSTAL_CODE");
+            add("Esch-sur-Alzette", 0, 1, "CITY");
+            add("Esch-sur-Alzette", 1, string::npos, "CITY");
+            add("Inès", 0, string::npos, "GIVEN_NAME");
+            add(" de Brunet", 1, 2, "FAMILY_NAME");
+            add("Brunet", 0, string::npos, "FAMILY_NAME");
+            add("Quebec", 0, string::npos, "CITY");
+            add("City", 0, string::npos, "CITY");
+            add("christina", 0, 5, "GIVEN_NAME");
+            add("christina", 5, string::npos, "GIVEN_NAME");
+            return spans;
+        });
+        const string pieces = "Le bailleur demeure au 4002 Esch-sur-Alzette. Inès de Brunet part pour Quebec City. "
+                              "Hey christina, did Isla reply?";
+        pieced.begin_document();
+        pieced.learn(pieces);
+        const std::vector<pii_entity> gp = pieced.detect(pieces);
+        DLIB_TEST(found(gp, pieces, pii_type::location, "4002 Esch-sur-Alzette"));
+        DLIB_TEST(found(gp, pieces, pii_type::person, "Inès de Brunet"));
+        DLIB_TEST(found(gp, pieces, pii_type::location, "Quebec City"));
+        DLIB_TEST(found(gp, pieces, pii_type::person, "christina"));
+
+        /* The pieces of a login meet and form one login, the at sign of a handle belongs to it,
+           and a common word is no login. */
+        pii_detector logins;
+        logins.add_recognizer([](const string& t) {
+            std::vector<pii_span> spans;
+            auto add = [&](const string& word, size_t offset, size_t length) {
+                const size_t p = t.find(word);
+                if (p == string::npos) return;
+                pii_span s;
+                s.begin = p + offset;
+                s.end = p + offset + (length == string::npos ? word.size() - offset : length);
+                s.label = "USERNAME";
+                s.confidence = 0.95;
+                spans.push_back(s);
+            };
+            add("vwojcikski", 0, 1);
+            add("vwojcikski", 1, string::npos);
+            add("hpetit38", 0, string::npos);
+            add("month", 0, string::npos);
+            return spans;
+        });
+        const string chat = "<vwojcikski> anyone got access to the server?\n@hpetit38 merci. Rent is due every month.";
+        logins.begin_document();
+        logins.learn(chat);
+        const std::vector<pii_entity> gl = logins.detect(chat);
+        DLIB_TEST(found(gl, chat, pii_type::identifier, "vwojcikski"));
+        DLIB_TEST(found(gl, chat, pii_type::identifier, "@hpetit38"));
+        DLIB_TEST(!covered(gl, chat, "month"));
     }
 
 // ----------------------------------------------------------------------------------------

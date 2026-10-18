@@ -130,7 +130,17 @@ namespace dlib
                 "hamid farid nordine bilal amine mehdi ilyes rayan sami yacine yassine ayoub anis idriss "
                 "karima malika khadija zineb salma hanane souad naima latifa rachida houria djamila "
                 "mamadou moussa ousmane abdoulaye ibrahima fatou aminata mariama awa kofi kwame "
-                "wei ming jing hui hiroshi takashi yuki kenji akira minh thanh huong");
+                "wei ming jing hui hiroshi takashi yuki kenji akira minh thanh huong "
+                "alix ambroise anselme aristide armand aurele barnabe bertille blandine brice cassandre "
+                "clelia daphne domitille elie eloise faustine gaspard gautier ghislain hector hortense "
+                "ignace joris laurine leonie lilian lisandre lorene lubin maeva mahaut melissandre milo "
+                "nathanael ninon ombeline pacome paulin philippine roxane sixtine swann tancrede tiphaine "
+                "violaine wandrille aidan callum cerys ciara connor declan eilidh eoin ffion finley freya "
+                "gemma hamish imogen keira kirsty lachlan maisie niamh orla owain phoebe rhys roisin rory "
+                "saoirse seren sinead tadhg aarav aditya ananya arjun deepak divya harpreet imran kavita "
+                "meera nikhil pooja priya rahul ravi sanjay sunita vikram yusuf zainab amara chidi emeka "
+                "femi kemi ngozi tunde haruto hiroko seoyeon minjun aoife cillian oisin ruaridh angharad "
+                "bethan dafydd gethin rhiannon");
             return s;
         }
 
@@ -143,7 +153,7 @@ namespace dlib
                 "patience esperance blanche ange angele celeste claire grace joy hope faith may june "
                 "april august summer olive lily iris violette jade ambre max tom guy rene martin "
                 "simon roy mark bill jean paris florence lou lea eden noel pascal dominique laurence "
-                "marion morgan justice ruth victor william");
+                "marion morgan justice ruth victor william ravi philippine gemma");
             return s;
         }
 
@@ -154,7 +164,9 @@ namespace dlib
                 "maitre dr docteur pr professeur prof sir dame lord lady mgr monseigneur pere soeur "
                 "colonel commandant capitaine lieutenant adjudant sergent juge president "
                 "presidente ministre senateur depute maire chairman chairwoman chairperson speaker mayor governor "
-                "senator congressman congresswoman");
+                "senator congressman congresswoman "
+                "abbe rabbin commissaire inspecteur brigadier amiral reverend captain sergeant inspector "
+                "detective");
             return s;
         }
 
@@ -291,7 +303,84 @@ namespace dlib
                 {"nino", pii_type::identifier}, {"vous etes", pii_type::gender},
                 {"code postal", pii_type::location}, {"postal code", pii_type::location},
                 {"zip code", pii_type::location}, {"postcode", pii_type::location},
-                {"nationalite d'origine", pii_type::nationality}
+                {"nationalite d'origine", pii_type::nationality},
+                {"nom du patient", pii_type::person}, {"nom de la patiente", pii_type::person},
+                {"nom de l'assure", pii_type::person}, {"nom de l'assuree", pii_type::person},
+                {"nom du titulaire", pii_type::person}, {"nom du conjoint", pii_type::person},
+                {"nom de l'epoux", pii_type::person}, {"nom de l'epouse", pii_type::person},
+                {"nom du pere", pii_type::person}, {"nom de la mere", pii_type::person},
+                {"prenom usuel", pii_type::person}, {"nom et prenoms", pii_type::person},
+                {"personne a contacter", pii_type::person}, {"personne a prevenir", pii_type::person},
+                {"personne de confiance", pii_type::person}, {"medecin traitant", pii_type::person},
+                {"medecin referent", pii_type::person}, {"a l'attention de", pii_type::person},
+                {"suivi par", pii_type::person}, {"dossier suivi par", pii_type::person},
+                {"affaire suivie par", pii_type::person}, {"tuteur", pii_type::person},
+                {"tutrice", pii_type::person}, {"epoux", pii_type::person}, {"epouse", pii_type::person},
+                {"temoin", pii_type::person}, {"stagiaire", pii_type::person}, {"eleve", pii_type::person},
+                {"etudiant", pii_type::person}, {"etudiante", pii_type::person}, {"enfant", pii_type::person},
+                {"contact person", pii_type::person}, {"contact name", pii_type::person},
+                {"emergency contact", pii_type::person}, {"next of kin", pii_type::person},
+                {"spouse", pii_type::person}, {"spouse's name", pii_type::person},
+                {"father's name", pii_type::person}, {"mother's name", pii_type::person},
+                {"maiden name", pii_type::person}, {"account holder", pii_type::person},
+                {"account name", pii_type::person}, {"cardholder", pii_type::person},
+                {"policyholder", pii_type::person}, {"policy holder", pii_type::person},
+                {"employee", pii_type::person}, {"employee name", pii_type::person},
+                {"applicant name", pii_type::person}, {"candidate", pii_type::person},
+                {"candidate name", pii_type::person}, {"student", pii_type::person},
+                {"student name", pii_type::person}, {"pupil", pii_type::person},
+                {"patient name", pii_type::person}, {"patient's name", pii_type::person}, {"gp", pii_type::person},
+                {"referred by", pii_type::person}, {"requested by", pii_type::person},
+                {"submitted by", pii_type::person}, {"completed by", pii_type::person}, {"attn", pii_type::person},
+                {"witness", pii_type::person},
+                {"adresse de facturation", pii_type::address}, {"adresse de livraison", pii_type::address},
+                {"adresse de correspondance", pii_type::address}, {"adresse personnelle", pii_type::address},
+                {"adresse actuelle", pii_type::address}, {"nouvelle adresse", pii_type::address},
+                {"ancienne adresse", pii_type::address}, {"billing address", pii_type::address},
+                {"shipping address", pii_type::address}, {"mailing address", pii_type::address},
+                {"delivery address", pii_type::address}, {"residential address", pii_type::address},
+                {"correspondence address", pii_type::address}, {"current address", pii_type::address},
+                {"previous address", pii_type::address}, {"permanent address", pii_type::address},
+                {"street address", pii_type::address}, {"adresse electronique", pii_type::email},
+                {"adresse de messagerie", pii_type::email}, {"adresse courriel", pii_type::email},
+                {"email address", pii_type::email}, {"e-mail address", pii_type::email},
+                {"work email", pii_type::email}, {"personal email", pii_type::email},
+                {"courriel professionnel", pii_type::email}, {"courriel personnel", pii_type::email},
+                {"email professionnel", pii_type::email}, {"email personnel", pii_type::email},
+                {"telephone portable", pii_type::phone}, {"telephone mobile", pii_type::phone},
+                {"telephone fixe", pii_type::phone}, {"telephone professionnel", pii_type::phone},
+                {"telephone personnel", pii_type::phone}, {"telephone domicile", pii_type::phone},
+                {"tel portable", pii_type::phone}, {"tel fixe", pii_type::phone}, {"tel mobile", pii_type::phone},
+                {"tel domicile", pii_type::phone}, {"home phone", pii_type::phone},
+                {"work phone", pii_type::phone}, {"mobile phone", pii_type::phone},
+                {"mobile number", pii_type::phone}, {"telephone number", pii_type::phone},
+                {"contact number", pii_type::phone}, {"cell phone", pii_type::phone},
+                {"cell number", pii_type::phone}, {"daytime phone", pii_type::phone},
+                {"landline", pii_type::phone}, {"lieu de residence", pii_type::location},
+                {"ville de residence", pii_type::location}, {"ville de naissance", pii_type::location},
+                {"commune de naissance", pii_type::location}, {"commune de residence", pii_type::location},
+                {"place of residence", pii_type::location}, {"town of birth", pii_type::location},
+                {"city of birth", pii_type::location}, {"town", pii_type::location},
+                {"numero de badge", pii_type::identifier}, {"badge number", pii_type::identifier},
+                {"numero d'employe", pii_type::identifier}, {"numero employe", pii_type::identifier},
+                {"staff number", pii_type::identifier}, {"staff id", pii_type::identifier},
+                {"student id", pii_type::identifier}, {"student number", pii_type::identifier},
+                {"numero etudiant", pii_type::identifier}, {"numero d'etudiant", pii_type::identifier},
+                {"numero ine", pii_type::identifier}, {"numero de sinistre", pii_type::identifier},
+                {"claim number", pii_type::identifier}, {"numero de police", pii_type::identifier},
+                {"numero d'adherent", pii_type::identifier}, {"patient number", pii_type::identifier},
+                {"nom de l'organisme", pii_type::organization}, {"nom de l'etablissement", pii_type::organization},
+                {"etablissement scolaire", pii_type::organization}, {"employer name", pii_type::organization},
+                {"organisation name", pii_type::organization}, {"organization name", pii_type::organization},
+                {"business name", pii_type::organization}, {"trading name", pii_type::organization},
+                {"nom commercial", pii_type::organization}, {"enseigne", pii_type::organization},
+                {"assureur", pii_type::organization}, {"insurer", pii_type::organization},
+                {"mutuelle", pii_type::organization}, {"banque", pii_type::organization},
+                {"bank", pii_type::organization}, {"bank name", pii_type::organization},
+                {"ecole", pii_type::organization}, {"school", pii_type::organization},
+                {"universite", pii_type::organization}, {"university", pii_type::organization},
+                {"employeur precedent", pii_type::organization}, {"previous employer", pii_type::organization},
+                {"former employer", pii_type::organization}
             };
             return m;
         }
@@ -333,7 +422,7 @@ namespace dlib
             static const std::unordered_set<std::string> s = make_word_set(
                 "sa sas sasu sarl eurl sci snc scs gie scop scp selarl selas selafa sem spl ei eirl "
                 "inc incorporated ltd limited llc llp plc corp corporation co gmbh ag kg ohg ug bv nv spa "
-                "srl sl pty");
+                "srl sl pty ltee asbl sprl scrl bvba vzw kgaa oyj ltda pte pllc sca");
             return s;
         }
 
@@ -344,7 +433,8 @@ namespace dlib
                 "hopital centre center institut institute universite university ecole school lycee "
                 "college laboratoire laboratoires mairie ministere ministry agence agency entreprise "
                 "entreprises etablissements ets federation syndicat cooperative mutuelle caisse "
-                "tribunal etude pharmacie ehpad club");
+                "tribunal etude pharmacie ehpad club compagnie imprimerie boulangerie garage atelier conservatoire "
+                "polyclinique");
             return s;
         }
 
@@ -421,7 +511,42 @@ namespace dlib
                 "vendredi samedi dimanche january february march april may june july august september "
                 "october november december janvier fevrier mars avril mai juin juillet aout septembre "
                 "octobre novembre decembre nord sud est ouest north south east west rue avenue "
-                "boulevard place chemin route impasse allee quai");
+                "boulevard place chemin route impasse allee quai "
+                "monde logiciel logiciels demande demandes reunions conge conges formulaire formulaires "
+                "procedure procedures planning budget budgets agenda calendrier programme objectif objectifs "
+                "resultat resultats priorite urgent urgence important attention avis remarque remarques question "
+                "questions reponse reponses suivi statut identifiant lien piece jointe jointes brouillon "
+                "confidentiel "
+                "world form forms request requests meetings leave schedule order orders invoice invoices quote "
+                "quotes delivery calendar program goal goals result results priority answer answers status "
+                "update number password link attachment attachments file files folder project projects draft "
+                "week weeks month months year years "
+                "confidential");
+            return s;
+        }
+
+        inline const std::unordered_set<std::string>& function_words()
+        {
+            /* Articles, pronouns, possessives, prepositions and conjunctions: a span made of
+               them alone names nobody. */
+            static const std::unordered_set<std::string> s = make_word_set(
+                "le la les l un une des du de d au aux a et ou mais donc or ni car ce c cet cette ces "
+                "mon ma mes ton ta tes son sa ses notre nos votre vos leur leurs je j tu il elle on nous "
+                "vous ils elles me m te t se s moi toi lui eux y en qui que qu quoi dont ou ceci cela ca "
+                "the an and nor but if of in on at to for from by with as is are was were be been this "
+                "that these those it its he she they we you i my your his her their our him us them who "
+                "whom what which when where why how not no yes so than then there here");
+            return s;
+        }
+
+        inline const std::unordered_set<std::string>& file_extensions()
+        {
+            // The extensions of the files a document names: "rapport_final.docx".
+            static const std::unordered_set<std::string> s = make_word_set(
+                "doc docx docm dot dotx xls xlsx xlsm xlsb csv tsv ppt pptx pptm odt ods odp rtf txt md pdf "
+                "xml json yaml yml html htm css js ts py cpp c h hpp java cs go rs rb php sh bat ps1 sql log "
+                "ini cfg conf zip tar gz tgz 7z rar png jpg jpeg gif bmp tif tiff svg webp mp3 mp4 wav avi "
+                "mov mkv eml msg ics vcf exe dll so bin iso dat bak tmp");
             return s;
         }
 
@@ -508,7 +633,16 @@ namespace dlib
                 "portuguese|qatari|romanian|russian|rwandan|salvadoran|saudi|scottish|senegalese|serbian|"
                 "sierra leonean|singaporean|slovak|slovenian|somali|south african|spanish|sri lankan|sudanese|"
                 "swedish|swiss|syrian|taiwanese|tajik|tanzanian|thai|togolese|tunisian|turkish|ugandan|"
-                "ukrainian|uruguayan|uzbek|venezuelan|vietnamese|welsh|yemeni|zambian|zimbabwean");
+                "ukrainian|uruguayan|uzbek|venezuelan|vietnamese|welsh|yemeni|zambian|zimbabwean|"
+                "bahreini|bahreinie|barbadien|barbadienne|bhoutanais|bhoutanaise|botswanais|botswanaise|"
+                "bruneien|bruneienne|fidjien|fidjienne|grenadien|grenadienne|guyanien|guyanienne|kirghize|"
+                "kirghiz|liechtensteinois|liechtensteinoise|malawite|maldivien|maldivienne|nauruan|nauruane|"
+                "papouan|papouane|samoan|samoane|seychellois|seychelloise|sierra-leonais|sierra-leonaise|"
+                "surinamais|surinamaise|timorais|timoraise|tongien|tongienne|trinidadien|trinidadienne|"
+                "turkmene|vanuatais|vanuataise|bahraini|barbadian|bhutanese|motswana|bruneian|fijian|"
+                "grenadian|guyanese|kazakhstani|kyrgyz|laotian|liechtensteiner|malawian|maldivian|"
+                "micronesian|sammarinese|surinamese|swazi|timorese|tongan|"
+                "trinidadian|turkmen|tuvaluan|ni-vanuatu|kosovan|azeri");
             return s;
         }
 
@@ -553,7 +687,9 @@ namespace dlib
                 "sgdsn ugap amf acpr arcep arcom hceres onisep cned unedic apec ircantec cnracl aphp dreal dreets "
                 "ddets ddpp dgac dgddi anah dila bnf inpi oniam fiva cnous ofb anct dinum "
                 "nhs hmrc dvla dvsa dwp hmcts hmpps fcdo dhsc dfe fca cma ofsted ofcom ofgem ofwat cqc mhra ukvi "
-                "irs ssa fbi cia nsa dhs uscis tsa fema fda doj hhs ftc fcc dmv nih nasa usda faa nhtsa");
+                "irs ssa fbi cia nsa dhs uscis tsa fema fda doj hhs ftc fcc dmv nih nasa usda faa nhtsa "
+                "ons nca fsa ico moj hmpo dbs ofqual ukhsa ehrc cbp atf osha anses ineris irsn cnsa agefiph "
+                "fiphfp pjj spip dgpn dggn dgt dares dgefp");
             return s;
         }
 
@@ -578,7 +714,25 @@ namespace dlib
                 "hm passport office|citizens advice|european commission|european parliament|"
                 "direction generale des finances publiques|office francais de l'immigration et de l'integration|"
                 "office national des forets|office francais de la biodiversite|commission europeenne|"
-                "parlement europeen|conseil de l'europe");
+                "parlement europeen|conseil de l'europe|"
+                "cour de justice de l'union europeenne|cour europeenne des droits de l'homme|"
+                "banque centrale europeenne|autorite des marches financiers|"
+                "autorite de controle prudentiel et de resolution|"
+                "commission nationale de l'informatique et des libertes|agence nationale de l'habitat|"
+                "caisse d'allocations familiales|caisse primaire d'assurance maladie|"
+                "mutualite sociale agricole|office national des anciens combattants|"
+                "agence nationale des titres securises|"
+                "institut national de la statistique et des etudes economiques|"
+                "conseil superieur de la magistrature|department for work and pensions|"
+                "driver and vehicle licensing agency|ministry of justice|ministry of defence|"
+                "department for education|department of health and social care|cabinet office|"
+                "financial conduct authority|information commissioner's office|care quality commission|"
+                "office for national statistics|health and safety executive|disclosure and barring service|"
+                "valuation office agency|federal bureau of investigation|department of veterans affairs|"
+                "census bureau|department of labor|federal trade commission|environmental protection agency|"
+                "canada revenue agency|service canada|australian taxation office|revenue commissioners|"
+                "health service executive|an garda siochana|european central bank|"
+                "european court of human rights|court of justice of the european union");
             return s;
         }
 

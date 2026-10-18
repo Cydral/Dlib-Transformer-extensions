@@ -1037,12 +1037,32 @@ namespace dlib
                 const std::vector<edit> found = unit_edits(u.text, report, restoring);
                 if (found.empty()) continue;
                 const std::vector<std::vector<edit>> local = split_edits(u, found);
+                std::vector<std::string> written(u.pieces.size());
                 for (std::size_t k = 0; k < u.pieces.size(); ++k)
                 {
-                    if (local[k].empty()) continue;
                     const markup_piece& pc = u.pieces[k];
                     const std::string raw = text.substr(pc.raw_begin, pc.raw_end - pc.raw_begin);
-                    edits.replace(pc.raw_begin, pc.raw_end, rewrite_raw(raw, pc.mode, local[k]));
+                    written[k] = local[k].empty() ? raw : rewrite_raw(raw, pc.mode, local[k]);
+                }
+                /* A CDATA section that anonymize() cut in two, because a tag ended right
+                   before a '>', is joined again once the tag is restored, so that the
+                   restored document is the original one byte for byte. */
+                for (std::size_t k = 0; k < u.pieces.size();)
+                {
+                    std::size_t last = k;
+                    std::string joined = written[k];
+                    while (restoring && last + 1 < u.pieces.size() &&
+                           split_cdata(text, u.pieces[last], u.pieces[last + 1]) &&
+                           (joined + written[last + 1]).find("]]>") == std::string::npos)
+                    {
+                        joined += written[last + 1];
+                        ++last;
+                    }
+                    if (last > k)
+                        edits.replace(u.pieces[k].raw_begin, u.pieces[last].raw_end, joined);
+                    else if (!local[k].empty())
+                        edits.replace(u.pieces[k].raw_begin, u.pieces[k].raw_end, written[k]);
+                    k = last + 1;
                 }
             }
             for (const attribute_unit& a : attributes)
@@ -1099,6 +1119,16 @@ namespace dlib
             return out;
         }
 
+        /* Two CDATA pieces of a unit separated by "]]><![CDATA[", the first ending with "]]"
+           and the second starting with '>': the cut anonymize() makes after a tag. */
+        static bool split_cdata(const std::string& text, const markup_piece& a, const markup_piece& b)
+        {
+            static const std::string seam = "]]><![CDATA[";
+            return a.mode == 1 && b.mode == 1 && b.raw_begin == a.raw_end + seam.size() &&
+                   text.compare(a.raw_end, seam.size(), seam) == 0 && a.raw_end >= a.raw_begin + 2 &&
+                   text.compare(a.raw_end - 2, 2, "]]") == 0 && b.raw_end > b.raw_begin && text[b.raw_begin] == '>';
+        }
+
         /* Applies piece edits to the raw character data: only the edited ranges are
            rewritten, so entities and character references elsewhere stay as written.
            mode is 0 for character data, 1 for a CDATA section, 2 for a comment. */
@@ -1115,15 +1145,31 @@ namespace dlib
             }
             std::string out;
             std::size_t pos = 0;
+            std::vector<std::size_t> ends;
             for (const edit& e : local)
             {
                 const std::size_t rb = map[e.b], re = map[e.e];
                 if (rb < pos) continue;
                 out.append(raw, pos, rb - pos);
                 out += mode != 0 ? e.rep : xml_escape_text(e.rep);
+                ends.push_back(out.size());
                 pos = re;
             }
             out.append(raw, pos, std::string::npos);
+            if (mode == 0)
+            {
+                /* Character data cannot hold "]]>": a tag followed by a '>' written as is
+                   ("Dupont &lt;jean.dupont@acme.fr>") ends with the reference of its last
+                   bracket, which every parser reads back as a bracket. */
+                for (auto it = ends.rbegin(); it != ends.rend(); ++it)
+                {
+                    const std::size_t p = *it;
+                    if (p == 0 || out[p - 1] != ']') continue;
+                    const bool closes = (p >= 2 && out[p - 2] == ']' && out.compare(p, 1, ">") == 0) ||
+                                        out.compare(p, 2, "]>") == 0;
+                    if (closes) out.replace(p - 1, 1, "&#93;");
+                }
+            }
             if (mode == 2)
             {
                 // A comment cannot hold "--".

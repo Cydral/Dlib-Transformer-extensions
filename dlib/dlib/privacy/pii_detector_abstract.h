@@ -141,11 +141,13 @@ namespace dlib
                    chance in ten or eleven also needs the label that announces it
                    ("BSN", "PESEL", "CPR-nr."), as do phone numbers outside the French
                    and international layouts, social handles, pre-2009 French plates
-                   and the references of files, customers, contracts, claims or invoices
-                   ("dossier n° 2024-00123"). A cue is a whole word: "SIM" is not found
-                   in "Simon", nor "tel" in "hotel"; a cue written with a final '*' in
-                   this implementation is a prefix ("tél." and "téléphone"). These
-                   scanners work in time linear in the length of the text.
+                   and the references of files, customers, contracts, claims, invoices,
+                   requests, applications, permits or asset tags ("dossier n° 2024-00123",
+                   reference "B4694342", "Ref: 2476486"), a file name excepted. A cue is a
+                   whole word: "SIM" is not found in "Simon", nor "tel" in "hotel"; a cue
+                   written with a final '*' in this implementation is a prefix ("tél." and
+                   "téléphone"). These scanners work in time linear in the length of the
+                   text.
 
                 2. Linguistic evidence. Person names are scored from civilities and
                    titles (M., Mme, Dr), field labels ("Nom :", "Signé par"), the
@@ -275,8 +277,21 @@ namespace dlib
                 - recognizer is called on every text analysed afterwards, and its spans
                   whose confidence is at least min_confidence are added to the candidates.
                   A span whose offsets fall inside a UTF-8 character covers that character.
-                  A person, place or organisation span made of a greeting or a closing
-                  alone ("Bonsoir", "Hello", "Cordialement") is ignored.
+                - The pieces of one word, one name or one login that recognizer reports
+                  side by side are merged first ("E" and "sch-sur-Alzette"; "Inès", "de"
+                  and "Brunet"; "v" and "wojcikski"), and the at sign before a login joins
+                  it ("@hpetit38"). A span that names nothing is then ignored: a piece of a
+                  word that no other piece completes ("Rem" in "Remplacez"), a login inside
+                  a longer token, a file name ("rapport_final.docx"), a single character or
+                  a common word in lower case ("month") and, for persons,
+                  places and organisations, function words alone ("Votre"), a greeting, a
+                  closing or a field label alone ("Bonsoir", "Cordialement", "Nom"), a
+                  common word in lower case ("commande"), an organisation opened by an
+                  article and a word in lower case ("Le logiciel Excel"), a person or a
+                  place that joins capitalized words to words in lower case other than
+                  particles ("Le projet", while "Jean de La Fontaine" is kept), and a word
+                  in lower case, other than a first name, in a text that capitalizes its
+                  words.
                 - The calls are serialized and their results cached, keyed by the
                   SHA-256 digest of the text, until the next begin_document(): learn() and
                   detect() see the same texts and models are seldom reentrant, so
