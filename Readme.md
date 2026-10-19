@@ -73,7 +73,7 @@ Most tooling around open-weight models stops at inference. This project delibera
 
 A published small model carries a tokenizer sized for the largest member of its family, and spends a third of its parameters on entries it barely needs. A project that builds its own tokenizer does not: it can size the vocabulary to the model, hold the embedding table to a sixth of the parameter count, and put the difference back into the blocks where it does work.
 
-That freedom has to be used carefully, because a vocabulary is a fixed budget shared between writing systems that share nothing with each other, and one spent badly leaves a language segmented almost byte by byte — a defect no training curve reveals. The library measures it before a run starts rather than after.
+That freedom has to be used carefully, because a vocabulary is a fixed budget shared between writing systems that share nothing with each other, and one spent badly leaves a language segmented almost byte by byte — a defect no training curve reveals. The library measures it before a run starts rather than after. Training a tokenizer is quick as well: pair counts are updated incrementally over the distinct segments of the corpus, so a gigabyte of text yields an eight-thousand-entry vocabulary in minutes, with the same merges as the plain algorithm.
 
 ### 7. It creates a foundation for sovereign and specialized model stacks in C++
 One of the strongest strategic dimensions of the project is that it supports an approach where organizations can build **specialized**, **inspectable**, and potentially **sovereign** model stacks without leaving the C++ / Dlib ecosystem. That is particularly compelling when teams need stronger control over model behavior, runtime integration, training artifacts, or deployment boundaries.
@@ -191,6 +191,10 @@ This closes a loop a generative model cannot close alone — answering from docu
 
 **Trained on synthetic data only.** The recognizers learn from annotated texts that a generator writes from templates and lexicons: about forty document genres, places and organisations of about fifty countries written the way each country writes them, OCR and casing noise, and held-out values that score what training never showed. The trained models are compiled into [`slm_document_anonymizer_ex.cpp`](examples/slm_document_anonymizer_ex.cpp), which runs with no file beside it.
 
+### Prediction as compression
+
+A trained network is a probability model of what comes next, and an arithmetic coder turns such a model into a lossless code whose length is the model's cross-entropy on the data. One example builds the whole chain: a BPE tokenizer and a decoder trained in Dlib, weights quantized and compiled into the program as data, an inference engine whose arithmetic is fixed operation by operation so that a decoder on another machine reproduces every probability, and context models mixed with the network decision by decision. Two macros reduce the same source to what coding needs, compression and decompression or decompression alone, without the network definition and the training.
+
 ### Python utilities, used as witnesses
 
 A small set of Python tools lives beside the examples, and their role is verification rather than production:
@@ -200,6 +204,7 @@ A small set of Python tools lives beside the examples, and their role is verific
 - **reference loss measurement** against Hugging Face weights, which is how a training pipeline is proven to measure what it claims;
 - **corpus preparation** for knowledge-alignment and task-alignment datasets;
 - **corpus collection for a tokenizer**, drawing on encyclopaedic prose, news archives, filtered and multilingual web text, and instruction data — the last of these being the one people leave out, and the one that cannot be recovered afterwards;
+- **reference corpora for text compression**, downloaded and checked against their published checksums, so that a compression result can be compared with published ones on the same bytes;
 - **benchmarking against published models**, each task run at the few-shot count under which it is normally reported, since a table built without that detail compares nothing;
 - **synthetic data for the personal data recognizers**, labelled to the byte, with a held-out share of every lexicon for the test of unseen values.
 
@@ -226,6 +231,7 @@ Today, the project is especially strong as a platform for:
 - finding and reversibly pseudonymizing the personal data of documents, with rules and small learned recognizers
 - text, image, and text-with-image workflows in a single codebase
 - training and running models whose working set exceeds the device, on a laptop-class card
+- coding text losslessly with a trained network compiled into the program, reproducible on any processor
 
 ---
 

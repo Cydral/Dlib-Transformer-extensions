@@ -71,6 +71,7 @@ Across the full example suite, the repository now covers:
 - **supervised fine-tuning and low-rank adaptation** (LoRA, DoRA) over an imported model
 - **knowledge distillation** from a teacher container into a student of a freely chosen architecture, dense or mixture-of-experts
 - **software-extended device memory**: a residency layer that lets a network occupy more than the card holds, driven by the access schedule the run reveals about itself
+- **lossless compression from a trained predictor**: a token-level network compiled into the program, mixed with context models under an arithmetic coder, with inference arithmetic fixed operation by operation so that decoding reproduces every probability
 - **privacy-preserving document processing**: reversible pseudonymization of Word, Excel, PowerPoint, PDF and text files, with a byte-level Transformer encoder and a structural SVM sequence labeler that learn, from synthetic data, where a name, a place or an organisation starts and ends
 
 > [!TIP]
@@ -94,8 +95,8 @@ Across the full example suite, the repository now covers:
    Longer-corpus training and context-window management.
 7. [`slm_hrm_arc_puzzle_ex.cpp`](#slm_hrm_arc_puzzle_excpp) and [`slm_hrm_sudoku_ex.cpp`](#slm_hrm_sudoku_excpp)  
    Hierarchical reasoning with the published network, on ARC-AGI with four ways of deciding when to stop, then on Sudoku-Extreme, trained the way the published work trains it.
-8. [`slm_predictive_compressor_ex.cpp`](#slm_predictive_compressor_excpp)  
-   Transformer as a **byte-level predictive model** for compression.
+8. [`slm_predictive_compressor_ex.cpp`](#slm_predictive_compressor_excpp) and [`slm_tok_predictive_compressor_ex.cpp`](#slm_tok_predictive_compressor_excpp)  
+   Transformer as a **predictive model** for lossless compression, over bytes, then over BPE tokens mixed with context models, with the network compiled into the program.
 
 Then the interoperability and specialization track, which can be read independently:
 
@@ -812,16 +813,58 @@ It is the pattern worth copying more than the code. Any component whose failure 
 
 ---
 
+<a id="slm_tok_predictive_compressor_excpp"></a>
 ## `slm_tok_predictive_compressor_ex.cpp`
 
 ### Purpose
-Lossless compression driven by a Transformer, over **BPE tokens** rather than raw bytes.
+Lossless text compression with a Transformer trained in Dlib on BPE tokens. The tokenizer and the quantized network are compiled into the program through a generated header, and the network's predictions are mixed with those of adaptive context models before a binary arithmetic coder writes them.
 
 ### What the example teaches
-A language model is a probability distribution over what comes next, and a good distribution is a good compressor. Working at the token level shortens the sequence the model has to predict, which improves both speed and ratio compared to the byte-level variant.
+A language model gives a distribution over the next token, and an arithmetic coder turns that distribution into a code whose length is the model's cross-entropy on the data. Three questions decide whether this holds in practice, and the program answers each of them in code.
+
+**How a distribution over tokens drives a coder of bits.** The vocabulary is kept in lexicographic order of the byte patterns of its tokens. The tokens sharing a prefix then form a contiguous range, each bit of the next byte splits that range in two, and the probability the network gives to a bit is the mass of one half of the range over the mass of the whole, with no approximation. A token is coded as the bits of its bytes plus, wherever the vocabulary allows both, a decision saying whether it ends at the current byte; bits that the vocabulary leaves no choice for cost nothing. Context models over the bytes already coded predict the same decisions, and the two sources are mixed decision by decision.
+
+**How the decoder reproduces every probability of the encoder.** Decoding goes wrong at the first probability that differs by one bit. Training runs wherever Dlib runs, a graphics card included, and only the weights cross over. Coding runs in an inference engine of the program, on one processor thread, with sums taken in an order fixed by the shapes alone, exponentials, logarithms and rotations computed by its own routines from basic IEEE operations, and multiplications fused with additions only where the source calls for it. A position gets the same probabilities whether it is coded alone or beside fifteen other streams, and on a processor with or without AVX2.
+
+**What belongs in the archive.** The merge table and the weights are static data, compiled into the program. The archive holds the coded text, its CRC-32 and the checksum of the data it was coded with, and a build holding another tokenizer or network refuses to decode it.
 
 ### Main technical choices
-The pipeline is **argmax-based** rather than arithmetic-coded, and the header says why: GPU floating-point results are not reproducible between runs, so an arithmetic coder that depends on exact probabilities would decompress to something else on another machine. Comparing predictions instead of encoding them makes the scheme robust to that non-determinism.
+- **Tokenizer.** `bpe_tokenizer` in `space_prefixed` mode, where the space before a word opens the word's segment, so that ` the` is learned as one token. On encyclopaedic text this gives about 40% more bytes per token than splitting segments on whitespace. Training counts pair frequencies incrementally over distinct segments and builds an 8,192-entry vocabulary from a gigabyte in a few minutes.
+- **Network.** `gqa_transformer_config<8192, 4, 4, 2, 256, attention_impl::unified, false>`: four pre-norm blocks of width 256, four query heads over two key-value heads with rotary positions, SwiGLU, a final RMS normalisation and a linear head scored at every position, about 7.1 million parameters, 4.2 million of which sit in the embedding table and the head. The sizes are macros (`SLM_EMBEDDING_DIM`, `SLM_NUM_LAYERS`, `SLM_NUM_HEADS`, `SLM_NUM_KV_HEADS`, `SLM_WINDOW`), and the engine reads the shape from the compiled-in data.
+- **Training.** AdamW (0.9, 0.98, weight decay 0.01), a linear warmup then a cosine decay to a tenth of the peak rate, windows drawn at random from the tokenized corpus, and a synchronization file every ten minutes. At the end, the program runs the last window of the corpus through the trained network and through the compiled form of its exported weights, prints both cross-entropies, and writes the header.
+- **Quantization.** Symmetric, one scale per output channel and per token for the embedding table, the clipping point of each channel chosen among eight fractions of its largest magnitude as the one of least squared error, 4 to 8 bits per weight (`--bits`). The header holds the result coded by a small context model of the program, which the decompressor needs anyway.
+- **Context models.** Orders one to six, a sparse context, the current word alone and after the previous word, the current token, and a match model that looks for the most recent repeat across every stream. Each counter holds a slow and a fast estimate of its probability. The network enters raw and through two adaptive maps that recalibrate it per kind of decision and per pair of previous bytes. Three mixers select their weights by the kind of decision with the network's confidence, by the previous byte, and by the number of contexts already seen, a fourth mixer combines them, and two adaptive probability maps refine the result. Each model has 2^`--tables` counters of four bytes, from the input size up to 2^25 unless given.
+- **Streams.** A long input is cut at line boundaries into up to 255 streams, 16 by default, which the engine advances together so that each step multiplies the weights by several rows at once. The context models are shared by all streams, and the match model searches all of them.
+- **Inference engine.** Weights packed in strips of sixteen columns and multiplied in register tiles of four rows by sixteen columns, matrix and attention kernels with AVX2 and FMA chosen at run time whatever the build options, a scalar path computing the same values on other processors, and per-stream key-value rings in which keys are kept rotated relative to a base that moves forward by a window every window steps. The default network codes about 2,700 tokens per second on one core of a 2.1 GHz Xeon, context models included.
+- **Reduced builds.** Two macros compile the same source without the network definition and the training. `SLM_CODEC_ONLY` set to 1 keeps compression and decompression, the program to hand over when one executable does both; `SLM_DECOMPRESSOR_ONLY` set to 1 keeps decompression alone, the program to hand over with an archive. Both keep the options of the full program and use only header-only parts of Dlib, `bpe_tokenizer`, `crc32` and `command_line_parser`, so that one compiler command builds each of them, at about 255 KB and 220 KB of code plus the compiled-in data. Every build of the source writes and reads the same archives.
+
+### Workflow
+```bash
+# A reference corpus, downloaded, checked against its published MD5 and unpacked
+python3 slm_tools/fetch_text_benchmark.py --out-dir corpus --name enwik8
+
+# From a build directory under dlib/examples/; each step writing the header is followed by a rebuild
+./slm_tok_predictive_compressor_ex --build-tokenizer --input corpus/enwik8 --header ../slm_tok_predictive_compressor_ex.h
+./slm_tok_predictive_compressor_ex --train --input corpus/enwik8 --header ../slm_tok_predictive_compressor_ex.h
+
+./slm_tok_predictive_compressor_ex --compress --input data.txt
+./slm_tok_predictive_compressor_ex --decompress --input data.txt.dlc --output data.txt.out
+
+# The decompressor alone, compiled from the same source and the same header, with the same options
+g++ -std=c++14 -O3 -s -DSLM_DECOMPRESSOR_ONLY=1 -I../.. ../slm_tok_predictive_compressor_ex.cpp -o slm_tok_decompressor
+./slm_tok_decompressor --input data.txt.dlc --output data.txt.out
+```
+
+### Useful reminders
+- The repository provides the header with a tokenizer and a demonstration network of three blocks of width 192, trained for a short time on a sample of encyclopaedic text, so that a fresh build compresses at once. `--train` and `--embed` write the tokenizer and the new network together; `--build-tokenizer` writes a header without a network, since a network belongs to the tokenizer it was trained with.
+- The archive is coded with the network trained beforehand, so its cost on a text the network was trained on is what the training paid for. The longer the training on the corpus to code, the lower the cost, until the capacity of the network is used.
+- What a decoder needs is the archive and an executable that decodes it, whose size includes the compiled-in data; `--compress` prints the size of the archive and that of the data. The reduced builds carry the same data for the cost of their own code.
+- `--bits` trades the size of the compiled-in weights against the cost of the archive. Every bit removed from the weights costs some prediction quality, measured by the check printed at the end of `--train`.
+- Training is interrupted cleanly with Ctrl+C, which brings the synchronization file up to date, saves the network and writes the header from it; restarting the same command resumes from the synchronization file. Without that file, a saved `slm_tok_predictive_compressor.dat` is taken as the starting point of a new schedule; without either, training starts from scratch.
+- An archive depends on the code that wrote it as much as on the compiled-in data: a change in the context models or in the engine changes the code, so an archive is decoded by a build of the same source. Builds with other compiler options give the same archives, provided that a GCC build enabling FMA for the whole program (`-march=native`, `-mfma`, 64-bit ARM) also passes `-ffp-contract=off`.
+
+### Why this example matters
+It turns the next-token objective trained throughout this repository into a measurable quantity, bits per byte of a lossless code, and shows the pattern needed whenever a trained network has to give identical results on two machines: train anywhere, ship the weights as data, and run inference in arithmetic whose every operation is fixed.
 
 [⬆ Back to top](#on-this-page)
 
@@ -878,6 +921,7 @@ Verify the C++ paths against the implementations everyone else uses.
 - **`slm_benchmark.py`** places a model against published small models on the usual tasks, each at the few-shot count under which it is normally reported — a detail that decides whether a table means anything, since five-shot and zero-shot MMLU differ by several points on the same model. The comparison figures are read from a file carrying each one's source and date, not fetched: a number quoted without its evaluation settings compares nothing.
 - **`build_arc_dataset.py`** and **`build_sudoku_dataset.py`** prepare ARC-AGI and Sudoku-Extreme for the hierarchical reasoning examples, in the layout of the reference implementation as well as in the one the C++ loader reads, so that the same data can feed either codebase.
 - **`build_pii_dataset.py`** writes the synthetic French and English training and test sets of the personal data recognizers: templates by document genre, names drawn by origin or synthesized from naming traditions, OCR and casing noise applied to labelled fragments so that every offset stays exact, and a held-out share of every lexicon for the test of unseen values. Sentences without personal data surround a share of the examples and make examples of their own, the evaluation splits hold no text of the training set, and French and English examples come in equal numbers unless `--fr-share` says otherwise. The lexicons, templates and sentences of a resource directory (`--resources`) replace the built-in ones of the same name.
+- **`fetch_text_benchmark.py`** downloads the reference corpora of the Large Text Compression Benchmark, enwik8 and enwik9, checks each against its published size and MD5, and unpacks it, so that the results of `slm_tok_predictive_compressor_ex` can be set against published ones on the same bytes.
 - **`slm_bpe_corpus.py`** collects a corpus for training a tokenizer, from encyclopaedic prose, news archives, filtered web text, multilingual web text and instruction data. The last of these is the one people leave out, and it cannot be recovered afterwards: a tokenizer trained on prose alone cuts numbered lists, code blocks and tabular answers into far more tokens than it needs, and those are what a chat model produces all day. It also reduces a corpus to a much smaller one that yields **the same merge table**, since BPE merges depend on pre-token frequencies and nothing else.
 
 ### Why this matters

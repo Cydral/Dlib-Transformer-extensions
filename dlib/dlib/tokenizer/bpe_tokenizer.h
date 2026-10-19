@@ -16,6 +16,11 @@
 #include <algorithm>
 #include <sstream>
 #include <list>
+#include <queue>
+#include <chrono>
+#include <cstdint>
+#include <climits>
+#include <stdexcept>
 
 #include "../base64.h"
 #include "../serialize.h"
@@ -23,6 +28,16 @@
 
 namespace dlib
 {
+
+    // How training and encoding cut a text into the segments merges are learned within.
+    enum class bpe_segmentation
+    {
+        // Every whitespace byte is a segment of its own (the historical behaviour).
+        whitespace_split = 0,
+        // As above, except that a space directly followed by a non-whitespace byte opens
+        // the segment that follows it, so that a word and the space before it can merge.
+        space_prefixed = 1
+    };
 
     class bpe_tokenizer
     {
@@ -32,17 +47,11 @@ namespace dlib
             vocab_size = BPE_BASE_VOCAB_SIZE + special_token_list.size();
 
             // Initialize base vocabulary (bytes 0-255)
-            for (int i = 0; i < BPE_BASE_VOCAB_SIZE; ++i) {
-                Merge m;
-                m.token_id = i;
-                m.left = i;
-                m.right = i;
-                m.pattern.push_back(static_cast<uint8_t>(i));
-                merges.push_back(m);
-            }
+            reset_to_base_vocabulary();
 
             // Initialize special tokens
             initialize_special_tokens();
+            rebuild_merge_index();
         }
 
         // Train the tokenizer on input data
@@ -50,9 +59,8 @@ namespace dlib
         {
             if (text.empty()) return;
 
-            // Convert text to bytes
-            std::vector<uint8_t> data(text.begin(), text.end());
-            if (max_bytes > 0 && data.size() > max_bytes) data.resize(max_bytes);
+            const auto t_start = std::chrono::steady_clock::now();
+            const size_t data_size = (max_bytes > 0 && text.size() > max_bytes) ? max_bytes : text.size();
 
             // Calculate available merges (reserving space for special tokens)
             size_t num_merges = max_vocab_size - BPE_BASE_VOCAB_SIZE - special_token_list.size();
@@ -66,7 +74,7 @@ namespace dlib
             }
 
             if (verbose) {
-                std::cout << "Training BPE tokenizer on " << data.size() << " bytes..." << std::endl;
+                std::cout << "Training BPE tokenizer on " << data_size << " bytes..." << std::endl;
                 std::cout << "Target vocabulary size: " << max_vocab_size << std::endl;
                 std::cout << "Base vocabulary: " << BPE_BASE_VOCAB_SIZE << " tokens" << std::endl;
                 std::cout << "Special tokens: " << special_token_list.size() << " tokens" << std::endl;
@@ -74,94 +82,52 @@ namespace dlib
             }
 
             // Reset merges beyond base vocabulary
-            merges.clear();
-            for (int i = 0; i < BPE_BASE_VOCAB_SIZE; ++i) {
-                Merge m;
-                m.token_id = i;
-                m.left = i;
-                m.right = i;
-                m.pattern.push_back(static_cast<uint8_t>(i));
-                merges.push_back(m);
-            }
+            reset_to_base_vocabulary();
 
-            // Tokenize input into segments (split on whitespace and newlines)
-            std::vector<std::list<uint16_t>> segments;
-            std::vector<uint32_t> segment_counts;
-            tokenize(data, segments, segment_counts);
+            /*
+                The merge table depends on the segments only through their frequencies, so each
+                distinct segment is held once with its count. The pair counts after merge k+1 are
+                then obtained from those after merge k by touching only the segments that held the
+                merged pair, and the most frequent pair comes out of a priority queue. The result
+                is the merge table of the plain algorithm, with the same pairs, order and
+                tie-breaking.
+            */
+            segment_set segments;
+            count_segments(text.data(), data_size, segmentation, segments);
 
             if (verbose) {
-                std::cout << "Created " << segments.size() << " segments for training" << std::endl;
+                std::cout << "Created " << segments.total << " segments for training ("
+                    << segments.count.size() << " distinct)" << std::endl;
             }
 
-            // Initialize pair counting
-            std::unordered_map<uint32_t, std::pair<int32_t, std::pair<uint16_t, uint16_t>>> pair_counts;
-            std::unordered_map<uint32_t, std::unordered_set<uint32_t>> where_to_update;
+            std::vector<std::pair<uint32_t, uint32_t>> learned;
+            learn_merges(segments, num_merges, BPE_BASE_VOCAB_SIZE, learned, verbose);
 
-            // Count initial pairs
-            for (uint32_t i = 0; i < segments.size(); i++) {
-                countInSegment(segments[i], i, segment_counts[i], pair_counts, where_to_update);
-            }
-
-            // Main training loop
-            size_t merges_performed = 0;
-
-            for (size_t merge_idx = 0; merge_idx < num_merges; merge_idx++) {
-                // Find most frequent pair
-                int32_t max_count = 0;
-                std::pair<uint16_t, uint16_t> max_pair = findMaxPair(pair_counts, max_count);
-
-                if (max_count <= 0) {
-                    if (verbose) {
-                        std::cout << "\nNo more pairs to merge at iteration " << merge_idx << std::endl;
-                    }
-                    break;
-                }
-
-                uint16_t new_token = BPE_BASE_VOCAB_SIZE + merge_idx;
-
-                // Create merge entry
+            for (size_t merge_idx = 0; merge_idx < learned.size(); ++merge_idx) {
                 Merge m;
-                m.token_id = new_token;
-                m.left = max_pair.first;
-                m.right = max_pair.second;
-
-                // Build pattern for new token
-                m.pattern = merges[max_pair.first].pattern;
-                const auto& right_pattern = merges[max_pair.second].pattern;
+                m.token_id = static_cast<int>(BPE_BASE_VOCAB_SIZE + merge_idx);
+                m.left = static_cast<int>(learned[merge_idx].first);
+                m.right = static_cast<int>(learned[merge_idx].second);
+                m.pattern = merges[m.left].pattern;
+                const auto& right_pattern = merges[m.right].pattern;
                 m.pattern.insert(m.pattern.end(), right_pattern.begin(), right_pattern.end());
-
                 merges.push_back(m);
-
-                // Store mapping for fast encoding
-                uint32_t pair_key = (static_cast<uint32_t>(max_pair.first) << 16) | max_pair.second;
-
-                if (verbose && (merge_idx % 1000 == 0 || merge_idx < 10)) {
-                    std::cout << "Merge " << merge_idx << ": (" << max_pair.first << ", " << max_pair.second
-                        << ") -> " << new_token << " (occurrences: " << max_count
-                        << ", pattern length: " << m.pattern.size() << ")" << std::endl;
-                }
-
-                // Apply merge to all affected segments
-                auto affected_segments = where_to_update[pair_key];
-                applyMerge(max_pair, new_token, segments, segment_counts, affected_segments,
-                    pair_counts, where_to_update);
-
-                // Clear this pair's count
-                pair_counts[pair_key].first = 0;
-
-                merges_performed++;
             }
 
             // Update vocabulary size: base + special tokens + actual merges performed
             vocab_size = merges.size() + special_token_list.size();
             initialize_special_tokens();
+            rebuild_merge_index();
 
             if (verbose) {
+                const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
                 std::cout << "\nTraining completed!" << std::endl;
                 std::cout << "Base vocabulary: " << BPE_BASE_VOCAB_SIZE << " tokens" << std::endl;
-                std::cout << "Merges performed: " << merges_performed << std::endl;
+                std::cout << "Merges performed: " << learned.size() << std::endl;
                 std::cout << "Special tokens: " << special_token_list.size() << " tokens" << std::endl;
                 std::cout << "Total vocabulary size: " << vocab_size << std::endl;
+                std::cout << "Training time: " << std::fixed << std::setprecision(1) << secs << " s"
+                    << std::defaultfloat << std::endl;
             }
         }
 
@@ -203,8 +169,7 @@ namespace dlib
 
             for (long i = 0; i < n_chunks; ++i) {
                 workers.emplace_back([this, &text, &chunks, &chunk_tokens, i]() {
-                    chunk_tokens[i] = encode_sequential(
-                        text.substr(chunks[i].first, chunks[i].second));
+                    chunk_tokens[i] = encode_range(text.data() + chunks[i].first, chunks[i].second);
                     });
             }
             for (auto& w : workers) w.join();
@@ -274,10 +239,66 @@ namespace dlib
         size_t get_vocab_size() const { return vocab_size; }
         size_t get_vocab_without_specials_size() const { return (vocab_size - special_token_list.size()); }
 
+        // Segmentation used by train() and encode(). Merges learned under one segmentation do
+        // not carry over to another, so changing it resets the tokenizer to its base vocabulary.
+        void set_segmentation(bpe_segmentation mode)
+        {
+            if (mode == segmentation) return;
+            segmentation = mode;
+            reset_to_base_vocabulary();
+            vocab_size = merges.size() + special_token_list.size();
+            initialize_special_tokens();
+            rebuild_merge_index();
+        }
+        bpe_segmentation get_segmentation() const { return segmentation; }
+
+        // The merge table, as the (left, right) pair each merge joins, in the order they were learned.
+        std::vector<std::pair<int, int>> get_merges() const
+        {
+            std::vector<std::pair<int, int>> result;
+            result.reserve(merges.size() - BPE_BASE_VOCAB_SIZE);
+            for (size_t i = BPE_BASE_VOCAB_SIZE; i < merges.size(); ++i)
+                result.push_back({ merges[i].left, merges[i].right });
+            return result;
+        }
+
+        // Rebuild the tokenizer from a merge table, as get_merges() returns it.
+        void set_merges(const std::vector<std::pair<int, int>>& merge_list)
+        {
+            if (merge_list.size() > static_cast<size_t>(MAX_TOKEN_ID - BPE_BASE_VOCAB_SIZE))
+                throw std::invalid_argument("bpe_tokenizer::set_merges: too many merges.");
+            reset_to_base_vocabulary();
+            for (size_t i = 0; i < merge_list.size(); ++i) {
+                const int id = static_cast<int>(BPE_BASE_VOCAB_SIZE + i);
+                const int left = merge_list[i].first, right = merge_list[i].second;
+                if (left < 0 || right < 0 || left >= id || right >= id)
+                    throw std::invalid_argument("bpe_tokenizer::set_merges: merge " + std::to_string(i)
+                        + " refers to a token that does not precede it.");
+                Merge m;
+                m.token_id = id;
+                m.left = left;
+                m.right = right;
+                m.pattern = merges[left].pattern;
+                m.pattern.insert(m.pattern.end(), merges[right].pattern.begin(), merges[right].pattern.end());
+                merges.push_back(m);
+            }
+            vocab_size = merges.size() + special_token_list.size();
+            initialize_special_tokens();
+            rebuild_merge_index();
+        }
+
         // Serialization
         friend void serialize(const bpe_tokenizer& item, std::ostream& out)
         {
-            serialize("bpe_tokenizer_", out);
+            // The historical segmentation keeps the historical format, byte for byte; any other
+            // is written under its own tag so that a reader that predates it refuses the stream.
+            if (item.segmentation == bpe_segmentation::whitespace_split) {
+                serialize("bpe_tokenizer_", out);
+            }
+            else {
+                serialize("bpe_tokenizer_segmented_", out);
+                serialize(static_cast<int>(item.segmentation), out);
+            }
             serialize(item.vocab_size, out);
 
             // Serialize only the merge entries beyond base vocabulary
@@ -297,20 +318,24 @@ namespace dlib
         {
             std::string version;
             deserialize(version, in);
-            if (version != "bpe_tokenizer_")
+            if (version == "bpe_tokenizer_") {
+                item.segmentation = bpe_segmentation::whitespace_split;
+            }
+            else if (version == "bpe_tokenizer_segmented_") {
+                int mode = 0;
+                deserialize(mode, in);
+                if (mode != static_cast<int>(bpe_segmentation::whitespace_split) &&
+                    mode != static_cast<int>(bpe_segmentation::space_prefixed))
+                    throw serialization_error("Unknown segmentation found while deserializing dlib::bpe_tokenizer.");
+                item.segmentation = static_cast<bpe_segmentation>(mode);
+            }
+            else {
                 throw serialization_error("Unexpected version found while deserializing dlib::bpe_tokenizer.");
+            }
             deserialize(item.vocab_size, in);
 
             // Initialize base vocabulary
-            item.merges.clear();
-            for (int i = 0; i < bpe_tokenizer::BPE_BASE_VOCAB_SIZE; ++i) {
-                Merge m;
-                m.token_id = i;
-                m.left = i;
-                m.right = i;
-                m.pattern.push_back(static_cast<uint8_t>(i));
-                item.merges.push_back(m);
-            }
+            item.reset_to_base_vocabulary();
 
             // Deserialize merge entries
             size_t num_merges;
@@ -326,6 +351,7 @@ namespace dlib
 
             // Initialize special tokens
             item.initialize_special_tokens();
+            item.rebuild_merge_index();
         }
 
     private:
@@ -340,6 +366,7 @@ namespace dlib
             "<answer>", "<search>", "<unk>", "<pad>"
         };
         static const int BPE_BASE_VOCAB_SIZE = 256;
+        static const int MAX_TOKEN_ID = 65536;
 
         // Merge structure
         struct Merge {
@@ -352,10 +379,56 @@ namespace dlib
         // Data members
         size_t vocab_size;
         std::vector<Merge> merges;
+        bpe_segmentation segmentation = bpe_segmentation::whitespace_split;
 
         // Special tokens handling
         std::map<std::string, int> special_tokens;
         std::unordered_map<int, std::string> special_token_map;
+
+        // Rank of each merge, keyed by its pair, for the encoder. Rebuilt whenever the merges change.
+        std::unordered_map<uint64_t, int> merge_rank;
+        // False when a merge holds a segment delimiter: the per-segment encoder would then differ
+        // from applying the merges over the whole text, and the reference encoder is used instead.
+        bool segment_encoder_valid = true;
+
+        static bool is_delimiter(uint8_t byte)
+        {
+            return byte == ' ' || byte == '\n' || byte == '\t' || byte == '\r';
+        }
+
+        // Length of the segment that starts at text[i]: a lone delimiter byte, or a run of
+        // non-delimiter bytes, opened under space_prefixed by the space directly before it.
+        static size_t segment_length(const char* text, size_t size, size_t i, bpe_segmentation mode)
+        {
+            const uint8_t byte = static_cast<uint8_t>(text[i]);
+            size_t j = i + 1;
+            if (is_delimiter(byte)) {
+                const bool opens_word = mode == bpe_segmentation::space_prefixed && byte == ' '
+                    && j < size && !is_delimiter(static_cast<uint8_t>(text[j]));
+                if (!opens_word) return 1;
+            }
+            while (j < size && !is_delimiter(static_cast<uint8_t>(text[j]))) ++j;
+            return j - i;
+        }
+
+        static uint64_t pair_key(uint32_t left, uint32_t right)
+        {
+            return (static_cast<uint64_t>(left) << 32) | right;
+        }
+
+        void reset_to_base_vocabulary()
+        {
+            merges.clear();
+            merges.reserve(BPE_BASE_VOCAB_SIZE);
+            for (int i = 0; i < BPE_BASE_VOCAB_SIZE; ++i) {
+                Merge m;
+                m.token_id = i;
+                m.left = i;
+                m.right = i;
+                m.pattern.push_back(static_cast<uint8_t>(i));
+                merges.push_back(m);
+            }
+        }
 
         void initialize_special_tokens()
         {
@@ -372,6 +445,23 @@ namespace dlib
             }
         }
 
+        void rebuild_merge_index()
+        {
+            merge_rank.clear();
+            segment_encoder_valid = true;
+            for (size_t i = BPE_BASE_VOCAB_SIZE; i < merges.size(); ++i) {
+                const Merge& m = merges[i];
+                const uint64_t key = pair_key(static_cast<uint32_t>(m.left), static_cast<uint32_t>(m.right));
+                // The first merge of a pair is the one the reference encoder applies.
+                merge_rank.insert(std::make_pair(key, static_cast<int>(i - BPE_BASE_VOCAB_SIZE)));
+                for (size_t k = 0; k < m.pattern.size(); ++k) {
+                    const uint8_t b = m.pattern[k];
+                    const bool leading_space = (segmentation == bpe_segmentation::space_prefixed && b == ' ' && k == 0);
+                    if (is_delimiter(b) && !leading_space) segment_encoder_valid = false;
+                }
+            }
+        }
+
         // Compute the number of worker threads for parallel encode/decode.
         // Progressive scaling: below 10k elements use 1 thread (sequential),
         // then scale proportionally up to (hardware_concurrency - 4).
@@ -384,10 +474,91 @@ namespace dlib
             return std::max(1L, std::min(max_threads, scaled));
         }
 
-        // Sequential encode: converts text to byte tokens then applies all
-        // merges in order.  Used directly for small inputs and as the per-chunk
-        // worker for parallel encode.
+        // Sequential encode, used directly for small inputs and as the per-chunk worker of the
+        // parallel encode.
         std::vector<int> encode_sequential(const std::string& text) const
+        {
+            return encode_range(text.data(), text.size());
+        }
+
+        /*
+            The merges never join across a segment boundary, so applying them over the whole text
+            gives the same tokens as applying them inside each segment. Within a segment, the merge of
+            lowest rank among the adjacent pairs is always the next one the whole-text algorithm
+            would apply there, since a merge can only join tokens that existed before it. Each
+            distinct segment is encoded once and its tokens reused from a cache.
+        */
+        std::vector<int> encode_range(const char* text, size_t size) const
+        {
+            if (size == 0) return {};
+            if (!segment_encoder_valid) return encode_reference(std::string(text, size));
+
+            std::vector<int> tokens;
+            tokens.reserve(size / 2 + 16);
+            std::unordered_map<std::string, std::vector<int>> cache;
+            std::vector<int> work;
+            const size_t max_cache_entries = 1 << 20;
+            const size_t max_cached_length = 256;
+
+            size_t i = 0;
+            while (i < size) {
+                const uint8_t byte = static_cast<uint8_t>(text[i]);
+                const size_t len = segment_length(text, size, i, segmentation);
+                const size_t j = i + len;
+
+                if (len == 1) {
+                    tokens.push_back(byte);
+                }
+                else if (len > max_cached_length) {
+                    encode_segment(text + i, len, work);
+                    tokens.insert(tokens.end(), work.begin(), work.end());
+                }
+                else {
+                    std::string key(text + i, len);
+                    auto it = cache.find(key);
+                    if (it == cache.end()) {
+                        encode_segment(text + i, len, work);
+                        if (cache.size() >= max_cache_entries) cache.clear();
+                        it = cache.emplace(std::move(key), work).first;
+                    }
+                    tokens.insert(tokens.end(), it->second.begin(), it->second.end());
+                }
+                i = j;
+            }
+            return tokens;
+        }
+
+        // Applies the merges to one segment, lowest rank first, every occurrence left to right.
+        void encode_segment(const char* text, size_t len, std::vector<int>& work) const
+        {
+            work.resize(len);
+            for (size_t k = 0; k < len; ++k) work[k] = static_cast<uint8_t>(text[k]);
+
+            while (work.size() > 1) {
+                int best = INT_MAX;
+                for (size_t k = 0; k + 1 < work.size(); ++k) {
+                    auto it = merge_rank.find(pair_key(static_cast<uint32_t>(work[k]), static_cast<uint32_t>(work[k + 1])));
+                    if (it != merge_rank.end() && it->second < best) best = it->second;
+                }
+                if (best == INT_MAX) break;
+
+                const Merge& m = merges[BPE_BASE_VOCAB_SIZE + best];
+                size_t out = 0;
+                for (size_t k = 0; k < work.size(); ) {
+                    if (k + 1 < work.size() && work[k] == m.left && work[k + 1] == m.right) {
+                        work[out++] = m.token_id;
+                        k += 2;
+                    }
+                    else {
+                        work[out++] = work[k++];
+                    }
+                }
+                work.resize(out);
+            }
+        }
+
+        // Applies every merge in order over the whole text. Used when a merge holds a delimiter.
+        std::vector<int> encode_reference(const std::string& text) const
         {
             if (text.empty()) return {};
             std::vector<int> tokens;
@@ -444,127 +615,278 @@ namespace dlib
             return std::string(result.begin(), result.end());
         }
 
-        // Segment-based training functions from BPETokenizer
-        void tokenize(const std::vector<uint8_t>& data,
-            std::vector<std::list<uint16_t>>& segments,
-            std::vector<uint32_t>& segment_counts)
+        // Distinct training segments, their symbols stored end to end, and their frequencies.
+        struct segment_set
         {
-            segments.clear();
-            segment_counts.clear();
+            std::vector<uint32_t> symbols;     // the symbols of every distinct segment
+            std::vector<uint64_t> start;       // where each segment begins in symbols
+            std::vector<uint32_t> length;      // its current length, which merges shorten
+            std::vector<uint64_t> count;       // how many times it occurs
+            uint64_t total = 0;                // segments in the text, delimiters included
+        };
 
-            // Split on whitespace and newlines to create meaningful segments
-            std::list<uint16_t> current_segment;
+        static uint64_t mix_hash(uint64_t h)
+        {
+            h ^= h >> 33; h *= 0xff51afd7ed558ccdULL;
+            h ^= h >> 33; h *= 0xc4ceb9fe1a85ec53ULL;
+            h ^= h >> 33;
+            return h;
+        }
 
-            for (size_t i = 0; i < data.size(); i++) {
-                uint8_t byte = data[i];
+        /*
+            Splits the text into segments as the encoder does and gathers the distinct segments
+            of two or more bytes with their frequencies. Segments of one byte hold no pair and
+            play no part in the merges.
+        */
+        static void count_segments(const char* text, size_t size, bpe_segmentation mode, segment_set& out)
+        {
+            struct slot { uint64_t hash; uint64_t offset; uint32_t length; uint32_t index; };
+            std::vector<slot> table(1 << 16, slot{ 0, 0, 0, UINT32_MAX });
+            size_t mask = table.size() - 1, used = 0;
+            std::vector<uint64_t> first_offset;
 
-                // Split on whitespace and newlines
-                if (byte == ' ' || byte == '\n' || byte == '\t' || byte == '\r') {
-                    if (!current_segment.empty()) {
-                        segments.push_back(current_segment);
-                        segment_counts.push_back(1);
-                        current_segment.clear();
+            auto grow = [&]() {
+                std::vector<slot> bigger(table.size() * 2, slot{ 0, 0, 0, UINT32_MAX });
+                const size_t bigger_mask = bigger.size() - 1;
+                for (const slot& s : table) {
+                    if (s.index == UINT32_MAX) continue;
+                    size_t p = s.hash & bigger_mask;
+                    while (bigger[p].index != UINT32_MAX) p = (p + 1) & bigger_mask;
+                    bigger[p] = s;
+                }
+                table.swap(bigger);
+                mask = table.size() - 1;
+            };
+
+            out = segment_set();
+            size_t i = 0;
+            while (i < size) {
+                const size_t len = segment_length(text, size, i, mode);
+                const size_t j = i + len;
+                ++out.total;
+                if (len >= 2) {
+                    uint64_t h = 0x9e3779b97f4a7c15ULL ^ len;
+                    for (size_t k = i; k < j; ++k) h = (h ^ static_cast<uint8_t>(text[k])) * 0x100000001b3ULL;
+                    h = mix_hash(h);
+                    size_t p = h & mask;
+                    for (;;) {
+                        slot& s = table[p];
+                        if (s.index == UINT32_MAX) {
+                            if (first_offset.size() >= UINT32_MAX - 1)
+                                throw std::runtime_error("bpe_tokenizer: too many distinct segments.");
+                            s.hash = h; s.offset = i; s.length = static_cast<uint32_t>(len);
+                            s.index = static_cast<uint32_t>(first_offset.size());
+                            first_offset.push_back(i);
+                            out.count.push_back(1);
+                            if (++used * 2 > table.size()) grow();
+                            break;
+                        }
+                        if (s.hash == h && s.length == len && std::equal(text + i, text + j, text + s.offset)) {
+                            ++out.count[s.index];
+                            break;
+                        }
+                        p = (p + 1) & mask;
                     }
-                    // Add the delimiter as its own segment
-                    segments.push_back({ static_cast<uint16_t>(byte) });
-                    segment_counts.push_back(1);
                 }
-                else {
-                    current_segment.push_back(static_cast<uint16_t>(byte));
-                }
+                i = j;
             }
 
-            // Add the last segment if not empty
-            if (!current_segment.empty()) {
-                segments.push_back(current_segment);
-                segment_counts.push_back(1);
+            out.start.resize(first_offset.size());
+            out.length.resize(first_offset.size());
+            uint64_t total_symbols = 0;
+            for (const slot& s : table) {
+                if (s.index == UINT32_MAX) continue;
+                out.length[s.index] = s.length;
+            }
+            for (size_t w = 0; w < first_offset.size(); ++w) {
+                out.start[w] = total_symbols;
+                total_symbols += out.length[w];
+            }
+            out.symbols.resize(total_symbols);
+            for (size_t w = 0; w < first_offset.size(); ++w) {
+                const uint8_t* src = reinterpret_cast<const uint8_t*>(text + first_offset[w]);
+                for (uint32_t k = 0; k < out.length[w]; ++k) out.symbols[out.start[w] + k] = src[k];
             }
         }
 
-        // Count pairs in a segment and update global pair counts
-        void countInSegment(const std::list<uint16_t>& segment, uint32_t segment_idx,
-            int32_t count_delta,
-            std::unordered_map<uint32_t, std::pair<int32_t, std::pair<uint16_t, uint16_t>>>& pair_counts,
-            std::unordered_map<uint32_t, std::unordered_set<uint32_t>>& where_to_update)
+        /*
+            Learns up to num_merges merges over the distinct segments. Pair counts are updated
+            from one merge to the next by difference over the segments the merged pair occurred
+            in, which each pair lists. A max-heap ordered by (count descending, pair ascending)
+            gives the next merge; an entry whose count is no longer current is discarded when it
+            reaches the top, and every pair whose count changes gets a fresh entry.
+        */
+        static void learn_merges(
+            segment_set& seg,
+            size_t num_merges,
+            uint32_t first_new_id,
+            std::vector<std::pair<uint32_t, uint32_t>>& learned,
+            bool verbose
+        )
         {
-            if (segment.size() < 2) return;
+            learned.clear();
 
-            auto it = segment.begin();
-            uint16_t prev_token = *it;
-            ++it;
+            // Pair index: open addressing from the pair key to a dense pair number.
+            std::vector<uint64_t> keys(1 << 16, UINT64_MAX);
+            std::vector<uint32_t> slots(1 << 16, 0);
+            size_t mask = keys.size() - 1;
+            std::vector<int64_t> pair_count;
+            std::vector<uint32_t> pair_left, pair_right, pair_dirty;
+            std::vector<std::vector<uint32_t>> pair_where;
 
-            while (it != segment.end()) {
-                uint16_t curr_token = *it;
-                uint32_t pair_key = (static_cast<uint32_t>(prev_token) << 16) | curr_token;
-
-                auto& entry = pair_counts[pair_key];
-                entry.first += count_delta;
-                entry.second = { prev_token, curr_token };
-
-                if (count_delta > 0) {
-                    where_to_update[pair_key].insert(segment_idx);
+            auto grow = [&]() {
+                std::vector<uint64_t> bigger_keys(keys.size() * 2, UINT64_MAX);
+                std::vector<uint32_t> bigger_slots(keys.size() * 2, 0);
+                const size_t bigger_mask = bigger_keys.size() - 1;
+                for (size_t p = 0; p < keys.size(); ++p) {
+                    if (keys[p] == UINT64_MAX) continue;
+                    size_t q = mix_hash(keys[p]) & bigger_mask;
+                    while (bigger_keys[q] != UINT64_MAX) q = (q + 1) & bigger_mask;
+                    bigger_keys[q] = keys[p];
+                    bigger_slots[q] = slots[p];
                 }
-                else {
-                    where_to_update[pair_key].erase(segment_idx);
-                }
+                keys.swap(bigger_keys);
+                slots.swap(bigger_slots);
+                mask = keys.size() - 1;
+            };
 
-                prev_token = curr_token;
-                ++it;
-            }
-        }
-
-        // Find the most frequent pair
-        std::pair<uint16_t, uint16_t> findMaxPair(
-            const std::unordered_map<uint32_t, std::pair<int32_t, std::pair<uint16_t, uint16_t>>>& pair_counts,
-            int32_t& max_count)
-        {
-            max_count = 0;
-            std::pair<uint16_t, uint16_t> max_pair = { 0, 0 };
-
-            for (const auto& entry : pair_counts) {
-                int32_t count = entry.second.first;
-                const auto& pair = entry.second.second;
-
-                if (count > max_count || (count == max_count && pair < max_pair)) {
-                    max_count = count;
-                    max_pair = pair;
-                }
-            }
-
-            return max_pair;
-        }
-
-        // Apply a merge to all affected segments
-        void applyMerge(const std::pair<uint16_t, uint16_t>& merge_pair, uint16_t new_token_id,
-            std::vector<std::list<uint16_t>>& segments,
-            const std::vector<uint32_t>& segment_counts,
-            const std::unordered_set<uint32_t>& affected_segments,
-            std::unordered_map<uint32_t, std::pair<int32_t, std::pair<uint16_t, uint16_t>>>& pair_counts,
-            std::unordered_map<uint32_t, std::unordered_set<uint32_t>>& where_to_update)
-        {
-            for (uint32_t segment_idx : affected_segments) {
-                auto& segment = segments[segment_idx];
-                int32_t count = segment_counts[segment_idx];
-
-                // Remove old pair counts for this segment
-                countInSegment(segment, segment_idx, -count, pair_counts, where_to_update);
-
-                // Apply merge in this segment
-                auto it = segment.begin();
-                while (it != segment.end()) {
-                    auto next_it = std::next(it);
-                    if (next_it != segment.end() && *it == merge_pair.first && *next_it == merge_pair.second) {
-                        *it = new_token_id;
-                        segment.erase(next_it);
-                        // Don't increment it, check the same position again
+            auto pair_id = [&](uint32_t left, uint32_t right) -> uint32_t {
+                const uint64_t key = pair_key(left, right);
+                size_t p = mix_hash(key) & mask;
+                for (;;) {
+                    if (keys[p] == key) return slots[p];
+                    if (keys[p] == UINT64_MAX) {
+                        const uint32_t id = static_cast<uint32_t>(pair_count.size());
+                        keys[p] = key;
+                        slots[p] = id;
+                        pair_count.push_back(0);
+                        pair_left.push_back(left);
+                        pair_right.push_back(right);
+                        pair_dirty.push_back(UINT32_MAX);
+                        pair_where.emplace_back();
+                        if (pair_count.size() * 2 > keys.size()) grow();
+                        return id;
                     }
-                    else {
-                        ++it;
+                    p = (p + 1) & mask;
+                }
+            };
+
+            struct entry { int64_t count; uint32_t left; uint32_t right; };
+            struct entry_order {
+                bool operator()(const entry& a, const entry& b) const {
+                    if (a.count != b.count) return a.count < b.count;
+                    if (a.left != b.left) return a.left > b.left;
+                    return a.right > b.right;
+                }
+            };
+            std::priority_queue<entry, std::vector<entry>, entry_order> heap;
+
+            const size_t num_segments = seg.count.size();
+            for (uint32_t w = 0; w < num_segments; ++w) {
+                const uint32_t* s = &seg.symbols[seg.start[w]];
+                const uint32_t len = seg.length[w];
+                for (uint32_t k = 0; k + 1 < len; ++k) {
+                    const uint32_t id = pair_id(s[k], s[k + 1]);
+                    pair_count[id] += static_cast<int64_t>(seg.count[w]);
+                    auto& where = pair_where[id];
+                    if (where.empty() || where.back() != w) where.push_back(w);
+                }
+            }
+            for (uint32_t id = 0; id < pair_count.size(); ++id)
+                if (pair_count[id] > 0) heap.push(entry{ pair_count[id], pair_left[id], pair_right[id] });
+
+            std::vector<uint32_t> visited(num_segments, UINT32_MAX);
+            std::vector<std::pair<uint64_t, int>> local;
+            std::vector<uint32_t> dirty;
+            size_t live_pairs = heap.size();
+
+            for (size_t merge_idx = 0; merge_idx < num_merges; ++merge_idx) {
+                // Most frequent pair, ties going to the smallest pair.
+                entry best{ 0, 0, 0 };
+                while (!heap.empty()) {
+                    const entry top = heap.top();
+                    const uint32_t id = pair_id(top.left, top.right);
+                    if (pair_count[id] != top.count) { heap.pop(); continue; }
+                    best = top;
+                    break;
+                }
+                if (best.count <= 0) {
+                    if (verbose) std::cout << "\nNo more pairs to merge at iteration " << merge_idx << std::endl;
+                    break;
+                }
+                heap.pop();
+
+                const uint32_t left = best.left, right = best.right;
+                const uint32_t new_id = static_cast<uint32_t>(first_new_id + merge_idx);
+                if (new_id >= static_cast<uint32_t>(MAX_TOKEN_ID)) break;
+                learned.push_back({ left, right });
+
+                if (verbose && (merge_idx % 1000 == 0 || merge_idx < 10)) {
+                    std::cout << "Merge " << merge_idx << ": (" << left << ", " << right << ") -> " << new_id
+                        << " (occurrences: " << best.count << ")" << std::endl;
+                }
+
+                const uint32_t merged_id = pair_id(left, right);
+                std::vector<uint32_t> where;
+                where.swap(pair_where[merged_id]);
+                dirty.clear();
+
+                for (uint32_t w : where) {
+                    if (visited[w] == merge_idx) continue;
+                    visited[w] = static_cast<uint32_t>(merge_idx);
+
+                    uint32_t* s = &seg.symbols[seg.start[w]];
+                    const uint32_t len = seg.length[w];
+                    bool present = false;
+                    for (uint32_t k = 0; k + 1 < len; ++k)
+                        if (s[k] == left && s[k + 1] == right) { present = true; break; }
+                    if (!present) continue;
+
+                    local.clear();
+                    for (uint32_t k = 0; k + 1 < len; ++k) local.push_back({ pair_key(s[k], s[k + 1]), -1 });
+                    uint32_t out = 0;
+                    for (uint32_t k = 0; k < len; ) {
+                        if (k + 1 < len && s[k] == left && s[k + 1] == right) { s[out++] = new_id; k += 2; }
+                        else s[out++] = s[k++];
+                    }
+                    seg.length[w] = out;
+                    for (uint32_t k = 0; k + 1 < out; ++k) local.push_back({ pair_key(s[k], s[k + 1]), +1 });
+
+                    std::sort(local.begin(), local.end());
+                    const int64_t freq = static_cast<int64_t>(seg.count[w]);
+                    for (size_t a = 0; a < local.size(); ) {
+                        size_t b = a;
+                        int delta = 0;
+                        while (b < local.size() && local[b].first == local[a].first) delta += local[b++].second;
+                        if (delta != 0) {
+                            const uint32_t id = pair_id(static_cast<uint32_t>(local[a].first >> 32),
+                                static_cast<uint32_t>(local[a].first & 0xffffffffu));
+                            pair_count[id] += delta * freq;
+                            if (delta > 0) {
+                                auto& list = pair_where[id];
+                                if (list.empty() || list.back() != w) list.push_back(w);
+                            }
+                            if (pair_dirty[id] != merge_idx) {
+                                pair_dirty[id] = static_cast<uint32_t>(merge_idx);
+                                dirty.push_back(id);
+                            }
+                        }
+                        a = b;
                     }
                 }
 
-                // Add new pair counts for this segment
-                countInSegment(segment, segment_idx, count, pair_counts, where_to_update);
+                pair_count[merged_id] = 0;
+                for (uint32_t id : dirty)
+                    if (pair_count[id] > 0) heap.push(entry{ pair_count[id], pair_left[id], pair_right[id] });
+
+                // Stale entries pile up; rebuild from the current counts when they dominate.
+                if (heap.size() > 4 * live_pairs + (1u << 20)) {
+                    std::vector<entry> fresh;
+                    for (uint32_t id = 0; id < pair_count.size(); ++id)
+                        if (pair_count[id] > 0) fresh.push_back(entry{ pair_count[id], pair_left[id], pair_right[id] });
+                    live_pairs = fresh.size();
+                    heap = std::priority_queue<entry, std::vector<entry>, entry_order>(entry_order(), std::move(fresh));
+                }
             }
         }
     };
@@ -572,3 +894,4 @@ namespace dlib
 }
 
 #endif // DLIB_BPE_TOKENIZER_H
+
