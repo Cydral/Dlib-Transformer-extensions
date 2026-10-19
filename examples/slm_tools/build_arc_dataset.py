@@ -11,16 +11,16 @@
 #
 # WHAT THE LAYOUT IS, AND WHY IT LOOKS LIKE THIS
 #
-# Each input-output pair is one example. A grid is flattened row by row into a fixed
-# window of 900 cells, which is the largest ARC grid, 30 by 30. Cells outside the grid
-# hold the pad token, so every example has the same length and no length bookkeeping
-# is needed at training time.
+# Each input-output pair is one example. A grid is written into a fixed window of 900
+# cells, the size of the largest ARC grid, 30 by 30, and the window is flattened row by
+# row. Cells outside the grid hold the pad token, so every example has the same length
+# and no length bookkeeping is needed at training time.
 #
 # The conditioning is the part worth understanding. The model is shown the input grid
 # and nothing else: no worked examples of the same task accompany it. What tells it
 # which transformation to apply is an integer, the puzzle identifier, which indexes a
-# learned embedding prepended to the sequence. The model therefore learns to associate
-# an identifier with a rule, rather than to infer a rule from demonstrations.
+# learned embedding prepended to the sequence. The model therefore learns which rule
+# each identifier names.
 #
 # This has a consequence that has to be accepted deliberately: an identifier the model
 # has never trained on means nothing to it, so evaluation puzzles must be present in
@@ -32,28 +32,49 @@
 # AUGMENTATION
 #
 # ARC ships a few hundred tasks with a handful of pairs each, which is far too little.
-# The reference work multiplies this by applying the transformations that leave the
-# nature of a puzzle intact: the eight rotations and reflections of the square, a
-# permutation of the ten colours, and a translation within the grid. Each augmentation
-# receives its own puzzle identifier, since it is a different rule from the model's
-# point of view even though a human would call it the same task.
+# The reference work multiplies them by the transformations that leave the nature of a
+# puzzle intact. A variant of a task is one draw of two of them, one of the eight
+# symmetries of the square and a permutation of the colours one to nine, colour zero
+# keeping its place as the background. The draw applies to every pair of the task, input
+# and output alike, in the training split as in the evaluation split, since a rule is
+# preserved only when everything it relates moves together. Each variant receives its own
+# puzzle identifier and a name recording the draw, the task's name followed by the
+# symmetry and the colour mapping, as in the reference. Two draws giving the same grids
+# make one variant, so a task with symmetries of its own receives fewer variants than
+# asked for once a bounded number of further draws has failed to find new ones.
 #
-# Augmentation is optional here. Building without it is the honest baseline and shows
-# how much of the result the augmentation is responsible for.
+# A translation comes on top, in the training split only. Every pair of a puzzle but one
+# moves to a random place inside the window, its input and its output to the same place,
+# and padding surrounds it. The evaluation split is never moved, so an answer is read
+# from the top-left corner of the window, and undoing a variant is undoing its symmetry
+# and its colours.
+#
+# Augmentation is optional here. Building without it gives the baseline that shows how
+# much of the result the augmentation is responsible for.
 #
 # GROUPING
 #
 # Two index arrays describe the nesting. puzzle_indices gives, for each puzzle, where
 # its examples begin; group_indices gives, for each group, where its puzzles begin. A
-# group holds one original task together with all of its augmentations, which lets a
-# sampler draw one variant per task per epoch rather than letting a heavily augmented
-# task dominate.
+# group holds one original task together with all of its variants, the task itself
+# first, which lets a sampler draw one variant per task per epoch, so that a task weighs
+# the same however many variants it has.
 #
 # OUTPUT
 #
-# Two formats are written by default. The .npy set is the reference layout, readable
-# by numpy and by the reference training code. The .bin file packs the same arrays
-# behind a small header for the C++ side, which needs no numpy and no parsing.
+# For each split, a .bin file packs the arrays behind a small header for the C++ side,
+# which needs no numpy and no parsing, and a .names file holds the name of every puzzle,
+# one per line in the order of the puzzles, the blank one first. A name records its
+# variant, which is what an evaluation reads to bring the answers of all the variants of
+# a task back to the task itself before they vote.
+#
+# The reference layout is written beside them when numpy is present: a train and a test
+# directory of .npy arrays with their dataset.json, which the reference's training code
+# reads as they are, and identifiers.json, the name of every identifier, which its
+# evaluation reads to undo the variants.
+#
+# The examples are produced while the files are written, one at a time, so building a
+# thousand variants of every task needs memory for the tasks alone.
 #
 # Usage:
 #   build_arc_dataset.py --data-dir arc-agi --out-dir arc-data
@@ -65,12 +86,17 @@
 #   build_arc_dataset.py --download --out-dir arc-data --augmentations 1000
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
+import random
+import shutil
 import struct
 import sys
+import tempfile
 import urllib.request
+from array import array
 from typing import Dict, List, Tuple
 
 try:
@@ -82,12 +108,11 @@ except ImportError:
 GRID_SIDE = 30
 SEQ_LEN = GRID_SIDE * GRID_SIDE
 
-# Token 0 is the pad, colours 0 to 9 become tokens 1 to 10. Keeping the pad at zero
-# means an unwritten cell is already correct and the fill costs nothing.
 # Token 0 is the padding outside the grid, token 1 marks where the grid ends, and the ten
-# colours follow as 2 to 11. The end marker is what lets a model say how large its answer
-# is: without it, a window of 900 cells carries no sign of where a 3 by 3 grid stops, and
-# an answer can only be read back by guessing its extent from where colours happen to be.
+# colours follow as 2 to 11. The end marker lets a model state the size of its answer. A
+# window of 900 cells carries no other sign of where a 3 by 3 grid stops, and an answer
+# without it could only be read back by guessing its extent from where colours happen to
+# be. Keeping the padding at zero means an unwritten cell already holds it.
 PAD_TOKEN = 0
 EOS_TOKEN = 1
 COLOUR_OFFSET = 2
@@ -97,6 +122,12 @@ VOCAB_SIZE = NUM_COLOURS + COLOUR_OFFSET
 # Identifier 0 is reserved for "no puzzle", which is what an evaluation run uses when
 # it wants to ask the model to work without being told which rule to apply.
 BLANK_PUZZLE_ID = 0
+BLANK_NAME = "<blank>"
+
+# A task with symmetries of its own gives the same grids under several draws. The draws
+# for a task stop after this many times the number of variants asked for, as in the
+# reference.
+RETRIES_FACTOR = 5
 
 ARC1_URL = "https://raw.githubusercontent.com/fchollet/ARC-AGI/master/data"
 
@@ -141,7 +172,7 @@ def read_task_directory(path: str, recursive: bool = False) -> Dict[str, dict]:
 
 
 def task_fingerprint(task: dict) -> str:
-    """Identifies a task by its demonstration pairs rather than by its filename.
+    """Identifies a task by its demonstration pairs, whatever its filename.
 
     Names travel between releases and so do tasks, but neither reliably: a task may be
     renamed, and two corpora may name different things alike. What does not change is the
@@ -160,8 +191,8 @@ def drop_overlap(extra: Dict[str, dict], evaluation: Dict[str, dict]) -> Tuple[D
     A release carries its predecessor's tasks forward, evaluation ones included, so adding
     its training set wholesale would inject through those tasks the answers the run is
     about to be graded on. The score would rise and would collapse against any set the
-    model had not seen; declaring the protocol does not repair that, because a leak is a
-    measurement error rather than a protocol choice.
+    model had not seen. Declaring the protocol does not repair that, since a leak is an
+    error of measurement, which no protocol accounts for.
 
     Matching is by name and by the fingerprint of the demonstration pairs, since either
     alone can miss.
@@ -269,226 +300,299 @@ def download_arc1(dest: str) -> None:
 
 
 Grid = List[List[int]]
+Pair = Tuple[Grid, Grid]
+
+# A variant is a symmetry of the square and a colour mapping, colour c becoming
+# mapping[c]. The task itself is the identity of both.
+Variant = Tuple[int, Tuple[int, ...]]
+IDENTITY: Variant = (0, tuple(range(NUM_COLOURS)))
 
 
-def encode_grid(grid: Grid) -> List[int]:
-    """Flattens a grid into the fixed window and marks where it ends.
-
-    The cells take their colour shifted past the two reserved tokens. The row just below
-    the grid and the column just to its right are filled with the end marker, as far as
-    the window allows, so that the grid's extent is written into the sequence rather than
-    left to be inferred. Everything else is padding, and padding is what the loss ignores.
-    """
-    out = [PAD_TOKEN] * SEQ_LEN
-    rows = min(len(grid), GRID_SIDE)
-    cols = min(len(grid[0]) if grid else 0, GRID_SIDE)
-    for r in range(rows):
-        base = r * GRID_SIDE
-        for c in range(cols):
-            out[base + c] = grid[r][c] + COLOUR_OFFSET
-    if rows < GRID_SIDE:                              # the row below the grid
-        base = rows * GRID_SIDE
-        for c in range(cols):
-            out[base + c] = EOS_TOKEN
-    if cols < GRID_SIDE:                              # the column to its right
-        for r in range(rows):
-            out[r * GRID_SIDE + cols] = EOS_TOKEN
-    return out
+def valid_grid(grid) -> bool:
+    """A grid the window can hold: rectangular, at most 30 by 30, colours 0 to 9."""
+    if not isinstance(grid, list) or not grid or len(grid) > GRID_SIDE:
+        return False
+    width = len(grid[0]) if isinstance(grid[0], list) else 0
+    if width == 0 or width > GRID_SIDE:
+        return False
+    return all(isinstance(row, list) and len(row) == width and
+               all(isinstance(v, int) and 0 <= v < NUM_COLOURS for v in row)
+               for row in grid)
 
 
 def rotate(grid: Grid) -> Grid:
-    """A quarter turn clockwise."""
-    return [list(row) for row in zip(*grid[::-1])]
-
-
-def flip(grid: Grid) -> Grid:
-    return [row[::-1] for row in grid]
+    """A quarter turn counter-clockwise, the turn of numpy's rot90."""
+    return [list(row) for row in zip(*grid)][::-1]
 
 
 def dihedral(grid: Grid, index: int) -> Grid:
-    """One of the eight symmetries of the square, index 0 being the identity."""
-    g = grid
-    for _ in range(index % 4):
-        g = rotate(g)
-    return flip(g) if index >= 4 else g
+    """One of the eight symmetries of the square, numbered as the reference numbers them.
 
-
-def recolour(grid: Grid, mapping: List[int]) -> Grid:
-    return [[mapping[v] for v in row] for row in grid]
-
-
-def translate(grid: Grid, dr: int, dc: int) -> Grid:
-    """Shifts within the window, filling what is vacated with colour zero.
-
-    A translation only makes sense while the grid still fits, so the caller checks the
-    room available before asking for one.
+    0 is the identity, 1 to 3 are one to three quarter turns counter-clockwise, 4 mirrors
+    left to right, 5 top to bottom, 6 transposes and 7 reflects across the other diagonal.
+    The number is part of a variant's name, where the reference's evaluation reads it to
+    undo the variant, so the numbering follows numpy's rot90, fliplr, flipud and transpose.
     """
-    h, w = len(grid), len(grid[0])
-    out = [[0] * (w + abs(dc)) for _ in range(h + abs(dr))]
-    for r in range(h):
-        for c in range(w):
-            out[r + max(dr, 0)][c + max(dc, 0)] = grid[r][c]
+    if index == 0:
+        return [list(row) for row in grid]
+    if 1 <= index <= 3:
+        g = grid
+        for _ in range(index):
+            g = rotate(g)
+        return g
+    if index == 4:
+        return [row[::-1] for row in grid]
+    if index == 5:
+        return [list(row) for row in grid[::-1]]
+    if index == 6:
+        return [list(row) for row in zip(*grid)]
+    if index == 7:
+        return [row[::-1] for row in rotate(grid)]
+    raise ValueError(f"there is no symmetry numbered {index}")
+
+
+def apply_variant(grid: Grid, variant: Variant) -> Grid:
+    """The colours first, then the symmetry, in the order of the reference."""
+    index, mapping = variant
+    return dihedral([[mapping[v] for v in row] for row in grid], index)
+
+
+def variant_name(task: str, variant: Variant) -> str:
+    """The reference's name for a variant: the task, the symmetry, then the colour mapping."""
+    if variant == IDENTITY:
+        return task
+    index, mapping = variant
+    return f"{task}_t{index}_{''.join(str(c) for c in mapping)}"
+
+
+def grid_hash(grid: Grid) -> str:
+    h = hashlib.sha256(bytes([len(grid), len(grid[0])]))
+    h.update(bytes(v for row in grid for v in row))
+    return h.hexdigest()
+
+
+def puzzle_hash(pairs: List[Pair]) -> str:
+    """What two variants are compared on: their pairs, in whatever order they come."""
+    keys = sorted(f"{grid_hash(gi)}|{grid_hash(go)}" for gi, go in pairs)
+    return hashlib.sha256("|".join(keys).encode()).hexdigest()
+
+
+def stream(seed: int, *parts: str) -> random.Random:
+    """A generator of its own for each use, so that what a task draws depends on its name
+    and the seed alone, and never on the other tasks or on the order they come in."""
+    return random.Random("/".join([str(seed)] + list(parts)))
+
+
+def draw_variants(pairs: List[Pair], count: int, rng: random.Random) -> List[Variant]:
+    """The variants of one task, the task itself first.
+
+    pairs holds every pair of the task, whichever split each one goes to, since a single
+    draw applies to all of them. A draw that gives the grids of the task or of a variant
+    already kept is dropped, and the draws stop after RETRIES_FACTOR times count.
+    """
+    variants = [IDENTITY]
+    if count <= 0:
+        return variants
+    seen = {puzzle_hash(pairs)}
+    for _ in range(RETRIES_FACTOR * count):
+        index = rng.randrange(8)
+        others = list(range(1, NUM_COLOURS))
+        rng.shuffle(others)
+        variant = (index, (0,) + tuple(others))
+        h = puzzle_hash([(apply_variant(gi, variant), apply_variant(go, variant))
+                         for gi, go in pairs])
+        if h not in seen:
+            seen.add(h)
+            variants.append(variant)
+            if len(variants) > count:
+                break
+    return variants
+
+
+def placements(pairs: List[Pair], rng: random.Random) -> List[Tuple[int, int]]:
+    """Where each pair of a training puzzle sits in the window, as a row and a column.
+
+    One pair, drawn at random, stays in the top-left corner, as in the reference. Every
+    other pair moves to a random place where both of its grids fit, its input and its
+    output to the same place.
+    """
+    kept = rng.randrange(len(pairs))
+    out = []
+    for k, (gi, go) in enumerate(pairs):
+        if k == kept:
+            out.append((0, 0))
+            continue
+        room_rows = GRID_SIDE - max(len(gi), len(go))
+        room_cols = GRID_SIDE - max(len(gi[0]), len(go[0]))
+        out.append((rng.randint(0, room_rows), rng.randint(0, room_cols)))
     return out
 
 
-def augment_pair(pair: Tuple[Grid, Grid], rng, allow_translate: bool
-                 ) -> Tuple[Grid, Grid]:
-    """Applies one draw of the transformations that leave a puzzle's nature intact.
+def encode_grid(grid: Grid, row: int = 0, col: int = 0) -> bytearray:
+    """Writes a grid into the window, its top-left cell at the given row and column.
 
-    The same draw is applied to the input and to the output, since a rule is only
-    preserved when both sides move together.
+    The cells take their colour shifted past the two reserved tokens. The row just below
+    the grid and the column just to its right hold the end marker, along the grid's own
+    width and height and as far as the window allows, so that the grid's extent is written
+    into the sequence. Everything else is padding, and padding is what the loss ignores.
     """
-    gi, go = pair
-    d = rng.randrange(8)
-    gi, go = dihedral(gi, d), dihedral(go, d)
-
-    perm = list(range(NUM_COLOURS))
-    rng.shuffle(perm)
-    gi, go = recolour(gi, perm), recolour(go, perm)
-
-    if allow_translate:
-        room_r = GRID_SIDE - max(len(gi), len(go))
-        room_c = GRID_SIDE - max(len(gi[0]), len(go[0]))
-        if room_r > 0 or room_c > 0:
-            dr = rng.randint(0, room_r) if room_r > 0 else 0
-            dc = rng.randint(0, room_c) if room_c > 0 else 0
-            if dr or dc:
-                gi, go = translate(gi, dr, dc), translate(go, dr, dc)
-    return gi, go
+    out = bytearray(SEQ_LEN)                          # every cell starts as the padding
+    height, width = len(grid), len(grid[0])
+    for r in range(height):
+        base = (row + r) * GRID_SIDE + col
+        out[base:base + width] = bytes(v + COLOUR_OFFSET for v in grid[r])
+    if row + height < GRID_SIDE:                      # the row below the grid
+        base = (row + height) * GRID_SIDE + col
+        out[base:base + width] = bytes([EOS_TOKEN]) * width
+    if col + width < GRID_SIDE:                       # the column to its right
+        for r in range(height):
+            out[(row + r) * GRID_SIDE + col + width] = EOS_TOKEN
+    return out
 
 
 # ----------------------------------------------------------------------------------
 # Building
 
 
-class Builder:
-    """Accumulates examples and the two index arrays that describe their nesting."""
+class Task:
+    """One task, the pairs each split receives from it, and its variants."""
 
-    def __init__(self):
-        self.inputs: List[List[int]] = []
-        self.labels: List[List[int]] = []
+    def __init__(self, name: str, splits: Dict[str, List[Pair]]):
+        self.name = name
+        self.splits = splits
+        self.variants: List[Variant] = [IDENTITY]
+
+    def all_pairs(self) -> List[Pair]:
+        return self.splits.get("training", []) + self.splits.get("evaluation", [])
+
+
+class Split:
+    """The puzzles of one split and the two index arrays that describe their nesting.
+
+    Only names and counts are held here. The grids are produced while the split is
+    written, one example at a time, so that a split of millions of examples never sits in
+    memory.
+    """
+
+    def __init__(self, name: str, translate: bool):
+        self.name = name
+        self.translate = translate
+        self.names: List[str] = [BLANK_NAME]
         self.puzzle_identifiers: List[int] = [BLANK_PUZZLE_ID]
         self.puzzle_indices: List[int] = [0]
         self.group_indices: List[int] = [0]
-        self.names: List[str] = ["<blank>"]
+        self.members: List[Tuple[Task, int]] = []      # each puzzle's task and variant
+        self.num_tasks = 0
 
-    def add_puzzle(self, name: str, pairs: List[Tuple[Grid, Grid]]) -> None:
-        for gi, go in pairs:
-            self.inputs.append(encode_grid(gi))
-            self.labels.append(encode_grid(go))
-        self.puzzle_indices.append(len(self.inputs))
-        self.puzzle_identifiers.append(len(self.puzzle_identifiers))
-        self.names.append(name)
+    @property
+    def num_examples(self) -> int:
+        return self.puzzle_indices[-1]
 
-    def close_group(self) -> None:
+    def add_task(self, task: Task) -> None:
+        """The task and its variants become one group, the task itself first."""
+        count = len(task.splits[self.name])
+        for k, variant in enumerate(task.variants):
+            self.names.append(variant_name(task.name, variant))
+            self.puzzle_identifiers.append(len(self.puzzle_identifiers))
+            self.puzzle_indices.append(self.num_examples + count)
+            self.members.append((task, k))
         self.group_indices.append(len(self.puzzle_indices) - 1)
+        self.num_tasks += 1
+
+    def examples(self, seed: int):
+        """Every example of the split in order, as the encoded input and label."""
+        for p, (task, k) in enumerate(self.members):
+            variant = task.variants[k]
+            pairs = [(apply_variant(gi, variant), apply_variant(go, variant))
+                     for gi, go in task.splits[self.name]]
+            if self.translate:
+                places = placements(pairs, stream(seed, "placement", self.name,
+                                                  self.names[p + 1]))
+            else:
+                places = [(0, 0)] * len(pairs)
+            for (gi, go), (row, col) in zip(pairs, places):
+                yield encode_grid(gi, row, col), encode_grid(go, row, col)
 
 
-def task_rng(name: str, seed: int):
-    """A generator tied to the task name, so a task augments identically in both splits.
+def pairs_of(task: dict, keys: Tuple[str, ...], rejected: List[str], name: str) -> List[Pair]:
+    """The complete pairs a task holds under the given keys, in their order."""
+    out = []
+    for key in keys:
+        for p in task.get(key, []):
+            if "output" not in p:
+                continue                      # no answer available, so nothing to learn
+            if valid_grid(p.get("input")) and valid_grid(p["output"]):
+                out.append((p["input"], p["output"]))
+            else:
+                rejected.append(name)
+    return out
 
-    This is what lets the reference protocol work: a puzzle keeps the same identifier
-    and the same transformation whether it is met while training or while being asked
-    for its held-out answer.
+
+def plan_tasks(protocol: str, train_tasks: Dict[str, dict], eval_tasks: Dict[str, dict],
+               extra_tasks: Dict[str, dict], include_test_pairs: bool,
+               rejected: List[str]) -> List[Task]:
+    """Decides which pairs of which task go to which split.
+
+    Under the reference protocol every task, evaluation ones included, receives its
+    identifier while training. A complementary corpus and the training tasks give the
+    training split everything they have and are never asked again. An evaluation task
+    gives its demonstrations to the training split and its test pairs to the evaluation
+    split, under the same identifiers, so the question put at evaluation time is one the
+    model can understand and has not seen answered. This is a form of learning at test
+    time and it is why those numbers are what they are. It is offered because it makes a
+    comparison possible; --protocol held-out is the harder setting.
+
+    Under the held-out protocol the evaluation tasks give their test pairs to the
+    evaluation split alone, and the model meets them without an identifier.
+
+    The complementary corpus comes first, so that its identifiers stay put when the ARC
+    tasks change, which lets two datasets built from the same corpora share a model.
     """
-    import random
-    return random.Random(seed ^ int(hashlib.md5(name.encode()).hexdigest()[:8], 16))
-
-
-def build_split(tasks: Dict[str, dict], augmentations: int, seed: int,
-                use_test_pairs: bool, allow_translate: bool) -> Builder:
-    """Independent identifier space, one puzzle per task and per augmentation."""
-    b = Builder()
-    for name in sorted(tasks):
-        task = tasks[name]
-        pairs = [(p["input"], p["output"]) for p in task.get("train", [])
-                 if "output" in p]
-        if use_test_pairs:
-            pairs += [(p["input"], p["output"]) for p in task.get("test", [])
-                      if "output" in p]
-        if not pairs:
-            continue
-
-        b.add_puzzle(name, pairs)                     # the original, always identifier one
-        rng = task_rng(name, seed)
-        for a in range(augmentations):
-            b.add_puzzle(f"{name}#{a}",
-                         [augment_pair(p, rng, allow_translate) for p in pairs])
-        b.close_group()
-    return b
-
-
-def build_reference_protocol(train_tasks: Dict[str, dict], eval_tasks: Dict[str, dict],
-                             augmentations: int, seed: int, allow_translate: bool,
-                             extra_tasks: Dict[str, dict] = None
-                             ) -> Tuple[Builder, Builder]:
-    """Builds both splits over one shared identifier space.
-
-    An identifier the model never trained on carries no meaning: its row of the
-    embedding is still at its initial value, so asking a question by naming it asks
-    nothing. Two independently numbered splits therefore cannot be used to evaluate
-    one another, which is the constraint the reference protocol answers.
-
-    The answer is to let every task, evaluation ones included, receive its identifier
-    while training, from its demonstration pairs alone. The held-out pair of each
-    evaluation task goes to the other split under the same identifier, so the question
-    put at evaluation time is one the model can understand and has not seen answered.
-
-    This is a form of learning at test time and it is why those numbers are what they
-    are. It is offered because it is what makes a comparison possible, not because it
-    is the harder setting; --protocol held-out is that.
-    """
-    tr, ev = Builder(), Builder()
-
-    def emit(builder, name, pairs, rng_state_name):
-        """Adds a task and its augmentations, drawing the same transformations both times."""
-        builder.add_puzzle(name, pairs)
-        rng = task_rng(rng_state_name, seed)
-        for a in range(augmentations):
-            builder.add_puzzle(f"{name}#{a}",
-                               [augment_pair(p, rng, allow_translate) for p in pairs])
-        builder.close_group()
-
-    # A complementary corpus contributes everything it has and is never asked again. It is
-    # emitted first so that its identifiers stay put when the ARC tasks change, which lets
-    # two datasets built from the same corpora share a model.
-    for name in sorted(extra_tasks or {}):
-        pairs = [(p["input"], p["output"]) for p in (extra_tasks[name].get("train", []) +
-                                                     extra_tasks[name].get("test", []))
-                 if "output" in p]
+    plan = []
+    for name in sorted(extra_tasks):
+        pairs = pairs_of(extra_tasks[name], ("train", "test"), rejected, name)
         if pairs:
-            emit(tr, "extra/" + name, pairs, "extra/" + name)
+            plan.append(Task("extra/" + name, {"training": pairs}))
 
-    # The training tasks contribute everything they have and are never asked again.
+    train_keys = ("train", "test") if protocol == "reference" or include_test_pairs else ("train",)
     for name in sorted(train_tasks):
-        pairs = [(p["input"], p["output"]) for p in train_tasks[name].get("train", [])
-                 if "output" in p]
-        pairs += [(p["input"], p["output"]) for p in train_tasks[name].get("test", [])
-                  if "output" in p]
+        pairs = pairs_of(train_tasks[name], train_keys, rejected, name)
         if pairs:
-            emit(tr, name, pairs, name)
+            plan.append(Task(name, {"training": pairs}))
 
-    # An evaluation task gives its demonstrations to the training split and its held-out
-    # pair to the evaluation split. Both use the same name, so both draw the same
-    # augmentations and land on the same identifiers.
     for name in sorted(eval_tasks):
-        demo = [(p["input"], p["output"]) for p in eval_tasks[name].get("train", [])
-                if "output" in p]
-        held = [(p["input"], p["output"]) for p in eval_tasks[name].get("test", [])
-                if "output" in p]
-        if not demo or not held:
-            continue
-        emit(tr, name, demo, name)
-        emit(ev, name, held, name)
+        test = pairs_of(eval_tasks[name], ("test",), rejected, name)
+        if protocol == "reference":
+            demo = pairs_of(eval_tasks[name], ("train",), rejected, name)
+            if demo and test:
+                plan.append(Task(name, {"training": demo, "evaluation": test}))
+        elif test:
+            plan.append(Task(name, {"evaluation": test}))
+    return plan
 
-    # The evaluation identifiers must be the ones the training split assigned, which the
-    # shared naming guarantees; the check is cheap and a silent mismatch would be fatal.
-    index = {n: i for i, n in enumerate(tr.names)}
-    ev.puzzle_identifiers = [index.get(n, BLANK_PUZZLE_ID) for n in ev.names]
-    missing = [n for n in ev.names[1:] if n not in index]
-    if missing:
-        raise RuntimeError(f"{len(missing)} evaluation puzzles have no identifier in the "
-                           f"training split, starting with {missing[0]}")
+
+def build_splits(plan: List[Task], protocol: str, translate: bool) -> Tuple[Split, Split]:
+    tr, ev = Split("training", translate), Split("evaluation", False)
+    for task in plan:
+        if "training" in task.splits:
+            tr.add_task(task)
+    for task in plan:
+        if "evaluation" in task.splits:
+            ev.add_task(task)
+
+    if protocol == "reference":
+        # The evaluation puzzles are named by the identifiers the training split gave
+        # them. A silent mismatch would be fatal, so it is checked.
+        index = {n: i for i, n in enumerate(tr.names)}
+        missing = [n for n in ev.names[1:] if n not in index]
+        if missing:
+            raise RuntimeError(f"{len(missing)} evaluation puzzles have no identifier in the "
+                               f"training split, starting with {missing[0]}")
+        ev.puzzle_identifiers = [index[n] for n in ev.names]
+    else:
+        # The evaluation puzzles were never named during training, so they carry the blank
+        # identifier, which is how the model is asked about them.
+        ev.puzzle_identifiers = [BLANK_PUZZLE_ID] * len(ev.names)
     return tr, ev
 
 
@@ -496,50 +600,104 @@ def build_reference_protocol(train_tasks: Dict[str, dict], eval_tasks: Dict[str,
 # Writing
 
 
-def write_npy(out_dir: str, split: str, b: Builder) -> None:
-    if np is None:
-        print("  numpy is not installed, so the .npy set is skipped", file=sys.stderr)
-        return
-    d = os.path.join(out_dir, split)
-    os.makedirs(d, exist_ok=True)
-    np.save(os.path.join(d, "all__inputs.npy"), np.array(b.inputs, dtype=np.int32))
-    np.save(os.path.join(d, "all__labels.npy"), np.array(b.labels, dtype=np.int32))
-    np.save(os.path.join(d, "all__puzzle_identifiers.npy"),
-            np.array(b.puzzle_identifiers, dtype=np.int32))
-    np.save(os.path.join(d, "all__puzzle_indices.npy"),
-            np.array(b.puzzle_indices, dtype=np.int32))
-    np.save(os.path.join(d, "all__group_indices.npy"),
-            np.array(b.group_indices, dtype=np.int32))
+def int32_bytes(values) -> bytes:
+    """Little-endian int32, the type of every value of the .bin file."""
+    block = array("i", array("B", values))
+    if sys.byteorder != "little":
+        block.byteswap()
+    return block.tobytes()
 
 
-def write_bin(out_dir: str, split: str, b: Builder) -> str:
-    """Packs the same arrays behind a header the C++ loader reads in one pass.
+def open_npy_rows(path: str, rows: int):
+    """An .npy file of rows of SEQ_LEN bytes, its header written, for the rows to follow in
+    order."""
+    f = open(path, "wb", buffering=1 << 20)
+    header = {"descr": np.lib.format.dtype_to_descr(np.dtype(np.uint8)),
+              "fortran_order": False, "shape": (rows, SEQ_LEN)}
+    np.lib.format.write_array_header_1_0(f, header)
+    return f
 
-    Everything is little-endian int32 after a fixed header, so the reader needs no
-    parsing and no third-party library.
+
+def write_split(out_dir: str, split: Split, seed: int, bin_out: bool, npy_out: bool,
+                num_identifiers: int) -> None:
+    """Writes the .bin file, the .names file and the reference layout of one split.
+
+    The .bin file holds a header, then the inputs, the labels, the identifiers, the puzzle
+    index and the group index, all int32, so that the reader needs no parsing and no
+    third-party library. The labels are gathered in a temporary file while the inputs are
+    written, and appended after them.
+
+    The reference layout stores the cells as bytes. Its identifier array holds one entry
+    per puzzle, where the .bin file opens with the blank puzzle.
+
+    Every file is written in order as the examples are produced, so the memory a split
+    takes is that of its names and indices.
     """
-    path = os.path.join(out_dir, f"{split}.bin")
-    with open(path, "wb") as f:
-        f.write(b"ARCD")
-        f.write(struct.pack("<7i", 1, SEQ_LEN, VOCAB_SIZE,
-                            len(b.inputs), len(b.puzzle_identifiers),
-                            len(b.puzzle_indices), len(b.group_indices)))
-        for seq in b.inputs:
-            f.write(struct.pack(f"<{SEQ_LEN}i", *seq))
-        for seq in b.labels:
-            f.write(struct.pack(f"<{SEQ_LEN}i", *seq))
-        f.write(struct.pack(f"<{len(b.puzzle_identifiers)}i", *b.puzzle_identifiers))
-        f.write(struct.pack(f"<{len(b.puzzle_indices)}i", *b.puzzle_indices))
-        f.write(struct.pack(f"<{len(b.group_indices)}i", *b.group_indices))
-    return path
+    n = split.num_examples
+    with open(os.path.join(out_dir, f"{split.name}.names"), "w", encoding="utf-8",
+              newline="\n") as f:
+        f.write("\n".join(split.names) + "\n")
+
+    npy_dir = os.path.join(out_dir, "train" if split.name == "training" else "test")
+    with contextlib.ExitStack() as stack:
+        if bin_out:
+            bin_file = stack.enter_context(open(os.path.join(out_dir, f"{split.name}.bin"),
+                                                "wb", buffering=1 << 20))
+            labels_tmp = stack.enter_context(tempfile.TemporaryFile(dir=out_dir))
+            bin_file.write(b"ARCD")
+            bin_file.write(struct.pack("<7i", 1, SEQ_LEN, VOCAB_SIZE, n,
+                                       len(split.puzzle_identifiers), len(split.puzzle_indices),
+                                       len(split.group_indices)))
+        if npy_out:
+            os.makedirs(npy_dir, exist_ok=True)
+            npy_inputs = stack.enter_context(
+                open_npy_rows(os.path.join(npy_dir, "all__inputs.npy"), n))
+            npy_labels = stack.enter_context(
+                open_npy_rows(os.path.join(npy_dir, "all__labels.npy"), n))
+
+        e = 0
+        for gi, go in split.examples(seed):
+            if bin_out:
+                bin_file.write(int32_bytes(gi))
+                labels_tmp.write(int32_bytes(go))
+            if npy_out:
+                npy_inputs.write(gi)
+                npy_labels.write(go)
+            e += 1
+        assert e == n, f"{split.name}: {e} examples written where the index counts {n}"
+
+        if bin_out:
+            labels_tmp.seek(0)
+            shutil.copyfileobj(labels_tmp, bin_file, 1 << 20)
+            for values in (split.puzzle_identifiers, split.puzzle_indices, split.group_indices):
+                bin_file.write(struct.pack(f"<{len(values)}i", *values))
+
+    if npy_out:
+        np.save(os.path.join(npy_dir, "all__puzzle_identifiers.npy"),
+                np.array(split.puzzle_identifiers[1:], dtype=np.int32))
+        np.save(os.path.join(npy_dir, "all__puzzle_indices.npy"),
+                np.array(split.puzzle_indices, dtype=np.int32))
+        np.save(os.path.join(npy_dir, "all__group_indices.npy"),
+                np.array(split.group_indices, dtype=np.int32))
+        puzzles = max(1, len(split.names) - 1)
+        meta = {
+            "pad_id": PAD_TOKEN,
+            "ignore_label_id": PAD_TOKEN,
+            "blank_identifier_id": BLANK_PUZZLE_ID,
+            "vocab_size": VOCAB_SIZE,
+            "seq_len": SEQ_LEN,
+            "num_puzzle_identifiers": num_identifiers,
+            "total_groups": len(split.group_indices) - 1,
+            "mean_puzzle_examples": n / puzzles,
+            "sets": ["all"],
+        }
+        with open(os.path.join(npy_dir, "dataset.json"), "w", encoding="utf-8") as f:
+            json.dump(meta, f)
 
 
-OVERLAP_DROPPED = 0
-
-
-def write_metadata(out_dir: str, split: str, b: Builder, args) -> None:
+def write_metadata(out_dir: str, split: Split, args, dropped: int, short: int) -> dict:
     meta = {
-        "split": split,
+        "split": split.name,
         "seq_len": SEQ_LEN,
         "grid_side": GRID_SIDE,
         "vocab_size": VOCAB_SIZE,
@@ -547,18 +705,20 @@ def write_metadata(out_dir: str, split: str, b: Builder, args) -> None:
         "eos_token": EOS_TOKEN,
         "colour_offset": COLOUR_OFFSET,
         "blank_puzzle_id": BLANK_PUZZLE_ID,
-        "num_examples": len(b.inputs),
-        "num_puzzles": len(b.puzzle_identifiers) - 1,
-        "num_groups": len(b.group_indices) - 1,
+        "num_tasks": split.num_tasks,
+        "num_examples": split.num_examples,
+        "num_puzzles": len(split.names) - 1,
+        "num_groups": len(split.group_indices) - 1,
         "protocol": args.protocol,
         "extra_corpora": args.extra_corpus,
-        "extra_tasks_dropped_as_overlap": OVERLAP_DROPPED,
+        "extra_tasks_dropped_as_overlap": dropped,
         "augmentations_per_task": args.augmentations,
-        "translations": bool(args.translations),
+        "tasks_with_fewer_variants": short,
+        "translated": split.translate,
         "test_pairs_included": bool(args.include_test_pairs),
         "seed": args.seed,
     }
-    with open(os.path.join(out_dir, f"{split}.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(out_dir, f"{split.name}.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
     return meta
 
@@ -576,21 +736,23 @@ def main():
     p.add_argument("--download", action="store_true",
                    help="fetch the original ARC-AGI task files into --data-dir first")
     p.add_argument("--augmentations", type=int, default=1000,
-                   help="variants generated per task, 0 for none (default: 1000)")
+                   help="variants drawn per task, 0 for none; a task whose own symmetries "
+                        "leave fewer distinct variants receives fewer (default: 1000)")
     p.add_argument("--translations", action="store_true", default=True,
-                   help="include translation among the augmentations (default: on)")
+                   help="move the pairs of the training split inside the window "
+                        "(default: on)")
     p.add_argument("--no-translations", dest="translations", action="store_false")
     p.add_argument("--protocol", choices=("held-out", "reference"), default="held-out",
-                   help="held-out numbers the two splits independently, so evaluation "
-                        "must be run with the blank identifier and the model is asked to "
-                        "work without being told the rule. reference gives every task, "
-                        "evaluation ones included, an identifier while training, from its "
-                        "demonstration pairs alone, and puts only the held-out pair in the "
+                   help="held-out puts the test pairs of the evaluation tasks in the "
+                        "evaluation split alone, under the blank identifier, so the model is "
+                        "asked to work without being told the rule. reference gives every "
+                        "task, evaluation ones included, an identifier while training, from "
+                        "its demonstration pairs alone, and puts only its test pairs in the "
                         "evaluation split; that is what makes the published numbers "
                         "comparable and it is learning at test time (default: held-out)")
     p.add_argument("--include-test-pairs", action="store_true",
-                   help="under held-out only, add each task's held-out pairs to its own "
-                        "training examples")
+                   help="under held-out only, add the test pairs of the training tasks to "
+                        "their training examples, as the reference protocol does")
     p.add_argument("--extra-corpus", action="append", default=[], metavar="DIR",
                    help="a further corpus of ARC-format tasks, added to the training split "
                         "and never evaluated on. Repeatable. The reference work trains on "
@@ -631,45 +793,55 @@ def main():
     extra_tasks, dropped = drop_overlap(extra_tasks, eval_tasks)
     if dropped:
         print(f"extra corpus: {dropped} tasks dropped, they are in the evaluation split")
-    global OVERLAP_DROPPED
-    OVERLAP_DROPPED = dropped
 
-    if args.protocol == "reference":
-        tr, ev = build_reference_protocol(train_tasks, eval_tasks, args.augmentations,
-                                          args.seed, args.translations, extra_tasks)
-        built = {"training": tr, "evaluation": ev}
-        counts = {"training": len(train_tasks) + len(eval_tasks) + len(extra_tasks),
-                  "evaluation": len(eval_tasks)}
-    else:
-        built, counts = {}, {}
-        for split, tasks in (("training", train_tasks), ("evaluation", eval_tasks)):
-            if not tasks:
-                continue
-            use_test = args.include_test_pairs and split == "training"
-            merged = dict(tasks)
-            if split == "training":
-                merged.update(extra_tasks)   # a complementary corpus is training data only
-            built[split] = build_split(merged, args.augmentations, args.seed, use_test,
-                                       args.translations)
-            counts[split] = len(merged)
+    rejected: List[str] = []
+    plan = plan_tasks(args.protocol, train_tasks, eval_tasks, extra_tasks,
+                      args.include_test_pairs, rejected)
+    if rejected:
+        print(f"{len(rejected)} pairs left out, a grid being empty, uneven, larger than "
+              f"{GRID_SIDE} by {GRID_SIDE} or holding a value outside 0 to 9, starting "
+              f"with task {rejected[0]}")
 
-    for split, b in built.items():
-        if args.format in ("npy", "both"):
-            write_npy(args.out_dir, split, b)
-        if args.format in ("bin", "both"):
-            write_bin(args.out_dir, split, b)
-        meta = write_metadata(args.out_dir, split, b, args)
-        print(f"{split}: {counts[split]} tasks, {meta['num_puzzles']} puzzles, "
+    short = 0
+    for task in plan:
+        task.variants = draw_variants(task.all_pairs(), args.augmentations,
+                                      stream(args.seed, "variants", task.name))
+        short += len(task.variants) <= args.augmentations
+    if short:
+        print(f"{short} tasks received fewer than {args.augmentations} variants, their own "
+              f"symmetries leaving fewer distinct ones")
+
+    tr, ev = build_splits(plan, args.protocol, args.translations)
+
+    npy_out = args.format in ("npy", "both")
+    if npy_out and np is None:
+        print("numpy is not installed, so the reference layout is skipped", file=sys.stderr)
+        npy_out = False
+    bin_out = args.format in ("bin", "both")
+    num_identifiers = len(tr.names)
+
+    for split in (tr, ev):
+        if split.num_tasks == 0:
+            continue
+        write_split(args.out_dir, split, args.seed, bin_out, npy_out, num_identifiers)
+        meta = write_metadata(args.out_dir, split, args, dropped,
+                              sum(len(t.variants) <= args.augmentations
+                                  for t, k in split.members if k == 0))
+        print(f"{split.name}: {meta['num_tasks']} tasks, {meta['num_puzzles']} puzzles, "
               f"{meta['num_examples']} examples, {meta['num_groups']} groups")
+
+    if npy_out:
+        with open(os.path.join(args.out_dir, "identifiers.json"), "w", encoding="utf-8") as f:
+            json.dump(tr.names, f)
 
     if args.protocol == "reference":
         print("\nThe two splits share one identifier space: every evaluation puzzle was "
-              "named during training,\nfrom its demonstration pairs only. Its held-out "
-              "answer is what the evaluation split asks for.")
+              "named during training,\nfrom its demonstration pairs only. Its test pairs "
+              "are what the evaluation split asks for.")
     else:
-        print("\nThe two splits are numbered independently, so evaluation identifiers "
-              "mean nothing to a model\ntrained on the other split. Evaluate with the "
-              "blank identifier, or build with --protocol reference.")
+        print("\nThe evaluation puzzles carry the blank identifier, since none of them was "
+              "named during\ntraining, so the model is asked about them without being told "
+              "the rule.")
 
     print(f"\nWritten to {args.out_dir}")
     print(f"window {SEQ_LEN} cells, vocabulary {VOCAB_SIZE}, pad token {PAD_TOKEN}")

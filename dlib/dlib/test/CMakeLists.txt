@@ -19,6 +19,7 @@ add_executable(${target_name} main.cpp tester.cpp
    active_learning.cpp
    any.cpp
    any_function.cpp
+   arc_agi.cpp
    array2d.cpp
    array.cpp
    assignment_learning.cpp

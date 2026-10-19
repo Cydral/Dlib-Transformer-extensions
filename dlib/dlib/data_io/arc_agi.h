@@ -4,6 +4,7 @@
 #define DLIB_ARC_AGI_H_
 
 #include "arc_agi_abstract.h"
+#include <array>
 #include <string>
 #include <vector>
 #include <map>
@@ -1392,7 +1393,7 @@ namespace dlib
     /*!
         THE PREPARED ARC DATASET
 
-        Reads what build_arc_dataset.py writes: every grid already flattened into a fixed
+        Reads what build_arc_dataset.py writes: every grid already written into a fixed
         window, and the two index arrays that say which examples belong to which puzzle
         and which puzzles belong to which task.
 
@@ -1407,8 +1408,11 @@ namespace dlib
 
         The price is stated plainly. An identifier the model never trained on carries no
         meaning, so a puzzle absent from training cannot be solved by naming it. Passing
-        blank_puzzle_id asks the model to work without being told, which is the honest
-        setting and the harder one.
+        arc_blank_puzzle_id asks the model to work without being told, which is the
+        harder setting.
+
+        The cells are held one byte each, the examples one after the other, so that a
+        split of a thousand variants per task fits in memory.
     !*/
 
     struct arc_dataset
@@ -1416,16 +1420,20 @@ namespace dlib
         long seq_len = 0;               // cells per grid, 900 for a 30 by 30 window
         long colour_vocab = 0;          // padding, the end marker and the ten colours
 
-        std::vector<std::vector<int>> inputs;
-        std::vector<std::vector<int>> labels;
+        std::vector<unsigned char> inputs;   // seq_len cells per example
+        std::vector<unsigned char> labels;   // seq_len cells per example
 
-        std::vector<int> puzzle_identifiers;
-        std::vector<int> puzzle_indices; // first example of each puzzle, plus the end
-        std::vector<int> group_indices;  // first puzzle of each group, plus the end
+        std::vector<int> puzzle_identifiers; // the blank puzzle first, then one per puzzle
+        std::vector<int> puzzle_indices;     // first example of each puzzle, plus the end
+        std::vector<int> group_indices;      // first puzzle of each group, plus the end
+
+        // The name of every puzzle, the blank one first, read from the .names file the
+        // builder writes beside the split. A name records the variant a puzzle is.
+        std::vector<std::string> puzzle_names;
 
         long num_puzzles () const { return (long)puzzle_identifiers.size(); }
         long num_groups  () const { return (long)group_indices.size() - 1; }
-        long num_examples() const { return (long)inputs.size(); }
+        long num_examples() const { return seq_len > 0 ? (long)(inputs.size() / (size_t)seq_len) : 0; }
 
         /*!
             The number of indices an input of this split can hold: the colours, then one
@@ -1439,7 +1447,22 @@ namespace dlib
         long sequence_length () const { return seq_len + 1; }
 
         /*!
-            Where in this split an example's puzzle sits. This is a position, not a name.
+            The cells of one example, seq_len of them.
+        !*/
+        const unsigned char* input_cells (long example) const
+        {
+            DLIB_CASSERT(example >= 0 && example < num_examples());
+            return inputs.data() + (size_t)example * (size_t)seq_len;
+        }
+        const unsigned char* label_cells (long example) const
+        {
+            DLIB_CASSERT(example >= 0 && example < num_examples());
+            return labels.data() + (size_t)example * (size_t)seq_len;
+        }
+
+        /*!
+            Where in this split an example's puzzle sits, counted as the identifiers and
+            the names are, the blank puzzle being 0. This is a position, not a name.
         !*/
         long puzzle_of (long example) const
         {
@@ -1449,14 +1472,29 @@ namespace dlib
         }
 
         /*!
+            The examples of the puzzle at a position given by puzzle_of(), from the first
+            to one past the last.
+        !*/
+        long first_example (long puzzle) const
+        {
+            DLIB_CASSERT(puzzle >= 1 && puzzle < (long)puzzle_indices.size());
+            return puzzle_indices[(size_t)puzzle - 1];
+        }
+        long end_example (long puzzle) const
+        {
+            DLIB_CASSERT(puzzle >= 1 && puzzle < (long)puzzle_indices.size());
+            return puzzle_indices[(size_t)puzzle];
+        }
+
+        /*!
             The identifier of the puzzle an example belongs to.
 
             This is the number the network looks up, and it is not the position above. A
             split built under the reference protocol stores identifiers assigned while the
             training split was built, so an evaluation puzzle sitting at position three may
-            be named twenty. Passing the position would name a different puzzle, silently,
-            and only on the protocol where the comparison is meant to happen: under the
-            other one the two coincide and nothing looks wrong.
+            be named twenty, and under the held-out protocol every evaluation puzzle carries
+            the blank identifier. Passing the position would name a different puzzle,
+            silently.
         !*/
         int identifier_of (long example) const
         {
@@ -1478,6 +1516,20 @@ namespace dlib
     };
 
 // ----------------------------------------------------------------------------------------
+
+    namespace impl
+    {
+        /* The names file the builder writes beside a split: the same path, with .names in
+           place of .bin. */
+        inline std::string arc_names_file (const std::string& filename)
+        {
+            const std::string ext = ".bin";
+            if (filename.size() > ext.size() &&
+                filename.compare(filename.size() - ext.size(), ext.size(), ext) == 0)
+                return filename.substr(0, filename.size() - ext.size()) + ".names";
+            return filename + ".names";
+        }
+    }
 
     inline arc_dataset load_arc_dataset (
         const std::string& filename
@@ -1518,13 +1570,38 @@ namespace dlib
         const long n_pidx     = read_i32();
         const long n_gidx     = read_i32();
 
-        DLIB_CASSERT(d.seq_len > 0 && d.colour_vocab > 0 && n_examples >= 0,
+        DLIB_CASSERT(d.seq_len > 0 && d.colour_vocab > 0 && d.colour_vocab <= 256 &&
+                     n_examples >= 0 && n_ids >= 0 && n_pidx >= 0 && n_gidx >= 0,
             "arc dataset: header of " << filename << " is not sensible");
 
-        d.inputs.resize((size_t)n_examples);
-        for (long i = 0; i < n_examples; ++i) d.inputs[(size_t)i] = read_vec(d.seq_len);
-        d.labels.resize((size_t)n_examples);
-        for (long i = 0; i < n_examples; ++i) d.labels[(size_t)i] = read_vec(d.seq_len);
+        /* The file stores every cell as an int32. They are read in blocks and kept one byte
+           each, which takes a quarter of the memory. */
+        auto read_cells = [&](std::vector<unsigned char>& out) {
+            const size_t count = (size_t)n_examples * (size_t)d.seq_len;
+            out.resize(count);
+            std::vector<unsigned char> block(4 * std::min<size_t>(std::max<size_t>(count, 1), 1 << 18));
+            for (size_t done = 0; done < count; )
+            {
+                const size_t n = std::min(count - done, block.size() / 4);
+                in.read((char*)block.data(), (std::streamsize)(4 * n));
+                if (!in)
+                    throw std::runtime_error("arc dataset: " + filename + " ended early");
+                for (size_t i = 0; i < n; ++i)
+                {
+                    const unsigned char* b = block.data() + 4 * i;
+                    const std::uint32_t v = (std::uint32_t)b[0] | ((std::uint32_t)b[1] << 8) |
+                                            ((std::uint32_t)b[2] << 16) | ((std::uint32_t)b[3] << 24);
+                    if (v >= (std::uint32_t)d.colour_vocab)
+                        throw std::runtime_error("arc dataset: " + filename + " holds a cell of value " +
+                            std::to_string((long long)(std::int32_t)v) + " outside its vocabulary of " +
+                            std::to_string(d.colour_vocab));
+                    out[done + i] = (unsigned char)v;
+                }
+                done += n;
+            }
+        };
+        read_cells(d.inputs);
+        read_cells(d.labels);
 
         d.puzzle_identifiers = read_vec(n_ids);
         d.puzzle_indices     = read_vec(n_pidx);
@@ -1541,6 +1618,23 @@ namespace dlib
                      d.group_indices.back() == (int)(n_pidx - 1),
             "arc dataset: the group index of " << filename << " does not end on the "
             "puzzle count, so the file is inconsistent");
+
+        const std::string names_file = impl::arc_names_file(filename);
+        std::ifstream names(names_file);
+        if (names)
+        {
+            std::string line;
+            while (std::getline(names, line))
+            {
+                if (!line.empty() && line.back() == '\r')
+                    line.pop_back();
+                d.puzzle_names.push_back(line);
+            }
+            if ((long)d.puzzle_names.size() != d.num_puzzles())
+                throw std::runtime_error("arc dataset: " + names_file + " names " +
+                    std::to_string(d.puzzle_names.size()) + " puzzles where " + filename +
+                    " holds " + std::to_string(d.num_puzzles()) + ", the blank one included");
+        }
 
         return d;
     }
@@ -1592,13 +1686,13 @@ namespace dlib
         DLIB_CASSERT(puzzle_id >= 0,
             "arc dataset: identifier " << puzzle_id << " is not a name");
 
-        const std::vector<int>& cells = d.inputs[(size_t)example];
+        const unsigned char* cells = d.input_cells(example);
         matrix<int, 0, 1> seq(d.sequence_length());
 
         // The identifier is numbered above the colours, so that one index addresses both.
         seq(0) = d.colour_vocab + puzzle_id;
         for (long i = 0; i < d.seq_len; ++i)
-            seq(i + 1) = cells[(size_t)i];
+            seq(i + 1) = cells[i];
         return seq;
     }
 
@@ -1614,12 +1708,12 @@ namespace dlib
     {
         DLIB_CASSERT(example >= 0 && example < d.num_examples());
 
-        const std::vector<int>& cells = d.labels[(size_t)example];
+        const unsigned char* cells = d.label_cells(example);
         matrix<unsigned long, 0, 1> seq(d.sequence_length());
         seq(0) = arc_ignore_label;                 // the identifier is given, not predicted
         for (long i = 0; i < d.seq_len; ++i)
         {
-            const unsigned long tok = (unsigned long)cells[(size_t)i];
+            const unsigned long tok = cells[i];
             seq(i + 1) = tok == arc_pad_token ? arc_ignore_label : tok;
         }
         return seq;
@@ -1661,12 +1755,63 @@ namespace dlib
 
 // ----------------------------------------------------------------------------------------
 
-    /*!
-        Turns a predicted sequence back into a grid.
+    namespace impl
+    {
+        /* The grid a window holds from its top-left corner, cropped as the reference crops
+           it: the largest rectangle anchored at the corner whose cells are all colours. The
+           width a row allows is how far it runs in colours, never more than the rows above
+           it allowed, and the rectangle of largest area over all heights is kept. */
+        template <typename T>
+        arc_grid_t arc_crop_window (
+            const T* cells,
+            long grid_side
+        )
+        {
+            auto is_colour = [](T tok) {
+                return (unsigned long)tok >= arc_colour_offset &&
+                       (unsigned long)tok <  arc_colour_offset + arc_num_colours; };
 
-        The extent is read from the end markers: the width is how far the first row runs
-        before its marker, the height how far the first column does. A prediction whose
-        first cell holds no colour yields an empty grid, which scores as a wrong answer.
+            long width = grid_side, best_rows = 0, best_cols = 0, best_area = 0;
+            for (long r = 0; r < grid_side && width > 0; ++r)
+            {
+                for (long c = 0; c < width; ++c)
+                {
+                    if (!is_colour(cells[r * grid_side + c]))
+                    {
+                        width = c;
+                        break;
+                    }
+                }
+                if ((r + 1) * width > best_area)
+                {
+                    best_area = (r + 1) * width;
+                    best_rows = r + 1;
+                    best_cols = width;
+                }
+            }
+
+            arc_grid_t g(best_rows, best_cols);
+            for (long r = 0; r < best_rows; ++r)
+                for (long c = 0; c < best_cols; ++c)
+                    g(r, c) = (unsigned char)((unsigned long)cells[r * grid_side + c] - arc_colour_offset);
+            return g;
+        }
+
+        inline long arc_grid_side (long seq_len)
+        {
+            long side = 0;
+            while ((side + 1) * (side + 1) <= seq_len) ++side;
+            DLIB_CASSERT(side * side == seq_len,
+                "arc dataset: a window of " << seq_len << " cells is not a square");
+            return side;
+        }
+    }
+
+    /*!
+        Turns a predicted sequence back into a grid, read from the top-left corner of the
+        window and cropped as the reference crops it, to the largest rectangle of colours
+        anchored there. An answer whose first cell holds no colour is an empty grid, which
+        matches no expected answer.
     !*/
     inline arc_grid_t arc_decode_grid (
         const std::vector<unsigned long>& predicted,
@@ -1677,31 +1822,381 @@ namespace dlib
         DLIB_CASSERT(grid_side > 0 && seq_len == grid_side * grid_side);
         const long offset = (long)predicted.size() - seq_len;   // skip the identifier
         DLIB_CASSERT(offset >= 0, "arc dataset: the prediction is shorter than a window");
-
-        /* A 30 by 30 grid has no room for a marker and simply fills the window. Only the
-           ten colour tokens count as cells, so a label, which holds the ignored value where
-           the padding was, decodes as well as a prediction does. A cell inside the extent
-           that holds no colour is returned as -1, which compares unequal to any colour. */
-        auto at = [&](long r, long c) { return predicted[(size_t)(offset + r * grid_side + c)]; };
-        auto is_colour = [](unsigned long tok) {
-            return tok >= arc_colour_offset && tok < arc_colour_offset + arc_num_colours; };
-
-        long cols = 0;
-        while (cols < grid_side && is_colour(at(0, cols))) ++cols;
-        long rows = 0;
-        while (rows < grid_side && is_colour(at(rows, 0))) ++rows;
-        if (rows == 0 || cols == 0)
-            return arc_grid_t();
-
-        arc_grid_t g(rows, cols);
-        for (long r = 0; r < rows; ++r)
-            for (long c = 0; c < cols; ++c)
-            {
-                const unsigned long tok = at(r, c);
-                g(r, c) = is_colour(tok) ? (int)(tok - arc_colour_offset) : -1;
-            }
-        return g;
+        return impl::arc_crop_window(predicted.data() + offset, grid_side);
     }
+
+    /*!
+        The input and the expected answer of an example as grids, read from the top-left
+        corner of its window. This is where they sit in a split the builder never moves,
+        the evaluation split.
+    !*/
+    inline arc_grid_t arc_input_grid (
+        const arc_dataset& d,
+        long example
+    )
+    {
+        return impl::arc_crop_window(d.input_cells(example), impl::arc_grid_side(d.seq_len));
+    }
+
+    inline arc_grid_t arc_label_grid (
+        const arc_dataset& d,
+        long example
+    )
+    {
+        return impl::arc_crop_window(d.label_cells(example), impl::arc_grid_side(d.seq_len));
+    }
+
+// ----------------------------------------------------------------------------------------
+
+    /*!
+        A variant of a task, as the builder draws it: a symmetry of the square, and a
+        mapping of the colours, colour c becoming colours[c]. The task itself is the
+        identity of both.
+
+        The symmetries are numbered as the reference numbers them, after numpy: 0 is the
+        identity, 1 to 3 are one to three quarter turns counter-clockwise, 4 mirrors left
+        to right, 5 top to bottom, 6 transposes and 7 reflects across the other diagonal.
+    !*/
+    struct arc_variant
+    {
+        int symmetry = 0;
+        std::array<unsigned char, arc_num_colours> colours;
+
+        arc_variant ()
+        {
+            for (unsigned long c = 0; c < arc_num_colours; ++c)
+                colours[c] = (unsigned char)c;
+        }
+
+        bool is_identity () const
+        {
+            for (unsigned long c = 0; c < arc_num_colours; ++c)
+                if (colours[c] != c)
+                    return false;
+            return symmetry == 0;
+        }
+    };
+
+    /*!
+        Applies one of the eight symmetries, numbered as above.
+    !*/
+    inline arc_grid_t arc_apply_symmetry (
+        const arc_grid_t& g,
+        int symmetry
+    )
+    {
+        DLIB_CASSERT(0 <= symmetry && symmetry < 8,
+            "arc dataset: there is no symmetry numbered " << symmetry);
+        const long rows = g.nr(), cols = g.nc();
+        const bool turned = symmetry == 1 || symmetry == 3 || symmetry == 6 || symmetry == 7;
+        arc_grid_t out(turned ? cols : rows, turned ? rows : cols);
+        for (long i = 0; i < out.nr(); ++i)
+        {
+            for (long j = 0; j < out.nc(); ++j)
+            {
+                switch (symmetry)
+                {
+                    case 0:  out(i, j) = g(i, j); break;
+                    case 1:  out(i, j) = g(j, cols - 1 - i); break;
+                    case 2:  out(i, j) = g(rows - 1 - i, cols - 1 - j); break;
+                    case 3:  out(i, j) = g(rows - 1 - j, i); break;
+                    case 4:  out(i, j) = g(i, cols - 1 - j); break;
+                    case 5:  out(i, j) = g(rows - 1 - i, j); break;
+                    case 6:  out(i, j) = g(j, i); break;
+                    default: out(i, j) = g(rows - 1 - j, cols - 1 - i); break;
+                }
+            }
+        }
+        return out;
+    }
+
+    /*!
+        The symmetry that undoes another: the quarter turns undo one another and every
+        reflection undoes itself.
+    !*/
+    inline int arc_inverse_symmetry (
+        int symmetry
+    )
+    {
+        DLIB_CASSERT(0 <= symmetry && symmetry < 8,
+            "arc dataset: there is no symmetry numbered " << symmetry);
+        const int inverse[8] = {0, 3, 2, 1, 4, 5, 6, 7};
+        return inverse[symmetry];
+    }
+
+    /*!
+        Makes a variant of a grid, the colours first and then the symmetry, as the builder
+        does, and undoes it. A cell holding no colour is left as it is.
+    !*/
+    inline arc_grid_t arc_apply_variant (
+        const arc_grid_t& g,
+        const arc_variant& v
+    )
+    {
+        arc_grid_t mapped = g;
+        for (long r = 0; r < mapped.nr(); ++r)
+            for (long c = 0; c < mapped.nc(); ++c)
+                if (mapped(r, c) < arc_num_colours)
+                    mapped(r, c) = v.colours[mapped(r, c)];
+        return arc_apply_symmetry(mapped, v.symmetry);
+    }
+
+    inline arc_grid_t arc_undo_variant (
+        const arc_grid_t& g,
+        const arc_variant& v
+    )
+    {
+        std::array<unsigned char, arc_num_colours> back;
+        for (unsigned long c = 0; c < arc_num_colours; ++c)
+            back[c] = (unsigned char)c;
+        for (unsigned long c = 0; c < arc_num_colours; ++c)
+            back[v.colours[c]] = (unsigned char)c;
+        arc_grid_t out = arc_apply_symmetry(g, arc_inverse_symmetry(v.symmetry));
+        for (long r = 0; r < out.nr(); ++r)
+            for (long c = 0; c < out.nc(); ++c)
+                if (out(r, c) < arc_num_colours)
+                    out(r, c) = back[out(r, c)];
+        return out;
+    }
+
+// ----------------------------------------------------------------------------------------
+
+    namespace impl
+    {
+        /* A variant's name is its task's name followed by _t, the symmetry, _ and the ten
+           digits of the colour mapping, as the reference writes it. */
+        inline bool arc_split_puzzle_name (
+            const std::string& name,
+            std::string& task,
+            arc_variant& variant
+        )
+        {
+            const size_t suffix = 4 + arc_num_colours;
+            if (name.size() <= suffix)
+                return false;
+            const size_t s = name.size() - suffix;
+            if (name[s] != '_' || name[s + 1] != 't' || name[s + 2] < '0' || name[s + 2] > '7' ||
+                name[s + 3] != '_')
+                return false;
+
+            arc_variant v;
+            bool seen[arc_num_colours] = {};
+            for (unsigned long c = 0; c < arc_num_colours; ++c)
+            {
+                const char ch = name[s + 4 + c];
+                if (ch < '0' || ch > '9' || seen[ch - '0'])
+                    return false;
+                seen[ch - '0'] = true;
+                v.colours[c] = (unsigned char)(ch - '0');
+            }
+            v.symmetry = name[s + 2] - '0';
+            task = name.substr(0, s);
+            variant = v;
+            return true;
+        }
+    }
+
+    /*!
+        The task a puzzle name belongs to, and the variant it records. A name with no
+        variant is a task itself, under the identity.
+    !*/
+    inline std::string arc_task_of (
+        const std::string& puzzle_name
+    )
+    {
+        std::string task;
+        arc_variant v;
+        return impl::arc_split_puzzle_name(puzzle_name, task, v) ? task : puzzle_name;
+    }
+
+    inline arc_variant arc_variant_of (
+        const std::string& puzzle_name
+    )
+    {
+        std::string task;
+        arc_variant v;
+        impl::arc_split_puzzle_name(puzzle_name, task, v);
+        return v;
+    }
+
+// ----------------------------------------------------------------------------------------
+
+    /*!
+        The vote between the variants of a task, as the reference casts it.
+
+        Every variant of a task answers each of its test inputs. Brought back to the task
+        by undoing the variant, each answer is a vote for a grid. The grids a test input
+        receives are ranked by their votes, then by the mean confidence of those votes,
+        then by the order in which they first came, and the first of them are the attempts.
+        A task is solved with k attempts when every one of its test inputs has its expected
+        answer among its first k grids.
+    !*/
+    class arc_vote
+    {
+    public:
+        /*!
+            Records one variant's answer to one test input of a task, both grids already
+            brought back to the task, and the confidence the model gave it. The expected
+            answer is the same whichever variant it comes from. Two variants bringing back
+            different ones means the variants were not undone as they were made, and that
+            throws.
+        !*/
+        void add (
+            const std::string& task,
+            long question,
+            const arc_grid_t& expected,
+            const arc_grid_t& answer,
+            double confidence
+        )
+        {
+            question_tally& q = tasks_[task][question];
+            const std::string expected_key = key_of(expected);
+            if (q.candidates.empty())
+                q.expected = expected_key;
+            else if (q.expected != expected_key)
+                throw std::runtime_error("arc_vote: two variants of " + task + " expect "
+                    "different answers to test input " + std::to_string(question) +
+                    ", so the variants were not undone as they were made");
+
+            const std::string key = key_of(answer);
+            auto found = q.index.find(key);
+            if (found == q.index.end())
+            {
+                found = q.index.emplace(key, q.candidates.size()).first;
+                q.candidates.push_back(candidate{key, 0, 0.0});
+            }
+            candidate& c = q.candidates[found->second];
+            ++c.votes;
+            c.confidence += confidence;
+            ++answers_;
+        }
+
+        long num_tasks () const { return (long)tasks_.size(); }
+
+        long num_questions () const
+        {
+            long n = 0;
+            for (const auto& t : tasks_)
+                n += (long)t.second.size();
+            return n;
+        }
+
+        long num_answers () const { return answers_; }
+
+        /*!
+            The number of tasks solved with the given number of attempts.
+        !*/
+        long solved (
+            long attempts
+        ) const
+        {
+            long count = 0;
+            for (const auto& t : tasks_)
+            {
+                bool all = true;
+                for (const auto& q : t.second)
+                {
+                    const std::vector<size_t> order = ranking(q.second);
+                    bool found = false;
+                    for (size_t i = 0; i < order.size() && (long)i < attempts; ++i)
+                        found = found || q.second.candidates[order[i]].key == q.second.expected;
+                    all = all && found;
+                }
+                count += all ? 1 : 0;
+            }
+            return count;
+        }
+
+        /*!
+            The first grids a test input of a task received, at most the given number, in
+            the order of the ranking.
+        !*/
+        std::vector<arc_grid_t> attempts (
+            const std::string& task,
+            long question,
+            long count
+        ) const
+        {
+            std::vector<arc_grid_t> out;
+            const auto t = tasks_.find(task);
+            if (t == tasks_.end())
+                return out;
+            const auto q = t->second.find(question);
+            if (q == t->second.end())
+                return out;
+            const std::vector<size_t> order = ranking(q->second);
+            for (size_t i = 0; i < order.size() && (long)i < count; ++i)
+                out.push_back(grid_of(q->second.candidates[order[i]].key));
+            return out;
+        }
+
+        void clear ()
+        {
+            tasks_.clear();
+            answers_ = 0;
+        }
+
+    private:
+        struct candidate
+        {
+            std::string key;
+            long votes;
+            double confidence;
+        };
+
+        struct question_tally
+        {
+            std::string expected;
+            std::vector<candidate> candidates;
+            std::map<std::string, size_t> index;
+        };
+
+        /* A grid as a string of bytes, its height and width on two bytes each and then its
+           cells, which is what two answers are compared on. */
+        static std::string key_of (const arc_grid_t& g)
+        {
+            std::string key(4 + (size_t)(g.nr() * g.nc()), '\0');
+            key[0] = (char)(g.nr() & 0xff);
+            key[1] = (char)((g.nr() >> 8) & 0xff);
+            key[2] = (char)(g.nc() & 0xff);
+            key[3] = (char)((g.nc() >> 8) & 0xff);
+            size_t i = 4;
+            for (long r = 0; r < g.nr(); ++r)
+                for (long c = 0; c < g.nc(); ++c)
+                    key[i++] = (char)g(r, c);
+            return key;
+        }
+
+        static arc_grid_t grid_of (const std::string& key)
+        {
+            auto byte = [&key](size_t i) { return (long)(unsigned char)key[i]; };
+            const long rows = byte(0) | (byte(1) << 8), cols = byte(2) | (byte(3) << 8);
+            arc_grid_t g(rows, cols);
+            size_t i = 4;
+            for (long r = 0; r < rows; ++r)
+                for (long c = 0; c < cols; ++c)
+                    g(r, c) = (unsigned char)key[i++];
+            return g;
+        }
+
+        static std::vector<size_t> ranking (const question_tally& q)
+        {
+            std::vector<size_t> order(q.candidates.size());
+            for (size_t i = 0; i < order.size(); ++i)
+                order[i] = i;
+            std::stable_sort(order.begin(), order.end(), [&q](size_t a, size_t b) {
+                const candidate& x = q.candidates[a];
+                const candidate& y = q.candidates[b];
+                if (x.votes != y.votes)
+                    return x.votes > y.votes;
+                return x.confidence / x.votes > y.confidence / y.votes;
+            });
+            return order;
+        }
+
+        std::map<std::string, std::map<long, question_tally>> tasks_;
+        long answers_ = 0;
+    };
 
 // ----------------------------------------------------------------------------------------
 

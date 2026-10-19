@@ -63,18 +63,30 @@
     position, which the puzzle_embeddings layer maps to its own row of a table trained by
     sign descent on the rows each batch names. An identifier the model never trained on
     keeps the zero row it started with, so a puzzle can only be asked about by name if it
-    was named during training. Build the dataset with --protocol reference to allow that,
-    or evaluate with --blank-puzzle-id to ask the model to work without being told, which
-    is the harder setting.
+    was named during training. Build the dataset with --protocol reference to allow that.
+    A dataset built with --protocol held-out asks about its evaluation puzzles under the
+    blank identifier, and --blank-puzzle-id withholds the identifier from any dataset; both
+    ask the model to work without being told, which is the harder setting.
 
     HOW IT IS MEASURED
 
     Evaluation runs every held-out example through --max-passes passes from the initial
     state and reads the last answer, as in the reference. An answer counts only if every
     cell of the expected grid and every end marker around it is right, which also checks
-    its size. The reference goes on to vote between the augmented variants of a task and
-    to score two attempts per task; this program reports the rate per example, on which
-    that vote is built.
+    its size.
+
+    The variants of a task then vote, as in the reference. An answer is read from the
+    top-left corner of the window, cropped to the largest rectangle of colours anchored
+    there, and brought back to its task by undoing the symmetry and the colours its
+    puzzle's name records. Each answer is a vote for a grid on its test input. The grids a
+    test input receives are ranked by their votes, then by the mean probability the halting
+    head gave them, and a task counts as solved with k attempts when every one of its test
+    inputs has its expected answer among the first k grids. The program reports one attempt
+    and two, two being the published measure.
+
+    A measurement limited by --eval-samples reads whole variants spread evenly across the
+    split, each answering all the test inputs of its task, so a task votes with the
+    variants read. The published measure reads them all, which --eval-samples 0 does.
 
     WHAT DIFFERS FROM THE REFERENCE
 
@@ -83,9 +95,11 @@
     the reference's output layer has none. The computation is in single precision, where
     the reference runs its forward pass in bfloat16.
 
-    Prepare the data first:
+    Prepare the data first, with the tasks of ConceptARC beside those of ARC-AGI-1, as the
+    reference trains:
+        git clone https://github.com/victorvikram/ConceptARC
         slm_tools/build_arc_dataset.py --download --data-dir arc-agi --out-dir arc-data \
-            --protocol reference
+            --protocol reference --extra-corpus ConceptARC/corpus
 
     Then:
         ./slm_hrm_arc_puzzle_ex --train --data arc-data
@@ -398,16 +412,42 @@ struct measurement
     // Answers within 90, 95 and 99 % of their cells, and what the ones within 1 % missed.
     long   near90 = 0, near95 = 0, near99 = 0;
     long   wrong_markers = 0, wrong_colours = 0;
+    // The vote: the variants read, their tasks and test inputs, and the tasks solved with
+    // one attempt and with two.
+    long   variants = 0, tasks = 0, questions = 0, solved1 = 0, solved2 = 0;
 };
 
 // The longest a run stays silent, during training as during a measurement.
 const auto REPORT_PERIOD = std::chrono::minutes(5);
 
 /*
+    The examples a measurement reads. A limit takes whole variants spread evenly across the
+    split, as many as hold about that many examples. Every variant read then answers all the
+    test inputs of its task, and the same variants are read every time, so successive
+    measurements during a run compare like with like.
+*/
+std::vector<long> examples_to_read (const arc_dataset& d, long limit)
+{
+    const long puzzles = d.num_puzzles() - 1;              // the blank one aside
+    long wanted = puzzles;
+    if (limit > 0 && limit < d.num_examples() && puzzles > 0)
+    {
+        const double per_puzzle = (double)d.num_examples() / (double)puzzles;
+        wanted = std::min(puzzles, std::max(1L, (long)std::ceil(limit / per_puzzle)));
+    }
+    std::vector<long> chosen;
+    for (long k = 0; k < wanted; ++k)
+    {
+        const long p = 1 + (long)((double)k * (double)puzzles / (double)wanted);
+        for (long e = d.first_example(p); e < d.end_example(p); ++e)
+            chosen.push_back(e);
+    }
+    return chosen;
+}
+
+/*
     Runs held-out examples through the full number of passes from the initial state and
-    scores the last answer. A limit reads that many examples spread evenly across the
-    split, the same ones every time, so successive measurements during a run compare like
-    with like.
+    scores the last answer, then lets the variants of each task vote.
 
     Only the positions the loss scores count, the cells of the expected answer and its end
     markers, never the padding around it. An exact grid needs every cell right, so the
@@ -422,14 +462,14 @@ template <typename network>
 measurement evaluate (network& net, const arc_dataset& test, const run_options& o, long limit)
 {
     measurement m;
-    const long available = test.num_examples();
-    const long n = (limit > 0 && limit < available) ? limit : available;
-    const double stride = (double)available / (double)std::max(1L, n);
+    const std::vector<long> chosen = examples_to_read(test, limit);
+    const long n = (long)chosen.size();
 
     auto& core = recurrence(net);
     std::vector<matrix<int, 0, 1>> xs;
     std::vector<long> ids;
     resizable_tensor x;
+    arc_vote vote;
     long cells_right = 0, cells_total = 0;
     const auto started = std::chrono::steady_clock::now();
     auto last_line = started;
@@ -440,9 +480,8 @@ measurement evaluate (network& net, const arc_dataset& test, const run_options& 
         ids.clear();
         for (; k < n && (long)xs.size() < o.batch_size; ++k)
         {
-            const long e = std::min(available - 1, (long)(k * stride));
-            ids.push_back(e);
-            xs.push_back(make_input(test, e, o));
+            ids.push_back(chosen[(size_t)k]);
+            xs.push_back(make_input(test, chosen[(size_t)k], o));
         }
         net.to_tensor(xs.begin(), xs.end(), x);
 
@@ -455,21 +494,37 @@ measurement evaluate (network& net, const arc_dataset& test, const run_options& 
         const float* logits = out.host();
         for (size_t b = 0; b < ids.size(); ++b)
         {
-            const auto label = arc_make_label(test, ids[b]);
+            const long e = ids[b];
+            const float* rows = logits + (long)b * SEQ_LEN * OUTPUTS;
+            const std::vector<unsigned long> predicted =
+                arc_predict_sequence(rows, OUTPUTS, SEQ_LEN, COLOUR_VOCAB);
+            const auto label = arc_make_label(test, e);
             long right = 0, scored = 0, markers = 0, colours = 0;
             for (long t = 0; t < SEQ_LEN; ++t)
             {
                 if (label(t) == arc_ignore_label)
                     continue;
-                const float* row = logits + ((long)b * SEQ_LEN + t) * OUTPUTS;
-                long best = 0;
-                for (long c = 1; c < COLOUR_VOCAB; ++c)
-                    if (row[c] > row[best]) best = c;
                 ++scored;
-                if ((unsigned long)best == label(t)) ++right;
+                if (predicted[(size_t)t] == label(t)) ++right;
                 else if (label(t) == arc_eos_token) ++markers;
                 else ++colours;
             }
+
+            /* The answer and the expected grid are read from the top-left corner, where
+               the held-out split keeps its grids, and brought back to the task by undoing
+               the variant the puzzle's name records. The confidence of the vote is the
+               probability the halting head gives the answer after the last pass. */
+            const long puzzle = test.puzzle_of(e);
+            const std::string& name = test.puzzle_names[(size_t)puzzle];
+            const arc_variant variant = arc_variant_of(name);
+            const long question = e - test.first_example(puzzle);
+            const double halting = rows[OUTPUTS - 1];
+            vote.add(arc_task_of(name), question,
+                     arc_undo_variant(arc_label_grid(test, e), variant),
+                     arc_undo_variant(arc_decode_grid(predicted, WINDOW, GRID_SIDE), variant),
+                     1 / (1 + std::exp(-halting)));
+            if (question == 0)
+                ++m.variants;
             cells_right += right;
             cells_total += scored;
             ++m.examples;
@@ -500,6 +555,10 @@ measurement evaluate (network& net, const arc_dataset& test, const run_options& 
     }
     core.reset_state();
     m.cells = cells_total ? 100.0 * cells_right / cells_total : 0.0;
+    m.tasks = vote.num_tasks();
+    m.questions = vote.num_questions();
+    m.solved1 = vote.solved(1);
+    m.solved2 = vote.solved(2);
     return m;
 }
 
@@ -513,6 +572,11 @@ void report (const measurement& m, const char* what)
     if (m.near99 > m.exact)
         cout << "    the answers within 1 % that missed hold " << m.wrong_markers
              << " wrong end markers and " << m.wrong_colours << " wrong colours\n";
+    if (m.tasks > 0)
+        cout << "    vote of " << m.variants << " variants over " << m.tasks << " tasks and "
+             << m.questions << " test inputs: " << m.solved1 << " tasks solved with one attempt ("
+             << 100.0 * m.solved1 / m.tasks << " %), " << m.solved2 << " with two ("
+             << 100.0 * m.solved2 / m.tasks << " %)\n";
     cout << std::flush;
 }
 
@@ -926,8 +990,9 @@ int main(int argc, char** argv)
         parser.add_option("epochs", "Passes over the training groups, in the reference's "
                                     "accounting (default: 100000)", 1);
         parser.add_option("eval-interval", "Measure every N epochs (default: 10000)", 1);
-        parser.add_option("eval-samples", "Held-out examples read by a measurement, spread "
-                                          "across the split, 0 for all of them (default: 2000)", 1);
+        parser.add_option("eval-samples", "Held-out examples read by a measurement, as whole "
+                                          "variants spread across the split, 0 for all of "
+                                          "them (default: 2000)", 1);
         parser.add_option("learning-rate", "Base learning rate (default: 1e-4 at a batch of 768)", 1);
         parser.add_option("warmup-steps", "Steps of linear warmup (default: 2000 at a batch of 768)", 1);
         parser.add_option("lr-min-ratio", "Where the cosine ends, as a fraction of the base rate; "
@@ -972,7 +1037,7 @@ int main(int argc, char** argv)
             parser.print_options();
             cout << "\nHierarchical reasoning on ARC-AGI, trained as the reference trains it\n"
                  << "  Prepare  : slm_tools/build_arc_dataset.py --download --data-dir arc-agi "
-                    "--out-dir arc-data --protocol reference\n"
+                    "--out-dir arc-data --protocol reference --extra-corpus ConceptARC/corpus\n"
                  << "  Train    : " << argv[0] << " --train --data arc-data\n"
                  << "  Evaluate : " << argv[0] << " --eval --data arc-data --eval-samples 0\n";
             return 0;
@@ -1071,6 +1136,15 @@ int main(int argc, char** argv)
                         "build_arc_dataset.py.\n";
                 return 1;
             }
+            /* The names record the variant of every puzzle, which the vote undoes. A split
+               without them was written by an earlier version of the builder. */
+            if (d->puzzle_names.empty())
+            {
+                cout << "The splits in " << o.data_dir << " have no .names file beside them. "
+                        "They were written by an\nearlier build_arc_dataset.py; rebuild them "
+                        "with the current one.\n";
+                return 1;
+            }
         }
         if (do_train && (train_set.num_examples() == 0 || train_set.num_groups() == 0))
         {
@@ -1089,7 +1163,9 @@ int main(int argc, char** argv)
             cout << "  training      : " << train_set.num_examples() << " examples of "
                  << (long)train_set.puzzle_indices.size() - 1 << " puzzles in "
                  << train_set.num_groups() << " groups\n";
-        cout << "  held out      : " << test.num_examples() << " examples\n"
+        cout << "  held out      : " << test.num_examples() << " examples of "
+             << std::max(0L, test.num_puzzles() - 1) << " puzzles in "
+             << std::max(0L, test.num_groups()) << " groups\n"
              << "  network       : width " << EMBED_DIM << ", " << NUM_HEADS << " heads, "
              << NUM_H_LAYERS << " and " << NUM_L_LAYERS << " blocks, " << HRM_N << " cycles of "
              << HRM_T << " steps per pass, attention "

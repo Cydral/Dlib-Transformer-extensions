@@ -340,7 +340,7 @@ namespace dlib
     {
         /*!
             WHAT THIS OBJECT REPRESENTS
-                A prepared ARC dataset: every grid already flattened into a fixed window,
+                A prepared ARC dataset: every grid already written into a fixed window,
                 and the index arrays saying which examples belong to which puzzle and which
                 puzzles belong to which group.
 
@@ -352,13 +352,55 @@ namespace dlib
                 identifier from its puzzle table. An identifier the model never trained on
                 keeps the row it started with and carries no meaning, so a puzzle can only
                 be asked about by name if it was named during training.
+
+                A group holds one task and its variants, the task itself first. A variant
+                is the task under one symmetry of the square and one mapping of its
+                colours, and its name, in puzzle_names, records both.
+        !*/
+
+        long seq_len;                         // cells per window, 900 for 30 by 30
+        long colour_vocab;                    // the tokens a cell can hold
+        std::vector<unsigned char> inputs;    // seq_len cells per example, one byte each
+        std::vector<unsigned char> labels;    // seq_len cells per example, one byte each
+        std::vector<int> puzzle_identifiers;  // the blank puzzle, then one per puzzle
+        std::vector<int> puzzle_indices;      // first example of each puzzle, plus the end
+        std::vector<int> group_indices;       // first puzzle of each group, plus the end
+        std::vector<std::string> puzzle_names;// one per puzzle, the blank one first, or none
+
+        long num_puzzles  () const;
+        long num_groups   () const;
+        long num_examples () const;
+        /*!
+            ensures
+                - num_puzzles() counts the blank puzzle with the others, as
+                  puzzle_identifiers and puzzle_names do.
+        !*/
+
+        const unsigned char* input_cells (long example) const;
+        const unsigned char* label_cells (long example) const;
+        /*!
+            requires
+                - 0 <= example < num_examples()
+            ensures
+                - returns the seq_len cells of the example.
         !*/
 
         long puzzle_of (long example) const;
         /*!
             ensures
-                - returns where in this split the example's puzzle sits.
+                - returns where in this split the example's puzzle sits, counted as
+                  puzzle_identifiers and puzzle_names count, the blank puzzle being 0.
                 - This is a position, not a name. Use identifier_of() to name a puzzle.
+        !*/
+
+        long first_example (long puzzle) const;
+        long end_example   (long puzzle) const;
+        /*!
+            requires
+                - 1 <= puzzle < num_puzzles()
+            ensures
+                - the puzzle at that position, as puzzle_of() gives it, holds the examples
+                  from first_example(puzzle) to end_example(puzzle) - 1.
         !*/
 
         int identifier_of (long example) const;
@@ -370,9 +412,9 @@ namespace dlib
                   number a network looks up.
                 - This is not puzzle_of(). A split built under the reference protocol stores
                   identifiers assigned while the training split was built, so an evaluation
-                  puzzle sitting at position three may be named twenty. Passing the position
-                  names a different puzzle, silently, and only on the protocol where the
-                  comparison is meant to happen.
+                  puzzle sitting at position three may be named twenty, and under the
+                  held-out protocol every evaluation puzzle carries the blank identifier.
+                  Passing the position names a different puzzle, silently.
         !*/
 
         int largest_identifier () const;
@@ -398,10 +440,14 @@ namespace dlib
     arc_dataset load_arc_dataset (const std::string& filename);
     /*!
         ensures
-            - reads a file written by slm_tools/build_arc_dataset.py.
+            - reads a .bin file written by slm_tools/build_arc_dataset.py, keeping every
+              cell in one byte.
+            - reads the .names file beside it, the same path with .names in place of .bin,
+              into puzzle_names when it exists. puzzle_names is empty otherwise.
         throws
             - std::runtime_error if the file is missing, is not a prepared ARC file, has a
-              version this build does not know, or ends early.
+              version this build does not know, ends early, holds a cell outside its
+              vocabulary, or if the names file names another number of puzzles.
     !*/
 
     matrix<int, 0, 1>           arc_make_input (const arc_dataset& d, long example, int puzzle_id);
@@ -426,7 +472,7 @@ namespace dlib
             - logits points at sequence_length rows of row_stride floats
             - row_stride >= vocabulary > 0
         ensures
-            - returns the most likely colour at each position, read in one pass. Generating
+            - returns the most likely token at each position, read in one pass. Generating
               the window token by token would be nine hundred forward passes to answer one
               puzzle, and the loss is per position, so every position already has its
               logits after a single pass.
@@ -438,18 +484,32 @@ namespace dlib
         requires
             - grid_side > 0, seq_len == grid_side * grid_side, predicted.size() >= seq_len
         ensures
-            - returns the grid the sequence describes. Its width is how far the first row
-              runs before an end marker and its height how far the first column does; a
-              30 by 30 grid has no room for a marker and fills the window.
-            - only the ten colour tokens count as cells, so a label, which holds
-              arc_ignore_label where the padding was, decodes as well as a prediction. A
-              cell inside the extent holding no colour is returned as -1.
-            - returns an empty grid when the first cell is not a colour: an empty answer is
-              a wrong answer rather than a malformed one.
+            - returns the grid the last seq_len tokens of predicted describe, read from the
+              top-left corner of the window and cropped as the reference crops it: the
+              largest rectangle anchored at the corner whose cells all hold colours, each
+              row reaching no further than the rows above it.
+            - returns an empty grid when the first cell holds no colour, which matches no
+              expected answer.
     !*/
 
+    arc_grid_t arc_input_grid (const arc_dataset& d, long example);
+    arc_grid_t arc_label_grid (const arc_dataset& d, long example);
+    /*!
+        requires
+            - 0 <= example < d.num_examples()
+            - d.seq_len is the square of a window side
+        ensures
+            - returns the input and the expected answer of the example, read from the
+              top-left corner of its window and cropped as arc_decode_grid() crops. That is
+              where they sit in a split the builder never moves, the evaluation split.
+    !*/
 
 // ----------------------------------------------------------------------------------------
+
+    constexpr int arc_blank_puzzle_id = 0;
+    /*!
+        Passed to arc_make_input() in place of an identifier, this withholds it.
+    !*/
 
     constexpr unsigned long arc_pad_token     = 0;
     constexpr unsigned long arc_eos_token     = 1;
@@ -469,6 +529,128 @@ namespace dlib
         whose padding index falls back to it never skips a position because the question
         was empty there.
     !*/
+
+// ----------------------------------------------------------------------------------------
+
+    struct arc_variant
+    {
+        /*!
+            WHAT THIS OBJECT REPRESENTS
+                A variant of a task, as build_arc_dataset.py draws it: one symmetry of the
+                square, and a mapping of the colours, colour c becoming colours[c]. The
+                builder keeps colour 0 in place, and the default object is the identity,
+                the task itself.
+
+                The symmetries are numbered as the reference implementation numbers them,
+                after numpy: 0 is the identity, 1 to 3 are one to three quarter turns
+                counter-clockwise, 4 mirrors left to right, 5 top to bottom, 6 transposes
+                and 7 reflects across the other diagonal.
+        !*/
+
+        int symmetry;                                         // 0 to 7
+        std::array<unsigned char, arc_num_colours> colours;   // a permutation of 0 to 9
+
+        bool is_identity () const;
+    };
+
+    arc_grid_t arc_apply_symmetry (const arc_grid_t& g, int symmetry);
+    int arc_inverse_symmetry (int symmetry);
+    /*!
+        requires
+            - 0 <= symmetry < 8
+        ensures
+            - arc_apply_symmetry() returns g under the symmetry, numbered as above.
+            - arc_inverse_symmetry() returns the symmetry that undoes it: the quarter turns
+              undo one another and every reflection undoes itself.
+    !*/
+
+    arc_grid_t arc_apply_variant (const arc_grid_t& g, const arc_variant& v);
+    arc_grid_t arc_undo_variant  (const arc_grid_t& g, const arc_variant& v);
+    /*!
+        requires
+            - v.colours is a permutation of 0 to 9
+        ensures
+            - arc_apply_variant() maps the colours, then applies the symmetry, as the builder
+              does. arc_undo_variant() undoes both, so that
+              arc_undo_variant(arc_apply_variant(g, v), v) == g.
+            - a cell holding a value of 10 or more is left as it is.
+    !*/
+
+    std::string arc_task_of    (const std::string& puzzle_name);
+    arc_variant arc_variant_of (const std::string& puzzle_name);
+    /*!
+        ensures
+            - a variant's name is its task's name followed by _t, the symmetry, _ and the
+              ten digits of its colour mapping, as the reference writes it.
+            - arc_task_of() returns the name without that suffix, and arc_variant_of() the
+              variant the suffix records.
+            - a name without such a suffix is a task itself: arc_task_of() returns it as it
+              is and arc_variant_of() the identity.
+    !*/
+
+// ----------------------------------------------------------------------------------------
+
+    class arc_vote
+    {
+        /*!
+            WHAT THIS OBJECT REPRESENTS
+                The vote between the variants of a task, as the reference casts it.
+
+                Every variant of a task answers each of its test inputs. Brought back to the
+                task by undoing the variant, each answer is a vote for a grid. The grids a
+                test input receives are ranked by their votes, then by the mean confidence
+                of those votes, then by the order in which they first came, and the first of
+                them are the attempts. A task is solved with k attempts when every one of its
+                test inputs has its expected answer among its first k grids.
+        !*/
+
+    public:
+
+        void add (
+            const std::string& task,
+            long question,
+            const arc_grid_t& expected,
+            const arc_grid_t& answer,
+            double confidence
+        );
+        /*!
+            ensures
+                - records one variant's answer to test input number question of the task,
+                  with the confidence the model gave it. expected and answer are both
+                  brought back to the task by the caller.
+            throws
+                - std::runtime_error if another variant brought back a different expected
+                  answer to the same test input, which means the variants were not undone
+                  as they were made.
+        !*/
+
+        long num_tasks () const;
+        long num_questions () const;
+        long num_answers () const;
+        /*!
+            ensures
+                - return the tasks, the test inputs and the answers recorded so far.
+        !*/
+
+        long solved (long attempts) const;
+        /*!
+            ensures
+                - returns the number of tasks solved with that many attempts.
+        !*/
+
+        std::vector<arc_grid_t> attempts (const std::string& task, long question, long count) const;
+        /*!
+            ensures
+                - returns, in the order of the ranking, the first grids the test input
+                  received, at most count of them, and none for a test input never answered.
+        !*/
+
+        void clear ();
+        /*!
+            ensures
+                - forgets everything recorded.
+        !*/
+    };
 
 } // namespace dlib
 
