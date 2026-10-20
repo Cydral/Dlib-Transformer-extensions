@@ -2528,6 +2528,17 @@ static int train_command (const std::string& input, const train_options& o)
     dnn_trainer<net_type, adamw> trainer(net, adamw(o.weight_decay, 0.9, 0.98));
     trainer.set_learning_rate_schedule(rate_schedule(o));
     trainer.set_synchronization_file(sync, std::chrono::minutes(10));
+    /*
+        The synchronization file holds the schedule the run started with. A run resumed with
+        another --steps follows the schedule of that length from the step it reached, so that
+        lengthening a run lengthens its cosine.
+    */
+    const long reached = static_cast<long>(trainer.get_train_one_step_calls());
+    if (trainer.get_learning_rate_schedule().size() != o.steps && reached < o.steps) {
+        const matrix<double, 0, 1> full = rate_schedule(o);
+        trainer.set_learning_rate_schedule(rowm(full, range(reached, o.steps - 1)));
+        cout << "Resuming at step " << reached << " on the schedule of " << o.steps << " steps" << endl;
+    }
     trainer.be_quiet();
     network_context::set_optimizer_params(o.weight_decay, 0.9, 0.98);
     cout << "Parameters: " << count_network_parameters(net, WINDOW).total << endl;
