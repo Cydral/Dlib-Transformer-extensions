@@ -19,11 +19,12 @@
     code chosen per type so that the useful operations keep working on protected data:
     the same name always gets the same code, in every document and every format; the
     surname code is shared by "Jean Dupont", "M. Dupont" and jean.dupont@acme.fr; a
-    protected IBAN or card number still passes its checksum; dates are all moved by the
-    same secret number of weeks, so intervals, ages and weekdays are preserved; IP
-    addresses are encrypted prefix by prefix (Crypto-PAn), so subnets are preserved; GPS
-    coordinates and UUIDs keep their layout. The last three characters authenticate the
-    tag with an HMAC.
+    protected IBAN or card number still passes its checksum; dates are all moved into the
+    past by the same secret number of weeks, so intervals, ages and weekdays are preserved
+    and no date shows up in the future, while a month with its year ("mars 2022") or a year
+    that dates a fact ("en 2019") moves by whole months or years; IP addresses are
+    encrypted prefix by prefix (Crypto-PAn), so subnets are preserved; GPS coordinates and
+    UUIDs keep their layout. The last three characters authenticate the tag with an HMAC.
 
     No correspondence table is written. The original values are inside the tags, and
     the key file is the only secret needed to restore them, in the protected document or
@@ -58,7 +59,9 @@
 
     Either one can be loaded, or both: the detector then follows the span model and adds,
     where the span model kept nothing, the confident spans of the tagger and the name
-    parts that complete a name already found.
+    parts that complete a name already found; where the span model reads an organisation
+    with little confidence and the tagger reads its words as the parts of a name, the
+    name is kept.
 
     The recognizers can be compiled into the program, so that the executable travels
     alone. The embed command writes them, compressed and encoded as file_to_code_ex does,
@@ -118,7 +121,7 @@
             writes the splits; --abroad-share sets the share of places, organisations,
             phone numbers and IBANs of other countries.
         ./slm_document_anonymizer_ex train-tagger pii-data/train.tsv --dev pii-data/dev.tsv
-            --examples 100000 --threads 4 --out pii_tagger.dat
+            --examples 70000 --threads 4 --out pii_tagger.dat
             trains the tagger afresh, in minutes; --cache 5 trains about three times
             faster with about six times the memory.
         ./slm_document_anonymizer_ex train-model pii-data/train.tsv --dev pii-data/dev.tsv
@@ -132,6 +135,25 @@
         ./slm_document_anonymizer_ex evaluate pii-data/test.tsv --tagger pii_tagger.dat
             --model pii_span.dat
             scores the rules alone, each recognizer alone and the whole detector.
+
+    BUILDING THE PROTECTION COMMANDS ONLY
+
+    Built with -DANONYMIZER_ESSENTIALS_ONLY=1, the program keeps the round trip of
+    protection, keygen, anonymize, restore, scan and text, with the recognizers compiled
+    into it, and leaves out detect, train-tagger, train-model, evaluate and embed with
+    their options: the build given to the people who only protect and restore documents,
+    such as a standalone executable for Windows. The default, 0, builds every command.
+
+        g++ -std=c++14 -O2 -DNDEBUG -DDLIB_NO_GUI_SUPPORT -DANONYMIZER_ESSENTIALS_ONLY=1
+            -I.. slm_document_anonymizer_ex.cpp ../dlib/all/source.cpp -lpthread
+            -o slm_document_anonymizer
+        x86_64-w64-mingw32-g++-posix -std=c++14 -O2 -DNDEBUG -DDLIB_NO_GUI_SUPPORT
+            -DANONYMIZER_ESSENTIALS_ONLY=1 -I.. slm_document_anonymizer_ex.cpp
+            ../dlib/all/source.cpp -static -lws2_32 -lwinmm -o slm_document_anonymizer.exe
+            cross-compiles it for 64-bit Windows as one executable that needs no library
+            beyond those of the system. Linked with a manifest that sets UTF-8 as the code
+            page of the process (activeCodePage), it also opens the files whose names the
+            ANSI code page cannot write.
 
     In the terms of the GDPR, the output is pseudonymized data: whoever holds the key can
     restore it, and it remains personal data for that party. With --irreversible the key
@@ -152,6 +174,7 @@
 #include <dlib/dir_nav.h>
 #include <dlib/zip.h>
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -166,10 +189,14 @@
 #include <vector>
 
 #if defined(_WIN32)
+#include <dlib/windows_magic.h>
+#include <windows.h>
 #include <direct.h>
 #include <fcntl.h>
 #include <io.h>
 #include <stdlib.h>
+#include <sys/types.h>
+#include <sys/stat.h>
 #else
 #include <fcntl.h>
 #include <limits.h>
@@ -195,6 +222,16 @@
 #endif
 #ifdef WITH_ANONYMIZER_MODELS
 #  include ANONYMIZER_MODELS_HEADER
+#endif
+
+/*  ANONYMIZER_ESSENTIALS_ONLY, 0 by default, builds every command. Set to 1
+    (-DANONYMIZER_ESSENTIALS_ONLY=1), it builds a program limited to the round trip of
+    protection, for the people who only protect and restore documents: keygen, anonymize,
+    restore, scan and text, with the recognizers compiled into it. detect, train-tagger,
+    train-model, evaluate and embed are not compiled, nor the training options and the
+    options that load, leave out or tune a recognizer. */
+#ifndef ANONYMIZER_ESSENTIALS_ONLY
+#  define ANONYMIZER_ESSENTIALS_ONLY 0
 #endif
 
 using namespace std;
@@ -226,6 +263,42 @@ namespace
 #endif
     }
 
+#if defined(_WIN32)
+    /* Standard input and output carry bytes unchanged, as on other systems, and the console
+       shows UTF-8 while the program runs; it gets its code pages back at the end. */
+    struct windows_console
+    {
+        const UINT input = GetConsoleCP();
+        const UINT output = GetConsoleOutputCP();
+
+        windows_console()
+        {
+            _setmode(_fileno(stdin), _O_BINARY);
+            _setmode(_fileno(stdout), _O_BINARY);
+            if (input) SetConsoleCP(CP_UTF8);
+            if (output) SetConsoleOutputCP(CP_UTF8);
+        }
+
+        ~windows_console()
+        {
+            if (input) SetConsoleCP(input);
+            if (output) SetConsoleOutputCP(output);
+        }
+    };
+#endif
+
+    /* The name the program was started under, without its folder and its ".exe". */
+    string program_name(const char* argv0)
+    {
+        string name = argv0 ? argv0 : "";
+        const size_t p = name.find_last_of("/\\");
+        if (p != string::npos) name = name.substr(p + 1);
+        string tail = name.size() > 4 ? name.substr(name.size() - 4) : string();
+        for (char& c : tail) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+        if (tail == ".exe") name.resize(name.size() - 4);
+        return name.empty() ? string("slm_document_anonymizer_ex") : name;
+    }
+
     string parent_of(const string& path)
     {
         const size_t p = path.find_last_of("/\\");
@@ -239,6 +312,8 @@ namespace
         if (dir.empty() || file_exists(dir)) return;
         make_directories(parent_of(dir), false);
 #if defined(_WIN32)
+        // The user profile that holds %APPDATA% is private already.
+        (void)private_dir;
         _mkdir(dir.c_str());
 #else
         mkdir(dir.c_str(), private_dir ? 0700 : 0777);
@@ -430,24 +505,26 @@ namespace
         }
 #if defined(_WIN32)
         ok = _close(fd) == 0 && ok;
-        // rename() does not replace an existing file on Windows.
-        if (ok) std::remove(path.c_str());
+        // rename() does not replace an existing file on Windows; MoveFileEx does.
+        ok = ok && MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
 #else
-        ok = ::close(fd) == 0 && ok;
+        ok = ::close(fd) == 0 && ok && std::rename(tmp.c_str(), path.c_str()) == 0;
 #endif
-        if (!ok || std::rename(tmp.c_str(), path.c_str()) != 0)
+        if (!ok)
         {
             std::remove(tmp.c_str());
             throw error("cannot write " + path);
         }
     }
 
+#if !ANONYMIZER_ESSENTIALS_ONLY
     string printable(const string& value)
     {
         string out;
         for (char c : value) out += (c == '\n') ? string("\\n") : (c == '\t') ? string("\\t") : string(1, c);
         return out;
     }
+#endif
 
 // ----------------------------------------------------------------------------------------
 // The regular expression channel
@@ -511,12 +588,12 @@ namespace
     struct span_model
     {
         string size;
-        std::shared_ptr<pii_span_model_tiny> tiny;
-        std::shared_ptr<pii_span_model_small> small;
+        std::shared_ptr<pii_span_model_tiny> tiny_net;
+        std::shared_ptr<pii_span_model_small> small_net;
 
         std::vector<pii_span> find(const string& text) const
         {
-            return tiny ? tiny->find(text) : small->find(text);
+            return tiny_net ? tiny_net->find(text) : small_net->find(text);
         }
     };
 
@@ -553,23 +630,25 @@ namespace
         m.size = span_model_size_in(in, source);
         if (m.size == "tiny")
         {
-            m.tiny = std::make_shared<pii_span_model_tiny>();
-            deserialize(*m.tiny, in);
+            m.tiny_net = std::make_shared<pii_span_model_tiny>();
+            deserialize(*m.tiny_net, in);
         }
         else
         {
-            m.small = std::make_shared<pii_span_model_small>();
-            deserialize(*m.small, in);
+            m.small_net = std::make_shared<pii_span_model_small>();
+            deserialize(*m.small_net, in);
         }
         return m;
     }
 
+#if !ANONYMIZER_ESSENTIALS_ONLY
     span_model load_span_model(const string& filename)
     {
         ifstream in(filename, ios::binary);
         if (!in) throw error("cannot read " + filename);
         return read_span_model(in, filename);
     }
+#endif
 
 // ----------------------------------------------------------------------------------------
 // The models compiled into the program
@@ -579,6 +658,7 @@ namespace
        compression is zlib (dlib/zip) rather than compress_stream: a little larger, and
        decoded about fifty times faster, which is what a program reading its models at
        every start needs. */
+#if !ANONYMIZER_ESSENTIALS_ONLY
     string encode_model(const string& bytes)
     {
         base64 coder;
@@ -590,6 +670,7 @@ namespace
             if (c != '\n' && c != '\r') out.push_back(c);
         return out;
     }
+#endif
 
     string decode_model(const string& text)
     {
@@ -634,6 +715,7 @@ namespace
 #endif
     }
 
+#if !ANONYMIZER_ESSENTIALS_ONLY
     // text written inside a C++ string literal.
     string literal_text(const string& text)
     {
@@ -738,6 +820,7 @@ namespace
              << ".\nPlace it next to slm_document_anonymizer_ex.cpp and rebuild the target.\n";
         return 0;
     }
+#endif
 
     struct recognizers
     {
@@ -751,22 +834,26 @@ namespace
     recognizers load_recognizers(const command_line_parser& parser)
     {
         recognizers r;
+#if ANONYMIZER_ESSENTIALS_ONLY
+        (void)parser;
+        const bool use_tagger = true, use_model = true;
+#else
         if (parser.option("tagger"))
         {
             r.tagger = std::make_shared<pii_sequence_tagger>();
             deserialize(parser.option("tagger").argument()) >> *r.tagger;
         }
-        else if (!parser.option("no-tagger") && !embedded_tagger().empty())
+        if (parser.option("model"))
+            r.model = std::make_shared<span_model>(load_span_model(parser.option("model").argument()));
+        const bool use_tagger = !parser.option("no-tagger"), use_model = !parser.option("no-model");
+#endif
+        if (!r.tagger && use_tagger && !embedded_tagger().empty())
         {
             r.tagger = std::make_shared<pii_sequence_tagger>();
             istringstream in(decode_model(embedded_tagger()));
             deserialize(*r.tagger, in);
         }
-        if (parser.option("model"))
-        {
-            r.model = std::make_shared<span_model>(load_span_model(parser.option("model").argument()));
-        }
-        else if (!parser.option("no-model") && !embedded_span_model().empty())
+        if (!r.model && use_model && !embedded_span_model().empty())
         {
             istringstream in(decode_model(embedded_span_model()));
             r.model = std::make_shared<span_model>(read_span_model(in, "the embedded span model"));
@@ -795,11 +882,43 @@ namespace
         return false;
     }
 
+    /* The spans of the model, where a span read as an organisation with a confidence below
+       doubt is replaced by the name parts the tagger reads over its words with more confidence,
+       when they cover all of it: "Lucie Rey" alone on its line. */
+    std::vector<pii_span> prefer_names(const string& text, const std::vector<pii_span>& model_spans,
+                                       const std::vector<pii_span>& tagger_spans, double doubt)
+    {
+        std::vector<pii_span> out;
+        for (const pii_span& m : model_spans)
+        {
+            std::vector<pii_span> parts;
+            if (m.label == "ORGANIZATION" && m.confidence < doubt)
+                for (const pii_span& s : tagger_spans)
+                    if (name_part(s) && s.begin < m.end && m.begin < s.end && s.confidence > m.confidence)
+                        parts.push_back(s);
+            bool covered = !parts.empty();
+            for (const pii_span& s : parts)
+                if (s.begin < m.begin || s.end > m.end) covered = false;
+            for (size_t k = m.begin; k < m.end && covered; ++k)
+            {
+                if (text[k] == ' ' || text[k] == '-') continue;
+                bool inside = false;
+                for (const pii_span& s : parts)
+                    if (s.begin <= k && k < s.end) inside = true;
+                covered = inside;
+            }
+            if (covered) out.insert(out.end(), parts.begin(), parts.end());
+            else out.push_back(m);
+        }
+        return out;
+    }
+
     /* Alone, either recognizer joins the detector with min_confidence. With both, the span
        model leads: the tagger, whose word features also fire on capitalized words that are not
        personal data, only fills its gaps, with spans of at least tagger_min_confidence where the
        span model kept nothing, and with the less confident name parts that complete a name
-       already found, so that the parts of a name are replaced together. */
+       already found, so that the parts of a name are replaced together. A doubtful
+       organisation of the span model gives way to the name the tagger reads there. */
     void attach(const recognizers& r, pii_detector& detector, double min_confidence, double tagger_min_confidence)
     {
         const std::shared_ptr<pii_sequence_tagger> tagger = r.tagger;
@@ -810,8 +929,10 @@ namespace
                 std::vector<pii_span> kept, spans, pending;
                 for (const pii_span& s : model->find(t))
                     if (s.confidence >= min_confidence) kept.push_back(s);
+                const std::vector<pii_span> tagged = tagger->find(t);
+                kept = prefer_names(t, kept, tagged, 0.9);
                 spans = kept;
-                for (const pii_span& s : tagger->find(t))
+                for (const pii_span& s : tagged)
                 {
                     bool free = true;
                     for (const pii_span& m : kept)
@@ -843,6 +964,7 @@ namespace
             detector.add_recognizer([tagger](const string& t) { return tagger->find(t); }, min_confidence);
     }
 
+#if !ANONYMIZER_ESSENTIALS_ONLY
     std::vector<pii_example> load_examples(const string& filename, unsigned long limit, unsigned long seed)
     {
         std::vector<pii_example> examples = load_pii_dataset(filename);
@@ -1025,6 +1147,7 @@ namespace
         if (size == "tiny") return train_span_model<pii_span_model_tiny>(parser, size, init_bytes);
         return train_span_model<pii_span_model_small>(parser, size, init_bytes);
     }
+#endif
 
     // The dictionaries and the regular expressions given on the command line.
     void configure(const command_line_parser& parser, pii_detector& detector)
@@ -1069,6 +1192,7 @@ namespace
         return types;
     }
 
+#if !ANONYMIZER_ESSENTIALS_ONLY
     /* Scores the rules alone, each recognizer alone and the detector with the recognizers,
        on a test set annotated by build_pii_dataset.py. Models are scored on the fine labels
        they learn; every system is also scored at the level at which values are replaced,
@@ -1115,7 +1239,8 @@ namespace
                 fine.push_back(f(ex.text));
                 coarse.push_back(coarsen_pii_spans(ex.text, fine.back()));
             }
-            cout << "\n" << name << ": " << chrono::duration<double>(chrono::steady_clock::now() - t0).count() << " s\n";
+            const double seconds = chrono::duration<double>(chrono::steady_clock::now() - t0).count();
+            cout << "\n" << name << ": " << seconds << " s\n";
             print_evaluation(name + " alone, fine labels",
                              evaluate_pii_spans(fine_truth, fine, span_match::exact, pii_fine_labels()),
                              evaluate_pii_spans(fine_truth, fine, span_match::overlap, pii_fine_labels()));
@@ -1133,8 +1258,8 @@ namespace
             predicted.clear();
             start = chrono::steady_clock::now();
             for (const pii_example& ex : test) predicted.push_back(detector_spans(combined, ex.text));
-            cout << "\ndetector with recognizers: " << chrono::duration<double>(chrono::steady_clock::now() - start).count()
-                 << " s\n";
+            const double seconds = chrono::duration<double>(chrono::steady_clock::now() - start).count();
+            cout << "\ndetector with recognizers: " << seconds << " s\n";
             score_coarse("Detector with recognizers, categories the models learn", predicted, learned);
             score_coarse("Detector with recognizers, every category", predicted, std::vector<string>());
         }
@@ -1165,12 +1290,16 @@ namespace
         if (r.model) show("model", r.model->find(text));
         return 0;
     }
+#endif
 }
 
 // ----------------------------------------------------------------------------------------
 
 int main(int argc, char** argv)
 {
+#if defined(_WIN32)
+    const windows_console console;
+#endif
     try
     {
         command_line_parser parser;
@@ -1200,17 +1329,21 @@ int main(int argc, char** argv)
             "keep", "File of terms never replaced (the organisation's own name, public figures), one per line.", 1);
         parser.add_option("patterns", "File of regular expressions, one \"TYPE<tab>regex[<tab>options]\" per line; "
                           "options: luhn, iban, icase, group=N, confidence=X.", 1);
+#if !ANONYMIZER_ESSENTIALS_ONLY
         parser.add_option("tagger", "Sequence tagger model (train-tagger) used with the rules, in place of the one "
                           "compiled into the program.", 1);
         parser.add_option("model", "Span model (train-model) used with the rules, in place of the one compiled into "
                           "the program.", 1);
         parser.add_option("no-tagger", "Use no sequence tagger.");
         parser.add_option("no-model", "Use no span model.");
-        parser.add_option("min-confidence", "Smallest confidence of a span kept from the recognizers. Default: 0.5.", 1);
+        parser.add_option("min-confidence", "Smallest confidence of a span kept from the recognizers. Default: 0.5.",
+                          1);
         parser.add_option("tagger-min-confidence", "With --model: smallest confidence of a tagger span kept where the "
                           "span model found nothing; a name part that completes a name found needs only "
                           "--min-confidence. Default: 0.9.", 1);
-        parser.add_option("dates", "Date policy: shift (default) moves every date by the same secret number of weeks, "
+#endif
+        parser.add_option("dates", "Date policy: shift (default) moves every date into the past by the same secret "
+                          "number of weeks, a month with its year or a year alone by whole months or years; "
                           "encrypt makes dates opaque, keep leaves them.", 1);
         parser.add_option("date-order", "Order of numeric dates such as 03/04/2026: dmy (default) or mdy.", 1);
         parser.add_option("all-urls",
@@ -1223,6 +1356,7 @@ int main(int argc, char** argv)
                           "Reports never contain personal values.");
         parser.add_option("force", "Overwrite existing outputs.");
         parser.add_option("restore", "With the text command: restore standard input.");
+#if !ANONYMIZER_ESSENTIALS_ONLY
         parser.set_group_name("Training options");
         parser.add_option("out", "File the trained model is written to.", 1);
         parser.add_option("dev", "Development set evaluated after training.", 1);
@@ -1244,46 +1378,61 @@ int main(int argc, char** argv)
         parser.add_option("evaluate-every", "Span model: steps between two evaluations on the dev set. Default: 2000.",
                           1);
         parser.add_option("verbose", "Print the progress of the solver.");
+#endif
         parser.set_group_name("Miscellaneous options");
         parser.add_option("h", "Display this help message.");
         parser.add_option("help", "Display this help message.");
 
         parser.parse(argc, argv);
+#if ANONYMIZER_ESSENTIALS_ONLY
+        const char* single[] = { "key", "passphrase-env", "context", "types", "except", "names", "terms", "keep",
+                                 "patterns", "dates", "date-order", "out-dir" };
+#else
         const char* single[] = { "key", "passphrase-env", "context", "types", "except", "names", "terms", "keep",
                                  "patterns",
                                  "tagger", "model", "min-confidence", "tagger-min-confidence", "dates", "date-order",
                                  "out-dir", "out", "dev",
                                  "examples", "seed", "c", "iterations", "threads", "cache", "size", "steps", "batch",
                                  "lr", "optimizer", "init", "evaluate-every" };
+#endif
         parser.check_one_time_options(single);
         const char* key_sources[] = { "key", "passphrase-env", "irreversible" };
         parser.check_incompatible_options(key_sources);
+#if !ANONYMIZER_ESSENTIALS_ONLY
         parser.check_incompatible_options("tagger", "no-tagger");
         parser.check_incompatible_options("model", "no-model");
+#endif
         const char* dates[] = { "shift", "encrypt", "keep" };
         parser.check_option_arg_range("dates", dates);
         const char* orders[] = { "dmy", "mdy" };
         parser.check_option_arg_range("date-order", orders);
+#if !ANONYMIZER_ESSENTIALS_ONLY
         const char* sizes[] = { "tiny", "small" };
         parser.check_option_arg_range("size", sizes);
         const char* optimizers[] = { "adamw", "adam-atan2" };
         parser.check_option_arg_range("optimizer", optimizers);
+#endif
 
         if (parser.option("h") || parser.option("help") || parser.number_of_arguments() == 0)
         {
-            cout << "Usage: slm_document_anonymizer_ex <command> [options] [files or folders]\n\n"
+            cout << "Usage: " << program_name(argc > 0 ? argv[0] : nullptr)
+                 << " <command> [options] [files or folders]\n\n"
                  << "Commands:\n"
                  << "  anonymize     Protect files and folders: x.docx gives x.anon.docx.\n"
                  << "  restore       Restore protected files: x.anon.docx gives x.restored.docx.\n"
                  << "  scan          Report the personal data of files and folders, without writing anything.\n"
                  << "  text          Protect standard input to standard output; restore it with --restore.\n"
+#if !ANONYMIZER_ESSENTIALS_ONLY
                  << "  detect        Print the personal data found in standard input: offsets, type, label.\n"
+#endif
                  << "  keygen        Create a new key file.\n"
+#if !ANONYMIZER_ESSENTIALS_ONLY
                  << "  train-tagger  Train the sequence tagger on a dataset (slm_tools/build_pii_dataset.py).\n"
                  << "  train-model   Train the span model on such a dataset.\n"
                  << "  evaluate      Score the rules, the recognizers and the whole detector on a test set.\n"
-                 << "  embed         Write the header that compiles the recognizers into the program.\n\n"
-                 << "Recognizers compiled into this program: " << embedded_models_description() << ".\n";
+                 << "  embed         Write the header that compiles the recognizers into the program.\n"
+#endif
+                 << "\nRecognizers compiled into this program: " << embedded_models_description() << ".\n";
             parser.print_options();
             return parser.number_of_arguments() == 0 && !parser.option("h") && !parser.option("help") ? 1 : 0;
         }
@@ -1295,19 +1444,23 @@ int main(int argc, char** argv)
         else if (verb == "scan") cmd = command::scan;
         else if (verb == "text") cmd = command::text;
         else if (verb == "keygen") cmd = command::keygen;
+#if !ANONYMIZER_ESSENTIALS_ONLY
         else if (verb == "detect") cmd = command::detect;
         else if (verb == "train-tagger") cmd = command::train_tagger;
         else if (verb == "train-model") cmd = command::train_model;
         else if (verb == "evaluate") cmd = command::evaluate;
         else if (verb == "embed") cmd = command::embed;
+#endif
         else
         {
             cerr << "Unknown command: " << verb << " (try --help)\n";
             return 1;
         }
+#if !ANONYMIZER_ESSENTIALS_ONLY
         if (cmd == command::train_tagger) return train_tagger(parser);
         if (cmd == command::train_model) return train_model(parser);
         if (cmd == command::embed) return embed(parser);
+#endif
 
         // The detector, shared by every remaining command.
         const numeric_date_order order = get_option(parser, "date-order", "dmy") == "mdy"
@@ -1331,13 +1484,19 @@ int main(int argc, char** argv)
         }
         if (date_policy_name == "keep")
             dopt.types.erase(std::remove(dopt.types.begin(), dopt.types.end(), pii_type::date), dopt.types.end());
+#if ANONYMIZER_ESSENTIALS_ONLY
+        const double min_confidence = 0.5, tagger_min_confidence = 0.9;
+#else
         const double min_confidence = get_option(parser, "min-confidence", 0.5);
         const double tagger_min_confidence = get_option(parser, "tagger-min-confidence", 0.9);
+#endif
         // Restoring and creating a key detect nothing, and load no model.
         const bool restoring_only = cmd == command::restore || cmd == command::keygen ||
                                     (cmd == command::text && parser.option("restore"));
         const recognizers learned = restoring_only ? recognizers() : load_recognizers(parser);
+#if !ANONYMIZER_ESSENTIALS_ONLY
         if (cmd == command::evaluate) return evaluate(parser, learned, dopt, min_confidence, tagger_min_confidence);
+#endif
 
         pii_detector detector(dopt);
         configure(parser, detector);
@@ -1349,7 +1508,9 @@ int main(int argc, char** argv)
                  << ".\n";
             return 1;
         }
+#if !ANONYMIZER_ESSENTIALS_ONLY
         if (cmd == command::detect) return detect(detector, learned);
+#endif
 
         const bool restoring = cmd == command::restore || (cmd == command::text && parser.option("restore"));
         if (parser.option("irreversible") && (restoring || cmd == command::keygen))

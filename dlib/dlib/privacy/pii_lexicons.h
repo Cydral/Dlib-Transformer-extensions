@@ -677,7 +677,7 @@ namespace dlib
                 "inc incorporated ltd limited llc llp plc corp corporation co gmbh ag kg ohg ug bv nv spa "
                 "srl sl pty ltee asbl sprl scrl bvba vzw kgaa oyj ltda pte pllc sca "
                 "mbh gbr aktiengesellschaft kommanditgesellschaft sau slu sll sapa sicav eireli ehf aps lllp bhd sdn "
-                "pvt pjsc jsc oao zao tov nyrt");
+                "pvt pjsc jsc oao zao tov nyrt asa kft zrt dac suarl sae kk");
             return s;
         }
 
@@ -713,7 +713,63 @@ namespace dlib
                 "airlines airways pharma pharmaceuticals laboratories telecom telecommunications shipping "
                 "immobilien versicherung versicherungen logistik beratung bau seguros servicios inmobiliaria "
                 "construcciones consultores asesores ingenieria transportes costruzioni servizi assicurazioni "
-                "immobiliare trasporti consulenza imobiliaria seguradora verzekeringen building");
+                "immobiliare trasporti consulenza imobiliaria seguradora verzekeringen building "
+                "architectes architects automobiles emballages agencement menuiserie plomberie nettoyage catering "
+                "haulage joinery interiors landscapes removals roofing recruitment logistiek logistika kuljetus "
+                "maschinenbau installatietechniek impianti tekstil treuhand import-export");
+            return s;
+        }
+
+        inline const std::unordered_set<std::string>& organization_partner_words()
+        {
+            // The partners and the family of a firm, written after its name: "Martin et Fils", "Soler y Asociados".
+            static const std::unordered_set<std::string> s = make_word_set(
+                "associes associees associe asociados associati associates partners sons fils filhos sohne hijos "
+                "figli freres brothers bros wspolnicy cie compagnie");
+            return s;
+        }
+
+        inline const std::unordered_set<std::string>& organization_short_forms()
+        {
+            /* Legal forms of two or three letters that other words or initials share ("AS", "AB",
+               "Oy", "HB", "a.s."): forms only when written as forms, after the name. */
+            static const std::unordered_set<std::string> s = make_word_set(
+                "as ab hb kb oy ky fze fzc fzco bt sti rl ek ks ad doo dd sro vof cv sab sal spj spk ev");
+            return s;
+        }
+
+        inline const std::unordered_set<std::string>& organization_trade_words()
+        {
+            // Trades written after the name of a company in other languages: "Haugen Konsult", "Taliq İnşaat".
+            static const std::unordered_set<std::string> s = make_word_set(
+                "advies agro agropecuaria bouw btp budownictwo byg bygg comercial comercio commerce construcoes "
+                "constructii construction contracting diensten eiendom electronics elektrotechnik emporiki "
+                "engenharia enterprises epito exports farming fastigheter infotech insaat konsult logistyka "
+                "lojistik manufacturing mining negoce palvelut radgivning rakennus servicii servicos sluzby stavby "
+                "stroy szolgaltato techniki technology ticaret trade trading transport travaux uslugi vastgoed "
+                "ventures");
+            return s;
+        }
+
+        inline const std::unordered_set<std::string>& organization_edge_words()
+        {
+            /* Words that open or close the name of an organisation in many languages: head nouns,
+               legal forms, trades and partners ("Klinikum", "Juzgado", "Logistiek", "Ltda",
+               "Asociados"), those of the other organisation lexicons included. */
+            static const std::unordered_set<std::string> s = []() {
+                std::unordered_set<std::string> words = make_word_set(
+                    "juzgado municipio ayuntamiento azienda jobcenter kommun kommune gemeente gemeinde stadt "
+                    "landratsamt amtsgericht magistrat prefeitura freguesia junta camara tribunale belediyesi "
+                    "ziekenhuis hospital praxis politechnika hogeschool sportverein raiffeisenbank privatbank caja "
+                    "universitatsklinikum landesklinikum comune commune municipalite ospedaliera universitario "
+                    "court council registry department office agency authority service services "
+                    "city county borough district province region state municipal municipality metropolitan town "
+                    "ville federal primaria apc chu chr comite deportivo oil gas energy power petroleum");
+                for (const auto* set : { &organization_heads(), &organization_forms(), &organization_sectors(),
+                                         &organization_partner_words(), &organization_trade_words() })
+                    words.insert(set->begin(), set->end());
+                return words;
+            }();
             return s;
         }
 
@@ -802,7 +858,11 @@ namespace dlib
                     "quotes delivery calendar program goal goals result results priority answer answers status "
                     "update number password link attachment attachments file files folder project projects draft "
                     "week weeks month months year years "
-                    "confidential ");
+                    "confidential "
+                    "embassy consulate consulat ambassade administratif administrative sociale paramedic paralegal "
+                    "notice booking inbound outbound high crown gate full ok commission convocation coordonnees "
+                    "police rdv deux trois sept dix treize ans two four five seven eight nine ten eleven thousand "
+                    "first second third up down out cour commissariat haute ");
                 // Frequent words of French and English that are neither given names nor family names
                 const char* const frequent[] = {
                     "one like time get also only after see make think back want because most very need really work being "
@@ -1485,6 +1545,46 @@ namespace dlib
             return s;
         }
 
+        inline const std::unordered_set<std::string>& technical_terms()
+        {
+            /* Terms of medical records, measures and the headings of their tables, in French and
+               English: written with a capital at the head of a cell, they still name nobody and
+               nothing ("Créatinine", "Niveau", "Audiogramme", "LDL-cholestérol", "Bilan de
+               santé"). None is a usual given name, family name, place or organisation. */
+            static const std::unordered_set<std::string> s = make_word_set(
+                "hypertension hypotension arterielle diabete cholesterol triglycerides glycemie hemoglobine "
+                "glyquee creatinine creatininemie kaliemie natremie ferritine albumine bilirubine transaminases "
+                "uricemie tsh vitamine lipidique lipidiques audiogramme audiometrie acuite visuelle spirometrie "
+                "electrocardiogramme echographie echocardiographie radiographie irm mammographie coloscopie "
+                "biopsie lombalgie cervicalgie sciatique tendinite entorse arthrose asthme bronchite pneumonie "
+                "allergie allergies rhinite eczema migraine insomnie obesite surpoids hypothyroidie "
+                "hyperthyroidie anemie vaccination vaccinations vaccin vaccins diphterie tetanos poliomyelite "
+                "coqueluche rougeole oreillons rubeole hepatite grippe kinesitherapie physiotherapie "
+                "ergotherapie orthophonie cardiologie pneumologie rhumatologie dermatologie ophtalmologie "
+                "neurologie urologie gynecologie pediatrie psychiatrie oncologie radiologie hospitalisation "
+                "antecedents anteriorite posologie diagnostic pathologie symptomes fievre imc vems ldl hdl dfg "
+                "ckd epi crp hba1c ecg ide idest od og analyse analyses resultat resultats statut norme normes "
+                "mesure mesures poids taille tension pression frequence cardiaque pouls saturation temperature "
+                "niveau niveaux bruit bruits risque risques exposition expositions visite visites embauche "
+                "reprise periodique intermediaire journee horaires examen examens bilan bilans rappel rappels "
+                "traitement traitements consultation consultations aptitude inaptitude amenagement "
+                "surveillance prevention commentaire commentaires sante travail interpretation valeur valeurs "
+                "unite unites observation observations evolution parametre parametres indicateur indicateurs "
+                "seuil seuils ecart tendance moyenne mediane minimum maximum echeance echeances "
+                "diabetes triglyceride glucose haemoglobin hemoglobin egfr potassium ferritin albumin vitamin "
+                "lipid lipids audiogram audiometry acuity spirometry echocardiogram ultrasound mammogram "
+                "colonoscopy biopsy tendinitis tendonitis sprain arthritis asthma bronchitis pneumonia allergy "
+                "rhinitis eczema insomnia obesity overweight hypothyroidism hyperthyroidism anaemia anemia "
+                "immunisation immunisations immunization immunizations vaccine vaccines booster diphtheria "
+                "tetanus polio pertussis measles mumps rubella hepatitis influenza physiotherapy cardiology "
+                "rheumatology dermatology ophthalmology neurology gastroenterology urology gynaecology "
+                "paediatrics psychiatry oncology radiology bmi fev1 mri ekg weight height pressure pulse noise "
+                "hazard hazards exposure exposures treatment medication prescription diagnosis symptoms fever "
+                "spirometry measure measures reading readings value values unit units trend average median "
+                "threshold parameter parameters indicator indicators findings outcome");
+            return s;
+        }
+
         inline const std::unordered_set<std::string>& function_words()
         {
             /* Articles, pronouns, possessives, prepositions and conjunctions: a span made of
@@ -1632,7 +1732,7 @@ namespace dlib
                 "new zealand|norway|poland|romania|russia|saudi arabia|scotland|senegal|serbia|slovakia|"
                 "slovenia|south africa|spain|sweden|switzerland|syria|tunisia|turkey|united kingdom|uk|"
                 "great britain|united states|united states of america|usa|us|wales|northern ireland|"
-                "ukraine|vietnam");
+                "ukraine|vietnam|afrique du sud|singapore|united arab emirates|uae");
             return s;
         }
 
@@ -1642,15 +1742,15 @@ namespace dlib
                European administrations, social security bodies, regulators, courts and police
                forces, from France, the United Kingdom, the United States and many other countries. */
             static const std::unordered_set<std::string> s = make_word_set(
-                "caf cpam cnam cnaf cnav carsat urssaf msa dgfip ddfip drfip insee cnil anssi ars ants ofii "
+                "caf cpam cnam cnaf cnav carsat urssaf msa mdph dgfip ddfip drfip insee cnil anssi ars ants ofii "
                 "ofpra cnda crous cnous ansm ademe cnes cnrs inserm inrae ifremer ign onf dgccrf dgsi dgse dga "
                 "sgdsn ugap amf acpr arcep arcom hceres onisep cned unedic apec ircantec cnracl aphp dreal dreets "
                 "ddets ddpp dgac dgddi anah dila bnf inpi oniam fiva cnous ofb anct dinum "
                 "nhs hmrc dvla dvsa dwp hmcts hmpps fcdo dhsc dfe fca cma ofsted ofcom ofgem ofwat cqc mhra ukvi "
-                "irs ssa fbi cia nsa dhs uscis tsa fema fda doj hhs ftc fcc dmv nih nasa usda faa nhtsa "
+                "cps hse irs ssa fbi cia nsa dhs uscis tsa fema fda doj hhs ftc fcc dmv nih nasa usda faa nhtsa "
                 "ons nca fsa ico moj hmpo dbs ofqual ukhsa ehrc cbp atf osha anses ineris irsn cnsa agefiph "
                 "fiphfp pjj spip dgpn dggn dgt dares dgefp "
-                "bka bnd bsi bfv bafin bamf destatis dguv aok dak kfw dfg ptb thw bpol lka suva seco fedpol ahv "
+                "bka bnd bsi bfv bafin bamf destatis dguv aok dak kfw ptb thw bpol lka suva seco fedpol ahv "
                 "onss inami riziv onem rva cpas ocmw onva forem actiris vdab inasti rsz uwv svb rdw cjib kvk sepe "
                 "aeat inss tgss cnmv cnmc inps inail istat consob agcm agcom anac enac enav aima iefp gnr inem "
                 "cnesst saaq ramq ircc cbsa asfc rcmp csis scrs esdc edsc spvm cnss cnops anapec dgsn onee cnas "
@@ -1672,6 +1772,7 @@ namespace dlib
                 "conseil d'etat|cour de cassation|cour des comptes|conseil constitutionnel|assemblee nationale|"
                 "senat|education nationale|gendarmerie nationale|police nationale|police municipale|"
                 "tresor public|haute autorite de sante|defenseur des droits|assurance maladie|assurance retraite|"
+                "securite sociale|"
                 "agirc-arrco|france competences|bpifrance|caisse nationale d'assurance vieillesse|"
                 "caisse nationale des allocations familiales|agence nationale de la securite des systemes "
                 "d'information|"

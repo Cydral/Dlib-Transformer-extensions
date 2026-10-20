@@ -179,6 +179,22 @@ namespace dlib
             return true;
         }
 
+        // A line in lower case around position pos: of its letters, at least eight, nearly all are small.
+        inline bool lower_case_line(const utf8_text& t, std::size_t pos)
+        {
+            const std::size_t n = t.size();
+            std::size_t b = pos, e = pos, letters = 0, upper = 0;
+            while (b > 0 && !is_line_break(t.cps[b - 1]) && pos - b < 200) --b;
+            while (e < n && !is_line_break(t.cps[e]) && e - pos < 200) ++e;
+            for (std::size_t q = b; q < e; ++q)
+                if (is_letter(t.cps[q]))
+                {
+                    ++letters;
+                    if (is_upper(t.cps[q])) ++upper;
+                }
+            return letters >= 8 && upper * 20 <= letters;
+        }
+
         /* The separator between two adjacent words of a name: a single or a doubled space, a
            hyphen, an apostrophe, or a period and a space after an initial. */
         inline bool name_gap(const utf8_text& t, std::size_t a, std::size_t b, bool after_initial)
@@ -515,6 +531,27 @@ namespace dlib
             }
         }
 
+        // True if code point b follows a street type and "du": "rue du ", "avenue du ".
+        static bool names_street(const utf8_text& t, std::size_t b)
+        {
+            using namespace privacy_impl;
+            auto word_before = [&](std::size_t& k) {
+                while (k > 0 && t.cps[k - 1] == ' ')
+                    --k;
+                const std::size_t e = k;
+                while (k > 0 && is_letter(t.cps[k - 1]))
+                    --k;
+                std::string w;
+                for (std::size_t n = k; n < e; ++n)
+                    utf8_append(w, to_lower(t.cps[n]));
+                return fold_key(w);
+            };
+            std::size_t k = b;
+            if (word_before(k) != "du")
+                return false;
+            return street_types().count(word_before(k)) != 0;
+        }
+
         void add(std::vector<candidate>& out, std::size_t b, std::size_t e, pii_type type,
                  double confidence, int bonus = 0, bool strong = false) const
         {
@@ -580,7 +617,14 @@ namespace dlib
                         std::lower_bound(t.offsets.begin(), t.offsets.end(), m.begin) - t.offsets.begin();
                     const std::size_t e =
                         std::lower_bound(t.offsets.begin(), t.offsets.end(), m.end) - t.offsets.begin();
-                    add(c, b, e, pii_type::date, 0.95);
+                    // "rue du 18 Juin 1940", "place du 8 Mai 1945": the date names the street.
+                    if (names_street(t, b))
+                        continue;
+                    // "1-29-17 Gion, Tokyo": the numbers of a Japanese address before its district.
+                    if (m.format.layout <= 1 && m.format.separator == 1 && m.format.two_digit_year &&
+                        t.at(e) == ' ' && privacy_impl::is_upper(t.at(e + 1)))
+                        continue;
+                    add(c, b, e, pii_type::date, m.format.has_day() ? 0.95 : 0.9);
                 }
             }
             scan_labels(text, t, words, context, c);
@@ -597,6 +641,7 @@ namespace dlib
             scan_aliases(t, words, c);
             scan_terms(t, words, c);
             scan_cued_references(t, words, c);
+            scan_year_references(t, c);
             scan_logins(t, words, c);
             scan_patterns(text, t, c);
             scan_recognizers(text, t, c);
@@ -629,6 +674,9 @@ namespace dlib
                 accepted.push_back(x);
                 taken[x.b] = x.e;
             }
+            join_given_and_family_names(text, t, taken, accepted);
+            attach_name_edges(t, words, taken, accepted);
+            attach_department_codes(t, taken, accepted);
             attach_titles(t, words, taken, accepted);
             attach_attributes(text, t, taken, accepted);
             std::sort(accepted.begin(), accepted.end(),
@@ -719,6 +767,250 @@ namespace dlib
             if (it == taken.begin()) return false;
             --it;
             return it->second > b;
+        }
+
+        /* True if a civility right before b, or a name label before a colon, announces the value
+           that starts at b: "Mme Le Floc'h", "Dr Le Floc'h", "Nom : LE FLOC'H", "Last name: Smith".
+           A function ("le maire de Quimper") and other labels ("Expéditeur :") may announce a place
+           or an organisation as well as a person. */
+        static bool announced_person(const std::string& text, const utf8_text& t, std::size_t b)
+        {
+            using namespace privacy_impl;
+            static const std::unordered_set<std::string> labels = make_phrase_set(
+                "nom|prenom|prenoms|nom de famille|nom de naissance|nom d usage|nom marital|nom complet|"
+                "nom et prenom|nom prenom|name|surname|last name|first name|given name|family name|full name");
+            static const std::unordered_set<std::string> civilities = make_word_set(
+                "m mr mrs ms mx mme mmes mlle mlles madame monsieur mademoiselle messieurs mesdames me maitre "
+                "dr docteur pr professeur sir dame");
+            auto blank = [&](std::size_t i) { return t.cps[i] == ' ' || t.cps[i] == 0xA0 || t.cps[i] == '\t'; };
+            std::size_t k = b;
+            while (k > 0 && blank(k - 1)) --k;
+            bool colon = false;
+            if (k > 0 && t.cps[k - 1] == ':')
+            {
+                colon = true;
+                --k;
+                while (k > 0 && blank(k - 1)) --k;
+            }
+            else if (k > 0 && t.cps[k - 1] == '.')
+            {
+                --k;
+            }
+            std::size_t s = k;
+            while (s > 0 && k - s < 40 && !is_line_break(t.cps[s - 1]) && t.cps[s - 1] != '\t' &&
+                   t.cps[s - 1] != ':' && t.cps[s - 1] != '|' && t.cps[s - 1] != ',' && t.cps[s - 1] != ';')
+                --s;
+            if (colon)
+                return labels.count(normalize_label(cp_substr(t, text, s, k))) != 0;
+            std::size_t w = k;
+            while (w > s && is_letter(t.cps[w - 1])) --w;
+            return w < k && civilities.count(fold_key(cp_substr(t, text, w, k))) != 0;
+        }
+
+        /* True if a word between b and e is a legal form, the head noun, the sector or the trade of
+           a firm, or the type of a street: words that no person name holds. */
+        static bool firm_or_street_words(const std::string& text, const utf8_text& t, std::size_t b, std::size_t e)
+        {
+            using namespace privacy_impl;
+            for (std::size_t q = b; q < e;)
+            {
+                if (!is_letter(t.cps[q])) { ++q; continue; }
+                std::size_t r = q;
+                while (r < e && is_letter(t.cps[r])) ++r;
+                const std::string key = fold_key(cp_substr(t, text, q, r));
+                if (organization_forms().count(key) || organization_heads().count(key) ||
+                    organization_sectors().count(key) || organization_trade_words().count(key) ||
+                    street_types().count(key))
+                    return true;
+                q = r;
+            }
+            return false;
+        }
+
+        /* A first name read as a person and the family name after it read apart, as a person, an
+           organisation, an address or a place, as a recognizer may read a name with a particle and
+           an apostrophe: "Yann" and "Le Floc'h". The two make one person when the second opens
+           with a capitalized particle, then holds one or two capitalized words, none of them a
+           word of a firm or of a street, and is no organisation known by its own name. */
+        static void join_given_and_family_names(const std::string& text, const utf8_text& t,
+                                                std::map<std::size_t, std::size_t>& taken,
+                                                std::vector<candidate>& accepted)
+        {
+            using namespace privacy_impl;
+            std::vector<std::size_t> order(accepted.size());
+            for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
+            std::sort(order.begin(), order.end(),
+                      [&](std::size_t a, std::size_t b) { return accepted[a].b < accepted[b].b; });
+            std::vector<bool> removed(accepted.size(), false);
+            for (std::size_t i = 0; i + 1 < order.size(); ++i)
+            {
+                candidate& x = accepted[order[i]];
+                candidate& y = accepted[order[i + 1]];
+                if (removed[order[i]] || x.type != pii_type::person ||
+                    !(y.type == pii_type::organization || y.type == pii_type::address ||
+                      y.type == pii_type::location || y.type == pii_type::person) ||
+                    y.b != x.e + 1 || !(t.cps[x.e] == ' ' || t.cps[x.e] == 0xA0))
+                    continue;
+                std::size_t w = x.e;
+                while (w > x.b && is_letter(t.cps[w - 1])) --w;
+                if (w == x.e || !first_names().count(fold_key(cp_substr(t, text, w, x.e))))
+                    continue;
+                // The words of the second span, separated by single spaces.
+                std::vector<std::pair<std::size_t, std::size_t>> parts;
+                bool ok = true;
+                for (std::size_t q = y.b; q < y.e && ok;)
+                {
+                    std::size_t r = q;
+                    while (r < y.e && (is_letter(t.cps[r]) ||
+                                       ((is_apostrophe(t.cps[r]) || is_hyphen(t.cps[r])) && r > q &&
+                                        r + 1 < t.size() && is_letter(t.cps[r + 1]))))
+                        ++r;
+                    if (r == q) ok = false;
+                    parts.push_back(std::make_pair(q, r));
+                    if (r < y.e && !(t.cps[r] == ' ' && r + 1 < y.e)) ok = false;
+                    q = r + 1;
+                }
+                if (!ok || parts.size() < 2 || parts.size() > 3)
+                    continue;
+                const std::string particle = fold_key(cp_substr(t, text, parts[0].first, parts[0].second));
+                if (!person_particles().count(particle) || !is_upper(t.cps[parts[0].first]) ||
+                    known_organizations().count(fold_key(cp_substr(t, text, y.b, y.e))))
+                    continue;
+                for (std::size_t p = 1; p < parts.size() && ok; ++p)
+                {
+                    const std::string key = fold_key(cp_substr(t, text, parts[p].first, parts[p].second));
+                    ok = is_upper(t.cps[parts[p].first]) && !common_words().count(key) && !function_words().count(key);
+                }
+                if (!ok || firm_or_street_words(text, t, y.b, y.e))
+                    continue;
+                taken.erase(y.b);
+                taken[x.b] = y.e;
+                x.e = y.e;
+                x.confidence = std::min(x.confidence, y.confidence);
+                removed[order[i + 1]] = true;
+                ++i;
+            }
+            std::vector<candidate> kept;
+            for (std::size_t i = 0; i < accepted.size(); ++i)
+                if (!removed[i]) kept.push_back(accepted[i]);
+            accepted.swap(kept);
+        }
+
+        /* The edges of a name that a rule or a recognizer leaves out. The end of a word after an
+           apostrophe, as in the Breton "c'h" ("Le Floc'h", "Penmarc'h") or in "Prud'homme", goes
+           with the name, place, address or organisation; an English possessive or contraction
+           ("Martin's") and the elision of "que" ("jusqu'") stay out. A capitalized particle right
+           before a person, in the case of the name, opens it: "LE FLOC'H Yann", "DE LA FONTAINE
+           Jean", "avec Le Bihan"; "de", "du" and "des", which may be prepositions, only before
+           another particle. */
+        static void attach_name_edges(const utf8_text& t, const std::vector<word_token>& words,
+                                      std::map<std::size_t, std::size_t>& taken,
+                                      std::vector<candidate>& accepted)
+        {
+            using namespace privacy_impl;
+            static const std::unordered_set<std::string> clitics = make_word_set("s t d m ll re ve");
+            static const std::unordered_set<std::string> prepositions = make_word_set("de du des d");
+            for (candidate& x : accepted)
+            {
+                if (!(x.type == pii_type::person || x.type == pii_type::organization ||
+                      x.type == pii_type::location || x.type == pii_type::address))
+                    continue;
+                const std::size_t e = x.e;
+                if (e >= x.b + 2 && is_apostrophe(t.at(e)) && is_letter(t.cps[e - 1]) && is_letter(t.cps[e - 2]) &&
+                    is_letter(t.at(e + 1)) && !(to_lower(t.cps[e - 2]) == 'q' && to_lower(t.cps[e - 1]) == 'u'))
+                {
+                    const bool upper_word = is_upper(t.cps[e - 1]) && is_upper(t.cps[e - 2]);
+                    std::size_t d = e + 1;
+                    bool same_case = true;
+                    std::string tail;
+                    while (d < t.size() && is_letter(t.cps[d]))
+                    {
+                        if (is_upper(t.cps[d]) != upper_word) same_case = false;
+                        utf8_append(tail, to_lower(t.cps[d]));
+                        ++d;
+                    }
+                    if (same_case && !is_word_char(t.at(d)) && !clitics.count(tail) && !overlaps(taken, e, d))
+                    {
+                        taken[x.b] = d;
+                        x.e = d;
+                    }
+                }
+                if (x.type != pii_type::person)
+                    continue;
+                auto it = std::lower_bound(words.begin(), words.end(), x.b,
+                                           [](const word_token& w, std::size_t p) { return w.b < p; });
+                if (it == words.end() || it->b != x.b)
+                    continue;
+                std::size_t first = static_cast<std::size_t>(it - words.begin());
+                const bool upper_head = it->shape == 2 && it->e - it->b >= 2;
+                if (!(upper_head || it->shape == 1 || it->shape == 3))
+                    continue;
+                bool head_particle = person_particles().count(it->key) != 0;
+                std::size_t b = x.b;
+                for (std::size_t k = first; k > 0 && first - k < 2; --k)
+                {
+                    const word_token& p = words[k - 1];
+                    if (p.e + 1 != words[k].b || !(t.cps[p.e] == ' ' || t.cps[p.e] == 0xA0) ||
+                        !person_particles().count(p.key) || p.e - p.b > 4 ||
+                        !(upper_head ? p.shape == 2 : p.shape == 1) ||
+                        (prepositions.count(p.key) && !head_particle) ||
+                        (p.b > 0 && (is_word_char(t.cps[p.b - 1]) || is_apostrophe(t.cps[p.b - 1]) ||
+                                     is_hyphen(t.cps[p.b - 1]) || t.cps[p.b - 1] == '.')) ||
+                        overlaps(taken, p.b, b))
+                        break;
+                    b = p.b;
+                    head_particle = true;
+                }
+                if (b < x.b)
+                {
+                    taken.erase(x.b);
+                    taken[b] = x.e;
+                    x.b = b;
+                }
+            }
+        }
+
+        /* "Quimper (29)", "Quimper (2A)", "Quimper (29000)": the department or the postal code
+           written in brackets after a town goes with it. */
+        static void attach_department_codes(const utf8_text& t, std::map<std::size_t, std::size_t>& taken,
+                                            std::vector<candidate>& accepted)
+        {
+            using namespace privacy_impl;
+            for (candidate& x : accepted)
+            {
+                if (x.type != pii_type::location)
+                    continue;
+                std::size_t k = x.e;
+                // A name learned with its code is found again up to its last word: "Quimper (29".
+                while (k > x.b && x.e - k < 6 && (is_ascii_digit(t.cps[k - 1]) || t.cps[k - 1] == 'A' ||
+                                                  t.cps[k - 1] == 'B'))
+                    --k;
+                if (k < x.e && k > x.b && t.cps[k - 1] == '(')
+                    k = k - 1;
+                else
+                    k = x.e;
+                if (t.at(k) == ' ')
+                    ++k;
+                if (t.at(k) != '(')
+                    continue;
+                std::size_t d = k + 1;
+                std::string code;
+                while (d < t.size() && d - k <= 6 && (is_ascii_digit(t.cps[d]) || t.cps[d] == 'A' || t.cps[d] == 'B'))
+                    code.push_back(static_cast<char>(t.cps[d++]));
+                if (t.at(d) != ')' || is_word_char(t.at(d + 1)))
+                    continue;
+                const bool digits = code.find_first_not_of("0123456789") == std::string::npos;
+                const int value = digits && !code.empty() ? std::stoi(code) : -1;
+                const bool department = (code.size() == 2 && digits && value >= 1 && value <= 95) ||
+                                        code == "2A" || code == "2B" ||
+                                        (code.size() == 3 && digits && value >= 971 && value <= 976);
+                if (!department && !(code.size() == 5 && digits))
+                    continue;
+                if (overlaps(taken, x.e, d + 1))
+                    continue;
+                taken[x.b] = d + 1;
+                x.e = d + 1;
+            }
         }
 
         /* The length of a civility glued to the name after it by a lost space:
@@ -1166,6 +1458,28 @@ namespace dlib
                         if (len > 1 && !name_joined(words[j - 1].e, words[j].b)) break;
                         if (names.count(fold_key(cp_substr(t, text, w.b, words[j].e)))) best = len;
                     }
+                    /* "numero de securite sociale", "Securite sociale : 1 85 05": the label of a number
+                       names no body. */
+                    if (best > 0)
+                    {
+                        std::size_t before = k;
+                        if (before > 0 && (words[before - 1].key == "de" || words[before - 1].key == "d") &&
+                            joined(words[before - 1].e, w.b))
+                            --before;
+                        const bool after_number = before > 0 && number_words.count(words[before - 1].key) &&
+                                                  words[before].b - words[before - 1].e <= 3 &&
+                                                  same_line(t, words[before - 1].e, words[before].b);
+                        std::size_t q = words[k + best - 1].e;
+                        while (q < t.size() && (t.cps[q] == ' ' || t.cps[q] == 0xA0)) ++q;
+                        bool before_number = false;
+                        if (q < t.size() && t.cps[q] == ':')
+                        {
+                            ++q;
+                            while (q < t.size() && (t.cps[q] == ' ' || t.cps[q] == 0xA0)) ++q;
+                            before_number = q < t.size() && is_ascii_digit(t.cps[q]);
+                        }
+                        if (after_number || before_number) best = 0;
+                    }
                     if (best > 0)
                     {
                         std::size_t first = k, last = k + best - 1;
@@ -1193,7 +1507,10 @@ namespace dlib
                         }
                         std::size_t place_end = last;
                         if (place_after(last, place_end)) last = place_end;
+                        // A name of the lexicon, matched whole: the recognizers keep to its boundaries.
+                        const std::size_t count = out.size();
                         add(out, words[first].b, words[last].e, pii_type::organization, 0.9, 10);
+                        if (out.size() > count) out.back().exact = true;
                         k = last;
                         continue;
                     }
@@ -1274,6 +1591,12 @@ namespace dlib
                 // "par l'intermediaire de l'agence Nerixa Atlantique": the name follows a lower case branch.
                 if (body && w.shape == 0 && branch_heads.count(w.key) && named_before_place > 0 && first_named > k)
                     begin = words[first_named].b;
+                // "the embassy of Spain", "le consulat d'Etats-Unis": a country names no diplomatic post.
+                static const std::unordered_set<std::string> diplomatic_heads = make_word_set(
+                    "ambassade consulat embassy consulate");
+                if (body && diplomatic_heads.count(w.key) && first_named > k &&
+                    country_names().count(fold_key(cp_substr(t, text, words[first_named].b, end))))
+                    body = false;
                 if (body)
                     add(out, begin, end, pii_type::organization, 0.85, 10);
             }
@@ -1468,7 +1791,8 @@ namespace dlib
             for (std::size_t k = 0; k < n; ++k)
             {
                 const word_token& w = words[k];
-                if (!index.first_words.count(w.key) || !capitalized(w) || !open_before(w.b)) continue;
+                const bool lower_line = !capitalized(w) && w.e - w.b >= 3 && lower_case_line(t, w.b);
+                if (!index.first_words.count(w.key) || !(capitalized(w) || lower_line) || !open_before(w.b)) continue;
                 std::size_t best = 0, best_end = 0;
                 for (std::size_t len = 1; len <= index.max_words && k + len <= n; ++len)
                 {
@@ -1502,7 +1826,7 @@ namespace dlib
                 for (std::size_t q = k; q > 0 && k - q < 3 && !street; --q)
                     if (street_types().count(words[q - 1].key) && same_line(t, words[q - 1].e, w.b)) street = true;
                 if (street) continue;
-                if (best > 1 && at_sentence_start(t, w.b))
+                if (best > 1 && !lower_line && at_sentence_start(t, w.b))
                 {
                     bool all_capitalized = true;
                     for (std::size_t q = k + 1; q <= last; ++q)
@@ -1540,6 +1864,8 @@ namespace dlib
                     // A line in capitals: "SALARIE D'AIRBUS DEPUIS 2010".
                     if (x.shape == 2 && w.shape == 2 && (common_words().count(x.key) || function_words().count(x.key)))
                         break;
+                    // "Turkcell Nous vous remercions": a sentence that lost its period ("Airbus A320" is a product).
+                    if (x.e - x.b >= 2 && function_words().count(x.key)) break;
                     longer = true;
                     break;
                 }
@@ -2953,6 +3279,19 @@ namespace dlib
                 if (!boundary_after(t, last) || (whole_run && t.at(last) == '.' && is_ascii_digit(t.at(last + 1))) ||
                     t.at(last) == '/')
                     continue;
+                // "entretien téléphonique du 16-02-2027": a date after the cue stays a date.
+                {
+                    std::string value;
+                    for (std::size_t q = i; q < last; ++q)
+                        value.push_back(static_cast<char>(t.cps[q]));
+                    civil_date d;
+                    date_format f;
+                    if (parse_date(value, options_.date_order, d, f) && f.has_day())
+                    {
+                        i = last - 1;
+                        continue;
+                    }
+                }
                 add(out, i, last, pii_type::phone, 0.85);
                 i = last - 1;
             }
@@ -3168,6 +3507,38 @@ namespace dlib
             }
         }
 
+        /* A reference that carries a year, without a cue: "INC-2026-0147", "LF-2026-0331". Two to
+           six capitals, a year from 1990 to 2099 and three to six digits, joined by hyphens: the
+           shape of a file, ticket or incident number, whose year would also tell how far the
+           protected dates moved. */
+        void scan_year_references(const utf8_text& t, std::vector<candidate>& out) const
+        {
+            using namespace privacy_impl;
+            if (!enabled(pii_type::identifier)) return;
+            const std::size_t n = t.size();
+            for (std::size_t i = 0; i < n; ++i)
+            {
+                if (!(t.cps[i] >= 'A' && t.cps[i] <= 'Z') || is_word_char(t.before(i)) || t.before(i) == '-')
+                    continue;
+                std::size_t j = i;
+                while (j < n && t.cps[j] >= 'A' && t.cps[j] <= 'Z') ++j;
+                if (j - i < 2 || j - i > 6 || t.at(j) != '-') continue;
+                std::size_t y = j + 1, d = y;
+                while (d < n && is_ascii_digit(t.cps[d]) && d - y < 5) ++d;
+                if (d - y != 4 || t.at(d) != '-') continue;
+                const int year = (static_cast<int>(t.cps[y] - '0') * 10 + static_cast<int>(t.cps[y + 1] - '0')) * 100 +
+                                 static_cast<int>(t.cps[y + 2] - '0') * 10 + static_cast<int>(t.cps[y + 3] - '0');
+                if (year < 1990 || year > 2099) continue;
+                std::size_t e = d + 1;
+                while (e < n && is_ascii_digit(t.cps[e]) && e - d <= 7) ++e;
+                if (e - d - 1 < 3 || e - d - 1 > 6 || is_word_char(t.at(e)) ||
+                    (t.at(e) == '-' && is_word_char(t.at(e + 1))))
+                    continue;
+                add(out, i, e, pii_type::identifier, 0.8);
+                i = e;
+            }
+        }
+
         void scan_cued_references(const utf8_text& t, const std::vector<word_token>& words,
                                   std::vector<candidate>& out) const
         {
@@ -3356,6 +3727,30 @@ namespace dlib
             }
         }
 
+        /* True if the words are terms of a medical record, a measure or a table heading, with
+           function words between them: "Créatinine", "LDL-cholestérol", "Bilan de santé". */
+        static bool technical_words(const std::string& text, const utf8_text& t,
+                                    const std::vector<std::pair<std::size_t, std::size_t>>& words)
+        {
+            using namespace privacy_impl;
+            bool any = false;
+            for (const auto& w : words)
+            {
+                const std::string key = fold_key(cp_substr(t, text, w.first, w.second));
+                std::size_t from = 0;
+                while (from <= key.size())
+                {
+                    std::size_t to = key.find_first_of("-'", from);
+                    if (to == std::string::npos) to = key.size();
+                    const std::string part = key.substr(from, to - from);
+                    if (technical_terms().count(part)) any = true;
+                    else if (!part.empty() && !function_words().count(part)) return false;
+                    from = to + 1;
+                }
+            }
+            return any;
+        }
+
         // The words of t in [b, e): letters and digits, with the hyphens and apostrophes inside them.
         static std::vector<std::pair<std::size_t, std::size_t>> span_words(const utf8_text& t, std::size_t b,
                                                                            std::size_t e)
@@ -3418,6 +3813,8 @@ namespace dlib
                 return false;
             const std::vector<std::pair<std::size_t, std::size_t>> words = span_words(t, b, e);
             if (words.empty()) return true;
+            // A country names no town: "Cameroun" on the line after "Douala", "Sud" in "Afrique du Sud".
+            if (type == pii_type::location && in_country_name(text, t, b, e)) return true;
             bool all_function = true, all_particles = true;
             for (const auto& w : words)
             {
@@ -3427,12 +3824,48 @@ namespace dlib
             }
             if (all_particles) return false;
             if (all_function) return true;
+            if (technical_words(text, t, words)) return true;
             if (words.size() > 1 || initial_word(t, words[0])) return false;
             const std::string key = fold_key(cp_substr(t, text, words[0].first, words[0].second));
             const char32_t c = name_letter(t, words[0]);
             if (greeting_words().count(key)) return true;
             if (field_labels().count(key) && !(after_same_type && is_upper(c))) return true;
             return type != pii_type::location && is_letter(c) && !is_upper(c) && common_words().count(key);
+        }
+
+        /* Whether [b, e) is the name of a country, or a piece of one within its line ("Sud" in
+           "Afrique du Sud"). The countries that are also the name of their capital
+           ("Luxembourg", "Singapore") stay places when they are the whole span. */
+        bool in_country_name(const std::string& text, const utf8_text& t, std::size_t b, std::size_t e) const
+        {
+            using namespace privacy_impl;
+            static const std::unordered_set<std::string> cities = make_phrase_set(
+                "luxembourg|singapour|singapore|monaco|djibouti|koweit|kuwait|panama|guatemala|mexico|saint-marin|"
+                "san marino");
+            const std::string key = fold_key(cp_substr(t, text, b, e));
+            if (country_names().count(key)) return !cities.count(key);
+            // The words around the span on its line, within a few words of it.
+            std::size_t lb = b, le = e;
+            while (lb > 0 && b - lb < 48 && !is_line_break(t.cps[lb - 1])) --lb;
+            while (le < t.size() && le - e < 48 && !is_line_break(t.cps[le])) ++le;
+            std::vector<std::pair<std::size_t, std::size_t>> words = span_words(t, lb, le);
+            if (!words.empty() && words.back().second == le && le < t.size() && is_word_char(t.cps[le]))
+                words.pop_back();
+            if (!words.empty() && words.front().first == lb && lb > 0 && is_word_char(t.cps[lb - 1]))
+                words.erase(words.begin());
+            std::size_t first = words.size(), last = words.size();
+            for (std::size_t k = 0; k < words.size(); ++k)
+            {
+                if (first == words.size() && words[k].second > b) first = k;
+                if (words[k].first < e) last = k;
+            }
+            if (first == words.size() || last == words.size() || first > last) return false;
+            for (std::size_t i = first >= 3 ? first - 3 : 0; i <= first; ++i)
+                for (std::size_t j = last; j < words.size() && j <= last + 3; ++j)
+                    if ((i < first || j > last) &&
+                        country_names().count(fold_key(cp_substr(t, text, words[i].first, words[j].second))))
+                        return true;
+            return false;
         }
 
         /* A span of a learned recognizer, its pieces merged, where the text holds no personal
@@ -3443,7 +3876,8 @@ namespace dlib
            ("Nom"), a common word in lower case ("commande"), a name or place that joins a
            capitalized word to lower case words ("Le projet", "Ajoutez la b"), a word in lower
            case, other than a first name, in a text that capitalizes its words ("de congés"), a
-           country alone read as an organisation ("Pologne"), the civility "M." before a name,
+           country alone read as an organisation ("Pologne"), a country or a piece of one read
+           as a place ("Maroc", "Sud" in "Afrique du Sud"), the civility "M." before a name,
            and a participle that opens a line before "à" ("Fait à Lyon"). */
         bool spurious_learned_span(const std::string& text, const utf8_text& t, std::size_t b, std::size_t e,
                                    pii_type type, bool capitalized_text) const
@@ -3463,10 +3897,33 @@ namespace dlib
                 return lower_letters && (common_words().count(key) || function_words().count(key) ||
                                          field_labels().count(key) || greeting_words().count(key));
             }
+            // A number alone read as an address, which no street name follows: "60" in "60 – 100".
+            if (type == pii_type::address)
+            {
+                for (std::size_t q = b; q < e; ++q)
+                    if (!is_ascii_digit(t.cps[q]) && t.cps[q] != ' ') return false;
+                std::size_t q = e;
+                while (q < n && (t.cps[q] == ' ' || t.cps[q] == 0xA0)) ++q;
+                return !(q < n && is_letter(t.cps[q]));
+            }
             if (type != pii_type::person && type != pii_type::location && type != pii_type::organization)
                 return false;
             if (b > 0 && is_letter(t.cps[b - 1]) && is_letter(t.cps[b]) && !is_upper(t.cps[b])) return true;
             if (e < n && is_letter(t.cps[e - 1]) && is_letter(t.cps[e]) && !is_upper(t.cps[e])) return true;
+            /* A piece of a short word, which no name of that length is cut from: the capitals of
+               a unit glued to its prefix ("UI" in "mUI/L", "Hg" in "mmHg"), a letter of an
+               acronym ("L" in "LDL-cholestérol"). */
+            auto short_run = [&](std::size_t q) {
+                std::size_t rb = q, re = q;
+                while (rb > 0 && is_letter(t.cps[rb - 1])) --rb;
+                while (re < n && is_letter(t.cps[re])) ++re;
+                return re - rb <= 5;
+            };
+            if ((b > 0 && is_letter(t.cps[b - 1]) && is_letter(t.cps[b]) && short_run(b)) ||
+                (e < n && is_letter(t.cps[e]) && is_letter(t.cps[e - 1]) && short_run(e - 1)))
+                return true;
+            // A place or an organisation of one letter.
+            if (type != pii_type::person && e == b + 1) return true;
             const std::vector<std::pair<std::size_t, std::size_t>> words = span_words(t, b, e);
             if (words.empty()) return true;
             std::vector<std::string> keys;
@@ -3477,9 +3934,11 @@ namespace dlib
                 if (initial_word(t, w) || !function_words().count(keys.back())) all_function = false;
             }
             if (all_function) return true;
+            if (technical_words(text, t, words)) return true;
             // A country alone names no organisation: "Pologne" on the line after a town.
             if (type == pii_type::organization && country_names().count(fold_key(cp_substr(t, text, b, e))))
                 return true;
+            if (type == pii_type::location && in_country_name(text, t, b, e)) return true;
             // The word before position b and its key, on the same line: "Monsieur" in "Monsieur M. Denis".
             auto word_before = [&](std::size_t q) {
                 while (q > 0 && (t.cps[q - 1] == ' ' || t.cps[q - 1] == 0xA0)) --q;
@@ -3493,6 +3952,13 @@ namespace dlib
             {
                 const std::string before = word_before(b);
                 if (!civility_words().count(before) && !person_titles().count(before)) return true;
+            }
+            // "Page 2", "Page 1 sur 3": the word of a page number.
+            if (words.size() == 1 && (keys[0] == "page" || keys[0] == "seite" || keys[0] == "pagina"))
+            {
+                std::size_t q = e;
+                if (q < n && t.cps[q] == ' ') ++q;
+                if (q < n && is_ascii_digit(t.cps[q])) return true;
             }
             if (words.size() == 1 && !initial_word(t, words[0]))
             {
@@ -3526,6 +3992,35 @@ namespace dlib
             }
             if (type == pii_type::organization)
             {
+                /* A common word, a head noun, a trade, a legal form or a title alone names no
+                   organisation ("Convocation", "Clinic", "Security", "Maître"), unless it is a known
+                   name or a bank named by its network ("Sparkasse"). */
+                static const std::unordered_set<std::string> networks = make_word_set(
+                    "sparkasse volksbank raiffeisenbank");
+                if (words.size() == 1 && !known_organizations().count(keys[0]) && !networks.count(keys[0]) &&
+                    (common_words().count(keys[0]) || organization_edge_words().count(keys[0]) ||
+                     person_titles().count(keys[0])))
+                    return true;
+                // "Bruit (quais de": a word in lower case alone, on a line that writes names with capitals.
+                if (words.size() == 1 && !known_organizations().count(keys[0]))
+                {
+                    bool lower_word = is_letter(t.cps[b]);
+                    for (std::size_t q = b; q < e && lower_word; ++q)
+                        if (is_upper(t.cps[q])) lower_word = false;
+                    std::size_t lb = b, le = e;
+                    while (lb > 0 && !is_line_break(t.cps[lb - 1])) --lb;
+                    while (le < n && !is_line_break(t.cps[le])) ++le;
+                    for (std::size_t q = lb; q < le && lower_word; ++q)
+                        if ((q < b || q >= e) && is_upper(t.cps[q])) return true;
+                }
+                /* "the embassy of Spain", "le consulat de Pologne": in a text that capitalizes its
+                   names, a common word in lower case opens none, unless it is a head noun or a
+                   particle ("ministère de la Santé", "de Mulder Vastgoed V.O.F."). */
+                const char32_t c = name_letter(t, words[0]);
+                if (capitalized_text && words.size() >= 2 && is_letter(c) && !is_upper(c) &&
+                    common_words().count(keys[0]) && !organization_heads().count(keys[0]) &&
+                    !person_particles().count(keys[0]))
+                    return true;
                 // "Le logiciel Excel": an article and a lower case word open no name.
                 return words.size() >= 2 && function_words().count(keys[0]) && !is_upper(t.cps[words[1].first]) &&
                        is_letter(t.cps[words[1].first]);
@@ -3542,11 +4037,731 @@ namespace dlib
             return capital && lower;
         }
 
+        struct learned_piece
+        {
+            std::size_t b, e;       // code point indices
+            pii_type type;
+            double confidence;
+            int parts;
+        };
+
+        /* The boundaries of the organisations a recognizer reads, made consistent with those of
+           the annotation. The pieces of one name are joined: pieces of an organisation that meet
+           or are one space apart ("Club" and "Dexiq"), that a comma, a bracket or a hyphen
+           separates before a head noun, a legal form, a trade or a partner word ("DUNMORE CO.,"
+           and "LTD."), that an ampersand or a conjunction separates next to one ("Thornfield y"
+           and "Asociados"), or that such words alone separate ("Zenane", "Oil and", "Gas Nigeria
+           Limited"). Head nouns alone join the person or the place they name ("Klinikum" and
+           "Hambourg"), legal forms, trades and partner words alone the name before them
+           ("Calance" and "Partners"), a legal form or a particle read as a person opens the name
+           ("TOV" and "Talion", "Van" and "Damme Logistiek B.V."), and partners after a conjunction
+           close it ("BARAN" and "I WSPÓLNICY S.A."). A person or a place read with a legal form, a
+           partner word, a trade or the head noun of a firm or a town is an organisation ("Lumelle
+           Bt.", "Stadt Karlsruhe"), and a place in brackets or after a comma that follows a legal
+           form or a head noun is a place ("Larkspur ltée, São Paulo"). A capitalized head noun,
+           trade or particle just before the name opens it ("Entreprise Meyer", "City of Sydney
+           Council", "Le Corre Holdings Inc."), a legal form or a partner word just after it
+           closes it ("Armium a.s.", "Kerexa SARL AU", "Foxglove A/S"), and a name made of head
+           nouns or legal forms alone takes the capitalized words around it ("TALIS CLINIC", "Club
+           Deportivo Madrid", "TOV Briora", "Instituto Désiré Carrasco"). A legal form ends the
+           name ("Solix FZE" in "Solix FZE Save"), and in a line of capitals the name starts after
+           the last word of the sentence ("ELEXA LTÉE" in "DIRIGE DEPUIS DIX ANS ELEXA LTÉE").
+           Greetings, articles and function words that open or close the name are left out, and so
+           are common words, in lower case or in a line of capitals. A legal form keeps its own
+           period ("S.A.", "Pte. Ltd.") and leaves out the period that ends the sentence ("Goelia
+           SNC."). */
+        void normalize_learned_organizations(const std::string& text, const utf8_text& t,
+                                             std::vector<learned_piece>& pieces) const
+        {
+            using namespace privacy_impl;
+            typedef std::pair<std::size_t, std::size_t> token;
+            const std::size_t n = t.size();
+            const auto& edge = organization_edge_words();
+            const auto& forms = organization_forms();
+            const auto& partners = organization_partner_words();
+            static const std::unordered_set<std::string> connectors = make_word_set(
+                "y i e et and und of de du des di da do del della dei der van von");
+            static const std::unordered_set<std::string> particles = make_word_set(
+                "van von der den ter ten le la de du del di da dos");
+            static const std::unordered_set<std::string> lower_particles = make_word_set("van von der den ter ten");
+            // Abbreviations written with their period: "Inc.", "Ltda.", "Kft.", "Co.", "Ets.".
+            static const std::unordered_set<std::string> period_forms = make_word_set(
+                "inc corp kft bt zrt lda ltda co pte pvt cie bros sti ets ste univ assoc mfg ltd");
+            // Legal forms written before the name: "TOV Briora", "SC Novion", "EURL Xanelle".
+            static const std::unordered_set<std::string> prefix_forms = make_word_set(
+                "tov ooo oao zao pao ao sc sas sasu sarl eurl sci snc selarl pt sia uab");
+            // Articles that open the sentence rather than the name: "La Police nationale".
+            static const std::unordered_set<std::string> articles = make_word_set(
+                "le la les the el il lo der die das het");
+            // The head nouns of a town and of its administration: "Stadt Karlsruhe", "Ålesund kommune".
+            static const std::unordered_set<std::string> town_heads = make_word_set(
+                "stadt kommune kommun gemeente gemeinde municipio ayuntamiento comune commune mairie prefeitura "
+                "belediyesi landratsamt magistrat primaria");
+            // Those written after the name of the town, in any case: "Stockholm kommun", "Oslo kommune".
+            static const std::unordered_set<std::string> town_suffixes = make_word_set("kommun kommune belediyesi");
+            // Head nouns of institutions named after a person: "Instituto Désiré Carrasco", "Lycée Victor Hugo".
+            static const std::unordered_set<std::string> eponym_heads = make_word_set(
+                "instituto institut institute istituto liceo lycee college colegio ecole escuela escola scuola "
+                "universite universidad hopital hospital clinique clinica fondation fundacion fondazione "
+                "foundation stiftung centre center museo musee museum teatro conservatoire conservatorio "
+                "academie accademia");
+            // Words before a name that its particle opens, as a value or after a preposition: "chez de Bruijn et Fils".
+            static const std::unordered_set<std::string> openers = make_word_set(
+                "chez contre entre avec rejoint rejoindre quitte quitter from at with joins joined de du des of");
+
+            /* The words of a name: letters, digits and the periods, hyphens, apostrophes, slashes
+               and ampersands inside or after them ("S.A.", "Inc.", "A/S", "AT&T"); the key drops
+               the periods and the slashes. */
+            auto tokens = [&](std::size_t b, std::size_t e) {
+                std::vector<token> out;
+                for (std::size_t i = b; i < e;)
+                {
+                    while (i < e && !is_word_char(t.cps[i])) ++i;
+                    std::size_t j = i;
+                    while (j < e && (is_word_char(t.cps[j]) || t.cps[j] == '.' || t.cps[j] == '&' ||
+                                     ((is_hyphen(t.cps[j]) || is_apostrophe(t.cps[j]) || t.cps[j] == '/') &&
+                                      j + 1 < e && is_word_char(t.cps[j + 1]))))
+                        ++j;
+                    if (j > i) out.push_back(std::make_pair(i, j));
+                    i = j;
+                }
+                return out;
+            };
+            auto key_of = [&](const token& w) {
+                std::string k = fold_key(cp_substr(t, text, w.first, w.second));
+                k.erase(std::remove_if(k.begin(), k.end(), [](char c) { return c == '.' || c == '/'; }), k.end());
+                return k;
+            };
+            auto inner_period = [&](const token& w) {
+                for (std::size_t q = w.first; q + 1 < w.second; ++q)
+                    if (t.cps[q] == '.' && is_word_char(t.cps[q + 1])) return true;
+                return false;
+            };
+            auto capital = [&](std::size_t b) { return is_letter(t.cps[b]) && is_upper(t.cps[b]); };
+            auto lower_word = [&](const token& w) { return is_letter(t.cps[w.first]) && !is_upper(t.cps[w.first]); };
+            auto common = [&](const std::string& key) {
+                return common_words().count(key) != 0 || function_words().count(key) != 0;
+            };
+            // A short legal form written as one: "AS", "a.s.", "A/S", "Oy", "Bt."; "As" and "Ab" open sentences.
+            auto short_form = [&](const token& w, const std::string& key) {
+                if (!organization_short_forms().count(key)) return false;
+                bool lower = false, period = false;
+                for (std::size_t q = w.first; q < w.second; ++q)
+                {
+                    if (t.cps[q] == '.' || t.cps[q] == '/') period = true;
+                    else if (is_letter(t.cps[q]) && !is_upper(t.cps[q])) lower = true;
+                }
+                if (period || !lower) return true;
+                return capital(w.first) && (key == "oy" || key == "bt" || key == "ky" || key == "sti");
+            };
+            auto form_word = [&](const token& w) {
+                const std::string key = key_of(w);
+                return forms.count(key) != 0 || short_form(w, key);
+            };
+            auto edge_word = [&](const token& w) {
+                const std::string key = key_of(w);
+                return edge.count(key) != 0 || short_form(w, key);
+            };
+            // A word of a firm, which no place holds: a legal form, a partner word, a head noun, a trade.
+            auto firm_word = [&](const token& w) {
+                const std::string key = key_of(w);
+                return form_word(w) || partners.count(key) || organization_heads().count(key) ||
+                       organization_sectors().count(key) || organization_trade_words().count(key);
+            };
+            // The words of compass points and sizes that open the names of places: "East Bradby".
+            static const std::unordered_set<std::string> place_words = make_word_set(
+                "north south east west upper lower new old great little saint sainte st");
+            // The letter after the elided article or preposition that opens a word: "d'Entreprise", "l'Office".
+            auto after_elision = [&](const token& w) {
+                if (w.second < w.first + 3 || !is_apostrophe(t.cps[w.first + 1]) || !is_letter(t.cps[w.first + 2]))
+                    return w.first;
+                const char32_t c = to_lower(t.cps[w.first]);
+                return c == 'd' || c == 'l' ? w.first + 2 : w.first;
+            };
+            auto all_edge = [&](const learned_piece& p) {
+                const auto w = tokens(p.b, p.e);
+                for (const auto& x : w)
+                    if (!edge_word(x)) return false;
+                return !w.empty();
+            };
+            // Head nouns and trades, without a legal form or a partner word: "Club Deportivo", "Klinikum".
+            auto all_heads = [&](const learned_piece& p) {
+                const auto w = tokens(p.b, p.e);
+                for (const auto& x : w)
+                {
+                    const std::string k = key_of(x);
+                    if (!edge.count(k) || forms.count(k) || partners.count(k)) return false;
+                }
+                return !w.empty();
+            };
+            auto all_prefix_forms = [&](const learned_piece& p) {
+                const auto w = tokens(p.b, p.e);
+                for (const auto& x : w)
+                    if (!prefix_forms.count(key_of(x)) || lower_word(x)) return false;
+                return !w.empty();
+            };
+            // A head noun of an institution and at most two words of the name of a person: "Instituto Désiré".
+            auto eponym = [&](const learned_piece& p) {
+                const auto w = tokens(p.b, p.e);
+                if (w.size() < 2 || w.size() > 3 || !eponym_heads.count(key_of(w.front()))) return false;
+                for (std::size_t i = 1; i < w.size(); ++i)
+                    if (!capital(w[i].first) || common(key_of(w[i])) || edge_word(w[i])) return false;
+                return true;
+            };
+            auto first_edge = [&](const learned_piece& p) {
+                const auto w = tokens(p.b, p.e);
+                return !w.empty() && edge_word(w.front());
+            };
+            auto last_edge = [&](const learned_piece& p) {
+                const auto w = tokens(p.b, p.e);
+                return !w.empty() && edge_word(w.back());
+            };
+            auto first_key = [&](const learned_piece& p) {
+                const auto w = tokens(p.b, p.e);
+                return w.empty() ? std::string() : key_of(w.front());
+            };
+            auto last_key = [&](const learned_piece& p) {
+                const auto w = tokens(p.b, p.e);
+                return w.empty() ? std::string() : key_of(w.back());
+            };
+            auto one_space = [&](std::size_t a, std::size_t b) {
+                return b == a + 1 && (t.cps[a] == ' ' || t.cps[a] == 0xA0);
+            };
+            // One space, or an ampersand between two spaces: the gap between two words of a trade.
+            auto word_gap = [&](std::size_t a, std::size_t b) {
+                return one_space(a, b) || (b == a + 3 && one_space(a, a + 1) && t.cps[a + 1] == '&' &&
+                                           one_space(a + 2, b));
+            };
+            // The gap between two pieces of a line, without its spaces: "", ",", "&", "(", "y".
+            auto gap_key = [&](std::size_t a, std::size_t b) {
+                std::string g;
+                for (std::size_t q = a; q < b; ++q)
+                    if (!(t.cps[q] == ' ' || t.cps[q] == 0xA0)) utf8_append(g, t.cps[q]);
+                return fold_key(g);
+            };
+            // Words of a trade and conjunctions between two pieces: " Oil and ", " & Gas ".
+            auto edge_gap = [&](std::size_t a, std::size_t b) {
+                if (b < a + 3 || b - a > 24 || !one_space(a, a + 1) || !one_space(b - 1, b)) return false;
+                const auto w = tokens(a + 1, b - 1);
+                if (w.empty() || w.size() > 3 || w.front().first != a + 1 || w.back().second != b - 1) return false;
+                bool trade = false;
+                for (std::size_t i = 0; i < w.size(); ++i)
+                {
+                    if (i > 0 && !word_gap(w[i - 1].second, w[i].first)) return false;
+                    if (capital(w[i].first) && edge_word(w[i])) trade = true;
+                    else if (!connectors.count(key_of(w[i]))) return false;
+                }
+                return trade;
+            };
+            // The share of capitals among the letters of the line around pos.
+            auto line_case = [&](std::size_t pos, std::size_t& upper) {
+                std::size_t b = pos, e = pos, letters = 0;
+                upper = 0;
+                while (b > 0 && !is_line_break(t.cps[b - 1]) && pos - b < 200) --b;
+                while (e < n && !is_line_break(t.cps[e]) && e - pos < 200) ++e;
+                for (std::size_t q = b; q < e; ++q)
+                    if (is_letter(t.cps[q]))
+                    {
+                        ++letters;
+                        if (is_upper(t.cps[q])) ++upper;
+                    }
+                return letters;
+            };
+            // A line written in capitals: most of its letters are.
+            auto caps_line = [&](std::size_t pos) {
+                std::size_t upper = 0;
+                const std::size_t letters = line_case(pos, upper);
+                return letters >= 8 && upper * 10 >= letters * 8;
+            };
+
+            /* A person or a place read with a legal form, a partner word or the head noun of a
+               town, or a person read with the head noun of a firm or a trade, is an organisation.
+               A piece of an organisation of several words takes the words it cuts, unless a change
+               of case marks a word glued to another and the whole word is no legal form ("Hollis
+               Ap" in "Hollis ApS"), and leaves out the function words in lower case that open or
+               close it ("S.L.U. to"). */
+            for (std::size_t k = 0; k < pieces.size(); ++k)
+            {
+                learned_piece& p = pieces[k];
+                const std::size_t floor = k > 0 ? pieces[k - 1].e : 0;
+                const std::size_t ceiling = k + 1 < pieces.size() ? pieces[k + 1].b : n;
+                if (p.type == pii_type::person || p.type == pii_type::location)
+                {
+                    const auto w = tokens(p.b, p.e);
+                    bool organisation = false;
+                    for (std::size_t i = 0; i < w.size() && !organisation; ++i)
+                    {
+                        const std::string key = key_of(w[i]);
+                        // "Lumelle Bt.", "Elance Oyj", "TOV"; "BAKKER Sem" is a person.
+                        bool written_form = false;
+                        if (i > 0 && i + 1 == w.size() && form_word(w[i]) && !first_names().count(key))
+                        {
+                            bool lower = false;
+                            for (std::size_t q = w[i].first; q < w[i].second; ++q)
+                                if (is_letter(t.cps[q]) && !is_upper(t.cps[q])) lower = true;
+                            written_form = inner_period(w[i]) || t.cps[w[i].second - 1] == '.' || !lower ||
+                                           (forms.count(key) && key.size() >= 3) || short_form(w[i], key);
+                        }
+                        if (town_heads.count(key) || partners.count(key) || written_form ||
+                            (w.size() == 1 && prefix_forms.count(key) && !lower_word(w[i]) && !inner_period(w[i])))
+                            organisation = true;
+                        else if (p.type == pii_type::person && key != "ste" &&
+                                 (organization_heads().count(key) || organization_trade_words().count(key)))
+                            organisation = true;
+                    }
+                    // "Ålesund kommune", "Stockholm kommun".
+                    if (!organisation && p.type == pii_type::location && p.e + 1 < ceiling && one_space(p.e, p.e + 1))
+                    {
+                        const auto x = tokens(p.e + 1, std::min(ceiling, p.e + 20));
+                        if (!x.empty() && x.front().first == p.e + 1 && town_suffixes.count(key_of(x.front())))
+                        {
+                            p.e = x.front().second;
+                            organisation = true;
+                        }
+                    }
+                    if (organisation) p.type = pii_type::organization;
+                }
+                if (p.type != pii_type::organization) continue;
+                const bool several = tokens(p.b, p.e).size() >= 2;
+                while (several && p.b > floor && is_letter(t.cps[p.b - 1]) && is_letter(t.cps[p.b]) &&
+                       !(is_lower(t.cps[p.b - 1]) && is_upper(t.cps[p.b])))
+                    --p.b;
+                if (several && p.e < ceiling && is_letter(t.cps[p.e - 1]) && is_letter(t.cps[p.e]))
+                {
+                    std::size_t s = p.e, e = p.e;
+                    while (s > p.b && is_letter(t.cps[s - 1])) --s;
+                    while (e < ceiling && is_letter(t.cps[e])) ++e;
+                    const bool glued = is_lower(t.cps[p.e - 1]) && is_upper(t.cps[p.e]);
+                    if (!glued || forms.count(fold_key(cp_substr(t, text, s, e)))) p.e = e;
+                }
+                auto w = tokens(p.b, p.e);
+                while (w.size() > 1 && lower_word(w.back()) && function_words().count(key_of(w.back())))
+                {
+                    w.pop_back();
+                    p.e = w.back().second;
+                }
+                while (w.size() > 1 && lower_word(w.front()) && function_words().count(key_of(w.front())) &&
+                       !particles.count(key_of(w.front())))
+                {
+                    w.erase(w.begin());
+                    p.b = w.front().first;
+                }
+                // "l'Auto-école du Steir", "d'Harmonie Mutuelle": the elided article stays outside the name.
+                if (p.e > p.b + 2 && (t.cps[p.b] == 'l' || t.cps[p.b] == 'd') && is_apostrophe(t.cps[p.b + 1]) &&
+                    is_letter(t.cps[p.b + 2]) && is_upper(t.cps[p.b + 2]) && !is_letter(t.before(p.b)))
+                    p.b += 2;
+            }
+
+            // The pieces of one name.
+            for (bool changed = true; changed;)
+            {
+                changed = false;
+                for (std::size_t k = 0; k + 1 < pieces.size() && !changed; ++k)
+                {
+                    learned_piece& p = pieces[k];
+                    const learned_piece& q = pieces[k + 1];
+                    const bool org_p = p.type == pii_type::organization, org_q = q.type == pii_type::organization;
+                    const bool named_p = p.type == pii_type::person || p.type == pii_type::location;
+                    const bool named_q = q.type == pii_type::person || q.type == pii_type::location;
+                    if ((!org_p && !org_q) || q.b < p.e || q.b - p.e > 24 || !same_line(t, p.e, q.b)) continue;
+                    const bool spaced = one_space(p.e, q.b), close = q.b - p.e <= 5;
+                    const std::string g = close ? gap_key(p.e, q.b) : std::string();
+                    bool join = false;
+                    if (org_p && org_q)
+                    {
+                        join = q.b == p.e || spaced || (close && (g == "," || g == "(" || g == "-") && first_edge(q)) ||
+                               (close && (g == "&" || connectors.count(g)) && (first_edge(q) || last_edge(p))) ||
+                               edge_gap(p.e, q.b);
+                    }
+                    else if (org_p && named_q && spaced)
+                    {
+                        join = all_heads(p) || all_edge(q) || (q.type == pii_type::person && eponym(p));
+                    }
+                    else if (org_p && named_q && close)
+                    {
+                        // "Câmara Municipal de Porto", "Universidad de Salamanca", "SCP Payet-Gautier".
+                        join = (all_heads(p) && (g == "de" || g == "of" || g == "di" || g == "do" || g == "da" ||
+                                                 g == "del" || g == "du" || g == "des")) ||
+                               (q.b == p.e + 1 && is_hyphen(t.cps[p.e]));
+                    }
+                    else if (named_p && org_q && spaced)
+                    {
+                        const std::size_t words_p = tokens(p.b, p.e).size(), words_q = tokens(q.b, q.e).size();
+                        const std::string k_p = first_key(p);
+                        join = all_edge(q) ||
+                               (words_p == 1 && (edge.count(k_p) || particles.count(k_p) ||
+                                                 (words_q >= 2 && forms.count(last_key(q)))));
+                    }
+                    else if (named_p && org_q && close)
+                    {
+                        // "BARAN I WSPÓLNICY S.A.", "Martin & Fils".
+                        join = p.type == pii_type::person && (g == "&" || connectors.count(g)) &&
+                               partners.count(first_key(q));
+                    }
+                    if (!join) continue;
+                    p.e = q.e;
+                    p.type = pii_type::organization;
+                    p.confidence = std::min(p.confidence, q.confidence);
+                    p.parts += q.parts;
+                    pieces.erase(pieces.begin() + static_cast<long>(k + 1));
+                    changed = true;
+                }
+            }
+
+            // A place after the legal form or the head noun of a name: "Larkspur ltée, São Paulo".
+            for (std::size_t k = 0; k + 1 < pieces.size(); ++k)
+            {
+                const learned_piece& p = pieces[k];
+                learned_piece& q = pieces[k + 1];
+                if (p.type != pii_type::organization || q.type != pii_type::organization || q.b < p.e ||
+                    q.b - p.e > 3 || !same_line(t, p.e, q.b))
+                    continue;
+                const std::string g = gap_key(p.e, q.b);
+                if ((g != "," && g != "(") || !last_edge(p)) continue;
+                const auto w = tokens(q.b, q.e);
+                bool place = !w.empty() && w.size() <= 3;
+                for (const auto& x : w)
+                {
+                    const std::string key = key_of(x);
+                    if (!capital(x.first) || firm_word(x) || (common(key) && !place_words.count(key))) place = false;
+                }
+                if (place) q.type = pii_type::location;
+            }
+
+            for (std::size_t k = 0; k < pieces.size(); ++k)
+            {
+                learned_piece& p = pieces[k];
+                if (p.type != pii_type::organization) continue;
+                const std::size_t floor = k > 0 ? pieces[k - 1].e : 0;
+                const std::size_t ceiling = k + 1 < pieces.size() ? pieces[k + 1].b : n;
+                const std::size_t limit = std::min(ceiling, n);
+                const bool caps = caps_line(p.b), lower = lower_case_line(t, p.b);
+                // The word that ends one space before position b, without its elided article ("d'Entreprise"),
+                // or an empty range.
+                auto word_before = [&](std::size_t b) {
+                    if (b < 2 || !one_space(b - 1, b)) return std::make_pair(b, b);
+                    std::size_t e = b - 1, s = e;
+                    while (s > floor && (is_word_char(t.cps[s - 1]) ||
+                                         ((is_hyphen(t.cps[s - 1]) || is_apostrophe(t.cps[s - 1])) && s - 1 > floor &&
+                                          is_word_char(t.cps[s - 2]))))
+                        --s;
+                    // A word that the previous piece holds in part is no word of its own.
+                    if (s == floor && floor > 0 && is_word_char(t.cps[floor - 1])) return std::make_pair(b, b);
+                    return std::make_pair(after_elision(std::make_pair(s, e)), e);
+                };
+                // A value or a preposition before position b: "Employeur : de Mulder", "chez de Bruijn".
+                auto opens_value = [&](std::size_t b) {
+                    std::size_t q = b;
+                    while (q > 0 && (t.cps[q - 1] == ' ' || t.cps[q - 1] == 0xA0)) --q;
+                    if (q == 0) return true;
+                    const char32_t c = t.cps[q - 1];
+                    if (is_line_break(c) || c == ':' || c == '(' || c == ',' || c == ';' || is_hyphen(c) || c == '\t')
+                        return true;
+                    std::size_t r = q;
+                    while (r > 0 && is_letter(t.cps[r - 1])) --r;
+                    return r < q && openers.count(fold_key(cp_substr(t, text, r, q))) != 0;
+                };
+
+                /* A person read with an organisation, an elision between them: "Typhaine Marnier
+                   d'Abeona S.r.l.", where a legal form, a head noun or a trade follows the elision. */
+                {
+                    const auto w = tokens(p.b, p.e);
+                    for (std::size_t i = 2; i < w.size() && i <= 3; ++i)
+                    {
+                        const std::size_t a = after_elision(w[i]);
+                        if (a == w[i].first) continue;
+                        bool person = capital(a), firm = false;
+                        for (std::size_t j = 0; j < i && person; ++j)
+                            if (!capital(w[j].first) || edge_word(w[j]) || common(key_of(w[j]))) person = false;
+                        for (std::size_t j = i + 1; j < w.size(); ++j)
+                            if (firm_word(w[j])) firm = true;
+                        if (person && firm) p.b = a;
+                        break;
+                    }
+                }
+                // In a line of capitals, the name starts after the last word of the sentence.
+                if (caps)
+                {
+                    const auto w = tokens(p.b, p.e);
+                    std::size_t cut = 0;
+                    for (std::size_t i = 0; i + 1 < w.size(); ++i)
+                    {
+                        const std::string key = key_of(w[i]);
+                        if (!common(key) || edge_word(w[i]) || connectors.count(key) ||
+                            (i > 0 && connectors.count(key_of(w[i - 1]))))
+                            continue;
+                        // "LE RONNEC SERVICES": a particle before a family name.
+                        if (particles.count(key) && !common(key_of(w[i + 1])) && !edge_word(w[i + 1])) continue;
+                        for (std::size_t j = i + 1; j < w.size(); ++j)
+                        {
+                            const std::string kj = key_of(w[j]);
+                            if (!common(kj) && !connectors.count(kj))
+                            {
+                                cut = i + 1;
+                                break;
+                            }
+                        }
+                    }
+                    if (cut > 0) p.b = w[cut].first;
+                }
+                /* A capitalized head noun, a trade or a particle just before the name; a head noun and
+                   its conjunction ("City of"); "Le" before a family name, even at the start of a
+                   sentence ("Le Corre Holdings Inc."); a particle in lower case after a value or a
+                   preposition ("chez de Bruijn et Fils"). A name made of head nouns, trades or legal
+                   forms alone takes the words before it, and then their particle ("LE RONNEC" before
+                   "SERVICES S.À R.L."). */
+                for (int pass = 0; pass < 2; ++pass)
+                {
+                    for (int step = 0; step < 3; ++step)
+                    {
+                        const auto w = word_before(p.b);
+                        if (w.first == w.second || w.first < floor) break;
+                        const std::string key = key_of(w);
+                        const bool head = (capital(w.first) || (lower && lower_word(w))) && edge.count(key) &&
+                                          !partners.count(key);
+                        bool particle = false;
+                        if (particles.count(key))
+                        {
+                            const auto first = tokens(p.b, p.e);
+                            const bool family = !first.empty() && capital(first.front().first) &&
+                                                !common(key_of(first.front())) && !edge_word(first.front()) &&
+                                                !first_names().count(key_of(first.front()));
+                            if (!capital(w.first))
+                                particle = lower_particles.count(key) ||
+                                           ((key == "de" || key == "du") && family && opens_value(w.first));
+                            else
+                                particle = !at_sentence_start(t, w.first) || family;
+                        }
+                        // "City of", "Pharmacie de la", "tribunal de commerce de": a head noun and its conjunction.
+                        if (!head && (!particle || !capital(w.first)) && capital(w.first) == caps &&
+                            (connectors.count(key) || articles.count(key)))
+                        {
+                            auto h = word_before(w.first);
+                            if (articles.count(key) && h.first < h.second && h.first >= floor &&
+                                connectors.count(key_of(h)))
+                                h = word_before(h.first);
+                            else if (!connectors.count(key))
+                                h = std::make_pair(w.first, w.first);
+                            const std::string hk = h.first < h.second && h.first >= floor ? key_of(h) : std::string();
+                            if (!hk.empty() && (capital(h.first) || lower) && edge.count(hk) && !partners.count(hk) &&
+                                !forms.count(hk))
+                            {
+                                p.b = h.first;
+                                continue;
+                            }
+                        }
+                        if (!head && !particle) break;
+                        p.b = w.first;
+                    }
+                    if (pass == 0 && all_edge(p))
+                    {
+                        for (int step = 0; step < 2; ++step)
+                        {
+                            const auto w = word_before(p.b);
+                            if (w.first == w.second || w.first < floor) break;
+                            const std::string key = key_of(w);
+                            if (greeting_words().count(key) || person_titles().count(key) ||
+                                civility_words().count(key))
+                                break;
+                            bool named;
+                            if (capital(w.first))
+                                named = !common(key) || (step == 0 && !caps && function_words().count(key) &&
+                                                         !at_sentence_start(t, w.first));
+                            else
+                                named = lower && !common(key);
+                            if (!named) break;
+                            p.b = w.first;
+                        }
+                    }
+                }
+                // After the name: its bracket, the period of its abbreviation, a legal form or a partner
+                // word, and the name that follows head nouns or legal forms alone.
+                bool name_after = false;
+                for (int round = 0; round < 8; ++round)
+                {
+                    std::size_t open = 0, shut = 0;
+                    for (std::size_t q = p.b; q < p.e; ++q)
+                    {
+                        if (t.cps[q] == '(') ++open;
+                        else if (t.cps[q] == ')') ++shut;
+                    }
+                    if (open > shut && p.e < limit && t.cps[p.e] == ')')
+                    {
+                        ++p.e;
+                        continue;
+                    }
+                    const auto w = tokens(p.b, p.e);
+                    if (w.empty()) break;
+                    const token last = w.back();
+                    if (p.e < limit && t.cps[p.e] == '.' && last.second == p.e && t.cps[p.e - 1] != '.' &&
+                        (inner_period(last) || period_forms.count(key_of(last))))
+                    {
+                        ++p.e;
+                        continue;
+                    }
+                    // "Oakridge Co., Ltd.": a legal form after the comma of another.
+                    if (p.e + 2 < limit && t.cps[p.e] == ',' && one_space(p.e + 1, p.e + 2) && form_word(last))
+                    {
+                        const auto x = tokens(p.e + 2, std::min(limit, p.e + 20));
+                        if (!x.empty() && x.front().first == p.e + 2)
+                        {
+                            const std::string key = key_of(x.front());
+                            if (key == "ltd" || key == "limited" || key == "inc" || key == "llc")
+                            {
+                                p.e = x.front().second;
+                                continue;
+                            }
+                        }
+                    }
+                    if (p.e + 1 >= limit || !one_space(p.e, p.e + 1)) break;
+                    const auto x = tokens(p.e + 1, std::min(limit, p.e + 60));
+                    if (x.empty() || x.front().first != p.e + 1) break;
+                    const token& f = x.front();
+                    const std::string key = key_of(f);
+                    if (form_word(f) || partners.count(key) || (key == "au" && !lower_word(f) && form_word(last)) ||
+                        town_suffixes.count(key))
+                    {
+                        p.e = f.second;
+                        continue;
+                    }
+                    /* "Weber Bâtiment", "Le Dunnec Conseil", "penzance city council": a trade or a head
+                       noun after a name, which common words alone do not make ("Crown Court"). */
+                    bool named = false;
+                    for (const auto& y : w)
+                        if (!common(key_of(y)) && !edge_word(y)) named = true;
+                    if (named && edge.count(key) && !form_word(last) && (capital(f.first) || (lower && lower_word(f))))
+                    {
+                        p.e = f.second;
+                        continue;
+                    }
+                    // "Private Limited".
+                    if ((key == "private" || key == "public") && capital(f.first) && x.size() > 1 &&
+                        one_space(f.second, x[1].first) && key_of(x[1]) == "limited")
+                    {
+                        p.e = x[1].second;
+                        continue;
+                    }
+                    if (name_after) break;
+                    name_after = true;
+                    const bool eponymous = eponym(p) || (w.size() == 1 && eponym_heads.count(key_of(last)));
+                    if (!all_heads(p) && !all_prefix_forms(p) && !eponymous) break;
+                    const std::size_t most = eponymous ? 3 - w.size() : 2;
+                    std::size_t e = p.e, taken = 0;
+                    for (std::size_t i = 0; i < x.size() && taken < most; ++i)
+                    {
+                        if (i > 0 && !one_space(x[i - 1].second, x[i].first)) break;
+                        const std::string kx = key_of(x[i]);
+                        const bool word = capital(x[i].first) ? !common(kx) && !greeting_words().count(kx) &&
+                                                                    !person_titles().count(kx) && !form_word(x[i])
+                                                              : lower && !common(kx);
+                        if (!word) break;
+                        e = x[i].second;
+                        ++taken;
+                    }
+                    if (e == p.e) break;
+                    p.e = e;
+                }
+                // A legal form ends the name: "Solix FZE" in "Solix FZE Save", "S.L.U." before "to Galis Ltd".
+                learned_piece rest = p;
+                rest.b = rest.e = 0;
+                {
+                    const auto w = tokens(p.b, p.e);
+                    for (std::size_t i = 1; i + 1 < w.size(); ++i)
+                    {
+                        if (!form_word(w[i])) continue;
+                        const std::string next = key_of(w[i + 1]);
+                        if (form_word(w[i + 1]) || edge_word(w[i + 1]) || partners.count(next) || next == "au" ||
+                            (connectors.count(next) && i + 2 < w.size() && form_word(w[i + 2])))
+                            continue;
+                        bool bracket = false, comma = false;
+                        for (std::size_t q = w[i].second; q < w[i + 1].first; ++q)
+                        {
+                            if (t.cps[q] == '(') bracket = true;
+                            if (t.cps[q] == ',') comma = true;
+                        }
+                        // "Galatis Mining (Pty) Ltd": a bracketed legal form belongs to the name.
+                        if (bracket && form_word(w[i + 1])) continue;
+                        std::size_t r = i + 1;
+                        while (r < w.size() && function_words().count(key_of(w[r])) && lower_word(w[r])) ++r;
+                        bool organisation = false, place = (bracket || comma) && r < w.size() && w.size() - r <= 3;
+                        for (std::size_t j = r; j < w.size(); ++j)
+                        {
+                            const std::string key = key_of(w[j]);
+                            if (form_word(w[j]) || partners.count(key)) organisation = true;
+                            if (!capital(w[j].first) || firm_word(w[j]) || (common(key) && !place_words.count(key)))
+                                place = false;
+                        }
+                        if (r < w.size() && capital(w[r].first) && (organisation || place))
+                        {
+                            rest.b = w[r].first;
+                            rest.e = w.back().second;
+                            rest.type = organisation ? pii_type::organization : pii_type::location;
+                        }
+                        p.e = w[i].second;
+                        break;
+                    }
+                }
+                /* Words that open or close the sentence around the name; neighbour is the word after
+                   a leading word, the word before a trailing one. */
+                auto droppable = [&](const token& w, const token& neighbour, bool leading) {
+                    const std::string key = key_of(w);
+                    if (key.empty() || edge_word(w)) return false;
+                    if (greeting_words().count(key)) return true;
+                    const bool lower_w = !capital(w.first);
+                    if (leading)
+                    {
+                        const std::string kn = key_of(neighbour);
+                        // An acronym after an article is no family name: "La CPAM de Saint-Brieuc".
+                        bool acronym = !caps && neighbour.second - neighbour.first >= 2;
+                        for (std::size_t q = neighbour.first; q < neighbour.second && acronym; ++q)
+                            if (is_letter(t.cps[q]) && !is_upper(t.cps[q])) acronym = false;
+                        const bool name_next = !common(kn) && !edge_word(neighbour) && !acronym;
+                        // "LE RONNEC", "de Mulder", "Le Corre": a particle before a family name.
+                        if (particles.count(key) && name_next) return false;
+                        // "La Police nationale": an article before a common word.
+                        if (articles.count(key) && !lower_w && !caps && !name_next) return true;
+                    }
+                    // "Kerexa SARL AU".
+                    else if (key == "au" && !lower_w && form_word(neighbour))
+                        return false;
+                    if (function_words().count(key)) return lower_w || caps || !leading;
+                    return common_words().count(key) && (lower_w || caps) && !first_names().count(key);
+                };
+                auto w = tokens(p.b, p.e);
+                if (w.empty()) continue;
+                std::size_t first = 0, last = w.size() - 1;
+                while (first < last && droppable(w[first], w[first + 1], true)) ++first;
+                while (last > first && droppable(w[last], w[last - 1], false)) --last;
+                // A word that a hyphen continues after the name: "Calovia Finance Saint" in "Saint-Ouen-en-Retz".
+                if (last > first + 1 && w[last].second < n && is_hyphen(t.cps[w[last].second]) &&
+                    w[last].second + 1 < n && is_letter(t.cps[w[last].second + 1]))
+                    --last;
+                p.b = w[first].first;
+                // The period of a legal form, and none of the sentence.
+                std::size_t end = w[last].second;
+                const std::string key = key_of(w[last]);
+                const bool keeps_period = inner_period(w[last]) || period_forms.count(key);
+                while (end > w[last].first + 1 && t.cps[end - 1] == '.' && t.cps[end - 2] == '.') --end;
+                if (end > w[last].first && t.cps[end - 1] == '.' && !keeps_period) --end;
+                if (end < limit && t.cps[end] == '.' && t.cps[end - 1] != '.' && keeps_period) ++end;
+                p.e = end;
+                // A bracket the name opens closes it: "Xanys Holdings (Pty) Ltd", "Lumivia (France)".
+                std::size_t open = 0, shut = 0;
+                for (std::size_t q = p.b; q < p.e; ++q)
+                {
+                    if (t.cps[q] == '(') ++open;
+                    else if (t.cps[q] == ')') ++shut;
+                }
+                if (open > shut && p.e < limit && t.cps[p.e] == ')') ++p.e;
+                if (rest.e > rest.b) pieces.insert(pieces.begin() + static_cast<long>(k + 1), rest);
+            }
+        }
+
         void add_recognized(const std::string& text, const utf8_text& t, const std::vector<pii_span>& spans,
                             double min_confidence, std::vector<candidate>& out) const
         {
             using namespace privacy_impl;
-            struct piece { std::size_t b, e; pii_type type; double confidence; int parts; };
+            typedef learned_piece piece;
             std::vector<piece> found;
             const std::size_t bytes = t.offsets.back();
             for (const pii_span& s : spans)
@@ -3564,19 +4779,50 @@ namespace dlib
             }
             std::sort(found.begin(), found.end(), [](const piece& x, const piece& y) { return x.b < y.b; });
             /* The gap between two pieces of one name: spaces and hyphens, at most two; the
-               pieces of a login meet ("v" and "wojcikski"). */
+               pieces of a login, and those of an address cut inside a word, meet ("v" and
+               "wojcikski"). */
             auto name_gap = [&](const piece& m, const piece& p) {
                 if (m.type == pii_type::identifier && p.type == pii_type::identifier) return p.b == m.e;
+                // Two pieces of an address that meet inside a word: "u" and "l. Długa 5".
+                if (m.type == pii_type::address && p.type == pii_type::address)
+                    return p.b == m.e && p.b > 0 && is_letter(t.cps[p.b - 1]) && is_letter(t.cps[p.b]);
                 bool gap = m.type == p.type && (p.type == pii_type::person || p.type == pii_type::location) &&
                            p.b >= m.e && p.b - m.e <= 2;
                 for (std::size_t k = m.e; k < p.b && gap; ++k)
                     if (!(t.cps[k] == ' ' || is_hyphen(t.cps[k]))) gap = false;
                 return gap;
             };
+            /* A capitalized word read as an organisation one space before another piece of one may
+               open its name: "Le" and "Moigne & Sons plc", "Vos" and "Diensten V.O.F.". */
+            auto opens_organization = [&](std::size_t k) {
+                const piece& p = found[k];
+                return p.type == pii_type::organization && k + 1 < found.size() &&
+                       found[k + 1].type == pii_type::organization && found[k + 1].b == p.e + 1 &&
+                       (t.cps[p.e] == ' ' || t.cps[p.e] == 0xA0) && is_upper(t.cps[p.b]);
+            };
+            /* A state or a province written in capitals beside a town or a postal code stays
+               readable: "Sydney NSW 2010", "São Paulo - SP, 01001-000". */
+            static const std::unordered_set<std::string> states = make_word_set(
+                "al ak az ar ca co ct de dc fl ga hi id il in ia ks ky la me md ma mi mn ms mo mt ne nv nh nj "
+                "nm ny nc nd oh ok or pa ri sc sd tn tx ut vt va wa wv wi wy nsw vic qld sa tas act nt on qc bc "
+                "ab mb sk ns nb nl pe yt nu ac ap am ba ce df es go mg pb pr pi rj rn rs ro rr sp se to");
+            auto state_beside_place = [&](std::size_t k) {
+                const piece& p = found[k];
+                if (p.type != pii_type::location || p.e - p.b < 2 || p.e - p.b > 3) return false;
+                for (std::size_t q = p.b; q < p.e; ++q)
+                    if (t.cps[q] < 'A' || t.cps[q] > 'Z') return false;
+                if (!states.count(fold_key(cp_substr(t, text, p.b, p.e)))) return false;
+                return (k > 0 && found[k - 1].type == pii_type::location && found[k - 1].e <= p.b &&
+                        p.b - found[k - 1].e <= 3) ||
+                       (k + 1 < found.size() && found[k + 1].type == pii_type::location && p.e <= found[k + 1].b &&
+                        found[k + 1].b - p.e <= 3);
+            };
             std::vector<piece> pieces;
             for (std::size_t k = 0; k < found.size(); ++k)
-                if (!spurious_learned_piece(text, t, found[k].b, found[k].e, found[k].type,
-                                            k > 0 && name_gap(found[k - 1], found[k])))
+                if (opens_organization(k) ||
+                    (!state_beside_place(k) &&
+                     !spurious_learned_piece(text, t, found[k].b, found[k].e, found[k].type,
+                                             k > 0 && name_gap(found[k - 1], found[k]))))
                     pieces.push_back(found[k]);
             /* A given name next to a family name is one person, a postal code next to its
                city one place, and the pieces of a word one word: they are replaced as a
@@ -3597,6 +4843,7 @@ namespace dlib
                 }
                 joined.push_back(p);
             }
+            normalize_learned_organizations(text, t, joined);
             // Two capitalized words after the first one: the text capitalizes its names too.
             std::size_t capitals = 0;
             for (std::size_t i = 1; i < t.size() && capitals < 2; ++i)
@@ -3625,11 +4872,24 @@ namespace dlib
                 confidence[p] = merged[p].confidence;
                 max_end[p] = std::max(p > 0 ? max_end[p - 1] : 0, merged[p].e);
             }
-            /* An organisation of the lexicon of known names or a postal code of another
-               country with its town, matched whole, keeps its boundaries against the pieces
-               read inside it, which would leave the rest readable: "Bahn" in "Deutsche Bahn",
-               "Santander" in "Banco Santander", "Tokyo 153" in "Tokyo 153-0063". */
+            /* An organisation of a lexicon of names or a postal code of another country with
+               its town, matched whole, keeps its boundaries and its type against the pieces
+               read inside it, which would leave the rest readable ("Bahn" in "Deutsche Bahn",
+               "Santander" in "Banco Santander", "Tokyo 153" in "Tokyo 153-0063"), against a
+               piece of another type read on the same words ("Vueling" read as a place), and
+               against an organisation that holds a part of it only ("Courrier de Le Parlement"
+               across "Parlement européen"). */
             std::vector<bool> inside_exact(merged.size(), false);
+            /* A piece inside a candidate of the rules, or beyond it by the end of its last word after
+               an apostrophe, which the rules leave out: "Le Floc'h" over "Le Floc". */
+            auto within = [&](const candidate& r, const piece& m) {
+                if (m.b < r.b || m.b >= r.e) return false;
+                if (m.e <= r.e) return true;
+                if (!is_apostrophe(t.cps[r.e]) || m.e < r.e + 2) return false;
+                for (std::size_t q = r.e + 1; q < m.e; ++q)
+                    if (!is_letter(t.cps[q])) return false;
+                return true;
+            };
             const std::size_t rule_candidates = out.size();
             for (std::size_t k = 0; k < rule_candidates; ++k)
             {
@@ -3640,8 +4900,20 @@ namespace dlib
                 {
                     if (merged[p].e <= r.b) continue;
                     if (r.exact && r.b <= merged[p].b && merged[p].e <= r.e &&
-                        (r.b != merged[p].b || r.e != merged[p].e))
+                        (r.b != merged[p].b || r.e != merged[p].e || r.type != merged[p].type))
                         inside_exact[p] = true;
+                    // "Courrier de Le Parlement" across "Parlement européen".
+                    if (r.exact && r.type == pii_type::organization && merged[p].type == pii_type::organization &&
+                        !(merged[p].b <= r.b && r.e <= merged[p].e) && !(r.b <= merged[p].b && merged[p].e <= r.e))
+                        inside_exact[p] = true;
+                    /* A person that a civility or a name label announces stays a person when a piece
+                       read inside it is an organisation, a place or an address with no word of a firm
+                       or of a street: "Nom : LE FLOC'H", "Mme Le Floc'h". */
+                    if (r.strong && r.type == pii_type::person && within(r, merged[p]) &&
+                        (merged[p].type == pii_type::organization || merged[p].type == pii_type::location ||
+                         merged[p].type == pii_type::address) &&
+                        announced_person(text, t, r.b) && !firm_or_street_words(text, t, merged[p].b, merged[p].e))
+                        merged[p].type = pii_type::person;
                     if (merged[p].type != r.type) continue;
                     strong[p] = strong[p] || r.strong;
                     confidence[p] = std::max(confidence[p], r.confidence);
@@ -3818,7 +5090,25 @@ namespace dlib
                 {
                     /* "12 rue des Lilas, 35000 Rennes": the street and the place after the
                        last comma are replaced as an address and a location, which is how the
-                       learned recognizers report them too. */
+                       learned recognizers report them too. The country written after the place
+                       stays readable, with the sentence that may follow it on the line: "60000
+                       Oujda, Maroc", "Miami, FL 33130, États-Unis. Est-elle toujours valable ?". */
+                    for (std::size_t k = e; k > b + 1; --k)
+                    {
+                        if (t.cps[k - 1] != ',') continue;
+                        std::size_t q = k, r = e;
+                        while (q < r && is_space(t.cps[q])) ++q;
+                        for (std::size_t p = q; p < r; ++p)
+                            if (t.cps[p] == '.') { r = p; break; }
+                        while (r > q && is_space(t.cps[r - 1])) --r;
+                        if (q < r && country_names().count(fold_key(cp_substr(t, text, q, r))))
+                        {
+                            e = k - 1;
+                            while (e > b && is_space(t.cps[e - 1])) --e;
+                        }
+                        break;
+                    }
+                    if (e <= b) return;
                     std::size_t comma = e;
                     for (std::size_t k = e; k > b + 1; --k)
                         if (t.cps[k - 1] == ',') { comma = k - 1; break; }
@@ -4256,6 +5546,17 @@ namespace dlib
                 // "Chemin C:\Users": without a number, a name of one letter is no street.
                 if (named == 0 || (!number && named == 1 && end - words[j - 1].b <= 1))
                     continue;
+                // "rue du 18 Juin 1940": the year of the date that names the street.
+                {
+                    static const std::unordered_set<std::string> months = make_word_set(
+                        "janvier fevrier mars avril mai juin juillet aout septembre octobre novembre decembre");
+                    std::size_t y = end + 1;
+                    while (y < t.size() && y - end <= 4 && is_ascii_digit(t.cps[y]))
+                        ++y;
+                    if (months.count(words[j - 1].key) && words[j - 1].e == end && t.at(end) == ' ' &&
+                        y - end == 5 && !is_word_char(t.at(y)))
+                        end = y;
+                }
                 add(out, start, end, pii_type::address, number ? 0.9 : 0.6);
             }
 
@@ -4295,6 +5596,119 @@ namespace dlib
                     if (compass.count(words[k + 1].key)) end = words[k + 1].e;
                 }
                 add(out, r, end, pii_type::address, 0.9);
+            }
+
+            /* Streets of other countries, the house number after the name: the type first ("ul.
+               Długa 5", "Calle Sol, 86", "Rua das Flores, 143", "Via Roma 5"), after the name
+               ("Kossuth Lajos utca 16", "Atatürk Caddesi No:12", "Karl Johans gate 1",
+               "Berliner Str. 5") or at the end of it ("Hauptstraße 12", "Keizersgracht 123"). */
+            static const std::unordered_set<std::string> type_first = make_word_set(
+                "ul ulica calle avenida avda carrer rua travessa via viale piazza piazzale corso largo strada calea "
+                "str bulevardul ulitsa prospekt vulytsia cesta trg namesti rruga odos jalan");
+            // Types also read as other words, which open a street only with their period: "al.", "pl.".
+            static const std::unordered_set<std::string> type_first_dotted = make_word_set("al pl");
+            // Written in lower case after the name ("Széchenyi tér 1", "Karl Johans gate 1"), or in any case.
+            static const std::unordered_set<std::string> type_after_lower = make_word_set(
+                "utca ut korut ter gate gata gaten vei veien vej gade gatan vagen tie katu");
+            static const std::unordered_set<std::string> type_after = make_word_set(
+                "sokak sokagı sokagi caddesi cad bulvarı bulvari yolu strasse strase str gasse platz allee straat "
+                "laan kade plein");
+            static const char* const glued_types[] = { "strasse", "strase", "str", "gasse", "weg", "platz", "allee",
+                "gracht", "straat", "laan", "markt", "damm", "ufer", "veien", "vegen", "gade", "gatan", "gata",
+                "vagen", "katu", "utca", "ulica", "kade", "plein" };
+            static const std::unordered_set<std::string> name_connectors = make_word_set(
+                "de del della dei degli di da do das dos la las los le les du des van von der den e y i");
+            const std::size_t n = t.size();
+            auto spaces_only = [&](std::size_t a, std::size_t b) {
+                for (std::size_t q = a; q < b; ++q)
+                    if (!(t.cps[q] == ' ' || t.cps[q] == 0xA0 || is_hyphen(t.cps[q]) || is_apostrophe(t.cps[q])))
+                        return false;
+                return b - a <= 3;
+            };
+            auto name_word = [&](const word_token& x) {
+                return (x.shape == 1 || x.shape == 2 || x.shape == 3) && !known_organizations().count(x.key) &&
+                       !acronym_words().count(x.key);
+            };
+            // The end of the house number that follows position p: " 5", ", 86", " nr 14", " No:9", " 12a", " 5/7".
+            auto number_after = [&](std::size_t p) {
+                std::size_t q = p;
+                if (q < n && t.cps[q] == '.') ++q;
+                if (q < n && t.cps[q] == ',') ++q;
+                while (q < n && (t.cps[q] == ' ' || t.cps[q] == 0xA0)) ++q;
+                std::size_t r = q;
+                std::string label;
+                while (r < n && r - q < 3 && t.cps[r] < 128 && is_letter(t.cps[r]))
+                    label.push_back(static_cast<char>(to_lower(t.cps[r++])));
+                if ((label == "nr" || label == "no" || label == "n") && r < n &&
+                    (t.cps[r] == '.' || t.cps[r] == ':' || t.cps[r] == 0xB0 || t.cps[r] == ' '))
+                {
+                    while (r < n && (t.cps[r] == '.' || t.cps[r] == ':' || t.cps[r] == 0xB0 || t.cps[r] == ' ')) ++r;
+                    q = r;
+                }
+                std::size_t d = q;
+                while (d < n && is_ascii_digit(t.cps[d]) && d - q < 5) ++d;
+                if (d == q || d - q > 4) return p;
+                if (d < n && is_letter(t.cps[d]) && !(d + 1 < n && is_letter(t.cps[d + 1]))) ++d;
+                else if (d + 1 < n && (t.cps[d] == '/' || t.cps[d] == '-') && is_ascii_digit(t.cps[d + 1]))
+                {
+                    ++d;
+                    while (d < n && is_ascii_digit(t.cps[d])) ++d;
+                }
+                if (d < n && is_word_char(t.cps[d])) return p;
+                return d;
+            };
+            for (std::size_t k = 0; k < words.size(); ++k)
+            {
+                const word_token& w = words[k];
+                if (k > 0 && is_ascii_digit(t.before(w.b))) continue;
+                // The type first, then the name.
+                const bool dotted = t.at(w.e) == '.';
+                if (type_first.count(w.key) || (dotted && type_first_dotted.count(w.key)))
+                {
+                    std::size_t cursor = dotted ? w.e + 1 : w.e, end = cursor;
+                    int named = 0;
+                    for (std::size_t j = k + 1; j < words.size() && j <= k + 6; ++j)
+                    {
+                        const word_token& x = words[j];
+                        if (!spaces_only(cursor, x.b) || x.b == cursor) break;
+                        if (name_connectors.count(x.key) && x.shape == 0 && j + 1 < words.size() &&
+                            name_word(words[j + 1]))
+                        {
+                            cursor = x.e;
+                            continue;
+                        }
+                        if (!name_word(x)) break;
+                        end = cursor = x.e;
+                        ++named;
+                    }
+                    const std::size_t number = named > 0 ? number_after(end) : end;
+                    if (number > end)
+                    {
+                        add(out, w.b, number, pii_type::address, 0.85);
+                        continue;
+                    }
+                }
+                // The type after the name, or at the end of it.
+                const bool after = k > 0 && (type_after.count(w.key) ||
+                                             (w.shape == 0 && type_after_lower.count(w.key)));
+                bool glued = false;
+                if (!after && name_word(w) && !common_words().count(w.key))
+                    for (const char* suffix : glued_types)
+                    {
+                        const std::size_t m = std::strlen(suffix);
+                        if (w.key.size() > m + 2 && w.key.compare(w.key.size() - m, m, suffix) == 0) glued = true;
+                    }
+                if (!glued && !after) continue;
+                std::size_t first = k;
+                if (!glued)
+                {
+                    while (first > 0 && k - first < 4 && name_word(words[first - 1]) &&
+                           spaces_only(words[first - 1].e, words[first].b) && words[first - 1].e < words[first].b)
+                        --first;
+                    if (first == k) continue;
+                }
+                const std::size_t number = number_after(w.e);
+                if (number > w.e) add(out, words[first].b, number, pii_type::address, 0.85);
             }
         }
 
@@ -4658,8 +6072,9 @@ namespace dlib
             static const std::unordered_set<std::string> foreign_street_words = make_word_set(
                 "ul ulica utca ut calle avenida avda rua via viale piazza corso strada calea str bulevardul ulitsa "
                 "prospekt vulytsia cesta trg namesti laan straat plein kade veien vegen vei vej gade gatan vagen "
-                "katu tie kuja sokak caddesi cad marg nagar");
-            static const char* const street_suffixes[] = { "strasse", "straße", "gasse", "weg", "platz", "allee",
+                "katu tie kuja sokak caddesi cad marg nagar strasse strase gasse allee platz");
+            // Folded keys: "Hauptstraße" reads "hauptstrase".
+            static const char* const street_suffixes[] = { "strasse", "strase", "gasse", "weg", "platz", "allee",
                 "gracht", "straat", "laan", "markt", "ring", "damm", "ufer", "veien", "vegen", "gade", "gatan",
                 "vagen", "katu", "utca", "ulica", "quai", "kade", "plein" };
             auto street_hint = [&](std::size_t a, std::size_t b) {
@@ -4834,6 +6249,12 @@ namespace dlib
                 "chez aupres avec entre par dans vers contre sans siege at with by from into via between against");
             static const std::unordered_set<std::string> descriptors = make_word_set(
                 "societe ste entreprise entreprises company firme enseigne");
+            static const std::unordered_set<std::string> determiners = make_word_set(
+                "la le l une un the a this cette notre votre sa");
+            // Legal forms read in a line in lower case: "weber conseil sarl", "bluewater ag".
+            static const std::unordered_set<std::string> lower_forms = make_word_set(
+                "sarl sas sasu eurl snc selarl sci scp gmbh ag bv nv llc llp plc ltd limited inc corp srl oy oyj kft "
+                "zrt asbl sprl bvba");
             static const std::unordered_set<std::string> partners = make_word_set(
                 "fils associes associe cie compagnie partenaires freres soeurs sons partners co company associates");
             static const std::unordered_set<std::string> professions = make_word_set(
@@ -4846,6 +6267,11 @@ namespace dlib
             static const std::unordered_set<std::string> tails = make_word_set("france europe ouest atlantique");
             static const std::unordered_set<std::string> particles = make_word_set("le la de du des van von di da del mac");
             // Words that qualify a sector word without naming a company: "Steering Group", "Grande Distribution".
+            // Adjectives between a head noun and its name: "Hôpital privé des Glénan", "Centre hospitalier de Brest".
+            static const std::unordered_set<std::string> qualifiers = make_word_set(
+                "prive privee public publique mutualiste hospitalier hospitaliere universitaire regional regionale "
+                "departemental departementale intercommunal intercommunale municipal municipale general generale "
+                "medical medicale dentaire veterinaire pluridisciplinaire specialise specialisee psychiatrique");
             static const std::unordered_set<std::string> modifiers = make_word_set(
                 "grand grande petit petite nouveau nouvelle haut haute bas basse premier premiere espace "
                 "international internationale global steering working focus advisory research support project "
@@ -4894,8 +6320,8 @@ namespace dlib
                     !sectors.count(words[first].key))
                 {
                     --first;
-                    if (first > 0 && (words[first - 1].key == "de" || words[first - 1].key == "van" ||
-                                      words[first - 1].key == "von") &&
+                    if (first > 0 && (words[first - 1].key == "de" || words[first - 1].key == "du" ||
+                                      words[first - 1].key == "van" || words[first - 1].key == "von") &&
                         words[first - 1].shape == 0 && spaced(first - 1) && line_start(first - 1))
                         --first;
                 }
@@ -4908,6 +6334,32 @@ namespace dlib
             for (std::size_t k = 0; k < words.size(); ++k)
             {
                 const word_token& w = words[k];
+                /* In a line in lower case, a legal form after one to three words of which one at
+                   least is neither a common word nor a trade: "weber conseil sarl", "kerix limited". */
+                if (w.shape == 0 && lower_forms.count(w.key) && k > 0 && lower_case_line(t, w.b))
+                {
+                    std::size_t first = k;
+                    int named = 0;
+                    while (first > 0 && k - first < 3 && spaced(first - 1))
+                    {
+                        const word_token& x = words[first - 1];
+                        const bool trade = sectors.count(x.key) || kept.count(x.key);
+                        if (x.shape != 0 || stops.count(x.key) || descriptors.count(x.key) ||
+                            privacy_impl::function_words().count(x.key) || person_titles().count(x.key) ||
+                            forms.count(x.key) || (common_words().count(x.key) && !trade))
+                            break;
+                        if (!trade) ++named;
+                        --first;
+                    }
+                    while (first < k && (sectors.count(words[first].key) || kept.count(words[first].key))) ++first;
+                    if (named > 0 && first < k)
+                    {
+                        std::size_t end = w.e;
+                        if (t.at(end) == '.' && (w.key == "inc" || w.key == "corp")) ++end;
+                        add(out, words[first].b, end, pii_type::organization, 0.75);
+                        continue;
+                    }
+                }
                 // Legal form after the name: "Dupont Conseil SAS", "Acme Inc.", "Briys plc".
                 // "IL A PERDU SA VOITURE": a possessive in a line of capitals.
                 const bool possessive = w.shape == 2 && w.e - w.b <= 2 && k + 1 < words.size() &&
@@ -4924,6 +6376,9 @@ namespace dlib
                     {
                         const word_token& x = words[first - 1];
                         if (stops.count(x.key) || descriptors.count(x.key) || person_titles().count(x.key)) break;
+                        // "BAGGAGE IS LIMITED", "PASSED TO THE DELHI MUNICIPAL CORPORATION".
+                        if (x.shape == 2 && privacy_impl::function_words().count(x.key) && !connectors.count(x.key))
+                            break;
                         // "SAS Iroise et SELARL Martin": two companies.
                         if ((forms.count(x.key) && x.shape == 2) ||
                             ((x.key == "et" || x.key == "and") && !partners.count(words[first].key)))
@@ -4936,12 +6391,15 @@ namespace dlib
                         else if (!kept.count(x.key)) break;
                         --first;
                     }
-                    // Connectors, articles, short common words and the word opening a sentence
-                    // ("Entre Dupont SARL") do not open the name.
+                    /* Connectors, articles, short common words, the word opening a sentence ("Entre
+                       Dupont SARL") and, in capitals, common words ("JOINED TALOVA SERVICES INC.") do
+                       not open the name. */
                     while (first < k && (words[first].shape == 0 || connectors.count(words[first].key) ||
                                          (common_words().count(words[first].key) &&
                                           (words[first].e - words[first].b <= 3 ||
-                                           at_sentence_start(t, words[first].b)))))
+                                           at_sentence_start(t, words[first].b) ||
+                                           (words[first].shape == 2 && !sectors.count(words[first].key) &&
+                                            !kept.count(words[first].key))))))
                         ++first;
                     if (named > 0 && first < k)
                     {
@@ -5023,15 +6481,18 @@ namespace dlib
                         continue;
                     }
                 }
-                // Head noun before the name: "Cabinet Dupont", "Universite de Rennes"; "Centre-Val de
-                // Loire" is a region.
-                if (heads.count(w.key) && (w.shape == 1 || w.shape == 2) && !is_hyphen(t.at(w.e)) &&
-                    !is_hyphen(t.before(w.b)))
+                /* Head noun before the name: "Cabinet Dupont", "Universite de Rennes", "Hôpital privé
+                   des Glénan", "Auto-école du Steir"; "Centre-Val de Loire" is a region. */
+                const bool auto_school = w.key == "ecole" && k > 0 && words[k - 1].key == "auto" &&
+                                         words[k - 1].shape == 1 && words[k - 1].e + 1 == w.b &&
+                                         is_hyphen(t.cps[words[k - 1].e]);
+                if (heads.count(w.key) && (w.shape == 1 || w.shape == 2 || auto_school) && !is_hyphen(t.at(w.e)) &&
+                    (!is_hyphen(t.before(w.b)) || auto_school))
                 {
                     // end follows the capitalized words, cursor the connectors between them too.
                     std::size_t j = k + 1, end = w.e, cursor = w.e, first_named = 0;
                     int named = 0, proper = 0;
-                    bool branch_place = false, after_connector = false;
+                    bool branch_place = false, after_connector = false, qualified = auto_school;
                     while (j < words.size() && j <= k + 6 && joinable(cursor, words[j].b))
                     {
                         const word_token& x = words[j];
@@ -5044,6 +6505,11 @@ namespace dlib
                             if (named == 0 && (x.key == "de" || x.key == "du" || x.key == "d")) branch_place = true;
                             cursor = x.e;
                             after_connector = true;
+                        }
+                        else if (named == 0 && !after_connector && x.shape == 0 && qualifiers.count(x.key))
+                        {
+                            cursor = x.e;
+                            qualified = true;
                         }
                         else if (capital(x))
                         {
@@ -5074,9 +6540,14 @@ namespace dlib
                     if (j < words.size() && professions.count(words[j].key) && words[j].b == end + 1 &&
                         t.cps[end] == ' ')
                         end = words[j].e;
-                    // "la societe Calixe Courtage": the name follows the descriptor.
-                    const std::size_t begin = descriptors.count(w.key) && first_named > k ? words[first_named].b : w.b;
-                    add(out, begin, end, pii_type::organization, 0.8);
+                    /* "la societe Calixe Courtage", "the company Ulmeo": after an article the name
+                       follows the descriptor, which otherwise opens it ("Societe Kerexa SARL"). */
+                    const bool determined = k > 0 && determiners.count(words[k - 1].key) &&
+                                            w.b - words[k - 1].e <= 2 && same_line(t, words[k - 1].e, w.b);
+                    const std::size_t begin = descriptors.count(w.key) && first_named > k && determined ?
+                                              words[first_named].b : (auto_school ? words[k - 1].b : w.b);
+                    // A qualified head names a body whose place or name follows: above the place alone.
+                    add(out, begin, end, pii_type::organization, 0.8, qualified ? 8 : 0);
                 }
             }
         }

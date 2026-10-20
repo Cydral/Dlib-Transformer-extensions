@@ -107,6 +107,9 @@ namespace dlib
         {
             return layout == 2 && separator == 1 && day_style == 1 && month_style == 1 && two_digit_year == 0;
         }
+
+        bool has_day() const { return layout <= 4; }
+        bool has_month() const { return layout <= 6; }
     };
 
     struct date_match
@@ -219,6 +222,246 @@ namespace dlib
         inline int expand_two_digit_year(int yy) { return yy < 50 ? 2000 + yy : 1900 + yy; }
 
         inline bool plausible_year(int y) { return y >= 1800 && y <= 2199; }
+
+        // A year written without its day: a narrower range, since four digits alone are often something else.
+        inline bool plausible_partial_year(int y) { return y >= 1900 && y <= 2099; }
+
+        // The lower case word made of the letters that end at code point e, and its first code point.
+        inline std::string letters_before(const utf8_text& t, std::size_t e, std::size_t& b)
+        {
+            b = e;
+            while (b > 0 && is_letter(t.cps[b - 1]))
+                --b;
+            std::string w;
+            for (std::size_t k = b; k < e; ++k)
+                utf8_append(w, to_lower(t.cps[k]));
+            return w;
+        }
+
+        inline bool is_range_dash(char32_t c) { return c == '-' || c == 0x2013 || c == 0x2014; }
+
+        enum class year_cue
+        {
+            none,
+            alone,      // "en 2019", "since 2019", "Année de naissance : 1985"
+            range       // "de 2015 à 2019", "between 2015 and 2019": only with the second year
+        };
+
+        /* What the words before the year starting at code point i make of it. A year alone
+           is a date of the document after a word of time: a preposition ("en", "depuis",
+           "in", "since"), a part of a year ("fin", "mi-", "early", "summer"), "année",
+           "l'an", "class of", or the label of a birth year. */
+        inline year_cue year_cue_before(const utf8_text& t, std::size_t i)
+        {
+            static const std::vector<std::string> alone = {
+                "en", "depuis", "avant", "apres", "fin", "debut", "courant", "vers", "annee", "printemps",
+                "ete", "automne", "hiver", "session", "promotion", "promo", "in", "since", "until", "till",
+                "before", "after", "around", "circa", "early", "late", "spring", "summer", "autumn", "fall",
+                "winter", "year", "born"
+            };
+            static const std::vector<std::string> range = { "de", "entre", "from", "between" };
+            static const std::vector<std::string> labels = { "naissance", "birth", "dob" };
+            auto in = [](const std::vector<std::string>& v, const std::string& w) {
+                for (const std::string& s : v)
+                    if (s == w) return true;
+                return false;
+            };
+            if (i == 0)
+                return year_cue::none;
+            std::size_t b;
+            if (t.cps[i - 1] == '-')
+            {
+                // "mi-2021", "mid-2021".
+                const std::string w = fold_key(letters_before(t, i - 1, b));
+                return (w == "mi" || w == "mid") && !is_letter(t.before(b)) ? year_cue::alone : year_cue::none;
+            }
+            std::size_t k = i;
+            while (k > 0 && t.cps[k - 1] == ' ' && i - k < 2)
+                --k;
+            if (k == i)
+                return year_cue::none;
+            if (k > 0 && t.cps[k - 1] == ':')
+            {
+                // A field label: "Année de naissance : 1985", "Year of birth: 1985".
+                --k;
+                while (k > 0 && t.cps[k - 1] == ' ')
+                    --k;
+                const std::string w = fold_key(letters_before(t, k, b));
+                return in(labels, w) ? year_cue::alone : year_cue::none;
+            }
+            const std::string lower = letters_before(t, k, b);
+            if (lower.empty() || is_ascii_digit(t.before(b)))
+                return year_cue::none;
+            if (lower == "d\xC3\xA8s")
+                return year_cue::alone;
+            const std::string w = fold_key(lower);
+            if (w == "an")
+            {
+                // "l'an 2019", not "un an".
+                return b >= 2 && is_apostrophe(t.cps[b - 1]) && to_lower(t.cps[b - 2]) == 'l' &&
+                       !is_letter(t.before(b - 2)) ? year_cue::alone : year_cue::none;
+            }
+            if (w == "of")
+            {
+                // "class of 2015".
+                std::size_t c = b;
+                if (c == 0 || t.cps[c - 1] != ' ')
+                    return year_cue::none;
+                return fold_key(letters_before(t, c - 1, c)) == "class" ? year_cue::alone : year_cue::none;
+            }
+            // A word glued to an apostrophe before it is still the word: "jusqu'en 2025".
+            if (in(alone, w))
+                return year_cue::alone;
+            if (w == "de" && b > 0 && t.cps[b - 1] == ' ')
+            {
+                // "à la session de 2011", "promotion de 2015".
+                std::size_t c;
+                const std::string before = fold_key(letters_before(t, b - 1, c));
+                if (before == "session" || before == "promotion")
+                    return year_cue::alone;
+            }
+            if (in(range, w))
+                return year_cue::range;
+            return year_cue::none;
+        }
+
+        // True if the year that ends at code point j stands on its own: no letter, digit or number after it.
+        inline bool year_ends(const utf8_text& t, std::size_t j)
+        {
+            const char32_t a = t.at(j);
+            if (is_word_char(a))
+                return false;
+            const char32_t b = t.at(j + 1);
+            if ((a == '/' || a == '-' || a == '.' || a == ',') && is_ascii_digit(b))
+                return false;
+            if (a == ':' && is_word_char(b))
+                return false;
+            return true;
+        }
+
+        // True if a unit or a counted noun follows the number that ends at code point j: "en 2000 exemplaires".
+        inline bool quantity_after(const utf8_text& t, std::size_t j)
+        {
+            static const std::vector<std::string> units = {
+                "an", "ans", "annee", "annees", "year", "years", "mois", "month", "months", "semaine", "semaines",
+                "week", "weeks", "jour", "jours", "day", "days", "heure", "heures", "hour", "hours", "h", "min",
+                "minutes", "km", "m", "m2", "cm", "mm", "kg", "g", "t", "tonne", "tonnes", "ton", "tons", "l",
+                "litre", "litres", "liter", "liters", "euro", "euros", "eur", "dollar", "dollars", "usd", "franc",
+                "francs", "chf", "livres", "pounds", "gbp", "exemplaire", "exemplaires", "copie", "copies",
+                "copy", "page", "pages", "mot", "mots", "word", "words", "personne", "personnes", "person",
+                "persons", "people", "habitant", "habitants", "inhabitants", "residents", "salarie", "salaries",
+                "employe", "employes", "employee", "employees", "membre", "membres", "member", "members",
+                "unite", "unites", "unit", "units", "piece", "pieces", "point", "points", "fois", "times", "voix",
+                "votes", "signatures", "places", "lits", "beds", "patients", "dossiers", "cas", "cases",
+                "articles", "lignes", "lines", "octets", "bytes", "mo", "go", "ko", "mb", "gb", "kb", "metre",
+                "metres", "meter", "meters", "kilometres", "kilometers", "miles", "pas", "steps", "kcal",
+                "participants", "candidats", "candidates", "eleves", "students", "etudiants", "enfants",
+                "children", "clients", "customers", "utilisateurs", "users", "visiteurs", "visitors",
+                "entreprises", "companies", "logements", "emplois", "jobs", "postes", "projets", "projects"
+            };
+            std::size_t k = j;
+            if (t.at(k) == ' ')
+                ++k;
+            const char32_t c = t.at(k);
+            if (c == '%' || c == 0x20AC || c == '$' || c == 0xA3)
+                return true;
+            std::size_t e = k;
+            while (e < t.size() && is_word_char(t.cps[e]))
+                ++e;
+            if (e == k || k == j)
+                return false;
+            std::string w;
+            for (std::size_t n = k; n < e; ++n)
+                utf8_append(w, to_lower(t.cps[n]));
+            w = fold_key(w);
+            for (const std::string& u : units)
+                if (u == w) return true;
+            return false;
+        }
+
+        // True if the text between the start of the line and code point i is empty or a bullet.
+        inline bool starts_line(const utf8_text& t, std::size_t i)
+        {
+            std::size_t k = i;
+            while (k > 0 && (t.cps[k - 1] == ' ' || t.cps[k - 1] == '\t'))
+                --k;
+            if (k > 0 && (t.cps[k - 1] == '-' || t.cps[k - 1] == '*' || t.cps[k - 1] == 0x2022 ||
+                          t.cps[k - 1] == 0x2013 || t.cps[k - 1] == 0x2014))
+            {
+                --k;
+                while (k > 0 && (t.cps[k - 1] == ' ' || t.cps[k - 1] == '\t'))
+                    --k;
+            }
+            return k == 0 || t.cps[k - 1] == '\n' || t.cps[k - 1] == '\r';
+        }
+
+        // True if a colon follows code point j, as in the lines of a CV: "2015 – 2019 : ingénieur".
+        inline bool colon_after(const utf8_text& t, std::size_t j)
+        {
+            std::size_t k = j;
+            while (k < t.size() && t.cps[k] == ' ')
+                ++k;
+            return t.at(k) == ':' && !is_word_char(t.at(k + 1));
+        }
+
+        /* A second year after the year that ends at code point j: "2015-2019", "2015 – 2019",
+           "2015 à 2019", "2015 and 2019". Sets [b, e) and the year. */
+        inline bool second_year(const utf8_text& t, std::size_t j, std::size_t& b, std::size_t& e, int& year)
+        {
+            static const std::vector<std::string> links = {
+                "a", "au", "et", "to", "and", "until", "till", "through", "thru"
+            };
+            std::size_t k = j;
+            if (t.at(k) == ' ')
+                ++k;
+            if (is_range_dash(t.at(k)))
+            {
+                ++k;
+                if (t.at(k) == ' ')
+                    ++k;
+            }
+            else
+            {
+                if (k == j)
+                    return false;
+                std::size_t w = k;
+                while (w < t.size() && is_letter(t.cps[w]))
+                    ++w;
+                std::string word;
+                for (std::size_t n = k; n < w; ++n)
+                    utf8_append(word, to_lower(t.cps[n]));
+                word = fold_key(word);
+                bool link = false;
+                for (const std::string& s : links)
+                    if (s == word) link = true;
+                if (!link || t.at(w) != ' ')
+                    return false;
+                k = w + 1;
+            }
+            int count;
+            b = k;
+            e = k;
+            if (!read_digits(t, e, 4, year, count) || count != 4 || !plausible_partial_year(year) ||
+                is_word_char(t.before(b)))
+                return false;
+            return year_ends(t, e) && !quantity_after(t, e);
+        }
+
+        // A number or a reference before code point i: "n° 03/2022", "Réf. 10/2025", "#12/2024".
+        inline bool reference_before(const utf8_text& t, std::size_t i)
+        {
+            std::size_t k = i;
+            while (k > 0 && (t.cps[k - 1] == ' ' || t.cps[k - 1] == ':' || t.cps[k - 1] == '.'))
+                --k;
+            const char32_t c = t.before(k);
+            if (c == 0xB0 || c == 0xBA || c == '#' || c == 0x2116)
+                return true;
+            std::size_t b;
+            const std::string w = fold_key(letters_before(t, k, b));
+            return w == "no" || w == "nr" || w == "num" || w == "numero" || w == "ref" || w == "reference" ||
+                   w == "dossier" || w == "affaire" || w == "lot" || w == "facture" || w == "invoice" ||
+                   w == "number" || w == "version";
+        }
     }
 
 // ----------------------------------------------------------------------------------------
@@ -313,7 +556,7 @@ namespace dlib
                         date_format f;
                         f.layout = 3;
                         f.day_style = (ld == 2) ? 1 : 0;
-                        if (t.at(j) == 'e' && t.at(j + 1) == 'r' && !is_letter(t.at(j + 2)))
+                        if (to_lower(t.at(j)) == 'e' && to_lower(t.at(j + 1)) == 'r' && !is_letter(t.at(j + 2)))
                         {
                             if (day == 1) { f.day_style = 2; j += 2; }
                         }
@@ -348,6 +591,77 @@ namespace dlib
                                         i = y;
                                     }
                                 }
+                            }
+                        }
+                    }
+                }
+
+                // Month and year in figures: "03/2022", "10.2025", not a reference "n° 03/2022".
+                if (!matched)
+                {
+                    std::size_t j = i;
+                    int month, lm;
+                    if (read_digits(t, j, 2, month, lm) && lm == 2 && month >= 1 && month <= 12 && j < n &&
+                        (t.cps[j] == '/' || t.cps[j] == '.'))
+                    {
+                        const char32_t sep = t.cps[j];
+                        std::size_t y = j + 1;
+                        int year, ly;
+                        if (read_digits(t, y, 4, year, ly) && ly == 4 && plausible_partial_year(year) &&
+                            year_ends(t, y) && !reference_before(t, i))
+                        {
+                            date_format f;
+                            f.layout = 6;
+                            f.separator = static_cast<std::uint8_t>(sep == '/' ? 0 : 2);
+                            f.day_style = 0;
+                            f.month_style = 1;
+                            m.begin = t.offsets[i];
+                            m.end = t.offsets[y];
+                            m.date.year = year; m.date.month = month; m.date.day = 0;
+                            m.format = f;
+                            matched = true;
+                            i = y;
+                        }
+                    }
+                }
+
+                /* A year alone, after a word of time ("en 2019", "since 2019", "fin 2022") or at
+                   the head of a line before a colon, as in a CV; with the second year of a range
+                   ("de 2015 à 2019", "2015-2019 :"). */
+                if (!matched)
+                {
+                    std::size_t j = i;
+                    int year, ly;
+                    if (read_digits(t, j, 4, year, ly) && ly == 4 && plausible_partial_year(year))
+                    {
+                        const year_cue cue = year_cue_before(t, i);
+                        std::size_t b2 = 0, e2 = 0;
+                        int year2 = 0;
+                        const bool pair = second_year(t, j, b2, e2, year2);
+                        const bool line = starts_line(t, i) && colon_after(t, pair ? e2 : j);
+                        const bool first = pair ? (cue != year_cue::none || line)
+                                                : (year_ends(t, j) && !quantity_after(t, j) &&
+                                                   (cue == year_cue::alone || line));
+                        if (first)
+                        {
+                            date_format f;
+                            f.layout = 7;
+                            f.separator = 0;
+                            f.day_style = 0;
+                            f.month_style = 0;
+                            m.begin = t.offsets[i];
+                            m.end = t.offsets[j];
+                            m.date.year = year; m.date.month = 0; m.date.day = 0;
+                            m.format = f;
+                            matched = true;
+                            i = j;
+                            if (pair)
+                            {
+                                out.push_back(m);
+                                m.begin = t.offsets[b2];
+                                m.end = t.offsets[e2];
+                                m.date.year = year2;
+                                i = e2;
                             }
                         }
                     }
@@ -398,6 +712,42 @@ namespace dlib
                         }
                     }
                 }
+
+                // Month and year: "mars 2022", "March, 2022", "sept. 2019".
+                if (!matched && variant >= 0)
+                {
+                    std::size_t j = mend;
+                    std::uint8_t comma = 0;
+                    if (t.at(j) == ',')
+                    {
+                        comma = 1;
+                        ++j;
+                    }
+                    std::size_t y = j;
+                    while (y < n && t.cps[y] == ' ' && y - j < 3)
+                        ++y;
+                    const std::size_t spaces = y - j;
+                    int year, ly;
+                    if ((spaces == 1 || spaces == 2) && read_digits(t, y, 4, year, ly) && ly == 4 &&
+                        plausible_partial_year(year) && year_ends(t, y) && !quantity_after(t, y))
+                    {
+                        date_format f;
+                        f.layout = 5;
+                        f.separator = static_cast<std::uint8_t>(spaces - 1);
+                        f.day_style = 0;
+                        f.month_style = static_cast<std::uint8_t>(variant);
+                        f.month_case = static_cast<std::uint8_t>(cs);
+                        f.comma = comma;
+                        m.begin = t.offsets[i];
+                        m.end = t.offsets[y];
+                        m.date.year = year;
+                        m.date.month = month_name_variants()[static_cast<std::size_t>(variant)].month;
+                        m.date.day = 0;
+                        m.format = f;
+                        matched = true;
+                        i = y;
+                    }
+                }
             }
 
             if (matched)
@@ -436,15 +786,18 @@ namespace dlib
         };
         const std::string year_text = f.two_digit_year ? two(((d.year % 100) + 100) % 100) : std::to_string(d.year);
 
-        if (f.layout <= 2)
+        if (f.layout <= 2 || f.layout == 6)
         {
             const char sep = "/-."[f.separator < 3 ? f.separator : 0];
             const std::string mo = f.month_style == 1 ? two(d.month) : std::to_string(d.month);
             const std::string da = f.day_style == 1 ? two(d.day) : std::to_string(d.day);
             if (f.layout == 0) return da + sep + mo + sep + year_text;
             if (f.layout == 1) return mo + sep + da + sep + year_text;
+            if (f.layout == 6) return mo + sep + year_text;
             return year_text + sep + mo + sep + da;
         }
+        if (f.layout == 7)
+            return year_text;
 
         /* A month name variant only fits its own month; other months use the variant of the
            same family at the same position (full names, abbreviations), found by month. */
@@ -483,6 +836,8 @@ namespace dlib
         name = apply_case(name, f.month_case);
         if (f.layout == 3)
             return day_text() + " " + name + " " + year_text;
+        if (f.layout == 5)
+            return name + (f.comma ? "," : "") + (f.separator == 1 ? "  " : " ") + year_text;
         return name + " " + day_text() + (f.comma ? "," : "") + " " + year_text;
     }
 
@@ -494,11 +849,26 @@ namespace dlib
     )
     {
         const std::vector<date_match> m = find_dates(text, order);
-        if (m.size() != 1 || m[0].begin != 0 || m[0].end != text.size())
-            return false;
-        date = m[0].date;
-        format = m[0].format;
-        return true;
+        if (m.size() == 1 && m[0].begin == 0 && m[0].end == text.size())
+        {
+            date = m[0].date;
+            format = m[0].format;
+            return true;
+        }
+        // A year alone: the words that made it a date are outside the value.
+        if (text.size() == 4 && text.find_first_not_of("0123456789") == std::string::npos &&
+            privacy_impl::plausible_partial_year(std::stoi(text)))
+        {
+            date = civil_date();
+            date.year = std::stoi(text);
+            format = date_format();
+            format.layout = 7;
+            format.separator = 0;
+            format.day_style = 0;
+            format.month_style = 0;
+            return true;
+        }
+        return false;
     }
 
 // ----------------------------------------------------------------------------------------

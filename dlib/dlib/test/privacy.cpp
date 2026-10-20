@@ -9,6 +9,7 @@
 #include <fstream>
 #include <functional>
 #include <sstream>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -277,7 +278,13 @@ namespace
                                                   { pii_type::date, "12/03/1985" },
                                                   { pii_type::date, "1er mars 1985" },
                                                   { pii_type::date, "March 1st, 1985" },
-                                                  { pii_type::date, "29 février 2024" } };
+                                                  { pii_type::date, "29 février 2024" },
+                                                  { pii_type::date, "mars 2022" },
+                                                  { pii_type::date, "March, 2022" },
+                                                  { pii_type::date, "SEPT. 2019" },
+                                                  { pii_type::date, "03/2022" },
+                                                  { pii_type::date, "10.2025" },
+                                                  { pii_type::date, "2019" } };
         for (const auto& v : values)
             DLIB_TEST_MSG(round_trip(p, v.first, v.second), v.second);
 
@@ -312,7 +319,21 @@ namespace
         DLIB_TEST(parse_date(tag_body(p.tag(pii_type::date, "2026-10-14")), numeric_date_order::day_month_year, a, fa));
         DLIB_TEST(parse_date(tag_body(p.tag(pii_type::date, "2026-10-21")), numeric_date_order::day_month_year, b, fb));
         DLIB_TEST(days_from_civil(b.year, b.month, b.day) - days_from_civil(a.year, a.month, a.day) == 7);
-        DLIB_TEST(p.date_shift_days() != 0 && p.date_shift_days() % 7 == 0);
+        DLIB_TEST(p.date_shift_days() < 0 && p.date_shift_days() % 7 == 0 && p.date_shift_days() >= -7 * 260);
+
+        // A month and its year move by whole months, a year alone by whole years, never by zero.
+        DLIB_TEST(p.date_shift_months() < 0 && p.date_shift_years() < 0);
+        DLIB_TEST(std::abs(p.date_shift_months() * 30.436875 - p.date_shift_days()) <= 16);
+        const string month_body = tag_body(p.tag(pii_type::date, "mars 2022"));
+        const long months = 12L * 2022 + 2 + p.date_shift_months();
+        DLIB_TEST(month_body.size() > 8 && month_body[7] == '~' &&
+                  month_body.substr(0, 7) == to_string(months / 12) + "-" + (months % 12 < 9 ? "0" : "") +
+                  to_string(months % 12 + 1));
+        DLIB_TEST(tag_body(p.tag(pii_type::date, "2019")).substr(0, 5) == to_string(2019 + p.date_shift_years()) + "~");
+
+        // The particles of a person name are encrypted with its other words.
+        DLIB_TEST(p.tag(pii_type::person, "Hélène Le Goff").find(" Le ") == string::npos);
+        DLIB_TEST(p.tag(pii_type::person, "Ludwig van Beethoven").find(" van ") == string::npos);
 
         // Restoration in derived text, percent-encoded, tampered, foreign context.
         const string text = "Contact: Jean Dupont <jean.dupont@acme.fr>, tel 06 12 34 56 78.";
@@ -463,7 +484,8 @@ namespace
         document_report csv_report;
         const string csv_out = a.anonymize(csv, document_format::delimited, csv_report);
         DLIB_TEST(csv_out.find("DUPONT") == string::npos && csv_out.find("MARTIN") == string::npos);
-        DLIB_TEST(csv_out.find("\"Client depuis 2019; RAS\"") != string::npos);
+        // The quoted cell keeps its quotes and its separator; the year it dates is protected.
+        DLIB_TEST(csv_out.find("\"Client depuis [[DATE:") != string::npos && csv_out.find("; RAS\"") != string::npos);
         DLIB_TEST(csv_out.find("Nom;Prénom;Email") == 0);
         document_report csv_back;
         DLIB_TEST(a.restore(csv_out, document_format::delimited, csv_back) == csv);
@@ -694,7 +716,7 @@ namespace
         clean("Le prix unitaire est 12.5000, 3.2000 par lot.");
         clean("L'hôtel 12345678 n'a rien à voir.");
         clean("La méthode @Override ne compte pas.");
-        clean("En 2024 le contrat 2024 prévoit une hausse.");
+        clean("Le contrat 2024 prévoit une hausse de 2024 euros.");   // a year dates a fact after "en", "depuis"...
         clean("Carte 4970 1012 3456 7894 refusée");     // fails Luhn
 
         // The new values are protected and restored exactly.
@@ -1159,6 +1181,346 @@ namespace
     }
 
 // ----------------------------------------------------------------------------------------
+
+    void test_learned_organizations()
+    {
+        /* The organisations a recognizer reads take the boundaries of the annotation: its
+           pieces are joined, legal forms and head nouns taken, the words of the sentence left
+           out, and a place after a legal form kept apart. */
+        auto spans = std::make_shared<std::vector<std::pair<string, string>>>();
+        pii_detector detector;
+        detector.add_recognizer([spans](const string& t) {
+            std::vector<pii_span> out;
+            for (const auto& v : *spans)
+            {
+                const size_t p = t.find(v.first);
+                if (p == string::npos) continue;
+                pii_span s;
+                s.begin = p; s.end = p + v.first.size(); s.label = v.second; s.confidence = 0.95;
+                out.push_back(s);
+            }
+            std::sort(out.begin(), out.end(), [](const pii_span& a, const pii_span& b) { return a.begin < b.begin; });
+            return out;
+        });
+        auto read = [&](const string& text, const std::vector<std::pair<string, string>>& values) {
+            *spans = values;
+            detector.begin_document();
+            return detector.detect(text);
+        };
+        // Legal forms after the name, written as forms.
+        string text = "Signé par Armium a.s. et par Foxglove A/S, puis par Kerexa SARL AU.";
+        std::vector<pii_entity> e = read(text, {{"Armium", "ORGANIZATION"}, {"Foxglove", "ORGANIZATION"},
+                                                 {"Kerexa SARL", "ORGANIZATION"}});
+        DLIB_TEST(found(e, text, pii_type::organization, "Armium a.s."));
+        DLIB_TEST(found(e, text, pii_type::organization, "Foxglove A/S"));
+        DLIB_TEST(found(e, text, pii_type::organization, "Kerexa SARL AU"));
+        text = "HERMINE PVT. LTD.\nReferences: Xanium Insaat Ltd. Sti. (Istanbul)";
+        e = read(text, {{"HERMINE PVT", "ORGANIZATION"}, {"Xanium Insaat Ltd.", "ORGANIZATION"},
+                        {"Sti", "FAMILY_NAME"}});
+        DLIB_TEST(found(e, text, pii_type::organization, "HERMINE PVT. LTD."));
+        DLIB_TEST(found(e, text, pii_type::organization, "Xanium Insaat Ltd. Sti."));
+        // Pieces of one name, the trade words between them, partners after a conjunction.
+        text = "Customer Service, Merrow Oil and Gas Plc\nCLUB: BARAN I WSPÓLNICY S.A.";
+        e = read(text, {{"Merrow Oil", "ORGANIZATION"}, {"Gas Plc", "ORGANIZATION"}, {"BARAN", "GIVEN_NAME"},
+                        {"SPÓLNICY S.A", "ORGANIZATION"}});
+        DLIB_TEST(found(e, text, pii_type::organization, "Merrow Oil and Gas Plc"));
+        DLIB_TEST(found(e, text, pii_type::organization, "BARAN I WSPÓLNICY S.A."));
+        // Head nouns and legal forms alone take the name after them.
+        text = "Committee minutes, Club Deportivo Madrid: Dr Caitlin Hall, TOV Briora, was elected chair.";
+        e = read(text, {{"Club Deportivo", "ORGANIZATION"}, {"Caitlin", "GIVEN_NAME"}, {"Hall", "FAMILY_NAME"},
+                        {"TOV", "ORGANIZATION"}});
+        DLIB_TEST(found(e, text, pii_type::organization, "Club Deportivo Madrid"));
+        DLIB_TEST(found(e, text, pii_type::organization, "TOV Briora"));
+        DLIB_TEST(found(e, text, pii_type::person, "Caitlin Hall"));
+        // A place after a legal form is a place; a legal form ends the name.
+        text = "Branch: Larkspur ltée, São Paulo\nCustomer Service, Solix FZE Save the file as export.xlsx.";
+        e = read(text, {{"Larkspur ltée", "ORGANIZATION"}, {"São Paulo", "ORGANIZATION"},
+                        {"Solix FZE Save", "ORGANIZATION"}});
+        DLIB_TEST(found(e, text, pii_type::organization, "Larkspur ltée"));
+        DLIB_TEST(found(e, text, pii_type::location, "São Paulo"));
+        DLIB_TEST(found(e, text, pii_type::organization, "Solix FZE") && !covered(e, text, "Save"));
+        // The words of the sentence around the name: capitals, an article, a person before an elision.
+        text = "DE MAILLARD CÉLESTIN DIRIGE DEPUIS DIX ANS ELEXA LTÉE, INSTALLÉE À PATRA.";
+        e = read(text, {{"CÉLESTIN DIRIGE DEPUIS DIX ANS ELEXA LTÉE", "ORGANIZATION"}});
+        DLIB_TEST(found(e, text, pii_type::organization, "ELEXA LTÉE"));
+        text = "Courrier de La Police nationale. Typhaine Marnier d'Abeona S.r.l. souhaite te rencontrer.";
+        e = read(text, {{"La Police nationale", "ORGANIZATION"},
+                        {"Typhaine Marnier d'Abeona S.r.l.", "ORGANIZATION"}});
+        DLIB_TEST(found(e, text, pii_type::organization, "Police nationale") && !covered(e, text, "La Police"));
+        DLIB_TEST(found(e, text, pii_type::organization, "Abeona S.r.l."));
+        // A particle before a family name opens the name, at the start of a line too.
+        text = "Le Moigne & Sons plc\nDirection des ressources humaines";
+        e = read(text, {{"Le", "ORGANIZATION"}, {"Moigne & Sons plc", "ORGANIZATION"}});
+        DLIB_TEST(found(e, text, pii_type::organization, "Le Moigne & Sons plc"));
+        // A common word alone or a common word in lower case names no organisation.
+        text = "Convocation\nThe embassy of Spain in Warsaw informs Mr. Larry Begum that his passport is ready.";
+        e = read(text, {{"Convocation", "ORGANIZATION"}, {"embassy of Spain", "ORGANIZATION"},
+                        {"Warsaw", "CITY"}});
+        DLIB_TEST(!covered(e, text, "Convocation") && !covered(e, text, "embassy"));
+        DLIB_TEST(found(e, text, pii_type::location, "Warsaw"));
+        // A known organisation keeps its type against a piece read as a place.
+        text = "LOPEZ Tony, Vueling";
+        e = read(text, {{"LOPEZ", "FAMILY_NAME"}, {"Tony", "GIVEN_NAME"}, {"Vueling", "CITY"}});
+        DLIB_TEST(found(e, text, pii_type::organization, "Vueling"));
+        DLIB_TEST(found(e, text, pii_type::person, "LOPEZ Tony"));
+    }
+
+// ----------------------------------------------------------------------------------------
+
+    void test_learned_places()
+    {
+        /* A country or a state stays readable when a recognizer reads it as a place, and a
+           country after an address value stays out of it. */
+        auto spans = std::make_shared<std::vector<std::pair<string, string>>>();
+        pii_detector detector;
+        detector.add_recognizer([spans](const string& t) {
+            std::vector<pii_span> out;
+            for (const auto& v : *spans)
+            {
+                const size_t p = t.find(v.first);
+                if (p == string::npos) continue;
+                pii_span s;
+                s.begin = p; s.end = p + v.first.size(); s.label = v.second; s.confidence = 0.95;
+                out.push_back(s);
+            }
+            std::sort(out.begin(), out.end(), [](const pii_span& a, const pii_span& b) { return a.begin < b.begin; });
+            return out;
+        });
+        auto read = [&](const string& text, const std::vector<std::pair<string, string>>& values) {
+            *spans = values;
+            detector.begin_document();
+            return detector.detect(text);
+        };
+        string text = "34 Hay Street, Sydney NSW 2010, Australia";
+        std::vector<pii_entity> e = read(text, {{"Sydney", "CITY"}, {"NSW", "POSTAL_CODE"}, {"2010", "POSTAL_CODE"},
+                                                 {"Australia", "CITY"}});
+        DLIB_TEST(found(e, text, pii_type::location, "Sydney"));
+        DLIB_TEST(found(e, text, pii_type::location, "2010"));
+        DLIB_TEST(!covered(e, text, "NSW") && !covered(e, text, "Australia"));
+        text = "Chevalier Holdings LLC\n47, rue Joss\nDouala\nCameroun\n\nPietermaritzburg 3201, Afrique du Sud";
+        e = read(text, {{"Douala", "CITY"}, {"Cameroun", "CITY"}, {"Pietermaritzburg", "CITY"}, {"3201", "POSTAL_CODE"},
+                        {"Sud", "CITY"}});
+        DLIB_TEST(found(e, text, pii_type::location, "Douala"));
+        DLIB_TEST(found(e, text, pii_type::location, "Pietermaritzburg 3201"));
+        DLIB_TEST(!covered(e, text, "Cameroun") && !covered(e, text, "Sud"));
+        // The pieces of an address cut inside a word are one address.
+        text = "ul. Długa 5\n00-238 Warszawa";
+        e = read(text, {{"u", "STREET_ADDRESS"}, {"l. Długa 5", "STREET_ADDRESS"}, {"00-238", "POSTAL_CODE"},
+                        {"Warszawa", "CITY"}});
+        DLIB_TEST(found(e, text, pii_type::address, "ul. Długa 5"));
+        // A country that is also the name of its capital stays a place.
+        text = "Siège : 3 Rue de la Gare, L-2449 Luxembourg";
+        e = read(text, {{"L-2449", "POSTAL_CODE"}, {"Luxembourg", "CITY"}});
+        DLIB_TEST(covered(e, text, "Luxembourg"));
+        // The streets of other countries, the number after the name, by the rules alone.
+        text = "ul. Długa 5\nCalle Sol, 86\nRua das Flores, 143\nKossuth Lajos utca 16\nAtatürk Caddesi No:12\n"
+               "Hauptstraße 12\nKeizersgracht 123\nKarl Johans gate 1\nBerliner Str. 5\nGarantie 2 ans";
+        e = read(text, {});
+        for (const char* street : { "ul. Długa 5", "Calle Sol, 86", "Rua das Flores, 143", "Kossuth Lajos utca 16",
+                                    "Atatürk Caddesi No:12", "Hauptstraße 12", "Keizersgracht 123", "Karl Johans gate 1",
+                                    "Berliner Str. 5" })
+            DLIB_TEST_MSG(found(e, text, pii_type::address, street), street);
+        DLIB_TEST(!covered(e, text, "Garantie"));
+        // The rules alone, after the label of an address.
+        text = "Adresse : 40 rue Tarik Ibn Ziad, 60000 Oujda, Maroc\nAddress: 15 Harambee Avenue, Nairobi 00200, Kenya";
+        e = read(text, {});
+        DLIB_TEST(covered(e, text, "Oujda") && !covered(e, text, "Maroc"));
+        DLIB_TEST(covered(e, text, "Nairobi") && !covered(e, text, "Kenya"));
+        text = "Adresse : 21 Oak Avenue, Miami, FL 33130, États-Unis. Est-elle toujours valable ?";
+        e = read(text, {});
+        DLIB_TEST(covered(e, text, "Miami") && !covered(e, text, "États-Unis") && !covered(e, text, "Est-elle"));
+    }
+
+    void test_learned_terms()
+    {
+        /* The terms of a medical record and the cells of its tables name nobody, whatever a
+           recognizer reads in them; the names around them stay found. */
+        struct value { string text; string label; double confidence; };
+        auto spans = std::make_shared<std::vector<value>>();
+        pii_detector detector;
+        detector.add_recognizer([spans](const string& t) {
+            std::vector<pii_span> out;
+            size_t from = 0;
+            for (const auto& v : *spans)
+            {
+                const size_t p = t.find(v.text, from);
+                if (p == string::npos) continue;
+                pii_span s;
+                s.begin = p; s.end = p + v.text.size(); s.label = v.label; s.confidence = v.confidence;
+                out.push_back(s);
+                from = s.end;
+            }
+            return out;
+        });
+        auto read = [&](const string& text, const std::vector<value>& values) {
+            *spans = values;
+            detector.begin_document();
+            return detector.detect(text);
+        };
+        string text = "TSH 2,1 mUI/L\nLDL-cholestérol 1,52 g/L\nCréatinine (DFG CKD-EPI) 8,0 mg/L\n"
+                      "Hypertension artérielle\nFréquence cardiaque 68 bpm 60 – 100 Normale\nPage 1";
+        std::vector<pii_entity> e = read(text, {{"UI", "CITY", 0.9}, {"L", "CITY", 0.9},
+                                                {"DL-cholestérol", "ORGANIZATION", 0.9},
+                                                {"Créatinine", "GIVEN_NAME", 0.9}, {"Hypertension", "ORGANIZATION", 0.9},
+                                                {"60", "STREET_ADDRESS", 0.9}, {"Page", "CITY", 0.9}});
+        for (const pii_entity& x : e)
+            DLIB_TEST_MSG(false, text.substr(x.begin, x.end - x.begin));
+        text = "Bruit (quais de chargement) : Mme Laure Quéméner, 12 rue des Lilas, Quimper (29)";
+        e = read(text, {{"quais", "ORGANIZATION", 0.9}, {"Laure", "GIVEN_NAME", 0.95},
+                        {"Quéméner", "FAMILY_NAME", 0.95}, {"12", "STREET_ADDRESS", 0.9},
+                        {"rue des Lilas", "STREET_ADDRESS", 0.9}, {"Quimper", "CITY", 0.95}});
+        DLIB_TEST(!covered(e, text, "quais"));
+        DLIB_TEST(found(e, text, pii_type::person, "Laure Quéméner"));
+        DLIB_TEST(covered(e, text, "12 rue") && covered(e, text, "rue des Lilas"));
+        DLIB_TEST(found(e, text, pii_type::location, "Quimper (29)"));
+        // A line in lower case keeps its organisations; an elided article stays outside one.
+        text = "elle travaille chez kerlys conseil depuis peu";
+        e = read(text, {{"kerlys conseil", "ORGANIZATION", 0.9}});
+        DLIB_TEST(found(e, text, pii_type::organization, "kerlys conseil"));
+        text = "Véhicule de service, formation de l'Auto-école du Steir";
+        e = read(text, {{"l'Auto-école du", "ORGANIZATION", 0.6}});
+        DLIB_TEST(found(e, text, pii_type::organization, "Auto-école du Steir"));
+    }
+
+    void test_name_edges()
+    {
+        /* A name keeps the end of its word after an apostrophe and the capitalized particle
+           written before it, and a first name joins the family name that a recognizer reads as
+           an organisation or an address. */
+        struct value { string text; string label; double confidence; };
+        auto spans = std::make_shared<std::vector<value>>();
+        pii_detector detector;
+        detector.add_recognizer([spans](const string& t) {
+            std::vector<pii_span> out;
+            size_t from = 0;
+            for (const auto& v : *spans)
+            {
+                const size_t p = t.find(v.text, from);
+                if (p == string::npos) continue;
+                pii_span s;
+                s.begin = p; s.end = p + v.text.size(); s.label = v.label; s.confidence = v.confidence;
+                out.push_back(s);
+                from = s.end;
+            }
+            return out;
+        });
+        auto read = [&](const string& text, const std::vector<value>& values) {
+            *spans = values;
+            detector.begin_document();
+            return detector.detect(text);
+        };
+        // The Breton "c'h" and "Prud'homme" after a civility, with the rules alone.
+        string text = "Visite de Mme Prud'homme et de M. Le Floc'h, puis de Mme Le Bec'h.";
+        std::vector<pii_entity> e = read(text, {});
+        DLIB_TEST(found(e, text, pii_type::person, "Prud'homme"));
+        DLIB_TEST(found(e, text, pii_type::person, "Le Floc'h"));
+        DLIB_TEST(found(e, text, pii_type::person, "Le Bec'h"));
+        // A place and an address that a recognizer stops at the apostrophe.
+        text = "Né à Penmarc'h, domicilié 12 rue de Penmarc'h.";
+        e = read(text, {{"Penmarc", "CITY", 0.95}, {"12 rue de Penmarc", "STREET_ADDRESS", 0.95}});
+        DLIB_TEST(found(e, text, pii_type::location, "Penmarc'h"));
+        DLIB_TEST(found(e, text, pii_type::address, "12 rue de Penmarc'h"));
+        // An English possessive and the elision of "que" stay outside.
+        text = "Mr Martin's report was late.";
+        e = read(text, {{"Martin", "FAMILY_NAME", 0.95}});
+        DLIB_TEST(found(e, text, pii_type::person, "Martin"));
+        DLIB_TEST(!covered(e, text, "'s report"));
+        // A particle in the case of the name opens it; "de" before a name without particle does not.
+        text = "LE FLOC'H Yann, né à Brest\nDE LA FONTAINE Jean\nRAPPORT DE DUPONT Marie\nAvec Le Bihan";
+        e = read(text, {{"LE", "ORGANIZATION", 0.55}, {"FLOC'H", "FAMILY_NAME", 0.62}, {"Yann", "GIVEN_NAME", 0.85},
+                        {"LA FONTAINE", "FAMILY_NAME", 0.95}, {"Jean", "GIVEN_NAME", 0.99},
+                        {"DUPONT", "FAMILY_NAME", 0.95}, {"Marie", "GIVEN_NAME", 0.99},
+                        {"Bihan", "FAMILY_NAME", 0.9}});
+        DLIB_TEST(found(e, text, pii_type::person, "LE FLOC'H Yann"));
+        DLIB_TEST(found(e, text, pii_type::person, "DE LA FONTAINE Jean"));
+        DLIB_TEST(found(e, text, pii_type::person, "DUPONT Marie"));
+        DLIB_TEST(found(e, text, pii_type::person, "Le Bihan"));
+        // A first name and the family name read as an address or an organisation make one person.
+        text = "Contact : Yann Le Floc'h, 29760 Penmarc'h.";
+        e = read(text, {{"Yann", "GIVEN_NAME", 0.99}, {"Le Floc'h", "STREET_ADDRESS", 0.77},
+                        {"29760", "POSTAL_CODE", 0.99}, {"Penmarc'h", "CITY", 0.99}});
+        DLIB_TEST(found(e, text, pii_type::person, "Yann Le Floc'h"));
+        DLIB_TEST(found(e, text, pii_type::location, "29760 Penmarc'h"));
+        text = "Yann Le Floc'h et Anne Le Bec'h sont arrivés.";
+        e = read(text, {{"Yann", "GIVEN_NAME", 0.92}, {"Le Floc'", "ORGANIZATION", 0.71},
+                        {"Anne", "GIVEN_NAME", 0.99}, {"Le", "FAMILY_NAME", 0.6}});
+        DLIB_TEST(found(e, text, pii_type::person, "Yann Le Floc'h"));
+        DLIB_TEST(found(e, text, pii_type::person, "Anne Le Bec'h"));
+        // A civility or a name label keeps a person that a recognizer reads as an organisation.
+        text = "Nom : LE FLOC'H\nSignature de Mme Le Floc'h\nNom : Garage Le Floc'h";
+        e = read(text, {{"LE FLOC'H", "ORGANIZATION", 0.83}, {"Le Floc'h", "ORGANIZATION", 0.92},
+                        {"Garage Le Floc'h", "ORGANIZATION", 0.9}});
+        DLIB_TEST(found(e, text, pii_type::person, "LE FLOC'H"));
+        DLIB_TEST(found(e, text, pii_type::person, "Le Floc'h"));
+        DLIB_TEST(found(e, text, pii_type::organization, "Garage Le Floc'h"));
+        // Another label may announce an organisation: the recognizer keeps its type.
+        text = "Expéditeur : FENYS, 91 rue de Brest, 29000 Quimper";
+        e = read(text, {{"FENYS", "ORGANIZATION", 0.9}});
+        DLIB_TEST(found(e, text, pii_type::organization, "FENYS"));
+        // An organisation known by its own name stays one.
+        text = "Le colis de Paul La Poste l'a livré.";
+        e = read(text, {{"Paul", "GIVEN_NAME", 0.95}, {"La Poste", "ORGANIZATION", 0.9}});
+        DLIB_TEST(found(e, text, pii_type::person, "Paul"));
+        DLIB_TEST(found(e, text, pii_type::organization, "La Poste"));
+    }
+
+    void test_partial_dates()
+    {
+        // A month and its year, a year that dates something: dates, which move with the others.
+        pii_detector detector;
+        string text = "Hypertension découverte en mars 2022, lombalgie en 2023, tabac arrêté depuis 2021. "
+                      "En baisse depuis octobre 2025 (10/2025). Axes : 03/2022 09/2023. Née en 1984, "
+                      "suivie de 2015 à 2019, mi-2021, the class of 2015, born in March, 1990.";
+        std::vector<pii_entity> e = detector.detect(text);
+        for (const char* date : { "mars 2022", "2023", "2021", "octobre 2025", "10/2025", "03/2022", "09/2023",
+                                  "1984", "2015", "2019", "March, 1990" })
+            DLIB_TEST_MSG(found(e, text, pii_type::date, date), date);
+        DLIB_TEST(found(e, text, pii_type::date, "2021") && covered(e, text, "2015 à") &&
+                  covered(e, text, "2021, the"));
+
+        // A CV line, alone or as a range before a colon.
+        text = "Expérience\n2015 – 2019 : technicien\n2012 : BTS\nLicence 2019-2020";
+        e = detector.detect(text);
+        DLIB_TEST(found(e, text, pii_type::date, "2015") && found(e, text, pii_type::date, "2019") &&
+                  found(e, text, pii_type::date, "2012"));
+        for (const pii_entity& x : e)
+            DLIB_TEST(!(x.type == pii_type::date && x.begin >= text.find("2019-2020")));
+
+        // Capital ordinals, a range in any order, a diploma session, a date after a phone cue.
+        text = "EXTRACTION DU 1ER FÉVRIER 2025\n2022–2005 : conducteur\nobtenu à la session de 2011. "
+               "Suite à notre entretien téléphonique du 16-02-2027, voici l'offre.";
+        e = detector.detect(text);
+        for (const char* date : { "1ER FÉVRIER 2025", "2022", "2005", "2011", "16-02-2027" })
+            DLIB_TEST_MSG(found(e, text, pii_type::date, date), date);
+
+        // A reference that carries a year is protected without its cue.
+        text = "Référence\nINC-2026-0147\nNorme ISO 27001:2022, version 3.2-2024.";
+        e = detector.detect(text);
+        DLIB_TEST(found(e, text, pii_type::identifier, "INC-2026-0147"));
+        DLIB_TEST(!covered(e, text, "27001") && !covered(e, text, "3.2-2024"));
+
+        // Numbers, references and quantities are no dates; the date of a street names it.
+        text = "Tiré en 2000 exemplaires, dossier n° 03/2022, version 10.2025, 2001:db8::1, 1500 € en 2000 euros, "
+               "1-29-17 Gion, Tokyo.";
+        e = detector.detect(text);
+        for (const pii_entity& x : e)
+            DLIB_TEST_MSG(x.type != pii_type::date, text.substr(x.begin, x.end - x.begin));
+        text = "Il habite 182 rue du 18 Juin 1940 à Rodez. Elle est née à Quimper (29) en 1984, à Brest (29200).";
+        e = detector.detect(text);
+        DLIB_TEST(found(e, text, pii_type::address, "182 rue du 18 Juin 1940"));
+        DLIB_TEST(found(e, text, pii_type::location, "Quimper (29)"));
+        DLIB_TEST(found(e, text, pii_type::location, "Brest (29200)"));
+
+        // Round trip through a pseudonymizer: the protected text keeps no date in clear.
+        const pseudonymization_key key = pseudonymization_key::from_bytes(string(32, '\x17'));
+        const pseudonymizer p(key);
+        text = "Découverte en mars 2022, suivie depuis 03/2022 et en 2023.";
+        e = detector.detect(text);
+        const string protected_text = p.apply(text, e);
+        DLIB_TEST(protected_text.find("mars 2022") == string::npos && protected_text.find("03/2022") == string::npos &&
+                  protected_text.find("en 2023") == string::npos);
+        DLIB_TEST(p.restore(protected_text) == text);
+    }
 
     void test_attribute_coverage()
     {
@@ -1859,6 +2221,13 @@ namespace
             test_attributes_and_public_bodies();
             print_spinner();
             test_known_names();
+            test_learned_organizations();
+            test_learned_places();
+            print_spinner();
+            test_partial_dates();
+            print_spinner();
+            test_learned_terms();
+            test_name_edges();
             print_spinner();
             test_attribute_coverage();
             print_spinner();

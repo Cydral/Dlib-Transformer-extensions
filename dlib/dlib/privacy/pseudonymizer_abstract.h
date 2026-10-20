@@ -110,8 +110,13 @@ namespace dlib
         /*!
             WHAT THIS ENUM REPRESENTS
                 How dates are protected.
-                shift   - every date moves by the same secret number of weeks: order,
-                          intervals, ages at a given date and weekdays are preserved
+                shift   - every date moves into the past by the same secret number of
+                          weeks: order, intervals, ages at a given date and weekdays are
+                          preserved, and a date of the past never shows up in the future.
+                          A month and its year ("mars 2022", "03/2022") move by the nearest
+                          whole number of months, a year alone by the nearest whole number
+                          of years, so that no date left without its day gives the shift
+                          away
                 encrypt - dates become opaque codes, only equality is preserved
                 keep    - dates are left in clear: apply() and the document handlers
                           leave them untouched (see keeps_in_clear())
@@ -133,8 +138,8 @@ namespace dlib
                                   of them); a different context makes them unlinkable.
                                   Restoration needs the context used for protection.
                 dates           - the date policy
-                max_shift_weeks - the largest shift of date_policy::shift, in weeks,
-                                  clamped to [1, 5200]
+                max_shift_weeks - the largest shift of date_policy::shift, in weeks into
+                                  the past, clamped to [1, 5200]
                 date_order      - how numeric dates such as 03/04/2026 are read
         !*/
         std::string context;
@@ -169,9 +174,12 @@ namespace dlib
                         carried by the case of its code. "Dupont" and "DUPONT" become
                         "Zkwrtuvqahb" and "ZKWRTUVQAHB", and the code of a word is the same
                         wherever it occurs, so "Jean Dupont", "M. Dupont" and
-                        jean.dupont@acme.fr visibly share their codes. Particles, street
-                        types and legal forms stay readable ("de", "rue", "SAS"); the top
-                        level domain of an e-mail stays readable. Digit groups of six or
+                        jean.dupont@acme.fr visibly share their codes. Street types,
+                        legal forms and the prepositions of places and organisations stay
+                        readable ("rue", "SAS", "de"); the particles of a person name are
+                        encrypted like its other words, since "Le", "van" or "bin" would
+                        tell the language of the name. The top level domain of an e-mail
+                        stays readable. Digit groups of six or
                         more are encrypted as digits. Words with irregular case are
                         encrypted exactly and marked with a trailing '!'. The length of a
                         code follows the length of its word, so a protected text still
@@ -202,7 +210,9 @@ namespace dlib
                     License plates (AA-123-AA): encrypted within the plate space.
                     IPv4 and IPv6: Crypto-PAn, so shared prefixes (subnets) are preserved.
                     Dates (date_policy::shift): ISO 8601 rendering of the shifted date,
-                        followed by "~" and a format code when the original was not ISO.
+                        YYYY-MM-DD, YYYY-MM for a month and its year, YYYY for a year
+                        alone, followed by "~" and a format code when the original was not
+                        ISO.
                     Anything a dedicated code cannot represent, and every value whose tag
                         would not decode back to it, takes an exact FF1 encryption of the
                         whole value, rendered as lower case letters followed by '!'.
@@ -314,9 +324,24 @@ namespace dlib
         long date_shift_days() const;
         /*!
             ensures
-                - Returns the secret shift of date_policy::shift in days: a non-zero
+                - Returns the secret shift of date_policy::shift in days: a negative
                   multiple of 7 whose magnitude is at most 7 times max_shift_weeks, once
                   clamped to [1, 5200]. It depends on the key and the context only.
+        !*/
+
+        long date_shift_months() const;
+        /*!
+            ensures
+                - Returns the shift of the dates written without a day: date_shift_days()
+                  in months of 30.436875 days, rounded to the nearest, and -1 when that
+                  gives 0.
+        !*/
+
+        long date_shift_years() const;
+        /*!
+            ensures
+                - Returns the shift of the years written alone: date_shift_days() in years
+                  of 365.2425 days, rounded to the nearest, and -1 when that gives 0.
         !*/
 
         double shift_date_serial(double serial, bool forward) const;

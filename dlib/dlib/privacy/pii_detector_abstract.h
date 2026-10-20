@@ -43,9 +43,11 @@ namespace dlib
                                     branch of a national body with its place ("Agence
                                     France Travail d'Arras", "the Leeds Jobcentre Plus").
                                     A head noun alone ("la préfecture"), a branch named by
-                                    its place only ("l'agence de Lyon") and the councils of
-                                    an organisation ("la Direction financière", "the
-                                    Steering Group") stay readable.
+                                    its place only ("l'agence de Lyon"), a diplomatic post
+                                    named by its country ("the embassy of Spain"), the
+                                    councils of an organisation ("la Direction financière",
+                                    "the Steering Group") and the label of a number
+                                    ("numéro de Sécurité sociale") stay readable.
         !*/
         std::vector<pii_type> types = all_pii_types();
         numeric_date_order date_order = numeric_date_order::day_month_year;
@@ -146,44 +148,59 @@ namespace dlib
                    international layouts, social handles, pre-2009 French plates
                    and the references of files, customers, contracts, claims, invoices,
                    requests, applications, permits or asset tags ("dossier n° 2024-00123",
-                   reference "B4694342", "Ref: 2476486"), a file name excepted. A cue is a
+                   reference "B4694342", "Ref: 2476486"), a file name excepted; a reference
+                   that carries a year between capitals and digits needs none, since its
+                   year would also tell how far the dates moved ("INC-2026-0147"). A cue is a
                    whole word: "SIM" is not found in "Simon", nor "tel" in "hotel"; a cue
                    written with a final '*' in this implementation is a prefix ("tél." and
                    "téléphone"). These scanners work in time linear in the length of the
-                   text.
+                   text. Dates are those of find_dates(): complete dates, a month with its
+                   year ("mars 2022", "03/2022") and a year that dates a fact ("en 2019",
+                   "depuis 2021", the years of a CV line), since a month or a year left in
+                   clear would tell how far the protected dates moved; a date that names a
+                   street ("rue du 18 Juin 1940") belongs to the address, the numbers of a
+                   Japanese address are no date ("1-29-17 Gion"), and a date after a phone cue
+                   stays a date ("entretien téléphonique du 16-02-2027").
 
-                2. Linguistic evidence. Person names are scored from civilities and
-                   titles (M., Mme, Dr), field labels ("Nom :", "Signé par"), the
-                   first-name lexicon (given names from all regions of the world, their
-                   short forms, nicknames and stage names), shape (Jean DUPONT, Amadou BA),
-                   surrounding cues ("né le", "épouse", "je soussigné") and the document
-                   lexicon; particles ("M. Le Goff", "M. de La Guen") and apostrophe forms
-                   ("N'Diaye", "O'Connor") belong to the name, a professional title (Dr,
-                   Maître) and a greeting ("Salut Murat") do not. A nickname, a stage name
-                   or a pen name announced by its cue is a person too ("Jean Dupont, dit
+                2. Linguistic evidence. Person names are scored from civilities and titles
+                   (M., Mme, Dr), field labels ("Nom :", "Signé par"), the first-name lexicon
+                   (given names from all regions of the world, their short forms, nicknames
+                   and stage names), shape (Jean DUPONT, Amadou BA), surrounding cues ("né
+                   le", "épouse", "je soussigné") and the document lexicon; particles ("M. Le
+                   Goff", "M. de La Guen", "LE FLOC'H Yann"), apostrophe forms ("N'Diaye",
+                   "O'Connor") and the end of a word after an apostrophe (the Breton "c'h" of
+                   "Le Floc'h" and "Penmarc'h", "Prud'homme") belong to the name or the
+                   place, an English possessive does not ("Martin's"), nor do a professional
+                   title (Dr, Maître) and a greeting ("Salut Murat"). A nickname, a stage
+                   name or a pen name announced by its cue is a person too ("Jean Dupont, dit
                    « Jojo »", "surnommée Mimi", "a.k.a. 'Smithy'", "sous le pseudonyme de
                    Vernon Sullivan"), while reported speech stays readable ("Il a dit
                    « bonjour »"). Organisations come from legal forms before or after the
                    name ("SAS Iroise", "Dupont Conseil SAS"), head nouns ("Cabinet Martin",
-                   "Universidad de Sevilla"), sector words after a name ("Zorvane Finance",
+                   "Universidad de Sevilla"), with the adjectives that qualify them ("Hôpital
+                   privé des Glénan", "Centre hospitalier de Brest", "Auto-école du Steir",
+                   above the place they hold), sector words after a name ("Zorvane Finance",
                    "Ulmeo Seguros"), partners ("Martin et Fils"), public body names, and
-                   about two thousand organisations of all countries known by their own
-                   name ("Airbus", "Johnson & Johnson", "La Banque postale"), with a legal
-                   form, a trade or a country after them ("AXA France"); such a name
-                   followed by another capitalized word is a product or a longer name and
-                   is left to the other channels ("Microsoft Teams", "Airbus A320").
-                   Products, applications and the intergovernmental organisations of the
-                   United Nations system are left out of that table. "La société"
-                   introduces a name and stays outside it. Addresses come
-                   from street types, places from postal codes ("CEDEX" stays readable),
+                   about two thousand organisations of all countries known by their own name
+                   ("Airbus", "Johnson & Johnson", "La Banque postale"), with a legal form, a
+                   trade or a country after them ("AXA France"); such a name followed by
+                   another capitalized word is a product or a longer name and is left to the
+                   other channels ("Microsoft Teams", "Airbus A320"). Products, applications
+                   and the intergovernmental organisations of the United Nations system are
+                   left out of that table. "La société" introduces a name and stays outside
+                   it. Addresses come from street types, and in other countries from the
+                   types written before, after or at the end of the name when the house
+                   number follows it ("ul. Długa 5", "Calle Sol, 86", "Kossuth Lajos utca
+                   16", "Hauptstraße 12"); places from postal codes ("CEDEX" stays readable),
                    from "City, ST 90012" and British postcodes, from the postal codes of
-                   other countries written before or after their town, after a street,
-                   before a country or alone on their line, as in a paragraph of a letter
-                   ("8004 Zurich", "00-238 Warszawa", "1015 CJ Amsterdam", "Tel Aviv
-                   6688116", "Tokyo 153-0063", "Dublin D02 X285"),
-                   from "né à", "domicilié à", "originaire de", and from the place before
-                   the date of a letter ("Rennes, le 12 mars 2024"). User names come from
-                   logs and chats ("user=jdupont", "[10:42] jdupont:", "opened by
+                   other countries written before or after their town, after a street, before
+                   a country or alone on their line, as in a paragraph of a letter ("8004
+                   Zurich", "00-238 Warszawa", "1015 CJ Amsterdam", "Tel Aviv 6688116",
+                   "Tokyo 153-0063", "Dublin D02 X285"), a place taking the department or
+                   postal code written in brackets after it ("Quimper (29)", "Brest
+                   (29200)"), from "né à", "domicilié à", "originaire de", and from the place
+                   before the date of a letter ("Rennes, le 12 mars 2024"). User names come
+                   from logs and chats ("user=jdupont", "[10:42] jdupont:", "opened by
                    jdupont").
 
                    A civility before a name is reported as title, since it tells the sex
@@ -220,10 +237,18 @@ namespace dlib
                    validated scanners; a given name and a family name side by side
                    become one person, a postal code and its city one place, and a
                    confident full name feeds the propagation of channel 3. A piece they
-                   read inside an organisation known by its own name, or inside a postal
-                   code of another country with its town, leaves that value whole ("Bahn"
-                   in "Deutsche Bahn", "Tokyo 153" in "Tokyo 153-0063"); a span that goes
-                   beyond it keeps its own boundaries.
+                   read inside an organisation known by its own name or a public body of
+                   the lexicon, or inside a postal code of another country with its town,
+                   leaves that value whole ("Bahn" in "Deutsche Bahn", "Tokyo 153" in
+                   "Tokyo 153-0063"), and so do a piece of another type read on the same
+                   words ("Vueling" read as a place) and an organisation that holds a part
+                   of it only ("Courrier de Le Parlement" across "Parlement européen"); a
+                   span that goes beyond it keeps its own boundaries. A person that a
+                   civility or a name label announces stays a person when they read it as
+                   an organisation, a place or an address with no word of a firm or of a
+                   street ("Nom : LE FLOC'H"), and a first name joins the family name that
+                   follows it with a capitalized particle, whatever type they give it
+                   ("Yann" and "Le Floc'h").
 
                 The detector is a recall-oriented filter. Its output is meant to be
                 pseudonymized, and a residual-risk audit of the protected document is
@@ -302,24 +327,63 @@ namespace dlib
                 - recognizer is called on every text analysed afterwards, and its spans
                   whose confidence is at least min_confidence are added to the candidates.
                   A span whose offsets fall inside a UTF-8 character covers that character.
-                - The pieces of one word, one name or one login that recognizer reports
-                  side by side are merged first ("E" and "sch-sur-Alzette"; "Inès", "de"
-                  and "Brunet"; "v" and "wojcikski"), and the at sign before a login joins
-                  it ("@hpetit38"). A span that names nothing is then ignored: a piece of a
-                  word that no other piece completes ("Rem" in "Remplacez"), a login inside
-                  a longer token, a file name ("rapport_final.docx"), a single character or
-                  a common word in lower case ("month") and, for persons,
-                  places and organisations, function words alone ("Votre"), a greeting, a
-                  closing or a field label alone ("Bonsoir", "Cordialement", "Nom"), a
-                  common word in lower case ("commande"), an organisation opened by an
-                  article and a word in lower case ("Le logiciel Excel"), a person or a
-                  place that joins capitalized words to words in lower case other than
-                  particles ("Le projet", while "Jean de La Fontaine" is kept), a word in
-                  lower case, other than a first name, in a text that capitalizes its
-                  words, a country alone read as an organisation ("Pologne"), the civility
-                  "M." before a name ("avec M. Martin", while "Monsieur M. Denis" keeps
-                  its initial), and a participle that opens a line before "à" ("Fait à
-                  Lyon").
+                - The pieces of one word, one name or one login that recognizer reports side
+                  by side are merged first ("E" and "sch-sur-Alzette"; "Inès", "de" and
+                  "Brunet"; "v" and "wojcikski"; "u" and "l. Długa 5"), and the at sign
+                  before a login joins it ("@hpetit38"). A span that names nothing is then
+                  ignored: a piece of a word that no other piece completes ("Rem" in
+                  "Remplacez"), a login inside a longer token, a file name
+                  ("rapport_final.docx"), a single character or a common word in lower case
+                  ("month") and, for persons, places and organisations, function words alone
+                  ("Votre"), a greeting, a closing or a field label alone ("Bonsoir",
+                  "Cordialement", "Nom"), a common word in lower case ("commande"), an
+                  organisation opened by an article and a word in lower case ("Le logiciel
+                  Excel"), a person or a place that joins capitalized words to words in
+                  lower case other than particles ("Le projet", while "Jean de La Fontaine"
+                  is kept), a word in lower case, other than a first name, in a text that
+                  capitalizes its words, a country alone read as an organisation
+                  ("Pologne"), a country or a piece of one read as a place ("Cameroun" on
+                  the line after "Douala", "Sud" in "Afrique du Sud"; a country that is also
+                  the name of its capital, such as "Luxembourg", stays a place), a state or
+                  a province in capitals beside a town or its postal code ("NSW" in "Sydney
+                  NSW 2010", which then makes two places), the civility "M." before a name
+                  ("avec M. Martin", while "Monsieur M. Denis" keeps its initial), a
+                  participle that opens a line before "à" ("Fait à Lyon"), a common word, a
+                  head noun, a legal form or a title alone read as an organisation
+                  ("Convocation", "Clinic", "Maître"), an organisation opened by a
+                  common word in lower case in a text that capitalizes its names ("the
+                  embassy of Spain"), terms of a medical record, a measure or a table
+                  heading, whatever their case ("Créatinine", "LDL-cholestérol", "Niveau",
+                  "Bilan de santé", "Audiogram"), and the capitals of a unit glued to its
+                  prefix ("UI" in "mUI/L").
+                - The organisations recognizer reports take the boundaries of the
+                  annotation of the pii datasets. Pieces of one name are joined: pieces
+                  that meet or are one space apart, that a comma, a bracket or a hyphen
+                  separates before a head noun, a legal form, a trade or a partner word,
+                  that an ampersand or a conjunction separates next to one, or that such
+                  words alone separate ("Zenane", "Oil and", "Gas Nigeria Limited"); head
+                  nouns and the place or the person they name ("Câmara Municipal de
+                  Porto"); a person and the partners that follow a conjunction ("BARAN I
+                  WSPÓLNICY S.A."). A person or a place read with a legal form, a partner
+                  word or the head noun of a town is an organisation ("Lumelle Bt.",
+                  "Stadt Karlsruhe"), and a place in brackets or after a comma that
+                  follows a legal form or a head noun is a place ("Larkspur ltée, São
+                  Paulo"). The name takes a capitalized head noun, trade or particle just
+                  before it ("Entreprise Meyer", "City of Sydney Council", "Le Corre
+                  Holdings Inc."), the legal forms, partner words, trades and head nouns
+                  just after it ("Armium a.s.", "Kerexa SARL AU", "Foxglove A/S", "Weber
+                  Bâtiment", "Oslo kommune"), and, when made of head nouns or legal forms
+                  alone, the capitalized words around it ("TALIS CLINIC", "Club Deportivo
+                  Madrid", "TOV Briora", "Instituto Désiré Carrasco"). A legal form ends
+                  the name ("Solix FZE" in "Solix FZE Save"); in a line of capitals the
+                  name starts after the last word of the sentence ("ELEXA LTÉE" in
+                  "DIRIGE DEPUIS DIX ANS ELEXA LTÉE"); greetings, articles before a common
+                  word or an acronym ("La Police nationale", "La CPAM"), an elided article
+                  in lower case ("l'Auto-école du Steir"), function words that open or
+                  close the name, and common words in lower case or in a line of capitals
+                  are left out. A legal form keeps its own period
+                  ("S.A.", "Pte. Ltd.") and leaves out the period of the sentence
+                  ("Goelia SNC.").
                 - The calls are serialized and their results cached, keyed by the
                   SHA-256 digest of the text, until the next begin_document(): learn() and
                   detect() see the same texts and models are seldom reentrant, so

@@ -44,9 +44,11 @@
 # already find, carry their tag keyword: EMAIL, PHONE, DATE, IBAN, CARD, NIR, SIRET, ID
 # (references, accounts, devices and the national numbers of other countries), IPV4,
 # IPV6, MAC, URL, PLATE, GEO, TITLE (a civility before a name or after its label: M.,
-# Mme, Mrs), GENDER (the value of a sex field) and NATIONALITY. Models ignore them when
-# they train; they make the annotation complete, so that the whole detection system,
-# rules and models together, can be scored.
+# Mme, Mrs), GENDER (the value of a sex field) and NATIONALITY. A DATE is a calendar date,
+# a month with its year ("mars 2022") or a year that dates a fact of a person's life ("a
+# rejoint Kerlys en 2019"), not the year of a report, a plan or a file name. Models ignore
+# these labels when they train; they make the annotation complete, so that the whole
+# detection system, rules and models together, can be scored.
 #
 # HOW TEXTS ARE MADE
 #
@@ -75,7 +77,10 @@
 # lexicon, the name between brackets being labelled: "la [CAF]", "the [NHS]". {NICK#1}
 # writes the nickname of person 1 ("Jojo", "Smithy") and {NICK:stage#1} a stage name ("DJ
 # Kerlys"), both labelled GIVEN_NAME; the variant abroad of the place slots, {CITY:abroad#2}
-# or {ADDRESS:abroad#2}, puts place 2 in another country.
+# or {ADDRESS:abroad#2}, puts place 2 in another country. {YEAR} writes a year left
+# unlabelled (a report, a file name, a plan); {YEAR:date} a year that dates a fact of a
+# person's life ("a rejoint {ORG#1} en {YEAR:date}"), labelled DATE together with the
+# month name written just before it ("Bulletin de paie – mars 2022").
 #
 # Names are drawn from lexicons by origin and gender, or synthesized from the
 # morphology of the family names of about twenty naming traditions (French, Breton,
@@ -187,7 +192,7 @@ LABEL_DESCRIPTIONS = {
     "ORGANIZATION": "named organisation",
     "EMAIL": "e-mail address",
     "PHONE": "telephone or fax number",
-    "DATE": "calendar date",
+    "DATE": "calendar date, month with its year, or year that dates a fact of a person's life",
     "IBAN": "international bank account number",
     "CARD": "payment card number",
     "NIR": "French social security number",
@@ -513,7 +518,7 @@ crm	2	Appel de {TITLE#1} {FAMILY#1} le {DATE} : souhaite modifier son RIB ({IBAN
 chat	2	[{TIME}] {USERNAME#1}: salut {GIVEN#2}, tu as vu le mail de {GIVEN#3} {FAMILY#3} ?\n[{TIME}] {USERNAME#2}: oui, je l'appelle cet après-midi
 log	2	{DATE:iso} {TIME} INFO login ok user={USERNAME#1} ip={IP}\n{DATE:iso} {TIME} WARN password expired user={USERNAME#1}
 table	2	NOM;PRÉNOM;DATE DE NAISSANCE;VILLE;TÉLÉPHONE\n{FAMILY:upper#1};{GIVEN#1};{BIRTHDATE#1};{CITY#1};{PHONE#1}\n{FAMILY:upper#2};{GIVEN#2};{BIRTHDATE#2};{CITY#2};{PHONE#2}
-narrative	2	{PERSON#1}, {AGE} ans, habitant de {CITY#1}, a rejoint {ORG#1} en {YEAR}. {Il#1} travaille avec {PERSON#2} sur le projet {PRODUCT}.
+narrative	2	{PERSON#1}, {AGE} ans, habitant de {CITY#1}, a rejoint {ORG#1} en {YEAR:date}. {Il#1} travaille avec {PERSON#2} sur le projet {PRODUCT}.
 legal	1	Par devant Maître {PERSON#1}, notaire à {CITY#1}, a comparu {TITLE#2} {PERSON:formal#2}, {g#2:né|née} à {CITY#3} le {BIRTHDATE#2}, demeurant {ADDRESS#4}.
 negative	2	{NEGATIVE} a validé la proposition le {DATE}. La réunion avec {INSTITUTION} aura lieu en {REGION}.
 negative	1	Le {JOB} doit compléter le formulaire dans {PRODUCT} avant la fin du mois, selon {NEGATIVE}.
@@ -594,7 +599,7 @@ hr	2	This agreement is made between {ORG#1}, whose registered office is at {ADDR
 medical	2	Patient: {PERSON:formal#1}, DOB {BIRTHDATE#1}. Referred by Dr {PERSON#2} of {ORG#1}. {He#1} reports chest pain since {DATE}.
 chat	2	[{TIME}] {USERNAME#1}: hey {GIVEN#2}, did {GIVEN#3} reply?\n[{TIME}] {USERNAME#2}: not yet, I'll ping {HANDLE#3}
 log	2	{DATE:iso} {TIME} INFO session started user={USERNAME#1} ip={IP}
-narrative	2	{PERSON#1}, {AGE}, of {CITY#1}, joined {ORG#1} in {YEAR} and now works with {PERSON#2}.
+narrative	2	{PERSON#1}, {AGE}, of {CITY#1}, joined {ORG#1} in {YEAR:date} and now works with {PERSON#2}.
 negative	2	{NEGATIVE} approved the budget on {DATE}. The next review with {INSTITUTION} is planned in {REGION}.
 """,
     "fr/world_cities.txt": WORLD_CITIES_BUILTIN,
@@ -2642,7 +2647,8 @@ class Generator:
             return [("%02d:%02d" % (r.randint(7, 19), r.randint(0, 59)) +
                      (":%02d" % r.randint(0, 59) if r.random() < 0.3 else ""), None)]
         if name == "YEAR":
-            return [(str(r.randint(1995, 2026)), None)]
+            year = str(r.randint(1995, 2026))
+            return [(DATE_OPEN + year + DATE_CLOSE if variant == "date" else year, None)]
         if name == "AGE":
             return [(str(r.randint(19, 88)), None)]
         if name == "AMOUNT":
@@ -2894,24 +2900,52 @@ def apply_style(fragments: list, style: dict, rng: random.Random) -> list:
     return out
 
 
+# A year that dates a fact of a person's life ({YEAR:date}) travels between these marks,
+# as unlabelled text, until assemble() labels it: the noise and the style then draw the
+# same random numbers as for any other year, and the texts stay those of a plain {YEAR}.
+DATE_OPEN, DATE_CLOSE = "\ue000", "\ue001"
+MONTH_BEFORE = re.compile(r"(?i)(?<![^\W\d_])(%s),? {1,2}$" % "|".join(
+    sorted({m for m in FR_MONTHS + EN_MONTHS} | {strip_accents(m) for m in FR_MONTHS}, key=len, reverse=True)))
+
+
 def assemble(fragments: list) -> Tuple[str, list]:
     """Joins the fragments and returns the text and its spans in byte offsets. Leading
-    and trailing spaces of a labelled fragment are left outside its span."""
-    text_parts, spans, pos = [], [], 0
+    and trailing spaces of a labelled fragment are left outside its span. A year between
+    date marks is labelled DATE, with the month name written just before it."""
+    text_parts, spans, dates, pos = [], [], [], 0
     for text, label in fragments:
         if not text:
             continue
-        data = text.encode("utf-8")
         if label:
+            data = text.encode("utf-8")
             stripped = text.strip()
             if stripped:
                 lead = len(text[:len(text) - len(text.lstrip())].encode("utf-8"))
                 b = pos + lead
                 e = b + len(stripped.encode("utf-8"))
                 spans.append((b, e, label))
-        text_parts.append(text)
-        pos += len(data)
-    return "".join(text_parts), spans
+            text_parts.append(text)
+            pos += len(data)
+            continue
+        for piece in re.split("([%s%s])" % (DATE_OPEN, DATE_CLOSE), text):
+            if piece == DATE_OPEN:
+                opened = pos
+            elif piece == DATE_CLOSE:
+                dates.append((opened, pos))
+            elif piece:
+                text_parts.append(piece)
+                pos += len(piece.encode("utf-8"))
+    joined = "".join(text_parts)
+    data = joined.encode("utf-8")
+    for b, e in dates:
+        m = MONTH_BEFORE.search(data[:b].decode("utf-8"))
+        if m:
+            month = len(data[:b].decode("utf-8")[:m.start()].encode("utf-8"))
+            if not any(sb < e and month < se for sb, se, _ in spans):
+                b = month
+        spans.append((b, e, "DATE"))
+    spans.sort()
+    return joined, spans
 
 
 def escape(text: str) -> str:

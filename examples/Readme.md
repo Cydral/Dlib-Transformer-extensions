@@ -71,8 +71,7 @@ Across the full example suite, the repository now covers:
 - **supervised fine-tuning and low-rank adaptation** (LoRA, DoRA) over an imported model
 - **knowledge distillation** from a teacher container into a student of a freely chosen architecture, dense or mixture-of-experts
 - **software-extended device memory**: a residency layer that lets a network occupy more than the card holds, driven by the access schedule the run reveals about itself
-- **lossless compression from a trained predictor**: a token-level network compiled into the program, mixed with context models under an arithmetic coder, with inference arithmetic fixed operation by operation so that decoding reproduces every probability
-- **privacy-preserving document processing**: reversible pseudonymization of Word, Excel, PowerPoint, PDF and text files, with a byte-level Transformer encoder and a structural SVM sequence labeler that learn, from synthetic data, where a name, a place or an organisation starts and ends
+- **privacy-preserving document processing**: reversible pseudonymization of Word, Excel, PowerPoint, PDF and text files, with a byte-level Transformer encoder and a structural SVM sequence labeler that learn, from synthetic data, where a name, a place or an organisation starts and ends, for people, addresses and organisations of many countries
 
 > [!TIP]
 > Read this directory not as a loose collection of demos, but as a **progressive design reference** for building Transformer-based applications with Dlib.
@@ -95,8 +94,8 @@ Across the full example suite, the repository now covers:
    Longer-corpus training and context-window management.
 7. [`slm_hrm_arc_puzzle_ex.cpp`](#slm_hrm_arc_puzzle_excpp) and [`slm_hrm_sudoku_ex.cpp`](#slm_hrm_sudoku_excpp)  
    Hierarchical reasoning with the published network, on ARC-AGI with four ways of deciding when to stop, then on Sudoku-Extreme, trained the way the published work trains it.
-8. [`slm_predictive_compressor_ex.cpp`](#slm_predictive_compressor_excpp) and [`slm_tok_predictive_compressor_ex.cpp`](#slm_tok_predictive_compressor_excpp)  
-   Transformer as a **predictive model** for lossless compression, over bytes, then over BPE tokens mixed with context models, with the network compiled into the program.
+8. [`slm_predictive_compressor_ex.cpp`](#slm_predictive_compressor_excpp)  
+   Transformer as a **byte-level predictive model** for compression.
 
 Then the interoperability and specialization track, which can be read independently:
 
@@ -813,58 +812,16 @@ It is the pattern worth copying more than the code. Any component whose failure 
 
 ---
 
-<a id="slm_tok_predictive_compressor_excpp"></a>
 ## `slm_tok_predictive_compressor_ex.cpp`
 
 ### Purpose
-Lossless text compression with a Transformer trained in Dlib on BPE tokens. The tokenizer and the quantized network are compiled into the program through a generated header, and the network's predictions are mixed with those of adaptive context models before a binary arithmetic coder writes them.
+Lossless compression driven by a Transformer, over **BPE tokens** rather than raw bytes.
 
 ### What the example teaches
-A language model gives a distribution over the next token, and an arithmetic coder turns that distribution into a code whose length is the model's cross-entropy on the data. Three questions decide whether this holds in practice, and the program answers each of them in code.
-
-**How a distribution over tokens drives a coder of bits.** The vocabulary is kept in lexicographic order of the byte patterns of its tokens. The tokens sharing a prefix then form a contiguous range, each bit of the next byte splits that range in two, and the probability the network gives to a bit is the mass of one half of the range over the mass of the whole, with no approximation. A token is coded as the bits of its bytes plus, wherever the vocabulary allows both, a decision saying whether it ends at the current byte; bits that the vocabulary leaves no choice for cost nothing. Context models over the bytes already coded predict the same decisions, and the two sources are mixed decision by decision.
-
-**How the decoder reproduces every probability of the encoder.** Decoding goes wrong at the first probability that differs by one bit. Training runs wherever Dlib runs, a graphics card included, and only the weights cross over. Coding runs in an inference engine of the program, on one processor thread, with sums taken in an order fixed by the shapes alone, exponentials, logarithms and rotations computed by its own routines from basic IEEE operations, and multiplications fused with additions only where the source calls for it. A position gets the same probabilities whether it is coded alone or beside fifteen other streams, and on a processor with or without AVX2.
-
-**What belongs in the archive.** The merge table and the weights are static data, compiled into the program. The archive holds the coded text, its CRC-32 and the checksum of the data it was coded with, and a build holding another tokenizer or network refuses to decode it.
+A language model is a probability distribution over what comes next, and a good distribution is a good compressor. Working at the token level shortens the sequence the model has to predict, which improves both speed and ratio compared to the byte-level variant.
 
 ### Main technical choices
-- **Tokenizer.** `bpe_tokenizer` in `space_prefixed` mode, where the space before a word opens the word's segment, so that ` the` is learned as one token. On encyclopaedic text this gives about 40% more bytes per token than splitting segments on whitespace. Training counts pair frequencies incrementally over distinct segments and builds an 8,192-entry vocabulary from a gigabyte in a few minutes.
-- **Network.** `gqa_transformer_config<8192, 4, 4, 2, 256, attention_impl::unified, false>`: four pre-norm blocks of width 256, four query heads over two key-value heads with rotary positions, SwiGLU, a final RMS normalisation and a linear head scored at every position, about 7.1 million parameters, 4.2 million of which sit in the embedding table and the head. The sizes are macros (`SLM_EMBEDDING_DIM`, `SLM_NUM_LAYERS`, `SLM_NUM_HEADS`, `SLM_NUM_KV_HEADS`, `SLM_WINDOW`), and the engine reads the shape from the compiled-in data.
-- **Training.** AdamW (0.9, 0.98, weight decay 0.01), a linear warmup then a cosine decay to a tenth of the peak rate, windows drawn at random from the tokenized corpus, and a synchronization file every ten minutes. At the end, the program runs the last window of the corpus through the trained network and through the compiled form of its exported weights, prints both cross-entropies, and writes the header.
-- **Quantization.** Symmetric, one scale per output channel and per token for the embedding table, the clipping point of each channel chosen among eight fractions of its largest magnitude as the one of least squared error, 4 to 8 bits per weight (`--bits`). The header holds the result coded by a small context model of the program, which the decompressor needs anyway.
-- **Context models.** Orders one to six, a sparse context, the current word alone and after the previous word, the current token, and a match model that looks for the most recent repeat across every stream. Each counter holds a slow and a fast estimate of its probability. The network enters raw and through two adaptive maps that recalibrate it per kind of decision and per pair of previous bytes. Three mixers select their weights by the kind of decision with the network's confidence, by the previous byte, and by the number of contexts already seen, a fourth mixer combines them, and two adaptive probability maps refine the result. Each model has 2^`--tables` counters of four bytes, from the input size up to 2^25 unless given.
-- **Streams.** A long input is cut at line boundaries into up to 255 streams, 16 by default, which the engine advances together so that each step multiplies the weights by several rows at once. The context models are shared by all streams, and the match model searches all of them.
-- **Inference engine.** Weights packed in strips of sixteen columns and multiplied in register tiles of four rows by sixteen columns, matrix and attention kernels with AVX2 and FMA chosen at run time whatever the build options, a scalar path computing the same values on other processors, and per-stream key-value rings in which keys are kept rotated relative to a base that moves forward by a window every window steps. The default network codes about 2,700 tokens per second on one core of a 2.1 GHz Xeon, context models included.
-- **Reduced builds.** Two macros compile the same source without the network definition and the training. `SLM_CODEC_ONLY` set to 1 keeps compression and decompression, the program to hand over when one executable does both; `SLM_DECOMPRESSOR_ONLY` set to 1 keeps decompression alone, the program to hand over with an archive. Both keep the options of the full program and use only header-only parts of Dlib, `bpe_tokenizer`, `crc32` and `command_line_parser`, so that one compiler command builds each of them, at about 255 KB and 220 KB of code plus the compiled-in data. Every build of the source writes and reads the same archives.
-
-### Workflow
-```bash
-# A reference corpus, downloaded, checked against its published MD5 and unpacked
-python3 slm_tools/fetch_text_benchmark.py --out-dir corpus --name enwik8
-
-# From a build directory under dlib/examples/; each step writing the header is followed by a rebuild
-./slm_tok_predictive_compressor_ex --build-tokenizer --input corpus/enwik8 --header ../slm_tok_predictive_compressor_ex.h
-./slm_tok_predictive_compressor_ex --train --input corpus/enwik8 --header ../slm_tok_predictive_compressor_ex.h
-
-./slm_tok_predictive_compressor_ex --compress --input data.txt
-./slm_tok_predictive_compressor_ex --decompress --input data.txt.dlc --output data.txt.out
-
-# The decompressor alone, compiled from the same source and the same header, with the same options
-g++ -std=c++14 -O3 -s -DSLM_DECOMPRESSOR_ONLY=1 -I../.. ../slm_tok_predictive_compressor_ex.cpp -o slm_tok_decompressor
-./slm_tok_decompressor --input data.txt.dlc --output data.txt.out
-```
-
-### Useful reminders
-- The repository provides the header with a tokenizer and a demonstration network of three blocks of width 192, trained for a short time on a sample of encyclopaedic text, so that a fresh build compresses at once. `--train` and `--embed` write the tokenizer and the new network together; `--build-tokenizer` writes a header without a network, since a network belongs to the tokenizer it was trained with.
-- The archive is coded with the network trained beforehand, so its cost on a text the network was trained on is what the training paid for. The longer the training on the corpus to code, the lower the cost, until the capacity of the network is used.
-- What a decoder needs is the archive and an executable that decodes it, whose size includes the compiled-in data; `--compress` prints the size of the archive and that of the data. The reduced builds carry the same data for the cost of their own code.
-- `--bits` trades the size of the compiled-in weights against the cost of the archive. Every bit removed from the weights costs some prediction quality, measured by the check printed at the end of `--train`.
-- Training is interrupted cleanly with Ctrl+C, which brings the synchronization file up to date, saves the network and writes the header from it; restarting the same command resumes from the synchronization file, and a restart with another `--steps` continues on the schedule of that length from the step reached. Without that file, a saved `slm_tok_predictive_compressor.dat` is taken as the starting point of a new schedule; without either, training starts from scratch.
-- An archive depends on the code that wrote it as much as on the compiled-in data: a change in the context models or in the engine changes the code, so an archive is decoded by a build of the same source. Builds with other compiler options give the same archives, provided that a GCC build enabling FMA for the whole program (`-march=native`, `-mfma`, 64-bit ARM) also passes `-ffp-contract=off`.
-
-### Why this example matters
-It turns the next-token objective trained throughout this repository into a measurable quantity, bits per byte of a lossless code, and shows the pattern needed whenever a trained network has to give identical results on two machines: train anywhere, ship the weights as data, and run inference in arithmetic whose every operation is fixed.
+The pipeline is **argmax-based** rather than arithmetic-coded, and the header says why: GPU floating-point results are not reproducible between runs, so an arithmetic coder that depends on exact probabilities would decompress to something else on another machine. Comparing predictions instead of encoding them makes the scheme robust to that non-determinism.
 
 [⬆ Back to top](#on-this-page)
 
@@ -877,31 +834,70 @@ It turns the next-token objective trained throughout this repository into a meas
 Protect the personal data of documents before they leave the organisation that owns them, or before they are sent to a language model, and restore them afterwards: Word, Excel, PowerPoint, PDF and every kind of text file, in French and English.
 
 ### What the example teaches
-**A tag can carry its value.** Each personal value is replaced by a tag such as `[[PERSON:Xoydoeh Nuggwdfsorn#EKR]]`, whose body is the value encrypted with format-preserving encryption (FF1 over AES-256) and whose last characters authenticate it. No correspondence table is written: the key alone restores a protected document, or any text derived from it, such as the summary a language model wrote. The codes are chosen per type so that protected data stays usable: the same name gets the same code everywhere, a protected IBAN still passes its checksum, every date moves by the same secret number of weeks.
+**A tag can carry its value.** Each personal value is replaced by a tag such as `[[PERSON:Xoydoeh Nuggwdfsorn#EKR]]`, whose body is the value encrypted with format-preserving encryption (FF1 over AES-256) and whose last characters authenticate it. No correspondence table is written: the key alone restores a protected document, or any text derived from it, such as the summary a language model wrote. The codes are chosen per type so that protected data stays usable: the same name gets the same code everywhere, a protected IBAN still passes its checksum, every date moves into the past by the same secret number of weeks, and a month with its year or a year that dates a fact by whole months or years, so that no date left in clear tells how far the others moved.
 
-**Four channels find the data.** Validated scanners find what has a structure and a check digit (e-mails, phones, IBAN, cards, social security and foreign national numbers, IMEI, VIN, UUID, GPS coordinates). Linguistic rules read civilities, field labels, legal forms, the names of companies and public bodies, and lexicons of given names, nationalities and places. Regular expressions and term lists add what is specific to an organisation. Two learned recognizers find, from the context in which they appear, the names, places, addresses and organisations the rules miss.
+**Four channels find the data.** Validated scanners find what has a structure and a check digit (e-mails, phones, IBAN, cards, social security and foreign national numbers, IMEI, VIN, UUID, GPS coordinates) and the dates, written whole or without their day (`mars 2022`, `03/2022`, `en 2019`, the years of a CV line). Linguistic rules read civilities, field labels, legal forms, the names of companies and public bodies, nicknames announced by their cue ("dit « Jojo »", "a.k.a."), the streets and postal codes of other countries in their own layout ("ul. Długa 5", "Kossuth Lajos utca 16", "00-238 Warszawa", "Tel Aviv 6688116"), and lexicons of given names from every region of the world, nicknames and stage names included, of about two thousand organisations of all countries known by their own name, of nationalities and of places. Regular expressions and term lists add what is specific to an organisation. Two learned recognizers find, from the context in which they appear, the names, places, addresses and organisations the rules miss.
 
 **The model answers with spans of its input.** `pii_span_model` is an encoder that gives each byte of its input a BIO class, and a constrained Viterbi pass turns the classes into spans. Every span it returns is a substring of its input with exact offsets, so the answer to "is there personal data here, where, and what is it" always points into the text.
+
+### Quick start
+Protecting a Word file and restoring it, with the recognizers compiled into the program:
+
+```bash
+./slm_document_anonymizer_ex keygen --key demo.key
+./slm_document_anonymizer_ex scan contract.docx                       # lists what was found, writes nothing
+./slm_document_anonymizer_ex anonymize --key demo.key --report contract.docx
+                                                                      # writes contract.anon.docx and its JSON report
+./slm_document_anonymizer_ex restore --key demo.key contract.anon.docx
+                                                                      # writes contract.restored.docx
+./slm_document_anonymizer_ex text < prompt.txt > protected.txt        # the same on text, for a language model
+./slm_document_anonymizer_ex text --restore < answer.txt
+```
+
+Using models of your own, then training and evaluating them on the synthetic data:
+
+```bash
+./slm_document_anonymizer_ex anonymize --model pii_span.dat contract.docx
+./slm_document_anonymizer_ex anonymize --tagger pii_tagger.dat --model pii_span.dat contract.docx
+python3 slm_tools/build_pii_dataset.py --out-dir pii-data --train 100000
+./slm_document_anonymizer_ex train-tagger pii-data/train.tsv --dev pii-data/dev.tsv --examples 70000 --out pii_tagger.dat
+./slm_document_anonymizer_ex train-model pii-data/train.tsv --dev pii-data/dev.tsv --init embedded --lr 0.0005 \
+    --steps 10000 --out pii_span.dat
+./slm_document_anonymizer_ex evaluate pii-data/test.tsv --tagger pii_tagger.dat --model pii_span.dat
+./slm_document_anonymizer_ex embed --tagger pii_tagger.dat --model pii_span.dat --out slm_document_anonymizer_ex.h
+```
+
+Building the protection commands alone, with the compiled recognizers, for the people who only protect and restore documents:
+
+```bash
+g++ -std=c++14 -O2 -DNDEBUG -DDLIB_NO_GUI_SUPPORT -DANONYMIZER_ESSENTIALS_ONLY=1 -I.. slm_document_anonymizer_ex.cpp \
+    ../dlib/all/source.cpp -lpthread -o slm_document_anonymizer
+x86_64-w64-mingw32-g++-posix -std=c++14 -O2 -DNDEBUG -DDLIB_NO_GUI_SUPPORT -DANONYMIZER_ESSENTIALS_ONLY=1 -I.. \
+    slm_document_anonymizer_ex.cpp ../dlib/all/source.cpp -static -lws2_32 -lwinmm -o slm_document_anonymizer.exe
+```
 
 ### Main technical choices
 - **Byte input.** The span model reads UTF-8 bytes: no tokenizer to train, no unknown word, and OCR accidents such as `JeanDupont` or `rn` read as `m` are just other byte sequences. Offsets come out exact, and span limits move to word limits after decoding, so that no end of a word stays readable.
 - **Bidirectional attention.** The fused `gqa_attention_` layer runs with its causal mask switched off, since whether `Rose` is a person depends on the words that follow as much as on those before.
 - **No padding.** Training windows are cut from the examples laid end to end, at lengths drawn from 32 to 256 bytes (32 to 128 for the tiny model), so attention never sees a padded position and the model reads a table cell as well as a paragraph. Long texts are read through overlapping windows; each byte keeps the prediction of the window where it is most central.
-- **A classical learner beside the Transformer.** `pii_sequence_tagger` is `dlib::sequence_labeler` trained as a structural SVM over hashed lexical, shape and context features, and trains in minutes. Its word features also fire on capitalized words that are not personal data, so when both models are loaded the detector follows the span model and takes from the tagger, where the span model found nothing, its confident spans (`--tagger-min-confidence`) and the name parts that complete a name already found, so that the given name and the family name of a person are replaced together.
+- **A classical learner beside the Transformer.** `pii_sequence_tagger` is `dlib::sequence_labeler` trained as a structural SVM over hashed lexical, shape and context features, and trains in minutes. Its word features also fire on capitalized words that are not personal data, so when both models are loaded the detector follows the span model and takes from the tagger, where the span model found nothing, its confident spans (`--tagger-min-confidence`) and the name parts that complete a name already found, so that the given name and the family name of a person are replaced together. Where the span model reads an organisation with a confidence below 0.9 and the tagger reads all its words as the parts of a name with more confidence, the name is kept (`Lucie Rey` alone on its line).
 - **Fine labels, coarse replacement.** The models learn `GIVEN_NAME`, `FAMILY_NAME`, `USERNAME`, `STREET_ADDRESS`, `POSTAL_CODE`, `CITY` and `ORGANIZATION`; the detector merges a given name and a family name side by side into one `PERSON`, a postal code and its city into one `LOCATION`, and replaces them as the rules would.
-- **Learned spans judged as a whole.** The pieces a recognizer cuts inside a word or a name (`E` and `sch-sur-Alzette`, `Inès`, `de` and `Brunet`) are merged before anything is judged. A span that names nothing is then dropped: a greeting or a field label alone, function words alone, a common word in lower case, a capitalized word joined to lower case words (`Le projet`), a login inside a file name.
-- **Synthetic data, held-out values.** `slm_tools/build_pii_dataset.py` writes the training sets from templates and lexicons, and reserves part of every lexicon for a `test_unseen` split, which scores the detection of names, streets, cities and organisations absent from training.
+- **Learned spans judged as a whole.** The pieces a recognizer cuts inside a word or a name (`E` and `sch-sur-Alzette`, `Inès`, `de` and `Brunet`) are merged before anything is judged. A span that names nothing is then dropped: a greeting or a field label alone, function words alone, a common word in lower case, a capitalized word joined to lower case words (`Le projet`), a login inside a file name, a country read as a place (`Cameroun` on the line after `Douala`), a state between a town and its postal code (`NSW` in `Sydney NSW 2010`), a term of a medical record or of a table heading (`Créatinine`, `LDL-cholestérol`, `Niveau`). A name or a place ends with its last word, the part after an apostrophe included (`Le Floc'h`, `Penmarc'h`); a person takes the particle written before it in its case (`LE FLOC'H Yann`) and stays a person when a civility or a name label announces it, whatever type a recognizer gives it; a first name joins the family name that follows it (`Yann` and `Le Floc'h`).
+- **Organisations rebuilt to their limits.** A recognizer often returns an organisation in pieces, or stops before its legal form. The detector joins the pieces that a connector, an ampersand or a hyphen links (`Merrow Oil and Gas Plc`, `Le Moigne & Sons plc`), carries a name on to the legal form, the trade word or the partner form that follows it in the spellings of about forty countries (`Kerexa SARL AU`, `Xanium Insaat Ltd. Sti.`, `Foxglove A/S`, `Haugen Konsult`), reads a short form such as `AS` or `Oy` as a legal form only when it is written as one, turns into an organisation a person or a place that such a word follows, and stops a name at a line written in capitals or at a common word that opens it. The names of public bodies and of the organisations known by their own name take precedence over a learned span that cuts across them.
+- **Synthetic data, held-out values.** `slm_tools/build_pii_dataset.py` writes the training sets from templates and lexicons, and reserves part of every lexicon for a `test_unseen` split, which scores the detection of names, streets, cities and organisations absent from training. The texts span about forty document genres, from forms, letters and contracts to booking confirmations, incident tickets, shipping labels, utility bills, social media posts and CVs, and a share of their places and organisations lies in one of about fifty other countries, written the way that country writes them ("ul. Długa 5, 00-238 Warszawa", "Toronto, ON M5H 2N2"). On test sets written by the generator and held out from training, the rules with the compiled recognizers reach an F1 of 0.980 over every category, 0.958 under heavy OCR noise and 0.978 when every place, organisation, phone number and IBAN belongs to another country; organisations, the hardest of the categories the recognizers learn, reach 0.964 on the main test set and 0.969 on the one abroad, and dates, whole or without their day, 0.998.
 
 ### Useful reminders
 - `detect` reads a text on standard input and prints `found: yes` or `found: no`, then one line per span with its byte offsets, its type, its confidence and its value; with recognizers loaded, it also prints what each of them finds on its own, with fine labels.
 - `evaluate` scores the rules alone, each recognizer alone and the whole detector on the same test set, at the level of the fine labels and at the level at which values are replaced.
 - `embed` writes `slm_document_anonymizer_ex.h`, which compiles the trained recognizers into the program: the executable then travels alone and uses them by default, `--tagger` and `--model` each replace one of them by a model file, and `train-model --init embedded` continues the training of the compiled span model on new data. The repository provides this header with trained recognizers; `embed` rewrites it after a new training.
+- `train-tagger --cache 5` lets the SVM solver keep five labelings per example: the training runs about three times faster and needs about six times the memory (about 15 kB per example of 50 tokens without cache). Beyond some 40000 examples, more examples no longer improve the tagger.
+- Built with `-DANONYMIZER_ESSENTIALS_ONLY=1`, the program keeps `keygen`, `anonymize`, `restore`, `scan` and `text`, with the recognizers compiled into it, and leaves out `detect`, `train-tagger`, `train-model`, `evaluate` and `embed`; the default, `0`, builds every command, as the CMake build of the repository does. Cross-compiled with MinGW-w64 and `-static`, it gives one Windows executable that needs no library beyond those of the system; on Windows it reads and writes standard input and output as bytes and sets the console to UTF-8 while it runs.
 - `train-model --optimizer adam-atan2` trains the span model with `dlib::adam_atan2`, whose step needs no epsilon and stays bounded; AdamW remains the default, the two reaching the same scores on this task.
 - `train-model` prints every 200 steps the mean loss of those steps, and every 2000 steps the loss on the same windows of the development set with the span F1. With `--init`, it prints them before its first step too: the point the complementary training starts from.
 - The output is **pseudonymized** data in the sense of the GDPR: whoever holds the key can restore it. `--irreversible` drops the key.
 
 ### Why this example matters
-It puts the Transformer stack of this repository to work on a task whose result can be measured, and shows a pattern for extraction tasks whose answer must come from the input: a small encoder, byte-level input, constrained decoding, and test sets built around the errors to watch (unseen values, OCR noise, texts without personal data, whole documents).
+It puts the Transformer stack of this repository to work on a task whose result can be measured, and shows a pattern for extraction tasks whose answer must come from the input: a small encoder, byte-level input, constrained decoding, and test sets built around the errors to watch (unseen values, OCR noise, texts without personal data, whole documents, places abroad).
 
 [⬆ Back to top](#on-this-page)
 
@@ -920,8 +916,7 @@ Verify the C++ paths against the implementations everyone else uses.
 - **`slm_prune_distill.py`** removes blocks from a published model and distils the survivors back into shape. Which blocks go is measured rather than guessed: a few forward passes record how far each block moves what passes through it, and the ones whose output stays closest to their input are the ones to drop. The survivors keep the teacher's weights, so the run repairs what the missing blocks did rather than learning the language again. What comes out is an ordinary model of its family with fewer blocks, so the standard converter produces a container this library reads.
 - **`slm_benchmark.py`** places a model against published small models on the usual tasks, each at the few-shot count under which it is normally reported — a detail that decides whether a table means anything, since five-shot and zero-shot MMLU differ by several points on the same model. The comparison figures are read from a file carrying each one's source and date, not fetched: a number quoted without its evaluation settings compares nothing.
 - **`build_arc_dataset.py`** and **`build_sudoku_dataset.py`** prepare ARC-AGI and Sudoku-Extreme for the hierarchical reasoning examples, in the layout of the reference implementation as well as in the one the C++ loader reads, so that the same data can feed either codebase.
-- **`build_pii_dataset.py`** writes the synthetic French and English training and test sets of the personal data recognizers: templates by document genre, names drawn by origin or synthesized from naming traditions, OCR and casing noise applied to labelled fragments so that every offset stays exact, and a held-out share of every lexicon for the test of unseen values. Sentences without personal data surround a share of the examples and make examples of their own, the evaluation splits hold no text of the training set, and French and English examples come in equal numbers unless `--fr-share` says otherwise. The lexicons, templates and sentences of a resource directory (`--resources`) replace the built-in ones of the same name.
-- **`fetch_text_benchmark.py`** downloads the reference corpora of the Large Text Compression Benchmark, enwik8 and enwik9, checks each against its published size and MD5, and unpacks it, so that the results of `slm_tok_predictive_compressor_ex` can be set against published ones on the same bytes.
+- **`build_pii_dataset.py`** writes the synthetic French and English training and test sets of the personal data recognizers: templates by document genre, names drawn by origin or synthesized from about twenty naming traditions, places and organisations abroad with the address layouts, legal forms, phone numbers and IBANs of their country (`--abroad-share`), nicknames and stage names, OCR and casing noise applied to labelled fragments so that every offset stays exact, and a held-out share of every lexicon for the test of unseen values. Sentences without personal data surround a share of the examples and make examples of their own, the evaluation splits hold no text of the training set, and French and English examples come in equal numbers unless `--fr-share` says otherwise. The lexicons, templates and sentences of a resource directory (`--resources`) replace the built-in ones of the same name.
 - **`slm_bpe_corpus.py`** collects a corpus for training a tokenizer, from encyclopaedic prose, news archives, filtered web text, multilingual web text and instruction data. The last of these is the one people leave out, and it cannot be recovered afterwards: a tokenizer trained on prose alone cuts numbered lists, code blocks and tabular answers into far more tokens than it needs, and those are what a chat model produces all day. It also reduces a corpus to a much smaller one that yields **the same merge table**, since BPE merges depend on pre-token frequencies and nothing else.
 
 ### Why this matters

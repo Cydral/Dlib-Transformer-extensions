@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -540,12 +541,15 @@ namespace dlib
             for (int i = 0; i < 8; ++i)
                 v = (v << 8) | h[static_cast<std::size_t>(i)];
             secure_wipe(h.data(), h.size());
-            // A shift of 1 to max_shift_weeks weeks, either way; the bound is clamped to [1, 5200].
+            /* A shift of 1 to max_shift_weeks weeks into the past, the bound clamped to [1, 5200]:
+               a date of the past never moves into the future, where it would show that it was
+               shifted. Dates written without a day move by the nearest whole number of months,
+               years alone by the nearest whole number of years, never by zero. */
             const long weeks = static_cast<long>(
                 std::min<unsigned long>(5200, std::max<unsigned long>(1, options_.max_shift_weeks)));
-            long k = static_cast<long>(v % static_cast<std::uint64_t>(2 * weeks)) - weeks;
-            if (k >= 0) ++k;
-            shift_days_ = 7 * k;
+            shift_days_ = -7 * (1 + static_cast<long>(v % static_cast<std::uint64_t>(weeks)));
+            shift_months_ = std::min(-1L, static_cast<long>(std::lround(shift_days_ / 30.436875)));
+            shift_years_ = std::min(-1L, static_cast<long>(std::lround(shift_days_ / 365.2425)));
 
             letter_lengths_.assign(1, 0);
             for (std::size_t n = 1; n <= 512; ++n)
@@ -582,6 +586,8 @@ namespace dlib
         };
 
         long date_shift_days() const { return shift_days_; }
+        long date_shift_months() const { return shift_months_; }
+        long date_shift_years() const { return shift_years_; }
 
         // True for the values the options leave in clear: dates under date_policy::keep.
         bool keeps_in_clear(pii_type type) const
@@ -884,12 +890,15 @@ namespace dlib
     // ------------------------------------------------------------------------------------
     // Word codes for names, organisations, places, addresses, e-mails and URLs.
 
-        const std::unordered_set<std::string>& kept_words(pii_type t) const
+        /* Words a body may hold in clear. A person name keeps none on protection: its particles
+           ("Le", "van", "bin") would tell the language of the name. They stay readable on
+           restoration, for the tags written while they were kept. */
+        const std::unordered_set<std::string>& kept_words(pii_type t, bool protecting = false) const
         {
             static const std::unordered_set<std::string> none;
             switch (t)
             {
-                case pii_type::person: return privacy_impl::person_particles();
+                case pii_type::person: return protecting ? none : privacy_impl::person_particles();
                 case pii_type::organization: return privacy_impl::organization_kept_words();
                 case pii_type::location: return privacy_impl::location_kept_words();
                 case pii_type::address: return privacy_impl::address_kept_words();
@@ -963,7 +972,7 @@ namespace dlib
         {
             using namespace privacy_impl;
             const std::vector<word_segment> segs = split_words(value);
-            const std::unordered_set<std::string>& kept = kept_words(type);
+            const std::unordered_set<std::string>& kept = kept_words(type, true);
             const std::size_t tld = verbatim_tld_index(type, segs);
             std::string body;
             for (std::size_t k = 0; k < segs.size(); ++k)
@@ -1514,14 +1523,34 @@ namespace dlib
             return true;
         }
 
+        static std::string four_digits(long v)
+        {
+            std::string s = std::to_string(v);
+            return s.size() < 4 ? std::string(4 - s.size(), '0') + s : s;
+        }
+
+        /* The body of a shifted date: YYYY-MM-DD, YYYY-MM for a month and its year, YYYY for a
+           year alone, followed by "~" and the format code unless the original was ISO. */
         bool date_forward(const std::string& v, std::string& body) const
         {
             civil_date d;
             date_format f;
             if (!parse_date(v, options_.date_order, d, f)) return false;
             if (format_date(d, f) != v) return false;
-            const civil_date s = civil_from_days(days_from_civil(d.year, d.month, d.day) + shift_days_);
-            body = format_date(s, date_format());
+            if (!f.has_month())
+            {
+                body = four_digits(d.year + shift_years_);
+            }
+            else if (!f.has_day())
+            {
+                const long m = 12L * d.year + (d.month - 1) + shift_months_;
+                body = four_digits(m / 12) + "-" + (m % 12 < 9 ? "0" : "") + std::to_string(m % 12 + 1);
+            }
+            else
+            {
+                const civil_date s = civil_from_days(days_from_civil(d.year, d.month, d.day) + shift_days_);
+                body = format_date(s, date_format());
+            }
             if (!f.is_iso())
                 body += "~" + privacy_impl::crockford_encode(f.pack(), 4);
             return true;
@@ -1529,26 +1558,45 @@ namespace dlib
 
         bool date_backward(const std::string& body, std::string& original) const
         {
-            if (body.size() < 10) return false;
-            const std::string iso = body.substr(0, 10);
+            const std::size_t tilde = body.find('~');
+            const std::string head = body.substr(0, tilde);
             date_format f;
-            if (body.size() > 10)
+            if (tilde != std::string::npos)
             {
                 std::uint32_t packed;
-                if (body[10] != '~' || !privacy_impl::crockford_decode(body.substr(11), packed)) return false;
+                if (!privacy_impl::crockford_decode(body.substr(tilde + 1), packed)) return false;
                 f = date_format::unpack(packed);
             }
-            // YYYY-MM-DD, read directly: a shifted date may fall outside the years find_dates() accepts.
-            if (iso[4] != '-' || iso[7] != '-') return false;
-            for (int k : { 0, 1, 2, 3, 5, 6, 8, 9 })
-                if (!privacy_impl::is_ascii_digit_char(iso[static_cast<std::size_t>(k)])) return false;
+            // Read directly: a shifted date may fall outside the years find_dates() accepts.
+            const std::size_t size = head.size();
+            if (size != 4 && size != 7 && size != 10) return false;
+            for (std::size_t k = 0; k < size; ++k)
+                if ((k == 4 || k == 7) ? head[k] != '-' : !privacy_impl::is_ascii_digit_char(head[k])) return false;
+            if ((size == 4) != (tilde != std::string::npos && !f.has_month()) ||
+                (size == 7) != (tilde != std::string::npos && f.has_month() && !f.has_day()))
+                return false;
             civil_date d;
-            d.year = std::stoi(iso.substr(0, 4));
-            d.month = std::stoi(iso.substr(5, 2));
-            d.day = std::stoi(iso.substr(8, 2));
-            if (!is_valid_civil_date(d.year, d.month, d.day)) return false;
-            const civil_date o = civil_from_days(days_from_civil(d.year, d.month, d.day) - shift_days_);
-            original = format_date(o, f);
+            d.year = std::stoi(head.substr(0, 4));
+            if (size == 4)
+            {
+                d.year -= static_cast<int>(shift_years_);
+            }
+            else if (size == 7)
+            {
+                const int month = std::stoi(head.substr(5, 2));
+                if (month < 1 || month > 12) return false;
+                const long m = 12L * d.year + (month - 1) - shift_months_;
+                d.year = static_cast<int>(m / 12);
+                d.month = static_cast<int>(m % 12 + 1);
+            }
+            else
+            {
+                d.month = std::stoi(head.substr(5, 2));
+                d.day = std::stoi(head.substr(8, 2));
+                if (!is_valid_civil_date(d.year, d.month, d.day)) return false;
+                d = civil_from_days(days_from_civil(d.year, d.month, d.day) - shift_days_);
+            }
+            original = format_date(d, f);
             return true;
         }
 
@@ -1748,6 +1796,8 @@ namespace dlib
         prefix_preserving_ip_cipher ip_;
         std::string check_key_;
         long shift_days_ = 0;
+        long shift_months_ = 0;
+        long shift_years_ = 0;
         std::vector<std::size_t> letter_lengths_;
         static const std::size_t max_cache_entries = 1 << 16;
         mutable std::mutex cache_mutex_;
