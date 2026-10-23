@@ -31,6 +31,12 @@ namespace dlib
         );
     }
 
+    namespace npu
+    {
+        // Gives the NPU routing the block behind a tensor, whose copy mark it reads.
+        struct storage_access;
+    }
+
 // ----------------------------------------------------------------------------------------
 
     class tensor
@@ -206,6 +212,7 @@ namespace dlib
         friend class alias_tensor;
         // Needs data() to pin a tensor's block while a raw device pointer is live.
         friend class device_scope;
+        friend struct npu::storage_access;
 
         virtual gpu_data& data() = 0;
         virtual const gpu_data& data() const = 0;

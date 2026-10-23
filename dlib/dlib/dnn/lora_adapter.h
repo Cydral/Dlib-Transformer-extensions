@@ -311,6 +311,10 @@ namespace dlib
         {
             if (!geom_.active()) return;
 
+            /* The merged weight is a parameter, so it is computed in single precision
+               whatever device the operations could be routed to. */
+            npu::exact_scope single_precision;
+
             tt::gemm(1.0f, base_w, scale_, a, false, b, true);   // W <- W + s.A.B
 
             if (geom_.method == adapter_method::dora)

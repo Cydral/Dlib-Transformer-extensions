@@ -39,6 +39,10 @@ if (@DLIB_USE_CUDA@)
    find_package(CUDAToolkit)
 endif()
 
+if (@DLIB_USE_NPU@)
+   find_package(OpenVINO COMPONENTS Runtime HINTS "@OpenVINO_DIR@")
+endif()
+
 mark_as_advanced(dlib_LIBRARIES)
 mark_as_advanced(dlib_LIBS)
 mark_as_advanced(dlib_INCLUDE_DIRS)

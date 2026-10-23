@@ -516,6 +516,9 @@ namespace dlib
 
         std::vector<pii_span> find_unlocked(const std::string& original) const
         {
+            /* What is reported as personal data must not depend on the hardware present, so
+               the network runs here with the arithmetic of the host. */
+            npu::exact_scope single_precision;
             std::vector<std::size_t> origin;
             const std::string text = privacy_impl::visible_bytes(original, origin);
             const long n = static_cast<long>(text.size());

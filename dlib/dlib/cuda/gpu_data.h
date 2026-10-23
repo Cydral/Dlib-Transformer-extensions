@@ -5,6 +5,7 @@
 
 #include "gpu_data_abstract.h"
 #include <atomic>
+#include <cstdint>
 #include <memory>
 #include <cstring>
 #include "cuda_errors.h"
@@ -83,6 +84,7 @@ namespace dlib
         {
             if (new_size == 0)
             {
+                forget_copies();
                 data_size = 0;
                 host_current = true;
                 device_current = true;
@@ -92,6 +94,7 @@ namespace dlib
             }
             else if (new_size != data_size)
             {
+                forget_copies();
                 data_size = new_size;
                 host_current = true;
                 device_current = true;
@@ -109,18 +112,20 @@ namespace dlib
             return data_host.get(); 
         }
 
-        float* host() 
+        float* host()
         {
+            forget_copies();
             if (!enter_host(true, true))
             {
                 copy_to_host();
                 device_current = false;
             }
-            return data_host.get(); 
+            return data_host.get();
         }
 
-        float* host_write_only() 
+        float* host_write_only()
         {
+            forget_copies();
             if (!enter_host(false, true))
             {
                 host_current = true;
@@ -140,11 +145,12 @@ namespace dlib
             return data_device.get(); 
         }
 
-        float* device() 
+        float* device()
         {
 #ifndef DLIB_USE_CUDA
             DLIB_CASSERT(false, "CUDA NOT ENABLED");
 #endif
+            forget_copies();
             enter_device(true, true);
             copy_to_device();
             host_current = false;
@@ -157,6 +163,7 @@ namespace dlib
 #ifndef DLIB_USE_CUDA
             DLIB_CASSERT(false, "CUDA NOT ENABLED");
 #endif
+            forget_copies();
             enter_device(false, true);
             wait_for_transfer_to_finish();
             host_current = false;
@@ -172,6 +179,19 @@ namespace dlib
         ) const { return device_current && !have_active_transfer; }
 
         size_t size() const { return data_size; }
+
+        uint64_t copy_mark (
+        ) const { return mark.load(std::memory_order_relaxed); }
+
+        uint64_t set_copy_mark (
+            uint64_t fresh
+        ) const
+        {
+            uint64_t current = 0;
+            if (mark.compare_exchange_strong(current, fresh, std::memory_order_relaxed))
+                return fresh;
+            return current;
+        }
 
         void swap (gpu_data& item)
         {
@@ -192,6 +212,10 @@ namespace dlib
             const bool in_use = device_in_use.load(std::memory_order_relaxed);
             device_in_use.store(item.device_in_use.load(std::memory_order_relaxed), std::memory_order_relaxed);
             item.device_in_use.store(in_use, std::memory_order_relaxed);
+            // The mark describes the values, so it moves with the buffers as well.
+            const uint64_t m = mark.load(std::memory_order_relaxed);
+            mark.store(item.mark.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            item.mark.store(m, std::memory_order_relaxed);
             std::swap(data_host, item.data_host);
             std::swap(data_device, item.data_device);
             std::swap(cuda_stream, item.cuda_stream);
@@ -203,6 +227,15 @@ namespace dlib
         }
 
     private:
+
+        // Called by every access that may change the values: copies taken under the mark
+        // stop being current.
+        void forget_copies (
+        )
+        {
+            if (mark.load(std::memory_order_relaxed) != 0)
+                mark.store(0, std::memory_order_relaxed);
+        }
 
 #ifdef DLIB_USE_CUDA
         void copy_to_device() const;
@@ -254,6 +287,10 @@ namespace dlib
 
         // Null unless the extended memory subsystem manages this block.
         mutable xmem::block_record* xrec;
+
+        /* Set by set_copy_mark() and cleared by forget_copies(). Atomic because a reader
+           marks blocks it only reads, possibly from another thread than their writer. */
+        mutable std::atomic<uint64_t> mark{0};
     };
 
     inline void serialize(const gpu_data& item, std::ostream& out)

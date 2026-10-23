@@ -6,6 +6,18 @@
 #include "tensor_tools.h"
 #include "../string.h"
 #include <atomic>
+#include <ostream>
+
+/*
+    DLIB_NPU_TRY(f(args)) offers the operation to the NPU module and returns when it computed
+    it; otherwise the host path that follows runs, timed when the routing asked for a host
+    measurement. Without DLIB_USE_NPU it expands to nothing.
+*/
+#ifdef DLIB_USE_NPU
+#define DLIB_NPU_TRY(call) if (::dlib::npu::call) return; ::dlib::npu::cpu_measure dlib_npu_measure_
+#else
+#define DLIB_NPU_TRY(call)
+#endif
 
 namespace dlib
 {
@@ -36,6 +48,34 @@ namespace dlib
     {
         dnn_prefer_fastest_algo() = false;
     }
+
+#ifndef DLIB_USE_NPU
+    // The run-time control of npu_dlib.h in a build without DLIB_USE_NPU: no device, nothing
+    // routed, so that programs can call it unconditionally.
+    namespace npu
+    {
+        bool is_compiled_in () { return false; }
+        bool is_available () { return false; }
+        std::string device_name () { return std::string(); }
+        bool uses_half_precision () { return false; }
+        std::string runtime_version () { return std::string(); }
+        void set_routing (routing) {}
+        routing get_routing () { return routing::never; }
+        void set_synchronous_compilation (bool) {}
+        exact_scope::exact_scope () {}
+        exact_scope::~exact_scope () {}
+        std::vector<op_statistics> get_statistics () { return std::vector<op_statistics>(); }
+        void reset_statistics () {}
+        void print_status (std::ostream& out)
+        {
+#ifdef DLIB_USE_CUDA
+            out << "dlib NPU routing\n  build    : without DLIB_USE_NPU, primary target CUDA\n";
+#else
+            out << "dlib NPU routing\n  build    : without DLIB_USE_NPU, primary target host\n";
+#endif
+        }
+    }
+#endif
 }
 
 namespace dlib { namespace tt
@@ -52,6 +92,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::inverse_norms(invnorms, data, eps);
 #else
+        DLIB_NPU_TRY(inverse_norms(invnorms, data, eps));
         invnorms = reciprocal(sqrt(sum_cols(squared(mat(data))) + eps));
 #endif
     }
@@ -67,6 +108,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::inverse_sqrt(dest, src, eps);
 #else
+        DLIB_NPU_TRY(inverse_sqrt(dest, src, eps));
         dest = reciprocal(sqrt(mat(src) + eps));
 #endif
     }
@@ -83,6 +125,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::divide_by_sqrt(dest, num, sqnorm, eps);
 #else
+        DLIB_NPU_TRY(divide_by_sqrt(dest, num, sqnorm, eps));
         cpu::divide_by_sqrt(dest, num, sqnorm, eps);
 #endif
     }
@@ -96,6 +139,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::dot_prods(out, lhs, rhs);
 #else
+        DLIB_NPU_TRY(dot_prods(out, lhs, rhs));
         out = sum_cols(pointwise_multiply(mat(lhs), mat(rhs))); 
 #endif
     }
@@ -110,6 +154,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::dot_prods(add_to, out, lhs, rhs);
 #else
+        DLIB_NPU_TRY(dot_prods(add_to, out, lhs, rhs));
         if (add_to)
             out += sum_cols(pointwise_multiply(mat(lhs), mat(rhs))); 
         else
@@ -133,6 +178,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::scale_columns(out, m, v);
 #else
+        DLIB_NPU_TRY(scale_columns(out, m, v));
         out = scale_columns(mat(m), mat(v));
 #endif
     }
@@ -153,6 +199,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::scale_rows(out, m, v);
 #else
+        DLIB_NPU_TRY(scale_rows(out, m, v));
         out = scale_rows(mat(m), mat(v));
 #endif
     }
@@ -175,6 +222,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::scale_rows2(beta, out, m1, m2, v1, v2);
 #else
+        DLIB_NPU_TRY(scale_rows2(beta, out, m1, m2, v1, v2));
         if (beta == 0)
             out = scale_rows(mat(m1) - scale_rows(mat(m2),mat(v1)), mat(v2));
         else
@@ -194,6 +242,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::exp(dest,src);
 #else
+        DLIB_NPU_TRY(exp(dest, src));
         dest = exp(mat(src));
 #endif
     }
@@ -210,6 +259,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::log(dest,src);
 #else
+        DLIB_NPU_TRY(log(dest, src));
         dest = log(mat(src));
 #endif
     }
@@ -226,6 +276,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::log10(dest,src);
 #else
+        DLIB_NPU_TRY(log10(dest, src));
         dest = log10(mat(src));
 #endif
     }
@@ -246,6 +297,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::gemm(beta, dest, alpha, lhs, trans_lhs, rhs, trans_rhs, mode);
 #else
+        DLIB_NPU_TRY(gemm(beta, dest, alpha, lhs, trans_lhs, rhs, trans_rhs, mode));
         if (mode == operation_mode::CHANNEL_WISE)
         {
             if (beta != 0)
@@ -412,6 +464,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::multiply(add_to, dest, src1, src2);
 #else
+        DLIB_NPU_TRY(multiply(add_to, dest, src1, src2));
         cpu::multiply(add_to, dest, src1, src2);
 #endif
 
@@ -427,6 +480,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::scale_channels(add_to, dest, src, scales);
 #else
+        DLIB_NPU_TRY(scale_channels(add_to, dest, src, scales));
         cpu::scale_channels(add_to, dest, src, scales);
 #endif
     }
@@ -441,6 +495,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::multiply_conv(add_to, dest, src1, src2);
 #else
+        DLIB_NPU_TRY(multiply_conv(add_to, dest, src1, src2));
         cpu::multiply_conv(add_to, dest, src1, src2);
 #endif
     }
@@ -455,6 +510,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::multiply_zero_padded(add_to, dest, src1, src2);
 #else
+        DLIB_NPU_TRY(multiply_zero_padded(add_to, dest, src1, src2));
         cpu::multiply_zero_padded(add_to, dest, src1, src2);
 #endif
     }
@@ -471,6 +527,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::affine_transform(dest,src,A,B);
 #else
+        DLIB_NPU_TRY(affine_transform(dest,src,A,B));
         cpu::affine_transform(dest,src,A,B);
 #endif
     }
@@ -484,6 +541,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::affine_transform(dest,src,A);
 #else
+        DLIB_NPU_TRY(affine_transform(dest,src,A,0));
         cpu::affine_transform(dest,src,A,0);
 #endif
     }
@@ -500,6 +558,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::affine_transform(dest,src1,src2,A,B,C);
 #else
+        DLIB_NPU_TRY(affine_transform(dest,src1,src2,A,B,C));
         cpu::affine_transform(dest,src1,src2,A,B,C);
 #endif
     }
@@ -515,6 +574,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::affine_transform(dest,src1,src2,A,B);
 #else
+        DLIB_NPU_TRY(affine_transform(dest,src1,src2,A,B,0));
         cpu::affine_transform(dest,src1,src2,A,B,0);
 #endif
     }
@@ -533,6 +593,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::affine_transform(dest,src1,src2,src3,A,B,C,D);
 #else
+        DLIB_NPU_TRY(affine_transform(dest,src1,src2,src3,A,B,C,D));
         cpu::affine_transform(dest,src1,src2,src3,A,B,C,D);
 #endif
     }
@@ -552,6 +613,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::affine_transform_range(begin, end, dest,src1,src2,src3,A,B,C);
 #else
+        DLIB_NPU_TRY(affine_transform_range(begin, end, dest,src1,src2,src3,A,B,C));
         cpu::affine_transform_range(begin, end, dest,src1,src2,src3,A,B,C);
 #endif
     }
@@ -570,6 +632,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::affine_transform(rect, dest,src1,src2,src3,A,B,C);
 #else
+        DLIB_NPU_TRY(affine_transform(rect, dest,src1,src2,src3,A,B,C));
         cpu::affine_transform(rect, dest,src1,src2,src3,A,B,C);
 #endif
     }
@@ -587,6 +650,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::affine_transform_range(0,dest.size(),dest,src1,src2,src3,A,B,C);
 #else
+        DLIB_NPU_TRY(affine_transform_range(0,dest.size(),dest,src1,src2,src3,A,B,C));
         cpu::affine_transform_range(0,dest.size(),dest,src1,src2,src3,A,B,C);
 #endif
     }
@@ -603,6 +667,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::affine_transform(dest,src,A,B);
 #else
+        DLIB_NPU_TRY(affine_transform(dest,src,A,B));
         cpu::affine_transform(dest,src,A,B);
 #endif
     }
@@ -619,6 +684,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::affine_transform_conv(dest,src,A,B);
 #else
+        DLIB_NPU_TRY(affine_transform_conv(dest,src,A,B));
         cpu::affine_transform_conv(dest,src,A,B);
 #endif
     }
@@ -644,6 +710,8 @@ namespace dlib { namespace tt
         cuda::compute_adam_update(begin, end, s, m, v, t, learning_rate, weight_decay, momentum1,
             momentum2, params, params_grad);
 #else
+        DLIB_NPU_TRY(compute_adam_update(begin, end, s, m, v, t, learning_rate, weight_decay, momentum1,
+            momentum2, params, params_grad));
         cpu::compute_adam_update(begin, end, s, m, v, t, learning_rate, weight_decay, momentum1,
             momentum2, params, params_grad);
 #endif
@@ -670,6 +738,8 @@ namespace dlib { namespace tt
         cuda::compute_adam_atan2_update(begin, end, s, m, v, t, learning_rate, weight_decay,
             momentum1, momentum2, params, params_grad);
 #else
+        DLIB_NPU_TRY(compute_adam_atan2_update(begin, end, s, m, v, t, learning_rate, weight_decay,
+            momentum1, momentum2, params, params_grad));
         cpu::compute_adam_atan2_update(begin, end, s, m, v, t, learning_rate, weight_decay,
             momentum1, momentum2, params, params_grad);
 #endif
@@ -690,6 +760,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::batch_normalize_inference(eps,dest,src,gamma,beta,running_means,running_variances);
 #else
+        DLIB_NPU_TRY(batch_normalize_inference(eps,dest,src,gamma,beta,running_means,running_variances));
         cpu::batch_normalize_inference(eps,dest,src,gamma,beta,running_means,running_variances);
 #endif
     }
@@ -710,6 +781,8 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::batch_normalize(eps,dest,means,vars,averaging_factor,running_means,running_variances,src,gamma,beta);
 #else
+        DLIB_NPU_TRY(batch_normalize(eps,dest,means,vars,averaging_factor,running_means,running_variances,
+            src,gamma,beta));
         cpu::batch_normalize(eps,dest,means,vars,averaging_factor,running_means,running_variances,src,gamma,beta);
 #endif
     }
@@ -730,6 +803,8 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::batch_normalize_gradient(eps,gradient_input, means, invstds, src, gamma, src_grad, gamma_grad, beta_grad);
 #else
+        DLIB_NPU_TRY(batch_normalize_gradient(eps,gradient_input, means, invstds, src, gamma, src_grad, gamma_grad,
+            beta_grad));
         cpu::batch_normalize_gradient(eps,gradient_input, means, invstds, src, gamma, src_grad, gamma_grad, beta_grad);
 #endif
     }
@@ -749,6 +824,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::batch_normalize_conv_inference(eps,dest,src,gamma,beta,running_means,running_variances);
 #else
+        DLIB_NPU_TRY(batch_normalize_conv_inference(eps,dest,src,gamma,beta,running_means,running_variances));
         cpu::batch_normalize_conv_inference(eps,dest,src,gamma,beta,running_means,running_variances);
 #endif
     }
@@ -769,6 +845,8 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::batch_normalize_conv(eps,dest,means,vars,averaging_factor,running_means,running_variances,src,gamma,beta);
 #else
+        DLIB_NPU_TRY(batch_normalize_conv(eps,dest,means,vars,averaging_factor,running_means,running_variances,
+            src,gamma,beta));
         cpu::batch_normalize_conv(eps,dest,means,vars,averaging_factor,running_means,running_variances,src,gamma,beta);
 #endif
     }
@@ -789,6 +867,8 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::batch_normalize_conv_gradient(eps,gradient_input, means, invstds, src, gamma, src_grad, gamma_grad, beta_grad);
 #else
+        DLIB_NPU_TRY(batch_normalize_conv_gradient(eps,gradient_input, means, invstds, src, gamma, src_grad,
+            gamma_grad, beta_grad));
         cpu::batch_normalize_conv_gradient(eps,gradient_input, means, invstds, src, gamma, src_grad, gamma_grad, beta_grad);
 #endif
     }
@@ -808,6 +888,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::layer_normalize(eps, dest, means, vars, src, gamma, beta);
 #else
+        DLIB_NPU_TRY(layer_normalize(eps, dest, means, vars, src, gamma, beta));
         cpu::layer_normalize(eps, dest, means, vars, src, gamma, beta);
 #endif
     }
@@ -829,6 +910,8 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::layer_normalize_gradient(eps, gradient_input, means, invstds, src, gamma, src_grad, gamma_grad, beta_grad, dmeans, dvars);
 #else
+        DLIB_NPU_TRY(layer_normalize_gradient(eps, gradient_input, means, invstds, src, gamma, src_grad, gamma_grad,
+            beta_grad, dmeans, dvars));
         cpu::layer_normalize_gradient(eps, gradient_input, means, invstds, src, gamma, src_grad, gamma_grad, beta_grad, dmeans, dvars);
 #endif
     }
@@ -847,6 +930,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::rms_normalize(eps, dest, scale, src, gamma, axis_is_nc);
 #else
+        DLIB_NPU_TRY(rms_normalize(eps, dest, scale, src, gamma, axis_is_nc));
         cpu::rms_normalize(eps, dest, scale, src, gamma, axis_is_nc);
 #endif
     }
@@ -865,6 +949,8 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::rms_normalize_gradient(gradient_input, scale, src, gamma, src_grad, gamma_grad, dscale, axis_is_nc);
 #else
+        DLIB_NPU_TRY(rms_normalize_gradient(gradient_input, scale, src, gamma, src_grad, gamma_grad, dscale,
+            axis_is_nc));
         cpu::rms_normalize_gradient(gradient_input, scale, src, gamma, src_grad, gamma_grad, dscale, axis_is_nc);
 #endif
     }
@@ -879,6 +965,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::threshold(data,thresh);
 #else
+        DLIB_NPU_TRY(threshold(data,thresh));
         cpu::threshold(data,thresh);
 #endif
     }
@@ -893,6 +980,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::dot(a,b,result,idx);
 #else
+        DLIB_NPU_TRY(dot(a,b,result,idx));
         cpu::dot(a,b,result,idx);
 #endif
     }
@@ -909,6 +997,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::add(beta,dest,alpha,src);
 #else
+        DLIB_NPU_TRY(add(beta,dest,alpha,src));
         cpu::add(beta,dest,alpha,src);
 #endif
     }
@@ -924,6 +1013,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::add(dest, src1, src2);
 #else
+        DLIB_NPU_TRY(add(dest, src1, src2));
         cpu::add(dest, src1, src2);
 #endif
     }
@@ -938,6 +1028,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::assign_conv_bias_gradient(grad,gradient_input);
 #else
+        DLIB_NPU_TRY(assign_conv_bias_gradient(grad,gradient_input));
         cpu::assign_conv_bias_gradient(grad,gradient_input);
 #endif
     }
@@ -952,6 +1043,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::assign_bias_gradient(grad,gradient_input);
 #else
+        DLIB_NPU_TRY(assign_bias_gradient(grad,gradient_input));
         cpu::assign_bias_gradient(grad,gradient_input);
 #endif
     }
@@ -967,6 +1059,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::softmax(dest, src, mode);
 #else
+        DLIB_NPU_TRY(softmax(dest, src, mode));
         cpu::softmax(dest, src, mode);
 #endif
     }
@@ -981,6 +1074,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::softmax_gradient(grad, dest, gradient_input, mode);
 #else
+        DLIB_NPU_TRY(softmax_gradient(grad, dest, gradient_input, mode));
         cpu::softmax_gradient(grad, dest, gradient_input, mode);
 #endif
     }
@@ -995,6 +1089,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::softmax_all(dest,src);
 #else
+        DLIB_NPU_TRY(softmax_all(dest,src));
         cpu::softmax_all(dest,src);
 #endif
     }
@@ -1008,6 +1103,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::softmax_all_gradient(grad, dest, gradient_input);
 #else
+        DLIB_NPU_TRY(softmax_all_gradient(grad, dest, gradient_input));
         cpu::softmax_all_gradient(grad, dest, gradient_input);
 #endif
     }
@@ -1022,6 +1118,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::sigmoid(dest,src);
 #else
+        DLIB_NPU_TRY(sigmoid(dest,src));
         cpu::sigmoid(dest,src);
 #endif
     }
@@ -1035,6 +1132,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::sigmoid_gradient(grad, dest, gradient_input);
 #else
+        DLIB_NPU_TRY(sigmoid_gradient(grad, dest, gradient_input));
         cpu::sigmoid_gradient(grad, dest, gradient_input);
 #endif
     }
@@ -1049,6 +1147,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::mish(dest,src);
 #else
+        DLIB_NPU_TRY(mish(dest,src));
         cpu::mish(dest,src);
 #endif
     }
@@ -1062,6 +1161,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::mish_gradient(grad, src, gradient_input);
 #else
+        DLIB_NPU_TRY(mish_gradient(grad, src, gradient_input));
         cpu::mish_gradient(grad, src, gradient_input);
 #endif
     }
@@ -1076,6 +1176,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::relu(dest,src);
 #else
+        DLIB_NPU_TRY(relu(dest,src));
         cpu::relu(dest,src);
 #endif
     }
@@ -1089,6 +1190,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::relu_gradient(grad, dest, gradient_input);
 #else
+        DLIB_NPU_TRY(relu_gradient(grad, dest, gradient_input));
         cpu::relu_gradient(grad, dest, gradient_input);
 #endif
     }
@@ -1104,6 +1206,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::prelu(dest, src, param);
 #else
+        DLIB_NPU_TRY(prelu(dest, src, param));
         cpu::prelu(dest, src, param);
 #endif
     }
@@ -1119,6 +1222,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::prelu_gradient(grad, src, gradient_input, param, params_grad);
 #else
+        DLIB_NPU_TRY(prelu_gradient(grad, src, gradient_input, param, params_grad));
         cpu::prelu_gradient(grad, src, gradient_input, param, params_grad);
 #endif
     }
@@ -1134,6 +1238,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::leaky_relu(dest, src, alpha);
 #else
+        DLIB_NPU_TRY(leaky_relu(dest, src, alpha));
         cpu::leaky_relu(dest, src, alpha);
 #endif
     }
@@ -1148,6 +1253,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::leaky_relu_gradient(grad, dest, gradient_input, alpha);
 #else
+        DLIB_NPU_TRY(leaky_relu_gradient(grad, dest, gradient_input, alpha));
         cpu::leaky_relu_gradient(grad, dest, gradient_input, alpha);
 #endif
     }
@@ -1162,6 +1268,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::tanh(dest,src);
 #else
+        DLIB_NPU_TRY(tanh(dest,src));
         cpu::tanh(dest,src);
 #endif
     }
@@ -1175,6 +1282,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::tanh_gradient(grad, dest, gradient_input);
 #else
+        DLIB_NPU_TRY(tanh_gradient(grad, dest, gradient_input));
         cpu::tanh_gradient(grad, dest, gradient_input);
 #endif
     }
@@ -1190,6 +1298,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::clipped_relu(dest, src, ceiling);
 #else
+        DLIB_NPU_TRY(clipped_relu(dest, src, ceiling));
         cpu::clipped_relu(dest, src, ceiling);
 #endif
     }
@@ -1204,6 +1313,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::clipped_relu_gradient(grad, dest, gradient_input, ceiling);
 #else
+        DLIB_NPU_TRY(clipped_relu_gradient(grad, dest, gradient_input, ceiling));
         cpu::clipped_relu_gradient(grad, dest, gradient_input, ceiling);
 #endif
     }
@@ -1219,6 +1329,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::elu(dest, src, alpha);
 #else
+        DLIB_NPU_TRY(elu(dest, src, alpha));
         cpu::elu(dest, src, alpha);
 #endif
     }
@@ -1233,6 +1344,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::elu_gradient(grad, dest, gradient_input, alpha);
 #else
+        DLIB_NPU_TRY(elu_gradient(grad, dest, gradient_input, alpha));
         cpu::elu_gradient(grad, dest, gradient_input, alpha);
 #endif
     }
@@ -1247,6 +1359,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::gelu(dest,src);
 #else
+        DLIB_NPU_TRY(gelu(dest,src));
         cpu::gelu(dest,src);
 #endif
     }
@@ -1260,6 +1373,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::gelu_gradient(grad, src, gradient_input);
 #else
+        DLIB_NPU_TRY(gelu_gradient(grad, src, gradient_input));
         cpu::gelu_gradient(grad, src, gradient_input);
 #endif
     }
@@ -1276,6 +1390,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::smelu(dest, src, beta);
 #else
+        DLIB_NPU_TRY(smelu(dest, src, beta));
         cpu::smelu(dest, src, beta);
 #endif
     }
@@ -1291,6 +1406,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::smelu_gradient(grad, dest, gradient_input, beta);
 #else
+        DLIB_NPU_TRY(smelu_gradient(grad, dest, gradient_input, beta));
         cpu::smelu_gradient(grad, dest, gradient_input, beta);
 #endif
     }
@@ -1305,6 +1421,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::silu(dest,src);
 #else
+        DLIB_NPU_TRY(silu(dest,src));
         cpu::silu(dest,src);
 #endif
     }
@@ -1318,6 +1435,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::silu_gradient(grad, src, gradient_input);
 #else
+        DLIB_NPU_TRY(silu_gradient(grad, src, gradient_input));
         cpu::silu_gradient(grad, src, gradient_input);
 #endif
     }
@@ -1336,6 +1454,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::resize_bilinear(dest,dest_row_stride,dest_channel_stride, src,src_row_stride,src_channel_stride);
 #else
+        DLIB_NPU_TRY(resize_bilinear(dest,dest_row_stride,dest_channel_stride, src,src_row_stride,src_channel_stride));
         cpu::resize_bilinear(dest,dest_row_stride,dest_channel_stride, src,src_row_stride,src_channel_stride);
 #endif
     }
@@ -1352,6 +1471,8 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::resize_bilinear_gradient(grad,grad_row_stride,grad_channel_stride,  gradient_input,gradient_input_row_stride,gradient_input_channel_stride);
 #else
+        DLIB_NPU_TRY(resize_bilinear_gradient(grad,grad_row_stride,grad_channel_stride,  gradient_input,
+            gradient_input_row_stride,gradient_input_channel_stride));
         cpu::resize_bilinear_gradient(grad,grad_row_stride,grad_channel_stride,  gradient_input,gradient_input_row_stride,gradient_input_channel_stride);
 #endif
     }
@@ -1369,6 +1490,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::reorg(add_to, dest, row_stride, col_stride, src);
 #else
+        DLIB_NPU_TRY(reorg(add_to, dest, row_stride, col_stride, src));
         cpu::reorg(add_to, dest, row_stride, col_stride, src);
 #endif
     }
@@ -1384,6 +1506,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::reorg_gradient(add_to, grad, row_stride, col_stride, gradient_input);
 #else
+        DLIB_NPU_TRY(reorg_gradient(add_to, grad, row_stride, col_stride, gradient_input));
         cpu::reorg_gradient(add_to, grad, row_stride, col_stride, gradient_input);
 #endif
     }
@@ -1402,6 +1525,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::copy_tensor(add_to, dest, dest_k_offset, src, src_k_offset, count_k);
 #else
+        DLIB_NPU_TRY(copy_tensor(add_to, dest, dest_k_offset, src, src_k_offset, count_k));
         cpu::copy_tensor(add_to, dest, dest_k_offset, src, src_k_offset, count_k);
 #endif
     }
@@ -1420,6 +1544,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::copy_tensor(add_to, dest, dk, dnr, dnc , src, sk, snr, snc, k, nr, nc);
 #else
+        DLIB_NPU_TRY(copy_tensor(add_to, dest, dk, dnr, dnc, src, sk, snr, snc, k, nr, nc));
         cpu::copy_tensor(add_to, dest, dk, dnr, dnc, src, sk, snr, snc, k, nr, nc);
 #endif
     }
@@ -1435,6 +1560,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         finv(m,out);
 #else
+        DLIB_NPU_TRY(inv(m, out));
         out = dlib::inv(mat(m));
 #endif
     }
@@ -1450,6 +1576,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::transpose(add_to, dest, src);
 #else
+        DLIB_NPU_TRY(transpose(add_to, dest, src));
         cpu::transpose(add_to, dest, src);
 #endif
     }
@@ -1465,6 +1592,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::embeddings(dest, src, embs);
 #else
+        DLIB_NPU_TRY(embeddings(dest, src, embs));
         cpu::embeddings(dest, src, embs);
 #endif
     }
@@ -1481,6 +1609,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::embeddings_gradient(prev, gradient_input, grads, freqs, learning_rate, scale);
 #else
+        DLIB_NPU_TRY(embeddings_gradient(prev, gradient_input, grads, freqs, learning_rate, scale));
         cpu::embeddings_gradient(prev, gradient_input, grads, freqs, learning_rate, scale);
 #endif
     }
@@ -1498,6 +1627,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::puzzle_embeddings(dest, tokens, token_table, puzzle_table, scale);
 #else
+        DLIB_NPU_TRY(puzzle_embeddings(dest, tokens, token_table, puzzle_table, scale));
         cpu::puzzle_embeddings(dest, tokens, token_table, puzzle_table, scale);
 #endif
     }
@@ -1516,6 +1646,8 @@ namespace dlib { namespace tt
         cuda::puzzle_embeddings_gradient(tokens, gradient_input, token_grad, puzzle_table,
                                          scale, puzzle_rate, puzzle_decay);
 #else
+        DLIB_NPU_TRY(puzzle_embeddings_gradient(tokens, gradient_input, token_grad, puzzle_table,
+                                        scale, puzzle_rate, puzzle_decay));
         cpu::puzzle_embeddings_gradient(tokens, gradient_input, token_grad, puzzle_table,
                                         scale, puzzle_rate, puzzle_decay);
 #endif
@@ -1542,6 +1674,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::repeat_channels(dest, src, repeat_factor);
 #else
+        DLIB_NPU_TRY(repeat_channels(dest, src, repeat_factor));
         cpu::repeat_channels(dest, src, repeat_factor);
 #endif
     }
@@ -1565,6 +1698,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::accumulate_repeated_channels(dest, src, repeat_factor);
 #else
+        DLIB_NPU_TRY(accumulate_repeated_channels(dest, src, repeat_factor));
         cpu::accumulate_repeated_channels(dest, src, repeat_factor);
 #endif
     }
@@ -1587,6 +1721,8 @@ namespace dlib { namespace tt
         cuda::compute_halt_logits(logits, halt_probs, state, halt_params, active_mask,
             batch_size, seq_len, num_channels, feature_dim);
 #else
+        DLIB_NPU_TRY(compute_halt_logits(logits, halt_probs, state, halt_params, active_mask,
+            batch_size, seq_len, num_channels, feature_dim));
         cpu::compute_halt_logits(logits, halt_probs, state, halt_params, active_mask,
             batch_size, seq_len, num_channels, feature_dim);
 #endif
@@ -1617,6 +1753,10 @@ namespace dlib { namespace tt
             current_step, batch_size, seq_len, num_channels, feature_dim,
             ponder_penalty, gradient_check_mode);
 #else
+        DLIB_NPU_TRY(compute_halt_gradient(grad_params, grad_state, gradient_input, state,
+            halt_probs, halt_params, active_mask, n_steps, final_state,
+            current_step, batch_size, seq_len, num_channels, feature_dim,
+            ponder_penalty, gradient_check_mode));
         cpu::compute_halt_gradient(grad_params, grad_state, gradient_input, state,
             halt_probs, halt_params, active_mask, n_steps, final_state,
             current_step, batch_size, seq_len, num_channels, feature_dim,
@@ -1639,6 +1779,8 @@ namespace dlib { namespace tt
         cuda::accumulate_weighted_state(output, state, weights, active_mask,
             batch_size, seq_len, num_channels, feature_dim);
 #else
+        DLIB_NPU_TRY(accumulate_weighted_state(output, state, weights, active_mask,
+            batch_size, seq_len, num_channels, feature_dim));
         cpu::accumulate_weighted_state(output, state, weights, active_mask,
             batch_size, seq_len, num_channels, feature_dim);
 #endif
@@ -1660,6 +1802,8 @@ namespace dlib { namespace tt
         cuda::apply_act_depth_scaling(gradients, n_steps, batch_size, seq_len,
             num_channels, feature_dim, max_steps);
 #else
+        DLIB_NPU_TRY(apply_act_depth_scaling(gradients, n_steps, batch_size, seq_len,
+            num_channels, feature_dim, max_steps));
         cpu::apply_act_depth_scaling(gradients, n_steps, batch_size, seq_len,
             num_channels, feature_dim, max_steps);
 #endif
@@ -1677,6 +1821,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::broadcast_row(dest, row);
 #else
+        DLIB_NPU_TRY(broadcast_row(dest, row));
         cpu::broadcast_row(dest, row);
 #endif
     }
@@ -1695,6 +1840,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::act_mark_active(active_mask, active_count, cumulative_halting, halt_threshold);
 #else
+        DLIB_NPU_TRY(act_mark_active(active_mask, active_count, cumulative_halting, halt_threshold));
         cpu::act_mark_active(active_mask, active_count, cumulative_halting, halt_threshold);
 #endif
     }
@@ -1723,6 +1869,8 @@ namespace dlib { namespace tt
         cuda::act_update_halting(cumulative_halting, remainders, n_steps, step_weights,
             halt_probs, active_mask, step, max_steps, halt_threshold);
 #else
+        DLIB_NPU_TRY(act_update_halting(cumulative_halting, remainders, n_steps, step_weights,
+            halt_probs, active_mask, step, max_steps, halt_threshold));
         cpu::act_update_halting(cumulative_halting, remainders, n_steps, step_weights,
             halt_probs, active_mask, step, max_steps, halt_threshold);
 #endif
@@ -1747,6 +1895,8 @@ namespace dlib { namespace tt
         cuda::act_gather_final_state(final_state, step_state, n_steps, step,
             batch_size, seq_len, num_channels, feature_dim);
 #else
+        DLIB_NPU_TRY(act_gather_final_state(final_state, step_state, n_steps, step,
+            batch_size, seq_len, num_channels, feature_dim));
         cpu::act_gather_final_state(final_state, step_state, n_steps, step,
             batch_size, seq_len, num_channels, feature_dim);
 #endif
@@ -1775,6 +1925,8 @@ namespace dlib { namespace tt
         cuda::act_accumulate_output_grad(grad_state, gradient_input, step_weights,
             active_mask, n_steps, step, batch_size, seq_len, num_channels, feature_dim);
 #else
+        DLIB_NPU_TRY(act_accumulate_output_grad(grad_state, gradient_input, step_weights,
+            active_mask, n_steps, step, batch_size, seq_len, num_channels, feature_dim));
         cpu::act_accumulate_output_grad(grad_state, gradient_input, step_weights,
             active_mask, n_steps, step, batch_size, seq_len, num_channels, feature_dim);
 #endif
@@ -1790,6 +1942,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::apply_rotary_positional_embedding(is_backward, data, cos_cache, sin_cache);
 #else
+        DLIB_NPU_TRY(apply_rotary_positional_embedding(is_backward, data, cos_cache, sin_cache));
         cpu::apply_rotary_positional_embedding(is_backward, data, cos_cache, sin_cache);
 #endif
     }
@@ -1804,6 +1957,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::split_heads(add_to, dst, src);
 #else
+        DLIB_NPU_TRY(split_heads(add_to, dst, src));
         cpu::split_heads(add_to, dst, src);
 #endif
     }
@@ -1816,6 +1970,7 @@ namespace dlib { namespace tt
 #ifdef DLIB_USE_CUDA
         cuda::merge_heads(add_to, dst, src);
 #else
+        DLIB_NPU_TRY(merge_heads(add_to, dst, src));
         cpu::merge_heads(add_to, dst, src);
 #endif
     }

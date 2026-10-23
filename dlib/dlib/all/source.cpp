@@ -84,6 +84,8 @@
 #include "../cuda/cpu_dlib.cpp"
 #include "../cuda/tensor_tools.cpp"
 #include "../cuda/extended_memory.cpp"
+// A build that defines DLIB_USE_NPU also compiles ../cuda/npu_dlib.cpp, as a separate C++17
+// file linked with the OpenVINO runtime.
 #include "../data_io/image_dataset_metadata.cpp"
 #include "../data_io/mnist.cpp"
 #include "../data_io/cifar.cpp"

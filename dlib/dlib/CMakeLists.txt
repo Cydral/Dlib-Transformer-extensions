@@ -157,6 +157,10 @@ if (NOT TARGET dlib)
       "Disable this if you don't want to use NVIDIA CUDA" )
    set (DLIB_USE_CUDA_COMPUTE_CAPABILITIES_STR
       "Set this to a comma-separated list of CUDA compute capabilities" )
+   set (DLIB_USE_NPU_STR
+      "Disable this if you don't want dlib to route computations to an NPU through OpenVINO" )
+   set (DLIB_BACKENDS_STR
+      "AUTO, or the backends to build among CPU, CUDA and NPU, such as CPU/NPU or CPU/NPU/CUDA.  A list makes each accelerator it names mandatory and turns the others off." )
    set (DLIB_USE_MKL_SEQUENTIAL_STR
       "Enable this if you have MKL installed and want to use the sequential version instead of the multi-core version." )
    set (DLIB_USE_MKL_WITH_TBB_STR
@@ -226,6 +230,7 @@ if (NOT TARGET dlib)
       option(DLIB_USE_BLAS ${DLIB_USE_BLAS_STR} OFF)
       option(DLIB_USE_LAPACK ${DLIB_USE_LAPACK_STR} OFF)
       option(DLIB_USE_CUDA ${DLIB_USE_CUDA_STR} OFF)
+      option(DLIB_USE_NPU ${DLIB_USE_NPU_STR} OFF)
       option(DLIB_PNG_SUPPORT ${DLIB_PNG_SUPPORT_STR} OFF)
       option(DLIB_GIF_SUPPORT ${DLIB_GIF_SUPPORT_STR} OFF)
       option(DLIB_WEBP_SUPPORT ${DLIB_WEBP_SUPPORT_STR} OFF)
@@ -239,6 +244,7 @@ if (NOT TARGET dlib)
       option(DLIB_USE_BLAS ${DLIB_USE_BLAS_STR} ON)
       option(DLIB_USE_LAPACK ${DLIB_USE_LAPACK_STR} ON)
       option(DLIB_USE_CUDA ${DLIB_USE_CUDA_STR} ON)
+      option(DLIB_USE_NPU ${DLIB_USE_NPU_STR} ON)
       option(DLIB_PNG_SUPPORT ${DLIB_PNG_SUPPORT_STR} ON)
       option(DLIB_GIF_SUPPORT ${DLIB_GIF_SUPPORT_STR} ON)
       option(DLIB_WEBP_SUPPORT ${DLIB_WEBP_SUPPORT_STR} ON)
@@ -247,6 +253,43 @@ if (NOT TARGET dlib)
       option(DLIB_USE_MKL_FFT ${DLIB_USE_MKL_FFT_STR} ON)
       option(DLIB_USE_FFMPEG ${DLIB_USE_FFMPEG_STR} ON)
    endif()
+
+   # DLIB_BACKENDS sets DLIB_USE_CUDA and DLIB_USE_NPU from a list of backends, the host
+   # backend being always there.  With AUTO, the default, these two options keep their values
+   # and each accelerator is used if found.
+   set(DLIB_BACKENDS "AUTO" CACHE STRING "${DLIB_BACKENDS_STR}")
+   set_property(CACHE DLIB_BACKENDS PROPERTY STRINGS AUTO CPU CPU/CUDA CPU/NPU CPU/NPU/CUDA)
+   set(dlib_required_backends)
+   string(TOUPPER "${DLIB_BACKENDS}" dlib_backends)
+   string(STRIP "${dlib_backends}" dlib_backends)
+   if (NOT dlib_backends STREQUAL "AUTO" AND NOT dlib_backends STREQUAL "")
+      string(REGEX REPLACE "[,;/+ ]+" ";" dlib_backends "${dlib_backends}")
+      set(dlib_backend_cuda OFF)
+      set(dlib_backend_npu OFF)
+      foreach (dlib_backend IN LISTS dlib_backends)
+         if (dlib_backend STREQUAL "CUDA")
+            set(dlib_backend_cuda ON)
+            list(APPEND dlib_required_backends CUDA)
+         elseif (dlib_backend STREQUAL "NPU")
+            set(dlib_backend_npu ON)
+            list(APPEND dlib_required_backends NPU)
+         elseif (NOT dlib_backend STREQUAL "CPU" AND NOT dlib_backend STREQUAL "")
+            message(FATAL_ERROR "DLIB_BACKENDS contains '${dlib_backend}'.  Use AUTO, or a list among CPU, CUDA and NPU such as CPU/NPU.")
+         endif()
+      endforeach()
+      if (DLIB_ISO_CPP_ONLY AND dlib_required_backends)
+         message(FATAL_ERROR "DLIB_BACKENDS=${DLIB_BACKENDS} asks for an accelerator, which DLIB_ISO_CPP_ONLY excludes.")
+      endif()
+      set(DLIB_USE_CUDA ${dlib_backend_cuda} CACHE BOOL ${DLIB_USE_CUDA_STR} FORCE)
+      set(DLIB_USE_NPU ${dlib_backend_npu} CACHE BOOL ${DLIB_USE_NPU_STR} FORCE)
+      if (NOT TARGET dlib)
+         message(STATUS "Building dlib for the backends ${DLIB_BACKENDS} (DLIB_USE_CUDA=${dlib_backend_cuda}, DLIB_USE_NPU=${dlib_backend_npu})")
+      endif()
+   endif()
+   if (DLIB_ISO_CPP_ONLY AND DLIB_USE_NPU)
+      set(DLIB_USE_NPU OFF CACHE BOOL ${DLIB_USE_NPU_STR} FORCE)
+   endif()
+
    toggle_preprocessor_switch(DLIB_JPEG_SUPPORT)
    toggle_preprocessor_switch(DLIB_USE_BLAS)
    toggle_preprocessor_switch(DLIB_USE_LAPACK)
@@ -718,6 +761,47 @@ if (NOT TARGET dlib)
             message(STATUS "Disabling CUDA support for dlib.  DLIB WILL NOT USE CUDA")
          endif()
       endif()
+      if ("CUDA" IN_LIST dlib_required_backends AND NOT DLIB_USE_CUDA)
+         message(FATAL_ERROR "DLIB_BACKENDS=${DLIB_BACKENDS} requires CUDA, which could not be enabled (see the messages above).")
+      endif()
+
+
+      # The NPU module receives the operations that CUDA does not implement.  Since CUDA
+      # implements all of them today, AUTO leaves the module out of CUDA builds, and the
+      # CPU/NPU/CUDA set builds both.
+      if (DLIB_USE_NPU AND DLIB_USE_CUDA AND NOT "NPU" IN_LIST dlib_required_backends)
+         set(DLIB_USE_NPU OFF CACHE BOOL ${DLIB_USE_NPU_STR} FORCE)
+         message(STATUS "Disabling NPU support for dlib because CUDA is enabled and implements every operation the NPU module routes.  Set DLIB_BACKENDS=CPU/NPU/CUDA to build both.")
+      endif()
+
+      if (DLIB_USE_NPU)
+         set(dlib_npu_problem)
+         if (NOT "cxx_std_17" IN_LIST CMAKE_CXX_COMPILE_FEATURES)
+            set(dlib_npu_problem "THE COMPILER DOES NOT SUPPORT C++17, WHICH THE OPENVINO HEADERS NEED")
+         else()
+            include(cmake_utils/find_openvino.cmake)
+            if (NOT OpenVINO_FOUND)
+               set(dlib_npu_problem "DID NOT FIND OPENVINO")
+            endif()
+         endif()
+
+         if (NOT dlib_npu_problem)
+            # cuda/npu_dlib.cpp is built as a separate object library (see the end of this
+            # file) because it alone is compiled as C++17.
+            message(STATUS "Enabling NPU support for dlib.  DLIB WILL USE AN NPU when one is found at run time, through OpenVINO ${OpenVINO_VERSION}.")
+            if (WIN32)
+               message(STATUS "Programs built with NPU support load the OpenVINO runtime: add ${DLIB_OPENVINO_LIBRARY_DIR} to the PATH before running them.")
+            endif()
+         else()
+            set(DLIB_USE_NPU OFF CACHE BOOL ${DLIB_USE_NPU_STR} FORCE)
+            message(STATUS "${dlib_npu_problem}")
+            message(STATUS "Disabling NPU support for dlib.  DLIB WILL NOT USE AN NPU")
+         endif()
+      endif()
+      if ("NPU" IN_LIST dlib_required_backends AND NOT DLIB_USE_NPU)
+         message(FATAL_ERROR "DLIB_BACKENDS=${DLIB_BACKENDS} requires NPU support, which could not be enabled (see the messages above).")
+      endif()
+      toggle_preprocessor_switch(DLIB_USE_NPU)
 
 
       if (DLIB_LINK_WITH_SQLITE3)
@@ -814,6 +898,25 @@ if (NOT TARGET dlib)
    else()
       target_compile_options(dlib PUBLIC $<$<COMPILE_LANGUAGE:CXX>:${active_compile_opts}>)
       target_compile_options(dlib PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${active_compile_opts_private}>)
+   endif()
+
+   if (DLIB_USE_NPU AND NOT DLIB_ISO_CPP_ONLY)
+      # cuda/npu_dlib.cpp is the only file that includes OpenVINO, whose headers need C++17.
+      # It is compiled on its own with the options of dlib, so that the other sources keep
+      # their standard and receive none of the usage requirements of OpenVINO.  dlib then
+      # links the runtime library itself.
+      add_library(dlib_npu OBJECT cuda/npu_dlib.cpp)
+      set_target_properties(dlib_npu PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+      if (BUILD_SHARED_LIBS OR CMAKE_POSITION_INDEPENDENT_CODE)
+         set_target_properties(dlib_npu PROPERTIES POSITION_INDEPENDENT_CODE ON)
+      endif()
+      target_link_libraries(dlib_npu PRIVATE openvino::runtime)
+      target_include_directories(dlib_npu PRIVATE $<TARGET_PROPERTY:dlib,INCLUDE_DIRECTORIES>)
+      target_compile_definitions(dlib_npu PRIVATE $<TARGET_PROPERTY:dlib,COMPILE_DEFINITIONS>)
+      target_compile_options(dlib_npu PRIVATE $<TARGET_PROPERTY:dlib,COMPILE_OPTIONS>)
+      target_sources(dlib PRIVATE $<TARGET_OBJECTS:dlib_npu>)
+      target_link_libraries(dlib PRIVATE $<TARGET_LINKER_FILE:openvino::runtime>
+         $<$<AND:$<CXX_COMPILER_ID:GNU>,$<VERSION_LESS:$<CXX_COMPILER_VERSION>,9.1>>:stdc++fs>)
    endif()
 
    # Install the library

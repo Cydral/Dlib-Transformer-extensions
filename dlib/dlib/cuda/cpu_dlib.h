@@ -7,6 +7,7 @@
 // and cudnn_dlibapi.h
 
 #include "tensor.h"
+#include "npu_dlib.h"
 #include "../geometry/rectangle.h"
 #include "../dnn/utilities.h"
 
@@ -917,7 +918,15 @@ namespace dlib
             double& loss
         ) const
         {
+#ifdef DLIB_USE_NPU
+            if (!npu::sigmoid(grad, output_tensor))
+            {
+                npu::cpu_measure measure;
+                sigmoid(grad, output_tensor);
+            }
+#else
             sigmoid(grad, output_tensor);
+#endif
             // The loss we output is the average loss over the mini-batch, and also over each element of the matrix output.
             const double scale = 1.0/(output_tensor.num_samples()*output_tensor.nr()*output_tensor.nc());
             loss = 0;
@@ -1002,6 +1011,33 @@ namespace dlib
             const long batch_size = output_tensor.num_samples();
             const long seq_len = output_tensor.nr();
             const long vocab_size = output_tensor.nc();
+
+#ifdef DLIB_USE_NPU
+            if (npu::is_available())
+            {
+                // The scored positions, selected here from the labels, for the device.
+                std::vector<long> rows;
+                std::vector<unsigned long> targets;
+                const float* in = input_tensor.host();
+                for (long i = 0; i < batch_size; ++i)
+                    for (long t = 0; t < seq_len; ++t)
+                    {
+                        const long token = static_cast<long>(in[tensor_index(input_tensor, i, 0, t, 0)]);
+                        if (pad_index >= 0 && token == pad_index)
+                            continue;
+                        const unsigned long target_class = (*(truth + i))(t);
+                        if (ignore_index >= 0 && static_cast<long>(target_class) == ignore_index)
+                            continue;
+                        DLIB_CASSERT(target_class < static_cast<unsigned long>(vocab_size),
+                            "Target class " << target_class << " >= vocab_size " << vocab_size);
+                        rows.push_back(i * seq_len + t);
+                        targets.push_back(target_class);
+                    }
+                if (npu::cross_entropy_rows(output_tensor, grad, rows, targets, label_smoothing, z_loss_weight, loss))
+                    return;
+            }
+            npu::cpu_measure measure;
+#endif
 
             const float* out_data = output_tensor.host();
             const float* in_data = input_tensor.host();
@@ -1128,6 +1164,31 @@ namespace dlib
             std::sort(sorted_ignore.begin(), sorted_ignore.end());
             auto is_ignored = [&](long target) -> bool
                 { return std::binary_search(sorted_ignore.begin(), sorted_ignore.end(), target); };
+
+#ifdef DLIB_USE_NPU
+            if (npu::is_available())
+            {
+                std::vector<long> rows;
+                std::vector<unsigned long> targets;
+                for (long i = 0; i < batch_size; ++i)
+                    for (long t = 0; t < seq_len; ++t)
+                    {
+                        const long token = static_cast<long>(in_data[tensor_index(input_tensor, i, 0, t, 0)]);
+                        if (pad_index >= 0 && token == pad_index)
+                            continue;
+                        const unsigned long target_class = (*(truth + i))(t);
+                        if (is_ignored(static_cast<long>(target_class)))
+                            continue;
+                        DLIB_CASSERT(target_class < static_cast<unsigned long>(vocab_size),
+                            "Target class " << target_class << " >= vocab_size " << vocab_size);
+                        rows.push_back(i * seq_len + t);
+                        targets.push_back(target_class);
+                    }
+                if (npu::cross_entropy_rows(output_tensor, grad, rows, targets, label_smoothing, z_loss_weight, loss))
+                    return;
+            }
+            npu::cpu_measure measure;
+#endif
 
             long valid_tokens = 0;
             loss = 0.0;
@@ -1493,7 +1554,15 @@ namespace dlib
             double& loss
         ) const
         {
+#ifdef DLIB_USE_NPU
+            if (!npu::softmax(grad, output_tensor, operation_mode::CHANNEL_WISE))
+            {
+                npu::cpu_measure measure;
+                softmax(grad, output_tensor);
+            }
+#else
             softmax(grad, output_tensor);
+#endif
             // The loss we output is the average loss over the mini-batch, and also over each element of the matrix output.
             const double scale = 1.0 / (output_tensor.num_samples() * output_tensor.nr() * output_tensor.nc());
             loss = 0;
@@ -1558,7 +1627,15 @@ namespace dlib
             double& loss
         ) const
         {
+#ifdef DLIB_USE_NPU
+            if (!npu::softmax(grad, output_tensor, operation_mode::CHANNEL_WISE))
+            {
+                npu::cpu_measure measure;
+                softmax(grad, output_tensor);
+            }
+#else
             softmax(grad, output_tensor);
+#endif
             // The loss we output is the weighted average loss over the mini-batch, and also over each element of the matrix output.
             const double scale = 1.0 / (output_tensor.num_samples() * output_tensor.nr() * output_tensor.nc());
             loss = 0;
@@ -1620,6 +1697,22 @@ namespace dlib
             double& loss
         ) const
         {
+#ifdef DLIB_USE_NPU
+            {
+                auto fill = [&](float* targets)
+                {
+                    const_label_iterator t = truth;
+                    for (long i = 0; i < output_tensor.num_samples(); ++i, ++t)
+                        for (long k = 0; k < output_tensor.k(); ++k)
+                            for (long r = 0; r < output_tensor.nr(); ++r)
+                                for (long c = 0; c < output_tensor.nc(); ++c)
+                                    targets[tensor_index(output_tensor, i, k, r, c)] = (*t)[k].operator()(r, c);
+                };
+                if (npu::mean_squared_per_pixel(output_tensor, fill, grad, loss))
+                    return;
+            }
+            npu::cpu_measure measure;
+#endif
             // The loss we output is the average loss over the mini-batch, and also over each element of the matrix output.
             const double scale = 1.0 / (output_tensor.num_samples() * output_tensor.k() * output_tensor.nr() * output_tensor.nc());
             loss = 0;

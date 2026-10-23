@@ -159,6 +159,7 @@ add_executable(${target_name} main.cpp tester.cpp
    vectorstream.cpp
    dnn.cpp
    cublas.cpp
+   npu.cpp
    find_optimal_parameters.cpp
    elastic_net.cpp
    te.cpp

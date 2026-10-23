@@ -195,10 +195,37 @@ namespace dlib
 
 
         size_t size(
-        ) const; 
+        ) const;
         /*!
             ensures
                 - returns the number of floats contained in this object.
+        !*/
+
+        uint64_t copy_mark (
+        ) const;
+        /*!
+            ensures
+                - returns the mark set by the last call to set_copy_mark(), or 0 if a call
+                  to host(), host_write_only(), device(), device_write_only() or set_size()
+                  that may have changed the values came after it.  swap() exchanges the
+                  marks of the two objects along with their values.
+                - A reader that keeps a copy of the values, such as the NPU routing with
+                  the device copies of the weights it reuses, knows the copy current for as
+                  long as copy_mark() returns the mark it obtained before taking it.
+        !*/
+
+        uint64_t set_copy_mark (
+            uint64_t fresh
+        ) const;
+        /*!
+            requires
+                - fresh != 0
+            ensures
+                - if (copy_mark() == 0) then
+                    - #copy_mark() == fresh
+                    - returns fresh
+                - else
+                    - returns copy_mark(), which still describes the current values.
         !*/
 
         void swap (

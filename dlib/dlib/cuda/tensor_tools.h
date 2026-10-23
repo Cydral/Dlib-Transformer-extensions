@@ -10,6 +10,7 @@
 #include "curand_dlibapi.h"
 #include "cpu_dlib.h"
 #include "cuda_dlib.h"
+#include "npu_dlib.h"
 #include "../rand.h"
 #include <memory>
 #include "../geometry/rectangle.h"
@@ -1188,14 +1189,28 @@ namespace dlib { namespace tt
         tensor_conv() {}
 
         void clear(
-        ) { impl.clear(); }
+        )
+        {
+            impl.clear();
+#if defined(DLIB_USE_NPU) && !defined(DLIB_USE_CUDA)
+            stride_y = stride_x = padding_y = padding_x = 0;
+#endif
+        }
 
         void operator() (
             const bool add_to_output,
             tensor& output,
             const tensor& data,
             const tensor& filters
-        ) { impl(add_to_output,output,data,filters); }
+        )
+        {
+#if defined(DLIB_USE_NPU) && !defined(DLIB_USE_CUDA)
+            if (npu::conv(add_to_output, output, data, filters, stride_y, stride_x, padding_y, padding_x))
+                return;
+            npu::cpu_measure measure;
+#endif
+            impl(add_to_output,output,data,filters);
+        }
         /*!
             requires
                 - setup() has been called.  Specifically, setup() has been called like this:
@@ -1221,7 +1236,21 @@ namespace dlib { namespace tt
             resizable_tensor& output,
             const tensor& data,
             const tensor& filters
-        ) { impl(add_to_output,output,data,filters); }
+        )
+        {
+#if defined(DLIB_USE_NPU) && !defined(DLIB_USE_CUDA)
+            if (stride_y > 0 && stride_x > 0)
+            {
+                output.set_size(data.num_samples(), filters.num_samples(),
+                    1+(data.nr()+2*padding_y-filters.nr())/stride_y,
+                    1+(data.nc()+2*padding_x-filters.nc())/stride_x);
+                if (npu::conv(add_to_output, output, data, filters, stride_y, stride_x, padding_y, padding_x))
+                    return;
+            }
+            npu::cpu_measure measure;
+#endif
+            impl(add_to_output,output,data,filters);
+        }
         /*!
             requires
                 - setup() has been called.  Specifically, setup() has been called like this:
@@ -1249,7 +1278,19 @@ namespace dlib { namespace tt
             const tensor& filters,
             const tensor& biases,
             bool use_relu
-        ) { impl(add_to_output,output,data,filters,biases,use_relu); }
+        )
+        {
+#if defined(DLIB_USE_NPU) && !defined(DLIB_USE_CUDA)
+            if (npu::conv(add_to_output, output, data, filters, stride_y, stride_x, padding_y, padding_x))
+            {
+                tt::add(1, output, 1, biases);
+                if (use_relu && !npu::relu(output, output))
+                    cpu::relu(output, output);
+                return;
+            }
+#endif
+            impl(add_to_output,output,data,filters,biases,use_relu);
+        }
         /*!
             requires
                 - setup() has been called.  Specifically, setup() has been called like this:
@@ -1281,7 +1322,25 @@ namespace dlib { namespace tt
             const tensor& filters,
             const tensor& biases,
             bool use_relu
-        ) { impl(add_to_output,output,data,filters,biases,use_relu); }
+        )
+        {
+#if defined(DLIB_USE_NPU) && !defined(DLIB_USE_CUDA)
+            if (stride_y > 0 && stride_x > 0)
+            {
+                output.set_size(data.num_samples(), filters.num_samples(),
+                    1+(data.nr()+2*padding_y-filters.nr())/stride_y,
+                    1+(data.nc()+2*padding_x-filters.nc())/stride_x);
+                if (npu::conv(add_to_output, output, data, filters, stride_y, stride_x, padding_y, padding_x))
+                {
+                    tt::add(1, output, 1, biases);
+                    if (use_relu && !npu::relu(output, output))
+                        cpu::relu(output, output);
+                    return;
+                }
+            }
+#endif
+            impl(add_to_output,output,data,filters,biases,use_relu);
+        }
         /*!
             requires
                 - setup() has been called.  Specifically, setup() has been called like this:
@@ -1309,7 +1368,16 @@ namespace dlib { namespace tt
             const tensor& gradient_input, 
             const tensor& filters,
             tensor& data_gradient
-        ) { impl.get_gradient_for_data(add_to_output,gradient_input,filters,data_gradient); }
+        )
+        {
+#if defined(DLIB_USE_NPU) && !defined(DLIB_USE_CUDA)
+            if (npu::conv_gradient_for_data(add_to_output, gradient_input, filters, data_gradient,
+                    stride_y, stride_x, padding_y, padding_x))
+                return;
+            npu::cpu_measure measure;
+#endif
+            impl.get_gradient_for_data(add_to_output,gradient_input,filters,data_gradient);
+        }
         /*!
             requires
                 - One of the following must be true:
@@ -1344,7 +1412,16 @@ namespace dlib { namespace tt
             const tensor& gradient_input, 
             const tensor& data,
             tensor& filters_gradient
-        ) { impl.get_gradient_for_filters(add_to_output,gradient_input,data,filters_gradient); }
+        )
+        {
+#if defined(DLIB_USE_NPU) && !defined(DLIB_USE_CUDA)
+            if (npu::conv_gradient_for_filters(add_to_output, gradient_input, data, filters_gradient,
+                    stride_y, stride_x, padding_y, padding_x))
+                return;
+            npu::cpu_measure measure;
+#endif
+            impl.get_gradient_for_filters(add_to_output,gradient_input,data,filters_gradient);
+        }
         /*!
             requires
                 - One of the following must be true:
@@ -1382,7 +1459,16 @@ namespace dlib { namespace tt
             int stride_x,
             int padding_y,
             int padding_x
-        ) {impl.setup(data,filters,stride_y,stride_x,padding_y,padding_x); }
+        )
+        {
+            impl.setup(data,filters,stride_y,stride_x,padding_y,padding_x);
+#if defined(DLIB_USE_NPU) && !defined(DLIB_USE_CUDA)
+            this->stride_y = stride_y;
+            this->stride_x = stride_x;
+            this->padding_y = padding_y;
+            this->padding_x = padding_x;
+#endif
+        }
         /*!
             requires
                 - filters.k() == data.k()
@@ -1410,6 +1496,13 @@ namespace dlib { namespace tt
 #else
         cpu::tensor_conv impl;
 #endif
+#if defined(DLIB_USE_NPU) && !defined(DLIB_USE_CUDA)
+        // The geometry given to setup(), which the device paths need.
+        int stride_y = 0;
+        int stride_x = 0;
+        int padding_y = 0;
+        int padding_x = 0;
+#endif
 
     };
 
@@ -1431,7 +1524,13 @@ namespace dlib { namespace tt
         ) = default;
 
         void clear(
-        ) { impl.clear(); }
+        )
+        {
+            impl.clear();
+#if defined(DLIB_USE_NPU) && !defined(DLIB_USE_CUDA)
+            remember(0, 0, 0, 0, 0, 0);
+#endif
+        }
 
         void setup_max_pooling(
             int window_height,
@@ -1440,7 +1539,13 @@ namespace dlib { namespace tt
             int stride_x,
             int padding_y,
             int padding_x
-        ) { impl.setup_max_pooling(window_height, window_width, stride_y, stride_x, padding_y, padding_x); }
+        )
+        {
+            impl.setup_max_pooling(window_height, window_width, stride_y, stride_x, padding_y, padding_x);
+#if defined(DLIB_USE_NPU) && !defined(DLIB_USE_CUDA)
+            remember(window_height, window_width, stride_y, stride_x, padding_y, padding_x);
+#endif
+        }
         /*!
             requires
                 - window_height > 0
@@ -1461,7 +1566,13 @@ namespace dlib { namespace tt
             int stride_x,
             int padding_y,
             int padding_x
-        ) { impl.setup_avg_pooling(window_height, window_width, stride_y, stride_x, padding_y, padding_x); }
+        )
+        {
+            impl.setup_avg_pooling(window_height, window_width, stride_y, stride_x, padding_y, padding_x);
+#if defined(DLIB_USE_NPU) && !defined(DLIB_USE_CUDA)
+            remember(window_height, window_width, stride_y, stride_x, padding_y, padding_x);
+#endif
+        }
         /*!
             requires
                 - window_height > 0
@@ -1481,7 +1592,22 @@ namespace dlib { namespace tt
         void operator() (
             resizable_tensor& dest,
             const tensor& src
-        ) { impl(dest, src); }
+        )
+        {
+#if defined(DLIB_USE_NPU) && !defined(DLIB_USE_CUDA)
+            if (geometry[2] > 0 && src.size() != 0)
+            {
+                dest.set_size(src.num_samples(), src.k(),
+                    1+(src.nr()+2*geometry[4]-geometry[0])/geometry[2],
+                    1+(src.nc()+2*geometry[5]-geometry[1])/geometry[3]);
+                if (npu::pooling(impl.does_max_pooling(), geometry[0], geometry[1], geometry[2], geometry[3],
+                        geometry[4], geometry[5], dest, src))
+                    return;
+            }
+            npu::cpu_measure measure;
+#endif
+            impl(dest, src);
+        }
         /*!
             requires
                 - is_same_object(dest,src) == false
@@ -1509,7 +1635,16 @@ namespace dlib { namespace tt
             const tensor& dest,
             const tensor& src,
             tensor& grad 
-        ) { impl.get_gradient(gradient_input, dest, src, grad); }
+        )
+        {
+#if defined(DLIB_USE_NPU) && !defined(DLIB_USE_CUDA)
+            if (geometry[2] > 0 && npu::pooling_gradient(impl.does_max_pooling(), geometry[0], geometry[1],
+                    geometry[2], geometry[3], geometry[4], geometry[5], gradient_input, dest, src, grad))
+                return;
+            npu::cpu_measure measure;
+#endif
+            impl.get_gradient(gradient_input, dest, src, grad);
+        }
         /*!
             requires
                 - have_same_dimensions(gradient_input,dest) == true
@@ -1530,6 +1665,15 @@ namespace dlib { namespace tt
         cuda::pooling impl;
 #else
         cpu::pooling impl;
+#endif
+#if defined(DLIB_USE_NPU) && !defined(DLIB_USE_CUDA)
+        // window height, window width, stride y, stride x, padding y, padding x
+        int geometry[6] = {0, 0, 0, 0, 0, 0};
+        void remember (int wh, int ww, int sy, int sx, int py, int px)
+        {
+            geometry[0] = wh; geometry[1] = ww; geometry[2] = sy;
+            geometry[3] = sx; geometry[4] = py; geometry[5] = px;
+        }
 #endif
     };
 

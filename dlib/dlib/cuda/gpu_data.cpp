@@ -192,6 +192,7 @@ namespace dlib
     {
         if (new_size == 0)
         {
+            forget_copies();
             if (device_in_use.load(std::memory_order_relaxed))
             {
                 // Wait for any possible CUDA kernels that might be using our memory block to
@@ -214,6 +215,7 @@ namespace dlib
         }
         else if (new_size != data_size)
         {
+            forget_copies();
             if (device_in_use.load(std::memory_order_relaxed))
             {
                 // Wait for any possible CUDA kernels that might be using our memory block to
