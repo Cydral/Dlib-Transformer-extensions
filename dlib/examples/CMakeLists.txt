@@ -201,6 +201,7 @@ add_example(slm_vit_ssl_ex)
 add_example(slm_distill_ex)
 add_example(slm_embed_ex)
 add_example(slm_extended_memory_ex)
+add_example(slm_npu_offload_ex)
 add_example(slm_document_anonymizer_ex)
 # The anonymizer compiles the document stack, the structural SVM tagger, two sizes of the
 # transformer span model and the trained recognizers of its header into one translation unit.

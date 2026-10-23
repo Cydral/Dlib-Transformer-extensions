@@ -389,6 +389,10 @@ void compress_file(const std::string& input_path, const std::string& output_path
     // Build inference network
     infer_net net(t_net);
 
+    /* The decompressor replays these predictions, so they must not depend on the hardware
+       present: while coding, the network runs with the arithmetic of the host. */
+    npu::exact_scope single_precision;
+
     // Compress data stream (always processes the full file)
     cout << "\nCompressing data stream..." << endl;
 
@@ -585,7 +589,8 @@ void decompress_file(const std::string& input_path, const std::string& output_pa
 
     cout << "Entropy-decoded bitstream: " << format_size(compressed_data.size()) << endl;
 
-    // Reconstruct byte stream
+    // Reconstruct byte stream, with the arithmetic the compressor used
+    npu::exact_scope single_precision;
     cout << "\nRestoring byte stream..." << endl;
 
     std::vector<uint8_t> decompressed_data = literal_seed;

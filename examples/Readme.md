@@ -39,6 +39,7 @@
   - [`slm_distill_ex.cpp`](#slm_distill_excpp)
   - [`slm_embed_ex.cpp`](#slm_embed_excpp)
   - [`slm_extended_memory_ex.cpp`](#slm_extended_memory_excpp)
+  - [`slm_npu_offload_ex.cpp`](#slm_npu_offload_excpp)
   - [`slm_document_anonymizer_ex.cpp`](#slm_document_anonymizer_excpp)
   - [`slm_tools/` Python witnesses](#slm_tools-python-witnesses)
   - [`slm_data.h`](#slm_datah-shared-data-layer)
@@ -71,6 +72,7 @@ Across the full example suite, the repository now covers:
 - **supervised fine-tuning and low-rank adaptation** (LoRA, DoRA) over an imported model
 - **knowledge distillation** from a teacher container into a student of a freely chosen architecture, dense or mixture-of-experts
 - **software-extended device memory**: a residency layer that lets a network occupy more than the card holds, driven by the access schedule the run reveals about itself
+- **run-time routing to an NPU**: every tensor operation the host would run is offered to the NPU of the processor when one is found, and runs where it was measured to be faster
 - **lossless compression from a trained predictor**: a token-level network compiled into the program, mixed with context models under an arithmetic coder, with inference arithmetic fixed operation by operation so that decoding reproduces every probability
 - **privacy-preserving document processing**: reversible pseudonymization of Word, Excel, PowerPoint, PDF and text files, with a byte-level Transformer encoder and a structural SVM sequence labeler that learn, from synthetic data, where a name, a place or an organisation starts and ends, for people, addresses and organisations of many countries
 
@@ -116,6 +118,8 @@ Then the interoperability and specialization track, which can be read independen
    Run a model **larger than the card**, by making device residency a scheduling problem.
 16. [`slm_document_anonymizer_ex.cpp`](#slm_document_anonymizer_excpp)  
    Protect the **personal data** of documents with reversible tags, and train a small **span tagger** that says, for any string, what is personal and where it starts and ends.
+17. [`slm_npu_offload_ex.cpp`](#slm_npu_offload_excpp)  
+   See what the **NPU** of the processor brings to the primitives of a transformer and to a training run, with routing decided at run time.
 
 A shared support layer, [`slm_data.h`](#slm_datah-shared-data-layer), provides embedded datasets and utilities used throughout the examples, and [`slm_tools/`](slm_tools) holds the Python witnesses used to verify the C++ paths against reference implementations.
 
@@ -738,6 +742,39 @@ The **pinned mirrors** line is the other one. With a store it should stay small 
 
 ---
 
+## `slm_npu_offload_ex.cpp`
+
+### Purpose
+Show, on the machine it runs on, what routing the tensor operations of a model to an NPU brings: which device was found and how it computes, how fast each primitive of a transformer runs on it compared with the host, and what a training run looks like when the routing is left to the library.
+
+### What the example teaches
+**The routing does not appear in the program.** Neither the network, nor the trainer, nor the calls of the example name the device. The same binary runs every operation on the host when no NPU is found, and a build without `DLIB_USE_NPU` compiles the same source.
+
+**A decision per shape, from measurements.** The benchmark forces each primitive on the device to time it. The training run leaves the decision to automatic routing: a graph is compiled the second time a shape is seen, device and host are then timed on a few calls, and the faster one keeps that shape. The routing summary printed at the end gives, operation by operation, the calls each side computed, the graphs compiled and the time spent compiling them.
+
+**Weights stay on the device.** The benchmark writes its activations before every call, as a network does, while its weights do not change: from the second call on, the device reuses its copy of them and converts the activations only. The products with one and eight token rows against the weights of a model of half a billion parameters show what that brings to token by token inference; `DLIB_NPU_RESIDENT_MB=0` converts every operand at every call, for comparison.
+
+**What half precision costs is measured.** Next to each timing, the benchmark prints the largest difference between the device result and the host result, relative to the magnitude of the result; the OpenVINO CPU plugin computing in FP16 (`DLIB_NPU_PRECISION=f16`) gives a few 1e-4. The training run reports the loss of both runs, started from the same weights on the same batches.
+
+### Running it
+- On Windows, with an Intel Core Ultra processor: build in Release with OpenVINO found by CMake, put the OpenVINO `libs` folder that CMake prints in the `PATH`, then run `slm_npu_offload_ex`.
+- On a machine without an NPU, WSL2 included: `DLIB_NPU_DEVICE=CPU ./slm_npu_offload_ex` runs the device paths on the OpenVINO CPU plugin. The timings then compare two host implementations, while the results and the routing are those of a real device. `DLIB_NPU_DEVICE=GPU` selects an integrated GPU.
+- `--info`, `--benchmark` and `--train` run one part; `--reps` and `--steps` size them.
+
+### Useful reminders
+- **Copies follow the writes.** A copy kept for the device is current until an access to the tensor that may change it (non-const `host()`, `host_write_only()`, `set_size()`): the next call then converts the tensor again. The `reused` column of the routing summary counts the device calls that bound a kept copy.
+- **The first run pays for compilation.** OpenVINO keeps compiled graphs in a cache, under the user cache folder unless `DLIB_NPU_CACHE_DIR` says otherwise, and later runs start from it.
+- **What must not round stays on the host.** On a device computing in half precision, parameter updates, optimizer moments, embedding tables, thresholds and data movement never leave the host, and the routing summary does not list them.
+- **Hardware-independent decisions.** Code that must produce the same decisions on every machine, such as the coding loop of a compressor, runs its inference inside an `npu::exact_scope`.
+- **Environment.** `DLIB_NPU=0` disables the routing, `DLIB_NPU_ROUTING=never|auto|always` sets its mode, `DLIB_NPU_OPS=gelu,-softmax` enables or disables operations by name, and `DLIB_NPU_VERBOSE=2` reports every compilation.
+
+### What to inspect in the output
+The `device` line of the status gives the device and the precision it computes in. In the benchmark, a speed-up above one marks a primitive whose arithmetic outweighs the conversions and copies the device adds, as the products and the convolutions do. In the routing summary of the training run, an operation with three device calls per graph and every other call on the host is one the host was measured to compute faster at those sizes; the device calls are those of the measurement.
+
+[⬆ Back to top](#on-this-page)
+
+---
+
 ## `slm_advanced_gqa_kvc_train_ex.cpp`
 
 ### Purpose
@@ -1033,6 +1070,7 @@ The repository strikes a useful balance:
 - Use **`slm_distill_ex.cpp`** if you want to build a smaller model of your own design from a larger one.
 - Read **`slm_extended_memory_ex.cpp`** if a model you want to run does not fit in your VRAM, or if you want to understand why prefetching needs a schedule rather than a heuristic.
 - Use **`slm_document_anonymizer_ex.cpp`** if documents must leave your organisation without their personal data, or if you want a template for a small, grounded extraction model.
+- Run **`slm_npu_offload_ex.cpp`** if your processor has an NPU, to see which operations it accelerates and what automatic routing makes of a training run.
 
 ---
 
