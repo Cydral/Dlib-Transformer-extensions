@@ -19,7 +19,8 @@ namespace dlib
     enum class bpe_segmentation
     {
         whitespace_split = 0,
-        space_prefixed = 1
+        space_prefixed = 1,
+        character_classes = 2
     };
     /*!
         WHAT THIS OBJECT REPRESENTS
@@ -33,6 +34,13 @@ namespace dlib
               non-whitespace byte opens the segment that follows it. A word and the space before
               it can then become one token, which shortens the token sequence of prose by more
               than a quarter.
+            - character_classes: as space_prefixed, except that a run of non-whitespace bytes
+              is further cut wherever the class of its bytes changes. The classes are letters
+              (a-z, A-Z and every byte from 0x80 up, so that UTF-8 text stays within its
+              words), digits, and all other bytes. A word then keeps the same tokens whatever
+              punctuation or markup touches it, as with the pre-tokenization of GPT-2
+              (Radford et al., 2019), at the cost of tokens that the other segmentations would
+              have joined across classes, such as character entities or markup.
     !*/
 
     class bpe_tokenizer

@@ -1070,6 +1070,110 @@ namespace
 
 // ----------------------------------------------------------------------------------------
 
+    void test_embeddings_gradient()
+    {
+        print_spinner();
+        // The table is the parameter of the layer, and each row receives the summed gradient of
+        // the positions holding its token; a token outside the table gives nothing.
+        using net_type = embeddings<5, 3, input<matrix<int, 0, 1>>>;
+        net_type net;
+        matrix<int, 0, 1> seq(4);
+        seq = 1, 3, 1, 9;
+        resizable_tensor x;
+        net.to_tensor(&seq, &seq + 1, x);
+        net.forward(x);
+        DLIB_TEST(layer<0>(net).layer_details().get_layer_params().size() == 15);
+        resizable_tensor g;
+        g.copy_size(net.get_output());
+        for (size_t i = 0; i < g.size(); ++i) g.host()[i] = 0.5f * i + 1;
+        net.back_propagate_error(x, g);
+        const tensor& pg = layer<0>(net).get_parameter_gradient();
+        DLIB_TEST(pg.size() == 15);
+        const float* gi = g.host();
+        const float* gr = pg.host();
+        for (long c = 0; c < 3; ++c)
+        {
+            DLIB_TEST(std::abs(gr[1 * 3 + c] - (gi[c] + gi[6 + c])) < 1e-6);
+            DLIB_TEST(std::abs(gr[3 * 3 + c] - gi[3 + c]) < 1e-6);
+            DLIB_TEST(gr[0 * 3 + c] == 0 && gr[2 * 3 + c] == 0 && gr[4 * 3 + c] == 0);
+        }
+    }
+
+    void test_hinted_embeddings()
+    {
+        print_spinner();
+        /* A hinted position gives E[t] + G[l-1] * (E[h] P), another E[t] alone, a token out of
+           the table nothing; each row of the parameters receives the gradients of the positions
+           that read it. Tokens 1 3 1 9, hints: none, token 2 at level 1, token 4 at level 2,
+           and a level beyond the last, which means none. */
+        using net_type = hinted_embeddings<5, 3, 2, input<matrix<int, 0, 1>>>;
+        net_type net;
+        matrix<int, 0, 1> seq(8);
+        seq = 1, 3, 1, 9, 0, 1 * 5 + 2, 2 * 5 + 4, 3 * 5;
+        resizable_tensor x;
+        net.to_tensor(&seq, &seq + 1, x);
+        net.forward(x);
+        tensor& params = layer<0>(net).layer_details().get_layer_params();
+        DLIB_TEST(params.size() == (5 + 3 + 2) * 3);
+        dlib::rand rnd(7);
+        for (size_t i = 0; i < params.size(); ++i)
+            params.host()[i] = static_cast<float>(rnd.get_random_gaussian());
+        net.forward(x);
+        const tensor& out = net.get_output();
+        DLIB_TEST(out.num_samples() == 1 && out.k() == 1 && out.nr() == 4 && out.nc() == 3);
+
+        const float* p = params.host();
+        auto E = [&](long r, long c) { return p[r * 3 + c]; };
+        auto P = [&](long i, long j) { return p[(5 + i) * 3 + j]; };
+        auto G = [&](long l, long c) { return p[(8 + l) * 3 + c]; };
+        const long tok[4] = { 1, 3, 1, -1 }, hint[4] = { -1, 2, 4, -1 }, lev[4] = { -1, 0, 1, -1 };
+        resizable_tensor g;
+        g.copy_size(out);
+        for (size_t i = 0; i < g.size(); ++i) g.host()[i] = 0.5f * i - 1;
+        std::vector<double> expected(params.size(), 0.0);
+        for (long t = 0; t < 4; ++t)
+        {
+            for (long c = 0; c < 3; ++c)
+            {
+                double v = tok[t] >= 0 ? E(tok[t], c) : 0.0;
+                const double gi = g.host()[t * 3 + c];
+                if (tok[t] >= 0) expected[tok[t] * 3 + c] += gi;
+                if (hint[t] >= 0)
+                {
+                    double projected = 0;
+                    for (long i = 0; i < 3; ++i) projected += E(hint[t], i) * P(i, c);
+                    v += G(lev[t], c) * projected;
+                    expected[(8 + lev[t]) * 3 + c] += gi * projected;
+                    const double dv = gi * G(lev[t], c);
+                    for (long i = 0; i < 3; ++i)
+                    {
+                        expected[(5 + i) * 3 + c] += E(hint[t], i) * dv;
+                        expected[hint[t] * 3 + i] += P(i, c) * dv;
+                    }
+                }
+                DLIB_TEST(std::abs(out.host()[t * 3 + c] - v) < 1e-5);
+            }
+        }
+        net.back_propagate_error(x, g);
+        const tensor& pg = layer<0>(net).get_parameter_gradient();
+        DLIB_TEST(pg.size() == params.size());
+        for (size_t i = 0; i < pg.size(); ++i)
+            DLIB_TEST_MSG(std::abs(pg.host()[i] - expected[i]) < 1e-4,
+                i << ": " << pg.host()[i] << " vs " << expected[i]);
+
+        // A copy of other sizes is refused.
+        std::ostringstream sout;
+        serialize(layer<0>(net).layer_details(), sout);
+        std::istringstream sin(sout.str());
+        hinted_embeddings_<5, 3, 3> other;
+        bool refused = false;
+        try { deserialize(other, sin); }
+        catch (const serialization_error&) { refused = true; }
+        DLIB_TEST(refused);
+    }
+
+// ----------------------------------------------------------------------------------------
+
     void test_adaptive_computation_time_network()
     {
         print_spinner();
@@ -2812,6 +2916,17 @@ namespace
             print_spinner();
             embeddings_<7, 12> l;
             auto res = test_layer(l);
+            DLIB_TEST_MSG(res, res);
+        }
+        {
+            print_spinner();
+            // One token, so that the random inputs hold tokens and hints of both levels.
+            hinted_embeddings_<1, 4, 2> l;
+            timpl::test_layer_params dims;
+            dims.k = 1;
+            dims.nr = 6;
+            dims.nc = 1;
+            auto res = test_layer(l, dims);
             DLIB_TEST_MSG(res, res);
         }
         {
@@ -6718,6 +6833,8 @@ void test_multm_prev()
             test_transpose();
             test_positional_encodings();
             test_embeddings();
+            test_embeddings_gradient();
+            test_hinted_embeddings();
             test_tril();
             test_adaptive_computation_time_network();
             test_rope_layer();

@@ -4796,7 +4796,14 @@ namespace dlib
 
                 The layer takes as input a tensor of integer indices and outputs a tensor of 
                 the same shape (except for the last dimension) where each index is replaced by 
-                its corresponding embedding vector.
+                its corresponding embedding vector. An index outside the table gives a zero
+                vector.
+
+                The table is the parameter of the layer, returned by get_layer_params(), and
+                is trained by the solver like the parameters of any other layer: backward()
+                gives each row the sum of the gradients of the positions holding its token,
+                and zero to a row no position holds. The layer is meant to sit on the input,
+                so no gradient goes further down. The rows start from a standard normal law.
 
                 For more information on embeddings, see:
                 Mikolov, T., Sutskever, I., Chen, K., Corrado, G. S., & Dean, J. (2013). 
@@ -4809,11 +4816,11 @@ namespace dlib
                 - embedding_dim_: The dimensionality of each embedding vector.
 
             CONVENTION
-                - get_embeddings() returns the tensor of embedding vectors.
+                - get_embeddings() returns the tensor of embedding vectors, the same tensor as
+                  get_layer_params(), of shape [num_embeddings_, embedding_dim_, 1, 1].
                 - get_num_embeddings() == num_embeddings_
                 - get_embedding_dim() == embedding_dim_
                 - get_learning_rate_multiplier() returns the learning rate multiplier for this layer.
-                - get_scale_by_freq() returns whether to scale gradients by token frequency.
         */        
     public:
         embeddings_() = default;
@@ -4821,12 +4828,10 @@ namespace dlib
         unsigned long get_num_embeddings() const;
         unsigned long get_embedding_dim() const;
         double get_learning_rate_multiplier() const;
-        bool get_scale_by_freq() const;
 
         void set_num_embeddings(unsigned long num);
         void set_embedding_dim(unsigned long dim);
         void set_learning_rate_multiplier(double val);
-        void set_scale_by_freq(bool val);
 
         template <typename SUBNET> void setup(const SUBNET& sub);
         template <typename SUBNET> void forward(const SUBNET& sub, resizable_tensor& output);
@@ -4853,6 +4858,92 @@ namespace dlib
         typename SUBNET
         >
     using embeddings = add_layer<embeddings_<num_embeddings, embedding_dim>, SUBNET>;
+
+// ----------------------------------------------------------------------------------------
+
+    template <
+        unsigned long num_embeddings_,
+        unsigned long embedding_dim_,
+        unsigned long num_levels_
+        >
+    class hinted_embeddings_
+    {
+        /*!
+            REQUIREMENTS ON TEMPLATE ARGUMENTS
+                - num_embeddings_ > 0, embedding_dim_ > 0, num_levels_ > 0
+
+            WHAT THIS OBJECT REPRESENTS
+                This object represents an embedding layer for token sequences that come with a
+                hint at every position: a second token, given with a level that says how far
+                the hint can be trusted. A typical hint is the token that a match model
+                predicts next, from the text that followed the most recent earlier occurrence
+                of the current context, with the length of that match as its level. The hint
+                brings to the network what lies beyond its attention span.
+
+                The input is a column of 2*T values per sample: the T tokens, then the T hints.
+                A hint is coded as level*num_embeddings_ + token, with level in [1, num_levels_];
+                a value below num_embeddings_ means that the position has no hint. The output
+                has the shape [num_samples, 1, T, embedding_dim_] and holds, for a token t with
+                a hint h of level l:
+                    E[t] + G[l-1] * (E[h] P)
+                where E is the table of embeddings_, P a square projection that tells hinted
+                tokens from read ones, and G one gate per level, applied element-wise. A
+                position without a hint gives E[t] alone, and a token outside the table gives
+                a zero vector.
+
+                The parameters are one tensor of num_embeddings_ + embedding_dim_ + num_levels_
+                rows of embedding_dim_ values: E from a standard normal law, P the identity and
+                G zero at start, so that the layer starts as embeddings_ and learns how much
+                each level adds. backward() gives each row the sum of the gradients of the
+                positions that read it, and the solver trains them like any other parameters.
+                The layer is meant to sit on the input, so no gradient goes further down.
+
+            TEMPLATE PARAMETERS
+                - num_embeddings_: The number of tokens of the table.
+                - embedding_dim_: The dimensionality of each embedding vector.
+                - num_levels_: The number of hint levels.
+
+            CONVENTION
+                - get_num_embeddings() == num_embeddings_
+                - get_embedding_dim() == embedding_dim_
+                - get_num_levels() == num_levels_
+                - get_layer_params() holds E, then P, then G, row by row.
+                - get_learning_rate_multiplier() returns the learning rate multiplier for this layer.
+        !*/
+    public:
+        hinted_embeddings_();
+
+        unsigned long get_num_embeddings() const;
+        unsigned long get_embedding_dim() const;
+        unsigned long get_num_levels() const;
+        double get_learning_rate_multiplier() const;
+        void set_learning_rate_multiplier(double val);
+
+        template <typename SUBNET> void setup(const SUBNET& sub);
+        template <typename SUBNET> void forward(const SUBNET& sub, resizable_tensor& output);
+        template <typename SUBNET> void backward(const tensor& gradient_input, SUBNET& sub, tensor& params_grad);
+
+        const tensor& get_layer_params() const;
+        tensor& get_layer_params();
+
+        friend void serialize(const hinted_embeddings_& item, std::ostream& out);
+        friend void deserialize(hinted_embeddings_& item, std::istream& in);
+        friend std::ostream& operator<<(std::ostream& out, const hinted_embeddings_& item);
+        friend void to_xml(const hinted_embeddings_& item, std::ostream& out);
+
+        /*!
+            These functions are implemented as described in the EXAMPLE_COMPUTATIONAL_LAYER_
+            interface. deserialize() refuses a layer of other sizes.
+        !*/
+    };
+
+    template <
+        unsigned long num_embeddings,
+        unsigned long embedding_dim,
+        unsigned long num_levels,
+        typename SUBNET
+        >
+    using hinted_embeddings = add_layer<hinted_embeddings_<num_embeddings, embedding_dim, num_levels>, SUBNET>;
 
 // ----------------------------------------------------------------------------------------
 

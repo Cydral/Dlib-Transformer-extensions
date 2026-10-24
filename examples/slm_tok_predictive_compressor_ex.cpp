@@ -22,12 +22,18 @@
     current byte. Bits that the vocabulary leaves no choice for are not coded.
 
     Each decision is predicted by context models over the bytes already coded (orders one
-    to six, a sparse context, words, the current token, a long-range match), by the network,
-    and by maps that recalibrate the network for each kind of decision and each pair of
-    previous bytes. Three mixers, whose weights are selected by the kind of decision with
-    the network's confidence, by the previous byte, and by the number of contexts already
-    seen, combine these predictions, a fourth mixer combines theirs, two adaptive maps
-    refine the result, and a binary arithmetic coder writes it.
+    to eight, sparse contexts, words, the line above, the current token and article, a
+    long-range match), which keep a bit history per context and decision and learn what
+    each history predicts, by the network, and by maps that recalibrate the network for each
+    kind of decision and each pair of previous bytes. Five mixers, whose weights are
+    selected by the kind of decision with the network's confidence, by the previous byte,
+    by the match, by the number of contexts already seen, and by the network's confidence
+    in its own first choice, combine these predictions, a sixth mixer combines theirs,
+    three adaptive maps refine the result, and a binary arithmetic coder writes it.
+
+    The network also learns while it codes: each stream has output biases that move after
+    every token by a step of gradient descent on the coding cost, so that the distribution
+    follows the tokens the stream's own text uses. The decoder takes the same steps.
 
     WHY THE CODING PATH HAS ITS OWN ARITHMETIC
 
@@ -38,9 +44,13 @@
     of the C library differ between versions and dispatch on the processor. Training
     runs on whatever dlib uses, a graphics card included; only the weights cross over.
     Multiplications and additions are fused only where the source asks for it. The matrix
-    and attention products have vector kernels for processors with AVX2 and FMA, compiled
-    whatever the options of the build and chosen at run time; they apply the same fused
-    operations in the same order as the scalar code, so that every processor computes the
+    products run on integers: the inputs of a product are rounded to signed bytes with one
+    scale per row, multiplied by the quantized weights, and summed exactly in 32 bits before
+    the two scales bring the result back to floating point. An integer sum does not depend
+    on its order, so the kernels for AVX-512 VNNI, AVX-VNNI and AVX2 give the values of the
+    portable code. The attention products have kernels for AVX2 and FMA that apply the same
+    fused operations in the same order as the scalar code. Every kernel is compiled whatever
+    the options of the build and chosen at run time, so that every processor computes the
     same values.
 
     HOW THE TEXT IS CUT FOR THE NETWORK
@@ -59,6 +69,18 @@
     directory unless --header names another path. Placed next to this file, it is compiled
     in by the next build. Without a network the program still compresses, with the context
     models alone.
+
+    --build-tokenizer cuts the corpus as --segmentation says before learning the merges:
+    spaces, the default, lets a word merge with the space before it; classes also cuts where
+    letters, digits and other bytes meet, so that a word keeps the same tokens whatever
+    punctuation or markup touches it. With --fold-capitals, the tokenizer works on a form of
+    the text where every ASCII capital is written in lower case after a marker byte, so that
+    "The" and "the" share their tokens; the program folds the text before tokenizing it and
+    unfolds what it decodes, and the archive still checks the original. A network belongs to
+    the tokenizer it was trained with. --build-tokenizer therefore writes a header without a
+    network, the saved network and the checkpoint of a run record their tokenizer, and
+    --train and --embed refuse a saved network or a checkpoint whose tokenizer differs from
+    the compiled-in one.
 
     Two macros reduce the program to what coding needs, without the network definition and
     the training: SLM_CODEC_ONLY set to 1 keeps compression and decompression, and
@@ -105,25 +127,43 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <map>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
-// The vector kernels are compiled for AVX2 with FMA whatever the options of the build.
+// The vector kernels are compiled for their instruction sets whatever the options of the build.
 #if defined(__x86_64__) || defined(_M_X64)
 #define SLM_CODEC_X86 1
 #include <immintrin.h>
 #if defined(_MSC_VER)
 #include <intrin.h>
+#else
+#include <cpuid.h>
 #endif
 #if defined(__GNUC__) || defined(__clang__)
 #define SLM_AVX2_FMA __attribute__((target("avx2,fma")))
+#define SLM_AVX2 __attribute__((target("avx2")))
+#define SLM_AVX512_VNNI __attribute__((target("avx2,avx512f,avx512vl,avx512vnni")))
+#define SLM_AVX_VNNI __attribute__((target("avx2,avxvnni")))
 #else
 #define SLM_AVX2_FMA
+#define SLM_AVX2
+#define SLM_AVX512_VNNI
+#define SLM_AVX_VNNI
+#endif
+// The compilers that know the VNNI instructions.
+#if (defined(__clang__) && __clang_major__ >= 12) || (!defined(__clang__) && defined(__GNUC__) && __GNUC__ >= 11) \
+    || (defined(_MSC_VER) && _MSC_VER >= 1930)
+#define SLM_VNNI_KERNELS 1
+#else
+#define SLM_VNNI_KERNELS 0
 #endif
 #else
 #define SLM_CODEC_X86 0
+#define SLM_VNNI_KERNELS 0
 #endif
 
 #include <dlib/cmd_line_parser.h>
@@ -441,50 +481,6 @@ namespace tok_codec
     }
 
     /*
-        The counter of a context model holds two estimates of the same probability in 32
-        bits: a slow one of 16 bits, whose rate 1 / (n + 1.5) follows a 6-bit count n up to
-        63, and a fast one of 10 bits, which moves a quarter of the way toward each bit. The
-        mixer receives both, and weighs the stationary view against the recent one per
-        context and per decision.
-    */
-    const uint32_t DUAL_INIT = 0x80008000u;
-    const uint32_t DUAL_LIMIT = 63;
-
-    inline int dual_slow (uint32_t slot)
-    {
-        const int p = static_cast<int>(slot >> 16);
-        return p < 1 ? 1 : p;
-    }
-
-    inline int dual_fast (uint32_t slot) { return static_cast<int>(((slot >> 6) & 1023u) << 6) | 32; }
-
-    inline bool dual_seen (uint32_t slot) { return (slot & 63u) != 0; }
-
-    inline void dual_update (uint32_t& slot, int bit)
-    {
-        const uint32_t n = slot & 63u;
-        int64_t p = slot >> 16;
-        p += (((bit ? 65535 : 0) - p) * static_cast<int64_t>(rates()[n])) >> 16;
-        int pf = static_cast<int>((slot >> 6) & 1023u);
-        pf += ((bit ? 1023 : 0) - pf) >> 2;
-        slot = (static_cast<uint32_t>(p) << 16) | (static_cast<uint32_t>(pf) << 6) | (n < DUAL_LIMIT ? n + 1 : n);
-    }
-
-    class hashed_counters
-    {
-    public:
-        void init (int bits)
-        {
-            shift = 64 - bits;
-            table.assign(size_t(1) << bits, DUAL_INIT);
-        }
-        uint32_t& at (uint64_t h) { return table[(h * 0x9E3779B97F4A7C15ULL) >> shift]; }
-    private:
-        std::vector<uint32_t> table;
-        int shift = 64;
-    };
-
-    /*
         Gated linear mixing in the logistic domain: a set of weights selected by a small
         context, an output squash(sum w_i * st_i), and weights moved along the gradient of the
         coding cost, err * st_i.
@@ -603,6 +599,107 @@ namespace tok_codec
     }
 
     // ----------------------------------------------------------------------------------------
+    // Folded capitals
+
+    /*
+        A reversible rewriting of the text in which ASCII capitals become lower case after a
+        marker byte, so that a word and its capitalized form share their tokens. Marker 1 makes
+        the next ASCII letter upper case, marker 2 the whole run of ASCII letters that follows,
+        used for runs of two capitals or more. The marker of the first letter of a run that
+        follows a space is written before the space, so that the run keeps the space-prefixed
+        tokens of its lower-case form. Bytes 1, 2 and 3 of the text are written after the
+        escape byte 3.
+    */
+    const uint8_t FOLD_ONE = 1, FOLD_RUN = 2, FOLD_ESCAPE = 3;
+
+    inline bool ascii_upper (uint8_t b) { return b >= 'A' && b <= 'Z'; }
+    inline bool ascii_lower (uint8_t b) { return b >= 'a' && b <= 'z'; }
+
+    template <typename container>
+    container fold_capitals (const uint8_t* text, size_t size)
+    {
+        typedef typename container::value_type value;
+        container out;
+        out.reserve(size + size / 16);
+        size_t i = 0;
+        while (i < size) {
+            const uint8_t b = text[i];
+            if (b >= FOLD_ONE && b <= FOLD_ESCAPE) {
+                out.push_back(static_cast<value>(FOLD_ESCAPE));
+                out.push_back(static_cast<value>(b));
+                ++i;
+                continue;
+            }
+            if (!ascii_upper(b) && !ascii_lower(b)) {
+                out.push_back(static_cast<value>(b));
+                ++i;
+                continue;
+            }
+            size_t j = i;
+            bool all_upper = true;
+            while (j < size && (ascii_upper(text[j]) || ascii_lower(text[j])))
+                all_upper = ascii_upper(text[j++]) && all_upper;
+            // A space before the run is already written; the marker of the first letter goes before it.
+            const bool after_space = i > 0 && text[i - 1] == ' ';
+            auto mark = [&](uint8_t marker, bool first) {
+                if (first && after_space) out.insert(out.end() - 1, static_cast<value>(marker));
+                else out.push_back(static_cast<value>(marker));
+            };
+            if (all_upper && j - i >= 2) {
+                mark(FOLD_RUN, true);
+                for (size_t k = i; k < j; ++k) out.push_back(static_cast<value>(text[k] + 32));
+            }
+            else {
+                for (size_t k = i; k < j; ++k) {
+                    if (ascii_upper(text[k])) {
+                        mark(FOLD_ONE, k == i);
+                        out.push_back(static_cast<value>(text[k] + 32));
+                    }
+                    else {
+                        out.push_back(static_cast<value>(text[k]));
+                    }
+                }
+            }
+            i = j;
+        }
+        return out;
+    }
+
+    inline std::vector<uint8_t> unfold_capitals (const uint8_t* text, size_t size)
+    {
+        std::vector<uint8_t> out;
+        out.reserve(size);
+        bool one = false, run_pending = false, run_active = false;
+        for (size_t i = 0; i < size; ++i) {
+            uint8_t b = text[i];
+            if (run_active) {
+                if (ascii_lower(b)) {
+                    out.push_back(static_cast<uint8_t>(b - 32));
+                    continue;
+                }
+                run_active = false;
+            }
+            if (b == FOLD_ESCAPE) {
+                if (++i < size) out.push_back(text[i]);
+                continue;
+            }
+            if (b == FOLD_ONE) { one = true; continue; }
+            if (b == FOLD_RUN) { run_pending = true; continue; }
+            if (ascii_lower(b) && one) {
+                b = static_cast<uint8_t>(b - 32);
+                one = false;
+            }
+            else if (ascii_lower(b) && run_pending) {
+                b = static_cast<uint8_t>(b - 32);
+                run_pending = false;
+                run_active = true;
+            }
+            out.push_back(b);
+        }
+        return out;
+    }
+
+    // ----------------------------------------------------------------------------------------
     // Vocabulary
 
     /*
@@ -656,30 +753,186 @@ namespace tok_codec
     };
 
     // ----------------------------------------------------------------------------------------
+    // Bit histories
+
+    /*
+        A bit history is a state, at most 255 of them, standing for a count of zeros n0 and a
+        count of ones n1, and for small totals the last bit seen. A new bit increments its
+        count and discounts the other one beyond 2, so that a history follows a context whose
+        statistics change. The states are enumerated at start-up from this rule, from the
+        empty state 0.
+    */
+    class bit_states
+    {
+    public:
+        bit_states ()
+        {
+            typedef std::tuple<int, int, int> history;    // n0, n1, last bit or 2
+            std::map<history, int> index;
+            std::vector<history> list;
+            auto cap = [](int other) {
+                static const int c[] = { 40, 24, 13, 9, 7, 6, 5 };
+                return other < 7 ? c[other] : 5;
+            };
+            auto discount = [](int n) { return n > 2 ? n / 2 + 1 : n; };
+            list.push_back(history(0, 0, 2));
+            index[list[0]] = 0;
+            for (size_t i = 0; i < list.size(); ++i) {
+                for (int y = 0; y < 2; ++y) {
+                    int n0 = std::get<0>(list[i]), n1 = std::get<1>(list[i]);
+                    if (y) { n1 += 1; n0 = discount(n0); } else { n0 += 1; n1 = discount(n1); }
+                    n0 = std::min(n0, cap(n1));
+                    n1 = std::min(n1, cap(n0));
+                    const history h(n0, n1, n0 > 0 && n1 > 0 && n0 + n1 <= 12 ? y : 2);
+                    auto it = index.find(h);
+                    if (it == index.end()) {
+                        it = index.insert(std::make_pair(h, static_cast<int>(list.size()))).first;
+                        list.push_back(h);
+                    }
+                    next_[i][y] = static_cast<uint8_t>(it->second);
+                }
+            }
+            for (size_t i = 0; i < list.size(); ++i) {
+                n0_[i] = static_cast<uint8_t>(std::get<0>(list[i]));
+                n1_[i] = static_cast<uint8_t>(std::get<1>(list[i]));
+            }
+        }
+
+        uint8_t next (uint8_t s, int bit) const { return next_[s][bit]; }
+        int n0 (uint8_t s) const { return n0_[s]; }
+        int n1 (uint8_t s) const { return n1_[s]; }
+        // A history that has seen bits of one value only.
+        bool deterministic (uint8_t s) const { return s != 0 && (n0_[s] == 0 || n1_[s] == 0); }
+
+    private:
+        uint8_t next_[256][2] = {};
+        uint8_t n0_[256] = {}, n1_[256] = {};
+    };
+
+    inline const bit_states& histories ()
+    {
+        static const bit_states s;
+        return s;
+    }
+
+    /*
+        What a bit history predicts, learned for each context model and each kind of decision
+        by an adaptive counter, which starts from the counts of the history.
+    */
+    class state_map
+    {
+    public:
+        void init (int sets)
+        {
+            const bit_states& bs = histories();
+            t.resize(static_cast<size_t>(sets) * 256);
+            for (int c = 0; c < sets; ++c)
+                for (int s = 0; s < 256; ++s) {
+                    const uint32_t n0 = static_cast<uint32_t>(bs.n0(static_cast<uint8_t>(s)));
+                    const uint32_t n1 = static_cast<uint32_t>(bs.n1(static_cast<uint8_t>(s)));
+                    const uint32_t p = ((2 * n1 + 1) << 22) / (2 * (n0 + n1) + 2);
+                    t[static_cast<size_t>(c) * 256 + s] = std::min(p, (1u << 22) - 1) << 10;
+                }
+        }
+
+        int p (int set, uint8_t s)
+        {
+            index = static_cast<size_t>(set) * 256 + s;
+            return counter_p16(t[index]);
+        }
+
+        void update (int bit) { counter_update(t[index], bit, 1023); }
+
+    private:
+        std::vector<uint32_t> t;
+        size_t index = 0;
+    };
+
+    /*
+        The bit histories of a context are kept per nibble: a slot holds the 15 histories of
+        the decisions of one nibble behind an 8-bit check of the context's hash. Four slots
+        share a 64-byte bucket, so that a nibble costs one cache line per context, and a
+        context missing from its bucket takes the slot whose first history has seen the
+        fewest bits.
+    */
+    struct history_slot
+    {
+        uint8_t check;
+        uint8_t st[15];
+    };
+
+    class slot_table
+    {
+    public:
+        void init (int bits)
+        {
+            bucket_bits = bits - 2;
+            t.assign(size_t(4) << bucket_bits, history_slot());
+            std::memset(t.data(), 0, t.size() * sizeof(history_slot));
+        }
+
+        history_slot* find (uint64_t h)
+        {
+            history_slot* b = &t[(h >> (64 - bucket_bits)) << 2];
+            const uint8_t check = static_cast<uint8_t>(h);
+            for (int j = 0; j < 4; ++j) if (b[j].check == check) return &b[j];
+            const bit_states& bs = histories();
+            int victim = 0, fewest = 1 << 30;
+            for (int j = 0; j < 4; ++j) {
+                const int n = bs.n0(b[j].st[0]) + bs.n1(b[j].st[0]);
+                if (n < fewest) { fewest = n; victim = j; }
+            }
+            std::memset(&b[victim], 0, sizeof(history_slot));
+            b[victim].check = check;
+            return &b[victim];
+        }
+
+    private:
+        std::vector<history_slot> t;
+        int bucket_bits = 0;
+    };
+
+    // ----------------------------------------------------------------------------------------
     // Context mixing
 
     /*
         Predicts one binary decision at a time over byte streams. A decision is a bit of the
         next byte, identified by the partial byte c0 (a one followed by the bits already known),
         or, when the stream is coded token by token, whether the current token ends at the
-        current byte, identified by 256 plus its depth. Each context model maps its context
-        and the decision to a counter holding a slow and a fast estimate; three mixers combine
-        them with the network's prediction when there is one, a fourth mixer combines the
-        three, and two adaptive maps refine the result.
+        current byte, identified by 256 plus its depth.
+
+        Twenty context models each give the bit history their context has for the decision,
+        turned into a probability by a map learned per model, and a second input when the
+        history is deterministic. Their contexts are the last one to eight bytes, two sparse
+        contexts, the current word alone and with one or two previous words, the byte above in
+        the previous line, the current token, the opening of the current line with the column,
+        the byte a long-range match predicts, and the current word and the last three bytes
+        within the current article. A match model gives the bit the predicted byte has, and
+        the network enters raw and through two maps that recalibrate it. Five mixers, whose
+        weights are selected by the kind of decision with the network's confidence, by the
+        previous byte, by the match, by the number of contexts already seen, and by the
+        network's confidence in its own first choice, combine these inputs; a sixth mixer
+        combines theirs, and three adaptive maps refine the result.
     */
-    const int CM_CONTEXTS = 10;
+    const int CM_CONTEXTS = 20;
 
     struct stream_state
     {
         std::vector<uint8_t> hist;     // bytes of the stream so far
         uint64_t last8 = 0;            // last eight bytes, the newest in the low byte
         uint64_t ctx[CM_CONTEXTS] = {};
-        uint32_t word = 0, word_prev = 0;
+        uint32_t w0 = 0, w1 = 0, w2 = 0;   // the current word and the two before, case folded
         uint64_t token_hash = 0;       // previous token and the bytes of the current one
         int depth = 0;                 // bytes of the current token already coded
         uint64_t match_ptr = 0;        // stream << 40 | position of the predicted byte
         int match_len = 0;
         int match_byte = -1;           // byte the match predicts, or -1
+        size_t line_start = 0, prev_line_start = 0;
+        uint64_t line_tag = 0;         // the opening of the current line, up to a space or '>'
+        int tag_len = 0;
+        bool tag_open = true;
+        uint64_t article = 0;          // the title line of the current page
+        int top_cost = 31;             // what the network's most likely token costs, in quarter bits
     };
 
     class predictor
@@ -687,28 +940,41 @@ namespace tok_codec
     public:
         static const int NUM_CTX = CM_CONTEXTS;
         static const int MIN_MATCH = 6;
-        // Mixer inputs: the slow estimate of each context model, the match model, the network
-        // raw and through its first map, the match length, a bias, the fast estimate of each
-        // context model, and the network through its second map.
-        static const int INPUTS = 2 * NUM_CTX + 6;
+        // Two inputs per context model, the match model's two, the network's three and a bias.
+        static const int INPUTS = 2 * NUM_CTX + 2 + 3 + 1;
 
         void init (int table_bits, std::vector<stream_state>* streams_)
         {
             streams = streams_;
-            for (int i = 0; i < NUM_CTX; ++i) tables[i].init(table_bits);
+            for (int i = 0; i < NUM_CTX; ++i) {
+                // A context with few distinct values fills a table 32 times smaller.
+                const bool few = i <= 1 || i == 8 || i == 9 || i == 14 || i == 17;
+                tables[i].init(few ? std::min(table_bits - 2, std::max(16, table_bits - 7)) : table_bits - 2);
+                end_tables[i].assign(size_t(1) << std::max(16, table_bits - 4), 0);
+                maps[i].init(8);
+                end_maps[i].init(4);
+            }
+            end_shift = 64 - std::max(16, table_bits - 4);
             const int match_bits = std::max(16, table_bits - 2);
             match_table.assign(size_t(1) << match_bits, 0);
             match_shift = 64 - match_bits;
-            match_map.assign(2 * 32, COUNTER_INIT);
+            match_map.init(19 * 2);
             nn_map.init(24, 7);
             nn_map2.init(1 << 16, 6);
-            m1.init(INPUTS, 12 * 8, 16, 16384);
-            m2.init(INPUTS, 512, 16, 16384);
-            m4.init(INPUTS, 12 * 8, 16, 16384);
-            m3.init(4, 64, 8, 21845);
+            m1.init(INPUTS, 12 * 8, 12, 16384);
+            m2.init(INPUTS, 512, 12, 16384);
+            m3.init(INPUTS, 12 * 4 * 3, 12, 16384);
+            m4.init(INPUTS, 12 * 8, 12, 16384);
+            m5.init(INPUTS, 12 * 32, 12, 16384);
+            mf.init(6, 12 * 4, 8, 16384);
             a1.init(1 << 17, 6);
             a2.init(1 << 16, 6);
+            a3.init(12 * 19 * 3, 6);
+            cached_stream = -1;
         }
+
+        // The cost of the network's most likely next token for stream s, in quarter bits up to 31.
+        void network_confidence (int s, int quarter_bits) { (*streams)[s].top_cost = quarter_bits; }
 
         // Returns P(bit == 1) as a 16-bit probability. nn_valid says whether nn_st, the
         // network's prediction in the logistic domain, exists.
@@ -716,78 +982,115 @@ namespace tok_codec
         {
             stream_state& st = (*streams)[s];
             const logistic& lg = logistic_tables();
+            const bit_states& bs = histories();
             const bool end_decision = code >= 256;
-            const uint64_t code_key = static_cast<uint64_t>(code) * 0x2545F4914F6CDD1DULL;
-
+            const int kind = end_decision ? 8 + std::min(3, code - 256) : bit_position(code);
             int* x = m1.input();
-            for (int i = 0; i < NUM_CTX; ++i) {
-                slots[i] = &tables[i].at(st.ctx[i] ^ code_key);
-                x[i] = lg.stretch(dual_slow(*slots[i]));
-                x[NUM_CTX + 5 + i] = lg.stretch(dual_fast(*slots[i]));
-            }
 
-            // Match model: the bit the predicted byte has here, trusted according to the length.
-            match_slot = nullptr;
-            int expected = -1;
-            if (st.match_byte >= 0 && !end_decision) {
-                const int known = bit_position(code);
-                if (((st.match_byte + 256) >> (8 - known)) == code) expected = (st.match_byte >> (7 - known)) & 1;
-            }
-            if (expected >= 0) {
-                match_slot = &match_map[std::min(31, st.match_len) * 2 + expected];
-                x[NUM_CTX] = lg.stretch(counter_p16(*match_slot));
+            if (end_decision) {
+                // Token ends have histories of their own, per context and depth.
+                const int depth = code - 256;
+                for (int i = 0; i < NUM_CTX; ++i) {
+                    uint8_t* h = &end_tables[i][hash64(st.ctx[i], static_cast<uint64_t>(depth)) >> end_shift];
+                    history[i] = h;
+                    const int stp = lg.stretch(end_maps[i].p(std::min(3, depth - 1), *h));
+                    x[2 * i] = stp;
+                    x[2 * i + 1] = bs.deterministic(*h) ? stp : 0;
+                }
             }
             else {
-                x[NUM_CTX] = 0;
+                // The slots of the current nibble, looked up at its first decision.
+                const int nibble = kind >= 4 ? 1 : 0;
+                const uint64_t key = (static_cast<uint64_t>(st.hist.size()) << 1) | static_cast<uint64_t>(nibble);
+                if (cached_stream != s || cached_key != key) {
+                    cached_stream = s;
+                    cached_key = key;
+                    for (int i = 0; i < NUM_CTX; ++i)
+                        slots[i] = tables[i].find(nibble
+                            ? hash64(st.ctx[i], static_cast<uint64_t>(code >> (kind - 4))) : st.ctx[i]);
+                }
+                const int k = nibble ? kind - 4 : kind;
+                const int node = (1 << k) - 1 + (code & ((1 << k) - 1));
+                for (int i = 0; i < NUM_CTX; ++i) {
+                    uint8_t* h = &slots[i]->st[node];
+                    history[i] = h;
+                    const int stp = lg.stretch(maps[i].p(kind, *h));
+                    x[2 * i] = stp;
+                    x[2 * i + 1] = bs.deterministic(*h) ? stp : 0;
+                }
+            }
+            end_active = end_decision;
+
+            // Match model: the bit the predicted byte has here, by length and expected bit.
+            match_active = false;
+            int expected = -1;
+            if (st.match_byte >= 0 && !end_decision && ((st.match_byte + 256) >> (8 - kind)) == code)
+                expected = (st.match_byte >> (7 - kind)) & 1;
+            const int length_class = st.match_len < 16 ? st.match_len
+                : (st.match_len < 32 ? 16 : (st.match_len < 64 ? 17 : 18));
+            if (expected >= 0) {
+                match_active = true;
+                x[2 * NUM_CTX] = lg.stretch(match_map.p(length_class * 2 + expected, 0));
+                x[2 * NUM_CTX + 1] = expected ? length_class * 64 : -length_class * 64;
+            }
+            else {
+                x[2 * NUM_CTX] = 0;
+                x[2 * NUM_CTX + 1] = 0;
             }
 
-            // The network, raw and through two maps that recalibrate it, per kind of decision and
-            // per kind of decision and two previous bytes.
-            const int kind = end_decision ? 8 + std::min(3, code - 256) : bit_position(code);
+            // The network, raw and through two maps, per kind of decision and per two previous bytes.
             nn_active = nn_valid;
-            x[NUM_CTX + 1] = nn_valid ? nn_st : 0;
-            x[NUM_CTX + 2] = nn_valid ? lg.stretch(nn_map.refine(nn_st, kind + 12 * (st.depth > 0))) : 0;
+            x[2 * NUM_CTX + 2] = nn_valid ? nn_st : 0;
+            x[2 * NUM_CTX + 3] = nn_valid ? lg.stretch(nn_map.refine(nn_st, kind + 12 * (st.depth > 0))) : 0;
             const int nn_ctx2 = static_cast<int>(hash64(st.last8 & 0xffff, static_cast<uint64_t>(kind)) >> 48);
-            x[2 * NUM_CTX + 5] = nn_valid ? lg.stretch(nn_map2.refine(nn_st, nn_ctx2)) : 0;
-            x[NUM_CTX + 3] = st.match_len > 0 ? std::min(st.match_len, 32) * 32 : 0;
-            x[NUM_CTX + 4] = 256;
+            x[2 * NUM_CTX + 4] = nn_valid ? lg.stretch(nn_map2.refine(nn_st, nn_ctx2)) : 0;
+            x[2 * NUM_CTX + 5] = 256;
 
             std::copy(x, x + INPUTS, m2.input());
+            std::copy(x, x + INPUTS, m3.input());
             std::copy(x, x + INPUTS, m4.input());
+            std::copy(x, x + INPUTS, m5.input());
             const int confidence = nn_valid ? std::min(7, 1 + std::abs(nn_st) / 384) : 0;
-            const int s1 = m1.mix(kind * 8 + confidence);
             const int last = static_cast<int>(st.last8 & 0xff);
-            const int s2 = m2.mix(end_decision ? 256 + std::min(255, code - 256) : last);
-            int seen = 0;
-            for (int i = 1; i <= 5; ++i) seen += dual_seen(*slots[i]);
-            const int s4 = m4.mix(kind * 8 + seen);
-
-            int* x3 = m3.input();
-            x3[0] = s1;
-            x3[1] = s2;
-            x3[2] = s4;
-            x3[3] = 256;
             const int match_state = st.match_len == 0 ? 0 : (st.match_len < 16 ? 1 : (st.match_len < 32 ? 2 : 3));
-            const int smix = m3.mix(kind * 4 + match_state);
+            int seen = 0;
+            for (int i = 1; i <= 7; ++i) seen += *history[i] != 0;
+            const int article_seen = *history[18] != 0 ? 1 : 0;
+            int* xf = mf.input();
+            xf[0] = m1.mix(kind * 8 + confidence);
+            xf[1] = m2.mix(end_decision ? 256 + std::min(255, code - 256) : last);
+            xf[2] = m3.mix((kind * 4 + match_state) * 3 + (expected + 1));
+            xf[3] = m4.mix(kind * 8 + std::min(7, seen));
+            xf[4] = m5.mix(kind * 32 + std::min(15, st.top_cost / 2) * 2 + article_seen);
+            xf[5] = 256;
+            const int smix = mf.mix(kind * 4 + match_state);
 
             const int p1 = a1.refine(smix, (last << 9) | std::min(code, 511));
-            const uint64_t a2_ctx = hash64(st.last8 & 0xffff, static_cast<uint64_t>(code));
-            const int p2 = a2.refine(smix, static_cast<int>(a2_ctx >> 48));
-            const int p = (m3.p16() + p1 + 2 * p2) >> 2;
+            const int p2 = a2.refine(smix,
+                static_cast<int>(hash64(st.last8 & 0xffff, static_cast<uint64_t>(code)) >> 48));
+            const int p3 = a3.refine(smix, (kind * 19 + length_class) * 3 + (expected + 1));
+            const int p = (2 * mf.p16() + p1 + 3 * p2 + 2 * p3) >> 3;
             return p < 1 ? 1 : (p > 65535 ? 65535 : p);
         }
 
         void update (int bit)
         {
-            for (int i = 0; i < NUM_CTX; ++i) dual_update(*slots[i], bit);
-            if (match_slot) counter_update(*match_slot, bit, 1023);
+            const bit_states& bs = histories();
+            for (int i = 0; i < NUM_CTX; ++i) {
+                if (end_active) end_maps[i].update(bit); else maps[i].update(bit);
+                *history[i] = bs.next(*history[i], bit);
+            }
+            if (match_active) match_map.update(bit);
             if (nn_active) { nn_map.update(bit); nn_map2.update(bit); }
             m1.update(bit);
             m2.update(bit);
             m3.update(bit);
             m4.update(bit);
+            m5.update(bit);
+            mf.update(bit);
             a1.update(bit);
             a2.update(bit);
+            a3.update(bit);
         }
 
         // A byte of stream s is complete: append it and recompute the contexts.
@@ -797,35 +1100,61 @@ namespace tok_codec
             st.hist.push_back(byte);
             st.last8 = (st.last8 << 8) | byte;
             ++st.depth;
+            const size_t n = st.hist.size();
 
             const bool letter = (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') || byte >= 128;
             if (letter) {
                 const uint32_t lower = (byte >= 'A' && byte <= 'Z') ? byte + 32u : byte;
-                st.word = (st.word + lower + 1) * 0x2F0F3A1Bu;
+                st.w0 = (st.w0 + lower + 1) * 0x2F0F3A1Bu;
             }
-            else if (st.word != 0) {
-                st.word_prev = st.word;
-                st.word = 0;
+            else if (st.w0 != 0) {
+                st.w2 = st.w1;
+                st.w1 = st.w0;
+                st.w0 = 0;
             }
+            track_lines(st, byte, n);
 
-            // Orders one to six, then the two bytes before the last one.
-            st.ctx[0] = hash64(1, st.last8 & 0xff);
-            st.ctx[1] = hash64(2, st.last8 & 0xffff);
-            st.ctx[2] = hash64(3, st.last8 & 0xffffff);
-            st.ctx[3] = hash64(4, st.last8 & 0xffffffffULL);
-            st.ctx[4] = hash64(5, st.last8 & 0xffffffffffULL);
-            st.ctx[5] = hash64(6, st.last8 & 0xffffffffffffULL);
-            st.ctx[6] = hash64(10, (st.last8 >> 8) & 0xffff);
-            // The word being written, alone and after the previous word; between words, the
+            const size_t column = n - st.line_start;
+            const size_t above_pos = st.prev_line_start + column;
+            const uint64_t above = (st.line_start > 0 && above_pos < st.line_start) ? st.hist[above_pos] : 0;
+            const uint64_t l8 = st.last8;
+            // Orders one to eight, then the two bytes before the last one, and the last byte with the third.
+            st.ctx[0] = hash64(1, l8 & 0xff);
+            st.ctx[1] = hash64(2, l8 & 0xffff);
+            st.ctx[2] = hash64(3, l8 & 0xffffff);
+            st.ctx[3] = hash64(4, l8 & 0xffffffffULL);
+            st.ctx[4] = hash64(5, l8 & 0xffffffffffULL);
+            st.ctx[5] = hash64(6, l8 & 0xffffffffffffULL);
+            st.ctx[6] = hash64(7, l8 & 0xffffffffffffffULL);
+            st.ctx[7] = hash64(8, l8);
+            st.ctx[8] = hash64(10, (l8 >> 8) & 0xffff);
+            st.ctx[9] = hash64(13, l8 & 0xff00ff);
+            // The word being written, alone and after the previous words; between words, the
             // previous word and the byte that ended it.
-            const uint64_t after_word = st.word_prev ^ (static_cast<uint64_t>(byte) << 32);
-            st.ctx[7] = letter ? hash64(11, st.word) : hash64(12, after_word);
-            st.ctx[8] = hash64(hash64(7, st.word), letter ? st.word_prev : after_word);
+            const uint64_t after_word = st.w1 ^ (static_cast<uint64_t>(byte) << 32);
+            st.ctx[10] = letter ? hash64(11, st.w0) : hash64(12, after_word);
+            st.ctx[11] = hash64(hash64(14, st.w0), st.w1);
+            st.ctx[12] = hash64(hash64(hash64(15, st.w0), st.w1), st.w2);
+            st.ctx[13] = hash64(hash64(16, st.w0), st.w2);
+            // The byte above in the previous line, for tables and aligned text.
+            st.ctx[14] = hash64(17, above | (static_cast<uint64_t>(byte) << 8));
             // The previous token and the bytes of the current one; in byte mode, the column.
             st.token_hash = hash64(st.token_hash, byte);
-            st.ctx[9] = token_mode ? hash64(8, st.token_hash) : hash64(9, (st.last8 & 0xff) | (column(st) << 8));
+            st.ctx[15] = token_mode ? hash64(18, st.token_hash)
+                : hash64(9, byte | (std::min<uint64_t>(column, 255) << 8));
+            // The opening of the line with the column, for the fields of structured lines.
+            st.ctx[16] = hash64(hash64(19, st.line_tag), std::min<uint64_t>(column, 63));
+            // The word and the last three bytes within the current article.
+            st.ctx[18] = hash64(hash64(22, st.article), letter ? st.w0 : after_word);
+            st.ctx[19] = hash64(hash64(23, st.article), l8 & 0xffffff);
 
             update_match(s, st, byte);
+            // The byte the match predicts with its length, or the last byte.
+            st.ctx[17] = st.match_len > 0
+                ? hash64(20, static_cast<uint64_t>(st.match_byte)
+                    | (static_cast<uint64_t>(std::min(st.match_len, 15)) << 8))
+                : hash64(21, l8 & 0xff);
+            cached_stream = -1;
         }
 
         // A token of stream s is complete.
@@ -834,7 +1163,8 @@ namespace tok_codec
             stream_state& st = (*streams)[s];
             st.depth = 0;
             st.token_hash = hash64(0x5bd1e995ULL, static_cast<uint64_t>(token));
-            st.ctx[9] = hash64(8, st.token_hash);
+            st.ctx[15] = hash64(18, st.token_hash);
+            cached_stream = -1;
         }
 
     private:
@@ -845,12 +1175,28 @@ namespace tok_codec
             return p;
         }
 
-        static uint64_t column (const stream_state& st)
+        // Line starts, the opening of the current line, and the title line of the current page.
+        static void track_lines (stream_state& st, uint8_t byte, size_t n)
         {
-            const size_t n = st.hist.size();
-            size_t i = n;
-            while (i > 0 && n - i < 255 && st.hist[i - 1] != '\n') --i;
-            return n - i;
+            if (byte == '\n') {
+                size_t i = st.line_start;
+                while (i < n && st.hist[i] == ' ') ++i;
+                if (i + 7 < n && std::memcmp(&st.hist[i], "<title>", 7) == 0) {
+                    uint64_t h = 0x7171;
+                    for (size_t j = i; j < n; ++j) h = hash64(h, st.hist[j]);
+                    st.article = h;
+                }
+                st.prev_line_start = st.line_start;
+                st.line_start = n;
+                st.line_tag = 0;
+                st.tag_len = 0;
+                st.tag_open = true;
+            }
+            else if (st.tag_open && !(byte == ' ' && st.tag_len == 0)) {
+                st.line_tag = hash64(st.line_tag + 1, byte);
+                ++st.tag_len;
+                if (byte == '>' || byte == ' ' || st.tag_len >= 12) st.tag_open = false;
+            }
         }
 
         void update_match (int s, stream_state& st, uint8_t byte)
@@ -882,16 +1228,119 @@ namespace tok_codec
         }
 
         std::vector<stream_state>* streams = nullptr;
-        hashed_counters tables[NUM_CTX];
-        uint32_t* slots[NUM_CTX];
+        slot_table tables[NUM_CTX];
+        std::vector<uint8_t> end_tables[NUM_CTX];
+        int end_shift = 48;
+        state_map maps[NUM_CTX], end_maps[NUM_CTX];
+        history_slot* slots[NUM_CTX] = {};
+        uint8_t* history[NUM_CTX] = {};
+        int cached_stream = -1;
+        uint64_t cached_key = 0;
+        bool end_active = false;
         std::vector<uint64_t> match_table;
         int match_shift = 44;
-        std::vector<uint32_t> match_map;
-        uint32_t* match_slot = nullptr;
+        state_map match_map;
+        bool match_active = false;
         apm nn_map, nn_map2;
         bool nn_active = false;
-        mixer m1, m2, m3, m4;
-        apm a1, a2;
+        mixer m1, m2, m3, m4, m5, mf;
+        apm a1, a2, a3;
+    };
+
+    // ----------------------------------------------------------------------------------------
+    // Token hints
+
+    /*
+        A match model over the tokens of several streams, which gives the network a hint at
+        every position: the token that followed the most recent earlier occurrence of the last
+        six tokens, or failing that of the last two, in any stream, verified backwards; a hint
+        that comes true extends the match. The level of a hint grows with the length of its
+        match, from 1 for one or two tokens to HINT_LEVELS from 32 on, and a hint is coded
+        level * vocab + token, 0 meaning none, as dlib::hinted_embeddings_ reads it. Training
+        runs it over the corpus as one stream, the coder over its streams side by side; it
+        depends only on the tokens already coded, so that the decoder finds the same hints.
+    */
+    const int HINT_LEVELS = 7;
+
+    class token_matcher
+    {
+    public:
+        // Tables sized for a text of about total_tokens tokens.
+        void init (int streams, uint64_t total_tokens)
+        {
+            int bits = 16;
+            while (bits < 24 && (uint64_t(1) << (bits + 2)) < total_tokens) ++bits;
+            shift = 64 - bits;
+            long_table.assign(size_t(1) << bits, 0);
+            short_table.assign(size_t(1) << bits, 0);
+            hist.assign(streams, std::vector<uint16_t>());
+            state.assign(streams, match_state());
+        }
+
+        void reserve (int s, size_t tokens) { hist[s].reserve(tokens); }
+
+        // Appends token t to stream s and returns the hint for the token that follows it.
+        uint32_t push (int s, uint16_t t, uint32_t vocab)
+        {
+            match_state& m = state[s];
+            if (m.len > 0 && predicted(m) == t) { ++m.len; ++m.ptr; }
+            else m.len = 0;
+            std::vector<uint16_t>& h = hist[s];
+            h.push_back(t);
+            const uint64_t n = h.size();
+            if (n >= 2) {
+                const size_t short_slot = static_cast<size_t>(hash64(h[n - 2] + 1, h[n - 1]) >> shift);
+                size_t long_slot = 0;
+                if (n >= 6) {
+                    uint64_t k = 0x6c6f6e67;
+                    for (uint64_t i = n - 6; i < n; ++i) k = hash64(k, h[i]);
+                    long_slot = static_cast<size_t>(k >> shift);
+                }
+                if (m.len == 0 && n >= 6 && long_table[long_slot] != 0) try_match(m, s, long_table[long_slot], 6);
+                if (m.len == 0 && short_table[short_slot] != 0) try_match(m, s, short_table[short_slot], 2);
+                const uint64_t here = (static_cast<uint64_t>(s) << 40) | n;
+                if (n >= 6) long_table[long_slot] = here;
+                short_table[short_slot] = here;
+            }
+            const int p = m.len > 0 ? predicted(m) : -1;
+            if (p < 0) return 0;
+            const uint32_t len = m.len;
+            const uint32_t level = len <= 2 ? 1 : len == 3 ? 2 : len <= 5 ? 3 : len <= 8 ? 4 : len <= 15 ? 5
+                : len <= 31 ? 6 : HINT_LEVELS;
+            return level * vocab + static_cast<uint32_t>(p);
+        }
+
+    private:
+        struct match_state
+        {
+            uint64_t ptr = 0;    // stream << 40 | position of the predicted token
+            uint32_t len = 0;
+        };
+
+        // The predicted token, or -1 when its stream has not reached it yet.
+        int predicted (const match_state& m) const
+        {
+            const std::vector<uint16_t>& src = hist[static_cast<size_t>(m.ptr >> 40)];
+            const uint64_t pos = m.ptr & ((uint64_t(1) << 40) - 1);
+            return pos < src.size() ? src[pos] : -1;
+        }
+
+        // Takes the candidate when the tokens before it match the last ones of stream s over at least min_len.
+        void try_match (match_state& m, int s, uint64_t candidate, uint32_t min_len)
+        {
+            const std::vector<uint16_t>& src = hist[static_cast<size_t>(candidate >> 40)];
+            const std::vector<uint16_t>& cur = hist[s];
+            const uint64_t pos = candidate & ((uint64_t(1) << 40) - 1);
+            const uint64_t n = cur.size();
+            uint32_t len = 0;
+            while (len < 64 && len < pos && len < n && src[pos - 1 - len] == cur[n - 1 - len]) ++len;
+            if (len >= min_len) { m.ptr = candidate; m.len = len; }
+        }
+
+        std::vector<std::vector<uint16_t>> hist;
+        std::vector<match_state> state;
+        std::vector<uint64_t> long_table, short_table;
+        int shift = 48;
     };
 
     // ----------------------------------------------------------------------------------------
@@ -900,6 +1349,7 @@ namespace tok_codec
     struct engine_shape
     {
         int vocab = 0, dim = 0, layers = 0, heads = 0, kv_heads = 0, head_dim = 0, ffn = 0, window = 0;
+        int hint_levels = 0;    // 0 when the network takes no hints
         int q_dim () const { return heads * head_dim; }
         int kv_dim () const { return kv_heads * head_dim; }
     };
@@ -934,72 +1384,79 @@ namespace tok_codec
     };
 
     /*
-        The products of the engine. On x86-64 each has a version with AVX2 and FMA, chosen at
-        run time when the processor has both and the system saves the vector registers. The two
-        versions accumulate every element through the same fused multiply-adds in the same
-        order, so they give the same values. The vector versions multiply only inside fused
-        multiply-adds, which leaves a compiler nothing to fuse on its own.
+        The products of the engine. On x86-64 the floating-point ones have a version with AVX2
+        and FMA, chosen at run time when the processor has both and the system saves the vector
+        registers. The two versions accumulate every element through the same fused
+        multiply-adds in the same order, so they give the same values. The vector versions
+        multiply only inside fused multiply-adds, which leaves a compiler nothing to fuse on
+        its own. The products of the weight matrices are on integers, exact in any order: they
+        have versions for the VNNI instructions, with 512-bit or 256-bit encodings, and for
+        AVX2, besides the portable one.
     */
+    struct processor_features
+    {
+        bool avx2_fma = false, avx512_vnni = false, avx_vnni = false;
+    };
+
 #if SLM_CODEC_X86
+    inline void cpuid (int leaf, int sub, unsigned r[4])
+    {
 #if defined(_MSC_VER)
-#if defined(__clang__)
+        int v[4];
+        __cpuidex(v, leaf, sub);
+        for (int i = 0; i < 4; ++i) r[i] = static_cast<unsigned>(v[i]);
+#else
+        __cpuid_count(leaf, sub, r[0], r[1], r[2], r[3]);
+#endif
+    }
+
+#if defined(_MSC_VER) && defined(__clang__)
     __attribute__((target("xsave")))
 #endif
-    inline bool processor_has_avx2_fma ()
+    inline uint64_t xcr0 ()
     {
-        int r[4];
-        __cpuid(r, 0);
-        if (r[0] < 7) return false;
-        __cpuid(r, 1);
-        const int fma_osxsave_avx = (1 << 12) | (1 << 27) | (1 << 28);
-        if ((r[2] & fma_osxsave_avx) != fma_osxsave_avx || (_xgetbv(0) & 6) != 6) return false;
-        __cpuidex(r, 7, 0);
-        return (r[1] & (1 << 5)) != 0;
+#if defined(_MSC_VER)
+        return _xgetbv(0);
+#else
+        unsigned lo, hi;
+        __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
+        return (static_cast<uint64_t>(hi) << 32) | lo;
+#endif
+    }
+
+    inline processor_features detect_processor ()
+    {
+        processor_features f;
+        unsigned r[4];
+        cpuid(0, 0, r);
+        if (r[0] < 7) return f;
+        cpuid(1, 0, r);
+        const unsigned fma_osxsave_avx = (1u << 12) | (1u << 27) | (1u << 28);
+        if ((r[2] & fma_osxsave_avx) != fma_osxsave_avx) return f;
+        const uint64_t saved = xcr0();
+        if ((saved & 6) != 6) return f;
+        cpuid(7, 0, r);
+        f.avx2_fma = (r[1] & (1u << 5)) != 0;
+        // AVX-512 with 256-bit vectors still needs the system to save the AVX-512 state.
+        f.avx512_vnni = f.avx2_fma && (r[1] & (1u << 16)) && (r[1] & (1u << 31)) && (r[2] & (1u << 11))
+            && (saved & 0xe0) == 0xe0;
+        cpuid(7, 1, r);
+        f.avx_vnni = f.avx2_fma && (r[0] & (1u << 4));
+        return f;
     }
 #else
-    inline bool processor_has_avx2_fma ()
-    {
-        __builtin_cpu_init();
-        return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
-    }
+    inline processor_features detect_processor () { return processor_features(); }
 #endif
 
+    inline const processor_features& processor ()
+    {
+        static const processor_features f = detect_processor();
+        return f;
+    }
+
+#if SLM_CODEC_X86
     namespace kernels_avx2
     {
-        // The eight accumulators are named one by one, which keeps them in registers.
-        SLM_AVX2_FMA inline void tile (const float* const* xr, const float* strip, int kdim, float (*out)[16])
-        {
-            const float* x0 = xr[0];
-            const float* x1 = xr[1];
-            const float* x2 = xr[2];
-            const float* x3 = xr[3];
-            __m256 a00 = _mm256_setzero_ps(), a01 = a00, a10 = a00, a11 = a00;
-            __m256 a20 = a00, a21 = a00, a30 = a00, a31 = a00;
-            for (int i = 0; i < kdim; ++i, strip += 16) {
-                const __m256 w0 = _mm256_loadu_ps(strip), w1 = _mm256_loadu_ps(strip + 8);
-                __m256 b = _mm256_broadcast_ss(x0 + i);
-                a00 = _mm256_fmadd_ps(b, w0, a00);
-                a01 = _mm256_fmadd_ps(b, w1, a01);
-                b = _mm256_broadcast_ss(x1 + i);
-                a10 = _mm256_fmadd_ps(b, w0, a10);
-                a11 = _mm256_fmadd_ps(b, w1, a11);
-                b = _mm256_broadcast_ss(x2 + i);
-                a20 = _mm256_fmadd_ps(b, w0, a20);
-                a21 = _mm256_fmadd_ps(b, w1, a21);
-                b = _mm256_broadcast_ss(x3 + i);
-                a30 = _mm256_fmadd_ps(b, w0, a30);
-                a31 = _mm256_fmadd_ps(b, w1, a31);
-            }
-            _mm256_storeu_ps(out[0], a00);
-            _mm256_storeu_ps(out[0] + 8, a01);
-            _mm256_storeu_ps(out[1], a10);
-            _mm256_storeu_ps(out[1] + 8, a11);
-            _mm256_storeu_ps(out[2], a20);
-            _mm256_storeu_ps(out[2] + 8, a21);
-            _mm256_storeu_ps(out[3], a30);
-            _mm256_storeu_ps(out[3] + 8, a31);
-        }
-
         SLM_AVX2_FMA inline void scores (const float* q, const float* keys, size_t stride, int hd, int cnt, float* sc)
         {
             int j = 0;
@@ -1080,30 +1537,7 @@ namespace tok_codec
 
     namespace kernels
     {
-        inline bool vector_paths ()
-        {
-#if SLM_CODEC_X86
-            static const bool available = processor_has_avx2_fma();
-            return available;
-#else
-            return false;
-#endif
-        }
-
-        // out[r][c] = sum over i of xr[r][i] * strip[16 i + c], for four rows and sixteen columns.
-        inline void tile (const float* const* xr, const float* strip, int kdim, float (*out)[16])
-        {
-#if SLM_CODEC_X86
-            if (vector_paths()) { kernels_avx2::tile(xr, strip, kdim, out); return; }
-#endif
-            for (int r = 0; r < 4; ++r)
-                for (int c = 0; c < 16; ++c) out[r][c] = 0.0f;
-            for (int i = 0; i < kdim; ++i, strip += 16)
-                for (int r = 0; r < 4; ++r) {
-                    const float xv = xr[r][i];
-                    for (int c = 0; c < 16; ++c) out[r][c] = std::fma(xv, strip[c], out[r][c]);
-                }
-        }
+        inline bool vector_paths () { return processor().avx2_fma; }
 
         // sc[j] = sum over i of q[i] * keys[i * stride + j], for j below cnt.
         inline void scores (const float* q, const float* keys, size_t stride, int hd, int cnt, float* sc)
@@ -1149,6 +1583,187 @@ namespace tok_codec
     }
 
     /*
+        A weight matrix for integer products: signed bytes with one scale per column, in
+        strips of sixteen columns. Within a strip, the rows go by groups of four, each group
+        holding the four bytes of every column side by side, the order the VNNI instructions
+        read; processors with AVX2 alone read pairs of 16-bit integers instead. The rows are
+        padded to a multiple of four and the columns to a multiple of sixteen with zeros.
+    */
+    struct int_matrix
+    {
+        int rows = 0, cols = 0, kpad = 0, strips = 0;
+        std::vector<float> scale;      // per column
+        std::vector<int8_t> q4;        // per strip, per group of four rows: sixteen columns of four bytes
+        std::vector<int16_t> q2;       // per strip, per pair of rows: sixteen columns of two, for AVX2
+        std::vector<int32_t> colsum;   // per padded column: the sum of its weights
+    };
+
+    inline bool vnni_paths () { return SLM_VNNI_KERNELS && (processor().avx512_vnni || processor().avx_vnni); }
+
+    // m holds rows x cols signed bytes, row by row.
+    inline int_matrix pack_int (const std::vector<int8_t>& m, std::vector<float> scale, int rows, int cols)
+    {
+        int_matrix w;
+        w.rows = rows;
+        w.cols = cols;
+        w.kpad = (rows + 3) & ~3;
+        w.strips = (cols + 15) / 16;
+        w.scale = std::move(scale);
+        w.q4.assign(static_cast<size_t>(w.strips) * w.kpad * 16, 0);
+        w.colsum.assign(static_cast<size_t>(w.strips) * 16, 0);
+        const bool pairs = !vnni_paths() && processor().avx2_fma;
+        if (pairs) w.q2.assign(w.q4.size(), 0);
+        for (int st = 0; st < w.strips; ++st)
+            for (int r = 0; r < rows; ++r)
+                for (int c = 0; c < 16 && st * 16 + c < cols; ++c) {
+                    const int8_t v = m[static_cast<size_t>(r) * cols + st * 16 + c];
+                    const size_t base = static_cast<size_t>(st) * w.kpad * 16;
+                    w.q4[base + static_cast<size_t>(r & ~3) * 16 + c * 4 + (r & 3)] = v;
+                    if (pairs) w.q2[base + static_cast<size_t>(r & ~1) * 16 + c * 2 + (r & 1)] = v;
+                    w.colsum[static_cast<size_t>(st) * 16 + c] += v;
+                }
+        return w;
+    }
+
+    /*
+        out[r][c] = sum over k of x[r][k] * w[k][c], exactly, for n rows of signed bytes padded
+        to w.kpad. The VNNI paths take the inputs as unsigned bytes, x + 128, and subtract 128
+        times the column sums; the AVX2 path takes them as 16-bit integers.
+    */
+    namespace kernels_int
+    {
+        inline void store_tile (const int32_t (*tile)[16], int rows, int c0, int cols, int m, int r0, int32_t* out)
+        {
+            for (int r = 0; r < rows; ++r)
+                std::memcpy(out + static_cast<size_t>(r0 + r) * m + c0, tile[r], sizeof(int32_t) * cols);
+        }
+
+        inline void portable (const int8_t* x, int n, const int_matrix& w, int32_t* out)
+        {
+            for (int st = 0; st < w.strips; ++st) {
+                const int8_t* strip = &w.q4[static_cast<size_t>(st) * w.kpad * 16];
+                const int c0 = st * 16, cols = std::min(16, w.cols - c0);
+                for (int r0 = 0; r0 < n; r0 += 4) {
+                    const int rows = std::min(4, n - r0);
+                    int32_t tile[4][16] = {};
+                    for (int r = 0; r < rows; ++r) {
+                        const int8_t* xr = x + static_cast<size_t>(r0 + r) * w.kpad;
+                        for (int k = 0; k < w.kpad; k += 4) {
+                            const int8_t* g = strip + static_cast<size_t>(k) * 16;
+                            for (int c = 0; c < 16; ++c)
+                                for (int j = 0; j < 4; ++j)
+                                    tile[r][c] += static_cast<int32_t>(xr[k + j]) * g[c * 4 + j];
+                        }
+                    }
+                    store_tile(tile, rows, c0, cols, w.cols, r0, out);
+                }
+            }
+        }
+
+#if SLM_CODEC_X86
+        // The accumulators of four rows by sixteen columns are named one by one, which keeps them in registers.
+#define SLM_INT_TILE(STEP, LOADX, KSTEP, PTRSTEP)                                                        \
+            __m256i a00 = _mm256_setzero_si256(), a01 = a00, a10 = a00, a11 = a00;                          \
+            __m256i a20 = a00, a21 = a00, a30 = a00, a31 = a00;                                             \
+            for (int k = 0; k < w.kpad; k += KSTEP, p += PTRSTEP) {                                         \
+                const __m256i w0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));                 \
+                const __m256i w1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + PTRSTEP / 2));   \
+                __m256i b = LOADX(xr[0] + k); a00 = STEP(a00, b, w0); a01 = STEP(a01, b, w1);                \
+                b = LOADX(xr[1] + k); a10 = STEP(a10, b, w0); a11 = STEP(a11, b, w1);                       \
+                b = LOADX(xr[2] + k); a20 = STEP(a20, b, w0); a21 = STEP(a21, b, w1);                       \
+                b = LOADX(xr[3] + k); a30 = STEP(a30, b, w0); a31 = STEP(a31, b, w1);                       \
+            }
+
+        // Broadcasts the four bytes (or two 16-bit integers) at p to every 32-bit lane.
+        SLM_AVX2 inline __m256i broadcast32 (const void* p)
+        {
+            int32_t v;
+            std::memcpy(&v, p, 4);
+            return _mm256_set1_epi32(v);
+        }
+
+        SLM_AVX2 inline __m256i madd16 (__m256i acc, __m256i x, __m256i w)
+        {
+            return _mm256_add_epi32(acc, _mm256_madd_epi16(x, w));
+        }
+
+        SLM_AVX2 inline void avx2 (const int16_t* x, int n, const int_matrix& w, int32_t* out)
+        {
+            for (int st = 0; st < w.strips; ++st) {
+                const int c0 = st * 16, cols = std::min(16, w.cols - c0);
+                for (int r0 = 0; r0 < n; r0 += 4) {
+                    const int rows = std::min(4, n - r0);
+                    const int16_t* xr[4];
+                    for (int r = 0; r < 4; ++r) xr[r] = x + static_cast<size_t>(r0 + (r < rows ? r : 0)) * w.kpad;
+                    const int16_t* p = &w.q2[static_cast<size_t>(st) * w.kpad * 16];
+                    SLM_INT_TILE(madd16, broadcast32, 2, 32)
+                    int32_t tile[4][16];
+                    _mm256_storeu_si256(reinterpret_cast<__m256i*>(tile[0]), a00);
+                    _mm256_storeu_si256(reinterpret_cast<__m256i*>(tile[0] + 8), a01);
+                    _mm256_storeu_si256(reinterpret_cast<__m256i*>(tile[1]), a10);
+                    _mm256_storeu_si256(reinterpret_cast<__m256i*>(tile[1] + 8), a11);
+                    _mm256_storeu_si256(reinterpret_cast<__m256i*>(tile[2]), a20);
+                    _mm256_storeu_si256(reinterpret_cast<__m256i*>(tile[2] + 8), a21);
+                    _mm256_storeu_si256(reinterpret_cast<__m256i*>(tile[3]), a30);
+                    _mm256_storeu_si256(reinterpret_cast<__m256i*>(tile[3] + 8), a31);
+                    store_tile(tile, rows, c0, cols, w.cols, r0, out);
+                }
+            }
+        }
+
+#if SLM_VNNI_KERNELS
+        // 128 times the column sums from c on: what the inputs, taken as unsigned bytes, add.
+        SLM_AVX2 inline __m256i offset_sums (const int32_t* c)
+        {
+            return _mm256_slli_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(c)), 7);
+        }
+
+        // Stores the sixteen sums of a row of a tile, their offsets removed.
+        SLM_AVX2 inline void store_row (int32_t* row, __m256i lo, __m256i hi, __m256i s0, __m256i s1)
+        {
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(row), _mm256_sub_epi32(lo, s0));
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(row + 8), _mm256_sub_epi32(hi, s1));
+        }
+
+#define SLM_VNNI_GEMM(NAME, TARGET, STEP)                                                                   \
+        TARGET inline __m256i NAME##_step (__m256i acc, __m256i x, __m256i w) { return STEP(acc, x, w); }   \
+        TARGET inline __m256i NAME##_load (const uint8_t* p)                                                \
+        {                                                                                                   \
+            int32_t v;                                                                                      \
+            std::memcpy(&v, p, 4);                                                                          \
+            return _mm256_set1_epi32(v);                                                                    \
+        }                                                                                                   \
+        TARGET inline void NAME (const uint8_t* x, int n, const int_matrix& w, int32_t* out)                \
+        {                                                                                                   \
+            for (int st = 0; st < w.strips; ++st) {                                                         \
+                const int c0 = st * 16, cols = std::min(16, w.cols - c0);                                   \
+                const __m256i s0 = offset_sums(&w.colsum[c0]), s1 = offset_sums(&w.colsum[c0 + 8]);         \
+                for (int r0 = 0; r0 < n; r0 += 4) {                                                         \
+                    const int rows = std::min(4, n - r0);                                                   \
+                    const uint8_t* xr[4];                                                                   \
+                    for (int r = 0; r < 4; ++r)                                                             \
+                        xr[r] = x + static_cast<size_t>(r0 + (r < rows ? r : 0)) * w.kpad;                  \
+                    const int8_t* p = &w.q4[static_cast<size_t>(st) * w.kpad * 16];                         \
+                    SLM_INT_TILE(NAME##_step, NAME##_load, 4, 64)                                           \
+                    int32_t tile[4][16];                                                                    \
+                    store_row(tile[0], a00, a01, s0, s1);                                                   \
+                    store_row(tile[1], a10, a11, s0, s1);                                                   \
+                    store_row(tile[2], a20, a21, s0, s1);                                                   \
+                    store_row(tile[3], a30, a31, s0, s1);                                                   \
+                    store_tile(tile, rows, c0, cols, w.cols, r0, out);                                      \
+                }                                                                                           \
+            }                                                                                               \
+        }
+
+        SLM_VNNI_GEMM(vnni512, SLM_AVX512_VNNI, _mm256_dpbusd_epi32)
+        SLM_VNNI_GEMM(vnni256, SLM_AVX_VNNI, _mm256_dpbusd_avx_epi32)
+#undef SLM_VNNI_GEMM
+#endif
+#undef SLM_INT_TILE
+#endif
+    }
+
+    /*
         Runs the decoder the training network defines, one position at a time for several
         independent streams at once:
 
@@ -1175,36 +1790,43 @@ namespace tok_codec
         bool loaded () const { return shape_.vocab > 0; }
         const engine_shape& shape () const { return shape_; }
 
-        void load (byte_reader& in)
+        // Reads the network; with_hints says whether the data gives it hint levels.
+        void load (byte_reader& in, bool with_hints)
         {
             engine_shape s;
             s.vocab = in.i32(); s.dim = in.i32(); s.layers = in.i32(); s.heads = in.i32();
             s.kv_heads = in.i32(); s.head_dim = in.i32(); s.ffn = in.i32(); s.window = in.i32();
+            s.hint_levels = with_hints ? in.i32() : 0;
             if (s.vocab <= 0 || s.dim <= 0 || s.layers <= 0 || s.heads <= 0 || s.kv_heads <= 0
-                || s.heads % s.kv_heads != 0 || s.head_dim % 2 != 0 || s.head_dim > 256 || s.ffn <= 0 || s.window <= 0)
+                || s.heads % s.kv_heads != 0 || s.head_dim % 2 != 0 || s.head_dim > 256 || s.ffn <= 0 || s.window <= 0
+                || s.hint_levels < 0 || s.hint_levels > 255 || (with_hints && s.hint_levels == 0))
                 throw std::runtime_error("invalid network shape in the embedded data");
             eps = in.f32();
             inv_freq.resize(s.head_dim / 2);
             for (auto& f : inv_freq) f = in.f32();
 
             emb = read_matrix(in, s.vocab, s.dim, true);
+            if (s.hint_levels > 0) {
+                hint_projection = read_int_matrix(in, s.dim, s.dim);
+                hint_gates = read_vector(in, s.hint_levels * s.dim);
+            }
             blocks.resize(s.layers);
             for (auto& b : blocks) {
                 b.g1 = read_vector(in, s.dim);
-                b.wq = pack(read_matrix(in, s.dim, s.q_dim(), false), s.dim, s.q_dim());
-                b.wk = pack(read_matrix(in, s.dim, s.kv_dim(), false), s.dim, s.kv_dim());
-                b.wv = pack(read_matrix(in, s.dim, s.kv_dim(), false), s.dim, s.kv_dim());
-                b.wo = pack(read_matrix(in, s.q_dim(), s.dim, false), s.q_dim(), s.dim);
+                b.wq = read_int_matrix(in, s.dim, s.q_dim());
+                b.wk = read_int_matrix(in, s.dim, s.kv_dim());
+                b.wv = read_int_matrix(in, s.dim, s.kv_dim());
+                b.wo = read_int_matrix(in, s.q_dim(), s.dim);
                 b.g2 = read_vector(in, s.dim);
-                b.wa = pack(read_matrix(in, s.dim, s.ffn, false), s.dim, s.ffn);
+                b.wa = read_int_matrix(in, s.dim, s.ffn);
                 b.ba = read_vector(in, s.ffn);
-                b.wb = pack(read_matrix(in, s.dim, s.ffn, false), s.dim, s.ffn);
+                b.wb = read_int_matrix(in, s.dim, s.ffn);
                 b.bb = read_vector(in, s.ffn);
-                b.wd = pack(read_matrix(in, s.ffn, s.dim, false), s.ffn, s.dim);
+                b.wd = read_int_matrix(in, s.ffn, s.dim);
                 b.bd = read_vector(in, s.dim);
             }
             gf = read_vector(in, s.dim);
-            wout = pack(read_matrix(in, s.dim, s.vocab, false), s.dim, s.vocab);
+            wout = read_int_matrix(in, s.dim, s.vocab);
             bout = read_vector(in, s.vocab);
             shape_ = s;
 
@@ -1232,10 +1854,28 @@ namespace tok_codec
             vals.assign(per_stream * streams, 0.0f);
             position.assign(streams, 0);
             base.assign(streams, 0);
+            adapted.assign(static_cast<size_t>(streams) * s.vocab, 0.0f);
         }
 
-        // Feeds the newest token of each listed stream and writes its next-token distribution.
-        void step (const int* ids, const int* tokens, int n, float* probs)
+        /*
+            Stream sid has coded token t with the distribution p the last step gave it. Each
+            output bias of the stream moves against its probability, and that of t up by the
+            same rate: a step of gradient descent on the coding cost, which follows the tokens
+            the stream's own text uses. The decoder takes the same steps after the same tokens.
+        */
+        void learn (int sid, int t, const float* p)
+        {
+            const int V = shape_.vocab;
+            float* b = &adapted[static_cast<size_t>(sid) * V];
+            for (int i = 0; i < V; ++i) b[i] -= ADAPT_RATE * p[i];
+            b[t] += ADAPT_RATE;
+        }
+
+        /*
+            Feeds the newest token of each listed stream, with its hint when the network takes
+            hints (hints may be null otherwise), and writes its next-token distribution.
+        */
+        void step (const int* ids, const int* tokens, const uint32_t* hints, int n, float* probs)
         {
             const engine_shape& s = shape_;
             const int D = s.dim, QD = s.q_dim(), KVD = s.kv_dim(), F = s.ffn, V = s.vocab, W = s.window;
@@ -1252,14 +1892,16 @@ namespace tok_codec
                     rebase(sid);
                 }
             }
+            if (s.hint_levels > 0 && hints) add_hints(hints, n);
 
             const float scale = 1.0f / std::sqrt(static_cast<float>(HD));
             for (int l = 0; l < s.layers; ++l) {
                 const block& b = blocks[l];
                 rms_norm(x.data(), b.g1.data(), n, D, h.data());
-                gemm(h.data(), n, b.wq, q.data());
-                gemm(h.data(), n, b.wk, k.data());
-                gemm(h.data(), n, b.wv, v.data());
+                quantize(h.data(), n, D);
+                gemm(n, b.wq, q.data());
+                gemm(n, b.wk, k.data());
+                gemm(n, b.wv, v.data());
 
                 for (int r = 0; r < n; ++r) {
                     const int sid = ids[r];
@@ -1298,12 +1940,14 @@ namespace tok_codec
                     }
                 }
 
-                gemm(ctx.data(), n, b.wo, o.data());
+                quantize(ctx.data(), n, QD);
+                gemm(n, b.wo, o.data());
                 for (size_t i = 0; i < static_cast<size_t>(n) * D; ++i) x[i] += o[i];
 
                 rms_norm(x.data(), b.g2.data(), n, D, h.data());
-                gemm(h.data(), n, b.wa, fa.data());
-                gemm(h.data(), n, b.wb, fb.data());
+                quantize(h.data(), n, D);
+                gemm(n, b.wa, fa.data());
+                gemm(n, b.wb, fb.data());
                 for (int r = 0; r < n; ++r) {
                     float* pa = &fa[static_cast<size_t>(r) * F];
                     const float* pb = &fb[static_cast<size_t>(r) * F];
@@ -1312,19 +1956,22 @@ namespace tok_codec
                         pa[i] = (pb[i] + b.bb[i]) * (za / (1.0f + det::expf(-za)));
                     }
                 }
-                gemm(fa.data(), n, b.wd, o.data());
+                quantize(fa.data(), n, F);
+                gemm(n, b.wd, o.data());
                 for (int r = 0; r < n; ++r)
                     for (int i = 0; i < D; ++i)
                         x[static_cast<size_t>(r) * D + i] += o[static_cast<size_t>(r) * D + i] + b.bd[i];
             }
 
             rms_norm(x.data(), gf.data(), n, D, h.data());
-            gemm(h.data(), n, wout, logits.data());
+            quantize(h.data(), n, D);
+            gemm(n, wout, logits.data());
             for (int r = 0; r < n; ++r) {
                 float* lg = &logits[static_cast<size_t>(r) * V];
                 float* pr = probs + static_cast<size_t>(r) * V;
+                const float* ab = &adapted[static_cast<size_t>(ids[r]) * V];
                 float mx = -3.0e38f;
-                for (int i = 0; i < V; ++i) { lg[i] += bout[i]; mx = lg[i] > mx ? lg[i] : mx; }
+                for (int i = 0; i < V; ++i) { lg[i] += bout[i] + ab[i]; mx = lg[i] > mx ? lg[i] : mx; }
                 for (int i = 0; i < V; ++i) pr[i] = det::expf(lg[i] - mx);
                 const float inv = 1.0f / sum(pr, V);
                 for (int i = 0; i < V; ++i) pr[i] *= inv;
@@ -1333,33 +1980,38 @@ namespace tok_codec
         }
 
     private:
-        // A matrix stored as strips of sixteen columns, each strip holding its rows end to end,
-        // so that a matrix product reads it sequentially. Columns past the last are zero.
-        struct packed_matrix
-        {
-            int rows = 0, cols = 0, strips = 0;
-            std::vector<float> data;
-        };
-
         struct block
         {
             std::vector<float> g1, g2, ba, bb, bd;
-            packed_matrix wq, wk, wv, wo, wa, wb, wd;
+            int_matrix wq, wk, wv, wo, wa, wb, wd;
         };
 
-        static packed_matrix pack (const std::vector<float>& m, int rows, int cols)
+        // x += G[level - 1] * (E[hinted token] P) for the rows that have a hint.
+        void add_hints (const uint32_t* hints, int n)
         {
-            packed_matrix p;
-            p.rows = rows;
-            p.cols = cols;
-            p.strips = (cols + 15) / 16;
-            p.data.assign(static_cast<size_t>(p.strips) * rows * 16, 0.0f);
-            for (int st = 0; st < p.strips; ++st)
-                for (int r = 0; r < rows; ++r)
-                    for (int c = 0; c < 16 && st * 16 + c < cols; ++c)
-                        p.data[(static_cast<size_t>(st) * rows + r) * 16 + c] =
-                            m[static_cast<size_t>(r) * cols + st * 16 + c];
-            return p;
+            const engine_shape& s = shape_;
+            const int D = s.dim;
+            const uint32_t V = static_cast<uint32_t>(s.vocab);
+            hint_rows.clear();
+            for (int r = 0; r < n; ++r) {
+                const uint32_t code = hints[r];
+                if (code < V) continue;
+                const uint32_t level = code / V;
+                if (level > static_cast<uint32_t>(s.hint_levels)) throw std::runtime_error("hint level out of range");
+                std::memcpy(&h[hint_rows.size() * D], &emb[static_cast<size_t>(code % V) * D], sizeof(float) * D);
+                hint_rows.push_back(r);
+            }
+            const int m = static_cast<int>(hint_rows.size());
+            if (m == 0) return;
+            quantize(h.data(), m, D);
+            gemm(m, hint_projection, o.data());
+            for (int j = 0; j < m; ++j) {
+                const int r = hint_rows[j];
+                const float* g = &hint_gates[static_cast<size_t>(hints[r] / V - 1) * D];
+                const float* pr = &o[static_cast<size_t>(j) * D];
+                float* xr = &x[static_cast<size_t>(r) * D];
+                for (int i = 0; i < D; ++i) xr[i] += g[i] * pr[i];
+            }
         }
 
         static std::vector<float> read_vector (byte_reader& in, int n)
@@ -1367,6 +2019,16 @@ namespace tok_codec
             std::vector<float> v(n);
             for (auto& f : v) f = in.f32();
             return v;
+        }
+
+        // A weight matrix of the blocks or of the head: one scale per column, then the integers row by row.
+        static int_matrix read_int_matrix (byte_reader& in, int rows, int cols)
+        {
+            std::vector<float> scales(cols);
+            for (auto& f : scales) f = in.f32();
+            std::vector<int8_t> m(static_cast<size_t>(rows) * cols);
+            for (auto& v : m) v = in.i8();
+            return pack_int(m, std::move(scales), rows, cols);
         }
 
         // A quantized matrix: one scale per row when by_row, per column otherwise, then the
@@ -1449,27 +2111,61 @@ namespace tok_codec
         }
 
         /*
-            out[n x cols] = in[n x rows] * w. Every element is accumulated over the rows of w in
-            increasing order with fused multiply-adds, whatever tile it falls in, so its value
-            does not depend on n, on the blocking or on the kernel the processor runs. Each
-            strip of w is read once and used for every row of in while it sits in cache; the
-            tiles of four rows by sixteen columns stay in registers.
+            The inputs of the next products, each row quantized to integers in [-127, 127] with
+            the scale of its largest magnitude, kept in the form the processor's path reads.
         */
-        static void gemm (const float* in, int n, const packed_matrix& w, float* out)
+        void quantize (const float* in, int n, int kdim)
         {
-            const int TC = 16, kdim = w.rows, m = w.cols;
-            for (int st = 0; st < w.strips; ++st) {
-                const float* strip = &w.data[static_cast<size_t>(st) * kdim * TC];
-                const int c0 = st * TC, cols = std::min(TC, m - c0);
-                for (int r0 = 0; r0 < n; r0 += 4) {
-                    const int rows = std::min(4, n - r0);
-                    const float* xr[4];
-                    for (int r = 0; r < 4; ++r) xr[r] = in + static_cast<size_t>(r0 + (r < rows ? r : 0)) * kdim;
-                    float tile[4][TC];
-                    kernels::tile(xr, strip, kdim, tile);
-                    for (int r = 0; r < rows; ++r)
-                        std::memcpy(out + static_cast<size_t>(r0 + r) * m + c0, tile[r], sizeof(float) * cols);
+            const int kpad = (kdim + 3) & ~3;
+            xq.assign(static_cast<size_t>(n) * kpad, 0);
+            xs.resize(n);
+            for (int r = 0; r < n; ++r) {
+                const float* row = in + static_cast<size_t>(r) * kdim;
+                float mx = 0.0f;
+                for (int i = 0; i < kdim; ++i) mx = std::max(mx, std::fabs(row[i]));
+                xs[r] = mx / 127.0f;
+                if (!(mx > 0.0f)) continue;
+                const float inv = 127.0f / mx;
+                int8_t* q8 = &xq[static_cast<size_t>(r) * kpad];
+                for (int i = 0; i < kdim; ++i) {
+                    const float magic = 12582912.0f;    // 1.5 * 2^23: rounds to the nearest integer, ties to even
+                    q8[i] = static_cast<int8_t>((row[i] * inv + magic) - magic);
                 }
+            }
+            if (vnni_paths()) {
+                xu.resize(xq.size());
+                for (size_t i = 0; i < xq.size(); ++i) xu[i] = static_cast<uint8_t>(xq[i] + 128);
+            }
+            else if (kernels::vector_paths()) {
+                x16.resize(xq.size());
+                for (size_t i = 0; i < xq.size(); ++i) x16[i] = xq[i];
+            }
+        }
+
+        /*
+            out[n x cols] = in[n x rows] * w for the inputs last quantized, which must have
+            w.rows columns. The integer sums are exact in any order, so every path gives the
+            same; each is then scaled by its row's and its column's scales, in that order.
+        */
+        void gemm (int n, const int_matrix& w, float* out)
+        {
+            acc.resize(static_cast<size_t>(n) * w.cols);
+#if SLM_CODEC_X86
+#if SLM_VNNI_KERNELS
+            if (processor().avx512_vnni) kernels_int::vnni512(xu.data(), n, w, acc.data());
+            else if (processor().avx_vnni) kernels_int::vnni256(xu.data(), n, w, acc.data());
+            else
+#endif
+            if (kernels::vector_paths()) kernels_int::avx2(x16.data(), n, w, acc.data());
+            else kernels_int::portable(xq.data(), n, w, acc.data());
+#else
+            kernels_int::portable(xq.data(), n, w, acc.data());
+#endif
+            for (int r = 0; r < n; ++r) {
+                const float sx = xs[r];
+                const int32_t* a = &acc[static_cast<size_t>(r) * w.cols];
+                float* o = out + static_cast<size_t>(r) * w.cols;
+                for (int c = 0; c < w.cols; ++c) o[c] = static_cast<float>(a[c]) * (sx * w.scale[c]);
             }
         }
 
@@ -1477,30 +2173,44 @@ namespace tok_codec
         float eps = 1e-5f;
         std::vector<float> inv_freq, rope_cos, rope_sin;
         std::vector<float> emb, gf, bout;
-        packed_matrix wout;
+        int_matrix hint_projection;
+        std::vector<float> hint_gates;
+        std::vector<int> hint_rows;
+        int_matrix wout;
         std::vector<block> blocks;
 
         std::vector<float> kraw, krot, vals;
         std::vector<int64_t> position, base;
+        std::vector<float> adapted;    // output biases learned while coding, per stream
+        static constexpr float ADAPT_RATE = 0.1f;
 
         std::vector<float> x, h, o, q, k, v, ctx, fa, fb, logits, att;
+        std::vector<int8_t> xq;        // the quantized inputs of the products
+        std::vector<uint8_t> xu;
+        std::vector<int16_t> x16;
+        std::vector<float> xs;
+        std::vector<int32_t> acc;
     };
 
     // ----------------------------------------------------------------------------------------
     // The compiled-in data
 
     /*
-        The embedded data is one container: the merge table of the tokenizer, then the network
-        when there is one, compressed by the coder of this program in byte mode. Its checksum
-        identifies the build: an archive records the checksum of the data it was coded with,
-        and a build holding other data refuses to decode it.
+        The embedded data is one container: the tokenizer, then the network when there is one,
+        compressed by the coder of this program in byte mode. Its checksum identifies the
+        build: an archive records the checksum of the data it was coded with, and a build
+        holding other data refuses to decode it.
 
-            "TQC1"  u32 segmentation  u32 merges  merges x (u16 left, u16 right)
-            u32 has_network  [network: shape, epsilon, rotation frequencies, tensors]
+            "TQC2"  u32 segmentation  u32 folded capitals  u32 merges  merges x (u16 left, u16 right)
+            u32 network (0: none, 1: a network, 2: a network that takes hints)
+            [network: shape, hint levels when it takes hints, epsilon, rotation frequencies, tensors]
+
+        A container of the earlier format "TQC1" has no field for the folded capitals.
     */
     struct codec_data
     {
-        int segmentation = 1;
+        int segmentation = 1;    // the value of dlib::bpe_segmentation
+        bool folded = false;     // whether the tokens are those of the text with folded capitals
         dlib::bpe_tokenizer tokenizer;
         vocabulary vocab;
         transformer_engine engine;
@@ -1508,23 +2218,51 @@ namespace tok_codec
         size_t container_size = 0;
         bool has_tokenizer () const { return vocab.size() > 256; }
         bool has_network () const { return engine.loaded(); }
+        // Text is coded in tokens with a network, in bytes otherwise; capitals fold in token mode.
+        bool token_mode () const { return has_network() && has_tokenizer(); }
+        bool folds () const { return folded && token_mode(); }
     };
+
+    // The names of the segmentations on the command line and in the reports.
+    inline const char* segmentation_name (int segmentation)
+    {
+        switch (segmentation) {
+            case 0: return "whitespace";
+            case 1: return "spaces";
+            case 2: return "classes";
+            default: return "unknown";
+        }
+    }
+
+    // How the tokenizer is described in the reports and the generated header.
+    inline std::string tokenizer_form (int segmentation, bool folded)
+    {
+        return std::string("segmentation ") + segmentation_name(segmentation) + (folded ? ", folded capitals" : "");
+    }
 
     inline void load_codec_data (const std::vector<uint8_t>& raw, codec_data& data)
     {
         byte_reader in(raw.data(), raw.size());
-        if (in.u32() != 0x31435154u) throw std::runtime_error("unknown embedded data format");    // "TQC1"
+        const uint32_t format = in.u32();
+        if (format != 0x31435154u && format != 0x32435154u)    // "TQC1", "TQC2"
+            throw std::runtime_error("unknown embedded data format");
         data.segmentation = in.i32();
+        if (data.segmentation < 0 || data.segmentation > 2)
+            throw std::runtime_error("unknown segmentation in the embedded data");
+        const uint32_t folded = format == 0x32435154u ? in.u32() : 0;
+        if (folded > 1) throw std::runtime_error("unknown text form in the embedded data");
+        data.folded = folded == 1;
         std::vector<std::pair<int, int>> merges(in.u32());
         for (auto& m : merges) {
             m.first = in.u16();
             m.second = in.u16();
         }
-        data.tokenizer.set_segmentation(data.segmentation == 1 ? dlib::bpe_segmentation::space_prefixed
-                                                               : dlib::bpe_segmentation::whitespace_split);
+        data.tokenizer.set_segmentation(static_cast<dlib::bpe_segmentation>(data.segmentation));
         data.tokenizer.set_merges(merges);
         data.vocab.build(data.tokenizer);
-        if (in.u32() != 0) data.engine.load(in);
+        const uint32_t network = in.u32();
+        if (network > 2) throw std::runtime_error("unknown network form in the embedded data");
+        if (network != 0) data.engine.load(in, network == 2);
         if (!in.done()) throw std::runtime_error("trailing bytes in the embedded data");
         data.fingerprint = checksum(raw.data(), raw.size());
     }
@@ -1535,12 +2273,12 @@ namespace tok_codec
     /*
         Archive layout, little-endian:
 
-            "DLC2"  u64 original size  u32 CRC-32 of the original  u32 data fingerprint
-            u8 mode (0: bytes, 1: tokens)  u8 log2 of the counters per model  u8 streams
+            "DLC3"  u64 original size  u32 CRC-32 of the original  u32 data fingerprint
+            u8 mode (0: bytes, 1: tokens)  u8 log2 of the table units per model  u8 streams
             per stream: varint byte length, and in token mode varint token count
             arithmetic code
     */
-    const uint32_t ARCHIVE_MAGIC = 0x32434C44u;    // "DLC2"
+    const uint32_t ARCHIVE_MAGIC = 0x33434C44u;    // "DLC3"
 
     inline void put_u32 (std::vector<uint8_t>& out, uint32_t v)
     {
@@ -1683,9 +2421,9 @@ namespace tok_codec
         of tokens of each stream.
     */
     template <typename SIDE>
-    void run_token_streams (SIDE& side, codec_data& data, int table_bits, const std::vector<std::vector<int>>& tokens,
-        const std::vector<uint64_t>& counts, std::vector<stream_state>& streams, coding_stats& stats,
-        bool encoding, void (*progress)(uint64_t, uint64_t))
+    void run_token_streams (SIDE& side, codec_data& data, int table_bits,
+        const std::vector<std::vector<uint16_t>>& tokens, const std::vector<uint64_t>& counts,
+        std::vector<stream_state>& streams, coding_stats& stats, bool encoding, void (*progress)(uint64_t, uint64_t))
     {
         const int num = static_cast<int>(counts.size());
         const int V = data.engine.shape().vocab;
@@ -1704,20 +2442,40 @@ namespace tok_codec
         uint64_t total = 0, coded = 0;
         for (uint64_t c : counts) total += c;
 
+        // A network that takes hints gets them from the tokens of all the streams coded so far.
+        const bool hinted = data.engine.shape().hint_levels > 0;
+        token_matcher matcher;
+        std::vector<uint32_t> hint(num, 0), feed_hint(num, 0);
+        if (hinted) {
+            matcher.init(num, total);
+            for (int s = 0; s < num; ++s) {
+                matcher.reserve(s, static_cast<size_t>(counts[s]) + 1);
+                hint[s] = matcher.push(s, static_cast<uint16_t>(line_break), static_cast<uint32_t>(V));
+            }
+        }
+
         while (coded < total) {
             int n = 0;
             for (int s = 0; s < num; ++s)
-                if (done[s] < counts[s]) { ids[n] = s; feed[n] = prev[s]; ++n; }
-            data.engine.step(ids.data(), feed.data(), n, probs.data());
+                if (done[s] < counts[s]) { ids[n] = s; feed[n] = prev[s]; feed_hint[n] = hint[s]; ++n; }
+            data.engine.step(ids.data(), feed.data(), hinted ? feed_hint.data() : nullptr, n, probs.data());
             for (int i = 0; i < n; ++i) {
                 const int s = ids[i];
                 const float* p = &probs[static_cast<size_t>(i) * V];
                 cum[0] = 0.0;
                 for (int r = 0; r < n_voc; ++r) cum[r + 1] = cum[r] + p[data.vocab.token_at(r)];
+                // What the network's most likely token would cost, a confidence the mixers use.
+                float top = p[0];
+                for (int r = 1; r < V; ++r) top = p[r] > top ? p[r] : top;
+                const double top_bits =
+                    -det::log(std::max(1e-30, static_cast<double>(top) / cum[n_voc])) / 0.69314718055994530942;
+                model.network_confidence(s, static_cast<int>(std::min(31.0, det::round_even(4.0 * top_bits))));
                 const int want = encoding ? tokens[s][done[s]] : -1;
                 const int t = code_token(side, model, data.vocab, s, cum.data(), want);
                 const double pt = std::max(1e-30, static_cast<double>(p[t]) / cum[n_voc]);
                 stats.network_bits -= det::log(pt) / 0.69314718055994530942;
+                data.engine.learn(s, t, p);
+                if (hinted) hint[s] = matcher.push(s, static_cast<uint16_t>(t), static_cast<uint32_t>(V));
                 prev[s] = t;
                 ++done[s];
                 ++coded;
@@ -1765,7 +2523,7 @@ namespace tok_codec
             }
         }
         else {
-            const std::vector<std::vector<int>> no_tokens(num);
+            const std::vector<std::vector<uint16_t>> no_tokens(num);
             coding_stats stats;
             run_token_streams(side, data, table_bits, no_tokens, counts, streams, stats, false, progress);
             for (int s = 0; s < num; ++s) {
@@ -1773,6 +2531,7 @@ namespace tok_codec
                 out.insert(out.end(), streams[s].hist.begin(), streams[s].hist.end());
                 std::vector<uint8_t>().swap(streams[s].hist);
             }
+            if (data.folded) out = unfold_capitals(out.data(), out.size());
         }
         if (out.size() != original_size) throw std::runtime_error("decoded size differs from the recorded size");
         if (checksum(out.data(), out.size()) != crc)
@@ -1789,42 +2548,52 @@ namespace tok_codec
         How a text is coded: in tokens when a network is compiled in, in bytes otherwise; with
         tables that grow with the input, four counters per byte up to 2^25 per model, since
         collisions between contexts cost more than the memory they would save; and, in token
-        mode, in streams cut at line boundaries, each of at least a megabyte.
+        mode, in streams cut at line boundaries, each of at least a megabyte. The text is the
+        input itself, or in token mode its form with folded capitals when the tokenizer was
+        built on that form.
     */
     struct coding_plan
     {
         bool token_mode = false;
         int table_bits = 0;
-        std::vector<size_t> bounds;     // stream s covers [bounds[s], bounds[s + 1])
+        std::vector<size_t> bounds;     // stream s covers [bounds[s], bounds[s + 1]) of the coded text
         int streams () const { return static_cast<int>(bounds.size()) - 1; }
     };
 
-    inline coding_plan plan_coding (const std::vector<uint8_t>& original, const codec_data& data, int streams_wanted,
+    inline coding_plan plan_coding (const std::vector<uint8_t>& text, const codec_data& data, int streams_wanted,
         int table_bits)
     {
         coding_plan plan;
-        plan.token_mode = data.has_network() && data.has_tokenizer();
+        plan.token_mode = data.token_mode();
         plan.table_bits = table_bits;
         if (plan.table_bits <= 0) {
             plan.table_bits = 18;
-            while (plan.table_bits < 25 && (size_t(1) << (plan.table_bits - 2)) < original.size()) ++plan.table_bits;
+            while (plan.table_bits < 26 && (size_t(1) << (plan.table_bits - 2)) < text.size()) ++plan.table_bits;
         }
-        const int megabytes = static_cast<int>(std::min<size_t>(original.size() >> 20, 255));
+        const int megabytes = static_cast<int>(std::min<size_t>(text.size() >> 20, 255));
         const int num = plan.token_mode ? std::max(1, std::min(streams_wanted, megabytes)) : 1;
         plan.bounds.assign(1, 0);
         for (int s = 1; s < num; ++s) {
-            size_t cut = original.size() * s / num;
-            while (cut < original.size() && original[cut - 1] != '\n') ++cut;
-            if (cut > plan.bounds.back() && cut < original.size()) plan.bounds.push_back(cut);
+            size_t cut = text.size() * s / num;
+            while (cut < text.size() && text[cut - 1] != '\n') ++cut;
+            if (cut > plan.bounds.back() && cut < text.size()) plan.bounds.push_back(cut);
         }
-        plan.bounds.push_back(original.size());
+        plan.bounds.push_back(text.size());
         return plan;
     }
 
-    // Codes a text into an archive. Nothing here depends on dlib.
-    inline std::vector<uint8_t> compress (const std::vector<uint8_t>& original, codec_data& data,
-        const coding_plan& plan, coding_stats& stats, size_t& header_size, void (*progress)(uint64_t, uint64_t))
+    /*
+        Codes a text into an archive. original is the input, whose size and checksum the archive
+        records, and folded its form with folded capitals when the tokenizer folds them, empty
+        otherwise; the form that is coded is the folded one when there is one. In token mode both
+        are released once tokenized, so that coding holds the tokens alone. Nothing here depends
+        on dlib.
+    */
+    inline std::vector<uint8_t> compress (std::vector<uint8_t>& original, std::vector<uint8_t>& folded,
+        codec_data& data, const coding_plan& plan, coding_stats& stats, size_t& header_size,
+        void (*progress)(uint64_t, uint64_t))
     {
+        const std::vector<uint8_t>& text = folded.empty() ? original : folded;
         const int num = plan.streams();
         std::vector<uint8_t> out;
         put_u32(out, ARCHIVE_MAGIC);
@@ -1836,14 +2605,19 @@ namespace tok_codec
         out.push_back(static_cast<uint8_t>(plan.table_bits));
         out.push_back(static_cast<uint8_t>(num));
 
-        std::vector<std::vector<int>> tokens(num);
+        std::vector<std::vector<uint16_t>> tokens(num);
         std::vector<uint64_t> counts(num, 0);
         if (plan.token_mode) {
+            if (data.tokenizer.get_vocab_size() > 65536)
+                throw std::runtime_error("coding tokens needs a tokenizer of at most 65536 entries");
             for (int s = 0; s < num; ++s) {
-                const std::string part(original.begin() + plan.bounds[s], original.begin() + plan.bounds[s + 1]);
-                tokens[s] = data.tokenizer.encode(part);
+                const std::string part(text.begin() + plan.bounds[s], text.begin() + plan.bounds[s + 1]);
+                const std::vector<int> ids = data.tokenizer.encode(part);
+                tokens[s].assign(ids.begin(), ids.end());
                 counts[s] = tokens[s].size();
             }
+            std::vector<uint8_t>().swap(original);
+            std::vector<uint8_t>().swap(folded);
         }
         for (int s = 0; s < num; ++s) {
             put_varint(out, plan.bounds[s + 1] - plan.bounds[s]);
@@ -1860,9 +2634,9 @@ namespace tok_codec
         else {
             predictor model;
             model.init(plan.table_bits, &streams);
-            for (size_t i = 0; i < original.size(); ++i) {
-                code_byte(side, model, 0, original[i]);
-                if (progress && (i & 0xffff) == 0) progress(i, original.size());
+            for (size_t i = 0; i < text.size(); ++i) {
+                code_byte(side, model, 0, text[i]);
+                if (progress && (i & 0xffff) == 0) progress(i, text.size());
             }
         }
         coder.flush();
@@ -2039,21 +2813,26 @@ static int decompress_command (const std::string& input, const std::string& outp
 static int compress_command (const std::string& input, const std::string& output, int streams_wanted, int table_bits)
 {
     tok_codec::codec_data& data = tok_codec::embedded_codec_data();
-    const std::vector<uint8_t> original = read_file(input);
-    const tok_codec::coding_plan plan = tok_codec::plan_coding(original, data, streams_wanted, table_bits);
+    std::vector<uint8_t> original = read_file(input);
+    std::vector<uint8_t> folded;
+    if (data.folds()) folded = tok_codec::fold_capitals<std::vector<uint8_t>>(original.data(), original.size());
+    const tok_codec::coding_plan plan = tok_codec::plan_coding(data.folds() ? folded : original, data, streams_wanted,
+        table_bits);
+    const size_t n = std::max<size_t>(1, original.size());
     std::cout << "=== Compression ===\n  input   : " << input << " (" << original.size() << " bytes)\n"
         << "  mode    : " << (plan.token_mode ? "tokens, network and context models" : "bytes, context models only")
-        << "\n  streams : " << plan.streams() << "\n  tables  : 2^" << plan.table_bits << " counters per model"
+        << (data.folds() ? ", folded capitals" : "")
+        << "\n  streams : " << plan.streams() << "\n  tables  : 2^" << plan.table_bits << " four-byte units per model"
         << std::endl;
 
     progress_start = std::chrono::steady_clock::now();
     tok_codec::coding_stats stats;
     size_t header_size = 0;
-    const std::vector<uint8_t> out = tok_codec::compress(original, data, plan, stats, header_size, print_progress);
+    const std::vector<uint8_t> out = tok_codec::compress(original, folded, data, plan, stats, header_size,
+        print_progress);
     const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - progress_start).count();
     write_file(output, out);
 
-    const size_t n = std::max<size_t>(1, original.size());
     std::cout << "\r  time    : " << std::fixed << std::setprecision(1) << secs << " s, " << std::setprecision(2)
         << 1e6 * secs / n << " us/byte                         \n"
         << "  archive : " << out.size() << " bytes, " << std::setprecision(4) << 8.0 * (out.size() - header_size) / n
@@ -2080,10 +2859,17 @@ using std::endl;
 /*
     A decoder of the library's unified GQA stack, without adaptive computation: pre-norm
     blocks of fused attention (rotary positions, grouped key-value heads) and SwiGLU, a final
-    RMS normalisation and a linear head scored at every position. The constants can be set
-    at compile time; the engine reads the shape from the compiled-in data, so a build with
-    other constants still decodes what an earlier one coded.
+    RMS normalisation and a linear head scored at every position. With SLM_HINTS=1 its input is
+    hinted_embeddings: each token comes with the hint of tok_codec::token_matcher, the token a
+    match over everything coded before predicts next, which brings the network the repeats
+    beyond its window. The network alone gains from it, but the context models already code
+    these repeats, so the default keeps plain embeddings. The constants can be set at compile
+    time; the engine reads the shape from the compiled-in data, so a build with other
+    constants still decodes what an earlier one coded.
 */
+#ifndef SLM_HINTS
+#define SLM_HINTS 0
+#endif
 #ifndef SLM_VOCAB_SIZE
 #define SLM_VOCAB_SIZE 8192
 #endif
@@ -2110,9 +2896,42 @@ const long NUM_KV_HEADS  = SLM_NUM_KV_HEADS;
 const long EMBEDDING_DIM = SLM_EMBEDDING_DIM;
 const long WINDOW        = SLM_WINDOW;          // training sequence, and attention span when coding
 
-using model_config = gqa_transformer_config<VOCAB_SIZE, NUM_LAYERS, NUM_HEADS, NUM_KV_HEADS, EMBEDDING_DIM,
-    attention_impl::unified, false>;
-using net_type = model_config::network_type<true>;
+const bool HINTS         = SLM_HINTS != 0;      // whether the network takes the matcher's hints
+
+#if SLM_HINTS
+using token_input = hinted_embeddings<VOCAB_SIZE, EMBEDDING_DIM, tok_codec::HINT_LEVELS, input<matrix<int, 0, 1>>>;
+#else
+using token_input = embeddings<VOCAB_SIZE, EMBEDDING_DIM, input<matrix<int, 0, 1>>>;
+#endif
+using net_type = classification_head<VOCAB_SIZE, impl::gqa_stack_selector<attention_impl::unified, NUM_LAYERS,
+    EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS, token_input, false>::type>;
+
+/*
+    The windows the network reads: the tokens alone, or with hints the tokens followed by
+    their hints, as hinted_embeddings takes them.
+*/
+static void fill_window (matrix<int, 0, 1>& x, const std::vector<uint16_t>& tokens, const std::vector<uint32_t>& hints,
+    size_t start)
+{
+    for (long i = 0; i < WINDOW; ++i) {
+        x(i) = tokens[start + i];
+        if (HINTS) x(WINDOW + i) = static_cast<int>(hints[start + i]);
+    }
+}
+
+// The hint of every position of a corpus, for the token after it, the corpus being one stream.
+static std::vector<uint32_t> corpus_hints (const std::vector<uint16_t>& tokens)
+{
+    std::vector<uint32_t> hints;
+    if (!HINTS) return hints;
+    hints.resize(tokens.size());
+    tok_codec::token_matcher matcher;
+    matcher.init(1, tokens.size());
+    matcher.reserve(0, tokens.size());
+    for (size_t i = 0; i < tokens.size(); ++i)
+        hints[i] = matcher.push(0, tokens[i], static_cast<uint32_t>(VOCAB_SIZE));
+    return hints;
+}
 
 const std::string MODEL_FILE = "slm_tok_predictive_compressor.dat";
 const std::string HEADER_FILE = "slm_tok_predictive_compressor_ex.h";     // default path of the generated header
@@ -2177,11 +2996,12 @@ static void write_header (const std::vector<uint8_t>& raw, const std::string& de
         << " bytes. It takes effect next to slm_tok_predictive_compressor_ex.cpp, after a rebuild." << endl;
 }
 
-static void append_tokenizer (std::vector<uint8_t>& raw, int segmentation,
+static void append_tokenizer (std::vector<uint8_t>& raw, int segmentation, bool folded,
     const std::vector<std::pair<int, int>>& merges)
 {
-    tok_codec::put_u32(raw, 0x31435154u);    // "TQC1"
+    tok_codec::put_u32(raw, 0x32435154u);    // "TQC2"
     tok_codec::put_u32(raw, static_cast<uint32_t>(segmentation));
+    tok_codec::put_u32(raw, folded ? 1 : 0);
     tok_codec::put_u32(raw, static_cast<uint32_t>(merges.size()));
     for (const auto& m : merges) {
         raw.push_back(static_cast<uint8_t>(m.first));
@@ -2191,25 +3011,118 @@ static void append_tokenizer (std::vector<uint8_t>& raw, int segmentation,
     }
 }
 
-static int build_tokenizer_command (const std::string& input, size_t max_bytes, long vocab_size,
-    const std::string& header)
+// The text the tokenizer works on: the corpus itself, or its form with folded capitals.
+static std::string tokenizer_text (const std::string& corpus, bool folded)
 {
-    const std::string text = read_corpus(input, max_bytes);
-    cout << "=== Building the tokenizer ===\n  corpus : " << input << " (" << text.size() << " bytes)\n"
-        << "  target : " << vocab_size << " entries, special tokens included\n" << endl;
+    if (!folded) return corpus;
+    return tok_codec::fold_capitals<std::string>(reinterpret_cast<const uint8_t*>(corpus.data()), corpus.size());
+}
+
+static int build_tokenizer_command (const std::string& input, size_t max_bytes, long vocab_size, int segmentation,
+    bool folded, const std::string& header)
+{
+    const std::string corpus = read_corpus(input, max_bytes);
+    const std::string form = tok_codec::tokenizer_form(segmentation, folded);
+    cout << "=== Building the tokenizer ===\n  corpus : " << input << " (" << corpus.size() << " bytes)\n"
+        << "  target : " << vocab_size << " entries, special tokens included\n"
+        << "  form   : " << form << "\n" << endl;
+    const std::string text = tokenizer_text(corpus, folded);
     bpe_tokenizer tok;
-    tok.set_segmentation(bpe_segmentation::space_prefixed);
+    tok.set_segmentation(static_cast<bpe_segmentation>(segmentation));
     tok.train(text, vocab_size, 0, true);
-    const std::vector<int> ids = tok.encode(text);
-    cout << "\n" << ids.size() << " tokens, " << std::fixed << std::setprecision(3)
-        << static_cast<double>(text.size()) / ids.size() << " bytes per token" << endl;
-    if (tok.decode(ids, false) != text) throw std::runtime_error("the tokenizer does not restore its corpus");
+
+    /*
+        The corpus is tokenized and restored by blocks of whole lines, the lines of the folded
+        text matching those of the corpus one for one, so that the check holds one block at a
+        time beside the two texts.
+    */
+    const size_t block = size_t(16) << 20;
+    size_t tokens = 0, a = 0, b = 0;
+    while (a < text.size()) {
+        size_t a_end = std::min(text.size(), a + block);
+        while (a_end < text.size() && text[a_end - 1] != '\n') ++a_end;
+        const std::string piece = text.substr(a, a_end - a);
+        const std::vector<int> ids = tok.encode(piece);
+        tokens += ids.size();
+        const std::string decoded = tok.decode(ids, false);
+        const size_t lines = static_cast<size_t>(std::count(piece.begin(), piece.end(), '\n'));
+        size_t b_end = b;
+        for (size_t seen = 0; b_end < corpus.size() && (seen < lines || a_end == text.size()); ++b_end)
+            if (corpus[b_end] == '\n') ++seen;
+        const bool restored = folded
+            ? tok_codec::unfold_capitals(reinterpret_cast<const uint8_t*>(decoded.data()), decoded.size())
+                == std::vector<uint8_t>(corpus.begin() + b, corpus.begin() + b_end)
+            : decoded == piece;
+        if (!restored) throw std::runtime_error("the tokenizer does not restore its corpus");
+        a = a_end;
+        b = b_end;
+    }
+    cout << "\n" << tokens << " tokens, " << std::fixed << std::setprecision(3)
+        << static_cast<double>(corpus.size()) / tokens << " bytes of the corpus per token" << endl;
 
     std::vector<uint8_t> raw;
-    append_tokenizer(raw, 1, tok.get_merges());
+    append_tokenizer(raw, segmentation, folded, tok.get_merges());
     tok_codec::put_u32(raw, 0);    // no network: a network belongs to the tokenizer it was trained with
-    write_header(raw, "Tokenizer of " + std::to_string(tok.get_vocab_size()) + " entries, no network.", header);
+    write_header(raw, "Tokenizer of " + std::to_string(tok.get_vocab_size()) + " entries, " + form
+        + ", no network.", header);
     return 0;
+}
+
+// ----------------------------------------------------------------------------------------
+// The tokenizer of a saved network
+
+/*
+    A network belongs to the tokenizer it was trained with, since its embedding rows and
+    output columns are token ids. The saved network is followed by its tokenizer and by
+    whether the capitals were folded, as other language model examples follow theirs with the
+    tokenizer, and the checkpoint of a run, which the trainer writes itself, has them in a file
+    of its own. A saved network or a checkpoint whose tokenizer differs from the compiled-in
+    one is refused. One that records no tokenizer, written by an earlier version of this
+    program, is taken with a warning.
+*/
+struct tokenizer_record
+{
+    bpe_tokenizer tokenizer;
+    bool folded = false;
+};
+
+static void write_record (std::ostream& out, const tok_codec::codec_data& data)
+{
+    serialize(data.tokenizer, out);
+    serialize(data.folded, out);
+}
+
+// Reads the record that follows a network, or fills a checkpoint's own file. False when there is none.
+static bool read_record (std::istream& in, tokenizer_record& record)
+{
+    if (in.peek() == std::char_traits<char>::eof()) return false;
+    deserialize(record.tokenizer, in);
+    deserialize(record.folded, in);
+    return true;
+}
+
+template <typename net_t>
+static bool load_network (const std::string& path, net_t& net, tokenizer_record& record)
+{
+    std::ifstream fin(path, std::ios::binary);
+    if (!fin) throw std::runtime_error("cannot open " + path);
+    deserialize(net, fin);
+    return read_record(fin, record);
+}
+
+static void check_tokenizer (const std::string& path, bool recorded, const tokenizer_record& saved,
+    const tok_codec::codec_data& data, const std::string& remedy)
+{
+    if (!recorded) {
+        cout << "Warning: " << path << " records no tokenizer; it is taken as trained with the compiled-in one."
+            << endl;
+        return;
+    }
+    const bool same = saved.folded == data.folded
+        && saved.tokenizer.get_segmentation() == data.tokenizer.get_segmentation()
+        && saved.tokenizer.get_merges() == data.tokenizer.get_merges();
+    if (!same)
+        throw std::runtime_error(path + " was trained with another tokenizer than the compiled-in one: " + remedy);
 }
 
 // ----------------------------------------------------------------------------------------
@@ -2224,9 +3137,9 @@ static int build_tokenizer_command (const std::string& input, size_t max_bytes, 
 */
 struct exported_layer
 {
-    enum kind_t { embedding, norm, attention, projection } kind;
+    enum kind_t { embedding, hint, norm, attention, projection } kind;
     std::vector<float> values;      // matrices as [inputs x outputs], the embedding as [tokens x dim]
-    std::vector<float> bias;
+    std::vector<float> bias;        // for the hints, the gates of the levels
     long rows = 0, cols = 0;
 };
 
@@ -2244,6 +3157,26 @@ struct weight_collector
         x.cols = e.k();
         x.values.assign(e.host(), e.host() + e.size());
         out->push_back(std::move(x));
+    }
+
+    // The table, then the projection of the hinted tokens and the gates, in the reversed order of the visit.
+    template <unsigned long N, unsigned long D, unsigned long L>
+    void operator() (hinted_embeddings_<N, D, L>& l)
+    {
+        const float* p = l.get_layer_params().host();
+        exported_layer h;
+        h.kind = exported_layer::hint;
+        h.rows = D;
+        h.cols = D;
+        h.values.assign(p + N * D, p + (N + D) * D);
+        h.bias.assign(p + (N + D) * D, p + (N + D + L) * D);
+        out->push_back(std::move(h));
+        exported_layer e;
+        e.kind = exported_layer::embedding;
+        e.rows = N;
+        e.cols = D;
+        e.values.assign(p, p + N * D);
+        out->push_back(std::move(e));
     }
 
     void operator() (rms_norm_& l)
@@ -2344,17 +3277,19 @@ static std::vector<uint8_t> export_network (net_type& net, const tok_codec::code
     visit_computational_layers(net, collector);
     std::reverse(layers.begin(), layers.end());
 
-    const size_t expected = 1 + 6 * NUM_LAYERS + 2;
+    const size_t first_block = HINTS ? 2 : 1;
+    const size_t expected = first_block + 6 * NUM_LAYERS + 2;
     if (layers.size() != expected) throw std::runtime_error("unexpected network layout");
     const long head_dim = EMBEDDING_DIM / NUM_HEADS, q = NUM_HEADS * head_dim, kv = NUM_KV_HEADS * head_dim;
 
     std::vector<uint8_t> raw;
-    append_tokenizer(raw, data.segmentation, data.tokenizer.get_merges());
-    tok_codec::put_u32(raw, 1);
-    const long ffn = layers[5].cols;
+    append_tokenizer(raw, data.segmentation, data.folded, data.tokenizer.get_merges());
+    tok_codec::put_u32(raw, HINTS ? 2 : 1);
+    const long ffn = layers[first_block + 4].cols;
     const long vocab = layers.back().cols;
     for (long v : { vocab, EMBEDDING_DIM, NUM_LAYERS, NUM_HEADS, NUM_KV_HEADS, head_dim, ffn, WINDOW })
         tok_codec::put_u32(raw, static_cast<uint32_t>(v));
+    if (HINTS) tok_codec::put_u32(raw, static_cast<uint32_t>(tok_codec::HINT_LEVELS));
 
     // The training layer's normalisation epsilon and rotary frequencies.
     put_f32(raw, static_cast<float>(DEFAULT_RMS_NORM_EPS));
@@ -2366,6 +3301,12 @@ static std::vector<uint8_t> export_network (net_type& net, const tok_codec::code
     const exported_layer& e = layers[idx++];
     if (e.kind != exported_layer::embedding) throw std::runtime_error("unexpected network layout");
     put_quantized(raw, e.values, e.rows, e.cols, true, bits, err, ref);
+    if (HINTS) {
+        const exported_layer& h = layers[idx++];
+        if (h.kind != exported_layer::hint) throw std::runtime_error("unexpected network layout");
+        put_quantized(raw, h.values, h.rows, h.cols, false, bits, err, ref);
+        put_floats(raw, h.bias);
+    }
     for (long l = 0; l < NUM_LAYERS; ++l) {
         const exported_layer& n1 = layers[idx++];
         const exported_layer& at = layers[idx++];
@@ -2443,15 +3384,15 @@ static matrix<double, 0, 1> rate_schedule (const train_options& o)
     layout shows up as a large gap; the gap of a correct export is what quantization costs.
 */
 static void check_network (net_type& net, const std::vector<uint8_t>& raw, const std::vector<uint16_t>& tokens,
-    double bytes_per_token)
+    const std::vector<uint32_t>& hints, double bytes_per_token)
 {
     if (tokens.size() < static_cast<size_t>(WINDOW + 1)) return;
     tok_codec::codec_data exported;
     tok_codec::load_codec_data(raw, exported);
     const size_t start = tokens.size() - WINDOW - 1;
 
-    matrix<int, 0, 1> win(WINDOW);
-    for (long i = 0; i < WINDOW; ++i) win(i) = tokens[start + i];
+    matrix<int, 0, 1> win(HINTS ? 2 * WINDOW : WINDOW);
+    fill_window(win, tokens, hints, start);
     resizable_tensor x;
     net.subnet().to_tensor(&win, &win + 1, x);
     net.subnet().forward(x);
@@ -2470,7 +3411,7 @@ static void check_network (net_type& net, const std::vector<uint8_t>& raw, const
         const int target = tokens[start + i + 1];
         ce_net += -(row[target] - mx - std::log(z));
         const int id = 0, t = tokens[start + i];
-        exported.engine.step(&id, &t, 1, probs.data());
+        exported.engine.step(&id, &t, HINTS ? &hints[start + i] : nullptr, 1, probs.data());
         ce_engine += -std::log(std::max(1e-30, static_cast<double>(probs[target])));
     }
     const double k = 1.0 / (WINDOW * std::log(2.0) * bytes_per_token);
@@ -2486,9 +3427,10 @@ static std::string network_shape ()
         + (NUM_KV_HEADS == 1 ? " key-value head" : " key-value heads") + ", window " + std::to_string(WINDOW);
 }
 
-static std::string network_description ()
+static std::string network_description (const tok_codec::codec_data& data)
 {
-    return "Tokenizer and network of " + network_shape() + ".";
+    return "Tokenizer of " + std::to_string(data.tokenizer.get_vocab_size()) + " entries, "
+        + tok_codec::tokenizer_form(data.segmentation, data.folded) + "; network of " + network_shape() + ".";
 }
 
 static int train_command (const std::string& input, const train_options& o)
@@ -2500,30 +3442,53 @@ static int train_command (const std::string& input, const train_options& o)
     if (static_cast<long>(tok.get_vocab_size()) > VOCAB_SIZE)
         throw std::runtime_error("the compiled-in tokenizer is larger than VOCAB_SIZE");
 
-    // The corpus is held as 16-bit tokens only, the text and the wider ids being released.
+    /*
+        The corpus is held as 16-bit tokens only, the text and the wider ids being released. The
+        rates per byte are those of the corpus as read, whether or not its capitals are folded.
+    */
     std::vector<uint16_t> tokens;
     size_t corpus_bytes = 0;
     {
-        const std::string text = read_corpus(input, o.max_bytes);
-        const std::vector<int> ids = tok.encode(text);
-        corpus_bytes = text.size();
+        const std::string corpus = read_corpus(input, o.max_bytes);
+        corpus_bytes = corpus.size();
+        const std::vector<int> ids = tok.encode(tokenizer_text(corpus, data.folded));
         tokens.assign(ids.begin(), ids.end());
     }
     const double bytes_per_token = static_cast<double>(corpus_bytes) / std::max<size_t>(1, tokens.size());
     if (tokens.size() < static_cast<size_t>(4 * WINDOW)) throw std::runtime_error("corpus too small for the window");
+    const std::vector<uint32_t> hints = corpus_hints(tokens);
 
     cout << "=== Training ===\n"
-        << "  corpus   : " << input << " (" << corpus_bytes << " bytes, " << tokens.size() << " tokens, "
+        << "  corpus    : " << input << " (" << corpus_bytes << " bytes, " << tokens.size() << " tokens, "
         << std::fixed << std::setprecision(3) << bytes_per_token << " bytes per token)\n"
-        << "  network  : " << network_shape() << ", vocabulary " << VOCAB_SIZE << "\n"
-        << "  schedule : " << o.steps << " steps of " << o.batch << " windows, peak rate " << std::setprecision(5)
+        << "  tokenizer : " << tok.get_vocab_size() << " entries, " << tok_codec::tokenizer_form(data.segmentation,
+            data.folded) << "\n"
+        << "  network   : " << network_shape() << ", vocabulary " << VOCAB_SIZE << (HINTS ? ", with hints" : "")
+        << "\n"
+        << "  schedule  : " << o.steps << " steps of " << o.batch << " windows, peak rate " << std::setprecision(5)
         << o.learning_rate << ", warmup " << o.warmup << "\n" << endl;
 
+    // A checkpoint or a saved network trained with another tokenizer stops the run here.
     net_type net;
-    const std::string sync = "chkpt-" + MODEL_FILE;
-    if (file_exists(MODEL_FILE) && !file_exists(sync)) {
-        deserialize(MODEL_FILE) >> net;
+    const std::string sync = "chkpt-" + MODEL_FILE, sync_tokenizer = sync + ".tokenizer";
+    tokenizer_record saved;
+    if (file_exists(sync) || file_exists(sync + "_")) {
+        bool recorded = false;
+        if (file_exists(sync_tokenizer)) {
+            std::ifstream fin(sync_tokenizer, std::ios::binary);
+            recorded = read_record(fin, saved);
+        }
+        check_tokenizer(sync, recorded, saved, data, "delete " + sync + "* to train from scratch");
+    }
+    else if (file_exists(MODEL_FILE)) {
+        const bool recorded = load_network(MODEL_FILE, net, saved);
+        check_tokenizer(MODEL_FILE, recorded, saved, data, "delete it to train from scratch");
         cout << "Continuing from " << MODEL_FILE << endl;
+    }
+    {
+        std::ofstream fout(sync_tokenizer, std::ios::binary);
+        write_record(fout, data);
+        if (!fout) throw std::runtime_error("cannot write " + sync_tokenizer);
     }
     dnn_trainer<net_type, adamw> trainer(net, adamw(o.weight_decay, 0.9, 0.98));
     trainer.set_learning_rate_schedule(rate_schedule(o));
@@ -2545,7 +3510,7 @@ static int train_command (const std::string& input, const train_options& o)
 
     std::mt19937_64 rng(42 + trainer.get_train_one_step_calls());
     std::uniform_int_distribution<size_t> pick(0, tokens.size() - WINDOW - 1);
-    std::vector<matrix<int, 0, 1>> xs(o.batch, matrix<int, 0, 1>(WINDOW));
+    std::vector<matrix<int, 0, 1>> xs(o.batch, matrix<int, 0, 1>(HINTS ? 2 * WINDOW : WINDOW));
     std::vector<matrix<unsigned long, 0, 1>> ys(o.batch, matrix<unsigned long, 0, 1>(WINDOW));
     const auto t0 = std::chrono::steady_clock::now();
     auto last_report = t0;
@@ -2555,10 +3520,8 @@ static int train_command (const std::string& input, const train_options& o)
         && !signal_handler::is_triggered()) {
         for (long b = 0; b < o.batch; ++b) {
             const size_t start = pick(rng);
-            for (long i = 0; i < WINDOW; ++i) {
-                xs[b](i) = tokens[start + i];
-                ys[b](i) = tokens[start + i + 1];
-            }
+            fill_window(xs[b], tokens, hints, start);
+            for (long i = 0; i < WINDOW; ++i) ys[b](i) = tokens[start + i + 1];
         }
         trainer.train_one_step(xs, ys);
         const auto now = std::chrono::steady_clock::now();
@@ -2567,7 +3530,9 @@ static int train_command (const std::string& input, const train_options& o)
             const unsigned long step = trainer.get_train_one_step_calls();
             const double secs = std::chrono::duration<double>(now - t0).count();
             const double rate = (step - first_step) / std::max(secs, 1e-9);
+            // The mean over the steps since the previous line, the trainer's mean being cleared after each.
             const double loss = trainer.get_average_loss();
+            trainer.clear_average_loss();
             cout << "step " << step << "/" << o.steps << "  loss " << std::fixed << std::setprecision(4) << loss
                 << " nats/token, " << std::setprecision(3) << loss / std::log(2.0) / bytes_per_token << " bits/byte"
                 << "  rate " << std::scientific << std::setprecision(2) << trainer.get_learning_rate() << std::fixed
@@ -2581,11 +3546,16 @@ static int train_command (const std::string& input, const train_options& o)
     }
     trainer.get_net();
     net.clean();
-    serialize(MODEL_FILE) << net;
+    {
+        std::ofstream fout(MODEL_FILE, std::ios::binary);
+        serialize(net, fout);
+        write_record(fout, data);
+        if (!fout) throw std::runtime_error("cannot write " + MODEL_FILE);
+    }
     cout << "Saved " << MODEL_FILE << endl;
     const std::vector<uint8_t> raw = export_network(net, data, o.bits);
-    check_network(net, raw, tokens, bytes_per_token);
-    write_header(raw, network_description(), o.header);
+    check_network(net, raw, tokens, hints, bytes_per_token);
+    write_header(raw, network_description(data), o.header);
     return 0;
 }
 
@@ -2594,8 +3564,10 @@ static int embed_command (const std::string& model_file, int bits, const std::st
     tok_codec::codec_data& data = tok_codec::embedded_codec_data();
     if (!data.has_tokenizer()) throw std::runtime_error("no compiled-in tokenizer");
     net_type net;
-    deserialize(model_file) >> net;
-    write_header(export_network(net, data, bits), network_description(), header);
+    tokenizer_record saved;
+    const bool recorded = load_network(model_file, net, saved);
+    check_tokenizer(model_file, recorded, saved, data, "rebuild with the header of its tokenizer");
+    write_header(export_network(net, data, bits), network_description(data), header);
     return 0;
 }
 
@@ -2622,13 +3594,17 @@ int main (int argc, char** argv)
         parser.add_option("output", "Output file.", 1);
 #if !SLM_DECOMPRESSOR_ONLY
         parser.add_option("streams", "Streams coded side by side in token mode (default: 16).", 1);
-        parser.add_option("tables", "log2 of the counters per context model, 16 to 30 "
-            "(default: from the input size, up to 25).", 1);
+        parser.add_option("tables", "Size of each context model's table, as log2 of its four-byte units, 16 to 30 "
+            "(default: from the input size, up to 26).", 1);
 #endif
 #if SLM_TRAINING
         parser.add_option("max-bytes", "Use at most this many megabytes of the corpus (default: all).", 1);
         parser.add_option("vocab", "Tokenizer size, special tokens included (default: "
             + std::to_string(VOCAB_SIZE) + ").", 1);
+        parser.add_option("segmentation", "How --build-tokenizer cuts the text: spaces, a word with the space "
+            "before it, or classes, which also cuts between letters, digits and other bytes (default: spaces).", 1);
+        parser.add_option("fold-capitals", "With --build-tokenizer, write capitals as lower case after a marker "
+            "byte, so that a word and its capitalized form share their tokens.");
         parser.add_option("steps", "Training steps (default: 20000).", 1);
         parser.add_option("batch", "Windows per training step (default: 32).", 1);
         parser.add_option("rate", "Peak learning rate (default: 0.001).", 1);
@@ -2640,8 +3616,8 @@ int main (int argc, char** argv)
         parser.parse(argc, argv);
 
         // The options of this build given more than once, or out of range.
-        const char* single[] = { "input", "output", "streams", "tables", "max-bytes", "vocab", "steps", "batch",
-            "rate", "warmup", "bits", "header" };
+        const char* single[] = { "input", "output", "streams", "tables", "max-bytes", "vocab", "segmentation",
+            "steps", "batch", "rate", "warmup", "bits", "header" };
         for (const char* name : single)
             if (parser.option_is_defined(name) && parser.option(name).count() > 1)
                 throw std::runtime_error(std::string("--") + name + " is given more than once");
@@ -2664,8 +3640,10 @@ int main (int argc, char** argv)
 #endif
             parser.print_options();
             const tok_codec::codec_data& data = tok_codec::embedded_codec_data();
-            const std::string tokenizer = data.has_tokenizer() ? std::to_string(data.vocab.size()) + "-token tokenizer"
-                                                                : std::string("no tokenizer");
+            const std::string tokenizer = data.has_tokenizer()
+                ? std::to_string(data.vocab.size()) + "-token tokenizer ("
+                    + tok_codec::tokenizer_form(data.segmentation, data.folded) + ")"
+                : std::string("no tokenizer");
             std::cout << "\nCompiled in: " << tokenizer << ", " << (data.has_network() ? "a network" : "no network")
                 << "." << std::endl;
             return parser.option("h") ? 0 : 1;
@@ -2681,8 +3659,15 @@ int main (int argc, char** argv)
         if (input.empty()) throw std::runtime_error("--input is required");
 #if SLM_TRAINING
         const size_t max_bytes = static_cast<size_t>(get_option(parser, "max-bytes", 0.0) * 1024 * 1024);
-        if (parser.option("build-tokenizer"))
-            return build_tokenizer_command(input, max_bytes, get_option(parser, "vocab", VOCAB_SIZE), header);
+        if (parser.option("build-tokenizer")) {
+            const std::string name = get_option(parser, "segmentation", std::string("spaces"));
+            if (name != "spaces" && name != "classes")
+                throw std::runtime_error("--segmentation is spaces or classes, not " + name);
+            const int segmentation = static_cast<int>(name == "classes" ? bpe_segmentation::character_classes
+                                                                        : bpe_segmentation::space_prefixed);
+            return build_tokenizer_command(input, max_bytes, get_option(parser, "vocab", VOCAB_SIZE), segmentation,
+                parser.option("fold-capitals").count() > 0, header);
+        }
         if (parser.option("train")) {
             train_options o;
             o.max_bytes = max_bytes;

@@ -36,7 +36,10 @@ namespace dlib
         whitespace_split = 0,
         // As above, except that a space directly followed by a non-whitespace byte opens
         // the segment that follows it, so that a word and the space before it can merge.
-        space_prefixed = 1
+        space_prefixed = 1,
+        // As space_prefixed, with every run of non-whitespace bytes further cut where the
+        // byte class changes: letters (bytes 0x80 and above included), digits, and the rest.
+        character_classes = 2
     };
 
     class bpe_tokenizer
@@ -325,7 +328,8 @@ namespace dlib
                 int mode = 0;
                 deserialize(mode, in);
                 if (mode != static_cast<int>(bpe_segmentation::whitespace_split) &&
-                    mode != static_cast<int>(bpe_segmentation::space_prefixed))
+                    mode != static_cast<int>(bpe_segmentation::space_prefixed) &&
+                    mode != static_cast<int>(bpe_segmentation::character_classes))
                     throw serialization_error("Unknown segmentation found while deserializing dlib::bpe_tokenizer.");
                 item.segmentation = static_cast<bpe_segmentation>(mode);
             }
@@ -396,19 +400,55 @@ namespace dlib
             return byte == ' ' || byte == '\n' || byte == '\t' || byte == '\r';
         }
 
-        // Length of the segment that starts at text[i]: a lone delimiter byte, or a run of
-        // non-delimiter bytes, opened under space_prefixed by the space directly before it.
+        // Class of a byte under character_classes: 0 delimiter, 1 letter, 2 digit, 3 other.
+        // Bytes 0x80 and above count as letters, so that UTF-8 text stays within its words.
+        static int byte_class(uint8_t byte)
+        {
+            if (is_delimiter(byte)) return 0;
+            if (byte >= 0x80 || (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z')) return 1;
+            if (byte >= '0' && byte <= '9') return 2;
+            return 3;
+        }
+
+        /*
+            Length of the segment that starts at text[i]: a lone delimiter byte, or a run of
+            non-delimiter bytes, opened under space_prefixed and character_classes by the space
+            directly before it. Under character_classes the run holds bytes of one class only.
+        */
         static size_t segment_length(const char* text, size_t size, size_t i, bpe_segmentation mode)
         {
-            const uint8_t byte = static_cast<uint8_t>(text[i]);
-            size_t j = i + 1;
-            if (is_delimiter(byte)) {
-                const bool opens_word = mode == bpe_segmentation::space_prefixed && byte == ' '
-                    && j < size && !is_delimiter(static_cast<uint8_t>(text[j]));
-                if (!opens_word) return 1;
+            size_t j = i;
+            if (is_delimiter(static_cast<uint8_t>(text[i]))) {
+                const bool opens_run = mode != bpe_segmentation::whitespace_split && text[i] == ' '
+                    && i + 1 < size && !is_delimiter(static_cast<uint8_t>(text[i + 1]));
+                if (!opens_run) return 1;
+                ++j;
             }
-            while (j < size && !is_delimiter(static_cast<uint8_t>(text[j]))) ++j;
+            if (mode == bpe_segmentation::character_classes) {
+                const int run_class = byte_class(static_cast<uint8_t>(text[j]));
+                ++j;
+                while (j < size && byte_class(static_cast<uint8_t>(text[j])) == run_class) ++j;
+            }
+            else {
+                ++j;
+                while (j < size && !is_delimiter(static_cast<uint8_t>(text[j]))) ++j;
+            }
             return j - i;
+        }
+
+        // Whether a merge pattern fits in one segment, so that it can never join two of them.
+        static bool fits_one_segment(const std::vector<uint8_t>& pattern, bpe_segmentation mode)
+        {
+            size_t k = 0;
+            if (mode != bpe_segmentation::whitespace_split && pattern.size() > 1 && pattern[0] == ' ') k = 1;
+            if (k == pattern.size()) return false;
+            const int run_class = byte_class(pattern[k]);
+            for (; k < pattern.size(); ++k) {
+                const int c = byte_class(pattern[k]);
+                if (c == 0) return false;
+                if (mode == bpe_segmentation::character_classes && c != run_class) return false;
+            }
+            return true;
         }
 
         static uint64_t pair_key(uint32_t left, uint32_t right)
@@ -454,11 +494,7 @@ namespace dlib
                 const uint64_t key = pair_key(static_cast<uint32_t>(m.left), static_cast<uint32_t>(m.right));
                 // The first merge of a pair is the one the reference encoder applies.
                 merge_rank.insert(std::make_pair(key, static_cast<int>(i - BPE_BASE_VOCAB_SIZE)));
-                for (size_t k = 0; k < m.pattern.size(); ++k) {
-                    const uint8_t b = m.pattern[k];
-                    const bool leading_space = (segmentation == bpe_segmentation::space_prefixed && b == ' ' && k == 0);
-                    if (is_delimiter(b) && !leading_space) segment_encoder_valid = false;
-                }
+                if (!fits_one_segment(m.pattern, segmentation)) segment_encoder_valid = false;
             }
         }
 

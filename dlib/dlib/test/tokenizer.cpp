@@ -6,7 +6,9 @@
 #include <sstream>
 #include <regex>
 #include <map>
+#include <set>
 #include <vector>
+#include <cctype>
 
 #include <dlib/tokenizer.h>
 #include <dlib/rand.h>
@@ -452,26 +454,42 @@ namespace
         return merges;
     }
 
-    // The segments the training algorithm sees, for either segmentation.
+    // The segments the training algorithm sees under segmentation mode 0, 1 or 2.
     std::vector<std::vector<int>> reference_segments(
         const std::string& text,
-        bool space_prefixed
+        int mode
     )
     {
         auto delim = [](unsigned char c) { return c == ' ' || c == '\n' || c == '\t' || c == '\r'; };
+        auto cls = [&](unsigned char c) {
+            if (delim(c)) return 0;
+            if (c >= 0x80 || std::isalpha(c)) return 1;
+            if (std::isdigit(c)) return 2;
+            return 3;
+        };
         std::vector<std::vector<int>> segments;
         size_t i = 0;
         while (i < text.size())
         {
             const unsigned char c = text[i];
             size_t j = i + 1;
-            if (delim(c) && !(space_prefixed && c == ' ' && j < text.size() && !delim(text[j])))
+            if (delim(c) && !(mode > 0 && c == ' ' && j < text.size() && !delim(text[j])))
             {
                 segments.push_back({ c });
                 i = j;
                 continue;
             }
-            while (j < text.size() && !delim(text[j])) ++j;
+            if (mode == 2)
+            {
+                // The class of the run is that of its first byte after an opening space.
+                const int run = cls(static_cast<unsigned char>(text[delim(c) ? j : i]));
+                if (delim(c)) ++j;
+                while (j < text.size() && cls(static_cast<unsigned char>(text[j])) == run) ++j;
+            }
+            else
+            {
+                while (j < text.size() && !delim(text[j])) ++j;
+            }
             std::vector<int> s;
             for (size_t k = i; k < j; ++k) s.push_back(static_cast<unsigned char>(text[k]));
             segments.push_back(s);
@@ -510,35 +528,57 @@ namespace
     {
         print_spinner();
 
-        // A text with repeated syllables, so that pairs tie and merges chain.
+        // A text with repeated syllables, so that pairs tie and merges chain, with numbers,
+        // markup and UTF-8 letters touching the words.
         dlib::rand rnd(7);
         const char* syllables[] = { "ka", "ri", "to", "ne", "su", "ma", "lo", "pe", "a", "e" };
         const char* spaces[] = { " ", " ", " ", "  ", "\n", "\t", " \n", "\r\n" };
+        const char* marks[] = { ",", ".", "[[", "]]", "&quot;", "19", "84", "\xc3\xa9", "''", "|" };
         std::string text;
         for (int w = 0; w < 3000; ++w)
         {
+            if (rnd.get_random_32bit_number() % 5 == 0) text += marks[rnd.get_random_32bit_number() % 10];
             const int len = 1 + rnd.get_random_32bit_number() % 4;
             for (int k = 0; k < len; ++k) text += syllables[rnd.get_random_32bit_number() % 10];
-            if (rnd.get_random_32bit_number() % 7 == 0) text += ",";
+            if (rnd.get_random_32bit_number() % 4 == 0) text += marks[rnd.get_random_32bit_number() % 10];
             text += spaces[rnd.get_random_32bit_number() % 8];
         }
         const size_t vocab = 256 + 120 + 28;
+        const bpe_segmentation modes[] = {
+            bpe_segmentation::whitespace_split, bpe_segmentation::space_prefixed, bpe_segmentation::character_classes
+        };
+        const std::string probe = text.substr(1000, 4000) + "  ka ri\n\n to [[Kari]] 1984,ka";
+        std::vector<std::pair<int, int>> whitespace_merges;
 
-        for (int mode = 0; mode < 2; ++mode)
+        for (int mode = 0; mode < 3; ++mode)
         {
             bpe_tokenizer tok;
-            if (mode == 1) tok.set_segmentation(bpe_segmentation::space_prefixed);
+            tok.set_segmentation(modes[mode]);
             tok.train(text, vocab);
             const std::vector<std::pair<int, int>> merges = tok.get_merges();
+            if (mode == 0) whitespace_merges = merges;
 
-            const auto expected = reference_bpe_merges(reference_segments(text, mode == 1), 120);
+            const auto expected = reference_bpe_merges(reference_segments(text, mode), 120);
             DLIB_TEST_MSG(merges == expected, "segmentation " << mode << ": merge table differs from the plain algorithm");
 
             // Encoding segment by segment gives what the whole-text application gives.
-            const std::string probe = text.substr(1000, 4000) + "  ka ri\n\n to";
             const std::vector<int> ids = tok.encode(probe);
             DLIB_TEST(ids == reference_encode(probe, merges));
             DLIB_TEST(tok.decode(ids, false) == probe);
+
+            // Under character_classes, no token mixes classes past a leading space.
+            if (mode == 2)
+            {
+                for (size_t id = 256; id < 256 + merges.size(); ++id)
+                {
+                    std::string piece = tok.decode(static_cast<int>(id), false);
+                    if (piece.size() > 1 && piece[0] == ' ') piece.erase(0, 1);
+                    std::set<int> classes;
+                    for (unsigned char c : piece)
+                        classes.insert(c >= 0x80 || std::isalpha(c) ? 1 : std::isdigit(c) ? 2 : std::isspace(c) ? 0 : 3);
+                    DLIB_TEST_MSG(classes.size() == 1 && classes.count(0) == 0, "token " << id << " mixes classes");
+                }
+            }
 
             // The merge table rebuilds the same tokenizer.
             bpe_tokenizer rebuilt;
@@ -560,6 +600,12 @@ namespace
             DLIB_TEST(loaded.get_segmentation() == tok.get_segmentation());
             DLIB_TEST(loaded.encode(probe) == ids);
         }
+
+        // Merges learned under another segmentation still encode as the whole-text application.
+        bpe_tokenizer foreign;
+        foreign.set_segmentation(bpe_segmentation::character_classes);
+        foreign.set_merges(whitespace_merges);
+        DLIB_TEST(foreign.encode(probe) == reference_encode(probe, whitespace_merges));
 
         // The space-prefixed segmentation yields fewer tokens on prose.
         bpe_tokenizer plain, prefixed;
