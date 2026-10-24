@@ -133,7 +133,7 @@ namespace
         int throw_counter{0};
         try  {
             o1.value();
-        } catch(const std::exception& e) {
+        } catch(const std::exception&) {
             throw_counter++;
         }
         DLIB_TEST(throw_counter == 1);

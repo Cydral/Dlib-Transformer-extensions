@@ -24,9 +24,16 @@
           thread of its own. Compiled graphs are cached on disk by OpenVINO, so a later run
           starts from them.
         - The host and every device whose graph is ready are timed on a few calls of that
-          shape, and the fastest is kept for every later call of that shape. A device whose
-          graph is ready later, as that of an NPU whose compiler is slower, is timed in turn
-          and takes the shape if it is faster.
+          shape, and the fastest is kept for the calls that follow. A device whose graph is
+          ready later, as that of an NPU whose compiler is slower, is timed in turn and takes
+          the shape if it is faster. No call is timed while a graph compiles, since the
+          compiler loads the processor and would make the host look slower than it is: a shape
+          not measured yet stays on the host until the compilers are idle.
+        - The choice is checked after 64 calls of the shape, then after twice as many calls at
+          each check, up to every 65536 calls: one call is timed on the host and on each ready
+          device, and only a check that finds another of them faster times them again on a
+          few calls before choosing. A choice that the load of the machine distorted does not
+          last.
         - Shapes that change from call to call, such as a growing sequence, are padded up to a
           small set of sizes, so that the number of graphs stays bounded.
         - The operands of the products and of the convolutions that keep their values from one

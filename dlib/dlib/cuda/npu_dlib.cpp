@@ -1662,11 +1662,18 @@ namespace dlib
                 std::atomic<int> rejects_in_row{0};
             };
 
+            // Calls timed on the host and on each device before a shape is given to the fastest.
+            const int calibration_samples = 3;
+            // Calls after which a choice is checked from new measurements, doubled at each check.
+            const unsigned long first_check = 64;
+            const unsigned long last_check = 65536;
+
             /*
                 One shape of one operation: its graph on each device, and the measurements that
                 choose where its calls run. The host and every device whose graph is ready are
                 timed on a few calls, and the fastest keeps the shape. The choice is made again
-                when a device joins later, as an NPU whose compiler is slower does, or leaves.
+                when a device joins later, as an NPU whose compiler is slower does, or leaves,
+                and it is checked from new measurements after next_check of its calls.
             */
             struct shape
             {
@@ -1676,13 +1683,17 @@ namespace dlib
                 long long host_best = std::numeric_limits<long long>::max();
                 int device_samples[max_devices] = {};
                 long long device_best[max_devices];
-                int choice = undecided;
+                int choice = undecided;          // kept while the shape is measured again
                 uint32_t chosen_among = 0;       // the devices ready when the choice was made
                 uint32_t excluded = 0;           // devices whose results were rejected repeatedly
+                unsigned long calls_since_choice = 0;
+                unsigned long next_check = first_check;
+                int samples = calibration_samples;   // the calls to time on each, see choose()
 
                 shape () { forget_measurements(); }
 
-                void forget_measurements ()
+                // Starts the measurements again; the choice holds until they are complete.
+                void measure_again ()
                 {
                     host_samples = 0;
                     host_best = std::numeric_limits<long long>::max();
@@ -1691,9 +1702,17 @@ namespace dlib
                         device_samples[d] = 0;
                         device_best[d] = std::numeric_limits<long long>::max();
                     }
-                    choice = undecided;
                     chosen_among = 0;
+                    calls_since_choice = 0;
+                }
+
+                void forget_measurements ()
+                {
+                    measure_again();
+                    choice = undecided;
                     excluded = 0;
+                    next_check = first_check;
+                    samples = calibration_samples;
                 }
             };
 
@@ -1715,7 +1734,6 @@ namespace dlib
                 std::atomic<bool> touched{false};
             };
 
-            const int calibration_samples = 3;
             const size_t max_graphs = 512;
             const size_t max_signatures = 16384;
             // Records of operands kept before those that carry no copy are forgotten.
@@ -1763,6 +1781,8 @@ namespace dlib
                 int verbose = 0;
                 std::atomic<int> mode{static_cast<int>(routing::automatic)};
                 std::atomic<bool> sync{false};
+                // Graphs queued or being compiled: their compilers load the processor.
+                std::atomic<int> compiling{0};
                 std::atomic<int> restricted{-1};  // restrict_to_device()
                 int overrides[OP_COUNT] = {};
 
@@ -2161,6 +2181,12 @@ namespace dlib
                 const op_info& info = op_table[e->sig.op];
                 const device_info& dev = *r.devices[e->dev];
                 const bool tracing = r.verbose > 2;
+                // The graph leaves the count of those compiling once its state is set.
+                struct compile_done
+                {
+                    std::atomic<int>& compiling;
+                    ~compile_done () { --compiling; }
+                } done{r.compiling};
                 try
                 {
                     if (tracing) trace(dev, e->sig, "compiling");
@@ -2301,7 +2327,10 @@ namespace dlib
                 device_info& dev = *r.devices[e->dev];
                 std::lock_guard<std::mutex> lock(dev.queue_mutex);
                 if (dev.stopping)
+                {
+                    --r.compiling;
                     return;
+                }
                 if (!dev.worker.joinable())
                     dev.worker = std::thread(worker_loop, &r, e->dev);
                 dev.queue.push_back(e);
@@ -2317,6 +2346,7 @@ namespace dlib
                     {
                         std::lock_guard<std::mutex> lock(d->queue_mutex);
                         d->stopping = true;
+                        r.compiling -= static_cast<int>(d->queue.size());
                         d->queue.clear();
                     }
                     d->queue_cv.notify_all();
@@ -2679,15 +2709,20 @@ namespace dlib
 
             /*
                 Under s.calib. Where the next call of shape s runs, among the host and the ready
-                devices of eligible. A device timed fewer than calibration_samples times is timed,
-                in turn with the host; once the host and every ready device are, the fastest keeps
-                the shape, and the choice is made again when the set of ready devices changes.
-                Sets timed for a device call that is a measurement, pending_host for a host call
-                that is one.
+                devices of eligible. Each of them is timed on s.samples calls, in turn; then the
+                fastest keeps the shape. The choice is made again when the set of ready devices
+                changes, and checked after next_check calls, a number that doubles at each check:
+                one call of each is timed, and only a check that finds another one faster times
+                them on calibration_samples calls before choosing again. quiet is false while a
+                graph compiles: its compiler loads the processor, which would time the host
+                slower than it is, so no call is timed and the shape keeps its last choice, or
+                the host. Sets timed for a device call that is a measurement, pending_host for a
+                host call that is one.
             */
             int choose (
                 shape& s,
                 uint32_t eligible,
+                bool quiet,
                 bool& timed
             )
             {
@@ -2697,33 +2732,51 @@ namespace dlib
                         ready_mask |= 1u << d;
                 if (ready_mask == 0)
                     return on_host;
-                int pick = -1;
-                for (int d = 0; d < max_devices; ++d)
+                if (s.choice != undecided && s.chosen_among == ready_mask)
                 {
-                    if ((ready_mask >> d & 1) && s.device_samples[d] < calibration_samples &&
-                        (pick < 0 || s.device_samples[d] < s.device_samples[pick]))
-                        pick = d;
+                    if (++s.calls_since_choice < s.next_check || !quiet)
+                        return s.choice;
+                    s.next_check = std::min(2 * s.next_check, last_check);
+                    s.measure_again();
+                    s.samples = 1;
                 }
-                if (pick >= 0 && s.device_samples[pick] <= s.host_samples)
+                if (!quiet)
+                    return (s.choice >= 0 && (ready_mask >> s.choice & 1)) ? s.choice : on_host;
+                for (;;)
                 {
-                    timed = true;
-                    return pick;
-                }
-                if (pick >= 0 || s.host_samples < calibration_samples)
-                {
-                    pending_host = &s;
-                    return on_host;
-                }
-                if (s.choice == undecided || s.chosen_among != ready_mask)
-                {
+                    int pick = -1;
+                    for (int d = 0; d < max_devices; ++d)
+                    {
+                        if ((ready_mask >> d & 1) && s.device_samples[d] < s.samples &&
+                            (pick < 0 || s.device_samples[d] < s.device_samples[pick]))
+                            pick = d;
+                    }
+                    if (pick >= 0 && s.device_samples[pick] <= s.host_samples)
+                    {
+                        timed = true;
+                        return pick;
+                    }
+                    if (pick >= 0 || s.host_samples < s.samples)
+                    {
+                        pending_host = &s;
+                        return on_host;
+                    }
                     int best = -1;
                     for (int d = 0; d < max_devices; ++d)
                         if ((ready_mask >> d & 1) && (best < 0 || s.device_best[d] < s.device_best[best]))
                             best = d;
-                    s.choice = (best >= 0 && s.device_best[best] < 0.9 * s.host_best) ? best : on_host;
+                    const int fastest = (best >= 0 && s.device_best[best] < 0.9 * s.host_best) ? best : on_host;
+                    if (s.samples < calibration_samples && fastest != s.choice)
+                    {
+                        s.samples = calibration_samples;
+                        continue;
+                    }
+                    s.samples = calibration_samples;
+                    s.choice = fastest;
                     s.chosen_among = ready_mask;
+                    s.calls_since_choice = 0;
+                    return s.choice;
                 }
-                return s.choice;
             }
 
             /*
@@ -2794,6 +2847,7 @@ namespace dlib
                         if (e->state.load() == fresh && ++e->seen >= needed)
                         {
                             e->state = queued;
+                            ++r.compiling;
                             if (sync) now[n_now++] = e;
                             else later[n_later++] = e;
                         }
@@ -2821,8 +2875,9 @@ namespace dlib
                 }
                 else
                 {
+                    const bool quiet = r.compiling.load(std::memory_order_relaxed) == 0;
                     std::lock_guard<std::mutex> lock(s->calib);
-                    target = choose(*s, eligible, timed);
+                    target = choose(*s, eligible, quiet, timed);
                 }
                 if (pending_host == s.get())
                     pending_owner = s;

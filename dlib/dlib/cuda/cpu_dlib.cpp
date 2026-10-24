@@ -3127,6 +3127,9 @@ namespace dlib
                                     r*stride_y+y_offset,
                                     window_width,
                                     window_height).intersect(imgbox);
+                                // A window outside the image has no pixel to update.
+                                if (win.is_empty())
+                                    continue;
                                 const float delta = giimg[r*dest.nc()+c]/win.area();
                                 for (long y = win.top(); y <= win.bottom(); ++y)
                                 {

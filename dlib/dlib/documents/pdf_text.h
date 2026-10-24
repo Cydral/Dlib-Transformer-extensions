@@ -546,8 +546,7 @@ namespace dlib
                     if (out.size() > max_stream_size) throw pdf_error("PDF: LZW stream too large");
                     if (!prev.empty() && table.size() < 4096) table.push_back(prev + entry[0]);
                     prev = entry;
-                    const std::size_t limit =
-                        static_cast<std::size_t>(1u << width) - static_cast<std::size_t>(early_change);
+                    const std::size_t limit = (std::size_t(1) << width) - static_cast<std::size_t>(early_change);
                     if (table.size() >= limit && width < 12) ++width;
                 }
             }

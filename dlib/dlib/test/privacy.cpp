@@ -2176,9 +2176,9 @@ namespace
 
         // A model of another size is refused with a clear message.
         std::istringstream sin2(sout.str());
-        pii_span_model_small small;
+        pii_span_model_small other_size;
         string message;
-        try { deserialize(small, sin2); }
+        try { deserialize(other_size, sin2); }
         catch (serialization_error& err) { message = err.what(); }
         DLIB_TEST(message.find("embedding dimension 64") != string::npos);
     }

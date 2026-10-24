@@ -393,9 +393,9 @@ namespace
         resizable_tensor dk = random_tensor(rnd, 1, 3, 1, 1);
         check("multiply_conv", {&d}, [&]{ tt::multiply_conv(false, d, a, Ak); });
         check("multiply_conv", {&dk}, [&]{ tt::multiply_conv(true, dk, a, b); }, 3);
-        resizable_tensor small = random_tensor(rnd, 4, 2, 9, 10);
-        check("multiply_zero_padded", {&d}, [&]{ tt::multiply_zero_padded(false, d, a, small); });
-        check("multiply_zero_padded", {&d}, [&]{ tt::multiply_zero_padded(true, d, a, small); });
+        resizable_tensor smaller = random_tensor(rnd, 4, 2, 9, 10);
+        check("multiply_zero_padded", {&d}, [&]{ tt::multiply_zero_padded(false, d, a, smaller); });
+        check("multiply_zero_padded", {&d}, [&]{ tt::multiply_zero_padded(true, d, a, smaller); });
 
         check("add", {&d}, [&]{ tt::add(0.5f, d, 2.0f, b); });
         resizable_tensor bias_k = random_tensor(rnd, 1, 3, 1, 1), bias_krc = random_tensor(rnd, 1, 3, 9, 13);
@@ -404,7 +404,7 @@ namespace
         check("add", {&d}, [&]{ tt::add(0.0f, d, 1.0f, bias_krc); });
         check("add", {&d}, [&]{ tt::add(1.0f, d, -1.0f, bias_rc); });
         check("add", {&d}, [&]{ tt::add(2.0f, d, 1.0f, bias_n); });
-        check("add", {&d}, [&]{ tt::add(d, a, small); });
+        check("add", {&d}, [&]{ tt::add(d, a, smaller); });
 
         // A tensor updated in place, as a parameter by its solver step, keeps single precision.
         resizable_tensor p = random_tensor(rnd, 4, 3, 9, 13), step = random_tensor(rnd, 4, 3, 9, 13, -1e-3f, 1e-3f);
@@ -1074,6 +1074,52 @@ namespace
         }
     }
 
+    /*
+        Automatic routing checks its choice for a shape after 64 calls of that shape: over 200
+        calls, the host and the devices are timed on three calls to choose, then on one more at
+        least, whichever of them computes the shape faster.
+    */
+    void test_checks (
+        dlib::rand& rnd
+    )
+    {
+        resizable_tensor a = random_tensor(rnd, 288, 1, 1, 176), b = random_tensor(rnd, 176, 1, 1, 144);
+        resizable_tensor expected(288, 1, 1, 144), d(288, 1, 1, 144);
+        npu::set_routing(npu::routing::never);
+        tt::gemm(0, expected, 1, a, false, b, false);
+        const double tolerance = npu::uses_half_precision() ? 2e-2 : 1e-4;
+
+        auto counts = [](unsigned long long& host, unsigned long long& device)
+        {
+            host = device = 0;
+            for (const auto& s : npu::get_statistics())
+            {
+                if (s.name == "gemm")
+                {
+                    host = s.host_calls;
+                    device = s.device_calls;
+                }
+            }
+        };
+        unsigned long long host_before, device_before;
+        counts(host_before, device_before);
+        npu::set_routing(npu::routing::automatic);
+        for (int i = 0; i < 200; ++i)
+        {
+            if (i % 20 == 0)
+                print_spinner();
+            a.host();
+            tt::gemm(0, d, 1, a, false, b, false);
+        }
+        npu::set_routing(npu::routing::never);
+        DLIB_TEST(relative_error(expected, d) <= tolerance);
+        unsigned long long host_after, device_after;
+        counts(host_after, device_after);
+        DLIB_TEST_MSG(host_after >= host_before + 4, "the host was timed on " << host_after - host_before << " calls");
+        DLIB_TEST_MSG(device_after >= device_before + 4 || refused_by_device("gemm"),
+            "the devices were timed on " << device_after - device_before << " calls");
+    }
+
 // ----------------------------------------------------------------------------------------
 
     void test_guards (
@@ -1220,6 +1266,7 @@ namespace
             test_losses(rnd);
             test_residency(rnd);
             test_devices(rnd);
+            test_checks(rnd);
             test_guards(rnd);
             test_training(rnd);
 
