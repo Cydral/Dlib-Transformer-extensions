@@ -4,24 +4,29 @@
 #define DLIB_DNN_NPU_DLIB_H_
 
 /*
-    Run-time routing of tensor operations to a neural processing unit.
+    Run-time routing of tensor operations to the inference devices of the processor: its
+    neural processing unit and its integrated GPU.
 
     dlib is compiled for one primary target, the host or CUDA. When it is also built with
     DLIB_USE_NPU, against the OpenVINO runtime, every tensor operation of tensor_tools.h that
-    runs on the host first offers itself to this module. The module looks for an inference
-    device once, at the first offer, and then decides call by call whether the device or the
-    host computes the result. Nothing changes for a program: the same calls, the same tensors,
-    the same results up to the arithmetic of the device. Without a device, or with routing
-    disabled, the host path runs exactly as it does in a build without DLIB_USE_NPU.
+    runs on the host first offers itself to this module. The module looks once, at the first
+    offer, for the devices DLIB_NPU_DEVICE lists, the NPU and the Intel GPU by default, and then
+    decides call by call whether one of them or the host computes the result. Nothing changes
+    for a program: the same calls, the same tensors, the same results up to the arithmetic of
+    the device. Without a device, or with routing disabled, the host path runs exactly as it
+    does in a build without DLIB_USE_NPU.
 
     How a call is routed
         - An operation qualifies when its size reaches a threshold of its own, so that small
           operations never pay the cost of a round trip.
         - The first qualifying calls of a given shape keep running on the host while a graph
-          for that shape is compiled in the background. Compiled graphs are cached on disk by
-          OpenVINO, so a later run starts from them.
-        - Once compiled, the device and the host are each timed on a few calls of that shape
-          and the faster of the two is kept for every later call of that shape.
+          for that shape is compiled in the background, for every device, each by a compiler
+          thread of its own. Compiled graphs are cached on disk by OpenVINO, so a later run
+          starts from them.
+        - The host and every device whose graph is ready are timed on a few calls of that
+          shape, and the fastest is kept for every later call of that shape. A device whose
+          graph is ready later, as that of an NPU whose compiler is slower, is timed in turn
+          and takes the shape if it is faster.
         - Shapes that change from call to call, such as a growing sequence, are padded up to a
           small set of sizes, so that the number of graphs stays bounded.
         - The operands of the products and of the convolutions that keep their values from one
@@ -37,19 +42,19 @@
           before writing, as dlib does everywhere.
 
     Arithmetic
-        An NPU computes in half precision. The module converts the operands on the host, where
-        it scales those that enter the result linearly by a power of two chosen from their
-        largest magnitude, so that neither overflow nor underflow occurs, and it undoes the
-        scaling, in single precision, when it writes the result. The rows of a softmax argument
-        are brought to a maximum of zero before their conversion, which leaves the result as it
-        is and keeps the resolution of the values near the maximum, which carry the probability.
-        A result the device returns with an infinity or a NaN that the host would not have
-        produced is discarded and the host computes the operation instead. Accumulations into
-        an existing tensor (beta and add_to arguments) are always done on the host in single
-        precision.
+        An NPU computes in half precision, and so does a GPU by default. The module converts
+        the operands on the host, where it scales those that enter the result linearly by a
+        power of two chosen from their largest magnitude, so that neither overflow nor
+        underflow occurs, and it undoes the scaling, in single precision, when it writes the
+        result. The rows of a softmax argument are brought to a maximum of zero before their
+        conversion, which leaves the result as it is and keeps the resolution of the values
+        near the maximum, which carry the probability. A result the device returns with an
+        infinity or a NaN that the host would not have produced is discarded and the host
+        computes the operation instead. Accumulations into an existing tensor (beta and add_to
+        arguments) are always done on the host in single precision.
 
-        Operations whose result must not round run on the device only when it computes in
-        single precision, which an NPU does not: those that update a persistent state in place,
+        Operations whose result must not round run only on a device that computes in single
+        precision, which an NPU never does: those that update a persistent state in place,
         such as the optimizer moments or an embedding table, threshold(), whose comparison would
         move with the rounding, divide_by_sqrt(), whose documented identity is exact, and the
         matrix inversion. A linear combination that assigns one of its own operands, as a solver
@@ -61,12 +66,17 @@
 
     Environment variables, read once at initialization
         DLIB_NPU            0, off or false disables the module; nothing is initialized.
-        DLIB_NPU_DEVICE     OpenVINO device to use, NPU by default. GPU selects an integrated
-                            GPU, and CPU runs every device path on the OpenVINO CPU plugin,
-                            which validates them on a machine without an NPU.
+        DLIB_NPU_DEVICE     comma separated OpenVINO devices to use, "NPU,GPU" by default:
+                            those found are used, in that order of preference for forced
+                            routing. GPU is the first Intel GPU, GPU.1 the second one, and CPU
+                            runs the device paths on the OpenVINO CPU plugin, which validates
+                            them on a machine without an NPU and can beat the host code on some
+                            operations. A name may end with :f16 or :f32, which sets the
+                            precision of that device, e.g. "NPU,GPU:f32".
         DLIB_NPU_ROUTING    auto (default), always or never. See set_routing().
-        DLIB_NPU_PRECISION  f16 or f32: the element type exchanged with the device and the
-                            inference precision requested. f16 by default, f32 on CPU.
+        DLIB_NPU_PRECISION  f16 or f32: the element type exchanged with the CPU and GPU devices
+                            and the inference precision requested from them. f16 by default,
+                            f32 on CPU.
         DLIB_NPU_CACHE_DIR  directory of the compiled graph cache, dlib/npu_cache under the user
                             cache folder by default (LOCALAPPDATA on Windows, XDG_CACHE_HOME or
                             ~/.cache elsewhere). An empty value disables it.
@@ -82,8 +92,11 @@
         DLIB_NPU_RESIDENT_MB
                             budget of the device copies of unchanged operands, 2048 by
                             default; 0 converts every operand at every call.
-        DLIB_NPU_VERBOSE    1 reports the device and, at exit, the routing summary; 2 also
-                            reports every compilation.
+        DLIB_NPU_VERBOSE    1 reports the devices and, at exit, the routing summary; 2 also
+                            reports every compilation; 3 also writes a line before each stage
+                            of every compilation and every device call, so that the last line
+                            names the graph and the stage at which a plugin or a driver stopped
+                            the program.
 */
 
 #include <cstddef>
@@ -126,17 +139,49 @@ namespace dlib
         );
         /*!
             ensures
-                - returns the OpenVINO name and the full name of the device in use, or an empty
-                  string if no device is in use.
+                - returns the OpenVINO name and the full name of each device in use, separated
+                  by " + ", or an empty string if no device is in use.
+        !*/
+
+        std::vector<std::string> device_names (
+        );
+        /*!
+            ensures
+                - returns the OpenVINO names of the devices in use, in the order of
+                  DLIB_NPU_DEVICE, which is also the order of op_statistics::calls_by_device. A
+                  device listed twice, with two precisions, carries its precision as well, e.g.
+                  CPU:f16 and CPU:f32.
         !*/
 
         bool uses_half_precision (
         );
         /*!
             ensures
-                - returns true if a device is in use and computes in half precision, and false
-                  otherwise. An NPU always does; the CPU and GPU devices do unless
-                  DLIB_NPU_PRECISION is f32, the default on CPU.
+                - returns true if a device in use computes in half precision, and false
+                  otherwise. An NPU always does; the CPU and GPU devices do unless their
+                  precision is f32, the default on CPU.
+        !*/
+
+        bool has_single_precision_device (
+        );
+        /*!
+            ensures
+                - returns true if a device in use computes in single precision, and false
+                  otherwise. The operations that must not round may run on such a device.
+        !*/
+
+        void restrict_to_device (
+            int index
+        );
+        /*!
+            ensures
+                - if (index >= 0) then
+                    - only the device device_names()[index] receives operations, in automatic
+                      and in forced routing, and an index past the last device leaves them all
+                      to the host. With routing::always, this times a given device, as the
+                      offload example does.
+                - else
+                    - every device in use receives operations.
         !*/
 
         std::string runtime_version (
@@ -149,8 +194,8 @@ namespace dlib
 
         enum class routing
         {
-            automatic, // each shape runs where it was measured to run faster
-            always,    // every operation the device supports runs on it once compiled
+            automatic, // each shape runs where it was measured to run fastest
+            always,    // every operation runs on the first device that supports it, once compiled
             never      // every operation runs on the host
         };
 
@@ -207,7 +252,8 @@ namespace dlib
         struct op_statistics
         {
             std::string name;
-            unsigned long long device_calls = 0;     // calls computed by the device
+            unsigned long long device_calls = 0;     // calls computed by a device
+            std::vector<unsigned long long> calls_by_device; // the same, per device_names()
             unsigned long long host_calls = 0;       // qualifying calls left to the host
             unsigned long long rejected = 0;         // device results discarded by the guards
             unsigned long long graphs = 0;           // graphs compiled for this operation
@@ -237,7 +283,7 @@ namespace dlib
         );
         /*!
             ensures
-                - writes the build configuration, the device in use, the routing settings and
+                - writes the build configuration, the devices in use, the routing settings and
                   the statistics to out.
         !*/
 

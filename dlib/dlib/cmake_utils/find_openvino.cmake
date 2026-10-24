@@ -3,11 +3,12 @@
 #
 # Finds the OpenVINO runtime.
 #
-# dlib uses the OpenVINO runtime to route computations to an NPU.  This script
-# looks for its CMake package in the usual CMake locations (OpenVINO_DIR as a
-# CMake or environment variable, CMAKE_PREFIX_PATH, INTEL_OPENVINO_DIR as set
-# by the setupvars scripts of the archive distributions), then in the openvino
-# Python package of the Python interpreter found on the PATH, which a
+# dlib uses the OpenVINO runtime to route computations to the NPU and the
+# integrated GPU of the processor.  This script looks for its CMake package in
+# the usual CMake locations (OpenVINO_DIR as a CMake or environment variable,
+# CMAKE_PREFIX_PATH, INTEL_OPENVINO_DIR as set by the setupvars scripts of the
+# archive distributions), then in the openvino Python package of the Python
+# interpreter found on the PATH, which a
 #    python -m pip install openvino
 # provides with its headers, libraries and CMake files.
 #
@@ -103,8 +104,9 @@ if (OpenVINO_FOUND)
    message(STATUS "Found OpenVINO ${OpenVINO_VERSION} in ${OpenVINO_DIR}")
 else()
    message(" *****************************************************************************")
-   message(" *** No OpenVINO runtime found, so dlib will not route computations to an  ***")
-   message(" *** NPU.  The simplest way to get one is the Python package:              ***")
+   message(" *** No OpenVINO runtime found, so dlib will not route computations to the ***")
+   message(" *** NPU or the integrated GPU.  The simplest way to get one is the Python ***")
+   message(" *** package:                                                              ***")
    message(" ***    python -m pip install openvino                                     ***")
    message(" *** You can also point OpenVINO_DIR to the folder holding                 ***")
    message(" *** OpenVINOConfig.cmake.  Then re-run cmake with -DDLIB_USE_NPU=ON.      ***")

@@ -37,6 +37,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -1225,9 +1226,8 @@ namespace dlib
                 // After the scaled inputs are scanned and before anything is written: may set
                 // scalars and output exponents; returning false sends the call to the host.
                 std::function<bool(call&)> finalize;
-                // Set by the executor: the call reused a device copy of an operand, or it saw an
-                // operand for the first time or made its first copy, which makes it unfit as a
-                // timing sample.
+                // Set by the executor: the call reused a device copy of an operand, or it made
+                // the first copy of one, which makes it unfit as a timing sample.
                 bool reused = false;
                 bool warming = false;
 
@@ -1585,6 +1585,7 @@ namespace dlib
             struct operand_key
             {
                 int op = 0;
+                int dev = 0;
                 const gpu_data* storage = nullptr;
                 const float* host = nullptr;
                 int64_t v[4] = {0, 0, 0, 0};
@@ -1595,7 +1596,7 @@ namespace dlib
 
                 bool operator== (const operand_key& o) const
                 {
-                    return op == o.op && storage == o.storage && host == o.host && target == o.target &&
+                    return op == o.op && dev == o.dev && storage == o.storage && host == o.host && target == o.target &&
                         half == o.half && std::equal(v, v + 4, o.v) && std::equal(p, p + 4, o.p) &&
                         std::equal(s, s + 4, o.s);
                 }
@@ -1607,7 +1608,7 @@ namespace dlib
                 {
                     uint64_t h = 1469598103934665603ull;
                     auto mix = [&](uint64_t x) { h ^= x; h *= 1099511628211ull; };
-                    mix(static_cast<uint64_t>(k.op));
+                    mix(static_cast<uint64_t>(k.op) * 8 + static_cast<uint64_t>(k.dev));
                     mix(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(k.storage)));
                     mix(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(k.host)));
                     for (int i = 0; i < 4; ++i)
@@ -1639,11 +1640,16 @@ namespace dlib
             };
 
             enum entry_state : int { fresh = 0, queued = 1, ready = 2, failed = 3 };
-            enum decision_t : int { undecided = 0, on_device = 1, on_host = 2 };
 
+            const int max_devices = 4;
+            const int undecided = -2;        // a shape still being measured
+            const int on_host = -1;          // a shape the host computes faster
+
+            // The graph of one shape on one device.
             struct entry
             {
                 signature sig;
+                int dev = 0;
                 std::atomic<int> state{fresh};
                 int seen = 0;                    // calls so far, under the cache mutex
                 std::mutex exec;                 // the request and its buffers
@@ -1653,21 +1659,52 @@ namespace dlib
                 std::vector<std::shared_ptr<operand_copy>> bound;   // the copy bound to an input
                 size_t io_bytes = 0;
                 std::atomic<unsigned long long> last_use{0};
-                std::mutex calib;                // the measurements below
-                std::atomic<int> device_samples{0};
-                std::atomic<int> host_samples{0};
-                long long device_best = std::numeric_limits<long long>::max();
-                long long host_best = std::numeric_limits<long long>::max();
-                std::atomic<int> decision{undecided};
                 std::atomic<int> rejects_in_row{0};
             };
 
+            /*
+                One shape of one operation: its graph on each device, and the measurements that
+                choose where its calls run. The host and every device whose graph is ready are
+                timed on a few calls, and the fastest keeps the shape. The choice is made again
+                when a device joins later, as an NPU whose compiler is slower does, or leaves.
+            */
+            struct shape
+            {
+                std::shared_ptr<entry> on[max_devices];
+                std::mutex calib;                // the measurements and the choice below
+                int host_samples = 0;
+                long long host_best = std::numeric_limits<long long>::max();
+                int device_samples[max_devices] = {};
+                long long device_best[max_devices];
+                int choice = undecided;
+                uint32_t chosen_among = 0;       // the devices ready when the choice was made
+                uint32_t excluded = 0;           // devices whose results were rejected repeatedly
+
+                shape () { forget_measurements(); }
+
+                void forget_measurements ()
+                {
+                    host_samples = 0;
+                    host_best = std::numeric_limits<long long>::max();
+                    for (int d = 0; d < max_devices; ++d)
+                    {
+                        device_samples[d] = 0;
+                        device_best[d] = std::numeric_limits<long long>::max();
+                    }
+                    choice = undecided;
+                    chosen_among = 0;
+                    excluded = 0;
+                }
+            };
+
             // The name cpu_measure, whose member is called entry, uses for the type.
-            typedef entry impl_entry;
+            typedef shape impl_entry;
 
             struct op_counters
             {
+                op_counters () { for (auto& c : by_device) c = 0; }
                 std::atomic<unsigned long long> device_calls{0};
+                std::atomic<unsigned long long> by_device[max_devices];
                 std::atomic<unsigned long long> host_calls{0};
                 std::atomic<unsigned long long> rejected{0};
                 std::atomic<unsigned long long> graphs{0};
@@ -1686,43 +1723,58 @@ namespace dlib
             // A copy unused for that long gives its memory to a new one when the budget is full.
             const long long idle_copy_ns = 30000000000LL;
 
+            // One of the devices DLIB_NPU_DEVICE lists, found on this machine.
+            struct device_info
+            {
+                std::string name;                // as OpenVINO names it: NPU, GPU, GPU.1, CPU
+                std::string label;               // the name, with its precision if listed twice
+                std::string full_name;
+                bool half = true;                // operands exchanged in half precision
+                bool single = false;             // the device computes in single precision
+                ov::AnyMap config;
+                bool enabled_auto[OP_COUNT] = {};
+                bool enabled_always[OP_COUNT] = {};
+                // Memory the device reads without a copy, when its plugin offers it. Under the
+                // operands mutex.
+                bool has_context = false;
+                ov::RemoteContext context;
+                // The background compiler of this device, so that a slow compiler, as that of
+                // an NPU, holds back no other device.
+                std::mutex queue_mutex;
+                std::condition_variable queue_cv;
+                std::deque<std::shared_ptr<entry>> queue;
+                std::thread worker;
+                bool stopping = false;
+            };
+
             class runtime
             {
             public:
                 bool disabled = false;
                 bool available = false;
-                std::string requested_device = "NPU";
-                std::string device;
-                std::string full_name;
+                std::string requested = "NPU,GPU";
+                std::vector<std::unique_ptr<device_info>> devices;
+                uint32_t single_mask = 0;        // devices that compute in single precision
+                bool any_half = false;           // a device computes in half precision
                 std::string why_unavailable;
-                bool half = true;                // operands exchanged in half precision
-                bool single = false;             // the device computes in single precision
                 bool cache_enabled = true;
                 std::string cache_dir;
                 size_t budget = size_t(2048) << 20;
                 int verbose = 0;
                 std::atomic<int> mode{static_cast<int>(routing::automatic)};
                 std::atomic<bool> sync{false};
+                std::atomic<int> restricted{-1};  // restrict_to_device()
                 int overrides[OP_COUNT] = {};
-                bool enabled_auto[OP_COUNT] = {};
-                bool enabled_always[OP_COUNT] = {};
 
                 std::unique_ptr<ov::Core> core;
-                ov::AnyMap config;
 
                 std::mutex cache_mutex;
-                std::unordered_map<signature, std::shared_ptr<entry>, signature_hash> cache;
+                std::unordered_map<signature, std::shared_ptr<shape>, signature_hash> cache;
                 size_t resident = 0;
                 size_t compiled_graphs = 0;
                 std::atomic<unsigned long long> clock{0};
 
-                std::mutex queue_mutex;
-                std::condition_variable queue_cv;
-                std::deque<std::shared_ptr<entry>> queue;
-                std::thread worker;
-                bool stopping = false;
-
-                // Operands kept for the device between calls, under operands_mutex.
+                // Operands kept for the devices between calls, under operands_mutex.
                 size_t operand_budget = size_t(2048) << 20;
                 std::mutex operands_mutex;
                 std::unordered_map<operand_key, std::shared_ptr<operand_copy>, operand_key_hash> operands;
@@ -1730,13 +1782,12 @@ namespace dlib
                 size_t operand_copies = 0;
                 unsigned long long operand_conversions = 0;
                 std::atomic<uint64_t> next_mark{1};
-                // Memory the device reads without a copy, when its plugin offers it.
-                bool has_context = false;
-                ov::RemoteContext context;
 
                 op_counters counters[OP_COUNT];
 
-                void derive_policies ()
+                void derive_policies (
+                    device_info& d
+                ) const
                 {
                     for (int op = 0; op < OP_COUNT; ++op)
                     {
@@ -1744,13 +1795,13 @@ namespace dlib
                         switch (op_table[op].cls)
                         {
                             case op_class::compute: a = true; w = true; break;
-                            case op_class::movement: a = false; w = single; break;
-                            case op_class::exact: a = single; w = single; break;
+                            case op_class::movement: a = false; w = d.single; break;
+                            case op_class::exact: a = d.single; w = d.single; break;
                         }
                         if (overrides[op] > 0) { a = true; w = true; }
                         if (overrides[op] < 0) { a = false; w = false; }
-                        enabled_auto[op] = a;
-                        enabled_always[op] = w;
+                        d.enabled_auto[op] = a;
+                        d.enabled_always[op] = w;
                     }
                 }
             };
@@ -1794,7 +1845,7 @@ namespace dlib
                 if (present) r->verbose = std::max(0, std::atoi(v.c_str()));
 
                 v = read_env("DLIB_NPU_DEVICE", present);
-                if (present && !v.empty()) r->requested_device = v;
+                if (present && !v.empty()) r->requested = v;
 
                 v = lowercase(read_env("DLIB_NPU_ROUTING", present));
                 if (present)
@@ -1859,74 +1910,6 @@ namespace dlib
                     return r;
                 }
 
-                // Only the plugin of the requested device is loaded, so that a host without an
-                // NPU pays for one plugin query and nothing else.
-                const std::string family = r->requested_device.substr(0, r->requested_device.find('.'));
-                const bool wants_id = family.size() < r->requested_device.size();
-                std::vector<std::string> ids;
-                try
-                {
-                    ids = r->core->get_property(family, ov::available_devices);
-                }
-                catch (const std::exception& e)
-                {
-                    r->why_unavailable = "no " + family + " plugin could be used: " + e.what();
-                }
-                for (const auto& id : ids)
-                {
-                    const std::string name = (ids.size() > 1 && !id.empty()) ? family + "." + id : family;
-                    if (!wants_id || name == r->requested_device || family + "." + id == r->requested_device)
-                    {
-                        r->device = wants_id ? r->requested_device : family;
-                        break;
-                    }
-                }
-                if (r->device.empty())
-                {
-                    if (r->why_unavailable.empty())
-                    {
-                        std::ostringstream sout;
-                        sout << "no " << r->requested_device << " device found";
-                        if (!ids.empty())
-                        {
-                            sout << " (" << family << " devices:";
-                            for (const auto& id : ids)
-                                sout << " " << (id.empty() ? family : family + "." + id);
-                            sout << ")";
-                        }
-                        r->why_unavailable = sout.str();
-                    }
-                    r->core.reset();
-                    if (r->verbose > 0)
-                        std::cerr << "dlib: NPU routing inactive, " << r->why_unavailable << std::endl;
-                    return r;
-                }
-
-                try
-                {
-                    r->full_name = r->core->get_property(r->device, ov::device::full_name);
-                }
-                catch (...)
-                {
-                    r->full_name = r->device;
-                }
-
-                const bool cpu_device = r->device.rfind("CPU", 0) == 0;
-                const bool gpu_device = r->device.rfind("GPU", 0) == 0;
-                r->half = !cpu_device;
-                v = lowercase(read_env("DLIB_NPU_PRECISION", present));
-                if (present && (v == "f32" || v == "fp32" || v == "float"))
-                    r->half = false;
-                else if (present && (v == "f16" || v == "fp16" || v == "half"))
-                    r->half = true;
-
-                // An NPU computes in reduced precision whatever the exchange type.
-                r->single = !r->half && (cpu_device || gpu_device);
-
-                r->config.insert(ov::hint::performance_mode(ov::hint::PerformanceMode::LATENCY));
-                if (cpu_device || gpu_device)
-                    r->config.insert(ov::hint::inference_precision(r->half ? ov::element::f16 : ov::element::f32));
-
                 if (r->cache_enabled)
                 {
                     std::error_code ec;
@@ -1941,27 +1924,157 @@ namespace dlib
                     }
                 }
 
-                // Copies of operands go in memory the device reads directly when the plugin
-                // provides it, as the NPU and GPU plugins do; elsewhere in ordinary memory.
-                try
+                v = lowercase(read_env("DLIB_NPU_PRECISION", present));
+                const bool all_f32 = present && (v == "f32" || v == "fp32" || v == "float");
+                const bool all_f16 = present && (v == "f16" || v == "fp16" || v == "half");
+
+                /*
+                    The devices of the list, in its order. Each family is queried once, and only
+                    the families listed are, so that a host without these devices pays for one
+                    query per plugin listed and nothing else.
+                */
+                std::vector<std::pair<std::string, std::vector<std::string>>> families;
+                std::string missing;
+                std::stringstream list(r->requested);
+                std::string item;
+                while (std::getline(list, item, ','))
                 {
-                    r->context = r->core->get_default_context(r->device);
-                    r->has_context = true;
-                }
-                catch (...)
-                {
-                    r->has_context = false;
+                    while (!item.empty() && std::isspace(static_cast<unsigned char>(item.front())))
+                        item.erase(item.begin());
+                    while (!item.empty() && std::isspace(static_cast<unsigned char>(item.back())))
+                        item.pop_back();
+                    if (item.empty())
+                        continue;
+                    std::string name = item, precision;
+                    const size_t colon = item.find(':');
+                    if (colon != std::string::npos)
+                    {
+                        name = item.substr(0, colon);
+                        precision = lowercase(item.substr(colon + 1));
+                    }
+                    for (auto& ch : name)
+                        ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+                    const std::string family = name.substr(0, name.find('.'));
+                    auto f = std::find_if(families.begin(), families.end(),
+                        [&](const std::pair<std::string, std::vector<std::string>>& x) { return x.first == family; });
+                    if (f == families.end())
+                    {
+                        std::vector<std::string> ids;
+                        try
+                        {
+                            ids = r->core->get_property(family, ov::available_devices);
+                        }
+                        catch (const std::exception& e)
+                        {
+                            std::string why = e.what();
+                            why = why.substr(0, why.find('\n'));
+                            missing += (missing.empty() ? "" : "; ") + family + ": " + why.substr(0, 160);
+                        }
+                        families.emplace_back(family, ids);
+                        f = families.end() - 1;
+                    }
+                    // GPU names the first GPU, as OpenVINO does; GPU.1 a given one.
+                    std::string device;
+                    for (const auto& id : f->second)
+                    {
+                        if (name == family || name == (id.empty() ? family : family + "." + id))
+                        {
+                            device = name;
+                            break;
+                        }
+                    }
+                    if (device.empty())
+                    {
+                        if (f->second.empty() && missing.find(family + ":") == std::string::npos)
+                            missing += (missing.empty() ? "" : "; ") + std::string("no ") + family + " device";
+                        else if (!f->second.empty())
+                            missing += (missing.empty() ? "" : "; ") + std::string("no ") + name + " device";
+                        continue;
+                    }
+                    if (r->devices.size() >= static_cast<size_t>(max_devices))
+                        break;
+
+                    std::unique_ptr<device_info> d(new device_info);
+                    d->name = device;
+                    const bool cpu_device = family == "CPU";
+                    const bool gpu_device = family == "GPU";
+                    d->half = !cpu_device;
+                    if (all_f32) d->half = false;
+                    if (all_f16) d->half = true;
+                    if (precision == "f32" || precision == "fp32") d->half = false;
+                    if (precision == "f16" || precision == "fp16") d->half = true;
+                    // An NPU computes in reduced precision whatever the exchange type.
+                    d->single = !d->half && (cpu_device || gpu_device);
+                    bool duplicate = false;
+                    for (const auto& o : r->devices)
+                        if (o->name == d->name && o->half == d->half)
+                            duplicate = true;
+                    if (duplicate)
+                        continue;
+                    try
+                    {
+                        d->full_name = r->core->get_property(device, ov::device::full_name);
+                    }
+                    catch (...)
+                    {
+                        d->full_name = device;
+                    }
+                    d->config.insert(ov::hint::performance_mode(ov::hint::PerformanceMode::LATENCY));
+                    if (cpu_device || gpu_device)
+                        d->config.insert(ov::hint::inference_precision(d->half ? ov::element::f16 : ov::element::f32));
+                    // Copies of operands go in memory the device reads directly when the plugin
+                    // provides it, as the NPU and GPU plugins do; elsewhere in ordinary memory.
+                    try
+                    {
+                        d->context = r->core->get_default_context(device);
+                        d->has_context = true;
+                    }
+                    catch (...)
+                    {
+                        d->has_context = false;
+                    }
+                    r->derive_policies(*d);
+                    if (d->single)
+                        r->single_mask |= 1u << r->devices.size();
+                    else
+                        r->any_half = true;
+                    r->devices.push_back(std::move(d));
                 }
 
-                r->derive_policies();
+                if (r->devices.empty())
+                {
+                    r->why_unavailable = "no device found among " + r->requested +
+                        (missing.empty() ? std::string() : " (" + missing + ")");
+                    r->core.reset();
+                    if (r->verbose > 0)
+                        std::cerr << "dlib: NPU routing inactive, " << r->why_unavailable << std::endl;
+                    return r;
+                }
+
+                for (auto& d : r->devices)
+                {
+                    d->label = d->name;
+                    for (const auto& o : r->devices)
+                        if (o != d && o->name == d->name)
+                            d->label = d->name + (d->half ? ":f16" : ":f32");
+                }
+
                 r->available = true;
                 // Registered after the OpenVINO runtime started, so that it runs before the
                 // runtime's own static objects are destroyed.
                 std::atexit(shutdown_runtime);
                 if (r->verbose > 0)
-                    std::cerr << "dlib: NPU routing active on " << r->device << " (" << r->full_name << "), "
-                        << (r->half ? "f16" : "f32") << " exchange, "
-                        << (r->single ? "single" : "half") << " precision arithmetic" << std::endl;
+                {
+                    std::cerr << "dlib: NPU routing active on";
+                    for (size_t i = 0; i < r->devices.size(); ++i)
+                    {
+                        const device_info& d = *r->devices[i];
+                        std::cerr << (i ? ";" : "") << " " << d.name << " (" << d.full_name << "), "
+                            << (d.half ? "f16" : "f32") << " exchange, " << (d.single ? "single" : "half")
+                            << " precision arithmetic";
+                    }
+                    std::cerr << std::endl;
+                }
                 return r;
             }
 
@@ -1975,29 +2088,39 @@ namespace dlib
             }
 
             thread_local int exact_depth = 0;
-            thread_local entry* pending_host = nullptr;
+            // The shape whose next host call is a measurement.
+            thread_local shape* pending_host = nullptr;
+            /*
+                Owners of those shapes: pending_owner from the moment pending_host is set, then
+                timed_host_shapes while the host computes, innermost call last. A shape left
+                uncompiled may be pruned from the cache by another thread, and these keep the
+                ones being timed alive until their sample is recorded.
+            */
+            thread_local std::shared_ptr<shape> pending_owner;
+            thread_local std::vector<std::shared_ptr<shape>> timed_host_shapes;
+            // The devices admit() found able to take the call being routed; rounds_in_place()
+            // narrows them to those that compute in single precision.
+            thread_local uint32_t call_devices = 0;
 
-            void record_sample (
-                entry& e,
-                bool device,
+            void record_host (
+                shape& s,
                 long long ns
             )
             {
-                std::lock_guard<std::mutex> lock(e.calib);
-                if (e.decision.load() != undecided)
-                    return;
-                if (device)
-                {
-                    ++e.device_samples;
-                    e.device_best = std::min(e.device_best, ns);
-                }
-                else
-                {
-                    ++e.host_samples;
-                    e.host_best = std::min(e.host_best, ns);
-                }
-                if (e.device_samples >= calibration_samples && e.host_samples >= calibration_samples)
-                    e.decision = (e.device_best < 0.9 * e.host_best) ? on_device : on_host;
+                std::lock_guard<std::mutex> lock(s.calib);
+                ++s.host_samples;
+                s.host_best = std::min(s.host_best, ns);
+            }
+
+            void record_device (
+                shape& s,
+                int d,
+                long long ns
+            )
+            {
+                std::lock_guard<std::mutex> lock(s.calib);
+                ++s.device_samples[d];
+                s.device_best[d] = std::min(s.device_best[d], ns);
             }
 
             void release (
@@ -2010,6 +2133,25 @@ namespace dlib
                 e.compiled = ov::CompiledModel();
             }
 
+            /*
+                With DLIB_NPU_VERBOSE=3, a line written before each stage of every compilation and
+                every device call, flushed at once, so that the last line names the graph, its
+                device and the stage at which a plugin or a driver stopped the program.
+            */
+            void trace (
+                const device_info& dev,
+                const signature& sig,
+                const char* stage
+            )
+            {
+                std::ostringstream sout;
+                sout << "dlib: NPU routing " << stage << " " << op_table[sig.op].name << " on " << dev.label << " [";
+                for (int i = 0; i < sig.p.n; ++i)
+                    sout << (i ? " " : "") << sig.p.v[i];
+                sout << "]\n";
+                std::cerr << sout.str() << std::flush;
+            }
+
             void compile_entry (
                 runtime& r,
                 const std::shared_ptr<entry>& e
@@ -2017,27 +2159,57 @@ namespace dlib
             {
                 const long long t0 = now_ns();
                 const op_info& info = op_table[e->sig.op];
+                const device_info& dev = *r.devices[e->dev];
+                const bool tracing = r.verbose > 2;
                 try
                 {
-                    graph g(r.half ? ov::element::f16 : ov::element::f32);
+                    if (tracing) trace(dev, e->sig, "compiling");
+                    graph g(dev.half ? ov::element::f16 : ov::element::f32);
                     e->sig.build(g, e->sig.p);
                     auto model = std::make_shared<ov::Model>(g.results, g.parameters, std::string("dlib_") + info.name);
-                    ov::CompiledModel compiled = r.core->compile_model(model, r.device, r.config);
+                    ov::CompiledModel compiled = r.core->compile_model(model, dev.name, dev.config);
+                    if (tracing) trace(dev, e->sig, "checking the buffers of");
+                    /*
+                        The executor writes and reads the buffers of the request as the graph
+                        declares them: a plugin that changed the number, the order, the type or
+                        the size of an input or an output gets no call of that graph.
+                    */
+                    if (compiled.inputs().size() != g.parameters.size() ||
+                        compiled.outputs().size() != g.results.size())
+                        throw std::runtime_error("the compiled graph has other inputs or outputs than its model");
                     ov::InferRequest request = compiled.create_infer_request();
+                    auto check_buffer = [](const ov::Tensor& t, const ov::element::Type& type, const ov::Shape& shape,
+                        const char* what, size_t i, bool written)
+                    {
+                        if (t.get_element_type() != type || t.get_shape() != shape || (written && !t.data()))
+                            throw std::runtime_error(std::string("the device gave ") + what + " " + std::to_string(i) +
+                                " another type or shape than the graph");
+                    };
                     size_t bytes = 0;
                     std::vector<ov::Tensor> own;
                     for (size_t i = 0; i < compiled.inputs().size(); ++i)
                     {
                         ov::Tensor t = request.get_input_tensor(i);
+                        check_buffer(t, g.parameters[i]->get_element_type(), g.parameters[i]->get_shape(), "input", i,
+                            true);
                         std::memset(t.data(), 0, t.get_byte_size());
                         bytes += t.get_byte_size();
                         own.push_back(t);
                     }
                     for (size_t i = 0; i < compiled.outputs().size(); ++i)
-                        bytes += request.get_output_tensor(i).get_byte_size();
+                    {
+                        const ov::Tensor t = request.get_output_tensor(i);
+                        check_buffer(t, g.results[i]->get_output_element_type(0), g.results[i]->get_output_shape(0),
+                            "output", i, false);
+                        bytes += t.get_byte_size();
+                    }
                     if (bytes > r.budget)
                         throw std::runtime_error("graph buffers exceed DLIB_NPU_MEMORY_MB");
+                    if (tracing) trace(dev, e->sig, "running for the first time");
                     request.infer(); // the first inference pays one-time costs; not a sample
+                    for (size_t i = 0; i < compiled.outputs().size(); ++i)
+                        check_buffer(request.get_output_tensor(i), g.results[i]->get_output_element_type(0),
+                            g.results[i]->get_output_shape(0), "output", i, true);
 
                     std::vector<std::shared_ptr<entry>> evicted;
                     {
@@ -2055,15 +2227,17 @@ namespace dlib
                         e->last_use = ++r.clock;
                         e->state = ready;
                         // Least recently used graphs give their buffers back first, past the memory
-                        // budget or the number of graphs kept.
+                        // budget or the number of graphs kept, whatever their device.
                         while (r.resident > r.budget || r.compiled_graphs > max_graphs)
                         {
                             std::shared_ptr<entry> victim;
                             for (auto& kv : r.cache)
                             {
-                                auto& c = kv.second;
-                                if (c == e || c->state.load() != ready) continue;
-                                if (!victim || c->last_use.load() < victim->last_use.load()) victim = c;
+                                for (auto& c : kv.second->on)
+                                {
+                                    if (!c || c == e || c->state.load() != ready) continue;
+                                    if (!victim || c->last_use.load() < victim->last_use.load()) victim = c;
+                                }
                             }
                             if (!victim) break;
                             victim->state = fresh;
@@ -2083,8 +2257,8 @@ namespace dlib
                     r.counters[e->sig.op].graphs++;
                     r.counters[e->sig.op].compile_ns += dt;
                     if (r.verbose > 1)
-                        std::cerr << "dlib: NPU compiled " << info.name << " in " << dt / 1e6 << " ms ("
-                            << bytes / 1024 << " KiB of buffers)" << std::endl;
+                        std::cerr << "dlib: NPU routing compiled " << info.name << " for " << dev.name << " in "
+                            << dt / 1e6 << " ms (" << bytes / 1024 << " KiB of buffers)" << std::endl;
                 }
                 catch (const std::exception& ex)
                 {
@@ -2092,25 +2266,28 @@ namespace dlib
                     r.counters[e->sig.op].failures++;
                     r.counters[e->sig.op].compile_ns += now_ns() - t0;
                     if (r.verbose > 0)
-                        std::cerr << "dlib: NPU could not compile " << info.name << ", the host keeps it: "
+                        std::cerr << "dlib: " << dev.name << " could not compile " << info.name
+                            << ", the other devices and the host keep it: "
                             << std::string(ex.what()).substr(0, 400) << std::endl;
                 }
             }
 
             void worker_loop (
-                runtime* r
+                runtime* r,
+                int d
             )
             {
+                device_info& dev = *r->devices[d];
                 for (;;)
                 {
                     std::shared_ptr<entry> e;
                     {
-                        std::unique_lock<std::mutex> lock(r->queue_mutex);
-                        r->queue_cv.wait(lock, [&] { return r->stopping || !r->queue.empty(); });
-                        if (r->stopping)
+                        std::unique_lock<std::mutex> lock(dev.queue_mutex);
+                        dev.queue_cv.wait(lock, [&] { return dev.stopping || !dev.queue.empty(); });
+                        if (dev.stopping)
                             return;
-                        e = r->queue.front();
-                        r->queue.pop_front();
+                        e = dev.queue.front();
+                        dev.queue.pop_front();
                     }
                     compile_entry(*r, e);
                 }
@@ -2121,53 +2298,65 @@ namespace dlib
                 const std::shared_ptr<entry>& e
             )
             {
-                std::lock_guard<std::mutex> lock(r.queue_mutex);
-                if (r.stopping)
+                device_info& dev = *r.devices[e->dev];
+                std::lock_guard<std::mutex> lock(dev.queue_mutex);
+                if (dev.stopping)
                     return;
-                if (!r.worker.joinable())
-                    r.worker = std::thread(worker_loop, &r);
-                r.queue.push_back(e);
-                r.queue_cv.notify_one();
+                if (!dev.worker.joinable())
+                    dev.worker = std::thread(worker_loop, &r, e->dev);
+                dev.queue.push_back(e);
+                dev.queue_cv.notify_one();
             }
 
             void shutdown_runtime (
             )
             {
                 runtime& r = rt();
+                for (auto& d : r.devices)
                 {
-                    std::lock_guard<std::mutex> lock(r.queue_mutex);
-                    r.stopping = true;
-                    r.queue.clear();
+                    {
+                        std::lock_guard<std::mutex> lock(d->queue_mutex);
+                        d->stopping = true;
+                        d->queue.clear();
+                    }
+                    d->queue_cv.notify_all();
+                    if (d->worker.joinable())
+                        d->worker.join();
                 }
-                r.queue_cv.notify_all();
-                if (r.worker.joinable())
-                    r.worker.join();
                 if (r.verbose > 0 && r.available)
                     print_report(std::cerr);
                 r.available = false;
                 std::lock_guard<std::mutex> lock(r.cache_mutex);
                 for (auto& kv : r.cache)
                 {
-                    std::lock_guard<std::mutex> elock(kv.second->exec);
-                    kv.second->state = failed;
-                    release(*kv.second);
+                    for (auto& e : kv.second->on)
+                    {
+                        if (!e) continue;
+                        std::lock_guard<std::mutex> elock(e->exec);
+                        e->state = failed;
+                        release(*e);
+                    }
                 }
                 r.cache.clear();
                 {
-                    // The copies of operands may live in memory of the plugin, released with it.
+                    // The copies of operands may live in memory of a plugin, released with it.
                     std::lock_guard<std::mutex> olock(r.operands_mutex);
                     r.operands.clear();
                     r.operand_bytes = 0;
                     r.operand_copies = 0;
-                    r.context = ov::RemoteContext();
-                    r.has_context = false;
+                    for (auto& d : r.devices)
+                    {
+                        d->context = ov::RemoteContext();
+                        d->has_context = false;
+                    }
                 }
                 r.core.reset();
             }
 
             /*
-                Whether an operation of this size may go to the device at all. Cheap: it is
-                called by every qualifying tensor operation before anything else is done.
+                Whether an operation of this size may go to a device at all, and which devices
+                may take it. Cheap: it is called by every qualifying tensor operation before
+                anything else is done.
             */
             bool admit (
                 int op,
@@ -2175,15 +2364,28 @@ namespace dlib
             )
             {
                 pending_host = nullptr;
+                call_devices = 0;
                 runtime& r = rt();
                 if (!r.available || exact_depth > 0)
                     return false;
                 const int m = r.mode.load(std::memory_order_relaxed);
                 if (m == static_cast<int>(routing::never))
                     return false;
-                if (m == static_cast<int>(routing::always))
-                    return r.enabled_always[op];
-                return r.enabled_auto[op] && work >= op_table[op].min_work;
+                const bool always = m == static_cast<int>(routing::always);
+                if (!always && work < op_table[op].min_work)
+                    return false;
+                const int only = r.restricted.load(std::memory_order_relaxed);
+                uint32_t mask = 0;
+                for (size_t d = 0; d < r.devices.size(); ++d)
+                {
+                    if (only >= 0 && static_cast<int>(d) != only)
+                        continue;
+                    const device_info& dev = *r.devices[d];
+                    if (always ? dev.enabled_always[op] : dev.enabled_auto[op])
+                        mask |= 1u << d;
+                }
+                call_devices = mask;
+                return mask != 0;
             }
 
     // ----------------------------------------------------------------------------------------
@@ -2198,26 +2400,27 @@ namespace dlib
             {
                 std::shared_ptr<operand_copy> copy;
                 bool hit = false;        // the copy holds the current values: nothing to convert
-                bool warming = false;    // first sight of the operand or first copy of it
+                bool warming = false;    // the first copy of the operand, written by this call
                 uint64_t mark = 0;       // a copy to write: the mark it carries once written
             };
 
-            // A buffer the device reads without a further copy where the plugin allows it.
+            // Under operands_mutex. A buffer the device reads without a further copy where the
+            // plugin allows it.
             ov::Tensor device_tensor (
-                runtime& r,
+                device_info& dev,
                 const ov::Shape& shape
             )
             {
-                const ov::element::Type t = r.half ? ov::element::f16 : ov::element::f32;
-                if (r.has_context)
+                const ov::element::Type t = dev.half ? ov::element::f16 : ov::element::f32;
+                if (dev.has_context)
                 {
                     try
                     {
-                        return r.context.create_host_tensor(t, shape);
+                        return dev.context.create_host_tensor(t, shape);
                     }
                     catch (...)
                     {
-                        r.has_context = false;
+                        dev.has_context = false;
                     }
                 }
                 return ov::Tensor(t, shape);
@@ -2293,12 +2496,14 @@ namespace dlib
                 operand_use u;
                 if (!x.storage || r.operand_budget == 0)
                     return u;
+                device_info& dev = *r.devices[e.dev];
                 operand_key key;
                 key.op = e.sig.op;
+                key.dev = e.dev;
                 key.storage = x.storage;
                 key.host = x.host;
                 key.target = x.target;
-                key.half = r.half;
+                key.half = dev.half;
                 for (int d = 0; d < 4; ++d)
                 {
                     key.v[d] = x.g.v[d];
@@ -2328,11 +2533,12 @@ namespace dlib
                 {
                     if (r.operands.size() >= max_operands)
                         prune_operands(r, now);
+                    // A first sight is converted into the buffer of the graph, as any call
+                    // whose operands change, and times like one.
                     auto c = std::make_shared<operand_copy>();
                     c->mark = mark;
                     c->last_use = now;
                     r.operands.emplace(key, std::move(c));
-                    u.warming = true;
                     return u;
                 }
                 const std::shared_ptr<operand_copy>& c = it->second;
@@ -2340,10 +2546,10 @@ namespace dlib
                 {
                     const bool unchanged = c->mark != 0 && c->mark == current;
                     const ov::Shape shape = e.compiled.input(i).get_shape();
-                    const size_t bytes = ov::shape_size(shape) * (r.half ? 2 : 4);
+                    const size_t bytes = ov::shape_size(shape) * (dev.half ? 2 : 4);
                     if (unchanged && make_room(r, bytes, now))
                     {
-                        c->tensor = device_tensor(r, shape);
+                        c->tensor = device_tensor(dev, shape);
                         c->bytes = bytes;
                         r.operand_bytes += bytes;
                         ++r.operand_copies;
@@ -2374,10 +2580,13 @@ namespace dlib
                 call& c
             )
             {
-                const bool half = r.half;
+                const device_info& dev = *r.devices[e.dev];
+                const bool half = dev.half;
+                const bool tracing = r.verbose > 2;
                 std::lock_guard<std::mutex> lock(e.exec);
                 if (e.state.load() != ready)
                     return false;
+                if (tracing) trace(dev, e.sig, "writing the inputs of");
                 ov::InferRequest& request = e.request;
                 DLIB_CASSERT(e.compiled.inputs().size() == c.in.size() && e.compiled.outputs().size() == c.out.size(),
                     "graph and call disagree on " << op_table[e.sig.op].name);
@@ -2457,7 +2666,9 @@ namespace dlib
                         }
                     }
                 }
+                if (tracing) trace(dev, e.sig, "running");
                 request.infer();
+                if (tracing) trace(dev, e.sig, "reading the outputs of");
                 for (size_t i = 0; i < c.out.size(); ++i)
                     if (!check_output(request.get_output_tensor(i), c.out[i], half))
                         return false;
@@ -2467,8 +2678,57 @@ namespace dlib
             }
 
             /*
-                Routes one call. bind(c) describes the operands and is only invoked when the
-                device is to compute. Returns true when it did.
+                Under s.calib. Where the next call of shape s runs, among the host and the ready
+                devices of eligible. A device timed fewer than calibration_samples times is timed,
+                in turn with the host; once the host and every ready device are, the fastest keeps
+                the shape, and the choice is made again when the set of ready devices changes.
+                Sets timed for a device call that is a measurement, pending_host for a host call
+                that is one.
+            */
+            int choose (
+                shape& s,
+                uint32_t eligible,
+                bool& timed
+            )
+            {
+                uint32_t ready_mask = 0;
+                for (int d = 0; d < max_devices; ++d)
+                    if ((eligible >> d & 1) && !(s.excluded >> d & 1) && s.on[d] && s.on[d]->state.load() == ready)
+                        ready_mask |= 1u << d;
+                if (ready_mask == 0)
+                    return on_host;
+                int pick = -1;
+                for (int d = 0; d < max_devices; ++d)
+                {
+                    if ((ready_mask >> d & 1) && s.device_samples[d] < calibration_samples &&
+                        (pick < 0 || s.device_samples[d] < s.device_samples[pick]))
+                        pick = d;
+                }
+                if (pick >= 0 && s.device_samples[pick] <= s.host_samples)
+                {
+                    timed = true;
+                    return pick;
+                }
+                if (pick >= 0 || s.host_samples < calibration_samples)
+                {
+                    pending_host = &s;
+                    return on_host;
+                }
+                if (s.choice == undecided || s.chosen_among != ready_mask)
+                {
+                    int best = -1;
+                    for (int d = 0; d < max_devices; ++d)
+                        if ((ready_mask >> d & 1) && (best < 0 || s.device_best[d] < s.device_best[best]))
+                            best = d;
+                    s.choice = (best >= 0 && s.device_best[best] < 0.9 * s.host_best) ? best : on_host;
+                    s.chosen_among = ready_mask;
+                }
+                return s.choice;
+            }
+
+            /*
+                Routes one call. bind(c) describes the operands and is only invoked when a device
+                is to compute. Returns true when one did.
             */
             template <typename BIND>
             bool route (
@@ -2482,13 +2742,16 @@ namespace dlib
                 op_counters& counters = r.counters[op];
                 counters.touched = true;
                 const bool always = r.mode.load(std::memory_order_relaxed) == static_cast<int>(routing::always);
+                const uint32_t eligible = call_devices;
+                const int devices = static_cast<int>(r.devices.size());
 
                 signature sig;
                 sig.op = op;
                 sig.build = build;
                 sig.p = p;
-                std::shared_ptr<entry> e;
-                bool compile_now = false, compile_later = false;
+                std::shared_ptr<shape> s;
+                std::shared_ptr<entry> now[max_devices], later[max_devices];
+                int n_now = 0, n_later = 0;
                 {
                     std::lock_guard<std::mutex> lock(r.cache_mutex);
                     auto it = r.cache.find(sig);
@@ -2499,78 +2762,92 @@ namespace dlib
                         {
                             for (auto i = r.cache.begin(); i != r.cache.end();)
                             {
-                                if (i->second->state.load() == fresh) i = r.cache.erase(i);
+                                bool compiled = false;
+                                for (auto& e : i->second->on)
+                                    if (e && e->state.load() != fresh) compiled = true;
+                                if (!compiled) i = r.cache.erase(i);
                                 else ++i;
                             }
                         }
-                        e = std::make_shared<entry>();
-                        e->sig = sig;
-                        r.cache.emplace(sig, e);
+                        it = r.cache.emplace(sig, std::make_shared<shape>()).first;
                     }
-                    else
+                    s = it->second;
+                    /*
+                        A shape seen once may never come back: its graphs are compiled from the
+                        second call, for every device that may take it. Forced routing compiles
+                        for the first such device of the list, and for the next one only when
+                        that compilation failed.
+                    */
+                    const bool sync = r.sync.load();
+                    const int needed = (sync || always) ? 1 : 2;
+                    for (int d = 0; d < devices; ++d)
                     {
-                        e = it->second;
-                    }
-                    if (e->state.load() == fresh)
-                    {
-                        // A shape seen once may never come back: compile from the second call.
-                        const bool sync = r.sync.load();
-                        const int needed = (sync || always) ? 1 : 2;
-                        if (++e->seen >= needed)
+                        if (!(eligible >> d & 1))
+                            continue;
+                        std::shared_ptr<entry>& e = s->on[d];
+                        if (!e)
+                        {
+                            e = std::make_shared<entry>();
+                            e->sig = sig;
+                            e->dev = d;
+                        }
+                        if (e->state.load() == fresh && ++e->seen >= needed)
                         {
                             e->state = queued;
-                            if (sync) compile_now = true;
-                            else compile_later = true;
+                            if (sync) now[n_now++] = e;
+                            else later[n_later++] = e;
                         }
+                        if (always && e->state.load() != failed)
+                            break;
                     }
                 }
-                if (compile_now) compile_entry(r, e);
-                else if (compile_later) enqueue_compile(r, e);
+                for (int i = 0; i < n_now; ++i)
+                    compile_entry(r, now[i]);
+                for (int i = 0; i < n_later; ++i)
+                    enqueue_compile(r, later[i]);
 
-                if (e->state.load() != ready)
+                int target = on_host;
+                bool timed = false;
+                if (always)
+                {
+                    for (int d = 0; d < devices; ++d)
+                    {
+                        if (!(eligible >> d & 1) || !s->on[d] || s->on[d]->state.load() == failed)
+                            continue;
+                        if (s->on[d]->state.load() == ready)
+                            target = d;
+                        break;
+                    }
+                }
+                else
+                {
+                    std::lock_guard<std::mutex> lock(s->calib);
+                    target = choose(*s, eligible, timed);
+                }
+                if (pending_host == s.get())
+                    pending_owner = s;
+                if (target < 0)
                 {
                     counters.host_calls++;
                     return false;
                 }
 
-                bool timed = false;
-                if (!always)
-                {
-                    const int d = e->decision.load();
-                    if (d == on_host)
-                    {
-                        counters.host_calls++;
-                        return false;
-                    }
-                    if (d == undecided)
-                    {
-                        if (e->device_samples <= e->host_samples)
-                        {
-                            timed = true;
-                        }
-                        else
-                        {
-                            pending_host = e.get();
-                            counters.host_calls++;
-                            return false;
-                        }
-                    }
-                }
-
+                entry& e = *s->on[target];
                 call c;
                 bind(c);
                 const long long t0 = now_ns();
                 bool ok = false;
                 try
                 {
-                    ok = execute(r, *e, c);
+                    ok = execute(r, e, c);
                 }
                 catch (const std::exception& ex)
                 {
-                    e->state = failed;
+                    e.state = failed;
                     counters.failures++;
                     if (r.verbose > 0)
-                        std::cerr << "dlib: NPU failed to run " << op_table[op].name << ", the host keeps it: "
+                        std::cerr << "dlib: " << r.devices[target]->name << " failed to run " << op_table[op].name
+                            << ", the other devices and the host keep it: "
                             << std::string(ex.what()).substr(0, 400) << std::endl;
                     ok = false;
                 }
@@ -2578,20 +2855,24 @@ namespace dlib
                 if (!ok)
                 {
                     counters.rejected++;
-                    if (++e->rejects_in_row >= 8 && !always)
-                        e->decision = on_host;
+                    if (++e.rejects_in_row >= 8 && !always)
+                    {
+                        std::lock_guard<std::mutex> lock(s->calib);
+                        s->excluded |= 1u << target;
+                    }
                     return false;
                 }
-                e->rejects_in_row = 0;
-                e->last_use = ++r.clock;
+                e.rejects_in_row = 0;
+                e.last_use = ++r.clock;
                 counters.device_calls++;
+                counters.by_device[target]++;
                 counters.device_ns += dt;
                 if (c.reused)
                     counters.reused++;
-                // A call that met an operand for the first time, or made its first copy, costs
-                // more than the calls that follow: the next one is timed instead.
+                // A call that made the first copy of an operand costs more than the calls that
+                // follow: the next one is timed instead.
                 if (timed && !c.warming)
-                    record_sample(*e, true, dt);
+                    record_device(*s, target, dt);
                 return true;
             }
 
@@ -2699,21 +2980,26 @@ namespace dlib
             }
 
             /*
-                True when a linear combination assigns one of its own operands while the device
-                computes in half precision. Such a call updates a tensor in place, as the solvers
-                do with the parameters and their moments, and the device result would round the
-                values that tensor carries from one call to the next, so the host keeps it.
+                For a linear combination that assigns one of its own operands, keeps among the
+                devices of the call those that compute in single precision, and returns true when
+                none is left. Such a call updates a tensor in place, as the solvers do with the
+                parameters and their moments, and a result in half precision would round the
+                values that tensor carries from one call to the next.
             */
             bool rounds_in_place (
                 const float* dest,
                 std::initializer_list<const float*> srcs
             )
             {
-                if (rt().single)
-                    return false;
                 for (const float* s : srcs)
+                {
                     if (s == dest)
-                        return true;
+                    {
+                        // Only the devices that compute in single precision may take the call.
+                        call_devices &= rt().single_mask;
+                        return call_devices == 0;
+                    }
+                }
                 return false;
             }
 
@@ -3241,10 +3527,14 @@ namespace dlib
                     return;
                 }
                 const int m = r.mode.load();
-                out << "  device   : " << r.device << ", " << r.full_name << ", " << (r.half ? "f16" : "f32")
-                    << " exchange, " << (r.single ? "single" : "half") << " precision arithmetic\n";
+                for (const auto& d : r.devices)
+                    out << "  device   : " << d->name << ", " << d->full_name << ", " << (d->half ? "f16" : "f32")
+                        << " exchange, " << (d->single ? "single" : "half") << " precision arithmetic\n";
+                const int only = r.restricted.load();
                 out << "  routing  : " << (m == static_cast<int>(routing::always) ? "always" :
                                            m == static_cast<int>(routing::never) ? "never" : "automatic")
+                    << (only >= 0 && only < static_cast<int>(r.devices.size()) ? ", restricted to " +
+                        r.devices[only]->label : std::string())
                     << ", " << (r.sync.load() ? "synchronous" : "background") << " compilation, cache "
                     << (r.cache_enabled ? r.cache_dir : std::string("off")) << "\n";
                 size_t resident = 0, graphs = 0;
@@ -3252,7 +3542,8 @@ namespace dlib
                     std::lock_guard<std::mutex> lock(r.cache_mutex);
                     resident = r.resident;
                     for (auto& kv : r.cache)
-                        if (kv.second->state.load() == ready) ++graphs;
+                        for (auto& e : kv.second->on)
+                            if (e && e->state.load() == ready) ++graphs;
                 }
                 out << "  memory   : " << resident / (1 << 20) << " MiB held by " << graphs << " graphs, budget "
                     << r.budget / (1 << 20) << " MiB\n";
@@ -3267,16 +3558,21 @@ namespace dlib
                 out << "  operands : " << operand_bytes / (1 << 20) << " MiB held by " << operand_copies
                     << " copies, written " << conversions << " times, budget " << r.operand_budget / (1 << 20)
                     << " MiB\n";
-                out << "  " << std::left << std::setw(32) << "operation" << std::right
-                    << std::setw(10) << "device" << std::setw(10) << "reused" << std::setw(10) << "host"
+                // One column of calls per device, headed by its name.
+                out << "  " << std::left << std::setw(32) << "operation" << std::right;
+                for (const auto& d : r.devices)
+                    out << std::setw(10) << d->label.substr(0, 9);
+                out << std::setw(10) << "reused" << std::setw(10) << "host"
                     << std::setw(10) << "rejected" << std::setw(8) << "graphs" << std::setw(8) << "failed"
                     << std::setw(12) << "device ms" << std::setw(12) << "compile ms" << "\n";
                 for (int op = 0; op < OP_COUNT; ++op)
                 {
                     const op_counters& c = r.counters[op];
                     if (!c.touched.load()) continue;
-                    out << "  " << std::left << std::setw(32) << op_table[op].name << std::right
-                        << std::setw(10) << c.device_calls.load() << std::setw(10) << c.reused.load()
+                    out << "  " << std::left << std::setw(32) << op_table[op].name << std::right;
+                    for (size_t d = 0; d < r.devices.size(); ++d)
+                        out << std::setw(10) << c.by_device[d].load();
+                    out << std::setw(10) << c.reused.load()
                         << std::setw(10) << c.host_calls.load()
                         << std::setw(10) << c.rejected.load() << std::setw(8) << c.graphs.load()
                         << std::setw(8) << c.failures.load()
@@ -3299,14 +3595,36 @@ namespace dlib
         std::string device_name ()
         {
             runtime& r = rt();
-            return r.available ? r.device + ", " + r.full_name : std::string();
+            std::string names;
+            if (r.available)
+                for (const auto& d : r.devices)
+                    names += (names.empty() ? "" : " + ") + d->name + ", " + d->full_name;
+            return names;
+        }
+
+        std::vector<std::string> device_names ()
+        {
+            runtime& r = rt();
+            std::vector<std::string> names;
+            if (r.available)
+                for (const auto& d : r.devices)
+                    names.push_back(d->label);
+            return names;
         }
 
         bool uses_half_precision ()
         {
             runtime& r = rt();
-            return r.available && !r.single;
+            return r.available && r.any_half;
         }
+
+        bool has_single_precision_device ()
+        {
+            runtime& r = rt();
+            return r.available && r.single_mask != 0;
+        }
+
+        void restrict_to_device (int index) { rt().restricted = index < 0 ? -1 : index; }
 
         std::string runtime_version ()
         {
@@ -3339,6 +3657,8 @@ namespace dlib
                 s.graphs = c.graphs.load();
                 s.compile_failures = c.failures.load();
                 s.reused_calls = c.reused.load();
+                for (size_t d = 0; d < r.devices.size(); ++d)
+                    s.calls_by_device.push_back(c.by_device[d].load());
                 s.device_seconds = c.device_ns.load() / 1e9;
                 s.compile_seconds = c.compile_ns.load() / 1e9;
                 result.push_back(s);
@@ -3353,6 +3673,7 @@ namespace dlib
             {
                 c.device_calls = 0; c.host_calls = 0; c.rejected = 0; c.graphs = 0; c.failures = 0;
                 c.reused = 0; c.device_ns = 0; c.compile_ns = 0; c.touched = false;
+                for (auto& d : c.by_device) d = 0;
             }
             {
                 std::lock_guard<std::mutex> lock(r.operands_mutex);
@@ -3361,12 +3682,11 @@ namespace dlib
             std::lock_guard<std::mutex> lock(r.cache_mutex);
             for (auto& kv : r.cache)
             {
-                entry& e = *kv.second;
-                std::lock_guard<std::mutex> elock(e.calib);
-                e.decision = undecided;
-                e.device_samples = e.host_samples = 0;
-                e.device_best = e.host_best = std::numeric_limits<long long>::max();
-                e.rejects_in_row = 0;
+                shape& s = *kv.second;
+                std::lock_guard<std::mutex> slock(s.calib);
+                s.forget_measurements();
+                for (auto& e : s.on)
+                    if (e) e->rejects_in_row = 0;
             }
         }
 
@@ -3377,6 +3697,7 @@ namespace dlib
             if (entry)
             {
                 pending_host = nullptr;
+                timed_host_shapes.push_back(std::move(pending_owner));
                 start = now_ns();
             }
         }
@@ -3384,7 +3705,10 @@ namespace dlib
         cpu_measure::~cpu_measure ()
         {
             if (entry)
-                record_sample(*static_cast<impl_entry*>(entry), false, now_ns() - start);
+            {
+                record_host(*static_cast<impl_entry*>(entry), now_ns() - start);
+                timed_host_shapes.pop_back();
+            }
         }
 
     // ----------------------------------------------------------------------------------------
@@ -5357,26 +5681,80 @@ namespace dlib
                 return a;
             }
 
-            // p: planes, h, w, window h, window w, sy, sx, py, px, max, oh, ow
+            /*
+                p: planes, h, w, window h, window w, sy, sx, py, px, max, oh, ow.
+
+                Max pooling sends the gradient of each output to the first largest value of its
+                window in row-major order, as the host does. The graph reads each offset of the
+                windows as a strided slice of the padded input, marks for every output the first
+                offset inside the input that holds the maximum of its window, and places the
+                gradients back with a transposed convolution whose kernel holds a single one per
+                offset. It needs no index output and no scatter: the GPU plugin of OpenVINO 2026.4
+                crashed compiling the graph that combined them.
+            */
             void build_pool_gradient (graph& g, const params& p)
             {
                 const int64_t planes = p[0], h = p[1], w = p[2], oh = p[10], ow = p[11];
                 if (p[9])
                 {
+                    const int64_t kh = p[3], kw = p[4], sy = p[5], sx = p[6], py = p[7], px = p[8];
                     const node x = g.input({planes, 1, h, w});
                     const node gi = g.input({planes, 1, oh, ow});
-                    auto pool = std::make_shared<ov::op::v8::MaxPool>(x,
-                        ov::Strides{static_cast<size_t>(p[5]), static_cast<size_t>(p[6])}, ov::Strides{1, 1},
-                        ov::Shape{static_cast<size_t>(p[7]), static_cast<size_t>(p[8])},
-                        ov::Shape{static_cast<size_t>(p[7]), static_cast<size_t>(p[8])},
-                        ov::Shape{static_cast<size_t>(p[3]), static_cast<size_t>(p[4])},
-                        ov::op::RoundingType::FLOOR, ov::op::PadType::EXPLICIT, ov::element::i64, 2);
-                    const node idx = g.reshape(pool->output(1), {planes, oh * ow});
-                    const node zeros = g.broadcast(g.c(0), {planes, h * w});
-                    const node scattered = std::make_shared<ov::op::v12::ScatterElementsUpdate>(zeros, idx,
-                        g.reshape(gi, {planes, oh * ow}), graph::ints({1}),
-                        ov::op::v12::ScatterElementsUpdate::Reduction::SUM, true);
-                    g.output(scattered);
+                    const node largest = std::make_shared<ov::op::v1::MaxPool>(x,
+                        ov::Strides{static_cast<size_t>(sy), static_cast<size_t>(sx)},
+                        ov::Shape{static_cast<size_t>(py), static_cast<size_t>(px)},
+                        ov::Shape{static_cast<size_t>(py), static_cast<size_t>(px)},
+                        ov::Shape{static_cast<size_t>(kh), static_cast<size_t>(kw)},
+                        ov::op::RoundingType::FLOOR, ov::op::PadType::EXPLICIT);
+                    const int64_t pad_bottom = std::max<int64_t>(0, sy * (oh - 1) + kh - py - h);
+                    const int64_t pad_right = std::max<int64_t>(0, sx * (ow - 1) + kw - px - w);
+                    const node padded = std::make_shared<ov::op::v1::Pad>(x, graph::ints({0, 0, py, px}),
+                        graph::ints({0, 0, pad_bottom, pad_right}), g.c(0), ov::op::PadMode::CONSTANT);
+                    std::vector<node> routed;
+                    node taken;
+                    for (int64_t dy = 0; dy < kh; ++dy)
+                    {
+                        for (int64_t dx = 0; dx < kw; ++dx)
+                        {
+                            const node value = std::make_shared<ov::op::v8::Slice>(padded, graph::ints({dy, dx}),
+                                graph::ints({dy + sy * (oh - 1) + 1, dx + sx * (ow - 1) + 1}), graph::ints({sy, sx}),
+                                graph::ints({2, 3}));
+                            node first = g.equal(value, largest);
+                            // The outputs whose window places this offset on the padding.
+                            std::vector<float> inside(static_cast<size_t>(oh * ow), 1.0f);
+                            bool all_inside = true;
+                            for (int64_t r = 0; r < oh; ++r)
+                            {
+                                for (int64_t c = 0; c < ow; ++c)
+                                {
+                                    const int64_t y = r * sy - py + dy, xx = c * sx - px + dx;
+                                    if (y < 0 || y >= h || xx < 0 || xx >= w)
+                                    {
+                                        inside[static_cast<size_t>(r * ow + c)] = 0.0f;
+                                        all_inside = false;
+                                    }
+                                }
+                            }
+                            if (!all_inside)
+                                first = g.logical_and(first, g.greater(g.constant({1, 1, oh, ow}, inside), g.c(0.5)));
+                            if (taken.get_node())
+                                first = g.logical_and(first, std::make_shared<ov::op::v1::LogicalNot>(taken));
+                            taken = taken.get_node() ? g.logical_or(taken, first) : first;
+                            routed.push_back(g.select(first, gi, g.c(0)));
+                        }
+                    }
+                    std::vector<float> one_hot(static_cast<size_t>(kh * kw * kh * kw), 0.0f);
+                    for (int64_t i = 0; i < kh * kw; ++i)
+                        one_hot[static_cast<size_t>(i * kh * kw + i)] = 1.0f;
+                    const node kernel = g.constant({kh * kw, 1, kh, kw}, one_hot);
+                    // The rows and columns of the input no window reaches, after the last stride.
+                    const int64_t extra_y = h - (sy * (oh - 1) + kh - 2 * py);
+                    const int64_t extra_x = w - (sx * (ow - 1) + kw - 2 * px);
+                    const node placed = std::make_shared<ov::op::v1::ConvolutionBackpropData>(g.concat(routed, 1),
+                        kernel, ov::Strides{static_cast<size_t>(sy), static_cast<size_t>(sx)},
+                        ov::CoordinateDiff{py, px}, ov::CoordinateDiff{py, px}, ov::Strides{1, 1},
+                        ov::op::PadType::EXPLICIT, ov::CoordinateDiff{extra_y, extra_x});
+                    g.output(g.reshape(placed, {planes, h * w}));
                 }
                 else
                 {
@@ -6096,6 +6474,15 @@ namespace dlib
                 return false;
             // The average adjoint is a dense matrix: kept to sizes where it stays small.
             if (!max_pooling && oh * ow * h * w > (int64_t(1) << 22))
+                return false;
+            /*
+                The max graph places the gradients back with a transposed convolution, which needs
+                every window to start inside the padded input and to reach a value of the input. It
+                also holds one copy of the gradient per offset of the window, kept below 2^26 values.
+            */
+            if (max_pooling && (h + 2 * padding_y < window_height || w + 2 * padding_x < window_width ||
+                padding_y >= window_height || padding_x >= window_width || stride_y <= 0 || stride_x <= 0 ||
+                planes * window_height * window_width * oh * ow > (int64_t(1) << 26)))
                 return false;
             params p;
             p << planes << h << w << window_height << window_width << stride_y << stride_x << padding_y << padding_x

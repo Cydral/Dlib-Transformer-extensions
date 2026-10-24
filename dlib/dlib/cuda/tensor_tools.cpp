@@ -57,7 +57,10 @@ namespace dlib
         bool is_compiled_in () { return false; }
         bool is_available () { return false; }
         std::string device_name () { return std::string(); }
+        std::vector<std::string> device_names () { return std::vector<std::string>(); }
         bool uses_half_precision () { return false; }
+        bool has_single_precision_device () { return false; }
+        void restrict_to_device (int) {}
         std::string runtime_version () { return std::string(); }
         void set_routing (routing) {}
         routing get_routing () { return routing::never; }

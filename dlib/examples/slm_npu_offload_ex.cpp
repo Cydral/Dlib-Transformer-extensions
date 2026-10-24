@@ -2,18 +2,20 @@
 // License: Boost Software License   See LICENSE.txt for the full license.
 /*
     @file slm_npu_offload_ex.cpp
-    @brief Routing the tensor operations of a language model to an NPU, and measuring the gain
+    @brief Routing the tensor operations of a language model to the NPU and the integrated GPU,
+           and measuring the gain
 
     dlib built with DLIB_USE_NPU (see the build notes of the main README) offers every tensor
-    operation it runs on the host to an inference device found when the program starts: the
-    NPU of the processor by default, reached through the OpenVINO runtime. Each operation
-    then runs where it was measured to be faster, with no change to the code that calls it.
-    This program shows that mechanism at work on the machine it runs on:
+    operation it runs on the host to the inference devices found when the program starts: the
+    NPU and the integrated GPU of the processor by default, reached through the OpenVINO
+    runtime. Each operation then runs where it was measured to be fastest, on one of them or on
+    the host, with no change to the code that calls it. This program shows that mechanism at
+    work on the machine it runs on:
 
-    1) --info      : what was built in, which device was found and how it computes.
+    1) --info      : what was built in, which devices were found and how they compute.
     2) --benchmark : the primitives of a transformer at the sizes of a small language model,
-                     timed on the host and on the device, with the difference between the
-                     two results.
+                     timed on the host and on each device, with the largest difference between
+                     a device result and the host result.
     3) --train     : training steps of a small transformer on the built-in Shakespeare
                      extract, once with every operation on the host and once with automatic
                      routing, from the same initial weights, with the time per step, the
@@ -21,10 +23,11 @@
 
     Without option, the three run in turn.
 
-    The device paths can be exercised on a machine without an NPU, on the OpenVINO CPU
-    plugin, by setting DLIB_NPU_DEVICE=CPU. The timings then compare the host code of dlib
-    with that of OpenVINO and say nothing about an NPU, while the results and the routing
-    are those of a real device. DLIB_NPU_DEVICE=GPU selects an integrated GPU instead.
+    The device paths can be exercised on a machine without these devices, on the OpenVINO
+    CPU plugin, by setting DLIB_NPU_DEVICE=CPU. The timings then compare the host code of
+    dlib with that of OpenVINO and say nothing about an NPU or a GPU, while the results and
+    the routing are those of a real device. DLIB_NPU_DEVICE=GPU keeps the integrated GPU
+    alone, DLIB_NPU_DEVICE=NPU the NPU alone, and NPU,GPU,CPU adds the CPU plugin to them.
 */
 
 #include <algorithm>
@@ -57,11 +60,12 @@ namespace
     const bool cuda_build = false;
 #endif
 
-    unsigned long long device_calls (const std::string& op)
+    // Calls of op computed by the device of index d.
+    unsigned long long device_calls (const std::string& op, size_t d)
     {
         for (const auto& s : npu::get_statistics())
-            if (s.name == op)
-                return s.device_calls;
+            if (s.name == op && d < s.calls_by_device.size())
+                return s.calls_by_device[d];
         return 0;
     }
 
@@ -119,9 +123,11 @@ namespace
     }
 
     /*
-        Times compute with every operation on the host, then forced on the device once its
-        graph is compiled, and compares what it left in out both times. op is the name the
-        routing statistics give to the operation.
+        Times compute with every operation on the host, then forced on each device in turn
+        once its graph is compiled, and compares what it left in out each time with the host
+        result. op is the name the routing statistics give to the operation. Prints the time
+        of each device, "-" for one that declines the operation, the speed-up of the fastest
+        device over the host and the largest difference.
     */
     template <typename F>
     void benchmark (const std::string& what, const std::string& op, const tensor& out, F compute, int reps)
@@ -134,21 +140,46 @@ namespace
         reference.copy_size(out);
         memcpy(reference, out);
 
+        const size_t devices = npu::device_names().size();
+        std::vector<double> device_ms(devices, -1);
+        double difference = 0;
         npu::set_synchronous_compilation(true);
-        npu::set_routing(npu::routing::always);
-        const unsigned long long before = device_calls(op);
-        compute();  // compiles the graph on first sight, then runs it once
-        const double device_ms = time_calls(compute, reps);
-        const bool ran = device_calls(op) > before;
-        npu::set_routing(initial);
+        for (size_t d = 0; d < devices; ++d)
+        {
+            npu::restrict_to_device(static_cast<int>(d));
+            npu::set_routing(npu::routing::always);
+            const unsigned long long before = device_calls(op, d);
+            compute();  // compiles the graph on first sight, then runs it once
+            const double ms = time_calls(compute, reps);
+            if (device_calls(op, d) > before)
+            {
+                device_ms[d] = ms;
+                difference = std::max(difference, relative_error(reference, out));
+            }
+            npu::set_routing(npu::routing::never);
+        }
+        npu::restrict_to_device(-1);
         npu::set_synchronous_compilation(false);
+        npu::set_routing(initial);
 
+        double fastest = -1;
         cout << "  " << left << setw(44) << what << right << fixed << setprecision(3) << setw(10) << host_ms;
-        if (ran)
-            cout << setw(12) << device_ms << setw(9) << setprecision(2) << host_ms / device_ms << "x"
-                 << setw(12) << scientific << setprecision(1) << relative_error(reference, out) << "\n";
+        for (double ms : device_ms)
+        {
+            if (ms < 0)
+            {
+                cout << setw(12) << "-";
+                continue;
+            }
+            cout << setw(12) << ms;
+            if (fastest < 0 || ms < fastest)
+                fastest = ms;
+        }
+        if (fastest > 0)
+            cout << setw(9) << setprecision(2) << host_ms / fastest << "x" << setw(12) << scientific
+                 << setprecision(1) << difference << "\n";
         else
-            cout << "      host only, the device declines it\n";
+            cout << "      host only, no device takes it\n";
         cout.unsetf(std::ios::floatfield);
     }
 }
@@ -162,16 +193,21 @@ void show_device ()
     {
         cout << "dlib was built without DLIB_USE_NPU: every operation runs on the "
              << (cuda_build ? "CUDA device.\n" : "host.\n");
-        cout << "Configure with -DDLIB_USE_NPU=ON, OpenVINO installed, to route them to an NPU.\n\n";
+        cout << "Configure with -DDLIB_USE_NPU=ON, OpenVINO installed, to route them to the NPU and the\n"
+             << "integrated GPU of the processor.\n\n";
         return;
     }
     npu::print_status(cout);
     if (npu::is_available())
-        cout << "Arithmetic on the device: " << (npu::uses_half_precision() ? "half" : "single")
-             << " precision. Operations that must not round stay on the host when it is half.\n";
+        cout << (npu::has_single_precision_device()
+                    ? "A device computes in single precision: the operations that must not round may run on it.\n"
+                    : "Every device computes in half precision: the operations that must not round stay on the\n"
+                      "host.\n");
     else
         cout << "No device was found, so every operation runs on the host. DLIB_NPU_DEVICE=CPU runs the\n"
-             << "device paths on the OpenVINO CPU plugin to see them at work anyway.\n";
+             << "device paths on the OpenVINO CPU plugin to see them at work anyway. Under WSL2, which\n"
+             << "exposes no NPU, the integrated GPU becomes visible once the Intel compute runtime is\n"
+             << "installed.\n";
     cout << "\n";
 }
 
@@ -187,15 +223,17 @@ void run_benchmark (int reps)
     }
     if (cuda_build)
     {
-        cout << "In a CUDA build, CUDA computes these operations and the NPU receives none.\n\n";
+        cout << "In a CUDA build, CUDA computes these operations and the devices receive none.\n\n";
         return;
     }
     dlib::rand rnd(7);
     const long B = 8, T = 128, D = 256, H = 4, HD = D / H, F = 4 * D, V = 4096;
     cout << "Shapes of a small decoder: batch " << B << ", " << T << " tokens, width " << D << ", " << H
          << " heads, feed-forward " << F << ", vocabulary " << V << ". Median of " << reps << " calls.\n";
-    cout << "  " << left << setw(44) << "operation" << right << setw(10) << "host ms" << setw(12) << "device ms"
-         << setw(10) << "speed-up" << setw(12) << "difference" << "\n";
+    cout << "  " << left << setw(44) << "operation" << right << setw(10) << "host ms";
+    for (const auto& name : npu::device_names())
+        cout << setw(12) << (name.substr(0, 8) + " ms");
+    cout << setw(10) << "speed-up" << setw(12) << "difference" << "\n";
 
     // The products of the linear layers: the token rows times a weight matrix.
     resizable_tensor x = random_tensor(rnd, B * T, D, 1, 1);

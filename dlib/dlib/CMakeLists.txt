@@ -158,7 +158,7 @@ if (NOT TARGET dlib)
    set (DLIB_USE_CUDA_COMPUTE_CAPABILITIES_STR
       "Set this to a comma-separated list of CUDA compute capabilities" )
    set (DLIB_USE_NPU_STR
-      "Disable this if you don't want dlib to route computations to an NPU through OpenVINO" )
+      "Disable this if you don't want dlib to route computations to the NPU and the Intel GPU of the processor through OpenVINO" )
    set (DLIB_BACKENDS_STR
       "AUTO, or the backends to build among CPU, CUDA and NPU, such as CPU/NPU or CPU/NPU/CUDA.  A list makes each accelerator it names mandatory and turns the others off." )
    set (DLIB_USE_MKL_SEQUENTIAL_STR
@@ -788,14 +788,14 @@ if (NOT TARGET dlib)
          if (NOT dlib_npu_problem)
             # cuda/npu_dlib.cpp is built as a separate object library (see the end of this
             # file) because it alone is compiled as C++17.
-            message(STATUS "Enabling NPU support for dlib.  DLIB WILL USE AN NPU when one is found at run time, through OpenVINO ${OpenVINO_VERSION}.")
+            message(STATUS "Enabling NPU support for dlib.  DLIB WILL USE THE NPU AND THE INTEL GPU of the processor when found at run time, through OpenVINO ${OpenVINO_VERSION}.")
             if (WIN32)
                message(STATUS "Programs built with NPU support load the OpenVINO runtime: add ${DLIB_OPENVINO_LIBRARY_DIR} to the PATH before running them.")
             endif()
          else()
             set(DLIB_USE_NPU OFF CACHE BOOL ${DLIB_USE_NPU_STR} FORCE)
             message(STATUS "${dlib_npu_problem}")
-            message(STATUS "Disabling NPU support for dlib.  DLIB WILL NOT USE AN NPU")
+            message(STATUS "Disabling NPU support for dlib.  DLIB WILL NOT USE THE NPU OR THE INTEL GPU of the processor.")
          endif()
       endif()
       if ("NPU" IN_LIST dlib_required_backends AND NOT DLIB_USE_NPU)

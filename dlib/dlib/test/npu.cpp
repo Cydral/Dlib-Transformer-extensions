@@ -12,7 +12,8 @@
 #include "tester.h"
 
 /*
-    Tests of the routing of tensor operations to an NPU (dlib/cuda/npu_dlib.h).
+    Tests of the routing of tensor operations to the NPU and the integrated GPU
+    (dlib/cuda/npu_dlib.h).
 
     The control functions are checked in every build. The device paths are checked when dlib
     is built with DLIB_USE_NPU, without CUDA, and a device is found: every operation is run
@@ -21,7 +22,10 @@
 
     A machine without an NPU runs the device paths on the OpenVINO CPU plugin:
         DLIB_NPU_DEVICE=CPU ./dtest --test_npu                         (single precision)
-        DLIB_NPU_DEVICE=CPU DLIB_NPU_PRECISION=f16 ./dtest --test_npu  (half precision)
+        DLIB_NPU_DEVICE=CPU:f16 ./dtest --test_npu                     (half precision)
+        DLIB_NPU_DEVICE=CPU:f16,CPU:f32 ./dtest --test_npu             (two devices)
+    With two devices, forced routing sends the operations that must not round to the second
+    one, the only one in single precision, and automatic routing times both.
 
     On an NPU or a GPU, an operation whose graph the device compiler refuses is left to the
     host and reported in the log (dtest -d writes it to debug.txt); with DLIB_NPU_VERBOSE=1,
@@ -54,6 +58,8 @@ namespace
         DLIB_TEST(!npu::is_compiled_in());
         DLIB_TEST(!npu::is_available());
         DLIB_TEST(npu::runtime_version().empty());
+        DLIB_TEST(npu::device_names().empty());
+        npu::restrict_to_device(0);
         DLIB_TEST(npu::get_routing() == npu::routing::never);
         npu::set_routing(npu::routing::always);
         DLIB_TEST(npu::get_routing() == npu::routing::never);
@@ -62,11 +68,15 @@ namespace
         if (npu::is_available())
         {
             DLIB_TEST(!npu::device_name().empty());
+            DLIB_TEST(!npu::device_names().empty());
+            DLIB_TEST(npu::uses_half_precision() || npu::has_single_precision_device());
         }
         else
         {
             DLIB_TEST(npu::device_name().empty());
+            DLIB_TEST(npu::device_names().empty());
             DLIB_TEST(!npu::uses_half_precision());
+            DLIB_TEST(!npu::has_single_precision_device());
         }
 
         {
@@ -134,7 +144,11 @@ namespace
         const std::string& op
     )
     {
-        return npu::device_name().compare(0, 3, "CPU") != 0 && refused_graphs(op) > 0;
+        bool beyond_cpu = false;
+        for (const auto& name : npu::device_names())
+            if (name.compare(0, 3, "CPU") != 0)
+                beyond_cpu = true;
+        return beyond_cpu && refused_graphs(op) > 0;
     }
 
     // The largest difference relative to the largest magnitude of the expected values. NaN and
@@ -227,11 +241,11 @@ namespace
             p[i] = static_cast<float>(order[i] - half) / 64.0f;
     }
 
-    // Whether the operations that must not round may run on the device in use.
+    // Whether the operations that must not round may run on a device in use.
     bool exact_on_device (
     )
     {
-        return !npu::uses_half_precision();
+        return npu::has_single_precision_device();
     }
 
     /*
@@ -651,6 +665,24 @@ namespace
         resizable_tensor pgrad = random_tensor(rnd, 2, 3, 13, 11);
         check("pooling_gradient", {&pgrad}, [&]{ maxp.get_gradient(gmax, pmax, pool_src, pgrad); });
         check("pooling_gradient", {&pgrad}, [&]{ avgp.get_gradient(gavg, pavg, pool_src, pgrad); });
+
+        // Ties, as after a rectifier: the gradient of each output goes to the first largest
+        // value of its window in row-major order, on the device as on the host, for windows
+        // that overlap and for windows that do not.
+        resizable_tensor ties(2, 3, 13, 11);
+        for (size_t i = 0; i < ties.size(); ++i)
+            ties.host()[i] = static_cast<float>(rnd.get_random_32bit_number() % 3);
+        tt::pooling square;
+        square.setup_max_pooling(2, 2, 2, 2, 0, 0);
+        for (tt::pooling* pool : {&maxp, &square})
+        {
+            resizable_tensor tmax;
+            npu::set_routing(npu::routing::never);
+            (*pool)(tmax, ties);
+            resizable_tensor tgi = random_tensor(rnd, tmax.num_samples(), tmax.k(), tmax.nr(), tmax.nc());
+            resizable_tensor tgrad = random_tensor(rnd, 2, 3, 13, 11);
+            check("pooling_gradient", {&tgrad}, [&]{ pool->get_gradient(tgi, tmax, ties, tgrad); });
+        }
     }
 
 // ----------------------------------------------------------------------------------------
@@ -988,6 +1020,62 @@ namespace
 
 // ----------------------------------------------------------------------------------------
 
+    /*
+        With several devices, automatic routing times each of them on a shape before it
+        chooses, and restrict_to_device() sends forced calls to the device it names.
+    */
+    void test_devices (
+        dlib::rand& rnd
+    )
+    {
+        const std::vector<std::string> names = npu::device_names();
+        if (names.size() < 2)
+            return;
+        const double tolerance = npu::uses_half_precision() ? 2e-2 : 1e-4;
+        resizable_tensor a = random_tensor(rnd, 256, 1, 1, 192), b = random_tensor(rnd, 192, 1, 1, 160);
+        resizable_tensor expected(256, 1, 1, 160), d(256, 1, 1, 160);
+        npu::set_routing(npu::routing::never);
+        tt::gemm(0, expected, 1, a, false, b, false);
+
+        auto calls = [](size_t i) -> unsigned long long
+        {
+            for (const auto& s : npu::get_statistics())
+                if (s.name == "gemm" && i < s.calls_by_device.size())
+                    return s.calls_by_device[i];
+            return 0;
+        };
+        std::vector<unsigned long long> before;
+        for (size_t i = 0; i < names.size(); ++i)
+            before.push_back(calls(i));
+
+        npu::set_routing(npu::routing::automatic);
+        for (int i = 0; i < 40; ++i)
+        {
+            print_spinner();
+            a.host();  // a changes from call to call as an activation does, b stays as a weight
+            tt::gemm(0, d, 1, a, false, b, false);
+            DLIB_TEST(relative_error(expected, d) <= tolerance);
+        }
+        npu::set_routing(npu::routing::never);
+        for (size_t i = 0; i < names.size(); ++i)
+            DLIB_TEST_MSG(calls(i) >= before[i] + 3 || refused_by_device("gemm"), names[i] << " was not timed");
+
+        for (size_t i = 0; i < names.size(); ++i)
+        {
+            print_spinner();
+            const unsigned long long n = calls(i);
+            npu::restrict_to_device(static_cast<int>(i));
+            npu::set_routing(npu::routing::always);
+            tt::gemm(0, d, 1, a, false, b, false);
+            npu::set_routing(npu::routing::never);
+            npu::restrict_to_device(-1);
+            DLIB_TEST(relative_error(expected, d) <= tolerance);
+            DLIB_TEST_MSG(calls(i) == n + 1 || refused_by_device("gemm"), names[i] << " did not take the call");
+        }
+    }
+
+// ----------------------------------------------------------------------------------------
+
     void test_guards (
         dlib::rand& rnd
     )
@@ -1099,7 +1187,7 @@ namespace
         npu_tester (
         ) :
             tester ("test_npu",
-                    "Runs tests on the routing of tensor operations to an NPU.")
+                    "Runs tests on the routing of tensor operations to the NPU and the integrated GPU.")
         {}
 
         void perform_test (
@@ -1131,6 +1219,7 @@ namespace
             test_attention_helpers(rnd);
             test_losses(rnd);
             test_residency(rnd);
+            test_devices(rnd);
             test_guards(rnd);
             test_training(rnd);
 
