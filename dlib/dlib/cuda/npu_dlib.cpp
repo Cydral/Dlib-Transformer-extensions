@@ -58,16 +58,6 @@
 #include <unordered_map>
 #include <vector>
 
-#include <cerrno>
-#include <fstream>
-#ifdef _WIN32
-#include "../windows_magic.h"
-#include <windows.h>
-#else
-#include <signal.h>
-#include <unistd.h>
-#endif
-
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 #define DLIB_NPU_X86 1
 #include <immintrin.h>
@@ -129,6 +119,7 @@ namespace dlib
 #endif
             }
 
+#ifdef _WIN32
             std::string to_utf8 (
                 const std::filesystem::path& p
             )
@@ -136,6 +127,7 @@ namespace dlib
                 const auto s = p.u8string();
                 return std::string(s.begin(), s.end());
             }
+#endif
 
             // An environment variable holding a path, as UTF-8 whatever the code page.
             std::string read_env_path (
@@ -897,7 +889,6 @@ namespace dlib
                 explicit graph (ov::element::Type t) : et(t) {}
 
                 const ov::element::Type et;
-                bool npu = false;   // built for an NPU, whose compiler some operations stopped
                 ov::ParameterVector parameters;
                 ov::ResultVector results;
 
@@ -1761,8 +1752,6 @@ namespace dlib
                 ov::AnyMap config;
                 bool enabled_auto[OP_COUNT] = {};
                 bool enabled_always[OP_COUNT] = {};
-                // Operations whose compilation stopped an earlier run, see load_stops().
-                bool stopped[OP_COUNT] = {};
                 // Memory the device reads without a copy, when its plugin offers it. Under the
                 // operands mutex.
                 bool has_context = false;
@@ -1788,7 +1777,6 @@ namespace dlib
                 std::string why_unavailable;
                 bool cache_enabled = true;
                 std::string cache_dir;
-                std::string journal_dir;         // the records of compilations, see load_stops()
                 size_t budget = size_t(2048) << 20;
                 int verbose = 0;
                 std::atomic<int> mode{static_cast<int>(routing::automatic)};
@@ -1821,6 +1809,14 @@ namespace dlib
                     device_info& d
                 ) const
                 {
+                    /*
+                        The compiler of an NPU stopped the program on the gradient for the data
+                        of a strided convolution, and computed that gradient wrongly once written
+                        as a convolution of stride one. An NPU takes none of the gradients of the
+                        convolutions and of the pooling, which only training needs and which the
+                        GPU computes faster: the other devices and the host keep them.
+                    */
+                    const bool npu = d.name.compare(0, 3, "NPU") == 0;
                     for (int op = 0; op < OP_COUNT; ++op)
                     {
                         bool a = false, w = false;
@@ -1832,6 +1828,12 @@ namespace dlib
                         }
                         if (overrides[op] > 0) { a = true; w = true; }
                         if (overrides[op] < 0) { a = false; w = false; }
+                        if (npu && (op == OP_conv_gradient_for_data || op == OP_conv_gradient_for_filters ||
+                            op == OP_pooling_gradient))
+                        {
+                            a = false;
+                            w = false;
+                        }
                         d.enabled_auto[op] = a;
                         d.enabled_always[op] = w;
                     }
@@ -1857,150 +1859,6 @@ namespace dlib
                 if (!present || base.empty()) return std::string();
                 return base + "/.cache/dlib/npu_cache";
 #endif
-            }
-
-            // Whether the process pid runs; one that cannot be inspected is taken as running.
-            bool process_runs (
-                unsigned long pid
-            )
-            {
-#ifdef _WIN32
-                HANDLE h = OpenProcess(SYNCHRONIZE, FALSE, static_cast<DWORD>(pid));
-                if (!h)
-                    return GetLastError() == ERROR_ACCESS_DENIED;
-                const bool runs = WaitForSingleObject(h, 0) == WAIT_TIMEOUT;
-                CloseHandle(h);
-                return runs;
-#else
-                return ::kill(static_cast<pid_t>(pid), 0) == 0 || errno == EPERM;
-#endif
-            }
-
-            unsigned long this_process (
-            )
-            {
-#ifdef _WIN32
-                return static_cast<unsigned long>(GetCurrentProcessId());
-#else
-                return static_cast<unsigned long>(::getpid());
-#endif
-            }
-
-            /*
-                A compiler or a driver that stops the program while it compiles a graph, as a
-                crash does, would stop every later run at the same graph. compile_entry() writes
-                a record of each compilation, compiling_<process>_<n>.txt in journal_dir, before
-                it starts, and removes it once the graph has run its first inference. A record
-                whose process no longer runs is that of a stop: load_stops() adds its line to
-                stopped.txt, and the device is no longer offered that operation while the device
-                and the version of OpenVINO stay the same. Deleting stopped.txt offers it again.
-            */
-            const char* const stops_name = "stopped.txt";
-
-            // The path of the record written, empty when none could be.
-            std::filesystem::path begin_record (
-                const runtime& r,
-                const device_info& dev,
-                const signature& sig
-            )
-            {
-                static std::atomic<unsigned long> records{0};
-                if (r.journal_dir.empty())
-                    return std::filesystem::path();
-                const std::filesystem::path path = std::filesystem::u8path(r.journal_dir) /
-                    ("compiling_" + std::to_string(this_process()) + "_" + std::to_string(++records) + ".txt");
-                std::ofstream out(path);
-                out << ov::get_openvino_version().buildNumber << '\t' << dev.full_name << '\t'
-                    << op_table[sig.op].name << '\t';
-                for (int i = 0; i < sig.p.n; ++i)
-                    out << (i ? " " : "") << sig.p.v[i];
-                out << '\n';
-                out.close();
-                return out ? path : std::filesystem::path();
-            }
-
-            void load_stops (
-                runtime& r
-            )
-            {
-                namespace fs = std::filesystem;
-                if (r.journal_dir.empty())
-                    return;
-                try
-                {
-                    std::error_code ec;
-                    const fs::path dir = fs::u8path(r.journal_dir);
-                    fs::create_directories(dir, ec);
-                    const fs::path stops = dir / stops_name;
-                    std::vector<fs::path> records;
-                    for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec))
-                    {
-                        const std::string name = to_utf8(it->path().filename());
-                        if (name.compare(0, 10, "compiling_") == 0)
-                            records.push_back(it->path());
-                    }
-                    for (const auto& path : records)
-                    {
-                        const std::string name = to_utf8(path.filename());
-                        unsigned long pid = 0;
-                        size_t i = 10;
-                        for (; i < name.size() && std::isdigit(static_cast<unsigned char>(name[i])); ++i)
-                            pid = pid * 10 + static_cast<unsigned long>(name[i] - '0');
-                        if (i == 10 || i >= name.size() || name[i] != '_')
-                            continue;
-                        // A record of this process can only be that of an earlier one of the same id.
-                        if (pid != this_process() && process_runs(pid))
-                            continue;
-                        std::string line;
-                        {
-                            std::ifstream in(path);
-                            std::getline(in, line);
-                        }
-                        if (!line.empty())
-                        {
-                            std::ofstream out(stops, std::ios::app);
-                            out << line << '\n';
-                        }
-                        fs::remove(path, ec);
-                    }
-
-                    const std::string version = ov::get_openvino_version().buildNumber;
-                    std::ifstream in(stops);
-                    std::string line;
-                    while (std::getline(in, line))
-                    {
-                        // The version of OpenVINO, the device, the operation and its shape.
-                        std::vector<std::string> field;
-                        std::stringstream fields(line);
-                        std::string part;
-                        while (std::getline(fields, part, '\t'))
-                            field.push_back(part);
-                        if (field.size() < 3 || field[0] != version)
-                            continue;
-                        for (auto& d : r.devices)
-                            for (int op = 0; op < OP_COUNT; ++op)
-                                if (d->full_name == field[1] && field[2] == op_table[op].name)
-                                    d->stopped[op] = true;
-                    }
-                    for (auto& d : r.devices)
-                    {
-                        for (int op = 0; op < OP_COUNT; ++op)
-                        {
-                            if (!d->stopped[op])
-                                continue;
-                            d->enabled_auto[op] = false;
-                            d->enabled_always[op] = false;
-                            r.counters[op].failures++;
-                            if (r.verbose > 0)
-                                std::cerr << "dlib: " << d->label << " leaves " << op_table[op].name
-                                    << " to the other devices and the host: compiling it stopped an earlier run, "
-                                    << "as " << to_utf8(stops) << " records" << std::endl;
-                        }
-                    }
-                }
-                catch (...)
-                {
-                }
             }
 
             runtime* make_runtime (
@@ -2053,8 +1911,6 @@ namespace dlib
                     r->cache_dir = default_cache_dir();
                     r->cache_enabled = !r->cache_dir.empty();
                 }
-                // The records of compilations stay in the default directory without a cache.
-                r->journal_dir = r->cache_enabled ? r->cache_dir : default_cache_dir();
 
                 v = read_env("DLIB_NPU_OPS", present);
                 if (present)
@@ -2253,7 +2109,6 @@ namespace dlib
                     }
                     std::cerr << std::endl;
                 }
-                load_stops(*r);
                 return r;
             }
 
@@ -2331,6 +2186,26 @@ namespace dlib
                 std::cerr << sout.str() << std::flush;
             }
 
+            /*
+                The message of a plugin exception on one line, so that a log filtered line by line
+                keeps the reason, which OpenVINO writes after the source location of the throw.
+            */
+            std::string one_line (
+                const std::exception& ex
+            )
+            {
+                std::string text;
+                for (const char* s = ex.what(); *s && text.size() < 400; ++s)
+                {
+                    const bool space = *s == '\n' || *s == '\r' || *s == '\t';
+                    if (!space)
+                        text += *s;
+                    else if (!text.empty() && text.back() != ' ')
+                        text += ' ';
+                }
+                return text;
+            }
+
             void compile_entry (
                 runtime& r,
                 const std::shared_ptr<entry>& e
@@ -2348,20 +2223,8 @@ namespace dlib
                 } done{r.compiling};
                 try
                 {
-                    // Removed once the graph has run; left behind by a stop, see load_stops().
-                    struct compile_record
-                    {
-                        std::filesystem::path path;
-                        ~compile_record ()
-                        {
-                            std::error_code ec;
-                            if (!path.empty())
-                                std::filesystem::remove(path, ec);
-                        }
-                    } record{begin_record(r, dev, e->sig)};
                     if (tracing) trace(dev, e->sig, "compiling");
                     graph g(dev.half ? ov::element::f16 : ov::element::f32);
-                    g.npu = dev.name.compare(0, 3, "NPU") == 0;
                     e->sig.build(g, e->sig.p);
                     auto model = std::make_shared<ov::Model>(g.results, g.parameters, std::string("dlib_") + info.name);
                     ov::CompiledModel compiled = r.core->compile_model(model, dev.name, dev.config);
@@ -2465,7 +2328,7 @@ namespace dlib
                     if (r.verbose > 0)
                         std::cerr << "dlib: " << dev.name << " could not compile " << info.name
                             << ", the other devices and the host keep it: "
-                            << std::string(ex.what()).substr(0, 400) << std::endl;
+                            << one_line(ex) << std::endl;
                 }
             }
 
@@ -3074,7 +2937,7 @@ namespace dlib
                     if (r.verbose > 0)
                         std::cerr << "dlib: " << r.devices[target]->name << " failed to run " << op_table[op].name
                             << ", the other devices and the host keep it: "
-                            << std::string(ex.what()).substr(0, 400) << std::endl;
+                            << one_line(ex) << std::endl;
                     ok = false;
                 }
                 const long long dt = now_ns() - t0;
@@ -3756,17 +3619,6 @@ namespace dlib
                 for (const auto& d : r.devices)
                     out << "  device   : " << d->name << ", " << d->full_name << ", " << (d->half ? "f16" : "f32")
                         << " exchange, " << (d->single ? "single" : "half") << " precision arithmetic\n";
-                for (const auto& d : r.devices)
-                {
-                    std::string names;
-                    for (int op = 0; op < OP_COUNT; ++op)
-                        if (d->stopped[op])
-                            names += (names.empty() ? "" : ", ") + std::string(op_table[op].name);
-                    if (!names.empty())
-                        out << "  stopped  : " << d->label << " no longer takes " << names
-                            << ", whose compilation stopped an earlier run (" << stops_name << " in "
-                            << r.journal_dir << ")\n";
-                }
                 const int only = r.restricted.load();
                 out << "  routing  : " << (m == static_cast<int>(routing::always) ? "always" :
                                            m == static_cast<int>(routing::never) ? "never" : "automatic")
@@ -3912,11 +3764,6 @@ namespace dlib
                 c.reused = 0; c.device_ns = 0; c.compile_ns = 0; c.touched = false;
                 for (auto& d : c.by_device) d = 0;
             }
-            // An operation a device no longer takes after a stop keeps counting as refused.
-            for (const auto& d : r.devices)
-                for (int op = 0; op < OP_COUNT; ++op)
-                    if (d->stopped[op])
-                        r.counters[op].failures++;
             {
                 std::lock_guard<std::mutex> lock(r.operands_mutex);
                 r.operand_conversions = 0;
@@ -5852,73 +5699,19 @@ namespace dlib
                     ov::Strides{1, 1}, ov::op::PadType::EXPLICIT));
             }
 
-            /*
-                The adjoint of a convolution of stride (sy, sx) and padding (py, px) over planes
-                of h x w, applied to y, the [n, c, oh, ow] gradient of its output, with kernel
-                laid out as [c, outputs, kh, kw]: a transposed convolution, which gives
-                [n, outputs, h, w]. For an NPU it is written as a convolution of stride one,
-                since a compiler of NPU stopped the program on the transposed one: the values of
-                y are spread sy rows and sx columns apart, and a convolution with the kernel,
-                its first two axes swapped and its rows and columns reversed, gathers them. That
-                form also computes the products with the zeros it spreads, sy * sx times the
-                work of the transposed convolution, which the other devices compute as it is.
-            */
-            node transposed_conv (
-                graph& g,
-                const node& y,
-                const node& kernel,
-                int64_t n,
-                int64_t c,
-                int64_t oh,
-                int64_t ow,
-                int64_t h,
-                int64_t w,
-                int64_t kh,
-                int64_t kw,
-                int64_t sy,
-                int64_t sx,
-                int64_t py,
-                int64_t px
-            )
-            {
-                // The rows and columns the values of y cover once spread.
-                const int64_t ly = sy * (oh - 1) + 1, lx = sx * (ow - 1) + 1;
-                if (!g.npu)
-                {
-                    return std::make_shared<ov::op::v1::ConvolutionBackpropData>(y, kernel,
-                        ov::Strides{static_cast<size_t>(sy), static_cast<size_t>(sx)},
-                        ov::CoordinateDiff{py, px}, ov::CoordinateDiff{py, px}, ov::Strides{1, 1},
-                        ov::op::PadType::EXPLICIT,
-                        ov::CoordinateDiff{h + 2 * py - (ly + kh - 1), w + 2 * px - (lx + kw - 1)});
-                }
-                node spread = y;
-                if (sx > 1)
-                    spread = g.concat({g.reshape(y, {n * c * oh, ow, 1}),
-                        g.broadcast(g.c(0), {n * c * oh, ow, sx - 1})}, 2);
-                if (sy > 1)
-                    spread = g.concat({g.reshape(spread, {n * c, oh, 1, sx * ow}),
-                        g.broadcast(g.c(0), {n * c, oh, sy - 1, sx * ow})}, 2);
-                if (sx > 1 || sy > 1)
-                    spread = g.slice(g.reshape(spread, {n, c, sy * oh, sx * ow}), {0, 0}, {ly, lx}, {2, 3});
-                std::vector<int64_t> rows(static_cast<size_t>(kh)), cols(static_cast<size_t>(kw));
-                for (int64_t i = 0; i < kh; ++i)
-                    rows[static_cast<size_t>(i)] = kh - 1 - i;
-                for (int64_t i = 0; i < kw; ++i)
-                    cols[static_cast<size_t>(i)] = kw - 1 - i;
-                const node reversed = g.gather(g.gather(g.transpose(kernel, {1, 0, 2, 3}), graph::ints(rows), 2),
-                    graph::ints(cols), 3);
-                return std::make_shared<ov::op::v1::Convolution>(spread, reversed, ov::Strides{1, 1},
-                    ov::CoordinateDiff{kh - 1 - py, kw - 1 - px}, ov::CoordinateDiff{h + py - ly, w + px - lx},
-                    ov::Strides{1, 1}, ov::op::PadType::EXPLICIT);
-            }
-
             void build_conv_data (graph& g, const params& p)
             {
                 const int64_t h = p[2], w = p[3], kh = p[5], kw = p[6], sy = p[7], sx = p[8], py = p[9], px = p[10];
                 const int64_t oh = p[11], ow = p[12];
                 const node gi = g.input({p[0], p[4], oh, ow});
                 const node f = g.input({p[4], p[1], kh, kw});
-                g.output(transposed_conv(g, gi, f, p[0], p[4], oh, ow, h, w, kh, kw, sy, sx, py, px));
+                // The rows and columns of the input no window reaches, after the last stride.
+                const int64_t extra_y = h - (sy * (oh - 1) + kh - 2 * py);
+                const int64_t extra_x = w - (sx * (ow - 1) + kw - 2 * px);
+                g.output(std::make_shared<ov::op::v1::ConvolutionBackpropData>(gi, f,
+                    ov::Strides{static_cast<size_t>(sy), static_cast<size_t>(sx)},
+                    ov::CoordinateDiff{py, px}, ov::CoordinateDiff{py, px}, ov::Strides{1, 1},
+                    ov::op::PadType::EXPLICIT, ov::CoordinateDiff{extra_y, extra_x}));
             }
 
             void build_conv_filters (graph& g, const params& p)
@@ -6043,8 +5836,13 @@ namespace dlib
                     for (int64_t i = 0; i < kh * kw; ++i)
                         one_hot[static_cast<size_t>(i * kh * kw + i)] = 1.0f;
                     const node kernel = g.constant({kh * kw, 1, kh, kw}, one_hot);
-                    const node placed = transposed_conv(g, g.concat(routed, 1), kernel, planes, kh * kw, oh, ow,
-                        h, w, kh, kw, sy, sx, py, px);
+                    // The rows and columns of the input no window reaches, after the last stride.
+                    const int64_t extra_y = h - (sy * (oh - 1) + kh - 2 * py);
+                    const int64_t extra_x = w - (sx * (ow - 1) + kw - 2 * px);
+                    const node placed = std::make_shared<ov::op::v1::ConvolutionBackpropData>(g.concat(routed, 1),
+                        kernel, ov::Strides{static_cast<size_t>(sy), static_cast<size_t>(sx)},
+                        ov::CoordinateDiff{py, px}, ov::CoordinateDiff{py, px}, ov::Strides{1, 1},
+                        ov::op::PadType::EXPLICIT, ov::CoordinateDiff{extra_y, extra_x});
                     g.output(g.reshape(placed, {planes, h * w}));
                 }
                 else
@@ -6683,10 +6481,7 @@ namespace dlib
             const int64_t n = sz(data_gradient.num_samples()), ch = sz(data_gradient.k());
             const int64_t h = sz(data_gradient.nr()), w = sz(data_gradient.nc());
             const int64_t o = sz(filters.num_samples()), kh = sz(filters.nr()), kw = sz(filters.nc());
-            // The graph of an NPU pads the spread gradient by the kernel size minus the padding.
             if (data_gradient.size() == 0 || filters.k() != ch || stride_y <= 0 || stride_x <= 0 ||
-                padding_y < 0 || padding_x < 0 || padding_y >= kh || padding_x >= kw ||
-                h + 2 * padding_y < kh || w + 2 * padding_x < kw ||
                 is_same_object(data_gradient, filters) || is_same_object(data_gradient, gradient_input))
                 return false;
             const int64_t oh = 1 + (h + 2 * padding_y - kh) / stride_y, ow = 1 + (w + 2 * padding_x - kw) / stride_x;

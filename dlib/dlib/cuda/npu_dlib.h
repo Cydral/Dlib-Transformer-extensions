@@ -34,15 +34,9 @@
           device, and only a check that finds another of them faster times them again on a
           few calls before choosing. A choice that the load of the machine distorted does not
           last.
-        - A compiler or a driver may stop the program while it compiles a graph, as a crash
-          does, and it would then stop every later run at the same graph. A record of each
-          compilation is written before it starts, in the cache directory, and removed once
-          the graph has run. The next run finds the record of a process that no longer runs,
-          adds it to stopped.txt in that directory, and no longer offers that operation to
-          that device, even when DLIB_NPU_OPS names it, as long as the device and the version
-          of OpenVINO stay the same. print_status() lists these operations; deleting
-          stopped.txt offers them again. A program interrupted while it compiles a graph
-          leaves the same record.
+        - An NPU is offered neither the gradients of the convolutions nor those of the pooling,
+          which only training needs, even when DLIB_NPU_OPS names them: its compiler stopped
+          the program on one of them. The GPU or the host computes them.
         - Shapes that change from call to call, such as a growing sequence, are padded up to a
           small set of sizes, so that the number of graphs stays bounded.
         - The operands of the products and of the convolutions that keep their values from one
@@ -95,8 +89,7 @@
                             f32 on CPU.
         DLIB_NPU_CACHE_DIR  directory of the compiled graph cache, dlib/npu_cache under the user
                             cache folder by default (LOCALAPPDATA on Windows, XDG_CACHE_HOME or
-                            ~/.cache elsewhere). An empty value disables the cache; the records
-                            of the compilations, see above, then stay in the default directory.
+                            ~/.cache elsewhere). An empty value disables it.
         DLIB_NPU_OPS        comma separated operation names to enable in auto routing, or to
                             disable when prefixed with '-', e.g. "split_heads,-softmax". A name
                             listed here is enabled whatever the precision of the device, for the

@@ -248,6 +248,16 @@ namespace
         return npu::has_single_precision_device();
     }
 
+    // Whether a device in use takes the gradients of convolutions and pooling, which no NPU does.
+    bool spatial_gradients_on_device (
+    )
+    {
+        for (const auto& name : npu::device_names())
+            if (name.compare(0, 3, "NPU") != 0)
+                return true;
+        return false;
+    }
+
     /*
         Runs compute twice from the same values of the tensors in io, which it reads or writes:
         on the host, then with every operation forced on the device. Checks that op ran on the
@@ -630,9 +640,9 @@ namespace
         resizable_tensor gi = random_tensor(rnd, out.num_samples(), out.k(), out.nr(), out.nc());
         resizable_tensor data_grad = random_tensor(rnd, 2, 3, 13, 11), filters_grad = random_tensor(rnd, 4, 3, 3, 3);
         check("conv_gradient_for_data", {&data_grad},
-            [&]{ conv.get_gradient_for_data(true, gi, filters, data_grad); }, 2);
+            [&]{ conv.get_gradient_for_data(true, gi, filters, data_grad); }, 2, spatial_gradients_on_device());
         check("conv_gradient_for_filters", {&filters_grad},
-            [&]{ conv.get_gradient_for_filters(false, gi, data, filters_grad); }, 3);
+            [&]{ conv.get_gradient_for_filters(false, gi, data, filters_grad); }, 3, spatial_gradients_on_device());
 
         // A stride that does not divide the padded width leaves the last columns of the input
         // out of every window, which the gradient for the data gives back as zeros.
@@ -644,10 +654,10 @@ namespace
         strided(false, wout, data, wide);
         resizable_tensor wgi = random_tensor(rnd, wout.num_samples(), wout.k(), wout.nr(), wout.nc());
         check("conv_gradient_for_data", {&data_grad},
-            [&]{ strided.get_gradient_for_data(false, wgi, wide, data_grad); }, 2);
+            [&]{ strided.get_gradient_for_data(false, wgi, wide, data_grad); }, 2, spatial_gradients_on_device());
         resizable_tensor wide_grad = random_tensor(rnd, 4, 3, 5, 5);
         check("conv_gradient_for_filters", {&wide_grad},
-            [&]{ strided.get_gradient_for_filters(true, wgi, data, wide_grad); }, 3);
+            [&]{ strided.get_gradient_for_filters(true, wgi, data, wide_grad); }, 3, spatial_gradients_on_device());
 
         resizable_tensor pool_src(2, 3, 13, 11);
         fill_distinct(pool_src, rnd);
@@ -663,8 +673,10 @@ namespace
         resizable_tensor gmax = random_tensor(rnd, pmax.num_samples(), pmax.k(), pmax.nr(), pmax.nc());
         resizable_tensor gavg = random_tensor(rnd, pavg.num_samples(), pavg.k(), pavg.nr(), pavg.nc());
         resizable_tensor pgrad = random_tensor(rnd, 2, 3, 13, 11);
-        check("pooling_gradient", {&pgrad}, [&]{ maxp.get_gradient(gmax, pmax, pool_src, pgrad); });
-        check("pooling_gradient", {&pgrad}, [&]{ avgp.get_gradient(gavg, pavg, pool_src, pgrad); });
+        check("pooling_gradient", {&pgrad}, [&]{ maxp.get_gradient(gmax, pmax, pool_src, pgrad); }, 1,
+            spatial_gradients_on_device());
+        check("pooling_gradient", {&pgrad}, [&]{ avgp.get_gradient(gavg, pavg, pool_src, pgrad); }, 1,
+            spatial_gradients_on_device());
 
         // Ties, as after a rectifier: the gradient of each output goes to the first largest
         // value of its window in row-major order, on the device as on the host, for windows
@@ -681,7 +693,8 @@ namespace
             (*pool)(tmax, ties);
             resizable_tensor tgi = random_tensor(rnd, tmax.num_samples(), tmax.k(), tmax.nr(), tmax.nc());
             resizable_tensor tgrad = random_tensor(rnd, 2, 3, 13, 11);
-            check("pooling_gradient", {&tgrad}, [&]{ pool->get_gradient(tgi, tmax, ties, tgrad); });
+            check("pooling_gradient", {&tgrad}, [&]{ pool->get_gradient(tgi, tmax, ties, tgrad); }, 1,
+                spatial_gradients_on_device());
         }
     }
 
