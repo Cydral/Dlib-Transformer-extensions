@@ -26,7 +26,10 @@ namespace dlib
 {
     inline const std::string& default_chat_web_ui()
     {
-        static const std::string page = R"dlibui(<!DOCTYPE html>
+        /* The page is written as several literals, joined when it is first requested: MSVC
+           limits a string literal to 16380 characters and a concatenation of literals to
+           65535. */
+        static const std::string page = std::string(R"dlibui(<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -187,7 +190,7 @@ border-radius:10px;color:var(--text);padding:9px 11px;font-family:inherit;font-s
 .modal .btns button{padding:8px 18px;border-radius:11px;font-size:13.5px;background:var(--panel2);border:1px solid var(--line)}
 .modal .btns .primary{background:var(--grad);border-color:transparent;color:#fff;font-weight:600}
 .modal p{font-size:13.5px;color:var(--dim);line-height:1.6;margin:6px 0}
-.modal a{color:var(--accent)}
+)dlibui") + R"dlibui(.modal a{color:var(--accent)}
 .modal .hint{font-size:11.5px;color:var(--dim);margin-top:4px;line-height:1.5}
 .modal .srow{display:flex;gap:8px}
 .modal .srow span{flex:1;display:flex;flex-direction:column;gap:2px}
@@ -383,7 +386,7 @@ function resetDatabase(){
     await new Promise(r=>{const q=indexedDB.deleteDatabase('dlib_chat');
       q.onsuccess=q.onerror=q.onblocked=()=>r()});
     localStorage.removeItem('dlib_chat_settings');
-    location.reload();
+)dlibui" + R"dlibui(    location.reload();
   });
 }
 
@@ -646,7 +649,7 @@ async function extractPptx(buf){
 /* Converts one attached document to text, by extension. Returns {text, format}. */
 async function convertToText(f){
   const ext=(f.name.split('.').pop()||'').toLowerCase();
-  const buf=await f.arrayBuffer();
+)dlibui" + R"dlibui(  const buf=await f.arrayBuffer();
   if(ext==='docx')return{text:await extractDocx(buf),format:'DOCX'};
   if(ext==='xlsx'||ext==='xls')return{text:await extractXlsx(buf),format:'XLSX'};
   if(ext==='pptx')return{text:await extractPptx(buf),format:'PPTX'};

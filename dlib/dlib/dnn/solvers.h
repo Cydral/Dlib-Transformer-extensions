@@ -1048,21 +1048,7 @@ namespace dlib
         {
             std::string version;
             deserialize(version, in);
-            if (version == "adamw")
-            {
-                item.type = network_context::optimizer_type::adamw;
-                item.adamw_solver.deserialize_state(in);
-            }
-            else if (version == "adam_atan2")
-            {
-                item.type = network_context::optimizer_type::adam_atan2;
-                item.atan2_solver.deserialize_state(in);
-            }
-            else
-            {
-                throw serialization_error("Unexpected version '" + version +
-                    "' found while deserializing dlib::subnet_solver.");
-            }
+            item.deserialize_state(version, in);
         }
 
         friend std::ostream& operator<< (std::ostream& out, const subnet_solver& item)
@@ -1075,6 +1061,28 @@ namespace dlib
         }
 
     private:
+        /* Reads the state that follows the tag into the solver the tag names. The friendship
+           adamw and adam_atan2 grant to this class covers its member functions on every
+           compiler, while MSVC denies it to the friend functions defined in the class. */
+        void deserialize_state(const std::string& version, std::istream& in)
+        {
+            if (version == "adamw")
+            {
+                type = network_context::optimizer_type::adamw;
+                adamw_solver.deserialize_state(in);
+            }
+            else if (version == "adam_atan2")
+            {
+                type = network_context::optimizer_type::adam_atan2;
+                atan2_solver.deserialize_state(in);
+            }
+            else
+            {
+                throw serialization_error("Unexpected version '" + version +
+                    "' found while deserializing dlib::subnet_solver.");
+            }
+        }
+
         network_context::optimizer_type type;
         adamw adamw_solver;
         adam_atan2 atan2_solver;

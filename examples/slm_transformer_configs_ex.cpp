@@ -295,16 +295,19 @@ moe_param_info get_moe_param_info(const net_type& net, long num_layers)
 }
 
 // SFINAE helper: prints MoE analysis when the network has a MoE layer at position 4,
-// and silently does nothing for other architectures (e.g. HRM).
+// and silently does nothing for other architectures (e.g. HRM). The last argument, an int,
+// prefers the first overload whenever it is viable; the network is passed by reference to
+// both, since a class object cannot portably go through a C variadic argument.
 template <typename net_type>
-auto try_print_moe_info(const net_type& net, long num_layers)
+auto try_print_moe_info(const net_type& net, long num_layers, int)
 -> decltype(layer<4>(net).layer_details().num_experts(), void())
 {
     auto info = get_moe_param_info(net, num_layers);
     if (info.num_experts > 0) info.print();
 }
 
-inline void try_print_moe_info(...) {}
+template <typename net_type>
+void try_print_moe_info(const net_type&, long, long) {}
 
 // Type-dependent training and generation logic, called once from main() with the concrete
 // transformer config selected by --arch. Each call site in main() compiles a completely
@@ -621,7 +624,7 @@ int run_pipeline(
         cout << "Number of model parameters: " << count_parameters(net) << "\n";
 
         // Display MoE expert usage and balance statistics (no-op for HRM)
-        try_print_moe_info(net, num_layers);
+        try_print_moe_info(net, num_layers, 0);
 
         if (tokenizer.get_vocab_size() == 0) {
             cerr << "Error: Tokenizer not loaded.\n";
