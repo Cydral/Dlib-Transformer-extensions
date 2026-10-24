@@ -34,9 +34,16 @@
           device, and only a check that finds another of them faster times them again on a
           few calls before choosing. A choice that the load of the machine distorted does not
           last.
-        - An NPU is offered neither the gradients of the convolutions nor those of the pooling,
-          which only training needs, even when DLIB_NPU_OPS names them: its compiler stopped
-          the program on one of them. The GPU or the host computes them.
+        - An NPU takes only the operations it computed correctly in the tests of dlib: the
+          products and the convolutions, the activations and their gradients, softmax, the
+          normalizations and the elementwise arithmetic. Its compiler stopped the program on
+          the gradient of a strided convolution and on an average pooling: the GPU or the host
+          computes the pooling, the gradients of the convolutions and of the pooling, the
+          rotary embeddings, the adaptive halting and the losses, even when DLIB_NPU_OPS names
+          them.
+        - A device whose plugin cannot compile a graph leaves that operation to the other
+          devices and the host, and DLIB_NPU_VERBOSE=1 gives the reason the plugin returns:
+          the GPU plugin, for instance, implements no matrix inversion.
         - Shapes that change from call to call, such as a growing sequence, are padded up to a
           small set of sizes, so that the number of graphs stays bounded.
         - The operands of the products and of the convolutions that keep their values from one
@@ -95,7 +102,8 @@
                             listed here is enabled whatever the precision of the device, for the
                             operations that must not round too, but a linear combination that
                             assigns one of its operands still stays on the host in half
-                            precision. print_status() gives the names.
+                            precision, and an NPU still takes only the operations of its list,
+                            see above. print_status() gives the names.
         DLIB_NPU_SYNC       1 compiles a graph on the call that needs it instead of in the
                             background.
         DLIB_NPU_MEMORY_MB  budget of the buffers held by compiled graphs, 2048 by default.
@@ -219,7 +227,8 @@ namespace dlib
                   operations. It is meant for tests and measurements.
                 - The operations that must not round, data movement included, are never
                   routed to a device that computes in half precision, whatever the mode,
-                  unless DLIB_NPU_OPS names them.
+                  unless DLIB_NPU_OPS names them. An NPU takes none of them in any case: it
+                  takes only the operations of its list, see the top of this file.
         !*/
 
         routing get_routing (

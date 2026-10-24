@@ -730,106 +730,110 @@ namespace dlib
 
             /*
                 One line per operation: its name, which DLIB_NPU_OPS and print_status() use, its
-                class, and the size from which automatic routing considers it, in elements, or
-                in multiply-accumulates for the products and the convolutions.
+                class, the size from which automatic routing considers it, in elements, or in
+                multiply-accumulates for the products and the convolutions, and whether an NPU
+                takes it. An NPU takes only the operations it computed correctly in the tests,
+                since its compiler stopped the program on the gradient for the data of a strided
+                convolution and on an average pooling. The GPU and the host keep the others, even
+                when DLIB_NPU_OPS names them.
             */
 #define DLIB_NPU_OPERATIONS(X) \
-            X(inverse_norms,                   compute,  1 << 16) \
-            X(inverse_sqrt,                    compute,  1 << 16) \
-            X(divide_by_sqrt,                  exact,    1 << 16) \
-            X(dot_prods,                       compute,  1 << 16) \
-            X(scale_columns,                   compute,  1 << 16) \
-            X(scale_rows,                      compute,  1 << 16) \
-            X(scale_rows2,                     compute,  1 << 16) \
-            X(exp,                             compute,  1 << 16) \
-            X(log,                             compute,  1 << 16) \
-            X(log10,                           compute,  1 << 16) \
-            X(gemm,                            compute,  1 << 21) \
-            X(multiply,                        compute,  1 << 16) \
-            X(scale_channels,                  compute,  1 << 16) \
-            X(multiply_conv,                   compute,  1 << 16) \
-            X(multiply_zero_padded,            compute,  1 << 16) \
-            X(affine_transform,                compute,  1 << 16) \
-            X(affine_transform_conv,           compute,  1 << 16) \
-            X(adam,                            exact,    1 << 16) \
-            X(adam_atan2,                      exact,    1 << 16) \
-            X(batch_normalize_inference,       compute,  1 << 16) \
-            X(batch_normalize,                 compute,  1 << 16) \
-            X(batch_normalize_gradient,        compute,  1 << 16) \
-            X(batch_normalize_conv_inference,  compute,  1 << 16) \
-            X(batch_normalize_conv,            compute,  1 << 16) \
-            X(batch_normalize_conv_gradient,   compute,  1 << 16) \
-            X(layer_normalize,                 compute,  1 << 16) \
-            X(layer_normalize_gradient,        compute,  1 << 16) \
-            X(rms_normalize,                   compute,  1 << 16) \
-            X(rms_normalize_gradient,          compute,  1 << 16) \
-            X(threshold,                       exact,    1 << 16) \
-            X(dot,                             compute,  1 << 16) \
-            X(add,                             compute,  1 << 16) \
-            X(assign_bias_gradient,            compute,  1 << 16) \
-            X(assign_conv_bias_gradient,       compute,  1 << 16) \
-            X(softmax,                         compute,  1 << 16) \
-            X(softmax_gradient,                compute,  1 << 16) \
-            X(softmax_all,                     compute,  1 << 16) \
-            X(softmax_all_gradient,            compute,  1 << 16) \
-            X(sigmoid,                         compute,  1 << 16) \
-            X(sigmoid_gradient,                compute,  1 << 16) \
-            X(mish,                            compute,  1 << 16) \
-            X(mish_gradient,                   compute,  1 << 16) \
-            X(relu,                            compute,  1 << 16) \
-            X(relu_gradient,                   compute,  1 << 16) \
-            X(prelu,                           compute,  1 << 16) \
-            X(prelu_gradient,                  compute,  1 << 16) \
-            X(leaky_relu,                      compute,  1 << 16) \
-            X(leaky_relu_gradient,             compute,  1 << 16) \
-            X(tanh,                            compute,  1 << 16) \
-            X(tanh_gradient,                   compute,  1 << 16) \
-            X(clipped_relu,                    compute,  1 << 16) \
-            X(clipped_relu_gradient,           compute,  1 << 16) \
-            X(elu,                             compute,  1 << 16) \
-            X(elu_gradient,                    compute,  1 << 16) \
-            X(gelu,                            compute,  1 << 16) \
-            X(gelu_gradient,                   compute,  1 << 16) \
-            X(smelu,                           compute,  1 << 16) \
-            X(smelu_gradient,                  compute,  1 << 16) \
-            X(silu,                            compute,  1 << 16) \
-            X(silu_gradient,                   compute,  1 << 16) \
-            X(resize_bilinear,                 compute,  1 << 16) \
-            X(resize_bilinear_gradient,        compute,  1 << 16) \
-            X(reorg,                           movement, 1 << 16) \
-            X(reorg_gradient,                  movement, 1 << 16) \
-            X(copy_tensor,                     movement, 1 << 16) \
-            X(inv,                             exact,    1 << 21) \
-            X(transpose,                       movement, 1 << 16) \
-            X(embeddings,                      movement, 1 << 16) \
-            X(embeddings_gradient,             exact,    1 << 16) \
-            X(puzzle_embeddings,               movement, 1 << 16) \
-            X(puzzle_embeddings_gradient,      exact,    1 << 16) \
-            X(repeat_channels,                 movement, 1 << 16) \
-            X(accumulate_repeated_channels,    movement, 1 << 16) \
-            X(compute_halt_logits,             compute,  1 << 16) \
-            X(compute_halt_gradient,           compute,  1 << 16) \
-            X(accumulate_weighted_state,       compute,  1 << 16) \
-            X(apply_act_depth_scaling,         compute,  1 << 16) \
-            X(broadcast_row,                   movement, 1 << 16) \
-            X(act_mark_active,                 movement, 1 << 16) \
-            X(act_update_halting,              exact,    1 << 16) \
-            X(act_gather_final_state,          movement, 1 << 16) \
-            X(act_accumulate_output_grad,      compute,  1 << 16) \
-            X(rotary_embedding,                compute,  1 << 16) \
-            X(split_heads,                     movement, 1 << 16) \
-            X(merge_heads,                     movement, 1 << 16) \
-            X(conv,                            compute,  1 << 21) \
-            X(conv_gradient_for_data,          compute,  1 << 21) \
-            X(conv_gradient_for_filters,       compute,  1 << 21) \
-            X(pooling,                         compute,  1 << 16) \
-            X(pooling_gradient,                compute,  1 << 16) \
-            X(cross_entropy,                   compute,  1 << 16) \
-            X(mean_squared,                    compute,  1 << 16)
+            X(inverse_norms,                   compute,  1 << 16,  true) \
+            X(inverse_sqrt,                    compute,  1 << 16,  true) \
+            X(divide_by_sqrt,                  exact,    1 << 16,  false) \
+            X(dot_prods,                       compute,  1 << 16,  true) \
+            X(scale_columns,                   compute,  1 << 16,  true) \
+            X(scale_rows,                      compute,  1 << 16,  true) \
+            X(scale_rows2,                     compute,  1 << 16,  true) \
+            X(exp,                             compute,  1 << 16,  true) \
+            X(log,                             compute,  1 << 16,  true) \
+            X(log10,                           compute,  1 << 16,  true) \
+            X(gemm,                            compute,  1 << 21,  true) \
+            X(multiply,                        compute,  1 << 16,  true) \
+            X(scale_channels,                  compute,  1 << 16,  true) \
+            X(multiply_conv,                   compute,  1 << 16,  true) \
+            X(multiply_zero_padded,            compute,  1 << 16,  true) \
+            X(affine_transform,                compute,  1 << 16,  true) \
+            X(affine_transform_conv,           compute,  1 << 16,  true) \
+            X(adam,                            exact,    1 << 16,  false) \
+            X(adam_atan2,                      exact,    1 << 16,  false) \
+            X(batch_normalize_inference,       compute,  1 << 16,  true) \
+            X(batch_normalize,                 compute,  1 << 16,  true) \
+            X(batch_normalize_gradient,        compute,  1 << 16,  true) \
+            X(batch_normalize_conv_inference,  compute,  1 << 16,  true) \
+            X(batch_normalize_conv,            compute,  1 << 16,  true) \
+            X(batch_normalize_conv_gradient,   compute,  1 << 16,  true) \
+            X(layer_normalize,                 compute,  1 << 16,  true) \
+            X(layer_normalize_gradient,        compute,  1 << 16,  true) \
+            X(rms_normalize,                   compute,  1 << 16,  true) \
+            X(rms_normalize_gradient,          compute,  1 << 16,  true) \
+            X(threshold,                       exact,    1 << 16,  false) \
+            X(dot,                             compute,  1 << 16,  true) \
+            X(add,                             compute,  1 << 16,  true) \
+            X(assign_bias_gradient,            compute,  1 << 16,  true) \
+            X(assign_conv_bias_gradient,       compute,  1 << 16,  true) \
+            X(softmax,                         compute,  1 << 16,  true) \
+            X(softmax_gradient,                compute,  1 << 16,  true) \
+            X(softmax_all,                     compute,  1 << 16,  true) \
+            X(softmax_all_gradient,            compute,  1 << 16,  true) \
+            X(sigmoid,                         compute,  1 << 16,  true) \
+            X(sigmoid_gradient,                compute,  1 << 16,  true) \
+            X(mish,                            compute,  1 << 16,  true) \
+            X(mish_gradient,                   compute,  1 << 16,  true) \
+            X(relu,                            compute,  1 << 16,  true) \
+            X(relu_gradient,                   compute,  1 << 16,  true) \
+            X(prelu,                           compute,  1 << 16,  true) \
+            X(prelu_gradient,                  compute,  1 << 16,  true) \
+            X(leaky_relu,                      compute,  1 << 16,  true) \
+            X(leaky_relu_gradient,             compute,  1 << 16,  true) \
+            X(tanh,                            compute,  1 << 16,  true) \
+            X(tanh_gradient,                   compute,  1 << 16,  true) \
+            X(clipped_relu,                    compute,  1 << 16,  true) \
+            X(clipped_relu_gradient,           compute,  1 << 16,  true) \
+            X(elu,                             compute,  1 << 16,  true) \
+            X(elu_gradient,                    compute,  1 << 16,  true) \
+            X(gelu,                            compute,  1 << 16,  true) \
+            X(gelu_gradient,                   compute,  1 << 16,  true) \
+            X(smelu,                           compute,  1 << 16,  true) \
+            X(smelu_gradient,                  compute,  1 << 16,  true) \
+            X(silu,                            compute,  1 << 16,  true) \
+            X(silu_gradient,                   compute,  1 << 16,  true) \
+            X(resize_bilinear,                 compute,  1 << 16,  true) \
+            X(resize_bilinear_gradient,        compute,  1 << 16,  true) \
+            X(reorg,                           movement, 1 << 16,  false) \
+            X(reorg_gradient,                  movement, 1 << 16,  false) \
+            X(copy_tensor,                     movement, 1 << 16,  false) \
+            X(inv,                             exact,    1 << 21,  false) \
+            X(transpose,                       movement, 1 << 16,  false) \
+            X(embeddings,                      movement, 1 << 16,  false) \
+            X(embeddings_gradient,             exact,    1 << 16,  false) \
+            X(puzzle_embeddings,               movement, 1 << 16,  false) \
+            X(puzzle_embeddings_gradient,      exact,    1 << 16,  false) \
+            X(repeat_channels,                 movement, 1 << 16,  false) \
+            X(accumulate_repeated_channels,    movement, 1 << 16,  false) \
+            X(compute_halt_logits,             compute,  1 << 16,  false) \
+            X(compute_halt_gradient,           compute,  1 << 16,  false) \
+            X(accumulate_weighted_state,       compute,  1 << 16,  false) \
+            X(apply_act_depth_scaling,         compute,  1 << 16,  false) \
+            X(broadcast_row,                   movement, 1 << 16,  false) \
+            X(act_mark_active,                 movement, 1 << 16,  false) \
+            X(act_update_halting,              exact,    1 << 16,  false) \
+            X(act_gather_final_state,          movement, 1 << 16,  false) \
+            X(act_accumulate_output_grad,      compute,  1 << 16,  false) \
+            X(rotary_embedding,                compute,  1 << 16,  false) \
+            X(split_heads,                     movement, 1 << 16,  false) \
+            X(merge_heads,                     movement, 1 << 16,  false) \
+            X(conv,                            compute,  1 << 21,  true) \
+            X(conv_gradient_for_data,          compute,  1 << 21,  false) \
+            X(conv_gradient_for_filters,       compute,  1 << 21,  false) \
+            X(pooling,                         compute,  1 << 16,  false) \
+            X(pooling_gradient,                compute,  1 << 16,  false) \
+            X(cross_entropy,                   compute,  1 << 16,  false) \
+            X(mean_squared,                    compute,  1 << 16,  false)
 
             enum op_id : int
             {
-#define DLIB_NPU_ENUM(name, cls, work) OP_##name,
+#define DLIB_NPU_ENUM(name, cls, work, npu) OP_##name,
                 DLIB_NPU_OPERATIONS(DLIB_NPU_ENUM)
 #undef DLIB_NPU_ENUM
                 OP_COUNT
@@ -840,10 +844,11 @@ namespace dlib
                 const char* name;
                 op_class cls;
                 double min_work;
+                bool npu;   // an NPU takes it
             };
 
             const op_info op_table[OP_COUNT] = {
-#define DLIB_NPU_INFO(name, cls, work) { #name, op_class::cls, static_cast<double>(work) },
+#define DLIB_NPU_INFO(name, cls, work, npu) { #name, op_class::cls, static_cast<double>(work), npu },
                 DLIB_NPU_OPERATIONS(DLIB_NPU_INFO)
 #undef DLIB_NPU_INFO
             };
@@ -1809,13 +1814,7 @@ namespace dlib
                     device_info& d
                 ) const
                 {
-                    /*
-                        The compiler of an NPU stopped the program on the gradient for the data
-                        of a strided convolution, and computed that gradient wrongly once written
-                        as a convolution of stride one. An NPU takes none of the gradients of the
-                        convolutions and of the pooling, which only training needs and which the
-                        GPU computes faster: the other devices and the host keep them.
-                    */
+                    // An NPU takes the operations of the table marked for it, see op_table.
                     const bool npu = d.name.compare(0, 3, "NPU") == 0;
                     for (int op = 0; op < OP_COUNT; ++op)
                     {
@@ -1828,8 +1827,7 @@ namespace dlib
                         }
                         if (overrides[op] > 0) { a = true; w = true; }
                         if (overrides[op] < 0) { a = false; w = false; }
-                        if (npu && (op == OP_conv_gradient_for_data || op == OP_conv_gradient_for_filters ||
-                            op == OP_pooling_gradient))
+                        if (npu && !op_table[op].npu)
                         {
                             a = false;
                             w = false;

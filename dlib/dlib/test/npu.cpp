@@ -248,8 +248,13 @@ namespace
         return npu::has_single_precision_device();
     }
 
-    // Whether a device in use takes the gradients of convolutions and pooling, which no NPU does.
-    bool spatial_gradients_on_device (
+    /*
+        Whether a device in use is not an NPU. An NPU takes only the operations it computed
+        correctly in these tests, see the operation table of npu_dlib.cpp: the others, as the
+        pooling, the gradients of convolutions and pooling, the rotary embeddings, the halting
+        and the losses, run on a device only when another one is in use.
+    */
+    bool beyond_npu (
     )
     {
         for (const auto& name : npu::device_names())
@@ -297,7 +302,7 @@ namespace
         else if (on_device)
             DLIB_TEST_MSG(ran, op << " did not run on the device");
         else
-            DLIB_TEST_MSG(!ran, op << " ran on the device although it must not round");
+            DLIB_TEST_MSG(!ran, op << " ran on a device although none in use may take it");
 
         const double tolerance = scale * (npu::uses_half_precision() ? 2e-2 : 1e-4);
         for (size_t i = 0; i < io.size(); ++i)
@@ -640,9 +645,9 @@ namespace
         resizable_tensor gi = random_tensor(rnd, out.num_samples(), out.k(), out.nr(), out.nc());
         resizable_tensor data_grad = random_tensor(rnd, 2, 3, 13, 11), filters_grad = random_tensor(rnd, 4, 3, 3, 3);
         check("conv_gradient_for_data", {&data_grad},
-            [&]{ conv.get_gradient_for_data(true, gi, filters, data_grad); }, 2, spatial_gradients_on_device());
+            [&]{ conv.get_gradient_for_data(true, gi, filters, data_grad); }, 2, beyond_npu());
         check("conv_gradient_for_filters", {&filters_grad},
-            [&]{ conv.get_gradient_for_filters(false, gi, data, filters_grad); }, 3, spatial_gradients_on_device());
+            [&]{ conv.get_gradient_for_filters(false, gi, data, filters_grad); }, 3, beyond_npu());
 
         // A stride that does not divide the padded width leaves the last columns of the input
         // out of every window, which the gradient for the data gives back as zeros.
@@ -654,10 +659,10 @@ namespace
         strided(false, wout, data, wide);
         resizable_tensor wgi = random_tensor(rnd, wout.num_samples(), wout.k(), wout.nr(), wout.nc());
         check("conv_gradient_for_data", {&data_grad},
-            [&]{ strided.get_gradient_for_data(false, wgi, wide, data_grad); }, 2, spatial_gradients_on_device());
+            [&]{ strided.get_gradient_for_data(false, wgi, wide, data_grad); }, 2, beyond_npu());
         resizable_tensor wide_grad = random_tensor(rnd, 4, 3, 5, 5);
         check("conv_gradient_for_filters", {&wide_grad},
-            [&]{ strided.get_gradient_for_filters(true, wgi, data, wide_grad); }, 3, spatial_gradients_on_device());
+            [&]{ strided.get_gradient_for_filters(true, wgi, data, wide_grad); }, 3, beyond_npu());
 
         resizable_tensor pool_src(2, 3, 13, 11);
         fill_distinct(pool_src, rnd);
@@ -665,8 +670,8 @@ namespace
         maxp.setup_max_pooling(3, 3, 2, 2, 1, 1);
         avgp.setup_avg_pooling(2, 3, 2, 1, 0, 1);
         resizable_tensor pmax, pavg;
-        check("pooling", {&pmax}, [&]{ maxp(pmax, pool_src); });
-        check("pooling", {&pavg}, [&]{ avgp(pavg, pool_src); });
+        check("pooling", {&pmax}, [&]{ maxp(pmax, pool_src); }, 1, beyond_npu());
+        check("pooling", {&pavg}, [&]{ avgp(pavg, pool_src); }, 1, beyond_npu());
         npu::set_routing(npu::routing::never);
         maxp(pmax, pool_src);
         avgp(pavg, pool_src);
@@ -674,9 +679,9 @@ namespace
         resizable_tensor gavg = random_tensor(rnd, pavg.num_samples(), pavg.k(), pavg.nr(), pavg.nc());
         resizable_tensor pgrad = random_tensor(rnd, 2, 3, 13, 11);
         check("pooling_gradient", {&pgrad}, [&]{ maxp.get_gradient(gmax, pmax, pool_src, pgrad); }, 1,
-            spatial_gradients_on_device());
+            beyond_npu());
         check("pooling_gradient", {&pgrad}, [&]{ avgp.get_gradient(gavg, pavg, pool_src, pgrad); }, 1,
-            spatial_gradients_on_device());
+            beyond_npu());
 
         // Ties, as after a rectifier: the gradient of each output goes to the first largest
         // value of its window in row-major order, on the device as on the host, for windows
@@ -694,7 +699,7 @@ namespace
             resizable_tensor tgi = random_tensor(rnd, tmax.num_samples(), tmax.k(), tmax.nr(), tmax.nc());
             resizable_tensor tgrad = random_tensor(rnd, 2, 3, 13, 11);
             check("pooling_gradient", {&tgrad}, [&]{ pool->get_gradient(tgi, tmax, ties, tgrad); }, 1,
-                spatial_gradients_on_device());
+                beyond_npu());
         }
     }
 
@@ -765,7 +770,7 @@ namespace
         fill_integers(steps, rnd, 5, 1);
         resizable_tensor logits(B * T, 1, 1, 1), probs(B * T, 1, 1, 1);
         check("compute_halt_logits", {&logits, &probs},
-            [&]{ tt::compute_halt_logits(logits, probs, state, halt_params, mask, B, T, C, F); }, 2);
+            [&]{ tt::compute_halt_logits(logits, probs, state, halt_params, mask, B, T, C, F); }, 2, beyond_npu());
         npu::set_routing(npu::routing::never);
         tt::compute_halt_logits(logits, probs, state, halt_params, mask, B, T, C, F);
 
@@ -773,15 +778,17 @@ namespace
         resizable_tensor gi = random_tensor(rnd, B, C, T, F), final_state = random_tensor(rnd, B, C, T, F);
         check("compute_halt_gradient", {&grad_params, &grad_state},
             [&]{ tt::compute_halt_gradient(grad_params, grad_state, gi, state, probs, halt_params, mask, steps,
-                final_state, 1, B, T, C, F, 0.01f, false); }, 3);
+                final_state, 1, B, T, C, F, 0.01f, false); }, 3, beyond_npu());
 
         resizable_tensor output = random_tensor(rnd, B, C, T, F), weights = random_tensor(rnd, B * T, 1, 1, 1, 0, 1);
         check("accumulate_weighted_state", {&output},
-            [&]{ tt::accumulate_weighted_state(output, state, weights, mask, B, T, C, F); });
+            [&]{ tt::accumulate_weighted_state(output, state, weights, mask, B, T, C, F); }, 1, beyond_npu());
         resizable_tensor scaled = random_tensor(rnd, B, C, T, F);
-        check("apply_act_depth_scaling", {&scaled}, [&]{ tt::apply_act_depth_scaling(scaled, steps, B, T, C, F, 4); });
+        check("apply_act_depth_scaling", {&scaled},
+            [&]{ tt::apply_act_depth_scaling(scaled, steps, B, T, C, F, 4); }, 1, beyond_npu());
         check("act_accumulate_output_grad", {&grad_state},
-            [&]{ tt::act_accumulate_output_grad(grad_state, gi, weights, mask, steps, 1, B, T, C, F); });
+            [&]{ tt::act_accumulate_output_grad(grad_state, gi, weights, mask, steps, 1, B, T, C, F); }, 1,
+            beyond_npu());
 
         resizable_tensor row = random_tensor(rnd, 1, 1, 1, F), filled = random_tensor(rnd, B, C, T, F);
         check("broadcast_row", {&filled}, [&]{ tt::broadcast_row(filled, row); }, 1, exact_on_device());
@@ -817,9 +824,9 @@ namespace
                     sin_cache.host()[r * (nc / 2) + i] = static_cast<float>(std::sin(angle));
                 }
             check("rotary_embedding", {&data},
-                [&]{ tt::apply_rotary_positional_embedding(false, data, cos_cache, sin_cache); });
+                [&]{ tt::apply_rotary_positional_embedding(false, data, cos_cache, sin_cache); }, 1, beyond_npu());
             check("rotary_embedding", {&data},
-                [&]{ tt::apply_rotary_positional_embedding(true, data, cos_cache, sin_cache); });
+                [&]{ tt::apply_rotary_positional_embedding(true, data, cos_cache, sin_cache); }, 1, beyond_npu());
         }
 
         resizable_tensor flat = random_tensor(rnd, 2, 1, 9, 24), heads = random_tensor(rnd, 2, 3, 9, 8);
@@ -883,7 +890,7 @@ namespace
             double l;
             squared_loss(targets.begin(), values, vgrad, l);
             loss.host()[0] = static_cast<float>(l);
-        });
+        }, 1, beyond_npu());
 
         // Cross entropy per token, with smoothing, z-loss, an ignored target and a padded query.
         const long vocab = 50, len = 9;
@@ -902,7 +909,7 @@ namespace
             double l;
             token_loss(next.begin(), input, token_logits, tgrad, l, 7, 0.1, 0, 1e-4);
             loss.host()[0] = static_cast<float>(l);
-        });
+        }, 1, beyond_npu());
         cpu::compute_loss_cross_entropy_per_token_multi multi_loss;
         const std::vector<long> ignored = {3, 7};
         check("cross_entropy", {&tgrad, &loss}, [&]{
@@ -910,7 +917,7 @@ namespace
             double l;
             multi_loss(next.begin(), input, token_logits, tgrad, l, ignored, 0.0, -1, 0.0);
             loss.host()[0] = static_cast<float>(l);
-        });
+        }, 1, beyond_npu());
     }
 
 // ----------------------------------------------------------------------------------------
