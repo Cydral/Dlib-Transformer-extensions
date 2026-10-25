@@ -441,30 +441,40 @@ int run_check_tokenizer(const std::string& tokenizer_file)
 
     /* The same statement in every language, so that what is compared is the writing system
        and not what happens to be said. Two other registers follow, because a model that
-       answers questions spends its life producing lists and code rather than prose. */
+       answers questions spends its life producing lists and code rather than prose. The
+       texts are spelled in UTF-8 bytes, which the tokenizer reads: a compiler stores the
+       characters of an ordinary literal in its execution character set, which MSVC takes
+       from the code page of the machine. */
     const std::vector<std::pair<std::string, std::string>> samples = {
         {"English", "The cryptographic module must be validated against the standard that "
                     "applies to the system before it is deployed in production."},
-        {"French",  "Le module cryptographique doit \u00eatre valid\u00e9 selon la norme "
-                    "applicable au syst\u00e8me avant sa mise en production."},
-        {"German",  "Das kryptografische Modul muss vor der Inbetriebnahme nach der f\u00fcr "
+        {"French",  "Le module cryptographique doit \xC3\xAAtre valid\xC3\xA9 selon la norme "
+                    "applicable au syst\xC3\xA8me avant sa mise en production."},
+        {"German",  "Das kryptografische Modul muss vor der Inbetriebnahme nach der f\xC3\xBCr "
                     "das System geltenden Norm validiert werden."},
-        {"Spanish", "El m\u00f3dulo criptogr\u00e1fico debe validarse conforme a la norma "
-                    "aplicable al sistema antes de su puesta en producci\u00f3n."},
-        {"Russian", "\u041a\u0440\u0438\u043f\u0442\u043e\u0433\u0440\u0430\u0444"
-                    "\u0438\u0447\u0435\u0441\u043a\u0438\u0439 \u043c\u043e\u0434"
-                    "\u0443\u043b\u044c \u0434\u043e\u043b\u0436\u0435\u043d "
-                    "\u0431\u044b\u0442\u044c \u043f\u0440\u043e\u0432\u0435\u0440"
-                    "\u0435\u043d \u0434\u043e \u0432\u0432\u043e\u0434\u0430 "
-                    "\u0432 \u044d\u043a\u0441\u043f\u043b\u0443\u0430\u0442"
-                    "\u0430\u0446\u0438\u044e."},
-        {"Chinese", "\u5bc6\u7801\u6a21\u5757\u5728\u6295\u5165\u751f\u4ea7\u4e4b"
-                    "\u524d\u5fc5\u987b\u6839\u636e\u9002\u7528\u4e8e\u8be5\u7cfb"
-                    "\u7edf\u7684\u6807\u51c6\u8fdb\u884c\u9a8c\u8bc1\u3002"},
-        {"Japanese","\u6697\u53f7\u30e2\u30b8\u30e5\u30fc\u30eb\u306f\u3001\u30b7"
-                    "\u30b9\u30c6\u30e0\u306b\u9069\u7528\u3055\u308c\u308b\u898f"
-                    "\u683c\u306b\u5f93\u3063\u3066\u691c\u8a3c\u3055\u308c\u306a"
-                    "\u3051\u308c\u3070\u306a\u3089\u306a\u3044\u3002"},
+        {"Spanish", "El m\xC3\xB3" "dulo criptogr\xC3\xA1" "fico debe validarse conforme a la "
+                    "norma aplicable al sistema antes de su puesta en producci\xC3\xB3n."},
+        {"Russian", "\xD0\x9A\xD1\x80\xD0\xB8\xD0\xBF\xD1\x82\xD0\xBE\xD0\xB3\xD1\x80\xD0\xB0"
+                    "\xD1\x84\xD0\xB8\xD1\x87\xD0\xB5\xD1\x81\xD0\xBA\xD0\xB8\xD0\xB9 "
+                    "\xD0\xBC\xD0\xBE\xD0\xB4\xD1\x83\xD0\xBB\xD1\x8C "
+                    "\xD0\xB4\xD0\xBE\xD0\xBB\xD0\xB6\xD0\xB5\xD0\xBD "
+                    "\xD0\xB1\xD1\x8B\xD1\x82\xD1\x8C "
+                    "\xD0\xBF\xD1\x80\xD0\xBE\xD0\xB2\xD0\xB5\xD1\x80\xD0\xB5\xD0\xBD "
+                    "\xD0\xB4\xD0\xBE \xD0\xB2\xD0\xB2\xD0\xBE\xD0\xB4\xD0\xB0 \xD0\xB2 "
+                    "\xD1\x8D\xD0\xBA\xD1\x81\xD0\xBF\xD0\xBB\xD1\x83\xD0\xB0\xD1\x82\xD0\xB0"
+                    "\xD1\x86\xD0\xB8\xD1\x8E."},
+        {"Chinese", "\xE5\xAF\x86\xE7\xA0\x81\xE6\xA8\xA1\xE5\x9D\x97\xE5\x9C\xA8\xE6\x8A\x95"
+                    "\xE5\x85\xA5\xE7\x94\x9F\xE4\xBA\xA7\xE4\xB9\x8B\xE5\x89\x8D\xE5\xBF\x85"
+                    "\xE9\xA1\xBB\xE6\xA0\xB9\xE6\x8D\xAE\xE9\x80\x82\xE7\x94\xA8\xE4\xBA\x8E"
+                    "\xE8\xAF\xA5\xE7\xB3\xBB\xE7\xBB\x9F\xE7\x9A\x84\xE6\xA0\x87\xE5\x87\x86"
+                    "\xE8\xBF\x9B\xE8\xA1\x8C\xE9\xAA\x8C\xE8\xAF\x81\xE3\x80\x82"},
+        {"Japanese","\xE6\x9A\x97\xE5\x8F\xB7\xE3\x83\xA2\xE3\x82\xB8\xE3\x83\xA5\xE3\x83\xBC"
+                    "\xE3\x83\xAB\xE3\x81\xAF\xE3\x80\x81\xE3\x82\xB7\xE3\x82\xB9\xE3\x83\x86"
+                    "\xE3\x83\xA0\xE3\x81\xAB\xE9\x81\xA9\xE7\x94\xA8\xE3\x81\x95\xE3\x82\x8C"
+                    "\xE3\x82\x8B\xE8\xA6\x8F\xE6\xA0\xBC\xE3\x81\xAB\xE5\xBE\x93\xE3\x81\xA3"
+                    "\xE3\x81\xA6\xE6\xA4\x9C\xE8\xA8\xBC\xE3\x81\x95\xE3\x82\x8C\xE3\x81\xAA"
+                    "\xE3\x81\x91\xE3\x82\x8C\xE3\x81\xB0\xE3\x81\xAA\xE3\x82\x89\xE3\x81\xAA"
+                    "\xE3\x81\x84\xE3\x80\x82"},
         {"Code",    "for (long i = 0; i < n; ++i) { total += weights[i] * values[i]; }"},
         {"Markdown","## Findings\n\n- **Severity**: High\n- **CVSS**: 9.8\n"
                     "1. Patch the service\n2. Rotate the credentials\n"},
