@@ -1248,108 +1248,11 @@ namespace tok_codec
     };
 
     // ----------------------------------------------------------------------------------------
-    // Token hints
-
-    /*
-        A match model over the tokens of several streams, which gives the network a hint at
-        every position: the token that followed the most recent earlier occurrence of the last
-        six tokens, or failing that of the last two, in any stream, verified backwards; a hint
-        that comes true extends the match. The level of a hint grows with the length of its
-        match, from 1 for one or two tokens to HINT_LEVELS from 32 on, and a hint is coded
-        level * vocab + token, 0 meaning none, as dlib::hinted_embeddings_ reads it. Training
-        runs it over the corpus as one stream, the coder over its streams side by side; it
-        depends only on the tokens already coded, so that the decoder finds the same hints.
-    */
-    const int HINT_LEVELS = 7;
-
-    class token_matcher
-    {
-    public:
-        // Tables sized for a text of about total_tokens tokens.
-        void init (int streams, uint64_t total_tokens)
-        {
-            int bits = 16;
-            while (bits < 24 && (uint64_t(1) << (bits + 2)) < total_tokens) ++bits;
-            shift = 64 - bits;
-            long_table.assign(size_t(1) << bits, 0);
-            short_table.assign(size_t(1) << bits, 0);
-            hist.assign(streams, std::vector<uint16_t>());
-            state.assign(streams, match_state());
-        }
-
-        void reserve (int s, size_t tokens) { hist[s].reserve(tokens); }
-
-        // Appends token t to stream s and returns the hint for the token that follows it.
-        uint32_t push (int s, uint16_t t, uint32_t vocab)
-        {
-            match_state& m = state[s];
-            if (m.len > 0 && predicted(m) == t) { ++m.len; ++m.ptr; }
-            else m.len = 0;
-            std::vector<uint16_t>& h = hist[s];
-            h.push_back(t);
-            const uint64_t n = h.size();
-            if (n >= 2) {
-                const size_t short_slot = static_cast<size_t>(hash64(h[n - 2] + 1, h[n - 1]) >> shift);
-                size_t long_slot = 0;
-                if (n >= 6) {
-                    uint64_t k = 0x6c6f6e67;
-                    for (uint64_t i = n - 6; i < n; ++i) k = hash64(k, h[i]);
-                    long_slot = static_cast<size_t>(k >> shift);
-                }
-                if (m.len == 0 && n >= 6 && long_table[long_slot] != 0) try_match(m, s, long_table[long_slot], 6);
-                if (m.len == 0 && short_table[short_slot] != 0) try_match(m, s, short_table[short_slot], 2);
-                const uint64_t here = (static_cast<uint64_t>(s) << 40) | n;
-                if (n >= 6) long_table[long_slot] = here;
-                short_table[short_slot] = here;
-            }
-            const int p = m.len > 0 ? predicted(m) : -1;
-            if (p < 0) return 0;
-            const uint32_t len = m.len;
-            const uint32_t level = len <= 2 ? 1 : len == 3 ? 2 : len <= 5 ? 3 : len <= 8 ? 4 : len <= 15 ? 5
-                : len <= 31 ? 6 : HINT_LEVELS;
-            return level * vocab + static_cast<uint32_t>(p);
-        }
-
-    private:
-        struct match_state
-        {
-            uint64_t ptr = 0;    // stream << 40 | position of the predicted token
-            uint32_t len = 0;
-        };
-
-        // The predicted token, or -1 when its stream has not reached it yet.
-        int predicted (const match_state& m) const
-        {
-            const std::vector<uint16_t>& src = hist[static_cast<size_t>(m.ptr >> 40)];
-            const uint64_t pos = m.ptr & ((uint64_t(1) << 40) - 1);
-            return pos < src.size() ? src[pos] : -1;
-        }
-
-        // Takes the candidate when the tokens before it match the last ones of stream s over at least min_len.
-        void try_match (match_state& m, int s, uint64_t candidate, uint32_t min_len)
-        {
-            const std::vector<uint16_t>& src = hist[static_cast<size_t>(candidate >> 40)];
-            const std::vector<uint16_t>& cur = hist[s];
-            const uint64_t pos = candidate & ((uint64_t(1) << 40) - 1);
-            const uint64_t n = cur.size();
-            uint32_t len = 0;
-            while (len < 64 && len < pos && len < n && src[pos - 1 - len] == cur[n - 1 - len]) ++len;
-            if (len >= min_len) { m.ptr = candidate; m.len = len; }
-        }
-
-        std::vector<std::vector<uint16_t>> hist;
-        std::vector<match_state> state;
-        std::vector<uint64_t> long_table, short_table;
-        int shift = 48;
-    };
-
-    // ----------------------------------------------------------------------------------------
     // Transformer inference
 
     struct engine_shape
     {
         int vocab = 0, dim = 0, layers = 0, heads = 0, kv_heads = 0, head_dim = 0, ffn = 0, window = 0;
-        int hint_levels = 0;    // 0 when the network takes no hints
         int q_dim () const { return heads * head_dim; }
         int kv_dim () const { return kv_heads * head_dim; }
     };
@@ -1790,26 +1693,19 @@ namespace tok_codec
         bool loaded () const { return shape_.vocab > 0; }
         const engine_shape& shape () const { return shape_; }
 
-        // Reads the network; with_hints says whether the data gives it hint levels.
-        void load (byte_reader& in, bool with_hints)
+        void load (byte_reader& in)
         {
             engine_shape s;
             s.vocab = in.i32(); s.dim = in.i32(); s.layers = in.i32(); s.heads = in.i32();
             s.kv_heads = in.i32(); s.head_dim = in.i32(); s.ffn = in.i32(); s.window = in.i32();
-            s.hint_levels = with_hints ? in.i32() : 0;
             if (s.vocab <= 0 || s.dim <= 0 || s.layers <= 0 || s.heads <= 0 || s.kv_heads <= 0
-                || s.heads % s.kv_heads != 0 || s.head_dim % 2 != 0 || s.head_dim > 256 || s.ffn <= 0 || s.window <= 0
-                || s.hint_levels < 0 || s.hint_levels > 255 || (with_hints && s.hint_levels == 0))
+                || s.heads % s.kv_heads != 0 || s.head_dim % 2 != 0 || s.head_dim > 256 || s.ffn <= 0 || s.window <= 0)
                 throw std::runtime_error("invalid network shape in the embedded data");
             eps = in.f32();
             inv_freq.resize(s.head_dim / 2);
             for (auto& f : inv_freq) f = in.f32();
 
             emb = read_matrix(in, s.vocab, s.dim, true);
-            if (s.hint_levels > 0) {
-                hint_projection = read_int_matrix(in, s.dim, s.dim);
-                hint_gates = read_vector(in, s.hint_levels * s.dim);
-            }
             blocks.resize(s.layers);
             for (auto& b : blocks) {
                 b.g1 = read_vector(in, s.dim);
@@ -1871,11 +1767,8 @@ namespace tok_codec
             b[t] += ADAPT_RATE;
         }
 
-        /*
-            Feeds the newest token of each listed stream, with its hint when the network takes
-            hints (hints may be null otherwise), and writes its next-token distribution.
-        */
-        void step (const int* ids, const int* tokens, const uint32_t* hints, int n, float* probs)
+        // Feeds the newest token of each listed stream and writes its next-token distribution.
+        void step (const int* ids, const int* tokens, int n, float* probs)
         {
             const engine_shape& s = shape_;
             const int D = s.dim, QD = s.q_dim(), KVD = s.kv_dim(), F = s.ffn, V = s.vocab, W = s.window;
@@ -1892,7 +1785,6 @@ namespace tok_codec
                     rebase(sid);
                 }
             }
-            if (s.hint_levels > 0 && hints) add_hints(hints, n);
 
             const float scale = 1.0f / std::sqrt(static_cast<float>(HD));
             for (int l = 0; l < s.layers; ++l) {
@@ -1985,34 +1877,6 @@ namespace tok_codec
             std::vector<float> g1, g2, ba, bb, bd;
             int_matrix wq, wk, wv, wo, wa, wb, wd;
         };
-
-        // x += G[level - 1] * (E[hinted token] P) for the rows that have a hint.
-        void add_hints (const uint32_t* hints, int n)
-        {
-            const engine_shape& s = shape_;
-            const int D = s.dim;
-            const uint32_t V = static_cast<uint32_t>(s.vocab);
-            hint_rows.clear();
-            for (int r = 0; r < n; ++r) {
-                const uint32_t code = hints[r];
-                if (code < V) continue;
-                const uint32_t level = code / V;
-                if (level > static_cast<uint32_t>(s.hint_levels)) throw std::runtime_error("hint level out of range");
-                std::memcpy(&h[hint_rows.size() * D], &emb[static_cast<size_t>(code % V) * D], sizeof(float) * D);
-                hint_rows.push_back(r);
-            }
-            const int m = static_cast<int>(hint_rows.size());
-            if (m == 0) return;
-            quantize(h.data(), m, D);
-            gemm(m, hint_projection, o.data());
-            for (int j = 0; j < m; ++j) {
-                const int r = hint_rows[j];
-                const float* g = &hint_gates[static_cast<size_t>(hints[r] / V - 1) * D];
-                const float* pr = &o[static_cast<size_t>(j) * D];
-                float* xr = &x[static_cast<size_t>(r) * D];
-                for (int i = 0; i < D; ++i) xr[i] += g[i] * pr[i];
-            }
-        }
 
         static std::vector<float> read_vector (byte_reader& in, int n)
         {
@@ -2173,9 +2037,6 @@ namespace tok_codec
         float eps = 1e-5f;
         std::vector<float> inv_freq, rope_cos, rope_sin;
         std::vector<float> emb, gf, bout;
-        int_matrix hint_projection;
-        std::vector<float> hint_gates;
-        std::vector<int> hint_rows;
         int_matrix wout;
         std::vector<block> blocks;
 
@@ -2202,8 +2063,7 @@ namespace tok_codec
         holding other data refuses to decode it.
 
             "TQC2"  u32 segmentation  u32 folded capitals  u32 merges  merges x (u16 left, u16 right)
-            u32 network (0: none, 1: a network, 2: a network that takes hints)
-            [network: shape, hint levels when it takes hints, epsilon, rotation frequencies, tensors]
+            u32 has_network  [network: shape, epsilon, rotation frequencies, tensors]
 
         A container of the earlier format "TQC1" has no field for the folded capitals.
     */
@@ -2260,9 +2120,7 @@ namespace tok_codec
         data.tokenizer.set_segmentation(static_cast<dlib::bpe_segmentation>(data.segmentation));
         data.tokenizer.set_merges(merges);
         data.vocab.build(data.tokenizer);
-        const uint32_t network = in.u32();
-        if (network > 2) throw std::runtime_error("unknown network form in the embedded data");
-        if (network != 0) data.engine.load(in, network == 2);
+        if (in.u32() != 0) data.engine.load(in);
         if (!in.done()) throw std::runtime_error("trailing bytes in the embedded data");
         data.fingerprint = checksum(raw.data(), raw.size());
     }
@@ -2442,23 +2300,11 @@ namespace tok_codec
         uint64_t total = 0, coded = 0;
         for (uint64_t c : counts) total += c;
 
-        // A network that takes hints gets them from the tokens of all the streams coded so far.
-        const bool hinted = data.engine.shape().hint_levels > 0;
-        token_matcher matcher;
-        std::vector<uint32_t> hint(num, 0), feed_hint(num, 0);
-        if (hinted) {
-            matcher.init(num, total);
-            for (int s = 0; s < num; ++s) {
-                matcher.reserve(s, static_cast<size_t>(counts[s]) + 1);
-                hint[s] = matcher.push(s, static_cast<uint16_t>(line_break), static_cast<uint32_t>(V));
-            }
-        }
-
         while (coded < total) {
             int n = 0;
             for (int s = 0; s < num; ++s)
-                if (done[s] < counts[s]) { ids[n] = s; feed[n] = prev[s]; feed_hint[n] = hint[s]; ++n; }
-            data.engine.step(ids.data(), feed.data(), hinted ? feed_hint.data() : nullptr, n, probs.data());
+                if (done[s] < counts[s]) { ids[n] = s; feed[n] = prev[s]; ++n; }
+            data.engine.step(ids.data(), feed.data(), n, probs.data());
             for (int i = 0; i < n; ++i) {
                 const int s = ids[i];
                 const float* p = &probs[static_cast<size_t>(i) * V];
@@ -2475,7 +2321,6 @@ namespace tok_codec
                 const double pt = std::max(1e-30, static_cast<double>(p[t]) / cum[n_voc]);
                 stats.network_bits -= det::log(pt) / 0.69314718055994530942;
                 data.engine.learn(s, t, p);
-                if (hinted) hint[s] = matcher.push(s, static_cast<uint16_t>(t), static_cast<uint32_t>(V));
                 prev[s] = t;
                 ++done[s];
                 ++coded;
@@ -2859,22 +2704,15 @@ using std::endl;
 /*
     A decoder of the library's unified GQA stack, without adaptive computation: pre-norm
     blocks of fused attention (rotary positions, grouped key-value heads) and SwiGLU, a final
-    RMS normalisation and a linear head scored at every position. With SLM_HINTS=1 its input is
-    hinted_embeddings: each token comes with the hint of tok_codec::token_matcher, the token a
-    match over everything coded before predicts next, which brings the network the repeats
-    beyond its window. The network alone gains from it, but the context models already code
-    these repeats, so the default keeps plain embeddings. The constants can be set at compile
-    time; the engine reads the shape from the compiled-in data, so a build with other
-    constants still decodes what an earlier one coded.
+    RMS normalisation and a linear head scored at every position. The constants can be set
+    at compile time; the engine reads the shape from the compiled-in data, so a build with
+    other constants still decodes what an earlier one coded.
 */
-#ifndef SLM_HINTS
-#define SLM_HINTS 0
-#endif
 #ifndef SLM_VOCAB_SIZE
 #define SLM_VOCAB_SIZE 8192
 #endif
 #ifndef SLM_NUM_LAYERS
-#define SLM_NUM_LAYERS 4
+#define SLM_NUM_LAYERS 8
 #endif
 #ifndef SLM_NUM_HEADS
 #define SLM_NUM_HEADS 4
@@ -2896,42 +2734,9 @@ const long NUM_KV_HEADS  = SLM_NUM_KV_HEADS;
 const long EMBEDDING_DIM = SLM_EMBEDDING_DIM;
 const long WINDOW        = SLM_WINDOW;          // training sequence, and attention span when coding
 
-const bool HINTS         = SLM_HINTS != 0;      // whether the network takes the matcher's hints
-
-#if SLM_HINTS
-using token_input = hinted_embeddings<VOCAB_SIZE, EMBEDDING_DIM, tok_codec::HINT_LEVELS, input<matrix<int, 0, 1>>>;
-#else
-using token_input = embeddings<VOCAB_SIZE, EMBEDDING_DIM, input<matrix<int, 0, 1>>>;
-#endif
-using net_type = classification_head<VOCAB_SIZE, impl::gqa_stack_selector<attention_impl::unified, NUM_LAYERS,
-    EMBEDDING_DIM, NUM_HEADS, NUM_KV_HEADS, token_input, false>::type>;
-
-/*
-    The windows the network reads: the tokens alone, or with hints the tokens followed by
-    their hints, as hinted_embeddings takes them.
-*/
-static void fill_window (matrix<int, 0, 1>& x, const std::vector<uint16_t>& tokens, const std::vector<uint32_t>& hints,
-    size_t start)
-{
-    for (long i = 0; i < WINDOW; ++i) {
-        x(i) = tokens[start + i];
-        if (HINTS) x(WINDOW + i) = static_cast<int>(hints[start + i]);
-    }
-}
-
-// The hint of every position of a corpus, for the token after it, the corpus being one stream.
-static std::vector<uint32_t> corpus_hints (const std::vector<uint16_t>& tokens)
-{
-    std::vector<uint32_t> hints;
-    if (!HINTS) return hints;
-    hints.resize(tokens.size());
-    tok_codec::token_matcher matcher;
-    matcher.init(1, tokens.size());
-    matcher.reserve(0, tokens.size());
-    for (size_t i = 0; i < tokens.size(); ++i)
-        hints[i] = matcher.push(0, tokens[i], static_cast<uint32_t>(VOCAB_SIZE));
-    return hints;
-}
+using model_config = gqa_transformer_config<VOCAB_SIZE, NUM_LAYERS, NUM_HEADS, NUM_KV_HEADS, EMBEDDING_DIM,
+    attention_impl::unified, false>;
+using net_type = model_config::network_type<true>;
 
 const std::string MODEL_FILE = "slm_tok_predictive_compressor.dat";
 const std::string HEADER_FILE = "slm_tok_predictive_compressor_ex.h";     // default path of the generated header
@@ -3137,9 +2942,9 @@ static void check_tokenizer (const std::string& path, bool recorded, const token
 */
 struct exported_layer
 {
-    enum kind_t { embedding, hint, norm, attention, projection } kind;
+    enum kind_t { embedding, norm, attention, projection } kind;
     std::vector<float> values;      // matrices as [inputs x outputs], the embedding as [tokens x dim]
-    std::vector<float> bias;        // for the hints, the gates of the levels
+    std::vector<float> bias;
     long rows = 0, cols = 0;
 };
 
@@ -3157,26 +2962,6 @@ struct weight_collector
         x.cols = e.k();
         x.values.assign(e.host(), e.host() + e.size());
         out->push_back(std::move(x));
-    }
-
-    // The table, then the projection of the hinted tokens and the gates, in the reversed order of the visit.
-    template <unsigned long N, unsigned long D, unsigned long L>
-    void operator() (hinted_embeddings_<N, D, L>& l)
-    {
-        const float* p = l.get_layer_params().host();
-        exported_layer h;
-        h.kind = exported_layer::hint;
-        h.rows = D;
-        h.cols = D;
-        h.values.assign(p + N * D, p + (N + D) * D);
-        h.bias.assign(p + (N + D) * D, p + (N + D + L) * D);
-        out->push_back(std::move(h));
-        exported_layer e;
-        e.kind = exported_layer::embedding;
-        e.rows = N;
-        e.cols = D;
-        e.values.assign(p, p + N * D);
-        out->push_back(std::move(e));
     }
 
     void operator() (rms_norm_& l)
@@ -3277,19 +3062,17 @@ static std::vector<uint8_t> export_network (net_type& net, const tok_codec::code
     visit_computational_layers(net, collector);
     std::reverse(layers.begin(), layers.end());
 
-    const size_t first_block = HINTS ? 2 : 1;
-    const size_t expected = first_block + 6 * NUM_LAYERS + 2;
+    const size_t expected = 1 + 6 * NUM_LAYERS + 2;
     if (layers.size() != expected) throw std::runtime_error("unexpected network layout");
     const long head_dim = EMBEDDING_DIM / NUM_HEADS, q = NUM_HEADS * head_dim, kv = NUM_KV_HEADS * head_dim;
 
     std::vector<uint8_t> raw;
     append_tokenizer(raw, data.segmentation, data.folded, data.tokenizer.get_merges());
-    tok_codec::put_u32(raw, HINTS ? 2 : 1);
-    const long ffn = layers[first_block + 4].cols;
+    tok_codec::put_u32(raw, 1);
+    const long ffn = layers[5].cols;
     const long vocab = layers.back().cols;
     for (long v : { vocab, EMBEDDING_DIM, NUM_LAYERS, NUM_HEADS, NUM_KV_HEADS, head_dim, ffn, WINDOW })
         tok_codec::put_u32(raw, static_cast<uint32_t>(v));
-    if (HINTS) tok_codec::put_u32(raw, static_cast<uint32_t>(tok_codec::HINT_LEVELS));
 
     // The training layer's normalisation epsilon and rotary frequencies.
     put_f32(raw, static_cast<float>(DEFAULT_RMS_NORM_EPS));
@@ -3301,12 +3084,6 @@ static std::vector<uint8_t> export_network (net_type& net, const tok_codec::code
     const exported_layer& e = layers[idx++];
     if (e.kind != exported_layer::embedding) throw std::runtime_error("unexpected network layout");
     put_quantized(raw, e.values, e.rows, e.cols, true, bits, err, ref);
-    if (HINTS) {
-        const exported_layer& h = layers[idx++];
-        if (h.kind != exported_layer::hint) throw std::runtime_error("unexpected network layout");
-        put_quantized(raw, h.values, h.rows, h.cols, false, bits, err, ref);
-        put_floats(raw, h.bias);
-    }
     for (long l = 0; l < NUM_LAYERS; ++l) {
         const exported_layer& n1 = layers[idx++];
         const exported_layer& at = layers[idx++];
@@ -3384,15 +3161,15 @@ static matrix<double, 0, 1> rate_schedule (const train_options& o)
     layout shows up as a large gap; the gap of a correct export is what quantization costs.
 */
 static void check_network (net_type& net, const std::vector<uint8_t>& raw, const std::vector<uint16_t>& tokens,
-    const std::vector<uint32_t>& hints, double bytes_per_token)
+    double bytes_per_token)
 {
     if (tokens.size() < static_cast<size_t>(WINDOW + 1)) return;
     tok_codec::codec_data exported;
     tok_codec::load_codec_data(raw, exported);
     const size_t start = tokens.size() - WINDOW - 1;
 
-    matrix<int, 0, 1> win(HINTS ? 2 * WINDOW : WINDOW);
-    fill_window(win, tokens, hints, start);
+    matrix<int, 0, 1> win(WINDOW);
+    for (long i = 0; i < WINDOW; ++i) win(i) = tokens[start + i];
     resizable_tensor x;
     net.subnet().to_tensor(&win, &win + 1, x);
     net.subnet().forward(x);
@@ -3411,7 +3188,7 @@ static void check_network (net_type& net, const std::vector<uint8_t>& raw, const
         const int target = tokens[start + i + 1];
         ce_net += -(row[target] - mx - std::log(z));
         const int id = 0, t = tokens[start + i];
-        exported.engine.step(&id, &t, HINTS ? &hints[start + i] : nullptr, 1, probs.data());
+        exported.engine.step(&id, &t, 1, probs.data());
         ce_engine += -std::log(std::max(1e-30, static_cast<double>(probs[target])));
     }
     const double k = 1.0 / (WINDOW * std::log(2.0) * bytes_per_token);
@@ -3456,17 +3233,15 @@ static int train_command (const std::string& input, const train_options& o)
     }
     const double bytes_per_token = static_cast<double>(corpus_bytes) / std::max<size_t>(1, tokens.size());
     if (tokens.size() < static_cast<size_t>(4 * WINDOW)) throw std::runtime_error("corpus too small for the window");
-    const std::vector<uint32_t> hints = corpus_hints(tokens);
 
     cout << "=== Training ===\n"
         << "  corpus    : " << input << " (" << corpus_bytes << " bytes, " << tokens.size() << " tokens, "
         << std::fixed << std::setprecision(3) << bytes_per_token << " bytes per token)\n"
         << "  tokenizer : " << tok.get_vocab_size() << " entries, " << tok_codec::tokenizer_form(data.segmentation,
             data.folded) << "\n"
-        << "  network   : " << network_shape() << ", vocabulary " << VOCAB_SIZE << (HINTS ? ", with hints" : "")
-        << "\n"
+        << "  network   : " << network_shape() << ", vocabulary " << VOCAB_SIZE << "\n"
         << "  schedule  : " << o.steps << " steps of " << o.batch << " windows, peak rate " << std::setprecision(5)
-        << o.learning_rate << ", warmup " << o.warmup << "\n" << endl;
+        << o.learning_rate << ", warmup " << o.warmup << ", ending at " << o.min_rate_ratio << " of the peak\n" << endl;
 
     // A checkpoint or a saved network trained with another tokenizer stops the run here.
     net_type net;
@@ -3494,12 +3269,12 @@ static int train_command (const std::string& input, const train_options& o)
     trainer.set_learning_rate_schedule(rate_schedule(o));
     trainer.set_synchronization_file(sync, std::chrono::minutes(10));
     /*
-        The synchronization file holds the schedule the run started with. A run resumed with
-        another --steps follows the schedule of that length from the step it reached, so that
-        lengthening a run lengthens its cosine.
+        The synchronization file holds the schedule the run started with. A resumed run follows
+        from the step it reached the schedule its options give, so that lengthening a run
+        lengthens its cosine and another --min-rate changes where the cosine ends.
     */
     const long reached = static_cast<long>(trainer.get_train_one_step_calls());
-    if (trainer.get_learning_rate_schedule().size() != o.steps && reached < o.steps) {
+    if (reached > 0 && reached < o.steps) {
         const matrix<double, 0, 1> full = rate_schedule(o);
         trainer.set_learning_rate_schedule(rowm(full, range(reached, o.steps - 1)));
         cout << "Resuming at step " << reached << " on the schedule of " << o.steps << " steps" << endl;
@@ -3510,7 +3285,7 @@ static int train_command (const std::string& input, const train_options& o)
 
     std::mt19937_64 rng(42 + trainer.get_train_one_step_calls());
     std::uniform_int_distribution<size_t> pick(0, tokens.size() - WINDOW - 1);
-    std::vector<matrix<int, 0, 1>> xs(o.batch, matrix<int, 0, 1>(HINTS ? 2 * WINDOW : WINDOW));
+    std::vector<matrix<int, 0, 1>> xs(o.batch, matrix<int, 0, 1>(WINDOW));
     std::vector<matrix<unsigned long, 0, 1>> ys(o.batch, matrix<unsigned long, 0, 1>(WINDOW));
     const auto t0 = std::chrono::steady_clock::now();
     auto last_report = t0;
@@ -3520,8 +3295,10 @@ static int train_command (const std::string& input, const train_options& o)
         && !signal_handler::is_triggered()) {
         for (long b = 0; b < o.batch; ++b) {
             const size_t start = pick(rng);
-            fill_window(xs[b], tokens, hints, start);
-            for (long i = 0; i < WINDOW; ++i) ys[b](i) = tokens[start + i + 1];
+            for (long i = 0; i < WINDOW; ++i) {
+                xs[b](i) = tokens[start + i];
+                ys[b](i) = tokens[start + i + 1];
+            }
         }
         trainer.train_one_step(xs, ys);
         const auto now = std::chrono::steady_clock::now();
@@ -3554,7 +3331,7 @@ static int train_command (const std::string& input, const train_options& o)
     }
     cout << "Saved " << MODEL_FILE << endl;
     const std::vector<uint8_t> raw = export_network(net, data, o.bits);
-    check_network(net, raw, tokens, hints, bytes_per_token);
+    check_network(net, raw, tokens, bytes_per_token);
     write_header(raw, network_description(data), o.header);
     return 0;
 }
@@ -3609,6 +3386,8 @@ int main (int argc, char** argv)
         parser.add_option("batch", "Windows per training step (default: 32).", 1);
         parser.add_option("rate", "Peak learning rate (default: 0.001).", 1);
         parser.add_option("warmup", "Warmup steps (default: 500).", 1);
+        parser.add_option("min-rate", "Rate at the end of the cosine decay, as a fraction of the peak rate "
+            "(default: 0.1).", 1);
         parser.add_option("bits", "Bits per quantized weight, 4 to 8 (default: 8).", 1);
         parser.add_option("header", "Path of the header to write (default: " + HEADER_FILE + ").", 1);
 #endif
@@ -3617,13 +3396,14 @@ int main (int argc, char** argv)
 
         // The options of this build given more than once, or out of range.
         const char* single[] = { "input", "output", "streams", "tables", "max-bytes", "vocab", "segmentation",
-            "steps", "batch", "rate", "warmup", "bits", "header" };
+            "steps", "batch", "rate", "warmup", "min-rate", "bits", "header" };
         for (const char* name : single)
             if (parser.option_is_defined(name) && parser.option(name).count() > 1)
                 throw std::runtime_error(std::string("--") + name + " is given more than once");
         if (parser.option_is_defined("tables")) parser.check_option_arg_range("tables", 16, 30);
         if (parser.option_is_defined("streams")) parser.check_option_arg_range("streams", 1, 255);
         if (parser.option_is_defined("bits")) parser.check_option_arg_range("bits", 4, 8);
+        if (parser.option_is_defined("min-rate")) parser.check_option_arg_range("min-rate", 0.0, 1.0);
 
         // One mode; the decompressor alone needs none.
         int modes = 0;
@@ -3675,6 +3455,7 @@ int main (int argc, char** argv)
             o.batch = get_option(parser, "batch", o.batch);
             o.learning_rate = get_option(parser, "rate", o.learning_rate);
             o.warmup = get_option(parser, "warmup", o.warmup);
+            o.min_rate_ratio = get_option(parser, "min-rate", o.min_rate_ratio);
             o.bits = get_option(parser, "bits", o.bits);
             o.header = header;
             return train_command(input, o);
