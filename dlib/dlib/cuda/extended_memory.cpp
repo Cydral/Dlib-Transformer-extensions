@@ -25,17 +25,35 @@ namespace dlib
            comes first so that the same binary can be pointed at a fast local disk on one
            machine and at whatever is available on another, and only then do we fall back on
            the platform's temporary directory. */
-        if (const char* v = std::getenv("DLIB_XMEM_STORE"))
-            if (*v) return std::string(v);
+        // The value of a variable, empty when it is not set. MSVC deprecates getenv().
+        const auto env = [](const char* name)
+        {
+            std::string value;
+#ifdef _MSC_VER
+            char* buf = nullptr;
+            std::size_t len = 0;
+            if (_dupenv_s(&buf, &len, name) == 0 && buf != nullptr)
+            {
+                value = buf;
+                std::free(buf);
+            }
+#else
+            if (const char* v = std::getenv(name))
+                value = v;
+#endif
+            return value;
+        };
+        std::string v = env("DLIB_XMEM_STORE");
+        if (!v.empty()) return v;
 #ifdef _WIN32
-        if (const char* v = std::getenv("TEMP"))
-            if (*v) return std::string(v);
-        if (const char* v = std::getenv("TMP"))
-            if (*v) return std::string(v);
+        v = env("TEMP");
+        if (!v.empty()) return v;
+        v = env("TMP");
+        if (!v.empty()) return v;
         return std::string("C:\\Windows\\Temp");
 #else
-        if (const char* v = std::getenv("TMPDIR"))
-            if (*v) return std::string(v);
+        v = env("TMPDIR");
+        if (!v.empty()) return v;
         return std::string("/tmp");
 #endif
     }

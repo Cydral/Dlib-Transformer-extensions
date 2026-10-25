@@ -993,6 +993,35 @@ if (NOT TARGET dlib)
 
    endif()
 
+   if (WIN32 AND mkl_iomp_dll)
+      # If we are using the Intel MKL on windows then try and copy the iomp dll
+      # file to the output folder.  We do this since a very large number of
+      # windows users don't understand that they need to add the Intel MKL's
+      # folders to their PATH to use the Intel MKL.  They then complain on the
+      # dlib forums.  Copying the Intel MKL dlls to the output directory removes
+      # the need to add the Intel MKL to the PATH.  The copy is attached here, in
+      # the directory that creates the dlib target, since add_custom_command()
+      # only accepts a target of its own directory and a project may add dlib
+      # more than once, as the tests do with the examples and the tools.
+      if (CMAKE_LIBRARY_OUTPUT_DIRECTORY)
+         add_custom_command(TARGET dlib POST_BUILD
+            # In some newer versions of windows/visual studio the output Config folder doesn't
+            # exist at first, so you can't copy to it unless you make it yourself.  So make
+            # sure the target folder exists first.
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/"
+            COMMAND ${CMAKE_COMMAND} -E copy "${mkl_iomp_dll}" "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/"
+            )
+      else()
+         add_custom_command(TARGET dlib POST_BUILD
+            # In some newer versions of windows/visual studio the output Config folder doesn't
+            # exist at first, so you can't copy to it unless you make it yourself.  So make
+            # sure the target folder exists first.
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/$<CONFIG>/"
+            COMMAND ${CMAKE_COMMAND} -E copy "${mkl_iomp_dll}" "${CMAKE_BINARY_DIR}/$<CONFIG>/"
+            )
+      endif()
+   endif()
+
 endif()
 
 if (MSVC)
@@ -1014,32 +1043,6 @@ if (COMMAND pybind11_add_module)
    # Don't export unnecessary symbols.
    set_target_properties(dlib PROPERTIES CXX_VISIBILITY_PRESET "hidden")
    set_target_properties(dlib PROPERTIES CUDA_VISIBILITY_PRESET "hidden")
-endif()
-
-if (WIN32 AND mkl_iomp_dll)
-   # If we are using the Intel MKL on windows then try and copy the iomp dll
-   # file to the output folder.  We do this since a very large number of
-   # windows users don't understand that they need to add the Intel MKL's
-   # folders to their PATH to use the Intel MKL.  They then complain on the
-   # dlib forums.  Copying the Intel MKL dlls to the output directory removes
-   # the need to add the Intel MKL to the PATH.
-   if (CMAKE_LIBRARY_OUTPUT_DIRECTORY)
-      add_custom_command(TARGET dlib POST_BUILD
-         # In some newer versions of windows/visual studio the output Config folder doesn't
-         # exist at first, so you can't copy to it unless you make it yourself.  So make
-         # sure the target folder exists first.
-         COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/"
-         COMMAND ${CMAKE_COMMAND} -E copy "${mkl_iomp_dll}" "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/"
-         )
-   else()
-      add_custom_command(TARGET dlib POST_BUILD
-         # In some newer versions of windows/visual studio the output Config folder doesn't
-         # exist at first, so you can't copy to it unless you make it yourself.  So make
-         # sure the target folder exists first.
-         COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/$<CONFIG>/"
-         COMMAND ${CMAKE_COMMAND} -E copy "${mkl_iomp_dll}" "${CMAKE_BINARY_DIR}/$<CONFIG>/"
-         )
-   endif()
 endif()
 
 add_library(dlib::dlib ALIAS dlib)

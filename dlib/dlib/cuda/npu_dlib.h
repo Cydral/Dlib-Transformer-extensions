@@ -52,8 +52,9 @@
           call binds it instead of converting them again. Any access to a tensor that may
           change its values (non-const host(), host_write_only(), set_size(), see
           gpu_data::copy_mark()) makes that copy outdated, and the next call writes it again.
-          This is what lets a product with few rows, such as the token by token inference of a
-          language model, gain from the device, whose cost is then that of the activations.
+          A product with few rows, such as the token by token inference of a language model,
+          then costs the device the conversion of its activations and the fixed cost of a
+          call, which the routing weighs against the host.
           As with the device copy of a CUDA build, a write through a pointer obtained before
           the call that took the copy goes unseen: code asks the tensor for its pointer again
           before writing, as dlib does everywhere.
