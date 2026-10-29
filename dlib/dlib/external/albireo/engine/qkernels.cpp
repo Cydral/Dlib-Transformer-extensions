@@ -43,7 +43,9 @@ namespace albireo
         inline float h2f(uint16_t h)
         {
 #if ALBIREO_QK_AVX2
-            return _cvtsh_ss(h);
+            // _cvtsh_ss is missing from the headers of MSVC; the F16C instruction is reached
+            // through its vector form.
+            return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(h)));
 #else
             return half_values.v[h];
 #endif

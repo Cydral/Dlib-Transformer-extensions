@@ -28,20 +28,47 @@ foreach (pattern IN LISTS extra)
    endif()
 endforeach()
 
+# The engine is read from a folder of its own.  Windows looks for the libraries of a file
+# in its folder first: read in place after an earlier build, the engine would lead to the
+# copies beside it and the other libraries to the originals, two paths for one name.
+get_filename_component(engine_name "${ENGINE}" NAME)
+get_filename_component(engine_stem "${ENGINE}" NAME_WE)
+get_filename_component(dest_parent "${DEST}" DIRECTORY)
+set(scan "${dest_parent}/runtime-scan-${engine_stem}")
+file(REMOVE_RECURSE "${scan}")
+file(MAKE_DIRECTORY "${scan}")
+file(COPY "${ENGINE}" DESTINATION "${scan}")
+
 file(GET_RUNTIME_DEPENDENCIES
-   LIBRARIES ${ENGINE} ${extra_files}
+   LIBRARIES "${scan}/${engine_name}" ${extra_files}
    RESOLVED_DEPENDENCIES_VAR resolved
    UNRESOLVED_DEPENDENCIES_VAR unresolved
+   CONFLICTING_DEPENDENCIES_PREFIX conflicting
    DIRECTORIES ${dirs}
    PRE_EXCLUDE_REGEXES ${exclude} "^api-ms-.*" "^ext-ms-.*" "^hvsifiletrust\\.dll$" "^ld-linux.*" "^libc\\.so.*"
       "^libm\\.so.*" "^libdl\\.so.*" "^libpthread\\.so.*" "^librt\\.so.*" "^libgcc_s\\.so.*" "^libstdc\\+\\+\\.so.*"
    POST_EXCLUDE_REGEXES ".*[/\\\\][Ww][Ii][Nn][Dd][Oo][Ww][Ss][/\\\\].*" "^/lib/.*" "^/lib64/.*" "^/usr/lib/.*"
       "^/usr/lib64/.*")
+file(REMOVE_RECURSE "${scan}")
 
+# A library found in two folders, such as the runtime of the compiler shipped by two
+# products, is taken from the first one.
+foreach (name IN LISTS conflicting_FILENAMES)
+   list(GET conflicting_${name} 0 first)
+   list(APPEND resolved "${first}")
+   message(STATUS "${name} found in several folders, copied from ${first}")
+endforeach()
+
+# file(COPY) keeps the time of the files, which tells the copies already up to date.
 set(copied 0)
 foreach (f IN LISTS resolved extra_files)
    get_filename_component(name "${f}" NAME)
-   if (NOT EXISTS "${DEST}/${name}" OR "${f}" IS_NEWER_THAN "${DEST}/${name}")
+   file(TIMESTAMP "${f}" source_time "%Y%m%d%H%M%S" UTC)
+   set(dest_time "")
+   if (EXISTS "${DEST}/${name}")
+      file(TIMESTAMP "${DEST}/${name}" dest_time "%Y%m%d%H%M%S" UTC)
+   endif()
+   if (NOT source_time STREQUAL dest_time)
       file(COPY "${f}" DESTINATION "${DEST}")
       math(EXPR copied "${copied} + 1")
    endif()

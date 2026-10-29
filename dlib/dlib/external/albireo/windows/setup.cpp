@@ -28,6 +28,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cwchar>
 #include <map>
 #include <memory>
 #include <string>
@@ -426,7 +427,7 @@ namespace albireo
                 crlf += ch;
             }
             const DWORD reader = ES_MULTILINE | ES_READONLY | WS_VSCROLL | ES_AUTOVSCROLL;
-            add(IDC_LICENSE, ui::edit(wz.hwnd, crlf, IDC_LICENSE, reader), ui::font_kind::small);
+            add(IDC_LICENSE, ui::edit(wz.hwnd, crlf, IDC_LICENSE, reader), ui::font_kind::note);
             add(IDC_ACCEPT, ui::checkbox(wz.hwnd, L"", IDC_ACCEPT, false));
 
             // Over an installation, the fields start from its current options.
@@ -444,7 +445,7 @@ namespace albireo
             add(IDC_MODELS, ui::edit(wz.hwnd, widen(current.models_dir), IDC_MODELS));
             add(IDC_MODELS_BROWSE, ui::button(wz.hwnd, L"", IDC_MODELS_BROWSE));
             add(IDC_SPACE, ui::label(wz.hwnd, L"", IDC_SPACE));
-            add(IDC_SPACE_NOTE, ui::label(wz.hwnd, L"", IDC_SPACE_NOTE), ui::font_kind::small);
+            add(IDC_SPACE_NOTE, ui::label(wz.hwnd, L"", IDC_SPACE_NOTE), ui::font_kind::note);
             add(IDC_AUTOSTART, ui::checkbox(wz.hwnd, L"", IDC_AUTOSTART, current.autostart));
             add(IDC_DESKTOP, ui::checkbox(wz.hwnd, L"", IDC_DESKTOP, current.desktop_shortcut));
             add(IDC_TRUST, ui::checkbox(wz.hwnd, L"", IDC_TRUST, current.trust_certificate));
@@ -453,7 +454,7 @@ namespace albireo
             add(IDC_PORT, ui::edit(wz.hwnd, std::to_wstring(current.port), IDC_PORT, ES_NUMBER));
             add(IDC_STEP, ui::label(wz.hwnd, L"", IDC_STEP), ui::font_kind::bold);
             add(IDC_PROGRESS, ui::progress(wz.hwnd, IDC_PROGRESS));
-            add(IDC_DETAIL, ui::label(wz.hwnd, L"", IDC_DETAIL, SS_PATHELLIPSIS), ui::font_kind::small);
+            add(IDC_DETAIL, ui::label(wz.hwnd, L"", IDC_DETAIL, SS_PATHELLIPSIS), ui::font_kind::note);
             add(IDC_LAUNCH, ui::checkbox(wz.hwnd, L"", IDC_LAUNCH, true));
             add(IDC_PURGE, ui::checkbox(wz.hwnd, L"", IDC_PURGE, false));
             add(IDC_BACK, ui::button(wz.hwnd, L"", IDC_BACK));

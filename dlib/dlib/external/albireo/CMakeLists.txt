@@ -44,7 +44,10 @@ else()
    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 if (MSVC)
-   add_compile_options(/utf-8 /bigobj /W3 /permissive-)
+   # Options of the C and C++ compiler, which nvcc would take for source files.
+   foreach (option /utf-8 /bigobj /W3 /permissive-)
+      add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:${option}>)
+   endforeach()
    add_compile_definitions(_CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
 elseif (MINGW)
    add_link_options(-static -static-libgcc -static-libstdc++)
@@ -235,11 +238,13 @@ endfunction()
 
 # The runtime libraries of the device of this tree, which its engine and its test program
 # load: the folders they come from, more files to copy, the names to leave out, and the
-# libraries loaded on first use only (MSVC).
+# libraries loaded on first use only (MSVC).  The test program receives more files than
+# the engine: the CPU plugin of OpenVINO, for a machine without NPU or Intel graphics.
 set(ALBIREO_RUNTIME_DIRS)
 set(ALBIREO_RUNTIME_EXTRA)
 set(ALBIREO_RUNTIME_EXCLUDE)
 set(ALBIREO_DELAYED_LIBRARIES)
+set(ALBIREO_TEST_RUNTIME_EXTRA)
 
 function(albireo_device_runtime target)
    foreach (name ${ALBIREO_DELAYED_LIBRARIES})
@@ -378,6 +383,8 @@ if (ALBIREO_ENGINE_OPENVINO)
          list(APPEND ALBIREO_RUNTIME_EXTRA "${openvino_dir}/${plugin}")
       endforeach()
       albireo_device_runtime(albireo-engine-openvino)
+      set(ALBIREO_TEST_RUNTIME_EXTRA
+         "${openvino_dir}/${CMAKE_SHARED_LIBRARY_PREFIX}openvino_intel_cpu_plugin${CMAKE_SHARED_LIBRARY_SUFFIX}")
       if (ALBIREO_COPY_RUNTIME)
          # The license of the Python package, or of the archive distribution.
          file(GLOB openvino_licenses "${openvino_dir}/../../openvino-*.dist-info/licenses/LICENSE"
@@ -464,6 +471,7 @@ if (ALBIREO_TESTS AND (ALBIREO_ENGINE_CUDA OR ALBIREO_ENGINE_OPENVINO OR ALBIREO
       target_link_libraries(test_offload PRIVATE Threads::Threads)
    endif()
    albireo_output_dir(test_offload ${CMAKE_BINARY_DIR}/tests)
+   list(APPEND ALBIREO_RUNTIME_EXTRA ${ALBIREO_TEST_RUNTIME_EXTRA})
    albireo_device_runtime(test_offload)
 endif()
 

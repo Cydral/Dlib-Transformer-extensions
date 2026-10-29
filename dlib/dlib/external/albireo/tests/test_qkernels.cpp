@@ -14,6 +14,7 @@
     the same way.  The program returns 0 when every check passes.
 */
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -335,15 +336,15 @@ namespace
         qk_half_to_float_row(h.data(), back.data(), static_cast<long>(f.size()));
         for (size_t i = 0; i < f.size(); ++i) check(back[i] == qk_half_to_float(h[i]), "float row conversion");
 
-        std::uniform_real_distribution<float> small(-4.0f, 4.0f);
+        std::uniform_real_distribution<float> bounded(-4.0f, 4.0f);
         for (long n : { 1L, 7L, 8L, 33L, 128L, 1000L })
         {
             std::vector<float> a(static_cast<size_t>(n)), b(static_cast<size_t>(n));
             std::vector<uint16_t> bh(static_cast<size_t>(n));
             for (long i = 0; i < n; ++i)
             {
-                a[static_cast<size_t>(i)] = small(rng);
-                b[static_cast<size_t>(i)] = small(rng);
+                a[static_cast<size_t>(i)] = bounded(rng);
+                b[static_cast<size_t>(i)] = bounded(rng);
                 bh[static_cast<size_t>(i)] = qk_float_to_half(b[static_cast<size_t>(i)]);
             }
             double ref = 0, ref_h = 0, mag = 0;

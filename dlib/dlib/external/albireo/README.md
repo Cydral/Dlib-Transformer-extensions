@@ -166,7 +166,8 @@ The installer is `build-albireo\bin\albireo-setup.exe`. The device trees copy be
 the libraries it loads (OpenVINO with the plugins of the NPU and of the GPU, or the runtime of CUDA,
 cuBLAS and the parts of cuDNN the engine uses, with the Visual C++ runtime) and their licenses,
 which the installer places in its `licenses` folder; the same libraries go beside
-`tests\test_offload.exe`, which then runs from its folder. The random numbers and the solvers of
+`tests\test_offload.exe`, with the CPU plugin of OpenVINO for a machine without NPU or Intel
+graphics, and the test then runs from its folder. The random numbers and the solvers of
 CUDA, which dlib links and the engine never calls, are loaded on first use only and are left out of
 the installation.
 

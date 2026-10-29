@@ -12,7 +12,9 @@
 
 #include "../common/engine_api.h"
 
+#include <algorithm>
 #include <cstring>
+#include <exception>
 #include <new>
 #include <stdexcept>
 #include <string>

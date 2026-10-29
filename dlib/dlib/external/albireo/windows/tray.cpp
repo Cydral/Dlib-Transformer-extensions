@@ -21,6 +21,7 @@
 
 #include <atomic>
 #include <cstdlib>
+#include <cwchar>
 #include <string>
 
 #include "../common/platform.h"

@@ -37,7 +37,7 @@ namespace ui
     UINT dpi_of(HWND w);
     int px(HWND w, int size96);
 
-    enum class font_kind { normal, bold, small, title, subtitle, mono };
+    enum class font_kind { normal, bold, note, title, subtitle, mono };
     // A font for the resolution of a window, kept for the life of the program.
     HFONT font(HWND w, font_kind kind);
 

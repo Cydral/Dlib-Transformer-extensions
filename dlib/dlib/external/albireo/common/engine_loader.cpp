@@ -59,8 +59,21 @@ namespace albireo
     {
         unload();
 #if defined(_WIN32)
-        // The dependencies of the engine are looked up next to it first.
-        HMODULE h = LoadLibraryExW(widen(path).c_str(), nullptr,
+        // The dependencies of the engine are looked up next to it first, a search that needs
+        // the full path of the library.
+        std::wstring file = widen(path);
+        const DWORD size = GetFullPathNameW(file.c_str(), 0, nullptr, nullptr);
+        if (size > 0)
+        {
+            std::wstring full(size, L'\0');
+            const DWORD length = GetFullPathNameW(file.c_str(), size, &full[0], nullptr);
+            if (length > 0 && length < size)
+            {
+                full.resize(length);
+                file = full;
+            }
+        }
+        HMODULE h = LoadLibraryExW(file.c_str(), nullptr,
             LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
         if (!h)
         {

@@ -28,6 +28,7 @@
 #include <memory>
 #include <stdexcept>
 #include <streambuf>
+#include <utility>
 
 namespace dlib
 {

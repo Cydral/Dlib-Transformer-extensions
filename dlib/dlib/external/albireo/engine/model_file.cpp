@@ -6,6 +6,7 @@
 #include <cerrno>
 #include <cstring>
 #include <stdexcept>
+#include <utility>
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN

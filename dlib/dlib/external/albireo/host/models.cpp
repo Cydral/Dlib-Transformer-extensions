@@ -4,8 +4,10 @@
 #include "models.h"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstring>
+#include <exception>
 #include <fstream>
 #include <map>
 

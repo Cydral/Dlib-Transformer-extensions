@@ -3,11 +3,14 @@
 
 #include "system_info.h"
 
+#include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <set>
 #include <sstream>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #if defined(_WIN32)

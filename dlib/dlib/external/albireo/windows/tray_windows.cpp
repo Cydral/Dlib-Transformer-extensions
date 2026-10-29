@@ -9,6 +9,7 @@
 #include <shobjidl.h>
 
 #include <algorithm>
+#include <cwchar>
 #include <map>
 #include <memory>
 #include <set>
@@ -228,7 +229,7 @@ namespace albireo
             void build() override
             {
                 intro = add(ui::label(hwnd, tr("models_intro"), IDC_INTRO, SS_LEFT), ui::font_kind::normal);
-                space = add(ui::label(hwnd, L"", IDC_SPACE, SS_RIGHT), ui::font_kind::small);
+                space = add(ui::label(hwnd, L"", IDC_SPACE, SS_RIGHT), ui::font_kind::note);
                 list = add(ui::listview(hwnd, IDC_LIST));
                 const char* columns[] = { "col_model", "col_roles", "col_size", "col_state", "col_active" };
                 const int widths[] = { 250, 170, 90, 150, 140 };
@@ -245,7 +246,7 @@ namespace albireo
                 const DWORD reader = ES_MULTILINE | ES_READONLY | WS_VSCROLL | ES_AUTOVSCROLL;
                 details = add(ui::edit(hwnd, L"", IDC_DETAILS, reader));
                 progress = add(ui::progress(hwnd, IDC_PROGRESS));
-                status = add(ui::label(hwnd, L"", IDC_STATUS), ui::font_kind::small);
+                status = add(ui::label(hwnd, L"", IDC_STATUS), ui::font_kind::note);
                 download = add(ui::button(hwnd, tr("btn_download"), IDC_DOWNLOAD));
                 activate = add(ui::button(hwnd, tr("btn_activate") + L"…", IDC_ACTIVATE));
                 deactivate = add(ui::button(hwnd, tr("btn_deactivate"), IDC_DEACTIVATE));
@@ -817,7 +818,7 @@ namespace albireo
                 v2max = add(ui::edit(hwnd, L"0", IDC_H_V2MAX, ES_NUMBER));
                 bar = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_OWNERDRAW, 0, 0, 10, 10, hwnd,
                     reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_H_BAR)), nullptr, nullptr);
-                legend = add(ui::label(hwnd, L"", IDC_H_LEGEND), ui::font_kind::small);
+                legend = add(ui::label(hwnd, L"", IDC_H_LEGEND), ui::font_kind::note);
                 folder = add(ui::label(hwnd, L"", IDC_H_FOLDER, SS_PATHELLIPSIS));
                 open_folder = add(ui::button(hwnd, tr("btn_open_folder"), IDC_H_OPEN));
                 change_folder = add(ui::button(hwnd, tr("btn_change"), IDC_H_CHANGE));
@@ -833,7 +834,7 @@ namespace albireo
                 proxy = add(ui::edit(hwnd, L"", IDC_H_PROXY, ES_AUTOHSCROLL));
                 SendMessageW(proxy, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(tr("proxy_hint").c_str()));
                 updates = add(ui::checkbox(hwnd, tr("lbl_auto_updates"), IDC_H_UPDATES, true));
-                status = add(ui::label(hwnd, L"", IDC_H_STATUS), ui::font_kind::small);
+                status = add(ui::label(hwnd, L"", IDC_H_STATUS), ui::font_kind::note);
                 apply = add(ui::button(hwnd, tr("btn_apply"), IDC_H_APPLY));
                 close = add(ui::button(hwnd, tr("btn_close"), IDC_H_CLOSE));
                 SetTimer(hwnd, 1, 3000, nullptr);

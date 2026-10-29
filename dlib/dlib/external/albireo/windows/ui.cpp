@@ -4,6 +4,7 @@
 #include "ui.h"
 
 #include <algorithm>
+#include <exception>
 #include <map>
 #include <mutex>
 #include <thread>
@@ -60,7 +61,7 @@ namespace ui
             switch (kind)
             {
             case font_kind::bold: weight = FW_SEMIBOLD; break;
-            case font_kind::small: points = 8; break;
+            case font_kind::note: points = 8; break;
             case font_kind::title: points = 17; weight = FW_SEMIBOLD; face = display_face.c_str(); break;
             case font_kind::subtitle: points = 11; weight = FW_SEMIBOLD; face = display_face.c_str(); break;
             case font_kind::mono: face = L"Cascadia Mono"; if (!font_exists(face)) face = L"Consolas"; break;
