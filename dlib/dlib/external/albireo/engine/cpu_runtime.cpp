@@ -534,6 +534,11 @@ namespace albireo
             const long t = batch.logit_rows[static_cast<size_t>(r)];
             rms_norm_rows(x_.data() + t * d, output_norm_.data(), hidden_out_.data() + r * d, 1, d, eps);
         }
+        if (batch.hidden_only)
+        {
+            logits.clear();
+            return;
+        }
         logits.resize(static_cast<size_t>(R * cfg_.vocab));
         if (R > 0)
         {

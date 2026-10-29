@@ -1,0 +1,184 @@
+# Copyright (C) 2026 Cydral Technology (cydraltechnology@gmail.com)
+# License: Boost Software License   See LICENSE.txt for the full license.
+<#
+    Tests a Windows build of Albireo and prints a summary, one line per step.
+
+        powershell -ExecutionPolicy Bypass -File test_windows.ps1 [-Model <model.gguf>]
+            [-EmbeddingModel <model.gguf>] [-Device CPU|GPU|NPU] [-NoService]
+
+    Run from the root of the repository after build_windows.ps1 -Tests.  Defaults:
+    $HOME\models\Qwen3-0.6B-Q4_K_M.gguf and $HOME\models\Qwen3-Embedding-0.6B-Q8_0.gguf; the
+    steps whose model or build tree is missing are skipped.
+
+    Steps: the quantized kernels; a question to each processor engine; with the OpenVINO
+    tree, test_offload on the device of -Device (CPU by default, which every machine has)
+    and a question to the OpenVINO engine; with the CUDA tree, a question to the CUDA engine
+    when the machine has a card it supports; the embedding model; then the installed
+    service, unless -NoService: its state, its models, a question and the vectors of two
+    texts through the OpenAI interface.  The exit code is the number of failed steps.
+#>
+param(
+    [string]$Model = (Join-Path $HOME "models\Qwen3-0.6B-Q4_K_M.gguf"),
+    [string]$EmbeddingModel = (Join-Path $HOME "models\Qwen3-Embedding-0.6B-Q8_0.gguf"),
+    [string]$Device = "CPU",
+    [switch]$NoService
+)
+
+$root = (Resolve-Path (Join-Path $PSScriptRoot "..\..\..\..\..")).Path
+$main = Join-Path $root "build-albireo"
+$openvino = Join-Path $root "build-albireo-ov"
+$cuda = Join-Path $root "build-albireo-cuda"
+$question = "What is the capital of France? Answer in one sentence."
+$logs = Join-Path ([System.IO.Path]::GetTempPath()) "albireo-tests"
+New-Item -ItemType Directory -Force -Path $logs | Out-Null
+$results = New-Object System.Collections.ArrayList
+
+function Add-Result([string]$step, [string]$result, [string]$detail, [double]$seconds) {
+    $line = $detail
+    if ($line.Length -gt 70) { $line = $line.Substring(0, 70) }
+    [void]$results.Add([pscustomobject]@{ Step = $step; Result = $result; Seconds = [math]::Round($seconds, 1);
+        Detail = $line })
+}
+
+# Runs a program, then checks that its output holds a pattern.
+function Invoke-Check([string]$step, [string]$pattern, [string]$program, [string[]]$arguments) {
+    if (-not (Test-Path $program)) {
+        Add-Result $step "SKIP" "no $program" 0
+        return $null
+    }
+    $watch = [System.Diagnostics.Stopwatch]::StartNew()
+    $output = & $program @arguments 2>&1 | ForEach-Object { "$_" }
+    $code = $LASTEXITCODE
+    $watch.Stop()
+    $text = $output -join "`n"
+    $found = @($output | Where-Object { $_ -match $pattern })
+    if ($code -eq 0 -and $found.Count -gt 0) {
+        Add-Result $step "PASS" $found[0] $watch.Elapsed.TotalSeconds
+    }
+    else {
+        $log = Join-Path $logs (($step -replace '[^A-Za-z0-9]+', '-') + ".log")
+        Set-Content -Path $log -Value $text -Encoding UTF8
+        Add-Result $step "FAIL" "exit $code, output in $log" $watch.Elapsed.TotalSeconds
+    }
+    return $text
+}
+
+$haveModel = Test-Path $Model
+$chat = Join-Path $main "tests\engine_chat.exe"
+
+Invoke-Check "quantized kernels" "all checks passed" (Join-Path $main "tests\test_qkernels.exe") @() | Out-Null
+
+foreach ($variant in @("cpu-avx2", "cpu")) {
+    $engine = Join-Path $main "bin\engines\albireo-engine-$variant.dll"
+    if (-not $haveModel) { Add-Result "engine $variant" "SKIP" "no $Model" 0; continue }
+    if (-not (Test-Path $engine)) { Add-Result "engine $variant" "SKIP" "no $engine" 0; continue }
+    Invoke-Check "engine $variant" "Paris" $chat @($engine, $Model, "--reasoning", "off", "--max", "40",
+        $question) | Out-Null
+}
+
+$ovEngine = Join-Path $openvino "bin\engines\albireo-engine-openvino.dll"
+if ((Test-Path $ovEngine) -and $haveModel) {
+    $env:DLIB_NPU_DEVICE = $Device
+    Invoke-Check "offload $Device" "all checks passed" (Join-Path $openvino "tests\test_offload.exe") @($Model,
+        $Device) | Out-Null
+    Remove-Item Env:DLIB_NPU_DEVICE
+    $arguments = @($ovEngine, $Model, "--reasoning", "off", "--max", "40")
+    if ($Device -ne "CPU") { $arguments += @("--device", $Device) }
+    Invoke-Check "engine openvino" "Paris" $chat ($arguments + $question) | Out-Null
+}
+else {
+    Add-Result "engine openvino" "SKIP" "no OpenVINO tree or no model" 0
+}
+
+$cudaEngine = Join-Path $cuda "bin\engines\albireo-engine-cuda.dll"
+if ((Test-Path $cudaEngine) -and $haveModel) {
+    # A machine without a supported card: the engine says so in its description.
+    $description = & $chat $cudaEngine $Model --max 1 "Hello" 2>&1 | ForEach-Object { "$_" } |
+        Where-Object { $_ -match '^\{' } | Select-Object -First 1
+    if ("$description" -match '"usable": *false') {
+        $reason = ""
+        if ("$description" -match '"reason": *"([^"]*)"') { $reason = $Matches[1] }
+        Add-Result "engine cuda" "SKIP" "unusable here: $reason" 0
+    }
+    else {
+        Invoke-Check "engine cuda" "Paris" $chat @($cudaEngine, $Model, "--reasoning", "off", "--max", "40",
+            $question) | Out-Null
+    }
+}
+else {
+    Add-Result "engine cuda" "SKIP" "no CUDA tree or no model" 0
+}
+
+$avx2 = Join-Path $main "bin\engines\albireo-engine-cpu-avx2.dll"
+if (Test-Path $EmbeddingModel) {
+    Invoke-Check "embedding model" "cosine" $chat @($avx2, $EmbeddingModel, "--parallel",
+        "The service runs on this computer.", "Where does the service run?", "The quarterly revenue grew.") | Out-Null
+}
+else {
+    Add-Result "embedding model" "SKIP" "no $EmbeddingModel" 0
+}
+
+if (-not $NoService) {
+    $service = Get-Service -Name Albireo -ErrorAction SilentlyContinue
+    if (-not $service) {
+        Add-Result "service" "SKIP" "Albireo is not installed (albireo-setup.exe)" 0
+    }
+    else {
+        $port = 8443
+        $settings = Join-Path $env:ProgramData "Albireo\settings.json"
+        if (Test-Path $settings) {
+            $saved = Get-Content -Raw -Path $settings | ConvertFrom-Json
+            if ($saved.port) { $port = [int]$saved.port }
+        }
+        $base = "https://localhost:$port"
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        $watch = [System.Diagnostics.Stopwatch]::StartNew()
+        try {
+            $status = Invoke-RestMethod -Uri "$base/albireo/v1/status" -TimeoutSec 10
+            $active = ($status.active.PSObject.Properties | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ", "
+            Add-Result "service status" "PASS" "$($service.Status), engine $($status.engine.variant), $active" `
+                $watch.Elapsed.TotalSeconds
+            $models = Invoke-RestMethod -Uri "$base/v1/models" -TimeoutSec 10
+            $names = @($models.data | ForEach-Object { $_.id })
+            Add-Result "service models" "PASS" ($names -join ", ") 0
+            if ($names -contains "albireo-general") {
+                $watch.Restart()
+                $body = @{ model = "albireo-general"; reasoning = $false; max_tokens = 40;
+                    messages = @(@{ role = "user"; content = $question }) } | ConvertTo-Json -Depth 5
+                $answer = Invoke-RestMethod -Method Post -Uri "$base/v1/chat/completions" -Body $body `
+                    -ContentType "application/json" -TimeoutSec 300
+                $text = "$($answer.choices[0].message.content)"
+                $result = "FAIL"
+                if ($text -match "Paris") { $result = "PASS" }
+                Add-Result "service chat" $result $text $watch.Elapsed.TotalSeconds
+            }
+            else {
+                Add-Result "service chat" "SKIP" "no general model active" 0
+            }
+            if ($names -contains "albireo-embedding") {
+                $watch.Restart()
+                $body = @{ model = "albireo-embedding"; input = @("The service runs on this computer.",
+                    "Where does the service run?") } | ConvertTo-Json -Depth 5
+                $vectors = Invoke-RestMethod -Method Post -Uri "$base/v1/embeddings" -Body $body `
+                    -ContentType "application/json" -TimeoutSec 300
+                $count = @($vectors.data).Count
+                $width = @($vectors.data[0].embedding).Count
+                $result = "FAIL"
+                if ($count -eq 2 -and $width -gt 0) { $result = "PASS" }
+                Add-Result "service embeddings" $result "$count vectors of $width dimensions" `
+                    $watch.Elapsed.TotalSeconds
+            }
+            else {
+                Add-Result "service embeddings" "SKIP" "no embedding model active" 0
+            }
+        }
+        catch {
+            Add-Result "service" "FAIL" "$($_.Exception.Message)" $watch.Elapsed.TotalSeconds
+        }
+    }
+}
+
+$results | Format-Table -AutoSize | Out-String -Width 160 | Write-Host
+$failed = @($results | Where-Object { $_.Result -eq "FAIL" }).Count
+Write-Host "failed steps: $failed"
+exit $failed

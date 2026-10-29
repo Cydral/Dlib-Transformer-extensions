@@ -11,6 +11,11 @@ name the commit, so that the file behind an address never changes after the cata
 signed.  A model published elsewhere, such as the parts made by publish_model.py on a
 GitHub release, is listed with its "files" given in full instead of "hub".
 
+The catalog names one default language model, which the service downloads when no language
+model is installed, and one default embedding model, which it downloads in every case: the
+search in the documents of the conversations and of the projects relies on it.  An embedding
+model holds the "embedding" role alone.
+
 The catalog is then signed with albireo-sign (sign <private key> catalog.json), and both
 files are published in dist/albireo of the repository.
 """
@@ -18,9 +23,9 @@ files are published in dist/albireo of the repository.
 import json
 import sys
 import urllib.request
-from datetime import date
+from datetime import datetime, timezone
 
-ROLES = ("general", "code", "security")
+ROLES = ("general", "code", "security", "embedding")
 
 MODELS = [
     {
@@ -46,6 +51,39 @@ MODELS = [
                   "dopo passo prima di rispondere. Funziona sulla maggior parte dei computer con 8 GB di memoria.",
             "es": "Asistente general para conversación, redacción, análisis y uso de herramientas. Puede razonar paso "
                   "a paso antes de responder. Funciona en la mayoría de los ordenadores con 8 GB de memoria.",
+        },
+    },
+    {
+        "id": "qwen3-embedding-0.6b",
+        "name": "Qwen3 Embedding 0.6B",
+        "publisher": "Qwen",
+        "hub": ("Qwen/Qwen3-Embedding-0.6B-GGUF", "Qwen3-Embedding-0.6B-Q8_0.gguf"),
+        "quantization": "Q8_0",
+        "roles": ["embedding"],
+        "default": True,
+        "embedding": True,
+        "dimensions": 1024,
+        "tools": False,
+        "reasoning": False,
+        "license": "Apache-2.0",
+        "description": {
+            "en": "Embedding model of the document search. It turns the passages of the attached documents and the "
+                  "questions into vectors, in more than 100 languages, so that the passages answering a question are "
+                  "found by their meaning. Albireo installs it in every case, the search relies on it.",
+            "fr": "Modèle d'embeddings de la recherche documentaire. Il convertit en vecteurs les passages des "
+                  "documents joints et les questions, dans plus de 100 langues, pour retrouver par leur sens les "
+                  "passages qui répondent à une question. Albireo l'installe dans tous les cas, la recherche en "
+                  "dépend.",
+            "de": "Embedding-Modell der Dokumentsuche. Es wandelt die Abschnitte der angehängten Dokumente und die "
+                  "Fragen in mehr als 100 Sprachen in Vektoren um, damit die Abschnitte, die eine Frage beantworten, "
+                  "über ihre Bedeutung gefunden werden. Albireo installiert es in jedem Fall, die Suche beruht darauf.",
+            "it": "Modello di embedding della ricerca nei documenti. Converte in vettori i passaggi dei documenti "
+                  "allegati e le domande, in più di 100 lingue, per ritrovare in base al significato i passaggi che "
+                  "rispondono a una domanda. Albireo lo installa in ogni caso, la ricerca si basa su di esso.",
+            "es": "Modelo de embeddings de la búsqueda en documentos. Convierte en vectores los pasajes de los "
+                  "documentos adjuntos y las preguntas, en más de 100 idiomas, para encontrar por su significado los "
+                  "pasajes que responden a una pregunta. Albireo lo instala en todos los casos, la búsqueda depende "
+                  "de él.",
         },
     },
     {
@@ -93,6 +131,35 @@ MODELS = [
                   "strumenti e risponde direttamente, senza fase di ragionamento.",
             "es": "Asistente general de Mistral AI, entrenado en muchas lenguas europeas, entre ellas el español. Usa "
                   "herramientas y responde directamente, sin fase de razonamiento.",
+        },
+    },
+    {
+        "id": "llama-3.2-3b",
+        "name": "Llama 3.2 3B",
+        "publisher": "Meta",
+        "hub": ("bartowski/Llama-3.2-3B-Instruct-GGUF", "Llama-3.2-3B-Instruct-Q4_K_M.gguf"),
+        "quantization": "Q4_K_M",
+        "roles": ["general"],
+        "tools": True,
+        "reasoning": False,
+        "license": "Llama 3.2 Community License, Built with Llama",
+        "description": {
+            "en": "General assistant from Meta, trained for English, French, German, Italian, Spanish, Portuguese, "
+                  "Hindi and Thai, with tool use and a context of 128K tokens. It answers directly, without a "
+                  "reasoning phase, and runs on computers with 8 GB of memory.",
+            "fr": "Assistant généraliste de Meta, entraîné pour l'anglais, le français, l'allemand, l'italien, "
+                  "l'espagnol, le portugais, l'hindi et le thaï, avec usage d'outils et un contexte de 128K jetons. "
+                  "Il répond directement, sans phase de raisonnement, et fonctionne sur les ordinateurs dotés de "
+                  "8 Go de mémoire.",
+            "de": "Allgemeiner Assistent von Meta, trainiert für Englisch, Französisch, Deutsch, Italienisch, "
+                  "Spanisch, Portugiesisch, Hindi und Thai, mit Werkzeugnutzung und einem Kontext von 128K Token. Er "
+                  "antwortet direkt, ohne Denkphase, und läuft auf Computern mit 8 GB Arbeitsspeicher.",
+            "it": "Assistente generale di Meta, addestrato per inglese, francese, tedesco, italiano, spagnolo, "
+                  "portoghese, hindi e thailandese, con uso di strumenti e un contesto di 128K token. Risponde "
+                  "direttamente, senza fase di ragionamento, e funziona su computer con 8 GB di memoria.",
+            "es": "Asistente general de Meta, entrenado para inglés, francés, alemán, italiano, español, portugués, "
+                  "hindi y tailandés, con uso de herramientas y un contexto de 128K tokens. Responde directamente, "
+                  "sin fase de razonamiento, y funciona en ordenadores con 8 GB de memoria.",
         },
     },
     {
@@ -300,12 +367,17 @@ def main():
     models = []
     for m in MODELS:
         assert all(r in ROLES for r in m["roles"]), m["id"]
+        assert "embedding" not in m["roles"] or (m["roles"] == ["embedding"] and m.get("embedding")), m["id"]
         assert set(m["description"]) == {"en", "fr", "de", "it", "es"}, m["id"]
         models.append(from_hub(m) if "hub" in m else m)
-        print("%-20s %6.2f GB  %s" % (models[-1]["id"], models[-1]["size"] / 1e9, models[-1]["sha256"]))
-    defaults = [m["id"] for m in models if m.get("default")]
-    assert len(defaults) == 1, defaults
-    catalog = {"format": 1, "updated": date.today().isoformat(), "models": models}
+        print("%-22s %6.2f GB  %s" % (models[-1]["id"], models[-1]["size"] / 1e9, models[-1]["sha256"]))
+    for embedding in (False, True):
+        defaults = [m["id"] for m in models if m.get("default") and ("embedding" in m["roles"]) == embedding]
+        assert len(defaults) == 1, defaults
+    # The time of publication, which the services compare as a string to keep the newer of
+    # two catalogs: the earlier catalogs gave the day alone, which sorts before any time of it.
+    updated = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    catalog = {"format": 1, "updated": updated, "models": models}
     with open(sys.argv[1], "w", encoding="utf-8", newline="\n") as f:
         json.dump(catalog, f, ensure_ascii=False, indent=2)
         f.write("\n")

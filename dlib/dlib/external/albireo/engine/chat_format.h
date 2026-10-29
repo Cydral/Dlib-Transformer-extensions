@@ -57,6 +57,7 @@ namespace albireo
         std::string today;          // dates, for the formats whose default prompt names them:
         std::string yesterday;      // "2026-10-29", "2026-10-28"
         std::string today_long;     // "October 29, 2026"
+        std::string today_short;    // "29 Oct 2026"
     };
 
     enum class output_kind { content, reasoning, tool_call };

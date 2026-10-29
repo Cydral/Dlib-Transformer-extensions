@@ -7,6 +7,17 @@
 #include <functional>
 #include <string>
 
+/*
+    The downloads of the service: the update feed, the catalog of the models, the
+    installers and the model files.  Every request runs on a thread of its own caller, a
+    background task of the service, and is bounded in time at each stage: the resolution
+    of the name of the server (on Windows), the connection, then each wait for data.  A
+    service that stops, or that the settings put offline, calls http_cancel_all(), which
+    ends the requests in progress at their next stage and makes the following ones fail at
+    once, so that an unreachable network, as on a machine without Internet access, never
+    delays the service.
+*/
+
 namespace albireo
 {
 
@@ -35,16 +46,36 @@ namespace albireo
 
     /*!
         ensures
-            - Downloads url into body, following redirects, verifying the certificates of
-              https servers against those of the system.  Fails beyond max_bytes.
+            - Ends the downloads in progress: a transfer stops at once, and on Windows a
+              name being resolved or a server being reached as well.  A connection that
+              httplib is opening, its TLS handshake or the answer of a proxy included,
+              ends within its bounds (connect_seconds, then the timeout of the request
+              for the proxy).  A request about to connect opens nothing: its client checks
+              the cancellation before its socket connects.
+            - Makes the downloads that follow fail at once, until http_restore().
+            - reason becomes the error of the downloads it ends or refuses.
+    !*/
+    void http_cancel_all(const std::string& reason);
+    void http_restore();
+    bool http_cancelled();
+
+    // Seconds allowed to resolve the name of a server, and to connect to it.
+    const int connect_seconds = 10;
+
+    /*!
+        ensures
+            - Downloads url into body, following up to five redirections, verifying the
+              certificates of https servers against those of the system.  Fails beyond
+              max_bytes, or when no data arrives during timeout_seconds.
     !*/
     bool http_get(const std::string& url, std::string& body, std::string& error, size_t max_bytes = 16u << 20,
-        int timeout_seconds = 30);
+        int timeout_seconds = 20);
 
     /*!
         ensures
             - Downloads the bytes [from, to] of url (to < 0: up to the end), handing them to
-              receiver as they arrive; receiver returns false to stop.
+              receiver as they arrive; receiver returns false to stop.  Redirections are
+              followed with the same range.
             - total, when given, receives the size of the whole resource when the server
               tells it (Content-Range or Content-Length), 0 otherwise.
             - Fails when the server ignores the range of a request that does not start at
@@ -52,9 +83,6 @@ namespace albireo
     !*/
     bool http_get_range(const std::string& url, uint64_t from, int64_t to,
         const std::function<bool(const char*, size_t)>& receiver, std::string& error, uint64_t* total = nullptr);
-
-    // Size of a resource from a HEAD request, 0 when unknown.
-    uint64_t http_content_length(const std::string& url, std::string& error);
 
 }
 

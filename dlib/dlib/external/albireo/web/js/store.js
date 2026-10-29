@@ -4,12 +4,13 @@
 /*
     The data of the application, kept in the IndexedDB database of this browser for the
     origin of the local server: the discussions with their messages, the projects with
-    their instructions and documents, and the preferences.  Nothing is sent anywhere; an
-    incognito discussion never reaches this module.
+    their instructions and documents, the passages of the documents with their vectors for
+    the document search, and the preferences.  Nothing is sent anywhere; an incognito
+    discussion never reaches this module.
 */
 
 const DB_NAME = 'albireo';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 let db = null;
 
 function request(r) {
@@ -31,6 +32,13 @@ export async function open() {
     }
     if (!d.objectStoreNames.contains('projects')) d.createObjectStore('projects', { keyPath: 'id' });
     if (!d.objectStoreNames.contains('settings')) d.createObjectStore('settings', { keyPath: 'key' });
+    // The passages of the documents: {id, owner (project or discussion), doc, ordinal, text,
+    // where, model, vector}.
+    if (!d.objectStoreNames.contains('chunks')) {
+      const c = d.createObjectStore('chunks', { keyPath: 'id' });
+      c.createIndex('owner', 'owner');
+      c.createIndex('doc', 'doc');
+    }
   };
   db = await request(r);
   return db;
@@ -65,6 +73,7 @@ export async function putConversation(c) {
 
 export async function deleteConversation(id) {
   await open();
+  await deleteChunks('owner', id);
   return request(store('conversations', 'readwrite').delete(id));
 }
 
@@ -95,7 +104,45 @@ export async function deleteProject(id) {
       await putConversation(c);
     }
   }
+  await deleteChunks('owner', id);
   return request(store('projects', 'readwrite').delete(id));
+}
+
+// The passages of the document search.
+export async function putChunks(records) {
+  await open();
+  if (!records.length) return;
+  const tx = db.transaction('chunks', 'readwrite');
+  const s = tx.objectStore('chunks');
+  for (const r of records) s.put(r);
+  await new Promise((resolve, reject) => {
+    tx.oncomplete = resolve;
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error);
+  });
+}
+
+export async function chunksOf(owner) {
+  await open();
+  return request(store('chunks', 'readonly').index('owner').getAll(owner));
+}
+
+// Deletes the passages of an owner ('owner') or of a document ('doc').
+export async function deleteChunks(index, key) {
+  await open();
+  const tx = db.transaction('chunks', 'readwrite');
+  const range = IDBKeyRange.only(key);
+  await new Promise((resolve, reject) => {
+    const cursor = tx.objectStore('chunks').index(index).openKeyCursor(range);
+    cursor.onsuccess = () => {
+      const c = cursor.result;
+      if (!c) return;
+      tx.objectStore('chunks').delete(c.primaryKey);
+      c.continue();
+    };
+    tx.oncomplete = resolve;
+    tx.onerror = () => reject(tx.error);
+  });
 }
 
 export async function getSettings() {
@@ -140,4 +187,5 @@ export async function clearAll() {
   await open();
   await request(store('conversations', 'readwrite').clear());
   await request(store('projects', 'readwrite').clear());
+  await request(store('chunks', 'readwrite').clear());
 }

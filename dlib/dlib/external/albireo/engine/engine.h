@@ -23,6 +23,7 @@ namespace albireo
     class tensor_device;
     struct loaded_model;
     struct request_state;
+    struct embedding_job;
 
     // Receives the events of a request: a kind of engine_api.h and its data.
     typedef std::function<void(int kind, const std::string& data)> event_sink;
@@ -50,6 +51,12 @@ namespace albireo
                 them over or copies them instead of computing them again.  The cached
                 sequences are dropped, least recently used first, when memory runs short.
 
+                An embedding model answers requests whose "input" lists texts: each text
+                is read as a prompt of its own, the texts of every request sharing the
+                passes, and the normalized hidden state of its last token becomes its
+                vector.  While a language model answers, the passes of the embedding
+                models stay short, so that indexing documents never stalls a conversation.
+
             THREAD SAFETY
                 Every member function may be called from any thread.  Event sinks run on
                 the scheduler thread and must return quickly.
@@ -75,7 +82,10 @@ namespace albireo
 
     private:
         void run();
-        bool step(const std::shared_ptr<loaded_model>& m);
+        bool step(const std::shared_ptr<loaded_model>& m, long budget);
+        uint64_t submit_embeddings(const std::shared_ptr<loaded_model>& m, const json& request, event_sink sink);
+        void complete_part(loaded_model& m, request_state& r, const float* hidden);
+        void end_job(embedding_job& job, const std::string& code, const std::string& message);
         void admit(loaded_model& m);
         bool assign_sequence(loaded_model& m, request_state& r);
         bool reserve(loaded_model& m, int seq, long length);
@@ -101,6 +111,7 @@ namespace albireo
         std::condition_variable unloaded_;
         std::map<std::string, std::shared_ptr<loaded_model>> models_;
         std::map<uint64_t, std::shared_ptr<request_state>> requests_;
+        std::map<uint64_t, std::shared_ptr<embedding_job>> jobs_;
         uint64_t next_id_ = 1;
         bool stop_ = false;
         std::thread worker_;

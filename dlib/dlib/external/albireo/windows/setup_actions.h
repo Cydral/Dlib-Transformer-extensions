@@ -27,6 +27,7 @@ namespace setup
         bool desktop_shortcut = false;
         bool trust_certificate = true;
         bool default_model = true;
+        bool offline = false;         // no Internet access: nothing is fetched, files are imported
         int port = 8443;
     };
 
@@ -40,9 +41,9 @@ namespace setup
 
     /*
         The options of the installation in place, for a new run of the installer over it:
-        its folder, the port, the models folder and the default model recorded in
-        settings.json, the start of the tray and the shortcut of the desktop as found in
-        the registry and on the desktop.  The defaults without an installation.
+        its folder, the port, the models folder, the default model and the offline mode
+        recorded in settings.json, the start of the tray and the shortcut of the desktop as
+        found in the registry and on the desktop.  The defaults without an installation.
     */
     install_options installed_options();
 
@@ -81,9 +82,13 @@ namespace setup
     // Merges the options into settings.json, keeping the other settings.
     bool write_settings(const install_options& o, std::string& error);
 
-    // Copies the models found next to the installer (a "models" folder on the medium) into
-    // the import folder of the service.
-    int stage_bundled_models(const std::function<void(const std::string&)>& progress);
+    /*
+        Copies the offline bundle the installer comes with, on a medium, into the import
+        folder of the service, which installs it at its start: the signed catalog next to
+        the installer (catalog.json and catalog.json.sig) and the models of its "models"
+        folder.  Returns the number of models; progress receives the name of each one.
+    */
+    int stage_bundle(const std::function<void(const std::string&)>& progress);
 
     // The certificates of the local server, and the trust of the authority by Windows.
     bool create_certificates(std::string& error);

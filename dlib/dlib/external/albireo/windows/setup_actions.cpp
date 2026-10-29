@@ -13,14 +13,19 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
-#include <aclapi.h>
-#include <exdisp.h>
-#include <sddl.h>
+// The COM declarations come first: the first declarations of exdisp.h in the Windows SDK use
+// the interface macro of objbase.h, which windows.h leaves out with WIN32_LEAN_AND_MEAN.
+// shellapi.h precedes shldisp.h, whose ShellExecute method then receives the same name as
+// the calls.
+#include <ole2.h>
 #include <shellapi.h>
-#include <shldisp.h>
-#include <shlguid.h>
 #include <shlobj.h>
 #include <shobjidl.h>
+#include <exdisp.h>
+#include <shldisp.h>
+#include <shlguid.h>
+#include <aclapi.h>
+#include <sddl.h>
 #include <wincrypt.h>
 
 #include <algorithm>
@@ -196,6 +201,7 @@ namespace setup
             if (port >= 1024 && port <= 65535) o.port = static_cast<int>(port);
             if (!s["models_dir"].as_string().empty()) o.models_dir = s["models_dir"].as_string();
             o.default_model = s["default_model"].as_bool(true);
+            o.offline = s["offline"].as_bool(false);
         }
         if (!dir.empty())
         {
@@ -480,6 +486,7 @@ namespace setup
         s["port"] = o.port;
         s["models_dir"] = o.models_dir.empty() || o.models_dir == default_models_dir() ? std::string() : o.models_dir;
         s["default_model"] = o.default_model;
+        s["offline"] = o.offline;
         if (!o.models_dir.empty()) make_dirs(o.models_dir);
         if (!write_file_atomic(path, s.dump_formatted(2) + "\n"))
         {
@@ -489,11 +496,19 @@ namespace setup
         return true;
     }
 
-    int stage_bundled_models(const std::function<void(const std::string&)>& progress)
+    int stage_bundle(const std::function<void(const std::string&)>& progress)
     {
-        const std::string source = join_path(executable_dir(), "models");
-        if (!dir_exists(source)) return 0;
+        const std::string bundle = executable_dir();
         const std::string inbox = join_path(data_dir(), "import");
+        const std::string catalog = join_path(bundle, "catalog.json");
+        if (file_exists(catalog) && file_exists(catalog + ".sig"))
+        {
+            make_dirs(inbox);
+            CopyFileW(widen(catalog + ".sig").c_str(), widen(join_path(inbox, "catalog.json.sig")).c_str(), FALSE);
+            CopyFileW(widen(catalog).c_str(), widen(join_path(inbox, "catalog.json")).c_str(), FALSE);
+        }
+        const std::string source = join_path(bundle, "models");
+        if (!dir_exists(source)) return 0;
         make_dirs(inbox);
         int n = 0;
         for (const auto& name : list_dir(source))

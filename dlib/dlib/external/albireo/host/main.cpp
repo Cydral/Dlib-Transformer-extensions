@@ -124,6 +124,10 @@ namespace
     {
         std::lock_guard<std::mutex> lock(status_m);
         static DWORD checkpoint = 1;
+        // Nothing follows the final state, whatever thread reports late.
+        static bool stopped = false;
+        if (stopped) return;
+        if (state == SERVICE_STOPPED) stopped = true;
         status.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
         status.dwCurrentState = state;
         status.dwWaitHint = wait_hint;
@@ -143,6 +147,25 @@ namespace
         SetServiceStatus(status_handle, &status);
     }
 
+    /*
+        Tells the service manager, every two seconds, that the stop goes on.  A request to
+        the network still opening its connection, which httplib cannot interrupt, holds the
+        stop for the bounds of its connection (http_fetch.h); the manager then waits rather
+        than report a service that does not answer.
+    */
+    void report_stop_progress()
+    {
+        static std::atomic<bool> started{false};
+        if (started.exchange(true)) return;
+        std::thread([]() {
+            for (int i = 0; i < 60; ++i)
+            {
+                std::this_thread::sleep_for(std::chrono::seconds(2));
+                report(SERVICE_STOP_PENDING, NO_ERROR, 10000);
+            }
+        }).detach();
+    }
+
     DWORD WINAPI control_handler(DWORD control, DWORD, LPVOID, LPVOID)
     {
         switch (control)
@@ -152,6 +175,7 @@ namespace
         case SERVICE_CONTROL_SHUTDOWN:
             report(SERVICE_STOP_PENDING, NO_ERROR, 30000);
             request_stop();
+            report_stop_progress();
             return NO_ERROR;
         case SERVICE_CONTROL_INTERROGATE:
             return NO_ERROR;

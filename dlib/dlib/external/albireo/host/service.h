@@ -68,6 +68,14 @@ namespace albireo
                 run() starts its installer instead of serving and returns with
                 update_started() true: the installer stops the service, replaces the
                 programs and starts the service again.
+
+            NETWORK
+                The catalog, the updates and the downloads run on threads of their own,
+                each request bounded in time, so that the local work (the models, the
+                imports, the requests of the users) never waits for the network.  With
+                the "offline" setting, no request leaves the machine: the catalog, the
+                updates and the models come from folders, the import folder of the data
+                folder or a folder named by the tray (import_folder()).
         !*/
     public:
         service();
@@ -98,10 +106,37 @@ namespace albireo
         json engines();
         // The engine model of a request: an identifier, a role or its alias, or auto.
         std::string resolve_model(const std::string& requested);
+        // The embedding model of a request: a loaded embedding model named by its
+        // identifier, otherwise the active one ("auto", "embedding", "albireo-embedding").
+        std::string resolve_embedding_model(const std::string& requested);
         bool activate(const std::string& id, const std::string& role, std::string& error);
-        void deactivate(const std::string& id);
+        /*!
+            ensures
+                - Takes every function from the model id and unloads it.  The model of the
+                  document search keeps its function unless removing, the model being
+                  deleted: the search always has its embedding model, which another
+                  embedding model replaces through activate().
+        !*/
+        bool deactivate(const std::string& id, std::string& error, bool removing = false);
         // Loads the models of the roles of the settings into the engine.
         void load_active_models();
+
+        /*!
+            ensures
+                - Installs what a folder brought to the machine holds, such as an offline
+                  bundle (tools/make_offline_bundle.py): its signed catalog (catalog.json
+                  and catalog.json.sig) first, so that the models take their entries, then
+                  its models (*.gguf, in the folder and in its "models" subfolder), then
+                  its signed update (feed.json, feed.json.sig and the installer).  A path
+                  to a single GGUF file installs that file.
+                - Returns {"imported", "errors"} as model_manager::import_path(), with
+                  "catalog" and "update" when the folder holds them.
+        !*/
+        json import_folder(const std::string& path);
+
+        // Applies the network settings at once: the proxy, and the offline mode, which
+        // ends the requests in progress.
+        void apply_network_settings(const host_settings& s);
 
         // Counts the usage of a finished request.
         void record_usage(long prompt_tokens, long generated_tokens);
@@ -119,6 +154,7 @@ namespace albireo
         void ensure_default_model();
         void scan_inbox();
         void on_installed(const installed_model& m);
+        static bool is_embedding(const installed_model& m);
         bool load_model(const installed_model& m, std::string& error);
         json engine_config(const host_settings& s, const std::string& device) const;
         std::string engines_dir() const;
@@ -136,6 +172,8 @@ namespace albireo
         engine_choice choice_;
         std::string engine_error_;
 
+        // Guards the server, the model manager and the updater while run() creates and
+        // releases them, for stop(), which a thread of the system may call at any time.
         std::mutex server_m_;
         std::unique_ptr<httplib::SSLServer> server_;
 
@@ -145,7 +183,9 @@ namespace albireo
         std::mutex m_;
         std::condition_variable cv_;
         std::thread background_;
+        std::thread restarter_;
         std::mutex models_m_;   // serializes the activations and the loads
+        std::mutex import_m_;   // serializes the imports of folders
         std::map<std::string, std::string> load_state_;   // model -> "loading", "ready" or the error
         int64_t started_at_ = 0;
         std::atomic<long long> usage_prompt_{0};

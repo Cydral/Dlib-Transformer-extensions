@@ -3,7 +3,7 @@
  "info": {
   "title": "Albireo local interface",
   "version": "1.0.0",
-  "description": "The interface of the Albireo service, served on https://localhost (port 8443 unless changed in the tray). The routes under /v1 follow the OpenAI interface, so that its client libraries work with base_url https://localhost:8443/v1 and any API key. The functions albireo-general, albireo-code and albireo-security name the models activated in the tray.\n\nThe administration routes require the token of the data folder of the service (admin.token) in the X-Albireo-Admin header.",
+  "description": "The interface of the Albireo service, served on https://localhost (port 8443 unless changed in the tray). The routes under /v1 follow the OpenAI interface, so that its client libraries work with base_url https://localhost:8443/v1 and any API key. The functions albireo-general, albireo-code and albireo-security name the models activated in the tray, and albireo-embedding the embedding model of the search in documents.\n\nThe administration routes require the token of the data folder of the service (admin.token) in the X-Albireo-Admin header.",
   "license": {
    "name": "Boost Software License 1.0",
    "url": "https://www.boost.org/LICENSE_1_0.txt"
@@ -132,6 +132,57 @@
        "application/json": {
         "schema": {
          "$ref": "#/components/schemas/Completion"
+        }
+       }
+      }
+     },
+     "400": {
+      "description": "Invalid request",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "404": {
+      "description": "Unknown or inactive model",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/v1/embeddings": {
+   "post": {
+    "tags": [
+     "OpenAI"
+    ],
+    "summary": "Vectors of texts, for search and comparison",
+    "description": "Computed by the embedding model of the service, which the search in the documents of the web application uses. The inputs of every client are computed together, and the passes of the embedding model stay short while a conversation is being answered.",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/EmbeddingRequest"
+       }
+      }
+     }
+    },
+    "responses": {
+     "200": {
+      "description": "One vector per input, in the order of the inputs",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/EmbeddingList"
         }
        }
       }
@@ -344,10 +395,20 @@
       "adminToken": []
      }
     ],
-    "summary": "Fetches the catalog again",
+    "summary": "Fetches the catalog again, in the background",
     "responses": {
-     "200": {
-      "description": "Result",
+     "202": {
+      "description": "Started",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object"
+        }
+       }
+      }
+     },
+     "409": {
+      "description": "Refused in offline mode",
       "content": {
        "application/json": {
         "schema": {
@@ -411,6 +472,24 @@
      },
      "400": {
       "description": "Refused",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "ok": {
+           "type": "boolean"
+          },
+          "error": {
+           "type": "string"
+          }
+         }
+        }
+       }
+      }
+     },
+     "409": {
+      "description": "Refused in offline mode",
       "content": {
        "application/json": {
         "schema": {
@@ -508,9 +587,11 @@
           "enum": [
            "general",
            "code",
-           "security"
+           "security",
+           "embedding"
           ],
-          "default": "general"
+          "default": "general",
+          "description": "embedding takes an embedding model only, the other functions a language model."
          }
         }
        }
@@ -684,6 +765,70 @@
     }
    }
   },
+  "/albireo/v1/import": {
+   "post": {
+    "tags": [
+     "Administration"
+    ],
+    "security": [
+     {
+      "adminToken": []
+     }
+    ],
+    "summary": "Imports an offline bundle, or the GGUF files of a local folder or file",
+    "description": "For a computer without network: a memory card or a disk brought to the machine. A folder may hold a signed catalog (catalog.json and catalog.json.sig), GGUF files, also in its models subfolder, and a signed update (feed.json, feed.json.sig and the installer it names), as tools/make_offline_bundle.py prepares them. An older catalog never replaces a newer one, and the update is installed at the next start of the service.",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "required": [
+         "path"
+        ],
+        "properties": {
+         "path": {
+          "type": "string"
+         }
+        }
+       }
+      }
+     }
+    },
+    "responses": {
+     "200": {
+      "description": "Imported models, catalog, update and errors",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "imported": {
+           "type": "array",
+           "items": {
+            "type": "string"
+           }
+          },
+          "errors": {
+           "type": "array",
+           "items": {
+            "type": "string"
+           }
+          },
+          "catalog": {
+           "type": "object"
+          },
+          "update": {
+           "type": "object"
+          }
+         }
+        }
+       }
+      }
+     }
+    }
+   }
+  },
   "/albireo/v1/models/import": {
    "post": {
     "tags": [
@@ -694,8 +839,7 @@
       "adminToken": []
      }
     ],
-    "summary": "Imports the GGUF files of a local folder or file",
-    "description": "For an installation without network: a memory card or a disk brought to the machine.",
+    "summary": "Same as /albireo/v1/import",
     "requestBody": {
      "required": true,
      "content": {
@@ -852,7 +996,7 @@
       "adminToken": []
      }
     ],
-    "summary": "Checks for an update and downloads it",
+    "summary": "Checks for an update and downloads it, in the background",
     "responses": {
      "202": {
       "description": "State",
@@ -860,6 +1004,24 @@
        "application/json": {
         "schema": {
          "type": "object"
+        }
+       }
+      }
+     },
+     "409": {
+      "description": "Refused in offline mode",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "ok": {
+           "type": "boolean"
+          },
+          "error": {
+           "type": "string"
+          }
+         }
         }
        }
       }
@@ -1481,6 +1643,130 @@
      }
     }
    },
+   "EmbeddingRequest": {
+    "type": "object",
+    "required": [
+     "input"
+    ],
+    "properties": {
+     "model": {
+      "type": "string",
+      "description": "albireo-embedding, auto, or the identifier of an active embedding model.",
+      "example": "albireo-embedding"
+     },
+     "input": {
+      "description": "A text, a list of texts, or token lists.",
+      "oneOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "array",
+        "items": {
+         "type": "string"
+        },
+        "maxItems": 2048
+       },
+       {
+        "type": "array",
+        "items": {
+         "type": "integer"
+        }
+       },
+       {
+        "type": "array",
+        "items": {
+         "type": "array",
+         "items": {
+          "type": "integer"
+         }
+        }
+       }
+      ]
+     },
+     "encoding_format": {
+      "type": "string",
+      "enum": [
+       "float",
+       "base64"
+      ],
+      "default": "float",
+      "description": "base64: the little-endian float32 values of each vector."
+     },
+     "dimensions": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Keeps the leading dimensions of each vector, normalized again, for the models trained to keep their meaning when shortened (Qwen3 Embedding: 32 to 1024)."
+     },
+     "user": {
+      "type": "string",
+      "description": "Accepted and ignored."
+     }
+    },
+    "example": {
+     "model": "albireo-embedding",
+     "input": [
+      "The service runs on this computer.",
+      "Where does the service run?"
+     ]
+    }
+   },
+   "EmbeddingList": {
+    "type": "object",
+    "properties": {
+     "object": {
+      "type": "string",
+      "enum": [
+       "list"
+      ]
+     },
+     "model": {
+      "type": "string"
+     },
+     "data": {
+      "type": "array",
+      "items": {
+       "type": "object",
+       "properties": {
+        "object": {
+         "type": "string",
+         "enum": [
+          "embedding"
+         ]
+        },
+        "index": {
+         "type": "integer"
+        },
+        "embedding": {
+         "description": "Unit vector: numbers, or a base64 string.",
+         "oneOf": [
+          {
+           "type": "array",
+           "items": {
+            "type": "number"
+           }
+          },
+          {
+           "type": "string"
+          }
+         ]
+        }
+       }
+      }
+     },
+     "usage": {
+      "type": "object",
+      "properties": {
+       "prompt_tokens": {
+        "type": "integer"
+       },
+       "total_tokens": {
+        "type": "integer"
+       }
+      }
+     }
+    }
+   },
    "ModelList": {
     "type": "object",
     "properties": {
@@ -1580,6 +1866,10 @@
      },
      "check_updates": {
       "type": "boolean"
+     },
+     "offline": {
+      "type": "boolean",
+      "description": "No access to the network: the catalog, the models and the updates come from imports, and the service opens no connection."
      },
      "proxy": {
       "type": "string",

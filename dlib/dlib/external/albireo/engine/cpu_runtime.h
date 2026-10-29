@@ -65,6 +65,7 @@ namespace albireo
         {
             return 2 * static_cast<size_t>(cfg_.n_layers) * cfg_.kv_dim() * sizeof(uint16_t);
         }
+        void trim_memory() override { kv_.trim(); }
         size_t weight_bytes() const override { return static_cast<size_t>(file_->size()); }
 
         std::string description() const override;
@@ -72,9 +73,7 @@ namespace albireo
         // Hands the products of the following passes to a device.
         void set_offload(std::unique_ptr<matmul_offload> offload) { offload_ = std::move(offload); }
 
-        // Hidden states after the final normalization for the rows of the last forward
-        // that produced logits (embedding extraction).
-        const std::vector<float>& last_hidden() const { return hidden_out_; }
+        const std::vector<float>& hidden() const override { return hidden_out_; }
 
     private:
         struct layer

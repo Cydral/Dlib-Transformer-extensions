@@ -1,6 +1,6 @@
 {
   "format": 1,
-  "updated": "2026-10-29",
+  "updated": "2026-10-29T20:22:43Z",
   "models": [
     {
       "id": "qwen3-4b",
@@ -32,6 +32,41 @@
           "url": "https://huggingface.co/Qwen/Qwen3-4B-GGUF/resolve/bc640142c66e1fdd12af0bd68f40445458f3869b/Qwen3-4B-Q4_K_M.gguf",
           "size": 2497280256,
           "sha256": "7485fe6f11af29433bc51cab58009521f205840f5b4ae3a32fa7f92e8534fdf5"
+        }
+      ]
+    },
+    {
+      "id": "qwen3-embedding-0.6b",
+      "name": "Qwen3 Embedding 0.6B",
+      "publisher": "Qwen",
+      "quantization": "Q8_0",
+      "roles": [
+        "embedding"
+      ],
+      "default": true,
+      "embedding": true,
+      "dimensions": 1024,
+      "tools": false,
+      "reasoning": false,
+      "license": "Apache-2.0",
+      "description": {
+        "en": "Embedding model of the document search. It turns the passages of the attached documents and the questions into vectors, in more than 100 languages, so that the passages answering a question are found by their meaning. Albireo installs it in every case, the search relies on it.",
+        "fr": "Modèle d'embeddings de la recherche documentaire. Il convertit en vecteurs les passages des documents joints et les questions, dans plus de 100 langues, pour retrouver par leur sens les passages qui répondent à une question. Albireo l'installe dans tous les cas, la recherche en dépend.",
+        "de": "Embedding-Modell der Dokumentsuche. Es wandelt die Abschnitte der angehängten Dokumente und die Fragen in mehr als 100 Sprachen in Vektoren um, damit die Abschnitte, die eine Frage beantworten, über ihre Bedeutung gefunden werden. Albireo installiert es in jedem Fall, die Suche beruht darauf.",
+        "it": "Modello di embedding della ricerca nei documenti. Converte in vettori i passaggi dei documenti allegati e le domande, in più di 100 lingue, per ritrovare in base al significato i passaggi che rispondono a una domanda. Albireo lo installa in ogni caso, la ricerca si basa su di esso.",
+        "es": "Modelo de embeddings de la búsqueda en documentos. Convierte en vectores los pasajes de los documentos adjuntos y las preguntas, en más de 100 idiomas, para encontrar por su significado los pasajes que responden a una pregunta. Albireo lo instala en todos los casos, la búsqueda depende de él."
+      },
+      "arch": "qwen3",
+      "parameters": 595776512,
+      "context": 32768,
+      "source": "https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF",
+      "size": 639150592,
+      "sha256": "06507c7b42688469c4e7298b0a1e16deff06caf291cf0a5b278c308249c3e439",
+      "files": [
+        {
+          "url": "https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF/resolve/370f27d7550e0def9b39c1f16d3fbaa13aa67728/Qwen3-Embedding-0.6B-Q8_0.gguf",
+          "size": 639150592,
+          "sha256": "06507c7b42688469c4e7298b0a1e16deff06caf291cf0a5b278c308249c3e439"
         }
       ]
     },
@@ -96,6 +131,38 @@
           "url": "https://huggingface.co/mistralai/Ministral-3-3B-Instruct-2512-GGUF/resolve/eb599d408350ea2bb60452cb86be7c7b2fc28227/Ministral-3-3B-Instruct-2512-Q4_K_M.gguf",
           "size": 2147023008,
           "sha256": "9ed150d4367e68df0ac8e1540f6ddc65b42d0ee26378329d1ecbca60f93fc5f8"
+        }
+      ]
+    },
+    {
+      "id": "llama-3.2-3b",
+      "name": "Llama 3.2 3B",
+      "publisher": "Meta",
+      "quantization": "Q4_K_M",
+      "roles": [
+        "general"
+      ],
+      "tools": true,
+      "reasoning": false,
+      "license": "Llama 3.2 Community License, Built with Llama",
+      "description": {
+        "en": "General assistant from Meta, trained for English, French, German, Italian, Spanish, Portuguese, Hindi and Thai, with tool use and a context of 128K tokens. It answers directly, without a reasoning phase, and runs on computers with 8 GB of memory.",
+        "fr": "Assistant généraliste de Meta, entraîné pour l'anglais, le français, l'allemand, l'italien, l'espagnol, le portugais, l'hindi et le thaï, avec usage d'outils et un contexte de 128K jetons. Il répond directement, sans phase de raisonnement, et fonctionne sur les ordinateurs dotés de 8 Go de mémoire.",
+        "de": "Allgemeiner Assistent von Meta, trainiert für Englisch, Französisch, Deutsch, Italienisch, Spanisch, Portugiesisch, Hindi und Thai, mit Werkzeugnutzung und einem Kontext von 128K Token. Er antwortet direkt, ohne Denkphase, und läuft auf Computern mit 8 GB Arbeitsspeicher.",
+        "it": "Assistente generale di Meta, addestrato per inglese, francese, tedesco, italiano, spagnolo, portoghese, hindi e thailandese, con uso di strumenti e un contesto di 128K token. Risponde direttamente, senza fase di ragionamento, e funziona su computer con 8 GB di memoria.",
+        "es": "Asistente general de Meta, entrenado para inglés, francés, alemán, italiano, español, portugués, hindi y tailandés, con uso de herramientas y un contexto de 128K tokens. Responde directamente, sin fase de razonamiento, y funciona en ordenadores con 8 GB de memoria."
+      },
+      "arch": "llama",
+      "parameters": 3212749888,
+      "context": 131072,
+      "source": "https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF",
+      "size": 2019377696,
+      "sha256": "6c1a2b41161032677be168d354123594c0e6e67d2b9227c84f296ad037c728ff",
+      "files": [
+        {
+          "url": "https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/5ab33fa94d1d04e903623ae72c95d1696f09f9e8/Llama-3.2-3B-Instruct-Q4_K_M.gguf",
+          "size": 2019377696,
+          "sha256": "6c1a2b41161032677be168d354123594c0e6e67d2b9227c84f296ad037c728ff"
         }
       ]
     },

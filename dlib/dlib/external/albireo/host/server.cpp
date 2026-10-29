@@ -10,6 +10,7 @@
         /v1/models                OpenAI compatible interface
         /v1/chat/completions
         /v1/completions
+        /v1/embeddings
         /albireo/v1/...           the interface of the web application and of the tray
 
     The operations that change the installation (downloads, activation, settings,
@@ -30,6 +31,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <fstream>
 #include <mutex>
@@ -323,7 +325,7 @@ namespace albireo
                 return;
             }
 
-            res.set_header("Cache-Control", "no-cache");
+            // The post-routing handler marks the answers of the interface "no-store".
             res.set_header("X-Accel-Buffering", "no");
             auto first = std::make_shared<bool>(true);
             auto tool_index = std::make_shared<int>(0);
@@ -442,7 +444,7 @@ namespace albireo
         bool validate_settings(const json& body, std::string& error)
         {
             static const char* const keys[] = { "port", "language", "engine", "accelerator", "v2ram", "v2ram_max_mb",
-                "threads", "context", "max_sequences", "kv_mb", "check_updates", "proxy" };
+                "threads", "context", "max_sequences", "kv_mb", "check_updates", "offline", "proxy" };
             for (const auto& kv : body.items())
             {
                 if (std::find_if(std::begin(keys), std::end(keys), [&](const char* k) { return kv.first == k; })
@@ -481,13 +483,121 @@ namespace albireo
                 && one_of("accelerator", { "auto", "none", "npu", "gpu", "both" })
                 && in_range("port", 1024, 65535) && in_range("threads", 0, 1024) && in_range("context", 0, 1 << 20)
                 && in_range("max_sequences", 1, 64) && in_range("kv_mb", 0, 1 << 24)
-                && in_range("v2ram_max_mb", 0, 1 << 24) && boolean("v2ram") && boolean("check_updates");
+                && in_range("v2ram_max_mb", 0, 1 << 24) && boolean("v2ram") && boolean("check_updates")
+                && boolean("offline");
+        }
+
+        // The floats of the base64 form of a vector.
+        std::vector<float> floats_of(const std::string& text)
+        {
+            const std::string bytes = base64_decode(text);
+            std::vector<float> v(bytes.size() / sizeof(float));
+            if (!v.empty()) std::memcpy(v.data(), bytes.data(), v.size() * sizeof(float));
+            return v;
+        }
+
+        /*
+            The vectors of texts, as the OpenAI interface computes them: "input" a text or a
+            list of texts (or of token lists), "encoding_format" float or base64, and
+            "dimensions" for the models that keep their meaning when shortened.  The
+            requests of every client share the passes of the embedding model.
+        */
+        void handle_embeddings(service& svc, const httplib::Request& req, httplib::Response& res)
+        {
+            json body;
+            if (!parse_body(req, res, body)) return;
+            const std::string requested = body["model"].as_string();
+            const std::string model = svc.resolve_embedding_model(requested);
+            if (model.empty())
+            {
+                send_error(res, 404, "invalid_request_error", requested.empty() || requested == "auto"
+                    ? std::string("no embedding model is active")
+                    : "the embedding model '" + requested + "' is not active", "model_not_found");
+                return;
+            }
+            const std::string format = body["encoding_format"].str("float");
+            if (format != "float" && format != "base64")
+            {
+                send_error(res, 400, "invalid_request_error", "encoding_format must be float or base64");
+                return;
+            }
+            json request = json::object();
+            request["model"] = model;
+            request["input"] = body["input"];
+            if (body.contains("dimensions")) request["dimensions"] = body["dimensions"];
+            auto ch = std::make_shared<event_channel>();
+            uint64_t id = 0;
+            std::string error;
+            if (!svc.engine().submit(request, [ch](int kind, const std::string& data) { ch->push(kind, data); }, id,
+                    error))
+            {
+                send_error(res, 400, "invalid_request_error", error);
+                return;
+            }
+            std::pair<int, std::string> e;
+            for (;;)
+            {
+                if (ch->pop(e, 1000))
+                {
+                    if (e.first == ALBIREO_EVENT_DONE || e.first == ALBIREO_EVENT_ERROR) break;
+                    continue;
+                }
+                if (svc.stopping())
+                {
+                    svc.engine().cancel(id);
+                    send_error(res, 503, "server_error", "the service is stopping");
+                    return;
+                }
+            }
+            const json done = json::parse_or_null(e.second);
+            if (e.first == ALBIREO_EVENT_ERROR)
+            {
+                send_error(res, 500, "server_error", done["message"].as_string(), done["code"].as_string());
+                return;
+            }
+            json data = json::array();
+            for (const auto& d : done["data"].elements())
+            {
+                json item = json::object();
+                item["object"] = "embedding";
+                item["index"] = d["index"];
+                if (format == "base64")
+                {
+                    item["embedding"] = d["embedding"];
+                }
+                else
+                {
+                    json values = json::array();
+                    for (float x : floats_of(d["embedding"].as_string())) values.push_back(static_cast<double>(x));
+                    item["embedding"] = values;
+                }
+                data.push_back(item);
+            }
+            svc.record_usage(static_cast<long>(done["usage"]["prompt_tokens"].as_int(0)), 0);
+            json out = json::object();
+            out["object"] = "list";
+            out["data"] = data;
+            out["model"] = requested.empty() ? model : requested;
+            json usage = json::object();
+            usage["prompt_tokens"] = done["usage"]["prompt_tokens"];
+            usage["total_tokens"] = done["usage"]["total_tokens"];
+            out["usage"] = usage;
+            send_json(res, 200, out);
         }
 
         uint64_t content_length(const httplib::Request& req)
         {
             const std::string v = req.get_header_value("Content-Length");
             return v.empty() ? 0 : std::strtoull(v.c_str(), nullptr, 10);
+        }
+
+        // Refuses an operation that needs the network on a computer set offline.
+        bool refuse_offline(service& svc, httplib::Response& res)
+        {
+            if (!svc.settings().get().offline) return false;
+            send_json(res, 409, ok_result(false, "offline mode: the catalog, the updates and the models come "
+                "from files (import)"));
+            return true;
         }
     }
 
@@ -607,6 +717,17 @@ namespace albireo
                 m["alias_of"] = target;
                 list.push_back(m);
             }
+            const std::string embedder = s->resolve_embedding_model(std::string());
+            if (!embedder.empty())
+            {
+                json m = json::object();
+                m["id"] = std::string("albireo-") + embedding_role;
+                m["object"] = "model";
+                m["created"] = now;
+                m["owned_by"] = "albireo";
+                m["alias_of"] = embedder;
+                list.push_back(m);
+            }
             json out = json::object();
             out["object"] = "list";
             out["data"] = list;
@@ -618,6 +739,9 @@ namespace albireo
         srv.Post("/v1/completions", [s](const httplib::Request& req, httplib::Response& res) {
             handle_completion(*s, req, res, false);
         });
+        srv.Post("/v1/embeddings", [s](const httplib::Request& req, httplib::Response& res) {
+            handle_embeddings(*s, req, res);
+        });
 
         // Interface of the web application and of the tray.
         srv.Get("/albireo/v1/status", [s](const httplib::Request&, httplib::Response& res) {
@@ -628,6 +752,8 @@ namespace albireo
             if (lang.empty() || lang == "auto") lang = "en";
             json o = s->models().overview(lang);
             const host_settings st = s->settings().get();
+            o["free"] = static_cast<unsigned long long>(free_disk_space(s->models().models_dir()));
+            o["offline"] = st.offline;
             json active = json::object();
             for (const auto& kv : st.active) active[kv.first] = kv.second;
             o["active"] = active;
@@ -662,15 +788,17 @@ namespace albireo
             send_json(res, r.contains("error") ? 400 : 200, r);
         });
 
+        // The catalog is fetched in the background; its state is in /albireo/v1/models.
         srv.Post("/albireo/v1/models/refresh", [s, admin](const httplib::Request& req, httplib::Response& res) {
-            if (!admin(req, res)) return;
-            std::string error;
-            const bool ok = s->models().refresh_catalog(error);
-            send_json(res, 200, ok_result(ok, error));
+            if (!admin(req, res) || refuse_offline(*s, res)) return;
+            s->models().refresh_catalog_async();
+            json o = ok_result(true);
+            o["catalog"] = s->models().catalog_status();
+            send_json(res, 202, o);
         });
         srv.Post(R"(/albireo/v1/models/([A-Za-z0-9._-]+)/download)", [s, admin](const httplib::Request& req,
                                                                                httplib::Response& res) {
-            if (!admin(req, res)) return;
+            if (!admin(req, res) || refuse_offline(*s, res)) return;
             std::string error;
             const bool ok = s->models().start_download(req.matches[1], error);
             send_json(res, ok ? 202 : 400, ok_result(ok, error));
@@ -693,8 +821,9 @@ namespace albireo
         srv.Post(R"(/albireo/v1/models/([A-Za-z0-9._-]+)/deactivate)", [s, admin](const httplib::Request& req,
                                                                                  httplib::Response& res) {
             if (!admin(req, res)) return;
-            s->deactivate(req.matches[1]);
-            send_json(res, 200, ok_result(true));
+            std::string error;
+            const bool ok = s->deactivate(req.matches[1], error);
+            send_json(res, ok ? 200 : 400, ok_result(ok, error));
         });
         srv.Post(R"(/albireo/v1/models/([A-Za-z0-9._-]+)/verify)", [s, admin](const httplib::Request& req,
                                                                              httplib::Response& res) {
@@ -705,12 +834,14 @@ namespace albireo
                                                                         httplib::Response& res) {
             if (!admin(req, res)) return;
             const std::string id = req.matches[1];
-            s->deactivate(id);
             std::string error;
+            s->deactivate(id, error, true);
             const bool ok = s->models().remove(id, error);
             send_json(res, ok ? 200 : 400, ok_result(ok, error));
         });
-        srv.Post("/albireo/v1/models/import", [s, admin](const httplib::Request& req, httplib::Response& res) {
+        // A folder or a file on a local drive or a medium: models, and the signed catalog
+        // and update of an offline bundle.
+        auto import = [s, admin](const httplib::Request& req, httplib::Response& res) {
             if (!admin(req, res)) return;
             json body;
             if (!parse_body(req, res, body)) return;
@@ -720,8 +851,10 @@ namespace albireo
                 send_error(res, 400, "invalid_request_error", "the path must be a local folder or file");
                 return;
             }
-            send_json(res, 200, s->models().import_path(path));
-        });
+            send_json(res, 200, s->import_folder(path));
+        };
+        srv.Post("/albireo/v1/import", import);
+        srv.Post("/albireo/v1/models/import", import);
         // A model file sent by the tray, for the files the service cannot read itself.
         srv.Post(upload_route, [s, admin](const httplib::Request& req, httplib::Response& res,
                                     const httplib::ContentReader& reader) {
@@ -782,13 +915,14 @@ namespace albireo
                 send_error(res, 400, "invalid_request_error", error);
                 return;
             }
-            const host_settings before = s->settings().get();
-            json merged = before.to_json();
-            for (const auto& kv : body.items()) merged[kv.first] = kv.second;
-            host_settings after;
-            after.from_json(merged);
-            s->settings().set(after);
-            set_http_proxy(after.proxy);
+            host_settings before;
+            const host_settings after = s->settings().update([&](host_settings& current) {
+                before = current;
+                json merged = current.to_json();
+                for (const auto& kv : body.items()) merged[kv.first] = kv.second;
+                current.from_json(merged);
+            });
+            s->apply_network_settings(after);
             // What the running engine or server cannot take without a restart.
             const bool restart = after.port != before.port || after.engine != before.engine
                 || after.accelerator != before.accelerator || after.v2ram != before.v2ram
@@ -801,7 +935,7 @@ namespace albireo
             if (restart) s->request_restart();
         });
         srv.Post("/albireo/v1/updates/check", [s, admin](const httplib::Request& req, httplib::Response& res) {
-            if (!admin(req, res)) return;
+            if (!admin(req, res) || refuse_offline(*s, res)) return;
             s->updates().check_async();
             send_json(res, 202, s->updates().status());
         });

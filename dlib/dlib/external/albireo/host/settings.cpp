@@ -10,6 +10,7 @@ namespace albireo
 {
 
     const char* const model_roles[3] = { "general", "code", "security" };
+    const char* const embedding_role = "embedding";
 
     json host_settings::to_json() const
     {
@@ -30,6 +31,7 @@ namespace albireo
         j["active"] = a;
         j["check_updates"] = check_updates;
         j["default_model"] = default_model;
+        j["offline"] = offline;
         j["proxy"] = proxy;
         j["update_feed"] = update_feed;
         j["catalog_url"] = catalog_url;
@@ -55,11 +57,15 @@ namespace albireo
         kv_mb = j["kv_mb"].as_int(d.kv_mb);
         active.clear();
         for (const auto& kv : j["active"].items())
-            if (kv.second.is_string() && !kv.second.as_string().empty())
-                for (const char* r : model_roles)
-                    if (kv.first == r) active[kv.first] = kv.second.as_string();
+        {
+            if (!kv.second.is_string() || kv.second.as_string().empty()) continue;
+            for (const char* r : model_roles)
+                if (kv.first == r) active[kv.first] = kv.second.as_string();
+            if (kv.first == embedding_role) active[kv.first] = kv.second.as_string();
+        }
         check_updates = j["check_updates"].as_bool(d.check_updates);
         default_model = j["default_model"].as_bool(d.default_model);
+        offline = j["offline"].as_bool(d.offline);
         proxy = j["proxy"].str(d.proxy);
         update_feed = j["update_feed"].str(d.update_feed);
         catalog_url = j["catalog_url"].str(d.catalog_url);
@@ -95,6 +101,16 @@ namespace albireo
         s_ = s;
         make_dirs(parent_path(path_));
         return write_file_atomic(path_, s_.to_json().dump_formatted(2) + "\n");
+    }
+
+    host_settings settings_store::update(const std::function<void(host_settings&)>& change)
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        change(s_);
+        make_dirs(parent_path(path_));
+        if (!write_file_atomic(path_, s_.to_json().dump_formatted(2) + "\n"))
+            log_warning("settings: " + path_ + " cannot be written");
+        return s_;
     }
 
 }

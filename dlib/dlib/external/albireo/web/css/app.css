@@ -209,6 +209,20 @@ a { color: var(--blue); }
 .attachment svg { width: 15px; height: 15px; flex: 0 0 15px; }
 .attachment.file-out { cursor: pointer; }
 .attachment.file-out:hover { border-color: var(--blue); }
+.attachment button:hover { color: var(--text); }
+/* The badge of a document: its format on the color of its family. */
+.format-badge {
+  display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; min-width: 34px; height: 22px;
+  padding: 0 4px; border-radius: 5px; font-size: 10px; font-weight: 700; letter-spacing: 0.02em; color: #fff;
+  background: #8a90aa;
+}
+.format-badge.word { background: #2b5bd7; }
+.format-badge.sheet { background: #1f8f4e; }
+.format-badge.slides { background: #d0562b; }
+.format-badge.pdf { background: #c8342e; }
+.format-badge.text { background: #6b7287; }
+.format-badge.code { background: #7d5bd6; }
+.index-state { font-size: 12px; white-space: nowrap; }
 
 /* Reasoning and agent steps */
 .thinking {

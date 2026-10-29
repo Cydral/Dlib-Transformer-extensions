@@ -3,12 +3,13 @@
 
 /*
     The tools of the agent mode, all executed in this page, without network: a calculator,
-    a JavaScript interpreter isolated in a sandboxed frame, the search and the reading of
-    the documents of the discussion and of its project, the search of the other
-    discussions, the date, and the creation of files offered for download.
+    a JavaScript interpreter isolated in a sandboxed frame, the search, the outline and the
+    reading of the documents of the discussion and of its project (a presentation slide by
+    slide, a Word document page by page, a workbook sheet by sheet), the search of the
+    other discussions, the date, and the creation of files offered for download.
 */
 
-import { searchPassages } from './documents.js';
+import { outline, partText } from './documents.js';
 
 export const definitions = [
   {
@@ -43,13 +44,13 @@ export const definitions = [
     type: 'function',
     function: {
       name: 'search_documents',
-      description: 'Searches the documents attached to this discussion and to its project and returns the most relevant ' +
-        'passages with the name of their document.',
+      description: 'Searches the documents attached to this discussion and to its project, by meaning and by words, and ' +
+        'returns the most relevant passages with their document and their place (page, slide, sheet).',
       parameters: {
         type: 'object',
         properties: {
-          query: { type: 'string', description: 'Words to look for.' },
-          limit: { type: 'integer', description: 'Number of passages, 5 by default.' }
+          query: { type: 'string', description: 'The question or the words to look for.' },
+          limit: { type: 'integer', description: 'Number of passages, 5 by default, at most 10.' }
         },
         required: ['query']
       }
@@ -58,13 +59,29 @@ export const definitions = [
   {
     type: 'function',
     function: {
+      name: 'document_outline',
+      description: 'Lists the parts of a document attached to this discussion or to its project: the pages of a PDF or ' +
+        'of a Word document, the slides of a presentation with their titles, the sheets of a workbook, the sections ' +
+        'of a text, each with its size. Use it to go through a document part by part with read_document.',
+      parameters: {
+        type: 'object',
+        properties: { name: { type: 'string', description: 'Name of the document.' } },
+        required: ['name']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
       name: 'read_document',
-      description: 'Reads part of a document attached to this discussion or to its project, from a character offset.',
+      description: 'Reads a document attached to this discussion or to its project: one part named as document_outline ' +
+        'names it ("Slide 3", "Page 12", "Sheet: Budget"), or the characters from an offset.',
       parameters: {
         type: 'object',
         properties: {
           name: { type: 'string', description: 'Name of the document.' },
-          offset: { type: 'integer', description: 'First character to read, 0 by default.' },
+          part: { type: 'string', description: 'The part to read, for example "Slide 3", "Page 12" or "Sheet: Budget".' },
+          offset: { type: 'integer', description: 'First character to read, within the part when one is given, 0 by default.' },
           length: { type: 'integer', description: 'Number of characters, 6000 by default, at most 20000.' }
         },
         required: ['name']
@@ -110,7 +127,8 @@ export const definitions = [
 
 export const agentInstructions = 'You can call tools. Call a tool when it gives a more reliable or more precise result ' +
   'than answering directly: arithmetic with the calculator, computations and data processing with run_javascript, ' +
-  'facts from the user documents with search_documents and read_document, earlier work with search_discussions. ' +
+  'facts from the user documents with search_documents, document_outline and read_document (to go through a whole ' +
+  'document, list its parts, then read them one after the other), earlier work with search_discussions. ' +
   'After the tool results, answer the user directly.';
 
 // Arithmetic without eval: a recursive descent over numbers, operators and functions.
@@ -254,8 +272,8 @@ function documentByName(documents, name) {
 }
 
 /*
-    Runs a tool call.  context = { documents: [{name, text}], searchDiscussions(query),
-    createFile(name, content) }.  Returns {ok, text, file?}.
+    Runs a tool call.  context = { documents: [{name, text}], searchDocuments(query, limit),
+    searchDiscussions(query), createFile(name, content) }.  Returns {ok, text, file?}.
 */
 export async function run(name, argumentsText, context) {
   let args = {};
@@ -274,22 +292,40 @@ export async function run(name, argumentsText, context) {
         return await runJavascript(args.code || '');
       case 'search_documents': {
         if (!context.documents.length) return { ok: true, text: 'No document is attached to this discussion or its project.' };
-        const hits = searchPassages(context.documents, args.query || '', Math.min(Math.max(args.limit || 5, 1), 10));
+        const hits = await context.searchDocuments(args.query || '', Math.min(Math.max(args.limit || 5, 1), 10));
         if (!hits.length) return { ok: true, text: 'No passage matches. Documents: ' + context.documents.map((d) => d.name).join(', ') };
         return {
           ok: true,
-          text: hits.map((h) => '[' + h.name + ', offset ' + h.start + ']\n' + h.text.trim()).join('\n\n---\n\n')
+          text: hits.map((h) => '[' + h.name + (h.where ? ', ' + h.where : '') + ']\n' + h.text.trim()).join('\n\n---\n\n')
         };
+      }
+      case 'document_outline': {
+        const d = documentByName(context.documents, args.name);
+        if (!d) return { ok: false, text: 'No document named "' + args.name + '". Documents: ' + context.documents.map((x) => x.name).join(', ') };
+        const parts = outline(d.text);
+        const lines = parts.map((p) => (p.title || '(beginning)') + ': ' + (p.end - p.start) + ' characters');
+        return { ok: true, text: '[' + d.name + ', ' + d.text.length + ' characters, ' + parts.length + ' parts]\n' + lines.join('\n') };
       }
       case 'read_document': {
         const d = documentByName(context.documents, args.name);
         if (!d) return { ok: false, text: 'No document named "' + args.name + '". Documents: ' + context.documents.map((x) => x.name).join(', ') };
+        let source = d.text;
+        let label = d.name;
+        if (args.part) {
+          const part = partText(d.text, args.part);
+          if (part == null) {
+            const names = outline(d.text).map((p) => p.title).filter((x) => x).slice(0, 60);
+            return { ok: false, text: 'No part "' + args.part + '" in ' + d.name + '. Parts: ' + (names.join(', ') || 'none') };
+          }
+          source = part;
+          label += ', ' + args.part;
+        }
         const offset = Math.max(0, args.offset | 0);
         const length = Math.min(Math.max(args.length || 6000, 100), 20000);
-        const part = d.text.slice(offset, offset + length);
+        const piece = source.slice(offset, offset + length);
         return {
           ok: true,
-          text: '[' + d.name + ', characters ' + offset + ' to ' + (offset + part.length) + ' of ' + d.text.length + ']\n' + part
+          text: '[' + label + ', characters ' + offset + ' to ' + (offset + piece.length) + ' of ' + source.length + ']\n' + piece
         };
       }
       case 'search_discussions': {

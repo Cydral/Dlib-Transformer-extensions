@@ -209,7 +209,8 @@ namespace albireo
         {
             IDC_INTRO = 1000, IDC_SPACE, IDC_LIST, IDC_DETAILS, IDC_PROGRESS, IDC_STATUS, IDC_DOWNLOAD, IDC_ACTIVATE,
             IDC_DEACTIVATE, IDC_VERIFY, IDC_DELETE, IDC_IMPORT, IDC_REFRESH, IDC_CLOSE,
-            IDM_ROLE_GENERAL = 1100, IDM_ROLE_CODE, IDM_ROLE_SECURITY, IDM_IMPORT_FILES, IDM_IMPORT_FOLDER
+            IDM_ROLE_GENERAL = 1100, IDM_ROLE_CODE, IDM_ROLE_SECURITY, IDM_ROLE_EMBEDDING, IDM_IMPORT_FILES,
+            IDM_IMPORT_FOLDER
         };
         enum { R_LIST = 1, R_ACTION, R_VERIFY, R_IMPORT, R_UPLOAD_DONE, R_CATALOG };
 
@@ -232,7 +233,7 @@ namespace albireo
                 space = add(ui::label(hwnd, L"", IDC_SPACE, SS_RIGHT), ui::font_kind::note);
                 list = add(ui::listview(hwnd, IDC_LIST));
                 const char* columns[] = { "col_model", "col_roles", "col_size", "col_state", "col_active" };
-                const int widths[] = { 250, 170, 90, 150, 140 };
+                const int widths[] = { 240, 175, 85, 140, 200 };
                 for (int i = 0; i < 5; ++i)
                 {
                     std::wstring text = tr(columns[i]);
@@ -265,9 +266,10 @@ namespace albireo
             {
                 // The actions on the selected model under the list, the window commands at the bottom.
                 const int m = px(16), g = px(8), bh = px(30);
-                ui::place(intro, m, m, w - 2 * m - px(260), px(36));
+                // The introduction, then the origin and the state of the catalog.
+                ui::place(intro, m, m, w - 2 * m - px(260), px(58));
                 ui::place(space, w - m - px(250), m, px(250), px(36));
-                const int list_top = m + px(42);
+                const int list_top = m + px(64);
                 const int details_h = px(100);
                 const int bottom = h - m - bh;
                 const int status_top = bottom - g - px(20);
@@ -336,11 +338,6 @@ namespace albireo
                     {
                         r = json::object();
                         r["error"] = error;
-                    }
-                    else
-                    {
-                        json s;
-                        if (c.get("/albireo/v1/status", s, error)) r["free"] = s["models_dir_free"];
                     }
                     return r;
                 });
@@ -448,14 +445,18 @@ namespace albireo
                 const bool in_catalog = m && (*m)["files"].is_array();
                 const bool dl = m && downloading(selected);
                 const bool update = installed && m->contains("up_to_date") && !(*m)["up_to_date"].as_bool(true);
+                // Offline, the models come from files only.
+                const bool offline = overview["offline"].as_bool(false);
                 ui::set_text(download, dl ? tr("btn_cancel_download") : tr("btn_download"));
-                ui::enable(download, !busy && m && (dl || (in_catalog && (!installed || update))));
+                ui::enable(download, !busy && m && (dl || (!offline && in_catalog && (!installed || update))));
                 ui::enable(activate, !busy && installed && !dl);
-                ui::enable(deactivate, !busy && installed && !active_roles(selected).empty());
+                // The document search keeps its embedding model, which another one replaces.
+                ui::enable(deactivate, !busy && installed && !active_roles(selected).empty()
+                    && !embedding_model(selected));
                 ui::enable(verify, !busy && installed);
                 ui::enable(remove, !busy && installed && !dl);
                 ui::enable(import, !busy && !uploading);
-                ui::enable(refresh, !busy);
+                ui::enable(refresh, !busy && !offline);
                 // The progress of the download of the selected model.
                 const json* d = m ? download_of(selected) : nullptr;
                 if (d && dl && !uploading)
@@ -497,6 +498,37 @@ namespace albireo
                 });
             }
 
+            // The origin and the state of the catalog, under the introduction.
+            std::wstring catalog_text() const
+            {
+                const json& c = overview["catalog"];
+                const std::string state = c["state"].as_string();
+                if (overview["offline"].as_bool(false)) return tr("catalog_offline");
+                if (state == "checking") return tr("catalog_checking");
+                if (overview["catalog_time"].as_int(0) == 0) return tr("no_catalog");
+                if (state == "error") return tr("catalog_error", { { "e", c["error"].as_string() } });
+                return std::wstring();
+            }
+
+            // What an import installed: the catalog, the models, the update, the errors.
+            std::wstring import_text(const json& r) const
+            {
+                std::wstring text = tr("import_done", { { "n", std::to_string(r["imported"].size()) } });
+                const json& c = r["catalog"];
+                if (c["models"].is_number())
+                    text += L"\n" + tr("import_catalog", { { "n", std::to_string(c["models"].as_int()) } });
+                else if (c["state"].as_string() == "kept") text += L"\n" + tr("import_catalog_kept");
+                else if (c["error"].is_string()) text += L"\n" + widen(c["error"].as_string());
+                const json& u = r["update"];
+                const std::string version = u["version"].as_string();
+                if (u["state"].as_string() == "ready") text += L"\n" + tr("import_update_ready", { { "v", version } });
+                else if (u["state"].as_string() == "up_to_date")
+                    text += L"\n" + tr("import_update_current", { { "v", version } });
+                else if (u["error"].is_string()) text += L"\n" + widen(u["error"].as_string());
+                for (const auto& e : r["errors"].elements()) text += L"\n" + widen(e.as_string());
+                return text;
+            }
+
             void on_result(WPARAM tag, const json& r) override
             {
                 if (tag == R_LIST)
@@ -507,9 +539,7 @@ namespace albireo
                         return;
                     }
                     overview = r;
-                    std::wstring text = tr("models_intro");
-                    if (overview["catalog_time"].as_int(0) == 0) text += L"\n" + tr("no_catalog");
-                    ui::set_text(intro, text);
+                    ui::set_text(intro, tr("models_intro") + L"\n" + catalog_text());
                     const std::string available = ui::format_size(static_cast<unsigned long long>(r["free"].as_int(0)));
                     ui::set_text(space, tr("lbl_free_space", { { "s", available } }));
                     fill_list();
@@ -534,9 +564,9 @@ namespace albireo
                 }
                 else if (tag == R_IMPORT || tag == R_UPLOAD_DONE)
                 {
-                    std::wstring text = tr("import_done", { { "n", std::to_string(r["imported"].size()) } });
-                    for (const auto& e : r["errors"].elements()) text += L"\n" + widen(e.as_string());
-                    ui::message(hwnd, text, MB_OK | (r["errors"].empty() ? MB_ICONINFORMATION : MB_ICONWARNING));
+                    const bool failed = !r["errors"].empty() || r["catalog"].contains("error")
+                        || r["update"].contains("error");
+                    ui::message(hwnd, import_text(r), MB_OK | (failed ? MB_ICONWARNING : MB_ICONINFORMATION));
                     ShowWindow(progress, SW_HIDE);
                     ui::set_text(status, L"");
                 }
@@ -544,13 +574,28 @@ namespace albireo
                 load();
             }
 
+            // Whether a model computes the vectors of the document search.
+            bool embedding_model(const std::string& id) const
+            {
+                const json* m = model(id);
+                if (!m) return false;
+                if ((*m)["embedding"].as_bool(false)) return true;
+                for (const auto& r : (*m)["roles"].elements())
+                    if (r.as_string() == "embedding") return true;
+                return false;
+            }
+
             void role_menu()
             {
                 HMENU m = CreatePopupMenu();
                 const auto act = active_roles(selected);
-                const char* roles[] = { "general", "code", "security" };
-                for (int i = 0; i < 3; ++i)
+                // An embedding model serves the document search only; the language models
+                // answer for the other functions.
+                const char* roles[] = { "general", "code", "security", "embedding" };
+                const bool embedding = embedding_model(selected);
+                for (int i = 0; i < 4; ++i)
                 {
+                    if ((i == 3) != embedding) continue;
                     const bool on = std::find(act.begin(), act.end(), roles[i]) != act.end();
                     const UINT flags = MF_STRING | (on ? MF_CHECKED : 0);
                     AppendMenuW(m, flags, IDM_ROLE_GENERAL + i, role_name(roles[i]).c_str());
@@ -560,7 +605,7 @@ namespace albireo
                 const UINT flags = TPM_RETURNCMD | TPM_LEFTALIGN | TPM_BOTTOMALIGN;
                 const UINT cmd = TrackPopupMenuEx(m, flags, r.left, r.top, hwnd, nullptr);
                 DestroyMenu(m);
-                if (cmd >= IDM_ROLE_GENERAL && cmd <= IDM_ROLE_SECURITY)
+                if (cmd >= IDM_ROLE_GENERAL && cmd <= IDM_ROLE_EMBEDDING)
                 {
                     json body = json::object();
                     body["role"] = roles[cmd - IDM_ROLE_GENERAL];
@@ -594,7 +639,7 @@ namespace albireo
                     json r, body = json::object();
                     body["path"] = path;
                     std::string error;
-                    if (!c.send("POST", "/albireo/v1/models/import", body, r, error, 3600))
+                    if (!c.send("POST", "/albireo/v1/import", body, r, error, 3600))
                     {
                         r = json::object();
                         r["error"] = error;
@@ -771,7 +816,7 @@ namespace albireo
         {
             IDC_H_INFO = 2000, IDC_H_ENGINE, IDC_H_ENGINES, IDC_H_V2RAM, IDC_H_V2MAX, IDC_H_BAR, IDC_H_LEGEND,
             IDC_H_FOLDER, IDC_H_OPEN, IDC_H_CHANGE, IDC_H_PORT, IDC_H_URL, IDC_H_LANG, IDC_H_UPDATES, IDC_H_APPLY,
-            IDC_H_CLOSE, IDC_H_STATUS, IDC_H_PROXY, IDC_H_GROUP = 2100
+            IDC_H_CLOSE, IDC_H_STATUS, IDC_H_PROXY, IDC_H_OFFLINE, IDC_H_GROUP = 2100
         };
         enum { R_HOST = 1, R_APPLY };
 
@@ -781,11 +826,11 @@ namespace albireo
             HWND groups[6];
             HWND info_keys, info_values, engine, engines, v2ram, v2max_label, v2max, bar, legend, folder;
             HWND open_folder, change_folder, port_label, port, url, lang_label, lang, proxy_label, proxy, updates;
-            HWND apply, close, status;
+            HWND offline, apply, close, status;
             json st, eng, settings;
             bool loaded = false;
 
-            host_window() { min_size = SIZE{ 720, 730 }; }
+            host_window() { min_size = SIZE{ 720, 756 }; }
 
             void build() override
             {
@@ -834,6 +879,7 @@ namespace albireo
                 proxy = add(ui::edit(hwnd, L"", IDC_H_PROXY, ES_AUTOHSCROLL));
                 SendMessageW(proxy, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(tr("proxy_hint").c_str()));
                 updates = add(ui::checkbox(hwnd, tr("lbl_auto_updates"), IDC_H_UPDATES, true));
+                offline = add(ui::checkbox(hwnd, tr("lbl_offline"), IDC_H_OFFLINE, false));
                 status = add(ui::label(hwnd, L"", IDC_H_STATUS), ui::font_kind::note);
                 apply = add(ui::button(hwnd, tr("btn_apply"), IDC_H_APPLY));
                 close = add(ui::button(hwnd, tr("btn_close"), IDC_H_CLOSE));
@@ -876,12 +922,13 @@ namespace albireo
                 ui::place(url, m + half + g + px(12), y + px(56), half - px(24), lh);
                 y += px(86) + g;
                 // Preferences.
-                ui::place(groups[5], m, y, inner, px(110));
+                ui::place(groups[5], m, y, inner, px(136));
                 ui::place(lang_label, m + px(12), y + px(27), px(110), lh);
                 ui::place(lang, m + px(126), y + px(23), px(200), px(200));
                 ui::place(proxy_label, m + px(12), y + px(56), px(110), lh);
                 ui::place(proxy, m + px(126), y + px(53), inner - px(138), px(24));
                 ui::place(updates, m + px(12), y + px(82), inner - px(24), lh);
+                ui::place(offline, m + px(12), y + px(106), inner - px(24), lh);
                 // Buttons.
                 ui::place(status, m, h - m - bh + px(6), inner - px(220), lh);
                 ui::place(close, w - m - px(100), h - m - bh, px(100), bh);
@@ -1007,6 +1054,11 @@ namespace albireo
                     SendMessageW(lang, CB_SETCURSEL, static_cast<WPARAM>(sel), 0);
                     const bool check = settings["check_updates"].as_bool(true);
                     SendMessageW(updates, BM_SETCHECK, check ? BST_CHECKED : BST_UNCHECKED, 0);
+                    const bool off = settings["offline"].as_bool(false);
+                    SendMessageW(offline, BM_SETCHECK, off ? BST_CHECKED : BST_UNCHECKED, 0);
+                    // Offline, neither the updates nor the proxy are used.
+                    ui::enable(updates, !off);
+                    ui::enable(proxy, !off);
                     ui::set_text(proxy, widen(settings["proxy"].as_string()));
                 }
             }
@@ -1135,6 +1187,8 @@ namespace albireo
                     if (lang_code != settings["language"].as_string()) changes["language"] = lang_code;
                     const bool u = ui::checked(updates);
                     if (u != settings["check_updates"].as_bool(true)) changes["check_updates"] = u;
+                    const bool off = ui::checked(offline);
+                    if (off != settings["offline"].as_bool(false)) changes["offline"] = off;
                     const std::string pr = narrow(ui::text_of(proxy));
                     if (pr != settings["proxy"].as_string()) changes["proxy"] = pr;
                     if (changes.empty())
@@ -1162,6 +1216,10 @@ namespace albireo
                     });
                     break;
                 }
+                case IDC_H_OFFLINE:
+                    ui::enable(updates, !ui::checked(offline));
+                    ui::enable(proxy, !ui::checked(offline));
+                    break;
                 case IDC_H_CLOSE: DestroyWindow(hwnd); break;
                 default: break;
                 }
@@ -1268,7 +1326,7 @@ namespace albireo
 
     void show_host_window(const service_client& client)
     {
-        show<host_window>(client, tr("host_title"), 760, 740, false);
+        show<host_window>(client, tr("host_title"), 760, 766, false);
     }
 
     void show_about_window(const service_client& client)

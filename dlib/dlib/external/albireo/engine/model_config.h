@@ -32,6 +32,12 @@ namespace albireo
                 scaling of Ministral 3), qwen2 (with QKV biases), qwen3 (with QK
                 normalization), qwen3moe, mixtral and granitemoe (mixtures of experts),
                 granite (with its embedding, residual, attention and logit scales).
+
+            EMBEDDING MODELS
+                A decoder that declares <arch>.pooling_type computes vectors instead of
+                text: its last step returns the normalized hidden state rather than the
+                logits.  The causal decoders take the state of their last token, the one
+                that has read the whole text (pooling type 3).
         !*/
 
         std::string arch;               // general.architecture
@@ -85,7 +91,12 @@ namespace albireo
         std::string chat_template;
         std::string tokenizer_pre;
 
+        // Pooling of an embedding model: 0 none (a language model), 1 mean, 2 first token,
+        // 3 last token, 4 rank.
+        int pooling = 0;
+
         bool is_moe() const { return n_experts > 0; }
+        bool is_embedding() const { return pooling != 0; }
         long kv_dim() const { return n_kv_heads * head_dim; }
         long q_dim() const { return n_heads * head_dim; }
         long v_dim() const { return n_kv_heads * head_dim_v; }

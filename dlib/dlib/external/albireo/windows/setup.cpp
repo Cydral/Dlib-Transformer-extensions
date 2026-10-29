@@ -5,9 +5,10 @@
     albireo-setup: the installer, the uninstaller and the updater of Albireo.
 
         albireo-setup                       the installation wizard
-        albireo-setup /silent [/dir <folder>] [/models <folder>] [/port <port>]
+        albireo-setup /silent [/dir <folder>] [/models <folder>] [/port <port>] [/offline]
                                             installation without questions; the options not
-                                            given keep those of the installation in place
+                                            given keep those of the installation in place;
+                                            /offline for a computer without Internet access
         albireo-setup /update /silent       update started by the service (keeps everything)
         albireo-setup /uninstall [/silent] [/purge]
                                             removal; /purge also deletes models and settings
@@ -16,9 +17,10 @@
         albireo-setup /lang <code>          language of the wizard: en, fr, de, it, es
 
     The programs travel inside this program as a ZIP payload (a resource); the copy left
-    in the installation folder, the uninstaller, has no payload.  A "models" folder next
-    to the installer, on a memory card for instance, is imported at the first start of
-    the service, for machines without network.
+    in the installation folder, the uninstaller, has no payload.  An offline bundle
+    (tools/make_offline_bundle.py) puts the installer next to a signed catalog and a
+    "models" folder, on a memory card for instance: they are imported at the first start
+    of the service, for the computers without network.
 */
 
 #include "ui.h"
@@ -143,7 +145,7 @@ namespace albireo
             if (!update)
             {
                 if (!setup::write_settings(o, error)) return false;
-                setup::stage_bundled_models([&](const std::string& f) {
+                setup::stage_bundle([&](const std::string& f) {
                     progress(820, tr("step_files", { { "f", f } }), true);
                 });
             }
@@ -218,7 +220,7 @@ namespace albireo
             IDC_TITLE = 100, IDC_TEXT, IDC_LANG_LABEL, IDC_LANG, IDC_LICENSE, IDC_ACCEPT, IDC_DIR_LABEL, IDC_DIR,
             IDC_DIR_BROWSE, IDC_MODELS_LABEL, IDC_MODELS, IDC_MODELS_BROWSE, IDC_SPACE, IDC_SPACE_NOTE, IDC_AUTOSTART,
             IDC_DESKTOP, IDC_TRUST, IDC_DEFAULT_MODEL, IDC_PORT_LABEL, IDC_PORT, IDC_STEP, IDC_PROGRESS, IDC_DETAIL,
-            IDC_LAUNCH, IDC_PURGE, IDC_BACK, IDC_NEXT, IDC_CANCEL
+            IDC_LAUNCH, IDC_PURGE, IDC_BACK, IDC_NEXT, IDC_CANCEL, IDC_OFFLINE
         };
 
         struct wizard
@@ -275,6 +277,7 @@ namespace albireo
             ui::set_text(ctl(IDC_DESKTOP), tr("opt_desktop"));
             ui::set_text(ctl(IDC_TRUST), tr("opt_trust"));
             ui::set_text(ctl(IDC_DEFAULT_MODEL), tr("opt_default_model"));
+            ui::set_text(ctl(IDC_OFFLINE), tr("opt_offline"));
             ui::set_text(ctl(IDC_PORT_LABEL), tr("opt_port"));
             ui::set_text(ctl(IDC_LAUNCH), tr("opt_launch"));
             ui::set_text(ctl(IDC_PURGE), tr("uninstall_data"));
@@ -287,8 +290,8 @@ namespace albireo
             wz.current = p;
             const std::vector<int> all = { IDC_TEXT, IDC_LANG_LABEL, IDC_LANG, IDC_LICENSE, IDC_ACCEPT, IDC_DIR_LABEL,
                 IDC_DIR, IDC_DIR_BROWSE, IDC_MODELS_LABEL, IDC_MODELS, IDC_MODELS_BROWSE, IDC_SPACE, IDC_SPACE_NOTE,
-                IDC_AUTOSTART, IDC_DESKTOP, IDC_TRUST, IDC_DEFAULT_MODEL, IDC_PORT_LABEL, IDC_PORT, IDC_STEP,
-                IDC_PROGRESS, IDC_DETAIL, IDC_LAUNCH, IDC_PURGE };
+                IDC_AUTOSTART, IDC_DESKTOP, IDC_TRUST, IDC_DEFAULT_MODEL, IDC_OFFLINE, IDC_PORT_LABEL, IDC_PORT,
+                IDC_STEP, IDC_PROGRESS, IDC_DETAIL, IDC_LAUNCH, IDC_PURGE };
             std::vector<int> visible;
             std::wstring title, text;
             switch (p)
@@ -311,7 +314,8 @@ namespace albireo
                 break;
             case P_OPTIONS:
                 title = tr("options_title");
-                visible = { IDC_AUTOSTART, IDC_DESKTOP, IDC_TRUST, IDC_DEFAULT_MODEL, IDC_PORT_LABEL, IDC_PORT };
+                visible = { IDC_AUTOSTART, IDC_DESKTOP, IDC_TRUST, IDC_DEFAULT_MODEL, IDC_OFFLINE, IDC_PORT_LABEL,
+                    IDC_PORT };
                 break;
             case P_PROGRESS:
                 title = wz.uninstall ? tr("uninstall_progress") : tr("progress_title");
@@ -391,7 +395,7 @@ namespace albireo
             ui::place(ctl(IDC_SPACE), x, y + px(136), cw, px(64));
             ui::place(ctl(IDC_SPACE_NOTE), x, y + px(204), cw, px(40));
             int oy = y;
-            for (int id : { IDC_AUTOSTART, IDC_DESKTOP, IDC_TRUST, IDC_DEFAULT_MODEL })
+            for (int id : { IDC_AUTOSTART, IDC_DESKTOP, IDC_TRUST, IDC_DEFAULT_MODEL, IDC_OFFLINE })
             {
                 ui::place(ctl(id), x, oy, cw, px(40));
                 oy += px(44);
@@ -450,6 +454,9 @@ namespace albireo
             add(IDC_DESKTOP, ui::checkbox(wz.hwnd, L"", IDC_DESKTOP, current.desktop_shortcut));
             add(IDC_TRUST, ui::checkbox(wz.hwnd, L"", IDC_TRUST, current.trust_certificate));
             add(IDC_DEFAULT_MODEL, ui::checkbox(wz.hwnd, L"", IDC_DEFAULT_MODEL, current.default_model));
+            add(IDC_OFFLINE, ui::checkbox(wz.hwnd, L"", IDC_OFFLINE, current.offline));
+            // Offline, no model is downloaded.
+            ui::enable(ctl(IDC_DEFAULT_MODEL), !current.offline);
             add(IDC_PORT_LABEL, ui::label(wz.hwnd, L"", IDC_PORT_LABEL));
             add(IDC_PORT, ui::edit(wz.hwnd, std::to_wstring(current.port), IDC_PORT, ES_NUMBER));
             add(IDC_STEP, ui::label(wz.hwnd, L"", IDC_STEP), ui::font_kind::bold);
@@ -493,7 +500,8 @@ namespace albireo
             o.autostart = ui::checked(ctl(IDC_AUTOSTART));
             o.desktop_shortcut = ui::checked(ctl(IDC_DESKTOP));
             o.trust_certificate = ui::checked(ctl(IDC_TRUST));
-            o.default_model = ui::checked(ctl(IDC_DEFAULT_MODEL));
+            o.offline = ui::checked(ctl(IDC_OFFLINE));
+            o.default_model = ui::checked(ctl(IDC_DEFAULT_MODEL)) && !o.offline;
             const long port = std::wcstol(ui::text_of(ctl(IDC_PORT)).c_str(), nullptr, 10);
             if (port >= 1024 && port <= 65535) o.port = static_cast<int>(port);
             std::thread([target, o, progress]() {
@@ -595,6 +603,9 @@ namespace albireo
                     return 0;
                 case IDC_ACCEPT:
                     ui::enable(ctl(IDC_NEXT), ui::checked(ctl(IDC_ACCEPT)));
+                    return 0;
+                case IDC_OFFLINE:
+                    ui::enable(ctl(IDC_DEFAULT_MODEL), !ui::checked(ctl(IDC_OFFLINE)));
                     return 0;
                 case IDC_DIR:
                     if (HIWORD(wp) == EN_CHANGE && wz.current == P_FOLDERS) update_space();
@@ -810,6 +821,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
         if (!dir.empty()) o.program_dir = narrow(dir);
         const std::wstring m = arg_after(args, L"/models");
         if (!m.empty()) o.models_dir = narrow(m);
+        if (has_arg(args, L"/offline"))
+        {
+            o.offline = true;
+            o.default_model = false;
+        }
         const std::wstring port = arg_after(args, L"/port");
         if (!port.empty())
         {

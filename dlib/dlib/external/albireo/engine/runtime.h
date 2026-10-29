@@ -29,6 +29,8 @@ namespace albireo
 
                 logit_rows lists the tokens whose next-token distribution is needed, the
                 last token of each segment that ends a prompt or continues a generation.
+                With hidden_only, the pass stops at their normalized hidden states, which
+                is what an embedding model returns.
         !*/
         struct segment
         {
@@ -40,12 +42,14 @@ namespace albireo
         std::vector<int> tokens;
         std::vector<segment> segments;
         std::vector<long> logit_rows;
+        bool hidden_only = false;
 
         void clear()
         {
             tokens.clear();
             segments.clear();
             logit_rows.clear();
+            hidden_only = false;
         }
     };
 
@@ -81,13 +85,21 @@ namespace albireo
         virtual bool copy_sequence(int src, int dst, long length) = 0;
 
         // Runs the batch, appends its keys and values to the sequences and writes, for each
-        // entry of logit_rows, a row of config().vocab logits into logits.
+        // entry of logit_rows, a row of config().vocab logits into logits, unless the batch
+        // asks for the hidden states only.
         virtual void forward(const forward_batch& batch, std::vector<float>& logits) = 0;
+
+        // The hidden states after the final normalization of the logit_rows of the last
+        // forward, config().d_model floats each.
+        virtual const std::vector<float>& hidden() const = 0;
 
         // Memory held for keys and values, in bytes, and the most it may hold.
         virtual size_t kv_bytes_used() const = 0;
         virtual size_t kv_bytes_budget() const = 0;
         virtual size_t kv_bytes_per_token() const = 0;
+
+        // Returns to the system the memory of the keys and values no sequence holds.
+        virtual void trim_memory() = 0;
 
         // Bytes of weights the runtime keeps resident (mapped files count for their size).
         virtual size_t weight_bytes() const = 0;

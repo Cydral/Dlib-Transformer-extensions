@@ -169,8 +169,19 @@ namespace albireo
                 if (kv.second > most) { most = kv.second; q = kv.first; }
             d["quantization"] = names.count(q) ? names.at(q) : q;
             const std::string tmpl = g.get_str("tokenizer.chat_template", "");
-            d["reasoning"] = tmpl.find("think") != std::string::npos || tmpl.find("[THINK]") != std::string::npos;
-            d["tools"] = tmpl.find("tool") != std::string::npos;
+            // An embedding model declares how it pools its states; it serves the document
+            // search and nothing else.
+            const bool embedding = g.get_int(arch + ".pooling_type", 0) != 0;
+            d["embedding"] = embedding;
+            if (embedding)
+            {
+                json roles = json::array();
+                roles.push_back("embedding");
+                d["roles"] = roles;
+            }
+            d["reasoning"] = !embedding && (tmpl.find("think") != std::string::npos
+                || tmpl.find("[THINK]") != std::string::npos);
+            d["tools"] = !embedding && tmpl.find("tool") != std::string::npos;
         }
         catch (const std::exception& e)
         {
@@ -217,25 +228,27 @@ namespace albireo
 
     model_manager::~model_manager()
     {
+        stop();
+        if (refresher_.joinable()) refresher_.join();
         std::map<std::string, std::shared_ptr<job>> jobs;
         {
             std::lock_guard<std::mutex> lock(m_);
             jobs = jobs_;
         }
-        for (auto& kv : jobs) kv.second->cancel = true;
         for (auto& kv : jobs)
             if (kv.second->worker.joinable()) kv.second->worker.join();
     }
 
-    bool model_manager::refresh_catalog(std::string& error)
+    void model_manager::stop()
     {
-        std::string body, sig;
-        if (!http_get(catalog_url_, body, error)) return false;
-        if (!http_get(catalog_url_ + ".sig", sig, error, 4096))
-        {
-            error = "the catalog has no signature: " + error;
-            return false;
-        }
+        stopped_ = true;
+        std::lock_guard<std::mutex> lock(m_);
+        for (auto& kv : jobs_) kv.second->cancel = true;
+    }
+
+    bool model_manager::install_catalog(const std::string& body, const std::string& sig, bool keep_newer,
+        json& result, std::string& error)
+    {
         if (!verify_signature(body, sig, feed_public_key_pem))
         {
             error = "the signature of the catalog is not valid";
@@ -249,12 +262,105 @@ namespace albireo
         }
         {
             std::lock_guard<std::mutex> lock(m_);
+            catalog_state_ = "ok";
+            catalog_error_.clear();
+            // The times of publication, "YYYY-MM-DDTHH:MM:SSZ" (the day alone in the first
+            // catalogs), compare as strings: an older catalog, replayed or brought on an old
+            // medium, never replaces a newer one.
+            const json& current = catalog_;
+            if (keep_newer && current["updated"].as_string() > c["updated"].as_string())
+            {
+                result["state"] = "kept";
+                return true;
+            }
             catalog_ = c;
+            // Written under the lock, so that of two catalogs installed at once, from the
+            // network and from a medium, the database keeps the one kept in memory.
+            db_.set_value("catalog", body);
+            db_.set_value("catalog_time", std::to_string(now_unix()));
         }
-        db_.set_value("catalog", body);
-        db_.set_value("catalog_time", std::to_string(now_unix()));
-        log_info("models: catalog of " + std::to_string(c["models"].size()) + " models");
+        ++generation_;
+        result["models"] = static_cast<long long>(c["models"].size());
+        log_info("models: catalog of " + std::to_string(c["models"].size()) + " models, published "
+            + c["updated"].as_string());
         return true;
+    }
+
+    bool model_manager::refresh_catalog(std::string& error)
+    {
+        std::string body, sig;
+        if (!http_get(catalog_url_, body, error)) return false;
+        if (!http_get(catalog_url_ + ".sig", sig, error, 4096))
+        {
+            error = "the catalog has no signature: " + error;
+            return false;
+        }
+        json result = json::object();
+        return install_catalog(body, sig, true, result, error);
+    }
+
+    void model_manager::refresh_catalog_async()
+    {
+        std::lock_guard<std::mutex> start(refresher_m_);
+        if (stopped_ || refreshing_.exchange(true)) return;
+        if (refresher_.joinable()) refresher_.join();
+        std::string before;
+        {
+            std::lock_guard<std::mutex> lock(m_);
+            before = catalog_state_;
+            catalog_state_ = "checking";
+        }
+        refresher_ = std::thread([this, before]() {
+            std::string error;
+            bool ok = false;
+            try
+            {
+                ok = refresh_catalog(error);
+            }
+            catch (const std::exception& e)
+            {
+                // A database that cannot be written, for instance a full disk.
+                error = e.what();
+            }
+            // A refresh ended by the service, which stops or goes offline, is no error.
+            const bool ended = stopped_ || http_cancelled();
+            if (!ok)
+            {
+                std::lock_guard<std::mutex> lock(m_);
+                catalog_state_ = ended ? before : std::string("error");
+                if (!ended) catalog_error_ = error;
+            }
+            if (!ok && !ended) log_warning("models: catalog not refreshed: " + error);
+            refreshing_ = false;
+        });
+    }
+
+    json model_manager::import_catalog(const std::string& folder)
+    {
+        json result = json::object();
+        std::string body, sig, error;
+        if (!read_file(join_path(folder, "catalog.json"), body, 16u << 20)
+            || !read_file(join_path(folder, "catalog.json.sig"), sig, 4096))
+        {
+            result["error"] = "no signed catalog (catalog.json and catalog.json.sig) in " + folder;
+            return result;
+        }
+        if (!install_catalog(body, sig, true, result, error)) result["error"] = error;
+        return result;
+    }
+
+    json model_manager::catalog_status() const
+    {
+        json s = json::object();
+        {
+            std::lock_guard<std::mutex> lock(m_);
+            s["state"] = catalog_state_;
+            if (!catalog_error_.empty()) s["error"] = catalog_error_;
+            s["updated"] = catalog_["updated"].as_string();
+            s["models"] = static_cast<long long>(catalog_["models"].size());
+        }
+        s["time"] = static_cast<long long>(std::atoll(db_.value("catalog_time", "0").c_str()));
+        return s;
     }
 
     json model_manager::catalog() const
@@ -316,7 +422,9 @@ namespace albireo
         json result = json::object();
         result["models"] = out;
         result["downloads"] = downloads();
-        result["catalog_time"] = static_cast<long long>(std::atoll(db_.value("catalog_time", "0").c_str()));
+        const json cs = catalog_status();
+        result["catalog_time"] = cs["time"];
+        result["catalog"] = cs;
         return result;
     }
 
@@ -341,6 +449,11 @@ namespace albireo
 
     bool model_manager::start_download(const std::string& id, std::string& error)
     {
+        if (stopped_)
+        {
+            error = "the service stops";
+            return false;
+        }
         json entry;
         if (!catalog_entry(id, entry))
         {
@@ -445,7 +558,22 @@ namespace albireo
         }
         jobs_[id] = j;
         j->started = now_unix();
-        j->worker = std::thread([this, j]() { run_job(j); });
+        j->worker = std::thread([this, j]() {
+            try
+            {
+                run_job(j);
+            }
+            catch (const std::exception& e)
+            {
+                // A database or a disk that fails under the download.
+                {
+                    std::lock_guard<std::mutex> lock(m_);
+                    j->state = "error";
+                    j->error = e.what();
+                }
+                log_error("models: download of " + j->id + ": " + e.what());
+            }
+        });
         return true;
     }
 
@@ -541,7 +669,10 @@ namespace albireo
                     bool ok = false;
                     for (int attempt = 0; attempt < 4 && !ok && !j->cancel; ++attempt)
                     {
-                        if (attempt > 0) std::this_thread::sleep_for(std::chrono::seconds(2 * attempt));
+                        // A pause before each new attempt, which a cancellation ends.
+                        for (int t = 0; t < 20 * attempt && !j->cancel && !http_cancelled(); ++t)
+                            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                        if (j->cancel) break;
                         if (c.gzip)
                         {
                             // Inflated as it arrives, written at the offsets of the part.
@@ -599,6 +730,9 @@ namespace albireo
                                 }, error);
                             ok = ok && c.done == c.length;
                         }
+                        // The downloads ended for the whole service (it stops, or goes
+                        // offline) are not attempted again; they resume later.
+                        if (!ok && http_cancelled()) break;
                     }
                     if (!ok && !j->cancel)
                     {
@@ -778,10 +912,10 @@ namespace albireo
     bool model_manager::import_file(const std::string& f, const std::string& original_name,
         const std::string& known_sha, bool move, std::string& id, std::string& error)
     {
-        const std::string sha = known_sha.empty() ? sha256_file(f) : known_sha;
+        const std::string sha = known_sha.empty() ? sha256_file(f, nullptr, &stopped_) : known_sha;
         if (sha.empty())
         {
-            error = "unreadable";
+            error = stopped_ ? "the service stops" : "unreadable";
             return false;
         }
         // A catalog entry with this hash gives the identifier and the description.
@@ -789,7 +923,8 @@ namespace albireo
         bool known = false;
         {
             std::lock_guard<std::mutex> lock(m_);
-            for (const auto& e : catalog_["models"].elements())
+            const json& catalog = catalog_;
+            for (const auto& e : catalog["models"].elements())
                 if (e["sha256"].as_string() == sha)
                 {
                     entry = e;
@@ -816,7 +951,7 @@ namespace albireo
             entry["id"] = id;
             // A sidecar description written next to the file, if any.
             std::string side;
-            if (!move && f.size() > 5 && f.substr(f.size() - 5) == ".gguf" &&
+            if (f.size() > 5 && f.substr(f.size() - 5) == ".gguf" &&
                 read_file(f.substr(0, f.size() - 5) + ".json", side, 1u << 20))
             {
                 const json s = json::parse_or_null(side);
@@ -836,38 +971,24 @@ namespace albireo
             if (move && f != existing.file) remove_file(f);
             return true;
         }
-        if (target != f)
+        // Moved when asked and when the models folder is on the same volume; copied
+        // otherwise, through a temporary name, then checked again.
+        if (target != f && !(move && rename_file(f, target)))
         {
-            if (move)
+            const std::string tmp = target + ".partial";
+            const bool copied = copy_file(f, tmp, &stopped_);
+            if (!copied || sha256_file(tmp, nullptr, &stopped_) != sha || !rename_file(tmp, target))
             {
-                if (!rename_file(f, target))
-                {
-                    remove_file(f);
-                    error = "cannot move the file into the models folder";
-                    return false;
-                }
+                remove_file(tmp);
+                error = stopped_ ? "the service stops" : "copy failed";
+                return false;
             }
-            else
-            {
-                // Copied through a temporary name, then checked again.
-                const std::string tmp = target + ".partial";
-#if defined(_WIN32)
-                const bool copied = CopyFileW(widen(f).c_str(), widen(tmp).c_str(), FALSE) != 0;
-#else
-                const bool copied = run_process("/bin/cp", { f, tmp }) == 0;
-#endif
-                if (!copied || sha256_file(tmp) != sha || !rename_file(tmp, target))
-                {
-                    remove_file(tmp);
-                    error = "copy failed";
-                    return false;
-                }
-            }
+            if (move) remove_file(f);
         }
         return install_file(id, target, entry, sha, known ? "catalog" : "import", error);
     }
 
-    json model_manager::import_path(const std::string& path)
+    json model_manager::import_path(const std::string& path, bool move)
     {
         json result = json::object();
         json imported = json::array();
@@ -875,8 +996,10 @@ namespace albireo
         std::vector<std::string> files;
         if (dir_exists(path))
         {
-            for (const auto& n : list_dir(path))
-                if (n.size() > 5 && n.substr(n.size() - 5) == ".gguf") files.push_back(join_path(path, n));
+            // The folder and its models subfolder, the layout of an offline bundle.
+            for (const std::string& dir : { path, join_path(path, "models") })
+                for (const auto& n : list_dir(dir))
+                    if (n.size() > 5 && n.substr(n.size() - 5) == ".gguf") files.push_back(join_path(dir, n));
         }
         else if (file_exists(path))
         {
@@ -888,8 +1011,9 @@ namespace albireo
         }
         for (const auto& f : files)
         {
+            if (stopped_) break;
             std::string id, error;
-            if (!import_file(f, f, std::string(), false, id, error))
+            if (!import_file(f, f, std::string(), move, id, error))
             {
                 errors.push_back(f + ": " + error);
                 continue;

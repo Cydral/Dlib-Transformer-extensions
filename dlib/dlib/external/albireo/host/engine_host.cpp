@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <thread>
 
 #include "../common/log.h"
 #include "../common/platform.h"
@@ -46,23 +47,33 @@ namespace albireo
             engine_candidate c;
             c.variant = v;
             c.path = path;
-            std::string output;
-            const int code = run_process(probe_program, { "--probe-engine", path }, &output, 60000);
-            // The description is the last line the probe prints.
-            const size_t start = output.find('{');
-            c.description = start == std::string::npos ? json() : json::parse_or_null(output.substr(start));
-            c.usable = code == 0 && c.description["usable"].as_bool(false);
-            if (!c.usable && !c.description.contains("reason"))
-            {
-                if (!c.description.is_object()) c.description = json::object();
-                c.description["reason"] = code == 0 ? std::string("not usable")
-                    : "the library could not be loaded (code " + std::to_string(code) + ")";
-            }
-            const std::string state = c.usable ? std::string("usable")
-                : "not usable: " + c.description["reason"].as_string();
-            log_info("engines: " + c.variant + " " + state);
             out.push_back(c);
         }
+        // Each library is described by a process of its own, all at the same time: the
+        // start of the service waits for the slowest one only.
+        std::vector<std::thread> probes;
+        for (auto& c : out)
+        {
+            engine_candidate* p = &c;
+            probes.emplace_back([p, &probe_program]() {
+                std::string output;
+                const int code = run_process(probe_program, { "--probe-engine", p->path }, &output, 60000);
+                // The description is the last line the probe prints.
+                const size_t start = output.find('{');
+                p->description = start == std::string::npos ? json() : json::parse_or_null(output.substr(start));
+                p->usable = code == 0 && p->description["usable"].as_bool(false);
+                if (!p->usable && !p->description.contains("reason"))
+                {
+                    if (!p->description.is_object()) p->description = json::object();
+                    p->description["reason"] = code == 0 ? std::string("not usable")
+                        : "the library could not be loaded (code " + std::to_string(code) + ")";
+                }
+            });
+        }
+        for (auto& t : probes) t.join();
+        for (const auto& c : out)
+            log_info("engines: " + c.variant + " "
+                + (c.usable ? std::string("usable") : "not usable: " + c.description["reason"].as_string()));
         return out;
     }
 
@@ -97,7 +108,7 @@ namespace albireo
     bool engine_host::start(const engine_candidate& c, const json& config, std::string& error)
     {
         stop();
-        std::lock_guard<std::mutex> lock(m_);
+        std::unique_lock<std::shared_timed_mutex> life(life_);
         std::unique_ptr<engine_library> lib(new engine_library());
         if (!lib->load(c.path, error)) return false;
         if (c.description["pinned"].as_bool(false)) pinned_started = true;
@@ -110,31 +121,39 @@ namespace albireo
         }
         lib_ = std::move(lib);
         engine_ = e;
-        current_ = c;
-        current_.description = lib_->description();
+        {
+            std::lock_guard<std::mutex> lock(m_);
+            running_ = true;
+            current_ = c;
+            current_.description = lib_->description();
+        }
         log_info("engines: " + c.variant + " started");
         return true;
     }
 
     void engine_host::stop()
     {
-        std::lock_guard<std::mutex> lock(m_);
+        std::unique_lock<std::shared_timed_mutex> life(life_);
+        {
+            std::lock_guard<std::mutex> lock(m_);
+            running_ = false;
+            models_.clear();
+        }
         if (engine_ && lib_) lib_->destroy(engine_);
         engine_ = nullptr;
         lib_.reset();
-        models_.clear();
     }
 
     bool engine_host::running() const
     {
         std::lock_guard<std::mutex> lock(m_);
-        return engine_ != nullptr;
+        return running_;
     }
 
     std::string engine_host::variant() const
     {
         std::lock_guard<std::mutex> lock(m_);
-        return engine_ ? current_.variant : std::string();
+        return running_ ? current_.variant : std::string();
     }
 
     json engine_host::description() const
@@ -146,7 +165,7 @@ namespace albireo
     bool engine_host::load_model(const std::string& id, const std::string& path, const json& options,
         std::string& error)
     {
-        std::lock_guard<std::mutex> lock(m_);
+        std::shared_lock<std::shared_timed_mutex> life(life_);
         if (!engine_)
         {
             error = "no engine is running";
@@ -159,16 +178,21 @@ namespace albireo
             error = err;
             return false;
         }
+        std::lock_guard<std::mutex> lock(m_);
         if (std::find(models_.begin(), models_.end(), id) == models_.end()) models_.push_back(id);
         return true;
     }
 
     void engine_host::unload_model(const std::string& id)
     {
-        std::lock_guard<std::mutex> lock(m_);
+        std::shared_lock<std::shared_timed_mutex> life(life_);
         if (!engine_) return;
+        {
+            // Out of the list first, so that no new request is sent to it.
+            std::lock_guard<std::mutex> lock(m_);
+            models_.erase(std::remove(models_.begin(), models_.end(), id), models_.end());
+        }
         lib_->unload_model(engine_, id.c_str());
-        models_.erase(std::remove(models_.begin(), models_.end(), id), models_.end());
     }
 
     std::vector<std::string> engine_host::loaded_models() const
@@ -195,7 +219,7 @@ namespace albireo
 
     bool engine_host::submit(const json& request, request_sink sink, uint64_t& id, std::string& error)
     {
-        std::lock_guard<std::mutex> lock(m_);
+        std::shared_lock<std::shared_timed_mutex> life(life_);
         if (!engine_)
         {
             error = "no engine is running";
@@ -215,13 +239,13 @@ namespace albireo
 
     void engine_host::cancel(uint64_t id)
     {
-        std::lock_guard<std::mutex> lock(m_);
+        std::shared_lock<std::shared_timed_mutex> life(life_);
         if (engine_) lib_->cancel(engine_, id);
     }
 
     json engine_host::query(const json& request)
     {
-        std::lock_guard<std::mutex> lock(m_);
+        std::shared_lock<std::shared_timed_mutex> life(life_);
         json answer;
         if (!engine_)
         {

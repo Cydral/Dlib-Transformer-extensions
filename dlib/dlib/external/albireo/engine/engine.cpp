@@ -66,6 +66,28 @@ namespace albireo
             return back + 1 >= need ? n : i - 1;
         }
 
+        // The base64 form of the bytes of an array of floats, as the embeddings travel.
+        std::string base64_floats(const std::vector<float>& v)
+        {
+            static const char table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            const size_t n = v.size() * sizeof(float);
+            std::vector<unsigned char> bytes(n);
+            if (n) std::memcpy(bytes.data(), v.data(), n);
+            std::string out;
+            out.reserve((n + 2) / 3 * 4);
+            for (size_t i = 0; i < n; i += 3)
+            {
+                const unsigned b0 = bytes[i];
+                const unsigned b1 = i + 1 < n ? bytes[i + 1] : 0;
+                const unsigned b2 = i + 2 < n ? bytes[i + 2] : 0;
+                out += table[b0 >> 2];
+                out += table[((b0 & 3) << 4) | (b1 >> 4)];
+                out += i + 1 < n ? table[((b1 & 15) << 2) | (b2 >> 6)] : '=';
+                out += i + 2 < n ? table[b2 & 63] : '=';
+            }
+            return out;
+        }
+
         long common_prefix(const std::vector<int>& a, const std::vector<int>& b)
         {
             const size_t n = std::min(a.size(), b.size());
@@ -167,7 +189,7 @@ namespace albireo
         std::vector<cache_entry> idle;
         std::vector<std::shared_ptr<request_state>> active;
         std::deque<std::shared_ptr<request_state>> waiting;
-        bool unloading = false;
+        std::atomic<bool> unloading{false};
         uint64_t stamp = 0;
         forward_batch batch;
         std::vector<float> logits;
@@ -178,6 +200,21 @@ namespace albireo
         std::atomic<long> n_idle{0};
         std::atomic<uint64_t> generated{0};
         std::atomic<uint64_t> prompted{0};
+    };
+
+    // A request of an embedding model: one vector per input, every input computed as a
+    // part of its own, a request_state that holds the job.
+    struct embedding_job
+    {
+        uint64_t id = 0;
+        event_sink sink;
+        std::vector<std::vector<float>> vectors;
+        long remaining = 0;
+        long tokens = 0;
+        long dimensions = 0;    // 0: the width of the model
+        std::atomic<bool> cancelled{false};
+        bool ended = false;
+        clock_type::time_point submitted, started;
     };
 
     struct request_state
@@ -204,6 +241,11 @@ namespace albireo
         phase ph = phase::waiting;
         clock_type::time_point submitted, started, prompt_end, finished;
         bool prompt_done = false;
+        // The embedding job this request computes one input of, and the index of the input.
+        std::shared_ptr<embedding_job> job;
+        long job_index = -1;
+
+        bool is_cancelled() const { return cancelled || (job && job->cancelled); }
     };
 
     namespace
@@ -245,6 +287,9 @@ namespace albireo
         for (auto& r : left)
             if (r->ph != request_state::phase::done) fail(*r, "cancelled", "the engine stopped");
         requests_.clear();
+        std::vector<std::shared_ptr<embedding_job>> jobs;
+        for (auto& j : jobs_) jobs.push_back(j.second);
+        for (auto& j : jobs) end_job(*j, "cancelled", "the engine stopped");
         models_.clear();
     }
 
@@ -332,16 +377,30 @@ namespace albireo
             throw std::runtime_error("the vocabulary and the output layer of the model disagree");
         m->format = chat_format::detect(m->tok, m->cfg.chat_template);
 
-        long ctx = options["context"].as_int(settings_["context"].as_int(0));
-        if (ctx <= 0) ctx = std::min<long>(m->cfg.ctx_train, 32768);
+        // An embedding model reads passages and questions of a few hundred tokens, many
+        // at a time, and keeps nothing of them: its defaults are its own, and its keys and
+        // values come in small blocks, given back as soon as each input is read.
+        const bool embedding = m->cfg.is_embedding();
+        if (embedding && m->cfg.pooling != 3)
+            throw std::runtime_error("this embedding model pools its hidden states by a method the engine does not "
+                "implement (the engine takes the state of the last token)");
+        long ctx = options["context"].as_int(embedding ? 0 : settings_["context"].as_int(0));
+        if (ctx <= 0) ctx = std::min<long>(m->cfg.ctx_train, embedding ? 8192 : 32768);
         const long limit = m->cfg.ctx_train > 0 ? std::max<long>(m->cfg.ctx_train, 256) : ctx;
         m->context = std::max<long>(256, std::min<long>(ctx, limit));
-        m->max_sequences = std::max<long>(1, options["max_sequences"].as_int(settings_["max_sequences"].as_int(8)));
-        m->batch_tokens = std::max<long>(16, options["batch_tokens"].as_int(settings_["batch_tokens"].as_int(512)));
+        m->max_sequences = std::max<long>(1, options["max_sequences"].as_int(
+            embedding ? 8 : settings_["max_sequences"].as_int(8)));
+        m->batch_tokens = std::max<long>(16, options["batch_tokens"].as_int(
+            embedding ? 256 : settings_["batch_tokens"].as_int(512)));
 
         const size_t per_token = 2 * static_cast<size_t>(m->cfg.n_layers) * m->cfg.kv_dim() * sizeof(uint16_t);
-        size_t kv = static_cast<size_t>(options["kv_mb"].as_int(settings_["kv_mb"].as_int(0))) << 20;
-        if (kv == 0)
+        size_t kv = static_cast<size_t>(options["kv_mb"].as_int(embedding ? 0 : settings_["kv_mb"].as_int(0))) << 20;
+        if (kv == 0 && embedding)
+        {
+            // One input of the whole context.
+            kv = per_token * static_cast<size_t>(m->context);
+        }
+        else if (kv == 0)
         {
             // Two full contexts, within a quarter of the memory available.
             const memory_info mem = read_memory_info();
@@ -349,7 +408,7 @@ namespace albireo
             if (mem.available > 0) kv = std::min<size_t>(kv, static_cast<size_t>(mem.available / 4));
             kv = std::max<size_t>(kv, per_token * static_cast<size_t>(std::min<long>(m->context, 4096)));
         }
-        std::unique_ptr<cpu_runtime> runtime(new cpu_runtime(m->file, m->cfg, *pool_, kv, 256));
+        std::unique_ptr<cpu_runtime> runtime(new cpu_runtime(m->file, m->cfg, *pool_, kv, embedding ? 64 : 256));
 #ifdef ALBIREO_TENSOR_BACKEND
         runtime->set_offload(device_->make_offload());
 #endif
@@ -374,7 +433,9 @@ namespace albireo
 
         if (settings_["warm_up"].as_bool(true)) m->file->warm_up(true);
 
-        log(ALBIREO_LOG_INFO, "model '" + id + "': " + m->runtime->description() + ", chat format " + m->format->name()
+        const std::string use = embedding ? "vectors of " + std::to_string(m->cfg.d_model) + " dimensions"
+            : std::string("chat format ") + m->format->name();
+        log(ALBIREO_LOG_INFO, "model '" + id + "': " + m->runtime->description() + ", " + use
             + ", context " + std::to_string(m->context) + ", keys and values up to "
             + std::to_string(m->runtime->kv_bytes_budget() >> 20) + " MB"
             + (m->tok.exact_pretokenizer() ? "" : ", pre-tokenizer '" + m->tok.pretokenizer() + "' approximated"));
@@ -404,13 +465,15 @@ namespace albireo
         j["context"] = m.context;
         j["trained_context"] = m.cfg.ctx_train;
         j["format"] = m.format->name();
-        j["tools"] = m.format->supports_tools();
-        j["reasoning"] = m.format->supports_reasoning();
+        j["tools"] = !m.cfg.is_embedding() && m.format->supports_tools();
+        j["reasoning"] = !m.cfg.is_embedding() && m.format->supports_reasoning();
         j["parameters"] = static_cast<unsigned long long>(m.parameters);
         j["quantization"] = m.quantization;
         j["bytes"] = static_cast<unsigned long long>(m.bytes);
         j["kv_bytes_per_token"] = static_cast<unsigned long long>(m.runtime->kv_bytes_per_token());
         j["experts"] = m.cfg.n_experts;
+        j["embedding"] = m.cfg.is_embedding();
+        if (m.cfg.is_embedding()) j["dimensions"] = m.cfg.d_model;
         j["description"] = albireo::describe(m.cfg);
         return j;
     }
@@ -428,6 +491,16 @@ namespace albireo
                 throw std::invalid_argument("the model '" + model_id + "' is not loaded");
             m = it->second;
         }
+        if (req.contains("input"))
+        {
+            if (!m->cfg.is_embedding())
+                throw std::invalid_argument("the model '" + model_id + "' writes text; vectors come from an embedding "
+                    "model");
+            return submit_embeddings(m, req, std::move(sink));
+        }
+        if (m->cfg.is_embedding())
+            throw std::invalid_argument("the model '" + model_id + "' computes vectors: its requests give their texts "
+                "in \"input\"");
 
         auto r = std::make_shared<request_state>();
         r->model_id = model_id;
@@ -513,6 +586,9 @@ namespace albireo
 
         std::lock_guard<std::mutex> lock(mutex_);
         if (stop_) throw std::runtime_error("the engine is stopping");
+        // The model may have been unloaded while the prompt was prepared: its queue is no
+        // longer read.
+        if (m->unloading) throw std::invalid_argument("the model '" + model_id + "' is not loaded");
         r->id = next_id_++;
         requests_[r->id] = r;
         m->waiting.push_back(r);
@@ -521,11 +597,153 @@ namespace albireo
         return r->id;
     }
 
+    uint64_t engine::submit_embeddings(const std::shared_ptr<loaded_model>& m, const json& req, event_sink sink)
+    {
+        // The inputs: a text, a list of texts, a list of token identifiers, or a list of
+        // such lists.  A text receives the tokens the model adds around its inputs (the
+        // final token whose state becomes the vector, for the decoders); token lists are
+        // taken as they are.
+        std::vector<std::vector<int>> inputs;
+        const json& in = req["input"];
+        auto text_tokens = [&](const std::string& text) {
+            return m->tok.encode(text, m->tok.add_bos_default(), m->tok.add_eos_default(), false);
+        };
+        auto token_list = [&](const json& list) {
+            std::vector<int> ids;
+            for (const auto& t : list.elements())
+            {
+                if (!t.is_integer() || t.as_int() < 0 || t.as_int() >= m->cfg.vocab)
+                    throw std::invalid_argument("input holds an invalid token identifier");
+                ids.push_back(static_cast<int>(t.as_int()));
+            }
+            return ids;
+        };
+        if (in.is_string()) inputs.push_back(text_tokens(in.as_string()));
+        else if (in.is_array() && !in.empty() && in[0].is_integer()) inputs.push_back(token_list(in));
+        else if (in.is_array())
+        {
+            for (const auto& e : in.elements())
+            {
+                if (e.is_string()) inputs.push_back(text_tokens(e.as_string()));
+                else if (e.is_array()) inputs.push_back(token_list(e));
+                else throw std::invalid_argument("input must hold texts or lists of token identifiers");
+            }
+        }
+        if (inputs.empty()) throw std::invalid_argument("input is empty");
+        if (inputs.size() > 2048) throw std::invalid_argument("at most 2048 inputs per request");
+        for (size_t i = 0; i < inputs.size(); ++i)
+        {
+            if (inputs[i].empty()) throw std::invalid_argument("input " + std::to_string(i) + " is empty");
+            if (static_cast<long>(inputs[i].size()) > m->context)
+                throw std::invalid_argument("input " + std::to_string(i) + " holds " + std::to_string(inputs[i].size())
+                    + " tokens, beyond the " + std::to_string(m->context) + " tokens the model reads at once");
+        }
+        const long dimensions = req["dimensions"].as_int(0);
+        if (dimensions < 0 || dimensions > m->cfg.d_model)
+            throw std::invalid_argument("dimensions must lie between 1 and " + std::to_string(m->cfg.d_model));
+
+        auto job = std::make_shared<embedding_job>();
+        job->sink = std::move(sink);
+        job->vectors.resize(inputs.size());
+        job->remaining = static_cast<long>(inputs.size());
+        job->dimensions = dimensions;
+        job->submitted = clock_type::now();
+        std::vector<std::shared_ptr<request_state>> parts;
+        for (size_t i = 0; i < inputs.size(); ++i)
+        {
+            auto r = std::make_shared<request_state>();
+            r->model_id = m->id;
+            r->job = job;
+            r->job_index = static_cast<long>(i);
+            r->submitted = job->submitted;
+            job->tokens += static_cast<long>(inputs[i].size());
+            r->prompt.swap(inputs[i]);
+            parts.push_back(r);
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (stop_) throw std::runtime_error("the engine is stopping");
+        if (m->unloading) throw std::invalid_argument("the model '" + m->id + "' is not loaded");
+        job->id = next_id_++;
+        jobs_[job->id] = job;
+        for (auto& r : parts)
+        {
+            r->id = next_id_++;
+            m->waiting.push_back(r);
+        }
+        ++total_requests_;
+        wake_.notify_all();
+        return job->id;
+    }
+
+    void engine::complete_part(loaded_model& m, request_state& r, const float* hidden)
+    {
+        // The state of the last token, cut to the dimensions asked (the leading ones, for
+        // the models trained to keep their meaning when shortened), at unit length.
+        embedding_job& job = *r.job;
+        const long n = job.dimensions > 0 ? job.dimensions : m.cfg.d_model;
+        std::vector<float> v(hidden, hidden + n);
+        double norm = 0;
+        for (float x : v) norm += static_cast<double>(x) * x;
+        const float scale = norm > 0 ? static_cast<float>(1.0 / std::sqrt(norm)) : 0.0f;
+        for (float& x : v) x *= scale;
+        job.vectors[static_cast<size_t>(r.job_index)].swap(v);
+        r.ph = request_state::phase::done;
+        r.finished = clock_type::now();
+        if (r.seq >= 0) m.runtime->release_sequence(r.seq);
+        r.seq = -1;
+        if (job.started.time_since_epoch().count() == 0 || r.started < job.started) job.started = r.started;
+        if (--job.remaining > 0 || job.ended) return;
+
+        job.ended = true;
+        json data = json::array();
+        for (size_t i = 0; i < job.vectors.size(); ++i)
+        {
+            json e = json::object();
+            e["index"] = static_cast<long long>(i);
+            e["embedding"] = base64_floats(job.vectors[i]);
+            data.push_back(e);
+        }
+        json done = json::object();
+        done["data"] = data;
+        done["dimensions"] = n;
+        json usage = json::object();
+        usage["prompt_tokens"] = job.tokens;
+        usage["total_tokens"] = job.tokens;
+        done["usage"] = usage;
+        json timings = json::object();
+        const clock_type::time_point end = clock_type::now();
+        const double compute = seconds_since(job.started, end);
+        timings["queued_ms"] = 1000.0 * seconds_since(job.submitted, job.started);
+        timings["prompt_ms"] = 1000.0 * compute;
+        timings["prompt_per_second"] = compute > 0 ? job.tokens / compute : 0.0;
+        done["timings"] = timings;
+        job.sink(ALBIREO_EVENT_DONE, done.dump());
+        std::lock_guard<std::mutex> lock(mutex_);
+        jobs_.erase(job.id);
+    }
+
+    void engine::end_job(embedding_job& job, const std::string& code, const std::string& message)
+    {
+        // The first failure or cancellation of an input ends the whole request; its other
+        // inputs see the cancellation and stop.
+        job.cancelled = true;
+        if (job.ended) return;
+        job.ended = true;
+        json e = json::object();
+        e["code"] = code;
+        e["message"] = message;
+        if (job.sink) job.sink(ALBIREO_EVENT_ERROR, e.dump());
+        std::lock_guard<std::mutex> lock(mutex_);
+        jobs_.erase(job.id);
+    }
+
     void engine::cancel(uint64_t id)
     {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = requests_.find(id);
         if (it != requests_.end()) it->second->cancelled = true;
+        auto j = jobs_.find(id);
+        if (j != jobs_.end()) j->second->cancelled = true;
         wake_.notify_all();
     }
 
@@ -536,6 +754,9 @@ namespace albireo
         for (;;)
         {
             std::vector<std::shared_ptr<loaded_model>> models;
+            // Whether a language model has requests: the embedding models then compute
+            // short passes, the answers being what the users wait for.
+            bool answering = false;
             {
                 std::unique_lock<std::mutex> lock(mutex_);
                 wake_.wait(lock, [&]() {
@@ -545,7 +766,12 @@ namespace albireo
                     return false;
                 });
                 if (stop_) break;
-                for (const auto& m : models_) models.push_back(m.second);
+                for (const auto& m : models_)
+                {
+                    models.push_back(m.second);
+                    if (!m.second->cfg.is_embedding() && (!m.second->waiting.empty() || !m.second->active.empty()))
+                        answering = true;
+                }
             }
             for (const auto& m : models)
             {
@@ -568,7 +794,19 @@ namespace albireo
                 }
                 try
                 {
-                    step(m);
+                    const bool short_pass = m->cfg.is_embedding() && answering;
+                    step(m, short_pass ? std::min<long>(m->batch_tokens, 16) : m->batch_tokens);
+                    // An embedding model keeps nothing between its requests: once idle, the
+                    // memory of the inputs it read goes back to the system.
+                    if (m->cfg.is_embedding() && m->active.empty())
+                    {
+                        bool idle = false;
+                        {
+                            std::lock_guard<std::mutex> lock(mutex_);
+                            idle = m->waiting.empty();
+                        }
+                        if (idle) m->runtime->trim_memory();
+                    }
                 }
                 catch (const std::exception& e)
                 {
@@ -594,7 +832,7 @@ namespace albireo
                 r = m.waiting.front();
                 m.waiting.pop_front();
             }
-            if (r->cancelled)
+            if (r->is_cancelled())
             {
                 finish(m, *r, "cancelled");
                 continue;
@@ -699,11 +937,11 @@ namespace albireo
         return true;
     }
 
-    bool engine::step(const std::shared_ptr<loaded_model>& mp)
+    bool engine::step(const std::shared_ptr<loaded_model>& mp, long budget_tokens)
     {
         loaded_model& m = *mp;
         for (auto& r : m.active)
-            if (r->cancelled && r->ph != request_state::phase::done) finish(m, *r, "cancelled");
+            if (r->is_cancelled() && r->ph != request_state::phase::done) finish(m, *r, "cancelled");
         m.active.erase(std::remove_if(m.active.begin(), m.active.end(), request_done), m.active.end());
         admit(m);
         if (m.active.empty())
@@ -717,7 +955,8 @@ namespace albireo
         std::vector<row> rows;
         forward_batch& b = m.batch;
         b.clear();
-        long budget = m.batch_tokens;
+        b.hidden_only = m.cfg.is_embedding();
+        long budget = budget_tokens;
         for (auto& rp : m.active)
         {
             request_state& r = *rp;
@@ -776,14 +1015,24 @@ namespace albireo
                 const long done = static_cast<long>(r.kv_tokens.size());
                 r.kv_tokens.insert(r.kv_tokens.end(), r.prompt.begin() + done, r.prompt.begin() + done + w.count);
                 prompt_tokens += w.count;
-                json p = json::object();
-                p["prompt_done"] = static_cast<long>(r.kv_tokens.size());
-                p["prompt_total"] = static_cast<long>(r.prompt.size());
-                p["cached"] = r.cached;
-                r.sink(ALBIREO_EVENT_PROGRESS, p.dump());
+                if (!r.job)
+                {
+                    json p = json::object();
+                    p["prompt_done"] = static_cast<long>(r.kv_tokens.size());
+                    p["prompt_total"] = static_cast<long>(r.prompt.size());
+                    p["cached"] = r.cached;
+                    r.sink(ALBIREO_EVENT_PROGRESS, p.dump());
+                }
             }
             if (!w.logits) continue;
-            float* lg = m.logits.data() + static_cast<long>(logit_row++) * V;
+            const long this_row = static_cast<long>(logit_row++);
+            if (r.job)
+            {
+                // An input of an embedding request, read to its end.
+                complete_part(m, r, m.runtime->hidden().data() + this_row * m.cfg.d_model);
+                continue;
+            }
+            float* lg = m.logits.data() + this_row * V;
             if (r.ph == request_state::phase::prefill)
             {
                 r.prompt_end = clock_type::now();
@@ -913,6 +1162,14 @@ namespace albireo
     void engine::finish(loaded_model& m, request_state& r, const std::string& reason, bool keep_cache)
     {
         if (r.ph == request_state::phase::done) return;
+        if (r.job)
+        {
+            r.ph = request_state::phase::done;
+            if (r.seq >= 0) m.runtime->release_sequence(r.seq);
+            r.seq = -1;
+            end_job(*r.job, reason, "the request was " + reason);
+            return;
+        }
         std::vector<output_event> events;
         if (r.parser)
         {
@@ -986,7 +1243,8 @@ namespace albireo
         json e = json::object();
         e["code"] = code;
         e["message"] = message;
-        if (r.sink) r.sink(ALBIREO_EVENT_ERROR, e.dump());
+        if (r.job) end_job(*r.job, code, message);
+        else if (r.sink) r.sink(ALBIREO_EVENT_ERROR, e.dump());
         if (r.seq >= 0)
         {
             std::shared_ptr<loaded_model> m;

@@ -4,6 +4,7 @@
 #include "platform.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -176,6 +177,22 @@ namespace albireo
 #endif
     }
 
+    bool file_being_written(const std::string& p)
+    {
+#if defined(_WIN32)
+        // Opening for reading while refusing to share the writing fails when another
+        // program holds the file open for writing, as a copy in progress does.
+        const HANDLE h = CreateFileW(widen(p).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return GetLastError() == ERROR_SHARING_VIOLATION;
+        CloseHandle(h);
+        return false;
+#else
+        struct stat st;
+        return stat(p.c_str(), &st) == 0 && std::time(nullptr) - st.st_mtime < 30;
+#endif
+    }
+
     bool remove_file(const std::string& p)
     {
 #if defined(_WIN32)
@@ -192,6 +209,46 @@ namespace albireo
             MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
 #else
         return std::rename(from.c_str(), to.c_str()) == 0;
+#endif
+    }
+
+#if defined(_WIN32)
+    namespace
+    {
+        // Called by CopyFileExW between the blocks it copies; the copy stops when cancel is set.
+        DWORD CALLBACK copy_progress(LARGE_INTEGER, LARGE_INTEGER, LARGE_INTEGER, LARGE_INTEGER, DWORD, DWORD,
+            HANDLE, HANDLE, LPVOID data)
+        {
+            const std::atomic<bool>* cancel = static_cast<const std::atomic<bool>*>(data);
+            return *cancel ? PROGRESS_CANCEL : PROGRESS_CONTINUE;
+        }
+    }
+#endif
+
+    bool copy_file(const std::string& from, const std::string& to, const std::atomic<bool>* cancel)
+    {
+#if defined(_WIN32)
+        return CopyFileExW(widen(from).c_str(), widen(to).c_str(), cancel ? copy_progress : nullptr,
+            const_cast<std::atomic<bool>*>(cancel), nullptr, 0) != 0;
+#else
+        bool ok = false;
+        {
+            std::ifstream in(from, std::ios::binary);
+            std::ofstream out(to, std::ios::binary | std::ios::trunc);
+            if (!in || !out) return false;
+            std::vector<char> buf(1 << 20);
+            ok = true;
+            while (ok && in)
+            {
+                in.read(buf.data(), static_cast<std::streamsize>(buf.size()));
+                const std::streamsize n = in.gcount();
+                ok = !(cancel && *cancel) && (n == 0 || static_cast<bool>(out.write(buf.data(), n)));
+            }
+            out.close();
+            ok = ok && !in.bad() && static_cast<bool>(out);
+        }
+        if (!ok) std::remove(to.c_str());
+        return ok;
 #endif
     }
 

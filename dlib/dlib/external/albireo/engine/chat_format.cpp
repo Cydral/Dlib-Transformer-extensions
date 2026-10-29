@@ -75,6 +75,8 @@ namespace albireo
         options.today = buf;
         std::snprintf(buf, sizeof(buf), "%s %02d, %d", months[t.tm_mon], t.tm_mday, t.tm_year + 1900);
         options.today_long = buf;
+        std::snprintf(buf, sizeof(buf), "%02d %.3s %d", t.tm_mday, months[t.tm_mon], t.tm_year + 1900);
+        options.today_short = buf;
         const std::time_t before = now - 24 * 3600;
 #if defined(_WIN32)
         localtime_s(&t, &before);
@@ -804,16 +806,18 @@ namespace albireo
                 size_t first = 0;
                 const bool tools = opt.tools.is_array() && !opt.tools.empty();
                 std::string system;
+                // The templates of the family trim the messages, the results of the tools aside.
                 if (!messages.empty() && messages[0].role == "system")
                 {
-                    system = messages[0].content;
+                    system = strip_spaces(messages[0].content);
                     first = 1;
                 }
                 if (dated_ || !system.empty())
                 {
                     w.markup("<|start_header_id|>system<|end_header_id|>\n\n");
                     if (tools) w.markup("Environment: ipython\n");
-                    if (dated_) w.markup("Cutting Knowledge Date: December 2023\nToday Date: " + opt.today + "\n\n");
+                    if (dated_)
+                        w.markup("Cutting Knowledge Date: December 2023\nToday Date: " + opt.today_short + "\n\n");
                     w.text(system);
                     w.markup("<|eot_id|>");
                 }
@@ -835,7 +839,7 @@ namespace albireo
                         }
                         else
                         {
-                            w.text(m.content);
+                            w.text(strip_spaces(m.content));
                         }
                         w.markup("<|eot_id|>");
                         continue;
@@ -856,7 +860,7 @@ namespace albireo
                         }
                         tools_given = true;
                     }
-                    w.text(m.content);
+                    w.text(m.role == "tool" ? m.content : strip_spaces(m.content));
                     w.markup("<|eot_id|>");
                 }
                 if (opt.add_generation_prompt) w.markup("<|start_header_id|>assistant<|end_header_id|>\n\n");

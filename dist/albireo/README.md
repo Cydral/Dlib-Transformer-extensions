@@ -16,25 +16,32 @@ programs, and ignore a file whose signature fails. A change of one byte of a JSO
 needs a new signature.
 
 The installers are attached to the GitHub releases of the repository, named `albireo-v<version>`,
-whose assets accept files up to 2 GB: the repository itself keeps only these small files.
+and the models published outside the Hugging Face hub to the release `albireo-models`; a release
+accepts files of less than 2 GiB, and the repository itself keeps only these small files.
 
 ## Publishing a version
 
-1. Set the version in `dlib/dlib/external/albireo/common/version.h`.
+1. Set the version in `dlib/dlib/external/albireo/common/version.h`, commit and push the sources.
 2. Build the installer on Windows (see the README of Albireo, section Building on Windows).
-3. Create the release `albireo-v<version>` on GitHub and attach `albireo-setup-<version>.exe`.
-4. Write the release notes as `notes.json`, `{"en": "...", "fr": "...", "de": "...", "it": "...", "es": "..."}`;
-   without this file, `make_feed.py` keeps the notes the feed already holds for the same version.
-5. Write and sign the feed, then push it:
+3. Write the release notes as `notes.json`, `{"en": "...", "fr": "...", "de": "...", "it": "...", "es": "..."}`;
+   without this file, the notes the feed already holds for the same version are kept.
+4. Publish the installer and sign the feed, then push the feed:
 
 ```
-python3 dlib/dlib/external/albireo/tools/make_feed.py dist/albireo/feed.json <version> <path of albireo-setup.exe> https://github.com/Cydral/Dlib-Transformer-extensions/releases/download/albireo-v<version>/albireo-setup-<version>.exe notes.json
-albireo-sign sign <private key> dist/albireo/feed.json
-albireo-sign verify dist/albireo/feed.json
+python3 dlib/dlib/external/albireo/tools/publish_release.py <albireo-setup.exe> --key <private key> --notes notes.json
 git add dist/albireo/feed.json dist/albireo/feed.json.sig
 git commit -m "Albireo <version>"
 git push
 ```
+
+`publish_release.py` checks that the installer carries the version of `version.h`, creates the
+release `albireo-v<version>` when it does not exist, attaches the installer as
+`albireo-setup-<version>.exe` (replacing a file of that name whose content differs), writes
+`feed.json`, signs it with `albireo-sign`, checks the signature, and reads the beginning of the
+installer back from its public address. Its token of GitHub comes from `GITHUB_TOKEN`, `GH_TOKEN`
+or `gh auth token`, with the right to write the contents of the repository; `--dry-run` checks
+everything without publishing. `make_feed.py` writes the feed alone, for an installer published
+by other means.
 
 The services see the new feed within six hours, or at once with "Check for updates" in the menu
 of the icon, download the installer in the background, check its size and its SHA-256, and install
@@ -43,9 +50,9 @@ it when the service restarts.
 ## Updating the catalog
 
 The list of models is in `dlib/dlib/external/albireo/tools/make_catalog.py`: identifiers,
-functions (general, code, security), descriptions in the five languages, licenses, and the file of
-each model on the Hugging Face hub. The script asks the hub for the commit, the size and the hash of
-each file and writes the catalog:
+functions (general, code, security, embedding), descriptions in the five languages, licenses, and
+the file of each model on the Hugging Face hub. The script asks the hub for the commit, the size and
+the hash of each file and writes the catalog:
 
 ```
 python3 dlib/dlib/external/albireo/tools/make_catalog.py dist/albireo/catalog.json
@@ -53,11 +60,31 @@ albireo-sign sign <private key> dist/albireo/catalog.json
 albireo-sign verify dist/albireo/catalog.json
 ```
 
-Exactly one model carries `"default": true`: the service downloads it at its first start.
+The catalog names one default language model, which the service downloads at its first start,
+and one default embedding model, which it downloads in every case for the search in documents.
+Its `updated` member is the time of publication: a service never replaces its catalog with an
+older one.
 
-A model published elsewhere, as parts attached to a release for instance, is cut with
-`tools/publish_model.py`, which prints the `size`, `sha256` and `files` of its entry; the entry is
-then added to the list of `make_catalog.py` with these fields in place of `hub`.
+A model published outside the hub, a model converted for the engine for instance, is cut into
+parts and attached to the release `albireo-models` by `tools/publish_model.py`, which prints its
+entry: architecture, parameters, context, `size`, `sha256` and `files`. The entry is added to the
+list of `make_catalog.py`, completed with the name, the functions and the descriptions, then the
+catalog is written and signed again:
+
+```
+python3 dlib/dlib/external/albireo/tools/publish_model.py model.gguf my-model parts --release albireo-models --gzip
+```
+
+## Offline bundle
+
+A computer without network receives the catalog, the models and the updates on a disk:
+
+```
+python3 dlib/dlib/external/albireo/tools/make_offline_bundle.py <folder> [--models <id,id>] [--from ~/models]
+```
+
+The bundle holds the signed files of this folder, the installer the feed announces and the models
+chosen, the two default models by default; its `README.txt` tells how to install it.
 
 ## The signing key
 

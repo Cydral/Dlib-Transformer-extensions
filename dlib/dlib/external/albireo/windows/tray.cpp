@@ -232,6 +232,7 @@ namespace albireo
             std::wstring tip = L"Albireo";
             if (!general.empty()) tip += L" · " + widen(model_name(general));
             tip += L"\n" + widen(s["engine"]["variant"].as_string());
+            if (s["offline"].as_bool(false)) tip += L" · " + tr("tip_offline");
             const long long active = stats["active"].as_int(0);
             const double tps = stats["generation_tokens_per_second"].as_double(0);
             if (general.empty()) tip += L" · " + tr("tip_no_model");
@@ -409,7 +410,9 @@ namespace albireo
             }
             AppendMenuW(m, MF_POPUP | (on ? 0 : MF_GRAYED), reinterpret_cast<UINT_PTR>(acc), tr("tray_accel").c_str());
             AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-            AppendMenuW(m, MF_STRING | (on ? 0 : MF_GRAYED), CMD_CHECK_UPDATES, tr("tray_updates").c_str());
+            // Offline, an update comes from a folder (Models, Import).
+            const bool offline = tray.status["offline"].as_bool(false);
+            AppendMenuW(m, MF_STRING | (on && !offline ? 0 : MF_GRAYED), CMD_CHECK_UPDATES, tr("tray_updates").c_str());
             const json& up = tray.status["updates"];
             if (on && up["state"].as_string() == "ready")
                 AppendMenuW(m, MF_STRING, CMD_INSTALL_UPDATE,

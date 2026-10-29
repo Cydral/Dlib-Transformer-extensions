@@ -29,7 +29,8 @@ namespace albireo
                 which attention reads them.
 
                 Blocks are allocated in groups as sequences grow, up to a budget in bytes;
-                a block given back is reused before any new memory is taken.
+                a block given back is reused before any new memory is taken, and trim()
+                returns the memory of the blocks no sequence holds to the system.
         !*/
     public:
         kv_pool(long n_layers, long n_kv_heads, long head_dim, long block_positions, size_t budget_bytes)
@@ -50,12 +51,20 @@ namespace albireo
         size_t block_bytes() const { return block_bytes_; }
         size_t max_blocks() const { return max_blocks_; }
 
-        size_t allocated_blocks() const { std::lock_guard<std::mutex> l(m_); return blocks_.size(); }
-        size_t used_blocks() const { std::lock_guard<std::mutex> l(m_); return blocks_.size() - free_.size(); }
+        size_t allocated_blocks() const
+        {
+            std::lock_guard<std::mutex> l(m_);
+            return blocks_.size() - vacant_.size();
+        }
+        size_t used_blocks() const
+        {
+            std::lock_guard<std::mutex> l(m_);
+            return blocks_.size() - free_.size() - vacant_.size();
+        }
         size_t free_capacity_blocks() const
         {
             std::lock_guard<std::mutex> l(m_);
-            return free_.size() + (max_blocks_ - blocks_.size());
+            return free_.size() + vacant_.size() + (max_blocks_ - blocks_.size());
         }
 
         // Returns a block index, or -1 when the budget is exhausted.
@@ -68,6 +77,13 @@ namespace albireo
                 free_.pop_back();
                 return b;
             }
+            if (!vacant_.empty())
+            {
+                const int b = vacant_.back();
+                blocks_[static_cast<size_t>(b)].reset(new uint16_t[2 * half_per_kind_]);
+                vacant_.pop_back();
+                return b;
+            }
             if (blocks_.size() >= max_blocks_) return -1;
             blocks_.emplace_back(new uint16_t[2 * half_per_kind_]);
             return static_cast<int>(blocks_.size() - 1);
@@ -78,6 +94,19 @@ namespace albireo
             if (b < 0) return;
             std::lock_guard<std::mutex> l(m_);
             free_.push_back(b);
+        }
+
+        // Frees the memory of the blocks no sequence holds; their slots in the table stay,
+        // so that the indices of the other blocks never change.
+        void trim()
+        {
+            std::lock_guard<std::mutex> l(m_);
+            for (int b : free_)
+            {
+                blocks_[static_cast<size_t>(b)].reset();
+                vacant_.push_back(b);
+            }
+            free_.clear();
         }
 
         // Copies the keys and values of block src into block dst.
@@ -110,7 +139,8 @@ namespace albireo
         size_t max_blocks_ = 0;
         mutable std::mutex m_;
         std::vector<std::unique_ptr<uint16_t[]>> blocks_;
-        std::vector<int> free_;
+        std::vector<int> free_;     // blocks with memory, held by no sequence
+        std::vector<int> vacant_;   // slots whose memory trim() freed
     };
 
     struct kv_sequence

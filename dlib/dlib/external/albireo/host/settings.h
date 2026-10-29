@@ -3,6 +3,7 @@
 #ifndef ALBIREO_HOST_SETTINGS_H_
 #define ALBIREO_HOST_SETTINGS_H_
 
+#include <functional>
 #include <map>
 #include <mutex>
 #include <string>
@@ -12,8 +13,11 @@
 namespace albireo
 {
 
-    // The roles a model can be activated for: one model at most per role.
+    // The roles a language model can be activated for: one model at most per role.
     extern const char* const model_roles[3];   // "general", "code", "security"
+    // The role of the embedding model, which computes the vectors of the document search
+    // of the web application; one is always active.
+    extern const char* const embedding_role;   // "embedding"
 
     struct host_settings
     {
@@ -38,6 +42,9 @@ namespace albireo
         std::map<std::string, std::string> active;   // role -> model identifier
         bool check_updates = true;
         bool default_model = true;              // download the default model of the catalog at the first start
+        // A machine without Internet access: no request leaves the machine, the catalog,
+        // the updates and the models come from files (import folder, removable media).
+        bool offline = false;
         std::string proxy;                      // "": the proxy of the system, "none", or http://host:port
         std::string update_feed =
             "https://raw.githubusercontent.com/Cydral/Dlib-Transformer-extensions/main/dist/albireo/feed.json";
@@ -61,6 +68,14 @@ namespace albireo
 
         host_settings get() const;
         bool set(const host_settings& s);
+        /*!
+            ensures
+                - Applies change to the current settings and writes them, in one step: two
+                  changes made at once, by a route and a background task for instance,
+                  both persist.
+                - Returns the settings written.
+        !*/
+        host_settings update(const std::function<void(host_settings&)>& change);
         const std::string& path() const { return path_; }
 
     private:

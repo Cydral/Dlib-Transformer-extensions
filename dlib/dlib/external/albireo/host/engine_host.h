@@ -7,6 +7,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <vector>
 
@@ -41,12 +42,18 @@ namespace albireo
                 measure exists, otherwise the first usable one of: cuda, openvino,
                 cpu-avx2, cpu.  "best" is "auto" with a measure made when none exists.
                 Any other value names a variant, used when it is usable.
+
+            CONCURRENCY
+                A model being loaded or unloaded never delays the other operations: the
+                requests, the queries and the cancellations go on during a load, which
+                may read several gigabytes.  Only start() and stop() wait for them.
         !*/
     public:
         engine_host();
         ~engine_host();
 
-        // Lists and describes the engine libraries of a folder, through probe_program.
+        // Lists and describes the engine libraries of a folder, through probe_program,
+        // probing them all at once.
         std::vector<engine_candidate> discover(const std::string& dir, const std::string& probe_program);
 
         static const engine_candidate* choose(const std::vector<engine_candidate>& candidates,
@@ -80,9 +87,14 @@ namespace albireo
         static void ALBIREO_ENGINE_CALL on_event(void* user, int kind, const char* data, size_t size);
         static void ALBIREO_ENGINE_CALL on_log(void* user, int level, const char* message);
 
-        mutable std::mutex m_;
+        // The engine itself: held exclusively to start and to stop it, shared by the
+        // operations that use it.
+        mutable std::shared_timed_mutex life_;
         std::unique_ptr<engine_library> lib_;
         albireo_engine* engine_ = nullptr;
+        // What the service asks often: the state, the description and the models.
+        mutable std::mutex m_;
+        bool running_ = false;
         engine_candidate current_;
         std::vector<std::string> models_;
     };

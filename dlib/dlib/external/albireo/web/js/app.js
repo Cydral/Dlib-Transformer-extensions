@@ -6,6 +6,21 @@
     discussions kept in memory only, the three functions of the service (general, code,
     cybersecurity), deep reasoning shown as it streams, and an agent mode whose tools run
     in the page.
+
+    THE CONTEXT OF A QUESTION
+        The engine keeps the keys and values of each conversation and of the prompts it
+        shares with others, and computes again only the tokens that differ from what it
+        already read.  The prompt is therefore built so that its beginning never changes
+        from one question to the next: the system message holds only what stays (the date,
+        the instructions, the documents of a project when they fit whole), each message
+        keeps, once sent, the excerpts of documents that were chosen for it, and the
+        oldest exchanges leave in one step, well below the limit, rather than one at a
+        time at each question.  Each question then costs its own tokens only, whatever
+        the length of the conversation, and the conversations of one project share the
+        reading of its documents.
+
+        The documents of a project that do not fit whole, and the large documents attached
+        to a message, are searched (rag.js): the excerpts closest to the question join it.
 */
 
 import { t, setLanguage, language, languages } from './i18n.js';
@@ -13,13 +28,29 @@ import { icon } from './icons.js';
 import * as store from './store.js';
 import { renderMarkdown, attachCodeButtons, escapeHtml } from './markdown.js';
 import * as api from './api.js';
-import { extractText, maxFileBytes, searchPassages } from './documents.js';
+import { extractText, maxFileBytes, extension, searchPassages } from './documents.js';
+import * as rag from './rag.js';
 import * as tools from './tools.js';
 
 const roles = ['general', 'code', 'security'];
 const roleIcons = { general: 'compass', code: 'code', security: 'shield' };
 const projectColors = ['#5b8cff', '#f2b544', '#3fb68b', '#e5534b', '#a371f7', '#2fb9d4', '#e08a3c', '#8a90aa'];
 const maxAgentSteps = 8;
+
+// Shares of the context of the model: the documents of a project read whole, an attached
+// document read whole, and the excerpts given with a question.  Beyond the first two, the
+// documents are searched.
+const knowledgeShare = 0.3;
+const attachmentShare = 0.25;
+const excerptShare = 0.2;
+// The exchanges kept when the oldest leave: the conversation then takes this share of the
+// room it has, so that it grows again for several questions before the next cut.
+const keptShare = 0.6;
+
+// Tokens of a text, estimated from its characters.
+function estimateTokens(text) {
+  return Math.ceil(String(text || '').length / 3.6);
+}
 
 const defaults = {
   theme: 'auto', language: 'auto', userName: '', defaultRole: 'general', temperature: null, topP: null,
@@ -167,6 +198,12 @@ async function refreshStatus() {
     state.status = s;
     state.statusError = false;
     if (changed || !state.catalog) state.catalog = await api.models(language()).catch(() => state.catalog);
+    // The embedding model of the document search; the documents not yet given vectors are
+    // indexed once it is there.
+    const embedder = (s.loaded_models || []).find((m) => m.embedding && s.active && m.id === s.active.embedding);
+    const previous = rag.embeddingModel();
+    rag.setEmbeddingModel(embedder ? { id: embedder.id, dimensions: embedder.dimensions } : null);
+    if (embedder && (!previous || previous.id !== embedder.id)) indexProjects();
   } catch (e) {
     changed = !state.statusError;
     state.statusError = true;
@@ -436,6 +473,64 @@ function exportConversation(c, format) {
   download(safe + '.md', lines.join('\n'), 'text/markdown');
 }
 
+// The document search: the documents being indexed, one at a time in the background.
+const indexing = new Map();   // document -> {done, total}
+let indexQueue = Promise.resolve();
+
+function queueIndex(owner, doc, persistent) {
+  if (indexing.has(doc.id)) return indexQueue;
+  indexing.set(doc.id, { done: 0, total: 0 });
+  showIndexing(doc.id);
+  indexQueue = indexQueue.then(() => rag.indexDocument(owner, doc, {
+    persistent,
+    onProgress: (done, total) => {
+      indexing.set(doc.id, { done, total });
+      showIndexing(doc.id);
+    }
+  })).catch(() => {}).then(() => {
+    indexing.delete(doc.id);
+    showIndexing(doc.id);
+  });
+  return indexQueue;
+}
+
+// The state of a document on the page of its project.
+async function indexText(owner, docId) {
+  const run = indexing.get(docId);
+  if (run) return run.total ? t('indexingProgress', { p: Math.floor(100 * run.done / run.total) }) : t('indexing');
+  const st = (await rag.status(owner)).get(docId);
+  if (!st) return '';
+  if (rag.embeddingModel() && st.vectors === st.passages) return t('indexed', { n: formatNumber(st.passages) });
+  return t('indexedWords', { n: formatNumber(st.passages) });
+}
+
+function showIndexing(docId) {
+  for (const el of document.querySelectorAll('[data-index-doc="' + docId + '"]')) {
+    indexText(el.dataset.indexOwner, docId).then((text) => { el.textContent = text; });
+  }
+}
+
+// Indexes the documents of the projects that have no passages, or no vectors of the
+// current embedding model.
+async function indexProjects() {
+  for (const p of state.projects) {
+    const st = await rag.status(p.id).catch(() => new Map());
+    for (const f of p.files || []) {
+      const s2 = st.get(f.id);
+      const model = rag.embeddingModel();
+      if (!s2 || (model && s2.vectors < s2.passages)) queueIndex(p.id, f, true);
+    }
+  }
+}
+
+// How a project gives its documents to the model: whole, searched, or not at all.
+function knowledgeMode(p, contextTokens) {
+  const files = (p && p.files) || [];
+  if (!files.length) return 'none';
+  const total = files.reduce((n, f) => n + estimateTokens(f.text), 0);
+  return total <= knowledgeShare * (contextTokens || 8192) ? 'whole' : 'search';
+}
+
 // Projects.
 async function newProject(silent) {
   const name = await promptDialog(t('newProject'), '');
@@ -482,16 +577,31 @@ function renderProject(p) {
     fileInput.value = '';
     await save();
     renderProject(p);
+    for (const f of added) queueIndex(p.id, f, true);
   });
   const fileList = h('div', { class: 'list' });
   for (const f of p.files || []) {
-    fileList.append(h('div', { class: 'row' }, h('span', { html: icon('file') }), h('span', { class: 'label' }, f.name),
-      h('span', { class: 'faint' }, f.format + ' · ' + t('characters', { n: formatNumber(f.text.length) })),
+    const indexState = h('span', { class: 'faint index-state', 'data-index-doc': f.id, 'data-index-owner': p.id });
+    fileList.append(h('div', { class: 'row' }, formatBadge(f), h('span', { class: 'label' }, f.name),
+      h('span', { class: 'faint' }, f.format + ' · ' + t('tokensEstimate', { n: formatNumber(estimateTokens(f.text)) })),
+      indexState,
       iconButton('trash', t('delete'), async () => {
         p.files = p.files.filter((x) => x.id !== f.id);
         await save();
+        await rag.removeDocument(p.id, f.id);
         renderProject(p);
       })));
+    indexText(p.id, f.id).then((text) => { indexState.textContent = text; });
+  }
+  // The share of the context the documents take, and how the model reads them.
+  const contextTokens = roleCapabilities('general').context || 0;
+  const totalTokens = (p.files || []).reduce((n, f) => n + estimateTokens(f.text), 0);
+  const capacity = h('p', { class: 'help' });
+  if ((p.files || []).length) {
+    const mode = knowledgeMode(p, contextTokens);
+    const share = contextTokens ? Math.round(100 * totalTokens / contextTokens) : 0;
+    capacity.textContent = t(mode === 'whole' ? 'knowledgeWhole' : 'knowledgeSearch',
+      { n: formatNumber(totalTokens), p: share }) + (rag.embeddingModel() ? '' : ' ' + t('knowledgeNoVectors'));
   }
   const convList = h('div', { class: 'list' });
   for (const c of convs) {
@@ -513,7 +623,7 @@ function renderProject(p) {
     h('div', { class: 'card' }, h('h3', { html: icon('edit') + escapeHtml(t('instructions')) }),
       h('p', { class: 'help' }, t('instructionsHelp')), h('div', { class: 'field' }, instructions)),
     h('div', { class: 'card' }, h('h3', { html: icon('book') + escapeHtml(t('knowledge')) }),
-      h('p', { class: 'help' }, t('knowledgeHelp')), fileList,
+      h('p', { class: 'help' }, t('knowledgeHelp')), capacity, fileList,
       h('div', { class: 'buttons', style: { marginTop: '10px' } },
         h('button', { class: 'button', type: 'button', onclick: () => fileInput.click(), html: icon('upload') + '<span>' + escapeHtml(t('addFiles')) + '</span>' }),
         fileInput)),
@@ -543,6 +653,7 @@ async function readFiles(files) {
       out.push({ id: store.uid(), name: f.name, size: f.size, format: r.format, text: r.text, added: Date.now() });
     } catch (e) {
       if (e.message === 'unsupported') toast(t('unsupported', { name: f.name }), true);
+      else if (e.message === 'legacy') toast(t('legacyFormat', { name: f.name }), true);
       else if (e.message === 'too-large') toast(t('tooLarge', { name: f.name, size: formatSize(f.size), limit: formatSize(maxFileBytes) }), true);
       else toast(t('readFailed', { name: f.name, error: e.message }), true);
     }
@@ -742,11 +853,23 @@ function messageElement(c, m, index, last) {
   return assistantElement(c, m, index, last);
 }
 
+// The badge of a document: its format on the color of its family.
+function formatBadge(a) {
+  const ext = extension(a.name || '') || String(a.format || '').toLowerCase();
+  const family = /^(docx?|docm|dotx|odt|rtf)$/.test(ext) ? 'word' : /^(xlsx?|xlsm|xltx|ods|csv|tsv)$/.test(ext) ? 'sheet'
+    : /^(pptx?|pptm|ppsx|potx|odp)$/.test(ext) ? 'slides' : ext === 'pdf' ? 'pdf'
+    : /^(md|markdown|txt|rst)$/.test(ext) ? 'text' : 'code';
+  const label = (ext || 'txt').slice(0, 4).toUpperCase();
+  return h('span', { class: 'format-badge ' + family, 'aria-hidden': 'true' }, label);
+}
+
 function attachmentChip(a, removable, onremove) {
   return h('span', { class: 'attachment', title: a.name },
-    h('span', { html: icon('file') }), h('span', { class: 'name' }, a.name),
-    h('span', { class: 'size' }, (a.format || '') + (a.size ? ' · ' + formatSize(a.size) : '')),
-    removable ? h('button', { type: 'button', title: t('delete'), html: icon('close'), onclick: onremove }) : null);
+    formatBadge(a), h('span', { class: 'name' }, a.name),
+    h('span', { class: 'size' }, (a.format || '') + (a.size ? ' · ' + formatSize(a.size) : '')
+      + (a.mode === 'search' ? ' · ' + t('searchedDocument') : '')),
+    removable ? h('button', { type: 'button', title: t('removeAttachment'), 'aria-label': t('removeAttachment'),
+      html: icon('close'), onclick: onremove }) : null);
 }
 
 function userElement(c, m, index, last) {
@@ -762,21 +885,51 @@ function userElement(c, m, index, last) {
   return el;
 }
 
+// Edits a question: its text, and its attached documents, which can be removed or added.
 function editMessage(c, m, index, el) {
   if (state.busy) return;
+  let attachments = (m.attachments || []).slice();
   const area = h('textarea', { style: { width: '100%', minHeight: '90px', borderRadius: '12px', padding: '10px', border: '1px solid var(--border-strong)', background: 'var(--bg-input)' } });
   area.value = m.content;
-  const box = h('div', { style: { width: '85%' } }, area, h('div', { class: 'buttons', style: { justifyContent: 'flex-end', marginTop: '6px' } },
+  const chips = h('div', { class: 'attachments', style: { justifyContent: 'flex-start', marginBottom: '6px' } });
+  const showChips = () => {
+    chips.replaceChildren(...attachments.map((a) => attachmentChip(a, true, () => {
+      attachments = attachments.filter((x) => x !== a);
+      showChips();
+    })));
+  };
+  showChips();
+  const fileInput = h('input', { type: 'file', multiple: true, class: 'hidden' });
+  fileInput.addEventListener('change', async () => {
+    attachments = attachments.concat(await readFiles(Array.from(fileInput.files)));
+    fileInput.value = '';
+    showChips();
+  });
+  const box = h('div', { style: { width: '85%' } }, chips, area, h('div', { class: 'buttons', style: { justifyContent: 'flex-end', marginTop: '6px' } },
+    h('button', { class: 'button', type: 'button', onclick: () => fileInput.click(), html: icon('clip') + '<span>' + escapeHtml(t('attach')) + '</span>' }),
+    fileInput,
+    h('span', { class: 'grow' }),
     h('button', { class: 'button', type: 'button', onclick: () => renderMain() }, t('cancel')),
     h('button', {
       class: 'button primary', type: 'button',
       onclick: async () => {
         const text = area.value.trim();
-        if (!text) return;
+        if (!text && !attachments.length) return;
         c.messages = c.messages.slice(0, index);
-        await sendMessage(text, m.attachments || []);
+        if ((c.contextStart || 0) > index) c.contextStart = 0;
+        // The documents no longer attached leave the search of the discussion.
+        const kept = new Set(attachments.map((a) => a.id));
+        for (const a of m.attachments || []) if (!kept.has(a.id) && a.mode === 'search') rag.removeDocument(c.id, a.id);
+        await sendMessage(text, attachments);
       }
     }, t('send'))));
+  box.addEventListener('dragover', (e) => e.preventDefault());
+  box.addEventListener('drop', async (e) => {
+    e.preventDefault();
+    if (!e.dataTransfer || !e.dataTransfer.files.length) return;
+    attachments = attachments.concat(await readFiles(Array.from(e.dataTransfer.files)));
+    showChips();
+  });
   el.replaceChildren(box);
   area.focus();
 }
@@ -942,7 +1095,9 @@ async function onSend() {
 
 async function sendMessage(text, attachments) {
   const c = state.current;
-  c.messages.push({ id: store.uid(), role: 'user', content: text, attachments: attachments || [], created: Date.now() });
+  const m = { id: store.uid(), role: 'user', content: text, attachments: attachments || [], created: Date.now() };
+  c.messages.push(m);
+  await prepareQuestion(c, m);
   if (!c.title) c.title = (text || (attachments[0] && attachments[0].name) || t('untitled')).replace(/\s+/g, ' ').slice(0, 70);
   c.updated = Date.now();
   await persist(c);
@@ -959,6 +1114,75 @@ async function regenerate(c) {
   await runTurn(c);
 }
 
+/*
+    Prepares a question once, when it is sent: its large documents are indexed for the
+    search of the discussion, and the excerpts of the searched documents closest to it are
+    kept with it, so that the prompt of the following questions starts the same way.
+*/
+async function prepareQuestion(c, m) {
+  const contextTokens = roleCapabilities(c.role).context || 8192;
+  const owners = [];
+  for (const a of m.attachments || []) {
+    if (!a.mode) a.mode = estimateTokens(a.text) <= attachmentShare * contextTokens ? 'whole' : 'search';
+    if (a.mode === 'search') {
+      // Indexed at once, beside the documents of the projects that may be in progress.
+      toast(t('indexingDocument', { name: a.name }));
+      await rag.indexDocument(c.id, a, { persistent: !c.incognito }).catch(() => {});
+    }
+  }
+  for (const x of c.messages) {
+    if (x.role === 'user' && (x.attachments || []).some((a) => a.mode === 'search')) {
+      owners.push(c.id);
+      break;
+    }
+  }
+  const p = c.projectId ? projectById(c.projectId) : null;
+  if (p && knowledgeMode(p, contextTokens) === 'search') owners.unshift(p.id);
+  m.context = '';
+  if (!owners.length) return;
+  // A short question takes the previous one with it: "and in 2025?" is searched with what
+  // it continues.
+  let question = m.content || '';
+  if (question.length < 80) {
+    const users = c.messages.filter((x) => x.role === 'user' && x !== m);
+    if (users.length) question = users[users.length - 1].content + '\n' + question;
+  }
+  if (!question.trim()) question = (m.attachments || []).map((a) => a.name).join(' ');
+  try {
+    const hits = await rag.search(owners, question, { budget: Math.floor(excerptShare * contextTokens * 3.6) });
+    if (hits.length) {
+      m.context = '<excerpts>\n' + hits.map((x) => '<excerpt document="' + x.name + '"'
+        + (x.where ? ' location="' + x.where + '"' : '') + '>\n' + x.text + '\n</excerpt>').join('\n') + '\n</excerpts>';
+    }
+  } catch (e) {
+    m.context = '';
+  }
+}
+
+/*
+    The passages of the documents of a discussion and of its project closest to a query: the
+    documents indexed by their passages (rag.js), and those read whole in the messages by
+    their words.
+*/
+async function searchDocumentsOf(c, query, limit) {
+  const owners = [];
+  const p = c.projectId ? projectById(c.projectId) : null;
+  if (p && (p.files || []).length) owners.push(p.id);
+  const whole = [];
+  let searched = false;
+  for (const m of c.messages) {
+    if (m.role !== 'user') continue;
+    for (const a of m.attachments || []) {
+      if (a.mode === 'search') searched = true;
+      else whole.push({ name: a.name, text: a.text });
+    }
+  }
+  if (searched) owners.push(c.id);
+  const hits = owners.length ? await rag.search(owners, query, { limit, budget: 1500 * limit }) : [];
+  const words = whole.length ? searchPassages(whole, query, limit).map((x) => ({ name: x.name, where: '', text: x.text })) : [];
+  return hits.concat(words).slice(0, limit);
+}
+
 // The context the model receives.
 function documentsOf(c) {
   const docs = [];
@@ -968,7 +1192,7 @@ function documentsOf(c) {
   return docs;
 }
 
-function systemPrompt(c, lastUserText, contextTokens) {
+function systemPrompt(c, contextTokens) {
   const parts = [];
   const now = new Date();
   parts.push('Current date: ' + now.toLocaleDateString('en-CA') + ' (' + now.toLocaleDateString(language(), { weekday: 'long' }) + ').');
@@ -979,18 +1203,16 @@ function systemPrompt(c, lastUserText, contextTokens) {
     parts.push('This discussion belongs to the project "' + p.name + '".' + (p.description ? ' ' + p.description : ''));
     if (p.instructions) parts.push('Instructions of the project:\n' + p.instructions);
     const files = p.files || [];
-    if (files.length) {
-      const total = files.reduce((s, f) => s + f.text.length, 0);
-      // The documents enter whole while they take less than a third of the context; beyond,
-      // the passages closest to the question do.
-      if (total / 3.5 < contextTokens / 3) {
-        parts.push('Documents of the project:\n' + files.map((f) => '<document name="' + f.name + '">\n' + f.text + '\n</document>').join('\n'));
-      } else {
-        const hits = searchPassages(files.map((f) => ({ name: f.name, text: f.text })), lastUserText, 8);
-        parts.push('The project has ' + files.length + ' documents (' + files.map((f) => f.name).join(', ') + ').' +
-          (hits.length ? ' Passages relevant to the question:\n' + hits.map((x) => '<excerpt document="' + x.name + '">\n' + x.text + '\n</excerpt>').join('\n') : '') +
-          (c.agent ? ' Use search_documents and read_document to read more of them.' : ''));
-      }
+    // The documents enter whole while they fit in their share of the context; beyond, the
+    // excerpts closest to each question come with it.  This message stays the same from one
+    // question to the next.
+    if (knowledgeMode(p, contextTokens) === 'whole') {
+      parts.push('Documents of the project:\n' + files.map((f) => '<document name="' + f.name + '">\n' + f.text + '\n</document>').join('\n'));
+    } else if (files.length) {
+      parts.push('The project holds ' + files.length + ' documents, too long to be read whole: '
+        + files.map((f) => f.name + ' (' + f.format + ')').join(', ') + '. The excerpts of these documents closest to '
+        + 'each question come with it, in <excerpts>; say so when they do not hold the answer.'
+        + (c.agent ? ' Use search_documents, document_outline and read_document to read more of them.' : ''));
     }
   }
   if (c.agent) parts.push(tools.agentInstructions);
@@ -999,14 +1221,23 @@ function systemPrompt(c, lastUserText, contextTokens) {
 
 function userContent(m) {
   let s = '';
-  for (const a of m.attachments || []) s += '<document name="' + a.name + '">\n' + a.text + '\n</document>\n\n';
+  for (const a of m.attachments || []) {
+    if (a.mode === 'search') {
+      s += '<document name="' + a.name + '" format="' + (a.format || '') + '">\n(Too long to be read whole: its excerpts '
+        + 'closest to the questions come with them.)\n</document>\n\n';
+    } else {
+      s += '<document name="' + a.name + '">\n' + a.text + '\n</document>\n\n';
+    }
+  }
+  if (m.context) s += m.context + '\n\n';
   return s + (m.content || '');
 }
 
 function apiMessages(c, system) {
   const out = [];
   if (system) out.push({ role: 'system', content: system });
-  for (const m of c.messages) {
+  // The exchanges before contextStart left the context in an earlier question.
+  for (const m of c.messages.slice(c.contextStart || 0)) {
     if (m.role === 'user') {
       out.push({ role: 'user', content: userContent(m) });
       continue;
@@ -1027,34 +1258,47 @@ function apiMessages(c, system) {
 }
 
 /*
-    Fits the messages in the context of the model: the oldest exchanges leave first, the
-    system message and the last question stay.  Returns {messages, trimmed, context}.
+    Fits the conversation in the context of the model.  When it no longer fits, the oldest
+    exchanges leave in one step, until the conversation takes keptShare of its room, and
+    the point where it now starts stays with the conversation: the following questions
+    start from that same point, so that the engine reuses what it already read, and the
+    next cut comes only after several questions.  The system message and the last
+    question always stay.  Returns {messages, trimmed, context, tokens}.
 */
-async function fitContext(model, messages, toolDefs, reserve) {
+async function fitContext(c, build, toolDefs, reserve) {
   let trimmed = false;
-  let list = messages.slice();
-  for (let attempt = 0; attempt < 24; ++attempt) {
+  for (let attempt = 0; attempt < 6; ++attempt) {
+    const list = build();
     let r;
     try {
-      r = await api.count(model, list, toolDefs);
+      r = await api.count('albireo-' + c.role, list, toolDefs);
     } catch (e) {
       return { messages: list, trimmed, context: 0 };
     }
     if (!r || typeof r.tokens !== 'number' || !r.context) return { messages: list, trimmed, context: 0 };
-    const budget = r.context - Math.min(reserve, Math.floor(r.context / 2));
-    if (r.tokens <= budget) return { messages: list, trimmed, context: r.context, tokens: r.tokens };
-    const first = list[0] && list[0].role === 'system' ? 1 : 0;
-    // The last user message and what follows it are kept.
-    let lastUser = list.length - 1;
-    while (lastUser > first && list[lastUser].role !== 'user') --lastUser;
-    if (lastUser <= first) return { messages: list, trimmed, context: r.context, tokens: r.tokens, overflow: true };
-    // Removes the oldest exchange: up to the next user message.
-    let end = first + 1;
-    while (end < lastUser && list[end].role !== 'user') ++end;
-    list = list.slice(0, first).concat(list.slice(end));
+    const room = r.context - Math.min(reserve, Math.floor(r.context / 2));
+    if (r.tokens <= room) return { messages: list, trimmed, context: r.context, tokens: r.tokens };
+    // The questions after the current start, the last one excepted, are where it may move.
+    const from = c.contextStart || 0;
+    const users = [];
+    for (let i = from + 1; i < c.messages.length; ++i) if (c.messages[i].role === 'user') users.push(i);
+    const last = users.pop();
+    if (last == null) return { messages: list, trimmed, context: r.context, tokens: r.tokens, overflow: true };
+    // The tokens of each candidate start, from the characters scaled to the measure.
+    const size = (msgs) => msgs.reduce((n, m) => n + JSON.stringify(m).length, 0);
+    const scale = r.tokens / Math.max(1, size(list));
+    let next = last;
+    for (const i of users.concat([last])) {
+      c.contextStart = i;
+      if (size(build()) * scale <= keptShare * room) {
+        next = i;
+        break;
+      }
+    }
+    c.contextStart = next;
     trimmed = true;
   }
-  return { messages: list, trimmed, context: 0 };
+  return { messages: build(), trimmed, context: 0 };
 }
 
 let renderPending = false;
@@ -1088,15 +1332,15 @@ async function runTurn(c) {
   const toolDefs = useTools ? tools.definitions : null;
   try {
     if (!model) throw new Error(t('noModel'));
-    const lastUser = [...c.messages].reverse().find((m) => m.role === 'user');
     for (let step = 0; step < maxAgentSteps; ++step) {
       const s = { reasoning: '', content: '', toolCalls: [] };
       turn.steps.push(s);
-      const system = systemPrompt(c, lastUser ? lastUser.content : '', caps.context || 8192);
-      const history = c.messages.slice(0, -1);
-      const fitted = await fitContext('albireo-' + c.role,
-        apiMessages(Object.assign({}, c, { messages: history.concat([Object.assign({}, turn, { steps: turn.steps.slice(0, -1) })]) }), system),
-        toolDefs, state.settings.maxTokens || 2048);
+      const system = systemPrompt(c, caps.context || 8192);
+      // The conversation, with the steps of this answer already done (the agent's).
+      const build = () => apiMessages(Object.assign({}, c, {
+        messages: c.messages.slice(0, -1).concat([Object.assign({}, turn, { steps: turn.steps.slice(0, -1) })])
+      }), system);
+      const fitted = await fitContext(c, build, toolDefs, state.settings.maxTokens || 2048);
       if (fitted.trimmed) turn.trimmed = true;
       const body = {
         model: 'albireo-' + c.role, messages: fitted.messages, reasoning: !!(c.reasoning && caps.reasoning)
@@ -1152,6 +1396,7 @@ async function runTurn(c) {
         scheduleRender(el, turn);
         const r = await tools.run(tc.name, tc.arguments, {
           documents: documentsOf(c),
+          searchDocuments: (query, limit) => searchDocumentsOf(c, query, limit),
           searchDiscussions: async (q) => searchConversations(q, 6).filter((x) => x.conversation.id !== c.id).map((x) => ({
             title: x.conversation.title, date: new Date(x.conversation.updated).toLocaleDateString(), excerpt: x.excerpt
           })),
@@ -1297,6 +1542,7 @@ function dataTab(body, close) {
       await reloadLists();
       renderSidebar();
       toast(t('imported', { n: r.conversations, p: r.projects }));
+      indexProjects();
     } catch (e) {
       toast(t('importFailed'), true);
     }
@@ -1475,6 +1721,7 @@ async function init() {
   } catch (e) {
     // Without IndexedDB (a private window of some browsers) the application keeps its
     // data in memory, as in an incognito discussion.
+    console.warn('Albireo: the database of the browser is unavailable', e);
     state.incognito = true;
   }
   applyLanguage();

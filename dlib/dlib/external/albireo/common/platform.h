@@ -3,6 +3,7 @@
 #ifndef ALBIREO_COMMON_PLATFORM_H_
 #define ALBIREO_COMMON_PLATFORM_H_
 
+#include <atomic>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -41,9 +42,15 @@ namespace albireo
     bool dir_exists(const std::string& p);
     bool make_dirs(const std::string& p);
     uint64_t file_size(const std::string& p);
+    // Whether another program still writes a file: held open for writing on Windows,
+    // modified during the last 30 seconds elsewhere.
+    bool file_being_written(const std::string& p);
     bool remove_file(const std::string& p);
     // Moves a file, replacing the destination.
     bool rename_file(const std::string& from, const std::string& to);
+    // Copies a file, replacing the destination; a copy that cancel ends leaves no
+    // destination behind.
+    bool copy_file(const std::string& from, const std::string& to, const std::atomic<bool>* cancel = nullptr);
     // Removes a folder and everything under it.
     bool remove_tree(const std::string& p);
     std::vector<std::string> list_dir(const std::string& p);

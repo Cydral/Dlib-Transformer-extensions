@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <exception>
 #include <functional>
 #include <iostream>
 
@@ -33,6 +34,10 @@ namespace albireo
         const int64_t certificate_period = 24 * 3600;
         const int64_t inbox_period = 60;
 
+        // The errors of the requests that the service ends.
+        const char* const stopping_reason = "the service stops";
+        const char* const offline_reason = "offline mode: no request leaves this computer";
+
         std::string trim(const std::string& s)
         {
             const size_t b = s.find_first_not_of(" \t\r\n");
@@ -50,7 +55,7 @@ namespace albireo
         {
             for (const char* m : model_roles)
                 if (r == m) return true;
-            return false;
+            return r == embedding_role;
         }
 
         // True when the catalog entry of a model names the role among its uses.
@@ -184,6 +189,7 @@ namespace albireo
     {
         stop();
         if (background_.joinable()) background_.join();
+        if (restarter_.joinable()) restarter_.join();
     }
 
     std::string service::engines_dir() const
@@ -226,7 +232,7 @@ namespace albireo
         const host_settings st = settings_->get();
         if (first_run) settings_->set(st);
         port_ = st.port;
-        set_http_proxy(st.proxy);
+        apply_network_settings(st);
 
         try
         {
@@ -256,8 +262,13 @@ namespace albireo
         if (!ensure_certificates(cert_dir, error)) return false;
 
         // An update downloaded earlier is applied before anything else starts.
-        updater_.reset(new updater(st.update_feed, join_path(data_dir_, "updates")));
-        if (!updater_->staged_installer().empty())
+        {
+            std::unique_ptr<updater> u(new updater(st.update_feed, join_path(data_dir_, "updates")));
+            std::lock_guard<std::mutex> lock(server_m_);
+            if (stopping_) u->cancel();
+            updater_ = std::move(u);
+        }
+        if (!updater_->staged_installer().empty() && !stopping_)
         {
             std::string e;
             if (updater_->launch_staged(e))
@@ -270,8 +281,13 @@ namespace albireo
             if (!e.empty()) log_warning("updates: " + e);
         }
 
-        models_.reset(new model_manager(*db_, st.effective_models_dir(), st.catalog_url));
-        models_->on_installed([this](const installed_model& m) { on_installed(m); });
+        {
+            std::unique_ptr<model_manager> m(new model_manager(*db_, st.effective_models_dir(), st.catalog_url));
+            m->on_installed([this](const installed_model& im) { on_installed(im); });
+            std::lock_guard<std::mutex> lock(server_m_);
+            if (stopping_) m->stop();
+            models_ = std::move(m);
+        }
 
         // The engine of this machine; a processor engine when the chosen one fails.
         candidates_ = engine_.discover(engines_dir(), executable_path());
@@ -332,23 +348,43 @@ namespace albireo
             error = "the port " + std::to_string(port_) + " is in use or cannot be opened";
             return false;
         }
+        {
+            // A stop that came before the bind found no socket to close: the bound one is
+            // closed here, and listen_after_bind() returns at once.
+            std::lock_guard<std::mutex> lock(server_m_);
+            if (stopping_) server_->stop();
+        }
         log_info("server: https://localhost:" + std::to_string(port_) + "/");
 
-        background_ = std::thread([this]() { background_loop(); });
+        background_ = std::thread([this]() {
+            try
+            {
+                background_loop();
+            }
+            catch (const std::exception& e)
+            {
+                log_error("service: the background tasks stopped: " + std::string(e.what()));
+            }
+        });
         server_->listen_after_bind();
         const bool stopped = stopping_;
 
-        // Shutdown: the background tasks, the downloads (their state is kept), the engine.
-        stopping_ = true;
-        cv_.notify_all();
+        // Shutdown: the requests to the network end first, so that nothing waits for
+        // them, then the background tasks, the downloads (their progress is kept), the
+        // engine.
+        stop();
         if (background_.joinable()) background_.join();
+        std::unique_ptr<model_manager> models;
+        std::unique_ptr<updater> updates;
         {
             std::lock_guard<std::mutex> lock(server_m_);
             server_.reset();
+            models = std::move(models_);
+            updates = std::move(updater_);
         }
-        models_.reset();
+        models.reset();
         engine_.stop();
-        updater_.reset();
+        updates.reset();
         log_info("service stopped");
         if (!stopped)
         {
@@ -360,56 +396,108 @@ namespace albireo
 
     void service::stop()
     {
-        stopping_ = true;
+        {
+            // Under the lock of the waits, so that a wait about to start sees the flag.
+            std::lock_guard<std::mutex> lock(m_);
+            stopping_ = true;
+        }
         cv_.notify_all();
         std::lock_guard<std::mutex> lock(server_m_);
+        // The downloads, the imports and the checks end at once; their progress is kept.
+        http_cancel_all(stopping_reason);
+        if (models_) models_->stop();
+        if (updater_) updater_->cancel();
         if (server_) server_->stop();
+    }
+
+    void service::apply_network_settings(const host_settings& s)
+    {
+        set_http_proxy(s.proxy);
+        {
+            std::lock_guard<std::mutex> lock(server_m_);
+            if (stopping_) return;
+            if (s.offline) http_cancel_all(offline_reason);
+            else http_restore();
+        }
+        // The background tasks start or end their network work at once.
+        cv_.notify_all();
     }
 
     void service::request_restart()
     {
+        if (restart_.exchange(true)) return;
         log_info("service: restart requested");
-        restart_ = true;
         // From a handler of the server: the response is written before the server stops.
-        std::thread([this]() {
-            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        restarter_ = std::thread([this]() {
+            std::unique_lock<std::mutex> lock(m_);
+            cv_.wait_for(lock, std::chrono::milliseconds(300), [this]() { return stopping_.load(); });
+            lock.unlock();
             stop();
-        }).detach();
+        });
     }
 
     void service::background_loop()
     {
+        /*
+            The network tasks run on threads of their own and start first; the local work
+            follows at once and never waits for them: the models of the roles, the files
+            of the import folder, the default model among those installed.
+        */
+        bool online = false;
+        int64_t next_catalog = 0;
+        int64_t next_update = 0;
+        auto network = [&](const host_settings& st) {
+            if (st.offline)
+            {
+                online = false;
+                return;
+            }
+            const int64_t now = now_unix();
+            if (!online)
+            {
+                // At the start, and back online: the interrupted downloads resume, the
+                // catalog and the updates are checked at once.
+                online = true;
+                models_->resume_pending();
+                next_catalog = now;
+                next_update = now;
+            }
+            if (now >= next_catalog)
+            {
+                next_catalog = now + catalog_period;
+                models_->refresh_catalog_async();
+            }
+            if (st.check_updates && now >= next_update)
+            {
+                next_update = now + update_period;
+                updater_->check_async();
+            }
+        };
+        network(settings_->get());
         load_active_models();
         if (stopping_) return;
-        std::string error;
-        if (!models_->refresh_catalog(error)) log_warning("models: catalog not refreshed: " + error);
-        models_->resume_pending();
         scan_inbox();
+        unsigned catalog_seen = models_->catalog_generation();
         ensure_default_model();
-        const host_settings st = settings_->get();
-        if (st.check_updates) updater_->check_async();
 
-        int64_t next_catalog = now_unix() + catalog_period;
-        int64_t next_update = now_unix() + update_period;
         int64_t next_certificate = now_unix() + certificate_period;
         int64_t next_inbox = now_unix() + inbox_period;
         std::unique_lock<std::mutex> lock(m_);
         while (!stopping_)
         {
-            cv_.wait_for(lock, std::chrono::seconds(15));
+            cv_.wait_for(lock, std::chrono::seconds(5));
             if (stopping_) break;
             lock.unlock();
+            const bool was_online = online;
+            network(settings_->get());
+            // A new catalog, downloaded or imported, may name the default model, which
+            // can be downloaded once back online.
+            if (models_->catalog_generation() != catalog_seen || (online && !was_online))
+            {
+                catalog_seen = models_->catalog_generation();
+                ensure_default_model();
+            }
             const int64_t now = now_unix();
-            if (now >= next_catalog)
-            {
-                next_catalog = now + catalog_period;
-                if (!models_->refresh_catalog(error)) log_warning("models: catalog not refreshed: " + error);
-            }
-            if (now >= next_update)
-            {
-                next_update = now + update_period;
-                if (settings_->get().check_updates) updater_->check_async();
-            }
             if (now >= next_inbox)
             {
                 next_inbox = now + inbox_period;
@@ -420,6 +508,7 @@ namespace albireo
                 next_certificate = now + certificate_period;
                 const std::string cert_dir = join_path(data_dir_, "certificates");
                 const std::string before = certificate_thumbprint(certificate_paths(cert_dir).server_cert);
+                std::string error;
                 if (ensure_certificates(cert_dir, error)
                     && certificate_thumbprint(certificate_paths(cert_dir).server_cert) != before)
                 {
@@ -433,46 +522,157 @@ namespace albireo
 
     void service::scan_inbox()
     {
-        // Files left in the import folder of the data folder, by the installer from its
-        // medium or by an administrator, are moved into the models folder.
+        /*
+            What is left in the import folder of the data folder, by the installer from its
+            medium or by an administrator, with the layout of an offline bundle: a signed
+            catalog, models (also in a "models" subfolder), a signed update with its
+            installer.  What is installed leaves the folder; a file that cannot be installed
+            is renamed with the suffix ".rejected", so that it is read only once.
+        */
         const std::string inbox = join_path(data_dir_, "import");
         if (!dir_exists(inbox)) return;
-        for (const auto& n : list_dir(inbox))
+        std::lock_guard<std::mutex> serial(import_m_);
+        const std::string sub = join_path(inbox, "models");
+        // A copy in progress: the folder waits for the next pass.
+        for (const std::string& dir : { inbox, sub })
+            for (const auto& n : list_dir(dir))
+                if (file_being_written(join_path(dir, n))) return;
+        auto set_aside = [](const std::string& f) {
+            if (file_exists(f)) rename_file(f, f + ".rejected");
+        };
+
+        const std::string catalog = join_path(inbox, "catalog.json");
+        if (file_exists(catalog) && file_exists(catalog + ".sig"))
         {
-            if (!ends_with(n, ".gguf") || stopping_) continue;
-            const std::string f = join_path(inbox, n);
-            const json r = models_->import_path(f);
-            if (!r["imported"].empty())
+            const json r = models_->import_catalog(inbox);
+            if (r.contains("error"))
             {
-                remove_file(f);
-                const std::string side = f.substr(0, f.size() - 5) + ".json";
-                if (file_exists(side)) remove_file(side);
+                log_warning("models: import folder: " + r["error"].as_string());
+                set_aside(catalog);
+                set_aside(catalog + ".sig");
             }
-            for (const auto& e : r["errors"].elements()) log_warning("models: import folder: " + e.as_string());
+            else
+            {
+                remove_file(catalog);
+                remove_file(catalog + ".sig");
+            }
         }
+
+        for (const std::string& dir : { inbox, sub })
+            for (const auto& n : list_dir(dir))
+            {
+                if (stopping_) return;
+                if (!ends_with(n, ".gguf")) continue;
+                const std::string f = join_path(dir, n);
+                const std::string side = f.substr(0, f.size() - 5) + ".json";
+                const json r = models_->import_path(f, true);
+                for (const auto& e : r["errors"].elements()) log_warning("models: import folder: " + e.as_string());
+                if (!r["imported"].empty()) remove_file(side);
+                else if (!stopping_)
+                {
+                    set_aside(f);
+                    set_aside(side);
+                }
+            }
+
+        const std::string feed = join_path(inbox, "feed.json");
+        if (file_exists(feed) && file_exists(feed + ".sig") && !stopping_)
+        {
+            const json r = updater_->import_offline(inbox);
+            const std::string installer = r["installer"].as_string();
+            const std::string source = installer.empty() ? std::string() : join_path(inbox, installer);
+            // The installer the feed names may still be on its way.
+            if (r.contains("error") && !source.empty() && !file_exists(source)) return;
+            if (r.contains("error"))
+            {
+                log_warning("updates: import folder: " + r["error"].as_string());
+                set_aside(feed);
+                set_aside(feed + ".sig");
+                if (!source.empty()) set_aside(source);
+            }
+            else
+            {
+                remove_file(feed);
+                remove_file(feed + ".sig");
+                if (!source.empty()) remove_file(source);
+            }
+        }
+    }
+
+    json service::import_folder(const std::string& path)
+    {
+        std::lock_guard<std::mutex> serial(import_m_);
+        json result = json::object();
+        const bool folder = dir_exists(path);
+        if (folder && file_exists(join_path(path, "catalog.json")))
+            result["catalog"] = models_->import_catalog(path);
+        const json r = models_->import_path(path);
+        result["imported"] = r["imported"];
+        result["errors"] = r["errors"];
+        if (folder && file_exists(join_path(path, "feed.json")))
+            result["update"] = updater_->import_offline(path);
+        log_info("import: " + path + ", " + std::to_string(r["imported"].size()) + " models");
+        return result;
+    }
+
+    bool service::is_embedding(const installed_model& m)
+    {
+        return m.descriptor["embedding"].as_bool(false) || has_role(m.descriptor, embedding_role);
     }
 
     void service::ensure_default_model()
     {
         const host_settings st = settings_->get();
-        if (st.active.count("general")) return;
         const std::vector<installed_model> installed = db_->models();
-        if (!installed.empty())
+        const json catalog = models_->catalog();
+
+        // The document search always has its embedding model: an installed one, else the
+        // default one of the catalog, downloaded whatever the options of the installation
+        // (the computers without network receive it in their offline bundle).
+        if (!st.active.count(embedding_role))
         {
-            // The model of the catalog meant for general use, else the first one.
-            const installed_model* pick = &installed.front();
+            const installed_model* pick = nullptr;
             for (const auto& m : installed)
-                if (has_role(m.descriptor, "general") || m.descriptor["default"].as_bool(false)) pick = &m;
+                if (is_embedding(m) && (!pick || m.descriptor["default"].as_bool(false))) pick = &m;
+            std::string error;
+            if (pick)
+            {
+                if (!activate(pick->id, embedding_role, error)) log_warning("models: " + pick->id + ": " + error);
+            }
+            else if (!st.offline)
+            {
+                for (const auto& e : catalog["models"].elements())
+                {
+                    if (!has_role(e, embedding_role) || !e["default"].as_bool(false)) continue;
+                    if (models_->start_download(e["id"].as_string(), error))
+                        log_info("models: download of the embedding model " + e["id"].as_string());
+                    else
+                        log_warning("models: the embedding model cannot be downloaded: " + error);
+                    break;
+                }
+            }
+        }
+
+        if (st.active.count("general")) return;
+        const installed_model* pick = nullptr;
+        for (const auto& m : installed)
+        {
+            // The model of the catalog meant for general use, else the first language model.
+            if (is_embedding(m)) continue;
+            if (!pick || has_role(m.descriptor, "general") || m.descriptor["default"].as_bool(false)) pick = &m;
+        }
+        if (pick)
+        {
             std::string error;
             if (!activate(pick->id, "general", error)) log_warning("models: " + pick->id + ": " + error);
             return;
         }
-        // Nothing installed: the default model of the catalog is downloaded, once, unless
-        // the installation asked otherwise.
-        if (!st.default_model || db_->value("default_model_requested") == "1") return;
-        for (const auto& e : models_->catalog()["models"].elements())
+        // No language model installed: the default model of the catalog is downloaded, once,
+        // unless the installation asked otherwise or the computer is offline.
+        if (!st.default_model || st.offline || db_->value("default_model_requested") == "1") return;
+        for (const auto& e : catalog["models"].elements())
         {
-            if (!e["default"].as_bool(false)) continue;
+            if (!e["default"].as_bool(false) || has_role(e, embedding_role)) continue;
             std::string error;
             if (models_->start_download(e["id"].as_string(), error))
             {
@@ -490,6 +690,14 @@ namespace albireo
     void service::on_installed(const installed_model& m)
     {
         if (stopping_) return;
+        if (is_embedding(m))
+        {
+            // The first embedding model serves the document search.
+            std::string error;
+            if (!settings_->get().active.count(embedding_role) && !activate(m.id, embedding_role, error))
+                log_warning("models: " + m.id + ": " + error);
+            return;
+        }
         // A new model takes the functions its catalog entry names and no model holds yet,
         // and the general one when it is free, so that every function has a model.
         std::vector<std::string> roles;
@@ -515,9 +723,14 @@ namespace albireo
         }
         const host_settings st = settings_->get();
         json options = json::object();
-        if (st.context > 0) options["context"] = st.context;
-        options["max_sequences"] = st.max_sequences;
-        if (st.kv_mb > 0) options["kv_mb"] = st.kv_mb;
+        // The settings of the conversations apply to the language models; an embedding
+        // model keeps the defaults of the engine for its short inputs.
+        if (!is_embedding(m))
+        {
+            if (st.context > 0) options["context"] = st.context;
+            options["max_sequences"] = st.max_sequences;
+            if (st.kv_mb > 0) options["kv_mb"] = st.kv_mb;
+        }
         const bool ok = engine_.load_model(m.id, m.file, options, error);
         std::lock_guard<std::mutex> lock(m_);
         load_state_[m.id] = ok ? std::string("ready") : error;
@@ -554,7 +767,7 @@ namespace albireo
     {
         if (!is_role(role))
         {
-            error = "unknown role '" + role + "' (general, code or security)";
+            error = "unknown role '" + role + "' (general, code, security or embedding)";
             return false;
         }
         std::lock_guard<std::mutex> serial(models_m_);
@@ -564,17 +777,32 @@ namespace albireo
             error = "the model " + id + " is not installed";
             return false;
         }
-        host_settings st = settings_->get();
-        const std::string previous = st.active.count(role) ? st.active[role] : std::string();
-        if (previous == id) return true;
+        if ((role == embedding_role) != is_embedding(m))
+        {
+            error = role == embedding_role ? "the model " + id + " writes text; the document search needs an "
+                "embedding model" : "the model " + id + " computes the vectors of the document search and "
+                "answers no conversation";
+            return false;
+        }
+        {
+            const host_settings st = settings_->get();
+            const auto current = st.active.find(role);
+            if (current != st.active.end() && current->second == id) return true;
+        }
         const std::vector<std::string> loaded = engine_.loaded_models();
         if (engine_.running() && std::find(loaded.begin(), loaded.end(), id) == loaded.end() && !load_model(m, error))
             return false;
-        st.active[role] = id;
-        settings_->set(st);
+        // The settings may have changed while the model loaded: the function is set on
+        // the settings as they are now.
+        std::string previous;
+        const host_settings st = settings_->update([&](host_settings& s) {
+            const auto current = s.active.find(role);
+            if (current != s.active.end()) previous = current->second;
+            s.active[role] = id;
+        });
         log_info("models: " + id + " active for " + role);
         // The model the role used before is released when no other role uses it.
-        if (!previous.empty())
+        if (!previous.empty() && previous != id)
         {
             bool used = false;
             for (const auto& kv : st.active) used = used || kv.second == previous;
@@ -588,31 +816,41 @@ namespace albireo
         return true;
     }
 
-    void service::deactivate(const std::string& id)
+    bool service::deactivate(const std::string& id, std::string& error, bool removing)
     {
         std::lock_guard<std::mutex> serial(models_m_);
-        host_settings st = settings_->get();
+        bool refused = false;
         bool changed = false;
-        for (auto it = st.active.begin(); it != st.active.end();)
-        {
-            if (it->second == id)
+        settings_->update([&](host_settings& st) {
+            const auto embedding = st.active.find(embedding_role);
+            if (!removing && embedding != st.active.end() && embedding->second == id)
             {
-                it = st.active.erase(it);
-                changed = true;
+                refused = true;
+                return;
             }
-            else
+            for (auto it = st.active.begin(); it != st.active.end();)
             {
-                ++it;
+                if (it->second == id)
+                {
+                    it = st.active.erase(it);
+                    changed = true;
+                }
+                else
+                {
+                    ++it;
+                }
             }
-        }
-        if (changed)
+        });
+        if (refused)
         {
-            settings_->set(st);
-            log_info("models: " + id + " deactivated");
+            error = "the document search needs an embedding model: activate another one to replace " + id;
+            return false;
         }
+        if (changed) log_info("models: " + id + " deactivated");
         engine_.unload_model(id);
         std::lock_guard<std::mutex> lock(m_);
         load_state_.erase(id);
+        return true;
     }
 
     std::string service::resolve_model(const std::string& requested)
@@ -625,16 +863,39 @@ namespace albireo
         std::string role = requested;
         if (role.compare(0, 8, "albireo-") == 0) role = role.substr(8);
         if (requested.empty() || requested == "auto" || requested == "albireo") role = "general";
+        const auto embedding = st.active.find(embedding_role);
+        const std::string embedder = embedding == st.active.end() ? std::string() : embedding->second;
+        if (role == embedding_role || requested == embedder) return std::string();
         if (is_role(role))
         {
             auto it = st.active.find(role);
             if (it != st.active.end() && is_loaded(it->second)) return it->second;
-            // A role without its own model is served by the general model.
+            // A role without its own model is served by the general model, else by the
+            // first language model loaded.
             it = st.active.find("general");
             if (it != st.active.end() && is_loaded(it->second)) return it->second;
-            return loaded.empty() ? std::string() : loaded.front();
+            for (const auto& id : loaded)
+                if (id != embedder) return id;
+            return std::string();
         }
         return is_loaded(requested) ? requested : std::string();
+    }
+
+    std::string service::resolve_embedding_model(const std::string& requested)
+    {
+        const host_settings st = settings_->get();
+        const std::vector<std::string> loaded = engine_.loaded_models();
+        auto is_loaded = [&](const std::string& id) {
+            return std::find(loaded.begin(), loaded.end(), id) != loaded.end();
+        };
+        if (!requested.empty() && requested != "auto" && requested != embedding_role
+            && requested != std::string("albireo-") + embedding_role)
+        {
+            installed_model m;
+            return is_loaded(requested) && db_->find_model(requested, m) && is_embedding(m) ? requested : std::string();
+        }
+        const auto it = st.active.find(embedding_role);
+        return it != st.active.end() && is_loaded(it->second) ? it->second : std::string();
     }
 
     void service::record_usage(long prompt_tokens, long generated_tokens)
@@ -725,6 +986,8 @@ namespace albireo
         s["usage"] = usage;
         s["downloads"] = models_->downloads();
         s["updates"] = updater_->status();
+        s["catalog"] = models_->catalog_status();
+        s["offline"] = st.offline;
         json settings = json::object();
         settings["engine"] = st.engine;
         settings["accelerator"] = st.accelerator;
@@ -732,6 +995,7 @@ namespace albireo
         settings["v2ram_max_mb"] = st.v2ram_max_mb;
         settings["language"] = st.language;
         settings["check_updates"] = st.check_updates;
+        settings["offline"] = st.offline;
         s["settings"] = settings;
         return s;
     }
@@ -799,7 +1063,6 @@ namespace albireo
             out["error"] = "no model is installed";
             return out;
         }
-        host_settings updated = st;
         json results = json::object();
         for (const auto& o : engine_options(candidates_))
         {
@@ -820,7 +1083,6 @@ namespace albireo
                 json m = r;
                 m["model"] = model.id;
                 m["measured_at"] = static_cast<long long>(now_unix());
-                updated.engine_benchmarks[o.key] = m;
                 results[o.key] = m;
                 log_info("engines: " + o.key + " " + std::to_string(r["tokens_per_second"].as_double()) + " tokens/s");
             }
@@ -833,7 +1095,11 @@ namespace albireo
                 log_warning("engines: measure of " + o.key + " failed");
             }
         }
-        settings_->set(updated);
+        // The measures join the settings as they are now, which may have changed meanwhile.
+        const host_settings updated = settings_->update([&](host_settings& s) {
+            for (const auto& kv : results.items())
+                if (!kv.second.contains("error")) s.engine_benchmarks[kv.first] = kv.second;
+        });
         out["model"] = model.id;
         out["results"] = results;
         // The engine "best", or an accelerator choice among several devices, follows the

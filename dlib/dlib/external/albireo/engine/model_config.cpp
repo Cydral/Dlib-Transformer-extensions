@@ -124,6 +124,8 @@ namespace albireo
 
         c.chat_template = g.get_str("tokenizer.chat_template", "");
         c.tokenizer_pre = g.get_str("tokenizer.ggml.pre", "");
+        c.pooling = static_cast<int>(g.get_int(a + ".pooling_type", 0));
+        if (c.pooling < 0 || c.pooling > 4) throw std::runtime_error("unknown pooling type");
         return c;
     }
 
@@ -142,6 +144,11 @@ namespace albireo
         if (c.qkv_bias) o << ", qkv bias";
         if (c.qk_norm) o << ", qk norm";
         if (c.tied_embeddings) o << ", tied embeddings";
+        if (c.is_embedding())
+        {
+            static const char* const pooling[] = { "none", "mean", "first token", "last token", "rank" };
+            o << ", embedding model, pooling " << pooling[c.pooling];
+        }
         o << ")";
         return o.str();
     }

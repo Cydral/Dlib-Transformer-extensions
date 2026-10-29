@@ -8,6 +8,7 @@
 
 import json
 import os
+import re
 
 
 def ref(name):
@@ -29,6 +30,8 @@ error_replies = {
     "404": reply("Unknown or inactive model", ref("Error")),
 }
 admin = [{"adminToken": []}]
+offline_reply = {"409": reply("Refused in offline mode", {"type": "object", "properties": {
+    "ok": {"type": "boolean"}, "error": {"type": "string"}}})}
 model_id = {"name": "id", "in": "path", "required": True, "schema": {"type": "string", "pattern": "^[A-Za-z0-9._-]+$"},
             "description": "Identifier of the model, as listed by /albireo/v1/models."}
 ok = {"type": "object", "properties": {"ok": {"type": "boolean"}, "error": {"type": "string"}}}
@@ -121,6 +124,29 @@ schemas = {
         "choices": {"type": "array", "items": {"type": "object", "properties": {
             "index": {"type": "integer"}, "text": {"type": "string"}, "finish_reason": {"type": "string"}}}},
         "usage": ref("Usage")}},
+    "EmbeddingRequest": {"type": "object", "required": ["input"], "properties": {
+        "model": {"type": "string", "description": "albireo-embedding, auto, or the identifier of an active embedding "
+                                                   "model.", "example": "albireo-embedding"},
+        "input": {"description": "A text, a list of texts, or token lists.", "oneOf": [
+            {"type": "string"}, {"type": "array", "items": {"type": "string"}, "maxItems": 2048},
+            {"type": "array", "items": {"type": "integer"}},
+            {"type": "array", "items": {"type": "array", "items": {"type": "integer"}}}]},
+        "encoding_format": {"type": "string", "enum": ["float", "base64"], "default": "float",
+                            "description": "base64: the little-endian float32 values of each vector."},
+        "dimensions": {"type": "integer", "minimum": 1, "description": "Keeps the leading dimensions of each "
+                       "vector, normalized again, for the models trained to keep their meaning when shortened "
+                       "(Qwen3 Embedding: 32 to 1024)."},
+        "user": {"type": "string", "description": "Accepted and ignored."}},
+        "example": {"model": "albireo-embedding", "input": ["The service runs on this computer.",
+                                                            "Where does the service run?"]}},
+    "EmbeddingList": {"type": "object", "properties": {
+        "object": {"type": "string", "enum": ["list"]}, "model": {"type": "string"},
+        "data": {"type": "array", "items": {"type": "object", "properties": {
+            "object": {"type": "string", "enum": ["embedding"]}, "index": {"type": "integer"},
+            "embedding": {"description": "Unit vector: numbers, or a base64 string.",
+                          "oneOf": [{"type": "array", "items": {"type": "number"}}, {"type": "string"}]}}}},
+        "usage": {"type": "object", "properties": {"prompt_tokens": {"type": "integer"},
+                                                   "total_tokens": {"type": "integer"}}}}},
     "ModelList": {"type": "object", "properties": {"object": {"type": "string"}, "data": {"type": "array", "items": {
         "type": "object", "properties": {"id": {"type": "string"}, "object": {"type": "string"},
                                          "owned_by": {"type": "string"},
@@ -137,6 +163,8 @@ schemas = {
         "threads": {"type": "integer"}, "context": {"type": "integer"},
         "max_sequences": {"type": "integer", "minimum": 1, "maximum": 64}, "kv_mb": {"type": "integer"},
         "check_updates": {"type": "boolean"},
+        "offline": {"type": "boolean", "description": "No access to the network: the catalog, the models and the "
+                    "updates come from imports, and the service opens no connection."},
         "proxy": {"type": "string",
                   "description": "Proxy of the downloads: empty for the proxy of the system, none for a direct "
                                  "connection, or http://[user:password@]host:port."}}},
@@ -157,6 +185,14 @@ paths = {
         "tags": ["OpenAI"], "summary": "Text completion of a raw prompt",
         "requestBody": json_body(ref("CompletionRequest")),
         "responses": dict({"200": reply("The completion", ref("Completion"))}, **error_replies)}},
+    "/v1/embeddings": {"post": {
+        "tags": ["OpenAI"], "summary": "Vectors of texts, for search and comparison",
+        "description": "Computed by the embedding model of the service, which the search in the documents of the "
+                       "web application uses. The inputs of every client are computed together, and the passes of "
+                       "the embedding model stay short while a conversation is being answered.",
+        "requestBody": json_body(ref("EmbeddingRequest")),
+        "responses": dict({"200": reply("One vector per input, in the order of the inputs", ref("EmbeddingList"))},
+                          **error_replies)}},
     "/albireo/v1/status": {"get": {
         "tags": ["Service"], "summary": "State of the service, of the engine and of the models",
         "responses": {"200": reply("The state", {"type": "object"})}}},
@@ -180,18 +216,22 @@ paths = {
         "responses": {"200": reply("The count and the context of the model", {"type": "object", "properties": {
             "tokens": {"type": "integer"}, "context": {"type": "integer"}}})}}},
     "/albireo/v1/models/refresh": {"post": {"tags": ["Administration"], "security": admin,
-                                            "summary": "Fetches the catalog again",
-                                            "responses": {"200": reply("Result", ok)}}},
+                                            "summary": "Fetches the catalog again, in the background",
+                                            "responses": dict({"202": reply("Started", {"type": "object"})},
+                                                              **offline_reply)}},
     "/albireo/v1/models/{id}/download": {
         "post": {"tags": ["Administration"], "security": admin, "summary": "Starts or resumes the download of a model",
-                 "parameters": [model_id], "responses": {"202": reply("Started", ok), "400": reply("Refused", ok)}},
+                 "parameters": [model_id],
+                 "responses": dict({"202": reply("Started", ok), "400": reply("Refused", ok)}, **offline_reply)},
         "delete": {"tags": ["Administration"], "security": admin, "summary": "Cancels a download",
                    "parameters": [model_id], "responses": {"200": reply("Cancelled", ok)}}},
     "/albireo/v1/models/{id}/activate": {"post": {
         "tags": ["Administration"], "security": admin, "summary": "Activates a model for a function",
         "parameters": [model_id],
         "requestBody": json_body({"type": "object", "properties": {
-            "role": {"type": "string", "enum": ["general", "code", "security"], "default": "general"}}}),
+            "role": {"type": "string", "enum": ["general", "code", "security", "embedding"], "default": "general",
+                     "description": "embedding takes an embedding model only, the other functions a language "
+                                    "model."}}}),
         "responses": {"200": reply("Activated", ok), "400": reply("Refused", ok)}}},
     "/albireo/v1/models/{id}/deactivate": {"post": {
         "tags": ["Administration"], "security": admin, "summary": "Deactivates a model for every function",
@@ -202,9 +242,21 @@ paths = {
     "/albireo/v1/models/{id}": {"delete": {
         "tags": ["Administration"], "security": admin, "summary": "Deletes an installed model",
         "parameters": [model_id], "responses": {"200": reply("Deleted", ok)}}},
+    "/albireo/v1/import": {"post": {
+        "tags": ["Administration"], "security": admin,
+        "summary": "Imports an offline bundle, or the GGUF files of a local folder or file",
+        "description": "For a computer without network: a memory card or a disk brought to the machine. A folder "
+                       "may hold a signed catalog (catalog.json and catalog.json.sig), GGUF files, also in its "
+                       "models subfolder, and a signed update (feed.json, feed.json.sig and the installer it "
+                       "names), as tools/make_offline_bundle.py prepares them. An older catalog never replaces a "
+                       "newer one, and the update is installed at the next start of the service.",
+        "requestBody": json_body({"type": "object", "required": ["path"], "properties": {"path": {"type": "string"}}}),
+        "responses": {"200": reply("Imported models, catalog, update and errors", {"type": "object", "properties": {
+            "imported": {"type": "array", "items": {"type": "string"}},
+            "errors": {"type": "array", "items": {"type": "string"}},
+            "catalog": {"type": "object"}, "update": {"type": "object"}}})}}},
     "/albireo/v1/models/import": {"post": {
-        "tags": ["Administration"], "security": admin, "summary": "Imports the GGUF files of a local folder or file",
-        "description": "For an installation without network: a memory card or a disk brought to the machine.",
+        "tags": ["Administration"], "security": admin, "summary": "Same as /albireo/v1/import",
         "requestBody": json_body({"type": "object", "required": ["path"], "properties": {"path": {"type": "string"}}}),
         "responses": {"200": reply("Imported files and errors", {"type": "object"})}}},
     "/albireo/v1/models/upload": {"post": {
@@ -220,8 +272,9 @@ paths = {
                 "requestBody": json_body(ref("Settings")),
                 "responses": {"200": reply("Saved; restart tells whether the service restarts", {"type": "object"})}}},
     "/albireo/v1/updates/check": {"post": {"tags": ["Administration"], "security": admin,
-                                           "summary": "Checks for an update and downloads it",
-                                           "responses": {"202": reply("State", {"type": "object"})}}},
+                                           "summary": "Checks for an update and downloads it, in the background",
+                                           "responses": dict({"202": reply("State", {"type": "object"})},
+                                                             **offline_reply)}},
     "/albireo/v1/updates/apply": {"post": {"tags": ["Administration"], "security": admin,
                                            "summary": "Restarts the service to install a downloaded update",
                                            "responses": {"202": reply("Restarting", ok)}}},
@@ -234,15 +287,20 @@ paths = {
                                  "responses": {"200": reply("The lines", {"type": "object"})}}},
 }
 
+here = os.path.dirname(os.path.abspath(__file__))
+with open(os.path.join(here, "..", "common", "version.h"), encoding="utf-8") as f:
+    version = re.search(r'#define ALBIREO_VERSION "([0-9.]+)"', f.read()).group(1)
+
 doc = {
     "openapi": "3.0.3",
     "info": {
         "title": "Albireo local interface",
-        "version": "1.0.0",
+        "version": version,
         "description": "The interface of the Albireo service, served on https://localhost (port 8443 unless changed in "
                        "the tray). The routes under /v1 follow the OpenAI interface, so that its client libraries "
                        "work with base_url https://localhost:8443/v1 and any API key. The functions albireo-general, "
-                       "albireo-code and albireo-security name the models activated in the tray.\n\n"
+                       "albireo-code and albireo-security name the models activated in the tray, and "
+                       "albireo-embedding the embedding model of the search in documents.\n\n"
                        "The administration routes require the token of the data folder of the service "
                        "(admin.token) in the X-Albireo-Admin header.",
         "license": {"name": "Boost Software License 1.0", "url": "https://www.boost.org/LICENSE_1_0.txt"},
@@ -256,7 +314,6 @@ doc = {
         "adminToken": {"type": "apiKey", "in": "header", "name": "X-Albireo-Admin"}}},
 }
 
-here = os.path.dirname(os.path.abspath(__file__))
 with open(os.path.join(here, "..", "web", "openapi.json"), "w", encoding="utf-8") as f:
     json.dump(doc, f, indent=1, ensure_ascii=False)
     f.write("\n")

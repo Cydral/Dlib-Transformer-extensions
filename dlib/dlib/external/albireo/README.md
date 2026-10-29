@@ -22,6 +22,7 @@ of a double star of the constellation Cygnus, one gold and one blue, which its i
 - [Settings](#settings)
 - [Interfaces](#interfaces)
 - [Models](#models)
+- [Computers without network](#computers-without-network)
 - [Publishing a version](#publishing-a-version)
 - [Security](#security)
 - [Data folders](#data-folders)
@@ -31,27 +32,35 @@ of a double star of the constellation Cygnus, one gold and one blue, which its i
 - **Chat** in the web application, with the discussions kept in the browser (IndexedDB), an
   incognito mode that keeps them in memory only, a search over the discussions, and the reasoning
   of the models that reason shown while they think, then folded once the answer starts.
-- **Projects**: discussions grouped with instructions and documents (text, Office, PDF) that the
-  model receives as context, whole when they fit in a third of its context, by passages chosen
-  with BM25 otherwise.
-- **Three functions**, general, code and security, each served by a model of the catalog, chosen
-  in the Models window or by the service when a model arrives.
+- **Documents** attached to a message or to a project: Word, Excel, PowerPoint, OpenDocument,
+  PDF, RTF, HTML, text, CSV, Markdown and source code. The browser extracts the text of every page
+  of a document, of every sheet of a workbook in the order of its tabs, and of every slide of a
+  presentation in the order of the show. Each file appears as a thumbnail with its format, which
+  can be removed before sending, and the edition of a question keeps, removes or adds its files.
+- **Projects**: discussions grouped with instructions and documents that form their shared
+  context, read whole when they fit, searched otherwise by meaning and by words, the search and
+  its index running in the browser (see [Documents and context](#documents-and-context)).
+- **Three functions**, general, code and security, each served by a language model of the
+  catalog, chosen in the Models window or by the service when a model arrives, and an embedding
+  model for the search in documents, which the service installs in every case.
 - **Agent mode**: the model calls tools that run in the page (calculator, JavaScript in a
-  sandboxed frame, search in the documents of the project), up to eight steps per answer.
+  sandboxed frame, outline, reading and search of the documents), up to eight steps per answer.
 - **Several conversations at once**: the requests of every client are computed together, one
   forward pass serving the next token of each, and the keys and values of a finished request stay
   cached so that the next turn of a conversation starts where the previous one ended.
-- **An interface for other programs**: `/v1/chat/completions`, `/v1/completions` and
-  `/v1/models` follow the OpenAI interface, streaming included, with its documentation as a
-  Swagger page at `/docs/`.
+- **An interface for other programs**: `/v1/chat/completions`, `/v1/completions`,
+  `/v1/embeddings` and `/v1/models` follow the OpenAI interface, streaming included, with its
+  documentation as a Swagger page at `/docs/`.
 - **Engines for each kind of processor**: portable, AVX2, Intel NPU and integrated GPU through
   OpenVINO, NVIDIA GPU through CUDA, behind a single C interface. The service measures them on the
   machine and runs the fastest, and the icon menu can force the NPU, the GPU or both while a
   processor engine runs.
 - **Models from a signed catalog**, downloaded in parallel parts, checked against their hashes,
-  or imported from a disk or a memory card for a machine without network.
-- **Updates** announced by a signed feed, downloaded in the background and installed when the
-  service restarts.
+  or imported from a disk or a memory card.
+- **Updates** announced by a signed feed, attached to the GitHub releases of the repository,
+  downloaded in the background and installed when the service restarts.
+- **An offline mode** for the computers without network: the service opens no connection, and
+  the catalog, the models and the updates come from an offline bundle brought on a disk.
 - **Five languages** in every window: English, French, German, Italian and Spanish, the language
   of Windows by default.
 
@@ -119,6 +128,43 @@ The web application ([`web/`](web)) is plain ES modules with its libraries in
 [`web/vendor`](web/vendor), served by the service with a content security policy that allows no
 other origin.
 
+### Documents and context
+
+The text of a document is extracted in the browser ([`web/js/documents.js`](web/js/documents.js)):
+the Office and OpenDocument formats are ZIP archives of XML, read with the decompression of the
+browser, and PDF goes through pdf.js. The text marks each page, slide and sheet with a line that
+starts with `## `, which names the passages of the search and lets the tools of the agent read a
+document part by part. Nothing leaves the browser but the text placed in the messages.
+
+The search ([`web/js/rag.js`](web/js/rag.js)) cuts the documents into passages of 1,200
+characters overlapping by 240, named after their document and their part. The embedding model of
+the service computes the vector of each passage once, through `/v1/embeddings`, and the passages
+are kept with their vectors in the database of the browser (IndexedDB), or in memory for an
+incognito discussion. A question is compared with the passages by meaning (cosine of the vectors)
+and by words (BM25); the two rankings are fused (reciprocal rank fusion), the passages chosen so
+that they do not repeat each other (maximal marginal relevance), and the consecutive passages of
+a document merged into one excerpt. The engine computes the vectors of every client in the same
+passes and keeps these passes short while a conversation is answered, so that indexing documents
+never delays an answer.
+
+The prompt of a question is built for the cache of the engine, which keeps the keys and values of
+each conversation and computes again only the tokens that differ from what it already read
+([`web/js/app.js`](web/js/app.js)):
+
+| Part of the prompt | Content | Share of the context |
+|---|---|---|
+| System message | date, instructions, documents of the project read whole | 30% at most, else the project is searched |
+| Attached document | read whole | 25% at most, else indexed and searched |
+| Excerpts of a question | the passages found for it, kept with the message once sent | 20% at most |
+| Exchanges | the conversation | the rest; the oldest leave in one step, down to 60% of the room |
+
+The beginning of the prompt therefore stays the same from one question to the next: each question
+costs its own tokens only, the conversations of a project share the reading of its documents
+(the engine copies the cached prefix from one sequence to another), and the cut of the oldest
+exchanges happens once every several questions. The service serves several sessions at once,
+each with its own context: the requests of every session are computed together, one forward pass
+serving the next token of each.
+
 ## Source tree
 
 | Folder                   | Content                                                                      |
@@ -131,7 +177,7 @@ other origin.
 | [`resources/`](resources)| icons, images, license, version resources                                     |
 | [`cmake/`](cmake)        | MinGW-w64 toolchain, payload of the installer, runtime libraries of devices   |
 | [`tests/`](tests)        | kernel, runtime, tokenizer and device tests, engine driver, benchmark          |
-| [`tools/`](tools)        | build script, catalog, feed, signatures, model parts, images, web libraries   |
+| [`tools/`](tools)        | build and test scripts, catalog, feed, publication, offline bundle, images    |
 
 ## Building on Windows
 
@@ -227,11 +273,25 @@ cmake --build build-albireo-win -j
 | `test_runtime`   | the logits of a model against `tests/reference_forward.py`, and the same results whatever the cut of the batches |
 | `test_tokenizer` | the tokenizer of a GGUF file against reference token sequences                     |
 | `test_offload`   | the products of a device against the processor kernels, the small budget path and the measured routing |
-| `engine_chat`    | drives an engine library through its C interface: chat, tools, reasoning, parallel requests |
+| `engine_chat`    | drives an engine library through its C interface: chat, tools, reasoning, parallel requests, embeddings compared with a reference |
 | `bench_runtime`  | tokens per second of the prompt and of the generation                               |
 
 `test_offload model.gguf CPU` validates the OpenVINO engine on a machine without NPU, with the CPU
 plugin of OpenVINO; `ALBIREO_ENGINE_DLIB=ON` builds the same test on the host code of dlib.
+
+Two scripts run these programs and the service, then print one line per step with its result:
+
+```
+bash dlib/dlib/external/albireo/tools/test_linux.sh
+powershell -ExecutionPolicy Bypass -File dlib\dlib\external\albireo\tools\test_windows.ps1
+```
+
+They take `~/models/Qwen3-0.6B-Q4_K_M.gguf` and `~/models/Qwen3-Embedding-0.6B-Q8_0.gguf` by
+default and skip the steps whose model or build tree is missing. The Linux script runs a service
+offline in a data folder of its own, imports the model and asks a question through the OpenAI
+interface; the Windows script asks the installed service a question and the vectors of two texts,
+and tests the OpenVINO and CUDA engines when their trees exist (`-Device GPU` or `-Device NPU`
+for `test_offload`, CPU by default). Their exit code is the number of failed steps.
 
 ## Installation
 
@@ -250,8 +310,10 @@ albireo-setup /service start|stop|restart
 albireo-setup /lang en|fr|de|it|es
 ```
 
-A `models` folder beside the installer, on a memory card for instance, is imported at the first
-start of the service, which installs a machine without network with its models.
+The installer started from an offline bundle (see [Computers without network](#computers-without-network))
+leaves its catalog and its models in the import folder, which the service reads at its first start.
+The option "This computer has no Internet access" of the wizard, or `/offline`, sets the service
+offline from the start.
 
 ## Settings
 
@@ -272,9 +334,10 @@ administration interface, and the service restarts when a change requires it.
 | `max_sequences` | 4       | requests computed together per model                                      |
 | `kv_mb`         | 0       | memory of the keys and values, 0 for automatic                            |
 | `check_updates` | true    | checks the feed at each start and every six hours                          |
-| `default_model` | true    | downloads the default model of the catalog at the first start             |
+| `default_model` | true    | downloads the default language model of the catalog at the first start    |
+| `offline`       | false   | no connection: catalog, models and updates come from imports              |
 | `proxy`         | `""`    | `""` for the proxy of the system (`HTTPS_PROXY`, then WinHTTP), `none`, or `http://[user:password@]host:port` |
-| `active`        |         | the model of each function: `general`, `code`, `security`                  |
+| `active`        |         | the model of each function: `general`, `code`, `security`, `embedding`     |
 | `update_feed`, `catalog_url` | | addresses of the signed feed and catalog                       |
 
 ## Interfaces
@@ -282,13 +345,14 @@ administration interface, and the service restarts when a change requires it.
 The interface compatible with OpenAI takes no key: the service listens on the loopback interface
 only and refuses the requests whose `Host` or `Origin` names another site. The `model` field takes
 the identifier of a loaded model, a function (`general`, `code`, `security`, or `albireo-code` and
-its siblings), or `auto`.
+its siblings), or `auto`; the `model` of `/v1/embeddings` takes `albireo-embedding`.
 
 | Route                                    | Use                                                       |
 |------------------------------------------|-----------------------------------------------------------|
 | `GET /v1/models`                         | loaded models and the aliases of the functions            |
 | `POST /v1/chat/completions`              | chat, streaming, tools, `reasoning_content`               |
 | `POST /v1/completions`                   | completion of a prompt                                    |
+| `POST /v1/embeddings`                    | vectors of texts, float or base64, `dimensions` to shorten them |
 | `GET /albireo/v1/status`                 | host, engine, statistics, models, downloads, updates      |
 | `GET /albireo/v1/models?lang=fr`         | catalog and installed models                              |
 | `GET /albireo/v1/engines`                | engine libraries, options and measures                    |
@@ -296,7 +360,7 @@ its siblings), or `auto`.
 | `/docs/`                                 | Swagger page of the interface                             |
 
 The administration routes (`/albireo/v1/settings`, `/albireo/v1/models/<id>/download`,
-`/activate`, `/deactivate`, `/verify`, `/models/import`, `/models/upload`, `/updates/check`,
+`/activate`, `/deactivate`, `/verify`, `/import`, `/models/upload`, `/updates/check`,
 `/updates/apply`, `/restart`, `/engines/benchmark`, `/logs`) require the header
 `X-Albireo-Admin` with the token of `admin.token`, which only the administrators, the service and
 the interactive users of the machine can read.
@@ -308,36 +372,99 @@ the architectures the engine supports (llama, mistral, mistral3, granite, granit
 qwen3moe, mixtral), with their functions, their descriptions in the five languages, their license,
 and the address, size and SHA-256 of each file. [`tools/make_catalog.py`](tools/make_catalog.py)
 writes it from the Hugging Face hub, the addresses pinned to a commit so that a file never changes
-under its hash. The service downloads the default model at its first start, unless the installation
-said otherwise, and a model that arrives takes the functions its entry names that no model holds.
+under its hash.
+
+| Model                  | Functions       | Size    | License                                  |
+|------------------------|-----------------|---------|------------------------------------------|
+| Qwen3 4B (default)     | general         | 2.50 GB | Apache-2.0                               |
+| Qwen3 Embedding 0.6B (default) | embedding | 0.64 GB | Apache-2.0                             |
+| Qwen3 1.7B             | general         | 1.83 GB | Apache-2.0                               |
+| Ministral 3 3B         | general         | 2.15 GB | Apache-2.0                               |
+| Llama 3.2 3B           | general         | 2.02 GB | Llama 3.2 Community License, Built with Llama |
+| Qwen3 8B               | general         | 5.03 GB | Apache-2.0                               |
+| Qwen3 30B A3B          | general         | 18.56 GB | Apache-2.0                              |
+| Qwen2.5 Coder 1.5B     | code            | 1.12 GB | Apache-2.0                               |
+| Qwen2.5 Coder 7B       | code            | 4.68 GB | Apache-2.0                               |
+| Granite 3.3 2B         | general, code   | 1.55 GB | Apache-2.0                               |
+| Granite 3.3 8B         | general, code   | 4.94 GB | Apache-2.0                               |
+| Foundation-Sec 1.1 8B  | security        | 4.92 GB | Llama 3.1 Community License              |
+
+The service downloads the default language model at its first start, unless the installation said
+otherwise, and the default embedding model in every case, since the search in documents relies on
+it. A language model that arrives takes the functions its entry names that no model holds; an
+embedding model serves the `embedding` function alone. The engine computes an embedding model as
+it computes a language model, then takes the hidden state of the last token of each text,
+normalized, as its vector (`pooling_type` 3 of the GGUF file); its keys and values are given back
+as soon as each text is read.
 
 A model can also be imported from any GGUF file: the Models window sends it to the service, or
 the service imports the files placed in `<data>\import`.
+
+## Computers without network
+
+The `offline` setting, set by the installer (option "This computer has no Internet access",
+`/offline`) or by the window of the computer, makes the service open no connection: the catalog, the updates and the downloads are
+refused with the reason, and the menu of the icon greys "Check for updates". What the service
+needs then comes from an offline bundle, prepared on a computer with network:
+
+```
+python3 dlib/dlib/external/albireo/tools/make_offline_bundle.py <folder> [--models qwen3-4b,qwen3-embedding-0.6b] [--from ~/models]
+```
+
+The bundle holds the signed catalog and the signed update feed of `dist/albireo`, the installer the
+feed announces, a `models` folder with the models chosen (the two default models when `--models`
+is absent) and a `README.txt`. Each file is checked against the hashes of the signed files when it
+enters the bundle, and again by the service when it installs it. The bundle is used in one of
+three ways:
+
+- `albireo-setup-<version>.exe` started from the bundle installs Albireo with its models;
+- the Import button of the Models window, given the folder of the bundle, installs the catalog,
+  the models and the update of an installed computer;
+- the content of the bundle copied into `C:\ProgramData\Albireo\import` is installed by the service
+  within a minute; a file that cannot be installed is renamed with the suffix `.rejected`.
+
+A catalog older than the one in place is never installed, and an update is installed at the next
+start of the service.
+
+On a computer with network, every request of the service runs on a thread of its own and is
+bounded in time: 10 seconds to resolve the name of the server and to connect to it, including the
+TLS handshake, then 20 seconds without data for the catalog and the feed. The requests of the users
+never wait for the network. When the service stops or goes offline, the transfers in progress stop
+at once and no new connection opens; a connection that httplib is opening ends within its bounds,
+10 seconds for the connection and its TLS handshake and, behind a proxy, the answer of the proxy,
+while the service tells the Windows service manager that its stop goes on.
 
 ## Publishing a version
 
 The feed and the catalog live in [`dist/albireo`](../../../../dist/albireo) of the repository, each
 with a detached signature (ECDSA P-256 over its exact bytes) that the programs check with the public
-key built into [`host/crypto.cpp`](host/crypto.cpp). The private key stays with the publisher.
+key built into [`host/crypto.cpp`](host/crypto.cpp). The private key stays with the publisher. The
+programs travel in the installer, which carries the service, the tray, every engine with the
+runtime libraries of its device, and the web application; the installer of each version is a file
+of the GitHub release `albireo-v<version>`.
+
+[`tools/publish_release.py`](tools/publish_release.py) publishes a version from its installer: it
+checks that the installer carries the version of [`common/version.h`](common/version.h), creates
+the release, attaches the installer, writes the feed with its address, size and SHA-256, signs it
+and checks the signature, then prints the commands that push the feed:
 
 ```
-albireo-sign keygen albireo-feed-signing.key albireo-feed-signing.pub
-python3 dlib/dlib/external/albireo/tools/make_catalog.py dist/albireo/catalog.json
-albireo-sign sign albireo-feed-signing.key dist/albireo/catalog.json
-python3 dlib/dlib/external/albireo/tools/make_feed.py dist/albireo/feed.json 1.0.1 albireo-setup.exe https://github.com/Cydral/Dlib-Transformer-extensions/releases/download/albireo-v1.0.1/albireo-setup-1.0.1.exe notes.json
-albireo-sign sign albireo-feed-signing.key dist/albireo/feed.json
+python3 dlib/dlib/external/albireo/tools/publish_release.py build-albireo/bin/albireo-setup.exe --key ~/keys/albireo-feed-signing.key --notes notes.json
 ```
 
-`keygen` is needed only to replace the key pair; its public key then goes into `host/crypto.cpp`,
-and the programs built afterwards accept only what the new private key signs. The installer of a
-version is attached to a GitHub release, whose assets accept files up to 2 GB; a model published
-outside the hub is cut into parts with [`tools/publish_model.py`](tools/publish_model.py), whose
-output is the `files` of its catalog entry. [`dist/albireo/README.md`](../../../../dist/albireo/README.md)
-gives the steps of a publication.
+The token of GitHub comes from `GITHUB_TOKEN`, `GH_TOKEN` or `gh auth token`. A model published
+outside the hub, a model converted for the engine for instance, is cut into parts of less than
+2 GiB and attached to the release `albireo-models` by [`tools/publish_model.py`](tools/publish_model.py),
+whose output is the entry of the catalog, with the architecture, the parameters and the context
+read from the file:
 
-The version of the programs is in [`common/version.h`](common/version.h); a feed announcing a
-higher version makes the services download the installer, check its size and its SHA-256, and run
-it in update mode at their next start.
+```
+python3 dlib/dlib/external/albireo/tools/publish_model.py model.gguf my-model parts --release albireo-models --gzip
+```
+
+[`dist/albireo/README.md`](../../../../dist/albireo/README.md) gives every step, the catalog
+included. A feed announcing a higher version makes the services download the installer, check its
+size and its SHA-256, and run it in update mode at their next start.
 
 ## Security
 
@@ -362,7 +489,7 @@ it in update mode at their next start.
 | `C:\ProgramData\Albireo\settings.json` | settings                                                     |
 | `C:\ProgramData\Albireo\albireo.db`    | installed models, downloads, usage, catalog                   |
 | `C:\ProgramData\Albireo\models`        | models (or the folder chosen at installation)                |
-| `C:\ProgramData\Albireo\import`        | files imported at the next start                             |
+| `C:\ProgramData\Albireo\import`        | offline bundles and models, installed within a minute        |
 | `C:\ProgramData\Albireo\certificates`  | local authority and certificate of the server                |
 | `C:\ProgramData\Albireo\engine-cache`  | compiled graphs of OpenVINO, file of the extended memory     |
 | `C:\ProgramData\Albireo\logs`          | logs of the service and of the installer                     |

@@ -127,8 +127,23 @@ ALBIREO_ENGINE_EXPORT int ALBIREO_ENGINE_CALL albireo_engine_unload_model(albire
 ALBIREO_ENGINE_EXPORT int ALBIREO_ENGINE_CALL albireo_engine_query(albireo_engine* engine,
     const char* request_json, char* json, size_t capacity, size_t* needed);
 
-/* Submits a generation request (see engine/README.md for its members) and returns at once
-   with its identifier.  Events reach callback, invoked with user, until the final one. */
+/* Submits a request and returns at once with its identifier.  Events reach callback,
+   invoked with user, until the final one.
+
+   A language model takes the members of an OpenAI chat completion request:
+     "model", "messages" (or "prompt", a text read as it is), "tools", "tool_choice",
+     "reasoning" (true or false) or "reasoning_effort" or
+     "chat_template_kwargs":{"enable_thinking"}, "max_tokens" or "max_completion_tokens",
+     "temperature", "top_p", "top_k", "min_p", "presence_penalty", "frequency_penalty",
+     "repeat_penalty", "repeat_last_n", "seed", "stop", "logit_bias".
+   Its events are CONTENT, REASONING, TOOL_CALL and PROGRESS, then DONE.
+
+   An embedding model takes "model", "input" (a text, a list of texts, a list of token
+   identifiers or a list of such lists, 2048 inputs at most) and "dimensions" (0 or absent
+   for the width of the model; otherwise the leading dimensions, normalized again).  Its
+   only event is DONE, whose JSON holds "data":[{"index","embedding"}] with each vector as
+   the base64 form of its little-endian float32 values at unit length, "dimensions",
+   "usage" and "timings"; or ERROR when any input fails. */
 ALBIREO_ENGINE_EXPORT int ALBIREO_ENGINE_CALL albireo_engine_submit(albireo_engine* engine,
     const char* request_json, albireo_event_callback callback, void* user, uint64_t* request_id,
     char* error, size_t error_capacity);
