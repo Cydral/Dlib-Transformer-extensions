@@ -1,0 +1,14 @@
+{
+  "name": "Albireo",
+  "short_name": "Albireo",
+  "description": "Private assistant running on this computer",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0b1022",
+  "theme_color": "#0b1022",
+  "icons": [
+    { "src": "img/albireo-icon.svg", "sizes": "any", "type": "image/svg+xml" },
+    { "src": "img/albireo-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "img/albireo-512.png", "sizes": "512x512", "type": "image/png" }
+  ]
+}

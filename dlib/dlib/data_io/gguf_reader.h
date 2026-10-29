@@ -24,7 +24,10 @@
 #include <vector>
 #include <map>
 #include <fstream>
+#include <istream>
+#include <memory>
 #include <stdexcept>
+#include <streambuf>
 
 namespace dlib
 {
@@ -34,7 +37,7 @@ namespace dlib
         F32 = 0, F16 = 1,
         Q4_0 = 2, Q4_1 = 3, Q5_0 = 6, Q5_1 = 7, Q8_0 = 8, Q8_1 = 9,
         Q2_K = 10, Q3_K = 11, Q4_K = 12, Q5_K = 13, Q6_K = 14, Q8_K = 15,
-        IQ4_NL = 20
+        IQ4_NL = 20, BF16 = 30
     };
 
     // GGUF metadata value types (values match the GGUF specification).
@@ -68,6 +71,7 @@ namespace dlib
         case ggml_type::Q6_K: return { 256, 210 };
         case ggml_type::Q8_K: return { 256, 292 };
         case ggml_type::IQ4_NL: return { 32, 18 };
+        case ggml_type::BF16: return { 1, 2 };
         default:
             throw std::runtime_error("gguf_reader: unsupported ggml type "
                 + std::to_string(static_cast<uint32_t>(t)));
@@ -119,16 +123,52 @@ namespace dlib
             for (uint64_t e : dims) n *= e;
             return n;
         }
-        bool is_quantized() const { return type != ggml_type::F32 && type != ggml_type::F16; }
+        bool is_quantized() const
+        {
+            return type != ggml_type::F32 && type != ggml_type::F16 && type != ggml_type::BF16;
+        }
     };
 
     class gguf_reader
     {
     public:
         explicit gguf_reader(const std::string& path)
-            : in_(path, std::ios::binary)
+            : in_(nullptr)
         {
-            if (!in_) throw std::runtime_error("gguf_reader: cannot open " + path);
+            std::unique_ptr<std::filebuf> file(new std::filebuf);
+            if (!file->open(path, std::ios::in | std::ios::binary))
+                throw std::runtime_error("gguf_reader: cannot open " + path);
+            buf_ = std::move(file);
+            in_.rdbuf(buf_.get());
+            parse();
+        }
+
+        /* Reads a GGUF container held in memory, for instance a file a program mapped
+           into its address space.  The memory must outlive this object, and
+           read_tensor_raw() copies tensors out of it. */
+        gguf_reader(const void* data, uint64_t size)
+            : in_(nullptr)
+        {
+            if (data == nullptr && size != 0)
+                throw std::runtime_error("gguf_reader: null memory block");
+            buf_.reset(new memory_buffer(static_cast<const char*>(data), size));
+            in_.rdbuf(buf_.get());
+            parse();
+        }
+
+        gguf_reader(const gguf_reader&) = delete;
+        gguf_reader& operator=(const gguf_reader&) = delete;
+
+    private:
+
+        void parse()
+        {
+            in_.seekg(0, std::ios::end);
+            const std::streamoff end = in_.tellg();
+            in_.seekg(0, std::ios::beg);
+            if (!in_ || end < 0) throw std::runtime_error("gguf_reader: cannot determine the size of the container");
+            size_ = static_cast<uint64_t>(end);
+            pos_ = 0;
 
             const uint32_t magic = read_raw<uint32_t>();
             if (magic != 0x46554747u /* "GGUF" */)
@@ -141,6 +181,10 @@ namespace dlib
 
             const uint64_t tensor_count = read_raw<uint64_t>();
             const uint64_t kv_count = read_raw<uint64_t>();
+            // Every entry takes several bytes, so counts beyond the size of the container
+            // can only come from a damaged file.
+            if (tensor_count > size_ || kv_count > size_)
+                throw std::runtime_error("gguf_reader: corrupt header (entry counts exceed the file size)");
 
             for (uint64_t k = 0; k < kv_count; ++k)
             {
@@ -159,8 +203,17 @@ namespace dlib
                 gguf_tensor_info info;
                 info.name = read_string();
                 const uint32_t ndim = read_raw<uint32_t>();
+                if (ndim == 0 || ndim > 8)
+                    throw std::runtime_error("gguf_reader: invalid number of dimensions for '" + info.name + "'");
                 info.dims.resize(ndim);
-                for (uint32_t d = 0; d < ndim; ++d) info.dims[d] = read_raw<uint64_t>();
+                uint64_t elements = 1;
+                for (uint32_t d = 0; d < ndim; ++d)
+                {
+                    info.dims[d] = read_raw<uint64_t>();
+                    if (info.dims[d] != 0 && elements > (uint64_t(1) << 60) / info.dims[d])
+                        throw std::runtime_error("gguf_reader: dimensions of '" + info.name + "' overflow");
+                    elements *= info.dims[d];
+                }
                 info.type = static_cast<ggml_type>(read_raw<uint32_t>());
                 info.offset = read_raw<uint64_t>();
 
@@ -173,11 +226,18 @@ namespace dlib
                 tensors_.push_back(std::move(info));
             }
 
-            const std::streampos pos = in_.tellg();
-            data_offset_ = align_up(static_cast<uint64_t>(pos), alignment_);
+            data_offset_ = align_up(pos_, alignment_);
+            for (const auto& t : tensors_)
+                if (t.offset > size_ || t.nbytes > size_ || data_offset_ + t.offset + t.nbytes > size_)
+                    throw std::runtime_error("gguf_reader: tensor '" + t.name + "' lies beyond the end of the file");
         }
 
+    public:
+
         uint32_t version() const { return version_; }
+        uint64_t size() const { return size_; }
+        uint64_t alignment() const { return alignment_; }
+        uint64_t data_offset() const { return data_offset_; }
         const std::map<std::string, gguf_value>& metadata() const { return meta_; }
         const std::vector<gguf_tensor_info>& tensors() const { return tensors_; }
 
@@ -229,16 +289,24 @@ namespace dlib
             T x{};
             in_.read(reinterpret_cast<char*>(&x), sizeof(T));
             if (!in_) throw std::runtime_error("gguf_reader: unexpected end of file");
+            pos_ += sizeof(T);
             return x;
         }
+
+        /* Bytes left after the parsing position, which parse() tracks itself rather than
+           asking the stream for it at every string of the vocabulary. */
+        uint64_t remaining() const { return pos_ > size_ ? 0 : size_ - pos_; }
 
         std::string read_string()
         {
             const uint64_t len = read_raw<uint64_t>();
+            if (len > remaining())
+                throw std::runtime_error("gguf_reader: string length exceeds the file size");
             std::string str;
             str.resize(static_cast<size_t>(len));
             if (len) in_.read(&str[0], static_cast<std::streamsize>(len));
             if (!in_) throw std::runtime_error("gguf_reader: unexpected end of file in string");
+            pos_ += len;
             return str;
         }
 
@@ -272,6 +340,8 @@ namespace dlib
             const gguf_type et = static_cast<gguf_type>(read_raw<uint32_t>());
             const uint64_t n = read_raw<uint64_t>();
             v.array_type = et;
+            if (n > remaining())
+                throw std::runtime_error("gguf_reader: array length exceeds the file size");
 
             if (et == gguf_type::STRING)
             {
@@ -297,7 +367,36 @@ namespace dlib
             return v;
         }
 
-        std::ifstream in_;
+        /* A read-only stream buffer over a block of memory, seekable in both directions. */
+        class memory_buffer : public std::streambuf
+        {
+        public:
+            memory_buffer(const char* data, uint64_t size)
+            {
+                char* p = const_cast<char*>(data);
+                setg(p, p, p + size);
+            }
+        protected:
+            pos_type seekoff(off_type off, std::ios_base::seekdir dir, std::ios_base::openmode) override
+            {
+                char* target = nullptr;
+                if (dir == std::ios_base::beg) target = eback() + off;
+                else if (dir == std::ios_base::cur) target = gptr() + off;
+                else target = egptr() + off;
+                if (target < eback() || target > egptr()) return pos_type(off_type(-1));
+                setg(eback(), target, egptr());
+                return pos_type(target - eback());
+            }
+            pos_type seekpos(pos_type pos, std::ios_base::openmode which) override
+            {
+                return seekoff(off_type(pos), std::ios_base::beg, which);
+            }
+        };
+
+        std::unique_ptr<std::streambuf> buf_;
+        std::istream in_;
+        uint64_t size_ = 0;
+        uint64_t pos_ = 0;
         uint32_t version_ = 0;
         uint64_t alignment_ = 32;
         uint64_t data_offset_ = 0;

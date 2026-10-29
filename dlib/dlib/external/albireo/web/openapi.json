@@ -1,0 +1,1599 @@
+{
+ "openapi": "3.0.3",
+ "info": {
+  "title": "Albireo local interface",
+  "version": "1.0.0",
+  "description": "The interface of the Albireo service, served on https://localhost (port 8443 unless changed in the tray). The routes under /v1 follow the OpenAI interface, so that its client libraries work with base_url https://localhost:8443/v1 and any API key. The functions albireo-general, albireo-code and albireo-security name the models activated in the tray.\n\nThe administration routes require the token of the data folder of the service (admin.token) in the X-Albireo-Admin header.",
+  "license": {
+   "name": "Boost Software License 1.0",
+   "url": "https://www.boost.org/LICENSE_1_0.txt"
+  },
+  "contact": {
+   "name": "Cydral Technology",
+   "url": "https://github.com/Cydral/Dlib-Transformer-extensions"
+  }
+ },
+ "servers": [
+  {
+   "url": "/"
+  }
+ ],
+ "tags": [
+  {
+   "name": "OpenAI",
+   "description": "Compatible with the OpenAI interface"
+  },
+  {
+   "name": "Service",
+   "description": "State of the service"
+  },
+  {
+   "name": "Administration",
+   "description": "Routes of the tray, protected by the administration token"
+  }
+ ],
+ "paths": {
+  "/v1/models": {
+   "get": {
+    "tags": [
+     "OpenAI"
+    ],
+    "summary": "Models of the engine and aliases of the functions",
+    "responses": {
+     "200": {
+      "description": "The models",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ModelList"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/v1/chat/completions": {
+   "post": {
+    "tags": [
+     "OpenAI"
+    ],
+    "summary": "Chat completion, streamed or not",
+    "description": "Compatible with the OpenAI interface. Requests from several clients are computed together. A stream also carries ': progress {...}' comment lines while a long prompt is read.",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/ChatCompletionRequest"
+       }
+      }
+     }
+    },
+    "responses": {
+     "200": {
+      "description": "The completion, or a stream of chunks",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ChatCompletion"
+        }
+       },
+       "text/event-stream": {
+        "schema": {
+         "$ref": "#/components/schemas/ChatCompletionChunk"
+        }
+       }
+      }
+     },
+     "400": {
+      "description": "Invalid request",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "404": {
+      "description": "Unknown or inactive model",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/v1/completions": {
+   "post": {
+    "tags": [
+     "OpenAI"
+    ],
+    "summary": "Text completion of a raw prompt",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/CompletionRequest"
+       }
+      }
+     }
+    },
+    "responses": {
+     "200": {
+      "description": "The completion",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Completion"
+        }
+       }
+      }
+     },
+     "400": {
+      "description": "Invalid request",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "404": {
+      "description": "Unknown or inactive model",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/albireo/v1/status": {
+   "get": {
+    "tags": [
+     "Service"
+    ],
+    "summary": "State of the service, of the engine and of the models",
+    "responses": {
+     "200": {
+      "description": "The state",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/albireo/v1/models": {
+   "get": {
+    "tags": [
+     "Service"
+    ],
+    "summary": "Catalog, installed models, downloads and active models",
+    "parameters": [
+     {
+      "name": "lang",
+      "in": "query",
+      "schema": {
+       "type": "string",
+       "enum": [
+        "en",
+        "fr",
+        "de",
+        "it",
+        "es"
+       ]
+      },
+      "description": "Language of the descriptions."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "The models",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/albireo/v1/usage": {
+   "get": {
+    "tags": [
+     "Service"
+    ],
+    "summary": "Usage per day over 30 days",
+    "responses": {
+     "200": {
+      "description": "The figures",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/albireo/v1/engines": {
+   "get": {
+    "tags": [
+     "Service"
+    ],
+    "summary": "Engines found, their devices and measures",
+    "responses": {
+     "200": {
+      "description": "The engines",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/albireo/v1/updates": {
+   "get": {
+    "tags": [
+     "Service"
+    ],
+    "summary": "State of the updates",
+    "responses": {
+     "200": {
+      "description": "The state",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/albireo/v1/count": {
+   "post": {
+    "tags": [
+     "Service"
+    ],
+    "summary": "Tokens of messages, or of a text, for a model",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "properties": {
+         "model": {
+          "type": "string"
+         },
+         "messages": {
+          "type": "array",
+          "items": {
+           "$ref": "#/components/schemas/Message"
+          }
+         },
+         "tools": {
+          "type": "array",
+          "items": {
+           "$ref": "#/components/schemas/Tool"
+          }
+         },
+         "text": {
+          "type": "string"
+         }
+        }
+       }
+      }
+     }
+    },
+    "responses": {
+     "200": {
+      "description": "The count and the context of the model",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "tokens": {
+           "type": "integer"
+          },
+          "context": {
+           "type": "integer"
+          }
+         }
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/albireo/v1/models/refresh": {
+   "post": {
+    "tags": [
+     "Administration"
+    ],
+    "security": [
+     {
+      "adminToken": []
+     }
+    ],
+    "summary": "Fetches the catalog again",
+    "responses": {
+     "200": {
+      "description": "Result",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "ok": {
+           "type": "boolean"
+          },
+          "error": {
+           "type": "string"
+          }
+         }
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/albireo/v1/models/{id}/download": {
+   "post": {
+    "tags": [
+     "Administration"
+    ],
+    "security": [
+     {
+      "adminToken": []
+     }
+    ],
+    "summary": "Starts or resumes the download of a model",
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string",
+       "pattern": "^[A-Za-z0-9._-]+$"
+      },
+      "description": "Identifier of the model, as listed by /albireo/v1/models."
+     }
+    ],
+    "responses": {
+     "202": {
+      "description": "Started",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "ok": {
+           "type": "boolean"
+          },
+          "error": {
+           "type": "string"
+          }
+         }
+        }
+       }
+      }
+     },
+     "400": {
+      "description": "Refused",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "ok": {
+           "type": "boolean"
+          },
+          "error": {
+           "type": "string"
+          }
+         }
+        }
+       }
+      }
+     }
+    }
+   },
+   "delete": {
+    "tags": [
+     "Administration"
+    ],
+    "security": [
+     {
+      "adminToken": []
+     }
+    ],
+    "summary": "Cancels a download",
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string",
+       "pattern": "^[A-Za-z0-9._-]+$"
+      },
+      "description": "Identifier of the model, as listed by /albireo/v1/models."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "Cancelled",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "ok": {
+           "type": "boolean"
+          },
+          "error": {
+           "type": "string"
+          }
+         }
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/albireo/v1/models/{id}/activate": {
+   "post": {
+    "tags": [
+     "Administration"
+    ],
+    "security": [
+     {
+      "adminToken": []
+     }
+    ],
+    "summary": "Activates a model for a function",
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string",
+       "pattern": "^[A-Za-z0-9._-]+$"
+      },
+      "description": "Identifier of the model, as listed by /albireo/v1/models."
+     }
+    ],
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "properties": {
+         "role": {
+          "type": "string",
+          "enum": [
+           "general",
+           "code",
+           "security"
+          ],
+          "default": "general"
+         }
+        }
+       }
+      }
+     }
+    },
+    "responses": {
+     "200": {
+      "description": "Activated",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "ok": {
+           "type": "boolean"
+          },
+          "error": {
+           "type": "string"
+          }
+         }
+        }
+       }
+      }
+     },
+     "400": {
+      "description": "Refused",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "ok": {
+           "type": "boolean"
+          },
+          "error": {
+           "type": "string"
+          }
+         }
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/albireo/v1/models/{id}/deactivate": {
+   "post": {
+    "tags": [
+     "Administration"
+    ],
+    "security": [
+     {
+      "adminToken": []
+     }
+    ],
+    "summary": "Deactivates a model for every function",
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string",
+       "pattern": "^[A-Za-z0-9._-]+$"
+      },
+      "description": "Identifier of the model, as listed by /albireo/v1/models."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "Deactivated",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "ok": {
+           "type": "boolean"
+          },
+          "error": {
+           "type": "string"
+          }
+         }
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/albireo/v1/models/{id}/verify": {
+   "post": {
+    "tags": [
+     "Administration"
+    ],
+    "security": [
+     {
+      "adminToken": []
+     }
+    ],
+    "summary": "Recomputes the hash of an installed model",
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string",
+       "pattern": "^[A-Za-z0-9._-]+$"
+      },
+      "description": "Identifier of the model, as listed by /albireo/v1/models."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "Result",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/albireo/v1/models/{id}": {
+   "delete": {
+    "tags": [
+     "Administration"
+    ],
+    "security": [
+     {
+      "adminToken": []
+     }
+    ],
+    "summary": "Deletes an installed model",
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string",
+       "pattern": "^[A-Za-z0-9._-]+$"
+      },
+      "description": "Identifier of the model, as listed by /albireo/v1/models."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "Deleted",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "ok": {
+           "type": "boolean"
+          },
+          "error": {
+           "type": "string"
+          }
+         }
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/albireo/v1/models/import": {
+   "post": {
+    "tags": [
+     "Administration"
+    ],
+    "security": [
+     {
+      "adminToken": []
+     }
+    ],
+    "summary": "Imports the GGUF files of a local folder or file",
+    "description": "For an installation without network: a memory card or a disk brought to the machine.",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "required": [
+         "path"
+        ],
+        "properties": {
+         "path": {
+          "type": "string"
+         }
+        }
+       }
+      }
+     }
+    },
+    "responses": {
+     "200": {
+      "description": "Imported files and errors",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/albireo/v1/models/upload": {
+   "post": {
+    "tags": [
+     "Administration"
+    ],
+    "security": [
+     {
+      "adminToken": []
+     }
+    ],
+    "summary": "Installs a GGUF file sent in the body",
+    "parameters": [
+     {
+      "name": "name",
+      "in": "query",
+      "required": true,
+      "schema": {
+       "type": "string"
+      }
+     }
+    ],
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/octet-stream": {
+       "schema": {
+        "type": "string",
+        "format": "binary"
+       }
+      }
+     }
+    },
+    "responses": {
+     "200": {
+      "description": "Imported",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object"
+        }
+       }
+      }
+     },
+     "400": {
+      "description": "Refused",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/albireo/v1/settings": {
+   "get": {
+    "tags": [
+     "Administration"
+    ],
+    "security": [
+     {
+      "adminToken": []
+     }
+    ],
+    "summary": "Settings of the service",
+    "responses": {
+     "200": {
+      "description": "The settings",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object"
+        }
+       }
+      }
+     }
+    }
+   },
+   "put": {
+    "tags": [
+     "Administration"
+    ],
+    "security": [
+     {
+      "adminToken": []
+     }
+    ],
+    "summary": "Changes settings",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/Settings"
+       }
+      }
+     }
+    },
+    "responses": {
+     "200": {
+      "description": "Saved; restart tells whether the service restarts",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/albireo/v1/updates/check": {
+   "post": {
+    "tags": [
+     "Administration"
+    ],
+    "security": [
+     {
+      "adminToken": []
+     }
+    ],
+    "summary": "Checks for an update and downloads it",
+    "responses": {
+     "202": {
+      "description": "State",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/albireo/v1/updates/apply": {
+   "post": {
+    "tags": [
+     "Administration"
+    ],
+    "security": [
+     {
+      "adminToken": []
+     }
+    ],
+    "summary": "Restarts the service to install a downloaded update",
+    "responses": {
+     "202": {
+      "description": "Restarting",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "ok": {
+           "type": "boolean"
+          },
+          "error": {
+           "type": "string"
+          }
+         }
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/albireo/v1/restart": {
+   "post": {
+    "tags": [
+     "Administration"
+    ],
+    "security": [
+     {
+      "adminToken": []
+     }
+    ],
+    "summary": "Restarts the service",
+    "responses": {
+     "202": {
+      "description": "Restarting",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "ok": {
+           "type": "boolean"
+          },
+          "error": {
+           "type": "string"
+          }
+         }
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/albireo/v1/engines/benchmark": {
+   "post": {
+    "tags": [
+     "Administration"
+    ],
+    "security": [
+     {
+      "adminToken": []
+     }
+    ],
+    "summary": "Measures every usable engine on this machine",
+    "responses": {
+     "200": {
+      "description": "The measures",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/albireo/v1/logs": {
+   "get": {
+    "tags": [
+     "Administration"
+    ],
+    "security": [
+     {
+      "adminToken": []
+     }
+    ],
+    "summary": "Last lines of the log",
+    "responses": {
+     "200": {
+      "description": "The lines",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object"
+        }
+       }
+      }
+     }
+    }
+   }
+  }
+ },
+ "components": {
+  "schemas": {
+   "Error": {
+    "type": "object",
+    "properties": {
+     "error": {
+      "type": "object",
+      "properties": {
+       "message": {
+        "type": "string"
+       },
+       "type": {
+        "type": "string"
+       },
+       "param": {
+        "nullable": true
+       },
+       "code": {
+        "type": "string",
+        "nullable": true
+       }
+      }
+     }
+    }
+   },
+   "Message": {
+    "type": "object",
+    "required": [
+     "role"
+    ],
+    "properties": {
+     "role": {
+      "type": "string",
+      "enum": [
+       "system",
+       "developer",
+       "user",
+       "assistant",
+       "tool"
+      ]
+     },
+     "content": {
+      "description": "Text, or a list of parts of type text.",
+      "oneOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "array",
+        "items": {
+         "type": "object"
+        }
+       }
+      ],
+      "nullable": true
+     },
+     "reasoning_content": {
+      "type": "string",
+      "description": "Reasoning of an earlier assistant message."
+     },
+     "tool_calls": {
+      "type": "array",
+      "items": {
+       "$ref": "#/components/schemas/ToolCall"
+      }
+     },
+     "tool_call_id": {
+      "type": "string",
+      "description": "For a tool message: the call it answers."
+     },
+     "name": {
+      "type": "string"
+     }
+    }
+   },
+   "ToolCall": {
+    "type": "object",
+    "properties": {
+     "index": {
+      "type": "integer",
+      "description": "Position of the call, in the chunks of a stream."
+     },
+     "id": {
+      "type": "string"
+     },
+     "type": {
+      "type": "string",
+      "enum": [
+       "function"
+      ]
+     },
+     "function": {
+      "type": "object",
+      "properties": {
+       "name": {
+        "type": "string"
+       },
+       "arguments": {
+        "type": "string",
+        "description": "JSON text."
+       }
+      }
+     }
+    }
+   },
+   "Tool": {
+    "type": "object",
+    "required": [
+     "type",
+     "function"
+    ],
+    "properties": {
+     "type": {
+      "type": "string",
+      "enum": [
+       "function"
+      ]
+     },
+     "function": {
+      "type": "object",
+      "required": [
+       "name"
+      ],
+      "properties": {
+       "name": {
+        "type": "string"
+       },
+       "description": {
+        "type": "string"
+       },
+       "parameters": {
+        "type": "object",
+        "description": "JSON Schema of the arguments."
+       }
+      }
+     }
+    }
+   },
+   "Sampling": {
+    "type": "object",
+    "properties": {
+     "max_tokens": {
+      "type": "integer",
+      "description": "Tokens to generate at most; by default up to the end of the context."
+     },
+     "max_completion_tokens": {
+      "type": "integer"
+     },
+     "temperature": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 2
+     },
+     "top_p": {
+      "type": "number"
+     },
+     "top_k": {
+      "type": "integer"
+     },
+     "min_p": {
+      "type": "number"
+     },
+     "presence_penalty": {
+      "type": "number"
+     },
+     "frequency_penalty": {
+      "type": "number"
+     },
+     "repeat_penalty": {
+      "type": "number"
+     },
+     "repeat_last_n": {
+      "type": "integer"
+     },
+     "seed": {
+      "type": "integer"
+     },
+     "stop": {
+      "oneOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "array",
+        "items": {
+         "type": "string"
+        },
+        "maxItems": 16
+       }
+      ]
+     },
+     "logit_bias": {
+      "type": "object",
+      "additionalProperties": {
+       "type": "number"
+      }
+     }
+    }
+   },
+   "ChatCompletionRequest": {
+    "allOf": [
+     {
+      "$ref": "#/components/schemas/Sampling"
+     },
+     {
+      "type": "object",
+      "required": [
+       "messages"
+      ],
+      "properties": {
+       "model": {
+        "type": "string",
+        "description": "A model identifier, a function (albireo-general, albireo-code, albireo-security) or auto. A function without a model of its own is served by the general model.",
+        "example": "albireo-general"
+       },
+       "messages": {
+        "type": "array",
+        "items": {
+         "$ref": "#/components/schemas/Message"
+        }
+       },
+       "stream": {
+        "type": "boolean",
+        "default": false
+       },
+       "stream_options": {
+        "type": "object",
+        "properties": {
+         "include_usage": {
+          "type": "boolean"
+         }
+        }
+       },
+       "tools": {
+        "type": "array",
+        "items": {
+         "$ref": "#/components/schemas/Tool"
+        }
+       },
+       "tool_choice": {
+        "description": "none disables the tools.",
+        "oneOf": [
+         {
+          "type": "string"
+         },
+         {
+          "type": "object"
+         }
+        ]
+       },
+       "reasoning": {
+        "type": "boolean",
+        "description": "Enables or disables the reasoning of the models that support both modes. The reasoning streams in reasoning_content."
+       },
+       "reasoning_effort": {
+        "type": "string",
+        "enum": [
+         "none",
+         "low",
+         "medium",
+         "high"
+        ]
+       },
+       "chat_template_kwargs": {
+        "type": "object",
+        "properties": {
+         "enable_thinking": {
+          "type": "boolean"
+         }
+        }
+       },
+       "n": {
+        "type": "integer",
+        "enum": [
+         1
+        ]
+       }
+      }
+     }
+    ],
+    "example": {
+     "model": "albireo-general",
+     "messages": [
+      {
+       "role": "user",
+       "content": "Hello!"
+      }
+     ],
+     "max_tokens": 200
+    }
+   },
+   "Usage": {
+    "type": "object",
+    "properties": {
+     "prompt_tokens": {
+      "type": "integer"
+     },
+     "completion_tokens": {
+      "type": "integer"
+     },
+     "total_tokens": {
+      "type": "integer"
+     },
+     "prompt_tokens_details": {
+      "type": "object",
+      "properties": {
+       "cached_tokens": {
+        "type": "integer"
+       }
+      }
+     }
+    }
+   },
+   "Timings": {
+    "type": "object",
+    "properties": {
+     "queued_ms": {
+      "type": "number"
+     },
+     "prompt_ms": {
+      "type": "number"
+     },
+     "generation_ms": {
+      "type": "number"
+     },
+     "prompt_per_second": {
+      "type": "number"
+     },
+     "generation_per_second": {
+      "type": "number"
+     }
+    }
+   },
+   "ChatCompletion": {
+    "type": "object",
+    "properties": {
+     "id": {
+      "type": "string"
+     },
+     "object": {
+      "type": "string",
+      "enum": [
+       "chat.completion"
+      ]
+     },
+     "created": {
+      "type": "integer"
+     },
+     "model": {
+      "type": "string"
+     },
+     "choices": {
+      "type": "array",
+      "items": {
+       "type": "object",
+       "properties": {
+        "index": {
+         "type": "integer"
+        },
+        "message": {
+         "$ref": "#/components/schemas/Message"
+        },
+        "finish_reason": {
+         "type": "string",
+         "enum": [
+          "stop",
+          "length",
+          "tool_calls",
+          "cancelled"
+         ]
+        }
+       }
+      }
+     },
+     "usage": {
+      "$ref": "#/components/schemas/Usage"
+     },
+     "timings": {
+      "$ref": "#/components/schemas/Timings"
+     },
+     "system_fingerprint": {
+      "type": "string"
+     }
+    }
+   },
+   "ChatCompletionChunk": {
+    "type": "object",
+    "description": "One event of a stream (text/event-stream), as 'data: <chunk>' lines ended by 'data: [DONE]'.",
+    "properties": {
+     "id": {
+      "type": "string"
+     },
+     "object": {
+      "type": "string",
+      "enum": [
+       "chat.completion.chunk"
+      ]
+     },
+     "choices": {
+      "type": "array",
+      "items": {
+       "type": "object",
+       "properties": {
+        "index": {
+         "type": "integer"
+        },
+        "delta": {
+         "type": "object",
+         "properties": {
+          "role": {
+           "type": "string"
+          },
+          "content": {
+           "type": "string"
+          },
+          "reasoning_content": {
+           "type": "string"
+          },
+          "tool_calls": {
+           "type": "array",
+           "items": {
+            "$ref": "#/components/schemas/ToolCall"
+           }
+          }
+         }
+        },
+        "finish_reason": {
+         "type": "string",
+         "nullable": true
+        }
+       }
+      }
+     },
+     "usage": {
+      "$ref": "#/components/schemas/Usage"
+     }
+    }
+   },
+   "CompletionRequest": {
+    "allOf": [
+     {
+      "$ref": "#/components/schemas/Sampling"
+     },
+     {
+      "type": "object",
+      "required": [
+       "prompt"
+      ],
+      "properties": {
+       "model": {
+        "type": "string",
+        "example": "albireo-general"
+       },
+       "prompt": {
+        "type": "string"
+       },
+       "stream": {
+        "type": "boolean"
+       }
+      }
+     }
+    ]
+   },
+   "Completion": {
+    "type": "object",
+    "properties": {
+     "id": {
+      "type": "string"
+     },
+     "object": {
+      "type": "string",
+      "enum": [
+       "text_completion"
+      ]
+     },
+     "choices": {
+      "type": "array",
+      "items": {
+       "type": "object",
+       "properties": {
+        "index": {
+         "type": "integer"
+        },
+        "text": {
+         "type": "string"
+        },
+        "finish_reason": {
+         "type": "string"
+        }
+       }
+      }
+     },
+     "usage": {
+      "$ref": "#/components/schemas/Usage"
+     }
+    }
+   },
+   "ModelList": {
+    "type": "object",
+    "properties": {
+     "object": {
+      "type": "string"
+     },
+     "data": {
+      "type": "array",
+      "items": {
+       "type": "object",
+       "properties": {
+        "id": {
+         "type": "string"
+        },
+        "object": {
+         "type": "string"
+        },
+        "owned_by": {
+         "type": "string"
+        },
+        "roles": {
+         "type": "array",
+         "items": {
+          "type": "string"
+         }
+        },
+        "alias_of": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    }
+   },
+   "Settings": {
+    "type": "object",
+    "description": "Settings the tray may change; a change of port, engine or memory restarts the service.",
+    "properties": {
+     "port": {
+      "type": "integer",
+      "minimum": 1024,
+      "maximum": 65535
+     },
+     "language": {
+      "type": "string",
+      "enum": [
+       "auto",
+       "en",
+       "fr",
+       "de",
+       "it",
+       "es"
+      ]
+     },
+     "engine": {
+      "type": "string",
+      "enum": [
+       "auto",
+       "best",
+       "cpu",
+       "cpu-avx2",
+       "openvino",
+       "cuda"
+      ]
+     },
+     "accelerator": {
+      "type": "string",
+      "enum": [
+       "auto",
+       "none",
+       "npu",
+       "gpu",
+       "both"
+      ]
+     },
+     "v2ram": {
+      "type": "boolean",
+      "description": "Extended device memory of the graphics engines."
+     },
+     "v2ram_max_mb": {
+      "type": "integer",
+      "description": "Limit of the extended memory, 0 for automatic."
+     },
+     "threads": {
+      "type": "integer"
+     },
+     "context": {
+      "type": "integer"
+     },
+     "max_sequences": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 64
+     },
+     "kv_mb": {
+      "type": "integer"
+     },
+     "check_updates": {
+      "type": "boolean"
+     },
+     "proxy": {
+      "type": "string",
+      "description": "Proxy of the downloads: empty for the proxy of the system, none for a direct connection, or http://[user:password@]host:port."
+     }
+    }
+   }
+  },
+  "securitySchemes": {
+   "adminToken": {
+    "type": "apiKey",
+    "in": "header",
+    "name": "X-Albireo-Admin"
+   }
+  }
+ }
+}

@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 520">
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0.4" y2="1">
+      <stop offset="0" stop-color="#1c2658"/>
+      <stop offset="0.6" stop-color="#0c1230"/>
+      <stop offset="1" stop-color="#05081a"/>
+    </linearGradient>
+    <radialGradient id="neb" cx="70%" cy="30%" r="70%">
+      <stop offset="0" stop-color="#3d6bff" stop-opacity="0.35"/>
+      <stop offset="1" stop-color="#7c4dff" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="neb2" cx="20%" cy="80%" r="60%">
+      <stop offset="0" stop-color="#f59e1b" stop-opacity="0.25"/>
+      <stop offset="1" stop-color="#f59e1b" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="gold" cx="50%" cy="50%" r="50%">
+      <stop offset="0" stop-color="#fff4d6"/>
+      <stop offset="0.25" stop-color="#ffcf5c"/>
+      <stop offset="0.6" stop-color="#f59e1b" stop-opacity="0.45"/>
+      <stop offset="1" stop-color="#f59e1b" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="blue" cx="50%" cy="50%" r="50%">
+      <stop offset="0" stop-color="#f2f6ff"/>
+      <stop offset="0.28" stop-color="#8fb2ff"/>
+      <stop offset="0.62" stop-color="#3f6dff" stop-opacity="0.45"/>
+      <stop offset="1" stop-color="#3f6dff" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="240" height="520" fill="url(#sky)"/>
+  <rect width="240" height="520" fill="url(#neb)"/>
+  <rect width="240" height="520" fill="url(#neb2)"/>
+  <g fill="#fff">
+    <circle cx="30" cy="40" r="1" opacity="0.7"/><circle cx="200" cy="30" r="1.2" opacity="0.8"/>
+    <circle cx="120" cy="90" r="0.8" opacity="0.5"/><circle cx="60" cy="300" r="1" opacity="0.6"/>
+    <circle cx="210" cy="250" r="0.9" opacity="0.6"/><circle cx="20" cy="420" r="1.1" opacity="0.7"/>
+    <circle cx="170" cy="460" r="0.8" opacity="0.5"/><circle cx="100" cy="500" r="1" opacity="0.6"/>
+    <circle cx="225" cy="380" r="1" opacity="0.6"/><circle cx="80" cy="180" r="0.7" opacity="0.4"/>
+    <circle cx="150" cy="330" r="0.7" opacity="0.4"/><circle cx="40" cy="230" r="0.9" opacity="0.5"/>
+  </g>
+  <ellipse cx="128" cy="168" rx="110" ry="34" transform="rotate(-42 128 168)" fill="none" stroke="#9aa9d6" stroke-opacity="0.28" stroke-width="1.5"/>
+  <circle cx="96" cy="206" r="80" fill="url(#gold)"/>
+  <circle cx="96" cy="206" r="15" fill="#ffd670"/>
+  <circle cx="96" cy="206" r="8" fill="#fff7e2"/>
+  <circle cx="164" cy="126" r="54" fill="url(#blue)"/>
+  <circle cx="164" cy="126" r="9" fill="#a9c3ff"/>
+  <circle cx="164" cy="126" r="5" fill="#f4f8ff"/>
+  <path d="M164 90 L166.4 123.6 L200 126 L166.4 128.4 L164 162 L161.6 128.4 L128 126 L161.6 123.6 Z" fill="#dce7ff" fill-opacity="0.45"/>
+  <text x="120" y="400" text-anchor="middle" font-family="Segoe UI Variable Display, Segoe UI, sans-serif" font-size="34" font-weight="650" fill="#ffffff">Albireo</text>
+  <text x="120" y="428" text-anchor="middle" font-family="Segoe UI, sans-serif" font-size="12.5" fill="#aab2d4">Local intelligence</text>
+  <text x="120" y="490" text-anchor="middle" font-family="Segoe UI, sans-serif" font-size="10.5" fill="#6f789e">Cydral Technology</text>
+</svg>

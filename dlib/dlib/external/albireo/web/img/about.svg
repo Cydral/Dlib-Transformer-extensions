@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 220" role="img" aria-label="Albireo">
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1a2352"/>
+      <stop offset="0.55" stop-color="#0c1230"/>
+      <stop offset="1" stop-color="#05081a"/>
+    </linearGradient>
+    <radialGradient id="nebula" cx="70%" cy="40%" r="60%">
+      <stop offset="0" stop-color="#3d6bff" stop-opacity="0.35"/>
+      <stop offset="0.5" stop-color="#7c4dff" stop-opacity="0.12"/>
+      <stop offset="1" stop-color="#7c4dff" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="nebula2" cx="25%" cy="75%" r="50%">
+      <stop offset="0" stop-color="#f59e1b" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#f59e1b" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="gold" cx="50%" cy="50%" r="50%">
+      <stop offset="0" stop-color="#fff4d6"/>
+      <stop offset="0.25" stop-color="#ffcf5c"/>
+      <stop offset="0.6" stop-color="#f59e1b" stop-opacity="0.45"/>
+      <stop offset="1" stop-color="#f59e1b" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="blue" cx="50%" cy="50%" r="50%">
+      <stop offset="0" stop-color="#f2f6ff"/>
+      <stop offset="0.28" stop-color="#8fb2ff"/>
+      <stop offset="0.62" stop-color="#3f6dff" stop-opacity="0.45"/>
+      <stop offset="1" stop-color="#3f6dff" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="720" height="220" fill="url(#sky)"/>
+  <rect width="720" height="220" fill="url(#nebula)"/>
+  <rect width="720" height="220" fill="url(#nebula2)"/>
+  <g fill="#ffffff">
+    <circle cx="40" cy="30" r="1.1" opacity="0.7"/><circle cx="96" cy="140" r="0.9" opacity="0.5"/>
+    <circle cx="150" cy="60" r="1.3" opacity="0.8"/><circle cx="210" cy="190" r="1" opacity="0.6"/>
+    <circle cx="260" cy="24" r="0.8" opacity="0.5"/><circle cx="318" cy="110" r="1.2" opacity="0.7"/>
+    <circle cx="372" cy="200" r="0.9" opacity="0.5"/><circle cx="420" cy="40" r="1" opacity="0.6"/>
+    <circle cx="470" cy="150" r="0.7" opacity="0.4"/><circle cx="530" cy="18" r="1.2" opacity="0.7"/>
+    <circle cx="610" cy="196" r="1" opacity="0.6"/><circle cx="660" cy="70" r="1.3" opacity="0.8"/>
+    <circle cx="700" cy="150" r="0.8" opacity="0.5"/><circle cx="20" cy="190" r="1" opacity="0.6"/>
+    <circle cx="560" cy="120" r="0.8" opacity="0.5"/><circle cx="120" cy="20" r="0.7" opacity="0.4"/>
+  </g>
+  <ellipse cx="590" cy="112" rx="120" ry="38" transform="rotate(-24 590 112)" fill="none" stroke="#9aa9d6" stroke-opacity="0.25" stroke-width="1.5"/>
+  <circle cx="550" cy="136" r="70" fill="url(#gold)"/>
+  <circle cx="550" cy="136" r="14" fill="#ffd670"/>
+  <circle cx="550" cy="136" r="7.5" fill="#fff7e2"/>
+  <circle cx="650" cy="82" r="50" fill="url(#blue)"/>
+  <circle cx="650" cy="82" r="8.5" fill="#a9c3ff"/>
+  <circle cx="650" cy="82" r="4.6" fill="#f4f8ff"/>
+  <path d="M650 46 L652.3 79.7 L686 82 L652.3 84.3 L650 118 L647.7 84.3 L614 82 L647.7 79.7 Z" fill="#dce7ff" fill-opacity="0.45"/>
+  <text x="44" y="104" font-family="Segoe UI Variable Display, Segoe UI, system-ui, sans-serif" font-size="46" font-weight="650" fill="#ffffff">Albireo</text>
+  <text x="46" y="138" font-family="Segoe UI, system-ui, sans-serif" font-size="16" fill="#aab2d4">Local intelligence, built on Dlib-Transformer-extensions</text>
+  <text x="46" y="164" font-family="Segoe UI, system-ui, sans-serif" font-size="13" fill="#6f789e">β Cygni · a gold and blue double star in the Swan</text>
+</svg>

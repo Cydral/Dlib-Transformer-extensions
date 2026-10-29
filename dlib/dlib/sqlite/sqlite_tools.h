@@ -5,12 +5,28 @@
 
 
 #include "sqlite_tools_abstract.h"
+#include <exception>
 #include "sqlite.h"
 
 // ----------------------------------------------------------------------------------------
 
 namespace dlib
 {
+
+    namespace impl
+    {
+        inline bool exception_in_flight (
+        )
+        {
+#if __cplusplus >= 201703L || (defined(_MSVC_LANG) && _MSVC_LANG >= 201703L)
+            return std::uncaught_exceptions() > 0;
+#else
+            return std::uncaught_exception();
+#endif
+        }
+    }
+
+// ----------------------------------------------------------------------------------------
 
     class transaction : noncopyable
     {
@@ -28,15 +44,29 @@ namespace dlib
         {
             if (!committed)
             {
-                committed = true;
+                // Marked as committed only once the commit succeeded: a commit that throws,
+                // on a busy database for instance, leaves the transaction open, and the
+                // destructor then rolls it back.
                 db.exec("commit");
+                committed = true;
             }
         }
 
         ~transaction() noexcept(false)
         {
             if (!committed)
-                db.exec("rollback");
+            {
+                // A second exception thrown while another one propagates would terminate the
+                // program, so a failed rollback is only reported when nothing else is.
+                if (impl::exception_in_flight())
+                {
+                    try { db.exec("rollback"); } catch (...) {}
+                }
+                else
+                {
+                    db.exec("rollback");
+                }
+            }
         }
 
     private:

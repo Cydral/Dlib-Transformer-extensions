@@ -72,11 +72,17 @@ namespace dlib
             filename = file;
             sqlite3* ptr = 0;
             int status = sqlite3_open(file.c_str(), &ptr);
-            db.reset(ptr, impl::db_deleter());
             if (status != SQLITE_OK)
             {
-                throw sqlite_error(sqlite3_errmsg(db.get()));
+                // sqlite3_open() hands back a connection even when it fails, so that the
+                // reason can be read from it.  It is closed here rather than kept, so that
+                // a failed open leaves this object closed.
+                const std::string message = ptr ? sqlite3_errmsg(ptr) : "unable to allocate a database connection";
+                sqlite3_close(ptr);
+                db.reset();
+                throw sqlite_error(message);
             }
+            db.reset(ptr, impl::db_deleter());
         }
 
         const std::string& get_database_filename (
@@ -165,12 +171,13 @@ namespace dlib
             needs_reset = true;
             if (step_status != SQLITE_DONE && step_status != SQLITE_ROW)
             {
-                if (step_status == SQLITE_ERROR)
-                    throw sqlite_error(sqlite3_errmsg(db.get()));
-                else if (step_status == SQLITE_BUSY)
-                    throw sqlite_error("statement::exec() failed.  SQLITE_BUSY returned");
+                // Statements prepared with sqlite3_prepare_v2() report the specific error
+                // code from sqlite3_step(), a constraint violation or a busy database for
+                // instance, and its message from sqlite3_errmsg().
+                if (step_status == SQLITE_BUSY)
+                    throw sqlite_error(std::string("statement::exec() failed.  SQLITE_BUSY returned: ") + sqlite3_errmsg(db.get()));
                 else
-                    throw sqlite_error("statement::exec() failed.");
+                    throw sqlite_error(sqlite3_errmsg(db.get()));
             }
         }
 
@@ -268,6 +275,9 @@ namespace dlib
             const char* data = static_cast<const char*>(sqlite3_column_blob(stmt, idx));
             const int size = sqlite3_column_bytes(stmt, idx);
 
+            // A NULL column and an empty BLOB both come back as a null pointer.
+            if (data == 0 || size <= 0)
+                return std::vector<char>();
             return std::vector<char>(data, data+size);
         }
 
@@ -287,7 +297,7 @@ namespace dlib
 
             const char* data = static_cast<const char*>(sqlite3_column_blob(stmt, idx));
             const int size = sqlite3_column_bytes(stmt, idx);
-            std::istringstream sin(std::string(data,size));
+            std::istringstream sin((data != 0 && size > 0) ? std::string(data,size) : std::string());
             deserialize(item, sin);
         }
 
@@ -303,9 +313,12 @@ namespace dlib
                         << "\n\t this: " << this
             );
 
+            // sqlite3_column_bytes() is called after sqlite3_column_text() so that it
+            // reports the size of the UTF-8 text, which may contain NUL characters.
             const char* data = reinterpret_cast<const char*>(sqlite3_column_text(stmt, idx));
-            if (data != 0)
-                return std::string(data);
+            const int size = sqlite3_column_bytes(stmt, idx);
+            if (data != 0 && size > 0)
+                return std::string(data, size);
             else
                 return std::string();
         }
@@ -425,7 +438,10 @@ namespace dlib
             );
 
             reset();
-            int status = sqlite3_bind_blob(stmt, parameter_id, &item[0], item.size(), SQLITE_TRANSIENT);
+            // A null pointer given to sqlite3_bind_blob() binds NULL, so an empty vector is
+            // bound as a BLOB of length zero explicitly.
+            int status = item.empty() ? sqlite3_bind_zeroblob(stmt, parameter_id, 0)
+                : sqlite3_bind_blob64(stmt, parameter_id, item.data(), static_cast<sqlite3_uint64>(item.size()), SQLITE_TRANSIENT);
 
             if (status != SQLITE_OK)
             {
@@ -452,7 +468,8 @@ namespace dlib
             std::ostringstream sout;
             serialize(item, sout);
             const std::string& str = sout.str();
-            int status = sqlite3_bind_blob(stmt, parameter_id, str.data(), str.size(), SQLITE_TRANSIENT);
+            int status = str.empty() ? sqlite3_bind_zeroblob(stmt, parameter_id, 0)
+                : sqlite3_bind_blob64(stmt, parameter_id, str.data(), static_cast<sqlite3_uint64>(str.size()), SQLITE_TRANSIENT);
 
             if (status != SQLITE_OK)
             {
@@ -566,7 +583,10 @@ namespace dlib
             );
 
             reset();
-            int status = sqlite3_bind_text(stmt, parameter_id, item.c_str(), -1, SQLITE_TRANSIENT);
+            // The length is given explicitly so that text holding NUL characters is bound
+            // whole rather than cut at the first of them.
+            int status = sqlite3_bind_text64(stmt, parameter_id, item.c_str(), static_cast<sqlite3_uint64>(item.size()),
+                                             SQLITE_TRANSIENT, SQLITE_UTF8);
 
             if (status != SQLITE_OK)
             {

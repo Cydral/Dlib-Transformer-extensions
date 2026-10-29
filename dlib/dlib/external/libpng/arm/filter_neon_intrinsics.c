@@ -1,11 +1,9 @@
-
 /* filter_neon_intrinsics.c - NEON optimised filter functions
  *
- * Copyright (c) 2013 Glenn Randers-Pehrson
+ * Copyright (c) 2018 Cosmin Truta
+ * Copyright (c) 2014,2016 Glenn Randers-Pehrson
  * Written by James Yu <james.yu at linaro.org>, October 2013.
  * Based on filter_neon.S, written by Mans Rullgard, 2011.
- *
- * Last changed in libpng 1.6.7 [November 14, 2013]
  *
  * This code is released under the libpng license.
  * For conditions of distribution and use, see the disclaimer
@@ -14,14 +12,20 @@
 
 #include "../pngpriv.h"
 
-/* This code requires -mfpu=neon on the command line: */
-#if PNG_ARM_NEON_IMPLEMENTATION == 1 /* intrinsics code */
+#ifdef PNG_READ_SUPPORTED
 
-#include <arm_neon.h>
+/* This code requires -mfpu=neon on the command line: */
+#if PNG_ARM_NEON_IMPLEMENTATION == 1 /* intrinsics code from pngpriv.h */
+
+#if defined(_MSC_VER) && !defined(__clang__) && defined(_M_ARM64)
+#  include <arm64_neon.h>
+#else
+#  include <arm_neon.h>
+#endif
 
 /* libpng row pointers are not necessarily aligned to any particular boundary,
  * however this code will only work with appropriate alignment.  arm/arm_init.c
- * checks for this (and will not compile unless it is done), this code uses
+ * checks for this (and will not compile unless it is done). This code uses
  * variants of png_aligncast to avoid compiler warnings.
  */
 #define png_ptr(type,pointer) png_aligncast(type *,pointer)
@@ -31,20 +35,26 @@
  * 'type'.  This is written this way just to hide the GCC strict aliasing
  * warning; note that the code is safe because there never is an alias between
  * the input and output pointers.
+ *
+ * When compiling with MSVC ARM64, the png_ldr macro can't be passed directly
+ * to vst4_lane_u32, because of an internal compiler error inside MSVC.
+ * To avoid this compiler bug, we use a temporary variable (vdest_val) to store
+ * the result of png_ldr.
  */
 #define png_ldr(type,pointer)\
    (temp_pointer = png_ptr(type,pointer), *temp_pointer)
 
-#ifdef PNG_READ_SUPPORTED
 #if PNG_ARM_NEON_OPT > 0
 
 void
 png_read_filter_row_up_neon(png_row_infop row_info, png_bytep row,
-   png_const_bytep prev_row)
+    png_const_bytep prev_row)
 {
    png_bytep rp = row;
    png_bytep rp_stop = row + row_info->rowbytes;
    png_const_bytep pp = prev_row;
+
+   png_debug(1, "in png_read_filter_row_up_neon");
 
    for (; rp < rp_stop; rp += 16, pp += 16)
    {
@@ -59,7 +69,7 @@ png_read_filter_row_up_neon(png_row_infop row_info, png_bytep row,
 
 void
 png_read_filter_row_sub3_neon(png_row_infop row_info, png_bytep row,
-   png_const_bytep prev_row)
+    png_const_bytep prev_row)
 {
    png_bytep rp = row;
    png_bytep rp_stop = row + row_info->rowbytes;
@@ -70,6 +80,8 @@ png_read_filter_row_sub3_neon(png_row_infop row_info, png_bytep row,
 
    uint8x8x4_t vdest;
    vdest.val[3] = vdup_n_u8(0);
+
+   png_debug(1, "in png_read_filter_row_sub3_neon");
 
    for (; rp < rp_stop;)
    {
@@ -104,7 +116,7 @@ png_read_filter_row_sub3_neon(png_row_infop row_info, png_bytep row,
 
 void
 png_read_filter_row_sub4_neon(png_row_infop row_info, png_bytep row,
-   png_const_bytep prev_row)
+    png_const_bytep prev_row)
 {
    png_bytep rp = row;
    png_bytep rp_stop = row + row_info->rowbytes;
@@ -112,18 +124,23 @@ png_read_filter_row_sub4_neon(png_row_infop row_info, png_bytep row,
    uint8x8x4_t vdest;
    vdest.val[3] = vdup_n_u8(0);
 
+   png_debug(1, "in png_read_filter_row_sub4_neon");
+
    for (; rp < rp_stop; rp += 16)
    {
       uint32x2x4_t vtmp = vld4_u32(png_ptr(uint32_t,rp));
       uint8x8x4_t *vrpt = png_ptr(uint8x8x4_t,&vtmp);
       uint8x8x4_t vrp = *vrpt;
       uint32x2x4_t *temp_pointer;
+      uint32x2x4_t vdest_val;
 
       vdest.val[0] = vadd_u8(vdest.val[3], vrp.val[0]);
       vdest.val[1] = vadd_u8(vdest.val[0], vrp.val[1]);
       vdest.val[2] = vadd_u8(vdest.val[1], vrp.val[2]);
       vdest.val[3] = vadd_u8(vdest.val[2], vrp.val[3]);
-      vst4_lane_u32(png_ptr(uint32_t,rp), png_ldr(uint32x2x4_t,&vdest), 0);
+
+      vdest_val = png_ldr(uint32x2x4_t, &vdest);
+      vst4_lane_u32(png_ptr(uint32_t,rp), vdest_val, 0);
    }
 
    PNG_UNUSED(prev_row)
@@ -131,7 +148,7 @@ png_read_filter_row_sub4_neon(png_row_infop row_info, png_bytep row,
 
 void
 png_read_filter_row_avg3_neon(png_row_infop row_info, png_bytep row,
-   png_const_bytep prev_row)
+    png_const_bytep prev_row)
 {
    png_bytep rp = row;
    png_const_bytep pp = prev_row;
@@ -146,6 +163,8 @@ png_read_filter_row_avg3_neon(png_row_infop row_info, png_bytep row,
    vtmp = vld1q_u8(rp);
    vrpt = png_ptr(uint8x8x2_t,&vtmp);
    vrp = *vrpt;
+
+   png_debug(1, "in png_read_filter_row_avg3_neon");
 
    for (; rp < rp_stop; pp += 12)
    {
@@ -197,7 +216,7 @@ png_read_filter_row_avg3_neon(png_row_infop row_info, png_bytep row,
 
 void
 png_read_filter_row_avg4_neon(png_row_infop row_info, png_bytep row,
-   png_const_bytep prev_row)
+    png_const_bytep prev_row)
 {
    png_bytep rp = row;
    png_bytep rp_stop = row + row_info->rowbytes;
@@ -206,12 +225,15 @@ png_read_filter_row_avg4_neon(png_row_infop row_info, png_bytep row,
    uint8x8x4_t vdest;
    vdest.val[3] = vdup_n_u8(0);
 
+   png_debug(1, "in png_read_filter_row_avg4_neon");
+
    for (; rp < rp_stop; rp += 16, pp += 16)
    {
       uint32x2x4_t vtmp;
       uint8x8x4_t *vrpt, *vppt;
       uint8x8x4_t vrp, vpp;
       uint32x2x4_t *temp_pointer;
+      uint32x2x4_t vdest_val;
 
       vtmp = vld4_u32(png_ptr(uint32_t,rp));
       vrpt = png_ptr(uint8x8x4_t,&vtmp);
@@ -229,7 +251,8 @@ png_read_filter_row_avg4_neon(png_row_infop row_info, png_bytep row,
       vdest.val[3] = vhadd_u8(vdest.val[2], vpp.val[3]);
       vdest.val[3] = vadd_u8(vdest.val[3], vrp.val[3]);
 
-      vst4_lane_u32(png_ptr(uint32_t,rp), png_ldr(uint32x2x4_t,&vdest), 0);
+      vdest_val = png_ldr(uint32x2x4_t, &vdest);
+      vst4_lane_u32(png_ptr(uint32_t,rp), vdest_val, 0);
    }
 }
 
@@ -262,7 +285,7 @@ paeth(uint8x8_t a, uint8x8_t b, uint8x8_t c)
 
 void
 png_read_filter_row_paeth3_neon(png_row_infop row_info, png_bytep row,
-   png_const_bytep prev_row)
+    png_const_bytep prev_row)
 {
    png_bytep rp = row;
    png_const_bytep pp = prev_row;
@@ -278,6 +301,8 @@ png_read_filter_row_paeth3_neon(png_row_infop row_info, png_bytep row,
    vtmp = vld1q_u8(rp);
    vrpt = png_ptr(uint8x8x2_t,&vtmp);
    vrp = *vrpt;
+
+   png_debug(1, "in png_read_filter_row_paeth3_neon");
 
    for (; rp < rp_stop; pp += 12)
    {
@@ -328,7 +353,7 @@ png_read_filter_row_paeth3_neon(png_row_infop row_info, png_bytep row,
 
 void
 png_read_filter_row_paeth4_neon(png_row_infop row_info, png_bytep row,
-   png_const_bytep prev_row)
+    png_const_bytep prev_row)
 {
    png_bytep rp = row;
    png_bytep rp_stop = row + row_info->rowbytes;
@@ -338,12 +363,15 @@ png_read_filter_row_paeth4_neon(png_row_infop row_info, png_bytep row,
    uint8x8x4_t vdest;
    vdest.val[3] = vdup_n_u8(0);
 
+   png_debug(1, "in png_read_filter_row_paeth4_neon");
+
    for (; rp < rp_stop; rp += 16, pp += 16)
    {
       uint32x2x4_t vtmp;
       uint8x8x4_t *vrpt, *vppt;
       uint8x8x4_t vrp, vpp;
       uint32x2x4_t *temp_pointer;
+      uint32x2x4_t vdest_val;
 
       vtmp = vld4_u32(png_ptr(uint32_t,rp));
       vrpt = png_ptr(uint8x8x4_t,&vtmp);
@@ -363,10 +391,11 @@ png_read_filter_row_paeth4_neon(png_row_infop row_info, png_bytep row,
 
       vlast = vpp.val[3];
 
-      vst4_lane_u32(png_ptr(uint32_t,rp), png_ldr(uint32x2x4_t,&vdest), 0);
+      vdest_val = png_ldr(uint32x2x4_t, &vdest);
+      vst4_lane_u32(png_ptr(uint32_t,rp), vdest_val, 0);
    }
 }
 
 #endif /* PNG_ARM_NEON_OPT > 0 */
-#endif /* PNG_READ_SUPPORTED */
 #endif /* PNG_ARM_NEON_IMPLEMENTATION == 1 (intrinsics) */
+#endif /* READ */

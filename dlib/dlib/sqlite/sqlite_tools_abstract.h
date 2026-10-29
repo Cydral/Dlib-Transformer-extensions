@@ -34,22 +34,31 @@ namespace dlib
         );
         /*!
             ensures
-                - if (commit() hasn't already been called) then
+                - if (commit() hasn't already succeeded) then
                     - Commits all changes made during this database transaction.
                     - In particular, performs: db.exec("commit");
                 - else
                     - does nothing
+            throws
+                - sqlite_error
+                    If the commit fails, the transaction stays uncommitted and the
+                    destructor rolls it back.
         !*/
 
         ~transaction(
         );
         /*!
             ensures
-                - if (commit() was never called) then
+                - if (commit() never succeeded) then
                     - rolls back any changes made to the database during this transaction.
                     - In particular, performs: db.exec("rollback");
                 - else
                     - does nothing
+            throws
+                - sqlite_error
+                    If the rollback fails.  When the destructor runs because another
+                    exception propagates, a failed rollback is not reported, since a
+                    second exception would terminate the program.
         !*/
 
     };

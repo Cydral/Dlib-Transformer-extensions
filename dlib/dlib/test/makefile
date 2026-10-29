@@ -70,6 +70,7 @@ SRC += geometry.cpp
 SRC += graph.cpp
 SRC += graph_cuts.cpp
 SRC += graph_labeler.cpp
+SRC += httplib.cpp
 SRC += hash.cpp
 SRC += hash_map.cpp
 SRC += hash_set.cpp
@@ -136,6 +137,7 @@ SRC += sockets2.cpp
 SRC += sockets.cpp
 SRC += sockstreambuf.cpp
 SRC += sparse_vector.cpp
+SRC += sqlite.cpp
 SRC += stack.cpp
 SRC += static_map.cpp
 SRC += static_set.cpp
@@ -159,15 +161,30 @@ SRC += type_safe_union.cpp
 SRC += vectorstream.cpp
 
 
+# The SQLite amalgamation bundled with dlib, compiled as C with the definitions listed in
+# ../external/sqlite/README.txt.
+SQLITE_DEFS = -DSQLITE_THREADSAFE=1 -DSQLITE_DQS=0 -DSQLITE_DEFAULT_MEMSTATUS=0 \
+              -DSQLITE_DEFAULT_WAL_SYNCHRONOUS=1 -DSQLITE_LIKE_DOESNT_MATCH_BLOBS \
+              -DSQLITE_TEMP_STORE=2 -DSQLITE_SECURE_DELETE -DSQLITE_ENABLE_API_ARMOR \
+              -DSQLITE_ENABLE_FTS5 -DSQLITE_ENABLE_MATH_FUNCTIONS -DSQLITE_OMIT_LOAD_EXTENSION
+SRC += ../external/sqlite/sqlite3.c
+CPPFLAGS += -I../external/sqlite
+LFLAGS += -lm
+
 ####################################################
 
 TMP = $(SRC:.cpp=.o)
 OBJ = $(TMP:.c=.o)
 
+
 $(TARGET): $(OBJ) 
 	@echo Linking $@
 	@$(CXX) $(LDFLAGS) $(OBJ) $(LFLAGS) -o $@
 	@echo Build Complete
+
+../external/sqlite/sqlite3.o: ../external/sqlite/sqlite3.c
+	@echo Compiling $<
+	@$(CC) -c -O2 $(SQLITE_DEFS) $< -o $@
 
 clean:
 	@rm -f $(OBJ) $(TARGET)

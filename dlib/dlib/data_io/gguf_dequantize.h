@@ -7,7 +7,7 @@
 // Matrix transposition, RoPE head permutation and fused packing for the Dlib layers are
 // the repacking stage's responsibility, not this one.
 //
-// Supported now: F32, F16, the legacy blocks (Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1), the
+// Supported now: F32, F16, BF16, the legacy blocks (Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1), the
 // k-quants (Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K) and IQ4_NL (4-bit with a fixed non-linear
 // value table, used as the fallback when a row is not a multiple of the k-quant super-block).
 // The _S/_M/_L mixes (e.g. Q4_K_M) are not tensor types: each tensor in such a file already
@@ -379,6 +379,21 @@ namespace dlib
         case ggml_type::Q6_K: gguf_dq_blocks(t, raw, out, 256, 210, gguf_dq_q6_K); break;
         case ggml_type::Q8_K: gguf_dq_blocks(t, raw, out, 256, 292, gguf_dq_q8_K); break;
         case ggml_type::IQ4_NL: gguf_dq_blocks(t, raw, out, 32, 18, gguf_dq_iq4_nl); break;
+        case ggml_type::BF16:
+        {
+            if (raw.size() < n * 2) throw std::runtime_error("gguf_dequantize: short BF16 buffer for '" + t.name + "'");
+            const uint8_t* p = raw.data();
+            for (uint64_t i = 0; i < n; ++i)
+            {
+                uint16_t h;
+                std::memcpy(&h, p + i * 2, 2);
+                const uint32_t bits = static_cast<uint32_t>(h) << 16;
+                float f;
+                std::memcpy(&f, &bits, sizeof(f));
+                out[static_cast<size_t>(i)] = f;
+            }
+            break;
+        }
         default:
             throw std::runtime_error("gguf_dequantize: ggml type not yet supported: "
                 + std::to_string(static_cast<uint32_t>(t.type)));

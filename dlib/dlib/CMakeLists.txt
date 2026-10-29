@@ -177,6 +177,10 @@ if (NOT TARGET dlib)
       "Disable this if you don't want to link against libjxl" )
    set (DLIB_LINK_WITH_SQLITE3_STR
       "Disable this if you don't want to link against sqlite3" )
+   set (DLIB_USE_SYSTEM_SQLITE3_STR
+      "Enable this to link against the sqlite3 library of the system rather than compile the copy in dlib/external/sqlite" )
+   set (DLIB_HTTPLIB_TLS_STR
+      "Disable this if programs using the dlib::httplib target should not get HTTPS through the Mbed TLS copy in dlib/external/mbedtls" )
    #set (DLIB_USE_FFTW_STR "Disable this if you don't want to link against fftw" )
    set (DLIB_USE_MKL_FFT_STR
       "Disable this is you don't want to use the MKL DFTI FFT implementation" )
@@ -194,6 +198,8 @@ if (NOT TARGET dlib)
    toggle_preprocessor_switch(DLIB_ENABLE_STACK_TRACE)
    option(DLIB_USE_MKL_SEQUENTIAL ${DLIB_USE_MKL_SEQUENTIAL_STR} OFF)
    option(DLIB_USE_MKL_WITH_TBB ${DLIB_USE_MKL_WITH_TBB_STR} OFF)
+   option(DLIB_USE_SYSTEM_SQLITE3 ${DLIB_USE_SYSTEM_SQLITE3_STR} OFF)
+   option(DLIB_HTTPLIB_TLS ${DLIB_HTTPLIB_TLS_STR} ON)
 
    if(DLIB_ENABLE_ASSERTS)
       # Set these variables so they are set in the config.h.in file when dlib
@@ -804,17 +810,33 @@ if (NOT TARGET dlib)
       toggle_preprocessor_switch(DLIB_USE_NPU)
 
 
+      set(dlib_bundled_sqlite3 OFF)
       if (DLIB_LINK_WITH_SQLITE3)
-         find_library(sqlite sqlite3)
-         # make sure sqlite3.h is in the include path
-         find_path(sqlite_path sqlite3.h)
-         if (sqlite AND sqlite_path)
-            list (APPEND dlib_needed_public_includes ${sqlite_path})
-            list (APPEND dlib_needed_public_libraries ${sqlite} )
-         else()
-            set(DLIB_LINK_WITH_SQLITE3 OFF CACHE STRING ${DLIB_LINK_WITH_SQLITE3_STR} FORCE )
+         set(dlib_bundled_sqlite3 ON)
+         if (DLIB_USE_SYSTEM_SQLITE3)
+            find_library(sqlite sqlite3)
+            # make sure sqlite3.h is in the include path
+            find_path(sqlite_path sqlite3.h)
+            if (sqlite AND sqlite_path)
+               list (APPEND dlib_needed_public_includes ${sqlite_path})
+               list (APPEND dlib_needed_public_libraries ${sqlite} )
+               set(dlib_bundled_sqlite3 OFF)
+            else()
+               message(STATUS "No system copy of sqlite3 found, using the copy in dlib/external/sqlite")
+            endif()
+            mark_as_advanced(sqlite sqlite_path)
          endif()
-         mark_as_advanced(sqlite sqlite_path)
+         if (dlib_bundled_sqlite3)
+            # Compile the SQLite amalgamation into dlib.  The definitions are documented in
+            # external/sqlite/README.txt.
+            set(source_files ${source_files} external/sqlite/sqlite3.c)
+            set_source_files_properties(external/sqlite/sqlite3.c PROPERTIES
+               COMPILE_DEFINITIONS "SQLITE_THREADSAFE=1;SQLITE_DQS=0;SQLITE_DEFAULT_MEMSTATUS=0;SQLITE_DEFAULT_WAL_SYNCHRONOUS=1;SQLITE_LIKE_DOESNT_MATCH_BLOBS;SQLITE_TEMP_STORE=2;SQLITE_SECURE_DELETE;SQLITE_ENABLE_API_ARMOR;SQLITE_ENABLE_FTS5;SQLITE_ENABLE_MATH_FUNCTIONS;SQLITE_OMIT_LOAD_EXTENSION")
+            if (UNIX)
+               # The mathematical SQL functions call the C math library.
+               list (APPEND dlib_needed_private_libraries m)
+            endif()
+         endif()
       endif()
 
 
@@ -859,6 +881,13 @@ if (NOT TARGET dlib)
       PUBLIC ${dlib_needed_public_includes}
       PRIVATE ${dlib_needed_private_includes}
       )
+   if (dlib_bundled_sqlite3)
+      # The bundled sqlite3.h must be found by #include <sqlite3.h> wherever dlib/sqlite.h is
+      # used, in the build tree as after an install.
+      target_include_directories(dlib PUBLIC
+         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/external/sqlite>
+         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/dlib/external/sqlite>)
+   endif()
    target_link_libraries(dlib PUBLIC ${dlib_needed_public_libraries} ${dlib_needed_public_ldflags})
    target_link_libraries(dlib PRIVATE ${dlib_needed_private_libraries})
    target_compile_options(dlib PUBLIC ${dlib_needed_public_cflags})
@@ -919,6 +948,57 @@ if (NOT TARGET dlib)
          $<$<AND:$<CXX_COMPILER_ID:GNU>,$<VERSION_LESS:$<CXX_COMPILER_VERSION>,9.1>>:stdc++fs>)
    endif()
 
+   # HTTP and HTTPS through the cpp-httplib header in external/httplib.  A program links the
+   # dlib::httplib target and includes <dlib/external/httplib/httplib.h>; the target carries
+   # the definitions and libraries the header needs, TLS included, so that every program
+   # configures it the same way.  In a project build, the Mbed TLS copy is only compiled
+   # when a program links the target.
+   if (NOT TARGET dlib_httplib)
+      add_library(dlib_httplib INTERFACE)
+      if (WIN32)
+         # cpp-httplib supports Windows 10 and later, and refuses an older target.
+         target_compile_definitions(dlib_httplib INTERFACE _WIN32_WINNT=0x0A00)
+         target_link_libraries(dlib_httplib INTERFACE ws2_32 crypt32)
+      else()
+         find_package(Threads REQUIRED)
+         target_link_libraries(dlib_httplib INTERFACE Threads::Threads)
+      endif()
+
+      if (DLIB_HTTPLIB_TLS)
+         file(GLOB dlib_mbedtls_sources ${CMAKE_CURRENT_SOURCE_DIR}/external/mbedtls/library/*.c)
+         if (DLIB_IN_PROJECT_BUILD)
+            add_library(dlib_mbedtls STATIC EXCLUDE_FROM_ALL ${dlib_mbedtls_sources}
+               external/mbedtls/dlib_config/dlib_mbedtls_threading_win32.c)
+         else()
+            add_library(dlib_mbedtls STATIC ${dlib_mbedtls_sources}
+               external/mbedtls/dlib_config/dlib_mbedtls_threading_win32.c)
+         endif()
+         set_target_properties(dlib_mbedtls PROPERTIES POSITION_INDEPENDENT_CODE ON C_STANDARD 99)
+         target_include_directories(dlib_mbedtls
+            PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/external/mbedtls/include>
+            PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/external/mbedtls/dlib_config>
+            PUBLIC $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/dlib/external/mbedtls/include>
+            PUBLIC $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/dlib/external/mbedtls/dlib_config>
+            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/external/mbedtls/library)
+         # Every translation unit that includes an Mbed TLS header must see the configuration
+         # the library was compiled with, see external/mbedtls/README.txt.
+         target_compile_definitions(dlib_mbedtls PUBLIC "MBEDTLS_USER_CONFIG_FILE=\"dlib_mbedtls_config.h\"")
+         if (WIN32)
+            target_link_libraries(dlib_mbedtls PUBLIC bcrypt ws2_32)
+         else()
+            find_package(Threads REQUIRED)
+            target_link_libraries(dlib_mbedtls PUBLIC Threads::Threads)
+         endif()
+         target_link_libraries(dlib_httplib INTERFACE dlib_mbedtls)
+         target_compile_definitions(dlib_httplib INTERFACE CPPHTTPLIB_MBEDTLS_SUPPORT)
+      endif()
+      set_target_properties(dlib_httplib PROPERTIES EXPORT_NAME httplib)
+      if (TARGET dlib_mbedtls)
+         set_target_properties(dlib_mbedtls PROPERTIES EXPORT_NAME mbedtls)
+      endif()
+      add_library(dlib::httplib ALIAS dlib_httplib)
+   endif()
+
    # Install the library
    if (NOT DLIB_IN_PROJECT_BUILD)
       string (REPLACE ";" " " pkg_config_dlib_needed_libraries "${dlib_needed_public_libraries}")
@@ -926,6 +1006,9 @@ if (NOT TARGET dlib)
       foreach (ITR ${dlib_needed_public_includes})
          set (pkg_config_dlib_needed_includes "${pkg_config_dlib_needed_includes} -I${ITR}")
       endforeach()
+      if (dlib_bundled_sqlite3)
+         set (pkg_config_dlib_needed_includes "${pkg_config_dlib_needed_includes} -I${CMAKE_INSTALL_FULL_INCLUDEDIR}/dlib/external/sqlite")
+      endif()
       set_target_properties(dlib PROPERTIES
          VERSION ${VERSION})
       install(TARGETS dlib
@@ -933,6 +1016,12 @@ if (NOT TARGET dlib)
          RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} # Windows considers .dll to be runtime artifacts
          LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
          ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+      install(TARGETS dlib_httplib EXPORT dlib)
+      if (TARGET dlib_mbedtls)
+         install(TARGETS dlib_mbedtls
+            EXPORT dlib
+            ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+      endif()
 
       install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/dlib
          FILES_MATCHING 

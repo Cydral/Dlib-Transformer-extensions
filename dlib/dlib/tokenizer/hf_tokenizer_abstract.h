@@ -38,12 +38,17 @@ namespace dlib
                     fallback for characters that are not in the vocabulary. encode and decode
                     are exact.
 
-                  - Byte-level BPE (kind::bpe): used by Llama 3, Qwen2 and GPT-2/NeoX-style
-                    models. decode is exact. encode applies the BPE merge rules exactly, but
-                    the pre-tokenization step is an ASCII-correct approximation of the GPT-2
-                    pre-tokenizer. Byte-exact parity for a specific model requires that
-                    model's own pre-tokenizer regular expression, which is reported by
-                    pretokenizer() but not yet branched on.
+                  - Byte-level BPE (kind::bpe): used by Llama 3, Qwen, Mistral (tekken),
+                    Granite, SmolLM and GPT-2/NeoX-style models. decode is exact. encode
+                    applies the pre-tokenizer of the vocabulary, selected by the name the
+                    GGUF container reports (tokenizer.ggml.pre), then the BPE merges in rank
+                    order. The pre-tokenizers of the gpt2, llama3, qwen2, qwen35 and tekken
+                    families, and gpt2 with isolated digits, are exact equivalents of their
+                    regular expressions, Unicode classes included; an unknown name receives
+                    the qwen2 pattern and exact_pretokenizer() returns false. The Qwen
+                    vocabularies also receive the canonical composition (NFC) their reference
+                    tokenizer applies, and the llama3 and tekken ones take a piece that is a
+                    token as a whole (ignore_merges).
 
                 Special tokens (those flagged as control or user-defined in the vocabulary,
                 such as begin/end-of-sequence or chat-template markers) are recognized inside
@@ -198,6 +203,48 @@ namespace dlib
             ensures
                 - returns the name of the byte-level BPE pre-tokenizer reported by the source
                   vocabulary, or an empty string if none was provided. Informational only.
+        !*/
+
+        bool exact_pretokenizer(
+        ) const;
+        /*!
+            ensures
+                - returns false when the byte-level pre-tokenizer named by pretokenizer() is
+                  not one this object reproduces exactly, so that encode() approximates it
+                  with the qwen2 pattern. Always true for SentencePiece.
+        !*/
+
+        int token_type(
+            int id
+        ) const;
+        /*!
+            ensures
+                - returns the token_type of token id, or TT_UNDEFINED when id is outside
+                  [0, size()).
+        !*/
+
+        int token_id(
+            const std::string& piece
+        ) const;
+        /*!
+            ensures
+                - returns the id of the token whose vocabulary string is piece, or -1. The
+                  string is given as stored, for example "<|im_end|>" or "[INST]".
+        !*/
+
+        std::string token_bytes(
+            int id
+        ) const;
+        /*!
+            ensures
+                - returns the bytes token id stands for: the byte of a byte token, the text
+                  of a control or user-defined token as written, and otherwise its
+                  vocabulary string with the SentencePiece meta-space turned into a space or
+                  the byte-level remapping undone. No leading space is removed.
+                - Concatenating token_bytes() over a sequence gives decode(ids, false)
+                  except for the leading space decode() drops for SentencePiece, which is
+                  what streaming a generation one token at a time needs.
+                - returns an empty string when id is outside [0, size()).
         !*/
 
         const std::string& id_to_token(

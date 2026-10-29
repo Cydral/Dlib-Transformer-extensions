@@ -168,6 +168,14 @@ add_executable(${target_name} main.cpp tester.cpp
    scope.cpp
 )
 
+if (DLIB_LINK_WITH_SQLITE3)
+   target_sources(${target_name} PRIVATE sqlite.cpp)
+endif()
+
+# cpp-httplib in dlib/external/httplib, with HTTPS when DLIB_HTTPLIB_TLS is ON.
+target_sources(${target_name} PRIVATE httplib.cpp)
+target_link_libraries(${target_name} dlib::httplib)
+
 get_filename_component(DLIB_FFMPEG_DATA ${CMAKE_SOURCE_DIR}/ffmpeg_data/details.cfg REALPATH)
 target_compile_definitions(${target_name} PRIVATE DLIB_FFMPEG_DATA="${DLIB_FFMPEG_DATA}")
 

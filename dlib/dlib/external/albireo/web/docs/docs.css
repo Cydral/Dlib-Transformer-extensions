@@ -1,0 +1,12 @@
+/* Copyright (C) 2026 Cydral Technology (cydraltechnology@gmail.com)
+   License: Boost Software License   See LICENSE.txt for the full license. */
+body { margin: 0; background: #fafbfe; }
+.albireo-head {
+  display: flex; align-items: center; gap: 10px; padding: 12px 24px;
+  background: linear-gradient(135deg, #1a2352, #0b1022); color: #fff;
+  font: 600 18px "Segoe UI", system-ui, sans-serif;
+}
+.albireo-head img { width: 30px; height: 30px; }
+.albireo-head a { margin-left: auto; color: #aab2d4; font-size: 13px; font-weight: 400; text-decoration: none; }
+.albireo-head a:hover { color: #fff; }
+.swagger-ui .topbar { display: none; }

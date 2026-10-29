@@ -14,6 +14,7 @@
 #include <stdexcept>
 
 #include "hf_tokenizer_abstract.h"
+#include "hf_unicode.h"
 #include "../data_io/gguf_reader.h"
 #include "../serialize.h"
 
@@ -70,6 +71,414 @@ namespace dlib
                 o.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
             }
             return o;
+        }
+
+        // ------------------------------------------------------------------------------------
+        //                                  Pre-tokenizers
+        // ------------------------------------------------------------------------------------
+
+        /*  The pre-tokenizers of the byte-level BPE vocabularies, each the hand-written
+            equivalent of the regular expression its vocabulary was trained with: the
+            alternatives are tried in their order at the current position and the first
+            that matches consumes its piece, with the backtracking of the greedy
+            quantifiers reproduced where it changes the result.  Each one is checked
+            against the expression itself in dlib/test/tokenizer.cpp.  */
+        enum class pre_family
+        {
+            gpt2,         // 's|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+
+            gpt2_digits,  // \p{N} isolated first, then gpt2 (StarCoder, SmolLM, Granite 3)
+            llama3,       // (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
+            qwen2,        // the same with \p{N} one digit at a time (Qwen 2 and 3)
+            qwen35,       // qwen2 with the marks \p{M} taken as letters (Qwen 3.5)
+            tekken        // [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|
+                          // [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|
+                          // \p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+  (Mistral)
+        };
+
+        /*  The family of a tokenizer.ggml.pre name.  exact is false for the names this
+            file does not know, which receive the qwen2 pattern, the closest to most
+            modern vocabularies.  */
+        inline pre_family pre_family_of(const std::string& pre, bool& exact)
+        {
+            exact = true;
+            if (pre == "qwen2" || pre == "stablelm2" || pre == "hunyuan" || pre == "solar-open" ||
+                pre == "grok-2" || pre == "laguna")
+                return pre_family::qwen2;
+            if (pre == "qwen35")
+                return pre_family::qwen35;
+            if (pre == "llama3" || pre == "llama-v3" || pre == "llama-bpe" || pre == "falcon3" ||
+                pre == "falcon-h1" || pre == "midm-2.0" || pre == "lfm2" || pre == "dbrx" ||
+                pre == "smaug-bpe" || pre == "chatglm-bpe" || pre == "jina-v5-nano")
+                return pre_family::llama3;
+            if (pre == "tekken")
+                return pre_family::tekken;
+            if (pre == "smollm" || pre == "starcoder" || pre == "command-r" || pre == "codeshell" ||
+                pre == "exaone" || pre == "minerva")
+                return pre_family::gpt2_digits;
+            /* "refact" is the name the conversion tools give to the vocabulary of the
+               Granite 3 models, whose reference tokenizer applies the plain gpt2 pattern
+               (its vocabulary holds no merge of digits, so isolating them changes nothing
+               but the attachment of a space to the other numerals, such as "½"). */
+            if (pre == "gpt-2" || pre == "gpt2" || pre == "phi-2" || pre == "olmo" || pre == "mpt" ||
+                pre == "jais" || pre == "trillion" || pre == "granite-docling" || pre == "refact")
+                return pre_family::gpt2;
+            exact = false;
+            if (pre.empty() || pre == "default") return pre_family::gpt2;
+            return pre_family::qwen2;
+        }
+
+        /*  Whether the reference tokenizer of a byte-level vocabulary normalizes its
+            input to the canonical composition (NFC): the Qwen family.  */
+        inline bool pre_normalizes_nfc(const std::string& pre)
+        {
+            return pre == "qwen2" || pre == "qwen35";
+        }
+
+        /*  The canonical composition of text: a decomposed character, such as a letter
+            followed by a combining accent, becomes the precomposed character the
+            vocabulary was built from.  The text is returned unchanged when it holds no
+            code point at or above U+0300, which is the case of nearly every input.
+            Otherwise the combining marks are put in canonical order and composed with
+            the character they follow, under the blocking rule of the standard; the
+            precomposed characters of the input are not decomposed first, which only
+            matters when they are followed by further marks.  Bytes that are not valid
+            UTF-8 are kept as they are.  */
+        inline std::string nfc_compose(const std::string& text)
+        {
+            bool needed = false;
+            for (unsigned char c : text)
+                if (c >= 0xCC) { needed = true; break; }
+            if (!needed) return text;
+
+            struct unit { uint32_t cp; unsigned cc; std::string bytes; };
+            const uint32_t invalid = 0xFFFFFFFFu;
+            std::vector<unit> units;
+            for (size_t i = 0; i < text.size();)
+            {
+                const unsigned char lead = static_cast<unsigned char>(text[i]);
+                const size_t len = static_cast<size_t>(utf8_char_len(lead));
+                bool valid = (lead < 0x80 || len > 1) && i + len <= text.size();
+                for (size_t k = 1; valid && k < len; ++k)
+                    valid = (static_cast<unsigned char>(text[i + k]) & 0xC0) == 0x80;
+                if (!valid)
+                {
+                    units.push_back(unit{ invalid, 0, text.substr(i, 1) });
+                    ++i;
+                    continue;
+                }
+                size_t dummy = 0;
+                const uint32_t c = utf8_decode(text, i, dummy);
+                units.push_back(unit{ c, hf_unicode::combining_class(c), text.substr(i, len) });
+                i += len;
+            }
+
+            // Canonical order: each run of marks sorted by class, stably.
+            for (size_t i = 0; i < units.size();)
+            {
+                if (units[i].cc == 0) { ++i; continue; }
+                size_t j = i;
+                while (j < units.size() && units[j].cc != 0) ++j;
+                std::stable_sort(units.begin() + static_cast<std::ptrdiff_t>(i), units.begin() + static_cast<std::ptrdiff_t>(j),
+                    [](const unit& a, const unit& b) { return a.cc < b.cc; });
+                i = j;
+            }
+
+            // Composition: a character joins the last starter unless a character between
+            // them has a class of 0 or one at least its own.
+            std::vector<unit> out;
+            long starter = -1;
+            unsigned last_cc = 0;
+            for (unit& u : units)
+            {
+                if (u.cp == invalid)
+                {
+                    out.push_back(u);
+                    starter = -1;
+                    continue;
+                }
+                if (starter >= 0)
+                {
+                    const bool adjacent = static_cast<long>(out.size()) == starter + 1;
+                    if (adjacent || (last_cc != 0 && last_cc < u.cc))
+                    {
+                        const uint32_t m = hf_unicode::compose(out[static_cast<size_t>(starter)].cp, u.cp);
+                        if (m)
+                        {
+                            out[static_cast<size_t>(starter)].cp = m;
+                            out[static_cast<size_t>(starter)].bytes = utf8_encode(m);
+                            continue;
+                        }
+                    }
+                }
+                out.push_back(u);
+                if (u.cc == 0)
+                {
+                    starter = static_cast<long>(out.size()) - 1;
+                    last_cc = 0;
+                }
+                else
+                {
+                    last_cc = u.cc;
+                }
+            }
+            std::string r;
+            r.reserve(text.size());
+            for (const unit& u : out) r += u.bytes;
+            return r;
+        }
+
+        /*  Whether a byte-level vocabulary skips the merges of a piece that is itself a
+            token (ignore_merges of the reference tokenizers of the llama 3 and Mistral
+            families).  */
+        inline bool pre_ignores_merges(const std::string& pre)
+        {
+            return pre == "llama3" || pre == "llama-v3" || pre == "llama-bpe" || pre == "falcon3" ||
+                pre == "falcon-h1" || pre == "midm-2.0" || pre == "lfm2" || pre == "jina-v5-nano" ||
+                pre == "tekken";
+        }
+
+        struct cp_class_cache
+        {
+            /*  The class of the code points of one text, computed once.  */
+            std::vector<uint32_t> cp;
+            std::vector<hf_unicode::char_class> cls;
+            std::vector<size_t> off;    // byte offset of each code point, then the size
+
+            void assign(const std::string& text)
+            {
+                cp.clear(); cls.clear(); off.clear();
+                for (size_t i = 0; i < text.size();)
+                {
+                    size_t len = 0;
+                    const uint32_t c = utf8_decode(text, i, len);
+                    cp.push_back(c);
+                    cls.push_back(hf_unicode::classify(c));
+                    off.push_back(i);
+                    i += len;
+                }
+                off.push_back(text.size());
+            }
+        };
+
+        inline bool is_letter(hf_unicode::char_class k) { return k >= hf_unicode::Lu && k <= hf_unicode::Lo; }
+        inline bool is_nl(uint32_t c) { return c == '\r' || c == '\n'; }
+        inline uint32_t ascii_lower(uint32_t c) { return (c >= 'A' && c <= 'Z') ? c + 32 : c; }
+
+        // End of the whitespace alternatives \s*[\r\n]+|\s+(?!\S)|\s+ at i, a white space.
+        inline size_t match_spaces(const cp_class_cache& t, size_t i)
+        {
+            const size_t n = t.cp.size();
+            size_t j = i;
+            size_t last_nl = n;
+            while (j < n && hf_unicode::is_white_space(t.cp[j]))
+            {
+                if (is_nl(t.cp[j])) last_nl = j;
+                ++j;
+            }
+            if (last_nl < n) return last_nl + 1;      // \s*[\r\n]+, up to the last newline
+            if (j == n || j - i == 1) return j;       // \s+(?!\S) at the end, or \s+
+            return j - 1;                             // \s+(?!\S): the last blank stays
+        }
+
+        // (?i:'s|'t|'re|'ve|'m|'ll|'d), or the same in lower case only.
+        inline size_t match_contraction(const cp_class_cache& t, size_t i, bool any_case)
+        {
+            const size_t n = t.cp.size();
+            if (t.cp[i] != '\'' || i + 1 >= n) return i;
+            const uint32_t a = any_case ? ascii_lower(t.cp[i + 1]) : t.cp[i + 1];
+            if (a == 's' || a == 't' || a == 'm' || a == 'd') return i + 2;
+            if (i + 2 < n)
+            {
+                const uint32_t b = any_case ? ascii_lower(t.cp[i + 2]) : t.cp[i + 2];
+                if ((a == 'r' && b == 'e') || (a == 'v' && b == 'e') || (a == 'l' && b == 'l')) return i + 3;
+            }
+            return i;
+        }
+
+        // The llama3, qwen2 and qwen35 patterns at i.
+        inline size_t match_gpt4_style(const cp_class_cache& t, size_t i, size_t max_digits, bool marks_are_letters)
+        {
+            using namespace hf_unicode;
+            const size_t n = t.cp.size();
+            auto letter = [&](size_t k) { return is_letter(t.cls[k]) || (marks_are_letters && t.cls[k] == M); };
+            auto number = [&](size_t k) { return t.cls[k] == N; };
+            size_t e = match_contraction(t, i, true);
+            if (e > i) return e;
+            // [^\r\n\p{L}\p{N}]?\p{L}+
+            if (letter(i))
+            {
+                e = i + 1;
+                while (e < n && letter(e)) ++e;
+                return e;
+            }
+            if (!is_nl(t.cp[i]) && !is_letter(t.cls[i]) && !number(i) && i + 1 < n && letter(i + 1))
+            {
+                e = i + 2;
+                while (e < n && letter(e)) ++e;
+                return e;
+            }
+            // \p{N}{1,max_digits}
+            if (number(i))
+            {
+                e = i + 1;
+                while (e < n && e - i < max_digits && number(e)) ++e;
+                return e;
+            }
+            //  ?[^\s\p{L}\p{N}]+[\r\n]*
+            auto punct = [&](size_t k) { return !is_white_space(t.cp[k]) && !letter(k) && !number(k); };
+            size_t s = (t.cp[i] == ' ' && i + 1 < n && punct(i + 1)) ? i + 1 : i;
+            if (punct(s))
+            {
+                e = s + 1;
+                while (e < n && punct(e)) ++e;
+                while (e < n && is_nl(t.cp[e])) ++e;
+                return e;
+            }
+            return match_spaces(t, i);
+        }
+
+        // End of \s+(?!\S)|\s+ at i, a white space: the alternatives of gpt2, which has
+        // no rule of its own for the newlines.
+        inline size_t match_spaces_gpt2(const cp_class_cache& t, size_t i)
+        {
+            const size_t n = t.cp.size();
+            size_t j = i;
+            while (j < n && hf_unicode::is_white_space(t.cp[j])) ++j;
+            if (j == n || j - i == 1) return j;
+            return j - 1;
+        }
+
+        // The gpt2 pattern at i.
+        inline size_t match_gpt2(const cp_class_cache& t, size_t i)
+        {
+            using namespace hf_unicode;
+            const size_t n = t.cp.size();
+            size_t e = match_contraction(t, i, false);
+            if (e > i) return e;
+            auto letter = [&](size_t k) { return is_letter(t.cls[k]); };
+            auto number = [&](size_t k) { return t.cls[k] == N; };
+            auto punct = [&](size_t k) { return !is_white_space(t.cp[k]) && !letter(k) && !number(k); };
+            const bool space = t.cp[i] == ' ' && i + 1 < n;
+            //  ?\p{L}+,  ?\p{N}+ and  ?[^\s\p{L}\p{N}]+, in this order.
+            for (int rule = 0; rule < 3; ++rule)
+            {
+                auto in_class = [&](size_t k) { return rule == 0 ? letter(k) : rule == 1 ? number(k) : punct(k); };
+                size_t s = n;
+                if (in_class(i)) s = i;
+                else if (space && in_class(i + 1)) s = i + 1;
+                if (s < n)
+                {
+                    e = s + 1;
+                    while (e < n && in_class(e)) ++e;
+                    return e;
+                }
+            }
+            return match_spaces_gpt2(t, i);
+        }
+
+        // The tekken pattern at i.
+        inline size_t match_tekken(const cp_class_cache& t, size_t i)
+        {
+            using namespace hf_unicode;
+            const size_t n = t.cp.size();
+            auto upper = [&](size_t k) { const char_class c = t.cls[k]; return c == Lu || c == Lt || c == Lm || c == Lo || c == M; };
+            auto lower = [&](size_t k) { const char_class c = t.cls[k]; return c == Ll || c == Lm || c == Lo || c == M; };
+            const bool lead = !is_nl(t.cp[i]) && !is_letter(t.cls[i]) && t.cls[i] != N;
+
+            // [^\r\n\p{L}\p{N}]?U*W+ : the longest run of U that leaves a W after it.
+            for (int with_lead = 1; with_lead >= 0; --with_lead)
+            {
+                if (with_lead && !lead) continue;
+                const size_t s = i + static_cast<size_t>(with_lead);
+                if (s >= n) continue;
+                size_t u = s;
+                while (u < n && upper(u)) ++u;
+                for (size_t k = u + 1; k-- > s;)
+                {
+                    if (k < n && lower(k))
+                    {
+                        size_t e = k + 1;
+                        while (e < n && lower(e)) ++e;
+                        return e;
+                    }
+                }
+            }
+            // [^\r\n\p{L}\p{N}]?U+W*
+            for (int with_lead = 1; with_lead >= 0; --with_lead)
+            {
+                if (with_lead && !lead) continue;
+                const size_t s = i + static_cast<size_t>(with_lead);
+                if (s < n && upper(s))
+                {
+                    size_t e = s + 1;
+                    while (e < n && upper(e)) ++e;
+                    while (e < n && lower(e)) ++e;
+                    return e;
+                }
+            }
+            if (t.cls[i] == N) return i + 1;
+            //  ?[^\s\p{L}\p{N}]+[\r\n/]*
+            auto punct = [&](size_t k) { return !is_white_space(t.cp[k]) && !is_letter(t.cls[k]) && t.cls[k] != N; };
+            const size_t s = (t.cp[i] == ' ' && i + 1 < n && punct(i + 1)) ? i + 1 : i;
+            if (punct(s))
+            {
+                size_t e = s + 1;
+                while (e < n && punct(e)) ++e;
+                while (e < n && (is_nl(t.cp[e]) || t.cp[e] == '/')) ++e;
+                return e;
+            }
+            return match_spaces(t, i);
+        }
+
+        /*  Splits text into the pieces BPE merges separately, as byte ranges
+            [first, second) of text.  */
+        inline void pretokenize(const std::string& text, pre_family family,
+            std::vector<std::pair<size_t, size_t>>& pieces)
+        {
+            pieces.clear();
+            cp_class_cache t;
+            t.assign(text);
+            const size_t n = t.cp.size();
+            size_t i = 0;
+            while (i < n)
+            {
+                size_t e = i + 1;
+                switch (family)
+                {
+                case pre_family::gpt2: e = match_gpt2(t, i); break;
+                case pre_family::gpt2_digits:
+                    if (t.cls[i] == hf_unicode::N)
+                    {
+                        e = i + 1;
+                    }
+                    else
+                    {
+                        // The pattern runs on the text between two digits only.
+                        size_t stop = i;
+                        while (stop < n && t.cls[stop] != hf_unicode::N) ++stop;
+                        cp_class_cache part;
+                        part.cp.assign(t.cp.begin() + i, t.cp.begin() + stop);
+                        part.cls.assign(t.cls.begin() + i, t.cls.begin() + stop);
+                        size_t k = 0;
+                        while (k < part.cp.size())
+                        {
+                            const size_t ke = match_gpt2(part, k);
+                            pieces.emplace_back(t.off[i + k], t.off[i + ke]);
+                            k = ke;
+                        }
+                        i = stop;
+                        continue;
+                    }
+                    break;
+                case pre_family::llama3: e = match_gpt4_style(t, i, 3, false); break;
+                case pre_family::qwen2: e = match_gpt4_style(t, i, 1, false); break;
+                case pre_family::qwen35: e = match_gpt4_style(t, i, 1, true); break;
+                case pre_family::tekken: e = match_tekken(t, i); break;
+                }
+                if (e <= i) e = i + 1;
+                pieces.emplace_back(t.off[i], t.off[e]);
+                i = e;
+            }
         }
     }
 
@@ -182,6 +591,26 @@ namespace dlib
         const std::string& pretokenizer() const { return pre_; }
         const std::string& id_to_token(int id) const { return id_to_token_.at(static_cast<size_t>(id)); }
 
+        bool exact_pretokenizer() const { return kind_ == kind::spm || pre_exact_; }
+
+        int token_type(int id) const
+        {
+            return (id >= 0 && id < static_cast<int>(token_types_.size())) ? token_types_[static_cast<size_t>(id)] : TT_UNDEFINED;
+        }
+
+        int token_id(const std::string& piece) const
+        {
+            auto it = token_to_id_.find(piece);
+            return it == token_to_id_.end() ? -1 : it->second;
+        }
+
+        std::string token_bytes(int id) const
+        {
+            std::string out;
+            append_token_bytes(id, out);
+            return out;
+        }
+
         std::vector<int> encode(const std::string& text) const
         {
             return encode(text, add_bos_, add_eos_, true);
@@ -199,7 +628,15 @@ namespace dlib
 
         std::string decode(const std::vector<int>& ids, bool skip_special = true) const
         {
-            return (kind_ == kind::spm) ? decode_spm(ids, skip_special) : decode_bpe(ids, skip_special);
+            std::string out;
+            for (int id : ids)
+            {
+                if (id < 0 || id >= static_cast<int>(id_to_token_.size())) continue;
+                if (skip_special && is_special(id)) continue;
+                append_token_bytes(id, out);
+            }
+            if (kind_ == kind::spm && add_space_prefix_ && !out.empty() && out[0] == ' ') out.erase(0, 1);
+            return out;
         }
 
         friend void serialize(const hf_tokenizer& t, std::ostream& out)
@@ -271,11 +708,19 @@ namespace dlib
                     special_pieces_.emplace_back(id_to_token_[i], i);
                 }
             }
-            /* Longest pieces first so matching is greedy and unambiguous. */
+            /* Longest pieces first so matching is greedy and unambiguous, grouped by their
+               first byte so that a position is only compared with the pieces that can
+               start there. */
             std::sort(special_pieces_.begin(), special_pieces_.end(),
                 [](const std::pair<std::string, int>& a, const std::pair<std::string, int>& b)
                 { return a.first.size() > b.first.size(); });
+            for (auto& bucket : special_by_byte_) bucket.clear();
+            for (size_t i = 0; i < special_pieces_.size(); ++i)
+                special_by_byte_[static_cast<unsigned char>(special_pieces_[i].first[0])].push_back(i);
 
+            pre_family_ = hf_tok_impl::pre_family_of(pre_, pre_exact_);
+            ignore_merges_ = hf_tok_impl::pre_ignores_merges(pre_);
+            nfc_ = kind_ == kind::bpe && hf_tok_impl::pre_normalizes_nfc(pre_);
             if (kind_ == kind::bpe)
             {
                 build_byte_unicode_tables();
@@ -311,8 +756,9 @@ namespace dlib
         /* Longest special piece that is a prefix of text at pos; -1 if none. */
         bool match_special(const std::string& text, size_t pos, int& id, size_t& len) const
         {
-            for (const auto& sp : special_pieces_)
+            for (size_t index : special_by_byte_[static_cast<unsigned char>(text[pos])])
             {
+                const auto& sp = special_pieces_[index];
                 const std::string& piece = sp.first;
                 if (pos + piece.size() <= text.size() && text.compare(pos, piece.size(), piece) == 0)
                 {
@@ -361,7 +807,7 @@ namespace dlib
         {
             std::vector<int> ids = (kind_ == kind::spm)
                 ? encode_spm(frag, first && allow_space_prefix && add_space_prefix_)
-                : encode_bpe(frag);
+                : encode_bpe(nfc_ ? hf_tok_impl::nfc_compose(frag) : frag);
             out.insert(out.end(), ids.begin(), ids.end());
         }
 
@@ -457,29 +903,44 @@ namespace dlib
             return out;
         }
 
-        std::string decode_spm(const std::vector<int>& ids, bool skip_special) const
+        /* The bytes a token stands for, appended to out: the byte of a byte token, the
+           text of a special token as written, and otherwise the vocabulary string with
+           the meta-space of SentencePiece or the byte remapping of byte-level BPE undone. */
+        void append_token_bytes(int id, std::string& out) const
         {
-            static const char meta_space[] = "\xe2\x96\x81";
-            std::string out;
-            for (int id : ids)
+            if (id < 0 || id >= static_cast<int>(id_to_token_.size())) return;
+            const size_t i = static_cast<size_t>(id);
+            if (byte_value_[i] >= 0)
             {
-                if (id < 0 || id >= static_cast<int>(id_to_token_.size())) continue;
-                if (skip_special && is_special(id)) continue;
-                if (byte_value_[static_cast<size_t>(id)] >= 0)
-                {
-                    out.push_back(static_cast<char>(byte_value_[static_cast<size_t>(id)]));
-                    continue;
-                }
-                const std::string& tok = id_to_token_[static_cast<size_t>(id)];
+                out.push_back(static_cast<char>(byte_value_[i]));
+                return;
+            }
+            const std::string& tok = id_to_token_[i];
+            const int tt = token_types_[i];
+            if (tt == TT_CONTROL || tt == TT_USER_DEFINED)
+            {
+                out += tok;
+                return;
+            }
+            if (kind_ == kind::spm)
+            {
+                static const char meta_space[] = "\xe2\x96\x81";
                 size_t pos = 0;
                 while (pos < tok.size())
                 {
                     if (tok.compare(pos, 3, meta_space) == 0) { out.push_back(' '); pos += 3; }
                     else out.push_back(tok[pos++]);
                 }
+                return;
             }
-            if (add_space_prefix_ && !out.empty() && out[0] == ' ') out.erase(0, 1);
-            return out;
+            for (size_t k = 0; k < tok.size();)
+            {
+                size_t len = 0;
+                const uint32_t cp = hf_tok_impl::utf8_decode(tok, k, len);
+                auto it = uni_to_byte_.find(cp);
+                if (it != uni_to_byte_.end()) out.push_back(static_cast<char>(it->second));
+                k += len;
+            }
         }
 
         // --- Byte-level BPE -------------------------------------------------------------
@@ -498,196 +959,112 @@ namespace dlib
             {
                 const uint32_t cp = printable[b] ? static_cast<uint32_t>(b) : static_cast<uint32_t>(256 + n++);
                 byte_to_uni_[static_cast<size_t>(b)] = cp;
+                byte_to_piece_[static_cast<size_t>(b)] = hf_tok_impl::utf8_encode(cp);
                 uni_to_byte_[cp] = static_cast<unsigned char>(b);
             }
         }
 
-        static bool is_ws(uint32_t c)
+        struct bpe_symbol { int prev; int next; size_t start; size_t len; };
+        struct bpe_bigram { int left; int right; int rank; size_t size; };
+        struct bpe_bigram_cmp
         {
-            return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
-        }
-        static bool is_nl(uint32_t c) { return c == '\n' || c == '\r'; }
-        static bool is_num(uint32_t c) { return c >= '0' && c <= '9'; }
-        /* Approximation of \p{L}: exact for ASCII, and every non-ASCII codepoint is taken
-           for a letter. Enough for Latin scripts, and wrong for CJK punctuation, emoji and
-           symbols, which a proper implementation would separate. Correcting it needs
-           Unicode category tables. */
-        static bool is_alpha(uint32_t c)
-        {
-            if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')) return true;
-            return c >= 128;
-        }
-        static uint32_t ascii_lower(uint32_t c) { return (c >= 'A' && c <= 'Z') ? c + 32 : c; }
-
-        /* Pre-tokenizer of the GPT-4 family, which Qwen and the other byte-level BPE
-           models of this catalogue use. It is an ordered alternation and the order is the
-           whole point: each rule is tried at the current position and the first that
-           matches consumes its piece.
-
-               (?i:'s|'t|'re|'ve|'m|'ll|'d)
-               [^\r\n\p{L}\p{N}]?\p{L}+          one optional lead char, then letters
-               \p{N}                              one digit at a time
-                ?[^\s\p{L}\p{N}]+[\r\n]*         punctuation, with its trailing newlines
-               \s*[\r\n]+                        a blank run ending on a newline
-               \s+(?!\S)                         a blank run, minus the last one
-               \s+
-
-           The second rule is what attaches a leading space to the word that follows, which
-           is where nearly every merge of a byte-level vocabulary begins: " Vulnerability"
-           is two tokens, "Vulnerability" alone is three. A run of punctuation must
-           therefore stop before that space rather than swallow it, and consecutive
-           newlines must form one piece of their own; getting either wrong inflates a
-           markdown corpus by more than a tenth while leaving plain prose untouched, which
-           is what makes it hard to notice. */
-        std::vector<std::string> pretokenize(const std::string& text) const
-        {
-            struct cp_info { uint32_t cp; size_t off; };
-            std::vector<cp_info> cps;
-            for (size_t i = 0; i < text.size();)
+            // Lowest rank first, then leftmost, as the reference implementations merge.
+            bool operator()(const bpe_bigram& a, const bpe_bigram& b) const
             {
-                size_t len = 0;
-                const uint32_t cp = hf_tok_impl::utf8_decode(text, i, len);
-                cps.push_back({ cp, i });
+                return a.rank > b.rank || (a.rank == b.rank && a.left > b.left);
+            }
+        };
+
+        /* Applies the merges to one pre-tokenized piece, already remapped to the
+           byte-level alphabet, with a queue of the candidate pairs ordered by rank: the
+           cost grows with the length of the piece times the log of it, so that a long run
+           of characters without spaces (a hash, a base64 block) stays cheap. */
+        void encode_bpe_piece(const std::string& word, std::vector<int>& out) const
+        {
+            if (word.empty()) return;
+            if (ignore_merges_)
+            {
+                auto it = token_to_id_.find(word);
+                if (it != token_to_id_.end()) { out.push_back(it->second); return; }
+            }
+            std::vector<bpe_symbol> syms;
+            for (size_t i = 0; i < word.size();)
+            {
+                size_t len = hf_tok_impl::utf8_char_len(static_cast<unsigned char>(word[i]));
+                if (i + len > word.size()) len = 1;
+                bpe_symbol s;
+                s.prev = static_cast<int>(syms.size()) - 1;
+                s.next = -1;
+                s.start = i;
+                s.len = len;
+                if (!syms.empty()) syms.back().next = static_cast<int>(syms.size());
+                syms.push_back(s);
                 i += len;
             }
-            const size_t n = cps.size();
 
-            auto slice = [&](size_t a, size_t b) -> std::string {
-                if (a >= b) return std::string();
-                const size_t bs = cps[a].off;
-                const size_t be = (b < n) ? cps[b].off : text.size();
-                return text.substr(bs, be - bs);
-            };
-            auto at = [&](size_t i) -> uint32_t { return i < n ? cps[i].cp : 0; };
-
-            std::vector<std::string> words;
-            size_t i = 0;
-            while (i < n)
+            std::priority_queue<bpe_bigram, std::vector<bpe_bigram>, bpe_bigram_cmp> work;
+            std::string key;
+            auto try_add = [&](int left, int right)
             {
-                const uint32_t c = cps[i].cp;
+                if (left < 0 || right < 0) return;
+                const bpe_symbol& l = syms[static_cast<size_t>(left)];
+                const bpe_symbol& r = syms[static_cast<size_t>(right)];
+                key.assign(word, l.start, l.len);
+                key.push_back(' ');
+                key.append(word, r.start, r.len);
+                auto it = bpe_ranks_.find(key);
+                if (it == bpe_ranks_.end()) return;
+                work.push(bpe_bigram{ left, right, it->second, l.len + r.len });
+            };
+            for (int i = 1; i < static_cast<int>(syms.size()); ++i) try_add(i - 1, i);
 
-                if (c == '\'' && i + 1 < n)                       // contractions
-                {
-                    const uint32_t a = ascii_lower(at(i + 1));
-                    if (a == 's' || a == 't' || a == 'm' || a == 'd')
-                    {
-                        words.push_back(slice(i, i + 2)); i += 2; continue;
-                    }
-                    if (i + 2 < n)
-                    {
-                        const uint32_t b = ascii_lower(at(i + 2));
-                        if ((a == 'r' && b == 'e') || (a == 'v' && b == 'e') ||
-                            (a == 'l' && b == 'l'))
-                        {
-                            words.push_back(slice(i, i + 3)); i += 3; continue;
-                        }
-                    }
-                }
-
-                {                                                // optional lead + letters
-                    size_t start = n + 1;
-                    if (is_alpha(c)) start = i;
-                    else if (!is_nl(c) && !is_num(c) && is_alpha(at(i + 1))) start = i + 1;
-                    if (start <= n)
-                    {
-                        size_t k = start;
-                        while (k < n && is_alpha(cps[k].cp)) ++k;
-                        if (k > start) { words.push_back(slice(i, k)); i = k; continue; }
-                    }
-                }
-
-                if (is_num(c)) { words.push_back(slice(i, i + 1)); ++i; continue; }
-
-                {                                                // punctuation run
-                    const size_t start = (c == ' ') ? i + 1 : i;
-                    size_t k = start;
-                    while (k < n && !is_ws(cps[k].cp) && !is_alpha(cps[k].cp) && !is_num(cps[k].cp))
-                        ++k;
-                    if (k > start)
-                    {
-                        while (k < n && is_nl(cps[k].cp)) ++k;
-                        words.push_back(slice(i, k)); i = k; continue;
-                    }
-                }
-
-                if (is_ws(c))
-                {
-                    size_t j = i;
-                    while (j < n && is_ws(cps[j].cp)) ++j;
-
-                    /* A blank run ending on a newline is one piece, up to the last one it
-                       contains: that is what makes a paragraph break a single token rather
-                       than two. */
-                    size_t last_nl = n + 1;
-                    for (size_t k = i; k < j; ++k) if (is_nl(cps[k].cp)) last_nl = k;
-                    if (last_nl <= n) { words.push_back(slice(i, last_nl + 1)); i = last_nl + 1; continue; }
-
-                    // Otherwise the last blank is left for the word that follows.
-                    if (j < n && j - 1 > i) { words.push_back(slice(i, j - 1)); i = j - 1; continue; }
-                    words.push_back(slice(i, j)); i = j; continue;
-                }
-
-                words.push_back(slice(i, i + 1)); ++i;   // unreachable in practice
+            while (!work.empty())
+            {
+                const bpe_bigram b = work.top();
+                work.pop();
+                bpe_symbol& l = syms[static_cast<size_t>(b.left)];
+                bpe_symbol& r = syms[static_cast<size_t>(b.right)];
+                // Skip the pairs a previous merge made obsolete.
+                if (l.len == 0 || r.len == 0 || l.len + r.len != b.size || l.next != b.right) continue;
+                l.len += r.len;
+                r.len = 0;
+                l.next = r.next;
+                if (r.next >= 0) syms[static_cast<size_t>(r.next)].prev = b.left;
+                try_add(l.prev, b.left);
+                try_add(b.left, l.next);
             }
-            return words;
+
+            for (int i = 0; i != -1; i = syms[static_cast<size_t>(i)].next)
+            {
+                const bpe_symbol& s = syms[static_cast<size_t>(i)];
+                if (s.len == 0) continue;
+                auto it = token_to_id_.find(word.substr(s.start, s.len));
+                if (it != token_to_id_.end()) { out.push_back(it->second); continue; }
+                // A symbol missing from the vocabulary: its characters one by one.
+                for (size_t k = s.start; k < s.start + s.len;)
+                {
+                    size_t len = hf_tok_impl::utf8_char_len(static_cast<unsigned char>(word[k]));
+                    if (k + len > s.start + s.len) len = 1;
+                    auto c = token_to_id_.find(word.substr(k, len));
+                    if (c != token_to_id_.end()) out.push_back(c->second);
+                    else if (unk_ >= 0) out.push_back(unk_);
+                    k += len;
+                }
+            }
         }
 
         std::vector<int> encode_bpe(const std::string& text) const
         {
             std::vector<int> out;
-            for (const std::string& word : pretokenize(text))
+            std::vector<std::pair<size_t, size_t>> pieces;
+            hf_tok_impl::pretokenize(text, pre_family_, pieces);
+            std::string word;
+            for (const auto& p : pieces)
             {
-                std::vector<std::string> symbols;
-                symbols.reserve(word.size());
-                for (unsigned char b : word)
-                    symbols.push_back(hf_tok_impl::utf8_encode(byte_to_uni_[b]));
-                if (symbols.empty()) continue;
-
-                for (;;)
-                {
-                    int best = -1, best_rank = std::numeric_limits<int>::max();
-                    for (size_t i = 0; i + 1 < symbols.size(); ++i)
-                    {
-                        auto it = bpe_ranks_.find(symbols[i] + " " + symbols[i + 1]);
-                        if (it != bpe_ranks_.end() && it->second < best_rank)
-                        {
-                            best_rank = it->second;
-                            best = static_cast<int>(i);
-                        }
-                    }
-                    if (best < 0) break;
-                    symbols[best] += symbols[best + 1];
-                    symbols.erase(symbols.begin() + best + 1);
-                }
-
-                for (const std::string& s : symbols)
-                {
-                    auto it = token_to_id_.find(s);
-                    if (it != token_to_id_.end()) out.push_back(it->second);
-                    else if (unk_ >= 0) out.push_back(unk_);
-                }
-            }
-            return out;
-        }
-
-        std::string decode_bpe(const std::vector<int>& ids, bool skip_special) const
-        {
-            std::string uni;
-            for (int id : ids)
-            {
-                if (id < 0 || id >= static_cast<int>(id_to_token_.size())) continue;
-                if (skip_special && is_special(id)) continue;
-                uni += id_to_token_[static_cast<size_t>(id)];
-            }
-            std::string out;
-            out.reserve(uni.size());
-            for (size_t i = 0; i < uni.size();)
-            {
-                size_t len = 0;
-                const uint32_t cp = hf_tok_impl::utf8_decode(uni, i, len);
-                auto it = uni_to_byte_.find(cp);
-                if (it != uni_to_byte_.end()) out.push_back(static_cast<char>(it->second));
-                i += len;
+                word.clear();
+                for (size_t k = p.first; k < p.second; ++k)
+                    word += byte_to_piece_[static_cast<unsigned char>(text[k])];
+                encode_bpe_piece(word, out);
             }
             return out;
         }
@@ -709,9 +1086,15 @@ namespace dlib
         std::array<int, 256> byte_to_id_{};
         std::vector<int> byte_value_;
         std::vector<std::pair<std::string, int>> special_pieces_;
+        std::array<std::vector<size_t>, 256> special_by_byte_;
         std::unordered_map<std::string, int> bpe_ranks_;
         std::array<uint32_t, 256> byte_to_uni_{};
+        std::array<std::string, 256> byte_to_piece_;
         std::unordered_map<uint32_t, unsigned char> uni_to_byte_;
+        hf_tok_impl::pre_family pre_family_ = hf_tok_impl::pre_family::gpt2;
+        bool pre_exact_ = true;
+        bool ignore_merges_ = false;
+        bool nfc_ = false;
     };
 }
 

@@ -9,6 +9,8 @@
 #    find_package(dlib REQUIRED)
 #    target_link_libraries(MY_TARGET_NAME dlib::dlib)
 #
+#  Programs that include <dlib/external/httplib/httplib.h> also link dlib::httplib.
+#
 # ===================================================================================
 
 
@@ -29,6 +31,11 @@ if(NOT TARGET dlib-shared AND NOT dlib_BINARY_DIR)
    endif()
    unset(dlib_deps_threads_idx)
    unset(dlib_deps_threads_check)
+   # dlib::httplib, and dlib::mbedtls when it is installed, use the threads library outside
+   # Windows.
+   if (TARGET dlib::httplib AND NOT WIN32 AND NOT TARGET Threads::Threads)
+      find_package(Threads REQUIRED)
+   endif()
 endif()
 
 set(dlib_LIBRARIES dlib::dlib)

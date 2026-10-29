@@ -85,6 +85,10 @@ namespace dlib
                   any statement objects still exist which reference this database
                   then the SQLite database connection won't be fully closed
                   until those statement objects are also destroyed.  
+            throws
+                - sqlite_error
+                    This exception is thrown if the database can't be opened.  In
+                    this case #is_open() == false and #get_database_filename() == file.
         !*/
 
         bool is_open (
@@ -409,7 +413,8 @@ namespace dlib
             ensures
                 - #get_num_columns() == 0
                 - binds the value of item into the SQL parameter indicated by 
-                  parameter_id.
+                  parameter_id.  An empty vector is bound as a BLOB of length zero,
+                  not as NULL.
         !*/
 
         template <

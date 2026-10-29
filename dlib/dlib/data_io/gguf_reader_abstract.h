@@ -35,6 +35,8 @@ namespace dlib
                                                 block; used by converters when a tensor
                                                 row is not a multiple of the k-quant
                                                 super-block size
+                BF16                          - Unquantized bfloat16, the upper half of
+                                                an IEEE single-precision float
 
             NOTES
                 - Quantization mixes such as Q4_K_M are file-level recipes, not tensor
@@ -206,7 +208,8 @@ namespace dlib
         ) const;
         /*!
             ensures
-                - Returns true if and only if the tensor type is neither F32 nor F16.
+                - Returns true if and only if the tensor type is neither F32, F16 nor
+                  BF16.
         !*/
     };
 
@@ -258,6 +261,35 @@ namespace dlib
                 - std::runtime_error if the file cannot be opened, is not a GGUF file,
                   uses an unsupported container version, is truncated, or contains a
                   tensor whose element count is not aligned to its type's block size.
+                - std::runtime_error if a count, a string length, an array length, a
+                  dimension or a tensor extent read from the header exceeds the size of
+                  the file, which only a damaged file produces; the check comes before
+                  any allocation of that size.
+        !*/
+
+        gguf_reader(
+            const void* data,
+            uint64_t size
+        );
+        /*!
+            requires
+                - data points to size readable bytes holding a GGUF container, and stays
+                  valid for the lifetime of this object.
+            ensures
+                - Parses the container in memory exactly as the file constructor parses a
+                  file.  A program that maps a model file into its address space can
+                  then read the metadata with this object and the tensors in place, at
+                  data + data_offset() + t.offset, without copying them.
+                - read_tensor_raw() copies tensors out of the memory block.
+            throws
+                - std::runtime_error under the same conditions as the file constructor.
+        !*/
+
+        uint64_t size(
+        ) const;
+        /*!
+            ensures
+                - Returns the size in bytes of the container, the file or the memory block.
         !*/
 
         uint32_t version(
@@ -265,6 +297,23 @@ namespace dlib
         /*!
             ensures
                 - Returns the GGUF container version (2 or 3).
+        !*/
+
+        uint64_t alignment(
+        ) const;
+        /*!
+            ensures
+                - Returns the alignment of the tensor data section, the general.alignment
+                  metadata value or 32 when the file does not declare one.
+        !*/
+
+        uint64_t data_offset(
+        ) const;
+        /*!
+            ensures
+                - Returns the position in the file, in bytes, of the tensor data section.
+                  The bytes of a tensor t start at data_offset() + t.offset, which lets a
+                  program map the file into memory and read the tensors in place.
         !*/
 
         const std::map<std::string, gguf_value>& metadata(

@@ -1,0 +1,21 @@
+{
+  "product": "Albireo",
+  "channels": {
+    "stable": {
+      "version": "1.0.0",
+      "date": "2026-10-29",
+      "notes": {
+        "en": "First version of Albireo.",
+        "fr": "Première version d'Albireo.",
+        "de": "Erste Version von Albireo.",
+        "it": "Prima versione di Albireo.",
+        "es": "Primera versión de Albireo."
+      },
+      "installer": {
+        "url": "https://github.com/Cydral/Dlib-Transformer-extensions/releases/download/albireo-v1.0.0/albireo-setup-1.0.0.exe",
+        "size": 0,
+        "sha256": ""
+      }
+    }
+  }
+}

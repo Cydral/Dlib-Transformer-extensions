@@ -1,0 +1,949 @@
+// Copyright (C) 2026 Cydral Technology (cydraltechnology@gmail.com)
+// License: Boost Software License   See LICENSE.txt for the full license.
+
+#if defined(_WIN32) && !defined(_WIN32_WINNT)
+#define _WIN32_WINNT 0x0A00
+#endif
+
+#include <dlib/external/httplib/httplib.h>
+
+#include "service.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <functional>
+#include <iostream>
+
+#include "../common/engine_loader.h"
+#include "../common/log.h"
+#include "../common/platform.h"
+#include "../common/system_info.h"
+#include "../common/version.h"
+#include "certificates.h"
+#include "http_fetch.h"
+
+namespace albireo
+{
+
+    namespace
+    {
+        const int64_t catalog_period = 6 * 3600;
+        const int64_t update_period = 6 * 3600;
+        const int64_t certificate_period = 24 * 3600;
+        const int64_t inbox_period = 60;
+
+        std::string trim(const std::string& s)
+        {
+            const size_t b = s.find_first_not_of(" \t\r\n");
+            if (b == std::string::npos) return std::string();
+            const size_t e = s.find_last_not_of(" \t\r\n");
+            return s.substr(b, e - b + 1);
+        }
+
+        bool ends_with(const std::string& s, const std::string& suffix)
+        {
+            return s.size() >= suffix.size() && s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+        }
+
+        bool is_role(const std::string& r)
+        {
+            for (const char* m : model_roles)
+                if (r == m) return true;
+            return false;
+        }
+
+        // True when the catalog entry of a model names the role among its uses.
+        bool has_role(const json& descriptor, const std::string& role)
+        {
+            for (const auto& r : descriptor["roles"].elements())
+                if (r.as_string() == role) return true;
+            return false;
+        }
+    }
+
+    std::vector<engine_choice> engine_options(const std::vector<engine_candidate>& candidates)
+    {
+        std::vector<engine_choice> out;
+        for (const auto& c : candidates)
+        {
+            if (!c.usable) continue;
+            if (c.variant == "openvino")
+            {
+                // One choice per kind of device, and one for the NPU and the graphics
+                // processor together, where dlib routes each product to the faster of
+                // them.
+                std::string npu, gpu;
+                for (const auto& d : c.description["devices"].elements())
+                {
+                    // The processor plugin is listed only when DLIB_NPU_DEVICE names it.
+                    const std::string type = d["type"].as_string();
+                    if (type != "npu" && type != "gpu" && !(type == "cpu" && d["id"].as_string() == "CPU")) continue;
+                    const std::string key = "openvino:" + type;
+                    bool seen = false;
+                    for (const auto& e : out) seen = seen || e.key == key;
+                    if (seen) continue;
+                    engine_choice e;
+                    e.candidate = &c;
+                    e.device = d["id"].str(type == "npu" ? "NPU" : type == "gpu" ? "GPU" : "CPU");
+                    e.key = key;
+                    out.push_back(e);
+                    if (type == "npu") npu = e.device;
+                    if (type == "gpu") gpu = e.device;
+                }
+                if (!npu.empty() && !gpu.empty())
+                {
+                    engine_choice e;
+                    e.candidate = &c;
+                    e.device = npu + "," + gpu;
+                    e.key = "openvino:both";
+                    out.push_back(e);
+                }
+                continue;
+            }
+            engine_choice e;
+            e.candidate = &c;
+            e.key = c.variant;
+            out.push_back(e);
+        }
+        return out;
+    }
+
+    engine_choice choose_engine(const std::vector<engine_candidate>& candidates, const host_settings& s)
+    {
+        const std::vector<engine_choice> options = engine_options(candidates);
+        auto rate = [&](const engine_choice& e) {
+            return s.engine_benchmarks[e.key]["tokens_per_second"].as_double(0);
+        };
+        auto is_cpu = [](const engine_choice& e) { return e.key == "cpu" || e.key == "cpu-avx2"; };
+        auto is_npu = [](const engine_choice& e) { return e.key == "openvino:npu"; };
+        auto is_gpu = [](const engine_choice& e) { return e.key == "cuda" || e.key == "openvino:gpu"; };
+        auto is_accelerator = [](const engine_choice& e) {
+            return e.key == "cuda" || e.key == "openvino:npu" || e.key == "openvino:gpu" || e.key == "openvino:both";
+        };
+        auto fastest = [&](const std::function<bool(const engine_choice&)>& keep) {
+            const engine_choice* best = nullptr;
+            for (const auto& e : options)
+                if (keep(e) && rate(e) > 0 && (!best || rate(e) > rate(*best))) best = &e;
+            return best;
+        };
+        auto first = [&](const std::vector<std::string>& keys) {
+            for (const auto& k : keys)
+                for (const auto& e : options)
+                    if (e.key == k) return &e;
+            return static_cast<const engine_choice*>(nullptr);
+        };
+
+        if (s.engine != "auto" && s.engine != "best")
+        {
+            // A variant named in the settings; for the engines with several devices, the
+            // accelerator setting picks the device.
+            const engine_choice* named = nullptr;
+            for (const auto& e : options)
+            {
+                if (e.key != s.engine && e.candidate->variant != s.engine) continue;
+                if (!named) named = &e;
+                if ((s.accelerator == "npu" && is_npu(e)) || (s.accelerator == "gpu" && is_gpu(e))
+                    || (s.accelerator == "both" && e.key == "openvino:both")) named = &e;
+            }
+            if (named) return *named;
+            log_warning("engines: the engine '" + s.engine + "' of the settings is not usable, automatic selection");
+        }
+        const engine_choice* e = nullptr;
+        if (s.accelerator == "npu")
+        {
+            e = fastest(is_npu);
+            if (!e) e = first({ "openvino:npu" });
+        }
+        else if (s.accelerator == "gpu")
+        {
+            e = fastest(is_gpu);
+            if (!e) e = first({ "cuda", "openvino:gpu" });
+        }
+        else if (s.accelerator == "both")
+        {
+            e = fastest(is_accelerator);
+            if (!e) e = first({ "cuda", "openvino:both", "openvino:gpu", "openvino:npu" });
+        }
+        else if (s.accelerator == "none")
+        {
+            e = fastest(is_cpu);
+            if (!e) e = first({ "cpu-avx2", "cpu" });
+        }
+        if (!e) e = fastest([](const engine_choice&) { return true; });
+        if (!e) e = first({ "cuda", "cpu-avx2", "cpu" });
+        if (!e && !options.empty()) e = &options.front();
+        return e ? *e : engine_choice();
+    }
+
+    service::service() : program_dir_(executable_dir()), data_dir_(albireo::data_dir())
+    {
+    }
+
+    service::~service()
+    {
+        stop();
+        if (background_.joinable()) background_.join();
+    }
+
+    std::string service::engines_dir() const
+    {
+        const std::string d = join_path(program_dir_, "engines");
+        return dir_exists(d) ? d : program_dir_;
+    }
+
+    json service::engine_config(const host_settings& s, const std::string& device) const
+    {
+        json c = json::object();
+        c["threads"] = s.threads;
+        c["context"] = s.context;
+        c["max_sequences"] = s.max_sequences;
+        c["kv_mb"] = s.kv_mb;
+        c["v2ram"] = s.v2ram;
+        c["v2ram_max_mb"] = s.v2ram_max_mb;
+        c["device"] = device;
+        c["cache_dir"] = join_path(data_dir_, "engine-cache");
+        return c;
+    }
+
+    bool service::run(std::string& error)
+    {
+        started_at_ = now_unix();
+        if (!make_dirs(data_dir_))
+        {
+            error = "cannot create the data folder " + data_dir_;
+            return false;
+        }
+        const std::string logs = join_path(data_dir_, "logs");
+        make_dirs(logs);
+        log_file::instance().open(join_path(logs, "service.log"));
+        log_info(std::string(ALBIREO_PRODUCT_NAME) + " " + ALBIREO_VERSION + " starting");
+        log_info("programs in " + program_dir_ + ", data in " + data_dir_);
+
+        const std::string settings_path = join_path(data_dir_, "settings.json");
+        const bool first_run = !file_exists(settings_path);
+        settings_.reset(new settings_store(settings_path));
+        const host_settings st = settings_->get();
+        if (first_run) settings_->set(st);
+        port_ = st.port;
+        set_http_proxy(st.proxy);
+
+        try
+        {
+            db_.reset(new store(join_path(data_dir_, "albireo.db")));
+        }
+        catch (const std::exception& e)
+        {
+            error = std::string("the database cannot be opened: ") + e.what();
+            return false;
+        }
+
+        // The token of the administration interface, read by the tray.
+        const std::string token_path = join_path(data_dir_, "admin.token");
+        std::string token;
+        if (!read_file(token_path, token, 4096) || trim(token).size() < 32)
+        {
+            token = random_hex(48);
+            if (!write_file_restricted(token_path, token, true))
+            {
+                error = "cannot write " + token_path;
+                return false;
+            }
+        }
+        admin_token_ = trim(token);
+
+        const std::string cert_dir = join_path(data_dir_, "certificates");
+        if (!ensure_certificates(cert_dir, error)) return false;
+
+        // An update downloaded earlier is applied before anything else starts.
+        updater_.reset(new updater(st.update_feed, join_path(data_dir_, "updates")));
+        if (!updater_->staged_installer().empty())
+        {
+            std::string e;
+            if (updater_->launch_staged(e))
+            {
+                update_started_ = true;
+                log_info("updates: the installer of version " + updater_->status()["latest"].as_string()
+                    + " is started, the service stops for the update");
+                return true;
+            }
+            if (!e.empty()) log_warning("updates: " + e);
+        }
+
+        models_.reset(new model_manager(*db_, st.effective_models_dir(), st.catalog_url));
+        models_->on_installed([this](const installed_model& m) { on_installed(m); });
+
+        // The engine of this machine; a processor engine when the chosen one fails.
+        candidates_ = engine_.discover(engines_dir(), executable_path());
+        choice_ = choose_engine(candidates_, st);
+        if (choice_.candidate)
+        {
+            std::string e;
+            if (!engine_.start(*choice_.candidate, engine_config(st, choice_.device), e))
+            {
+                engine_error_ = choice_.key + ": " + e;
+                log_error("engines: " + engine_error_);
+                for (const auto& o : engine_options(candidates_))
+                {
+                    if (o.key != "cpu-avx2" && o.key != "cpu") continue;
+                    if (engine_.start(*o.candidate, engine_config(st, o.device), e))
+                    {
+                        choice_ = o;
+                        break;
+                    }
+                    log_error("engines: " + o.key + ": " + e);
+                }
+            }
+        }
+        else
+        {
+            engine_error_ = "no usable engine in " + engines_dir();
+            log_error("engines: " + engine_error_);
+        }
+
+        const certificate_files certs = certificate_paths(cert_dir);
+        {
+            std::lock_guard<std::mutex> lock(server_m_);
+            if (stopping_) return true;
+            server_.reset(new httplib::SSLServer(certs.server_cert.c_str(), certs.server_key.c_str()));
+        }
+        if (!server_->is_valid())
+        {
+            error = "the TLS configuration of the server failed";
+            return false;
+        }
+        // The limits of the bodies are those of each route (server.cpp).
+        server_->set_payload_max_length(0);
+        server_->set_keep_alive_timeout(30);
+        server_->set_read_timeout(120);
+        server_->set_write_timeout(120);
+        server_->new_task_queue = []() { return new httplib::ThreadPool(8, 64); };
+        server_->set_socket_options([](socket_t sock) {
+#if defined(_WIN32)
+            // No other process may bind the port of the service.
+            httplib::set_socket_opt(sock, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, 1);
+#else
+            httplib::set_socket_opt(sock, SOL_SOCKET, SO_REUSEADDR, 1);
+#endif
+        });
+        install_routes(*server_, *this);
+        if (!server_->bind_to_port("127.0.0.1", port_))
+        {
+            error = "the port " + std::to_string(port_) + " is in use or cannot be opened";
+            return false;
+        }
+        log_info("server: https://localhost:" + std::to_string(port_) + "/");
+
+        background_ = std::thread([this]() { background_loop(); });
+        server_->listen_after_bind();
+        const bool stopped = stopping_;
+
+        // Shutdown: the background tasks, the downloads (their state is kept), the engine.
+        stopping_ = true;
+        cv_.notify_all();
+        if (background_.joinable()) background_.join();
+        {
+            std::lock_guard<std::mutex> lock(server_m_);
+            server_.reset();
+        }
+        models_.reset();
+        engine_.stop();
+        updater_.reset();
+        log_info("service stopped");
+        if (!stopped)
+        {
+            error = "the server stopped unexpectedly";
+            return false;
+        }
+        return true;
+    }
+
+    void service::stop()
+    {
+        stopping_ = true;
+        cv_.notify_all();
+        std::lock_guard<std::mutex> lock(server_m_);
+        if (server_) server_->stop();
+    }
+
+    void service::request_restart()
+    {
+        log_info("service: restart requested");
+        restart_ = true;
+        // From a handler of the server: the response is written before the server stops.
+        std::thread([this]() {
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            stop();
+        }).detach();
+    }
+
+    void service::background_loop()
+    {
+        load_active_models();
+        if (stopping_) return;
+        std::string error;
+        if (!models_->refresh_catalog(error)) log_warning("models: catalog not refreshed: " + error);
+        models_->resume_pending();
+        scan_inbox();
+        ensure_default_model();
+        const host_settings st = settings_->get();
+        if (st.check_updates) updater_->check_async();
+
+        int64_t next_catalog = now_unix() + catalog_period;
+        int64_t next_update = now_unix() + update_period;
+        int64_t next_certificate = now_unix() + certificate_period;
+        int64_t next_inbox = now_unix() + inbox_period;
+        std::unique_lock<std::mutex> lock(m_);
+        while (!stopping_)
+        {
+            cv_.wait_for(lock, std::chrono::seconds(15));
+            if (stopping_) break;
+            lock.unlock();
+            const int64_t now = now_unix();
+            if (now >= next_catalog)
+            {
+                next_catalog = now + catalog_period;
+                if (!models_->refresh_catalog(error)) log_warning("models: catalog not refreshed: " + error);
+            }
+            if (now >= next_update)
+            {
+                next_update = now + update_period;
+                if (settings_->get().check_updates) updater_->check_async();
+            }
+            if (now >= next_inbox)
+            {
+                next_inbox = now + inbox_period;
+                scan_inbox();
+            }
+            if (now >= next_certificate)
+            {
+                next_certificate = now + certificate_period;
+                const std::string cert_dir = join_path(data_dir_, "certificates");
+                const std::string before = certificate_thumbprint(certificate_paths(cert_dir).server_cert);
+                if (ensure_certificates(cert_dir, error)
+                    && certificate_thumbprint(certificate_paths(cert_dir).server_cert) != before)
+                {
+                    log_info("certificates: the server certificate was renewed, restart");
+                    request_restart();
+                }
+            }
+            lock.lock();
+        }
+    }
+
+    void service::scan_inbox()
+    {
+        // Files left in the import folder of the data folder, by the installer from its
+        // medium or by an administrator, are moved into the models folder.
+        const std::string inbox = join_path(data_dir_, "import");
+        if (!dir_exists(inbox)) return;
+        for (const auto& n : list_dir(inbox))
+        {
+            if (!ends_with(n, ".gguf") || stopping_) continue;
+            const std::string f = join_path(inbox, n);
+            const json r = models_->import_path(f);
+            if (!r["imported"].empty())
+            {
+                remove_file(f);
+                const std::string side = f.substr(0, f.size() - 5) + ".json";
+                if (file_exists(side)) remove_file(side);
+            }
+            for (const auto& e : r["errors"].elements()) log_warning("models: import folder: " + e.as_string());
+        }
+    }
+
+    void service::ensure_default_model()
+    {
+        const host_settings st = settings_->get();
+        if (st.active.count("general")) return;
+        const std::vector<installed_model> installed = db_->models();
+        if (!installed.empty())
+        {
+            // The model of the catalog meant for general use, else the first one.
+            const installed_model* pick = &installed.front();
+            for (const auto& m : installed)
+                if (has_role(m.descriptor, "general") || m.descriptor["default"].as_bool(false)) pick = &m;
+            std::string error;
+            if (!activate(pick->id, "general", error)) log_warning("models: " + pick->id + ": " + error);
+            return;
+        }
+        // Nothing installed: the default model of the catalog is downloaded, once, unless
+        // the installation asked otherwise.
+        if (!st.default_model || db_->value("default_model_requested") == "1") return;
+        for (const auto& e : models_->catalog()["models"].elements())
+        {
+            if (!e["default"].as_bool(false)) continue;
+            std::string error;
+            if (models_->start_download(e["id"].as_string(), error))
+            {
+                db_->set_value("default_model_requested", "1");
+                log_info("models: download of the default model " + e["id"].as_string());
+            }
+            else
+            {
+                log_warning("models: the default model cannot be downloaded: " + error);
+            }
+            return;
+        }
+    }
+
+    void service::on_installed(const installed_model& m)
+    {
+        if (stopping_) return;
+        // A new model takes the functions its catalog entry names and no model holds yet,
+        // and the general one when it is free, so that every function has a model.
+        std::vector<std::string> roles;
+        for (const auto& r : m.descriptor["roles"].elements())
+        {
+            const std::string role = r.as_string();
+            if (role == "general" || role == "code" || role == "security") roles.push_back(role);
+        }
+        roles.push_back("general");
+        for (const auto& role : roles)
+        {
+            if (settings_->get().active.count(role)) continue;
+            std::string error;
+            if (!activate(m.id, role, error)) log_warning("models: " + m.id + ": " + error);
+        }
+    }
+
+    bool service::load_model(const installed_model& m, std::string& error)
+    {
+        {
+            std::lock_guard<std::mutex> lock(m_);
+            load_state_[m.id] = "loading";
+        }
+        const host_settings st = settings_->get();
+        json options = json::object();
+        if (st.context > 0) options["context"] = st.context;
+        options["max_sequences"] = st.max_sequences;
+        if (st.kv_mb > 0) options["kv_mb"] = st.kv_mb;
+        const bool ok = engine_.load_model(m.id, m.file, options, error);
+        std::lock_guard<std::mutex> lock(m_);
+        load_state_[m.id] = ok ? std::string("ready") : error;
+        if (ok) log_info("models: " + m.id + " loaded");
+        else log_error("models: " + m.id + " not loaded: " + error);
+        return ok;
+    }
+
+    void service::load_active_models()
+    {
+        std::lock_guard<std::mutex> serial(models_m_);
+        if (!engine_.running()) return;
+        const host_settings st = settings_->get();
+        std::vector<std::string> done;
+        for (const auto& kv : st.active)
+        {
+            if (stopping_) return;
+            if (std::find(done.begin(), done.end(), kv.second) != done.end()) continue;
+            done.push_back(kv.second);
+            installed_model m;
+            if (!db_->find_model(kv.second, m) || !file_exists(m.file))
+            {
+                log_warning("models: the active model " + kv.second + " is not installed");
+                std::lock_guard<std::mutex> lock(m_);
+                load_state_[kv.second] = "not installed";
+                continue;
+            }
+            std::string error;
+            load_model(m, error);
+        }
+    }
+
+    bool service::activate(const std::string& id, const std::string& role, std::string& error)
+    {
+        if (!is_role(role))
+        {
+            error = "unknown role '" + role + "' (general, code or security)";
+            return false;
+        }
+        std::lock_guard<std::mutex> serial(models_m_);
+        installed_model m;
+        if (!db_->find_model(id, m) || !file_exists(m.file))
+        {
+            error = "the model " + id + " is not installed";
+            return false;
+        }
+        host_settings st = settings_->get();
+        const std::string previous = st.active.count(role) ? st.active[role] : std::string();
+        if (previous == id) return true;
+        const std::vector<std::string> loaded = engine_.loaded_models();
+        if (engine_.running() && std::find(loaded.begin(), loaded.end(), id) == loaded.end() && !load_model(m, error))
+            return false;
+        st.active[role] = id;
+        settings_->set(st);
+        log_info("models: " + id + " active for " + role);
+        // The model the role used before is released when no other role uses it.
+        if (!previous.empty())
+        {
+            bool used = false;
+            for (const auto& kv : st.active) used = used || kv.second == previous;
+            if (!used)
+            {
+                engine_.unload_model(previous);
+                std::lock_guard<std::mutex> lock(m_);
+                load_state_.erase(previous);
+            }
+        }
+        return true;
+    }
+
+    void service::deactivate(const std::string& id)
+    {
+        std::lock_guard<std::mutex> serial(models_m_);
+        host_settings st = settings_->get();
+        bool changed = false;
+        for (auto it = st.active.begin(); it != st.active.end();)
+        {
+            if (it->second == id)
+            {
+                it = st.active.erase(it);
+                changed = true;
+            }
+            else
+            {
+                ++it;
+            }
+        }
+        if (changed)
+        {
+            settings_->set(st);
+            log_info("models: " + id + " deactivated");
+        }
+        engine_.unload_model(id);
+        std::lock_guard<std::mutex> lock(m_);
+        load_state_.erase(id);
+    }
+
+    std::string service::resolve_model(const std::string& requested)
+    {
+        const host_settings st = settings_->get();
+        const std::vector<std::string> loaded = engine_.loaded_models();
+        auto is_loaded = [&](const std::string& id) {
+            return std::find(loaded.begin(), loaded.end(), id) != loaded.end();
+        };
+        std::string role = requested;
+        if (role.compare(0, 8, "albireo-") == 0) role = role.substr(8);
+        if (requested.empty() || requested == "auto" || requested == "albireo") role = "general";
+        if (is_role(role))
+        {
+            auto it = st.active.find(role);
+            if (it != st.active.end() && is_loaded(it->second)) return it->second;
+            // A role without its own model is served by the general model.
+            it = st.active.find("general");
+            if (it != st.active.end() && is_loaded(it->second)) return it->second;
+            return loaded.empty() ? std::string() : loaded.front();
+        }
+        return is_loaded(requested) ? requested : std::string();
+    }
+
+    void service::record_usage(long prompt_tokens, long generated_tokens)
+    {
+        usage_prompt_ += prompt_tokens;
+        usage_generated_ += generated_tokens;
+        ++usage_requests_;
+        try
+        {
+            db_->add_usage(prompt_tokens, generated_tokens, 1);
+        }
+        catch (const std::exception& e)
+        {
+            log_warning(std::string("usage: ") + e.what());
+        }
+    }
+
+    json service::status()
+    {
+        const host_settings st = settings_->get();
+        json s = json::object();
+        s["product"] = ALBIREO_PRODUCT_NAME;
+        s["version"] = ALBIREO_VERSION;
+        s["company"] = ALBIREO_COMPANY_NAME;
+        s["author"] = ALBIREO_AUTHOR_NAME;
+        s["copyright"] = ALBIREO_COPYRIGHT;
+        s["project"] = ALBIREO_PROJECT_URL;
+        s["started_at"] = static_cast<long long>(started_at_);
+        s["uptime"] = static_cast<long long>(now_unix() - started_at_);
+        s["port"] = port_;
+        s["url"] = "https://localhost:" + std::to_string(port_) + "/";
+        s["data_dir"] = data_dir_;
+        s["models_dir"] = st.effective_models_dir();
+        s["models_dir_free"] = static_cast<unsigned long long>(free_disk_space(st.effective_models_dir()));
+
+        json host = json::object();
+        const cpu_info cpu = read_cpu_info();
+        const memory_info mem = read_memory_info();
+        host["name"] = host_name();
+        host["os"] = operating_system_name();
+        json c = json::object();
+        c["name"] = cpu.brand.empty() ? cpu.vendor : cpu.brand;
+        c["cores"] = cpu.physical_cores;
+        c["threads"] = cpu.logical_cores;
+        json features = json::array();
+        if (cpu.avx2) features.push_back("AVX2");
+        if (cpu.fma) features.push_back("FMA");
+        if (cpu.f16c) features.push_back("F16C");
+        if (cpu.avx_vnni) features.push_back("AVX-VNNI");
+        if (cpu.avx512f) features.push_back("AVX-512");
+        if (cpu.avx512vnni) features.push_back("AVX512-VNNI");
+        if (cpu.amx) features.push_back("AMX");
+        c["features"] = features;
+        host["cpu"] = c;
+        json m = json::object();
+        m["total"] = static_cast<unsigned long long>(mem.total);
+        m["available"] = static_cast<unsigned long long>(mem.available);
+        host["memory"] = m;
+        s["host"] = host;
+
+        json e = json::object();
+        e["running"] = engine_.running();
+        e["variant"] = engine_.variant();
+        e["key"] = choice_.key;
+        e["device"] = choice_.device;
+        e["error"] = engine_error_;
+        e["description"] = engine_.description();
+        json query = json::object();
+        query["op"] = "stats";
+        e["stats"] = engine_.running() ? engine_.query(query) : json();
+        s["engine"] = e;
+        query["op"] = "models";
+        s["loaded_models"] = engine_.running() ? engine_.query(query)["models"] : json::array();
+
+        json active = json::object();
+        for (const auto& kv : st.active) active[kv.first] = kv.second;
+        s["active"] = active;
+        json loading = json::object();
+        {
+            std::lock_guard<std::mutex> lock(m_);
+            for (const auto& kv : load_state_) loading[kv.first] = kv.second;
+        }
+        s["models_state"] = loading;
+        json usage = json::object();
+        usage["requests"] = usage_requests_.load();
+        usage["prompt_tokens"] = usage_prompt_.load();
+        usage["completion_tokens"] = usage_generated_.load();
+        s["usage"] = usage;
+        s["downloads"] = models_->downloads();
+        s["updates"] = updater_->status();
+        json settings = json::object();
+        settings["engine"] = st.engine;
+        settings["accelerator"] = st.accelerator;
+        settings["v2ram"] = st.v2ram;
+        settings["v2ram_max_mb"] = st.v2ram_max_mb;
+        settings["language"] = st.language;
+        settings["check_updates"] = st.check_updates;
+        s["settings"] = settings;
+        return s;
+    }
+
+    json service::engines()
+    {
+        const host_settings st = settings_->get();
+        json list = json::array();
+        for (const auto& c : candidates_)
+        {
+            json j = json::object();
+            j["variant"] = c.variant;
+            j["path"] = c.path;
+            j["usable"] = c.usable;
+            j["version"] = c.description["version"];
+            j["build"] = c.description["build"];
+            j["devices"] = c.description["devices"];
+            if (!c.usable) j["reason"] = c.description["reason"];
+            j["current"] = choice_.candidate && choice_.candidate->path == c.path;
+            list.push_back(j);
+        }
+        json options = json::array();
+        for (const auto& o : engine_options(candidates_))
+        {
+            json j = json::object();
+            j["key"] = o.key;
+            j["variant"] = o.candidate->variant;
+            j["device"] = o.device;
+            j["current"] = o.key == choice_.key;
+            j["measure"] = st.engine_benchmarks[o.key];
+            options.push_back(j);
+        }
+        json out = json::object();
+        out["engines"] = list;
+        out["options"] = options;
+        out["current"] = choice_.key;
+        out["setting"] = st.engine;
+        out["accelerator"] = st.accelerator;
+        // The tray offers the choice of the accelerator while a processor engine runs.
+        bool accelerators = false;
+        for (const auto& o : engine_options(candidates_))
+            accelerators = accelerators || o.key == "cuda" || o.key == "openvino:npu" || o.key == "openvino:gpu";
+        out["accelerators_available"] = accelerators;
+        return out;
+    }
+
+    json service::benchmark_engines()
+    {
+        // The model of the measure: the general model, else the smallest one installed.
+        const host_settings st = settings_->get();
+        installed_model model;
+        bool found = st.active.count("general") && db_->find_model(st.active.at("general"), model);
+        if (!found)
+        {
+            for (const auto& m : db_->models())
+                if (!found || m.size < model.size)
+                {
+                    model = m;
+                    found = true;
+                }
+        }
+        json out = json::object();
+        if (!found)
+        {
+            out["error"] = "no model is installed";
+            return out;
+        }
+        host_settings updated = st;
+        json results = json::object();
+        for (const auto& o : engine_options(candidates_))
+        {
+            if (stopping_) break;
+            json config = engine_config(st, o.device);
+            config["context"] = 2048;
+            // The graphs of a device compile before the products they serve, so that the
+            // measure reflects the device.
+            config["benchmark"] = true;
+            std::string output;
+            log_info("engines: measuring " + o.key + " with " + model.id);
+            const std::vector<std::string> args = { "--bench-engine", o.candidate->path, model.file, config.dump() };
+            const int code = run_process(executable_path(), args, &output, 600000);
+            const size_t start = output.rfind("\n{");
+            const json r = json::parse_or_null(start == std::string::npos ? output : output.substr(start + 1));
+            if (code == 0 && r["tokens_per_second"].as_double(0) > 0)
+            {
+                json m = r;
+                m["model"] = model.id;
+                m["measured_at"] = static_cast<long long>(now_unix());
+                updated.engine_benchmarks[o.key] = m;
+                results[o.key] = m;
+                log_info("engines: " + o.key + " " + std::to_string(r["tokens_per_second"].as_double()) + " tokens/s");
+            }
+            else
+            {
+                json m = json::object();
+                const std::string failed = "the measure failed (code " + std::to_string(code) + ")";
+                m["error"] = r["error"].is_string() ? r["error"] : json(failed);
+                results[o.key] = m;
+                log_warning("engines: measure of " + o.key + " failed");
+            }
+        }
+        settings_->set(updated);
+        out["model"] = model.id;
+        out["results"] = results;
+        // The engine "best", or an accelerator choice among several devices, follows the
+        // new measures after a restart.
+        const engine_choice next = choose_engine(candidates_, updated);
+        out["restart"] = next.key != choice_.key;
+        if (next.key != choice_.key) request_restart();
+        return out;
+    }
+
+    int service::probe_engine(const std::string& path)
+    {
+        engine_library lib;
+        std::string error;
+        json d;
+        if (!lib.load(path, error))
+        {
+            d = json::object();
+            d["usable"] = false;
+            d["reason"] = error;
+            std::cout << d.dump() << std::endl;
+            return 2;
+        }
+        d = lib.description();
+        if (!d.is_object())
+        {
+            d = json::object();
+            d["usable"] = false;
+            d["reason"] = "the library gives no description";
+        }
+        std::cout << d.dump() << std::endl;
+        return 0;
+    }
+
+    int service::benchmark_engine(const std::string& path, const std::string& model, const std::string& config)
+    {
+        auto fail = [](const std::string& message) {
+            json r = json::object();
+            r["error"] = message;
+            std::cout << r.dump() << std::endl;
+            return 2;
+        };
+        engine_library lib;
+        std::string error;
+        if (!lib.load(path, error)) return fail(error);
+        char err[2048] = { 0 };
+        albireo_engine* e = lib.create(config.c_str(), nullptr, nullptr, err, sizeof(err));
+        if (!e) return fail(err);
+        json options = json::object();
+        options["context"] = 2048;
+        options["max_sequences"] = 1;
+        if (lib.load_model(e, "bench", model.c_str(), options.dump().c_str(), err, sizeof(err)) != ALBIREO_OK)
+        {
+            lib.destroy(e);
+            return fail(err);
+        }
+
+        struct waiter
+        {
+            std::mutex m;
+            std::condition_variable cv;
+            bool done = false;
+            std::string result;
+            static void ALBIREO_ENGINE_CALL on_event(void* user, int kind, const char* data, size_t size)
+            {
+                waiter* w = static_cast<waiter*>(user);
+                if (kind != ALBIREO_EVENT_DONE && kind != ALBIREO_EVENT_ERROR) return;
+                std::lock_guard<std::mutex> lock(w->m);
+                w->done = true;
+                w->result.assign(data, size);
+                w->cv.notify_all();
+            }
+        };
+        auto run = [&](int tokens, json& done) {
+            json req = json::object();
+            req["model"] = "bench";
+            json messages = json::array();
+            json msg = json::object();
+            msg["role"] = "user";
+            msg["content"] = "Write a detailed explanation of how a refracting telescope forms an image, "
+                "covering the objective lens, the focal length, the eyepiece and the magnification.";
+            messages.push_back(msg);
+            req["messages"] = messages;
+            req["max_tokens"] = tokens;
+            req["temperature"] = 0;
+            req["reasoning"] = false;
+            json stop_none = json::array();
+            req["stop"] = stop_none;
+            waiter w;
+            uint64_t id = 0;
+            if (lib.submit(e, req.dump().c_str(), &waiter::on_event, &w, &id, err, sizeof(err)) != ALBIREO_OK)
+                return false;
+            std::unique_lock<std::mutex> lock(w.m);
+            w.cv.wait(lock, [&]() { return w.done; });
+            done = json::parse_or_null(w.result);
+            return done["usage"].is_object();
+        };
+        json warm, done;
+        // A first short request warms the caches and lets a device compile its graphs.
+        const bool ok = run(8, warm) && run(64, done);
+        lib.unload_model(e, "bench");
+        lib.destroy(e);
+        if (!ok) return fail(done["message"].str("the measure did not complete"));
+        const json& t = done["timings"];
+        json r = json::object();
+        r["tokens_per_second"] = t["generation_per_second"];
+        r["prompt_tokens_per_second"] = t["prompt_per_second"];
+        r["generated"] = done["usage"]["completion_tokens"];
+        std::cout << r.dump() << std::endl;
+        return 0;
+    }
+
+}
