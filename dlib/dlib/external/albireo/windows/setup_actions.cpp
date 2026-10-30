@@ -30,16 +30,23 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
+#include <cstring>
 #include <ctime>
 #include <cwchar>
 #include <fstream>
+#include <map>
+#include <memory>
+#include <set>
 #include <thread>
 #include <vector>
 
+#include "../common/builtin_models.h"
 #include "../common/json.h"
 #include "../common/platform.h"
 #include "../common/version.h"
 #include "../host/certificates.h"
+#include "../host/crypto.h"
 #include "resource.h"
 
 namespace albireo
@@ -422,15 +429,265 @@ namespace setup
         }
     }
 
+    namespace
+    {
+        struct file_closer
+        {
+            void operator()(std::FILE* f) const { if (f) std::fclose(f); }
+        };
+        typedef std::unique_ptr<std::FILE, file_closer> file_ptr;
+
+        file_ptr open_file(const std::string& path, const wchar_t* mode)
+        {
+            return file_ptr(_wfopen(widen(path).c_str(), mode));
+        }
+
+        bool read_at(std::FILE* f, uint64_t pos, void* data, size_t n)
+        {
+            return _fseeki64(f, static_cast<__int64>(pos), SEEK_SET) == 0 && std::fread(data, 1, n, f) == n;
+        }
+
+        template <typename T> T little(const unsigned char* p)
+        {
+            T v = 0;
+            for (size_t i = 0; i < sizeof(T); ++i) v |= static_cast<T>(p[i]) << (8 * i);
+            return v;
+        }
+
+        /*
+            The layout of a program: the end of its sections, the position of the entry of
+            its certificate table in its headers, and the position of the table, 0 when the
+            program is not signed.
+        */
+        bool pe_layout(std::FILE* f, uint64_t size, uint64_t& sections_end, uint64_t& security_entry,
+            uint64_t& certificates)
+        {
+            unsigned char dos[64];
+            if (size < sizeof(dos) || !read_at(f, 0, dos, sizeof(dos)) || dos[0] != 'M' || dos[1] != 'Z') return false;
+            const uint64_t pe = little<uint32_t>(dos + 0x3c);
+            unsigned char head[24 + 240];
+            if (pe + sizeof(head) > size || !read_at(f, pe, head, sizeof(head))) return false;
+            if (std::memcmp(head, "PE\0\0", 4) != 0) return false;
+            const unsigned sections = little<uint16_t>(head + 6);
+            const unsigned optional = little<uint16_t>(head + 20);
+            const unsigned magic = little<uint16_t>(head + 24);
+            // The data directories: 96 bytes into a PE32 optional header, 112 into PE32+.
+            const unsigned directories = magic == 0x20b ? 112 : 96;
+            const unsigned count = little<uint32_t>(head + 24 + directories - 4);
+            security_entry = pe + 24 + directories + 4 * 8;
+            certificates = 0;
+            if (count > 4 && directories + 5 * 8 <= optional)
+            {
+                const uint64_t at = little<uint32_t>(head + 24 + directories + 4 * 8);
+                const uint64_t length = little<uint32_t>(head + 24 + directories + 4 * 8 + 4);
+                if (at && length && at + length <= size) certificates = at;
+            }
+            sections_end = 0;
+            const uint64_t table = pe + 24 + optional;
+            for (unsigned i = 0; i < sections; ++i)
+            {
+                unsigned char s[40];
+                if (!read_at(f, table + 40ull * i, s, sizeof(s))) return false;
+                const uint64_t raw = little<uint32_t>(s + 16);
+                const uint64_t at = little<uint32_t>(s + 20);
+                if (raw && at + raw > sections_end) sections_end = at + raw;
+            }
+            return sections_end > 0 && sections_end <= size;
+        }
+
+        // Copies the first length bytes of a program, without the entry of its certificate
+        // table, which the copy no longer holds.
+        bool copy_program(const std::string& from, const std::wstring& to, uint64_t length, std::string& error)
+        {
+            file_ptr in = open_file(from, L"rb");
+            file_ptr out(_wfopen(to.c_str(), L"wb"));
+            if (!in || !out)
+            {
+                error = "cannot copy the uninstaller";
+                return false;
+            }
+            const uint64_t size = file_size(from);
+            uint64_t sections_end = 0, security_entry = 0, certificates = 0;
+            const bool pe = pe_layout(in.get(), size, sections_end, security_entry, certificates);
+            if (_fseeki64(in.get(), 0, SEEK_SET) != 0) return false;
+            std::vector<char> b(1u << 20);
+            for (uint64_t done = 0; done < length;)
+            {
+                const size_t n = static_cast<size_t>(std::min<uint64_t>(length - done, b.size()));
+                if (std::fread(b.data(), 1, n, in.get()) != n)
+                {
+                    error = "cannot read " + from;
+                    return false;
+                }
+                // The entry of the certificate table, emptied.
+                if (pe && certificates && security_entry + 8 > done && security_entry < done + n)
+                    for (uint64_t i = std::max(done, security_entry); i < std::min(done + n, security_entry + 8); ++i)
+                        b[static_cast<size_t>(i - done)] = 0;
+                if (std::fwrite(b.data(), 1, n, out.get()) != n)
+                {
+                    error = "cannot write the uninstaller";
+                    return false;
+                }
+                done += n;
+            }
+            return std::fflush(out.get()) == 0;
+        }
+    }
+
+    builtin_overlay read_builtin_overlay(const std::string& installer)
+    {
+        builtin_overlay o;
+        file_ptr f = open_file(installer, L"rb");
+        if (!f) return o;
+        const uint64_t size = file_size(installer);
+        uint64_t sections_end = 0, security_entry = 0, certificates = 0;
+        if (!pe_layout(f.get(), size, sections_end, security_entry, certificates)) return o;
+        // The overlay ends before the certificate table, which a signing tool may precede
+        // with up to 7 bytes of zeros.
+        const uint64_t end = certificates ? certificates : size;
+        for (uint64_t pad = 0; pad < 8; ++pad)
+        {
+            if (end < sections_end + sizeof(builtin_trailer) + pad) break;
+            const uint64_t tail = end - pad;
+            builtin_trailer t;
+            if (!read_at(f.get(), tail - sizeof(t), &t, sizeof(t)) || !t.valid()) continue;
+            if (t.overlay_size > tail - sections_end || t.manifest_size > (16u << 20)
+                || t.manifest_offset + t.manifest_size > t.overlay_size)
+                break;
+            const uint64_t start = tail - t.overlay_size;
+            std::string text(static_cast<size_t>(t.manifest_size), '\0');
+            if (!read_at(f.get(), start + t.manifest_offset, &text[0], text.size())) break;
+            json manifest = json::parse_or_null(text);
+            uint64_t total = 0;
+            bool valid = manifest["models"].is_array();
+            for (const auto& m : manifest["models"].elements())
+            {
+                const uint64_t at = static_cast<uint64_t>(m["offset"].as_int(-1));
+                const uint64_t length = static_cast<uint64_t>(m["size"].as_int(-1));
+                valid = valid && m["offset"].is_number() && m["size"].is_number() && at + length <= t.manifest_offset;
+                total += length;
+            }
+            if (!valid) break;
+            o.start = start;
+            o.total = total;
+            o.manifest = manifest;
+            break;
+        }
+        return o;
+    }
+
+    bool install_builtin_models(const std::string& program_dir,
+        const std::function<void(uint64_t done, uint64_t total, const std::string& file)>& progress,
+        std::string& error)
+    {
+        const std::string installer = executable_path();
+        const builtin_overlay o = read_builtin_overlay(installer);
+        if (!o.present()) return true;
+        const std::string dir = join_path(program_dir, builtin_models_folder);
+        make_dirs(dir);
+        // The files of the installation in place, kept when they are the same.
+        std::string text;
+        const json before = read_file(join_path(dir, builtin_manifest_name), text, 16u << 20)
+            ? json::parse_or_null(text) : json();
+        std::map<std::string, std::string> had;
+        for (const auto& m : before["models"].elements()) had[m["file"].as_string()] = m["sha256"].as_string();
+        file_ptr in = open_file(installer, L"rb");
+        if (!in)
+        {
+            error = "cannot read " + installer;
+            return false;
+        }
+        json manifest = o.manifest;
+        std::set<std::string> names;
+        uint64_t done = 0;
+        std::vector<char> b(1u << 20);
+        for (auto& m : manifest["models"].elements())
+        {
+            const std::string name = m["file"].as_string();
+            const uint64_t size = static_cast<uint64_t>(m["size"].as_int(0));
+            const std::string sha = m["sha256"].as_string();
+            const uint64_t at = o.start + static_cast<uint64_t>(m["offset"].as_int(0));
+            m.erase("offset");
+            if (name.empty() || name.find_first_of("/\\:") != std::string::npos || name.find("..") != std::string::npos)
+            {
+                error = "invalid file name in the models of the installer: " + name;
+                return false;
+            }
+            names.insert(name);
+            const std::string target = join_path(dir, name);
+            if (had.count(name) && had[name] == sha && file_exists(target) && file_size(target) == size)
+            {
+                log("model " + name + ": already installed");
+                done += size;
+                if (progress) progress(done, o.total, name);
+                continue;
+            }
+            const std::string partial = target + ".new";
+            {
+                file_ptr out = open_file(partial, L"wb");
+                if (!out || _fseeki64(in.get(), static_cast<__int64>(at), SEEK_SET) != 0)
+                {
+                    error = "cannot write " + partial;
+                    return false;
+                }
+                sha256_stream hash;
+                for (uint64_t left = size; left > 0;)
+                {
+                    const size_t n = static_cast<size_t>(std::min<uint64_t>(left, b.size()));
+                    if (std::fread(b.data(), 1, n, in.get()) != n || std::fwrite(b.data(), 1, n, out.get()) != n)
+                    {
+                        out.reset();
+                        remove_file(partial);
+                        error = "cannot copy the model " + name + " (disk full?)";
+                        return false;
+                    }
+                    hash.update(b.data(), n);
+                    left -= n;
+                    done += n;
+                    if (progress) progress(done, o.total, name);
+                }
+                if (std::fflush(out.get()) != 0 || hash.hex() != sha)
+                {
+                    out.reset();
+                    remove_file(partial);
+                    error = "the model " + name + " of the installer is damaged";
+                    return false;
+                }
+            }
+            if (!MoveFileExW(widen(partial).c_str(), widen(target).c_str(), MOVEFILE_REPLACE_EXISTING))
+            {
+                error = last_error(("cannot install the model " + name).c_str());
+                remove_file(partial);
+                return false;
+            }
+            log("model " + name + ": installed");
+        }
+        // The models that no longer come with Albireo.
+        for (const auto& kv : had)
+            if (!names.count(kv.first) && kv.first.find_first_of("/\\:") == std::string::npos)
+                remove_file(join_path(dir, kv.first));
+        const std::string path = join_path(dir, builtin_manifest_name);
+        if (!write_file_atomic(path, manifest.dump_formatted(2) + "\n"))
+        {
+            error = "cannot write " + path;
+            return false;
+        }
+        return true;
+    }
+
     bool install_uninstaller(const std::string& program_dir, std::string& error)
     {
         const std::string self = executable_path();
         const std::string target = join_path(program_dir, "albireo-setup.exe");
         if (_wcsicmp(widen(self).c_str(), widen(target).c_str()) == 0) return true;
         const std::wstring tmp = widen(target) + L".tmp";
-        if (!CopyFileW(widen(self).c_str(), tmp.c_str(), FALSE))
+        // The program alone: the models that follow it stay in the installer.
+        const builtin_overlay overlay = read_builtin_overlay(self);
+        if (overlay.present() ? !copy_program(self, tmp, overlay.start, error)
+                : !CopyFileW(widen(self).c_str(), tmp.c_str(), FALSE))
         {
-            error = last_error("cannot copy the uninstaller");
+            if (error.empty()) error = last_error("cannot copy the uninstaller");
+            DeleteFileW(tmp.c_str());
             return false;
         }
         // The copy keeps everything but the payload; when the payload cannot be removed,
@@ -509,13 +766,22 @@ namespace setup
         }
         const std::string source = join_path(bundle, "models");
         if (!dir_exists(source)) return 0;
+        // The models folder of programs (a build tree, an installation) holds the models
+        // that come with Albireo, which the installer carries already: they are no bundle.
+        std::set<std::string> builtin;
+        std::string text;
+        if (read_file(join_path(source, builtin_manifest_name), text, 16u << 20))
+        {
+            builtin.insert(builtin_manifest_name);
+            for (const auto& m : json::parse_or_null(text)["models"].elements()) builtin.insert(m["file"].as_string());
+        }
         make_dirs(inbox);
         int n = 0;
         for (const auto& name : list_dir(source))
         {
             const bool gguf = name.size() > 5 && name.substr(name.size() - 5) == ".gguf";
             const bool side = name.size() > 5 && name.substr(name.size() - 5) == ".json";
-            if (!gguf && !side) continue;
+            if ((!gguf && !side) || builtin.count(name)) continue;
             if (progress && gguf) progress(name);
             const bool copied = CopyFileW(widen(join_path(source, name)).c_str(),
                 widen(join_path(inbox, name)).c_str(), FALSE) != FALSE;
@@ -580,7 +846,7 @@ namespace setup
         };
         const std::wstring dir = widen(program_dir);
         const std::wstring setup = L"\"" + widen(join_path(program_dir, "albireo-setup.exe")) + L"\"";
-        str(L"DisplayName", L"Albireo");
+        str(L"DisplayName", widen(ALBIREO_FULL_NAME));
         str(L"DisplayVersion", widen(ALBIREO_VERSION));
         str(L"Publisher", widen(ALBIREO_COMPANY_NAME));
         str(L"DisplayIcon", widen(join_path(program_dir, "albireo-tray.exe")) + L",0");

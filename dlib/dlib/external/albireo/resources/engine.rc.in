@@ -24,7 +24,7 @@ BEGIN
             VALUE "InternalName", "@ALBIREO_RC_FILE@"
             VALUE "LegalCopyright", ALBIREO_COPYRIGHT
             VALUE "OriginalFilename", "@ALBIREO_RC_FILE@"
-            VALUE "ProductName", ALBIREO_PRODUCT_NAME
+            VALUE "ProductName", ALBIREO_FULL_NAME
             VALUE "ProductVersion", ALBIREO_VERSION
         END
     END

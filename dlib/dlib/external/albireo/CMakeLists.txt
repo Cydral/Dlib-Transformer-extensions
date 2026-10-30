@@ -16,7 +16,7 @@
 # folders whose files go into the engines folder of the installation.
 
 cmake_minimum_required(VERSION 3.16)
-project(albireo VERSION 1.0.0 LANGUAGES C CXX)
+project(albireo VERSION 1.0.6 LANGUAGES C CXX)
 
 option(ALBIREO_PROGRAMS "Build the service, the tray, the installer and the processor engines" ON)
 option(ALBIREO_ENGINE_CUDA "Build the engine for NVIDIA graphics processors (dlib built with CUDA)" OFF)
@@ -321,10 +321,17 @@ function(albireo_device_runtime target)
 endfunction()
 
 # Engines whose products go to a device through the tensors of dlib.  Their processor side
-# is the one of cpu-avx2: every machine with such a device has these instructions.
+# is the one of cpu-avx2, which every machine with such a device has, or the quantized kernels
+# of the family given after the variant (avxvnni, avx512), the rest of the library staying at
+# AVX2.
 function(albireo_tensor_engine variant)
    set(ALBIREO_DEVICE_ENGINE ON)
-   albireo_engine(${variant} inline engine/tensor_backend.cpp)
+   set(family "${ARGN}")
+   if (family)
+      albireo_engine(${variant} ${family} engine/tensor_backend.cpp)
+   else()
+      albireo_engine(${variant} inline engine/tensor_backend.cpp)
+   endif()
    set(target albireo-engine-${variant})
    foreach (f ${ALBIREO_RUNTIME_LICENSES})
       get_filename_component(name "${f}" NAME)
@@ -422,7 +429,18 @@ if (ALBIREO_ENGINE_OPENVINO)
       message(FATAL_ERROR "dlib could not be configured with OpenVINO (see the messages above): the OpenVINO engine "
          "needs the OpenVINO runtime, from its archive or from pip install openvino.")
    endif()
+   # One engine per family of processor kernels, so that the NPU and the graphics processor
+   # join the richest kernels of the processor: the service runs the one this processor takes.
    albireo_tensor_engine(openvino)
+   set(openvino_engines albireo-engine-openvino)
+   if (ALBIREO_HAS_avxvnni)
+      albireo_tensor_engine(openvino-avxvnni avxvnni)
+      list(APPEND openvino_engines albireo-engine-openvino-avxvnni)
+   endif()
+   if (ALBIREO_HAS_avx512)
+      albireo_tensor_engine(openvino-avx512 avx512)
+      list(APPEND openvino_engines albireo-engine-openvino-avx512)
+   endif()
    # The folder of the runtime of OpenVINO, which loads the plugins of the devices by name.
    find_package(OpenVINO QUIET COMPONENTS Runtime PATHS "${OpenVINO_DIR}" NO_DEFAULT_PATH)
    set(openvino_dir)
@@ -440,7 +458,9 @@ if (ALBIREO_ENGINE_OPENVINO)
          set(plugin "${CMAKE_SHARED_LIBRARY_PREFIX}openvino_intel_${device}_plugin${CMAKE_SHARED_LIBRARY_SUFFIX}")
          list(APPEND ALBIREO_RUNTIME_EXTRA "${openvino_dir}/${plugin}")
       endforeach()
-      albireo_device_runtime(albireo-engine-openvino)
+      foreach (engine ${openvino_engines})
+         albireo_device_runtime(${engine})
+      endforeach()
       set(ALBIREO_TEST_RUNTIME_EXTRA
          "${openvino_dir}/${CMAKE_SHARED_LIBRARY_PREFIX}openvino_intel_cpu_plugin${CMAKE_SHARED_LIBRARY_SUFFIX}")
       if (ALBIREO_COPY_RUNTIME)
@@ -498,6 +518,65 @@ if (ALBIREO_PROGRAMS)
    add_executable(albireo-sign tools/albireo_sign.cpp host/crypto.cpp)
    target_link_libraries(albireo-sign PRIVATE albireo_common dlib::httplib)
    target_compile_options(albireo-sign PRIVATE ${ALBIREO_WARNINGS})
+
+   # The preparation of the models that come with Albireo: checked and converted with the
+   # code of the engine, then given to the programs of the tree and to the installer.
+   albireo_kernels(portable)
+   add_executable(albireo-builtin tools/albireo_builtin.cpp engine/chat_format.cpp engine/model_config.cpp
+      engine/model_file.cpp $<TARGET_OBJECTS:albireo-kernels-portable> host/crypto.cpp)
+   target_link_libraries(albireo-builtin PRIVATE albireo_common dlib::httplib)
+   target_compile_options(albireo-builtin PRIVATE ${ALBIREO_WARNINGS})
+
+   # The models that come with Albireo (resources/builtin_models.json): downloaded once into
+   # the cache (cmake/builtin_models.cmake), checked and converted by albireo-builtin, then
+   # given to the "models" folder of the programs of the tree and, on Windows, to the
+   # complete installer.  A cross build takes the albireo-builtin of the build machine.
+   if (WIN32 AND NOT CMAKE_CROSSCOMPILING)
+      set(builtin_default ON)
+   else()
+      set(builtin_default OFF)
+   endif()
+   option(ALBIREO_BUILTIN_MODELS "Prepare the models that come with Albireo and put them in the installer"
+      ${builtin_default})
+   if (WIN32 AND DEFINED ENV{LOCALAPPDATA})
+      file(TO_CMAKE_PATH "$ENV{LOCALAPPDATA}/Albireo/build-cache" cache_default)
+   elseif (DEFINED ENV{XDG_CACHE_HOME})
+      set(cache_default "$ENV{XDG_CACHE_HOME}/albireo")
+   else()
+      set(cache_default "$ENV{HOME}/.cache/albireo")
+   endif()
+   set(ALBIREO_MODEL_CACHE "${cache_default}" CACHE PATH
+      "Folder of the downloaded and converted models that come with Albireo")
+   set(ALBIREO_BUILTIN_MANIFEST "${CMAKE_CURRENT_SOURCE_DIR}/resources/builtin_models.json" CACHE FILEPATH
+      "Manifest of the models that come with Albireo")
+   set(ALBIREO_BUILTIN_TOOL "" CACHE FILEPATH "albireo-builtin of the build machine, for a cross build")
+   if (ALBIREO_BUILTIN_MODELS)
+      if (CMAKE_VERSION VERSION_LESS 3.19)
+         message(FATAL_ERROR "the models that come with Albireo need CMake 3.19 or later "
+            "(-DALBIREO_BUILTIN_MODELS=OFF builds without them)")
+      endif()
+      if (ALBIREO_BUILTIN_TOOL)
+         set(ALBIREO_BUILTIN_COMMAND "${ALBIREO_BUILTIN_TOOL}")
+         set(builtin_tool_target)
+      elseif (CMAKE_CROSSCOMPILING)
+         message(FATAL_ERROR "a cross build prepares its models with the albireo-builtin of the build machine: "
+            "set ALBIREO_BUILTIN_TOOL")
+      else()
+         set(ALBIREO_BUILTIN_COMMAND $<TARGET_FILE:albireo-builtin>)
+         set(builtin_tool_target albireo-builtin)
+      endif()
+      set(ALBIREO_BUILTIN_STAMP ${CMAKE_BINARY_DIR}/bin/models/builtin.json)
+      add_custom_command(OUTPUT ${ALBIREO_BUILTIN_STAMP}
+         COMMAND ${CMAKE_COMMAND} -DMANIFEST=${ALBIREO_BUILTIN_MANIFEST} -DCACHE=${ALBIREO_MODEL_CACHE}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/builtin_models.cmake
+         COMMAND ${ALBIREO_BUILTIN_COMMAND} --manifest ${ALBIREO_BUILTIN_MANIFEST} --cache ${ALBIREO_MODEL_CACHE}
+            --models-out ${CMAKE_BINARY_DIR}/bin/models
+         DEPENDS ${ALBIREO_BUILTIN_MANIFEST} ${CMAKE_CURRENT_SOURCE_DIR}/cmake/builtin_models.cmake
+            ${builtin_tool_target}
+         COMMENT "Preparing the models that come with Albireo"
+         VERBATIM)
+      add_custom_target(albireo-builtin-models ALL DEPENDS ${ALBIREO_BUILTIN_STAMP})
+   endif()
 
    # The web application and the documentation of the interface, next to the service.
    add_custom_target(albireo-web ALL

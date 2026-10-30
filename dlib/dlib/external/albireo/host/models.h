@@ -42,8 +42,19 @@ namespace albireo
                 import_path() installs the GGUF files of a folder (and of its "models"
                 subfolder) or a single file, such as a memory card or a disk brought to a
                 machine without network.  A file whose hash is in the catalog takes its
-                entry; another one is described from its own metadata.  import_catalog()
-                installs a signed catalog brought the same way.
+                entry; another one is described from its own metadata, the identity of a
+                model of Albireo included (albireo.id, albireo.name, albireo.roles,
+                albireo.inputs).  import_catalog() installs a signed catalog brought the
+                same way.
+
+            MODELS THAT COME WITH ALBIREO
+                register_builtin() records the models of the folder of the programs, which
+                the complete installer places there.  They are listed like the others and
+                take the functions no model holds; they cannot be deleted, only replaced.
+
+            THE LISTS OF THE WINDOWS
+                overview() lists the language models only: the embedding model serves the
+                document search, which always has one, and is given apart ("embedding").
         !*/
     public:
         model_manager(store& db, const std::string& models_dir, const std::string& catalog_url);
@@ -97,6 +108,18 @@ namespace albireo
         // Installs a file received by the service (a transfer from the tray), moved into
         // the models folder; sha is the hash computed while it was received.
         json import_received(const std::string& file, const std::string& original_name, const std::string& sha);
+
+        /*!
+            ensures
+                - Registers the models that come with Albireo, listed by the manifest
+                  builtin.json of dir, the "models" folder of the programs
+                  (common/builtin_models.h): source "builtin", their files where they lie,
+                  their hashes as the installer checked them.  The models of an earlier
+                  manifest that this one no longer lists, or whose file is gone, leave the
+                  database; their identifiers are added to removed.
+                - Returns the models this call registers for the first time.
+        !*/
+        std::vector<installed_model> register_builtin(const std::string& dir, std::vector<std::string>& removed);
 
         // Called when a download completes or an import installs a model.
         void on_installed(std::function<void(const installed_model&)> f) { installed_cb_ = std::move(f); }

@@ -28,7 +28,7 @@ import { icon } from './icons.js';
 import * as store from './store.js';
 import { renderMarkdown, attachCodeButtons, escapeHtml } from './markdown.js';
 import * as api from './api.js';
-import { extractText, maxFileBytes, extension, searchPassages } from './documents.js';
+import { extractText, maxFileBytes, extension, searchPassages, documentAccept, fileKind } from './documents.js';
 import * as rag from './rag.js';
 import * as tools from './tools.js';
 
@@ -193,7 +193,8 @@ function roleModel(role) {
 
 function modelInfo(id) {
   if (!state.catalog || !id) return null;
-  return (state.catalog.models || []).find((m) => m.id === id) || null;
+  const same = (m) => m.id === id;
+  return (state.catalog.models || []).find(same) || (state.catalog.embedding_models || []).find(same) || null;
 }
 
 function modelName(id) {
@@ -204,6 +205,26 @@ function modelName(id) {
 function loadedModel(id) {
   const list = (state.status && state.status.loaded_models) || [];
   return list.find((m) => m.id === id) || null;
+}
+
+// What the model of a role reads: "text", and "image" or "audio" for the models that read
+// them; the attachments follow.
+function roleInputs(role) {
+  const m = modelInfo(roleModel(role));
+  return m && Array.isArray(m.inputs) && m.inputs.length ? m.inputs : ['text'];
+}
+
+function inputsLabel(inputs) {
+  return inputs.map((i) => t('input_' + i)).join(', ');
+}
+
+// The file picker of a role: the documents, read as text, and the media its model reads.
+function acceptFor(role) {
+  const inputs = roleInputs(role);
+  let accept = documentAccept();
+  if (inputs.includes('image')) accept += ',image/*';
+  if (inputs.includes('audio')) accept += ',audio/*';
+  return accept;
 }
 
 function roleCapabilities(role) {
@@ -258,7 +279,10 @@ function renderStatusLine() {
     const stats = s.engine && s.engine.stats;
     const loading = Object.values(s.models_state || {}).some((v) => v === 'loading');
     const model = roleModel(state.current ? state.current.role : 'general');
-    if (!model) {
+    if (s.state === 'starting') {
+      led = 'busy';
+      text = t('serviceStarting');
+    } else if (!model) {
       led = 'error';
       text = t('noModel');
     } else if (loading) {
@@ -873,7 +897,7 @@ function renderProject(p) {
       onclick: async () => { p.color = col; await save(); renderProject(p); }
     }));
   }
-  const fileInput = h('input', { type: 'file', multiple: true, class: 'hidden' });
+  const fileInput = h('input', { type: 'file', multiple: true, class: 'hidden', accept: documentAccept() });
   fileInput.addEventListener('change', async () => {
     const added = await readFiles(Array.from(fileInput.files));
     p.files = (p.files || []).concat(added);
@@ -944,11 +968,23 @@ function renderProject(p) {
 }
 
 // Files.
-async function readFiles(files) {
+/*
+    Reads the files attached for the model of role (the documents of a project for none):
+    the documents become text; an image or a sound is attached only when the model reads it.
+*/
+async function readFiles(files, role) {
   const out = [];
+  const inputs = role ? roleInputs(role) : ['text'];
   for (const f of files) {
     if (f.size > maxFileBytes) {
       toast(t('tooLarge', { name: f.name, size: formatSize(f.size), limit: formatSize(maxFileBytes) }), true);
+      continue;
+    }
+    const kind = fileKind(f);
+    if (kind !== 'document' && !inputs.includes(kind)) {
+      const model = role ? modelName(roleModel(role)) : '';
+      toast(role ? t('inputRefused', { name: f.name, model, inputs: inputsLabel(inputs) })
+        : t('unsupported', { name: f.name }), true);
       continue;
     }
     try {
@@ -1203,9 +1239,9 @@ function editMessage(c, m, index, el) {
     })));
   };
   showChips();
-  const fileInput = h('input', { type: 'file', multiple: true, class: 'hidden' });
+  const fileInput = h('input', { type: 'file', multiple: true, class: 'hidden', accept: acceptFor(c.role) });
   fileInput.addEventListener('change', async () => {
-    attachments = attachments.concat(await readFiles(Array.from(fileInput.files)));
+    attachments = attachments.concat(await readFiles(Array.from(fileInput.files), c.role));
     fileInput.value = '';
     showChips();
   });
@@ -1236,7 +1272,7 @@ function editMessage(c, m, index, el) {
   box.addEventListener('drop', async (e) => {
     e.preventDefault();
     if (!e.dataTransfer || !e.dataTransfer.files.length) return;
-    attachments = attachments.concat(await readFiles(Array.from(e.dataTransfer.files)));
+    attachments = attachments.concat(await readFiles(Array.from(e.dataTransfer.files), c.role));
     showChips();
   });
   el.replaceChildren(box);
@@ -1367,6 +1403,14 @@ function renderComposerState() {
   ui.reasonButton.disabled = !caps.reasoning;
   ui.agentButton.classList.toggle('on', !!(c && c.agent && caps.tools));
   ui.agentButton.disabled = !caps.tools;
+  // The attachments the model of the function reads.
+  const role = c ? c.role : 'general';
+  if (ui.fileInput) ui.fileInput.accept = acceptFor(role);
+  if (ui.attachButton) {
+    const hint = t('attachInputs', { inputs: inputsLabel(roleInputs(role)) });
+    ui.attachButton.title = hint;
+    ui.attachButton.setAttribute('aria-label', hint);
+  }
   ui.sendButton.classList.toggle('stop', state.busy);
   ui.sendButton.innerHTML = icon(state.busy ? 'stop' : 'send');
   ui.sendButton.title = state.busy ? t('stop') : t('send');
@@ -1387,7 +1431,7 @@ function autoGrow() {
 }
 
 async function addPending(files) {
-  const added = await readFiles(files);
+  const added = await readFiles(files, state.current ? state.current.role : 'general');
   state.pending = state.pending.concat(added);
   renderComposerState();
 }
@@ -2085,7 +2129,8 @@ async function remember(c) {
 
 // An error of the service in the language of the interface, by its code when it has one.
 function errorText(e) {
-  const known = { model_not_found: 'errModelNotFound', context_length_exceeded: 'errContextLength', unloaded: 'errUnloaded' };
+  const known = { model_not_found: 'errModelNotFound', context_length_exceeded: 'errContextLength', unloaded: 'errUnloaded',
+    starting: 'errStarting', model_loading: 'modelLoading' };
   if (e && known[e.code]) return t(known[e.code]);
   // fetch rejects with a TypeError when the service does not answer.
   if (e instanceof TypeError) return t('errService');
@@ -2406,7 +2451,7 @@ async function aboutTab(body) {
   const art = h('div', { class: 'about-art' }, h('img', { src: 'img/about.svg', alt: '' }));
   const kv = h('div', { class: 'kv' });
   const row = (k, v) => kv.append(h('div', null, k), h('div', null, v));
-  row(t('version'), (s.product || 'Albireo') + ' ' + (s.version || ''));
+  row(t('version'), [s.product || 'Albireo', s.edition, s.version].filter(Boolean).join(' '));
   row(t('engine'), s.engine ? (s.engine.variant || '-') + (s.engine.device ? ' (' + s.engine.device + ')' : '') : '-');
   if (s.host) {
     row(t('processor'), s.host.cpu.name + ' · ' + s.host.cpu.cores + ' / ' + s.host.cpu.threads);
@@ -2499,6 +2544,7 @@ function buildLayout() {
   });
   const fileInput = h('input', { type: 'file', multiple: true, class: 'hidden' });
   fileInput.addEventListener('change', () => { addPending(Array.from(fileInput.files)); fileInput.value = ''; });
+  ui.fileInput = fileInput;
   ui.reasonButton = h('button', {
     class: 'toggle reason', type: 'button', title: t('reasoningHint'), html: icon('spark') + '<span>' + escapeHtml(t('reasoning')) + '</span>',
     onclick: async () => {
@@ -2521,9 +2567,9 @@ function buildLayout() {
   });
   ui.sendButton = h('button', { class: 'send', type: 'button', onclick: onSend });
   ui.pendingBox = h('div', { class: 'composer-attachments hidden' });
+  ui.attachButton = iconButton('clip', t('attach'), () => fileInput.click());
   const composer = h('div', { class: 'composer' }, ui.pendingBox, ui.input, h('div', { class: 'row' },
-    iconButton('clip', t('attach'), () => fileInput.click()), fileInput, ui.reasonButton, ui.agentButton,
-    h('span', { class: 'grow' }), ui.sendButton));
+    ui.attachButton, fileInput, ui.reasonButton, ui.agentButton, h('span', { class: 'grow' }), ui.sendButton));
   for (const ev of ['dragenter', 'dragover']) composer.addEventListener(ev, (e) => { e.preventDefault(); composer.classList.add('drag'); });
   for (const ev of ['dragleave', 'drop']) composer.addEventListener(ev, () => composer.classList.remove('drag'));
   composer.addEventListener('drop', (e) => {

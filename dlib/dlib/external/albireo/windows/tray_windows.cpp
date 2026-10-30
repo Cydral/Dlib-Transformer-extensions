@@ -264,9 +264,10 @@ namespace albireo
                 intro = add(ui::label(hwnd, tr("models_intro"), IDC_INTRO, SS_LEFT), ui::font_kind::normal);
                 space = add(ui::label(hwnd, L"", IDC_SPACE, SS_RIGHT), ui::font_kind::note);
                 list = add(ui::listview(hwnd, IDC_LIST));
-                const char* columns[] = { "col_model", "col_roles", "col_size", "col_state", "col_active" };
-                const int widths[] = { 240, 175, 85, 140, 200 };
-                for (int i = 0; i < 5; ++i)
+                const char* columns[] = { "col_model", "col_roles", "col_inputs", "col_size", "col_state",
+                    "col_active" };
+                const int widths[] = { 220, 165, 110, 80, 140, 180 };
+                for (int i = 0; i < 6; ++i)
                 {
                     std::wstring text = tr(columns[i]);
                     LVCOLUMNW c = {};
@@ -405,10 +406,26 @@ namespace albireo
                 }
                 if (m["installed"].as_bool(false))
                 {
+                    if (m["builtin"].as_bool(false)) return tr("state_builtin");
                     const bool outdated = m.contains("up_to_date") && !m["up_to_date"].as_bool(true);
                     return outdated ? tr("state_update") : tr("state_installed");
                 }
                 return tr("state_available");
+            }
+
+            // What a model reads: text, images, sound; the attachments of the web
+            // application follow them.
+            std::wstring inputs_text(const json& m) const
+            {
+                std::wstring text;
+                for (const auto& i : m["inputs"].elements())
+                {
+                    const std::string kind = i.as_string();
+                    const std::wstring name = kind == "image" ? tr("input_image") : kind == "audio" ? tr("input_audio")
+                        : kind == "text" ? tr("input_text") : widen(kind);
+                    text += (text.empty() ? L"" : L", ") + name;
+                }
+                return text.empty() ? tr("input_text") : text;
             }
 
             void fill_list()
@@ -432,14 +449,16 @@ namespace albireo
                     for (const auto& r : m["roles"].elements())
                         roles += (roles.empty() ? L"" : L", ") + role_name(r.as_string());
                     ListView_SetItemText(list, row, 1, &roles[0]);
+                    std::wstring inputs = inputs_text(m);
+                    ListView_SetItemText(list, row, 2, &inputs[0]);
                     unsigned long long size = static_cast<unsigned long long>(m["size"].as_int(0));
                     std::wstring sz = size ? widen(ui::format_size(size)) : L"";
-                    ListView_SetItemText(list, row, 2, &sz[0]);
+                    ListView_SetItemText(list, row, 3, &sz[0]);
                     std::wstring st = state_text(m);
-                    ListView_SetItemText(list, row, 3, &st[0]);
+                    ListView_SetItemText(list, row, 4, &st[0]);
                     std::wstring act;
                     for (const auto& r : active_roles(id)) act += (act.empty() ? L"" : L", ") + role_name(r);
-                    ListView_SetItemText(list, row, 4, &act[0]);
+                    ListView_SetItemText(list, row, 5, &act[0]);
                     const UINT focus = LVIS_SELECTED | LVIS_FOCUSED;
                     if (id == selected) ListView_SetItemState(list, row, focus, focus);
                     ++row;
@@ -470,6 +489,7 @@ namespace albireo
                     line("lbl_parameters", buf);
                 }
                 line("lbl_quantization", (*m)["quantization"].as_string());
+                line("lbl_inputs", narrow(inputs_text(*m)));
                 if ((*m)["context"].as_int(0) > 0) line("lbl_context", std::to_string((*m)["context"].as_int()));
                 line("lbl_license", (*m)["license"].as_string());
                 const json& source = (*m)["source"].is_string() ? (*m)["source"] : (*m)["homepage"];
@@ -500,7 +520,8 @@ namespace albireo
                 ui::enable(deactivate, !busy && installed && !active_roles(selected).empty()
                     && !embedding_model(selected) && !removing);
                 ui::enable(verify, !busy && installed && !removing);
-                ui::enable(remove, !busy && installed && !dl && !removing);
+                // A model that comes with Albireo stays installed.
+                ui::enable(remove, !busy && installed && !dl && !removing && !(*m)["builtin"].as_bool(false));
                 ui::enable(import, !busy && !uploading);
                 ui::enable(refresh, !busy && !offline);
                 // The progress of the download of the selected model.
@@ -1311,8 +1332,9 @@ namespace albireo
 
             void build() override
             {
-                title = add(ui::label(hwnd, L"Albireo", IDC_A_TITLE), ui::font_kind::title);
-                const std::wstring body = tr("about_version", { { "v", ALBIREO_VERSION } }) + L"\n\n"
+                title = add(ui::label(hwnd, widen(ALBIREO_FULL_NAME), IDC_A_TITLE), ui::font_kind::title);
+                const std::wstring body = tr("about_version", { { "v", ALBIREO_VERSION }, { "e", ALBIREO_EDITION } })
+                    + L"\n\n"
                     + tr("about_built") + L"\n" + tr("about_created", { { "a", ALBIREO_AUTHOR_NAME } }) + L"\n"
                     + tr("about_company", { { "c", ALBIREO_COMPANY_NAME } }) + L"\n\n" + tr("about_license") + L"\n"
                     + widen(ALBIREO_COPYRIGHT);

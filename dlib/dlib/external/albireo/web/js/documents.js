@@ -29,6 +29,29 @@ const textExtensions = new Set(('txt md markdown rst csv tsv json jsonl ndjson x
 // The binary formats of the Office versions before 2007, which the browser cannot read.
 const legacyExtensions = new Set(['doc', 'dot', 'xls', 'xlt', 'ppt', 'pot', 'pps']);
 
+// The formats this module reads, for the file pickers: its documents and the text files.
+export function documentAccept() {
+  const office = ['pdf', 'docx', 'docm', 'dotx', 'pptx', 'pptm', 'ppsx', 'potx', 'xlsx', 'xlsm', 'xltx', 'odt', 'ods',
+    'odp', 'rtf', 'html', 'htm', 'xhtml'];
+  return office.concat(Array.from(textExtensions)).map((e) => '.' + e).join(',') + ',text/*';
+}
+
+/*
+    What a file brings to a model: "image", "audio" or "video" by its type or its extension,
+    "document" otherwise, whose text extractText() reads.
+*/
+export function fileKind(file) {
+  const type = (file.type || '').toLowerCase();
+  const ext = extension(file.name);
+  if (type.startsWith('image/') && type !== 'image/svg+xml') return 'image';
+  if (type.startsWith('audio/')) return 'audio';
+  if (type.startsWith('video/')) return 'video';
+  if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'tif', 'tiff', 'heic', 'avif'].includes(ext)) return 'image';
+  if (['mp3', 'wav', 'ogg', 'oga', 'flac', 'm4a', 'aac', 'opus', 'wma'].includes(ext)) return 'audio';
+  if (['mp4', 'mov', 'avi', 'mkv', 'webm', 'wmv'].includes(ext)) return 'video';
+  return 'document';
+}
+
 export function extension(name) {
   const base = String(name).toLowerCase();
   if (base === 'dockerfile' || base === 'makefile' || base === 'cmakelists.txt') return 'txt';

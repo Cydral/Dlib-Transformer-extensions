@@ -4,11 +4,13 @@
 /*
     albireo-setup: the installer, the uninstaller and the updater of Albireo.
 
-        albireo-setup                       the installation wizard
+        albireo-setup                       the installation wizard, or the update wizard
+                                            when Albireo is installed
         albireo-setup /silent [/dir <folder>] [/models <folder>] [/port <port>] [/offline]
-                                            installation without questions; the options not
-                                            given keep those of the installation in place;
-                                            /offline for a computer without Internet access
+                                            installation without questions; over an
+                                            installation, an update that keeps everything but
+                                            the options given; /offline for a computer
+                                            without Internet access
         albireo-setup /update /silent       update started by the service (keeps everything)
         albireo-setup /uninstall [/silent] [/purge]
                                             removal; /purge also deletes models and settings
@@ -17,7 +19,12 @@
         albireo-setup /lang <code>          language of the wizard: en, fr, de, it, es
 
     The programs travel inside this program as a ZIP payload (a resource); the copy left
-    in the installation folder, the uninstaller, has no payload.  An offline bundle
+    in the installation folder, the uninstaller, has no payload.
+
+    Over an installation, the programs are replaced in their folder and everything else
+    stays: the settings, the models, the certificates and their trust, the token of the
+    tray, the shortcuts and the start of the icon.  A newer version in place is left as
+    it is.  An offline bundle
     (tools/make_offline_bundle.py) puts the installer next to a signed catalog and a
     "models" folder, on a memory card for instance: they are imported at the first start
     of the service, for the computers without network.
@@ -125,30 +132,49 @@ namespace albireo
             return true;
         }
 
-        bool perform_install(const setup::install_options& o, bool update, const progress_fn& progress, bool& reboot,
-            std::string& error)
+        /*
+            Installs the programs, or updates them when update is true: the settings, the
+            certificates and their trust, the shortcuts and the start of the icon then stay
+            as they are.  close_icons closes the icons of the users first; the update started
+            by the service leaves them open, and each one starts again from the new program
+            when it sees the new version of the service.
+        */
+        bool perform_install(const setup::install_options& o, bool update, bool close_icons,
+            const progress_fn& progress, bool& reboot, std::string& error)
         {
             const std::string what = update ? "update" : "installation";
             setup::log(what + " of " + ALBIREO_VERSION + " in " + o.program_dir + ", port " + std::to_string(o.port));
             progress(0, tr("step_stop"), false);
             setup::stop_service(60000, error);
             error.clear();
-            setup::close_trays(10000);
+            if (close_icons) setup::close_trays(10000);
             make_dirs(o.program_dir);
             setup::remove_old_files(o.program_dir);
             uint64_t total = 0;
             progress(0, tr("progress_title"), false);
-            auto copying = [&](int p, const std::wstring& t, bool d) { progress(p * 8 / 10, t, d); };
+            // The programs, then the models that come with the complete installer.
+            const bool models = setup::read_builtin_overlay(executable_path()).present();
+            const int programs_end = models ? 300 : 800;
+            auto copying = [&](int p, const std::wstring& t, bool d) { progress(p * programs_end / 1000, t, d); };
             if (!extract_payload(o.program_dir, copying, total, reboot, error)) return false;
-            if (!setup::install_uninstaller(o.program_dir, error)) return false;
-            if (!setup::prepare_data_dir(error)) return false;
-            if (!update)
+            if (models)
             {
-                if (!setup::write_settings(o, error)) return false;
-                setup::stage_bundle([&](const std::string& f) {
-                    progress(820, tr("step_files", { { "f", f } }), true);
-                });
+                auto placing = [&](uint64_t done, uint64_t all, const std::string& f) {
+                    const int p = programs_end + static_cast<int>(all ? (800 - programs_end) * done / all : 0);
+                    progress(p, tr("step_models", { { "f", f } }), true);
+                };
+                if (!setup::install_builtin_models(o.program_dir, placing, error)) return false;
             }
+            if (!setup::install_uninstaller(o.program_dir, error)) return false;
+            // The size of the installation, with the models that came with it, now or before.
+            const std::string models_dir = join_path(o.program_dir, "models");
+            for (const auto& name : list_dir(models_dir)) total += file_size(join_path(models_dir, name));
+            if (!setup::prepare_data_dir(error)) return false;
+            if (!update && !setup::write_settings(o, error)) return false;
+            // The models and the catalog of an offline bundle next to this program.
+            setup::stage_bundle([&](const std::string& f) {
+                progress(820, tr("step_files", { { "f", f } }), true);
+            });
             progress(850, tr("step_certificates"), false);
             if (!setup::create_certificates(error)) return false;
             if (!update && o.trust_certificate && !setup::trust_authority(error))
@@ -238,6 +264,12 @@ namespace albireo
             bool reboot = false;
             std::string error;
             std::string previous_version;
+            // Albireo is installed: the wizard updates it, or leaves a newer version alone.
+            bool update = false;
+            bool newer_installed = false;
+            std::string installed_dir;
+            // The size of the models this installer brings, 0 for the installer without models.
+            uint64_t builtin_size = 0;
         } wz;
 
         HWND ctl(int id) { return wz.c[id]; }
@@ -265,7 +297,8 @@ namespace albireo
 
         void apply_texts()
         {
-            SetWindowTextW(wz.hwnd, (wz.uninstall ? tr("uninstall_title") : tr("setup_title")).c_str());
+            SetWindowTextW(wz.hwnd, (wz.uninstall ? tr("uninstall_title") : wz.update ? tr("update_title")
+                : tr("setup_title")).c_str());
             ui::set_text(ctl(IDC_LANG_LABEL), tr("lbl_language"));
             ui::set_text(ctl(IDC_ACCEPT), tr("license_accept"));
             ui::set_text(ctl(IDC_DIR_LABEL), tr("folder_programs"));
@@ -297,12 +330,18 @@ namespace albireo
             switch (p)
             {
             case P_WELCOME:
-                title = tr("welcome_title");
-                text = tr("welcome_text", { { "v", ALBIREO_VERSION } });
-                if (!wz.previous_version.empty())
-                    text += L"\n\n" + tr("welcome_update", { { "o", wz.previous_version } });
+            {
+                title = wz.update ? tr("update_title") : tr("welcome_title");
+                const std::vector<std::pair<std::string, std::string>> values = { { "v", ALBIREO_VERSION },
+                    { "o", wz.previous_version }, { "d", wz.installed_dir } };
+                if (wz.newer_installed) text = tr("update_newer", values);
+                else if (wz.update) text = tr("update_text", values);
+                else text = tr("welcome_text", values);
+                if (wz.builtin_size && !wz.newer_installed)
+                    text += L"\n\n" + tr("welcome_models", { { "s", ui::format_size(wz.builtin_size) } });
                 visible = { IDC_TEXT, IDC_LANG_LABEL, IDC_LANG };
                 break;
+            }
             case P_LICENSE:
                 title = tr("license_title");
                 visible = { IDC_LICENSE, IDC_ACCEPT };
@@ -314,16 +353,28 @@ namespace albireo
                 break;
             case P_OPTIONS:
                 title = tr("options_title");
-                visible = { IDC_AUTOSTART, IDC_DESKTOP, IDC_TRUST, IDC_DEFAULT_MODEL, IDC_OFFLINE, IDC_PORT_LABEL,
-                    IDC_PORT };
+                // The models of the complete installer answer at once: no default model to download.
+                visible = { IDC_AUTOSTART, IDC_DESKTOP, IDC_TRUST, IDC_OFFLINE, IDC_PORT_LABEL, IDC_PORT };
+                if (!wz.builtin_size) visible.push_back(IDC_DEFAULT_MODEL);
                 break;
             case P_PROGRESS:
-                title = wz.uninstall ? tr("uninstall_progress") : tr("progress_title");
+                title = wz.uninstall ? tr("uninstall_progress") : wz.update ? tr("update_progress")
+                    : tr("progress_title");
                 visible = { IDC_STEP, IDC_PROGRESS, IDC_DETAIL };
                 break;
             case P_FINISH:
-                title = wz.succeeded ? tr("finish_title") : tr("error_title");
-                text = wz.succeeded ? tr("finish_text") : tr("error_failed", { { "e", wz.error } });
+                if (wz.update)
+                {
+                    title = wz.succeeded ? tr("update_done_title") : tr("update_title");
+                    text = wz.succeeded
+                        ? tr("update_done_text", { { "v", ALBIREO_VERSION }, { "o", wz.previous_version } })
+                        : tr("update_failed", { { "e", wz.error } });
+                }
+                else
+                {
+                    title = wz.succeeded ? tr("finish_title") : tr("error_title");
+                    text = wz.succeeded ? tr("finish_text") : tr("error_failed", { { "e", wz.error } });
+                }
                 if (wz.succeeded && wz.reboot) text += L"\n\n" + tr("reboot_note");
                 visible = { IDC_TEXT };
                 if (wz.succeeded) visible.push_back(IDC_LAUNCH);
@@ -351,10 +402,12 @@ namespace albireo
             ui::enable(ctl(IDC_CANCEL), p != P_PROGRESS);
             std::wstring next = tr("btn_next");
             if (p == P_OPTIONS) next = tr("btn_install");
+            else if (p == P_LICENSE && wz.update) next = tr("btn_update");
             else if (p == P_UNINSTALL) next = tr("btn_uninstall");
             else if (last) next = tr("btn_finish");
             ui::set_text(ctl(IDC_NEXT), next);
-            ui::enable(ctl(IDC_NEXT), p != P_PROGRESS && (p != P_LICENSE || ui::checked(ctl(IDC_ACCEPT))));
+            ui::enable(ctl(IDC_NEXT), p != P_PROGRESS && (p != P_LICENSE || ui::checked(ctl(IDC_ACCEPT)))
+                && !(p == P_WELCOME && wz.newer_installed));
             if (p == P_FOLDERS) update_space();
             InvalidateRect(wz.hwnd, nullptr, TRUE);
         }
@@ -495,20 +548,24 @@ namespace albireo
                 return;
             }
             setup::install_options o = setup::installed_options();
-            o.program_dir = narrow(ui::text_of(ctl(IDC_DIR)));
-            o.models_dir = narrow(ui::text_of(ctl(IDC_MODELS)));
-            o.autostart = ui::checked(ctl(IDC_AUTOSTART));
-            o.desktop_shortcut = ui::checked(ctl(IDC_DESKTOP));
-            o.trust_certificate = ui::checked(ctl(IDC_TRUST));
-            o.offline = ui::checked(ctl(IDC_OFFLINE));
-            o.default_model = ui::checked(ctl(IDC_DEFAULT_MODEL)) && !o.offline;
-            const long port = std::wcstol(ui::text_of(ctl(IDC_PORT)).c_str(), nullptr, 10);
-            if (port >= 1024 && port <= 65535) o.port = static_cast<int>(port);
-            std::thread([target, o, progress]() {
+            const bool update = wz.update;
+            if (!update)
+            {
+                o.program_dir = narrow(ui::text_of(ctl(IDC_DIR)));
+                o.models_dir = narrow(ui::text_of(ctl(IDC_MODELS)));
+                o.autostart = ui::checked(ctl(IDC_AUTOSTART));
+                o.desktop_shortcut = ui::checked(ctl(IDC_DESKTOP));
+                o.trust_certificate = ui::checked(ctl(IDC_TRUST));
+                o.offline = ui::checked(ctl(IDC_OFFLINE));
+                o.default_model = ui::checked(ctl(IDC_DEFAULT_MODEL)) && !o.offline;
+                const long port = std::wcstol(ui::text_of(ctl(IDC_PORT)).c_str(), nullptr, 10);
+                if (port >= 1024 && port <= 65535) o.port = static_cast<int>(port);
+            }
+            std::thread([target, o, update, progress]() {
                 CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
                 std::string* error = new std::string();
                 bool reboot = false;
-                const bool ok = perform_install(o, false, progress, reboot, *error);
+                const bool ok = perform_install(o, update, true, progress, reboot, *error);
                 if (!ok) setup::log("failed: " + *error);
                 CoUninitialize();
                 const WPARAM result = (ok ? 1 : 0) | (reboot ? 2 : 0);
@@ -632,7 +689,11 @@ namespace albireo
                     switch (wz.current)
                     {
                     case P_WELCOME: show_page(P_LICENSE); break;
-                    case P_LICENSE: show_page(P_FOLDERS); break;
+                    // An update keeps the folders and the options of the installation.
+                    case P_LICENSE:
+                        if (wz.update) start_work();
+                        else show_page(P_FOLDERS);
+                        break;
                     case P_FOLDERS: show_page(P_OPTIONS); break;
                     case P_OPTIONS: start_work(); break;
                     case P_UNINSTALL: start_work(); break;
@@ -688,10 +749,29 @@ namespace albireo
             }
         }
 
+        /*
+            The installation in place: its version and its folder, when its programs are
+            there.  A registration whose folder lost its programs is installed again.
+        */
+        bool installed_in_place(std::string& version, std::string& dir)
+        {
+            version = setup::installed_version();
+            dir = setup::installed_dir();
+            return !version.empty() && !dir.empty() && file_exists(join_path(dir, "albireo-service.exe"));
+        }
+
         int run_wizard(HINSTANCE instance, bool uninstall)
         {
             wz.uninstall = uninstall;
-            wz.previous_version = setup::installed_version();
+            if (!uninstall && installed_in_place(wz.previous_version, wz.installed_dir))
+            {
+                wz.update = true;
+                wz.newer_installed = compare_versions(wz.previous_version, ALBIREO_VERSION) > 0;
+            }
+            else
+            {
+                wz.previous_version.clear();
+            }
             const payload_view pv = payload();
             if (pv.data)
             {
@@ -699,6 +779,8 @@ namespace albireo
                 std::string e;
                 if (z.open(pv.data, pv.size, e)) wz.required = z.total_size();
             }
+            wz.builtin_size = setup::read_builtin_overlay(executable_path()).total;
+            wz.required += wz.builtin_size;
             WNDCLASSEXW wc = { sizeof(wc) };
             wc.lpfnWndProc = proc;
             wc.hInstance = instance;
@@ -792,7 +874,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
         // Started by the service, which stops for it; everything else is kept.
         const setup::install_options o = setup::installed_options();
         bool reboot = false;
-        const bool ok = perform_install(o, true, [](int, const std::wstring&, bool) {}, reboot, error);
+        const bool ok = perform_install(o, true, false, [](int, const std::wstring&, bool) {}, reboot, error);
         if (!ok)
         {
             setup::log("update failed: " + error);
@@ -817,14 +899,28 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
     {
         // The options not given keep the values of the installation in place.
         setup::install_options o = setup::installed_options();
+        std::string version, installed;
+        const bool update = installed_in_place(version, installed);
+        if (update && compare_versions(version, ALBIREO_VERSION) > 0)
+        {
+            setup::log("Albireo " + version + " is installed, newer than " + ALBIREO_VERSION + ": nothing done");
+            return 0;
+        }
+        bool options = false;
         const std::wstring dir = arg_after(args, L"/dir");
-        if (!dir.empty()) o.program_dir = narrow(dir);
+        // An update replaces the programs in their folder.
+        if (!dir.empty() && !update) o.program_dir = narrow(dir);
         const std::wstring m = arg_after(args, L"/models");
-        if (!m.empty()) o.models_dir = narrow(m);
+        if (!m.empty())
+        {
+            o.models_dir = narrow(m);
+            options = true;
+        }
         if (has_arg(args, L"/offline"))
         {
             o.offline = true;
             o.default_model = false;
+            options = true;
         }
         const std::wstring port = arg_after(args, L"/port");
         if (!port.empty())
@@ -836,9 +932,16 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
                 return 1;
             }
             o.port = static_cast<int>(p);
+            options = true;
+        }
+        // Over an installation, the options given join its settings, which stay otherwise.
+        if (update && options && !setup::write_settings(o, error))
+        {
+            setup::log("failed: " + error);
+            return 1;
         }
         bool reboot = false;
-        const bool ok = perform_install(o, false, [](int, const std::wstring&, bool) {}, reboot, error);
+        const bool ok = perform_install(o, update, true, [](int, const std::wstring&, bool) {}, reboot, error);
         if (!ok) setup::log("failed: " + error);
         return ok ? 0 : 1;
     }

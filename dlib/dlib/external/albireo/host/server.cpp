@@ -74,6 +74,30 @@ namespace albireo
             send_json(res, status, e);
         }
 
+        /*
+            The answer to a request whose model is not in the engine yet, because the
+            service starts or the model loads: 503 with a code and the delay after which to
+            try again.  Returns false when the model is missing for good.
+        */
+        bool send_not_ready(service& svc, httplib::Response& res, const std::string& requested)
+        {
+            const std::string phase = svc.starting_phase();
+            if (!phase.empty())
+            {
+                send_error(res, 503, "server_error", "the service is starting (" + phase + ")", "starting");
+            }
+            else if (svc.model_loading(requested))
+            {
+                send_error(res, 503, "server_error", "the model is loading", "model_loading");
+            }
+            else
+            {
+                return false;
+            }
+            res.set_header("Retry-After", "5");
+            return true;
+        }
+
         json ok_result(bool ok, const std::string& error = std::string())
         {
             json o = json::object();
@@ -238,7 +262,10 @@ namespace albireo
             std::string error, model_name;
             if (!engine_request(svc, body, request, error, model_name))
             {
-                send_error(res, 404, "invalid_request_error", error, "model_not_found");
+                // A model resolved and an invalid option, or no model in the engine.
+                if (!model_name.empty()) send_error(res, 400, "invalid_request_error", error);
+                else if (!send_not_ready(svc, res, body["model"].as_string()))
+                    send_error(res, 404, "invalid_request_error", error, "model_not_found");
                 return;
             }
             if (chat && !request["messages"].is_array())
@@ -521,6 +548,9 @@ namespace albireo
             const std::string model = svc.resolve_embedding_model(requested);
             if (model.empty())
             {
+                const bool alias = requested.empty() || requested == "auto" || requested == "embedding"
+                    || requested == "albireo-embedding";
+                if (send_not_ready(svc, res, alias ? std::string("embedding") : requested)) return;
                 send_error(res, 404, "invalid_request_error", requested.empty() || requested == "auto"
                     ? std::string("no embedding model is active")
                     : "the embedding model '" + requested + "' is not active", "model_not_found");

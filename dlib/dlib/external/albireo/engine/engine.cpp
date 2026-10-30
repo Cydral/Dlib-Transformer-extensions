@@ -353,20 +353,25 @@ namespace albireo
         }
 #ifdef ALBIREO_TENSOR_BACKEND
         // The devices of dlib take the products; the library stays loaded once started,
-        // since the runtimes of the devices keep threads in the process.
-        std::string backend, runtime, why, why_code;
-        json why_args = json::object();
-        const json accelerators = tensor_device::describe(backend, runtime, why, why_code, why_args);
-        d["backend"] = backend;
-        if (!runtime.empty()) d["runtime"] = runtime;
-        for (const auto& a : accelerators.elements()) devices.push_back(a);
+        // since the runtimes of the devices keep threads in the process.  An engine whose
+        // kernels cannot run here leaves its devices alone: their runtimes take seconds to
+        // start.
+        d["backend"] = tensor_device::backend_name();
         d["pinned"] = true;
-        if (usable && accelerators.empty() && backend != "dlib")
+        if (usable)
         {
-            usable = false;
-            reason = why;
-            reason_code = why_code;
-            reason_args = why_args;
+            std::string backend, runtime, why, why_code;
+            json why_args = json::object();
+            const json accelerators = tensor_device::describe(backend, runtime, why, why_code, why_args);
+            if (!runtime.empty()) d["runtime"] = runtime;
+            for (const auto& a : accelerators.elements()) devices.push_back(a);
+            if (accelerators.empty() && backend != "dlib")
+            {
+                usable = false;
+                reason = why;
+                reason_code = why_code;
+                reason_args = why_args;
+            }
         }
 #endif
         d["devices"] = devices;

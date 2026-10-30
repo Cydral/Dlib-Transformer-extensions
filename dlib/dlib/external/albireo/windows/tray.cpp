@@ -13,6 +13,12 @@
     downloads.  Its menu opens the web application, the windows of the models, of this
     computer and the About window, chooses the accelerator, checks for updates and
     restarts Albireo.
+
+    While the service does not answer, the icon asks the service manager of Windows what
+    the service does.  A service that starts (the delayed start after the system starts,
+    the engines and the models of a slow machine), restarts or stops for an update is
+    shown as starting, and the icon warns only when the service stays stopped, or stays
+    silent while it runs, beyond the time such a step takes.
 */
 
 #include "ui.h"
@@ -62,15 +68,61 @@ namespace albireo
             json status;
             json engines;
             bool online = false;
-            bool was_online = true;
+            // The service answered since the icon started.
+            bool seen_online = false;
+            // When the service stopped answering (GetTickCount64), and whether the icon
+            // warned of it.
+            ULONGLONG silent_since = 0;
+            bool warned = false;
+            // The web application opens once the service answers.
+            bool open_pending = false;
             bool polling = false;
             int icon_state = -1;
             std::string notified_update;
             bool check_requested = false;
             json download_states = json::object();
             bool relaunch_on_restart = false;
-            int failures = 0;
         } tray;
+
+        /*
+            The state of the service for the service manager: "stopped", "starting",
+            "running", "stopping", "other" or "missing", whether it starts with the system,
+            and the code of its last stop.  Read while the service does not answer.
+        */
+        json service_manager_state()
+        {
+            json out = json::object();
+            out["state"] = "missing";
+            SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+            if (!scm) return out;
+            SC_HANDLE svc = OpenServiceW(scm, L"Albireo", SERVICE_QUERY_STATUS | SERVICE_QUERY_CONFIG);
+            if (svc)
+            {
+                SERVICE_STATUS_PROCESS sp = {};
+                DWORD needed = 0;
+                if (QueryServiceStatusEx(svc, SC_STATUS_PROCESS_INFO, reinterpret_cast<LPBYTE>(&sp), sizeof(sp),
+                        &needed))
+                {
+                    const DWORD s = sp.dwCurrentState;
+                    out["state"] = s == SERVICE_STOPPED ? "stopped" : s == SERVICE_START_PENDING ? "starting"
+                        : s == SERVICE_RUNNING ? "running" : s == SERVICE_STOP_PENDING ? "stopping" : "other";
+                    out["exit_code"] = static_cast<long long>(sp.dwWin32ExitCode == ERROR_SERVICE_SPECIFIC_ERROR
+                        ? sp.dwServiceSpecificExitCode : sp.dwWin32ExitCode);
+                }
+                DWORD size = 0;
+                QueryServiceConfigW(svc, nullptr, 0, &size);
+                if (size > 0)
+                {
+                    std::vector<unsigned char> buf(size);
+                    QUERY_SERVICE_CONFIGW* config = reinterpret_cast<QUERY_SERVICE_CONFIGW*>(buf.data());
+                    if (QueryServiceConfigW(svc, config, size, &size))
+                        out["auto"] = config->dwStartType == SERVICE_AUTO_START;
+                }
+                CloseServiceHandle(svc);
+            }
+            CloseServiceHandle(scm);
+            return out;
+        }
 
         HICON load_icon(int id, int size)
         {
@@ -155,6 +207,7 @@ namespace albireo
                 if (!c.get("/albireo/v1/status", status, error, 5))
                 {
                     r["error"] = error;
+                    r["service"] = service_manager_state();
                     return r;
                 }
                 r["status"] = status;
@@ -177,16 +230,6 @@ namespace albireo
             }
         }
 
-        int compare_version(const std::string& a, const std::string& b)
-        {
-            int x[3] = { 0, 0, 0 }, y[3] = { 0, 0, 0 };
-            sscanf(a.c_str(), "%d.%d.%d", &x[0], &x[1], &x[2]);
-            sscanf(b.c_str(), "%d.%d.%d", &y[0], &y[1], &y[2]);
-            for (int i = 0; i < 3; ++i)
-                if (x[i] != y[i]) return x[i] < y[i] ? -1 : 1;
-            return 0;
-        }
-
         void on_status(json* result)
         {
             tray.polling = false;
@@ -194,21 +237,72 @@ namespace albireo
             if (!online)
             {
                 tray.online = false;
-                // A restart of the service makes it silent a few seconds: no notification
-                // before several failed polls.
-                if (tray.was_online && ++tray.failures >= 4)
+                const ULONGLONG now = GetTickCount64();
+                if (!tray.silent_since) tray.silent_since = now;
+                const ULONGLONG silent = now - tray.silent_since;
+                const json& scm = (*result)["service"];
+                const std::string st = scm["state"].as_string();
+                const ULONGLONG minute = 60000;
+                /*
+                    How long each state may last before the icon warns.  The delayed start of
+                    the service comes about two minutes after the system starts, then a slow
+                    machine describes its engines and loads its models; a restart and an
+                    update stop the service for a while.
+                */
+                bool starting = false;
+                ULONGLONG grace = minute;
+                const char* warning = "notify_service_down";
+                const char* tip = "tip_off";
+                if (st == "starting")
                 {
-                    tray.was_online = false;
-                    notify(L"Albireo", tr("notify_service_down"));
+                    starting = true;
+                    grace = 10 * minute;
                 }
-                set_icon(2);
-                set_tooltip(tr("tip_off"));
+                else if (st == "running")
+                {
+                    starting = !tray.seen_online;
+                    grace = tray.seen_online ? minute / 2 : 5 * minute;
+                }
+                else if (st == "stopping")
+                {
+                    grace = 2 * minute;
+                    tip = "tip_stopping";
+                }
+                else if (st == "stopped")
+                {
+                    // Before its delayed start, a service that starts with the system is
+                    // stopped: the icon, started at sign in, waits for it.
+                    starting = scm["auto"].as_bool(false) && !tray.seen_online && now < 15 * minute;
+                    grace = starting ? 15 * minute : minute;
+                    warning = "notify_service_stopped";
+                    tip = "tip_stopped";
+                }
+                else if (!tray.seen_online)
+                {
+                    // A service the manager does not know, as a console run: a long wait.
+                    grace = 5 * minute;
+                }
+                const bool waiting = starting && silent < grace;
+                if (waiting) tip = "tip_starting";
+                if (!tray.warned && silent >= grace)
+                {
+                    tray.warned = true;
+                    notify(L"Albireo", tr(warning));
+                }
+                set_icon(waiting ? 1 : 2);
+                set_tooltip(tr(tip));
                 tray.client.reload();
                 return;
             }
-            tray.failures = 0;
+            tray.silent_since = 0;
+            tray.warned = false;
             tray.online = true;
-            tray.was_online = true;
+            tray.seen_online = true;
+            if (tray.open_pending)
+            {
+                tray.open_pending = false;
+                ui::open_url(widen(tray.client.base_url()));
+            }
             tray.status = (*result)["status"];
             if ((*result).contains("engines")) tray.engines = (*result)["engines"];
             const json& s = tray.status;
@@ -216,7 +310,7 @@ namespace albireo
             // A newer service means the programs were updated: the icon starts again from
             // the new program, once.
             const std::string version = s["version"].as_string();
-            if (compare_version(version, ALBIREO_VERSION) > 0 && !tray.relaunch_on_restart)
+            if (compare_versions(version, ALBIREO_VERSION) > 0 && !tray.relaunch_on_restart)
             {
                 tray.relaunch_on_restart = true;
                 relaunch(L"--relaunched");
@@ -245,6 +339,9 @@ namespace albireo
                 snprintf(buf, sizeof(buf), "%.1f", tps);
                 tip += L"\n" + tr("tokens_s", { { "n", buf } });
             }
+            // The server answers while the engines start and the models load.
+            const bool starting = s["state"].as_string() == "starting";
+            if (starting) tip = tr("tip_starting");
             set_tooltip(tip);
 
             // Updates: notified once per version; a check asked from the menu is answered.
@@ -279,7 +376,7 @@ namespace albireo
                 tray.download_states[id] = st;
             }
 
-            set_icon(ready ? 3 : active > 0 || loading ? 1 : 0);
+            set_icon(ready ? 3 : active > 0 || loading || starting ? 1 : 0);
         }
 
         void put_settings(const json& changes)
@@ -518,7 +615,9 @@ namespace albireo
                 return 0;
             }
             case WM_OPEN_APP:
-                open_app();
+                // Asked at the end of an installation, before the service answers.
+                if (tray.online) open_app();
+                else tray.open_pending = true;
                 return 0;
             case WM_SHOW_WINDOW:
                 if (wp == 1) show_models_window(tray.client);

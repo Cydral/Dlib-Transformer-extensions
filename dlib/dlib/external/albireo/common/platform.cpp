@@ -413,6 +413,20 @@ namespace albireo
         return buf;
     }
 
+    int compare_versions(const std::string& a, const std::string& b)
+    {
+        std::istringstream sa(a), sb(b);
+        for (int i = 0; i < 4; ++i)
+        {
+            long x = 0, y = 0;
+            std::string pa, pb;
+            if (std::getline(sa, pa, '.')) x = std::atol(pa.c_str());
+            if (std::getline(sb, pb, '.')) y = std::atol(pb.c_str());
+            if (x != y) return x < y ? -1 : 1;
+        }
+        return 0;
+    }
+
     std::string random_hex(size_t n)
     {
         static const char* hex = "0123456789abcdef";

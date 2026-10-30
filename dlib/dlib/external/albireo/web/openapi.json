@@ -1,8 +1,8 @@
 {
  "openapi": "3.0.3",
  "info": {
-  "title": "Albireo local interface",
-  "version": "1.0.0",
+  "title": "Albireo Community Edition local interface",
+  "version": "1.0.6",
   "description": "The interface of the Albireo service, served on https://localhost (port 8443 unless changed in the tray). The routes under /v1 follow the OpenAI interface, so that its client libraries work with base_url https://localhost:8443/v1 and any API key. The functions albireo-general, albireo-code and albireo-security name the models activated in the tray, and albireo-embedding the embedding model of the search in documents.\n\nThe administration routes require the token of the data folder of the service (admin.token) in the X-Albireo-Admin header.",
   "license": {
    "name": "Boost Software License 1.0",
@@ -105,6 +105,16 @@
         }
        }
       }
+     },
+     "503": {
+      "description": "The service starts (code starting) or the model loads (code model_loading); the Retry-After header gives the seconds to wait",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
      }
     }
    }
@@ -148,6 +158,16 @@
      },
      "404": {
       "description": "Unknown or inactive model",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "503": {
+      "description": "The service starts (code starting) or the model loads (code model_loading); the Retry-After header gives the seconds to wait",
       "content": {
        "application/json": {
         "schema": {
@@ -206,6 +226,16 @@
         }
        }
       }
+     },
+     "503": {
+      "description": "The service starts (code starting) or the model loads (code model_loading); the Retry-After header gives the seconds to wait",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
      }
     }
    }
@@ -216,13 +246,37 @@
      "Service"
     ],
     "summary": "State of the service, of the engine and of the models",
+    "description": "The server answers while the service starts: state is \"starting\" and starting names the step in progress, \"engines\" then \"models\", until the service is \"ready\".",
     "responses": {
      "200": {
       "description": "The state",
       "content": {
        "application/json": {
         "schema": {
-         "type": "object"
+         "type": "object",
+         "properties": {
+          "edition": {
+           "type": "string",
+           "description": "The edition, Community Edition."
+          },
+          "version": {
+           "type": "string"
+          },
+          "state": {
+           "type": "string",
+           "enum": [
+            "starting",
+            "ready"
+           ]
+          },
+          "starting": {
+           "type": "string",
+           "enum": [
+            "engines",
+            "models"
+           ]
+          }
+         }
         }
        }
       }
@@ -236,6 +290,7 @@
      "Service"
     ],
     "summary": "Catalog, installed models, downloads and active models",
+    "description": "The language models: those that come with Albireo first (builtin), then the catalog and the imports. The embedding models serve the document search and are given apart.",
     "parameters": [
      {
       "name": "lang",
@@ -261,6 +316,93 @@
         "schema": {
          "type": "object",
          "properties": {
+          "models": {
+           "type": "array",
+           "items": {
+            "type": "object",
+            "properties": {
+             "id": {
+              "type": "string"
+             },
+             "name": {
+              "type": "string"
+             },
+             "roles": {
+              "type": "array",
+              "items": {
+               "type": "string"
+              }
+             },
+             "inputs": {
+              "type": "array",
+              "items": {
+               "type": "string",
+               "enum": [
+                "text",
+                "image",
+                "audio"
+               ]
+              },
+              "description": "What the model reads; the attachments of the web application follow."
+             },
+             "installed": {
+              "type": "boolean"
+             },
+             "builtin": {
+              "type": "boolean",
+              "description": "Comes with Albireo: it cannot be deleted."
+             },
+             "size": {
+              "type": "integer"
+             },
+             "quantization": {
+              "type": "string"
+             },
+             "description": {
+              "type": "string"
+             }
+            }
+           }
+          },
+          "embedding_models": {
+           "type": "array",
+           "items": {
+            "type": "object",
+            "properties": {
+             "id": {
+              "type": "string"
+             },
+             "name": {
+              "type": "string"
+             },
+             "source": {
+              "type": "string",
+              "enum": [
+               "builtin",
+               "catalog",
+               "import"
+              ]
+             },
+             "size": {
+              "type": "integer"
+             }
+            }
+           },
+           "description": "The installed embedding models."
+          },
+          "downloads": {
+           "type": "array",
+           "items": {
+            "type": "object"
+           }
+          },
+          "active": {
+           "type": "object",
+           "additionalProperties": {
+            "type": "string"
+           },
+           "description": "The model of each function."
+          },
           "loaded": {
            "type": "array",
            "items": {
@@ -770,7 +912,7 @@
      }
     ],
     "summary": "Deletes an installed model",
-    "description": "A model of the engine is deleted once its requests are served and it left the engine: pending is then true, and the model is listed under leaving until then.",
+    "description": "A model of the engine is deleted once its requests are served and it left the engine: pending is then true, and the model is listed under leaving until then. A model that comes with Albireo is refused with the code builtin_model.",
     "parameters": [
      {
       "name": "id",
@@ -1886,6 +2028,8 @@
        "best",
        "cpu",
        "cpu-avx2",
+       "cpu-avxvnni",
+       "cpu-avx512",
        "openvino",
        "cuda"
       ]

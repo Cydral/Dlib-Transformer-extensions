@@ -28,6 +28,8 @@ def reply(description, schema=None):
 error_replies = {
     "400": reply("Invalid request", ref("Error")),
     "404": reply("Unknown or inactive model", ref("Error")),
+    "503": reply("The service starts (code starting) or the model loads (code model_loading); the Retry-After "
+                 "header gives the seconds to wait", ref("Error")),
 }
 admin = [{"adminToken": []}]
 offline_reply = {"409": reply("Refused in offline mode", {"type": "object", "properties": {
@@ -198,13 +200,37 @@ paths = {
                           **error_replies)}},
     "/albireo/v1/status": {"get": {
         "tags": ["Service"], "summary": "State of the service, of the engine and of the models",
-        "responses": {"200": reply("The state", {"type": "object"})}}},
+        "description": "The server answers while the service starts: state is \"starting\" and starting names the "
+                       "step in progress, \"engines\" then \"models\", until the service is \"ready\".",
+        "responses": {"200": reply("The state", {"type": "object", "properties": {
+            "edition": {"type": "string", "description": "The edition, Community Edition."},
+            "version": {"type": "string"},
+            "state": {"type": "string", "enum": ["starting", "ready"]},
+            "starting": {"type": "string", "enum": ["engines", "models"]}}})}}},
     "/albireo/v1/models": {"get": {
         "tags": ["Service"], "summary": "Catalog, installed models, downloads and active models",
+        "description": "The language models: those that come with Albireo first (builtin), then the catalog and "
+                       "the imports. The embedding models serve the document search and are given apart.",
         "parameters": [{"name": "lang", "in": "query",
                         "schema": {"type": "string", "enum": ["en", "fr", "de", "it", "es"]},
                         "description": "Language of the descriptions."}],
         "responses": {"200": reply("The models", {"type": "object", "properties": {
+            "models": {"type": "array", "items": {"type": "object", "properties": {
+                "id": {"type": "string"}, "name": {"type": "string"},
+                "roles": {"type": "array", "items": {"type": "string"}},
+                "inputs": {"type": "array", "items": {"type": "string", "enum": ["text", "image", "audio"]},
+                           "description": "What the model reads; the attachments of the web application follow."},
+                "installed": {"type": "boolean"},
+                "builtin": {"type": "boolean", "description": "Comes with Albireo: it cannot be deleted."},
+                "size": {"type": "integer"}, "quantization": {"type": "string"},
+                "description": {"type": "string"}}}},
+            "embedding_models": {"type": "array", "items": {"type": "object", "properties": {
+                "id": {"type": "string"}, "name": {"type": "string"},
+                "source": {"type": "string", "enum": ["builtin", "catalog", "import"]},
+                "size": {"type": "integer"}}}, "description": "The installed embedding models."},
+            "downloads": {"type": "array", "items": {"type": "object"}},
+            "active": {"type": "object", "additionalProperties": {"type": "string"},
+                       "description": "The model of each function."},
             "loaded": {"type": "array", "items": {"type": "string"}, "description": "Models of the engine."},
             "leaving": {"type": "object", "additionalProperties": {"type": "string", "enum": ["unloading",
                                                                                             "removing"]},
@@ -252,7 +278,8 @@ paths = {
     "/albireo/v1/models/{id}": {"delete": {
         "tags": ["Administration"], "security": admin, "summary": "Deletes an installed model",
         "description": "A model of the engine is deleted once its requests are served and it left the engine: "
-                       "pending is then true, and the model is listed under leaving until then.",
+                       "pending is then true, and the model is listed under leaving until then. A model that "
+                       "comes with Albireo is refused with the code builtin_model.",
         "parameters": [model_id],
         "responses": {"200": reply("Deleted, or to be deleted", {"type": "object", "properties": {
             "ok": {"type": "boolean"}, "pending": {"type": "boolean"}}}), "400": reply("Refused", ok)}}},
@@ -308,7 +335,7 @@ with open(os.path.join(here, "..", "common", "version.h"), encoding="utf-8") as 
 doc = {
     "openapi": "3.0.3",
     "info": {
-        "title": "Albireo local interface",
+        "title": "Albireo Community Edition local interface",
         "version": version,
         "description": "The interface of the Albireo service, served on https://localhost (port 8443 unless changed in "
                        "the tray). The routes under /v1 follow the OpenAI interface, so that its client libraries "

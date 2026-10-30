@@ -78,6 +78,9 @@ namespace albireo
     // A random hexadecimal string of n characters, from the generator of the system.
     std::string random_hex(size_t n);
 
+    // Compares versions "1.2.3": negative, zero or positive as a is older, equal or newer.
+    int compare_versions(const std::string& a, const std::string& b);
+
     // Runs a program with arguments and waits for it; returns its exit code, or -1.
     int run_process(const std::string& program, const std::vector<std::string>& args, std::string* output = nullptr,
         unsigned timeout_ms = 60000);

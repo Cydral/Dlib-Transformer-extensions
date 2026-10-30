@@ -967,6 +967,17 @@ namespace albireo
 #endif
     }
 
+    const char* tensor_device::backend_name()
+    {
+#if defined(DLIB_USE_CUDA)
+        return "cuda";
+#elif defined(DLIB_USE_NPU)
+        return "openvino";
+#else
+        return "dlib";
+#endif
+    }
+
     json tensor_device::describe(std::string& backend, std::string& runtime, std::string& reason, std::string& code,
         json& args)
     {

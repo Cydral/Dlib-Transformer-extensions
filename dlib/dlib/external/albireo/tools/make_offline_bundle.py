@@ -5,14 +5,17 @@ Prepares the offline bundle of Albireo, which installs or updates a computer wit
 from a disk or a memory card.
 
     python3 make_offline_bundle.py <output folder> [--models <id,id,...> | --all]
-                                   [--installer <albireo-setup.exe>] [--from <folder>]...
+                                   [--installer <albireo-setup-online.exe>]
+                                   [--complete <albireo-setup.exe>] [--from <folder>]...
                                    [--dist <folder>] [--sign <albireo-sign>]
 
 The bundle holds the signed catalog and the signed update feed of dist/albireo, the installer
 the feed announces, and in its models folder the models chosen: by default the default
 language model and the default embedding model of the catalog, which the search in the
 documents needs.  The installer is taken from --installer when given, else downloaded from
-the address of the feed; each model is taken from the folders of --from when one of their
+the address of the feed.  --complete adds the complete installer of the version, which
+carries the models that come with Albireo: the default models are then left out, unless
+--models or --all name models; each model is taken from the folders of --from when one of their
 files has its size and its SHA-256, else downloaded from the addresses of the catalog.
 Every file is checked against the hashes of the signed files before it enters the bundle,
 and the signatures are checked with albireo-sign when it is found.
@@ -48,9 +51,9 @@ README = """Albireo {version}, offline bundle of {date}
 Content
 - catalog.json, catalog.json.sig: the signed catalog of the models;
 - feed.json, feed.json.sig, {installer}: the signed update and its installer;
-- models: {models}.
+- models: {models}.{complete_en}
 
-New installation: start {installer} from this folder. The service installs the catalog
+New installation: start {first} from this folder. The service installs the catalog
 and the models at its first start.
 
 Installed computer: in the Models window, Import, then choose this folder; or copy the
@@ -64,9 +67,9 @@ Albireo {version}, paquet hors ligne du {date}
 Contenu
 - catalog.json, catalog.json.sig : le catalogue signé des modèles ;
 - feed.json, feed.json.sig, {installer} : la mise à jour signée et son installateur ;
-- models : {models}.
+- models : {models}.{complete_fr}
 
-Nouvelle installation : lancer {installer} depuis ce dossier. Le service installe le
+Nouvelle installation : lancer {first} depuis ce dossier. Le service installe le
 catalogue et les modèles à son premier démarrage.
 
 Ordinateur déjà équipé : dans la fenêtre Modèles, Importer, puis choisir ce dossier ; ou
@@ -157,6 +160,7 @@ def main():
     which.add_argument("--models", help="identifiers of the catalog, separated by commas")
     which.add_argument("--all", action="store_true")
     p.add_argument("--installer")
+    p.add_argument("--complete")
     p.add_argument("--from", dest="sources", action="append", default=[])
     p.add_argument("--dist", default=os.path.join(publish_release.ROOT, "dist", "albireo"))
     p.add_argument("--sign")
@@ -200,6 +204,11 @@ def main():
                 raise RuntimeError("the installer downloaded does not match the feed")
             os.replace(target + ".partial", target)
         print("%s: version %s" % (installer_name, stable["version"]))
+        complete_name = None
+        if a.complete:
+            complete_name = "albireo-setup-complete-%s.exe" % stable["version"]
+            shutil.copyfile(a.complete, os.path.join(a.output, complete_name))
+            print("%s: the complete installer, with the models that come with Albireo" % complete_name)
 
         entries = catalog["models"]
         if a.all:
@@ -210,6 +219,8 @@ def main():
             if unknown:
                 raise RuntimeError("not in the catalog: " + ", ".join(unknown))
             chosen = [e for e in entries if e["id"] in wanted]
+        elif complete_name:
+            chosen = []
         else:
             chosen = [e for e in entries if e.get("default")]
         by_size = local_files(a.sources)
@@ -219,8 +230,14 @@ def main():
             total += e["size"]
 
         with open(os.path.join(a.output, "README.txt"), "w", encoding="utf-8", newline="\r\n") as f:
+            complete_en = ("\n- %s: the complete installer, with the models that come with Albireo."
+                           % complete_name) if complete_name else ""
+            complete_fr = ("\n- %s : l'installateur complet, avec les modèles livrés avec Albireo."
+                           % complete_name) if complete_name else ""
             f.write(README.format(version=stable["version"], date=catalog["updated"][:10], installer=installer_name,
-                                  models=", ".join(e["id"] for e in chosen) or "-"))
+                                  models=", ".join(e["id"] for e in chosen) or "-",
+                                  first=complete_name or installer_name, complete_en=complete_en,
+                                  complete_fr=complete_fr))
     except (OSError, ValueError, KeyError, RuntimeError, subprocess.CalledProcessError) as e:
         print("error: %s" % e, file=sys.stderr)
         return 1

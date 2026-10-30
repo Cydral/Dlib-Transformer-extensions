@@ -16,6 +16,7 @@
 #include <functional>
 #include <iostream>
 
+#include "../common/builtin_models.h"
 #include "../common/engine_loader.h"
 #include "../common/log.h"
 #include "../common/platform.h"
@@ -67,14 +68,26 @@ namespace albireo
         }
     }
 
+    bool is_openvino_variant(const std::string& variant)
+    {
+        return variant.compare(0, 8, "openvino") == 0;
+    }
+
     std::vector<engine_choice> engine_options(const std::vector<engine_candidate>& candidates)
     {
+        // The OpenVINO engine with the richest processor kernels that run here: its devices
+        // make the choices of the NPU and of the graphics processor.
+        const engine_candidate* openvino = nullptr;
+        for (const char* v : { "openvino-avx512", "openvino-avxvnni", "openvino" })
+            for (const auto& c : candidates)
+                if (!openvino && c.usable && c.variant == v) openvino = &c;
         std::vector<engine_choice> out;
         for (const auto& c : candidates)
         {
             if (!c.usable) continue;
-            if (c.variant == "openvino")
+            if (is_openvino_variant(c.variant))
             {
+                if (&c != openvino) continue;
                 // One choice per kind of device, and one for the NPU and the graphics
                 // processor together, where dlib routes each product to the faster of
                 // them.
@@ -142,11 +155,13 @@ namespace albireo
         if (s.engine != "auto" && s.engine != "best")
         {
             // A variant named in the settings; for the engines with several devices, the
-            // accelerator setting picks the device.
+            // accelerator setting picks the device.  "openvino" names the OpenVINO engine
+            // that engine_options() keeps.
             const engine_choice* named = nullptr;
             for (const auto& e : options)
             {
-                if (e.key != s.engine && e.candidate->variant != s.engine) continue;
+                const bool openvino = s.engine == "openvino" && is_openvino_variant(e.candidate->variant);
+                if (e.key != s.engine && e.candidate->variant != s.engine && !openvino) continue;
                 if (!named) named = &e;
                 if ((s.accelerator == "npu" && is_npu(e)) || (s.accelerator == "gpu" && is_gpu(e))
                     || (s.accelerator == "both" && e.key == "openvino:both")) named = &e;
@@ -224,7 +239,7 @@ namespace albireo
         const std::string logs = join_path(data_dir_, "logs");
         make_dirs(logs);
         log_file::instance().open(join_path(logs, "service.log"));
-        log_info(std::string(ALBIREO_PRODUCT_NAME) + " " + ALBIREO_VERSION + " starting");
+        log_info(std::string(ALBIREO_FULL_NAME) + " " + ALBIREO_VERSION + " starting");
         log_info("programs in " + program_dir_ + ", data in " + data_dir_);
 
         const std::string settings_path = join_path(data_dir_, "settings.json");
@@ -290,34 +305,9 @@ namespace albireo
             models_ = std::move(m);
         }
 
-        // The engine of this machine; a processor engine when the chosen one fails.
-        candidates_ = engine_.discover(engines_dir(), executable_path());
-        choice_ = choose_engine(candidates_, st);
-        if (choice_.candidate)
-        {
-            std::string e;
-            if (!engine_.start(*choice_.candidate, engine_config(st, choice_.device), e))
-            {
-                engine_error_ = choice_.key + ": " + e;
-                log_error("engines: " + engine_error_);
-                for (const auto& o : engine_options(candidates_))
-                {
-                    if (o.key.compare(0, 3, "cpu") != 0) continue;
-                    if (engine_.start(*o.candidate, engine_config(st, o.device), e))
-                    {
-                        choice_ = o;
-                        break;
-                    }
-                    log_error("engines: " + o.key + ": " + e);
-                }
-            }
-        }
-        else
-        {
-            engine_error_ = "no usable engine in " + engines_dir();
-            log_error("engines: " + engine_error_);
-        }
+        register_builtin_models();
 
+        // The engines start in the background (start_engines()), once the server answers.
         const certificate_files certs = certificate_paths(cert_dir);
         {
             std::lock_guard<std::mutex> lock(server_m_);
@@ -366,6 +356,9 @@ namespace albireo
             {
                 log_error("service: the background tasks stopped: " + std::string(e.what()));
             }
+            // A start cut short by an error ends the starting state all the same.
+            engines_ready_ = true;
+            models_ready_ = true;
         });
         server_->listen_after_bind();
         const bool stopped = stopping_;
@@ -452,12 +445,78 @@ namespace albireo
         });
     }
 
+    void service::start_engines()
+    {
+        // The status reports the start until the end of this function, whatever happens.
+        struct ready_at_exit
+        {
+            std::atomic<bool>& flag;
+            ~ready_at_exit() { flag = true; }
+        } ready{ engines_ready_ };
+        // The engine of this machine; a processor engine when the chosen one fails.
+        const host_settings st = settings_->get();
+        candidates_ = engine_.discover(engines_dir(), executable_path());
+        choice_ = choose_engine(candidates_, st);
+        if (stopping_) return;
+        if (choice_.candidate)
+        {
+            std::string e;
+            if (!engine_.start(*choice_.candidate, engine_config(st, choice_.device), e))
+            {
+                engine_error_ = choice_.key + ": " + e;
+                log_error("engines: " + engine_error_);
+                for (const auto& o : engine_options(candidates_))
+                {
+                    if (o.key.compare(0, 3, "cpu") != 0) continue;
+                    if (engine_.start(*o.candidate, engine_config(st, o.device), e))
+                    {
+                        choice_ = o;
+                        break;
+                    }
+                    log_error("engines: " + o.key + ": " + e);
+                }
+            }
+        }
+        else
+        {
+            engine_error_ = "no usable engine in " + engines_dir();
+            log_error("engines: " + engine_error_);
+        }
+    }
+
+    std::string service::starting_phase() const
+    {
+        if (!engines_ready_) return "engines";
+        if (!models_ready_) return "models";
+        return std::string();
+    }
+
+    bool service::model_loading(const std::string& requested)
+    {
+        const host_settings st = settings_->get();
+        std::string id = requested;
+        std::string role = requested;
+        if (role.compare(0, 8, "albireo-") == 0) role = role.substr(8);
+        if (requested.empty() || requested == "auto" || requested == "albireo") role = "general";
+        if (is_role(role))
+        {
+            auto it = st.active.find(role);
+            if (it == st.active.end() && role != embedding_role) it = st.active.find("general");
+            if (it == st.active.end()) return false;
+            id = it->second;
+        }
+        std::lock_guard<std::mutex> lock(m_);
+        const auto state = load_state_.find(id);
+        return state != load_state_.end() && state->second == "loading";
+    }
+
     void service::background_loop()
     {
         /*
             The network tasks run on threads of their own and start first; the local work
-            follows at once and never waits for them: the models of the roles, the files
-            of the import folder, the default model among those installed.
+            follows at once and never waits for them: the engines, while the server already
+            answers, the models of the roles, the files of the import folder, the default
+            model among those installed.
         */
         bool online = false;
         int64_t next_catalog = 0;
@@ -490,7 +549,9 @@ namespace albireo
             }
         };
         network(settings_->get());
+        start_engines();
         load_active_models();
+        models_ready_ = true;
         if (stopping_) return;
         scan_inbox();
         unsigned catalog_seen = models_->catalog_generation();
@@ -634,6 +695,26 @@ namespace albireo
     bool service::is_embedding(const installed_model& m)
     {
         return m.descriptor["embedding"].as_bool(false) || has_role(m.descriptor, embedding_role);
+    }
+
+    void service::register_builtin_models()
+    {
+        std::vector<std::string> removed;
+        const std::vector<installed_model> added =
+            models_->register_builtin(join_path(program_dir_, builtin_models_folder), removed);
+        if (!removed.empty())
+        {
+            settings_->update([&](host_settings& s) {
+                for (auto it = s.active.begin(); it != s.active.end();)
+                {
+                    if (std::find(removed.begin(), removed.end(), it->second) != removed.end()) it = s.active.erase(it);
+                    else ++it;
+                }
+            });
+        }
+        // The engine is not started yet: the functions are given now, the models load with
+        // the others.
+        for (const auto& m : added) on_installed(m);
     }
 
     void service::note_default_failure(const json& entry, const user_error& error, const std::string& what)
@@ -965,6 +1046,12 @@ namespace albireo
             return false;
         }
         const std::string name = m.name.empty() ? id : m.name;
+        if (m.source == "builtin")
+        {
+            error.set("the model " + id + " comes with Albireo: it can leave its functions to other models, it "
+                "cannot be deleted", "builtin_model").arg("m", name);
+            return false;
+        }
         bool changed = false;
         settings_->update([&](host_settings& st) {
             for (auto it = st.active.begin(); it != st.active.end();)
@@ -1071,6 +1158,7 @@ namespace albireo
         const host_settings st = settings_->get();
         json s = json::object();
         s["product"] = ALBIREO_PRODUCT_NAME;
+        s["edition"] = ALBIREO_EDITION;
         s["version"] = ALBIREO_VERSION;
         s["company"] = ALBIREO_COMPANY_NAME;
         s["author"] = ALBIREO_AUTHOR_NAME;
@@ -1078,6 +1166,9 @@ namespace albireo
         s["project"] = ALBIREO_PROJECT_URL;
         s["started_at"] = static_cast<long long>(started_at_);
         s["uptime"] = static_cast<long long>(now_unix() - started_at_);
+        const std::string phase = starting_phase();
+        s["state"] = phase.empty() ? "ready" : "starting";
+        if (!phase.empty()) s["starting"] = phase;
         s["port"] = port_;
         s["url"] = "https://localhost:" + std::to_string(port_) + "/";
         s["data_dir"] = data_dir_;
@@ -1112,9 +1203,10 @@ namespace albireo
         json e = json::object();
         e["running"] = engine_.running();
         e["variant"] = engine_.variant();
-        e["key"] = choice_.key;
-        e["device"] = choice_.device;
-        e["error"] = engine_error_;
+        const bool chosen = engines_ready_;
+        e["key"] = chosen ? choice_.key : std::string();
+        e["device"] = chosen ? choice_.device : std::string();
+        e["error"] = chosen ? engine_error_ : std::string();
         e["description"] = engine_.description();
         json query = json::object();
         query["op"] = "stats";
@@ -1157,6 +1249,19 @@ namespace albireo
     json service::engines()
     {
         const host_settings st = settings_->get();
+        if (!engines_ready_)
+        {
+            // The engines are being described: nothing to list yet.
+            json out = json::object();
+            out["starting"] = true;
+            out["engines"] = json::array();
+            out["options"] = json::array();
+            out["current"] = "";
+            out["setting"] = st.engine;
+            out["accelerator"] = st.accelerator;
+            out["accelerators_available"] = false;
+            return out;
+        }
         json list = json::array();
         for (const auto& c : candidates_)
         {
@@ -1206,7 +1311,8 @@ namespace albireo
             // Why none is offered: no engine of a device in the installation, or none that
             // runs on this computer (the list of the engines gives the reasons).
             bool installed = false;
-            for (const auto& c : candidates_) installed = installed || c.variant == "cuda" || c.variant == "openvino";
+            for (const auto& c : candidates_)
+                installed = installed || c.variant == "cuda" || is_openvino_variant(c.variant);
             out["accelerators_reason"] = installed ? "unusable" : "not_installed";
         }
         return out;
@@ -1228,6 +1334,12 @@ namespace albireo
                 }
         }
         json out = json::object();
+        if (!engines_ready_)
+        {
+            out["error"] = "the service is starting";
+            out["code"] = "starting";
+            return out;
+        }
         if (!found)
         {
             out["error"] = "no model is installed";

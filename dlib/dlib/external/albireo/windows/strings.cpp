@@ -81,6 +81,15 @@ namespace albireo
             { "tip_off", { "Albireo: the service does not answer", "Albireo : le service ne répond pas",
                 "Albireo: Der Dienst antwortet nicht", "Albireo: il servizio non risponde",
                 "Albireo: el servicio no responde" } },
+            { "tip_starting", { "Albireo: the service is starting", "Albireo : démarrage du service",
+                "Albireo: Der Dienst startet", "Albireo: avvio del servizio",
+                "Albireo: el servicio se está iniciando" } },
+            { "tip_stopping", { "Albireo: the service is stopping", "Albireo : arrêt du service",
+                "Albireo: Der Dienst wird beendet", "Albireo: arresto del servizio",
+                "Albireo: el servicio se está deteniendo" } },
+            { "tip_stopped", { "Albireo: the service is stopped", "Albireo : le service est arrêté",
+                "Albireo: Der Dienst ist beendet", "Albireo: il servizio è arrestato",
+                "Albireo: el servicio está detenido" } },
             { "tip_no_model", { "no active model", "aucun modèle actif", "kein aktives Modell", "nessun modello attivo",
                 "ningún modelo activo" } },
             { "tip_loading", { "loading the model", "chargement du modèle", "Modell wird geladen",
@@ -110,6 +119,11 @@ namespace albireo
             { "notify_service_down", { "The Albireo service does not answer.", "Le service Albireo ne répond pas.",
                 "Der Albireo-Dienst antwortet nicht.", "Il servizio Albireo non risponde.",
                 "El servicio Albireo no responde." } },
+            { "notify_service_stopped", { "The Albireo service is stopped: start it from the menu of this icon.",
+                "Le service Albireo est arrêté : démarrez-le depuis le menu de cette icône.",
+                "Der Albireo-Dienst ist beendet: Starten Sie ihn über das Menü dieses Symbols.",
+                "Il servizio Albireo è arrestato: avviatelo dal menu di questa icona.",
+                "El servicio Albireo está detenido: inícielo desde el menú de este icono." } },
             { "notify_measures", { "The engines are measured: {r}", "Les moteurs sont mesurés : {r}",
                 "Die Engines sind gemessen: {r}", "I motori sono stati misurati: {r}",
                 "Los motores están medidos: {r}" } },
@@ -120,20 +134,32 @@ namespace albireo
                 "Modelos de Albireo" } },
             { "models_intro", {
                 "Up to three models answer, one per function; a function without a model uses the general model. "
-                "An embedding model serves the document search.",
+                "The inputs of a model decide the attachments of the web application; the document search has its "
+                "own embedding model.",
                 "Jusqu'à trois modèles répondent, un par fonction ; une fonction sans modèle utilise le modèle "
-                "général. Un modèle d'embeddings sert la recherche documentaire.",
+                "général. Les entrées d'un modèle décident des pièces jointes de l'application web ; la recherche "
+                "documentaire a son propre modèle d'embeddings.",
                 "Bis zu drei Modelle antworten, eines pro Funktion; eine Funktion ohne Modell verwendet das "
-                "allgemeine Modell. Ein Embedding-Modell dient der Dokumentensuche.",
+                "allgemeine Modell. Die Eingaben eines Modells bestimmen die Anhänge der Webanwendung; die "
+                "Dokumentensuche hat ihr eigenes Embedding-Modell.",
                 "Fino a tre modelli rispondono, uno per funzione; una funzione senza modello usa il modello generale. "
-                "Un modello di embedding serve la ricerca nei documenti.",
+                "Gli ingressi di un modello decidono gli allegati dell'applicazione web; la ricerca nei documenti ha "
+                "il proprio modello di embedding.",
                 "Hasta tres modelos responden, uno por función; una función sin modelo usa el modelo general. "
-                "Un modelo de embeddings sirve la búsqueda en documentos." } },
+                "Las entradas de un modelo deciden los adjuntos de la aplicación web; la búsqueda en documentos "
+                "tiene su propio modelo de embeddings." } },
             { "col_model", { "Model", "Modèle", "Modell", "Modello", "Modelo" } },
             { "col_roles", { "Functions", "Fonctions", "Funktionen", "Funzioni", "Funciones" } },
             { "col_size", { "Size", "Taille", "Größe", "Dimensione", "Tamaño" } },
             { "col_state", { "State", "État", "Status", "Stato", "Estado" } },
             { "col_active", { "Active for", "Actif pour", "Aktiv für", "Attivo per", "Activo para" } },
+            { "col_inputs", { "Inputs", "Entrées", "Eingaben", "Ingressi", "Entradas" } },
+            { "input_text", { "Text", "Texte", "Text", "Testo", "Texto" } },
+            { "input_image", { "images", "images", "Bilder", "immagini", "imágenes" } },
+            { "input_audio", { "sound", "son", "Ton", "audio", "sonido" } },
+            { "state_builtin", { "Comes with Albireo", "Livré avec Albireo", "Mit Albireo geliefert",
+                "Fornito con Albireo", "Incluido con Albireo" } },
+            { "lbl_inputs", { "Inputs", "Entrées", "Eingaben", "Ingressi", "Entradas" } },
             { "role_general", { "General", "Général", "Allgemein", "Generale", "General" } },
             { "role_code", { "Code", "Code", "Code", "Codice", "Código" } },
             { "role_embedding", { "Document search", "Recherche documentaire", "Dokumentensuche",
@@ -213,6 +239,12 @@ namespace albireo
                 "La ricerca nei documenti ha bisogno di un modello di embedding: attivatene un altro per questa "
                 "funzione per sostituire {m}.", "La búsqueda en documentos necesita un modelo de embeddings: active "
                 "otro para esta función para sustituir a {m}." } },
+            { "err_builtin_model", { "{m} comes with Albireo: it can leave its functions to other models, it "
+                "cannot be deleted.", "{m} est livré avec Albireo : il peut laisser ses fonctions à d'autres modèles, "
+                "il ne peut pas être supprimé.", "{m} wird mit Albireo ausgeliefert: Es kann seine Funktionen anderen "
+                "Modellen überlassen, aber nicht gelöscht werden.", "{m} è fornito con Albireo: può lasciare le sue "
+                "funzioni ad altri modelli, non può essere eliminato.", "{m} se incluye con Albireo: puede dejar sus "
+                "funciones a otros modelos, no se puede eliminar." } },
             { "err_delete_failed", { "{m} could not be deleted: its file is in use or protected ({file}).",
                 "{m} n'a pas pu être supprimé : son fichier est utilisé ou protégé ({file}).",
                 "{m} konnte nicht gelöscht werden: Seine Datei ist in Gebrauch oder geschützt ({file}).",
@@ -448,7 +480,8 @@ namespace albireo
 
             { "about_title", { "About Albireo", "À propos d'Albireo", "Über Albireo", "Informazioni su Albireo",
                 "Acerca de Albireo" } },
-            { "about_version", { "Version {v}", "Version {v}", "Version {v}", "Versione {v}", "Versión {v}" } },
+            { "about_version", { "{e}, version {v}", "{e}, version {v}", "{e}, Version {v}", "{e}, versione {v}",
+                "{e}, versión {v}" } },
             { "about_built", { "Built on the Dlib-Transformer-extensions library",
                 "Construit sur la bibliothèque Dlib-Transformer-extensions",
                 "Entwickelt auf der Bibliothek Dlib-Transformer-extensions",
@@ -471,22 +504,58 @@ namespace albireo
             { "welcome_title", { "Welcome to Albireo", "Bienvenue dans Albireo", "Willkommen bei Albireo",
                 "Benvenuto in Albireo", "Bienvenido a Albireo" } },
             { "welcome_text", {
-                "This assistant installs Albireo {v}: the service that runs language models on this computer, its icon "
-                "in the notification area and its web application. Nothing leaves this computer.",
-                "Cet assistant installe Albireo {v} : le service qui exécute des modèles de langage sur cet "
-                "ordinateur, son icône dans la zone de notification et son application web. Rien ne quitte cet "
-                "ordinateur.",
-                "Dieser Assistent installiert Albireo {v}: den Dienst, der Sprachmodelle auf diesem Computer ausführt, "
-                "sein Symbol im Infobereich und seine Webanwendung. Nichts verlässt diesen Computer.",
-                "Questa procedura installa Albireo {v}: il servizio che esegue i modelli linguistici su questo "
-                "computer, la sua icona nell'area di notifica e la sua applicazione web. Nulla lascia questo computer.",
-                "Este asistente instala Albireo {v}: el servicio que ejecuta modelos de lenguaje en este equipo, su "
-                "icono en el área de notificación y su aplicación web. Nada sale de este equipo." } },
-            { "welcome_update", { "Version {o} is installed: it is updated, its models and settings are kept.",
-                "La version {o} est installée : elle est mise à jour, ses modèles et ses réglages sont conservés.",
-                "Version {o} ist installiert: Sie wird aktualisiert, ihre Modelle und Einstellungen bleiben erhalten.",
-                "La versione {o} è installata: viene aggiornata, i suoi modelli e le impostazioni sono conservati.",
-                "La versión {o} está instalada: se actualiza y se conservan sus modelos y ajustes." } },
+                "This assistant installs Albireo Community Edition {v}: the service that runs language models on this "
+                "computer, its icon in the notification area and its web application. Nothing leaves this computer.",
+                "Cet assistant installe Albireo Community Edition {v} : le service qui exécute des modèles de langage "
+                "sur cet ordinateur, son icône dans la zone de notification et son application web. Rien ne quitte "
+                "cet ordinateur.",
+                "Dieser Assistent installiert Albireo Community Edition {v}: den Dienst, der Sprachmodelle auf diesem "
+                "Computer ausführt, sein Symbol im Infobereich und seine Webanwendung. Nichts verlässt diesen "
+                "Computer.",
+                "Questa procedura installa Albireo Community Edition {v}: il servizio che esegue i modelli linguistici "
+                "su questo computer, la sua icona nell'area di notifica e la sua applicazione web. Nulla lascia "
+                "questo computer.",
+                "Este asistente instala Albireo Community Edition {v}: el servicio que ejecuta modelos de lenguaje en "
+                "este equipo, su icono en el área de notificación y su aplicación web. Nada sale de este equipo." } },
+            { "update_title", { "Albireo update", "Mise à jour d'Albireo", "Albireo-Aktualisierung",
+                "Aggiornamento di Albireo", "Actualización de Albireo" } },
+            { "update_text", {
+                "Albireo {o} is installed in {d}. This assistant updates it to version {v} of Albireo Community "
+                "Edition and keeps its settings, its models, its certificates, its shortcuts and the start of its "
+                "icon.",
+                "Albireo {o} est installé dans {d}. Cet assistant le met à jour vers la version {v} d'Albireo "
+                "Community Edition et conserve ses réglages, ses modèles, ses certificats, ses raccourcis et le "
+                "démarrage de son icône.",
+                "Albireo {o} ist in {d} installiert. Dieser Assistent aktualisiert es auf Version {v} von Albireo "
+                "Community Edition und behält seine Einstellungen, Modelle, Zertifikate, Verknüpfungen und den Start "
+                "seines Symbols bei.",
+                "Albireo {o} è installato in {d}. Questa procedura lo aggiorna alla versione {v} di Albireo Community "
+                "Edition e conserva le impostazioni, i modelli, i certificati, i collegamenti e l'avvio della sua "
+                "icona.",
+                "Albireo {o} está instalado en {d}. Este asistente lo actualiza a la versión {v} de Albireo Community "
+                "Edition y conserva sus ajustes, sus modelos, sus certificados, sus accesos directos y el inicio de "
+                "su icono." } },
+            { "update_newer", {
+                "Albireo {o}, newer than version {v} of this assistant, is installed in {d}: it stays in place.",
+                "Albireo {o}, plus récent que la version {v} de cet assistant, est installé dans {d} : il reste en "
+                "place.",
+                "Albireo {o}, neuer als Version {v} dieses Assistenten, ist in {d} installiert: Es bleibt erhalten.",
+                "Albireo {o}, più recente della versione {v} di questa procedura, è installato in {d}: resta al suo "
+                "posto.",
+                "Albireo {o}, más reciente que la versión {v} de este asistente, está instalado en {d}: se "
+                "mantiene." } },
+            { "btn_update", { "Update", "Mettre à jour", "Aktualisieren", "Aggiorna", "Actualizar" } },
+            { "update_progress", { "Update", "Mise à jour", "Aktualisierung", "Aggiornamento", "Actualización" } },
+            { "update_done_title", { "Albireo is up to date", "Albireo est à jour", "Albireo ist aktuell",
+                "Albireo è aggiornato", "Albireo está actualizado" } },
+            { "update_done_text", { "Albireo {v} replaced version {o}. The service started again with its models.",
+                "Albireo {v} a remplacé la version {o}. Le service a redémarré avec ses modèles.",
+                "Albireo {v} hat Version {o} ersetzt. Der Dienst wurde mit seinen Modellen neu gestartet.",
+                "Albireo {v} ha sostituito la versione {o}. Il servizio è ripartito con i suoi modelli.",
+                "Albireo {v} reemplazó la versión {o}. El servicio se reinició con sus modelos." } },
+            { "update_failed", { "The update failed: {e}", "La mise à jour a échoué : {e}",
+                "Die Aktualisierung ist fehlgeschlagen: {e}", "L'aggiornamento non è riuscito: {e}",
+                "La actualización falló: {e}" } },
             { "license_title", { "License", "Licence", "Lizenz", "Licenza", "Licencia" } },
             { "license_accept", { "I accept the terms of the license", "J'accepte les termes de la licence",
                 "Ich akzeptiere die Lizenzbedingungen", "Accetto i termini della licenza",
@@ -501,6 +570,14 @@ namespace albireo
                 "Espacio necesario para los programas: {s}" } },
             { "space_available", { "Space available: {s}", "Espace disponible : {s}", "Verfügbarer Speicher: {s}",
                 "Spazio disponibile: {s}", "Espacio disponible: {s}" } },
+            { "welcome_models", { "This installer brings the models that come with Albireo ({s}): Albireo "
+                "answers as soon as it is installed, without network.", "Ce programme d'installation apporte les "
+                "modèles livrés avec Albireo ({s}) : Albireo répond dès son installation, sans réseau.",
+                "Dieses Installationsprogramm bringt die mit Albireo gelieferten Modelle mit ({s}): Albireo "
+                "antwortet gleich nach der Installation, ohne Netzwerk.", "Questo programma di installazione porta i "
+                "modelli forniti con Albireo ({s}): Albireo risponde appena installato, senza rete.", "Este programa "
+                "de instalación trae los modelos incluidos con Albireo ({s}): Albireo responde en cuanto se instala, "
+                "sin red." } },
             { "space_models", { "A model needs 1 to 20 GB in the models folder.",
                 "Un modèle occupe de 1 à 20 Go dans le dossier des modèles.",
                 "Ein Modell benötigt 1 bis 20 GB im Modellordner.",
@@ -538,6 +615,11 @@ namespace albireo
                 "Laufende Programme werden beendet", "Arresto dei programmi in esecuzione",
                 "Deteniendo los programas en ejecución" } },
             { "step_files", { "Copying {f}", "Copie de {f}", "{f} wird kopiert", "Copia di {f}", "Copiando {f}" } },
+            { "step_models", { "Installing the model {f}, which comes with Albireo",
+                "Installation du modèle {f}, livré avec Albireo",
+                "Das mit Albireo gelieferte Modell {f} wird installiert",
+                "Installazione del modello {f}, fornito con Albireo",
+                "Instalando el modelo {f}, incluido con Albireo" } },
             { "step_service", { "Registering the service", "Enregistrement du service", "Dienst wird registriert",
                 "Registrazione del servizio", "Registrando el servicio" } },
             { "step_certificates", { "Creating the certificates of the local server",

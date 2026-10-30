@@ -333,7 +333,7 @@ int main(int argc, char** argv)
         return albireo::service::benchmark_engine(args[2], args[3], args[4]);
     if (args.size() >= 2 && args[1] == "--version")
     {
-        std::cout << ALBIREO_PRODUCT_NAME << " " << ALBIREO_VERSION << std::endl;
+        std::cout << ALBIREO_FULL_NAME << " " << ALBIREO_VERSION << std::endl;
         return 0;
     }
     const bool console = args.size() >= 2 && args[1] == "--console";

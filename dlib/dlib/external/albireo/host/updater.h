@@ -13,9 +13,6 @@
 namespace albireo
 {
 
-    // Compares versions "1.2.3": negative, zero or positive as a is older, equal or newer.
-    int compare_versions(const std::string& a, const std::string& b);
-
     class updater
     {
         /*!

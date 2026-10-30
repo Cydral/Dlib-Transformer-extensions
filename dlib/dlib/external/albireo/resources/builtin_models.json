@@ -1,0 +1,67 @@
+{
+  "format": 1,
+  "models": [
+    {
+      "id": "qwen3-1.7b-albireo",
+      "name": "Qwen3-1.7B-albireo",
+      "publisher": "Qwen",
+      "license": "Apache-2.0",
+      "roles": [
+        "general",
+        "code",
+        "security"
+      ],
+      "inputs": [
+        "text"
+      ],
+      "tools": true,
+      "reasoning": true,
+      "quantization": "Q4_K_M",
+      "description": {
+        "en": "Model that comes with Albireo, converted by its build from the Q8_0 version published by Qwen: a compact assistant with step by step reasoning, which serves the conversation, the code and the security from the installation on, without network. The larger models of the catalog answer in more depth.",
+        "fr": "Modèle livré avec Albireo, converti par sa chaîne de construction depuis la version Q8_0 publiée par Qwen : assistant compact avec raisonnement étape par étape, qui sert la discussion, le code et la sécurité dès l'installation, sans réseau. Les modèles plus grands du catalogue répondent avec plus de profondeur.",
+        "de": "Mit Albireo ausgeliefertes Modell, beim Bau aus der von Qwen veröffentlichten Q8_0-Fassung umgewandelt: ein kompakter Assistent mit schrittweisem Denken, der Gespräche, Code und Sicherheit ab der Installation bedient, ohne Netzwerk. Die größeren Modelle des Katalogs antworten mit mehr Tiefe.",
+        "it": "Modello fornito con Albireo, convertito dalla sua catena di costruzione a partire dalla versione Q8_0 pubblicata da Qwen: un assistente compatto con ragionamento passo dopo passo, che serve la conversazione, il codice e la sicurezza fin dall'installazione, senza rete. I modelli più grandi del catalogo rispondono con maggiore profondità.",
+        "es": "Modelo incluido con Albireo, convertido por su cadena de construcción a partir de la versión Q8_0 publicada por Qwen: un asistente compacto con razonamiento paso a paso, que atiende la conversación, el código y la seguridad desde la instalación, sin red. Los modelos más grandes del catálogo responden con más profundidad."
+      },
+      "source": "https://huggingface.co/Qwen/Qwen3-1.7B-GGUF",
+      "from": {
+        "url": "https://huggingface.co/Qwen/Qwen3-1.7B-GGUF/resolve/90862c4b9d2787eaed51d12237eafdfe7c5f6077/Qwen3-1.7B-Q8_0.gguf",
+        "size": 1834426016,
+        "sha256": "061b54daade076b5d3362dac252678d17da8c68f07560be70818cace6590cb1a",
+        "quantization": "Q8_0"
+      }
+    },
+    {
+      "id": "qwen3-embedding-0.6b-albireo",
+      "name": "Qwen3-Embedding-0.6B-albireo",
+      "publisher": "Qwen",
+      "license": "Apache-2.0",
+      "roles": [
+        "embedding"
+      ],
+      "inputs": [
+        "text"
+      ],
+      "embedding": true,
+      "dimensions": 1024,
+      "tools": false,
+      "reasoning": false,
+      "quantization": "Q8_0",
+      "description": {
+        "en": "Embedding model of the document search, which comes with Albireo: it turns the passages of the documents and the questions into vectors, in more than 100 languages, so that the passages answering a question are found by their meaning.",
+        "fr": "Modèle d'embeddings de la recherche documentaire, livré avec Albireo : il convertit en vecteurs les passages des documents et les questions, dans plus de 100 langues, pour retrouver par leur sens les passages qui répondent à une question.",
+        "de": "Embedding-Modell der Dokumentsuche, mit Albireo ausgeliefert: Es wandelt die Abschnitte der Dokumente und die Fragen in mehr als 100 Sprachen in Vektoren um, damit die Abschnitte, die eine Frage beantworten, über ihre Bedeutung gefunden werden.",
+        "it": "Modello di embedding della ricerca nei documenti, fornito con Albireo: converte in vettori i passaggi dei documenti e le domande, in più di 100 lingue, per ritrovare in base al significato i passaggi che rispondono a una domanda.",
+        "es": "Modelo de embeddings de la búsqueda en documentos, incluido con Albireo: convierte en vectores los pasajes de los documentos y las preguntas, en más de 100 idiomas, para encontrar por su significado los pasajes que responden a una pregunta."
+      },
+      "source": "https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF",
+      "from": {
+        "url": "https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF/resolve/370f27d7550e0def9b39c1f16d3fbaa13aa67728/Qwen3-Embedding-0.6B-Q8_0.gguf",
+        "size": 639150592,
+        "sha256": "06507c7b42688469c4e7298b0a1e16deff06caf291cf0a5b278c308249c3e439",
+        "quantization": "Q8_0"
+      }
+    }
+  ]
+}

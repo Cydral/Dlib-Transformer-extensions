@@ -7,6 +7,8 @@
 #include <functional>
 #include <string>
 
+#include "../common/json.h"
+
 namespace albireo
 {
 namespace setup
@@ -72,8 +74,34 @@ namespace setup
     // Deletes the files left aside by an earlier update.
     void remove_old_files(const std::string& program_dir);
 
-    // Copies this program into the installation, without its payload, as the uninstaller.
+    // Copies this program into the installation, without its payload and its models, as
+    // the uninstaller.
     bool install_uninstaller(const std::string& program_dir, std::string& error);
+
+    /*
+        The models that come with Albireo, which the complete installer carries after its
+        program (common/builtin_models.h): the manifest, with the position of each file in
+        the installer, and the size of their files.  The installer without models has none.
+    */
+    struct builtin_overlay
+    {
+        uint64_t start = 0;     // position of the overlay, the size of the program before it
+        uint64_t total = 0;     // bytes of the files of the models
+        json manifest;
+        bool present() const { return manifest["models"].size() > 0; }
+    };
+    builtin_overlay read_builtin_overlay(const std::string& installer);
+
+    /*
+        Installs the models that come with this installer in the "models" folder of
+        program_dir: each file copied and checked against its hash, unless the same file is
+        there already; the files of the models that no longer come with Albireo deleted;
+        the manifest builtin.json written last, which the service reads at its start.
+        progress receives the bytes done and the name of the file.
+    */
+    bool install_builtin_models(const std::string& program_dir,
+        const std::function<void(uint64_t done, uint64_t total, const std::string& file)>& progress,
+        std::string& error);
 
     // The data folder with its permissions: SYSTEM and administrators full control,
     // users read (the tray reads the certificate of the authority and the token).
@@ -86,7 +114,9 @@ namespace setup
         Copies the offline bundle the installer comes with, on a medium, into the import
         folder of the service, which installs it at its start: the signed catalog next to
         the installer (catalog.json and catalog.json.sig) and the models of its "models"
-        folder.  Returns the number of models; progress receives the name of each one.
+        folder, except those its manifest builtin.json lists (the models that come with
+        Albireo, in a folder of programs).  Returns the number of models; progress receives
+        the name of each one.
     */
     int stage_bundle(const std::function<void(const std::string&)>& progress);
 

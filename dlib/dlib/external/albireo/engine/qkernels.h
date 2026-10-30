@@ -118,14 +118,6 @@ namespace albireo
     // Name of the instruction set the kernels were compiled for.
     const char* qk_isa();
 
-    // The instruction sets beyond SSE2 that the kernels of a build use.
-    enum qk_isa_flags : unsigned
-    {
-        qk_isa_avx2 = 1,       // AVX2, FMA and F16C
-        qk_isa_avx_vnni = 2,   // AVX-VNNI
-        qk_isa_avx512 = 4      // AVX-512 F, BW, DQ and VL, with VNNI
-    };
-
     /*!
         ensures
             - Returns the qk_isa_flags of this build, which the processor must have.  The
@@ -143,38 +135,7 @@ namespace albireo
     !*/
     inline unsigned qk_missing_isa(const cpu_info& cpu, unsigned extra = 0)
     {
-        const unsigned isa = qk_required_isa() | extra;
-        if ((isa & qk_isa_avx2) && !(cpu.avx2 && cpu.fma && cpu.f16c)) return qk_isa_avx2;
-        if ((isa & qk_isa_avx_vnni) && !cpu.avx_vnni) return qk_isa_avx_vnni;
-        if ((isa & qk_isa_avx512) && !(cpu.avx512f && cpu.avx512bw && cpu.avx512dq && cpu.avx512vl && cpu.avx512vnni))
-            return qk_isa_avx512;
-        return 0;
-    }
-
-    // The instructions of one of the qk_isa_flags, with the processors that have them.
-    inline const char* qk_isa_text(unsigned flag)
-    {
-        switch (flag)
-        {
-        case qk_isa_avx2: return "AVX2, FMA and F16C";
-        case qk_isa_avx_vnni: return "AVX-VNNI (Intel Core from Alder Lake on, AMD Zen 5)";
-        case qk_isa_avx512:
-            return "AVX-512 with VNNI (Intel Xeon from Cascade Lake on, Intel Core Ice Lake, Tiger Lake and Rocket "
-                "Lake, AMD Zen 4 and later)";
-        default: return "";
-        }
-    }
-
-    // The code of one of the qk_isa_flags in the descriptions of the engines.
-    inline const char* qk_isa_code(unsigned flag)
-    {
-        switch (flag)
-        {
-        case qk_isa_avx2: return "isa_avx2";
-        case qk_isa_avx_vnni: return "isa_avx_vnni";
-        case qk_isa_avx512: return "isa_avx512";
-        default: return "";
-        }
+        return qk_lacking_isa(cpu, qk_required_isa() | extra);
     }
 
     /*!

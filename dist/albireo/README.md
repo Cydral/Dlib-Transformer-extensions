@@ -22,13 +22,15 @@ accepts files of less than 2 GiB, and the repository itself keeps only these sma
 ## Publishing a version
 
 1. Set the version in `dlib/dlib/external/albireo/common/version.h`, commit and push the sources.
-2. Build the installer on Windows (see the README of Albireo, section Building on Windows).
+2. Build the installers on Windows (see the README of Albireo, section Building on Windows):
+   `albireo-setup-online.exe`, which the feed announces, and `albireo-setup.exe`, complete with
+   the models that come with Albireo.
 3. Write the release notes as `notes.json`, `{"en": "...", "fr": "...", "de": "...", "it": "...", "es": "..."}`;
    without this file, the notes the feed already holds for the same version are kept.
-4. Publish the installer and sign the feed, then push the feed:
+4. Publish the installers and sign the feed, then push the feed:
 
 ```
-python3 dlib/dlib/external/albireo/tools/publish_release.py <albireo-setup.exe> --key <private key> --notes notes.json
+python3 dlib/dlib/external/albireo/tools/publish_release.py build-albireo/bin/albireo-setup-online.exe --complete build-albireo/bin/albireo-setup.exe --key <private key> --notes notes.json
 git add dist/albireo/feed.json dist/albireo/feed.json.sig
 git commit -m "Albireo <version>"
 git push
@@ -36,7 +38,8 @@ git push
 
 `publish_release.py` checks that the installer carries the version of `version.h`, creates the
 release `albireo-v<version>` when it does not exist, attaches the installer as
-`albireo-setup-<version>.exe` (replacing a file of that name whose content differs), writes
+`albireo-setup-<version>.exe` (replacing a file of that name whose content differs), and the
+complete installer as `albireo-setup-complete-<version>.exe` when it fits 2 GiB, writes
 `feed.json`, signs it with `albireo-sign`, checks the signature, and reads the beginning of the
 installer back from its public address. Its token of GitHub comes from `GITHUB_TOKEN`, `GH_TOKEN`
 or `gh auth token`, with the right to write the contents of the repository; `--dry-run` checks
@@ -45,7 +48,8 @@ by other means.
 
 The services see the new feed within six hours, or at once with "Check for updates" in the menu
 of the icon, download the installer in the background, check its size and its SHA-256, and install
-it when the service restarts.
+it when the service restarts, or at once with "Install version <version> and restart". The update
+keeps the models that came with an earlier complete installer.
 
 ## Updating the catalog
 

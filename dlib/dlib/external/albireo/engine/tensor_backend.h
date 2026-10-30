@@ -99,6 +99,9 @@ namespace albireo
         static json describe(std::string& backend, std::string& runtime, std::string& reason, std::string& code,
             json& args);
 
+        // The name of the backend of this build: "cuda", "openvino" or "dlib".
+        static const char* backend_name();
+
     private:
         struct impl;
         std::unique_ptr<impl> impl_;

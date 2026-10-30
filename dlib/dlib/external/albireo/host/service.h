@@ -50,8 +50,15 @@ namespace albireo
     !*/
     engine_choice choose_engine(const std::vector<engine_candidate>& candidates, const host_settings& s);
 
-    // The engines a set of candidates offers, one per device: what the tray lists.
+    /*!
+        ensures
+            - Returns the engines a set of candidates offers, one per device: what the tray
+              lists.  Among the OpenVINO engines, one per family of processor kernels
+              (openvino-avx512, openvino-avxvnni, openvino), the richest usable one offers
+              the NPU, the graphics processor and both.
+    !*/
     std::vector<engine_choice> engine_options(const std::vector<engine_candidate>& candidates);
+    bool is_openvino_variant(const std::string& variant);
 
     class service
     {
@@ -69,6 +76,12 @@ namespace albireo
                 run() starts its installer instead of serving and returns with
                 update_started() true: the installer stops the service, replaces the
                 programs and starts the service again.
+
+                The server answers as soon as its port is open.  The engines are described
+                and the chosen one starts in the background, then the active models load:
+                until then, starting_phase() names the step in progress, the status says
+                so, and the requests for a model answer 503 with the code "starting", so
+                that the tray and the clients tell a slow start from a failure.
 
             NETWORK
                 The catalog, the updates and the downloads run on threads of their own,
@@ -105,6 +118,11 @@ namespace albireo
 
         json status();
         json engines();
+        // The step of the start in progress: "engines" (described, then the chosen one
+        // starts), "models" (the active models load), or empty once the service is ready.
+        std::string starting_phase() const;
+        // True while the model of a role, or the model named, loads into the engine.
+        bool model_loading(const std::string& requested);
         // The engine model of a request: an identifier, a role or its alias, or auto.
         std::string resolve_model(const std::string& requested);
         // The embedding model of a request: a loaded embedding model named by its
@@ -132,6 +150,8 @@ namespace albireo
                   and deletes its file.  A model in the engine is deleted once its requests
                   are served and it left the engine: pending is then true, and the model
                   stays listed, in the state "removing", until then.
+                - A model that comes with Albireo is refused (code "builtin_model"): it
+                  leaves its functions to other models and stays installed.
         !*/
         bool remove_model(const std::string& id, user_error& error, bool& pending);
         // The models waiting for their requests before they leave: id -> "unloading" or
@@ -170,6 +190,12 @@ namespace albireo
 
     private:
         void background_loop();
+        // Describes the engines next to the service and starts the one of the settings, a
+        // processor engine when it fails; then engines_ready_ becomes true.
+        void start_engines();
+        // Registers the models that come with Albireo, in the folder of the programs: a new
+        // one takes the functions no model holds, those of a model that left are freed.
+        void register_builtin_models();
         void ensure_default_model();
         // Logs why a default model of the catalog could not be downloaded, which the Models
         // window shows as the error of its download until a download starts.
@@ -199,9 +225,13 @@ namespace albireo
         std::unique_ptr<model_manager> models_;
         std::unique_ptr<updater> updater_;
         engine_host engine_;
+        // Written once by start_engines(), then read by the routes once engines_ready_ is
+        // true.
         std::vector<engine_candidate> candidates_;
         engine_choice choice_;
         std::string engine_error_;
+        std::atomic<bool> engines_ready_{false};
+        std::atomic<bool> models_ready_{false};
 
         // Guards the server, the model manager and the updater while run() creates and
         // releases them, for stop(), which a thread of the system may call at any time.

@@ -8,7 +8,10 @@ to manage it, and an installer. The conversations, the documents and the models 
 machine, and nothing asks for an account.
 
 Albireo is published by Cydral Technology and was created by Aldric Pierrain. Its name is that
-of a double star of the constellation Cygnus, one gold and one blue, which its icon draws.
+of a double star of the constellation Cygnus, one gold and one blue, which its icon draws. This
+version is the Community Edition: the installer, the About windows of the icon and of the web
+application, the description of the interface and the list of the programs of Windows name it
+"Albireo Community Edition".
 
 ## Contents
 
@@ -22,6 +25,7 @@ of a double star of the constellation Cygnus, one gold and one blue, which its i
 - [Settings](#settings)
 - [Interfaces](#interfaces)
 - [Models](#models)
+- [Models that come with Albireo](#models-that-come-with-albireo)
 - [Computers without network](#computers-without-network)
 - [Publishing a version](#publishing-a-version)
 - [Security](#security)
@@ -43,6 +47,10 @@ of a double star of the constellation Cygnus, one gold and one blue, which its i
 - **Three functions**, general, code and security, each served by a language model of the
   catalog, chosen in the Models window or by the service when a model arrives, and an embedding
   model for the search in documents, which the service installs in every case.
+- **Models that come with Albireo**: the complete installer carries Qwen3-1.7B-albireo, which
+  serves the three functions as soon as Albireo is installed, and Qwen3-Embedding-0.6B-albireo
+  for the search, both retrieved and converted by the build (see
+  [Models that come with Albireo](#models-that-come-with-albireo)).
 - **Agent mode**: the model calls tools that run in the page (calculator, JavaScript in a
   sandboxed frame, outline, reading and search of the documents), up to eight steps per answer.
 - **Several conversations at once**: the requests of every client are computed together, one
@@ -79,7 +87,9 @@ models). Every variant is built from the same sources:
 | `cpu-avx2`    | quantized kernels, AVX2, FMA and F16C (Intel Haswell, AMD Zen and later) | the main build tree       |
 | `cpu-avxvnni` | `cpu-avx2` with the dot products of AVX-VNNI (Intel Core from Alder Lake on, AMD Zen 5) | the main build tree |
 | `cpu-avx512`  | AVX-512 F, BW, DQ and VL with VNNI (Intel Xeon from Cascade Lake on, Intel Core Ice Lake, Tiger Lake and Rocket Lake, AMD Zen 4 and later) | the main build tree |
-| `openvino`    | NPU and integrated GPU of Intel processors, AVX2 kernels             | `ALBIREO_ENGINE_OPENVINO=ON` |
+| `openvino`    | NPU and integrated GPU of Intel processors, kernels of `cpu-avx2`     | `ALBIREO_ENGINE_OPENVINO=ON` |
+| `openvino-avxvnni` | `openvino` with the kernels of `cpu-avxvnni`                     | `ALBIREO_ENGINE_OPENVINO=ON` |
+| `openvino-avx512`  | `openvino` with the kernels of `cpu-avx512`                      | `ALBIREO_ENGINE_OPENVINO=ON` |
 | `cuda`        | NVIDIA graphics processors, AVX2 kernels                              | `ALBIREO_ENGINE_CUDA=ON`     |
 
 The half precision conversions of F16C belong to `cpu-avx2`: every processor with AVX2 has them,
@@ -95,6 +105,15 @@ activations, those of Q4_K, Q5_K and Q6_K apply their scales with `vpdpwssd`, an
 kernels take two blocks, or two sub-blocks of a super-block, per vector, with the products of the
 prompts on 512-bit vectors. The AVX-VNNI intrinsics need Visual Studio 2022 (GCC 11, Clang 12);
 an older compiler builds the other variants.
+
+The products the NPU or the graphics processor does not take, and every product the routing of
+dlib leaves to the processor, run on the quantized kernels of the engine. The OpenVINO engine is
+therefore built once per family of kernels, so that a processor with AVX-VNNI or AVX-512 keeps its
+kernels when the NPU or the GPU serves the models. The service describes the OpenVINO engine of the
+richest family the processor runs and offers its devices (`openvino:npu`, `openvino:gpu`,
+`openvino:both`); the setting `"engine": "openvino"` names that engine. A library whose kernels
+need instructions the processor lacks is reported as such without being loaded, since the runtime
+of a device takes seconds to start.
 
 The forward pass ([`engine/cpu_runtime.cpp`](engine/cpu_runtime.cpp)) keeps the weights in the
 memory mapping of the GGUF file, in their quantized form, and multiplies them with kernels that
@@ -159,11 +178,26 @@ and, for development, in a console with `--console`. It:
 - restarts itself when a setting requires it, in a new process once the engine of a device has
   run, since that library stays loaded with the threads of its runtime.
 
+The server answers as soon as its port is open: the engines are described and the chosen one
+starts in the background, then the active models load. Until then `/api/status` gives the state
+`starting` with the step in progress (`engines`, then `models`), the requests for a model answer
+503 with the code `starting` or `model_loading` and a `Retry-After` header, and the web application
+says that the service is starting. A slow computer, after an installation or at the start of the
+session, thus shows a start in progress instead of a failure.
+
 ### Tray, installer and web application
 
 `albireo-tray.exe` places the icon in the notification area and opens the windows of the models,
 of the computer (processor, engine, extended memory with its usage, models folder, port, language,
-proxy) and of the product. The service gives its errors with a code and its values
+proxy) and of the product. While the service does not answer, the icon reads its state in the
+Service Control Manager: a service starting, or a delayed automatic start that has not come yet
+at the opening of the session, shows the icon of a start in progress, and the icon warns that the
+service does not answer, once per episode, only after a grace period adapted to that state: 10
+minutes for a service in its start, 5 minutes for a running service that has not answered yet, 15
+minutes for a delayed automatic start during the first 15 minutes after the boot, 2 minutes for a
+service that stops, 30 seconds for a service that answered before, one minute for a stopped
+service. The application opened
+from the icon during a start opens once the service answers. The service gives its errors with a code and its values
 ([`host/user_error.h`](host/user_error.h)), and the engines the reasons for which they cannot run
 (`reason_code`), which the windows explain in the language of the interface; a default model
 that could not be downloaded shows its download in error, with the reason, in the Models window.
@@ -251,16 +285,20 @@ computer, unless its own settings choose another.
 | [`common/`](common)      | the C interface of the engines, JSON, logs, platform and processor details    |
 | [`windows/`](windows)    | the tray, the installer, their windows and their texts in five languages      |
 | [`web/`](web)            | the web application, the Swagger page and the OpenAPI description            |
-| [`resources/`](resources)| icons, images, license, version resources                                     |
-| [`cmake/`](cmake)        | MinGW-w64 toolchain, payload of the installer, runtime libraries of devices   |
+| [`resources/`](resources)| icons, images, license, version resources, models that come with Albireo      |
+| [`cmake/`](cmake)        | MinGW-w64 toolchain, payload of the installer, runtime libraries of devices, downloads of the models |
 | [`tests/`](tests)        | kernel, runtime, tokenizer and device tests, engine driver, benchmark          |
-| [`tools/`](tools)        | build and test scripts, catalog, feed, publication, offline bundle, images    |
+| [`tools/`](tools)        | build and test scripts, preparation of the models that come with Albireo, catalog, feed, publication, offline bundle, images |
 
 ## Building on Windows
 
-Requirements: Visual Studio 2022 with the C++ workload and CMake 3.21 or later. The OpenVINO
-engine needs the runtime of OpenVINO (`python -m pip install openvino`, or the archive with
-`INTEL_OPENVINO_DIR` set); the CUDA engine needs the CUDA toolkit 12.8 or later and cuDNN 9.
+Requirements: Visual Studio 2022, or the Build Tools for Visual Studio 2022, with the C++ workload,
+and CMake 3.21 or later (the C++ CMake tools of the workload serve, the script finds them outside
+the PATH), and about 6 GB of free space for the models that come with Albireo, their cache and the
+complete installer. The OpenVINO engines need the runtime of OpenVINO (`python -m pip install openvino`, or
+the archive with `INTEL_OPENVINO_DIR` set); the CUDA engine needs the CUDA toolkit 12.8 or later
+and cuDNN 9. Without Visual Studio, the installer of the CUDA toolkit adds its integration to the
+Build Tools.
 
 dlib is configured for one device per build tree, so the engines of the devices are built in their
 own trees and join the installer through `ALBIREO_EXTRA_ENGINE_DIRS`. The script
@@ -268,9 +306,17 @@ own trees and join the installer through `ALBIREO_EXTRA_ENGINE_DIRS`. The script
 repository:
 
 ```
-powershell -ExecutionPolicy Bypass -File dlib\dlib\external\albireo\tools\build_windows.ps1 -OpenVINO -Cuda
+powershell -ExecutionPolicy Bypass -File dlib\dlib\external\albireo\tools\build_windows.ps1 -Cuda
 ```
 
+The OpenVINO engines are built by default, so that every installation reaches the NPU and the
+graphics processor of an Intel machine; the script stops with a message when the runtime of
+OpenVINO is missing, and `-NoOpenVINO` builds without these engines (`-OpenVINO`, which earlier
+versions required, is still accepted). The CUDA engine stays optional: on a machine with a
+supported NVIDIA card, the service prefers it, since the card takes every product. A build tree
+configured by a Visual Studio installation removed since, such as Visual Studio Community
+replaced by the Build Tools, is deleted and configured again. `-NoBuiltinModels` builds without
+the models that come with Albireo and `-ModelCache <folder>` puts their cache on another drive.
 `-Tests` adds the test programs, `-Jobs <n>` bounds the compilations run at once on a machine with
 little memory, `-CudaVersion 12.9` picks one of several installed CUDA toolkits, `-Cudnn <folder>`
 one cuDNN installation (`C:\Program Files\NVIDIA\CUDNN\v9.11` for instance), and
@@ -285,7 +331,9 @@ cmake -S dlib/dlib/external/albireo -B build-albireo -G "Visual Studio 17 2022" 
 cmake --build build-albireo --config Release
 ```
 
-The installer is `build-albireo\bin\albireo-setup.exe`. The device trees copy beside their engine
+The installers are `build-albireo\bin\albireo-setup.exe`, complete with the models that come with
+Albireo, and `build-albireo\bin\albireo-setup-online.exe`, the one of the updates; the script
+prints their size and SHA-256. The device trees copy beside their engine
 the libraries it loads (OpenVINO with the plugins of the NPU and of the GPU, or the runtime of CUDA,
 cuBLAS and the parts of cuDNN the engine uses, with the Visual C++ runtime) and their licenses,
 which the installer places in its `licenses` folder; the same libraries go beside
@@ -312,12 +360,16 @@ reported as unusable, with its compute capability, and the other engines serve t
 | CMake option              | Default | Effect                                                            |
 |---------------------------|---------|-------------------------------------------------------------------|
 | `ALBIREO_PROGRAMS`        | ON      | service, tray, installer, processor engines                       |
-| `ALBIREO_ENGINE_OPENVINO` | OFF     | OpenVINO engine (dlib with `DLIB_USE_NPU`)                        |
+| `ALBIREO_ENGINE_OPENVINO` | OFF     | OpenVINO engines (dlib with `DLIB_USE_NPU`), one per family of kernels |
 | `ALBIREO_ENGINE_CUDA`     | OFF     | CUDA engine (dlib with `DLIB_USE_CUDA`)                           |
 | `ALBIREO_ENGINE_DLIB`     | OFF     | engine whose products go through the host code of dlib (tests)     |
 | `ALBIREO_TESTS`           | ON      | test programs, in `<build>/tests`                                 |
 | `ALBIREO_EXTRA_ENGINE_DIRS` |       | folders of engines built in other trees, added to the installer   |
 | `ALBIREO_COPY_RUNTIME`    | ON on Windows | copy of the runtime libraries beside the device engines      |
+| `ALBIREO_BUILTIN_MODELS`  | ON on Windows | models that come with Albireo, in `bin/models` and the complete installer |
+| `ALBIREO_MODEL_CACHE`     | user cache | downloaded and converted models that come with Albireo         |
+| `ALBIREO_BUILTIN_MANIFEST`| `resources/builtin_models.json` | the models that come with Albireo           |
+| `ALBIREO_BUILTIN_TOOL`    |         | `albireo-builtin` of the build machine, for a cross build         |
 | `ALBIREO_RUNTIME_LICENSES`|         | more license files for the `licenses` folder                      |
 
 The programs link their C and C++ runtime statically and depend on system libraries only; the
@@ -372,12 +424,16 @@ for `test_offload`, CPU by default). Their exit code is the number of failed ste
 
 ## Installation
 
+A build gives two installers. `albireo-setup.exe` is complete: it carries the models that come
+with Albireo and installs a computer that answers at once, without network. `albireo-setup-online.exe`
+is the same program without them: the updates take it, and on a new computer the service
+downloads the default models of the catalog.
+
 The wizard asks for the language, the license, the folders of the programs and of the models, the
 options (start with Windows, desktop shortcut, trust of the local certificate, download of the
-default model, port), then installs, registers the service and starts the tray. Over an installed
-version, its fields start from the options in place, and the programs keep their folder. The
-command line covers the other cases; the options it does not give keep the values of the
-installation in place:
+default model, which the complete installer does not need, port), then installs, registers the
+service and starts the tray. The command line covers the other cases; the options it does not
+give keep the values of the installation in place:
 
 ```
 albireo-setup /silent [/dir <folder>] [/models <folder>] [/port <port>]
@@ -391,6 +447,28 @@ The installer started from an offline bundle (see [Computers without network](#c
 leaves its catalog and its models in the import folder, which the service reads at its first start.
 The option "This computer has no Internet access" of the wizard, or `/offline`, sets the service
 offline from the start.
+
+### Updates
+
+The installer finds the installation in place through the entry of the installed programs and its
+service, and updates it instead of installing a second copy: the wizard opens on "Albireo
+<version> is installed in <folder>", goes from the license to the update, and keeps the folder of
+the programs, the settings, the models, the certificates and their trust, the token of the tray,
+the shortcuts and the start of the icon; the entry of the installed programs and the service are
+rewritten in place. A newer version in place is left as it is. `/silent` updates the same way,
+the options given joining the settings, and `/update /silent` is the update the service starts.
+The models that come with Albireo are copied only when they differ from those in place, their
+hash checked; an update by the installer without models keeps them.
+
+Two ways to update an installed computer:
+
+- by hand: start the new `albireo-setup.exe`, or `albireo-setup-online.exe`, and follow the
+  update wizard;
+- automatically: once a version is published (see [Publishing a version](#publishing-a-version)),
+  the service reads the signed feed at its start and every six hours, downloads the installer
+  without models in the background, checks its size, its SHA-256 and the signature of the feed,
+  and the menu of the icon offers "Install version <version> and restart"; otherwise the update is
+  installed at the next start of the service. "Check for updates" asks the feed at once.
 
 ## Settings
 
@@ -472,16 +550,78 @@ under its hash.
 | Granite 3.3 8B         | general, code   | 4.94 GB | Apache-2.0                               |
 | Foundation-Sec 1.1 8B  | security        | 4.92 GB | Llama 3.1 Community License              |
 
-The service downloads the default language model at its first start, unless the installation said
-otherwise, and the default embedding model in every case, since the search in documents relies on
-it. A language model that arrives takes the functions its entry names that no model holds; an
+Without the models that come with the complete installer, the service downloads the default
+language model at its first start, unless the installation said otherwise, and the default
+embedding model in every case, since the search in documents relies on it. A language model that arrives takes the functions its entry names that no model holds; an
 embedding model serves the `embedding` function alone. The engine computes an embedding model as
 it computes a language model, then takes the hidden state of the last token of each text,
 normalized, as its vector (`pooling_type` 3 of the GGUF file); its keys and values are given back
 as soon as each text is read.
 
 A model can also be imported from any GGUF file: the Models window sends it to the service, or
-the service imports the files placed in `<data>\import`.
+the service imports the files placed in `<data>\import`. A file prepared by the build of Albireo
+keeps its identity (`albireo.id`, `albireo.name`, `albireo.roles`, `albireo.inputs` in its
+metadata).
+
+The Models window lists the language models, with their functions, their inputs and their state;
+the embedding model serves the document search and is given apart (`embedding_models` of
+`/albireo/v1/models`). The inputs of a model (`inputs`: `text`, and `image` or `audio` for the
+models that read them, text when the catalog does not say) decide the attachments of the web
+application: the documents, whose text the browser extracts, go to every model, and an image or
+a sound only to a model that reads it; the attachment button of each conversation names the inputs
+of the model of its function, and the file picker offers what it reads. The engine reads text
+today, so every listed model has the input `text`.
+
+## Models that come with Albireo
+
+[`resources/builtin_models.json`](resources/builtin_models.json) names the models the complete
+installer carries, the file each one comes from, pinned to a commit with its size and its SHA-256,
+and the quantization Albireo ships:
+
+| Model                        | From                                   | Shipped        | Functions               |
+|------------------------------|----------------------------------------|----------------|-------------------------|
+| Qwen3-1.7B-albireo           | Qwen3-1.7B-Q8_0.gguf of Qwen, 1.83 GB  | Q4_K_M, 1.11 GB | general, code, security |
+| Qwen3-Embedding-0.6B-albireo | Qwen3-Embedding-0.6B-Q8_0.gguf, 0.64 GB | Q8_0, 0.64 GB | document search         |
+
+The build retrieves and converts them as the import example of dlib reads a GGUF file
+([`examples/slm_gguf_import_ex.cpp`](../../../../examples/slm_gguf_import_ex.cpp)), with the code
+of the engine:
+
+1. [`cmake/builtin_models.cmake`](cmake/builtin_models.cmake) downloads each file once into the
+   cache, `%LOCALAPPDATA%\Albireo\build-cache` (`~/.cache/albireo` on Linux, `ALBIREO_MODEL_CACHE`
+   or `-ModelCache` otherwise), named by its SHA-256, which it checks; behind a proxy, the download
+   takes the one of `HTTPS_PROXY`. `build_windows.ps1` first gives the cache the files already on
+   the computer, in the models folder of an installation of Albireo or in `$HOME\models`, whose
+   SHA-256 matches;
+2. [`tools/albireo_builtin.cpp`](tools/albireo_builtin.cpp) reads it with the GGUF reader of dlib,
+   resolves its geometry as the engine does, which rejects an architecture or a configuration the
+   engine does not run, checks that its tokenizer gives back a text it encoded and that the engine
+   recognizes its chat template;
+3. it converts the model: the weights of Qwen3 1.7B are quantized again from Q8_0 to the Q4_K_M
+   mix of the GGUF format (Q4_K, with Q6_K for the shared embeddings, the values of the attention
+   and the down projections of the first and last eighths of the layers and of one layer in three
+   between them), with the search and the mix of the reference quantizer of the format, whose
+   output it matches byte for byte; the first and last rows of each matrix are checked against their
+   source. The metadata receive the identity of the model in Albireo;
+4. the converted file is read and checked again, then kept in the cache under the name of its
+   conversion, so that the next builds reuse it; it reaches `bin/models` of the build tree by a
+   hard link, with its manifest `builtin.json`, and the complete installer as the overlay that
+   follows its program ([`common/builtin_models.h`](common/builtin_models.h)).
+
+The conversion takes a few minutes and the cache holds about 4.2 GB, the downloaded files and the
+converted ones. The Q4_K_M model is 1.7 times faster than the Q8_0 it comes from on a processor,
+its generation being bound by the reading of the weights. `-DALBIREO_BUILTIN_MODELS=OFF`, or
+`-NoBuiltinModels` of `build_windows.ps1`, builds without them; a cross build gives
+`ALBIREO_BUILTIN_TOOL`, the `albireo-builtin` of the build machine.
+
+The installer copies the models to the `models` folder of the programs, checks their hashes, and
+writes their manifest last; the service registers them at each start (source `builtin`, the
+suffix `-albireo` in their names). A model that comes with Albireo takes the functions no model
+holds, which on a new computer means every function; it can leave them to other models, and it
+cannot be deleted (code `builtin_model`). Albireo runs these models with its own engine, the
+quantized kernels over the mapped file, as every other model: the compiled networks of dlib
+(`slm_gguf_import_ex --convert`) compute in single precision and remain the tool of training and
+fine tuning.
 
 ## Computers without network
 
@@ -496,7 +636,8 @@ python3 dlib/dlib/external/albireo/tools/make_offline_bundle.py <folder> [--mode
 
 The bundle holds the signed catalog and the signed update feed of `dist/albireo`, the installer the
 feed announces, a `models` folder with the models chosen (the two default models when `--models`
-is absent) and a `README.txt`. Each file is checked against the hashes of the signed files when it
+is absent) and a `README.txt`. `--complete build-albireo/bin/albireo-setup.exe` adds the complete
+installer, which carries the models that come with Albireo: the bundle then needs no models. Each file is checked against the hashes of the signed files when it
 enters the bundle, and again by the service when it installs it. The bundle is used in one of
 three ways:
 
@@ -526,13 +667,15 @@ programs travel in the installer, which carries the service, the tray, every eng
 runtime libraries of its device, and the web application; the installer of each version is a file
 of the GitHub release `albireo-v<version>`.
 
-[`tools/publish_release.py`](tools/publish_release.py) publishes a version from its installer: it
-checks that the installer carries the version of [`common/version.h`](common/version.h), creates
-the release, attaches the installer, writes the feed with its address, size and SHA-256, signs it
-and checks the signature, then prints the commands that push the feed:
+[`tools/publish_release.py`](tools/publish_release.py) publishes a version from its installer
+without models, the one of the updates: it checks that the installer carries the version of
+[`common/version.h`](common/version.h), creates the release, attaches the installer, writes the
+feed with its address, size and SHA-256, signs it and checks the signature, then prints the
+commands that push the feed. `--complete` also attaches the complete installer, as
+`albireo-setup-complete-<version>.exe`, when it fits the 2 GiB of a release file:
 
 ```
-python3 dlib/dlib/external/albireo/tools/publish_release.py build-albireo/bin/albireo-setup.exe --key ~/keys/albireo-feed-signing.key --notes notes.json
+python3 dlib/dlib/external/albireo/tools/publish_release.py build-albireo/bin/albireo-setup-online.exe --complete build-albireo/bin/albireo-setup.exe --key ~/keys/albireo-feed-signing.key --notes notes.json
 ```
 
 The token of GitHub comes from `GITHUB_TOKEN`, `GH_TOKEN` or `gh auth token`. A model published
@@ -569,6 +712,7 @@ size and its SHA-256, and run it in update mode at their next start.
 | Path (Windows)                         | Content                                                      |
 |----------------------------------------|--------------------------------------------------------------|
 | `C:\Program Files\Albireo`             | programs, engines, web application, licenses                 |
+| `C:\Program Files\Albireo\models`      | the models that come with Albireo and their `builtin.json`   |
 | `C:\ProgramData\Albireo\settings.json` | settings                                                     |
 | `C:\ProgramData\Albireo\albireo.db`    | installed models, downloads, usage, catalog                   |
 | `C:\ProgramData\Albireo\models`        | models (or the folder chosen at installation)                |

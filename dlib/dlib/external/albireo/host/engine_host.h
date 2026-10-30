@@ -20,7 +20,9 @@ namespace albireo
 
     struct engine_candidate
     {
-        std::string variant;   // "cpu", "cpu-avx2", "cpu-avxvnni", "cpu-avx512", "openvino", "cuda"
+        // "cpu", "cpu-avx2", "cpu-avxvnni", "cpu-avx512", "openvino", "openvino-avxvnni",
+        // "openvino-avx512", "cuda"
+        std::string variant;
         std::string path;
         json description;
         bool usable = false;
@@ -62,7 +64,8 @@ namespace albireo
         ~engine_host();
 
         // Lists and describes the engine libraries of a folder, through probe_program,
-        // probing them all at once.
+        // probing them all at once.  A library whose kernels need instructions the processor
+        // lacks is described without being loaded.
         std::vector<engine_candidate> discover(const std::string& dir, const std::string& probe_program);
 
         static const engine_candidate* choose(const std::vector<engine_candidate>& candidates,

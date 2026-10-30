@@ -10,6 +10,7 @@
 #include <exception>
 #include <fstream>
 #include <map>
+#include <set>
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -28,6 +29,7 @@
 
 #include <dlib/data_io/gguf_reader.h>
 
+#include "../common/builtin_models.h"
 #include "../common/log.h"
 #include "../common/platform.h"
 #include "crypto.h"
@@ -182,6 +184,24 @@ namespace albireo
             d["reasoning"] = !embedding && (tmpl.find("think") != std::string::npos
                 || tmpl.find("[THINK]") != std::string::npos);
             d["tools"] = !embedding && tmpl.find("tool") != std::string::npos;
+            // The inputs the engine reads from the model, and the identity a file prepared
+            // by the build of Albireo carries (tools/albireo_builtin.cpp).
+            json inputs = json::array();
+            if (g.has("albireo.inputs"))
+                for (const auto& s : g.at("albireo.inputs").arr_str) inputs.push_back(s);
+            if (inputs.size() == 0) inputs.push_back("text");
+            d["inputs"] = inputs;
+            if (g.has("albireo.id"))
+            {
+                d["albireo_id"] = g.get_str("albireo.id");
+                if (g.has("albireo.name")) d["name"] = g.get_str("albireo.name");
+                if (g.has("albireo.roles"))
+                {
+                    json roles = json::array();
+                    for (const auto& s : g.at("albireo.roles").arr_str) roles.push_back(s);
+                    d["roles"] = roles;
+                }
+            }
         }
         catch (const std::exception& e)
         {
@@ -387,8 +407,31 @@ namespace albireo
         json out = json::array();
         std::map<std::string, bool> seen;
         json cat = catalog();
+        auto embedding = [](const json& d) {
+            if (d["embedding"].as_bool(false)) return true;
+            for (const auto& r : d["roles"].elements())
+                if (r.as_string() == "embedding") return true;
+            return false;
+        };
+        // The models that come with Albireo first, in the order of their manifest.
+        for (const auto& im : installed)
+        {
+            if (im.source != "builtin" || embedding(im.descriptor)) continue;
+            json m = im.descriptor;
+            m["id"] = im.id;
+            m["name"] = im.name;
+            m["description"] = localized(m["description"], language);
+            m["installed"] = true;
+            m["file"] = im.file;
+            m["size"] = static_cast<unsigned long long>(im.size);
+            m["local_sha256"] = im.sha256;
+            m["verified_at"] = static_cast<long long>(im.verified_at);
+            seen[im.id] = true;
+            out.push_back(m);
+        }
         for (const auto& e : cat["models"].elements())
         {
+            if (embedding(e)) continue;
             json m = e;
             m["description"] = localized(e["description"], language);
             m["installed"] = false;
@@ -407,7 +450,7 @@ namespace albireo
         }
         for (const auto& im : installed)
         {
-            if (seen.count(im.id)) continue;
+            if (seen.count(im.id) || embedding(im.descriptor)) continue;
             json m = im.descriptor.is_object() ? im.descriptor : json::object();
             m["id"] = im.id;
             if (!m.contains("name")) m["name"] = im.name;
@@ -419,8 +462,28 @@ namespace albireo
             m["source"] = im.source;
             out.push_back(m);
         }
+        // The inputs a model reads (text, image, audio), text when its entry does not say.
+        json embedders = json::array();
+        for (auto& m : out.elements())
+            if (!m["inputs"].is_array() || m["inputs"].size() == 0)
+            {
+                json inputs = json::array();
+                inputs.push_back("text");
+                m["inputs"] = inputs;
+            }
+        for (const auto& im : installed)
+        {
+            if (!embedding(im.descriptor)) continue;
+            json e = json::object();
+            e["id"] = im.id;
+            e["name"] = im.name;
+            e["source"] = im.source;
+            e["size"] = static_cast<unsigned long long>(im.size);
+            embedders.push_back(e);
+        }
         json result = json::object();
         result["models"] = out;
+        result["embedding_models"] = embedders;
         result["downloads"] = downloads();
         const json cs = catalog_status();
         result["catalog_time"] = cs["time"];
@@ -976,6 +1039,14 @@ namespace albireo
             for (char& c : base)
                 if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '-' || c == '_' || c == '.')) c = '-';
             id = base;
+            // A model of Albireo keeps its identifier, unless it would replace a model that
+            // comes with this installation.
+            const std::string own = entry["albireo_id"].as_string();
+            installed_model holder;
+            if (!own.empty())
+                id = db_.find_model(own, holder) && holder.source == "builtin" && holder.sha256 != sha
+                    ? own + "-import" : own;
+            entry.erase("albireo_id");
             entry["id"] = id;
             // A sidecar description written next to the file, if any.
             std::string side;
@@ -1014,6 +1085,60 @@ namespace albireo
             if (move) remove_file(f);
         }
         return install_file(id, target, entry, sha, known ? "catalog" : "import", error);
+    }
+
+    std::vector<installed_model> model_manager::register_builtin(const std::string& dir,
+        std::vector<std::string>& removed)
+    {
+        std::vector<installed_model> added;
+        std::string text;
+        const json manifest = read_file(join_path(dir, builtin_manifest_name), text, 16u << 20)
+            ? json::parse_or_null(text) : json();
+        std::set<std::string> listed;
+        for (const auto& e : manifest["models"].elements())
+        {
+            const std::string id = e["id"].as_string();
+            const std::string name = e["file"].as_string();
+            const std::string file = join_path(dir, name);
+            const bool plain = !name.empty() && name.find_first_of("/\\:") == std::string::npos;
+            if (!safe_id(id) || !plain || !file_exists(file))
+            {
+                log_warning("models: the model " + id + " of " + builtin_manifest_name + " is missing from " + dir);
+                continue;
+            }
+            listed.insert(id);
+            json d = e;
+            d.erase("file");
+            d.erase("offset");
+            d["builtin"] = true;
+            installed_model existing;
+            const bool known = db_.find_model(id, existing);
+            if (known && existing.source == "builtin" && existing.file == file && existing.sha256 == e["sha256"].as_string()
+                && existing.descriptor == d)
+                continue;
+            installed_model m;
+            m.id = id;
+            m.name = e["name"].str(id);
+            m.file = file;
+            m.size = file_size(file);
+            m.sha256 = e["sha256"].as_string();
+            m.source = "builtin";
+            m.installed_at = known ? existing.installed_at : now_unix();
+            // The installer checked the hash of the file it wrote.
+            m.verified_at = known && existing.sha256 == m.sha256 ? existing.verified_at : now_unix();
+            m.descriptor = d;
+            db_.put_model(m);
+            if (!known) added.push_back(m);
+            log_info("models: " + id + " comes with Albireo, in " + file);
+        }
+        for (const auto& m : db_.models())
+        {
+            if (m.source != "builtin" || listed.count(m.id)) continue;
+            db_.remove_model(m.id);
+            removed.push_back(m.id);
+            log_info("models: " + m.id + " no longer comes with Albireo");
+        }
+        return added;
     }
 
     json model_manager::import_path(const std::string& path, bool move)

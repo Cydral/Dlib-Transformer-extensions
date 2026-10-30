@@ -38,7 +38,7 @@ BEGIN
             VALUE "InternalName", "albireo-tray"
             VALUE "LegalCopyright", ALBIREO_COPYRIGHT
             VALUE "OriginalFilename", "albireo-tray.exe"
-            VALUE "ProductName", ALBIREO_PRODUCT_NAME
+            VALUE "ProductName", ALBIREO_FULL_NAME
             VALUE "ProductVersion", ALBIREO_VERSION
         END
     END
