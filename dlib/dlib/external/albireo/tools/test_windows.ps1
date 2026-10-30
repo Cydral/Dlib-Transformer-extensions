@@ -66,12 +66,29 @@ function Invoke-Check([string]$step, [string]$pattern, [string]$program, [string
 $haveModel = Test-Path $Model
 $chat = Join-Path $main "tests\engine_chat.exe"
 
-Invoke-Check "quantized kernels" "all checks passed" (Join-Path $main "tests\test_qkernels.exe") @() | Out-Null
+# The kernels of each family of processors, skipped by the processors without their instructions.
+foreach ($family in @("", "_avxvnni", "_avx512")) {
+    $test = Join-Path $main "tests\test_qkernels$family.exe"
+    $name = "quantized kernels" + $family.Replace("_", " ")
+    if (-not (Test-Path $test)) {
+        if (-not $family) { Add-Result $name "SKIP" "no $test (ALBIREO_TESTS=ON)" 0 }
+        continue
+    }
+    $out = (& $test 2>&1 | ForEach-Object { "$_" }) -join "`n"
+    if ($out -match "skipped, the processor lacks ([^(]*)") { Add-Result $name "SKIP" "lacks $($Matches[1])" 0 }
+    else { Invoke-Check $name "all checks passed" $test @() | Out-Null }
+}
 
-foreach ($variant in @("cpu-avx2", "cpu")) {
+foreach ($variant in @("cpu-avx512", "cpu-avxvnni", "cpu-avx2", "cpu")) {
     $engine = Join-Path $main "bin\engines\albireo-engine-$variant.dll"
     if (-not $haveModel) { Add-Result "engine $variant" "SKIP" "no $Model" 0; continue }
     if (-not (Test-Path $engine)) { Add-Result "engine $variant" "SKIP" "no $engine" 0; continue }
+    $description = (& $chat $engine --describe 2>&1 | ForEach-Object { "$_" }) -join "`n"
+    if ($LASTEXITCODE -eq 3) {
+        $reason = if ($description -match "lacks ([^(]*)") { "lacks $($Matches[1])" } else { "not usable here" }
+        Add-Result "engine $variant" "SKIP" $reason 0
+        continue
+    }
     Invoke-Check "engine $variant" "Paris" $chat @($engine, $Model, "--reasoning", "off", "--max", "40",
         $question) | Out-Null
 }

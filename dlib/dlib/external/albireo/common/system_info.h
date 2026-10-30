@@ -30,6 +30,8 @@ namespace albireo
         bool avx_vnni = false;
         bool avx512f = false;
         bool avx512bw = false;
+        bool avx512dq = false;
+        bool avx512vl = false;
         bool avx512vnni = false;
         bool amx = false;
     };

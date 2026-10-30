@@ -140,7 +140,7 @@ namespace albireo
         bool cpu_engine()
         {
             const std::string key = tray.status["engine"]["key"].as_string();
-            return key == "cpu" || key == "cpu-avx2" || key.empty();
+            return key.compare(0, 3, "cpu") == 0 || key.empty();
         }
 
         void poll()
@@ -400,6 +400,14 @@ namespace albireo
                 }
                 AppendMenuW(acc, MF_STRING | (allowed && has ? 0 : MF_GRAYED) | (setting == v ? MF_CHECKED : 0), it.id,
                     tr(it.key).c_str());
+            }
+            if (on && !available)
+            {
+                // Why the choices are grayed: no engine of a device, or none that runs here.
+                const bool unusable = tray.engines["accelerators_reason"].as_string() == "unusable";
+                AppendMenuW(acc, MF_SEPARATOR, 0, nullptr);
+                const char* why = unusable ? "accel_unusable" : "accel_not_installed";
+                AppendMenuW(acc, MF_STRING | MF_GRAYED, 0, tr(why).c_str());
             }
             AppendMenuW(acc, MF_SEPARATOR, 0, nullptr);
             AppendMenuW(acc, MF_STRING | (on ? 0 : MF_GRAYED), CMD_MEASURE, tr("accel_measure").c_str());

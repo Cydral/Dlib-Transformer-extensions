@@ -10,6 +10,8 @@
 
 #include <dlib/data_io/gguf_reader.h>
 
+#include "../common/system_info.h"
+
 namespace albireo
 {
     class thread_pool;
@@ -116,6 +118,65 @@ namespace albireo
     // Name of the instruction set the kernels were compiled for.
     const char* qk_isa();
 
+    // The instruction sets beyond SSE2 that the kernels of a build use.
+    enum qk_isa_flags : unsigned
+    {
+        qk_isa_avx2 = 1,       // AVX2, FMA and F16C
+        qk_isa_avx_vnni = 2,   // AVX-VNNI
+        qk_isa_avx512 = 4      // AVX-512 F, BW, DQ and VL, with VNNI
+    };
+
+    /*!
+        ensures
+            - Returns the qk_isa_flags of this build, which the processor must have.  The
+              function holds no instruction of these sets: a program checks them before it
+              calls a kernel.
+    !*/
+    unsigned qk_required_isa();
+
+    /*!
+        ensures
+            - Returns the first of the qk_isa_flags that the kernels of this build, plus the
+              flags of extra, use and that cpu lacks, or 0 when cpu runs them.  Defined here,
+              it is compiled with the instructions of the program that calls it, as are the
+              two functions that follow.
+    !*/
+    inline unsigned qk_missing_isa(const cpu_info& cpu, unsigned extra = 0)
+    {
+        const unsigned isa = qk_required_isa() | extra;
+        if ((isa & qk_isa_avx2) && !(cpu.avx2 && cpu.fma && cpu.f16c)) return qk_isa_avx2;
+        if ((isa & qk_isa_avx_vnni) && !cpu.avx_vnni) return qk_isa_avx_vnni;
+        if ((isa & qk_isa_avx512) && !(cpu.avx512f && cpu.avx512bw && cpu.avx512dq && cpu.avx512vl && cpu.avx512vnni))
+            return qk_isa_avx512;
+        return 0;
+    }
+
+    // The instructions of one of the qk_isa_flags, with the processors that have them.
+    inline const char* qk_isa_text(unsigned flag)
+    {
+        switch (flag)
+        {
+        case qk_isa_avx2: return "AVX2, FMA and F16C";
+        case qk_isa_avx_vnni: return "AVX-VNNI (Intel Core from Alder Lake on, AMD Zen 5)";
+        case qk_isa_avx512:
+            return "AVX-512 with VNNI (Intel Xeon from Cascade Lake on, Intel Core Ice Lake, Tiger Lake and Rocket "
+                "Lake, AMD Zen 4 and later)";
+        default: return "";
+        }
+    }
+
+    // The code of one of the qk_isa_flags in the descriptions of the engines.
+    inline const char* qk_isa_code(unsigned flag)
+    {
+        switch (flag)
+        {
+        case qk_isa_avx2: return "isa_avx2";
+        case qk_isa_avx_vnni: return "isa_avx_vnni";
+        case qk_isa_avx512: return "isa_avx512";
+        default: return "";
+        }
+    }
+
     /*!
         ensures
             - When on is true, qk_matmul() expands every weight row to floats and computes
@@ -140,6 +201,25 @@ namespace albireo
     float qk_max(const float* x, long n);
     // x[i] = exp(x[i] - m), returns the sum of the results.
     float qk_exp_shift_sum(float* x, float m, long n);
+
+    /*!
+        The attention by tiles of the processor runtime.  A tile holds rows of queries, the
+        heads that share one key/value head for consecutive tokens of one sequence, and
+        reads the cache block after block: every key and every value taken from memory
+        serves all the rows of the tile.  K and V hold m rows of hd halves, Q and O rows of
+        hd floats, and scratch qk_attention_scratch(hd) floats private to the caller.
+
+        qk_attention_scores() ensures:
+            - S[r * lds + j] == dot(Q + r * hd, K + j * hd), for r < rows and j < m.
+        qk_attention_values() ensures:
+            - O[r * hd + i] += sum over j < m of P[r * lds + j] * V[j * hd + i], for
+              r < rows and i < hd.
+    !*/
+    long qk_attention_scratch(long hd);
+    void qk_attention_scores(const float* Q, long rows, const uint16_t* K, long m, long hd, float* S, long lds,
+        float* scratch);
+    void qk_attention_values(const float* P, long lds, long rows, const uint16_t* V, long m, long hd, float* O,
+        float* scratch);
 
 }
 

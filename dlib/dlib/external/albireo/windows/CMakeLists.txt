@@ -18,12 +18,18 @@ set(ALBIREO_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/..)
 set(ALBIREO_WINDOWS_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 set(ALBIREO_PAYLOAD ${CMAKE_BINARY_DIR}/payload/albireo-payload.zip)
 file(GLOB_RECURSE web_files ${ALBIREO_SOURCE_DIR}/web/*)
+set(processor_engines albireo-engine-cpu albireo-engine-cpu-avx2)
+foreach (e albireo-engine-cpu-avxvnni albireo-engine-cpu-avx512)
+   if (TARGET ${e})
+      list(APPEND processor_engines ${e})
+   endif()
+endforeach()
 add_custom_command(OUTPUT ${ALBIREO_PAYLOAD}
    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/payload/stage
    COMMAND ${CMAKE_COMMAND} -DBIN_DIR=${CMAKE_BINARY_DIR}/bin -DSTAGE=${CMAKE_BINARY_DIR}/payload/stage
       -DOUTPUT=${ALBIREO_PAYLOAD} -DSOURCE_DIR=${ALBIREO_SOURCE_DIR} -DDLIB_DIR=${ALBIREO_DLIB_DIR}
       "-DEXTRA_ENGINE_DIRS=${ALBIREO_EXTRA_ENGINE_DIRS}" -P ${ALBIREO_SOURCE_DIR}/cmake/payload.cmake
-   DEPENDS albireo-service albireo-tray albireo-engine-cpu albireo-engine-cpu-avx2 ${web_files}
+   DEPENDS albireo-service albireo-tray ${processor_engines} ${web_files}
       ${ALBIREO_SOURCE_DIR}/cmake/payload.cmake ${ALBIREO_SOURCE_DIR}/resources/license.txt
    COMMENT "Packing the programs into the payload of the installer")
 add_custom_target(albireo-payload DEPENDS ${ALBIREO_PAYLOAD})

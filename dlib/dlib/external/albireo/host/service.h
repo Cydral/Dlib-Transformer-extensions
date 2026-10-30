@@ -8,6 +8,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -44,7 +45,7 @@ namespace albireo
                   fastest measured one for "both";
                 - otherwise the fastest measured engine, or, without measures, the
                   graphics processor engine (cuda) when usable, then the processor
-                  engines (cpu-avx2, cpu).
+                  engines (cpu-avx512, cpu-avxvnni, cpu-avx2, cpu).
             - The returned candidate is null when no engine is usable.
     !*/
     engine_choice choose_engine(const std::vector<engine_candidate>& candidates, const host_settings& s);
@@ -109,15 +110,33 @@ namespace albireo
         // The embedding model of a request: a loaded embedding model named by its
         // identifier, otherwise the active one ("auto", "embedding", "albireo-embedding").
         std::string resolve_embedding_model(const std::string& requested);
-        bool activate(const std::string& id, const std::string& role, std::string& error);
         /*!
             ensures
-                - Takes every function from the model id and unloads it.  The model of the
-                  document search keeps its function unless removing, the model being
-                  deleted: the search always has its embedding model, which another
-                  embedding model replaces through activate().
+                - Gives the function role to the model id, loading it when needed.  The
+                  model the function used before leaves the engine once its requests are
+                  served, unless another function uses it.  A model activated while it
+                  waits to leave stays loaded.
         !*/
-        bool deactivate(const std::string& id, std::string& error, bool removing = false);
+        bool activate(const std::string& id, const std::string& role, user_error& error);
+        /*!
+            ensures
+                - Takes every function from the model id and unloads it once its requests
+                  are served.  The model of the document search keeps its function: the
+                  search always has its embedding model, which another embedding model
+                  replaces through activate().
+        !*/
+        bool deactivate(const std::string& id, user_error& error);
+        /*!
+            ensures
+                - Takes every function from the model id, the document search included,
+                  and deletes its file.  A model in the engine is deleted once its requests
+                  are served and it left the engine: pending is then true, and the model
+                  stays listed, in the state "removing", until then.
+        !*/
+        bool remove_model(const std::string& id, user_error& error, bool& pending);
+        // The models waiting for their requests before they leave: id -> "unloading" or
+        // "removing".
+        json leaving_models();
         // Loads the models of the roles of the settings into the engine.
         void load_active_models();
 
@@ -152,10 +171,22 @@ namespace albireo
     private:
         void background_loop();
         void ensure_default_model();
+        // Logs why a default model of the catalog could not be downloaded, which the Models
+        // window shows as the error of its download until a download starts.
+        void note_default_failure(const json& entry, const user_error& error, const std::string& what);
         void scan_inbox();
         void on_installed(const installed_model& m);
         static bool is_embedding(const installed_model& m);
         bool load_model(const installed_model& m, std::string& error);
+        /*!
+            ensures
+                - Unloads the model id on a thread of its own once its requests are served
+                  (engine_host::unload_model), so that the function it held passes at once
+                  to the model that replaces it.
+        !*/
+        void retire(const std::string& id);
+        // Waits for the model id to finish unloading, when it is.
+        void wait_retired(const std::string& id);
         json engine_config(const host_settings& s, const std::string& device) const;
         std::string engines_dir() const;
 
@@ -186,7 +217,15 @@ namespace albireo
         std::thread restarter_;
         std::mutex models_m_;   // serializes the activations and the loads
         std::mutex import_m_;   // serializes the imports of folders
-        std::map<std::string, std::string> load_state_;   // model -> "loading", "ready" or the error
+        // model -> "loading", "ready", "unloading", "removing" or the error
+        std::map<std::string, std::string> load_state_;
+        // The models leaving the engine, each on a thread of retirers_, and those whose
+        // file is deleted once they left.
+        std::mutex retire_m_;
+        std::condition_variable retire_cv_;
+        std::set<std::string> retiring_;
+        std::set<std::string> removing_;
+        std::vector<std::thread> retirers_;
         int64_t started_at_ = 0;
         std::atomic<long long> usage_prompt_{0};
         std::atomic<long long> usage_generated_{0};

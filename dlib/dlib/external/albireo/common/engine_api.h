@@ -99,7 +99,12 @@ typedef void (ALBIREO_ENGINE_CALL *albireo_log_callback)(void* user, int level, 
 ALBIREO_ENGINE_EXPORT uint32_t ALBIREO_ENGINE_CALL albireo_engine_abi_version(void);
 
 /* JSON description of the engine and of the devices it found on this machine:
-   {"variant","version","backend","build","devices":[...],"usable":true|false,"reason"}.
+   {"variant","version","backend","build","kernels","devices":[...],"usable":true|false,
+   "reason","reason_code","reason_args"}.  An engine that cannot run here gives the reason
+   in English, and a code with its values for the windows, which explain it in the language
+   of the user: isa_avx2, isa_avx_vnni, isa_avx512 (the processor lacks the instructions of
+   the kernels), no_nvidia_driver, old_nvidia_driver {driver, runtime}, no_nvidia_card,
+   old_nvidia_card {card, cc}, no_intel_device.
    Safe to call before albireo_engine_create(); the host runs it in a child process to
    rank the engines without risking its own process. */
 ALBIREO_ENGINE_EXPORT int ALBIREO_ENGINE_CALL albireo_engine_describe(char* json, size_t capacity, size_t* needed);

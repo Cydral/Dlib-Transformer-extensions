@@ -171,8 +171,9 @@ int main(int argc, char** argv)
     std::printf("%s\n", describe(cfg).c_str());
     const long V = cfg.vocab;
 
-    std::string backend, runtime, reason;
-    const json devices = tensor_device::describe(backend, runtime, reason);
+    std::string backend, runtime, reason, reason_code;
+    json reason_args = json::object();
+    const json devices = tensor_device::describe(backend, runtime, reason, reason_code, reason_args);
     std::printf("backend %s (%s), devices %s%s\n", backend.c_str(), runtime.c_str(), devices.dump().c_str(),
         reason.empty() ? "" : (", " + reason).c_str());
 
@@ -223,8 +224,18 @@ int main(int argc, char** argv)
         else
             expect(d.max_abs <= 2e-3 * std::max(1.0, d.scale) && d.top1 >= 0.97, "device products");
         expect(st["device_products"].as_int() > 0, "the device computed products");
-        if (backend != "openvino" && !budget)
-            expect(st["host_products"].as_int() == 0, "no product left to the processor");
+        if (backend != "openvino" && !budget && !cfg.is_moe())
+        {
+            // Every product stays on the device when the automatic budget, a share of the free
+            // memory, holds every matrix in single precision.
+            const double matrices = 4.0 * cfg.d_model * (cfg.vocab + cfg.n_layers * (2.0 * cfg.q_dim()
+                + 2.0 * cfg.kv_dim() + 3.0 * cfg.d_ffn));
+            if (st["weights_budget"].as_double(0) >= matrices)
+                expect(st["host_products"].as_int() == 0, "no product left to the processor");
+            else
+                std::printf("  the automatic budget holds %.0f MB of the %.0f MB of the matrices\n",
+                    st["weights_budget"].as_double(0) / 1048576.0, matrices / 1048576.0);
+        }
         expect(st["failures"].as_int() == 0, "no device failure");
     }
 

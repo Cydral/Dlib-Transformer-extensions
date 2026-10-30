@@ -156,10 +156,13 @@ schemas = {
                  "restarts the service.", "properties": {
         "port": {"type": "integer", "minimum": 1024, "maximum": 65535},
         "language": {"type": "string", "enum": ["auto", "en", "fr", "de", "it", "es"]},
-        "engine": {"type": "string", "enum": ["auto", "best", "cpu", "cpu-avx2", "openvino", "cuda"]},
+        "engine": {"type": "string", "enum": ["auto", "best", "cpu", "cpu-avx2", "cpu-avxvnni", "cpu-avx512",
+                                              "openvino", "cuda"]},
         "accelerator": {"type": "string", "enum": ["auto", "none", "npu", "gpu", "both"]},
         "v2ram": {"type": "boolean", "description": "Extended device memory of the graphics engines."},
         "v2ram_max_mb": {"type": "integer", "description": "Limit of the extended memory, 0 for automatic."},
+        "device_mb": {"type": "integer", "description": "Memory of the device for the copies of the weights of "
+                      "the models, in megabytes, 0 for automatic."},
         "threads": {"type": "integer"}, "context": {"type": "integer"},
         "max_sequences": {"type": "integer", "minimum": 1, "maximum": 64}, "kv_mb": {"type": "integer"},
         "check_updates": {"type": "boolean"},
@@ -201,7 +204,11 @@ paths = {
         "parameters": [{"name": "lang", "in": "query",
                         "schema": {"type": "string", "enum": ["en", "fr", "de", "it", "es"]},
                         "description": "Language of the descriptions."}],
-        "responses": {"200": reply("The models", {"type": "object"})}}},
+        "responses": {"200": reply("The models", {"type": "object", "properties": {
+            "loaded": {"type": "array", "items": {"type": "string"}, "description": "Models of the engine."},
+            "leaving": {"type": "object", "additionalProperties": {"type": "string", "enum": ["unloading",
+                                                                                            "removing"]},
+                        "description": "Models waiting for their requests before they leave the engine."}}})}}},
     "/albireo/v1/usage": {"get": {"tags": ["Service"], "summary": "Usage per day over 30 days",
                                   "responses": {"200": reply("The figures", {"type": "object"})}}},
     "/albireo/v1/engines": {"get": {"tags": ["Service"], "summary": "Engines found, their devices and measures",
@@ -235,13 +242,20 @@ paths = {
         "responses": {"200": reply("Activated", ok), "400": reply("Refused", ok)}}},
     "/albireo/v1/models/{id}/deactivate": {"post": {
         "tags": ["Administration"], "security": admin, "summary": "Deactivates a model for every function",
-        "parameters": [model_id], "responses": {"200": reply("Deactivated", ok)}}},
+        "description": "The model leaves the engine once its requests in progress and waiting are served; an "
+                       "activation meanwhile keeps it loaded. The model of the document search is replaced by "
+                       "the activation of another embedding model.",
+        "parameters": [model_id], "responses": {"200": reply("Deactivated", ok), "400": reply("Refused", ok)}}},
     "/albireo/v1/models/{id}/verify": {"post": {
         "tags": ["Administration"], "security": admin, "summary": "Recomputes the hash of an installed model",
         "parameters": [model_id], "responses": {"200": reply("Result", {"type": "object"})}}},
     "/albireo/v1/models/{id}": {"delete": {
         "tags": ["Administration"], "security": admin, "summary": "Deletes an installed model",
-        "parameters": [model_id], "responses": {"200": reply("Deleted", ok)}}},
+        "description": "A model of the engine is deleted once its requests are served and it left the engine: "
+                       "pending is then true, and the model is listed under leaving until then.",
+        "parameters": [model_id],
+        "responses": {"200": reply("Deleted, or to be deleted", {"type": "object", "properties": {
+            "ok": {"type": "boolean"}, "pending": {"type": "boolean"}}}), "400": reply("Refused", ok)}}},
     "/albireo/v1/import": {"post": {
         "tags": ["Administration"], "security": admin,
         "summary": "Imports an offline bundle, or the GGUF files of a local folder or file",

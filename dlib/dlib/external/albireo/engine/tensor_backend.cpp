@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <sstream>
@@ -202,7 +203,15 @@ namespace albireo
         // Thrown for a matrix whose copy does not fit and which is too large to expand at
         // each product: the processor computes its products.
         struct beyond_budget {};
+
+        long long now_ns()
+        {
+            return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                clock_type::now().time_since_epoch()).count();
+        }
     }
+
+    class tensor_offload;
 
     struct tensor_device::impl
     {
@@ -221,6 +230,18 @@ namespace albireo
         int forced = 0;
 
         std::atomic<size_t> resident{0};
+        /*
+            The offloads of the loaded models.  A model that needs room for a copy takes
+            it from the models without requests, the least recently used first.  The
+            generation counts the events that may give room, a release of copies or a
+            model that has no more requests; a matrix refused for lack of room is offered
+            again after one of them.
+        */
+        std::mutex registry_m;
+        std::vector<tensor_offload*> offloads;
+        std::atomic<unsigned long long> generation{0};
+        std::atomic<unsigned long long> evictions{0};
+        std::atomic<unsigned long long> evicted_bytes{0};
         std::atomic<unsigned long long> device_products{0};
         std::atomic<unsigned long long> host_products{0};
         std::atomic<unsigned long long> device_us{0};
@@ -247,7 +268,19 @@ namespace albireo
             return true;
         }
 
-        void release(size_t bytes) { resident -= bytes; }
+        void release(size_t bytes)
+        {
+            resident -= bytes;
+            ++generation;
+        }
+
+        /*
+            Frees copies of the models without requests, the least recently used model
+            first, until bytes fit in the budget, and a sixteenth of the budget more so
+            that the next matrices of the requester find room too; true when bytes fit.
+            A model keeps the copies it does not have to give.
+        */
+        bool make_room(size_t bytes, const tensor_offload* requester);
 
         void note_route(const std::string& key, const json& value)
         {
@@ -259,18 +292,69 @@ namespace albireo
     class tensor_offload : public matmul_offload
     {
     public:
-        explicit tensor_offload(tensor_device::impl& d) : d_(d) {}
+        tensor_offload(tensor_device::impl& d, const std::string& model) : d_(d), model_(model)
+        {
+            std::lock_guard<std::mutex> lock(d_.registry_m);
+            d_.offloads.push_back(this);
+        }
 
         ~tensor_offload() override
         {
+            std::lock_guard<std::mutex> lock(d_.registry_m);
+            d_.offloads.erase(std::remove(d_.offloads.begin(), d_.offloads.end(), this), d_.offloads.end());
+            evict_copies(std::numeric_limits<size_t>::max());
+        }
+
+        void set_busy(bool busy) override
+        {
+            // A model whose requests are all served may give its room.
+            if (busy_.exchange(busy) && !busy) ++d_.generation;
+        }
+
+        bool busy() const { return busy_.load(); }
+        long long last_use() const { return last_use_.load(); }
+        const std::string& model() const { return model_; }
+
+        // Whether the copies this model gave since its last product were already
+        // reported, so that a model giving its room in several steps is reported once.
+        bool reported_eviction()
+        {
+            const long long use = last_use_.load();
+            if (reported_use_ == use) return true;
+            reported_use_ = use;
+            return false;
+        }
+
+        size_t copy_bytes() const
+        {
             size_t total = 0;
             for (const auto& kv : weights_) total += kv.second.bytes;
-            d_.release(total);
+            return total;
+        }
+
+        /*
+            Frees copies of this model until wanted bytes are freed or none is left,
+            under the lock of the registry, and returns the bytes freed.  The forward
+            passes of every model run on the thread of the scheduler of the engine, the
+            one that asks for room: no product of this model runs meanwhile.  A freed
+            copy is made again when the model needs the matrix.
+        */
+        size_t evict_copies(size_t wanted)
+        {
+            size_t freed = 0;
+            for (auto it = weights_.begin(); it != weights_.end() && freed < wanted;)
+            {
+                freed += it->second.bytes;
+                it = weights_.erase(it);
+            }
+            if (freed > 0) d_.release(freed);
+            return freed;
         }
 
         void matmul(const weight_matrix& W, const float* X, long n, long x_stride, float* Y, long y_stride,
             const std::function<void()>& host) override
         {
+            last_use_ = now_ns();
             if (n < d_.min_tokens || d_.disabled.load(std::memory_order_relaxed))
             {
                 host_product(host);
@@ -304,6 +388,9 @@ namespace albireo
             bool decided = false;
             bool on_device = false;
             bool failed = false;
+            // No room for the copies of the shape, until the generation of the device moves.
+            bool no_room = false;
+            unsigned long long room_generation = 0;
             unsigned long long calls = 0;
             unsigned long long next_check = 0;
             unsigned long long interval = 64;
@@ -362,11 +449,17 @@ namespace albireo
             created = false;
             auto it = weights_.find(W.data);
             if (it != weights_.end()) return it->second.t.get();
-            if (refused_.count(W.data)) return nullptr;
-            const size_t bytes = static_cast<size_t>(W.rows) * static_cast<size_t>(W.cols) * sizeof(float);
-            if (!d_.reserve(bytes))
+            const unsigned long long generation = d_.generation.load();
+            auto refused = refused_.find(W.data);
+            if (refused != refused_.end())
             {
-                refused_.insert(W.data);
+                if (refused->second == generation) return nullptr;
+                refused_.erase(refused);
+            }
+            const size_t bytes = static_cast<size_t>(W.rows) * static_cast<size_t>(W.cols) * sizeof(float);
+            if (!d_.reserve(bytes) && !(d_.make_room(bytes, this) && d_.reserve(bytes)))
+            {
+                refused_[W.data] = d_.generation.load();
                 return nullptr;
             }
             copy c;
@@ -379,7 +472,7 @@ namespace albireo
             catch (...)
             {
                 d_.release(bytes);
-                refused_.insert(W.data);
+                refused_[W.data] = d_.generation.load();
                 throw;
             }
             c.bytes = bytes;
@@ -476,9 +569,10 @@ namespace albireo
             const std::tuple<long, long, int> key(W.rows, W.cols, token_class(n));
             route& r = routes_[key];
             ++r.calls;
+            if (r.no_room && r.room_generation != d_.generation.load()) r.no_room = false;
             bool on_device = false;
             bool check = false;
-            if (r.failed || d_.forced < 0)
+            if (r.failed || r.no_room || d_.forced < 0)
                 on_device = false;
             else if (d_.forced > 0)
                 on_device = true;
@@ -504,7 +598,10 @@ namespace albireo
                 }
                 catch (const beyond_budget&)
                 {
-                    r.failed = true;
+                    // No room for now: the processor computes the shape until copies leave
+                    // the device or a model has no more requests.
+                    r.no_room = true;
+                    r.room_generation = d_.generation.load();
                     host_product(host);
                     return;
                 }
@@ -526,7 +623,7 @@ namespace albireo
                 d_.host_us += static_cast<unsigned long long>(seconds * 1e6);
             }
 
-            if (r.failed || d_.forced != 0) return;
+            if (r.failed || r.no_room || d_.forced != 0) return;
             if (!r.decided)
             {
                 if (!on_device) add_sample(r.host, r.host_n, seconds);
@@ -621,11 +718,42 @@ namespace albireo
 #endif
 
         tensor_device::impl& d_;
+        std::string model_;
+        std::atomic<bool> busy_{false};
+        std::atomic<long long> last_use_{0};
+        long long reported_use_ = -1;
         std::unordered_map<const uint8_t*, copy> weights_;
-        std::unordered_set<const uint8_t*> refused_;
+        // The matrices refused for lack of room, with the generation of the refusal.
+        std::unordered_map<const uint8_t*, unsigned long long> refused_;
         std::map<std::tuple<long, long, int>, route> routes_;
         dlib::resizable_tensor x_, y_, w_;
     };
+
+    bool tensor_device::impl::make_room(size_t bytes, const tensor_offload* requester)
+    {
+        // A matrix larger than the whole budget never fits: nothing leaves for it.
+        if (bytes > budget) return false;
+        std::lock_guard<std::mutex> lock(registry_m);
+        std::vector<tensor_offload*> idle;
+        for (tensor_offload* o : offloads)
+            if (o != requester && !o->busy() && o->copy_bytes() > 0) idle.push_back(o);
+        std::sort(idle.begin(), idle.end(),
+            [](const tensor_offload* a, const tensor_offload* b) { return a->last_use() < b->last_use(); });
+        const size_t room = budget - bytes;
+        const size_t target = room - std::min(room, budget / 16);
+        for (tensor_offload* o : idle)
+        {
+            const size_t current = resident.load();
+            if (current <= target) break;
+            const size_t freed = o->evict_copies(current - target);
+            ++evictions;
+            evicted_bytes += freed;
+            message(o->reported_eviction() ? ALBIREO_LOG_DEBUG : ALBIREO_LOG_INFO, "device: copies of '"
+                + o->model() + "', without requests, leave the device for '" + requester->model() + "' ("
+                + megabytes(freed) + ", " + megabytes(o->copy_bytes()) + " stay)");
+        }
+        return resident.load() + bytes <= budget;
+    }
 
     tensor_device::tensor_device(const json& config, thread_pool& pool, log_function log)
         : impl_(new impl(config, pool, std::move(log)))
@@ -760,9 +888,9 @@ namespace albireo
     {
     }
 
-    std::unique_ptr<matmul_offload> tensor_device::make_offload()
+    std::unique_ptr<matmul_offload> tensor_device::make_offload(const std::string& model)
     {
-        return std::unique_ptr<matmul_offload>(new tensor_offload(*impl_));
+        return std::unique_ptr<matmul_offload>(new tensor_offload(*impl_, model));
     }
 
     json tensor_device::stats() const
@@ -779,6 +907,8 @@ namespace albireo
         s["host_seconds"] = d.host_us.load() / 1e6;
         s["failures"] = d.failures.load();
         s["disabled"] = d.disabled.load();
+        s["evictions"] = d.evictions.load();
+        s["evicted_bytes"] = d.evicted_bytes.load();
 #if defined(DLIB_USE_NPU) && !defined(DLIB_USE_CUDA)
         for (const auto& op : dlib::npu::get_statistics())
         {
@@ -837,7 +967,8 @@ namespace albireo
 #endif
     }
 
-    json tensor_device::describe(std::string& backend, std::string& runtime, std::string& reason)
+    json tensor_device::describe(std::string& backend, std::string& runtime, std::string& reason, std::string& code,
+        json& args)
     {
         json devices = json::array();
 #if defined(DLIB_USE_CUDA)
@@ -849,12 +980,17 @@ namespace albireo
         if (cudaDriverGetVersion(&driver) != cudaSuccess || driver == 0)
         {
             reason = "no NVIDIA driver is installed";
+            code = "no_nvidia_driver";
             return devices;
         }
         if (driver < version)
         {
-            reason = "the NVIDIA driver supports CUDA " + std::to_string(driver / 1000) + "."
-                + std::to_string((driver % 1000) / 10) + ", this engine needs " + runtime + "; update the driver";
+            const std::string supported = std::to_string(driver / 1000) + "." + std::to_string((driver % 1000) / 10);
+            reason = "the NVIDIA driver supports CUDA " + supported + ", this engine needs " + runtime
+                + "; update the driver";
+            code = "old_nvidia_driver";
+            args["driver"] = "CUDA " + supported;
+            args["runtime"] = runtime;
             return devices;
         }
         std::string older;
@@ -870,13 +1006,25 @@ namespace albireo
             d["compute_capability"] = std::to_string(p.major) + "." + std::to_string(p.minor);
             devices.push_back(d);
         }
-        if (devices.empty()) reason = older.empty() ? "no NVIDIA graphics processor was found" : too_old(older);
+        if (devices.empty() && older.empty())
+        {
+            reason = "no NVIDIA graphics processor was found";
+            code = "no_nvidia_card";
+        }
+        else if (devices.empty())
+        {
+            reason = too_old(older);
+            code = "old_nvidia_card";
+            args["card"] = older;
+            args["cc"] = std::to_string(ALBIREO_CUDA_MIN_CC / 10) + "." + std::to_string(ALBIREO_CUDA_MIN_CC % 10);
+        }
 #elif defined(DLIB_USE_NPU)
         backend = "openvino";
         runtime = "OpenVINO " + dlib::npu::runtime_version();
         if (!dlib::npu::is_available())
         {
             reason = "no NPU or Intel graphics processor was found";
+            code = "no_intel_device";
             return devices;
         }
         // "NPU, Intel(R) AI Boost + GPU, Intel(R) Graphics"
@@ -898,11 +1046,17 @@ namespace albireo
             d["name"] = full;
             devices.push_back(d);
         }
-        if (devices.empty()) reason = "no NPU or Intel graphics processor was found";
+        if (devices.empty())
+        {
+            reason = "no NPU or Intel graphics processor was found";
+            code = "no_intel_device";
+        }
 #else
         backend = "dlib";
         runtime = "dlib host code";
         (void)reason;
+        (void)code;
+        (void)args;
 #endif
         return devices;
     }

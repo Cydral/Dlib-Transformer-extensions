@@ -132,13 +132,67 @@ set(ALBIREO_ENGINE_SOURCES
    engine/engine_api.cpp
    engine/model_config.cpp
    engine/model_file.cpp
-   engine/qkernels.cpp
    engine/sampler.cpp
    common/system_info.cpp)
 
-function(albireo_engine variant)
+# The instructions of the processor engines.  An engine of the AVX2 family is built for AVX2,
+# FMA and F16C, and its quantized kernels (engine/qkernels.cpp) for the instructions of its
+# variant: the description of the library then runs on any processor of the family, and says
+# whether the kernels run on it.  MSVC defines no macro for VNNI, which the build names.
+include(CheckCXXCompilerFlag)
+if (MSVC)
+   set(ALBIREO_ISA_avx2 /arch:AVX2)
+   set(ALBIREO_ISA_avxvnni /arch:AVX2)
+   set(ALBIREO_ISA_avxvnni_DEFS ALBIREO_AVX_VNNI)
+   set(ALBIREO_ISA_avx512 /arch:AVX512)
+   set(ALBIREO_ISA_avx512_DEFS ALBIREO_AVX512_VNNI)
+   # The intrinsics of AVX-VNNI came with Visual Studio 2022.
+   if (MSVC_VERSION GREATER_EQUAL 1930)
+      set(ALBIREO_HAS_avxvnni ON)
+   endif()
+   set(ALBIREO_HAS_avx512 ON)
+else()
+   set(ALBIREO_ISA_avx2 -mavx2 -mfma -mf16c)
+   set(ALBIREO_ISA_avxvnni ${ALBIREO_ISA_avx2} -mavxvnni)
+   set(ALBIREO_ISA_avx512 ${ALBIREO_ISA_avx2} -mavx512f -mavx512bw -mavx512dq -mavx512vl -mavx512vnni)
+   # The 256-bit VNNI kernels through the AVX-512 form of their instructions, to test them
+   # on the processors that have AVX-512 VNNI and lack AVX-VNNI.
+   set(ALBIREO_ISA_vnni256 ${ALBIREO_ISA_avx2} -mavx512vl -mavx512vnni)
+   set(ALBIREO_ISA_vnni256_DEFS ALBIREO_QK_VNNI_EVEX)
+   check_cxx_compiler_flag(-mavxvnni ALBIREO_HAS_avxvnni)
+   check_cxx_compiler_flag(-mavx512vnni ALBIREO_HAS_avx512)
+   set(ALBIREO_HAS_vnni256 ${ALBIREO_HAS_avx512})
+endif()
+set(ALBIREO_HAS_portable ON)
+set(ALBIREO_HAS_avx2 ON)
+
+# The quantized kernels of a family of processors, shared by the engines and the tests.
+function(albireo_kernels family)
+   set(target albireo-kernels-${family})
+   if (TARGET ${target})
+      return()
+   endif()
+   add_library(${target} OBJECT engine/qkernels.cpp)
+   target_include_directories(${target} PRIVATE ${ALBIREO_INCLUDE_DIR})
+   target_compile_options(${target} PRIVATE ${ALBIREO_WARNINGS} ${ALBIREO_ISA_${family}})
+   target_compile_definitions(${target} PRIVATE ${ALBIREO_ISA_${family}_DEFS})
+   set_target_properties(${target} PROPERTIES POSITION_INDEPENDENT_CODE ON
+      C_VISIBILITY_PRESET hidden CXX_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN ON)
+endfunction()
+
+# An engine library; kernels is the family of its quantized kernels, or "inline" for kernels
+# compiled with the library itself (the device engines, built for AVX2 with dlib).
+function(albireo_engine variant kernels)
    set(target albireo-engine-${variant})
-   add_library(${target} SHARED ${ALBIREO_ENGINE_SOURCES} ${ARGN})
+   if (kernels STREQUAL "inline")
+      add_library(${target} SHARED ${ALBIREO_ENGINE_SOURCES} engine/qkernels.cpp ${ARGN})
+   else()
+      albireo_kernels(${kernels})
+      add_library(${target} SHARED ${ALBIREO_ENGINE_SOURCES} $<TARGET_OBJECTS:albireo-kernels-${kernels}> ${ARGN})
+      if (NOT kernels STREQUAL "portable")
+         target_compile_options(${target} PRIVATE ${ALBIREO_ISA_avx2})
+      endif()
+   endif()
    target_include_directories(${target} PRIVATE ${ALBIREO_INCLUDE_DIR})
    target_compile_definitions(${target} PRIVATE ALBIREO_ENGINE_BUILD ALBIREO_ENGINE_VARIANT="${variant}")
    target_compile_options(${target} PRIVATE ${ALBIREO_WARNINGS})
@@ -179,13 +233,21 @@ endfunction()
 
 if (ALBIREO_PROGRAMS)
    # Portable engine: the instructions of every x86-64 processor.
-   albireo_engine(cpu)
+   albireo_engine(cpu portable)
    # Engine for the processors with AVX2, FMA and F16C (2013 and later).
-   albireo_engine(cpu-avx2)
-   if (MSVC)
-      target_compile_options(albireo-engine-cpu-avx2 PRIVATE /arch:AVX2)
+   albireo_engine(cpu-avx2 avx2)
+   # AVX-VNNI: Intel Core 12th generation and later, AMD Zen 5.
+   if (ALBIREO_HAS_avxvnni)
+      albireo_engine(cpu-avxvnni avxvnni)
    else()
-      target_compile_options(albireo-engine-cpu-avx2 PRIVATE -mavx2 -mfma -mf16c)
+      message(STATUS "The compiler lacks AVX-VNNI: no cpu-avxvnni engine.")
+   endif()
+   # AVX-512 with VNNI: Intel Xeon from Cascade Lake on, Core 10th and 11th generation for
+   # laptops and desktops (Ice Lake, Tiger Lake, Rocket Lake), AMD Zen 4 and Zen 5.
+   if (ALBIREO_HAS_avx512)
+      albireo_engine(cpu-avx512 avx512)
+   else()
+      message(STATUS "The compiler lacks AVX-512 VNNI: no cpu-avx512 engine.")
    endif()
 endif()
 
@@ -262,7 +324,7 @@ endfunction()
 # is the one of cpu-avx2: every machine with such a device has these instructions.
 function(albireo_tensor_engine variant)
    set(ALBIREO_DEVICE_ENGINE ON)
-   albireo_engine(${variant} engine/tensor_backend.cpp)
+   albireo_engine(${variant} inline engine/tensor_backend.cpp)
    set(target albireo-engine-${variant})
    foreach (f ${ALBIREO_RUNTIME_LICENSES})
       get_filename_component(name "${f}" NAME)
@@ -270,11 +332,7 @@ function(albireo_tensor_engine variant)
    endforeach()
    target_compile_definitions(${target} PRIVATE ALBIREO_TENSOR_BACKEND)
    target_link_libraries(${target} PRIVATE dlib::dlib)
-   if (MSVC)
-      target_compile_options(${target} PRIVATE /arch:AVX2)
-   else()
-      target_compile_options(${target} PRIVATE -mavx2 -mfma -mf16c)
-   endif()
+   target_compile_options(${target} PRIVATE ${ALBIREO_ISA_avx2})
 endfunction()
 
 if (ALBIREO_ENGINE_CUDA)
@@ -481,18 +539,33 @@ if (ALBIREO_TESTS AND ALBIREO_PROGRAMS)
          add_executable(${t} tests/${t}.cpp)
          target_link_libraries(${t} PRIVATE albireo_common)
       else()
+         albireo_kernels(avx2)
          add_executable(${t} tests/${t}.cpp engine/cpu_runtime.cpp engine/model_config.cpp engine/model_file.cpp
-            engine/qkernels.cpp common/system_info.cpp)
+            $<TARGET_OBJECTS:albireo-kernels-avx2> common/system_info.cpp)
          target_include_directories(${t} PRIVATE ${ALBIREO_INCLUDE_DIR})
-         if (MSVC)
-            target_compile_options(${t} PRIVATE /arch:AVX2)
-         else()
-            target_compile_options(${t} PRIVATE -mavx2 -mfma -mf16c)
-         endif()
+         target_compile_options(${t} PRIVATE ${ALBIREO_ISA_avx2})
          if (NOT WIN32)
             target_link_libraries(${t} PRIVATE Threads::Threads)
          endif()
       endif()
       albireo_output_dir(${t} ${CMAKE_BINARY_DIR}/tests)
+   endforeach()
+   # The kernels of the other families: their checks and their speed, on the processors
+   # that have their instructions (the others skip them).
+   foreach (family avxvnni avx512 vnni256)
+      if (NOT ALBIREO_HAS_${family})
+         continue()
+      endif()
+      albireo_kernels(${family})
+      foreach (t test_qkernels bench_runtime)
+         add_executable(${t}_${family} tests/${t}.cpp engine/cpu_runtime.cpp engine/model_config.cpp
+            engine/model_file.cpp $<TARGET_OBJECTS:albireo-kernels-${family}> common/system_info.cpp)
+         target_include_directories(${t}_${family} PRIVATE ${ALBIREO_INCLUDE_DIR})
+         target_compile_options(${t}_${family} PRIVATE ${ALBIREO_ISA_avx2})
+         if (NOT WIN32)
+            target_link_libraries(${t}_${family} PRIVATE Threads::Threads)
+         endif()
+         albireo_output_dir(${t}_${family} ${CMAKE_BINARY_DIR}/tests)
+      endforeach()
    endforeach()
 endif()

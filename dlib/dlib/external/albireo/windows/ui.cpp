@@ -301,19 +301,34 @@ namespace ui
 
     void place(HWND control, int x, int y, int w, int h)
     {
-        SetWindowPos(control, nullptr, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+        RECT r;
+        GetWindowRect(control, &r);
+        MapWindowPoints(HWND_DESKTOP, GetParent(control), reinterpret_cast<POINT*>(&r), 2);
+        if (r.left == x && r.top == y && r.right - r.left == w && r.bottom - r.top == h) return;
+        // A control that moves paints itself again: the pixels it would carry along may
+        // hold a part of a sibling that moved before it.
+        SetWindowPos(control, nullptr, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
+    }
+
+    int button_width(HWND button, int min_width, const std::vector<std::wstring>& texts)
+    {
+        HDC dc = GetDC(button);
+        HGDIOBJ old = SelectObject(dc, reinterpret_cast<HFONT>(SendMessageW(button, WM_GETFONT, 0, 0)));
+        int widest = 0;
+        for (const std::wstring& text : texts)
+        {
+            SIZE s = { 0, 0 };
+            GetTextExtentPoint32W(dc, text.c_str(), static_cast<int>(text.size()), &s);
+            widest = std::max(widest, static_cast<int>(s.cx));
+        }
+        SelectObject(dc, old);
+        ReleaseDC(button, dc);
+        return std::max(min_width, widest + px(button, 32));
     }
 
     int button_width(HWND button, int min_width)
     {
-        const std::wstring text = text_of(button);
-        HDC dc = GetDC(button);
-        HGDIOBJ old = SelectObject(dc, reinterpret_cast<HFONT>(SendMessageW(button, WM_GETFONT, 0, 0)));
-        SIZE s = { 0, 0 };
-        GetTextExtentPoint32W(dc, text.c_str(), static_cast<int>(text.size()), &s);
-        SelectObject(dc, old);
-        ReleaseDC(button, dc);
-        return std::max(min_width, static_cast<int>(s.cx) + px(button, 32));
+        return button_width(button, min_width, { text_of(button) });
     }
 
     std::wstring text_of(HWND control)

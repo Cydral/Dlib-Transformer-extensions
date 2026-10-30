@@ -4,6 +4,11 @@
     Drives an engine library through its C interface, as the host does.
 
         engine_chat engine_library model.gguf [options] "question" ["question"...]
+        engine_chat engine_library --describe
+
+    The second form prints the description of the library and returns 0, and 3 when the
+    engine cannot run on this computer.  The first one refuses such an engine the same way,
+    before it runs any of its kernels.
 
     Options:
         --reasoning on|off   reasoning of the models that can reason
@@ -271,9 +276,11 @@ int main(int argc, char** argv)
     if (wargc == argc) argv = utf8_argv.data();
     SetConsoleOutputCP(CP_UTF8);
 #endif
-    if (argc < 4)
+    const bool describe_only = argc == 3 && std::string(argv[2]) == "--describe";
+    if (argc < 4 && !describe_only)
     {
-        std::printf("usage: engine_chat engine_library model.gguf [options] question...\n");
+        std::printf("usage: engine_chat engine_library model.gguf [options] question...\n"
+            "       engine_chat engine_library --describe\n");
         return 2;
     }
     std::string reasoning = "";
@@ -323,7 +330,14 @@ int main(int argc, char** argv)
     }
     bool render_mode = false;
     for (int i = 3; i < argc; ++i) render_mode = render_mode || std::string(argv[i]) == "--render";
-    if (!render_mode) std::printf("%s\n", lib.description().dump_formatted().c_str());
+    const json description = lib.description();
+    if (!render_mode) std::printf("%s\n", description.dump_formatted().c_str());
+    if (!description["usable"].as_bool(false))
+    {
+        std::printf("the engine cannot run on this computer: %s\n", description["reason"].as_string().c_str());
+        return 3;
+    }
+    if (describe_only) return 0;
 
     json config = json::object();
     config["threads"] = threads;

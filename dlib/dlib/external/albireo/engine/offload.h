@@ -45,6 +45,15 @@ namespace albireo
         virtual void matmul(const weight_matrix& W, const float* X, long n_tokens, long x_stride,
             float* Y, long y_stride, const std::function<void()>& host) = 0;
 
+        /*!
+            ensures
+                - Tells whether the model has requests in progress or waiting.  When the
+                  device lacks room, copies of the models without requests leave it, the
+                  least recently used model first, for those of a model that has some; the
+                  copies of a model with requests stay until its requests are served.
+        !*/
+        virtual void set_busy(bool busy) = 0;
+
         // A short description, such as "NVIDIA GeForce RTX 4070 through CUDA".
         virtual std::string description() const = 0;
     };

@@ -38,8 +38,13 @@ namespace albireo
                 mixtures of SwiGLU experts, and the global scale factors of the families
                 that declare them.
 
-                Attention runs over the paged keys of each sequence directly, one task per
-                token and head, with a numerically stable softmax.
+                Attention runs over the paged keys of each sequence directly, by tiles: a
+                task takes the heads that share one key/value head for up to tile_rows
+                rows of consecutive tokens of one sequence, and reads the cache block after
+                block with a running maximum and sum (the softmax of FlashAttention), so
+                that every key and value read from memory serves all the rows of the tile.
+                When the tiles are fewer than the threads, as in the generation of a single
+                answer, each head of the group makes a task of its own.
 
                 With a matmul_offload, the products with the weight matrices go through it,
                 and it decides, product by product, whether a device computes them.
@@ -66,6 +71,10 @@ namespace albireo
             return 2 * static_cast<size_t>(cfg_.n_layers) * cfg_.kv_dim() * sizeof(uint16_t);
         }
         void trim_memory() override { kv_.trim(); }
+        void set_busy(bool busy) override
+        {
+            if (offload_) offload_->set_busy(busy);
+        }
         size_t weight_bytes() const override { return static_cast<size_t>(file_->size()); }
 
         std::string description() const override;
@@ -83,6 +92,24 @@ namespace albireo
             weight_matrix w_gate, w_up, w_down;
             weight_matrix router;
             std::vector<weight_matrix> e_gate, e_up, e_down;
+        };
+
+        // The rows of queries of an attention tile, at most: the scores of a tile over one
+        // block of the cache stay within a few tens of kilobytes.
+        static const long tile_rows = 64;
+
+        // Consecutive tokens of one segment of the batch, which attend together.
+        struct attention_tile
+        {
+            int sequence;
+            long start;     // first token in the batch
+            long count;
+        };
+
+        // The buffers of one thread of the attention.
+        struct attention_work
+        {
+            std::vector<float> q, s, o, max, sum, scratch;
         };
 
         void rms_norm_rows(const float* x, const float* gamma, float* y, long rows, long width, float eps);
@@ -116,7 +143,8 @@ namespace albireo
         std::vector<float> x_, xn_, q_, k_, v_, ctx_, tmp_, gate_, up_;
         std::vector<float> router_logits_, hidden_out_;
         std::vector<qk_scratch> scratch_;
-        std::vector<std::vector<float>> scores_;
+        std::vector<attention_work> attention_work_;
+        std::vector<attention_tile> tiles_;
         std::vector<long> positions_;
     };
 

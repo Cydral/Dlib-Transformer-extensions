@@ -15,6 +15,7 @@
 
 #include "../common/json.h"
 #include "store.h"
+#include "user_error.h"
 
 namespace albireo
 {
@@ -73,7 +74,9 @@ namespace albireo
         // The catalog merged with the installed models and the downloads, for the windows.
         json overview(const std::string& language) const;
 
-        bool start_download(const std::string& id, std::string& error);
+        bool start_download(const std::string& id, user_error& error);
+        // Shows a download of id that could not start, with its error, until one starts.
+        void note_failure(const std::string& id, const user_error& error);
         void cancel_download(const std::string& id);
         void resume_pending();
         json downloads() const;

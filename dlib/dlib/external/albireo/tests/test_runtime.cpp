@@ -209,6 +209,8 @@ int main(int argc, char** argv)
         const long m = std::max<long>(1, 2 * T / 3);
         rt.truncate_sequence(seq, m);
         expect(rt.sequence_length(seq) == m, "length after truncation");
+        // The blocks beyond the kept positions went back to the pool.
+        expect(rt.reserve_sequence(seq, T), "reserve after truncation");
         b.clear();
         b.tokens.assign(tokens.begin() + m, tokens.end());
         b.segments.push_back({ seq, 0, T - m });

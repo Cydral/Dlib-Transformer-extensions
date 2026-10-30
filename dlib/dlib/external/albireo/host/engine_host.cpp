@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <thread>
 
 #include "../common/log.h"
@@ -18,9 +19,11 @@ namespace albireo
         struct sink_holder
         {
             request_sink sink;
+            engine_host* host;
+            std::string model;
         };
 
-        const char* const variant_order[] = { "cuda", "openvino", "cpu-avx2", "cpu" };
+        const char* const variant_order[] = { "cuda", "openvino", "cpu-avx512", "cpu-avxvnni", "cpu-avx2", "cpu" };
 
         std::atomic<bool> pinned_started{false};
     }
@@ -67,6 +70,13 @@ namespace albireo
                     if (!p->description.is_object()) p->description = json::object();
                     p->description["reason"] = code == 0 ? std::string("not usable")
                         : "the library could not be loaded (code " + std::to_string(code) + ")";
+                    if (code != 0)
+                    {
+                        p->description["reason_code"] = "library_failed";
+                        json args = json::object();
+                        args["code"] = std::to_string(code);
+                        p->description["reason_args"] = args;
+                    }
                 }
             });
         }
@@ -108,6 +118,11 @@ namespace albireo
     bool engine_host::start(const engine_candidate& c, const json& config, std::string& error)
     {
         stop();
+        {
+            std::lock_guard<std::mutex> lock(flight_m_);
+            stopping_ = false;
+            in_flight_.clear();
+        }
         std::unique_lock<std::shared_timed_mutex> life(life_);
         std::unique_ptr<engine_library> lib(new engine_library());
         if (!lib->load(c.path, error)) return false;
@@ -133,6 +148,12 @@ namespace albireo
 
     void engine_host::stop()
     {
+        {
+            // The unloadings waiting for their requests end at once.
+            std::lock_guard<std::mutex> lock(flight_m_);
+            stopping_ = true;
+        }
+        flight_cv_.notify_all();
         std::unique_lock<std::shared_timed_mutex> life(life_);
         {
             std::lock_guard<std::mutex> lock(m_);
@@ -183,16 +204,56 @@ namespace albireo
         return true;
     }
 
-    void engine_host::unload_model(const std::string& id)
+    bool engine_host::unload_model(const std::string& id, int drain_seconds)
     {
-        std::shared_lock<std::shared_timed_mutex> life(life_);
-        if (!engine_) return;
+        begin_unload(id);
+        return finish_unload(id, drain_seconds);
+    }
+
+    void engine_host::begin_unload(const std::string& id)
+    {
+        // From now on, submit() refuses the requests for it, and it leaves the list of the
+        // models, in one step for keep_model().
+        std::lock_guard<std::mutex> lock(flight_m_);
+        draining_.emplace(id, false);
+        std::lock_guard<std::mutex> models(m_);
+        models_.erase(std::remove(models_.begin(), models_.end(), id), models_.end());
+    }
+
+    bool engine_host::finish_unload(const std::string& id, int drain_seconds)
+    {
         {
-            // Out of the list first, so that no new request is sent to it.
-            std::lock_guard<std::mutex> lock(m_);
-            models_.erase(std::remove(models_.begin(), models_.end(), id), models_.end());
+            // The requests in progress and waiting are served first, without holding the
+            // engine, so that a stop never waits for them.
+            std::unique_lock<std::mutex> lock(flight_m_);
+            flight_cv_.wait_for(lock, std::chrono::seconds(drain_seconds), [&]() {
+                return stopping_ || draining_.count(id) == 0 || in_flight_.find(id) == in_flight_.end();
+            });
+            const auto it = draining_.find(id);
+            if (it == draining_.end()) return false;
+            it->second = true;
         }
-        lib_->unload_model(engine_, id.c_str());
+        {
+            std::shared_lock<std::shared_timed_mutex> life(life_);
+            if (engine_) lib_->unload_model(engine_, id.c_str());
+        }
+        std::lock_guard<std::mutex> lock(flight_m_);
+        draining_.erase(id);
+        return true;
+    }
+
+    bool engine_host::keep_model(const std::string& id)
+    {
+        {
+            std::lock_guard<std::mutex> lock(flight_m_);
+            const auto it = draining_.find(id);
+            if (it == draining_.end() || it->second) return false;
+            draining_.erase(it);
+            std::lock_guard<std::mutex> models(m_);
+            if (std::find(models_.begin(), models_.end(), id) == models_.end()) models_.push_back(id);
+        }
+        flight_cv_.notify_all();
+        return true;
     }
 
     std::vector<std::string> engine_host::loaded_models() const
@@ -205,7 +266,21 @@ namespace albireo
     {
         sink_holder* h = static_cast<sink_holder*>(user);
         h->sink(kind, std::string(data, size));
-        if (kind == ALBIREO_EVENT_DONE || kind == ALBIREO_EVENT_ERROR) delete h;
+        if (kind == ALBIREO_EVENT_DONE || kind == ALBIREO_EVENT_ERROR)
+        {
+            h->host->request_ended(h->model);
+            delete h;
+        }
+    }
+
+    void engine_host::request_ended(const std::string& model)
+    {
+        {
+            std::lock_guard<std::mutex> lock(flight_m_);
+            auto it = in_flight_.find(model);
+            if (it != in_flight_.end() && --it->second <= 0) in_flight_.erase(it);
+        }
+        flight_cv_.notify_all();
     }
 
     void ALBIREO_ENGINE_CALL engine_host::on_log(void*, int level, const char* message)
@@ -225,12 +300,24 @@ namespace albireo
             error = "no engine is running";
             return false;
         }
-        sink_holder* h = new sink_holder{ std::move(sink) };
+        const std::string model = request["model"].as_string();
+        {
+            // Counted before the engine sees it, since its last event may come first.
+            std::lock_guard<std::mutex> lock(flight_m_);
+            if (draining_.count(model) != 0)
+            {
+                error = "the model " + model + " is being unloaded";
+                return false;
+            }
+            ++in_flight_[model];
+        }
+        sink_holder* h = new sink_holder{ std::move(sink), this, model };
         char err[2048] = { 0 };
         const int rc = lib_->submit(engine_, request.dump().c_str(), &engine_host::on_event, h, &id, err, sizeof(err));
         if (rc != ALBIREO_OK)
         {
             delete h;
+            request_ended(model);
             error = err;
             return false;
         }

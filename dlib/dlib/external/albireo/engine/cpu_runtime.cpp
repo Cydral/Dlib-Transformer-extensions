@@ -79,7 +79,19 @@ namespace albireo
         output_norm_ = f.floats("output_norm.weight", static_cast<size_t>(d));
         token_embd_ = f.matrix("token_embd.weight", cfg_.vocab, d);
         output_ = cfg_.tied_embeddings ? token_embd_ : f.matrix("output.weight", cfg_.vocab, d);
-        scores_.resize(static_cast<size_t>(pool_.size()));
+
+        const long rep = cfg_.n_heads / cfg_.n_kv_heads;
+        const size_t rows = static_cast<size_t>(std::max<long>(1, tile_rows / rep) * rep);
+        attention_work_.resize(static_cast<size_t>(pool_.size()));
+        for (auto& w : attention_work_)
+        {
+            w.q.resize(rows * static_cast<size_t>(hd));
+            w.o.resize(rows * static_cast<size_t>(hd));
+            w.s.resize(rows * static_cast<size_t>(kv_.block_positions()));
+            w.max.resize(rows);
+            w.sum.resize(rows);
+            w.scratch.resize(static_cast<size_t>(qk_attention_scratch(hd)));
+        }
     }
 
     std::string cpu_runtime::description() const
@@ -275,59 +287,91 @@ namespace albireo
     void cpu_runtime::attention(long layer_index, const forward_batch& batch, const std::vector<long>& positions)
     {
         const long T = static_cast<long>(batch.tokens.size());
-        const long H = cfg_.n_heads;
+        const long KVH = cfg_.n_kv_heads;
         const long hd = cfg_.head_dim;
         const long qd = cfg_.q_dim();
-        const long rep = H / cfg_.n_kv_heads;
+        const long rep = cfg_.n_heads / KVH;
         const long B = kv_.block_positions();
         const float scale = cfg_.attention_scale > 0.0
             ? static_cast<float>(cfg_.attention_scale)
             : 1.0f / std::sqrt(static_cast<float>(hd));
 
-        // The sequence of every token, for the tasks below.
-        std::vector<int> seq_of(static_cast<size_t>(T), -1);
-        long max_len = 0;
+        // The tiles: consecutive tokens of one segment, whose positions are consecutive too.
+        const long per_tile = std::max<long>(1, tile_rows / rep);
+        tiles_.clear();
         for (const auto& s : batch.segments)
-            for (long j = 0; j < s.count; ++j)
-            {
-                seq_of[static_cast<size_t>(s.start + j)] = s.sequence;
-                max_len = std::max(max_len, positions[static_cast<size_t>(s.start + j)] + 1);
-            }
-        for (auto& sc : scores_)
-            if (static_cast<long>(sc.size()) < max_len) sc.resize(static_cast<size_t>(max_len));
+            for (long j = 0; j < s.count; j += per_tile)
+                tiles_.push_back({ s.sequence, s.start + j, std::min(per_tile, s.count - j) });
+        // The heads of a task: the whole group of a key/value head, or a single head when
+        // the tiles are too few to keep the threads busy.
+        const long nh = static_cast<long>(tiles_.size()) * KVH < pool_.size() ? 1 : rep;
+        const long groups = rep / nh;
 
         ctx_.resize(static_cast<size_t>(T * qd));
-        pool_.parallel_for(T * H, [&](long item, int thread) {
-            const long t = item / H;
-            const long h = item % H;
-            const long kvh = h / rep;
-            const kv_sequence& seq = *sequences_[static_cast<size_t>(seq_of[static_cast<size_t>(t)])];
-            const long n = positions[static_cast<size_t>(t)] + 1;
-            const float* q = q_.data() + t * qd + h * hd;
-            float* sc = scores_[static_cast<size_t>(thread)].data();
+        pool_.parallel_for(static_cast<long>(tiles_.size()) * KVH * groups, [&](long item, int thread) {
+            const attention_tile& tile = tiles_[static_cast<size_t>(item / (KVH * groups))];
+            const long kvh = item / groups % KVH;
+            const long h0 = kvh * rep + item % groups * nh;
+            const kv_sequence& seq = *sequences_[static_cast<size_t>(tile.sequence)];
+            attention_work& w = attention_work_[static_cast<size_t>(thread)];
+            const long rows = tile.count * nh;
+            const long last = positions[static_cast<size_t>(tile.start + tile.count - 1)];
 
-            for (long p = 0; p < n; p += B)
+            // Row a * nh + i holds token tile.start + a and head h0 + i, scaled.
+            for (long a = 0; a < tile.count; ++a)
+            {
+                const float* src = q_.data() + (tile.start + a) * qd + h0 * hd;
+                float* dst = w.q.data() + a * nh * hd;
+                for (long e = 0; e < nh * hd; ++e) dst[e] = src[e] * scale;
+            }
+            std::fill(w.o.begin(), w.o.begin() + rows * hd, 0.0f);
+            std::fill(w.max.begin(), w.max.begin() + rows, -INFINITY);
+            std::fill(w.sum.begin(), w.sum.begin() + rows, 0.0f);
+
+            for (long p = 0; p <= last; p += B)
             {
                 const int block = seq.blocks[static_cast<size_t>(p / B)];
-                const long m = std::min(B, n - p);
-                const uint16_t* K = kv_.keys(block, layer_index, kvh);
-                for (long i = 0; i < m; ++i)
-                    sc[p + i] = qk_dot_f32_f16(q, K + i * hd, hd) * scale;
+                const long m = std::min(B, last + 1 - p);
+                qk_attention_scores(w.q.data(), rows, kv_.keys(block, layer_index, kvh), m, hd, w.s.data(), B,
+                    w.scratch.data());
+                for (long a = 0; a < tile.count; ++a)
+                {
+                    // Each token sees the positions up to its own.
+                    const long own = positions[static_cast<size_t>(tile.start + a)];
+                    const long seen = std::max<long>(0, std::min(m, own + 1 - p));
+                    for (long i = 0; i < nh; ++i)
+                    {
+                        const long r = a * nh + i;
+                        float* sr = w.s.data() + r * B;
+                        std::fill(sr + seen, sr + m, 0.0f);
+                        if (seen == 0) continue;
+                        const float old = w.max[static_cast<size_t>(r)];
+                        const float mx = std::max(old, qk_max(sr, seen));
+                        const float added = qk_exp_shift_sum(sr, mx, seen);
+                        if (mx != old && w.sum[static_cast<size_t>(r)] > 0.0f)
+                        {
+                            // A larger maximum: what the row gathered so far shrinks.
+                            const float shrink = std::exp(old - mx);
+                            w.sum[static_cast<size_t>(r)] *= shrink;
+                            qk_scale(w.o.data() + r * hd, shrink, hd);
+                        }
+                        w.max[static_cast<size_t>(r)] = mx;
+                        w.sum[static_cast<size_t>(r)] += added;
+                    }
+                }
+                qk_attention_values(w.s.data(), B, rows, kv_.values(block, layer_index, kvh), m, hd, w.o.data(),
+                    w.scratch.data());
             }
-            const float mx = qk_max(sc, n);
-            const float sum = qk_exp_shift_sum(sc, mx, n);
-            const float inv = 1.0f / sum;
 
-            float* out = ctx_.data() + t * qd + h * hd;
-            std::fill(out, out + hd, 0.0f);
-            for (long p = 0; p < n; p += B)
-            {
-                const int block = seq.blocks[static_cast<size_t>(p / B)];
-                const long m = std::min(B, n - p);
-                const uint16_t* V = kv_.values(block, layer_index, kvh);
-                for (long i = 0; i < m; ++i)
-                    qk_axpy_f16(sc[p + i] * inv, V + i * hd, out, hd);
-            }
+            for (long a = 0; a < tile.count; ++a)
+                for (long i = 0; i < nh; ++i)
+                {
+                    const long r = a * nh + i;
+                    const float inv = 1.0f / w.sum[static_cast<size_t>(r)];
+                    const float* src = w.o.data() + r * hd;
+                    float* dst = ctx_.data() + (tile.start + a) * qd + (h0 + i) * hd;
+                    for (long e = 0; e < hd; ++e) dst[e] = src[e] * inv;
+                }
         });
     }
 

@@ -82,6 +82,15 @@ namespace albireo
             return o;
         }
 
+        // The result of an operation of the windows, with the code of its error.
+        json ok_result(bool ok, const user_error& error)
+        {
+            json o = json::object();
+            o["ok"] = ok;
+            if (!ok) error.add_to(o);
+            return o;
+        }
+
         bool parse_body(const httplib::Request& req, httplib::Response& res, json& body)
         {
             std::string error;
@@ -444,7 +453,7 @@ namespace albireo
         bool validate_settings(const json& body, std::string& error)
         {
             static const char* const keys[] = { "port", "language", "engine", "accelerator", "v2ram", "v2ram_max_mb",
-                "threads", "context", "max_sequences", "kv_mb", "check_updates", "offline", "proxy" };
+                "device_mb", "threads", "context", "max_sequences", "kv_mb", "check_updates", "offline", "proxy" };
             for (const auto& kv : body.items())
             {
                 if (std::find_if(std::begin(keys), std::end(keys), [&](const char* k) { return kv.first == k; })
@@ -479,11 +488,13 @@ namespace albireo
                 return false;
             }
             return one_of("language", { "auto", "en", "fr", "de", "it", "es" })
-                && one_of("engine", { "auto", "best", "cpu", "cpu-avx2", "openvino", "cuda" })
+                && one_of("engine", { "auto", "best", "cpu", "cpu-avx2", "cpu-avxvnni", "cpu-avx512", "openvino",
+                    "cuda" })
                 && one_of("accelerator", { "auto", "none", "npu", "gpu", "both" })
                 && in_range("port", 1024, 65535) && in_range("threads", 0, 1024) && in_range("context", 0, 1 << 20)
                 && in_range("max_sequences", 1, 64) && in_range("kv_mb", 0, 1 << 24)
-                && in_range("v2ram_max_mb", 0, 1 << 24) && boolean("v2ram") && boolean("check_updates")
+                && in_range("v2ram_max_mb", 0, 1 << 24) && in_range("device_mb", 0, 1 << 24) && boolean("v2ram")
+                && boolean("check_updates")
                 && boolean("offline");
         }
 
@@ -595,8 +606,8 @@ namespace albireo
         bool refuse_offline(service& svc, httplib::Response& res)
         {
             if (!svc.settings().get().offline) return false;
-            send_json(res, 409, ok_result(false, "offline mode: the catalog, the updates and the models come "
-                "from files (import)"));
+            send_json(res, 409, ok_result(false, user_error().set("offline mode: the catalog, the updates and the "
+                "models come from files (import)", "offline")));
             return true;
         }
     }
@@ -760,6 +771,7 @@ namespace albireo
             json loaded = json::array();
             for (const auto& id : s->engine().loaded_models()) loaded.push_back(id);
             o["loaded"] = loaded;
+            o["leaving"] = s->leaving_models();
             send_json(res, 200, o);
         });
         srv.Get("/albireo/v1/usage", [s](const httplib::Request&, httplib::Response& res) {
@@ -799,7 +811,7 @@ namespace albireo
         srv.Post(R"(/albireo/v1/models/([A-Za-z0-9._-]+)/download)", [s, admin](const httplib::Request& req,
                                                                                httplib::Response& res) {
             if (!admin(req, res) || refuse_offline(*s, res)) return;
-            std::string error;
+            user_error error;
             const bool ok = s->models().start_download(req.matches[1], error);
             send_json(res, ok ? 202 : 400, ok_result(ok, error));
         });
@@ -814,14 +826,14 @@ namespace albireo
             if (!admin(req, res)) return;
             json body;
             if (!parse_body(req, res, body)) return;
-            std::string error;
+            user_error error;
             const bool ok = s->activate(req.matches[1], body["role"].str("general"), error);
             send_json(res, ok ? 200 : 400, ok_result(ok, error));
         });
         srv.Post(R"(/albireo/v1/models/([A-Za-z0-9._-]+)/deactivate)", [s, admin](const httplib::Request& req,
                                                                                  httplib::Response& res) {
             if (!admin(req, res)) return;
-            std::string error;
+            user_error error;
             const bool ok = s->deactivate(req.matches[1], error);
             send_json(res, ok ? 200 : 400, ok_result(ok, error));
         });
@@ -834,10 +846,12 @@ namespace albireo
                                                                         httplib::Response& res) {
             if (!admin(req, res)) return;
             const std::string id = req.matches[1];
-            std::string error;
-            s->deactivate(id, error, true);
-            const bool ok = s->models().remove(id, error);
-            send_json(res, ok ? 200 : 400, ok_result(ok, error));
+            user_error error;
+            bool pending = false;
+            const bool ok = s->remove_model(id, error, pending);
+            json o = ok_result(ok, error);
+            if (ok) o["pending"] = pending;
+            send_json(res, ok ? 200 : 400, o);
         });
         // A folder or a file on a local drive or a medium: models, and the signed catalog
         // and update of an offline bundle.
@@ -926,7 +940,8 @@ namespace albireo
             // What the running engine or server cannot take without a restart.
             const bool restart = after.port != before.port || after.engine != before.engine
                 || after.accelerator != before.accelerator || after.v2ram != before.v2ram
-                || after.v2ram_max_mb != before.v2ram_max_mb || after.threads != before.threads
+                || after.v2ram_max_mb != before.v2ram_max_mb || after.device_mb != before.device_mb
+                || after.threads != before.threads
                 || after.context != before.context || after.max_sequences != before.max_sequences
                 || after.kv_mb != before.kv_mb;
             json o = ok_result(true);

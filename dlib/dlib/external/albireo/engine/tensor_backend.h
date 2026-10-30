@@ -29,8 +29,14 @@ namespace albireo
                 A product runs on the device with a copy of its weight matrix in single
                 precision, the element type of the tensors of dlib.  The copies are made
                 the first time the device takes a matrix and kept while they fit in a
-                budget shared by the models; beyond it, a matrix is expanded again at each
-                product it is given (CUDA), or left to the processor (OpenVINO).
+                budget shared by the models.  A model that lacks room takes it from the
+                models without requests, the least recently used first, each giving the
+                room asked and keeping its other copies; the copies that leave come back
+                when their model needs them again.  The copies of a model with requests in
+                progress or waiting stay, so that the requests of several models are served
+                together, each model keeping the room it holds.  Beyond the budget, a matrix
+                is expanded again at each product it is given (CUDA), or left to the
+                processor (OpenVINO), until a model has no more requests or copies leave.
 
                 Where a product runs is measured, shape by shape: the first products of a
                 shape run on the device and on the processor in turn, the faster place keeps
@@ -72,8 +78,9 @@ namespace albireo
         tensor_device(const tensor_device&) = delete;
         tensor_device& operator=(const tensor_device&) = delete;
 
-        // The offload of one model; it must be destroyed before this object.
-        std::unique_ptr<matmul_offload> make_offload();
+        // The offload of one model, named for the messages; it must be destroyed before
+        // this object.
+        std::unique_ptr<matmul_offload> make_offload(const std::string& model = std::string());
 
         // The counters of the device, for the statistics of the engine.
         json stats() const;
@@ -84,11 +91,13 @@ namespace albireo
         /*!
             ensures
                 - Returns the devices this build can use on this machine, in the form of the
-                  "devices" of engine_api.h, and sets reason when there is none.
+                  "devices" of engine_api.h, and sets reason when there is none, with its
+                  code and the values of the code in args (engine_api.h, "reason_code").
                 - Fills backend with the name of the backend ("cuda", "openvino", "dlib")
                   and runtime with the version of its runtime, when known.
         !*/
-        static json describe(std::string& backend, std::string& runtime, std::string& reason);
+        static json describe(std::string& backend, std::string& runtime, std::string& reason, std::string& code,
+            json& args);
 
     private:
         struct impl;

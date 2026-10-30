@@ -259,7 +259,27 @@
       "content": {
        "application/json": {
         "schema": {
-         "type": "object"
+         "type": "object",
+         "properties": {
+          "loaded": {
+           "type": "array",
+           "items": {
+            "type": "string"
+           },
+           "description": "Models of the engine."
+          },
+          "leaving": {
+           "type": "object",
+           "additionalProperties": {
+            "type": "string",
+            "enum": [
+             "unloading",
+             "removing"
+            ]
+           },
+           "description": "Models waiting for their requests before they leave the engine."
+          }
+         }
         }
        }
       }
@@ -649,6 +669,7 @@
      }
     ],
     "summary": "Deactivates a model for every function",
+    "description": "The model leaves the engine once its requests in progress and waiting are served; an activation meanwhile keeps it loaded. The model of the document search is replaced by the activation of another embedding model.",
     "parameters": [
      {
       "name": "id",
@@ -664,6 +685,24 @@
     "responses": {
      "200": {
       "description": "Deactivated",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "ok": {
+           "type": "boolean"
+          },
+          "error": {
+           "type": "string"
+          }
+         }
+        }
+       }
+      }
+     },
+     "400": {
+      "description": "Refused",
       "content": {
        "application/json": {
         "schema": {
@@ -731,6 +770,7 @@
      }
     ],
     "summary": "Deletes an installed model",
+    "description": "A model of the engine is deleted once its requests are served and it left the engine: pending is then true, and the model is listed under leaving until then.",
     "parameters": [
      {
       "name": "id",
@@ -745,7 +785,25 @@
     ],
     "responses": {
      "200": {
-      "description": "Deleted",
+      "description": "Deleted, or to be deleted",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "ok": {
+           "type": "boolean"
+          },
+          "pending": {
+           "type": "boolean"
+          }
+         }
+        }
+       }
+      }
+     },
+     "400": {
+      "description": "Refused",
       "content": {
        "application/json": {
         "schema": {
@@ -1849,6 +1907,10 @@
      "v2ram_max_mb": {
       "type": "integer",
       "description": "Limit of the extended memory, 0 for automatic."
+     },
+     "device_mb": {
+      "type": "integer",
+      "description": "Memory of the device for the copies of the weights of the models, in megabytes, 0 for automatic."
      },
      "threads": {
       "type": "integer"

@@ -3,19 +3,30 @@
 
 // Calls to the local service: its OpenAI compatible interface and its own interface.
 
+// An error of the service, with the code of its answer (model_not_found,
+// context_length_exceeded, unloaded...), which the interface explains in its language.
+function serviceError(message, code) {
+  const e = new Error(message);
+  if (code) e.code = code;
+  return e;
+}
+
 async function errorOf(r) {
   try {
     const j = await r.json();
-    if (j && j.error) return typeof j.error === 'string' ? j.error : j.error.message || r.statusText;
+    if (j && j.error) {
+      if (typeof j.error === 'string') return serviceError(j.error, j.code);
+      return serviceError(j.error.message || r.statusText, j.error.code);
+    }
   } catch (e) {
     // The body was not JSON.
   }
-  return r.status + ' ' + r.statusText;
+  return serviceError(r.status + ' ' + r.statusText);
 }
 
 export async function getJSON(url) {
   const r = await fetch(url, { cache: 'no-store' });
-  if (!r.ok) throw new Error(await errorOf(r));
+  if (!r.ok) throw await errorOf(r);
   return r.json();
 }
 
@@ -23,7 +34,7 @@ export async function postJSON(url, body, signal) {
   const r = await fetch(url, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal
   });
-  if (!r.ok) throw new Error(await errorOf(r));
+  if (!r.ok) throw await errorOf(r);
   return r.json();
 }
 
@@ -39,7 +50,7 @@ export async function* streamChat(body, signal) {
     body: JSON.stringify(Object.assign({}, body, { stream: true, stream_options: { include_usage: true } })),
     signal
   });
-  if (!r.ok) throw new Error(await errorOf(r));
+  if (!r.ok) throw await errorOf(r);
   const reader = r.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
@@ -59,7 +70,7 @@ export async function* streamChat(body, signal) {
           // The response is read to its end, so that the connection stays reusable.
           if (payload === '[DONE]') { finished = true; break; }
           const data = JSON.parse(payload);
-          if (data.error) throw new Error(data.error.message || 'error');
+          if (data.error) throw serviceError(data.error.message || 'error', data.error.code);
           yield { type: 'chunk', data };
         } else if (line.startsWith(': progress ')) {
           try {

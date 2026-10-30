@@ -30,6 +30,37 @@ namespace albireo
         const UINT WM_RESULT = WM_APP + 20;
         const UINT WM_PROGRESS = WM_APP + 21;
 
+        /*
+            A text that the service gives with a code: the text of prefix + code in the
+            language of the windows, with its values and its sizes, or the English text of
+            the service for a code the windows do not know.
+        */
+        std::wstring coded_text(const char* prefix, const json& code, const json& args, const json& sizes,
+            const std::string& english)
+        {
+            const std::string key = prefix + code.as_string();
+            if (code.as_string().empty() || !has_text(key)) return widen(english);
+            std::vector<std::pair<std::string, std::string>> values;
+            for (const auto& kv : args.items())
+                values.emplace_back(kv.first, kv.second.is_string() ? kv.second.as_string() : kv.second.dump());
+            for (const auto& kv : sizes.items())
+                values.emplace_back(kv.first, ui::format_size(static_cast<unsigned long long>(kv.second.as_int(0))));
+            return tr(key, values);
+        }
+
+        // The error of an answer of the service, or of a download.
+        std::wstring error_text(const json& r)
+        {
+            return coded_text("err_", r["code"], r["args"], r["sizes"], r["error"].as_string());
+        }
+
+        // Why an engine cannot run on this computer.
+        std::wstring reason_text(const json& engine)
+        {
+            return coded_text("why_", engine["reason_code"], engine["reason_args"], json(),
+                engine["reason"].as_string());
+        }
+
         class tool_window
         {
             /*!
@@ -224,6 +255,7 @@ namespace albireo
             std::string selected;
             bool busy = false;
             bool uploading = false;
+            bool showing_download = false;   // the status line shows the progress of a download
 
             models_window() { min_size = SIZE{ 760, 520 }; }
 
@@ -279,7 +311,9 @@ namespace albireo
                 int x = m;
                 for (HWND b : { download, activate, deactivate, verify, remove })
                 {
-                    const int bw = ui::button_width(b, px(90));
+                    const int bw = b == download
+                        ? ui::button_width(b, px(90), { tr("btn_download"), tr("btn_cancel_download") })
+                        : ui::button_width(b, px(90));
                     ui::place(b, x, actions_top, bw, bh);
                     x += bw + g;
                 }
@@ -343,9 +377,19 @@ namespace albireo
                 });
             }
 
+            // "unloading" or "removing" for a model that waits for its requests before it
+            // leaves the engine.
+            std::string leaving(const std::string& id) const
+            {
+                return overview["leaving"][id].as_string();
+            }
+
             std::wstring state_text(const json& m) const
             {
                 const std::string id = m["id"].as_string();
+                const std::string leave = leaving(id);
+                if (leave == "removing") return tr("state_removing");
+                if (leave == "unloading") return tr("state_unloading");
                 if (const json* d = download_of(id))
                 {
                     const std::string s = (*d)["state"].as_string();
@@ -432,9 +476,9 @@ namespace albireo
                 const json& sha = (*m)["sha256"].is_string() ? (*m)["sha256"] : (*m)["local_sha256"];
                 line("lbl_source", source.as_string());
                 line("lbl_sha256", sha.as_string());
-                if (const json* d = download_of(selected))
-                    if ((*d)["error"].is_string()) text += "\r\n" + (*d)["error"].as_string();
                 std::wstring w = widen(text);
+                if (const json* d = download_of(selected))
+                    if ((*d)["error"].is_string()) w += L"\r\n" + error_text(*d);
                 ui::set_text(details, w);
             }
 
@@ -445,16 +489,18 @@ namespace albireo
                 const bool in_catalog = m && (*m)["files"].is_array();
                 const bool dl = m && downloading(selected);
                 const bool update = installed && m->contains("up_to_date") && !(*m)["up_to_date"].as_bool(true);
+                // A model deleted once its requests are served takes no other action.
+                const bool removing = leaving(selected) == "removing";
                 // Offline, the models come from files only.
                 const bool offline = overview["offline"].as_bool(false);
                 ui::set_text(download, dl ? tr("btn_cancel_download") : tr("btn_download"));
                 ui::enable(download, !busy && m && (dl || (!offline && in_catalog && (!installed || update))));
-                ui::enable(activate, !busy && installed && !dl);
+                ui::enable(activate, !busy && installed && !dl && !removing);
                 // The document search keeps its embedding model, which another one replaces.
                 ui::enable(deactivate, !busy && installed && !active_roles(selected).empty()
-                    && !embedding_model(selected));
-                ui::enable(verify, !busy && installed);
-                ui::enable(remove, !busy && installed && !dl);
+                    && !embedding_model(selected) && !removing);
+                ui::enable(verify, !busy && installed && !removing);
+                ui::enable(remove, !busy && installed && !dl && !removing);
                 ui::enable(import, !busy && !uploading);
                 ui::enable(refresh, !busy && !offline);
                 // The progress of the download of the selected model.
@@ -464,16 +510,19 @@ namespace albireo
                     const double total = (*d)["total"].as_double(0), got = (*d)["received"].as_double(0);
                     ShowWindow(progress, SW_SHOW);
                     SendMessageW(progress, PBM_SETPOS, total > 0 ? static_cast<WPARAM>(1000 * got / total) : 0, 0);
-                    char buf[128];
                     const std::string done = ui::format_size(static_cast<unsigned long long>(got));
                     const std::string size = ui::format_size(static_cast<unsigned long long>(total));
-                    snprintf(buf, sizeof(buf), "%s / %s · %.1f MB/s", done.c_str(), size.c_str(),
-                        (*d)["speed"].as_double(0) / 1048576.0);
-                    ui::set_text(status, widen(buf));
+                    const unsigned long long rate = static_cast<unsigned long long>((*d)["speed"].as_double(0));
+                    const std::string speed = ui::format_size(rate);
+                    ui::set_text(status, widen(done + " / " + size + " · " + speed + "/s"));
+                    showing_download = true;
                 }
                 else if (!uploading)
                 {
                     ShowWindow(progress, SW_HIDE);
+                    // The progress of a download leaves with the selection of its model.
+                    if (showing_download) ui::set_text(status, L"");
+                    showing_download = false;
                 }
                 RECT rc;
                 GetClientRect(hwnd, &rc);
@@ -489,10 +538,14 @@ namespace albireo
                 request(R_ACTION, [c, m, path, body]() {
                     json r;
                     std::string error;
-                    if (!c.send(m.c_str(), path, body, r, error, 120))
+                    if (!c.send(m.c_str(), path, body, r, error, 120) && !r.contains("code"))
                     {
                         r = json::object();
                         r["error"] = error;
+                        r["code"] = "service";
+                        json args = json::object();
+                        args["e"] = error;
+                        r["args"] = args;
                     }
                     return r;
                 });
@@ -550,7 +603,7 @@ namespace albireo
                 busy = false;
                 if (tag == R_UPLOAD_DONE) uploading = false;
                 if (r.contains("error") && r["error"].is_string() && !r["error"].as_string().empty())
-                    ui::message(hwnd, widen(r["error"].as_string()), MB_OK | MB_ICONWARNING);
+                    ui::message(hwnd, error_text(r), MB_OK | MB_ICONWARNING);
                 else if (tag == R_VERIFY)
                 {
                     std::wstring text = r["local_match"].as_bool(false) ? tr("verify_ok") : tr("verify_bad");
@@ -847,8 +900,10 @@ namespace albireo
                 info_values = add(ui::label(hwnd, L"", IDC_H_INFO + 50), ui::font_kind::normal);
                 engine = add(ui::label(hwnd, L"", IDC_H_ENGINE), ui::font_kind::normal);
                 engines = add(ui::listview(hwnd, IDC_H_ENGINES, LVS_NOSORTHEADER));
-                const char* columns[] = { "col_engine", "col_version", "col_devices", "col_state", "col_measure" };
-                const int widths[] = { 140, 70, 230, 100, 100 };
+                // The state comes last: it gives the reason of an engine that cannot run here,
+                // and takes the width of its longest text.
+                const char* columns[] = { "col_engine", "col_version", "col_devices", "col_measure", "col_state" };
+                const int widths[] = { 110, 60, 220, 90, 160 };
                 for (int i = 0; i < 5; ++i)
                 {
                     std::wstring text = tr(columns[i]);
@@ -1005,8 +1060,8 @@ namespace albireo
                     std::wstring state = x["current"].as_bool(false) ? tr("in_use")
                         : x["usable"].as_bool(false) ? tr("usable") : tr("unavailable");
                     if (!x["usable"].as_bool(false) && x["reason"].is_string())
-                        state += L": " + widen(x["reason"].as_string());
-                    ListView_SetItemText(engines, row, 3, &state[0]);
+                        state += L": " + reason_text(x);
+                    ListView_SetItemText(engines, row, 4, &state[0]);
                     std::string measure;
                     for (const auto& o : eng["options"].elements())
                         if (o["variant"].as_string() == x["variant"].as_string()
@@ -1017,12 +1072,28 @@ namespace albireo
                             measure += (measure.empty() ? "" : ", ") + std::string(buf);
                         }
                     std::wstring ms = widen(measure);
-                    ListView_SetItemText(engines, row, 4, &ms[0]);
+                    ListView_SetItemText(engines, row, 3, &ms[0]);
                     ++row;
                 }
+                // The state takes the width of its longest text, or the rest of the list.
+                ListView_SetColumnWidth(engines, 4, LVSCW_AUTOSIZE);
+                const int fit = ListView_GetColumnWidth(engines, 4);
+                ListView_SetColumnWidth(engines, 4, LVSCW_AUTOSIZE_USEHEADER);
+                if (ListView_GetColumnWidth(engines, 4) < fit) ListView_SetColumnWidth(engines, 4, fit);
 
+                // V²RAM extends the memory of an NVIDIA card, for the CUDA engine only.
+                bool cuda = false;
+                for (const auto& x : eng["engines"].elements())
+                    cuda = cuda || (x["variant"].as_string() == "cuda" && x["usable"].as_bool(false));
+                ui::enable(v2ram, cuda);
+                ui::enable(v2max_label, cuda);
+                ui::enable(v2max, cuda);
                 const json& mem = e["stats"]["memory"];
-                if (mem.is_object() && mem["vram_budget"].as_int(0) > 0)
+                if (!cuda)
+                {
+                    ui::set_text(legend, tr("v2ram_no_cuda"));
+                }
+                else if (mem.is_object() && mem["vram_budget"].as_int(0) > 0)
                 {
                     auto size_of = [&](const char* key) {
                         return ui::format_size(static_cast<unsigned long long>(mem[key].as_int()));

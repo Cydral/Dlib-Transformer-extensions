@@ -54,16 +54,28 @@ skip() { record "$1" SKIP "$2" 0.0; }
 ENGINES=$BUILD/bin/engines
 CHAT=$BUILD/tests/engine_chat
 
-if [ -x "$BUILD/tests/test_qkernels" ]; then
-  step "quantized kernels" "all checks passed" "$BUILD/tests/test_qkernels"
-else
-  skip "quantized kernels" "no $BUILD/tests/test_qkernels (ALBIREO_TESTS=ON)"
-fi
+# The kernels of each family of processors, skipped by the processors without their instructions.
+for family in "" _avxvnni _avx512 _vnni256; do
+  test=$BUILD/tests/test_qkernels$family
+  name="quantized kernels${family:+ ${family#_}}"
+  if [ ! -x "$test" ]; then
+    [ -z "$family" ] && skip "$name" "no $test (ALBIREO_TESTS=ON)"
+    continue
+  fi
+  out=$("$test" 2>&1)
+  if printf '%s\n' "$out" | grep -q "skipped, the processor lacks"; then
+    skip "$name" "$(printf '%s\n' "$out" | grep -o 'lacks [^(]*' | head -1)"
+  else
+    step "$name" "all checks passed" "$test"
+  fi
+done
 
-for variant in cpu-avx2 cpu; do
+for variant in cpu-avx512 cpu-avxvnni cpu-avx2 cpu; do
   lib=$ENGINES/libalbireo-engine-$variant.so
   if [ ! -f "$lib" ]; then skip "engine $variant" "no $lib"
   elif [ ! -f "$MODEL" ]; then skip "engine $variant" "no $MODEL"
+  elif ! "$CHAT" "$lib" --describe > /dev/null 2>&1; then
+    skip "engine $variant" "$("$CHAT" "$lib" --describe 2>&1 | grep -o 'lacks [^(]*' | head -1)"
   else step "engine $variant" "Paris" "$CHAT" "$lib" "$MODEL" --reasoning off --max 40 "$QUESTION"
   fi
 done

@@ -47,6 +47,17 @@ namespace albireo
                 "NPU o GPU, el más rápido medido" } },
             { "accel_measure", { "Measure the engines", "Mesurer les moteurs", "Engines messen", "Misura i motori",
                 "Medir los motores" } },
+            { "accel_not_installed", { "No accelerator engine installed: OpenVINO (Intel NPU and graphics) or CUDA "
+                "(NVIDIA)", "Aucun moteur d'accélération installé : OpenVINO (NPU et graphique Intel) ou CUDA (NVIDIA)",
+                "Keine Beschleuniger-Engine installiert: OpenVINO (Intel-NPU und -Grafik) oder CUDA (NVIDIA)",
+                "Nessun motore di accelerazione installato: OpenVINO (NPU e grafica Intel) o CUDA (NVIDIA)",
+                "Ningún motor de aceleración instalado: OpenVINO (NPU y gráficos Intel) o CUDA (NVIDIA)" } },
+            { "accel_unusable", { "The accelerator engines of this installation cannot run here (see This computer)",
+                "Les moteurs d'accélération de cette installation ne peuvent pas fonctionner ici (voir Cet "
+                "ordinateur)", "Die Beschleuniger-Engines dieser Installation können hier nicht laufen (siehe "
+                "Dieser Computer)", "I motori di accelerazione di questa installazione non possono funzionare qui "
+                "(vedere Questo computer)", "Los motores de aceleración de esta instalación no pueden funcionar aquí "
+                "(véase Este equipo)" } },
             { "accel_cpu_only", { "Available while the processor engine runs",
                 "Disponible lorsque le moteur processeur est actif", "Verfügbar, solange die Prozessor-Engine läuft",
                 "Disponibile quando è attivo il motore del processore",
@@ -137,6 +148,135 @@ namespace albireo
             { "state_queued", { "Waiting", "En attente", "Wartet", "In attesa", "En espera" } },
             { "state_error", { "Error", "Erreur", "Fehler", "Errore", "Error" } },
             { "state_cancelled", { "Cancelled", "Annulé", "Abgebrochen", "Annullato", "Cancelado" } },
+            { "state_unloading", { "Unloading", "Déchargement", "Wird entladen", "Rilascio in corso",
+                "Liberando memoria" } },
+            { "state_removing", { "Deleting", "Suppression", "Wird gelöscht", "Eliminazione", "Eliminando" } },
+            // The errors of the service, by their code ({m}: the model).
+            { "err_stopping", { "The service is stopping.", "Le service s'arrête.", "Der Dienst wird beendet.",
+                "Il servizio si sta arrestando.", "El servicio se está deteniendo." } },
+            { "err_offline", { "Offline mode: the catalog, the models and the updates come from imports.",
+                "Mode hors ligne : le catalogue, les modèles et les mises à jour viennent d'imports.",
+                "Offline-Modus: Katalog, Modelle und Updates kommen aus Importen.",
+                "Modalità offline: il catalogo, i modelli e gli aggiornamenti provengono da importazioni.",
+                "Modo sin conexión: el catálogo, los modelos y las actualizaciones proceden de importaciones." } },
+            { "err_service", { "The Albireo service does not answer ({e}).", "Le service Albireo ne répond pas ({e}).",
+                "Der Albireo-Dienst antwortet nicht ({e}).", "Il servizio Albireo non risponde ({e}).",
+                "El servicio Albireo no responde ({e})." } },
+            { "err_not_in_catalog", { "{m} is not in the catalog.", "{m} ne figure pas dans le catalogue.",
+                "{m} ist nicht im Katalog.", "{m} non è nel catalogo.", "{m} no está en el catálogo." } },
+            { "err_catalog_entry", { "The catalog entry of {m} is not valid; update the catalog.",
+                "L'entrée du catalogue pour {m} n'est pas valide ; actualisez le catalogue.",
+                "Der Katalogeintrag von {m} ist ungültig; aktualisieren Sie den Katalog.",
+                "La voce del catalogo di {m} non è valida; aggiornate il catalogo.",
+                "La entrada del catálogo de {m} no es válida; actualice el catálogo." } },
+            { "err_disk_space", { "Not enough space in the models folder for {m}: {needed} are needed, {model} for "
+                "the model and {reserve} kept free for the system, and {available} are free. Free some space, or "
+                "choose a models folder on another drive in This computer.",
+                "Espace insuffisant dans le dossier des modèles pour {m} : il faut {needed}, soit {model} pour le "
+                "modèle et {reserve} laissés libres pour le système, et {available} sont libres. Libérez de la "
+                "place, ou choisissez un dossier des modèles sur un autre disque dans Cet ordinateur.",
+                "Nicht genug Platz im Modellordner für {m}: Benötigt werden {needed}, {model} für das Modell und "
+                "{reserve}, die für das System frei bleiben, und {available} sind frei. Geben Sie Speicherplatz "
+                "frei oder wählen Sie unter Dieser Computer einen Modellordner auf einem anderen Laufwerk.",
+                "Spazio insufficiente nella cartella dei modelli per {m}: servono {needed}, {model} per il modello "
+                "e {reserve} lasciati liberi per il sistema, e sono liberi {available}. Liberate spazio o scegliete "
+                "una cartella dei modelli su un altro disco in Questo computer.",
+                "No hay espacio suficiente en la carpeta de modelos para {m}: se necesitan {needed}, {model} para "
+                "el modelo y {reserve} que quedan libres para el sistema, y hay {available} libres. Libere espacio "
+                "o elija una carpeta de modelos en otra unidad en Este equipo." } },
+            { "err_unknown_role", { "Unknown function: {role}.", "Fonction inconnue : {role}.",
+                "Unbekannte Funktion: {role}.", "Funzione sconosciuta: {role}.", "Función desconocida: {role}." } },
+            { "err_not_installed", { "{m} is not installed.", "{m} n'est pas installé.", "{m} ist nicht installiert.",
+                "{m} non è installato.", "{m} no está instalado." } },
+            { "err_being_deleted", { "{m} is being deleted, once its requests in progress are served.",
+                "{m} est en cours de suppression, une fois servies ses requêtes en cours.",
+                "{m} wird gelöscht, sobald seine laufenden Anfragen beantwortet sind.",
+                "{m} è in corso di eliminazione, appena servite le sue richieste in corso.",
+                "{m} se está eliminando, en cuanto se atiendan sus solicitudes en curso." } },
+            { "err_needs_embedding_model", { "{m} writes text: the document search needs an embedding model.",
+                "{m} rédige du texte : la recherche documentaire demande un modèle d'embeddings.",
+                "{m} schreibt Text: Die Dokumentensuche braucht ein Embedding-Modell.",
+                "{m} scrive testo: la ricerca nei documenti richiede un modello di embedding.",
+                "{m} escribe texto: la búsqueda en documentos necesita un modelo de embeddings." } },
+            { "err_embedding_model_only", { "{m} computes the vectors of the document search and answers no "
+                "conversation.", "{m} calcule les vecteurs de la recherche documentaire et ne répond à aucune "
+                "conversation.", "{m} berechnet die Vektoren der Dokumentensuche und beantwortet keine Unterhaltung.",
+                "{m} calcola i vettori della ricerca nei documenti e non risponde ad alcuna conversazione.",
+                "{m} calcula los vectores de la búsqueda en documentos y no responde a ninguna conversación." } },
+            { "err_load_failed", { "{m} could not be loaded: {e}", "{m} n'a pas pu être chargé : {e}",
+                "{m} konnte nicht geladen werden: {e}", "{m} non è stato caricato: {e}",
+                "{m} no se pudo cargar: {e}" } },
+            { "err_embedding_needed", { "The document search needs an embedding model: activate another one for this "
+                "function to replace {m}.", "La recherche documentaire a besoin d'un modèle d'embeddings : activez-en "
+                "un autre pour cette fonction afin de remplacer {m}.", "Die Dokumentensuche braucht ein "
+                "Embedding-Modell: Aktivieren Sie ein anderes für diese Funktion, um {m} zu ersetzen.",
+                "La ricerca nei documenti ha bisogno di un modello di embedding: attivatene un altro per questa "
+                "funzione per sostituire {m}.", "La búsqueda en documentos necesita un modelo de embeddings: active "
+                "otro para esta función para sustituir a {m}." } },
+            { "err_delete_failed", { "{m} could not be deleted: its file is in use or protected ({file}).",
+                "{m} n'a pas pu être supprimé : son fichier est utilisé ou protégé ({file}).",
+                "{m} konnte nicht gelöscht werden: Seine Datei ist in Gebrauch oder geschützt ({file}).",
+                "{m} non è stato eliminato: il suo file è in uso o protetto ({file}).",
+                "{m} no se pudo eliminar: su archivo está en uso o protegido ({file})." } },
+            { "err_download_failed", { "The download failed: {e}", "Le téléchargement a échoué : {e}",
+                "Der Download ist fehlgeschlagen: {e}", "Il download non è riuscito: {e}",
+                "La descarga ha fallado: {e}" } },
+            { "err_download_file", { "The file of the download cannot be created: {file}",
+                "Le fichier du téléchargement ne peut pas être créé : {file}",
+                "Die Datei des Downloads kann nicht angelegt werden: {file}",
+                "Il file del download non può essere creato: {file}",
+                "No se puede crear el archivo de la descarga: {file}" } },
+            { "err_download_hash", { "The downloaded file does not match the fingerprint of the catalog; it was "
+                "deleted.", "Le fichier téléchargé ne correspond pas à l'empreinte du catalogue ; il a été supprimé.",
+                "Die heruntergeladene Datei entspricht nicht dem Fingerabdruck des Katalogs; sie wurde gelöscht.",
+                "Il file scaricato non corrisponde all'impronta del catalogo; è stato eliminato.",
+                "El archivo descargado no coincide con la huella del catálogo; se ha eliminado." } },
+            { "err_download_install", { "The downloaded model could not be installed: {e}",
+                "Le modèle téléchargé n'a pas pu être installé : {e}",
+                "Das heruntergeladene Modell konnte nicht installiert werden: {e}",
+                "Il modello scaricato non è stato installato: {e}", "El modelo descargado no se pudo instalar: {e}" } },
+            // Why an engine cannot run on this computer, by its code.
+            { "why_isa_avx2", { "the processor lacks AVX2, FMA or F16C", "le processeur ne dispose pas d'AVX2, FMA "
+                "ou F16C", "dem Prozessor fehlen AVX2, FMA oder F16C", "il processore non dispone di AVX2, FMA o F16C",
+                "el procesador no dispone de AVX2, FMA o F16C" } },
+            { "why_isa_avx_vnni", { "the processor lacks AVX-VNNI (Intel Core from the 12th generation on, AMD Zen 5)",
+                "le processeur ne dispose pas d'AVX-VNNI (Intel Core à partir de la 12e génération, AMD Zen 5)",
+                "dem Prozessor fehlt AVX-VNNI (Intel Core ab der 12. Generation, AMD Zen 5)",
+                "il processore non dispone di AVX-VNNI (Intel Core dalla 12ª generazione, AMD Zen 5)",
+                "el procesador no dispone de AVX-VNNI (Intel Core desde la 12.ª generación, AMD Zen 5)" } },
+            { "why_isa_avx512", { "the processor lacks AVX-512 with VNNI (Intel Xeon from Cascade Lake on, Intel Core "
+                "Ice Lake, Tiger Lake and Rocket Lake, AMD Zen 4 and later)", "le processeur ne dispose pas "
+                "d'AVX-512 avec VNNI (Intel Xeon depuis Cascade Lake, Intel Core Ice Lake, Tiger Lake et Rocket Lake, "
+                "AMD Zen 4 et suivants)", "dem Prozessor fehlt AVX-512 mit VNNI (Intel Xeon ab Cascade Lake, Intel "
+                "Core Ice Lake, Tiger Lake und Rocket Lake, AMD Zen 4 und neuer)", "il processore non dispone di "
+                "AVX-512 con VNNI (Intel Xeon da Cascade Lake, Intel Core Ice Lake, Tiger Lake e Rocket Lake, AMD "
+                "Zen 4 e successivi)", "el procesador no dispone de AVX-512 con VNNI (Intel Xeon desde Cascade Lake, "
+                "Intel Core Ice Lake, Tiger Lake y Rocket Lake, AMD Zen 4 y posteriores)" } },
+            { "why_no_nvidia_driver", { "no NVIDIA driver is installed", "aucun pilote NVIDIA n'est installé",
+                "kein NVIDIA-Treiber installiert", "nessun driver NVIDIA installato",
+                "no hay ningún controlador NVIDIA instalado" } },
+            { "why_old_nvidia_driver", { "the NVIDIA driver supports {driver}, this engine needs {runtime}: update "
+                "the driver", "le pilote NVIDIA prend en charge {driver}, ce moteur demande {runtime} : mettez à jour "
+                "le pilote", "der NVIDIA-Treiber unterstützt {driver}, diese Engine braucht {runtime}: Treiber "
+                "aktualisieren", "il driver NVIDIA supporta {driver}, questo motore richiede {runtime}: aggiornate "
+                "il driver", "el controlador NVIDIA admite {driver}, este motor necesita {runtime}: actualice el "
+                "controlador" } },
+            { "why_no_nvidia_card", { "no NVIDIA graphics card was found", "aucune carte graphique NVIDIA n'a été "
+                "trouvée", "keine NVIDIA-Grafikkarte gefunden", "nessuna scheda grafica NVIDIA trovata",
+                "no se ha encontrado ninguna tarjeta gráfica NVIDIA" } },
+            { "why_old_nvidia_card", { "{card} predates the cards of this engine (compute capability {cc} and later)",
+                "{card} est antérieure aux cartes de ce moteur (capacité de calcul {cc} et suivantes)",
+                "{card} ist älter als die Karten dieser Engine (Compute Capability {cc} und höher)",
+                "{card} è precedente alle schede di questo motore (capacità di calcolo {cc} e successive)",
+                "{card} es anterior a las tarjetas de este motor (capacidad de cómputo {cc} y posteriores)" } },
+            { "why_no_intel_device", { "no NPU or Intel graphics processor was found", "aucun NPU ni processeur "
+                "graphique Intel n'a été trouvé", "keine NPU und kein Intel-Grafikprozessor gefunden",
+                "nessuna NPU né processore grafico Intel trovato",
+                "no se ha encontrado ninguna NPU ni procesador gráfico Intel" } },
+            { "why_library_failed", { "the library could not be loaded (code {code})", "la bibliothèque n'a pas pu "
+                "être chargée (code {code})", "die Bibliothek konnte nicht geladen werden (Code {code})",
+                "la libreria non è stata caricata (codice {code})",
+                "no se pudo cargar la biblioteca (código {code})" } },
             { "state_update", { "Update available", "Mise à jour disponible", "Update verfügbar",
                 "Aggiornamento disponibile", "Actualización disponible" } },
             { "btn_download", { "Download", "Télécharger", "Herunterladen", "Scarica", "Descargar" } },
@@ -265,6 +405,13 @@ namespace albireo
             { "v2ram_host", { "in system memory", "en mémoire système", "im Arbeitsspeicher",
                 "nella memoria di sistema", "en la memoria del sistema" } },
             { "v2ram_disk", { "on disk", "sur disque", "auf dem Datenträger", "su disco", "en disco" } },
+            { "v2ram_no_cuda", { "V²RAM extends the memory of an NVIDIA graphics card for the CUDA engine, which is "
+                "not usable on this computer.", "V²RAM étend la mémoire d'une carte graphique NVIDIA pour le moteur "
+                "CUDA, qui n'est pas utilisable sur cet ordinateur.", "V²RAM erweitert den Speicher einer "
+                "NVIDIA-Grafikkarte für die CUDA-Engine, die auf diesem Computer nicht verwendbar ist.", "V²RAM "
+                "estende la memoria di una scheda grafica NVIDIA per il motore CUDA, che non è utilizzabile su "
+                "questo computer.", "V²RAM amplía la memoria de una tarjeta gráfica NVIDIA para el motor CUDA, que "
+                "no se puede usar en este equipo." } },
             { "v2ram_none", { "The engine in use keeps its data in system memory.",
                 "Le moteur utilisé garde ses données en mémoire système.",
                 "Die verwendete Engine hält ihre Daten im Arbeitsspeicher.",
@@ -521,16 +668,33 @@ namespace albireo
         return widen(tr_utf8(key));
     }
 
+    namespace
+    {
+        void replace_marks(std::string& s, const std::string& name, const std::string& value)
+        {
+            const std::string mark = "{" + name + "}";
+            for (size_t p = s.find(mark); p != std::string::npos; p = s.find(mark, p + value.size()))
+                s.replace(p, mark.size(), value);
+        }
+    }
+
     std::wstring tr(const char* key, std::initializer_list<std::pair<const char*, std::string>> values)
     {
         std::string s = tr_utf8(key);
-        for (const auto& v : values)
-        {
-            const std::string mark = std::string("{") + v.first + "}";
-            for (size_t p = s.find(mark); p != std::string::npos; p = s.find(mark, p + v.second.size()))
-                s.replace(p, mark.size(), v.second);
-        }
+        for (const auto& v : values) replace_marks(s, v.first, v.second);
         return widen(s);
+    }
+
+    std::wstring tr(const std::string& key, const std::vector<std::pair<std::string, std::string>>& values)
+    {
+        std::string s = tr_utf8(key.c_str());
+        for (const auto& v : values) replace_marks(s, v.first, v.second);
+        return widen(s);
+    }
+
+    bool has_text(const std::string& key)
+    {
+        return table().count(key) != 0;
     }
 
 }

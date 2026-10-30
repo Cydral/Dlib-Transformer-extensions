@@ -158,12 +158,14 @@ namespace
     void test_dots(std::mt19937& rng)
     {
         std::uniform_real_distribution<float> value(-2.0f, 2.0f);
-        const long n = 1024;
         for (const fmt& f : formats())
         {
             double worst = 0;
             for (int trial = 0; trial < 50; ++trial)
             {
+                // An odd number of blocks, or a length that no vector divides, every other
+                // trial: the kernels that take two blocks or 16 values at a time end alone.
+                const long n = trial % 2 == 0 ? 1024 : f.block == 256 ? 1280 : f.block == 32 ? 1056 : 1003;
                 const std::vector<uint8_t> w = random_row(f, n, rng);
                 std::vector<float> x(static_cast<size_t>(n));
                 for (auto& e : x) e = value(rng);
@@ -236,78 +238,85 @@ namespace
         }
     }
 
-    void test_matmul(std::mt19937& rng, thread_pool& pool)
+    void test_matmul_case(const fmt& f, long cols, std::mt19937& rng, thread_pool& pool)
     {
         std::uniform_real_distribution<float> value(-1.0f, 1.0f);
+        const long rows = 77;
+        std::vector<uint8_t> data;
+        for (long r = 0; r < rows; ++r)
+        {
+            const std::vector<uint8_t> row = random_row(f, cols, rng);
+            data.insert(data.end(), row.begin(), row.end());
+        }
+        weight_matrix W;
+        W.type = f.type;
+        W.data = data.data();
+        W.rows = rows;
+        W.cols = cols;
+        W.row_bytes = qk_row_bytes(f.type, cols);
+        check(W.row_bytes * rows == data.size(), "row bytes");
+
+        for (long tokens : { 1L, 3L, 7L, 8L, 37L, 100L })
+        {
+            const long xs = cols + 5, ys = rows + 3;
+            std::vector<float> X(static_cast<size_t>(tokens * xs));
+            for (auto& e : X) e = value(rng);
+            std::vector<float> Y(static_cast<size_t>(tokens * ys), 7.0f);
+            qk_scratch scratch;
+            qk_matmul(W, X.data(), tokens, xs, Y.data(), ys, pool, scratch);
+            std::vector<float> Y2 = Y;
+            qk_matmul(W, X.data(), tokens, xs, Y2.data(), ys, pool, scratch, true);
+
+            // Few tokens go through the integer kernels, many through floats.
+            const bool floats = tokens >= qk_float_product_tokens;
+            const act_format af = qk_activation_format(f.type);
+            std::vector<uint8_t> act(qk_activation_row_bytes(af, cols));
+            std::vector<float> wf(static_cast<size_t>(cols));
+            for (long t = 0; t < tokens; ++t)
+            {
+                qk_quantize_row(af, X.data() + t * xs, act.data(), cols);
+                for (long r = 0; r < rows; ++r)
+                {
+                    float ref;
+                    // Single precision sums: their rounding follows the magnitude of
+                    // the terms rather than that of the result.
+                    double mag = 0;
+                    if (floats)
+                    {
+                        qk_dequantize_row(f.type, W.data + r * W.row_bytes, wf.data(), cols);
+                        double d = 0;
+                        for (long i = 0; i < cols; ++i)
+                        {
+                            const double p = static_cast<double>(wf[static_cast<size_t>(i)])
+                                * X[static_cast<size_t>(t * xs + i)];
+                            d += p;
+                            mag += std::fabs(p);
+                        }
+                        ref = static_cast<float>(d);
+                    }
+                    else
+                    {
+                        ref = qk_dot(f.type, W.data + r * W.row_bytes, act.data(), cols);
+                    }
+                    const float got = Y[static_cast<size_t>(t * ys + r)];
+                    const double tol = 1e-5 * (std::fabs(ref) + 1) + 2e-6 * mag;
+                    check(std::fabs(got - ref) <= tol, "matmul", got, ref);
+                    check(std::fabs(Y2[static_cast<size_t>(t * ys + r)] - 2 * ref) <= 2 * tol,
+                        "matmul accumulate", Y2[static_cast<size_t>(t * ys + r)], 2 * ref);
+                }
+                for (long r = rows; r < ys; ++r)
+                    check(Y[static_cast<size_t>(t * ys + r)] == 7.0f, "matmul writes outside its rows");
+            }
+        }
+    }
+
+    void test_matmul(std::mt19937& rng, thread_pool& pool)
+    {
         for (const fmt& f : formats())
         {
-            const long rows = 77, cols = 512;
-            std::vector<uint8_t> data;
-            for (long r = 0; r < rows; ++r)
-            {
-                const std::vector<uint8_t> row = random_row(f, cols, rng);
-                data.insert(data.end(), row.begin(), row.end());
-            }
-            weight_matrix W;
-            W.type = f.type;
-            W.data = data.data();
-            W.rows = rows;
-            W.cols = cols;
-            W.row_bytes = qk_row_bytes(f.type, cols);
-            check(W.row_bytes * rows == data.size(), "row bytes");
-
-            for (long tokens : { 1L, 3L, 7L, 8L, 37L, 100L })
-            {
-                const long xs = cols + 5, ys = rows + 3;
-                std::vector<float> X(static_cast<size_t>(tokens * xs));
-                for (auto& e : X) e = value(rng);
-                std::vector<float> Y(static_cast<size_t>(tokens * ys), 7.0f);
-                qk_scratch scratch;
-                qk_matmul(W, X.data(), tokens, xs, Y.data(), ys, pool, scratch);
-                std::vector<float> Y2 = Y;
-                qk_matmul(W, X.data(), tokens, xs, Y2.data(), ys, pool, scratch, true);
-
-                // Few tokens go through the integer kernels, many through floats.
-                const bool floats = tokens >= qk_float_product_tokens;
-                const act_format af = qk_activation_format(f.type);
-                std::vector<uint8_t> act(qk_activation_row_bytes(af, cols));
-                std::vector<float> wf(static_cast<size_t>(cols));
-                for (long t = 0; t < tokens; ++t)
-                {
-                    qk_quantize_row(af, X.data() + t * xs, act.data(), cols);
-                    for (long r = 0; r < rows; ++r)
-                    {
-                        float ref;
-                        // Single precision sums: their rounding follows the magnitude of
-                        // the terms rather than that of the result.
-                        double mag = 0;
-                        if (floats)
-                        {
-                            qk_dequantize_row(f.type, W.data + r * W.row_bytes, wf.data(), cols);
-                            double d = 0;
-                            for (long i = 0; i < cols; ++i)
-                            {
-                                const double p = static_cast<double>(wf[static_cast<size_t>(i)])
-                                    * X[static_cast<size_t>(t * xs + i)];
-                                d += p;
-                                mag += std::fabs(p);
-                            }
-                            ref = static_cast<float>(d);
-                        }
-                        else
-                        {
-                            ref = qk_dot(f.type, W.data + r * W.row_bytes, act.data(), cols);
-                        }
-                        const float got = Y[static_cast<size_t>(t * ys + r)];
-                        const double tol = 1e-5 * (std::fabs(ref) + 1) + 2e-6 * mag;
-                        check(std::fabs(got - ref) <= tol, "matmul", got, ref);
-                        check(std::fabs(Y2[static_cast<size_t>(t * ys + r)] - 2 * ref) <= 2 * tol,
-                            "matmul accumulate", Y2[static_cast<size_t>(t * ys + r)], 2 * ref);
-                    }
-                    for (long r = rows; r < ys; ++r)
-                        check(Y[static_cast<size_t>(t * ys + r)] == 7.0f, "matmul writes outside its rows");
-                }
-            }
+            test_matmul_case(f, 512, rng, pool);
+            // The formats of single values also take a length that no vector divides.
+            if (f.block == 1) test_matmul_case(f, 523, rng, pool);
         }
         std::printf("  matmul: every format, 1 to 100 tokens, integer and float paths, strided, accumulated\n");
     }
@@ -394,6 +403,70 @@ namespace
         std::printf("  conversions and vector helpers\n");
     }
 
+    void test_attention_tiles(std::mt19937& rng)
+    {
+        // Rows of queries against blocks of keys and values in half precision, with sizes
+        // around the groups and the vector widths of the kernels.
+        std::uniform_real_distribution<float> value(-2.0f, 2.0f);
+        const long cases[][3] = { { 1, 1, 64 }, { 2, 5, 128 }, { 3, 37, 80 }, { 64, 256, 128 }, { 5, 100, 256 },
+            { 2, 33, 72 }, { 7, 70, 64 }, { 1, 256, 128 }, { 4, 9, 40 } };
+        for (const auto& c : cases)
+        {
+            const long rows = c[0], m = c[1], hd = c[2];
+            const long lds = m + 3;
+            std::vector<float> Q(static_cast<size_t>(rows * hd)), O(static_cast<size_t>(rows * hd));
+            std::vector<float> P(static_cast<size_t>(rows * lds));
+            std::vector<uint16_t> K(static_cast<size_t>(m * hd)), V(static_cast<size_t>(m * hd));
+            for (auto& e : Q) e = value(rng);
+            for (auto& e : O) e = value(rng);
+            for (auto& e : P) e = value(rng) * 0.5f + 0.5f;
+            for (auto& e : K) e = qk_float_to_half(value(rng));
+            for (auto& e : V) e = qk_float_to_half(value(rng));
+            std::vector<float> scratch(static_cast<size_t>(qk_attention_scratch(hd)));
+
+            std::vector<float> S(static_cast<size_t>(rows * lds), 1234.0f);
+            qk_attention_scores(Q.data(), rows, K.data(), m, hd, S.data(), lds, scratch.data());
+            double worst = 0;
+            for (long r = 0; r < rows; ++r)
+            {
+                for (long j = 0; j < m; ++j)
+                {
+                    double ref = 0, mag = 0;
+                    for (long i = 0; i < hd; ++i)
+                    {
+                        const double t = static_cast<double>(Q[static_cast<size_t>(r * hd + i)])
+                            * qk_half_to_float(K[static_cast<size_t>(j * hd + i)]);
+                        ref += t;
+                        mag += std::fabs(t);
+                    }
+                    worst = std::max(worst, std::fabs(S[static_cast<size_t>(r * lds + j)] - ref) / (mag + 1));
+                }
+                for (long j = m; j < lds; ++j)
+                    check(S[static_cast<size_t>(r * lds + j)] == 1234.0f, "attention scores stay in their rows");
+            }
+            check(worst <= 1e-6, "attention scores", worst, static_cast<double>(rows * 1000000 + m * 1000 + hd));
+
+            std::vector<float> got = O;
+            qk_attention_values(P.data(), lds, rows, V.data(), m, hd, got.data(), scratch.data());
+            worst = 0;
+            for (long r = 0; r < rows; ++r)
+                for (long i = 0; i < hd; ++i)
+                {
+                    double ref = O[static_cast<size_t>(r * hd + i)], mag = std::fabs(ref);
+                    for (long j = 0; j < m; ++j)
+                    {
+                        const double t = static_cast<double>(P[static_cast<size_t>(r * lds + j)])
+                            * qk_half_to_float(V[static_cast<size_t>(j * hd + i)]);
+                        ref += t;
+                        mag += std::fabs(t);
+                    }
+                    worst = std::max(worst, std::fabs(got[static_cast<size_t>(r * hd + i)] - ref) / (mag + 1));
+                }
+            check(worst <= 1e-6, "attention values", worst, static_cast<double>(rows * 1000000 + m * 1000 + hd));
+        }
+        std::printf("  attention by tiles\n");
+    }
+
     void test_pool(thread_pool& pool)
     {
         // Many small sections in a row, the pattern of a generation step.
@@ -428,6 +501,12 @@ namespace
 
 int main()
 {
+    const unsigned lacks = qk_missing_isa(read_cpu_info());
+    if (lacks)
+    {
+        std::printf("albireo quantized kernels (%s): skipped, the processor lacks %s\n", qk_isa(), qk_isa_text(lacks));
+        return 0;
+    }
     std::printf("albireo quantized kernels (%s)\n", qk_isa());
     std::mt19937 rng(1234);
     thread_pool pool(4);
@@ -435,6 +514,7 @@ int main()
     test_dots(rng);
     test_matmul(rng, pool);
     test_helpers(rng);
+    test_attention_tiles(rng);
     test_pool(pool);
     if (failures)
     {

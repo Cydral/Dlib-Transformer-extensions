@@ -6,6 +6,7 @@
 #include <initializer_list>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace albireo
 {
@@ -27,6 +28,9 @@ namespace albireo
     std::wstring tr(const char* key);
     // A text with its {name} marks replaced by the values given.
     std::wstring tr(const char* key, std::initializer_list<std::pair<const char*, std::string>> values);
+    std::wstring tr(const std::string& key, const std::vector<std::pair<std::string, std::string>>& values);
+    // Whether the table holds a text for key.
+    bool has_text(const std::string& key);
 
 }
 

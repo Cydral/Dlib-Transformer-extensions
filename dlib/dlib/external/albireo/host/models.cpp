@@ -212,7 +212,7 @@ namespace albireo
         std::atomic<uint64_t> received{0};
         std::atomic<bool> cancel{false};
         std::string state = "queued";
-        std::string error;
+        user_error error;
         double speed = 0;
         int64_t started = 0;
         std::thread worker;
@@ -441,28 +441,29 @@ namespace albireo
             d["received"] = static_cast<unsigned long long>(j.received.load());
             d["total"] = static_cast<unsigned long long>(j.total);
             d["speed"] = j.speed;
-            if (!j.error.empty()) d["error"] = j.error;
+            if (!j.error.text.empty()) j.error.add_to(d);
             out.push_back(d);
         }
         return out;
     }
 
-    bool model_manager::start_download(const std::string& id, std::string& error)
+    bool model_manager::start_download(const std::string& id, user_error& error)
     {
         if (stopped_)
         {
-            error = "the service stops";
+            error.set("the service stops", "stopping");
             return false;
         }
         json entry;
         if (!catalog_entry(id, entry))
         {
-            error = "the model '" + id + "' is not in the catalog";
+            error.set("the model '" + id + "' is not in the catalog", "not_in_catalog").arg("m", id);
             return false;
         }
+        const std::string name = entry["name"].str(id);
         if (!safe_id(id))
         {
-            error = "invalid model identifier";
+            error.set("invalid model identifier", "catalog_entry").arg("m", name);
             return false;
         }
         std::shared_ptr<job> j(new job());
@@ -482,7 +483,7 @@ namespace albireo
             const bool gz = f["compression"].as_string() == "gzip";
             if (url.empty() || size == 0)
             {
-                error = "the catalog entry of '" + id + "' lists an invalid file";
+                error.set("the catalog entry of '" + id + "' lists an invalid file", "catalog_entry").arg("m", name);
                 return false;
             }
             if (gz)
@@ -497,7 +498,8 @@ namespace albireo
                 c->part = part;
                 if (c->length == 0)
                 {
-                    error = "the catalog entry of '" + id + "' gives no compressed size";
+                    error.set("the catalog entry of '" + id + "' gives no compressed size", "catalog_entry")
+                        .arg("m", name);
                     return false;
                 }
                 j->chunks.push_back(std::move(c));
@@ -522,14 +524,20 @@ namespace albireo
         j->total = offset;
         if (static_cast<uint64_t>(entry["size"].as_int(static_cast<long long>(offset))) != offset)
         {
-            error = "the sizes of the parts of '" + id + "' do not add up to the size of the model";
+            error.set("the sizes of the parts of '" + id + "' do not add up to the size of the model", "catalog_entry")
+                .arg("m", name);
             return false;
         }
+        // The model, and room kept free for the system and the other programs.
         const uint64_t room = free_disk_space(dir_);
-        if (room < offset + (offset / 20) + (256ull << 20) && !file_exists(j->partial))
+        const uint64_t reserve = offset / 20 + (256ull << 20);
+        if (room < offset + reserve && !file_exists(j->partial))
         {
-            error = "not enough disk space: " + std::to_string(offset >> 20) + " MB needed, "
-                + std::to_string(room >> 20) + " MB available";
+            error.set("not enough disk space for " + id + ": " + std::to_string((offset + reserve) >> 20)
+                + " MB needed (" + std::to_string(offset >> 20) + " MB for the model, " + std::to_string(reserve >> 20)
+                + " MB kept free), " + std::to_string(room >> 20) + " MB available", "disk_space")
+                .arg("m", name).size("needed", offset + reserve).size("model", offset).size("reserve", reserve)
+                .size("available", room);
             return false;
         }
 
@@ -569,12 +577,29 @@ namespace albireo
                 {
                     std::lock_guard<std::mutex> lock(m_);
                     j->state = "error";
-                    j->error = e.what();
+                    j->error.set(e.what(), "download_failed").arg("e", e.what());
                 }
                 log_error("models: download of " + j->id + ": " + e.what());
             }
         });
         return true;
+    }
+
+    void model_manager::note_failure(const std::string& id, const user_error& error)
+    {
+        std::shared_ptr<job> j(new job());
+        j->id = id;
+        j->state = "error";
+        j->error = error;
+        std::lock_guard<std::mutex> lock(m_);
+        auto it = jobs_.find(id);
+        if (it != jobs_.end())
+        {
+            const std::string& s = it->second->state;
+            if (s == "downloading" || s == "verifying" || s == "queued") return;
+            if (it->second->worker.joinable()) it->second->worker.join();
+        }
+        jobs_[id] = j;
     }
 
     void model_manager::cancel_download(const std::string& id)
@@ -589,8 +614,8 @@ namespace albireo
     {
         for (const auto& id : db_.pending_downloads())
         {
-            std::string error;
-            if (!start_download(id, error)) log_warning("models: cannot resume " + id + ": " + error);
+            user_error error;
+            if (!start_download(id, error)) log_warning("models: cannot resume " + id + ": " + error.text);
         }
     }
 
@@ -622,7 +647,7 @@ namespace albireo
 
     void model_manager::run_job(std::shared_ptr<job> j)
     {
-        auto set_state = [&](const std::string& s, const std::string& e = std::string()) {
+        auto set_state = [&](const std::string& s, const user_error& e = user_error()) {
             std::lock_guard<std::mutex> lock(m_);
             j->state = s;
             j->error = e;
@@ -644,7 +669,8 @@ namespace albireo
             random_access_file file;
             if (!file.open(j->partial, j->total))
             {
-                set_state("error", "cannot create " + j->partial);
+                set_state("error", user_error().set("cannot create " + j->partial, "download_file")
+                    .arg("file", j->partial));
                 return;
             }
             save();
@@ -785,7 +811,7 @@ namespace albireo
             save();
             if (failed)
             {
-                set_state("error", failure);
+                set_state("error", user_error().set(failure, "download_failed").arg("e", failure));
                 log_error("models: download of " + j->id + " failed: " + failure);
                 return;
             }
@@ -806,7 +832,8 @@ namespace albireo
                 if (!rename_file(j->partial, j->target) ||
                     !install_file(j->id, j->target, j->entry, sha, "catalog", error))
                 {
-                    set_state("error", error.empty() ? "cannot install the file" : error);
+                    if (error.empty()) error = "cannot install " + j->target;
+                    set_state("error", user_error().set(error, "download_install").arg("e", error));
                     return;
                 }
                 db_.remove_download_state(j->id);
@@ -839,7 +866,8 @@ namespace albireo
             }
             if (!any) break;
         }
-        set_state("error", "the downloaded file does not match the hash of the catalog");
+        set_state("error", user_error().set("the downloaded file does not match the hash of the catalog",
+            "download_hash"));
         log_error("models: " + j->id + " does not match its hash");
         db_.remove_download_state(j->id);
         remove_file(j->partial);

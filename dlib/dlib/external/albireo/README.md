@@ -51,10 +51,10 @@ of a double star of the constellation Cygnus, one gold and one blue, which its i
 - **An interface for other programs**: `/v1/chat/completions`, `/v1/completions`,
   `/v1/embeddings` and `/v1/models` follow the OpenAI interface, streaming included, with its
   documentation as a Swagger page at `/docs/`.
-- **Engines for each kind of processor**: portable, AVX2, Intel NPU and integrated GPU through
-  OpenVINO, NVIDIA GPU through CUDA, behind a single C interface. The service measures them on the
-  machine and runs the fastest, and the icon menu can force the NPU, the GPU or both while a
-  processor engine runs.
+- **Engines for each kind of processor**: portable, AVX2, AVX-VNNI, AVX-512, Intel NPU and
+  integrated GPU through OpenVINO, NVIDIA GPU through CUDA, behind a single C interface. The
+  service measures them on the machine and runs the fastest, and the icon menu can force the NPU,
+  the GPU or both while a processor engine runs.
 - **Models from a signed catalog**, downloaded in parallel parts, checked against their hashes,
   or imported from a disk or a memory card.
 - **Updates** announced by a signed feed, attached to the GitHub releases of the repository,
@@ -73,19 +73,41 @@ An engine is a library (`engines\albireo-engine-<variant>.dll`) that exports the
 request whose tokens come back as events, cancel it, and answer queries (statistics, tokens,
 models). Every variant is built from the same sources:
 
-| Variant    | Products with the weights                                   | Built with                        |
-|------------|-------------------------------------------------------------|-----------------------------------|
-| `cpu`      | quantized kernels, every x86-64 processor                   | the main build tree               |
-| `cpu-avx2` | quantized kernels, AVX2, FMA and F16C                       | the main build tree               |
-| `openvino` | NPU and integrated GPU of Intel processors, AVX2 kernels   | `ALBIREO_ENGINE_OPENVINO=ON`      |
-| `cuda`     | NVIDIA graphics processors, AVX2 kernels                    | `ALBIREO_ENGINE_CUDA=ON`          |
+| Variant       | Products with the weights                                             | Built with                   |
+|---------------|-----------------------------------------------------------------------|------------------------------|
+| `cpu`         | quantized kernels, every x86-64 processor                             | the main build tree          |
+| `cpu-avx2`    | quantized kernels, AVX2, FMA and F16C (Intel Haswell, AMD Zen and later) | the main build tree       |
+| `cpu-avxvnni` | `cpu-avx2` with the dot products of AVX-VNNI (Intel Core from Alder Lake on, AMD Zen 5) | the main build tree |
+| `cpu-avx512`  | AVX-512 F, BW, DQ and VL with VNNI (Intel Xeon from Cascade Lake on, Intel Core Ice Lake, Tiger Lake and Rocket Lake, AMD Zen 4 and later) | the main build tree |
+| `openvino`    | NPU and integrated GPU of Intel processors, AVX2 kernels             | `ALBIREO_ENGINE_OPENVINO=ON` |
+| `cuda`        | NVIDIA graphics processors, AVX2 kernels                              | `ALBIREO_ENGINE_CUDA=ON`     |
+
+The half precision conversions of F16C belong to `cpu-avx2`: every processor with AVX2 has them,
+and the keys and values of the attention, kept in half precision, go through them. The variants
+differ in their quantized kernels only ([`engine/qkernels.cpp`](engine/qkernels.cpp)), compiled for
+the instructions of each variant (`/arch:AVX2`, `/arch:AVX512` with Visual Studio; `-mavxvnni`,
+`-mavx512f -mavx512bw -mavx512dq -mavx512vl -mavx512vnni` with GCC and Clang) while the rest of the
+library stays at AVX2: the description of a library runs on any processor with AVX2 and reports the
+instructions the processor lacks, so that the service passes to the next variant. VNNI adds up four
+products of bytes, or two products of 16-bit integers, in one instruction (`vpdpbusd`,
+`vpdpwssd`): the kernels of Q4_0 and Q8_0 take the offsets of their weights from the sums of the
+activations, those of Q4_K, Q5_K and Q6_K apply their scales with `vpdpwssd`, and the AVX-512
+kernels take two blocks, or two sub-blocks of a super-block, per vector, with the products of the
+prompts on 512-bit vectors. The AVX-VNNI intrinsics need Visual Studio 2022 (GCC 11, Clang 12);
+an older compiler builds the other variants.
 
 The forward pass ([`engine/cpu_runtime.cpp`](engine/cpu_runtime.cpp)) keeps the weights in the
 memory mapping of the GGUF file, in their quantized form, and multiplies them with kernels that
 quantize the activations to 8 bits per block, so that a generated token reads each weight once.
 The keys and values live in half precision in pages of 256 positions, one sequence per request.
-The scheduler ([`engine/engine.cpp`](engine/engine.cpp)) builds each pass from the next token of
-every request being generated and a slice of the prompts being read.
+The attention runs on the processor in every variant, by tiles: up to 64 rows of queries, the
+heads that share one key/value head for consecutive tokens of a prompt, read the pages one after
+the other with a running maximum and sum, as FlashAttention does, so that each key and value
+taken from memory serves the whole tile instead of a single row. On two cores, the 2,900 tokens
+of a question that a project adds to a discussion of 3,200 tokens took 80 s instead of 228 s with
+Qwen3 0.6B. While a single answer is generated, each head makes a task of its own, so that every
+thread takes part. The scheduler ([`engine/engine.cpp`](engine/engine.cpp)) builds each pass from
+the next token of every request being generated and a slice of the prompts being read.
 
 The engines of the devices add a `matmul_offload` ([`engine/offload.h`](engine/offload.h)) that
 receives each product with the way to compute it on the processor
@@ -102,6 +124,25 @@ all the models fit in a budget:
 
 The products of a single token often stay on the processor, which serves them from the compact
 weights; the products of the prompts go to the device.
+
+The models loaded together share the budget of the device (`device_mb`, automatic by default:
+80 % of the free memory of the card, or the card and the extended memory with V²RAM, a quarter of
+the memory of the host with OpenVINO). A model with requests in progress or waiting keeps its
+copies. When it needs room, the models without requests give theirs, the least recently used model
+first, each giving the room asked and keeping its other copies; those copies come back when their
+model answers again. The embedding model takes part like the language models: while no document is
+being indexed or searched, its room goes to the models that answer. When every model has requests
+and the budget is full, a matrix without room is expanded at each product (CUDA) or computed by the
+processor, so that the requests of all the models go on together. The statistics of the device
+count the copies that left (`evictions`, `evicted_bytes`).
+
+A model replaced or deactivated in the Models window leaves the engine once its requests are served
+(`engine_host::unload_model`): from that moment the service routes no new request to it, the
+requests in progress and waiting end normally, possibly computed together with those of the other
+models, and the model is unloaded after the last one (the requests still running after 30 minutes
+end with the unloading). The window shows it as unloading meanwhile; activated again before it
+leaves, the model stays loaded. A model deleted while it answers is deleted the same way, once its
+requests are served, and is shown as being deleted until then.
 
 ### Service
 
@@ -122,7 +163,13 @@ and, for development, in a console with `--console`. It:
 
 `albireo-tray.exe` places the icon in the notification area and opens the windows of the models,
 of the computer (processor, engine, extended memory with its usage, models folder, port, language,
-proxy) and of the product. `albireo-setup.exe` carries the programs as a ZIP payload, installs them
+proxy) and of the product. The service gives its errors with a code and its values
+([`host/user_error.h`](host/user_error.h)), and the engines the reasons for which they cannot run
+(`reason_code`), which the windows explain in the language of the interface; a default model
+that could not be downloaded shows its download in error, with the reason, in the Models window.
+The settings of the extended memory apply to the CUDA engine and are grayed without it, and the
+Accelerator menu says why it offers no choice: no engine of a device installed, or none that runs
+on this computer. `albireo-setup.exe` carries the programs as a ZIP payload, installs them
 with a wizard or silently, registers the service and the entry of Apps & Features, and removes them.
 The web application ([`web/`](web)) is plain ES modules with its libraries in
 [`web/vendor`](web/vendor), served by the service with a content security policy that allows no
@@ -153,7 +200,9 @@ each conversation and computes again only the tokens that differ from what it al
 
 | Part of the prompt | Content | Share of the context |
 |---|---|---|
-| System message | date, instructions, documents of the project read whole | 30% at most, else the project is searched |
+| System message | date, instructions, memory, documents of the project read whole | 30% at most, else the project is searched |
+| Memory | short notes on the user, as they were when the discussion started | 4% at most, 120 words |
+| Summary | the exchanges that left the context, compressed by the model | 15% at most |
 | Attached document | read whole | 25% at most, else indexed and searched |
 | Excerpts of a question | the passages found for it, kept with the message once sent | 20% at most |
 | Exchanges | the conversation | the rest; the oldest leave in one step, down to 60% of the room |
@@ -164,6 +213,34 @@ costs its own tokens only, the conversations of a project share the reading of i
 exchanges happens once every several questions. The service serves several sessions at once,
 each with its own context: the requests of every session are computed together, one forward pass
 serving the next token of each.
+
+A discussion has no length limit. Once an answer fills 80% of the room of the context, the
+oldest exchanges are compressed in the background: the model of the discussion rewrites the
+summary of the discussion with them, oldest first, keeping the facts, figures, names, decisions,
+requests and open questions, and the discussion then starts with the summary, given with its
+first remaining question. A question that comes before the summary waits for it; a summary that
+cannot be written lets the exchanges leave without it. When the last question alone does not fit,
+the oldest texts lose their beginnings, at the end of a sentence: the summary first, then the
+documents and the texts of the questions. A question deleted from a discussion leaves with its
+answer and the documents attached to it; when it was already compressed, the summary is written
+again without it.
+
+The memory of the discussions holds short notes on the user (profession, projects, preferences,
+the way to answer), which the model of a discussion writes from the messages of the user once the
+discussion has had no new question for 30 seconds. The notes leave out sensitive information
+(health, finances, opinions, identifiers, other people) unless the settings keep it, and the
+lines that hold a password, a key or a payment number never enter the memory unless they do. A
+discussion receives the memory as it was when it started, so that its prompt keeps the same
+beginning; the private discussions neither read nor feed it. The settings show the memory, let the
+user edit it, turn it off and reset it. The model also names each discussion from its first
+question, unless the user renames it.
+
+The lists of the side panel show the 20 most recent projects and discussions; the search window
+of each finds the others, the words in any case and accents, complete or not, in the titles first,
+then in the content (questions, answers, descriptions, instructions and documents of the projects),
+and shows where it found them. Each answer exports to Markdown or JSON with its question, as the
+whole discussion does. The interface takes the language of Albireo, set in the window of the
+computer, unless its own settings choose another.
 
 ## Source tree
 
@@ -269,12 +346,12 @@ cmake --build build-albireo-win -j
 
 | Program          | Checks                                                                               |
 |------------------|--------------------------------------------------------------------------------------|
-| `test_qkernels`  | every quantized kernel against its portable version and a reference in floats        |
+| `test_qkernels`  | every quantized kernel against its portable version and a reference in floats, and the attention by tiles against a reference in double precision; `test_qkernels_avxvnni` and `test_qkernels_avx512` check the kernels of the other variants, and skip the processors without their instructions, and `test_qkernels_vnni256` (GCC, Clang) runs the 256-bit VNNI kernels through the AVX-512 form of their instructions |
 | `test_runtime`   | the logits of a model against `tests/reference_forward.py`, and the same results whatever the cut of the batches |
 | `test_tokenizer` | the tokenizer of a GGUF file against reference token sequences                     |
 | `test_offload`   | the products of a device against the processor kernels, the small budget path and the measured routing |
 | `engine_chat`    | drives an engine library through its C interface: chat, tools, reasoning, parallel requests, embeddings compared with a reference |
-| `bench_runtime`  | tokens per second of the prompt and of the generation                               |
+| `bench_runtime`  | tokens per second of the prompt and of the generation, also as `bench_runtime_avxvnni` and `bench_runtime_avx512` |
 
 `test_offload model.gguf CPU` validates the OpenVINO engine on a machine without NPU, with the CPU
 plugin of OpenVINO; `ALBIREO_ENGINE_DLIB=ON` builds the same test on the host code of dlib.
@@ -325,10 +402,11 @@ administration interface, and the service restarts when a change requires it.
 | `port`          | 8443    | port of `https://localhost`                                               |
 | `models_dir`    | `""`    | folder of the models, `<data>\models` when empty                          |
 | `language`      | `auto`  | `auto`, `en`, `fr`, `de`, `it`, `es`                                      |
-| `engine`        | `auto`  | `auto` (fastest measured, else the first usable of cuda, cpu-avx2, cpu), `best` (measured first), or a variant |
+| `engine`        | `auto`  | `auto` (fastest measured, else the first usable of cuda, cpu-avx512, cpu-avxvnni, cpu-avx2, cpu), `best` (measured first), or a variant |
 | `accelerator`   | `auto`  | `none`, `npu`, `gpu`, `both`: the device of the engines that have several |
 | `v2ram`         | true    | extended device memory of the CUDA engine                                  |
 | `v2ram_max_mb`  | 0       | size of its file in megabytes, 0 for automatic                            |
+| `device_mb`     | 0       | memory of the device for the copies of the weights, 0 for automatic       |
 | `threads`       | 0       | threads of the engine, 0 for the physical cores                           |
 | `context`       | 0       | context of the models, 0 for the trained one up to 32768                  |
 | `max_sequences` | 4       | requests computed together per model                                      |
@@ -360,10 +438,15 @@ its siblings), or `auto`; the `model` of `/v1/embeddings` takes `albireo-embeddi
 | `/docs/`                                 | Swagger page of the interface                             |
 
 The administration routes (`/albireo/v1/settings`, `/albireo/v1/models/<id>/download`,
-`/activate`, `/deactivate`, `/verify`, `/import`, `/models/upload`, `/updates/check`,
-`/updates/apply`, `/restart`, `/engines/benchmark`, `/logs`) require the header
-`X-Albireo-Admin` with the token of `admin.token`, which only the administrators, the service and
-the interactive users of the machine can read.
+`/activate`, `/deactivate`, `DELETE /albireo/v1/models/<id>`, `/verify`, `/import`,
+`/models/upload`, `/updates/check`, `/updates/apply`, `/restart`, `/engines/benchmark`, `/logs`)
+require the header `X-Albireo-Admin` with the token of `admin.token`, which only the
+administrators, the service and the interactive users of the machine can read. A model
+deactivated, replaced or deleted while it answers leaves the engine once its requests are served:
+`/albireo/v1/models` lists it under `leaving` (`unloading` or `removing`) meanwhile, and the
+deletion answers `"pending": true`. The errors these routes return carry a `code` with its `args`
+and `sizes` (`disk_space`, `not_installed`, `being_deleted`, `embedding_needed`, `load_failed`...),
+which the windows explain in the language of the user.
 
 ## Models
 

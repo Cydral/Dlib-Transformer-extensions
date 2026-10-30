@@ -334,18 +334,29 @@ namespace albireo
         devices.push_back(dev);
         bool usable = true;
         std::string reason;
+        // The kernels of the variant: the rest of the library uses AVX2 at most, so that
+        // this description runs on the processors that lack the instructions of the kernels.
 #if defined(__AVX2__)
-        if (!(cpu.avx2 && cpu.fma && cpu.f16c))
+        const unsigned lacks = qk_missing_isa(cpu, qk_isa_avx2);
+#else
+        const unsigned lacks = qk_missing_isa(cpu);
+#endif
+        // The reasons carry a code, with which the windows explain them in the language of
+        // the user.
+        std::string reason_code;
+        json reason_args = json::object();
+        if (lacks)
         {
             usable = false;
-            reason = "the processor or the system lacks AVX2, FMA or F16C";
+            reason = std::string("the processor or the system lacks ") + qk_isa_text(lacks);
+            reason_code = qk_isa_code(lacks);
         }
-#endif
 #ifdef ALBIREO_TENSOR_BACKEND
         // The devices of dlib take the products; the library stays loaded once started,
         // since the runtimes of the devices keep threads in the process.
-        std::string backend, runtime, why;
-        const json accelerators = tensor_device::describe(backend, runtime, why);
+        std::string backend, runtime, why, why_code;
+        json why_args = json::object();
+        const json accelerators = tensor_device::describe(backend, runtime, why, why_code, why_args);
         d["backend"] = backend;
         if (!runtime.empty()) d["runtime"] = runtime;
         for (const auto& a : accelerators.elements()) devices.push_back(a);
@@ -354,11 +365,18 @@ namespace albireo
         {
             usable = false;
             reason = why;
+            reason_code = why_code;
+            reason_args = why_args;
         }
 #endif
         d["devices"] = devices;
         d["usable"] = usable;
         if (!reason.empty()) d["reason"] = reason;
+        if (!reason_code.empty())
+        {
+            d["reason_code"] = reason_code;
+            if (reason_args.size() > 0) d["reason_args"] = reason_args;
+        }
         return d;
     }
 
@@ -410,7 +428,7 @@ namespace albireo
         }
         std::unique_ptr<cpu_runtime> runtime(new cpu_runtime(m->file, m->cfg, *pool_, kv, embedding ? 64 : 256));
 #ifdef ALBIREO_TENSOR_BACKEND
-        runtime->set_offload(device_->make_offload());
+        runtime->set_offload(device_->make_offload(id));
 #endif
         m->runtime = std::move(runtime);
 
@@ -757,6 +775,7 @@ namespace albireo
             // Whether a language model has requests: the embedding models then compute
             // short passes, the answers being what the users wait for.
             bool answering = false;
+            std::vector<bool> busy;
             {
                 std::unique_lock<std::mutex> lock(mutex_);
                 wake_.wait(lock, [&]() {
@@ -769,10 +788,14 @@ namespace albireo
                 for (const auto& m : models_)
                 {
                     models.push_back(m.second);
-                    if (!m.second->cfg.is_embedding() && (!m.second->waiting.empty() || !m.second->active.empty()))
-                        answering = true;
+                    const bool has_requests = !m.second->waiting.empty() || !m.second->active.empty();
+                    busy.push_back(has_requests);
+                    if (!m.second->cfg.is_embedding() && has_requests) answering = true;
                 }
             }
+            // The device keeps the copies of the models with requests, and may give the
+            // room of the others to them (tensor_backend.h).
+            for (size_t i = 0; i < models.size(); ++i) models[i]->runtime->set_busy(busy[i]);
             for (const auto& m : models)
             {
                 if (m->unloading)
@@ -1271,12 +1294,18 @@ namespace albireo
         {
             std::lock_guard<std::mutex> lock(stats_mutex_);
             const double t = now_seconds();
+            // The tokens of the last five seconds: none once the engine waits, rather than a
+            // rate that falls slowly after the last pass.
             auto rate = [&](const std::deque<std::pair<double, long>>& w) {
-                if (w.empty()) return 0.0;
                 long total = 0;
-                for (const auto& e : w) total += e.second;
-                const double span = std::max(1.0, t - w.front().first);
-                return total / span;
+                double first = t;
+                for (const auto& e : w)
+                {
+                    if (e.first < t - 5) continue;
+                    total += e.second;
+                    first = std::min(first, e.first);
+                }
+                return total > 0 ? total / std::max(1.0, t - first) : 0.0;
             };
             s["generation_tokens_per_second"] = rate(generated_window_);
             s["prompt_tokens_per_second"] = rate(prompt_window_);

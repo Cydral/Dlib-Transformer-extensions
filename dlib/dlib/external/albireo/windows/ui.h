@@ -14,6 +14,7 @@
 
 #include <functional>
 #include <string>
+#include <vector>
 
 #include "../common/json.h"
 
@@ -70,6 +71,9 @@ namespace ui
     void place(HWND control, int x, int y, int w, int h);
     // Width of a button for its text and font, at least min_width pixels.
     int button_width(HWND button, int min_width);
+    // The width that fits the widest of the texts a button shows in turn, so that it keeps
+    // its size, and its neighbors their places, when its text changes.
+    int button_width(HWND button, int min_width, const std::vector<std::wstring>& texts);
     std::wstring text_of(HWND control);
     void set_text(HWND control, const std::wstring& text);
     bool checked(HWND control);

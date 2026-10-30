@@ -120,7 +120,7 @@ namespace albireo
         auto rate = [&](const engine_choice& e) {
             return s.engine_benchmarks[e.key]["tokens_per_second"].as_double(0);
         };
-        auto is_cpu = [](const engine_choice& e) { return e.key == "cpu" || e.key == "cpu-avx2"; };
+        auto is_cpu = [](const engine_choice& e) { return e.key.compare(0, 3, "cpu") == 0; };
         auto is_npu = [](const engine_choice& e) { return e.key == "openvino:npu"; };
         auto is_gpu = [](const engine_choice& e) { return e.key == "cuda" || e.key == "openvino:gpu"; };
         auto is_accelerator = [](const engine_choice& e) {
@@ -173,10 +173,10 @@ namespace albireo
         else if (s.accelerator == "none")
         {
             e = fastest(is_cpu);
-            if (!e) e = first({ "cpu-avx2", "cpu" });
+            if (!e) e = first({ "cpu-avx512", "cpu-avxvnni", "cpu-avx2", "cpu" });
         }
         if (!e) e = fastest([](const engine_choice&) { return true; });
-        if (!e) e = first({ "cuda", "cpu-avx2", "cpu" });
+        if (!e) e = first({ "cuda", "cpu-avx512", "cpu-avxvnni", "cpu-avx2", "cpu" });
         if (!e && !options.empty()) e = &options.front();
         return e ? *e : engine_choice();
     }
@@ -207,6 +207,7 @@ namespace albireo
         c["kv_mb"] = s.kv_mb;
         c["v2ram"] = s.v2ram;
         c["v2ram_max_mb"] = s.v2ram_max_mb;
+        c["offload_mb"] = s.device_mb;
         c["device"] = device;
         c["cache_dir"] = join_path(data_dir_, "engine-cache");
         return c;
@@ -301,7 +302,7 @@ namespace albireo
                 log_error("engines: " + engine_error_);
                 for (const auto& o : engine_options(candidates_))
                 {
-                    if (o.key != "cpu-avx2" && o.key != "cpu") continue;
+                    if (o.key.compare(0, 3, "cpu") != 0) continue;
                     if (engine_.start(*o.candidate, engine_config(st, o.device), e))
                     {
                         choice_ = o;
@@ -384,6 +385,17 @@ namespace albireo
         }
         models.reset();
         engine_.stop();
+        {
+            // The unloadings end with the engine.
+            std::vector<std::thread> retirers;
+            {
+                std::lock_guard<std::mutex> lock(retire_m_);
+                retirers.swap(retirers_);
+            }
+            retire_cv_.notify_all();
+            for (auto& t : retirers)
+                if (t.joinable()) t.join();
+        }
         updates.reset();
         log_info("service stopped");
         if (!stopped)
@@ -402,6 +414,10 @@ namespace albireo
             stopping_ = true;
         }
         cv_.notify_all();
+        {
+            std::lock_guard<std::mutex> lock(retire_m_);
+        }
+        retire_cv_.notify_all();
         std::lock_guard<std::mutex> lock(server_m_);
         // The downloads, the imports and the checks end at once; their progress is kept.
         http_cancel_all(stopping_reason);
@@ -620,6 +636,12 @@ namespace albireo
         return m.descriptor["embedding"].as_bool(false) || has_role(m.descriptor, embedding_role);
     }
 
+    void service::note_default_failure(const json& entry, const user_error& error, const std::string& what)
+    {
+        log_warning("models: " + what + " cannot be downloaded: " + error.text);
+        models_->note_failure(entry["id"].as_string(), error);
+    }
+
     void service::ensure_default_model()
     {
         const host_settings st = settings_->get();
@@ -634,10 +656,10 @@ namespace albireo
             const installed_model* pick = nullptr;
             for (const auto& m : installed)
                 if (is_embedding(m) && (!pick || m.descriptor["default"].as_bool(false))) pick = &m;
-            std::string error;
+            user_error error;
             if (pick)
             {
-                if (!activate(pick->id, embedding_role, error)) log_warning("models: " + pick->id + ": " + error);
+                if (!activate(pick->id, embedding_role, error)) log_warning("models: " + pick->id + ": " + error.text);
             }
             else if (!st.offline)
             {
@@ -647,7 +669,7 @@ namespace albireo
                     if (models_->start_download(e["id"].as_string(), error))
                         log_info("models: download of the embedding model " + e["id"].as_string());
                     else
-                        log_warning("models: the embedding model cannot be downloaded: " + error);
+                        note_default_failure(e, error, "the embedding model");
                     break;
                 }
             }
@@ -663,8 +685,8 @@ namespace albireo
         }
         if (pick)
         {
-            std::string error;
-            if (!activate(pick->id, "general", error)) log_warning("models: " + pick->id + ": " + error);
+            user_error error;
+            if (!activate(pick->id, "general", error)) log_warning("models: " + pick->id + ": " + error.text);
             return;
         }
         // No language model installed: the default model of the catalog is downloaded, once,
@@ -673,7 +695,7 @@ namespace albireo
         for (const auto& e : catalog["models"].elements())
         {
             if (!e["default"].as_bool(false) || has_role(e, embedding_role)) continue;
-            std::string error;
+            user_error error;
             if (models_->start_download(e["id"].as_string(), error))
             {
                 db_->set_value("default_model_requested", "1");
@@ -681,7 +703,7 @@ namespace albireo
             }
             else
             {
-                log_warning("models: the default model cannot be downloaded: " + error);
+                note_default_failure(e, error, "the default model");
             }
             return;
         }
@@ -693,9 +715,9 @@ namespace albireo
         if (is_embedding(m))
         {
             // The first embedding model serves the document search.
-            std::string error;
+            user_error error;
             if (!settings_->get().active.count(embedding_role) && !activate(m.id, embedding_role, error))
-                log_warning("models: " + m.id + ": " + error);
+                log_warning("models: " + m.id + ": " + error.text);
             return;
         }
         // A new model takes the functions its catalog entry names and no model holds yet,
@@ -710,8 +732,8 @@ namespace albireo
         for (const auto& role : roles)
         {
             if (settings_->get().active.count(role)) continue;
-            std::string error;
-            if (!activate(m.id, role, error)) log_warning("models: " + m.id + ": " + error);
+            user_error error;
+            if (!activate(m.id, role, error)) log_warning("models: " + m.id + ": " + error.text);
         }
     }
 
@@ -763,35 +785,56 @@ namespace albireo
         }
     }
 
-    bool service::activate(const std::string& id, const std::string& role, std::string& error)
+    bool service::activate(const std::string& id, const std::string& role, user_error& error)
     {
         if (!is_role(role))
         {
-            error = "unknown role '" + role + "' (general, code, security or embedding)";
+            error.set("unknown role '" + role + "' (general, code, security or embedding)", "unknown_role")
+                .arg("role", role);
             return false;
         }
         std::lock_guard<std::mutex> serial(models_m_);
         installed_model m;
         if (!db_->find_model(id, m) || !file_exists(m.file))
         {
-            error = "the model " + id + " is not installed";
+            error.set("the model " + id + " is not installed", "not_installed").arg("m", id);
             return false;
+        }
+        const std::string name = m.name.empty() ? id : m.name;
+        {
+            std::lock_guard<std::mutex> lock(retire_m_);
+            if (removing_.count(id) != 0)
+            {
+                error.set("the model " + id + " is being deleted", "being_deleted").arg("m", name);
+                return false;
+            }
         }
         if ((role == embedding_role) != is_embedding(m))
         {
-            error = role == embedding_role ? "the model " + id + " writes text; the document search needs an "
-                "embedding model" : "the model " + id + " computes the vectors of the document search and "
-                "answers no conversation";
+            if (role == embedding_role)
+                error.set("the model " + id + " writes text; the document search needs an embedding model",
+                    "needs_embedding_model").arg("m", name);
+            else
+                error.set("the model " + id + " computes the vectors of the document search and answers no "
+                    "conversation", "embedding_model_only").arg("m", name);
             return false;
         }
+        // A model waiting for its requests before it leaves stays.
+        if (engine_.keep_model(id)) log_info("models: " + id + " stays loaded");
+        wait_retired(id);
         {
             const host_settings st = settings_->get();
             const auto current = st.active.find(role);
             if (current != st.active.end() && current->second == id) return true;
         }
         const std::vector<std::string> loaded = engine_.loaded_models();
-        if (engine_.running() && std::find(loaded.begin(), loaded.end(), id) == loaded.end() && !load_model(m, error))
+        std::string load_error;
+        if (engine_.running() && std::find(loaded.begin(), loaded.end(), id) == loaded.end()
+            && !load_model(m, load_error))
+        {
+            error.set(load_error, "load_failed").arg("m", name).arg("e", load_error);
             return false;
+        }
         // The settings may have changed while the model loaded: the function is set on
         // the settings as they are now.
         std::string previous;
@@ -806,24 +849,81 @@ namespace albireo
         {
             bool used = false;
             for (const auto& kv : st.active) used = used || kv.second == previous;
-            if (!used)
-            {
-                engine_.unload_model(previous);
-                std::lock_guard<std::mutex> lock(m_);
-                load_state_.erase(previous);
-            }
+            if (!used) retire(previous);
         }
         return true;
     }
 
-    bool service::deactivate(const std::string& id, std::string& error, bool removing)
+    void service::retire(const std::string& id)
+    {
+        std::lock_guard<std::mutex> lock(retire_m_);
+        if (stopping_ || !retiring_.insert(id).second) return;
+        {
+            std::lock_guard<std::mutex> state(m_);
+            load_state_[id] = removing_.count(id) != 0 ? "removing" : "unloading";
+        }
+        // No new request goes to the model; the thread waits for those it has.
+        engine_.begin_unload(id);
+        retirers_.emplace_back([this, id]() {
+            bool unloaded = engine_.finish_unload(id);
+            if (unloaded) log_info("models: " + id + " unloaded");
+            for (;;)
+            {
+                bool remove = false;
+                {
+                    // The last check and the end of the retirement in one step, so that a
+                    // deletion asked meanwhile is either seen here or done by remove_model.
+                    std::lock_guard<std::mutex> l(retire_m_);
+                    if (removing_.count(id) == 0)
+                    {
+                        std::lock_guard<std::mutex> state(m_);
+                        if (unloaded) load_state_.erase(id);
+                        else load_state_[id] = "ready";
+                        retiring_.erase(id);
+                        break;
+                    }
+                    remove = unloaded;
+                    if (remove) removing_.erase(id);
+                }
+                if (!remove)
+                {
+                    // Kept by an activation, then deleted: it leaves after all.
+                    engine_.begin_unload(id);
+                    unloaded = engine_.finish_unload(id);
+                    if (unloaded) log_info("models: " + id + " unloaded");
+                    continue;
+                }
+                std::string error;
+                std::lock_guard<std::mutex> server(server_m_);
+                if (models_ && !models_->remove(id, error)) log_warning("models: " + error);
+            }
+            retire_cv_.notify_all();
+        });
+    }
+
+    json service::leaving_models()
+    {
+        json o = json::object();
+        std::lock_guard<std::mutex> state(m_);
+        for (const auto& kv : load_state_)
+            if (kv.second == "unloading" || kv.second == "removing") o[kv.first] = kv.second;
+        return o;
+    }
+
+    void service::wait_retired(const std::string& id)
+    {
+        std::unique_lock<std::mutex> lock(retire_m_);
+        retire_cv_.wait(lock, [&]() { return stopping_.load() || retiring_.count(id) == 0; });
+    }
+
+    bool service::deactivate(const std::string& id, user_error& error)
     {
         std::lock_guard<std::mutex> serial(models_m_);
         bool refused = false;
         bool changed = false;
         settings_->update([&](host_settings& st) {
             const auto embedding = st.active.find(embedding_role);
-            if (!removing && embedding != st.active.end() && embedding->second == id)
+            if (embedding != st.active.end() && embedding->second == id)
             {
                 refused = true;
                 return;
@@ -843,13 +943,66 @@ namespace albireo
         });
         if (refused)
         {
-            error = "the document search needs an embedding model: activate another one to replace " + id;
+            installed_model m;
+            const std::string name = db_->find_model(id, m) && !m.name.empty() ? m.name : id;
+            error.set("the document search needs an embedding model: activate another one to replace " + id,
+                "embedding_needed").arg("m", name);
             return false;
         }
         if (changed) log_info("models: " + id + " deactivated");
-        engine_.unload_model(id);
-        std::lock_guard<std::mutex> lock(m_);
-        load_state_.erase(id);
+        retire(id);
+        return true;
+    }
+
+    bool service::remove_model(const std::string& id, user_error& error, bool& pending)
+    {
+        std::lock_guard<std::mutex> serial(models_m_);
+        pending = false;
+        installed_model m;
+        if (!db_->find_model(id, m))
+        {
+            error.set("the model '" + id + "' is not installed", "not_installed").arg("m", id);
+            return false;
+        }
+        const std::string name = m.name.empty() ? id : m.name;
+        bool changed = false;
+        settings_->update([&](host_settings& st) {
+            for (auto it = st.active.begin(); it != st.active.end();)
+            {
+                if (it->second == id)
+                {
+                    it = st.active.erase(it);
+                    changed = true;
+                }
+                else
+                {
+                    ++it;
+                }
+            }
+        });
+        if (changed) log_info("models: " + id + " deactivated");
+        const std::vector<std::string> loaded = engine_.loaded_models();
+        const bool in_engine = std::find(loaded.begin(), loaded.end(), id) != loaded.end();
+        {
+            std::lock_guard<std::mutex> lock(retire_m_);
+            if (in_engine || retiring_.count(id) != 0)
+            {
+                // Deleted by its retirement, once its requests are served.
+                removing_.insert(id);
+                pending = true;
+            }
+        }
+        if (!pending)
+        {
+            std::string why;
+            if (models_->remove(id, why)) return true;
+            error.set(why, "delete_failed").arg("m", name).arg("file", m.file);
+            return false;
+        }
+        retire(id);
+        std::lock_guard<std::mutex> state(m_);
+        load_state_[id] = "removing";
+        log_info("models: " + id + " deleted once its requests are served");
         return true;
     }
 
@@ -993,6 +1146,7 @@ namespace albireo
         settings["accelerator"] = st.accelerator;
         settings["v2ram"] = st.v2ram;
         settings["v2ram_max_mb"] = st.v2ram_max_mb;
+        settings["device_mb"] = st.device_mb;
         settings["language"] = st.language;
         settings["check_updates"] = st.check_updates;
         settings["offline"] = st.offline;
@@ -1013,7 +1167,15 @@ namespace albireo
             j["version"] = c.description["version"];
             j["build"] = c.description["build"];
             j["devices"] = c.description["devices"];
-            if (!c.usable) j["reason"] = c.description["reason"];
+            if (!c.usable)
+            {
+                j["reason"] = c.description["reason"];
+                if (c.description.contains("reason_code"))
+                {
+                    j["reason_code"] = c.description["reason_code"];
+                    j["reason_args"] = c.description["reason_args"];
+                }
+            }
             j["current"] = choice_.candidate && choice_.candidate->path == c.path;
             list.push_back(j);
         }
@@ -1039,6 +1201,14 @@ namespace albireo
         for (const auto& o : engine_options(candidates_))
             accelerators = accelerators || o.key == "cuda" || o.key == "openvino:npu" || o.key == "openvino:gpu";
         out["accelerators_available"] = accelerators;
+        if (!accelerators)
+        {
+            // Why none is offered: no engine of a device in the installation, or none that
+            // runs on this computer (the list of the engines gives the reasons).
+            bool installed = false;
+            for (const auto& c : candidates_) installed = installed || c.variant == "cuda" || c.variant == "openvino";
+            out["accelerators_reason"] = installed ? "unusable" : "not_installed";
+        }
         return out;
     }
 

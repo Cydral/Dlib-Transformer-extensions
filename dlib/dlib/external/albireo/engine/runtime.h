@@ -101,6 +101,9 @@ namespace albireo
         // Returns to the system the memory of the keys and values no sequence holds.
         virtual void trim_memory() = 0;
 
+        // Whether the model has requests in progress or waiting (see matmul_offload).
+        virtual void set_busy(bool busy) = 0;
+
         // Bytes of weights the runtime keeps resident (mapped files count for their size).
         virtual size_t weight_bytes() const = 0;
 

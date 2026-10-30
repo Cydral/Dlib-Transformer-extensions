@@ -31,6 +31,7 @@
   --danger: #d4483b;
   --success: #1f9d64;
   --incognito: #7c4dff;
+  --mark: rgba(242, 181, 68, 0.38);
   color-scheme: light;
 }
 
@@ -49,6 +50,7 @@
   --border: rgba(200, 210, 255, 0.10);
   --border-strong: rgba(200, 210, 255, 0.18);
   --shadow: 0 10px 34px rgba(0, 0, 0, 0.45);
+  --mark: rgba(242, 181, 68, 0.30);
   color-scheme: dark;
 }
 
@@ -144,13 +146,13 @@ a { color: var(--blue); }
 .status-line .led.busy { background: var(--gold); animation: pulse 1.2s infinite; }
 .status-line .led.error { background: var(--danger); }
 .status-line .grow { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.footer-buttons { display: flex; gap: 6px; }
+/* The buttons take the width of their labels and pass to a second line rather than cut them. */
+.footer-buttons { display: flex; flex-wrap: wrap; gap: 6px; }
 .footer-buttons button {
-  flex: 1 1 0; min-width: 0; display: inline-flex; align-items: center; justify-content: center; gap: 5px; height: 32px;
-  padding: 0 6px; border-radius: 9px; border: 1px solid var(--border); background: transparent; color: var(--text-soft);
+  flex: 1 1 auto; display: inline-flex; align-items: center; justify-content: center; gap: 5px; height: 32px;
+  padding: 0 8px; border-radius: 9px; border: 1px solid var(--border); background: transparent; color: var(--text-soft);
   font-size: 12.5px; white-space: nowrap;
 }
-.footer-buttons button span { overflow: hidden; text-overflow: ellipsis; }
 .footer-buttons button:hover { background: var(--bg-hover); color: var(--text); }
 .footer-buttons svg { width: 15px; height: 15px; }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
@@ -429,3 +431,29 @@ a { color: var(--blue); }
   .thread { padding: 16px 14px 160px; }
   .composer-wrap { padding: 0 10px 12px; }
 }
+
+/* The search of the projects and of the discussions. */
+.side-tools { display: inline-flex; gap: 2px; }
+.item.new-item, .item.more-item { color: var(--text-faint); }
+.item.new-item:hover, .item.more-item:hover { color: var(--text); }
+.side-excerpt { display: block; font-size: 12px; color: var(--text-faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+mark { background: var(--mark); color: inherit; border-radius: 3px; padding: 0 1px; }
+.search-dialog input[type="search"] {
+  width: 100%; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--border-strong);
+  background: var(--bg-input); color: var(--text); font: inherit; outline: none;
+}
+.search-dialog input[type="search"]:focus { border-color: var(--blue); }
+.search-dialog .help { margin-top: 8px; font-size: 12.5px; color: var(--text-faint); }
+.search-results { max-height: 58vh; overflow-y: auto; margin-top: 8px; display: flex; flex-direction: column; gap: 2px; }
+.search-result { padding: 8px 10px; border-radius: 10px; cursor: pointer; outline: none; }
+.search-result:hover, .search-result:focus { background: var(--bg-hover); }
+.search-result .line { display: flex; align-items: center; gap: 8px; }
+.search-result .line svg { width: 15px; height: 15px; flex: 0 0 15px; opacity: 0.8; }
+.search-result .dot { width: 9px; height: 9px; border-radius: 50%; flex: 0 0 9px; }
+.search-result .title { flex: 1; min-width: 0; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.search-result .date { flex: 0 0 auto; font-size: 12px; color: var(--text-faint); }
+.search-result .where { margin-top: 3px; display: flex; align-items: baseline; gap: 8px; font-size: 13px; color: var(--text-soft); }
+.search-result .badge {
+  flex: 0 0 auto; font-size: 11px; padding: 1px 8px; border-radius: 999px; background: var(--bg-active); color: var(--text-soft);
+}
+.search-result .excerpt { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

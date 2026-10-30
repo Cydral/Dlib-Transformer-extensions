@@ -3,6 +3,7 @@
 #ifndef ALBIREO_HOST_ENGINE_HOST_H_
 #define ALBIREO_HOST_ENGINE_HOST_H_
 
+#include <condition_variable>
 #include <functional>
 #include <map>
 #include <memory>
@@ -19,7 +20,7 @@ namespace albireo
 
     struct engine_candidate
     {
-        std::string variant;   // "cpu", "cpu-avx2", "openvino", "cuda"
+        std::string variant;   // "cpu", "cpu-avx2", "cpu-avxvnni", "cpu-avx512", "openvino", "cuda"
         std::string path;
         json description;
         bool usable = false;
@@ -40,13 +41,21 @@ namespace albireo
             SELECTION
                 "auto" takes the fastest variant measured on this machine when a
                 measure exists, otherwise the first usable one of: cuda, openvino,
-                cpu-avx2, cpu.  "best" is "auto" with a measure made when none exists.
-                Any other value names a variant, used when it is usable.
+                cpu-avx512, cpu-avxvnni, cpu-avx2, cpu.  "best" is "auto" with a measure
+                made when none exists.  Any other value names a variant, used when it is
+                usable.
 
             CONCURRENCY
                 A model being loaded or unloaded never delays the other operations: the
                 requests, the queries and the cancellations go on during a load, which
                 may read several gigabytes.  Only start() and stop() wait for them.
+
+            UNLOADING
+                A model leaves the engine once its requests are served: from the start of
+                unload_model(), submit() refuses the new requests for it, those in progress
+                and those waiting are computed, possibly together with those of the other
+                models, and the model is unloaded when the last one ends.  stop() ends the
+                waits.
         !*/
     public:
         engine_host();
@@ -75,7 +84,30 @@ namespace albireo
         json description() const;
 
         bool load_model(const std::string& id, const std::string& path, const json& options, std::string& error);
-        void unload_model(const std::string& id);
+        /*!
+            ensures
+                - Unloads the model id once its requests are served (see UNLOADING) and
+                  returns true, or returns false when keep_model() cancelled the unloading
+                  while it waited.  The requests still running after drain_seconds end
+                  with the unloading.
+        !*/
+        bool unload_model(const std::string& id, int drain_seconds = 1800);
+        /*!
+            ensures
+                - The two steps of unload_model(): begin_unload() returns at once, the model
+                  taking no new request from then on, and finish_unload() waits for its
+                  requests and unloads it, unless keep_model() was called in between.
+        !*/
+        void begin_unload(const std::string& id);
+        bool finish_unload(const std::string& id, int drain_seconds = 1800);
+        /*!
+            ensures
+                - Cancels the unloading of id while it waits for the requests of the model:
+                  the model takes requests again, and finish_unload() returns false.
+                - Returns false when id is not waiting to leave (not being unloaded, or its
+                  unloading already started).
+        !*/
+        bool keep_model(const std::string& id);
         std::vector<std::string> loaded_models() const;
 
         // Submits a request; the sink receives its events until the final one.
@@ -85,6 +117,7 @@ namespace albireo
 
     private:
         static void ALBIREO_ENGINE_CALL on_event(void* user, int kind, const char* data, size_t size);
+        void request_ended(const std::string& model);
         static void ALBIREO_ENGINE_CALL on_log(void* user, int level, const char* message);
 
         // The engine itself: held exclusively to start and to stop it, shared by the
@@ -97,6 +130,15 @@ namespace albireo
         bool running_ = false;
         engine_candidate current_;
         std::vector<std::string> models_;
+
+        // The requests in progress of each model, which an unloading waits for, and the
+        // models being unloaded, which take no new request: false while they wait for their
+        // requests, true once they leave the engine.
+        mutable std::mutex flight_m_;
+        std::condition_variable flight_cv_;
+        std::map<std::string, long> in_flight_;
+        std::map<std::string, bool> draining_;
+        bool stopping_ = false;
     };
 
 }

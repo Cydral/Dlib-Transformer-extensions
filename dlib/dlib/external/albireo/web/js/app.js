@@ -46,6 +46,11 @@ const excerptShare = 0.2;
 // The exchanges kept when the oldest leave: the conversation then takes this share of the
 // room it has, so that it grows again for several questions before the next cut.
 const keptShare = 0.6;
+// An answer after which the discussion takes this share of its room leads to the compression
+// of its oldest exchanges, in the background, before the next question needs it.
+const compactShare = 0.8;
+// The summary of the exchanges that left the context takes at most this share of the room.
+const summaryShare = 0.15;
 
 // Tokens of a text, estimated from its characters.
 function estimateTokens(text) {
@@ -54,8 +59,21 @@ function estimateTokens(text) {
 
 const defaults = {
   theme: 'auto', language: 'auto', userName: '', defaultRole: 'general', temperature: null, topP: null,
-  maxTokens: 0, sendOnEnter: true, systemPrompt: '', lastReasoning: false, lastAgent: false, sidebar: true
+  maxTokens: 0, sendOnEnter: true, systemPrompt: '', lastReasoning: false, lastAgent: false, sidebar: true,
+  memoryEnabled: true, memorySensitive: false, memory: '', memoryUpdated: 0
 };
+
+// The memory of the discussions: short notes on the user, which the model writes from the
+// discussions, private ones excepted, and which each discussion receives at its start.  Its
+// size follows the context of the model: memoryShare of it, memoryWords words at most.
+const memoryWords = 120;
+const memoryShare = 0.04;
+// The memory is updated once a discussion has had no new question for this long.
+const memoryDelay = 30000;
+
+function memoryLimitWords(contextTokens) {
+  return Math.max(30, Math.min(memoryWords, Math.floor(memoryShare * (contextTokens || 8192) * 0.7)));
+}
 
 const state = {
   settings: Object.assign({}, defaults),
@@ -150,8 +168,15 @@ function applyTheme() {
   document.getElementById('hljs-dark').disabled = !dark;
 }
 
+/*
+    The language of the interface: the one chosen here, else the one of Albireo, chosen in
+    the window of the computer of its icon, else the one of the browser, as the windows of
+    Albireo follow the one of Windows.
+*/
 function applyLanguage() {
-  setLanguage(state.settings.language === 'auto' ? null : state.settings.language);
+  const own = state.settings.language;
+  const system = state.status && state.status.settings ? state.status.settings.language : 'auto';
+  setLanguage(own && own !== 'auto' ? own : system && system !== 'auto' ? system : null);
 }
 
 async function saveSetting(key, value) {
@@ -195,8 +220,17 @@ async function refreshStatus() {
     const s = await api.status();
     const before = state.status ? JSON.stringify([state.status.active, state.status.loaded_models]) : '';
     changed = before !== JSON.stringify([s.active, s.loaded_models]);
+    const before_language = language();
     state.status = s;
     state.statusError = false;
+    // A language chosen in Albireo meanwhile, which this interface follows.
+    applyLanguage();
+    if (language() !== before_language) {
+      state.catalog = await api.models(language()).catch(() => state.catalog);
+      buildLayout();
+      renderAll();
+    }
+    if (ui.hint) ui.hint.textContent = hintText();
     if (changed || !state.catalog) state.catalog = await api.models(language()).catch(() => state.catalog);
     // The embedding model of the document search; the documents not yet given vectors are
     // indexed once it is there.
@@ -261,28 +295,213 @@ function dateGroup(ts) {
   return 'older';
 }
 
-function conversationText(c) {
-  const parts = [c.title || ''];
-  for (const m of c.messages || []) {
-    if (m.role === 'user') parts.push(m.content || '');
-    else for (const s of m.steps || []) parts.push(s.content || '');
+// The lists of the sidebar show this many projects and discussions at most; the others are
+// found by the search.
+const sideLimit = 20;
+
+// Text as the search compares it: lower case, without accents.
+function fold(text) {
+  return String(text || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
+}
+
+function queryTerms(query) {
+  return fold(query).split(/\s+/).filter(Boolean);
+}
+
+// The first position of a term of terms in text, or -1 when one of them is missing.  A term
+// matches the beginning, the middle or the end of a word.
+function findTerms(text, terms) {
+  const f = fold(text);
+  let first = -1;
+  for (const term of terms) {
+    const i = f.indexOf(term);
+    if (i < 0) return -1;
+    if (first < 0 || i < first) first = i;
   }
+  return first;
+}
+
+// A part of text around a position, with the terms marked.
+function excerptHtml(text, at, terms, width) {
+  text = String(text || '').replace(/\s+/g, ' ');
+  const w = width || 160;
+  const start = Math.max(0, at - Math.floor(w / 3));
+  const piece = text.slice(start, start + w);
+  return (start > 0 ? '…' : '') + markTerms(piece, terms) + (start + w < text.length ? '…' : '');
+}
+
+// text as HTML, the terms of the search in <mark>.
+function markTerms(text, terms) {
+  text = String(text || '');
+  const f = fold(text);
+  // Folding keeps the length of most texts; the marks are left out of the others.
+  if (f.length !== text.length || !terms.length) return escapeHtml(text);
+  const marked = new Array(text.length).fill(false);
+  for (const term of terms) {
+    for (let i = f.indexOf(term); i >= 0; i = f.indexOf(term, i + 1)) marked.fill(true, i, i + term.length);
+  }
+  let out = '';
+  let open = false;
+  for (let i = 0; i < text.length; ++i) {
+    if (marked[i] !== open) {
+      out += open ? '</mark>' : '<mark>';
+      open = marked[i];
+    }
+    out += escapeHtml(text[i]);
+  }
+  return out + (open ? '</mark>' : '');
+}
+
+function messageText(m) {
+  if (m.role === 'user') return m.content || '';
+  return (m.steps || []).map((s) => s.content || '').join('\n');
+}
+
+/*
+    The discussions that hold every term of a query, whatever their case and their accents,
+    a term matching the beginning, the middle or the end of a word: those whose title holds
+    them first, then those whose messages hold them, each group the most recent first.  Each
+    result tells where the terms are: {conversation, where: 'title', 'question', 'answer' or
+    'messages' (several of them), at, text, excerpt}.
+*/
+function searchConversations(query, limit) {
+  const terms = queryTerms(query);
+  if (!terms.length) return [];
+  const titles = [];
+  const contents = [];
+  for (const c of state.conversations) {
+    const title = c.title || '';
+    const at = findTerms(title, terms);
+    if (at >= 0) {
+      titles.push({ conversation: c, where: 'title', at, text: title });
+      continue;
+    }
+    // The first message that holds every term, else the discussion as a whole.
+    let hit = null;
+    for (const m of c.messages || []) {
+      const text = messageText(m);
+      const i = findTerms(text, terms);
+      if (i >= 0) {
+        hit = { conversation: c, where: m.role === 'user' ? 'question' : 'answer', at: i, text, created: m.created };
+        break;
+      }
+    }
+    if (!hit) {
+      const all = (c.messages || []).map(messageText).join('\n');
+      if (findTerms(all, terms) >= 0) {
+        const f = fold(all);
+        hit = { conversation: c, where: 'messages', at: f.indexOf(terms[0]), text: all };
+      }
+    }
+    if (hit) contents.push(hit);
+  }
+  const out = titles.concat(contents).slice(0, limit || 100);
+  for (const x of out) x.excerpt = String(x.text).replace(/\s+/g, ' ').slice(Math.max(0, x.at - 60), x.at + 120);
+  return out;
+}
+
+// The time of the last activity of a project: its own changes and those of its discussions.
+function projectActivity(p) {
+  let t0 = p.updated || p.created || 0;
+  for (const c of state.conversations) if (c.projectId === p.id && c.updated > t0) t0 = c.updated;
+  return t0;
+}
+
+/*
+    The projects that hold every term of a query, as searchConversations: those whose name
+    holds them first, then those whose description, instructions, documents or discussions
+    hold them.  where: 'name', 'description', 'instructions', 'document' or 'discussion',
+    with the name of the document or the title of the discussion in label.
+*/
+function searchProjects(query, limit) {
+  const terms = queryTerms(query);
+  if (!terms.length) return [];
+  const names = [];
+  const contents = [];
+  for (const p of state.projects) {
+    const at = findTerms(p.name, terms);
+    if (at >= 0) {
+      names.push({ project: p, where: 'name', at, text: p.name });
+      continue;
+    }
+    const fields = [['description', p.description, ''], ['instructions', p.instructions, '']];
+    for (const f of p.files || []) fields.push(['document', f.name + '\n' + (f.text || ''), f.name]);
+    for (const c of state.conversations) {
+      if (c.projectId === p.id) fields.push(['discussion', (c.title || '') + '\n' + conversationText(c), c.title || t('untitled')]);
+    }
+    for (const [where, text, label] of fields) {
+      const i = findTerms(text, terms);
+      if (i >= 0) {
+        contents.push({ project: p, where, at: i, text, label });
+        break;
+      }
+    }
+  }
+  const byActivity = (a, b) => projectActivity(b.project) - projectActivity(a.project);
+  return names.sort(byActivity).concat(contents.sort(byActivity)).slice(0, limit || 100);
+}
+
+function conversationText(c) {
+  const parts = [];
+  for (const m of c.messages || []) parts.push(messageText(m));
   return parts.join('\n');
 }
 
-function searchConversations(query, limit) {
-  const q = query.trim().toLowerCase();
-  if (!q) return [];
-  const out = [];
-  for (const c of state.conversations) {
-    const text = conversationText(c);
-    const i = text.toLowerCase().indexOf(q);
-    if (i < 0) continue;
-    const start = Math.max(0, i - 60);
-    out.push({ conversation: c, excerpt: (start ? '…' : '') + text.slice(start, i + q.length + 100).replace(/\s+/g, ' ') });
-    if (out.length >= (limit || 50)) break;
-  }
-  return out;
+/*
+    The window of the search of the projects (kind 'projects') or of the discussions: each
+    result shows its title, where the words were found, and the passage that holds them.
+*/
+function searchDialog(kind) {
+  const projects = kind === 'projects';
+  return dialog((box, close) => {
+    const input = h('input', { type: 'search', placeholder: t('searchPlaceholder'), 'aria-label': t('searchPlaceholder') });
+    const count = h('div', { class: 'help' });
+    const list = h('div', { class: 'search-results', role: 'listbox' });
+    const open = (hit) => {
+      close(true);
+      go(projects ? '#/p/' + hit.project.id : '#/c/' + hit.conversation.id);
+    };
+    const show = () => {
+      const terms = queryTerms(input.value);
+      const hits = projects ? searchProjects(input.value) : searchConversations(input.value);
+      list.replaceChildren();
+      if (!terms.length) {
+        count.textContent = t('searchHint');
+        return;
+      }
+      count.textContent = t('resultsCount', { n: hits.length });
+      for (const hit of hits) {
+        const title = projects ? hit.project.name : (hit.conversation.title || t('untitled'));
+        const date = new Date(projects ? projectActivity(hit.project) : hit.conversation.updated);
+        const p = projects ? hit.project : (hit.conversation.projectId ? projectById(hit.conversation.projectId) : null);
+        const inTitle = hit.where === 'title' || hit.where === 'name';
+        const where = t('found_' + hit.where, { name: hit.label || '' });
+        list.append(h('div', { class: 'search-result', role: 'option', tabindex: '0', onclick: () => open(hit),
+          onkeydown: (e) => { if (e.key === 'Enter') open(hit); } },
+          h('div', { class: 'line' },
+            p ? h('span', { class: 'dot', style: { background: p.color || projectColors[0] } })
+              : h('span', { html: icon(roleIcons[hit.conversation.role] || 'chat') }),
+            h('span', { class: 'title', html: inTitle ? markTerms(title, terms) : escapeHtml(title) }),
+            h('span', { class: 'date' }, date.toLocaleDateString(language()))),
+          h('div', { class: 'where' }, h('span', { class: 'badge' }, where),
+            inTitle ? null : h('span', { class: 'excerpt', html: excerptHtml(hit.text, hit.at, terms) }))));
+      }
+      if (!hits.length) list.append(h('div', { class: 'empty-note' }, t('noResults')));
+    };
+    let timer = 0;
+    input.addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(show, 120); });
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        const first = list.querySelector('.search-result');
+        if (first) first.click();
+      }
+    });
+    box.classList.add('search-dialog');
+    box.append(h('h2', null, projects ? t('searchProjects') : t('searchDiscussions')), input, count, list,
+      h('div', { class: 'actions' }, h('button', { class: 'button', type: 'button', onclick: () => close(null) }, t('close'))));
+    show();
+    setTimeout(() => input.focus(), 0);
+  });
 }
 
 // Sidebar.
@@ -290,12 +509,19 @@ function renderSidebar() {
   const scroll = ui.sideScroll;
   scroll.replaceChildren();
   if (state.search.trim()) {
+    const terms = queryTerms(state.search);
     const hits = searchConversations(state.search);
     const section = h('div', { class: 'side-section' }, h('div', { class: 'side-title' }, t('searchIn')));
     if (!hits.length) section.append(h('div', { class: 'empty-note' }, t('noResults')));
     for (const hit of hits) {
       const item = conversationItem(hit.conversation);
-      item.title = hit.excerpt;
+      item.title = hit.where === 'title' ? hit.text : t('found_' + hit.where) + ' : ' + hit.excerpt;
+      if (hit.where !== 'title') {
+        item.querySelector('.label').innerHTML = escapeHtml(hit.conversation.title || t('untitled'))
+          + '<span class="side-excerpt">' + excerptHtml(hit.text, hit.at, terms, 60) + '</span>';
+      } else {
+        item.querySelector('.label').innerHTML = markTerms(hit.text, terms);
+      }
       section.append(item);
     }
     scroll.append(section);
@@ -304,9 +530,14 @@ function renderSidebar() {
 
   const projects = h('div', { class: 'side-section' },
     h('div', { class: 'side-title' }, h('span', null, t('projects')),
-      h('button', { type: 'button', title: t('newProject'), onclick: () => newProject(false), html: icon('plus') })));
-  if (!state.projects.length) projects.append(h('div', { class: 'empty-note' }, t('noProjects')));
-  for (const p of state.projects) {
+      h('span', { class: 'side-tools' },
+        h('button', { type: 'button', title: t('searchProjects'), onclick: () => searchDialog('projects'), html: icon('search') }),
+        h('button', { type: 'button', title: t('newProject'), onclick: () => newProject(false), html: icon('plus') }))));
+  // A project is created from here as well as from a discussion.
+  projects.append(h('div', { class: 'item new-item', onclick: () => newProject(false) },
+    h('span', { html: icon('plus') }), h('span', { class: 'label' }, t('newProject'))));
+  const recent = state.projects.slice().sort((a, b) => projectActivity(b) - projectActivity(a));
+  for (const p of recent.slice(0, sideLimit)) {
     const count = state.conversations.filter((c) => c.projectId === p.id).length;
     projects.append(h('div', {
       class: 'item' + (state.view === 'project' && state.projectId === p.id ? ' active' : ''),
@@ -315,26 +546,39 @@ function renderSidebar() {
     h('span', { class: 'label' }, p.name), h('span', { class: 'faint', style: { fontSize: '12px', color: 'var(--text-faint)' } },
       count ? String(count) : '')));
   }
+  if (recent.length > sideLimit) {
+    projects.append(h('div', { class: 'item more-item', onclick: () => searchDialog('projects') },
+      h('span', { html: icon('search') }), h('span', { class: 'label' }, t('searchMoreProjects', { n: recent.length }))));
+  }
   scroll.append(projects);
 
+  // The discussions: the pinned ones, then by date, sideLimit of them at most.
+  scroll.append(h('div', { class: 'side-section side-head' }, h('div', { class: 'side-title' }, h('span', null, t('discussions')),
+    h('span', { class: 'side-tools' },
+      h('button', { type: 'button', title: t('searchDiscussions'), onclick: () => searchDialog('discussions'), html: icon('search') })))));
   const pinned = state.conversations.filter((c) => c.pinned);
-  if (pinned.length) {
+  const shown = pinned.slice(0, sideLimit);
+  if (shown.length) {
     const section = h('div', { class: 'side-section' }, h('div', { class: 'side-title' }, t('pinned')));
-    for (const c of pinned) section.append(conversationItem(c));
+    for (const c of shown) section.append(conversationItem(c));
     scroll.append(section);
   }
+  let left = sideLimit - shown.length;
   const groups = { today: [], yesterday: [], week: [], month: [], older: [] };
   for (const c of state.conversations) if (!c.pinned) groups[dateGroup(c.updated)].push(c);
-  let any = pinned.length > 0;
   for (const g of Object.keys(groups)) {
-    if (!groups[g].length) continue;
-    any = true;
+    if (!groups[g].length || left <= 0) continue;
     const section = h('div', { class: 'side-section' }, h('div', { class: 'side-title' }, t(g)));
-    for (const c of groups[g]) section.append(conversationItem(c));
+    for (const c of groups[g].slice(0, left)) section.append(conversationItem(c));
+    left -= Math.min(left, groups[g].length);
     scroll.append(section);
   }
-  if (!any) scroll.append(h('div', { class: 'side-section' }, h('div', { class: 'side-title' }, t('discussions')),
-    h('div', { class: 'empty-note' }, t('noDiscussions'))));
+  if (!state.conversations.length) scroll.append(h('div', { class: 'empty-note' }, t('noDiscussions')));
+  if (state.conversations.length > sideLimit) {
+    scroll.append(h('div', { class: 'side-section' }, h('div', { class: 'item more-item', onclick: () => searchDialog('discussions') },
+      h('span', { html: icon('search') }), h('span', { class: 'label' },
+        t('searchMoreDiscussions', { n: state.conversations.length })))));
+  }
 }
 
 function conversationItem(c) {
@@ -420,6 +664,8 @@ async function renameConversation(c) {
   const name = await promptDialog(t('rename'), c.title || '');
   if (name == null) return;
   c.title = name.trim() || c.title;
+  // A title of the user stays: the model no longer names the discussion.
+  c.titleSource = 'user';
   await persist(c);
   renderSidebar();
   if (state.current && state.current.id === c.id) renderTopbar();
@@ -449,14 +695,14 @@ async function removeConversation(c) {
   else renderSidebar();
 }
 
-function exportConversation(c, format) {
-  const safe = (c.title || 'discussion').replace(/[\\/:*?"<>|]+/g, '_').slice(0, 80);
-  if (format === 'json') {
-    download(safe + '.json', JSON.stringify(c, null, 2), 'application/json');
-    return;
-  }
-  const lines = ['# ' + (c.title || t('untitled')), ''];
-  for (const m of c.messages) {
+function fileName(c) {
+  return (c.title || 'discussion').replace(/[\\/:*?"<>|]+/g, '_').slice(0, 80);
+}
+
+// The messages of a discussion in Markdown, under its title.
+function markdownOf(title, messages) {
+  const lines = ['# ' + title, ''];
+  for (const m of messages) {
     if (m.role === 'user') {
       lines.push('## ' + (state.settings.userName || 'User'), '', m.content || '');
       for (const a of m.attachments || []) lines.push('', '> ' + a.name + ' (' + formatSize(a.size || 0) + ')');
@@ -470,7 +716,64 @@ function exportConversation(c, format) {
     }
     lines.push('');
   }
-  download(safe + '.md', lines.join('\n'), 'text/markdown');
+  return lines.join('\n');
+}
+
+function exportConversation(c, format) {
+  if (format === 'json') download(fileName(c) + '.json', JSON.stringify(c, null, 2), 'application/json');
+  else download(fileName(c) + '.md', markdownOf(c.title || t('untitled'), c.messages), 'text/markdown');
+}
+
+// One answer of a discussion, with the question it answers.
+function exportAnswer(c, index, format) {
+  let q = index - 1;
+  while (q >= 0 && c.messages[q].role !== 'user') --q;
+  const messages = (q >= 0 ? [c.messages[q]] : []).concat([c.messages[index]]);
+  const n = c.messages.slice(0, index + 1).filter((m) => m.role !== 'user').length;
+  const name = fileName(c) + '-' + n;
+  if (format === 'json') {
+    const doc = { title: c.title || '', conversation: c.id, exported: new Date().toISOString(), messages };
+    download(name + '.json', JSON.stringify(doc, null, 2), 'application/json');
+  } else {
+    download(name + '.md', markdownOf(c.title || t('untitled'), messages), 'text/markdown');
+  }
+}
+
+/*
+  Deletes a question with its answer, the messages up to the next question, and takes the
+  documents attached to the question out of the search of the discussion.  The start of the
+  context follows the messages that remain.
+*/
+async function deleteQuestion(c, index) {
+  if (state.busy) return;
+  if (!await confirmDialog(t('deleteQuestionTitle'), t('deleteQuestionText'))) return;
+  // A compression in progress moves the start of the discussion: it ends first.
+  if (compactions.has(c.id)) await compactions.get(c.id).catch(() => {});
+  const m = c.messages[index];
+  let end = index + 1;
+  while (end < c.messages.length && c.messages[end].role !== 'user') ++end;
+  for (const a of (m && m.attachments) || []) if (a.mode === 'search') rag.removeDocument(c.id, a.id);
+  const removed = end - index;
+  c.messages.splice(index, removed);
+  const start = c.contextStart || 0;
+  if (start >= end) c.contextStart = start - removed;
+  else if (start > index) c.contextStart = index;
+  // A question already compressed: the summary is written again from the exchanges before the
+  // start, without it.
+  if (c.summary && index < start) await rewriteSummary(c);
+  c.updated = Date.now();
+  await persist(c);
+  renderMain();
+}
+
+async function rewriteSummary(c) {
+  const start = c.contextStart || 0;
+  c.summary = null;
+  if (start === 0 || !roleModel(c.role)) return;
+  const context = roleCapabilities(c.role).context || 8192;
+  const room = context - Math.min(state.settings.maxTokens || 2048, Math.floor(context / 2));
+  toast(t('compacting'));
+  await compact(c, 0, start, room, 1 / 3.6, null).then((r) => applyCompaction(c, r)).catch(() => { c.summary = null; });
 }
 
 // The document search: the documents being indexed, one at a time in the background.
@@ -881,7 +1184,8 @@ function userElement(c, m, index, last) {
   el.append(bubble);
   el.append(h('div', { class: 'meta' },
     iconButton('copy', t('copy'), () => { navigator.clipboard.writeText(m.content); toast(t('copied')); }),
-    iconButton('edit', t('edit'), () => editMessage(c, m, index, el))));
+    iconButton('edit', t('edit'), () => editMessage(c, m, index, el)),
+    iconButton('trash', t('deleteQuestion'), () => deleteQuestion(c, index))));
   return el;
 }
 
@@ -915,8 +1219,13 @@ function editMessage(c, m, index, el) {
       onclick: async () => {
         const text = area.value.trim();
         if (!text && !attachments.length) return;
+        if (compactions.has(c.id)) await compactions.get(c.id).catch(() => {});
         c.messages = c.messages.slice(0, index);
-        if ((c.contextStart || 0) > index) c.contextStart = 0;
+        if ((c.contextStart || 0) > index) {
+          // The exchanges come back into the context, without the summary of what follows.
+          c.contextStart = 0;
+          c.summary = null;
+        }
         // The documents no longer attached leave the search of the discussion.
         const kept = new Set(attachments.map((a) => a.id));
         for (const a of m.attachments || []) if (!kept.has(a.id) && a.mode === 'search') rag.removeDocument(c.id, a.id);
@@ -943,6 +1252,11 @@ function assistantElement(c, m, index, last) {
   const text = (m.steps || []).map((s) => s.content || '').join('\n\n').trim();
   meta.append(iconButton('copy', t('copy'), () => { navigator.clipboard.writeText(text); toast(t('copied')); }));
   if (last) meta.append(iconButton('refresh', t('regenerate'), () => regenerate(c)));
+  const exporter = iconButton('download', t('exportAnswer'), () => showMenu(exporter, [
+    { label: t('exportMarkdown'), icon: 'download', action: () => exportAnswer(c, index, 'md') },
+    { label: t('exportJson'), icon: 'archive', action: () => exportAnswer(c, index, 'json') }
+  ]));
+  meta.append(exporter);
   const stats = statsText(m);
   if (stats) meta.append(h('span', { class: 'stats' }, stats));
   el.append(meta);
@@ -979,7 +1293,11 @@ function fillAssistant(bubble, m, live) {
   } else if (live && !steps.some((s) => s.content || s.reasoning || (s.toolCalls || []).length)) {
     bubble.append(h('div', { class: 'progress-line' }, h('span', { class: 'spinner' }), h('span', { class: 'shimmer' }, t('thinking') + '…')));
   }
-  if (m.trimmed) bubble.append(h('div', { class: 'progress-line' }, h('span', { html: icon('info') }), t('contextTrimmed')));
+  if (live && m.compacting) {
+    bubble.append(h('div', { class: 'progress-line' }, h('span', { class: 'spinner' }), h('span', { class: 'shimmer' }, t('compacting'))));
+  }
+  if (m.compacted) bubble.append(h('div', { class: 'progress-line' }, h('span', { html: icon('info') }), t('contextCompacted')));
+  else if (m.trimmed) bubble.append(h('div', { class: 'progress-line' }, h('span', { html: icon('info') }), t('contextTrimmed')));
   if (m.error) bubble.append(h('div', { class: 'error-box' }, t('errorPrefix', { message: m.error })));
   if (m.cancelled) bubble.append(h('div', { class: 'progress-line' }, t('cancelled')));
   if (!live && !m.error && !m.cancelled && !steps.some((s) => s.content || (s.toolCalls || []).length)) {
@@ -990,15 +1308,11 @@ function fillAssistant(bubble, m, live) {
 
 function thinkingElement(s, live) {
   const d = h('details', { class: 'thinking' + (live ? ' live' : '') });
-  // Open while the model thinks, unless the user closed it; closed afterwards, unless the
-  // user opened it.
-  const open = live ? !s.collapsed : !!s.expanded;
+  // Closed, while the model thinks and afterwards: the user opens it, and it then stays as
+  // the user left it.
+  const open = !!s.expanded;
   if (open) d.open = true;
-  d.addEventListener('toggle', () => {
-    if (d.open === open) return;
-    if (live) s.collapsed = !d.open;
-    else s.expanded = d.open;
-  });
+  d.addEventListener('toggle', () => { if (d.open !== open) s.expanded = d.open; });
   let label;
   if (live) label = h('span', { class: 'shimmer' }, t('thinking') + '…' + (s.reasoningStart ? ' ' + formatDuration(Date.now() - s.reasoningStart) : ''));
   else label = h('span', null, s.reasoningMs ? t('thoughtFor', { s: formatDuration(s.reasoningMs) }) : t('thoughtBriefly'));
@@ -1097,8 +1411,13 @@ async function sendMessage(text, attachments) {
   const c = state.current;
   const m = { id: store.uid(), role: 'user', content: text, attachments: attachments || [], created: Date.now() };
   c.messages.push(m);
+  // A new discussion starts with the memory as it is now.
+  if (c.messages.length === 1 && !c.incognito && state.settings.memoryEnabled && state.settings.memory) {
+    c.memory = state.settings.memory;
+  }
+  clearTimeout(memoryTimers.get(c.id));
   await prepareQuestion(c, m);
-  if (!c.title) c.title = (text || (attachments[0] && attachments[0].name) || t('untitled')).replace(/\s+/g, ' ').slice(0, 70);
+  if (!c.title) c.title = provisionalTitle(m);
   c.updated = Date.now();
   await persist(c);
   if (!c.incognito && location.hash !== '#/c/' + c.id) history.replaceState(null, '', '#/c/' + c.id);
@@ -1198,6 +1517,11 @@ function systemPrompt(c, contextTokens) {
   parts.push('Current date: ' + now.toLocaleDateString('en-CA') + ' (' + now.toLocaleDateString(language(), { weekday: 'long' }) + ').');
   if (state.settings.userName) parts.push('The user is named ' + state.settings.userName + '.');
   if (state.settings.systemPrompt) parts.push(state.settings.systemPrompt);
+  // The memory as it was when the discussion started: its prompt keeps the same beginning.
+  if (c.memory && state.settings.memoryEnabled && !c.incognito) {
+    parts.push('What you remember from earlier discussions with the user, to use when it helps, without mentioning it '
+      + 'otherwise:\n' + c.memory);
+  }
   const p = c.projectId ? projectById(c.projectId) : null;
   if (p) {
     parts.push('This discussion belongs to the project "' + p.name + '".' + (p.description ? ' ' + p.description : ''));
@@ -1219,27 +1543,41 @@ function systemPrompt(c, contextTokens) {
   return parts.join('\n\n');
 }
 
-function userContent(m) {
+// The text of a question for the model; cuts (fitContext) shortens the oldest texts.
+function userContent(m, cuts) {
+  const cut = (key, text) => {
+    const kept = cuts && cuts.texts.get(key);
+    return kept == null ? text : keepEnd(text, kept);
+  };
   let s = '';
   for (const a of m.attachments || []) {
     if (a.mode === 'search') {
       s += '<document name="' + a.name + '" format="' + (a.format || '') + '">\n(Too long to be read whole: its excerpts '
         + 'closest to the questions come with them.)\n</document>\n\n';
     } else {
-      s += '<document name="' + a.name + '">\n' + a.text + '\n</document>\n\n';
+      s += '<document name="' + a.name + '">\n' + cut(a.id, a.text || '') + '\n</document>\n\n';
     }
   }
   if (m.context) s += m.context + '\n\n';
-  return s + (m.content || '');
+  return s + cut(m.id, m.content || '');
 }
 
-function apiMessages(c, system) {
+function apiMessages(c, system, cuts) {
   const out = [];
   if (system) out.push({ role: 'system', content: system });
-  // The exchanges before contextStart left the context in an earlier question.
-  for (const m of c.messages.slice(c.contextStart || 0)) {
+  // The exchanges before contextStart left the context in an earlier question; their summary
+  // comes with the first question that stays.
+  const start = c.contextStart || 0;
+  let summary = start > 0 && c.summary && c.summary.text ? c.summary.text : '';
+  if (summary && cuts && cuts.summary != null) summary = keepEnd(summary, cuts.summary);
+  for (const m of c.messages.slice(start)) {
     if (m.role === 'user') {
-      out.push({ role: 'user', content: userContent(m) });
+      let content = userContent(m, cuts);
+      if (summary) {
+        content = '<summary_of_the_earlier_discussion>\n' + summary + '\n</summary_of_the_earlier_discussion>\n\n' + content;
+        summary = '';
+      }
+      out.push({ role: 'user', content });
       continue;
     }
     for (const s of m.steps || []) {
@@ -1257,48 +1595,251 @@ function apiMessages(c, system) {
   return out;
 }
 
+// Where text may be cut: after the end of a sentence followed by a space, or a blank line.
+const sentenceBreak = /[.!?\u2026\u3002\uff01\uff1f]["'\u00bb\u201d)\]]*\s+|\n\s*\n/g;
+
+/*
+    The end of text, without the beginning that takes it over max characters: the cut comes
+    after the end of a sentence, so that the oldest information leaves first and no sentence
+    is left in part.  A text without a sentence break there is cut at a space.
+*/
+function keepEnd(text, max) {
+  text = String(text || '');
+  if (text.length <= max) return text;
+  const from = text.length - Math.max(0, max - 2);
+  sentenceBreak.lastIndex = from;
+  const m = sentenceBreak.exec(text);
+  let start = m ? m.index + m[0].length : text.indexOf(' ', from) + 1;
+  if (start <= 0 || start >= text.length) start = from;
+  return '\u2026 ' + text.slice(start);
+}
+
+// The beginning of text, at most max characters, ending with its last whole sentence.
+function keepStart(text, max) {
+  text = String(text || '');
+  if (text.length <= max) return text;
+  const head = text.slice(0, max);
+  let end = 0;
+  sentenceBreak.lastIndex = 0;
+  for (let m; (m = sentenceBreak.exec(head)); ) end = m.index + m[0].length;
+  if (end < max / 2) end = Math.max(head.lastIndexOf(' '), max / 2);
+  return head.slice(0, end).trim() + ' \u2026';
+}
+
+// The exchanges as plain text, for their summary: the questions with the names of their
+// documents, the answers without their reasoning, the results of the tools in short.
+function transcriptOf(messages) {
+  const lines = [];
+  for (const m of messages) {
+    if (m.role === 'user') {
+      const docs = (m.attachments || []).map((a) => a.name);
+      lines.push('User: ' + (m.content || '') + (docs.length ? '\n(documents: ' + docs.join(', ') + ')' : ''));
+      continue;
+    }
+    const parts = [];
+    for (const s of m.steps || []) {
+      for (const tc of s.toolCalls || []) {
+        parts.push('[' + tc.name + ' ' + (tc.arguments || '') + ': ' + keepStart(tc.result || '', 600) + ']');
+      }
+      if (s.content) parts.push(s.content);
+    }
+    if (parts.length) lines.push('Assistant: ' + parts.join('\n'));
+  }
+  return lines.join('\n\n');
+}
+
+function summaryInstructions(words) {
+  return 'You keep the memory of a long discussion between a user and an assistant. Rewrite the previous summary, '
+    + 'when there is one, together with the new exchanges, into a single summary that the assistant will read in '
+    + 'place of these exchanges. Keep, in the order they came: the facts, figures, names, decisions and '
+    + 'conclusions; the requests, preferences and constraints of the user; the code, commands and values that may '
+    + 'be needed again, in short; the documents by their names; the questions left open. Leave out greetings, '
+    + 'repetitions and reasoning. Write in the language of the exchanges, as a compact list of points, in at most '
+    + words + ' words.';
+}
+
+// A summary written by the model of the discussion from the previous one and a transcript.
+async function summarize(c, previous, transcript, limit, signal) {
+  const body = {
+    model: 'albireo-' + c.role, reasoning: false, temperature: 0.2, max_tokens: limit,
+    messages: [
+      { role: 'system', content: summaryInstructions(Math.floor(limit * 0.6)) },
+      { role: 'user', content: (previous ? '<previous_summary>\n' + previous + '\n</previous_summary>\n\n' : '')
+        + '<exchanges>\n' + transcript + '\n</exchanges>' }
+    ]
+  };
+  let text = '';
+  let finish = null;
+  for await (const ev of api.streamChat(body, signal)) {
+    const choice = ev.type === 'chunk' && ev.data.choices && ev.data.choices[0];
+    if (!choice) continue;
+    if (choice.delta && choice.delta.content) text += choice.delta.content;
+    if (choice.finish_reason) finish = choice.finish_reason;
+  }
+  text = text.trim();
+  if (!text) throw new Error('empty summary');
+  // A summary stopped by its length ends with its last whole sentence.
+  return finish === 'length' ? keepStart(text, text.length - 1) : text;
+}
+
+/*
+    Compresses the exchanges [from, to) of a discussion into its summary: the model of the
+    discussion rewrites the summary with them, in parts that fit its context, oldest first.
+    Returns {summary, to}, which applyCompaction gives to the discussion, then started at
+    to, its summary given with its first question.  A summary grown beyond its share of the
+    room loses its oldest points.
+*/
+async function compact(c, from, to, room, scale, signal) {
+  const limit = Math.max(128, Math.min(1024, Math.floor(summaryShare * room)));
+  let summary = (c.summary && c.summary.text) || '';
+  // Characters of exchanges per part: the room, less the summary, its instructions and the
+  // summary to write.
+  const chars = (n) => Math.floor(n / Math.max(scale, 1e-6));
+  let i = from;
+  while (i < to) {
+    const available = Math.max(chars(Math.floor(room / 4)), chars(room - limit - 400) - summary.length);
+    let j = i;
+    let length = 0;
+    while (j < to) {
+      const piece = transcriptOf([c.messages[j]]).length + 2;
+      if (j > i && length + piece > available) break;
+      length += piece;
+      ++j;
+    }
+    summary = await summarize(c, summary, keepEnd(transcriptOf(c.messages.slice(i, j)), available), limit, signal);
+    i = j;
+  }
+  return { summary: { text: keepEnd(summary, chars(limit)), upTo: to, updated: Date.now() }, to,
+    last: c.messages[to - 1] && c.messages[to - 1].id };
+}
+
+function applyCompaction(c, r) {
+  c.summary = r.summary;
+  c.contextStart = r.to;
+}
+
+// The discussion as it is now, for the work that ends in the background: the one shown, else
+// the one stored.  Null when it was deleted.
+async function currentVersion(c) {
+  if (state.current && state.current.id === c.id) return state.current;
+  if (c.incognito) return c;
+  return (await store.getConversation(c.id)) || null;
+}
+
+const compactions = new Map();   // discussion -> its compression in the background
+
+/*
+    The start of a discussion that leaves to the exchanges after it keptShare of the room of
+    the context: the first question after the current start for which the conversation built
+    by build fits, the last question at most.  Returns -1 when no question can leave.
+*/
+function nextStart(c, build, scale, room) {
+  const from = c.contextStart || 0;
+  const users = [];
+  for (let i = from + 1; i < c.messages.length; ++i) if (c.messages[i].role === 'user') users.push(i);
+  // The question being answered stays: the last one of the messages, or the one before the
+  // answer in progress.
+  const lastUser = c.messages.map((m) => m.role).lastIndexOf('user');
+  const candidates = users.filter((i) => i <= lastUser);
+  if (!candidates.length) return -1;
+  const size = (msgs) => msgs.reduce((n, m) => n + JSON.stringify(m).length, 0);
+  const saved = c.contextStart;
+  let next = candidates[candidates.length - 1];
+  for (const i of candidates) {
+    c.contextStart = i;
+    if (size(build()) * scale <= keptShare * room) {
+      next = i;
+      break;
+    }
+  }
+  c.contextStart = saved;
+  return next;
+}
+
 /*
     Fits the conversation in the context of the model.  When it no longer fits, the oldest
     exchanges leave in one step, until the conversation takes keptShare of its room, and
     the point where it now starts stays with the conversation: the following questions
     start from that same point, so that the engine reuses what it already read, and the
-    next cut comes only after several questions.  The system message and the last
-    question always stay.  Returns {messages, trimmed, context, tokens}.
+    next cut comes only after several questions.  The exchanges that leave are compressed
+    into the summary of the discussion, which the model receives with the first question
+    that stays (compact); the exchanges leave without it when the model cannot write it.
+    When the last question alone does not fit, the oldest texts lose their beginnings,
+    at the end of a sentence: the summary first, then the documents of the questions, then
+    the questions.  The system message and the last question always stay.  onCompact tells
+    when a compression starts.  Returns {messages, trimmed, compacted, context, tokens}.
 */
-async function fitContext(c, build, toolDefs, reserve) {
+async function fitContext(c, build, toolDefs, reserve, signal, onCompact) {
   let trimmed = false;
-  for (let attempt = 0; attempt < 6; ++attempt) {
-    const list = build();
+  let compacted = false;
+  if (compactions.has(c.id)) {
+    if (onCompact) onCompact();
+    await compactions.get(c.id).catch(() => {});
+  }
+  const cuts = { summary: null, texts: new Map() };
+  for (let attempt = 0; attempt < 12; ++attempt) {
+    const list = build(cuts);
     let r;
     try {
       r = await api.count('albireo-' + c.role, list, toolDefs);
     } catch (e) {
-      return { messages: list, trimmed, context: 0 };
+      return { messages: list, trimmed, compacted, context: 0 };
     }
-    if (!r || typeof r.tokens !== 'number' || !r.context) return { messages: list, trimmed, context: 0 };
+    if (!r || typeof r.tokens !== 'number' || !r.context) return { messages: list, trimmed, compacted, context: 0 };
     const room = r.context - Math.min(reserve, Math.floor(r.context / 2));
-    if (r.tokens <= room) return { messages: list, trimmed, context: r.context, tokens: r.tokens };
-    // The questions after the current start, the last one excepted, are where it may move.
-    const from = c.contextStart || 0;
-    const users = [];
-    for (let i = from + 1; i < c.messages.length; ++i) if (c.messages[i].role === 'user') users.push(i);
-    const last = users.pop();
-    if (last == null) return { messages: list, trimmed, context: r.context, tokens: r.tokens, overflow: true };
-    // The tokens of each candidate start, from the characters scaled to the measure.
+    if (r.tokens <= room) return { messages: list, trimmed, compacted, context: r.context, tokens: r.tokens };
+    // The tokens of a list of messages, from their characters scaled to the measure.
     const size = (msgs) => msgs.reduce((n, m) => n + JSON.stringify(m).length, 0);
     const scale = r.tokens / Math.max(1, size(list));
-    let next = last;
-    for (const i of users.concat([last])) {
-      c.contextStart = i;
-      if (size(build()) * scale <= keptShare * room) {
-        next = i;
-        break;
+    const next = nextStart(c, () => build(cuts), scale, room);
+    if (next > (c.contextStart || 0)) {
+      try {
+        if (onCompact) onCompact();
+        applyCompaction(c, await compact(c, c.contextStart || 0, next, room, scale, signal));
+        compacted = true;
+      } catch (e) {
+        if (e.name === 'AbortError') throw e;
+        c.contextStart = next;
+        trimmed = true;
       }
+      continue;
     }
-    c.contextStart = next;
+    // Nothing more can leave whole: the oldest texts lose their beginnings.
+    const excess = Math.ceil((r.tokens - room) / scale) + 200;
+    if (!shortenOldest(c, cuts, excess)) {
+      return { messages: list, trimmed, compacted, context: r.context, tokens: r.tokens, overflow: true };
+    }
     trimmed = true;
   }
-  return { messages: build(), trimmed, context: 0 };
+  return { messages: build(cuts), trimmed, compacted, context: 0 };
+}
+
+/*
+    Takes excess characters from the beginnings of the oldest texts the model receives, the
+    summary first, then the documents and the texts of the questions in their order: cuts
+    holds the characters each of them keeps.  Returns false when nothing is left to take.
+*/
+function shortenOldest(c, cuts, excess) {
+  const texts = [];
+  if (c.summary && c.summary.text && (c.contextStart || 0) > 0) texts.push({ key: 'summary', text: c.summary.text });
+  for (const m of c.messages.slice(c.contextStart || 0)) {
+    if (m.role !== 'user') continue;
+    for (const a of m.attachments || []) if (a.mode !== 'search') texts.push({ key: a.id, text: a.text || '' });
+    texts.push({ key: m.id, text: m.content || '' });
+  }
+  for (const x of texts) {
+    if (excess <= 0) break;
+    const kept = x.key === 'summary' ? cuts.summary : cuts.texts.get(x.key);
+    const length = kept == null ? x.text.length : kept;
+    // A text keeps a short end: what remains of the question, its last sentences.
+    const floor = Math.min(length, 200);
+    const take = Math.min(excess, length - floor);
+    if (take <= 0) continue;
+    if (x.key === 'summary') cuts.summary = length - take;
+    else cuts.texts.set(x.key, length - take);
+    excess -= take;
+  }
+  return excess <= 0;
 }
 
 let renderPending = false;
@@ -1337,11 +1878,20 @@ async function runTurn(c) {
       turn.steps.push(s);
       const system = systemPrompt(c, caps.context || 8192);
       // The conversation, with the steps of this answer already done (the agent's).
-      const build = () => apiMessages(Object.assign({}, c, {
+      const build = (cuts) => apiMessages(Object.assign({}, c, {
         messages: c.messages.slice(0, -1).concat([Object.assign({}, turn, { steps: turn.steps.slice(0, -1) })])
-      }), system);
-      const fitted = await fitContext(c, build, toolDefs, state.settings.maxTokens || 2048);
+      }), system, cuts);
+      const fitted = await fitContext(c, build, toolDefs, state.settings.maxTokens || 2048, state.abort.signal, () => {
+        turn.compacting = true;
+        scheduleRender(el, turn);
+      });
+      turn.compacting = false;
       if (fitted.trimmed) turn.trimmed = true;
+      if (fitted.compacted) turn.compacted = true;
+      if (fitted.context) {
+        turn.contextTokens = fitted.context;
+        turn.promptTokens = fitted.tokens;
+      }
       const body = {
         model: 'albireo-' + c.role, messages: fitted.messages, reasoning: !!(c.reasoning && caps.reasoning)
       };
@@ -1413,10 +1963,11 @@ async function runTurn(c) {
     }
   } catch (e) {
     if (e.name === 'AbortError') turn.cancelled = true;
-    else turn.error = e.message || String(e);
+    else turn.error = errorText(e);
   } finally {
     for (const s of turn.steps) delete s.reasoningStart;
     turn.progress = null;
+    turn.compacting = false;
     state.busy = false;
     state.abort = null;
     c.updated = Date.now();
@@ -1425,6 +1976,214 @@ async function runTurn(c) {
     renderComposerState();
     renderSidebar();
   }
+  if (!turn.error && !turn.cancelled) {
+    // A discussion still named after its first question receives a title from the model.
+    const first = c.messages.find((m) => m.role === 'user');
+    if (!c.titleSource && first && c.title === provisionalTitle(first)) nameConversation(c);
+    compactLater(c, turn);
+    rememberLater(c);
+  }
+}
+
+const memoryTimers = new Map();   // discussion -> the update of the memory to come
+let memoryQueue = Promise.resolve();
+
+// Updates the memory from a discussion once it has had no new question for memoryDelay.
+function rememberLater(c) {
+  if (c.incognito || !state.settings.memoryEnabled) return;
+  clearTimeout(memoryTimers.get(c.id));
+  memoryTimers.set(c.id, setTimeout(() => {
+    memoryTimers.delete(c.id);
+    memoryQueue = memoryQueue.then(() => remember(c)).catch(() => {});
+  }, memoryDelay));
+}
+
+function memoryInstructions(words, sensitive) {
+  return 'You keep a short memory about the user for the future discussions of an assistant. Update it with what '
+    + 'the new messages of the user teach about them that lasts: profession, projects, preferences, habits of work, '
+    + 'the way they want to be answered. Leave out what serves this discussion only, the content of documents, and what '
+    + 'the memory already holds. '
+    + (sensitive ? 'Information the user shares about themselves may be kept, sensitive or not. '
+      : 'Leave out sensitive information: health, finances, passwords, keys and identifiers, political, religious '
+        + 'or philosophical opinions, sexual orientation, private matters, and information about other people. ')
+    + 'Write each fact in your own words, as a short line that starts with "- ", without copying the messages. '
+    + 'Return the whole memory, the newest lines last, in at most ' + words + ' words; when nothing changes, return '
+    + 'the memory as it is. Write in the language of the user.';
+}
+
+// The credentials, keys and payment identifiers, which the memory keeps only when the settings
+// keep sensitive information, whatever the model wrote.
+const secretPatterns = [
+  /\b(mots? de passe|passwords?|passw[o\u00f6]rt|kennwort|contrase[n\u00f1]as?|parol[ae] d'ordine|passphrase|passcode)\b/i,
+  /\b(pin|cvv|cvc|iban|bic|swift)\b/i,
+  /\b(api[ _-]?keys?|cl[e\u00e9]s? d'api|access[ _-]?tokens?|bearer|secret[ _-]?keys?|private[ _-]?keys?|cl[e\u00e9]s? priv[e\u00e9]es?)\b/i,
+  /\b(?:\d[ -]?){13,19}\b/,
+  /[A-Za-z0-9+\/=_-]{32,}/
+];
+
+// The lines of a memory written by the model, within words words: the oldest leave first.
+function memoryLines(text, words, sensitive) {
+  let lines = String(text || '').split('\n').map((l) => l.trim()).filter((l) => /^[-*\u2022]\s*\S/.test(l))
+    .map((l) => '- ' + l.replace(/^[-*\u2022]\s*/, ''))
+    .filter((l) => sensitive || !secretPatterns.some((re) => re.test(l)));
+  const count = (ls) => ls.join(' ').split(/\s+/).filter(Boolean).length;
+  while (lines.length > 1 && count(lines) > words) lines = lines.slice(1);
+  return lines.join('\n');
+}
+
+/*
+    Updates the memory with the exchanges of a discussion that it has not read yet: the model
+    rewrites the memory from them, leaving out the sensitive information unless the settings
+    keep it.  The questions count, with the beginning of the answers for their context.
+*/
+async function remember(c) {
+  if (c.incognito || !state.settings.memoryEnabled) return;
+  if (state.busy && state.current && state.current.id === c.id) return;
+  const from = c.memoryMark || 0;
+  const to = c.messages.length;
+  const exchanges = c.messages.slice(from, to);
+  const asked = exchanges.filter((m) => m.role === 'user').map((m) => m.content || '').join(' ');
+  const mark = async () => {
+    const now = await currentVersion(c).catch(() => null);
+    if (!now) return;
+    now.memoryMark = Math.max(now.memoryMark || 0, Math.min(to, now.messages.length));
+    await persist(now).catch(() => {});
+  };
+  if (asked.trim().length < 40) {
+    await mark();
+    return;
+  }
+  // What the user wrote: the memory is about the user, and the answers would fill it with
+  // what the assistant said.
+  const lines = [];
+  for (const m of exchanges) if (m.role === 'user') lines.push('User: ' + keepStart(m.content || '', 1500));
+  const context = roleCapabilities(c.role).context || 8192;
+  const words = memoryLimitWords(context);
+  const current = state.settings.memory || '';
+  let text = '';
+  const body = {
+    model: 'albireo-' + c.role, reasoning: false, temperature: 0.2, max_tokens: Math.ceil(words * 2.2) + 16,
+    messages: [
+      { role: 'system', content: memoryInstructions(words, !!state.settings.memorySensitive) },
+      { role: 'user', content: '<memory>\n' + (current || '(empty)') + '\n</memory>\n\n<messages>\n'
+        + keepEnd(lines.join('\n\n'), Math.floor(context * 3.6 * 0.5)) + '\n</messages>' }
+    ]
+  };
+  for await (const ev of api.streamChat(body)) {
+    const choice = ev.type === 'chunk' && ev.data.choices && ev.data.choices[0];
+    if (choice && choice.delta && choice.delta.content) text += choice.delta.content;
+  }
+  // The memory may have been reset or edited meanwhile: the update is then dropped.
+  if (!state.settings.memoryEnabled || (state.settings.memory || '') !== current) return;
+  const updated = memoryLines(text, words, !!state.settings.memorySensitive);
+  if (updated || !current) {
+    await saveSetting('memory', updated);
+    await saveSetting('memoryUpdated', Date.now());
+  }
+  await mark();
+}
+
+// An error of the service in the language of the interface, by its code when it has one.
+function errorText(e) {
+  const known = { model_not_found: 'errModelNotFound', context_length_exceeded: 'errContextLength', unloaded: 'errUnloaded' };
+  if (e && known[e.code]) return t(known[e.code]);
+  // fetch rejects with a TypeError when the service does not answer.
+  if (e instanceof TypeError) return t('errService');
+  return (e && e.message) || String(e);
+}
+
+// The title of a discussion until the model names it: the beginning of its first question.
+function provisionalTitle(m) {
+  const first = m.content || ((m.attachments || [])[0] || {}).name || t('untitled');
+  return first.replace(/\s+/g, ' ').slice(0, 70);
+}
+
+// A title as the model writes it, without its quotes, marks and final punctuation.
+function cleanTitle(text) {
+  let title = String(text || '').split('\n').map((l) => l.trim()).find((l) => l) || '';
+  title = title.replace(/^(title|titre|titel|titolo|t[ií]tulo)\s*:\s*/i, '').replace(/[*#_`]+/g, '')
+    .replace(/^["'\u00ab\u201c\u201e\s]+|["'\u00bb\u201d\s]+$/g, '').replace(/[.!?:;,\u2026]+$/, '').trim();
+  return title.length > 70 ? keepStart(title, 70).replace(/\s*\u2026$/, '') : title;
+}
+
+/*
+    Names a discussion after its first question: the model of the discussion writes a short
+    title, which replaces the beginning of the question that served until then, unless the
+    user renames the discussion meanwhile.
+*/
+async function nameConversation(c) {
+  const first = c.messages.find((m) => m.role === 'user');
+  if (!first) return;
+  c.titleSource = 'pending';
+  const question = keepStart((first.content || '') + ((first.attachments || []).length
+    ? '\n(' + first.attachments.map((a) => a.name).join(', ') + ')' : ''), 1500);
+  let text = '';
+  try {
+    const body = {
+      model: 'albireo-' + c.role, reasoning: false, temperature: 0.2, max_tokens: 24,
+      messages: [
+        { role: 'system', content: 'You name discussions. Answer with a title of at most six words for the discussion '
+          + 'that starts with the question of the user, in the language of that question, without quotes, emoji or '
+          + 'final punctuation.' },
+        { role: 'user', content: question }
+      ]
+    };
+    for await (const ev of api.streamChat(body)) {
+      const choice = ev.type === 'chunk' && ev.data.choices && ev.data.choices[0];
+      if (choice && choice.delta && choice.delta.content) text += choice.delta.content;
+    }
+  } catch (e) {
+    text = '';
+  }
+  const title = cleanTitle(text);
+  const now = await currentVersion(c).catch(() => null);
+  if (!now || now.titleSource === 'user' || now.titleSource === 'model') return;
+  if (!title) {
+    // The beginning of the question stays, and the next answer tries again.
+    delete now.titleSource;
+    return;
+  }
+  now.title = title;
+  now.titleSource = 'model';
+  await persist(now).catch(() => {});
+  renderSidebar();
+  if (state.current && state.current.id === now.id) renderTopbar();
+}
+
+/*
+    Compresses the oldest exchanges of a discussion in the background when its last answer
+    filled compactShare of the room of the context: the next question then starts from the
+    summary, without waiting for it, unless it comes before the summary is written.
+*/
+function compactLater(c, turn) {
+  const context = turn.contextTokens;
+  if (!context || compactions.has(c.id)) return;
+  const room = context - Math.min(state.settings.maxTokens || 2048, Math.floor(context / 2));
+  const used = (turn.promptTokens || 0) + ((turn.usage && turn.usage.completion_tokens) || 0);
+  if (used < compactShare * room) return;
+  const system = systemPrompt(c, context);
+  const build = () => apiMessages(c, system);
+  const size = build().reduce((n, m) => n + JSON.stringify(m).length, 0);
+  const scale = used / Math.max(1, size);
+  // The questions after the start, the last one included: the next question comes after it.
+  const saved = c.messages;
+  c.messages = saved.concat([{ id: 'next', role: 'user', content: '' }]);
+  const next = nextStart(c, build, scale, room);
+  c.messages = saved;
+  if (next <= (c.contextStart || 0)) return;
+  const job = compact(c, c.contextStart || 0, next, room, scale, null)
+    .then(async (r) => {
+      // The summary goes to the discussion as it is now, when its compressed messages are
+      // still the same.
+      const now = await currentVersion(c);
+      const last = now && now.messages[r.to - 1];
+      if (!now || !last || last.id !== r.last || (now.contextStart || 0) > r.to) return;
+      applyCompaction(now, r);
+      await persist(now);
+    })
+    .catch(() => {})
+    .finally(() => compactions.delete(c.id));
+  compactions.set(c.id, job);
 }
 
 // Dialogs.
@@ -1464,7 +2223,7 @@ function promptDialog(title, value) {
 
 function settingsDialog(initialTab) {
   dialog((box, close) => {
-    const tabs = ['general', 'model', 'data', 'about'];
+    const tabs = ['general', 'model', 'memoryTab', 'data', 'about'];
     const tabBar = h('div', { class: 'tabs' });
     const body = h('div');
     const show = (tab) => {
@@ -1472,10 +2231,11 @@ function settingsDialog(initialTab) {
       body.replaceChildren();
       if (tab === 'general') generalTab(body, close);
       else if (tab === 'model') modelTab(body);
+      else if (tab === 'memoryTab') memoryTab(body);
       else if (tab === 'data') dataTab(body, close);
       else aboutTab(body);
     };
-    for (const tab of tabs) tabBar.append(h('button', { type: 'button', 'data-tab': tab, onclick: () => show(tab) }, tab === 'about' ? t('about') : t(tab)));
+    for (const tab of tabs) tabBar.append(h('button', { type: 'button', 'data-tab': tab, onclick: () => show(tab) }, t(tab)));
     box.append(h('h2', { html: icon('gear') + escapeHtml(t('settings')) }), tabBar, body,
       h('div', { class: 'actions' }, h('button', { class: 'button primary', type: 'button', onclick: () => close(true) }, t('close'))));
     show(initialTab || 'general');
@@ -1531,6 +2291,64 @@ function modelTab(body) {
   max.addEventListener('change', () => saveSetting('maxTokens', Math.max(0, parseInt(max.value, 10) || 0)));
   body.append(field(t('temperature'), slider('temperature', 0, 2, 0.05, 0.7), t('temperatureHelp')),
     field(t('topP'), slider('topP', 0.05, 1, 0.05, 0.95)), field(t('maxTokens'), max, '0 = ' + t('maxTokensAuto')));
+}
+
+// The memory of the discussions: its use, its content, which the user may edit, and its reset.
+function memoryTab(body) {
+  const context = roleCapabilities('general').context || 8192;
+  const words = memoryLimitWords(context);
+  const enabled = h('input', { type: 'checkbox', checked: !!state.settings.memoryEnabled });
+  const sensitive = h('input', { type: 'checkbox', checked: !!state.settings.memorySensitive });
+  const text = h('textarea', { rows: 8, placeholder: t('memoryEmpty') });
+  text.value = state.settings.memory || '';
+  const size = h('p', { class: 'help', style: { margin: 0, color: 'var(--text-faint)', fontSize: '12.5px' } });
+  const showSize = () => {
+    const n = text.value.split(/\s+/).filter(Boolean).length;
+    size.textContent = t('memorySize', { n, max: words })
+      + (state.settings.memoryUpdated ? ' · ' + t('memoryUpdated', { date: new Date(state.settings.memoryUpdated).toLocaleString(language()) }) : '');
+  };
+  showSize();
+  enabled.addEventListener('change', async () => {
+    await saveSetting('memoryEnabled', enabled.checked);
+    sensitive.disabled = text.disabled = !enabled.checked;
+  });
+  sensitive.addEventListener('change', () => saveSetting('memorySensitive', sensitive.checked));
+  text.addEventListener('input', showSize);
+  text.addEventListener('change', async () => {
+    // What the user writes stays, sensitive or not, within twice the size of the memory.
+    await saveSetting('memory', memoryLines(text.value.split('\n').map((l) => l.trim() && !/^[-*\u2022]/.test(l.trim())
+      ? '- ' + l.trim() : l).join('\n'), words * 2, true));
+    await saveSetting('memoryUpdated', Date.now());
+    text.value = state.settings.memory;
+    showSize();
+  });
+  sensitive.disabled = text.disabled = !enabled.checked;
+  body.append(h('p', null, t('memoryIntro')),
+    h('div', { class: 'field' }, h('label', { class: 'inline' }, enabled, ' ', t('memoryEnabled'))),
+    h('div', { class: 'field' }, h('label', { class: 'inline' }, sensitive, ' ', t('memorySensitive')),
+      h('p', { class: 'help', style: { margin: 0, color: 'var(--text-faint)', fontSize: '12.5px' } }, t('memorySensitiveHelp'))),
+    field(t('memoryText'), text), size,
+    h('div', { class: 'buttons', style: { marginTop: '10px' } }, h('button', {
+      class: 'button danger', type: 'button', html: icon('trash') + '<span>' + escapeHtml(t('memoryReset')) + '</span>',
+      onclick: async () => {
+        if (!await confirmDialog(t('memoryReset'), t('memoryResetText'))) return;
+        await saveSetting('memory', '');
+        await saveSetting('memoryUpdated', 0);
+        // The discussions forget the memory they started with, and what they already said
+        // stays out of the next updates.
+        const all = state.conversations.slice();
+        if (state.current && !state.current.incognito) all.push(state.current);
+        for (const c of all) {
+          delete c.memory;
+          c.memoryMark = c.messages.length;
+          await store.putConversation(c);
+        }
+        for (const timer of memoryTimers.values()) clearTimeout(timer);
+        memoryTimers.clear();
+        text.value = '';
+        showSize();
+      }
+    })));
 }
 
 function dataTab(body, close) {
@@ -1624,6 +2442,11 @@ async function aboutTab(body) {
     ' · ', h('a', { href: '/docs/', target: '_blank' }, t('apiDocs')), ' · ', h('a', { href: 'vendor/README.txt', target: '_blank' }, t('thirdParty'))));
 }
 
+// The line under the composer: what the answers are; the version and the copyright are in About.
+function hintText() {
+  return t('aiNotice');
+}
+
 // Layout.
 function buildLayout() {
   const app = document.getElementById('app');
@@ -1707,8 +2530,8 @@ function buildLayout() {
     e.preventDefault();
     if (e.dataTransfer && e.dataTransfer.files.length) addPending(Array.from(e.dataTransfer.files));
   });
-  ui.composerWrap = h('div', { class: 'composer-wrap' }, composer,
-    h('div', { class: 'hint' }, 'Albireo · ' + (state.status ? state.status.version : '')));
+  ui.hint = h('div', { class: 'hint' }, hintText());
+  ui.composerWrap = h('div', { class: 'composer-wrap' }, composer, ui.hint);
   ui.toasts = h('div', { class: 'toast-zone' });
   const main = h('main', { class: 'main' }, ui.topbar, ui.banner, ui.content, ui.composerWrap);
   app.append(ui.sidebar, main, ui.toasts);
@@ -1724,6 +2547,8 @@ async function init() {
     console.warn('Albireo: the database of the browser is unavailable', e);
     state.incognito = true;
   }
+  // The language of Albireo, when this interface follows it, before the first texts.
+  state.status = await api.status().catch(() => null);
   applyLanguage();
   applyTheme();
   window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', applyTheme);

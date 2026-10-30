@@ -121,6 +121,8 @@ namespace albireo
             c.avx2 = ((r[1] >> 5) & 1) && c.avx;
             c.avx512f = ((r[1] >> 16) & 1) && os_zmm;
             c.avx512bw = ((r[1] >> 30) & 1) && os_zmm;
+            c.avx512dq = ((r[1] >> 17) & 1) && os_zmm;
+            c.avx512vl = ((r[1] >> 31) & 1) && os_zmm;
             c.avx512vnni = ((r[2] >> 11) & 1) && os_zmm;
             c.amx = ((r[3] >> 24) & 1) && os_amx;
             cpuid(7, 1, r);
