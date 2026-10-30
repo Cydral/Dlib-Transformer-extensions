@@ -248,7 +248,9 @@ The mechanism, what it costs, and what it does not do are treated at length in [
 
 **What it serves.** The requests of every client are computed together in each forward pass, and the keys and values of a finished request stay cached for the next turn of its conversation. Three functions, general, code and security, each get a model from a signed catalog, downloaded in parallel parts and checked against its hashes, or imported from a disk for a machine without network. The web application keeps its discussions and projects in the browser, works without network, shows the reasoning of the models that reason, and lets a model call tools in agent mode. Updates come from a signed feed and install when the service restarts.
 
-The [README of Albireo](dlib/dlib/external/albireo/README.md) describes its architecture, its build, its tests and its publication.
+![A discussion in the web application of Albireo](dlib/dlib/external/albireo/docs/images/chat.png)
+
+The [README of Albireo](dlib/dlib/external/albireo/README.md) describes its architecture, its build, its tests and its publication, with screenshots of the web application, of the windows of the icon and of the installer.
 
 ---
 

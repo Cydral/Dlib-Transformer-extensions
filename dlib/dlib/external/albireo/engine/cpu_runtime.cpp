@@ -56,6 +56,13 @@ namespace albireo
             f.optional_floats(p + "attn_v.bias", static_cast<size_t>(kvd), L.bv);
             f.optional_floats(p + "attn_q_norm.weight", static_cast<size_t>(hd), L.q_norm);
             f.optional_floats(p + "attn_k_norm.weight", static_cast<size_t>(hd), L.k_norm);
+            // The forward pass adds the three biases together and normalizes queries and keys together.
+            if (L.bq.empty() != L.bk.empty() || L.bq.empty() != L.bv.empty())
+                throw std::runtime_error("layer " + std::to_string(i) + " holds some of the attn_q, attn_k and "
+                    "attn_v biases without the others");
+            if (L.q_norm.empty() != L.k_norm.empty())
+                throw std::runtime_error("layer " + std::to_string(i) + " holds one of attn_q_norm and attn_k_norm "
+                    "without the other");
             L.ffn_norm = f.floats(p + "ffn_norm.weight", static_cast<size_t>(d));
             if (cfg_.is_moe())
             {
@@ -143,16 +150,10 @@ namespace albireo
 
     bool cpu_runtime::copy_sequence(int src, int dst, long length)
     {
-        kv_sequence& s = *sequences_.at(static_cast<size_t>(src));
+        const kv_sequence& s = *sequences_.at(static_cast<size_t>(src));
         kv_sequence& d = *sequences_.at(static_cast<size_t>(dst));
-        d.clear(kv_);
-        length = std::max<long>(0, std::min(length, s.length));
-        if (!d.reserve(kv_, length)) return false;
-        const long B = kv_.block_positions();
-        const size_t blocks = static_cast<size_t>((length + B - 1) / B);
-        for (size_t b = 0; b < blocks; ++b) kv_.copy_block(s.blocks[b], d.blocks[b]);
-        d.length = length;
-        return true;
+        // The full blocks are shared; each sequence copies a shared block before writing in it.
+        return d.share_prefix(kv_, s, length);
     }
 
     // Building blocks
@@ -468,6 +469,8 @@ namespace albireo
             kv_sequence& seq = *sequences_.at(static_cast<size_t>(s.sequence));
             if (static_cast<long>(seq.blocks.size()) * B < seq.length + s.count)
                 throw std::runtime_error("cpu_runtime: sequence storage was not reserved");
+            if (s.count > 0 && kv_.shared(seq.blocks[static_cast<size_t>(seq.length / B)]))
+                throw std::runtime_error("cpu_runtime: a sequence would write in a block other sequences hold");
             for (long j = 0; j < s.count; ++j)
             {
                 positions_[static_cast<size_t>(s.start + j)] = seq.length + j;

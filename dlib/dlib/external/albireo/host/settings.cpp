@@ -13,6 +13,52 @@ namespace albireo
 
     const char* const model_roles[3] = { "general", "code", "security" };
     const char* const embedding_role = "embedding";
+    const char* const proxy_password_mask = "********";
+
+    namespace
+    {
+        // Where the password of a proxy setting "http://user:password@host:port" lies, as
+        // http_fetch.cpp reads the setting; false when it has none.
+        bool password_span(const std::string& proxy, size_t& from, size_t& length)
+        {
+            const size_t scheme = proxy.find("://");
+            const size_t start = scheme == std::string::npos ? 0 : scheme + 3;
+            const size_t at = proxy.rfind('@');
+            if (at == std::string::npos || at < start) return false;
+            const size_t colon = proxy.find(':', start);
+            if (colon == std::string::npos || colon > at) return false;
+            from = colon + 1;
+            length = at - from;
+            return length > 0;
+        }
+
+        // The setting without its password, ":password" removed.
+        std::string without_password(const std::string& proxy)
+        {
+            size_t from = 0, length = 0;
+            if (!password_span(proxy, from, length)) return proxy;
+            return proxy.substr(0, from - 1) + proxy.substr(from + length);
+        }
+
+        // The file of the proxy with its password, beside settings.json.
+        std::string secret_path(const std::string& settings_path)
+        {
+            return join_path(parent_path(settings_path), "proxy.secret");
+        }
+    }
+
+    std::string masked_proxy(const std::string& proxy)
+    {
+        size_t from = 0, length = 0;
+        if (!password_span(proxy, from, length)) return proxy;
+        return proxy.substr(0, from) + proxy_password_mask + proxy.substr(from + length);
+    }
+
+    bool proxy_password_masked(const std::string& proxy)
+    {
+        size_t from = 0, length = 0;
+        return password_span(proxy, from, length) && proxy.compare(from, length, proxy_password_mask) == 0;
+    }
 
     json host_settings::to_json() const
     {
@@ -35,7 +81,7 @@ namespace albireo
         j["check_updates"] = check_updates;
         j["default_model"] = default_model;
         j["offline"] = offline;
-        j["proxy"] = proxy;
+        j["proxy"] = masked_proxy(proxy);
         j["update_feed"] = update_feed;
         j["catalog_url"] = catalog_url;
         j["engine_benchmarks"] = engine_benchmarks;
@@ -91,6 +137,40 @@ namespace albireo
             if (json::parse(text, j, &error)) s_.from_json(j);
             else log_warning("settings: " + path_ + " is not valid JSON (" + error + "), defaults used");
         }
+        std::lock_guard<std::mutex> lock(m_);
+        if (proxy_password_masked(s_.proxy))
+        {
+            // The password stored for this address and this user.
+            std::string stored;
+            if (read_file(secret_path(path_), stored, 4096))
+                while (!stored.empty() && (stored.back() == '\n' || stored.back() == '\r' || stored.back() == ' '))
+                    stored.pop_back();
+            if (!stored.empty() && masked_proxy(stored) == s_.proxy)
+            {
+                s_.proxy = stored;
+            }
+            else
+            {
+                log_warning("settings: the password of the proxy is not stored, the proxy is used without it");
+                s_.proxy = without_password(s_.proxy);
+            }
+        }
+        else if (masked_proxy(s_.proxy) != s_.proxy && !write())
+        {
+            log_warning("settings: the password of the proxy cannot move from " + path_ + " to proxy.secret");
+        }
+    }
+
+    bool settings_store::write()
+    {
+        make_dirs(parent_path(path_));
+        // The password first, so that settings.json masks no password that is not stored.
+        const std::string secret = secret_path(path_);
+        const bool password = masked_proxy(s_.proxy) != s_.proxy;
+        if (password && !write_file_restricted(secret, s_.proxy)) return false;
+        if (!write_file_atomic(path_, s_.to_json().dump_formatted(2) + "\n")) return false;
+        if (!password && file_exists(secret)) remove_file(secret);
+        return true;
     }
 
     host_settings settings_store::get() const
@@ -103,17 +183,14 @@ namespace albireo
     {
         std::lock_guard<std::mutex> lock(m_);
         s_ = s;
-        make_dirs(parent_path(path_));
-        return write_file_atomic(path_, s_.to_json().dump_formatted(2) + "\n");
+        return write();
     }
 
     host_settings settings_store::update(const std::function<void(host_settings&)>& change)
     {
         std::lock_guard<std::mutex> lock(m_);
         change(s_);
-        make_dirs(parent_path(path_));
-        if (!write_file_atomic(path_, s_.to_json().dump_formatted(2) + "\n"))
-            log_warning("settings: " + path_ + " cannot be written");
+        if (!write()) log_warning("settings: " + path_ + " cannot be written");
         return s_;
     }
 

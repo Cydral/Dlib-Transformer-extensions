@@ -44,6 +44,25 @@ namespace albireo
         }
 
         std::atomic<bool> pinned_started{false};
+
+        // The last line of a program output that holds a JSON object, the runtimes of the
+        // libraries writing their own messages to the same output, before or after it.
+        json last_json_line(const std::string& output)
+        {
+            size_t end = output.size();
+            for (;;)
+            {
+                const size_t newline = end == 0 ? std::string::npos : output.rfind('\n', end - 1);
+                const size_t begin = newline == std::string::npos ? 0 : newline + 1;
+                if (begin < end && output[begin] == '{')
+                {
+                    json j;
+                    if (json::parse(output.substr(begin, end - begin), j) && j.is_object()) return j;
+                }
+                if (newline == std::string::npos) return json();
+                end = newline;
+            }
+        }
     }
 
     bool engine_host::pinned_engine_started()
@@ -103,8 +122,7 @@ namespace albireo
                 std::string output;
                 const int code = run_process(probe_program, { "--probe-engine", p->path }, &output, 60000);
                 // The description is the last line the probe prints.
-                const size_t start = output.find('{');
-                p->description = start == std::string::npos ? json() : json::parse_or_null(output.substr(start));
+                p->description = last_json_line(output);
                 p->usable = code == 0 && p->description["usable"].as_bool(false);
                 if (!p->usable && !p->description.contains("reason"))
                 {

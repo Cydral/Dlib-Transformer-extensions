@@ -194,21 +194,29 @@ ALBIREO_ENGINE_EXPORT int ALBIREO_ENGINE_CALL albireo_engine_query(albireo_engin
     const char* request_json, char* json, size_t capacity, size_t* needed)
 {
     if (!engine) return ALBIREO_E_INVALID_ARGUMENT;
-    std::string text;
-    int code = ALBIREO_OK;
     try
     {
-        text = engine->impl->query(parse_or_throw(request_json)).dump();
+        std::string text;
+        int code = ALBIREO_OK;
+        try
+        {
+            text = engine->impl->query(parse_or_throw(request_json)).dump();
+        }
+        catch (const std::exception& ex)
+        {
+            code = code_of(ex);
+            albireo::json e = albireo::json::object();
+            e["error"] = ex.what();
+            text = e.dump();
+        }
+        const int w = write_json(text, json, capacity, needed);
+        return w != ALBIREO_OK ? w : code;
     }
-    catch (const std::exception& ex)
+    catch (...)
     {
-        code = code_of(ex);
-        albireo::json e = albireo::json::object();
-        e["error"] = ex.what();
-        text = e.dump();
+        // Out of memory while the answer or the error was written.
+        return ALBIREO_E_INTERNAL;
     }
-    const int w = write_json(text, json, capacity, needed);
-    return w != ALBIREO_OK ? w : code;
 }
 
 ALBIREO_ENGINE_EXPORT int ALBIREO_ENGINE_CALL albireo_engine_submit(albireo_engine* engine,

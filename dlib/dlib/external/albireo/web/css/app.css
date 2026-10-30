@@ -307,10 +307,6 @@ a { color: var(--blue); }
 .suggestion:hover { border-color: var(--blue); transform: translateY(-1px); }
 .suggestion b { display: block; font-size: 14px; margin-bottom: 2px; }
 .suggestion span { color: var(--text-faint); font-size: 13px; }
-.role-cards { display: flex; gap: 8px; justify-content: center; margin: 0 0 18px; flex-wrap: wrap; }
-.role-card { border: 1px solid var(--border); border-radius: 999px; padding: 6px 12px; background: var(--bg-elevated); display: inline-flex; align-items: center; gap: 7px; font-size: 13px; color: var(--text-soft); cursor: pointer; }
-.role-card.active { border-color: var(--blue); color: var(--text); background: var(--bg-active); }
-.role-card svg { width: 15px; height: 15px; }
 
 /* Composer */
 .composer-wrap { position: absolute; left: 0; right: 0; bottom: 0; padding: 0 24px 18px; background: linear-gradient(to top, var(--bg) 70%, transparent); pointer-events: none; }
@@ -353,7 +349,7 @@ a { color: var(--blue); }
 .card h3 { margin: 0 0 4px; font-size: 15px; display: flex; align-items: center; gap: 8px; }
 .card h3 svg, .dialog h2 svg, .page h2 svg { width: 17px; height: 17px; flex: 0 0 17px; color: var(--text-soft); }
 .list .row svg { width: 16px; height: 16px; flex: 0 0 16px; color: var(--text-soft); }
-.chip span svg, .role-card span, .item > span:first-child { display: inline-flex; }
+.chip span svg, .item > span:first-child { display: inline-flex; }
 .card p.help { margin: 0 0 10px; color: var(--text-faint); font-size: 13px; }
 .field { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; }
 .field label { font-size: 13px; font-weight: 600; color: var(--text-soft); }

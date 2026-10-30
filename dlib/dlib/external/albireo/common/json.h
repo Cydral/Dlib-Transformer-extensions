@@ -3,6 +3,7 @@
 #ifndef ALBIREO_COMMON_JSON_H_
 #define ALBIREO_COMMON_JSON_H_
 
+#include <algorithm>
 #include <cerrno>
 #include <cmath>
 #include <cstddef>
@@ -38,7 +39,11 @@ namespace albireo
             PARSING
                 parse() accepts the strict grammar of RFC 8259 and refuses documents
                 nested deeper than a given limit, so that a hostile body cannot exhaust
-                the stack.
+                the stack, and documents holding more values than a given budget, each
+                value taking about a hundred bytes of memory whatever its length in the
+                text.  A member repeated in an object keeps the place of its first
+                occurrence and the value of its last one; the repetitions are found in a
+                time that grows as n log n with the number of members.
 
             SERIALIZATION
                 dump() produces compact UTF-8 text.  Invalid UTF-8 sequences found in
@@ -319,10 +324,12 @@ namespace albireo
 
         // Parsing
 
+        // Reads at most max_depth levels of nesting and max_values values, each element, member
+        // value, array and object counting as one.
         static bool parse(const std::string& text, json& out, std::string* error = nullptr,
-            size_t max_depth = 128)
+            size_t max_depth = 128, size_t max_values = size_t(1) << 20)
         {
-            parser p(text, max_depth);
+            parser p(text, max_depth, max_values);
             json v;
             if (!p.value(v, 0) || (p.skip_ws(), p.pos != text.size()))
             {
@@ -406,11 +413,17 @@ namespace albireo
 
         struct parser
         {
-            parser(const std::string& t, size_t d) : s(t), max_depth(d) {}
+            parser(const std::string& t, size_t d, size_t n) : s(t), max_depth(d), max_values(n) {}
             const std::string& s;
             size_t pos = 0;
             size_t max_depth;
+            size_t max_values;
+            size_t values = 0;
             std::string error;
+
+            // The members of an object compared with each new member as it is read; a larger
+            // object is checked once, at its end.
+            static const size_t scanned_members = 16;
 
             void skip_ws()
             {
@@ -431,6 +444,7 @@ namespace albireo
             bool value(json& v, size_t depth)
             {
                 if (depth > max_depth) return fail("document nested too deeply");
+                if (++values > max_values) return fail("document holding too many values");
                 skip_ws();
                 if (pos >= s.size()) return fail("unexpected end of document");
                 const char c = s[pos];
@@ -464,15 +478,58 @@ namespace albireo
                     if (!value(member, depth + 1)) return false;
                     // A repeated member replaces the earlier one, as most parsers do.
                     bool replaced = false;
-                    for (auto& kv : v.object_)
-                        if (kv.first == key) { kv.second = std::move(member); replaced = true; break; }
+                    if (v.object_.size() < scanned_members)
+                        for (auto& kv : v.object_)
+                            if (kv.first == key) { kv.second = std::move(member); replaced = true; break; }
                     if (!replaced) v.object_.emplace_back(std::move(key), std::move(member));
                     skip_ws();
                     if (pos >= s.size()) return fail("unexpected end of document");
                     if (s[pos] == ',') { ++pos; continue; }
-                    if (s[pos] == '}') { ++pos; return true; }
+                    if (s[pos] == '}')
+                    {
+                        ++pos;
+                        if (v.object_.size() > scanned_members) merge_repeated_members(v.object_);
+                        return true;
+                    }
                     return fail("',' or '}' expected");
                 }
+            }
+
+            // Keeps each name once, at the place of its first member and with the value of
+            // its last one: the members sorted by name, then by place, show the repetitions
+            // side by side.
+            static void merge_repeated_members(object_type& members)
+            {
+                const size_t n = members.size();
+                std::vector<size_t> order(n);
+                for (size_t i = 0; i < n; ++i) order[i] = i;
+                std::sort(order.begin(), order.end(), [&members](size_t a, size_t b) {
+                    const int c = members[a].first.compare(members[b].first);
+                    return c < 0 || (c == 0 && a < b);
+                });
+                std::vector<char> dropped(n, 0);
+                bool repeated = false;
+                for (size_t i = 0; i < n;)
+                {
+                    size_t j = i + 1;
+                    while (j < n && members[order[j]].first == members[order[i]].first) ++j;
+                    if (j - i > 1)
+                    {
+                        members[order[i]].second = std::move(members[order[j - 1]].second);
+                        for (size_t k = i + 1; k < j; ++k) dropped[order[k]] = 1;
+                        repeated = true;
+                    }
+                    i = j;
+                }
+                if (!repeated) return;
+                size_t kept = 0;
+                for (size_t i = 0; i < n; ++i)
+                {
+                    if (dropped[i]) continue;
+                    if (kept != i) members[kept] = std::move(members[i]);
+                    ++kept;
+                }
+                members.resize(kept);
             }
 
             bool array(json& v, size_t depth)

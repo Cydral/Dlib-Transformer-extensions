@@ -19,6 +19,11 @@ export const maxFileBytes = 64 * 1024 * 1024;
 export const maxTextChars = 4 * 1024 * 1024;
 // Rows of a sheet kept in the text; the following ones are counted.
 const maxSheetRows = 20000;
+// The bytes the entries of an archive read for its text may hold once decompressed, all of
+// them; an entry larger than ratioFloor may also hold at most maxRatio times its compressed size.
+const maxUnzippedBytes = 256 * 1024 * 1024;
+const maxRatio = 200;
+const ratioFloor = 1024 * 1024;
 
 const textExtensions = new Set(('txt md markdown rst csv tsv json jsonl ndjson xml yaml yml toml ini cfg conf log env ' +
   'c h cc cpp cxx hpp hh hxx inl cu cuh py pyw pyi js mjs cjs ts tsx jsx java kt kts scala go rs swift m mm cs fs vb ' +
@@ -74,7 +79,35 @@ function looksBinary(bytes) {
   return false;
 }
 
-// The entries of a ZIP archive, read on demand.
+// The bytes of a deflated entry, from a stream that stops past limit bytes.
+async function inflate(data, limit) {
+  const reader = new Blob([data]).stream().pipeThrough(new DecompressionStream('deflate-raw')).getReader();
+  const parts = [];
+  let size = 0;
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    size += value.length;
+    if (size > limit) {
+      reader.cancel().catch(() => {});
+      throw new Error('too-large-content');
+    }
+    parts.push(value);
+  }
+  const out = new Uint8Array(size);
+  let at = 0;
+  for (const v of parts) {
+    out.set(v, at);
+    at += v.length;
+  }
+  return out;
+}
+
+/*
+    The entries of a ZIP archive, read on demand.  An entry whose size, declared by the
+    central directory or met while it is decompressed, goes beyond the limits of the archive
+    (maxUnzippedBytes for all the entries read, maxRatio) throws "too-large-content".
+*/
 async function unzip(buffer) {
   const dv = new DataView(buffer);
   let end = -1;
@@ -93,26 +126,38 @@ async function unzip(buffer) {
     if (dv.getUint32(p, true) !== 0x02014b50) break;
     const method = dv.getUint16(p + 10, true);
     const csize = dv.getUint32(p + 20, true);
+    // The size once decompressed; a ZIP64 entry declares 0xffffffff, beyond every limit here.
+    const usize = dv.getUint32(p + 24, true);
     const nlen = dv.getUint16(p + 28, true);
     const elen = dv.getUint16(p + 30, true);
     const clen = dv.getUint16(p + 32, true);
     const offset = dv.getUint32(p + 42, true);
-    entries.set(names.decode(new Uint8Array(buffer, p + 46, nlen)), { method, csize, offset });
+    entries.set(names.decode(new Uint8Array(buffer, p + 46, nlen)), { method, csize, usize, offset });
     p += 46 + nlen + elen + clen;
   }
+  let used = 0;
   return {
     names: () => Array.from(entries.keys()),
     has: (name) => entries.has(name),
     async text(name) {
       const e = entries.get(name);
       if (!e) return null;
+      // The bytes the entry may hold: what the archive has left, and for a compressed entry
+      // maxRatio times its compressed size.
+      const room = maxUnzippedBytes - used;
+      const cap = e.method === 0 ? room : Math.min(room, Math.max(ratioFloor, maxRatio * e.csize));
+      if ((e.method === 0 ? e.csize : e.usize) > cap) throw new Error('too-large-content');
       const nlen = dv.getUint16(e.offset + 26, true);
       const elen = dv.getUint16(e.offset + 28, true);
       const data = new Uint8Array(buffer, e.offset + 30 + nlen + elen, e.csize);
-      if (e.method === 0) return decodeText(data);
+      if (e.method === 0) {
+        used += data.length;
+        return decodeText(data);
+      }
       if (e.method !== 8) throw new Error('unsupported compression');
-      const stream = new Blob([data]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
-      return decodeText(new Uint8Array(await new Response(stream).arrayBuffer()));
+      const bytes = await inflate(data, cap);
+      used += bytes.length;
+      return decodeText(bytes);
     }
   };
 }
@@ -189,6 +234,8 @@ async function docxText(zip) {
   let page = 1;
   let pageMarks = false;
   const lines = [];
+  // The characters read, which end the reading at maxTextChars.
+  let size = 0;
   // A page starts at a break, unless nothing was written since the previous one: an explicit
   // break and the break Word records where it rendered a page fall at the same place.
   const pageBreak = () => {
@@ -217,7 +264,10 @@ async function docxText(zip) {
     }
     let s = '';
     const flush = () => {
-      if (s.trim()) lines.push(prefix + s);
+      if (s.trim()) {
+        lines.push(prefix + s);
+        size += prefix.length + s.length + 1;
+      }
       s = '';
     };
     const walk = (n) => {
@@ -256,6 +306,7 @@ async function docxText(zip) {
 
   const table = (tbl) => {
     for (const row of Array.from(tbl.childNodes).filter((n) => n.nodeType === 1 && n.localName === 'tr')) {
+      if (size > maxTextChars) break;
       const cells = [];
       for (const cell of Array.from(row.childNodes).filter((n) => n.nodeType === 1 && n.localName === 'tc')) {
         const before = lines.length;
@@ -271,6 +322,7 @@ async function docxText(zip) {
   // The paragraphs and tables of a container, the content controls opened.
   const blocks = (container) => {
     for (const node of container.childNodes) {
+      if (size > maxTextChars) return;
       if (node.nodeType !== 1) continue;
       if (node.localName === 'p') paragraph(node);
       else if (node.localName === 'tbl') table(node);
@@ -299,6 +351,7 @@ async function docxText(zip) {
   const extra = async (title, pattern, item) => {
     const texts = [];
     for (const name of zip.names().filter((n) => pattern.test(n)).sort(numericOrder)) {
+      if (size > maxTextChars) break;
       const part = parseXml(await zip.text(name));
       lines.length = 0;
       const items = item ? byLocalName(part, item) : [part.documentElement];
@@ -386,7 +439,10 @@ async function pptxText(zip) {
   if (!slides.length) slides = zip.names().filter((n) => /^ppt\/slides\/slide\d+\.xml$/.test(n)).sort(numericOrder);
   const out = [];
   let i = 0;
+  // The characters read, which end the reading at maxTextChars.
+  let size = 0;
   for (const s of slides) {
+    if (size > maxTextChars) break;
     const doc = parseXml(await zip.text(s));
     const hidden = doc.documentElement.getAttribute('show') === '0';
     let title = '';
@@ -432,7 +488,9 @@ async function pptxText(zip) {
     const head = '## Slide ' + (++i) + (title ? ': ' + title : '') + (hidden ? ' (hidden)' : '');
     const lines = [head].concat(body, extras);
     if (notes) lines.push('Notes: ' + notes);
-    out.push(lines.join('\n'));
+    const text = lines.join('\n');
+    out.push(text);
+    size += text.length + 2;
   }
   return out.join('\n\n');
 }
@@ -511,7 +569,10 @@ async function xlsxText(zip) {
       .forEach((n, k) => sheets.push({ name: 'Sheet ' + (k + 1), state: 'visible', part: n }));
   }
   const result = [];
+  // The characters read, which end the reading at maxTextChars.
+  let size = 0;
   for (const sheet of sheets) {
+    if (size > maxTextChars) break;
     if (!sheet.part || !zip.has(sheet.part)) continue;
     if (!/worksheets\//.test(sheet.part)) {
       // A chart sheet: its chart.
@@ -523,14 +584,19 @@ async function xlsxText(zip) {
           for (const d of drels.values()) if (/\/chart$/.test(d.type)) charts.push(await chartText(zip, d.target));
         }
       }
-      result.push('## Sheet: ' + sheet.name + '\n' + charts.filter((c) => c).join('\n'));
+      const text = '## Sheet: ' + sheet.name + '\n' + charts.filter((c) => c).join('\n');
+      result.push(text);
+      size += text.length + 2;
       continue;
     }
     const doc = parseXml(await zip.text(sheet.part));
     const lines = [];
     let rows = 0, skipped = 0;
     for (const row of byLocalName(doc, 'row')) {
+      // The cells that hold a value, at their columns: the empty columns at the end of a row
+      // leave no separators.  A cell without a reference follows the previous one.
       const cells = [];
+      let next = 0;
       for (const c of Array.from(row.childNodes).filter((n) => n.nodeType === 1 && n.localName === 'c')) {
         const type = c.getAttribute('t') || 'n';
         const v = child(c, 'v');
@@ -549,15 +615,18 @@ async function xlsxText(zip) {
           value = '=' + child(c, 'f').textContent;
         }
         const ref = c.getAttribute('r');
-        const k = ref ? columnIndex(ref) : cells.length;
-        if (k >= 0 && k < 16384) cells[k] = csvField(value);
+        const k = ref ? columnIndex(ref) : next;
+        next = k + 1;
+        if (k >= 0 && k < 16384 && value !== '') cells[k] = csvField(value);
       }
       if (!cells.some((x) => x)) continue;
-      if (rows >= maxSheetRows) {
+      if (rows >= maxSheetRows || size > maxTextChars) {
         ++skipped;
         continue;
       }
-      lines.push(Array.from(cells, (x) => x || '').join(','));
+      const line = Array.from(cells, (x) => x || '').join(',');
+      lines.push(line);
+      size += line.length + 1;
       ++rows;
     }
     if (skipped) lines.push('(' + skipped + ' more rows)');
@@ -573,17 +642,26 @@ async function odfText(zip) {
   const doc = parseXml(await zip.text('content.xml'));
   const out = [];
   let slide = 0;
+  // The characters read, which end the reading at maxTextChars.
+  let size = 0;
+  const add = (...lines) => {
+    for (const l of lines) {
+      out.push(l);
+      size += l.length + 1;
+    }
+  };
   const walk = (n) => {
     for (const c of n.childNodes) {
+      if (size > maxTextChars) return;
       if (c.nodeType !== 1) continue;
-      if (c.localName === 'h' || c.localName === 'p') out.push(c.textContent);
+      if (c.localName === 'h' || c.localName === 'p') add(c.textContent);
       else if (c.localName === 'table-row') {
-        out.push(byLocalName(c, 'table-cell').map((cell) => cell.textContent.trim()).join(' | '));
+        add(byLocalName(c, 'table-cell').map((cell) => cell.textContent.trim()).join(' | '));
       } else if (c.localName === 'table' && c.namespaceURI && /table/.test(c.namespaceURI) && attr(c, 'name')) {
-        out.push('', '## Sheet: ' + attr(c, 'name'));
+        add('', '## Sheet: ' + attr(c, 'name'));
         walk(c);
       } else if (c.localName === 'page' && attr(c, 'name')) {
-        out.push('', '## Slide ' + (++slide) + ': ' + attr(c, 'name'));
+        add('', '## Slide ' + (++slide) + ': ' + attr(c, 'name'));
         walk(c);
       } else walk(c);
     }
@@ -634,7 +712,8 @@ function htmlText(s) {
 
 /*
     The text of a file: {text, format}, or an exception whose message says why it cannot
-    be read: too-large, legacy (an Office format before 2007), unsupported.
+    be read: too-large, too-large-content (an archive too large once decompressed), legacy
+    (an Office format before 2007), unsupported.
 */
 export async function extractText(file) {
   if (file.size > maxFileBytes) throw new Error('too-large');

@@ -27,6 +27,7 @@
 
 #include <atomic>
 #include <cstdlib>
+#include <cstring>
 #include <cwchar>
 #include <string>
 
@@ -82,6 +83,12 @@ namespace albireo
             bool check_requested = false;
             json download_states = json::object();
             bool relaunch_on_restart = false;
+            // When the version of the program file was last read (GetTickCount64).
+            ULONGLONG version_checked = 0;
+            // When the engines were last asked for, 0 to ask at the next poll.
+            ULONGLONG engines_at = 0;
+            // The period of the polls: short while something changes, long otherwise.
+            UINT poll_ms = 2000;
         } tray;
 
         /*
@@ -200,7 +207,11 @@ namespace albireo
             if (tray.polling) return;
             tray.polling = true;
             service_client c = tray.client;
-            ui::run_async(tray.hwnd, WM_STATUS, 0, [c]() {
+            // The engines change rarely: they are asked for every thirty seconds, and after a change.
+            const ULONGLONG now = GetTickCount64();
+            const bool with_engines = !tray.online || tray.engines_at == 0 || now - tray.engines_at >= 30000;
+            if (with_engines) tray.engines_at = now;
+            ui::run_async(tray.hwnd, WM_STATUS, 0, [c, with_engines]() {
                 json r = json::object();
                 std::string error;
                 json status;
@@ -212,9 +223,52 @@ namespace albireo
                 }
                 r["status"] = status;
                 json engines;
-                if (c.get("/albireo/v1/engines", engines, error, 5)) r["engines"] = engines;
+                if (with_engines && c.get("/albireo/v1/engines", engines, error, 5)) r["engines"] = engines;
                 return r;
             });
+        }
+
+        void set_poll_period(UINT ms)
+        {
+            if (ms == tray.poll_ms) return;
+            tray.poll_ms = ms;
+            SetTimer(tray.hwnd, TIMER_POLL, ms, nullptr);
+        }
+
+        // The version of the program file on disk, which an update replaces while this one runs.
+        std::string file_version(const std::string& path)
+        {
+            const DWORD flags = LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE;
+            HMODULE m = LoadLibraryExW(widen(path).c_str(), nullptr, flags);
+            if (!m) return std::string();
+            HRSRC r = FindResourceW(m, MAKEINTRESOURCEW(VS_VERSION_INFO), RT_VERSION);
+            HGLOBAL g = r ? LoadResource(m, r) : nullptr;
+            const BYTE* data = g ? static_cast<const BYTE*>(LockResource(g)) : nullptr;
+            const DWORD size = r ? SizeofResource(m, r) : 0;
+            std::string version;
+            // The fixed part of the version starts with its signature, on a boundary of 4 bytes.
+            for (DWORD at = 0; data && at + sizeof(VS_FIXEDFILEINFO) <= size && version.empty(); at += 4)
+            {
+                VS_FIXEDFILEINFO info;
+                std::memcpy(&info, data + at, sizeof(info));
+                if (info.dwSignature != 0xFEEF04BD) continue;
+                version = std::to_string(HIWORD(info.dwFileVersionMS)) + "."
+                    + std::to_string(LOWORD(info.dwFileVersionMS)) + "." + std::to_string(HIWORD(info.dwFileVersionLS));
+            }
+            FreeLibrary(m);
+            return version;
+        }
+
+        /*
+            Whether the program file of the icon is newer than the icon that runs, read once
+            a minute at most: an icon whose file an update did not replace keeps running.
+        */
+        bool program_replaced()
+        {
+            const ULONGLONG now = GetTickCount64();
+            if (tray.version_checked && now - tray.version_checked < 60000) return false;
+            tray.version_checked = now;
+            return compare_versions(file_version(executable_path()), ALBIREO_VERSION) > 0;
         }
 
         void relaunch(const wchar_t* args)
@@ -292,6 +346,7 @@ namespace albireo
                 set_icon(waiting ? 1 : 2);
                 set_tooltip(tr(tip));
                 tray.client.reload();
+                set_poll_period(2000);
                 return;
             }
             tray.silent_since = 0;
@@ -307,10 +362,10 @@ namespace albireo
             if ((*result).contains("engines")) tray.engines = (*result)["engines"];
             const json& s = tray.status;
 
-            // A newer service means the programs were updated: the icon starts again from
-            // the new program, once.
+            // A newer service means the programs were updated: the icon starts again, once,
+            // when its program file is the new one.
             const std::string version = s["version"].as_string();
-            if (compare_versions(version, ALBIREO_VERSION) > 0 && !tray.relaunch_on_restart)
+            if (compare_versions(version, ALBIREO_VERSION) > 0 && !tray.relaunch_on_restart && program_replaced())
             {
                 tray.relaunch_on_restart = true;
                 relaunch(L"--relaunched");
@@ -362,6 +417,7 @@ namespace albireo
             }
 
             // Downloads that finished since the last poll.
+            bool downloading = false;
             for (const auto& d : s["downloads"].elements())
             {
                 const std::string id = d["id"].as_string();
@@ -374,9 +430,14 @@ namespace albireo
                         notify(L"Albireo", tr("notify_failed", { { "m", id }, { "e", d["error"].as_string() } }));
                 }
                 tray.download_states[id] = st;
+                downloading = downloading || st == "downloading" || st == "verifying" || st == "queued";
             }
 
             set_icon(ready ? 3 : active > 0 || loading || starting ? 1 : 0);
+            // Every two seconds while something changes, every ten seconds otherwise.
+            const bool changing = starting || loading || active > 0 || downloading || tray.check_requested
+                || state == "checking" || state == "downloading";
+            set_poll_period(changing ? 2000 : 10000);
         }
 
         void put_settings(const json& changes)
@@ -411,6 +472,9 @@ namespace albireo
 
         void on_action_done(WPARAM tag, json* r)
         {
+            // The service changes after an action: it is followed closely, its engines included.
+            tray.engines_at = 0;
+            set_poll_period(2000);
             if (r->contains("error") && !(*r)["error"].as_string().empty() && tag != ACT_MEASURE)
             {
                 ui::message(nullptr, widen((*r)["error"].as_string()), MB_OK | MB_ICONWARNING);
@@ -649,6 +713,8 @@ namespace albireo
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int)
 {
+    // The libraries loaded from here on come from System32 only.
+    SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32);
     using namespace albireo;
     const std::wstring args = command_line ? command_line : L"";
     const bool open = args.find(L"--open") != std::wstring::npos;

@@ -2,8 +2,8 @@
  "openapi": "3.0.3",
  "info": {
   "title": "Albireo Community Edition local interface",
-  "version": "1.0.6",
-  "description": "The interface of the Albireo service, served on https://localhost (port 8443 unless changed in the tray). The routes under /v1 follow the OpenAI interface, so that its client libraries work with base_url https://localhost:8443/v1 and any API key. The functions albireo-general, albireo-code and albireo-security name the models activated in the tray, and albireo-embedding the embedding model of the search in documents.\n\nThe administration routes require the token of the data folder of the service (admin.token) in the X-Albireo-Admin header.",
+  "version": "1.0.7",
+  "description": "The interface of the Albireo service, served on https://localhost (port 8443 unless changed in the tray). The routes under /v1 follow the OpenAI interface, so that its client libraries work with base_url https://localhost:8443/v1 and any API key. The functions albireo-general, albireo-code and albireo-security name the models activated in the tray, albireo-background the model that comes with Albireo, which the web application uses for its work in the background, and albireo-embedding the embedding model of the search in documents.\n\nThe administration routes require the token of the data folder of the service (admin.token) in the X-Albireo-Admin header.\n\nRequests carry JSON bodies of 64 MB and 524,288 values at most, with their length: a body without length is refused with 411, a longer one with 413, another type with 415. GET, HEAD, DELETE and OPTIONS take no body (400). An answer being written whose model has no memory left for its keys and values ends with the error code out_of_memory.",
   "license": {
    "name": "Boost Software License 1.0",
    "url": "https://www.boost.org/LICENSE_1_0.txt"
@@ -275,6 +275,38 @@
             "engines",
             "models"
            ]
+          },
+          "active": {
+           "type": "object",
+           "additionalProperties": {
+            "type": "string"
+           },
+           "description": "The model of each function: general, code, security, embedding. A function without a model chosen for it takes the general model, else the model that comes with Albireo."
+          },
+          "selected": {
+           "type": "object",
+           "additionalProperties": {
+            "type": "string"
+           },
+           "description": "The models chosen for the functions, which Deactivate gives back."
+          },
+          "background": {
+           "type": "string",
+           "description": "The model that comes with Albireo and serves albireo-background, which stays loaded; empty without one."
+          },
+          "loaded_models": {
+           "type": "array",
+           "items": {
+            "type": "object"
+           },
+           "description": "The models of the engine, with their context and capabilities."
+          },
+          "models_state": {
+           "type": "object",
+           "additionalProperties": {
+            "type": "string"
+           },
+           "description": "loading, ready, unloading, removing, or the error of a load."
           }
          }
         }
@@ -364,6 +396,10 @@
             }
            }
           },
+          "background": {
+           "type": "string",
+           "description": "The model of albireo-background, empty without one."
+          },
           "embedding_models": {
            "type": "array",
            "items": {
@@ -401,7 +437,14 @@
            "additionalProperties": {
             "type": "string"
            },
-           "description": "The model of each function."
+           "description": "The model of each function, as in the status."
+          },
+          "selected": {
+           "type": "object",
+           "additionalProperties": {
+            "type": "string"
+           },
+           "description": "The models chosen for the functions."
           },
           "loaded": {
            "type": "array",
@@ -1141,7 +1184,7 @@
     "summary": "Settings of the service",
     "responses": {
      "200": {
-      "description": "The settings",
+      "description": "The settings, the password of the proxy given as ********",
       "content": {
        "application/json": {
         "schema": {
@@ -1162,6 +1205,7 @@
      }
     ],
     "summary": "Changes settings",
+    "description": "A new port is opened once before it is saved.",
     "requestBody": {
      "required": true,
      "content": {
@@ -1179,6 +1223,26 @@
        "application/json": {
         "schema": {
          "type": "object"
+        }
+       }
+      }
+     },
+     "400": {
+      "description": "A value out of range, or the masked password of the proxy with another user, host or port (code proxy_password)",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "409": {
+      "description": "The new port is in use or cannot be opened (code port_unavailable)",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
         }
        }
       }
@@ -1503,7 +1567,9 @@
       "type": "number"
      },
      "top_k": {
-      "type": "integer"
+      "type": "integer",
+      "minimum": 0,
+      "description": "Candidates kept, 1024 at most; 0 for none."
      },
      "min_p": {
       "type": "number"
@@ -1541,7 +1607,8 @@
       "type": "object",
       "additionalProperties": {
        "type": "number"
-      }
+      },
+      "description": "Bias added to the logits of tokens, keyed by token identifiers of the vocabulary of the model; another key is refused."
      }
     }
    },
@@ -1558,7 +1625,7 @@
       "properties": {
        "model": {
         "type": "string",
-        "description": "A model identifier, a function (albireo-general, albireo-code, albireo-security) or auto. A function without a model of its own is served by the general model.",
+        "description": "A model identifier, a function (albireo-general, albireo-code, albireo-security), albireo-background or auto. A function without a model of its own is served by the general model; albireo-background, the work done in the background (titles, summaries, memory), by the model that comes with Albireo, else the general one.",
         "example": "albireo-general"
        },
        "messages": {
@@ -2079,7 +2146,7 @@
      },
      "proxy": {
       "type": "string",
-      "description": "Proxy of the downloads: empty for the proxy of the system, none for a direct connection, or http://[user:password@]host:port."
+      "description": "Proxy of the downloads: empty for the proxy of the system, none for a direct connection, or http://[user:password@]host:port.  The settings give the password as ********; that value sent back keeps the stored password when the user, the host and the port stay the same, and is refused (code proxy_password) otherwise."
      }
     }
    }

@@ -16,7 +16,7 @@
 # folders whose files go into the engines folder of the installation.
 
 cmake_minimum_required(VERSION 3.16)
-project(albireo VERSION 1.0.6 LANGUAGES C CXX)
+project(albireo VERSION 1.0.7 LANGUAGES C CXX)
 
 option(ALBIREO_PROGRAMS "Build the service, the tray, the installer and the processor engines" ON)
 option(ALBIREO_ENGINE_CUDA "Build the engine for NVIDIA graphics processors (dlib built with CUDA)" OFF)

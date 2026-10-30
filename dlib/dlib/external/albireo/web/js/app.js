@@ -68,8 +68,6 @@ const defaults = {
 // size follows the context of the model: memoryShare of it, memoryWords words at most.
 const memoryWords = 120;
 const memoryShare = 0.04;
-// The memory is updated once a discussion has had no new question for this long.
-const memoryDelay = 30000;
 
 function memoryLimitWords(contextTokens) {
   return Math.max(30, Math.min(memoryWords, Math.floor(memoryShare * (contextTokens || 8192) * 0.7)));
@@ -136,10 +134,10 @@ function formatNumber(n) {
   return new Intl.NumberFormat(language()).format(n);
 }
 
-function toast(message, error) {
+function toast(message, error, ms) {
   const el = h('div', { class: 'toast' + (error ? ' error' : '') }, message);
   ui.toasts.append(el);
-  setTimeout(() => el.remove(), error ? 6000 : 2600);
+  setTimeout(() => el.remove(), ms || (error ? 6000 : 2600));
 }
 
 function download(name, content, type) {
@@ -182,6 +180,49 @@ function applyLanguage() {
 async function saveSetting(key, value) {
   state.settings[key] = value;
   await store.setSetting(key, value);
+  broadcast({ type: 'setting', key, value });
+}
+
+/*
+    The tabs of the application tell each other the settings they change and the reset of the
+    memory, so that the settings of each stay current: by a BroadcastChannel, else by the
+    storage event of localStorage.
+*/
+let channel = null;
+try {
+  channel = new BroadcastChannel('albireo');
+  channel.onmessage = (e) => receive(e.data);
+} catch (e) {
+  channel = null;
+  window.addEventListener('storage', (ev) => {
+    if (ev.key !== 'albireo-message' || !ev.newValue) return;
+    try {
+      receive(JSON.parse(ev.newValue).message);
+    } catch (e2) {
+      // A value that another application of the origin wrote.
+    }
+  });
+}
+
+function broadcast(message) {
+  try {
+    if (channel) channel.postMessage(message);
+    else localStorage.setItem('albireo-message', JSON.stringify({ message, n: Math.random() }));
+  } catch (e) {
+    // The other tabs read the settings again at their next start.
+  }
+}
+
+// A message of another tab.
+function receive(message) {
+  if (!message || typeof message !== 'object') return;
+  if (message.type === 'setting' && Object.prototype.hasOwnProperty.call(defaults, message.key)) {
+    state.settings[message.key] = message.value;
+    // The language follows at the next status of the service (refreshStatus).
+    if (message.key === 'theme') applyTheme();
+  } else if (message.type === 'memoryReset') {
+    forgetMemory();
+  }
 }
 
 // Service status and models.
@@ -233,6 +274,36 @@ function roleCapabilities(role) {
   if (loaded) return { reasoning: loaded.reasoning !== false, tools: loaded.tools !== false, context: loaded.context || 0 };
   const m = modelInfo(id);
   return { reasoning: m ? m.reasoning !== false : true, tools: m ? m.tools !== false : true, context: 0 };
+}
+
+/*
+    The work done in the background (titles, summaries, memory) goes to the model that comes
+    with Albireo, which the service keeps loaded, without reasoning; the service gives it to
+    the general model when there is none.
+*/
+const backgroundModel = 'albireo-background';
+
+function backgroundContext() {
+  const s = state.status;
+  const loaded = s && s.background ? loadedModel(s.background) : null;
+  return (loaded && loaded.context) || roleCapabilities('general').context || 8192;
+}
+
+// The text the background model writes for an instruction and a message.
+async function backgroundText(system, user, maxTokens, signal) {
+  const body = {
+    model: backgroundModel, reasoning: false, temperature: 0.2, max_tokens: maxTokens,
+    messages: [{ role: 'system', content: system }, { role: 'user', content: user }]
+  };
+  let text = '';
+  let finish = null;
+  for await (const ev of api.streamChat(body, signal)) {
+    const choice = ev.type === 'chunk' && ev.data.choices && ev.data.choices[0];
+    if (!choice) continue;
+    if (choice.delta && choice.delta.content) text += choice.delta.content;
+    if (choice.finish_reason) finish = choice.finish_reason;
+  }
+  return { text: text.trim(), finish };
 }
 
 async function refreshStatus() {
@@ -322,6 +393,8 @@ function dateGroup(ts) {
 // The lists of the sidebar show this many projects and discussions at most; the others are
 // found by the search.
 const sideLimit = 20;
+// The searches run once the user stops typing for this many milliseconds.
+const searchDelay = 200;
 
 // Text as the search compares it: lower case, without accents.
 function fold(text) {
@@ -513,7 +586,7 @@ function searchDialog(kind) {
       if (!hits.length) list.append(h('div', { class: 'empty-note' }, t('noResults')));
     };
     let timer = 0;
-    input.addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(show, 120); });
+    input.addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(show, searchDelay); });
     input.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') {
         const first = list.querySelector('.search-result');
@@ -653,7 +726,14 @@ function closeMenu() {
   document.removeEventListener('mousedown', outsideMenu);
 }
 
-function conversationMenu(c, anchor) {
+// The open discussion is the copy that answers and saves: an action of the sidebar on it
+// changes that copy, so that the next save keeps the action.
+function liveCopy(c) {
+  return state.current && state.current.id === c.id ? state.current : c;
+}
+
+function conversationMenu(entry, anchor) {
+  const c = liveCopy(entry);
   showMenu(anchor, [
     { label: t('rename'), icon: 'edit', action: () => renameConversation(c) },
     { label: c.pinned ? t('unpin') : t('pin'), icon: 'pin', action: () => togglePin(c) },
@@ -675,8 +755,12 @@ function moveMenu(c, anchor) {
   showMenu(anchor, entries);
 }
 
+// The discussions deleted in this tab: the work that ends after their deletion (an answer, a
+// title, a summary, the marks of the memory) does not save them again.
+const deleted = new Set();
+
 async function persist(c) {
-  if (!c || c.incognito) return;
+  if (!c || c.incognito || deleted.has(c.id)) return;
   await store.putConversation(c);
   const i = state.conversations.findIndex((x) => x.id === c.id);
   if (i >= 0) state.conversations[i] = c;
@@ -713,6 +797,11 @@ async function setProject(c, projectId) {
 async function removeConversation(c) {
   const ok = await confirmDialog(t('deleteDiscussion'), t('deleteDiscussionText', { title: c.title || t('untitled') }));
   if (!ok) return;
+  deleted.add(c.id);
+  // The answer in progress stops, and the passages of the documents leave the memory of the
+  // search with those of the database.
+  if (state.busy && state.current && state.current.id === c.id) stopGeneration();
+  await forgetOwner(c.id);
   await store.deleteConversation(c.id);
   state.conversations = state.conversations.filter((x) => x.id !== c.id);
   if (state.current && state.current.id === c.id) go('#/');
@@ -776,7 +865,7 @@ async function deleteQuestion(c, index) {
   const m = c.messages[index];
   let end = index + 1;
   while (end < c.messages.length && c.messages[end].role !== 'user') ++end;
-  for (const a of (m && m.attachments) || []) if (a.mode === 'search') rag.removeDocument(c.id, a.id);
+  for (const a of (m && m.attachments) || []) if (a.mode === 'search') forgetDocument(c.id, a.id);
   const removed = end - index;
   c.messages.splice(index, removed);
   const start = c.contextStart || 0;
@@ -801,24 +890,77 @@ async function rewriteSummary(c) {
 }
 
 // The document search: the documents being indexed, one at a time in the background.
-const indexing = new Map();   // document -> {done, total}
+const indexing = new Map();   // document -> {owner, done, total, abort}
 let indexQueue = Promise.resolve();
 
 function queueIndex(owner, doc, persistent) {
   if (indexing.has(doc.id)) return indexQueue;
-  indexing.set(doc.id, { done: 0, total: 0 });
+  const run = { owner, done: 0, total: 0, abort: new AbortController() };
+  indexing.set(doc.id, run);
   showIndexing(doc.id);
-  indexQueue = indexQueue.then(() => rag.indexDocument(owner, doc, {
-    persistent,
-    onProgress: (done, total) => {
-      indexing.set(doc.id, { done, total });
-      showIndexing(doc.id);
-    }
-  })).catch(() => {}).then(() => {
-    indexing.delete(doc.id);
+  indexQueue = indexQueue.then(() => {
+    // A document removed while it waited is not indexed.
+    if (run.abort.signal.aborted) return null;
+    return rag.indexDocument(owner, doc, {
+      persistent, signal: run.abort.signal,
+      onProgress: (done, total) => {
+        run.done = done;
+        run.total = total;
+        showIndexing(doc.id);
+      }
+    });
+  }).catch(() => {}).then(() => {
+    if (indexing.get(doc.id) === run) indexing.delete(doc.id);
     showIndexing(doc.id);
   });
   return indexQueue;
+}
+
+// Stops the indexing, waiting or in progress, of the documents of an owner, of one of them,
+// or of all of them.
+function cancelIndex(owner, docId) {
+  for (const [id, run] of indexing) {
+    if ((owner == null || run.owner === owner) && (docId == null || id === docId)) {
+      run.abort.abort();
+      indexing.delete(id);
+    }
+  }
+}
+
+/*
+    Takes a document, or the documents of an owner (a project or a discussion), out of the
+    search: their indexing stops, and the passages it was computing are never written.
+*/
+function forgetDocument(owner, docId) {
+  cancelIndex(owner, docId);
+  return rag.removeDocument(owner, docId);
+}
+
+function forgetOwner(owner) {
+  cancelIndex(owner);
+  return rag.removeOwner(owner);
+}
+
+/*
+    Deletes the passages of the documents that no longer belong to their project or to their
+    discussion, such as those another tab wrote back while this one removed the document.
+    indexed lists the documents that had passages before the lists were read: a document is
+    saved in its project or its discussion before it is indexed, so that one indexed meanwhile
+    is never taken for a removed one.
+*/
+async function pruneIndex(indexed) {
+  if (!indexed.length) return;
+  const documents = new Map();
+  for (const p of state.projects) documents.set(p.id, new Set((p.files || []).map((f) => f.id)));
+  for (const c of state.conversations) {
+    const ids = new Set();
+    for (const m of c.messages || []) for (const a of m.attachments || []) ids.add(a.id);
+    documents.set(c.id, ids);
+  }
+  for (const { owner, doc } of indexed) {
+    const ids = documents.get(owner);
+    if (!ids || !ids.has(doc)) await rag.removeDocument(owner, doc);
+  }
 }
 
 // The state of a document on the page of its project.
@@ -913,9 +1055,10 @@ function renderProject(p) {
       h('span', { class: 'faint' }, f.format + ' · ' + t('tokensEstimate', { n: formatNumber(estimateTokens(f.text)) })),
       indexState,
       iconButton('trash', t('delete'), async () => {
+        const removed = forgetDocument(p.id, f.id);
         p.files = p.files.filter((x) => x.id !== f.id);
         await save();
-        await rag.removeDocument(p.id, f.id);
+        await removed;
         renderProject(p);
       })));
     indexText(p.id, f.id).then((text) => { indexState.textContent = text; });
@@ -960,7 +1103,11 @@ function renderProject(p) {
         class: 'button danger', type: 'button', html: icon('trash') + '<span>' + escapeHtml(t('deleteProject')) + '</span>',
         onclick: async () => {
           if (!await confirmDialog(t('deleteProject'), t('deleteProjectText', { name: p.name }))) return;
+          // The documents leave the search, in memory and in the database, and the discussion
+          // shown leaves the project as the stored ones do.
+          await forgetOwner(p.id);
           await store.deleteProject(p.id);
+          if (state.current && state.current.projectId === p.id) state.current.projectId = null;
           await reloadLists();
           go('#/');
         }
@@ -994,6 +1141,7 @@ async function readFiles(files, role) {
       if (e.message === 'unsupported') toast(t('unsupported', { name: f.name }), true);
       else if (e.message === 'legacy') toast(t('legacyFormat', { name: f.name }), true);
       else if (e.message === 'too-large') toast(t('tooLarge', { name: f.name, size: formatSize(f.size), limit: formatSize(maxFileBytes) }), true);
+      else if (e.message === 'too-large-content') toast(t('tooLargeContent', { name: f.name }), true);
       else toast(t('readFailed', { name: f.name, error: e.message }), true);
     }
   }
@@ -1080,6 +1228,8 @@ function renderTopbar() {
     const v = title.textContent.trim();
     if (v && v !== c.title) {
       c.title = v;
+      // A title of the user stays: the model no longer names the discussion.
+      c.titleSource = 'user';
       await persist(c);
       renderSidebar();
     }
@@ -1108,8 +1258,11 @@ function renderTopbar() {
 function roleMenu(anchor) {
   const c = state.current;
   const entries = [];
+  // The functions without a model of their own share the general one, or the model that comes
+  // with Albireo.
+  const chosen = state.status && (state.status.selected || state.status.active);
   for (const r of roles) {
-    const own = state.status && state.status.active && state.status.active[r];
+    const own = chosen && chosen[r];
     const model = roleModel(r);
     entries.push({
       label: t('role_' + r), icon: roleIcons[r], checked: c.role === r,
@@ -1157,13 +1310,7 @@ function renderMain() {
 function renderWelcome() {
   const c = state.current;
   const name = state.settings.userName ? ', ' + state.settings.userName : '';
-  const roleCards = h('div', { class: 'role-cards' });
-  for (const r of roles) {
-    roleCards.append(h('button', {
-      type: 'button', class: 'role-card' + (c.role === r ? ' active' : ''), title: t('roleHint_' + r),
-      onclick: async () => { c.role = r; await saveSetting('defaultRole', r); renderTopbar(); renderComposerState(); renderWelcome(); renderStatusLine(); }
-    }, h('span', { html: icon(roleIcons[r]) }), t('role_' + r)));
-  }
+  // The function comes from the picker of the top bar; the suggestions follow it.
   const suggestions = h('div', { class: 'suggestions' });
   for (let i = 1; i <= 4; ++i) {
     const [title, prompt] = t('suggest_' + c.role + '_' + i).split('|');
@@ -1177,7 +1324,7 @@ function renderWelcome() {
     h('img', { class: 'hero', src: 'img/albireo-mark.svg', alt: '' }),
     h('h1', { html: escapeHtml(t('welcome', { name })).replace('Albireo', '<span>Albireo</span>') }),
     h('p', null, p ? t('newProjectDiscussion', { name: p.name }) : t('welcomeSub')),
-    notice, roleCards, suggestions));
+    notice, suggestions));
   ui.thread = null;
 }
 
@@ -1253,18 +1400,24 @@ function editMessage(c, m, index, el) {
     h('button', {
       class: 'button primary', type: 'button',
       onclick: async () => {
+        if (state.busy) return;
         const text = area.value.trim();
         if (!text && !attachments.length) return;
         if (compactions.has(c.id)) await compactions.get(c.id).catch(() => {});
+        // A question sent meanwhile is being answered: the messages stay as they are.
+        if (state.busy) return;
+        // The documents no longer attached, to this question or to the questions after it,
+        // which leave with it, leave the search of the discussion.
+        const kept = new Set(attachments.map((a) => a.id));
+        for (const x of c.messages.slice(index)) {
+          for (const a of x.attachments || []) if (!kept.has(a.id) && a.mode === 'search') forgetDocument(c.id, a.id);
+        }
         c.messages = c.messages.slice(0, index);
         if ((c.contextStart || 0) > index) {
           // The exchanges come back into the context, without the summary of what follows.
           c.contextStart = 0;
           c.summary = null;
         }
-        // The documents no longer attached leave the search of the discussion.
-        const kept = new Set(attachments.map((a) => a.id));
-        for (const a of m.attachments || []) if (!kept.has(a.id) && a.mode === 'search') rag.removeDocument(c.id, a.id);
         await sendMessage(text, attachments);
       }
     }, t('send'))));
@@ -1283,7 +1436,7 @@ function assistantElement(c, m, index, last) {
   const el = h('div', { class: 'message assistant' + (last ? ' last' : '') });
   const bubble = h('div', { class: 'bubble' });
   el.append(bubble);
-  fillAssistant(bubble, m, state.busy && last);
+  fillAssistant(bubble, m, m === liveTurn);
   const meta = h('div', { class: 'meta' });
   const text = (m.steps || []).map((s) => s.content || '').join('\n\n').trim();
   meta.append(iconButton('copy', t('copy'), () => { navigator.clipboard.writeText(text); toast(t('copied')); }));
@@ -1316,7 +1469,7 @@ function fillAssistant(bubble, m, live) {
     const activeStep = live && k === steps.length - 1;
     if (s.reasoning) bubble.append(thinkingElement(s, activeStep && !s.content && !(s.toolCalls || []).length));
     if (s.content) {
-      const md = h('div', { class: 'md' + (activeStep && live ? ' cursor-host' : ''), html: renderMarkdown(s.content) });
+      const md = h('div', { class: 'md' + (activeStep && live ? ' cursor-host' : ''), html: renderMarkdown(s.content, live) });
       attachCodeButtons(md, t('copy'));
       bubble.append(md);
     }
@@ -1451,46 +1604,78 @@ async function onSend() {
   await sendMessage(text, attachments);
 }
 
+/*
+    Starts an answer: the composer offers to stop it, and the questions wait for its end.
+    Returns the controller that stops it.
+*/
+function beginTurn() {
+  state.busy = true;
+  state.abort = new AbortController();
+  renderComposerState();
+  return state.abort;
+}
+
 async function sendMessage(text, attachments) {
+  if (state.busy) return;
   const c = state.current;
+  const abort = beginTurn();
   const m = { id: store.uid(), role: 'user', content: text, attachments: attachments || [], created: Date.now() };
+  // The update of the memory gives way to the question, and comes back once the user is quiet.
+  if (memoryAbort) memoryAbort.abort();
   c.messages.push(m);
   // A new discussion starts with the memory as it is now.
   if (c.messages.length === 1 && !c.incognito && state.settings.memoryEnabled && state.settings.memory) {
     c.memory = state.settings.memory;
   }
-  clearTimeout(memoryTimers.get(c.id));
-  await prepareQuestion(c, m);
+  attachmentModes(c, m);
   if (!c.title) c.title = provisionalTitle(m);
   c.updated = Date.now();
-  await persist(c);
-  if (!c.incognito && location.hash !== '#/c/' + c.id) history.replaceState(null, '', '#/c/' + c.id);
-  renderSidebar();
-  renderTopbar();
-  await runTurn(c);
+  try {
+    // The question shows at once, and is saved before its documents are indexed (pruneIndex).
+    renderMain();
+    renderTopbar();
+    await persist(c);
+    if (!c.incognito && state.current === c && location.hash !== '#/c/' + c.id) history.replaceState(null, '', '#/c/' + c.id);
+    renderSidebar();
+    await prepareQuestion(c, m, abort.signal);
+    await persist(c);
+  } catch (e) {
+    // A question that could not be saved is answered all the same, and saved with its answer.
+  }
+  await runTurn(c, abort);
 }
 
 async function regenerate(c) {
   if (state.busy) return;
   while (c.messages.length && c.messages[c.messages.length - 1].role === 'assistant') c.messages.pop();
   if (!c.messages.length) return;
-  await runTurn(c);
+  await runTurn(c, beginTurn());
+}
+
+// How the model reads the documents of a question: whole while they fit in their share of the
+// context, searched beyond.
+function attachmentModes(c, m) {
+  const contextTokens = roleCapabilities(c.role).context || 8192;
+  for (const a of m.attachments || []) {
+    if (!a.mode) a.mode = estimateTokens(a.text) <= attachmentShare * contextTokens ? 'whole' : 'search';
+  }
 }
 
 /*
     Prepares a question once, when it is sent: its large documents are indexed for the
     search of the discussion, and the excerpts of the searched documents closest to it are
-    kept with it, so that the prompt of the following questions starts the same way.
+    kept with it, so that the prompt of the following questions starts the same way.  signal
+    stops the vectors of the documents, then searched by their words, and the search.
 */
-async function prepareQuestion(c, m) {
+async function prepareQuestion(c, m, signal) {
   const contextTokens = roleCapabilities(c.role).context || 8192;
   const owners = [];
+  attachmentModes(c, m);
   for (const a of m.attachments || []) {
-    if (!a.mode) a.mode = estimateTokens(a.text) <= attachmentShare * contextTokens ? 'whole' : 'search';
     if (a.mode === 'search') {
       // Indexed at once, beside the documents of the projects that may be in progress.
       toast(t('indexingDocument', { name: a.name }));
-      await rag.indexDocument(c.id, a, { persistent: !c.incognito }).catch(() => {});
+      await rag.indexDocument(c.id, a, { persistent: !c.incognito, signal }).catch(() => {});
     }
   }
   for (const x of c.messages) {
@@ -1512,7 +1697,7 @@ async function prepareQuestion(c, m) {
   }
   if (!question.trim()) question = (m.attachments || []).map((a) => a.name).join(' ');
   try {
-    const hits = await rag.search(owners, question, { budget: Math.floor(excerptShare * contextTokens * 3.6) });
+    const hits = await rag.search(owners, question, { budget: Math.floor(excerptShare * contextTokens * 3.6), signal });
     if (hits.length) {
       m.context = '<excerpts>\n' + hits.map((x) => '<excerpt document="' + x.name + '"'
         + (x.where ? ' location="' + x.where + '"' : '') + '>\n' + x.text + '\n</excerpt>').join('\n') + '\n</excerpts>';
@@ -1702,39 +1887,29 @@ function summaryInstructions(words) {
     + words + ' words.';
 }
 
-// A summary written by the model of the discussion from the previous one and a transcript.
+// A summary written by the background model from the previous one and a transcript.
 async function summarize(c, previous, transcript, limit, signal) {
-  const body = {
-    model: 'albireo-' + c.role, reasoning: false, temperature: 0.2, max_tokens: limit,
-    messages: [
-      { role: 'system', content: summaryInstructions(Math.floor(limit * 0.6)) },
-      { role: 'user', content: (previous ? '<previous_summary>\n' + previous + '\n</previous_summary>\n\n' : '')
-        + '<exchanges>\n' + transcript + '\n</exchanges>' }
-    ]
-  };
-  let text = '';
-  let finish = null;
-  for await (const ev of api.streamChat(body, signal)) {
-    const choice = ev.type === 'chunk' && ev.data.choices && ev.data.choices[0];
-    if (!choice) continue;
-    if (choice.delta && choice.delta.content) text += choice.delta.content;
-    if (choice.finish_reason) finish = choice.finish_reason;
-  }
-  text = text.trim();
+  const r = await backgroundText(summaryInstructions(Math.floor(limit * 0.6)),
+    (previous ? '<previous_summary>\n' + previous + '\n</previous_summary>\n\n' : '')
+      + '<exchanges>\n' + transcript + '\n</exchanges>', limit, signal);
+  const text = r.text;
+  const finish = r.finish;
   if (!text) throw new Error('empty summary');
   // A summary stopped by its length ends with its last whole sentence.
   return finish === 'length' ? keepStart(text, text.length - 1) : text;
 }
 
 /*
-    Compresses the exchanges [from, to) of a discussion into its summary: the model of the
-    discussion rewrites the summary with them, in parts that fit its context, oldest first.
+    Compresses the exchanges [from, to) of a discussion into its summary: the background model
+    rewrites the summary with them, in parts that fit its context, oldest first.
     Returns {summary, to}, which applyCompaction gives to the discussion, then started at
     to, its summary given with its first question.  A summary grown beyond its share of the
     room loses its oldest points.
 */
 async function compact(c, from, to, room, scale, signal) {
   const limit = Math.max(128, Math.min(1024, Math.floor(summaryShare * room)));
+  // The parts fit the context of the background model, which writes the summary.
+  room = Math.min(room, backgroundContext() - 64);
   let summary = (c.summary && c.summary.text) || '';
   // Characters of exchanges per part: the room, less the summary, its instructions and the
   // summary to write.
@@ -1765,6 +1940,7 @@ function applyCompaction(c, r) {
 // The discussion as it is now, for the work that ends in the background: the one shown, else
 // the one stored.  Null when it was deleted.
 async function currentVersion(c) {
+  if (deleted.has(c.id)) return null;
   if (state.current && state.current.id === c.id) return state.current;
   if (c.incognito) return c;
   return (await store.getConversation(c.id)) || null;
@@ -1886,13 +2062,25 @@ function shortenOldest(c, cuts, excess) {
   return excess <= 0;
 }
 
-let renderPending = false;
+// The answer being written, drawn live.
+let liveTurn = null;
 
-function scheduleRender(el, m) {
-  if (renderPending) return;
-  renderPending = true;
-  requestAnimationFrame(() => {
-    renderPending = false;
+/*
+    The answer in progress is drawn again at most once every renderInterval milliseconds, in
+    the next frame, while its discussion is the one shown.
+*/
+const renderInterval = 100;
+let renderTimer = 0;
+let renderFrame = 0;
+let renderedAt = 0;
+
+function scheduleRender(c, m) {
+  if (renderTimer || renderFrame) return;
+  const draw = () => {
+    renderFrame = 0;
+    renderedAt = performance.now();
+    const el = answerElement(c, m);
+    if (!el) return;
     const bubble = el.querySelector('.bubble');
     const thought = bubble.querySelector('.thinking.live .thought');
     const keepScroll = thought ? thought.scrollHeight - thought.scrollTop - thought.clientHeight < 40 : true;
@@ -1900,22 +2088,50 @@ function scheduleRender(el, m) {
     const t2 = bubble.querySelector('.thinking.live .thought');
     if (t2 && keepScroll) t2.scrollTop = t2.scrollHeight;
     scrollToEnd(false);
-  });
+  };
+  const wait = renderInterval - (performance.now() - renderedAt);
+  if (wait > 0) {
+    renderTimer = setTimeout(() => {
+      renderTimer = 0;
+      renderFrame = requestAnimationFrame(draw);
+    }, wait);
+  } else {
+    renderFrame = requestAnimationFrame(draw);
+  }
 }
 
-async function runTurn(c) {
+// Drops the drawing scheduleRender planned, once the answer is drawn whole.
+function cancelRender() {
+  clearTimeout(renderTimer);
+  cancelAnimationFrame(renderFrame);
+  renderTimer = 0;
+  renderFrame = 0;
+}
+
+// The element of the message m of the discussion c, while c is the discussion shown.
+function answerElement(c, m) {
+  if (state.view !== 'chat' || state.current !== c || !ui.thread || !ui.thread.isConnected) return null;
+  const index = c.messages.indexOf(m);
+  const el = index >= 0 ? ui.thread.children[index] : null;
+  return el && el.dataset.index === String(index) ? el : null;
+}
+
+/*
+    Answers the last question of c; abort, from beginTurn, stops the answer.  The answer is
+    drawn while c is the discussion shown, and saved with it at its end.
+*/
+async function runTurn(c, abort) {
   const model = roleModel(c.role);
   const turn = { id: store.uid(), role: 'assistant', steps: [], created: Date.now(), model: model || '' };
   c.messages.push(turn);
-  state.busy = true;
-  state.abort = new AbortController();
-  renderMain();
-  renderComposerState();
-  const el = ui.thread.lastChild;
+  liveTurn = turn;
+  const signal = abort.signal;
   const caps = roleCapabilities(c.role);
   const useTools = c.agent && caps.tools;
   const toolDefs = useTools ? tools.definitions : null;
   try {
+    if (state.current === c) renderMain();
+    if (signal.aborted) throw new DOMException('The answer was stopped.', 'AbortError');
     if (!model) throw new Error(t('noModel'));
     for (let step = 0; step < maxAgentSteps; ++step) {
       const s = { reasoning: '', content: '', toolCalls: [] };
@@ -1925,9 +2141,9 @@ async function runTurn(c) {
       const build = (cuts) => apiMessages(Object.assign({}, c, {
         messages: c.messages.slice(0, -1).concat([Object.assign({}, turn, { steps: turn.steps.slice(0, -1) })])
       }), system, cuts);
-      const fitted = await fitContext(c, build, toolDefs, state.settings.maxTokens || 2048, state.abort.signal, () => {
+      const fitted = await fitContext(c, build, toolDefs, state.settings.maxTokens || 2048, signal, () => {
         turn.compacting = true;
-        scheduleRender(el, turn);
+        scheduleRender(c, turn);
       });
       turn.compacting = false;
       if (fitted.trimmed) turn.trimmed = true;
@@ -1944,10 +2160,10 @@ async function runTurn(c) {
       if (state.settings.topP != null) body.top_p = state.settings.topP;
       if (state.settings.maxTokens > 0) body.max_tokens = state.settings.maxTokens;
       let finish = null;
-      for await (const ev of api.streamChat(body, state.abort.signal)) {
+      for await (const ev of api.streamChat(body, signal)) {
         if (ev.type === 'progress') {
           turn.progress = ev.data;
-          scheduleRender(el, turn);
+          scheduleRender(c, turn);
           continue;
         }
         const chunk = ev.data;
@@ -1979,7 +2195,7 @@ async function runTurn(c) {
         }
         if (choice.finish_reason) finish = choice.finish_reason;
         turn.progress = null;
-        scheduleRender(el, turn);
+        scheduleRender(c, turn);
       }
       if (s.reasoningStart && !s.reasoningMs) s.reasoningMs = Date.now() - s.reasoningStart;
       delete s.reasoningStart;
@@ -1987,21 +2203,22 @@ async function runTurn(c) {
       // The tools of the step run, then the model continues with their results.
       for (const tc of s.toolCalls) {
         tc.status = 'running';
-        scheduleRender(el, turn);
+        scheduleRender(c, turn);
         const r = await tools.run(tc.name, tc.arguments, {
           documents: documentsOf(c),
           searchDocuments: (query, limit) => searchDocumentsOf(c, query, limit),
           searchDiscussions: async (q) => searchConversations(q, 6).filter((x) => x.conversation.id !== c.id).map((x) => ({
             title: x.conversation.title, date: new Date(x.conversation.updated).toLocaleDateString(), excerpt: x.excerpt
           })),
-          createFile: (name, content) => ({ name, content })
+          createFile: (name, content) => ({ name, content }),
+          signal
         });
         tc.status = 'done';
         tc.ok = r.ok;
         tc.result = r.text;
         if (r.file) tc.file = r.file;
         delete tc.index;
-        scheduleRender(el, turn);
+        scheduleRender(c, turn);
       }
       if (step === maxAgentSteps - 1) turn.agentLimit = true;
     }
@@ -2009,6 +2226,8 @@ async function runTurn(c) {
     if (e.name === 'AbortError') turn.cancelled = true;
     else turn.error = errorText(e);
   } finally {
+    cancelRender();
+    liveTurn = null;
     for (const s of turn.steps) delete s.reasoningStart;
     turn.progress = null;
     turn.compacting = false;
@@ -2016,43 +2235,78 @@ async function runTurn(c) {
     state.abort = null;
     c.updated = Date.now();
     await persist(c).catch(() => {});
-    renderMain();
+    if (state.current === c) renderMain();
     renderComposerState();
     renderSidebar();
   }
-  if (!turn.error && !turn.cancelled) {
-    // A discussion still named after its first question receives a title from the model.
+  if (!turn.error && !turn.cancelled && !deleted.has(c.id)) {
+    // A discussion still named after its first question receives a title from the model, also
+    // one left "pending" by a tab that closed while naming it.
     const first = c.messages.find((m) => m.role === 'user');
-    if (!c.titleSource && first && c.title === provisionalTitle(first)) nameConversation(c);
+    if ((!c.titleSource || c.titleSource === 'pending') && !naming.has(c.id) && first && c.title === provisionalTitle(first)) {
+      nameConversation(c);
+    }
     compactLater(c, turn);
-    rememberLater(c);
+    if (!c.incognito) rememberLater();
   }
 }
 
-const memoryTimers = new Map();   // discussion -> the update of the memory to come
-let memoryQueue = Promise.resolve();
+/*
+    The memory reads the questions of the discussions that it has not read yet, each discussion
+    from its mark, in one pass once they are enough (memoryBatchQuestions questions or
+    memoryBatchChars characters) and the user has been idle for memoryIdle: the model writes
+    the new facts only, which join the memory without a rewriting, and the memory is rewritten
+    as a whole only when it outgrows its size.  One tab updates it at a time, by a lease that
+    expires: a tab closed in the middle of an update holds nothing, and the questions it was
+    reading are read again by the next update, since the marks move only once the memory is
+    saved.
+*/
+const memoryBatchQuestions = 3;
+const memoryBatchChars = 1200;
+const memoryIdle = 20000;
+const memoryLeaseMs = 180000;
+const tabId = store.uid();
+let memoryTimer = null;
+let memoryRunning = false;
+let memoryAbort = null;   // the update in progress, which a new question stops
 
-// Updates the memory from a discussion once it has had no new question for memoryDelay.
-function rememberLater(c) {
-  if (c.incognito || !state.settings.memoryEnabled) return;
-  clearTimeout(memoryTimers.get(c.id));
-  memoryTimers.set(c.id, setTimeout(() => {
-    memoryTimers.delete(c.id);
-    memoryQueue = memoryQueue.then(() => remember(c)).catch(() => {});
-  }, memoryDelay));
+function rememberLater() {
+  if (!state.settings.memoryEnabled) return;
+  clearTimeout(memoryTimer);
+  memoryTimer = setTimeout(() => {
+    memoryTimer = null;
+    updateMemory().catch(() => {});
+  }, memoryIdle);
 }
 
-function memoryInstructions(words, sensitive) {
-  return 'You keep a short memory about the user for the future discussions of an assistant. Update it with what '
-    + 'the new messages of the user teach about them that lasts: profession, projects, preferences, habits of work, '
-    + 'the way they want to be answered. Leave out what serves this discussion only, the content of documents, and what '
-    + 'the memory already holds. '
-    + (sensitive ? 'Information the user shares about themselves may be kept, sensitive or not. '
-      : 'Leave out sensitive information: health, finances, passwords, keys and identifiers, political, religious '
-        + 'or philosophical opinions, sexual orientation, private matters, and information about other people. ')
-    + 'Write each fact in your own words, as a short line that starts with "- ", without copying the messages. '
-    + 'Return the whole memory, the newest lines last, in at most ' + words + ' words; when nothing changes, return '
-    + 'the memory as it is. Write in the language of the user.';
+function sensitiveRule(sensitive) {
+  return sensitive ? 'Information the user shares about themselves may be kept, sensitive or not. '
+    : 'Leave out sensitive information: health, finances, passwords, keys and identifiers, political, religious '
+      + 'or philosophical opinions, sexual orientation, private matters, and information about other people. ';
+}
+
+// The language the memory is written in: the one of the interface.
+function memoryLanguage() {
+  return { en: 'English', fr: 'French', de: 'German', it: 'Italian', es: 'Spanish' }[language()] || 'English';
+}
+
+// The new facts the questions teach, which join the memory.
+function memoryDeltaInstructions(words, sensitive) {
+  return 'You keep a short memory about the user for the future discussions of an assistant. From the new messages '
+    + 'of the user, write the lasting facts about the user that the memory does not hold yet: profession, projects, '
+    + 'preferences, habits of work, the way they want to be answered. A topic the user asks about once teaches '
+    + 'nothing lasting: keep what the user says about themselves. Leave out what serves one discussion only, the '
+    + 'content of documents, and what the memory already holds, even in other words. ' + sensitiveRule(sensitive)
+    + 'Write each new fact in your own words, as a short line that starts with "- ", without copying the messages, '
+    + 'in at most ' + words + ' words in all. When there is no new fact, answer NONE. Write in ' + memoryLanguage()
+    + '.';
+}
+
+// The memory rewritten within its size, when the new facts made it outgrow it.
+function memoryCompactInstructions(words, sensitive) {
+  return 'You keep a short memory about the user for the future discussions of an assistant. Rewrite it in at most '
+    + words + ' words: merge the lines that say the same thing, keep the most lasting facts, the newest last, each '
+    + 'as a short line that starts with "- ". ' + sensitiveRule(sensitive) + 'Write in ' + memoryLanguage() + '.';
 }
 
 // The credentials, keys and payment identifiers, which the memory keeps only when the settings
@@ -2065,66 +2319,190 @@ const secretPatterns = [
   /[A-Za-z0-9+\/=_-]{32,}/
 ];
 
-// The lines of a memory written by the model, within words words: the oldest leave first.
-function memoryLines(text, words, sensitive) {
-  let lines = String(text || '').split('\n').map((l) => l.trim()).filter((l) => /^[-*\u2022]\s*\S/.test(l))
+// The lines of a text written by the model, "- " lines only, without the secrets unless the
+// settings keep sensitive information.
+function memoryLineList(text, sensitive) {
+  return String(text || '').split('\n').map((l) => l.trim()).filter((l) => /^[-*\u2022]\s*\S/.test(l))
     .map((l) => '- ' + l.replace(/^[-*\u2022]\s*/, ''))
     .filter((l) => sensitive || !secretPatterns.some((re) => re.test(l)));
-  const count = (ls) => ls.join(' ').split(/\s+/).filter(Boolean).length;
-  while (lines.length > 1 && count(lines) > words) lines = lines.slice(1);
+}
+
+const wordCount = (lines) => lines.join(' ').split(/\s+/).filter(Boolean).length;
+
+// The lines of a memory written by the model, within words words: the oldest leave first.
+function memoryLines(text, words, sensitive) {
+  let lines = memoryLineList(text, sensitive);
+  while (lines.length > 1 && wordCount(lines) > words) lines = lines.slice(1);
   return lines.join('\n');
 }
 
+// The words of a line, for the comparison of two facts: their first five letters, which
+// bring the forms of a word together ("courtes", "court").
+function factWords(line) {
+  return new Set(line.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .split(' ').filter((w) => w.length > 2).map((w) => w.slice(0, 5)));
+}
+
+// True when two lines say nearly the same thing: most of their words are shared.
+function sameFact(a, b) {
+  const x = factWords(a);
+  const y = factWords(b);
+  if (!x.size || !y.size) return false;
+  let shared = 0;
+  for (const w of x) if (y.has(w)) ++shared;
+  return shared / (x.size + y.size - shared) >= 0.7;
+}
+
+// The questions the memory has not read yet, each discussion from its mark.
+function pendingMemory() {
+  const items = [];
+  let questions = 0;
+  let chars = 0;
+  const all = state.conversations.slice();
+  if (state.current && !state.current.incognito && !all.includes(state.current)) all.push(state.current);
+  for (const c of all) {
+    if (c.incognito || !Array.isArray(c.messages) || c.messages.length <= (c.memoryMark || 0)) continue;
+    const asked = c.messages.slice(c.memoryMark || 0).filter((m) => m.role === 'user' && (m.content || '').trim())
+      .map((m) => m.content);
+    items.push({ id: c.id, to: c.messages.length, asked });
+    questions += asked.length;
+    chars += asked.reduce((n, a) => n + a.length, 0);
+  }
+  return { items, questions, chars };
+}
+
+// The lease of this tab on the memory: false when another tab holds it and it has not expired.
+async function takeMemoryLease() {
+  const settings = await store.getSettings();
+  const lease = settings.memoryLease;
+  if (lease && lease.owner !== tabId && lease.until > Date.now()) return false;
+  await store.setSetting('memoryLease', { owner: tabId, until: Date.now() + memoryLeaseMs });
+  return true;
+}
+
+async function releaseMemoryLease() {
+  const settings = await store.getSettings().catch(() => ({}));
+  if (settings.memoryLease && settings.memoryLease.owner === tabId) await store.setSetting('memoryLease', null);
+}
+
+// The copies of a discussion in this tab: the one shown and the one of the lists.
+function copiesOf(id) {
+  const out = state.conversations.filter((x) => x.id === id);
+  if (state.current && state.current.id === id && !out.includes(state.current)) out.push(state.current);
+  return out;
+}
+
 /*
-    Updates the memory with the exchanges of a discussion that it has not read yet: the model
-    rewrites the memory from them, leaving out the sensitive information unless the settings
-    keep it.  The questions count, with the beginning of the answers for their context.
+    The discussions read up to the questions the memory took.  The mark changes on the stored
+    discussion, read again from the database, so that the messages another tab saved stay,
+    and on the copies of this tab, so that their next save keeps it.
 */
-async function remember(c) {
-  if (c.incognito || !state.settings.memoryEnabled) return;
-  if (state.busy && state.current && state.current.id === c.id) return;
-  const from = c.memoryMark || 0;
-  const to = c.messages.length;
-  const exchanges = c.messages.slice(from, to);
-  const asked = exchanges.filter((m) => m.role === 'user').map((m) => m.content || '').join(' ');
-  const mark = async () => {
-    const now = await currentVersion(c).catch(() => null);
-    if (!now) return;
-    now.memoryMark = Math.max(now.memoryMark || 0, Math.min(to, now.messages.length));
-    await persist(now).catch(() => {});
-  };
-  if (asked.trim().length < 40) {
-    await mark();
+async function markRead(items) {
+  for (const item of items) {
+    if (deleted.has(item.id)) continue;
+    const mark = (x) => {
+      const to = Math.min(item.to, Array.isArray(x.messages) ? x.messages.length : 0);
+      if ((x.memoryMark || 0) >= to) return false;
+      x.memoryMark = to;
+      return true;
+    };
+    await store.updateConversations(mark, item.id).catch(() => {});
+    copiesOf(item.id).forEach(mark);
+  }
+}
+
+// The memory and its settings as stored, which another tab may have changed.
+async function storedMemory() {
+  const s = Object.assign({}, defaults, await store.getSettings());
+  return { enabled: !!s.memoryEnabled, sensitive: !!s.memorySensitive, memory: s.memory || '' };
+}
+
+// The copies of the discussions in this tab, after a reset of the memory in this tab or in another one.
+function forgetMemory() {
+  const all = state.conversations.slice();
+  if (state.current && !all.includes(state.current)) all.push(state.current);
+  for (const c of all) {
+    delete c.memory;
+    c.memoryMark = c.messages.length;
+  }
+  clearTimeout(memoryTimer);
+  memoryTimer = null;
+}
+
+/*
+    Updates the memory with the questions it has not read yet, when they are enough or force is
+    true: the background model writes the new facts, which join the memory unless it holds them
+    already, then the memory is rewritten within its size when it outgrew it, or loses its
+    oldest lines when the rewriting fails.  A notification says how many facts joined.
+*/
+async function updateMemory(force) {
+  if (memoryRunning || !state.settings.memoryEnabled || state.incognito) return;
+  const pending = pendingMemory();
+  if (!pending.items.length) return;
+  if (!force && pending.questions < memoryBatchQuestions && pending.chars < memoryBatchChars) return;
+  // The answer in progress comes first.
+  if (state.busy) {
+    rememberLater();
     return;
   }
-  // What the user wrote: the memory is about the user, and the answers would fill it with
-  // what the assistant said.
-  const lines = [];
-  for (const m of exchanges) if (m.role === 'user') lines.push('User: ' + keepStart(m.content || '', 1500));
-  const context = roleCapabilities(c.role).context || 8192;
-  const words = memoryLimitWords(context);
-  const current = state.settings.memory || '';
-  let text = '';
-  const body = {
-    model: 'albireo-' + c.role, reasoning: false, temperature: 0.2, max_tokens: Math.ceil(words * 2.2) + 16,
-    messages: [
-      { role: 'system', content: memoryInstructions(words, !!state.settings.memorySensitive) },
-      { role: 'user', content: '<memory>\n' + (current || '(empty)') + '\n</memory>\n\n<messages>\n'
-        + keepEnd(lines.join('\n\n'), Math.floor(context * 3.6 * 0.5)) + '\n</messages>' }
-    ]
-  };
-  for await (const ev of api.streamChat(body)) {
-    const choice = ev.type === 'chunk' && ev.data.choices && ev.data.choices[0];
-    if (choice && choice.delta && choice.delta.content) text += choice.delta.content;
+  memoryRunning = true;
+  memoryAbort = new AbortController();
+  const signal = memoryAbort.signal;
+  let leased = false;
+  try {
+    leased = await takeMemoryLease();
+    if (!leased) return;
+    // The memory as stored: another tab may have reset or edited it.
+    const stored = await storedMemory();
+    if (!stored.enabled) return;
+    const sensitive = stored.sensitive;
+    const context = backgroundContext();
+    const words = memoryLimitWords(context);
+    const current = stored.memory;
+    // True when the memory was reset, edited or turned off meanwhile, in this tab or in another
+    // one, as stored now: the update is then dropped.
+    const changed = async () => {
+      const now = await storedMemory();
+      return !now.enabled || now.memory !== current;
+    };
+    let lines = memoryLineList(current, true);
+    let added = 0;
+    if (pending.chars >= 40) {
+      // What the user wrote: the memory is about the user, and the answers would fill it with
+      // what the assistant said.
+      const asked = [];
+      for (const item of pending.items) for (const a of item.asked) asked.push('User: ' + keepStart(a, 1500));
+      const r = await backgroundText(memoryDeltaInstructions(words, sensitive),
+        '<memory>\n' + (current || '(empty)') + '\n</memory>\n\n<messages>\n'
+          + keepEnd(asked.join('\n\n'), Math.floor(context * 3.6 * 0.5)) + '\n</messages>',
+        Math.ceil(words * 1.6) + 16, signal);
+      if (await changed()) return;
+      for (const fact of memoryLineList(r.text, sensitive)) {
+        if (lines.some((l) => sameFact(l, fact))) continue;
+        lines.push(fact);
+        ++added;
+      }
+      if (added && wordCount(lines) > words) {
+        const rewritten = await backgroundText(memoryCompactInstructions(words, sensitive),
+          '<memory>\n' + lines.join('\n') + '\n</memory>', Math.ceil(words * 2.2) + 16, signal).catch(() => null);
+        if (signal.aborted) return;
+        if (await changed()) return;
+        const compacted = rewritten ? memoryLineList(rewritten.text, sensitive) : [];
+        if (compacted.length && wordCount(compacted) <= words * 1.2) lines = compacted;
+        while (lines.length > 1 && wordCount(lines) > words) lines = lines.slice(1);
+      }
+      if (added) {
+        await saveSetting('memory', lines.join('\n'));
+        await saveSetting('memoryUpdated', Date.now());
+      }
+    }
+    await markRead(pending.items);
+    if (added) toast(t(added === 1 ? 'memoryLearnedOne' : 'memoryLearned', { n: added }), false, 4500);
+  } finally {
+    memoryRunning = false;
+    memoryAbort = null;
+    if (leased) await releaseMemoryLease().catch(() => {});
   }
-  // The memory may have been reset or edited meanwhile: the update is then dropped.
-  if (!state.settings.memoryEnabled || (state.settings.memory || '') !== current) return;
-  const updated = memoryLines(text, words, !!state.settings.memorySensitive);
-  if (updated || !current) {
-    await saveSetting('memory', updated);
-    await saveSetting('memoryUpdated', Date.now());
-  }
-  await mark();
 }
 
 // An error of the service in the language of the interface, by its code when it has one.
@@ -2148,51 +2526,51 @@ function cleanTitle(text) {
   let title = String(text || '').split('\n').map((l) => l.trim()).find((l) => l) || '';
   title = title.replace(/^(title|titre|titel|titolo|t[ií]tulo)\s*:\s*/i, '').replace(/[*#_`]+/g, '')
     .replace(/^["'\u00ab\u201c\u201e\s]+|["'\u00bb\u201d\s]+$/g, '').replace(/[.!?:;,\u2026]+$/, '').trim();
+  // An identifier written as a title (ReverseWordsInSentence) becomes words.
+  if (!/\s/.test(title) && /[a-z][A-Z]/.test(title)) title = title.replace(/([a-z0-9])([A-Z])/g, '$1 $2');
+  if (title) title = title.charAt(0).toLocaleUpperCase() + title.slice(1);
   return title.length > 70 ? keepStart(title, 70).replace(/\s*\u2026$/, '') : title;
 }
 
+// The discussions this tab is naming.  The mark stays out of the discussions, so that none is
+// saved with it: a discussion whose tab closed while it was named is named by a later answer.
+const naming = new Set();
+
 /*
-    Names a discussion after its first question: the model of the discussion writes a short
-    title, which replaces the beginning of the question that served until then, unless the
-    user renames the discussion meanwhile.
+    Names a discussion after its first question: the background model writes a short title,
+    which replaces the beginning of the question that served until then, unless the user
+    renames the discussion meanwhile.
 */
 async function nameConversation(c) {
   const first = c.messages.find((m) => m.role === 'user');
   if (!first) return;
-  c.titleSource = 'pending';
-  const question = keepStart((first.content || '') + ((first.attachments || []).length
-    ? '\n(' + first.attachments.map((a) => a.name).join(', ') + ')' : ''), 1500);
-  let text = '';
+  naming.add(c.id);
   try {
-    const body = {
-      model: 'albireo-' + c.role, reasoning: false, temperature: 0.2, max_tokens: 24,
-      messages: [
-        { role: 'system', content: 'You name discussions. Answer with a title of at most six words for the discussion '
-          + 'that starts with the question of the user, in the language of that question, without quotes, emoji or '
-          + 'final punctuation.' },
-        { role: 'user', content: question }
-      ]
-    };
-    for await (const ev of api.streamChat(body)) {
-      const choice = ev.type === 'chunk' && ev.data.choices && ev.data.choices[0];
-      if (choice && choice.delta && choice.delta.content) text += choice.delta.content;
+    const question = keepStart((first.content || '') + ((first.attachments || []).length
+      ? '\n(' + first.attachments.map((a) => a.name).join(', ') + ')' : ''), 1500);
+    let text = '';
+    try {
+      // A small model given the question alone tends to answer it: the request frames it.
+      text = (await backgroundText('You write the titles of discussions. Answer with the title only: two to six words '
+        + 'separated by spaces, in the language of the question, without quotes, emoji, code formatting or final '
+        + 'punctuation. Never answer the question.',
+        'Question: ' + question + '\n\nTitle of the discussion that starts with this question:', 24)).text;
+    } catch (e) {
+      text = '';
     }
-  } catch (e) {
-    text = '';
+    const title = cleanTitle(text);
+    const now = await currentVersion(c).catch(() => null);
+    if (!now || now.titleSource === 'user' || now.titleSource === 'model') return;
+    // Without a title, the beginning of the question stays, and the next answer tries again.
+    if (!title) return;
+    now.title = title;
+    now.titleSource = 'model';
+    await persist(now).catch(() => {});
+    renderSidebar();
+    if (state.current && state.current.id === now.id) renderTopbar();
+  } finally {
+    naming.delete(c.id);
   }
-  const title = cleanTitle(text);
-  const now = await currentVersion(c).catch(() => null);
-  if (!now || now.titleSource === 'user' || now.titleSource === 'model') return;
-  if (!title) {
-    // The beginning of the question stays, and the next answer tries again.
-    delete now.titleSource;
-    return;
-  }
-  now.title = title;
-  now.titleSource = 'model';
-  await persist(now).catch(() => {});
-  renderSidebar();
-  if (state.current && state.current.id === now.id) renderTopbar();
 }
 
 /*
@@ -2380,16 +2758,17 @@ function memoryTab(body) {
         await saveSetting('memory', '');
         await saveSetting('memoryUpdated', 0);
         // The discussions forget the memory they started with, and what they already said
-        // stays out of the next updates.
-        const all = state.conversations.slice();
-        if (state.current && !state.current.incognito) all.push(state.current);
-        for (const c of all) {
-          delete c.memory;
-          c.memoryMark = c.messages.length;
-          await store.putConversation(c);
-        }
-        for (const timer of memoryTimers.values()) clearTimeout(timer);
-        memoryTimers.clear();
+        // stays out of the next updates: the stored discussions change in place, read again
+        // from the database with the messages other tabs saved, and the copies of the tabs follow.
+        await store.updateConversations((x) => {
+          const mark = Array.isArray(x.messages) ? x.messages.length : 0;
+          if (x.memory === undefined && x.memoryMark === mark) return false;
+          delete x.memory;
+          x.memoryMark = mark;
+          return true;
+        }).catch(() => {});
+        forgetMemory();
+        broadcast({ type: 'memoryReset' });
         text.value = '';
         showSize();
       }
@@ -2402,6 +2781,8 @@ function dataTab(body, close) {
     try {
       const data = JSON.parse(await input.files[0].text());
       const r = await store.importAll(data);
+      // A discussion deleted earlier comes back with the import, and is saved again.
+      for (const c of data.conversations) if (c && typeof c.id === 'string') deleted.delete(c.id);
       await reloadLists();
       renderSidebar();
       toast(t('imported', { n: r.conversations, p: r.projects }));
@@ -2423,6 +2804,13 @@ function dataTab(body, close) {
         class: 'button danger', type: 'button', html: icon('trash') + '<span>' + escapeHtml(t('clearAll')) + '</span>',
         onclick: async () => {
           if (!await confirmDialog(t('clearAll'), t('clearAllText'))) return;
+          // The answer in progress stops, the stored discussions are not saved again, and the
+          // indexing in progress writes no passage.  A new discussion, not yet stored, stays.
+          for (const c of state.conversations) deleted.add(c.id);
+          if (state.current && state.current.messages.length) deleted.add(state.current.id);
+          if (state.busy) stopGeneration();
+          cancelIndex();
+          rag.removeAll();
           await store.clearAll();
           await reloadLists();
           close(true);
@@ -2457,7 +2845,13 @@ async function aboutTab(body) {
     row(t('processor'), s.host.cpu.name + ' · ' + s.host.cpu.cores + ' / ' + s.host.cpu.threads);
     row(t('memory'), formatSize(s.host.memory.total));
   }
-  const models = Object.entries(s.active || {}).map(([r, id]) => t('role_' + r) + ': ' + modelName(id)).join(' · ');
+  // The functions of each model, in the order of the picker, the document search last.
+  const byModel = new Map();
+  for (const r of roles.concat(['embedding'])) {
+    const id = (s.active || {})[r];
+    if (id) byModel.set(id, (byModel.get(id) || []).concat([t('role_' + r)]));
+  }
+  const models = Array.from(byModel, ([id, names]) => names.join(', ') + ': ' + modelName(id)).join(' · ');
   row(t('models'), models || '-');
   if (s.usage) row(t('requests'), formatNumber(s.usage.requests) + ' · ' + t('tokensIn') + ' ' + formatNumber(s.usage.prompt_tokens) +
     ' · ' + t('tokensOut') + ' ' + formatNumber(s.usage.completion_tokens));
@@ -2500,7 +2894,14 @@ function buildLayout() {
   ui.sideScroll = h('div', { class: 'side-scroll' });
   ui.statusLine = h('div', { class: 'status-line' });
   const search = h('input', { type: 'search', placeholder: t('search'), value: state.search });
-  search.addEventListener('input', () => { state.search = search.value; renderSidebar(); });
+  let searchTimer = 0;
+  search.addEventListener('input', () => {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => {
+      state.search = search.value;
+      renderSidebar();
+    }, searchDelay);
+  });
   ui.incognitoButton = h('button', {
     class: 'incognito-toggle' + (state.incognito ? ' on' : ''), type: 'button', title: t('incognitoStart'), html: icon('incognito'),
     onclick: () => {
@@ -2598,12 +2999,18 @@ async function init() {
   applyLanguage();
   applyTheme();
   window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', applyTheme);
-  await reloadLists().catch(() => {});
+  // The documents that have passages, listed before the lists are read (pruneIndex), which
+  // prunes them only once the lists are read whole.
+  const indexed = state.incognito ? [] : await store.chunkDocuments().catch(() => []);
+  if (await reloadLists().then(() => true, () => false)) pruneIndex(indexed).catch(() => {});
   buildLayout();
   window.addEventListener('hashchange', route);
   await route();
   await refreshStatus();
   setInterval(refreshStatus, 4000);
+  // The questions an earlier visit left to the memory, once the service answers.
+  rememberLater();
+  window.addEventListener('pagehide', () => { if (memoryRunning) releaseMemoryLease().catch(() => {}); });
 }
 
 init();

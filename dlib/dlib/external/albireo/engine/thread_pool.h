@@ -7,6 +7,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <exception>
 #include <mutex>
 #include <thread>
 #include <type_traits>
@@ -37,7 +38,9 @@ namespace albireo
                 parallel_for() splits a range of tasks among the workers and the calling
                 thread, hands them out one at a time through an atomic counter so that
                 uneven tasks balance themselves, and returns once every task is done.
-                Calls are serialized: a single thread drives the pool.
+                Calls are serialized: a single thread drives the pool.  An exception thrown
+                by a task skips the tasks not yet started and reaches the caller once every
+                worker has left the section.
         !*/
 
     public:
@@ -74,6 +77,7 @@ namespace albireo
                   thread_index being in [0, size()), and returns when all calls returned.
                 - Runs everything on the calling thread when n_tasks == 1 or the pool
                   has a single thread.
+                - Rethrows the first exception a task threw, after every worker is done.
         !*/
         template <typename F>
         void parallel_for(long n_tasks, F&& fn)
@@ -87,8 +91,8 @@ namespace albireo
             job_ctx_ = static_cast<void*>(&fn);
             job_fn_ = &invoke<typename std::remove_reference<F>::type>;
             n_tasks_ = n_tasks;
-            next_.store(0, std::memory_order_relaxed);
-            pending_.store(static_cast<int>(workers_.size()), std::memory_order_relaxed);
+            next_.value.store(0, std::memory_order_relaxed);
+            pending_.value.store(static_cast<long>(workers_.size()), std::memory_order_relaxed);
             // Sequentially consistent, as the sleeping count below: a worker that is
             // about to sleep either sees the new generation or is seen sleeping.
             generation_.fetch_add(1);
@@ -101,10 +105,21 @@ namespace albireo
             // Spin while the workers finish, then give the processor away: a worker that
             // the system preempted must be able to run on it.
             unsigned spins = 0;
-            while (pending_.load(std::memory_order_acquire) != 0)
+            while (pending_.value.load(std::memory_order_acquire) != 0)
             {
                 if (++spins < 4096) ALBIREO_CPU_RELAX();
                 else std::this_thread::yield();
+            }
+            if (failed_.load(std::memory_order_acquire))
+            {
+                std::exception_ptr e;
+                {
+                    std::lock_guard<std::mutex> lock(error_mutex_);
+                    e = error_;
+                    error_ = nullptr;
+                    failed_.store(false, std::memory_order_relaxed);
+                }
+                std::rethrow_exception(e);
             }
         }
 
@@ -120,9 +135,20 @@ namespace albireo
         {
             for (;;)
             {
-                const long t = next_.fetch_add(1, std::memory_order_relaxed);
+                const long t = next_.value.fetch_add(1, std::memory_order_relaxed);
                 if (t >= n_tasks_) break;
-                job_fn_(job_ctx_, t, thread);
+                try
+                {
+                    job_fn_(job_ctx_, t, thread);
+                }
+                catch (...)
+                {
+                    // The tasks not yet handed out are skipped; the first exception is kept for the caller.
+                    std::lock_guard<std::mutex> lock(error_mutex_);
+                    if (!error_) error_ = std::current_exception();
+                    failed_.store(true, std::memory_order_release);
+                    next_.value.store(n_tasks_, std::memory_order_relaxed);
+                }
             }
         }
 
@@ -160,22 +186,35 @@ namespace albireo
                 seen = g;
                 if (stop_.load(std::memory_order_acquire)) return;
                 run_tasks(thread);
-                pending_.fetch_sub(1, std::memory_order_acq_rel);
+                pending_.value.fetch_sub(1, std::memory_order_acq_rel);
             }
         }
+
+        // A counter alone on its cache line: the counters below change with every task
+        // and every worker, while the spinning workers keep reading the fields of the
+        // section.
+        struct counter_line
+        {
+            char before[64];
+            std::atomic<long> value{0};
+            char after[64];
+        };
 
         std::vector<std::thread> workers_;
         std::mutex mutex_;
         std::condition_variable cv_;
         std::atomic<uint64_t> generation_{0};
         std::atomic<int> sleeping_{0};
-        std::atomic<int> pending_{0};
-        std::atomic<long> next_{0};
         std::atomic<long long> spin_us_{2000};
         long n_tasks_ = 0;
         void* job_ctx_ = nullptr;
         void (*job_fn_)(void*, long, int) = nullptr;
         std::atomic<bool> stop_{false};
+        std::atomic<bool> failed_{false};
+        std::mutex error_mutex_;
+        std::exception_ptr error_;
+        counter_line next_;
+        counter_line pending_;
     };
 
 }

@@ -1,6 +1,6 @@
 {
   "format": 1,
-  "updated": "2026-10-29T20:22:43Z",
+  "updated": "2026-10-30T18:11:31Z",
   "models": [
     {
       "id": "qwen3-4b",
@@ -67,38 +67,6 @@
           "url": "https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF/resolve/370f27d7550e0def9b39c1f16d3fbaa13aa67728/Qwen3-Embedding-0.6B-Q8_0.gguf",
           "size": 639150592,
           "sha256": "06507c7b42688469c4e7298b0a1e16deff06caf291cf0a5b278c308249c3e439"
-        }
-      ]
-    },
-    {
-      "id": "qwen3-1.7b",
-      "name": "Qwen3 1.7B",
-      "publisher": "Qwen",
-      "quantization": "Q8_0",
-      "roles": [
-        "general"
-      ],
-      "tools": true,
-      "reasoning": true,
-      "license": "Apache-2.0",
-      "description": {
-        "en": "Compact general assistant with step by step reasoning, for computers with little memory and no accelerator. It answers faster than the larger models, in less depth.",
-        "fr": "Assistant généraliste compact, avec raisonnement étape par étape, pour les ordinateurs disposant de peu de mémoire et sans accélérateur. Il répond plus vite que les modèles plus grands, avec moins de profondeur.",
-        "de": "Kompakter allgemeiner Assistent mit schrittweisem Denken, für Computer mit wenig Arbeitsspeicher und ohne Beschleuniger. Er antwortet schneller als die größeren Modelle, mit weniger Tiefe.",
-        "it": "Assistente generale compatto, con ragionamento passo dopo passo, per computer con poca memoria e senza acceleratore. Risponde più rapidamente dei modelli più grandi, con meno profondità.",
-        "es": "Asistente general compacto, con razonamiento paso a paso, para ordenadores con poca memoria y sin acelerador. Responde más rápido que los modelos más grandes, con menos profundidad."
-      },
-      "arch": "qwen3",
-      "parameters": 1720574976,
-      "context": 40960,
-      "source": "https://huggingface.co/Qwen/Qwen3-1.7B-GGUF",
-      "size": 1834426016,
-      "sha256": "061b54daade076b5d3362dac252678d17da8c68f07560be70818cace6590cb1a",
-      "files": [
-        {
-          "url": "https://huggingface.co/Qwen/Qwen3-1.7B-GGUF/resolve/90862c4b9d2787eaed51d12237eafdfe7c5f6077/Qwen3-1.7B-Q8_0.gguf",
-          "size": 1834426016,
-          "sha256": "061b54daade076b5d3362dac252678d17da8c68f07560be70818cace6590cb1a"
         }
       ]
     },

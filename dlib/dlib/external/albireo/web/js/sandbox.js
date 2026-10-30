@@ -24,13 +24,26 @@
     '  if (typeof v === "bigint") return v.toString() + "n";',
     '  try { var s = JSON.stringify(v, null, 2); return s === undefined ? String(v) : s; } catch (e) { return String(v); }',
     '}',
+    // The output stops at limit characters, the text the page keeps of a run.
+    'var limit = 20000;',
+    'function cut(s) { return s.length > limit ? s.slice(0, limit) + " [...]" : s; }',
     'self.onmessage = function (e) {',
-    '  var logs = [];',
-    '  var print = function () { logs.push(Array.prototype.map.call(arguments, show).join(" ")); };',
+    '  var logs = [], size = 0;',
+    '  var print = function () {',
+    '    if (size > limit || logs.length >= 2000) return;',
+    '    var line = cut(Array.prototype.map.call(arguments, show).join(" "));',
+    '    size += line.length + 1;',
+    '    logs.push(line);',
+    '    if (size > limit) logs.push("[...]");',
+    '  };',
     '  self.console = { log: print, info: print, warn: print, error: print, debug: print, table: print };',
     '  var done = function (ok, value, error) {',
-    '    postMessage({ ok: ok, logs: logs.slice(0, 2000), result: ok && value !== undefined ? show(value) : undefined,',
-    '                  error: error });',
+    '    try {',
+    '      postMessage({ ok: ok, logs: logs, result: ok && value !== undefined ? cut(show(value)) : undefined,',
+    '                    error: error === undefined ? undefined : cut(String(error)) });',
+    '    } catch (err) {',
+    '      postMessage({ ok: false, logs: logs, error: "The result of the code could not be read." });',
+    '    }',
     '  };',
     '  var code = String(e.data.code);',
     '  var value;',
@@ -47,23 +60,54 @@
     '};'
   ].join('\n');
   var url = URL.createObjectURL(new Blob([workerSource], { type: 'text/javascript' }));
+  var maxChars = 20000;
+  var text = function (v) {
+    return typeof v === 'string' ? (v.length > maxChars ? v.slice(0, maxChars) : v) : undefined;
+  };
+  /*
+      The reply to the page, built from the fields of what the worker posted that are strings,
+      truncated: the code it runs may post anything itself, a number, null, a reply of its own
+      or objects that cannot be sent on.
+  */
+  var reply = function (id, data) {
+    try {
+      var d = data !== null && typeof data === 'object' ? data : {};
+      var logs = [];
+      var size = 0;
+      if (Array.isArray(d.logs)) {
+        for (var i = 0; i < d.logs.length && logs.length < 2000 && size <= maxChars; ++i) {
+          var line = text(d.logs[i]);
+          if (line === undefined) continue;
+          size += line.length + 1;
+          logs.push(line);
+        }
+      }
+      var ok = d.ok === true;
+      return {
+        id: id, ok: ok, logs: logs, result: ok ? text(d.result) : undefined,
+        error: ok ? undefined : text(d.error) || 'The code posted a message that is not a result.'
+      };
+    } catch (err) {
+      return { id: id, ok: false, logs: [], error: 'The result of the code could not be read.' };
+    }
+  };
   window.addEventListener('message', function (e) {
     if (e.source !== window.parent || !e.data || typeof e.data.code !== 'string') return;
     var id = e.data.id;
     var worker = new Worker(url);
     var finished = false;
-    var finish = function (result) {
+    var finish = function (data) {
       if (finished) return;
       finished = true;
       clearTimeout(timer);
       worker.terminate();
-      result.id = id;
-      window.parent.postMessage(result, '*');
+      window.parent.postMessage(reply(id, data), '*');
     };
     var timer = setTimeout(function () {
       finish({ ok: false, logs: [], error: 'The code did not finish within the time limit.' });
     }, Math.min(Math.max(e.data.timeout || 15000, 1000), 60000));
     worker.onmessage = function (m) { finish(m.data); };
+    worker.onmessageerror = function () { finish(null); };
     worker.onerror = function (ev) {
       ev.preventDefault();
       finish({ ok: false, logs: [], error: ev.message || 'error' });

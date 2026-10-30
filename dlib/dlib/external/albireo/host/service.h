@@ -123,8 +123,25 @@ namespace albireo
         std::string starting_phase() const;
         // True while the model of a role, or the model named, loads into the engine.
         bool model_loading(const std::string& requested);
-        // The engine model of a request: an identifier, a role or its alias, or auto.
+        // The engine model of a request: an identifier, a role or its alias, "background",
+        // or auto.
         std::string resolve_model(const std::string& requested);
+        /*!
+            ensures
+                - Returns the model of the work the applications do in the background
+                  (titles, summaries, memory): the language model that comes with Albireo,
+                  which stays loaded whatever the functions, or empty without one, the
+                  requests for "background" then going to the general model.
+        !*/
+        const std::string& background_model() const { return background_model_; }
+        /*!
+            ensures
+                - Returns the model of each function: the one chosen for it, else the general
+                  model, else the language model that comes with Albireo, so that the three
+                  functions keep a model once every choice is undone; the embedding role keeps
+                  the model chosen for it.
+        !*/
+        std::map<std::string, std::string> effective_models(const host_settings& st) const;
         // The embedding model of a request: a loaded embedding model named by its
         // identifier, otherwise the active one ("auto", "embedding", "albireo-embedding").
         std::string resolve_embedding_model(const std::string& requested);
@@ -230,6 +247,8 @@ namespace albireo
         std::vector<engine_candidate> candidates_;
         engine_choice choice_;
         std::string engine_error_;
+        // Set by register_builtin_models() before the server starts, then read only.
+        std::string background_model_;
         std::atomic<bool> engines_ready_{false};
         std::atomic<bool> models_ready_{false};
 
@@ -256,6 +275,8 @@ namespace albireo
         std::set<std::string> retiring_;
         std::set<std::string> removing_;
         std::vector<std::thread> retirers_;
+        // The retirers that ended, joined by the next retirement.
+        std::vector<std::thread::id> ended_retirers_;
         int64_t started_at_ = 0;
         std::atomic<long long> usage_prompt_{0};
         std::atomic<long long> usage_generated_{0};
@@ -264,6 +285,10 @@ namespace albireo
 
     // Installs the routes of the HTTPS server (server.cpp).
     void install_routes(httplib::Server& server, service& svc);
+
+    // Whether the server can open port on the loopback interface, with the options of its
+    // own socket; the port is closed again at once.
+    bool port_available(int port);
 
 }
 

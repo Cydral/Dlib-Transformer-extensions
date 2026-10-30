@@ -1825,9 +1825,205 @@ namespace albireo
                     store_result(Y + t * y_stride + r, qk_dot_f32(W + r * K, X + t * x_stride, K), accumulate);
         }
 
+#if ALBIREO_QK_AVX2
+        /*
+            The products of the long prompt passes as a packed matrix product, the method of
+            the BLAS libraries.  Each task takes a tile of weight rows and expands it to floats
+            by slices of packed_depth columns, laid out in panels of packed_rows rows: for each
+            column, the values of the rows of a panel lie side by side.  The tokens are laid
+            out once per product in panels of packed_tokens tokens, column by column.  The
+            kernel keeps packed_tokens x packed_rows results in registers and, for each column,
+            multiplies one load of weights by each token: every value read serves several
+            multiply-adds, and the panels of a slice stay in the caches while they are read.
+        */
+#if ALBIREO_QK_AVX512
+        const long packed_rows = 32;    // two vectors of 16 floats
+#else
+        const long packed_rows = 16;    // two vectors of 8 floats
+#endif
+        const long packed_tokens = 6;
+        const long packed_depth = 256;  // a multiple of the block of every quantization type
+        const long packed_tile = 64;    // rows of weights per task
+        /*
+            Below these passes, expanding and laying out the weights costs more than the
+            packed kernel saves (measured on Qwen3 1.7B with two threads: with AVX-512, 1.05
+            to 1.3 times faster from 128 tokens and 1.4 to 2 times at 512; with AVX2, even at
+            128 tokens and 1.05 to 1.25 times faster at 512).
+        */
+#if ALBIREO_QK_AVX512
+        const long packed_min_tokens = 128;
+#else
+        const long packed_min_tokens = 256;
+#endif
+
+        // n floats of v, 64-byte aligned.
+        float* aligned_floats(std::vector<float>& v, size_t n)
+        {
+            if (v.size() < n + 16) v.resize(n + 16);
+            const uintptr_t p = reinterpret_cast<uintptr_t>(v.data());
+            return reinterpret_cast<float*>((p + 63) & ~static_cast<uintptr_t>(63));
+        }
+
+        // c (packed_tokens x packed_rows) = the products of depth columns of a panel of
+        // weights w and a panel of tokens x.
+        void packed_kernel(const float* w, const float* x, long depth, float* c)
+        {
+#if ALBIREO_QK_AVX512
+            const __m512 zero = _mm512_setzero_ps();
+            __m512 c00 = zero, c01 = zero, c10 = zero, c11 = zero, c20 = zero, c21 = zero;
+            __m512 c30 = zero, c31 = zero, c40 = zero, c41 = zero, c50 = zero, c51 = zero;
+            for (long k = 0; k < depth; ++k, w += 32, x += 6)
+            {
+                const __m512 w0 = _mm512_load_ps(w);
+                const __m512 w1 = _mm512_load_ps(w + 16);
+                __m512 b = _mm512_set1_ps(x[0]);
+                c00 = _mm512_fmadd_ps(w0, b, c00); c01 = _mm512_fmadd_ps(w1, b, c01);
+                b = _mm512_set1_ps(x[1]);
+                c10 = _mm512_fmadd_ps(w0, b, c10); c11 = _mm512_fmadd_ps(w1, b, c11);
+                b = _mm512_set1_ps(x[2]);
+                c20 = _mm512_fmadd_ps(w0, b, c20); c21 = _mm512_fmadd_ps(w1, b, c21);
+                b = _mm512_set1_ps(x[3]);
+                c30 = _mm512_fmadd_ps(w0, b, c30); c31 = _mm512_fmadd_ps(w1, b, c31);
+                b = _mm512_set1_ps(x[4]);
+                c40 = _mm512_fmadd_ps(w0, b, c40); c41 = _mm512_fmadd_ps(w1, b, c41);
+                b = _mm512_set1_ps(x[5]);
+                c50 = _mm512_fmadd_ps(w0, b, c50); c51 = _mm512_fmadd_ps(w1, b, c51);
+            }
+            _mm512_store_ps(c, c00); _mm512_store_ps(c + 16, c01);
+            _mm512_store_ps(c + 32, c10); _mm512_store_ps(c + 48, c11);
+            _mm512_store_ps(c + 64, c20); _mm512_store_ps(c + 80, c21);
+            _mm512_store_ps(c + 96, c30); _mm512_store_ps(c + 112, c31);
+            _mm512_store_ps(c + 128, c40); _mm512_store_ps(c + 144, c41);
+            _mm512_store_ps(c + 160, c50); _mm512_store_ps(c + 176, c51);
+#else
+            const __m256 zero = _mm256_setzero_ps();
+            __m256 c00 = zero, c01 = zero, c10 = zero, c11 = zero, c20 = zero, c21 = zero;
+            __m256 c30 = zero, c31 = zero, c40 = zero, c41 = zero, c50 = zero, c51 = zero;
+            for (long k = 0; k < depth; ++k, w += 16, x += 6)
+            {
+                const __m256 w0 = _mm256_load_ps(w);
+                const __m256 w1 = _mm256_load_ps(w + 8);
+                __m256 b = _mm256_broadcast_ss(x);
+                c00 = _mm256_fmadd_ps(w0, b, c00); c01 = _mm256_fmadd_ps(w1, b, c01);
+                b = _mm256_broadcast_ss(x + 1);
+                c10 = _mm256_fmadd_ps(w0, b, c10); c11 = _mm256_fmadd_ps(w1, b, c11);
+                b = _mm256_broadcast_ss(x + 2);
+                c20 = _mm256_fmadd_ps(w0, b, c20); c21 = _mm256_fmadd_ps(w1, b, c21);
+                b = _mm256_broadcast_ss(x + 3);
+                c30 = _mm256_fmadd_ps(w0, b, c30); c31 = _mm256_fmadd_ps(w1, b, c31);
+                b = _mm256_broadcast_ss(x + 4);
+                c40 = _mm256_fmadd_ps(w0, b, c40); c41 = _mm256_fmadd_ps(w1, b, c41);
+                b = _mm256_broadcast_ss(x + 5);
+                c50 = _mm256_fmadd_ps(w0, b, c50); c51 = _mm256_fmadd_ps(w1, b, c51);
+            }
+            _mm256_store_ps(c, c00); _mm256_store_ps(c + 8, c01);
+            _mm256_store_ps(c + 16, c10); _mm256_store_ps(c + 24, c11);
+            _mm256_store_ps(c + 32, c20); _mm256_store_ps(c + 40, c21);
+            _mm256_store_ps(c + 48, c30); _mm256_store_ps(c + 56, c31);
+            _mm256_store_ps(c + 64, c40); _mm256_store_ps(c + 72, c41);
+            _mm256_store_ps(c + 80, c50); _mm256_store_ps(c + 88, c51);
+#endif
+        }
+
+        // Expands rows [r0, r0 + n) of W, columns [k0, k0 + depth), into panels of packed_rows
+        // rows; the rows past n are zeros.
+        void pack_weights(const weight_matrix& W, long r0, long n, long k0, long depth, float* panels, float* row)
+        {
+            if (n % packed_rows != 0)
+            {
+                float* last = panels + n / packed_rows * packed_rows * depth;
+                std::fill(last, last + packed_rows * depth, 0.0f);
+            }
+            const size_t offset = qk_row_bytes(W.type, k0);
+            for (long r = 0; r < n; ++r)
+            {
+                const uint8_t* src = W.data + static_cast<size_t>(r0 + r) * W.row_bytes + offset;
+                const float* v = row;
+                if (W.type == ggml_type::F32) v = reinterpret_cast<const float*>(src);
+                else qk_dequantize_row(W.type, src, row, depth);
+                float* dst = panels + r / packed_rows * packed_rows * depth + r % packed_rows;
+                for (long k = 0; k < depth; ++k) dst[k * packed_rows] = v[k];
+            }
+        }
+
+        // Panel q of the tokens: K columns of packed_tokens tokens, the tokens past n being zeros.
+        void pack_tokens(const float* X, long n, long x_stride, long K, long q, float* panels)
+        {
+            float* dst = panels + q * K * packed_tokens;
+            for (long i = 0; i < packed_tokens; ++i)
+            {
+                const long t = q * packed_tokens + i;
+                if (t < n)
+                {
+                    const float* src = X + t * x_stride;
+                    for (long k = 0; k < K; ++k) dst[k * packed_tokens + i] = src[k];
+                }
+                else
+                {
+                    for (long k = 0; k < K; ++k) dst[k * packed_tokens + i] = 0.0f;
+                }
+            }
+        }
+
+        void matmul_packed(const weight_matrix& W, const float* X, long n_tokens, long x_stride,
+            float* Y, long y_stride, thread_pool& pool, bool accumulate)
+        {
+            const long rows = W.rows, K = W.cols;
+            const long token_panels = (n_tokens + packed_tokens - 1) / packed_tokens;
+            static thread_local std::vector<float> token_buffer;
+            float* xp = aligned_floats(token_buffer, static_cast<size_t>(token_panels * K * packed_tokens));
+            pool.parallel_for(token_panels, [&](long q, int) { pack_tokens(X, n_tokens, x_stride, K, q, xp); });
+
+            const long n_tiles = (rows + packed_tile - 1) / packed_tile;
+            pool.parallel_for(n_tiles, [&](long tile, int) {
+                static thread_local std::vector<float> weight_buffer, row_buffer;
+                const long r0 = tile * packed_tile;
+                const long n = std::min(packed_tile, rows - r0);
+                const long panels = (n + packed_rows - 1) / packed_rows;
+                float* wp = aligned_floats(weight_buffer, static_cast<size_t>(panels * packed_rows * packed_depth));
+                float* row = aligned_floats(row_buffer, static_cast<size_t>(packed_depth));
+                alignas(64) float c[packed_tokens * packed_rows];
+                for (long k0 = 0; k0 < K; k0 += packed_depth)
+                {
+                    const long depth = std::min(packed_depth, K - k0);
+                    pack_weights(W, r0, n, k0, depth, wp, row);
+                    // The first slice writes the results, the next ones add to them.
+                    const bool add = accumulate || k0 > 0;
+                    for (long q = 0; q < token_panels; ++q)
+                    {
+                        const float* xq = xp + (q * K + k0) * packed_tokens;
+                        const long t0 = q * packed_tokens;
+                        const long nt = std::min(packed_tokens, n_tokens - t0);
+                        for (long p = 0; p < panels; ++p)
+                        {
+                            packed_kernel(wp + p * packed_rows * depth, xq, depth, c);
+                            const long nr = std::min(packed_rows, n - p * packed_rows);
+                            for (long i = 0; i < nt; ++i)
+                            {
+                                float* y = Y + (t0 + i) * y_stride + r0 + p * packed_rows;
+                                const float* ci = c + i * packed_rows;
+                                if (add)
+                                    for (long j = 0; j < nr; ++j) y[j] += ci[j];
+                                else
+                                    for (long j = 0; j < nr; ++j) y[j] = ci[j];
+                            }
+                        }
+                    }
+                }
+            });
+        }
+#endif
+
         void matmul_float(const weight_matrix& W, const float* X, long n_tokens, long x_stride,
             float* Y, long y_stride, thread_pool& pool, bool accumulate)
         {
+#if ALBIREO_QK_AVX2
+            if (n_tokens >= packed_min_tokens)
+            {
+                matmul_packed(W, X, n_tokens, x_stride, Y, y_stride, pool, accumulate);
+                return;
+            }
+#endif
             const long rows = W.rows, K = W.cols;
             // A tile of rows is expanded once to floats and serves every token: its
             // floats stay in the second level cache while the tokens go by, in groups

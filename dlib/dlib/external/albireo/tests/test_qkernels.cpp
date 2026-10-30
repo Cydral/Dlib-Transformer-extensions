@@ -256,7 +256,7 @@ namespace
         W.row_bytes = qk_row_bytes(f.type, cols);
         check(W.row_bytes * rows == data.size(), "row bytes");
 
-        for (long tokens : { 1L, 3L, 7L, 8L, 37L, 100L })
+        for (long tokens : { 1L, 3L, 7L, 8L, 37L, 100L, 150L, 300L })
         {
             const long xs = cols + 5, ys = rows + 3;
             std::vector<float> X(static_cast<size_t>(tokens * xs));
@@ -318,7 +318,7 @@ namespace
             // The formats of single values also take a length that no vector divides.
             if (f.block == 1) test_matmul_case(f, 523, rng, pool);
         }
-        std::printf("  matmul: every format, 1 to 100 tokens, integer and float paths, strided, accumulated\n");
+        std::printf("  matmul: every format, 1 to 300 tokens, integer, float and packed paths, strided, accumulated\n");
     }
 
     void test_helpers(std::mt19937& rng)

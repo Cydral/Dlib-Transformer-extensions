@@ -118,7 +118,9 @@ ALBIREO_ENGINE_EXPORT albireo_engine* ALBIREO_ENGINE_CALL albireo_engine_create(
 ALBIREO_ENGINE_EXPORT void ALBIREO_ENGINE_CALL albireo_engine_destroy(albireo_engine* engine);
 
 /* Loads the GGUF model at path (UTF-8) under the identifier model_id.  options_json may
-   override the context length and other settings for this model. */
+   override the context length and other settings for this model.  The context never exceeds
+   the positions the memory of the keys and values holds ("kv_mb", or the automatic budget);
+   the "models" query gives the context in force. */
 ALBIREO_ENGINE_EXPORT int ALBIREO_ENGINE_CALL albireo_engine_load_model(albireo_engine* engine,
     const char* model_id, const char* path, const char* options_json, char* error, size_t error_capacity);
 
@@ -141,7 +143,10 @@ ALBIREO_ENGINE_EXPORT int ALBIREO_ENGINE_CALL albireo_engine_query(albireo_engin
      "chat_template_kwargs":{"enable_thinking"}, "max_tokens" or "max_completion_tokens",
      "temperature", "top_p", "top_k", "min_p", "presence_penalty", "frequency_penalty",
      "repeat_penalty", "repeat_last_n", "seed", "stop", "logit_bias".
-   Its events are CONTENT, REASONING, TOOL_CALL and PROGRESS, then DONE.
+   "top_k" is limited to 1024, and the keys of "logit_bias" must be token identifiers of the
+   vocabulary.  Its events are CONTENT, REASONING, TOOL_CALL and PROGRESS, then DONE, or ERROR
+   with the code "out_of_memory" when the answers being written fill the memory of the keys
+   and values.
 
    An embedding model takes "model", "input" (a text, a list of texts, a list of token
    identifiers or a list of such lists, 2048 inputs at most) and "dimensions" (0 or absent

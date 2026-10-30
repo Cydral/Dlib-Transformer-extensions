@@ -522,7 +522,6 @@ namespace albireo
                 const std::string smollm = "You are a helpful AI assistant named SmolLM, trained by Hugging Face";
                 if (tmpl.find(qwen) != std::string::npos) default_system_ = qwen;
                 else if (tmpl.find(smollm) != std::string::npos) default_system_ = smollm;
-                separate_pieces_ = tok.type() == dlib::hf_tokenizer::kind::bpe;
                 add_markers(tok, { "<think>", "</think>", "<tool_call>", "</tool_call>" });
             }
 
@@ -681,7 +680,6 @@ namespace albireo
                 eos_ = tok.eos_id() >= 0 ? tok.id_to_token(tok.eos_id()) : std::string("</s>");
                 reasoning_ = tok.token_id("[THINK]") >= 0 && tmpl.find("[THINK]") != std::string::npos;
                 default_system_ = template_string(tmpl, "default_system_message");
-                separate_pieces_ = tok.type() == dlib::hf_tokenizer::kind::bpe;
                 add_markers(tok, { "[TOOL_CALLS]", "[ARGS]", "[CALL_ID]", "[THINK]", "[/THINK]" });
             }
 
@@ -968,10 +966,7 @@ namespace albireo
         class plain_format : public chat_format
         {
         public:
-            explicit plain_format(const dlib::hf_tokenizer& tok)
-            {
-                separate_pieces_ = tok.type() == dlib::hf_tokenizer::kind::bpe;
-            }
+            plain_format() {}
 
             const char* name() const override { return "plain"; }
             bool supports_tools() const override { return false; }
@@ -1032,27 +1027,26 @@ namespace albireo
             if (tok.token_id("[INST]") >= 0 && tok.token_id("[/INST]") >= 0)
                 return std::unique_ptr<chat_format>(new mistral_format(tok, tmpl));
         }
-        return std::unique_ptr<chat_format>(new plain_format(tok));
+        return std::unique_ptr<chat_format>(new plain_format());
     }
 
-    std::vector<int> chat_format::tokenize(const dlib::hf_tokenizer& tok, const std::vector<prompt_piece>& pieces,
-        bool separate_pieces)
+    std::vector<int> chat_format::tokenize(const dlib::hf_tokenizer& tok, const std::vector<prompt_piece>& pieces)
     {
+        /*
+            The markup is searched for control tokens; the text between two of them, markup
+            and messages together, is encoded in one go so that the pre-tokenizer sees it as
+            the reference tokenizer would see the whole prompt.  The text of the messages is
+            never searched for control tokens.  A SentencePiece vocabulary puts its leading
+            space before the first stretch of text only, as when the whole prompt is encoded
+            at once.
+        */
         std::vector<int> ids;
-        if (!separate_pieces)
-        {
-            // SentencePiece: the whole prompt at once, its markers recognized.
-            std::string all;
-            for (const auto& p : pieces) all += p.text;
-            return tok.encode(all, false, false, true);
-        }
-        // The markup is searched for control tokens; the text between two of them, markup
-        // and messages together, is encoded in one go so that the pre-tokenizer sees it as
-        // the reference tokenizer would see the whole prompt.
         std::string pending;
+        bool first_text = true;
         auto flush = [&]() {
             if (pending.empty()) return;
-            const std::vector<int> part = tok.encode(pending, false, false, false);
+            const std::vector<int> part = tok.encode(pending, false, false, false, first_text);
+            first_text = false;
             ids.insert(ids.end(), part.begin(), part.end());
             pending.clear();
         };
@@ -1063,7 +1057,9 @@ namespace albireo
                 pending += p.text;
                 continue;
             }
-            const std::vector<int> marked = tok.encode(p.text, false, false, true);
+            // Without the leading space of SentencePiece, so that the stretches spell the
+            // markup back as written.
+            const std::vector<int> marked = tok.encode(p.text, false, false, true, false);
             // Split the markup on its control tokens, by encoding it with them recognized
             // and spelling the remaining stretches back.
             std::string stretch;

@@ -10,7 +10,7 @@
 
 set(ALBIREO_EXTRA_ENGINE_DIRS "" CACHE STRING "Folders of engines built elsewhere, added to the installer")
 
-set(ui_libraries comctl32 windowscodecs msimg32 ole32 oleaut32 shell32 uuid advapi32)
+set(ui_libraries comctl32 windowscodecs ole32 oleaut32 shell32 uuid advapi32)
 
 add_executable(albireo-tray WIN32 tray.cpp tray_windows.cpp ui.cpp strings.cpp service_client.cpp tray.rc)
 target_link_libraries(albireo-tray PRIVATE albireo_common dlib::httplib ${ui_libraries})
@@ -68,9 +68,42 @@ add_custom_target(albireo-setup-complete ALL DEPENDS ${complete_setup})
 
 foreach (t albireo-tray albireo-setup-online)
    if (MSVC)
-      # The manifest is a resource of the program.
-      target_link_options(${t} PRIVATE /MANIFEST:NO)
+      # The manifest is a resource of the program; the libraries it imports are loaded from
+      # System32 only (LOAD_LIBRARY_SEARCH_SYSTEM32), never from the folder of the program.
+      target_link_options(${t} PRIVATE /MANIFEST:NO /DEPENDENTLOADFLAG:0x800)
    elseif (MINGW)
       target_link_options(${t} PRIVATE -municode)
    endif()
 endforeach()
+
+# The installer runs elevated from any folder, a folder of downloads for instance.  MinGW has
+# no /DEPENDENTLOADFLAG: the system libraries it imports that Windows does not load from
+# System32 by itself (bcrypt, crypt32) are delay-loaded instead, at their first call, once
+# SetDefaultDllDirectories() limits the search to System32.  The delay-import libraries are
+# made from the import libraries of the toolchain and take their names, ahead of them.
+if (MINGW)
+   set(delay_dir ${CMAKE_BINARY_DIR}/delay-import)
+   file(MAKE_DIRECTORY ${delay_dir})
+   set(delay_libraries)
+   foreach (lib bcrypt crypt32)
+      find_library(ALBIREO_IMPORT_${lib} ${lib})
+      if (NOT ALBIREO_IMPORT_${lib} OR NOT CMAKE_DLLTOOL OR NOT CMAKE_NM)
+         message(FATAL_ERROR "The delay-import library of ${lib} needs the import library, nm and dlltool of MinGW")
+      endif()
+      execute_process(COMMAND ${CMAKE_NM} -g --defined-only ${ALBIREO_IMPORT_${lib}} OUTPUT_VARIABLE symbols)
+      string(REGEX MATCHALL "__imp_[A-Za-z0-9_]+" imports "${symbols}")
+      list(REMOVE_DUPLICATES imports)
+      list(TRANSFORM imports REPLACE "^__imp_" "")
+      list(JOIN imports "\n" exports)
+      file(WRITE ${delay_dir}/${lib}.def "LIBRARY ${lib}.dll\nEXPORTS\n${exports}\n")
+      add_custom_command(OUTPUT ${delay_dir}/lib${lib}.a
+         COMMAND ${CMAKE_DLLTOOL} -d ${delay_dir}/${lib}.def -y ${delay_dir}/lib${lib}.a
+         DEPENDS ${delay_dir}/${lib}.def
+         COMMENT "Making the delay-import library of ${lib}.dll")
+      list(APPEND delay_libraries ${delay_dir}/lib${lib}.a)
+   endforeach()
+   add_custom_target(albireo-delay-import DEPENDS ${delay_libraries})
+   add_dependencies(albireo-setup-online albireo-delay-import)
+   target_link_directories(albireo-setup-online BEFORE PRIVATE ${delay_dir})
+   set_property(TARGET albireo-setup-online APPEND PROPERTY LINK_DEPENDS ${delay_libraries})
+endif()

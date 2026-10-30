@@ -240,7 +240,8 @@ namespace ui
         HDC mem = CreateCompatibleDC(dc);
         HGDIOBJ old = SelectObject(mem, bmp);
         BLENDFUNCTION bf = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
-        AlphaBlend(dc, x, y, b.bmWidth, b.bmHeight, mem, 0, 0, b.bmWidth, b.bmHeight, bf);
+        // The blend of gdi32, a library Windows loads from System32 only (AlphaBlend is in msimg32).
+        GdiAlphaBlend(dc, x, y, b.bmWidth, b.bmHeight, mem, 0, 0, b.bmWidth, b.bmHeight, bf);
         SelectObject(mem, old);
         DeleteDC(mem);
     }

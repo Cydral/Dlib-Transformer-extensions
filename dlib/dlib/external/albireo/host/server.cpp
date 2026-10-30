@@ -51,6 +51,9 @@ namespace albireo
     {
         // Bodies of the JSON routes; a model is sent to its own route without this limit.
         const uint64_t max_json_body = 64u << 20;
+        // The values of a body, each taking about a hundred bytes once read: more than the
+        // 300,000 tokens a request of embeddings may list.
+        const size_t max_body_values = size_t(1) << 19;
 
         const char* const upload_route = "/albireo/v1/models/upload";
 
@@ -123,7 +126,7 @@ namespace albireo
                 body = json::object();
                 return true;
             }
-            if (!json::parse(req.body, body, &error, 64) || !body.is_object())
+            if (!json::parse(req.body, body, &error, 64, max_body_values) || !body.is_object())
             {
                 send_error(res, 400, "invalid_request_error", "the body is not a JSON object: " + error);
                 return false;
@@ -161,13 +164,29 @@ namespace albireo
             return o == "https://localhost" + p || o == "https://127.0.0.1" + p || o == "https://[::1]" + p;
         }
 
-        // The paths the service imports from: local drives and mounted media, never a
-        // network share (the service would authenticate to it) nor a device of the system.
+        /*
+            The paths the service imports from: local drives and mounted media, never a
+            network share (the service would authenticate to it) nor a device of the system.
+            On Windows the service reads them with the rights of the system: the path must
+            reach its drive through no link, and a folder must hold no link where the import
+            reads, since a junction or a link may lead to a share, to a device or to the
+            files of another user.
+        */
         bool acceptable_import_path(const std::string& p)
         {
 #if defined(_WIN32)
-            return p.size() >= 3 && std::isalpha(static_cast<unsigned char>(p[0])) && p[1] == ':'
-                && (p[2] == '\\' || p[2] == '/');
+            if (p.size() < 3 || !std::isalpha(static_cast<unsigned char>(p[0])) || p[1] != ':'
+                || (p[2] != '\\' && p[2] != '/'))
+                return false;
+            const UINT drive = GetDriveTypeW(widen(p.substr(0, 2) + "\\").c_str());
+            if (drive != DRIVE_FIXED && drive != DRIVE_REMOVABLE && drive != DRIVE_CDROM && drive != DRIVE_RAMDISK)
+                return false;
+            if (!direct_path(p)) return false;
+            if (dir_exists(p))
+                for (const std::string& dir : { p, join_path(p, "models") })
+                    for (const auto& n : list_dir(dir))
+                        if (is_link(join_path(dir, n))) return false;
+            return true;
 #else
             return !p.empty() && p[0] == '/' && p.compare(0, 5, "/dev/") != 0 && p.compare(0, 6, "/proc/") != 0
                 && p.compare(0, 5, "/sys/") != 0;
@@ -198,6 +217,50 @@ namespace albireo
                 return true;
             }
         };
+
+        /*
+            Whether the client of a request left: its connection closed, or ended by a TLS
+            close_notify, whose bytes wait on the socket where the check of httplib sees a live
+            client.  The TLS probe is the one httplib makes for the answers it streams, and
+            gives back to the next read the byte it takes from a request that follows.
+        */
+        bool client_left(const httplib::Request& req)
+        {
+            if (req.is_connection_closed()) return true;
+#if defined(CPPHTTPLIB_MBEDTLS_SUPPORT)
+            auto session = static_cast<httplib::tls::impl::MbedTlsSession*>(const_cast<void*>(req.ssl));
+            return session && session->sock != INVALID_SOCKET
+                && httplib::tls::is_peer_closed(session, session->sock);
+#else
+            return false;
+#endif
+        }
+
+        /*
+            Ends the engine request id of an answer sent whole when the service stops, with
+            503, or when its client left.  Looks at them once a second at most, whether the
+            events of the engine flow or not; returns true when it ended the request.
+        */
+        bool end_abandoned(service& svc, const httplib::Request& req, httplib::Response& res, uint64_t id,
+            std::chrono::steady_clock::time_point& next_look)
+        {
+            const auto now = std::chrono::steady_clock::now();
+            if (now < next_look) return false;
+            next_look = now + std::chrono::seconds(1);
+            if (svc.stopping())
+            {
+                svc.engine().cancel(id);
+                send_error(res, 503, "server_error", "the service is stopping");
+                return true;
+            }
+            // A client that left ends its request, whose place in the engine the others take.
+            if (client_left(req))
+            {
+                svc.engine().cancel(id);
+                return true;
+            }
+            return false;
+        }
 
         // The engine request of a completion of the OpenAI interface.
         bool engine_request(service& svc, const json& body, json& out, std::string& error, std::string& model_name)
@@ -298,29 +361,24 @@ namespace albireo
                 json calls = json::array();
                 json done;
                 bool failed = false;
+                auto next_look = std::chrono::steady_clock::now();
                 for (;;)
                 {
                     std::pair<int, std::string> e;
-                    if (!ch->pop(e, 1000))
+                    if (ch->pop(e, 1000))
                     {
-                        if (svc.stopping())
+                        if (e.first == ALBIREO_EVENT_CONTENT) content += e.second;
+                        else if (e.first == ALBIREO_EVENT_REASONING) reasoning += e.second;
+                        else if (e.first == ALBIREO_EVENT_TOOL_CALL)
+                            calls.push_back(tool_call_of(json::parse_or_null(e.second), -1));
+                        else if (e.first == ALBIREO_EVENT_DONE || e.first == ALBIREO_EVENT_ERROR)
                         {
-                            svc.engine().cancel(id);
-                            send_error(res, 503, "server_error", "the service is stopping");
-                            return;
+                            done = json::parse_or_null(e.second);
+                            failed = e.first == ALBIREO_EVENT_ERROR;
+                            break;
                         }
-                        continue;
                     }
-                    if (e.first == ALBIREO_EVENT_CONTENT) content += e.second;
-                    else if (e.first == ALBIREO_EVENT_REASONING) reasoning += e.second;
-                    else if (e.first == ALBIREO_EVENT_TOOL_CALL)
-                        calls.push_back(tool_call_of(json::parse_or_null(e.second), -1));
-                    else if (e.first == ALBIREO_EVENT_DONE || e.first == ALBIREO_EVENT_ERROR)
-                    {
-                        done = json::parse_or_null(e.second);
-                        failed = e.first == ALBIREO_EVENT_ERROR;
-                        break;
-                    }
+                    if (end_abandoned(svc, req, res, id, next_look)) return;
                 }
                 if (failed)
                 {
@@ -387,6 +445,13 @@ namespace albireo
                         const std::string line = "data: " + c.dump() + "\n\n";
                         return sink.write(line.data(), line.size());
                     };
+                    // A service that stops ends the answers in progress, whose tokens may flow
+                    // without pause.
+                    if (s->stopping())
+                    {
+                        s->engine().cancel(id);
+                        return false;
+                    }
                     std::pair<int, std::string> e;
                     if (!ch->pop(e, 2000))
                     {
@@ -576,19 +641,11 @@ namespace albireo
                 return;
             }
             std::pair<int, std::string> e;
+            auto next_look = std::chrono::steady_clock::now();
             for (;;)
             {
-                if (ch->pop(e, 1000))
-                {
-                    if (e.first == ALBIREO_EVENT_DONE || e.first == ALBIREO_EVENT_ERROR) break;
-                    continue;
-                }
-                if (svc.stopping())
-                {
-                    svc.engine().cancel(id);
-                    send_error(res, 503, "server_error", "the service is stopping");
-                    return;
-                }
+                if (ch->pop(e, 1000) && (e.first == ALBIREO_EVENT_DONE || e.first == ALBIREO_EVENT_ERROR)) break;
+                if (end_abandoned(svc, req, res, id, next_look)) return;
             }
             const json done = json::parse_or_null(e.second);
             if (e.first == ALBIREO_EVENT_ERROR)
@@ -660,8 +717,14 @@ namespace albireo
             const std::string origin = req.get_header_value("Origin");
             if (!origin.empty() && !is_local_origin(origin, port))
                 return refuse(403, "cross-origin requests are refused");
-            const bool with_body = req.method == "POST" || req.method == "PUT" || req.method == "PATCH";
-            if (with_body && req.path != upload_route)
+            // The methods that send no data take no body, which httplib would read whole before
+            // their handlers run.  Any other body is JSON of a known length, of 64 MB at most,
+            // apart from the models sent to their own route.
+            const bool no_body = req.method == "GET" || req.method == "HEAD" || req.method == "DELETE"
+                || req.method == "OPTIONS";
+            if (no_body && (req.has_header("Transfer-Encoding") || content_length(req) > 0))
+                return refuse(400, "this method takes no body");
+            if (!(req.method == "POST" && req.path == upload_route))
             {
                 if (req.has_header("Transfer-Encoding")) return refuse(411, "the body must have a length");
                 if (content_length(req) > max_json_body) return refuse(413, "the body is too large");
@@ -758,6 +821,17 @@ namespace albireo
                 m["alias_of"] = target;
                 list.push_back(m);
             }
+            const std::string background = s->resolve_model("background");
+            if (!background.empty())
+            {
+                json m = json::object();
+                m["id"] = "albireo-background";
+                m["object"] = "model";
+                m["created"] = now;
+                m["owned_by"] = "albireo";
+                m["alias_of"] = background;
+                list.push_back(m);
+            }
             const std::string embedder = s->resolve_embedding_model(std::string());
             if (!embedder.empty())
             {
@@ -795,13 +869,16 @@ namespace albireo
             const host_settings st = s->settings().get();
             o["free"] = static_cast<unsigned long long>(free_disk_space(s->models().models_dir()));
             o["offline"] = st.offline;
-            json active = json::object();
-            for (const auto& kv : st.active) active[kv.first] = kv.second;
+            json active = json::object(), selected = json::object();
+            for (const auto& kv : s->effective_models(st)) active[kv.first] = kv.second;
+            for (const auto& kv : st.active) selected[kv.first] = kv.second;
             o["active"] = active;
+            o["selected"] = selected;
             json loaded = json::array();
             for (const auto& id : s->engine().loaded_models()) loaded.push_back(id);
             o["loaded"] = loaded;
             o["leaving"] = s->leaving_models();
+            o["background"] = s->background_model();
             send_json(res, 200, o);
         });
         srv.Get("/albireo/v1/usage", [s](const httplib::Request&, httplib::Response& res) {
@@ -945,6 +1022,7 @@ namespace albireo
             send_json(res, r["imported"].empty() ? 400 : 200, r);
         });
 
+        // The password of the proxy is given as proxy_password_mask (host_settings::to_json()).
         srv.Get("/albireo/v1/settings", [s, admin](const httplib::Request& req, httplib::Response& res) {
             if (!admin(req, res)) return;
             send_json(res, 200, s->settings().get().to_json());
@@ -959,13 +1037,40 @@ namespace albireo
                 send_error(res, 400, "invalid_request_error", error);
                 return;
             }
+            // Read through a const reference, which adds no member to the body.
+            const json& changes = body;
+            // A new port is opened once before it is saved, so that a port taken by another
+            // program or reserved by the system never leaves the service without an address.
+            const long long port = changes["port"].as_int(s->port());
+            if (port != s->port() && !port_available(static_cast<int>(port)))
+            {
+                send_error(res, 409, "invalid_request_error", "the port " + std::to_string(port)
+                    + " is in use or cannot be opened", "port_unavailable");
+                return;
+            }
             host_settings before;
+            bool masked_elsewhere = false;
             const host_settings after = s->settings().update([&](host_settings& current) {
                 before = current;
+                // The mask of the password stands for the stored password, with the address and
+                // the user it was given for only: it never sends the password to another server.
+                const std::string proxy = changes["proxy"].as_string();
+                if (proxy_password_masked(proxy) && proxy != masked_proxy(current.proxy))
+                {
+                    masked_elsewhere = true;
+                    return;
+                }
                 json merged = current.to_json();
                 for (const auto& kv : body.items()) merged[kv.first] = kv.second;
                 current.from_json(merged);
+                if (current.proxy == masked_proxy(before.proxy)) current.proxy = before.proxy;
             });
+            if (masked_elsewhere)
+            {
+                send_error(res, 400, "invalid_request_error", "the masked password of the proxy applies to its "
+                    "stored address and user only: type the password again", "proxy_password");
+                return;
+            }
             s->apply_network_settings(after);
             // What the running engine or server cannot take without a restart.
             const bool restart = after.port != before.port || after.engine != before.engine

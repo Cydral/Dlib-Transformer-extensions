@@ -19,6 +19,14 @@ namespace albireo
     // of the web application; one is always active.
     extern const char* const embedding_role;   // "embedding"
 
+    // The text that stands for the password of the proxy in settings.json and in the answers
+    // of the administration interface; settings_store keeps the password itself apart.
+    extern const char* const proxy_password_mask;   // "********"
+    // The proxy setting with its password, when it has one, replaced by proxy_password_mask.
+    std::string masked_proxy(const std::string& proxy);
+    // Whether the password of a proxy setting is proxy_password_mask.
+    bool proxy_password_masked(const std::string& proxy);
+
     struct host_settings
     {
         /*!
@@ -53,6 +61,8 @@ namespace albireo
             "https://raw.githubusercontent.com/Cydral/Dlib-Transformer-extensions/main/dist/albireo/catalog.json";
         json engine_benchmarks = json::object();     // variant -> measured tokens per second
 
+        // The settings as settings.json and the administration interface give them, the
+        // password of the proxy masked.
         json to_json() const;
         void from_json(const json& j);
         std::string effective_models_dir() const;
@@ -63,6 +73,12 @@ namespace albireo
         /*!
             WHAT THIS OBJECT REPRESENTS
                 The settings file, read at start and written atomically at each change.
+
+                settings.json is readable by the users of the machine, and gives the
+                password of the proxy as proxy_password_mask.  The proxy with its password
+                is kept in proxy.secret beside it, which only the service and the
+                administrators read.  A password found in settings.json, written by an
+                earlier version or by hand, moves to proxy.secret at once.
         !*/
     public:
         explicit settings_store(const std::string& path);
@@ -80,6 +96,9 @@ namespace albireo
         const std::string& path() const { return path_; }
 
     private:
+        // Writes proxy.secret, then settings.json; m_ is held.
+        bool write();
+
         std::string path_;
         mutable std::mutex m_;
         host_settings s_;

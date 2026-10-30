@@ -11,8 +11,10 @@ such as the releases of GitHub (2 GiB per file), and publishes them on a release
 Each part is written to the output folder as <identifier>.gguf.partNN, compressed with gzip
 when --gzip is given (<identifier>.gguf.partNN.gz).  With --release, the parts are attached
 to that release of the repository (Cydral/Dlib-Transformer-extensions by default), created
-when it does not exist; with --base, they are expected at <address>/<name of the part> once
-published by other means.
+when it does not exist, and the first part is read back whole from its public address: an
+address that serves another file, or that cannot be read while the repository is public,
+ends the program with an error and no entry.  With --base, the parts are expected at
+<address>/<name of the part> once published by other means.
 
 The program prints the catalog entry of the model: its architecture, number of parameters
 and trained context read from the file, its size and SHA-256, and the "files" of its parts.
@@ -141,15 +143,13 @@ def main():
                                           latest=False)
             for path in paths:
                 repo.attach(release, path)
+            # The entry is printed only once the public address serves the first part.
+            warning = github_release.verify_public(repo, files[0]["url"], paths[0])
+            if warning:
+                print("WARNING: " + warning, file=sys.stderr)
         except (OSError, RuntimeError) as e:
             print("error: %s" % e, file=sys.stderr)
             return 1
-        try:
-            if not github_release.read_back(files[0]["url"], paths[0]):
-                print("WARNING: %s serves another file" % files[0]["url"], file=sys.stderr)
-        except OSError as e:
-            print("WARNING: %s cannot be read (%s); a private repository serves its files to signed-in users "
-                  "only" % (files[0]["url"], e), file=sys.stderr)
 
     entry = {
         "id": a.identifier,

@@ -11,10 +11,12 @@ replaces the address of the interface, for GitHub Enterprise.  The files go thro
 proxy of HTTPS_PROXY when it is set.
 
 A release holds files of less than 2 GiB each.  A file attached under a name already taken
-replaces the earlier one when their contents differ, and is left as it is otherwise.
+is left as it is when GitHub gives for the earlier one the same size and SHA-256, and
+replaces it otherwise, a file without SHA-256 included.
 """
 
 import hashlib
+import http.client
 import json
 import os
 import subprocess
@@ -144,9 +146,14 @@ class repository:
     def assets(self, release):
         return self._api("GET", "/repos/%s/releases/%d/assets?per_page=100" % (self.name, release["id"]))
 
+    def is_private(self):
+        """Whether the repository is private, its files then downloaded by signed-in users only."""
+        return bool((self._api("GET", "/repos/%s" % self.name) or {}).get("private"))
+
     def attach(self, release, path, name=None, sha256=None, attempts=3):
         """Attaches the file path to release under name and returns its asset.  A file of the
-        same name and content stays; one of another content is replaced."""
+        same name, size and SHA-256 stays; one of another content, or whose SHA-256 GitHub does
+        not give, is replaced."""
         name = name or os.path.basename(path)
         size = os.path.getsize(path)
         if size > MAX_ASSET:
@@ -158,7 +165,7 @@ class repository:
             for a in self.assets(release):
                 if a["name"] != name:
                     continue
-                if a.get("state") == "uploaded" and a.get("size") == size and a.get("digest") in (digest, None):
+                if a.get("state") == "uploaded" and a.get("size") == size and a.get("digest") == digest:
                     print("  %s: already attached" % name, file=sys.stderr)
                     return a
                 self._api("DELETE", "/repos/%s/releases/assets/%d" % (self.name, a["id"]), expect=(204,))
@@ -168,6 +175,7 @@ class repository:
                                           headers={"Content-Type": "application/octet-stream",
                                                    "Content-Length": str(size)},
                                           timeout=600)
+            # A server that computes no SHA-256 gives none, and the size then checks the upload.
             if status == 201 and j.get("size") == size and j.get("digest") in (digest, None):
                 return j
             error = "%d %s" % (status, (j or {}).get("message", "the size or the digest differs"))
@@ -175,12 +183,62 @@ class repository:
         raise RuntimeError("%s could not be attached: %s" % (name, error))
 
 
-def read_back(url, path, length=1 << 20, timeout=120):
-    """Whether the first bytes served at url, a public address, are those of the file path."""
-    with open(path, "rb") as f:
-        expected = f.read(length)
-    req = urllib.request.Request(url, headers={"Range": "bytes=0-%d" % (len(expected) - 1),
-                                               "User-Agent": "albireo-publisher"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        got = r.read(len(expected))
-    return got == expected
+def read_back(url, path, sha256=None, timeout=120):
+    """Whether the file served at url, a public address, is the file path: the whole download
+    is compared with its size and its SHA-256.  Raises OSError when the address cannot be read
+    to its end."""
+    size = os.path.getsize(path)
+    expected = sha256 or sha256_of(path)
+    label = os.path.basename(path)
+    h = hashlib.sha256()
+    got = 0
+    shown = 0.0
+    req = urllib.request.Request(url, headers={"User-Agent": "albireo-publisher"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            # An announced size other than the one of the file is another file; the same one
+            # tells a transfer cut before its end.
+            length = r.headers.get("Content-Length", "").strip()
+            if length.isdigit() and int(length) != size:
+                return False
+            while got <= size:
+                block = r.read(1 << 20)
+                if not block:
+                    break
+                got += len(block)
+                h.update(block)
+                now = time.monotonic()
+                if now - shown >= 2:
+                    shown = now
+                    print("\r  %s: %d of %d MB read back" % (label, got >> 20, size >> 20), end="", file=sys.stderr)
+    except http.client.HTTPException as e:
+        raise OSError("the transfer stopped after %d bytes (%r)" % (got, e))
+    print("\r  %s: %d of %d MB read back" % (label, got >> 20, size >> 20), file=sys.stderr)
+    if length.isdigit() and got < size:
+        raise OSError("the transfer stopped after %d of %d bytes" % (got, size))
+    return got == size and h.hexdigest() == expected
+
+
+def verify_public(repo, url, path, sha256=None):
+    """Reads back the whole file served at url, the public address of the file path attached
+    to a release of repo.  Raises RuntimeError when the address serves another file, or when
+    it cannot be read and the repository is not known to be private.  Returns a warning when
+    the repository is private, whose files only signed-in users download, and None when the
+    address serves the file."""
+    try:
+        same = read_back(url, path, sha256)
+    except OSError as e:
+        failure = e
+    else:
+        if not same:
+            raise RuntimeError("%s serves another file than %s" % (url, path))
+        return None
+    try:
+        private = repo.is_private()
+    except (OSError, RuntimeError, ValueError) as e:
+        raise RuntimeError("%s cannot be read (%s), and whether %s is private cannot be told (%s)"
+                           % (url, failure, repo.name, e))
+    if not private:
+        raise RuntimeError("%s cannot be read (%s)" % (url, failure))
+    return ("%s cannot be read without signing in (%s): %s is a private repository, whose files the services "
+            "download only once it is public" % (url, failure, repo.name))

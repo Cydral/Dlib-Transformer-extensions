@@ -44,9 +44,11 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <map>
@@ -72,6 +74,7 @@
 #if defined(_WIN32)
 #include <windows.h>
 #else
+#include <signal.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
@@ -580,6 +583,9 @@ namespace
             p.type = t->type;
             if (requantize && quantizable(*t))
             {
+                // A tensor is converted row by row: it needs rows, of at least one value each.
+                for (uint64_t d : t->dims)
+                    if (d == 0) throw std::runtime_error(t->name + ": a dimension of the tensor is zero");
                 const uint64_t ne0 = t->dims[0];
                 ggml_type type = ggml_type::Q4_K;
                 if (t->name == "output.weight" || (tied && t->name == "token_embd.weight"))
@@ -781,9 +787,72 @@ namespace
         }
     }
 
+    // The identifier of this process, which names its partial files in the cache.
+    unsigned long process_id()
+    {
+#if defined(_WIN32)
+        return static_cast<unsigned long>(GetCurrentProcessId());
+#else
+        return static_cast<unsigned long>(::getpid());
+#endif
+    }
+
+    // Whether a process of this identifier runs; a process the system hides from this one counts as running.
+    bool process_running(unsigned long pid)
+    {
+#if defined(_WIN32)
+        const HANDLE h = OpenProcess(SYNCHRONIZE, FALSE, static_cast<DWORD>(pid));
+        if (!h) return GetLastError() == ERROR_ACCESS_DENIED;
+        const bool running = WaitForSingleObject(h, 0) == WAIT_TIMEOUT;
+        CloseHandle(h);
+        return running;
+#else
+        return ::kill(static_cast<pid_t>(pid), 0) == 0 || errno == EPERM;
+#endif
+    }
+
+    /*
+        Removes the partial files of a converted file, <file>.<process>.partial, whose process
+        ended before renaming them, as an interrupted build does.  The partial file of a
+        conversion still running stays.
+    */
+    void remove_stale_partials(const std::string& converted)
+    {
+        const std::string dir = parent_path(converted);
+        const std::string prefix = file_name(converted) + ".";
+        const std::string suffix = ".partial";
+        for (const auto& n : list_dir(dir))
+        {
+            if (n.size() <= prefix.size() + suffix.size() || n.compare(0, prefix.size(), prefix) != 0
+                || !ends_with(n, suffix))
+                continue;
+            const std::string pid = n.substr(prefix.size(), n.size() - prefix.size() - suffix.size());
+            if (pid.find_first_not_of("0123456789") != std::string::npos) continue;
+            if (!process_running(std::strtoul(pid.c_str(), nullptr, 10))) remove_file(join_path(dir, n));
+        }
+    }
+
+    // Removes the partial file at the end of its scope; a file renamed before then keeps its new name.
+    class partial_file
+    {
+    public:
+        explicit partial_file(const std::string& path) : path_(path) {}
+        ~partial_file() { remove_file(path_); }
+        partial_file(const partial_file&) = delete;
+        partial_file& operator=(const partial_file&) = delete;
+
+    private:
+        std::string path_;
+    };
+
     void convert(model_entry& m, unsigned threads, std::string& sha, uint64_t& size)
     {
         dlib::gguf_reader r(m.source);
+        // The tensors of both files start at multiples of the alignment, a power of two in the format.
+        const uint64_t alignment = r.alignment();
+        if (alignment == 0 || alignment > 65536 || (alignment & (alignment - 1)) != 0)
+            throw std::runtime_error("the alignment of " + m.source + ", " + std::to_string(alignment)
+                + ", is not a power of two between 1 and 65536");
         const std::string arch = r.get_str("general.architecture");
         const int n_layers = static_cast<int>(r.get_int(arch + ".block_count"));
         const std::vector<tensor_plan> plan = plan_tensors(r, m.quantization, n_layers);
@@ -806,11 +875,18 @@ namespace
         meta["albireo.builtin"] = builtin;
         meta["albireo.source_sha256"] = string_value(m.source_sha);
 
-        const std::string tmp = m.converted + ".partial";
+        // Each process writes a partial file of its own, so that two builds sharing the cache never mix their output.
+        const std::string tmp = m.converted + "." + std::to_string(process_id()) + ".partial";
+        remove_stale_partials(m.converted);
+        /*
+            Destroyed in the reverse order of their declarations: the stream is closed while its
+            buffer exists, then the guard removes the partial file of a conversion that failed.
+        */
+        std::vector<char> buffer(4u << 20);
+        const partial_file partial(tmp);
         std::FILE* f = open_file(tmp, "wb");
         if (!f) throw std::runtime_error("cannot create " + tmp);
         std::unique_ptr<std::FILE, int (*)(std::FILE*)> closer(f, std::fclose);
-        std::vector<char> buffer(4u << 20);
         std::setvbuf(f, buffer.data(), _IOFBF, buffer.size());
         sha256_stream hash;
         gguf_out o(f, hash);
@@ -819,7 +895,6 @@ namespace
         o.raw<uint64_t>(plan.size());
         o.raw<uint64_t>(meta.size() + 1);
         // The architecture first, as the converters of the format write it.
-        const uint64_t alignment = r.alignment();
         o.str("general.architecture");
         put_value(o, meta.at("general.architecture"));
         for (const auto& kv : meta)
@@ -1072,13 +1147,24 @@ namespace
             m.converted = join_path(cache, m.id + "-" + m.key + ".gguf");
             std::cout << m.id << "\n";
 
-            // A converted file of the same conversion is reused: its description, written
-            // once it was checked, gives its hash.
+            /*
+                A converted file of the same conversion is reused when its size and its SHA-256
+                are those of its description, written once it was checked; it is converted
+                again otherwise.
+            */
             const std::string side = m.converted + ".json";
             std::string side_text;
             json info = file_exists(m.converted) && read_file(side, side_text, 1u << 20)
                 ? json::parse_or_null(side_text) : json();
-            if (!info.is_object() || info["size"].as_int(-1) != static_cast<long long>(file_size(m.converted)))
+            bool reuse = info.is_object() && !info["sha256"].as_string().empty()
+                && info["size"].as_int(-1) == static_cast<long long>(file_size(m.converted));
+            if (reuse)
+            {
+                std::cout << "  checking " << m.converted << "\n";
+                reuse = sha256_file(m.converted) == info["sha256"].as_string();
+                if (!reuse) std::cout << "  the SHA-256 of the converted file differs from its description\n";
+            }
+            if (!reuse)
             {
                 if (!file_exists(m.source))
                     throw std::runtime_error(m.id + ": " + m.source + " is missing (cmake/builtin_models.cmake "

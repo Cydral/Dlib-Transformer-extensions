@@ -87,30 +87,6 @@ MODELS = [
         },
     },
     {
-        "id": "qwen3-1.7b",
-        "name": "Qwen3 1.7B",
-        "publisher": "Qwen",
-        "hub": ("Qwen/Qwen3-1.7B-GGUF", "Qwen3-1.7B-Q8_0.gguf"),
-        "quantization": "Q8_0",
-        "roles": ["general"],
-        "tools": True,
-        "reasoning": True,
-        "license": "Apache-2.0",
-        "description": {
-            "en": "Compact general assistant with step by step reasoning, for computers with little memory and no "
-                  "accelerator. It answers faster than the larger models, in less depth.",
-            "fr": "Assistant généraliste compact, avec raisonnement étape par étape, pour les ordinateurs disposant de "
-                  "peu de mémoire et sans accélérateur. Il répond plus vite que les modèles plus grands, avec moins "
-                  "de profondeur.",
-            "de": "Kompakter allgemeiner Assistent mit schrittweisem Denken, für Computer mit wenig Arbeitsspeicher "
-                  "und ohne Beschleuniger. Er antwortet schneller als die größeren Modelle, mit weniger Tiefe.",
-            "it": "Assistente generale compatto, con ragionamento passo dopo passo, per computer con poca memoria e "
-                  "senza acceleratore. Risponde più rapidamente dei modelli più grandi, con meno profondità.",
-            "es": "Asistente general compacto, con razonamiento paso a paso, para ordenadores con poca memoria y sin "
-                  "acelerador. Responde más rápido que los modelos más grandes, con menos profundidad.",
-        },
-    },
-    {
         "id": "ministral-3-3b",
         "name": "Ministral 3 3B",
         "publisher": "Mistral AI",

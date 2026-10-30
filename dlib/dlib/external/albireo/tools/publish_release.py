@@ -15,16 +15,19 @@ also attaches the installer that carries the models that come with Albireo, for 
 installations without network, as albireo-setup-complete-<version>.exe, when it fits the
 2 GiB of a release file.
 
-The version is that of common/version.h, which must also be the version the installer
-carries in its resources.  The release albireo-v<version> is created when it does not exist
+The version is that of common/version.h, which must also be the version both installers
+carry in their resources.  The release albireo-v<version> is created when it does not exist
 yet, at the head of the default branch of the repository, which therefore holds the sources
 of the version once they are pushed.  The installer is attached as albireo-setup-<version>.exe;
 an earlier file of that name is replaced when its content differs.
 
-The program then writes <dist>/feed.json (dist/albireo of the repository by default) with
-the address, the size and the SHA-256 of the installer, signs it with albireo-sign, checks
-the signature, reads the beginning of the installer back from its public address, and
-prints the commands that publish the feed.  notes.json holds the release notes by language,
+The program then reads the whole installer back from its public address, and stops with an
+error when the address serves another file, or cannot be read while the repository is public;
+the files of a private repository need a sign-in, which a warning recalls.  It writes the
+feed, with the address, the size and the SHA-256 of the installer, beside <dist>/feed.json
+(dist/albireo of the repository by default), signs it with albireo-sign, checks the
+signature, puts the feed and its signature in place of the published ones, and prints the
+commands that publish them.  notes.json holds the release notes by language,
 {"en": "...", "fr": "...", "de": "...", "it": "...", "es": "..."}, which also become the
 description of the release.
 
@@ -83,6 +86,29 @@ def compare(a, b):
     return (x > y) - (x < y)
 
 
+def remove_quietly(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def write_signed_feed(feed_path, feed, signer, key):
+    """Writes the feed and its signature beside feed_path, checks the signature, then puts both
+    in place of the published files.  A failure before that leaves the published files as they
+    are."""
+    new = feed_path + ".new"
+    try:
+        make_feed.write_feed(new, feed)
+        subprocess.run([signer, "sign", key, new], check=True)
+        subprocess.run([signer, "verify", new], check=True)
+        os.replace(new, feed_path)
+        os.replace(new + ".sig", feed_path + ".sig")
+    finally:
+        remove_quietly(new)
+        remove_quietly(new + ".sig")
+
+
 def release_notes(version, notes, complete):
     lines = []
     for code, title in LANGUAGES:
@@ -131,6 +157,7 @@ def main():
             pass
         complete = None
         if a.complete:
+            make_feed.check_installer(a.complete, version)
             complete_size = os.path.getsize(a.complete)
             if complete_size > github_release.MAX_ASSET:
                 print("WARNING: the complete installer holds %d bytes, more than the 2 GiB of a release file: it "
@@ -156,15 +183,10 @@ def main():
             asset = repo.attach(release, a.complete, complete[0], complete[1])
             print("attached: %s" % asset.get("browser_download_url", complete[0]))
 
-        make_feed.write_feed(feed_path, feed)
-        subprocess.run([signer, "sign", a.key, feed_path], check=True)
-        subprocess.run([signer, "verify", feed_path], check=True)
-        try:
-            ok = github_release.read_back(url, a.installer)
-            print("public address checked" if ok else "WARNING: the public address serves another file: " + url)
-        except OSError as e:
-            print("WARNING: the public address cannot be read (%s); a private repository serves its files to "
-                  "signed-in users only" % e)
+        # The feed changes only once the public address serves the installer it announces.
+        warning = github_release.verify_public(repo, url, a.installer, sha)
+        print("WARNING: " + warning if warning else "public address checked: " + url)
+        write_signed_feed(feed_path, feed, signer, a.key)
     except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as e:
         print("error: %s" % e, file=sys.stderr)
         return 1

@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 
@@ -41,6 +42,13 @@ namespace albireo
         double now_seconds()
         {
             return std::chrono::duration<double>(clock_type::now().time_since_epoch()).count();
+        }
+
+        // An integer of a request within [lo, hi], read before any narrowing to a smaller type.
+        long long bounded(const json& v, long long def, long long lo, long long hi)
+        {
+            const long long x = v.as_int(def);
+            return x < lo ? lo : x > hi ? hi : x;
         }
 
         // Bytes of text that end on a complete UTF-8 character; an incomplete sequence at
@@ -191,6 +199,10 @@ namespace albireo
         std::deque<std::shared_ptr<request_state>> waiting;
         std::atomic<bool> unloading{false};
         uint64_t stamp = 0;
+        // When the model last computed, and whether the memory of its free blocks went back
+        // to the system since (engine::trim_idle).
+        clock_type::time_point last_step;
+        bool trimmed = true;
         forward_batch batch;
         std::vector<float> logits;
         uint64_t parameters = 0;
@@ -281,15 +293,22 @@ namespace albireo
         }
         wake_.notify_all();
         if (worker_.joinable()) worker_.join();
-        // Requests the worker had no step left to finish.
-        std::vector<std::shared_ptr<request_state>> left;
-        for (auto& r : requests_) left.push_back(r.second);
-        for (auto& r : left)
-            if (r->ph != request_state::phase::done) fail(*r, "cancelled", "the engine stopped");
-        requests_.clear();
-        std::vector<std::shared_ptr<embedding_job>> jobs;
-        for (auto& j : jobs_) jobs.push_back(j.second);
-        for (auto& j : jobs) end_job(*j, "cancelled", "the engine stopped");
+        // Requests the worker had no step left to finish.  The destructor throws nothing: an
+        // event that cannot be written for lack of memory is dropped.
+        try
+        {
+            std::vector<std::shared_ptr<request_state>> left;
+            for (auto& r : requests_) left.push_back(r.second);
+            for (auto& r : left)
+                if (r->ph != request_state::phase::done) fail(*r, "cancelled", "the engine stopped");
+            requests_.clear();
+            std::vector<std::shared_ptr<embedding_job>> jobs;
+            for (auto& j : jobs_) jobs.push_back(j.second);
+            for (auto& j : jobs) end_job(*j, "cancelled", "the engine stopped");
+        }
+        catch (...)
+        {
+        }
         models_.clear();
     }
 
@@ -390,6 +409,9 @@ namespace albireo
     void engine::load_model(const std::string& id, const std::string& path, const json& options)
     {
         if (id.empty()) throw std::invalid_argument("a model needs an identifier");
+        // One load at a time: two loads of the same identifier would otherwise both replace
+        // the model, the requests of the first one never ending.
+        std::lock_guard<std::mutex> serial(loading_);
         auto m = std::make_shared<loaded_model>();
         m->id = id;
         m->path = path;
@@ -425,10 +447,29 @@ namespace albireo
         }
         else if (kv == 0)
         {
-            // Two full contexts, within a quarter of the memory available.
+            /*
+                Two full contexts, within a quarter of the memory available once the other
+                models have grown to their own budgets: the blocks are allocated as the
+                sequences grow, so the memory free now still has to hold that growth.
+            */
             const memory_info mem = read_memory_info();
+            size_t growth = 0;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                for (const auto& o : models_)
+                {
+                    if (o.first == id) continue;
+                    const size_t budget = o.second->runtime->kv_bytes_budget();
+                    const size_t used = o.second->runtime->kv_bytes_used();
+                    if (budget > used) growth += budget - used;
+                }
+            }
             kv = per_token * static_cast<size_t>(m->context) * 2;
-            if (mem.available > 0) kv = std::min<size_t>(kv, static_cast<size_t>(mem.available / 4));
+            if (mem.available > 0)
+            {
+                const size_t available = static_cast<size_t>(mem.available);
+                kv = std::min<size_t>(kv, (available > growth ? available - growth : 0) / 4);
+            }
             kv = std::max<size_t>(kv, per_token * static_cast<size_t>(std::min<long>(m->context, 4096)));
         }
         std::unique_ptr<cpu_runtime> runtime(new cpu_runtime(m->file, m->cfg, *pool_, kv, embedding ? 64 : 256));
@@ -436,6 +477,17 @@ namespace albireo
         runtime->set_offload(device_->make_offload(id));
 #endif
         m->runtime = std::move(runtime);
+
+        // The context never exceeds what the keys and values can hold: a prompt the engine
+        // accepts can then always be read to its end, and a longer one is refused at once.
+        const long room = static_cast<long>(m->runtime->kv_bytes_budget() / m->runtime->kv_bytes_per_token());
+        if (room < m->context)
+        {
+            log(ALBIREO_LOG_INFO, "model '" + id + "': context reduced from " + std::to_string(m->context) + " to "
+                + std::to_string(room) + " tokens, the positions its keys and values can hold in the memory given "
+                "to them");
+            m->context = room;
+        }
 
         if (m->tok.eos_id() >= 0) m->stops.push_back(m->tok.eos_id());
         for (int s : m->format->stop_tokens()) m->stops.push_back(s);
@@ -550,7 +602,7 @@ namespace albireo
             const std::vector<chat_message> messages = parse_messages(req["messages"]);
             std::vector<prompt_piece> pieces;
             m->format->render(messages, opt, pieces);
-            r->prompt = chat_format::tokenize(m->tok, pieces, m->format->separate_pieces());
+            r->prompt = chat_format::tokenize(m->tok, pieces);
             r->parser = m->format->make_parser(opt);
         }
         else if (req["prompt"].is_string())
@@ -583,24 +635,32 @@ namespace albireo
         const bool chatml_reasoning = opt.reasoning && std::string(m->format->name()) == "chatml";
         sp.temperature = static_cast<float>(req["temperature"].as_double(chatml_reasoning ? 0.6 : 0.7));
         sp.top_p = static_cast<float>(req["top_p"].as_double(chatml_reasoning ? 0.95 : 0.9));
-        sp.top_k = static_cast<int>(req["top_k"].as_int(chatml_reasoning ? 20 : 40));
+        // The candidates are selected in a heap: more than 1024 of them would cost time at every
+        // token for a mass that temperature and top-p leave aside.
+        sp.top_k = static_cast<int>(bounded(req["top_k"], chatml_reasoning ? 20 : 40, 0, 1024));
         sp.min_p = static_cast<float>(req["min_p"].as_double(0.0));
         sp.repeat_penalty =
             static_cast<float>(req["repeat_penalty"].as_double(req["repetition_penalty"].as_double(1.0)));
-        sp.repeat_last_n = static_cast<int>(req["repeat_last_n"].as_int(64));
+        sp.repeat_last_n = static_cast<int>(bounded(req["repeat_last_n"], 64, -1, 1 << 20));
         sp.presence_penalty = static_cast<float>(req["presence_penalty"].as_double(0.0));
         sp.frequency_penalty = static_cast<float>(req["frequency_penalty"].as_double(0.0));
         sp.seed = static_cast<uint64_t>(req["seed"].as_int(0));
         for (const auto& b : req["logit_bias"].items())
-            sp.logit_bias[std::atoi(b.first.c_str())] = static_cast<float>(b.second.as_double(0.0));
+        {
+            char* end = nullptr;
+            const long long token = std::strtoll(b.first.c_str(), &end, 10);
+            if (end == b.first.c_str() || *end != '\0' || token < 0 || token >= m->cfg.vocab)
+                throw std::invalid_argument("logit_bias holds an invalid token identifier");
+            sp.logit_bias[static_cast<int>(token)] = static_cast<float>(b.second.as_double(0.0));
+        }
         if (sp.temperature < 0 || sp.top_p < 0 || sp.top_p > 1 || sp.min_p < 0 || sp.min_p > 1)
             throw std::invalid_argument("sampling parameters out of range");
         r->smp.reset(new sampler(sp));
 
         const long room = m->context - static_cast<long>(r->prompt.size());
-        long max_tokens = req["max_completion_tokens"].as_int(req["max_tokens"].as_int(0));
-        if (max_tokens <= 0 || max_tokens > room) max_tokens = room;
-        r->max_tokens = max_tokens;
+        // Compared before any narrowing: long has 32 bits on Windows.
+        const long long asked = req["max_completion_tokens"].as_int(req["max_tokens"].as_int(0));
+        r->max_tokens = asked <= 0 || asked > room ? room : static_cast<long>(asked);
 
         if (req["stop"].is_string() && !req["stop"].as_string().empty()) r->stops.push_back(req["stop"].as_string());
         for (const auto& s : req["stop"].elements())
@@ -661,7 +721,7 @@ namespace albireo
                 throw std::invalid_argument("input " + std::to_string(i) + " holds " + std::to_string(inputs[i].size())
                     + " tokens, beyond the " + std::to_string(m->context) + " tokens the model reads at once");
         }
-        const long dimensions = req["dimensions"].as_int(0);
+        const long long dimensions = req["dimensions"].as_int(0);
         if (dimensions < 0 || dimensions > m->cfg.d_model)
             throw std::invalid_argument("dimensions must lie between 1 and " + std::to_string(m->cfg.d_model));
 
@@ -669,7 +729,7 @@ namespace albireo
         job->sink = std::move(sink);
         job->vectors.resize(inputs.size());
         job->remaining = static_cast<long>(inputs.size());
-        job->dimensions = dimensions;
+        job->dimensions = static_cast<long>(dimensions);
         job->submitted = clock_type::now();
         std::vector<std::shared_ptr<request_state>> parts;
         for (size_t i = 0; i < inputs.size(); ++i)
@@ -774,6 +834,11 @@ namespace albireo
 
     void engine::run()
     {
+#ifdef ALBIREO_TENSOR_BACKEND
+        // CUDA keeps one current device per thread: this thread computes on the card of the
+        // engine.
+        if (!device_->bind_thread()) log(ALBIREO_LOG_WARNING, "device: the card of the engine cannot be selected");
+#endif
         for (;;)
         {
             std::vector<std::shared_ptr<loaded_model>> models;
@@ -781,9 +846,12 @@ namespace albireo
             // short passes, the answers being what the users wait for.
             bool answering = false;
             std::vector<bool> busy;
+            bool woken = false;
             {
                 std::unique_lock<std::mutex> lock(mutex_);
-                wake_.wait(lock, [&]() {
+                // Without requests, the thread still wakes now and then to give the memory of
+                // the idle models back (trim_idle).
+                woken = wake_.wait_for(lock, std::chrono::seconds(5), [&]() {
                     if (stop_) return true;
                     for (const auto& m : models_)
                         if (m.second->unloading || !m.second->waiting.empty() || !m.second->active.empty()) return true;
@@ -798,6 +866,11 @@ namespace albireo
                     if (!m.second->cfg.is_embedding() && has_requests) answering = true;
                 }
             }
+            if (!woken)
+            {
+                trim_idle(models);
+                continue;
+            }
             // The device keeps the copies of the models with requests, and may give the
             // room of the others to them (tensor_backend.h).
             for (size_t i = 0; i < models.size(); ++i) models[i]->runtime->set_busy(busy[i]);
@@ -811,10 +884,18 @@ namespace albireo
                         std::lock_guard<std::mutex> lock(mutex_);
                         waiting.swap(m->waiting);
                     }
-                    for (auto& r : waiting) fail(*r, "unloaded", "the model was unloaded");
-                    for (auto& r : m->active)
-                        if (r->ph != request_state::phase::done) fail(*r, "unloaded", "the model was unloaded");
-                    m->active.clear();
+                    for (auto& r : waiting)
+                    {
+                        try
+                        {
+                            fail(*r, "unloaded", "the model was unloaded");
+                        }
+                        catch (...)
+                        {
+                            // Out of memory while the event was written: the request ends without it.
+                        }
+                    }
+                    abandon(*m, "unloaded", "the model was unloaded");
                     std::lock_guard<std::mutex> lock(mutex_);
                     models_.erase(m->id);
                     unloaded_.notify_all();
@@ -838,15 +919,123 @@ namespace albireo
                 }
                 catch (const std::exception& e)
                 {
-                    log(ALBIREO_LOG_ERROR, "model '" + m->id + "': " + e.what());
-                    for (auto& r : m->active)
-                        if (r->ph != request_state::phase::done) fail(*r, "internal", e.what());
-                    for (auto& r : m->active)
-                        if (r->seq >= 0) { m->runtime->release_sequence(r->seq); r->seq = -1; }
-                    m->active.clear();
+                    try
+                    {
+                        log(ALBIREO_LOG_ERROR, "model '" + m->id + "': " + e.what());
+                    }
+                    catch (...)
+                    {
+                    }
+                    abandon(*m, "internal", e.what());
+                }
+                catch (...)
+                {
+                    abandon(*m, "internal", "unknown error");
                 }
             }
         }
+    }
+
+    void engine::abandon(loaded_model& m, const std::string& code, const std::string& message)
+    {
+        /*
+            Ends every request the model computes with an error and gives their sequences
+            back.  Writing an event may run out of memory: that request then ends without
+            its event, and the others still end.
+        */
+        for (auto& r : m.active)
+        {
+            try
+            {
+                if (r->ph != request_state::phase::done) fail(*r, code, message);
+            }
+            catch (...)
+            {
+                r->ph = request_state::phase::done;
+            }
+            try
+            {
+                if (r->seq >= 0) m.runtime->release_sequence(r->seq);
+            }
+            catch (...)
+            {
+            }
+            r->seq = -1;
+        }
+        m.active.clear();
+    }
+
+    void engine::trim_idle(const std::vector<std::shared_ptr<loaded_model>>& models)
+    {
+        // The free blocks of a language model without requests for a while go back to the
+        // system; its cached conversations stay.
+        const auto now = clock_type::now();
+        for (const auto& m : models)
+        {
+            if (m->trimmed || m->unloading || !m->active.empty()) continue;
+            if (seconds_since(m->last_step, now) < 30) continue;
+            m->runtime->trim_memory();
+            m->trimmed = true;
+        }
+    }
+
+    void engine::drop_cancelled(loaded_model& m)
+    {
+        // The cancelled requests leave the queue at once, whether a slot is free or not.
+        std::vector<std::shared_ptr<request_state>> dropped;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (auto it = m.waiting.begin(); it != m.waiting.end();)
+            {
+                if ((*it)->is_cancelled())
+                {
+                    dropped.push_back(*it);
+                    it = m.waiting.erase(it);
+                }
+                else
+                {
+                    ++it;
+                }
+            }
+        }
+        for (auto& r : dropped) finish(m, *r, "cancelled");
+    }
+
+    bool engine::preempt(loaded_model& m, const request_state* keep)
+    {
+        /*
+            Gives the memory of a request reading its prompt to the answers being written,
+            the request admitted last first: it goes back to the front of the queue
+            (requeue_preempted) and reads its prompt again once there is room.
+        */
+        for (auto it = m.active.rbegin(); it != m.active.rend(); ++it)
+        {
+            request_state& r = **it;
+            if (&r == keep || r.ph != request_state::phase::prefill || r.job || r.seq < 0) continue;
+            if (m.runtime->sequence_length(r.seq) == 0) continue;
+            m.runtime->release_sequence(r.seq);
+            r.seq = -1;
+            r.kv_tokens.clear();
+            r.cached = 0;
+            r.ph = request_state::phase::waiting;
+            log(ALBIREO_LOG_DEBUG, "model '" + m.id + "': a prompt being read gave its memory to the answers being "
+                "written, and will be read again");
+            return true;
+        }
+        return false;
+    }
+
+    void engine::requeue_preempted(loaded_model& m)
+    {
+        std::vector<std::shared_ptr<request_state>> back;
+        for (const auto& r : m.active)
+            if (r->ph == request_state::phase::waiting) back.push_back(r);
+        if (back.empty()) return;
+        m.active.erase(std::remove_if(m.active.begin(), m.active.end(),
+            [](const std::shared_ptr<request_state>& r) { return r->ph == request_state::phase::waiting; }),
+            m.active.end());
+        std::lock_guard<std::mutex> lock(mutex_);
+        m.waiting.insert(m.waiting.begin(), back.begin(), back.end());
     }
 
     void engine::admit(loaded_model& m)
@@ -971,6 +1160,7 @@ namespace albireo
         for (auto& r : m.active)
             if (r->is_cancelled() && r->ph != request_state::phase::done) finish(m, *r, "cancelled");
         m.active.erase(std::remove_if(m.active.begin(), m.active.end(), request_done), m.active.end());
+        drop_cancelled(m);
         admit(m);
         if (m.active.empty())
         {
@@ -990,9 +1180,17 @@ namespace albireo
             request_state& r = *rp;
             if (r.ph != request_state::phase::decode) continue;
             const long len = m.runtime->sequence_length(r.seq);
-            if (len + 1 > m.context || !reserve(m, r.seq, len + 1))
+            if (len + 1 > m.context)
             {
                 finish(m, r, "length");
+                continue;
+            }
+            bool reserved = reserve(m, r.seq, len + 1);
+            while (!reserved && preempt(m)) reserved = reserve(m, r.seq, len + 1);
+            if (!reserved)
+            {
+                // The answers being written hold the whole memory of the keys and values.
+                fail(r, "out_of_memory", "no memory left for the keys and values of this answer");
                 continue;
             }
             b.segments.push_back({ r.seq, static_cast<long>(b.tokens.size()), 1 });
@@ -1001,6 +1199,7 @@ namespace albireo
             rows.push_back({ &r, 1, true });
             --budget;
         }
+        requeue_preempted(m);
         for (auto& rp : m.active)
         {
             request_state& r = *rp;
@@ -1009,9 +1208,20 @@ namespace albireo
             const long n = std::min<long>(static_cast<long>(r.prompt.size()) - done, budget);
             if (!reserve(m, r.seq, done + n))
             {
-                // Nothing else to give back: this prompt does not fit.
-                if (rows.empty()) fail(r, "out_of_memory", "the keys and values of this prompt do not fit in memory");
-                continue;
+                /*
+                    The other requests hold the memory.  While one of them computes in this
+                    pass, this prompt waits for room; otherwise the prompts admitted after
+                    this one give theirs, so that two prompts never wait for each other.
+                */
+                bool reserved = false;
+                if (rows.empty())
+                    while (!reserved && preempt(m, &r)) reserved = reserve(m, r.seq, done + n);
+                if (!reserved)
+                {
+                    if (rows.empty())
+                        fail(r, "out_of_memory", "the keys and values of this prompt do not fit in memory");
+                    continue;
+                }
             }
             const bool last = done + n == static_cast<long>(r.prompt.size());
             b.segments.push_back({ r.seq, static_cast<long>(b.tokens.size()), n });
@@ -1020,6 +1230,7 @@ namespace albireo
             rows.push_back({ &r, n, last });
             budget -= n;
         }
+        requeue_preempted(m);
         if (rows.empty())
         {
             m.active.erase(std::remove_if(m.active.begin(), m.active.end(), request_done), m.active.end());
@@ -1027,10 +1238,16 @@ namespace albireo
         }
 
         m.runtime->forward(b, m.logits);
+        m.last_step = clock_type::now();
+        m.trimmed = false;
 
         long prompt_tokens = 0, generated = 0;
         size_t logit_row = 0;
         const long V = m.cfg.vocab;
+        // The rows whose next token is drawn: each request has a sampler of its own, so the
+        // draws run in parallel and the tokens are then handled in order.
+        struct draw { request_state* r; float* logits; int token; };
+        std::vector<draw> draws;
         for (const row& w : rows)
         {
             request_state& r = *w.r;
@@ -1074,9 +1291,19 @@ namespace albireo
                 finish(m, r, "cancelled");
                 continue;
             }
-            const int token = r.smp->sample(lg, V);
+            draws.push_back({ &r, lg, -1 });
+        }
+        if (draws.size() == 1)
+            draws[0].token = draws[0].r->smp->sample(draws[0].logits, V);
+        else if (draws.size() > 1)
+            pool_->parallel_for(static_cast<long>(draws.size()), [&](long i, int) {
+                draw& d = draws[static_cast<size_t>(i)];
+                d.token = d.r->smp->sample(d.logits, V);
+            });
+        for (const draw& d : draws)
+        {
             ++generated;
-            handle_token(m, r, token);
+            handle_token(m, *d.r, d.token);
         }
 
         m.prompted += static_cast<uint64_t>(prompt_tokens);
@@ -1384,7 +1611,13 @@ namespace albireo
         if (op == "detokenize")
         {
             std::string text;
-            for (const auto& t : req["tokens"].elements()) text += m->tok.token_bytes(static_cast<int>(t.as_int()));
+            for (const auto& t : req["tokens"].elements())
+            {
+                const long long id = t.as_int(-1);
+                if (!t.is_integer() || id < 0 || id >= m->cfg.vocab)
+                    throw std::invalid_argument("tokens holds an invalid token identifier");
+                text += m->tok.token_bytes(static_cast<int>(id));
+            }
             out["text"] = text;
             return out;
         }
@@ -1397,7 +1630,7 @@ namespace albireo
             const std::vector<chat_message> messages = parse_messages(req["messages"]);
             std::vector<prompt_piece> pieces;
             m->format->render(messages, opt, pieces);
-            const std::vector<int> ids = chat_format::tokenize(m->tok, pieces, m->format->separate_pieces());
+            const std::vector<int> ids = chat_format::tokenize(m->tok, pieces);
             out["tokens"] = static_cast<long>(ids.size());
             out["context"] = m->context;
             if (op == "render")

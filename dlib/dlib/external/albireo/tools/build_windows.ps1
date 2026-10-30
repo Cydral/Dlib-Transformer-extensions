@@ -37,7 +37,10 @@
     The build trees are created at the root of the repository: build-albireo,
     build-albireo-ov and build-albireo-cuda.  A tree configured by a Visual Studio
     installation removed since (Visual Studio Community replaced by the Build Tools, for
-    instance) is created again.  The installers are build-albireo\bin\albireo-setup.exe,
+    instance) is created again.  The bin\engines folder of a device tree is emptied before
+    its build, which places the engines and the libraries they load there again, so that the
+    installer carries the libraries of the current runtimes only; the payload of the
+    installer is then packed again.  The installers are build-albireo\bin\albireo-setup.exe,
     complete with its models, and build-albireo\bin\albireo-setup-online.exe, the one of
     the updates, which installs the programs and downloads the models.
 #>
@@ -99,6 +102,20 @@ function Reset-StaleTree([string]$tree) {
     }
 }
 
+# The engines folder of a device tree only receives files: the libraries of an earlier version
+# of the CUDA runtime, for instance, would stay there and join the installer.  Its build places
+# the engines and the libraries they load there again.
+function Clear-Engines([string]$tree) {
+    $engines = Join-Path $tree "bin\engines"
+    if (-not (Test-Path -LiteralPath $engines)) { return }
+    try {
+        Get-ChildItem -LiteralPath $engines -Force | Remove-Item -Recurse -Force
+    }
+    catch {
+        throw "$engines cannot be emptied, a program may still use its files: $($_.Exception.Message)"
+    }
+}
+
 # The runtime of OpenVINO, where dlib looks for it (dlib/cmake_utils/find_openvino.cmake).
 function Test-OpenVINO {
     if ($env:INTEL_OPENVINO_DIR -or $env:OpenVINO_DIR) { return $true }
@@ -142,6 +159,7 @@ if (-not $NoOpenVINO) {
     Reset-StaleTree $tree
     Invoke-Step "configuring the OpenVINO engine" (@("-S", $source, "-B", $tree) + $generator +
         @("-DALBIREO_PROGRAMS=OFF", "-DALBIREO_ENGINE_OPENVINO=ON", "-DALBIREO_TESTS=$testing"))
+    Clear-Engines $tree
     Invoke-Step "building the OpenVINO engine" (@("--build", $tree, "--config", "Release") + $parallel)
     $extra += (Join-Path $tree "bin\engines")
 }
@@ -170,6 +188,7 @@ if ($Cuda) {
     }
     if ($CudaArchitectures) { $options += "-DCMAKE_CUDA_ARCHITECTURES=$CudaArchitectures" }
     Invoke-Step "configuring the CUDA engine" (@("-S", $source, "-B", $tree) + $generator + $toolset + $options)
+    Clear-Engines $tree
     Invoke-Step "building the CUDA engine" (@("--build", $tree, "--config", "Release") + $parallel)
     $extra += (Join-Path $tree "bin\engines")
 }
@@ -208,6 +227,12 @@ $builtin = if ($NoBuiltinModels) { "OFF" } else { "ON" }
 $options = @("-DALBIREO_EXTRA_ENGINE_DIRS=$dirs", "-DALBIREO_TESTS=$testing", "-DALBIREO_BUILTIN_MODELS=$builtin")
 if ($ModelCache) { $options += "-DALBIREO_MODEL_CACHE=$($ModelCache.Replace('\', '/'))" }
 Invoke-Step "configuring the programs" (@("-S", $source, "-B", $main) + $generator + $options)
+# The payload of the installer depends on the programs of this tree only: deleted, it is packed
+# again with the engines the device trees have just built.
+$payload = Join-Path $main "payload"
+if ($extra.Count -gt 0 -and (Test-Path -LiteralPath $payload)) {
+    Remove-Item -LiteralPath $payload -Recurse -Force
+}
 Invoke-Step "building the programs, the models and the installers" (@("--build", $main, "--config", "Release") +
     $parallel)
 

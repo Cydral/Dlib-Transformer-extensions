@@ -7,7 +7,7 @@ from a disk or a memory card.
     python3 make_offline_bundle.py <output folder> [--models <id,id,...> | --all]
                                    [--installer <albireo-setup-online.exe>]
                                    [--complete <albireo-setup.exe>] [--from <folder>]...
-                                   [--dist <folder>] [--sign <albireo-sign>]
+                                   [--dist <folder>] [--sign <albireo-sign> | --no-verify]
 
 The bundle holds the signed catalog and the signed update feed of dist/albireo, the installer
 the feed announces, and in its models folder the models chosen: by default the default
@@ -18,7 +18,10 @@ carries the models that come with Albireo: the default models are then left out,
 --models or --all name models; each model is taken from the folders of --from when one of their
 files has its size and its SHA-256, else downloaded from the addresses of the catalog.
 Every file is checked against the hashes of the signed files before it enters the bundle,
-and the signatures are checked with albireo-sign when it is found.
+and the complete installer must carry the version of the feed.  The signatures are checked
+with albireo-sign (--sign, else build-albireo/bin of the repository, else the PATH); the
+program stops when it is not found, unless --no-verify leaves that check to the service.
+A download stops when the server sends more than the feed or the catalog announces.
 
 The bundle is used in one of three ways:
 - albireo-setup-<version>.exe started from the bundle installs Albireo, and the service
@@ -31,6 +34,7 @@ The bundle is used in one of three ways:
 
 import argparse
 import hashlib
+import http.client
 import json
 import os
 import shutil
@@ -78,39 +82,71 @@ la minute. La mise à jour s'installe au prochain démarrage du service.
 """
 
 
-def download(url, out, expected_size=None, gzip_part=False, label="", whole=None):
+def download(url, out, expected_size, gzip_part=False, label="", whole=None, compressed_size=None):
     """Writes the content of url to the open file out, inflated when gzip_part, and returns
-    the SHA-256 and the size of what was written; whole also receives the content."""
+    the SHA-256 and the size of what was written; whole also receives the content.  The
+    transfer stops with an error when the server sends more bytes than announced, the
+    compressed_size of a compressed part or else expected_size, when a compressed part
+    inflates beyond expected_size, and when the connection ends before the size the server
+    announced."""
     h = hashlib.sha256()
     written = 0
+    received = 0
     shown = 0.0
+    announced = compressed_size if gzip_part else expected_size
     inflate = zlib.decompressobj(16 + zlib.MAX_WBITS) if gzip_part else None
     req = urllib.request.Request(url, headers={"User-Agent": "albireo-bundle"})
-    with urllib.request.urlopen(req, timeout=120) as r:
-        while True:
-            block = r.read(1 << 20)
-            if not block:
-                break
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            length = r.headers.get("Content-Length", "").strip()
+            while True:
+                block = r.read(1 << 20)
+                if not block:
+                    break
+                received += len(block)
+                if received > announced:
+                    raise RuntimeError("%s sends more than the %d bytes announced" % (url, announced))
+                if inflate:
+                    # One byte beyond the rest of the part tells a part that inflates too far.
+                    block = inflate.decompress(block, expected_size - written + 1)
+                    if written + len(block) > expected_size:
+                        raise RuntimeError("%s inflates beyond the %d bytes announced" % (url, expected_size))
+                out.write(block)
+                h.update(block)
+                if whole is not None:
+                    whole.update(block)
+                written += len(block)
+                if time.monotonic() - shown >= 2:
+                    shown = time.monotonic()
+                    print("\r  %s: %d of %d MB" % (label, written >> 20, expected_size >> 20), end="",
+                          file=sys.stderr)
+            # The reading of a content of announced length stops without an error when the
+            # connection closes before its end.
+            if length.isdigit() and received < int(length):
+                raise RuntimeError("the transfer of %s was cut off after %d bytes" % (url, received))
             if inflate:
-                block = inflate.decompress(block)
-            out.write(block)
-            h.update(block)
-            if whole:
-                whole.update(block)
-            written += len(block)
-            if expected_size and time.monotonic() - shown >= 2:
-                shown = time.monotonic()
-                print("\r  %s: %d of %d MB" % (label, written >> 20, expected_size >> 20), end="", file=sys.stderr)
-        if inflate:
-            tail = inflate.flush()
-            out.write(tail)
-            h.update(tail)
-            if whole:
-                whole.update(tail)
-            written += len(tail)
-    if expected_size:
-        print("\r  %s: %d of %d MB" % (label, written >> 20, expected_size >> 20), file=sys.stderr)
+                tail = inflate.flush()
+                if written + len(tail) > expected_size:
+                    raise RuntimeError("%s inflates beyond the %d bytes announced" % (url, expected_size))
+                out.write(tail)
+                h.update(tail)
+                if whole is not None:
+                    whole.update(tail)
+                written += len(tail)
+    except http.client.IncompleteRead:
+        raise RuntimeError("the transfer of %s was cut off after %d bytes" % (url, received))
+    except zlib.error as e:
+        raise RuntimeError("%s is not a valid gzip part (%s)" % (url, e))
+    print("\r  %s: %d of %d MB" % (label, written >> 20, expected_size >> 20), file=sys.stderr)
     return h.hexdigest(), written
+
+
+def remove_partial(path):
+    """Removes the partial file of a transfer, which a completed transfer has renamed."""
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 def local_files(folders):
@@ -132,23 +168,31 @@ def bundle_model(entry, models_dir, by_size):
             and make_feed.sha256_of(target) == entry["sha256"]:
         print("%s: already in the bundle" % entry["id"])
         return target
-    for path in by_size.get(entry["size"], []):
-        if make_feed.sha256_of(path) == entry["sha256"]:
-            shutil.copyfile(path, target + ".partial")
-            os.replace(target + ".partial", target)
-            print("%s: copied from %s" % (entry["id"], path))
-            return target
-    whole = hashlib.sha256()
-    with open(target + ".partial", "wb") as out:
-        for i, part in enumerate(files):
-            label = "%s %d/%d" % (entry["id"], i + 1, len(files))
-            sha, size = download(part["url"], out, part["size"], part.get("compression") == "gzip", label, whole)
-            if sha != part["sha256"] or size != part["size"]:
-                raise RuntimeError("%s: the part %s does not match the catalog" % (entry["id"], part["url"]))
-    if whole.hexdigest() != entry["sha256"]:
-        os.remove(target + ".partial")
-        raise RuntimeError("%s: the model does not match the catalog" % entry["id"])
-    os.replace(target + ".partial", target)
+    partial = target + ".partial"
+    try:
+        for path in by_size.get(entry["size"], []):
+            if make_feed.sha256_of(path) == entry["sha256"]:
+                shutil.copyfile(path, partial)
+                os.replace(partial, target)
+                print("%s: copied from %s" % (entry["id"], path))
+                return target
+        whole = hashlib.sha256()
+        with open(partial, "wb") as out:
+            for i, part in enumerate(files):
+                gzip_part = part.get("compression") == "gzip"
+                if gzip_part and not part.get("compressed_size"):
+                    raise RuntimeError("%s: the catalog gives no compressed size for the part %s"
+                                       % (entry["id"], part["url"]))
+                label = "%s %d/%d" % (entry["id"], i + 1, len(files))
+                sha, size = download(part["url"], out, part["size"], gzip_part, label, whole,
+                                     part.get("compressed_size"))
+                if sha != part["sha256"] or size != part["size"]:
+                    raise RuntimeError("%s: the part %s does not match the catalog" % (entry["id"], part["url"]))
+        if whole.hexdigest() != entry["sha256"]:
+            raise RuntimeError("%s: the model does not match the catalog" % entry["id"])
+        os.replace(partial, target)
+    finally:
+        remove_partial(partial)
     print("%s: downloaded" % entry["id"])
     return target
 
@@ -163,16 +207,22 @@ def main():
     p.add_argument("--complete")
     p.add_argument("--from", dest="sources", action="append", default=[])
     p.add_argument("--dist", default=os.path.join(publish_release.ROOT, "dist", "albireo"))
-    p.add_argument("--sign")
+    check = p.add_mutually_exclusive_group()
+    check.add_argument("--sign")
+    check.add_argument("--no-verify", action="store_true",
+                       help="copy the signed files without checking their signatures, left to the service")
     a = p.parse_args()
 
     try:
+        signer = None
+        if a.no_verify:
+            print("--no-verify: the signatures are checked by the service only")
+        else:
+            try:
+                signer = publish_release.find_signer(a.sign)
+            except RuntimeError as e:
+                raise RuntimeError("%s; --no-verify leaves the check of the signatures to the service" % e)
         os.makedirs(os.path.join(a.output, "models"), exist_ok=True)
-        try:
-            signer = publish_release.find_signer(a.sign)
-        except RuntimeError:
-            signer = None
-            print("albireo-sign not found: the signatures are checked by the service only")
         for name in ("catalog.json", "feed.json"):
             source = os.path.join(a.dist, name)
             if signer:
@@ -190,6 +240,8 @@ def main():
         if not installer.get("size"):
             raise RuntimeError("the feed of %s announces no installer yet: publish the version first "
                                "(publish_release.py)" % a.dist)
+        if a.complete:
+            make_feed.check_installer(a.complete, stable["version"])
         target = os.path.join(a.output, installer_name)
         if a.installer:
             if os.path.getsize(a.installer) != installer["size"] \
@@ -197,12 +249,15 @@ def main():
                 raise RuntimeError("%s is not the installer the feed announces" % a.installer)
             shutil.copyfile(a.installer, target)
         elif not (os.path.isfile(target) and make_feed.sha256_of(target) == installer["sha256"]):
-            with open(target + ".partial", "wb") as out:
-                sha, size = download(installer["url"], out, installer["size"], label=installer_name)
-            if sha != installer["sha256"] or size != installer["size"]:
-                os.remove(target + ".partial")
-                raise RuntimeError("the installer downloaded does not match the feed")
-            os.replace(target + ".partial", target)
+            partial = target + ".partial"
+            try:
+                with open(partial, "wb") as out:
+                    sha, size = download(installer["url"], out, installer["size"], label=installer_name)
+                if sha != installer["sha256"] or size != installer["size"]:
+                    raise RuntimeError("the installer downloaded does not match the feed")
+                os.replace(partial, target)
+            finally:
+                remove_partial(partial)
         print("%s: version %s" % (installer_name, stable["version"]))
         complete_name = None
         if a.complete:
@@ -238,7 +293,8 @@ def main():
                                   models=", ".join(e["id"] for e in chosen) or "-",
                                   first=complete_name or installer_name, complete_en=complete_en,
                                   complete_fr=complete_fr))
-    except (OSError, ValueError, KeyError, RuntimeError, subprocess.CalledProcessError) as e:
+    except (OSError, ValueError, KeyError, RuntimeError, subprocess.CalledProcessError,
+            http.client.HTTPException) as e:
         print("error: %s" % e, file=sys.stderr)
         return 1
     print("bundle %s: installer %s, %d models, %.2f GB of models"

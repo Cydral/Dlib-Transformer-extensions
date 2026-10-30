@@ -232,6 +232,11 @@ let frameReady = null;
 let nextRun = 1;
 const runs = new Map();
 
+// The time limit of a run in the frame, and the one of the page, longer, which also ends the
+// runs of a frame that does not answer.
+const runLimit = 15000;
+const pageLimit = runLimit + 5000;
+
 function sandbox() {
   if (frameReady) return frameReady;
   frameReady = new Promise((resolve) => {
@@ -241,29 +246,53 @@ function sandbox() {
     frame.src = 'sandbox.html';
     window.addEventListener('message', (e) => {
       if (!frame || e.source !== frame.contentWindow) return;
-      const d = e.data || {};
-      if (d.ready) { resolve(frame); return; }
+      const d = e.data !== null && typeof e.data === 'object' ? e.data : {};
+      // The frame says it is ready in a message of its own, without the id of a run.
+      if (d.id === undefined) {
+        if (d.ready === true) resolve(frame);
+        return;
+      }
       const r = runs.get(d.id);
-      if (r) { runs.delete(d.id); r(d); }
+      if (r) r(d);
     });
     document.body.appendChild(frame);
   });
   return frameReady;
 }
 
-async function runJavascript(code) {
-  const f = await sandbox();
+// Runs code in the frame; the run ends with its result, the time limit of the page, or signal.
+async function runJavascript(code, signal) {
   const id = nextRun++;
   const result = await new Promise((resolve) => {
-    runs.set(id, resolve);
-    // The frame has an opaque origin, which no target origin can name.
-    f.contentWindow.postMessage({ id, code: String(code), timeout: 15000 }, '*');
+    let timer = 0;
+    const end = (r) => {
+      if (!runs.has(id)) return;
+      runs.delete(id);
+      clearTimeout(timer);
+      if (signal) signal.removeEventListener('abort', stopped);
+      resolve(r);
+    };
+    const stopped = () => end({ ok: false, error: 'The run was stopped.' });
+    runs.set(id, end);
+    timer = setTimeout(() => end({ ok: false, error: 'The interpreter did not answer within the time limit.' }), pageLimit);
+    if (signal) {
+      if (signal.aborted) {
+        stopped();
+        return;
+      }
+      signal.addEventListener('abort', stopped);
+    }
+    sandbox().then((f) => {
+      // The frame has an opaque origin, which no target origin can name.
+      if (runs.has(id)) f.contentWindow.postMessage({ id, code: String(code), timeout: runLimit }, '*');
+    });
   });
+  const ok = result.ok === true;
   const parts = [];
-  if (result.logs && result.logs.length) parts.push(result.logs.join('\n'));
-  if (result.ok && result.result !== undefined) parts.push('=> ' + result.result);
-  if (!result.ok) parts.push('Error: ' + result.error);
-  return { ok: !!result.ok, text: parts.join('\n').slice(0, 20000) || '(no output)' };
+  if (Array.isArray(result.logs) && result.logs.length) parts.push(result.logs.join('\n'));
+  if (ok && typeof result.result === 'string') parts.push('=> ' + result.result);
+  if (!ok) parts.push('Error: ' + (typeof result.error === 'string' && result.error ? result.error : 'The interpreter sent no result.'));
+  return { ok, text: parts.join('\n').slice(0, 20000) || '(no output)' };
 }
 
 function documentByName(documents, name) {
@@ -273,7 +302,8 @@ function documentByName(documents, name) {
 
 /*
     Runs a tool call.  context = { documents: [{name, text}], searchDocuments(query, limit),
-    searchDiscussions(query), createFile(name, content) }.  Returns {ok, text, file?}.
+    searchDiscussions(query), createFile(name, content), signal }, signal stopping the run of
+    code with the answer.  Returns {ok, text, file?}.
 */
 export async function run(name, argumentsText, context) {
   let args = {};
@@ -289,7 +319,7 @@ export async function run(name, argumentsText, context) {
         return { ok: Number.isFinite(v), text: Number.isFinite(v) ? String(+v.toPrecision(15)) : 'Not a finite number' };
       }
       case 'run_javascript':
-        return await runJavascript(args.code || '');
+        return await runJavascript(args.code || '', context.signal);
       case 'search_documents': {
         if (!context.documents.length) return { ok: true, text: 'No document is attached to this discussion or its project.' };
         const hits = await context.searchDocuments(args.query || '', Math.min(Math.max(args.limit || 5, 1), 10));

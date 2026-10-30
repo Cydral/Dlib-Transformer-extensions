@@ -65,6 +65,10 @@ const math = [
   }
 ];
 
+// True while renderMarkdown draws an answer that streams: the code without a language waits
+// for the end of the answer to have its language detected.
+let streaming = false;
+
 const marked = new Marked({ gfm: true, breaks: false });
 marked.use({
   extensions: math,
@@ -73,10 +77,12 @@ marked.use({
       const language = String(lang || '').trim().split(/\s+/)[0].toLowerCase();
       let body = escapeHtml(text);
       const hl = window.hljs;
-      if (hl) {
+      // A block marked as plain text or as the output of a program stays as it is.
+      const plain = /^(text|txt|plain|plaintext|output)$/.test(language);
+      if (hl && !plain) {
         try {
           if (language && hl.getLanguage(language)) body = hl.highlight(text, { language, ignoreIllegals: true }).value;
-          else if (text.length < 20000) body = hl.highlightAuto(text).value;
+          else if (!streaming && text.length < 20000) body = hl.highlightAuto(text).value;
         } catch (e) {
           body = escapeHtml(text);
         }
@@ -104,9 +110,14 @@ const purifyOptions = {
   ADD_ATTR: ['data-action', 'aria-hidden']
 };
 
-export function renderMarkdown(text) {
-  const html = marked.parse(String(text || ''));
-  return DOMPurify.sanitize(html, purifyOptions);
+// The HTML of a text; live for an answer that streams, drawn again at each of its pieces.
+export function renderMarkdown(text, live) {
+  streaming = !!live;
+  try {
+    return DOMPurify.sanitize(marked.parse(String(text || '')), purifyOptions);
+  } finally {
+    streaming = false;
+  }
 }
 
 // The copy buttons of the code blocks of an element.

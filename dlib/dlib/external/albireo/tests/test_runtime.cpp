@@ -254,6 +254,71 @@ int main(int argc, char** argv)
         expect(rt.kv_bytes_used() == 0, "every block returned");
     }
 
+    // 5. A sequence that starts with the positions of another: the full blocks are shared,
+    //    the last one copied, and a sequence that writes in a shared block copies it first.
+    {
+        const long B = 16;
+        const long h = std::min(T - 1, B + 1 + T / 4);
+        // Passes of fewer tokens go through the integer kernels: they agree with the whole
+        // pass as distributions.
+        auto agree = [&](const stats& d, long batch_tokens) {
+            if (exact || batch_tokens >= qk_float_product_tokens) return d.max_abs <= 1e-3 * std::max(1.0, d.scale);
+            return d.mean_kl < 0.05 && d.top1 >= 0.85;
+        };
+        std::vector<float> logits;
+        const int a = rt.create_sequence();
+        expect(rt.reserve_sequence(a, h), "reserve before sharing");
+        forward_batch b;
+        b.tokens.assign(tokens.begin(), tokens.begin() + h);
+        b.segments.push_back({ a, 0, h });
+        rt.forward(b, logits);
+        const size_t before = rt.kv_bytes_used();
+        const int c = rt.create_sequence();
+        expect(rt.copy_sequence(a, c, h), "share a prefix");
+        expect(rt.sequence_length(c) == h, "length of the shared prefix");
+        const size_t copied = static_cast<size_t>(h % B != 0 ? B : 0) * rt.kv_bytes_per_token();
+        expect(rt.kv_bytes_used() - before == copied, "full blocks held once");
+
+        // Both sequences go on from the shared prefix, in one batch.
+        expect(rt.reserve_sequence(a, T) && rt.reserve_sequence(c, T), "reserve after sharing");
+        b.clear();
+        b.tokens.assign(tokens.begin() + h, tokens.end());
+        b.tokens.insert(b.tokens.end(), tokens.begin() + h, tokens.end());
+        b.segments.push_back({ a, 0, T - h });
+        b.segments.push_back({ c, T - h, T - h });
+        for (long i = 0; i < 2 * (T - h); ++i) b.logit_rows.push_back(i);
+        rt.forward(b, logits);
+        const stats d1 = compare(whole.data() + h * V, logits.data(), T - h, V);
+        const stats d2 = compare(whole.data() + h * V, logits.data() + (T - h) * V, T - h, V);
+        report("shared prefix, first sequence", d1);
+        report("shared prefix, second sequence", d2);
+        expect(agree(d1, 2 * (T - h)), "first sequence after sharing");
+        expect(agree(d2, 2 * (T - h)), "second sequence after sharing");
+
+        // The first sequence rewrites a shared block with other tokens; the second one keeps
+        // its positions.
+        const long cut = B / 2;
+        rt.truncate_sequence(a, cut);
+        expect(rt.reserve_sequence(a, T), "reserve a shared block for writing");
+        b.clear();
+        b.tokens.assign(static_cast<size_t>(T - cut), tokens[0]);
+        b.segments.push_back({ a, 0, T - cut });
+        rt.forward(b, logits);
+        rt.truncate_sequence(c, T - 1);
+        expect(rt.reserve_sequence(c, T), "reserve the last position again");
+        b.clear();
+        b.tokens.push_back(tokens[static_cast<size_t>(T - 1)]);
+        b.segments.push_back({ c, 0, 1 });
+        b.logit_rows.push_back(0);
+        rt.forward(b, logits);
+        const stats d3 = compare(whole.data() + (T - 1) * V, logits.data(), 1, V);
+        report("shared prefix after a write of the other sequence", d3);
+        expect(agree(d3, 1), "positions of a shared block kept");
+        rt.release_sequence(a);
+        rt.release_sequence(c);
+        expect(rt.kv_bytes_used() == 0, "every shared block returned");
+    }
+
     if (failures)
     {
         std::printf("%d checks FAILED\n", failures);

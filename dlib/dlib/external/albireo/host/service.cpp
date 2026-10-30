@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <functional>
 #include <iostream>
@@ -66,6 +67,28 @@ namespace albireo
                 if (r.as_string() == role) return true;
             return false;
         }
+
+        // The options of the socket the server listens on.
+        void set_listen_options(httplib::Server& server)
+        {
+            server.set_socket_options([](socket_t sock) {
+#if defined(_WIN32)
+                // No other process may bind the port of the service.
+                httplib::set_socket_opt(sock, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, 1);
+#else
+                httplib::set_socket_opt(sock, SOL_SOCKET, SO_REUSEADDR, 1);
+#endif
+            });
+        }
+    }
+
+    bool port_available(int port)
+    {
+        httplib::Server probe;
+        set_listen_options(probe);
+        const bool ok = probe.bind_to_port("127.0.0.1", port);
+        probe.stop();
+        return ok;
     }
 
     bool is_openvino_variant(const std::string& variant)
@@ -325,20 +348,45 @@ namespace albireo
         server_->set_read_timeout(120);
         server_->set_write_timeout(120);
         server_->new_task_queue = []() { return new httplib::ThreadPool(8, 64); };
-        server_->set_socket_options([](socket_t sock) {
-#if defined(_WIN32)
-            // No other process may bind the port of the service.
-            httplib::set_socket_opt(sock, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, 1);
-#else
-            httplib::set_socket_opt(sock, SOL_SOCKET, SO_REUSEADDR, 1);
-#endif
-        });
-        install_routes(*server_, *this);
+        set_listen_options(*server_);
         if (!server_->bind_to_port("127.0.0.1", port_))
         {
-            error = "the port " + std::to_string(port_) + " is in use or cannot be opened";
-            return false;
+            /*
+                The port of the settings is taken by another program, or reserved by the
+                system since it was chosen: the server opens the last port it served on, which
+                the settings take again so that the tray finds the service there.
+            */
+            int last = 0;
+            try
+            {
+                last = std::atoi(db_->value("server_port").c_str());
+            }
+            catch (const std::exception& e)
+            {
+                log_warning(std::string("server: the last port served on cannot be read: ") + e.what());
+            }
+            // A bind that failed leaves the server refusing the next one until stop().
+            if (last != port_ && last >= 1024 && last <= 65535) server_->stop();
+            if (last == port_ || last < 1024 || last > 65535 || !server_->bind_to_port("127.0.0.1", last))
+            {
+                error = "the port " + std::to_string(port_) + " is in use or cannot be opened";
+                return false;
+            }
+            log_warning("server: the port " + std::to_string(port_) + " is in use or cannot be opened, the service "
+                "answers on " + std::to_string(last) + ", its last port");
+            port_ = last;
+            settings_->update([last](host_settings& s) { s.port = last; });
         }
+        try
+        {
+            db_->set_value("server_port", std::to_string(port_));
+        }
+        catch (const std::exception& e)
+        {
+            log_warning(std::string("server: the port served on cannot be recorded: ") + e.what());
+        }
+        // The routes compare the Host header with the port opened.
+        install_routes(*server_, *this);
         {
             // A stop that came before the bind found no socket to close: the bound one is
             // closed here, and listen_after_bind() returns at once.
@@ -498,11 +546,16 @@ namespace albireo
         std::string role = requested;
         if (role.compare(0, 8, "albireo-") == 0) role = role.substr(8);
         if (requested.empty() || requested == "auto" || requested == "albireo") role = "general";
+        if (role == "background")
+        {
+            if (!background_model_.empty()) id = background_model_;
+            else role = "general";
+        }
         if (is_role(role))
         {
-            auto it = st.active.find(role);
-            if (it == st.active.end() && role != embedding_role) it = st.active.find("general");
-            if (it == st.active.end()) return false;
+            const std::map<std::string, std::string> models = effective_models(st);
+            const auto it = models.find(role);
+            if (it == models.end()) return false;
             id = it->second;
         }
         std::lock_guard<std::mutex> lock(m_);
@@ -548,14 +601,26 @@ namespace albireo
                 updater_->check_async();
             }
         };
-        network(settings_->get());
-        start_engines();
-        load_active_models();
+        // A task that fails, on a database that cannot be written for instance, is logged and
+        // comes again at its next turn, and the other tasks go on.
+        auto attempt = [](const char* task, const std::function<void()>& work) {
+            try
+            {
+                work();
+            }
+            catch (const std::exception& e)
+            {
+                log_error(std::string("service: ") + task + ": " + e.what());
+            }
+        };
+        attempt("network", [&]() { network(settings_->get()); });
+        attempt("engines", [&]() { start_engines(); });
+        attempt("models", [&]() { load_active_models(); });
         models_ready_ = true;
         if (stopping_) return;
-        scan_inbox();
+        attempt("import folder", [&]() { scan_inbox(); });
         unsigned catalog_seen = models_->catalog_generation();
-        ensure_default_model();
+        attempt("default models", [&]() { ensure_default_model(); });
 
         int64_t next_certificate = now_unix() + certificate_period;
         int64_t next_inbox = now_unix() + inbox_period;
@@ -566,32 +631,34 @@ namespace albireo
             if (stopping_) break;
             lock.unlock();
             const bool was_online = online;
-            network(settings_->get());
+            attempt("network", [&]() { network(settings_->get()); });
             // A new catalog, downloaded or imported, may name the default model, which
             // can be downloaded once back online.
             if (models_->catalog_generation() != catalog_seen || (online && !was_online))
             {
                 catalog_seen = models_->catalog_generation();
-                ensure_default_model();
+                attempt("default models", [&]() { ensure_default_model(); });
             }
             const int64_t now = now_unix();
             if (now >= next_inbox)
             {
                 next_inbox = now + inbox_period;
-                scan_inbox();
+                attempt("import folder", [&]() { scan_inbox(); });
             }
             if (now >= next_certificate)
             {
                 next_certificate = now + certificate_period;
-                const std::string cert_dir = join_path(data_dir_, "certificates");
-                const std::string before = certificate_thumbprint(certificate_paths(cert_dir).server_cert);
-                std::string error;
-                if (ensure_certificates(cert_dir, error)
-                    && certificate_thumbprint(certificate_paths(cert_dir).server_cert) != before)
-                {
-                    log_info("certificates: the server certificate was renewed, restart");
-                    request_restart();
-                }
+                attempt("certificates", [&]() {
+                    const std::string cert_dir = join_path(data_dir_, "certificates");
+                    const std::string before = certificate_thumbprint(certificate_paths(cert_dir).server_cert);
+                    std::string error;
+                    if (ensure_certificates(cert_dir, error)
+                        && certificate_thumbprint(certificate_paths(cert_dir).server_cert) != before)
+                    {
+                        log_info("certificates: the server certificate was renewed, restart");
+                        request_restart();
+                    }
+                });
             }
             lock.lock();
         }
@@ -715,6 +782,12 @@ namespace albireo
         // The engine is not started yet: the functions are given now, the models load with
         // the others.
         for (const auto& m : added) on_installed(m);
+        // The language model that comes with Albireo serves the work in the background.
+        background_model_.clear();
+        for (const auto& m : db_->models())
+            if (m.source == "builtin" && !is_embedding(m) && file_exists(m.file) && background_model_.empty())
+                background_model_ = m.id;
+        if (!background_model_.empty()) log_info("models: " + background_model_ + " serves the work in the background");
     }
 
     void service::note_default_failure(const json& entry, const user_error& error, const std::string& what)
@@ -864,6 +937,14 @@ namespace albireo
             std::string error;
             load_model(m, error);
         }
+        // The model of the work in the background, loaded with or without functions.
+        if (!background_model_.empty() && !stopping_
+            && std::find(done.begin(), done.end(), background_model_) == done.end())
+        {
+            installed_model m;
+            std::string error;
+            if (db_->find_model(background_model_, m) && file_exists(m.file)) load_model(m, error);
+        }
     }
 
     bool service::activate(const std::string& id, const std::string& role, user_error& error)
@@ -937,7 +1018,19 @@ namespace albireo
 
     void service::retire(const std::string& id)
     {
+        // The model of the work in the background stays loaded without functions.
+        if (!background_model_.empty() && id == background_model_) return;
         std::lock_guard<std::mutex> lock(retire_m_);
+        // The threads of the retirements that ended, which take this lock no more.
+        for (const auto& ended : ended_retirers_)
+        {
+            const auto t = std::find_if(retirers_.begin(), retirers_.end(),
+                [&ended](const std::thread& r) { return r.get_id() == ended; });
+            if (t == retirers_.end()) continue;
+            t->join();
+            retirers_.erase(t);
+        }
+        ended_retirers_.clear();
         if (stopping_ || !retiring_.insert(id).second) return;
         {
             std::lock_guard<std::mutex> state(m_);
@@ -946,37 +1039,55 @@ namespace albireo
         // No new request goes to the model; the thread waits for those it has.
         engine_.begin_unload(id);
         retirers_.emplace_back([this, id]() {
-            bool unloaded = engine_.finish_unload(id);
-            if (unloaded) log_info("models: " + id + " unloaded");
-            for (;;)
+            try
             {
-                bool remove = false;
+                bool unloaded = engine_.finish_unload(id);
+                if (unloaded) log_info("models: " + id + " unloaded");
+                for (;;)
                 {
-                    // The last check and the end of the retirement in one step, so that a
-                    // deletion asked meanwhile is either seen here or done by remove_model.
-                    std::lock_guard<std::mutex> l(retire_m_);
-                    if (removing_.count(id) == 0)
+                    bool remove = false;
                     {
-                        std::lock_guard<std::mutex> state(m_);
-                        if (unloaded) load_state_.erase(id);
-                        else load_state_[id] = "ready";
-                        retiring_.erase(id);
-                        break;
+                        // The last check and the end of the retirement in one step, so that a
+                        // deletion asked meanwhile is either seen here or done by remove_model.
+                        std::lock_guard<std::mutex> l(retire_m_);
+                        if (removing_.count(id) == 0)
+                        {
+                            std::lock_guard<std::mutex> state(m_);
+                            if (unloaded) load_state_.erase(id);
+                            else load_state_[id] = "ready";
+                            retiring_.erase(id);
+                            break;
+                        }
+                        remove = unloaded;
+                        if (remove) removing_.erase(id);
                     }
-                    remove = unloaded;
-                    if (remove) removing_.erase(id);
+                    if (!remove)
+                    {
+                        // Kept by an activation, then deleted: it leaves after all.
+                        engine_.begin_unload(id);
+                        unloaded = engine_.finish_unload(id);
+                        if (unloaded) log_info("models: " + id + " unloaded");
+                        continue;
+                    }
+                    std::string error;
+                    std::lock_guard<std::mutex> server(server_m_);
+                    if (models_ && !models_->remove(id, error)) log_warning("models: " + error);
                 }
-                if (!remove)
-                {
-                    // Kept by an activation, then deleted: it leaves after all.
-                    engine_.begin_unload(id);
-                    unloaded = engine_.finish_unload(id);
-                    if (unloaded) log_info("models: " + id + " unloaded");
-                    continue;
-                }
-                std::string error;
-                std::lock_guard<std::mutex> server(server_m_);
-                if (models_ && !models_->remove(id, error)) log_warning("models: " + error);
+            }
+            catch (const std::exception& e)
+            {
+                // A database that cannot be written, for instance: the retirement ends all the
+                // same, so that no activation waits for it.
+                log_error("models: " + id + ": " + e.what());
+                std::lock_guard<std::mutex> l(retire_m_);
+                removing_.erase(id);
+                retiring_.erase(id);
+                std::lock_guard<std::mutex> state(m_);
+                load_state_.erase(id);
+            }
+            {
+                std::lock_guard<std::mutex> l(retire_m_);
+                ended_retirers_.push_back(std::this_thread::get_id());
             }
             retire_cv_.notify_all();
         });
@@ -1093,6 +1204,19 @@ namespace albireo
         return true;
     }
 
+    std::map<std::string, std::string> service::effective_models(const host_settings& st) const
+    {
+        std::map<std::string, std::string> out = st.active;
+        const auto general = st.active.find("general");
+        for (const char* role : model_roles)
+        {
+            if (out.count(role)) continue;
+            if (general != st.active.end()) out[role] = general->second;
+            else if (!background_model_.empty()) out[role] = background_model_;
+        }
+        return out;
+    }
+
     std::string service::resolve_model(const std::string& requested)
     {
         const host_settings st = settings_->get();
@@ -1103,6 +1227,13 @@ namespace albireo
         std::string role = requested;
         if (role.compare(0, 8, "albireo-") == 0) role = role.substr(8);
         if (requested.empty() || requested == "auto" || requested == "albireo") role = "general";
+        // The work in the background goes to the model that comes with Albireo, else to the
+        // general model.
+        if (role == "background")
+        {
+            if (!background_model_.empty() && is_loaded(background_model_)) return background_model_;
+            role = "general";
+        }
         const auto embedding = st.active.find(embedding_role);
         const std::string embedder = embedding == st.active.end() ? std::string() : embedding->second;
         if (role == embedding_role || requested == embedder) return std::string();
@@ -1110,10 +1241,11 @@ namespace albireo
         {
             auto it = st.active.find(role);
             if (it != st.active.end() && is_loaded(it->second)) return it->second;
-            // A role without its own model is served by the general model, else by the
-            // first language model loaded.
+            // A role without its own model is served by the general model, else by the model
+            // that comes with Albireo, else by the first language model loaded.
             it = st.active.find("general");
             if (it != st.active.end() && is_loaded(it->second)) return it->second;
+            if (!background_model_.empty() && is_loaded(background_model_)) return background_model_;
             for (const auto& id : loaded)
                 if (id != embedder) return id;
             return std::string();
@@ -1215,9 +1347,12 @@ namespace albireo
         query["op"] = "models";
         s["loaded_models"] = engine_.running() ? engine_.query(query)["models"] : json::array();
 
-        json active = json::object();
-        for (const auto& kv : st.active) active[kv.first] = kv.second;
+        json active = json::object(), selected = json::object();
+        for (const auto& kv : effective_models(st)) active[kv.first] = kv.second;
+        for (const auto& kv : st.active) selected[kv.first] = kv.second;
         s["active"] = active;
+        s["selected"] = selected;
+        s["background"] = background_model_;
         json loading = json::object();
         {
             std::lock_guard<std::mutex> lock(m_);
@@ -1357,7 +1492,8 @@ namespace albireo
             std::string output;
             log_info("engines: measuring " + o.key + " with " + model.id);
             const std::vector<std::string> args = { "--bench-engine", o.candidate->path, model.file, config.dump() };
-            const int code = run_process(executable_path(), args, &output, 600000);
+            // The measure ends with the service, which then waits for no child process.
+            const int code = run_process(executable_path(), args, &output, 600000, &stopping_);
             const size_t start = output.rfind("\n{");
             const json r = json::parse_or_null(start == std::string::npos ? output : output.substr(start + 1));
             if (code == 0 && r["tokens_per_second"].as_double(0) > 0)

@@ -89,6 +89,11 @@ namespace albireo
         void admit(loaded_model& m);
         bool assign_sequence(loaded_model& m, request_state& r);
         bool reserve(loaded_model& m, int seq, long length);
+        bool preempt(loaded_model& m, const request_state* keep = nullptr);
+        void requeue_preempted(loaded_model& m);
+        void drop_cancelled(loaded_model& m);
+        void abandon(loaded_model& m, const std::string& code, const std::string& message);
+        void trim_idle(const std::vector<std::shared_ptr<loaded_model>>& models);
         void handle_token(loaded_model& m, request_state& r, int token);
         void emit_text(loaded_model& m, request_state& r, const std::string& text);
         void finish(loaded_model& m, request_state& r, const std::string& reason, bool keep_cache = true);
@@ -97,7 +102,8 @@ namespace albireo
         json model_info(const loaded_model& m) const;
         json stats();
 
-        json settings_;
+        // Read only: the const accessors of json never insert the keys they look for.
+        const json settings_;
         log_sink log_;
         std::unique_ptr<thread_pool> pool_;
 #ifdef ALBIREO_TENSOR_BACKEND
@@ -106,6 +112,8 @@ namespace albireo
 #endif
         int threads_ = 1;
 
+        // Serializes the loading of models.
+        std::mutex loading_;
         std::mutex mutex_;
         std::condition_variable wake_;
         std::condition_variable unloaded_;

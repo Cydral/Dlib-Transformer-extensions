@@ -82,6 +82,14 @@ namespace albireo
         // this object.
         std::unique_ptr<matmul_offload> make_offload(const std::string& model = std::string());
 
+        /*!
+            ensures
+                - Makes the device of the engine the current one of the calling thread, for
+                  the backends that keep one per thread (CUDA); returns false when the
+                  runtime refuses it.  The products bind their thread themselves.
+        !*/
+        bool bind_thread();
+
         // The counters of the device, for the statistics of the engine.
         json stats() const;
 

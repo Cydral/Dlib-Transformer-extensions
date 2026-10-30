@@ -68,18 +68,24 @@ schemas = {
                        "description": "Tokens to generate at most; by default up to the end of the context."},
         "max_completion_tokens": {"type": "integer"},
         "temperature": {"type": "number", "minimum": 0, "maximum": 2},
-        "top_p": {"type": "number"}, "top_k": {"type": "integer"}, "min_p": {"type": "number"},
+        "top_p": {"type": "number"},
+        "top_k": {"type": "integer", "minimum": 0, "description": "Candidates kept, 1024 at most; 0 for none."},
+        "min_p": {"type": "number"},
         "presence_penalty": {"type": "number"}, "frequency_penalty": {"type": "number"},
         "repeat_penalty": {"type": "number"}, "repeat_last_n": {"type": "integer"},
         "seed": {"type": "integer"},
         "stop": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}, "maxItems": 16}]},
-        "logit_bias": {"type": "object", "additionalProperties": {"type": "number"}}}},
+        "logit_bias": {"type": "object", "additionalProperties": {"type": "number"},
+                       "description": "Bias added to the logits of tokens, keyed by token identifiers of the "
+                                      "vocabulary of the model; another key is refused."}}},
     "ChatCompletionRequest": {"allOf": [ref("Sampling"), {
         "type": "object", "required": ["messages"],
         "properties": {
             "model": {"type": "string",
-                      "description": "A model identifier, a function (albireo-general, albireo-code, albireo-security) "
-                                     "or auto. A function without a model of its own is served by the general model.",
+                      "description": "A model identifier, a function (albireo-general, albireo-code, albireo-security), "
+                                     "albireo-background or auto. A function without a model of its own is served by "
+                                     "the general model; albireo-background, the work done in the background (titles, "
+                                     "summaries, memory), by the model that comes with Albireo, else the general one.",
                       "example": "albireo-general"},
             "messages": {"type": "array", "items": ref("Message")},
             "stream": {"type": "boolean", "default": False},
@@ -172,7 +178,9 @@ schemas = {
                     "updates come from imports, and the service opens no connection."},
         "proxy": {"type": "string",
                   "description": "Proxy of the downloads: empty for the proxy of the system, none for a direct "
-                                 "connection, or http://[user:password@]host:port."}}},
+                                 "connection, or http://[user:password@]host:port.  The settings give the password "
+                                 "as ********; that value sent back keeps the stored password when the user, the "
+                                 "host and the port stay the same, and is refused (code proxy_password) otherwise."}}},
 }
 
 paths = {
@@ -206,7 +214,20 @@ paths = {
             "edition": {"type": "string", "description": "The edition, Community Edition."},
             "version": {"type": "string"},
             "state": {"type": "string", "enum": ["starting", "ready"]},
-            "starting": {"type": "string", "enum": ["engines", "models"]}}})}}},
+            "starting": {"type": "string", "enum": ["engines", "models"]},
+            "active": {"type": "object", "additionalProperties": {"type": "string"},
+                       "description": "The model of each function: general, code, security, embedding. A "
+                                      "function without a model chosen for it takes the general model, else the "
+                                      "model that comes with Albireo."},
+            "selected": {"type": "object", "additionalProperties": {"type": "string"},
+                         "description": "The models chosen for the functions, which Deactivate gives back."},
+            "background": {"type": "string",
+                           "description": "The model that comes with Albireo and serves albireo-background, which "
+                                          "stays loaded; empty without one."},
+            "loaded_models": {"type": "array", "items": {"type": "object"},
+                              "description": "The models of the engine, with their context and capabilities."},
+            "models_state": {"type": "object", "additionalProperties": {"type": "string"},
+                             "description": "loading, ready, unloading, removing, or the error of a load."}}})}}},
     "/albireo/v1/models": {"get": {
         "tags": ["Service"], "summary": "Catalog, installed models, downloads and active models",
         "description": "The language models: those that come with Albireo first (builtin), then the catalog and "
@@ -224,13 +245,16 @@ paths = {
                 "builtin": {"type": "boolean", "description": "Comes with Albireo: it cannot be deleted."},
                 "size": {"type": "integer"}, "quantization": {"type": "string"},
                 "description": {"type": "string"}}}},
+            "background": {"type": "string", "description": "The model of albireo-background, empty without one."},
             "embedding_models": {"type": "array", "items": {"type": "object", "properties": {
                 "id": {"type": "string"}, "name": {"type": "string"},
                 "source": {"type": "string", "enum": ["builtin", "catalog", "import"]},
                 "size": {"type": "integer"}}}, "description": "The installed embedding models."},
             "downloads": {"type": "array", "items": {"type": "object"}},
             "active": {"type": "object", "additionalProperties": {"type": "string"},
-                       "description": "The model of each function."},
+                       "description": "The model of each function, as in the status."},
+            "selected": {"type": "object", "additionalProperties": {"type": "string"},
+                         "description": "The models chosen for the functions."},
             "loaded": {"type": "array", "items": {"type": "string"}, "description": "Models of the engine."},
             "leaving": {"type": "object", "additionalProperties": {"type": "string", "enum": ["unloading",
                                                                                             "removing"]},
@@ -308,10 +332,16 @@ paths = {
         "responses": {"200": reply("Imported", {"type": "object"}), "400": reply("Refused", {"type": "object"})}}},
     "/albireo/v1/settings": {
         "get": {"tags": ["Administration"], "security": admin, "summary": "Settings of the service",
-                "responses": {"200": reply("The settings", {"type": "object"})}},
+                "responses": {"200": reply("The settings, the password of the proxy given as ********",
+                                           {"type": "object"})}},
         "put": {"tags": ["Administration"], "security": admin, "summary": "Changes settings",
+                "description": "A new port is opened once before it is saved.",
                 "requestBody": json_body(ref("Settings")),
-                "responses": {"200": reply("Saved; restart tells whether the service restarts", {"type": "object"})}}},
+                "responses": {"200": reply("Saved; restart tells whether the service restarts", {"type": "object"}),
+                              "400": reply("A value out of range, or the masked password of the proxy with another "
+                                           "user, host or port (code proxy_password)", ref("Error")),
+                              "409": reply("The new port is in use or cannot be opened (code port_unavailable)",
+                                           ref("Error"))}}},
     "/albireo/v1/updates/check": {"post": {"tags": ["Administration"], "security": admin,
                                            "summary": "Checks for an update and downloads it, in the background",
                                            "responses": dict({"202": reply("State", {"type": "object"})},
@@ -340,10 +370,16 @@ doc = {
         "description": "The interface of the Albireo service, served on https://localhost (port 8443 unless changed in "
                        "the tray). The routes under /v1 follow the OpenAI interface, so that its client libraries "
                        "work with base_url https://localhost:8443/v1 and any API key. The functions albireo-general, "
-                       "albireo-code and albireo-security name the models activated in the tray, and "
-                       "albireo-embedding the embedding model of the search in documents.\n\n"
+                       "albireo-code and albireo-security name the models activated in the tray, "
+                       "albireo-background the model that comes with Albireo, which the web application uses for its "
+                       "work in the background, and albireo-embedding the embedding model of the search in "
+                       "documents.\n\n"
                        "The administration routes require the token of the data folder of the service "
-                       "(admin.token) in the X-Albireo-Admin header.",
+                       "(admin.token) in the X-Albireo-Admin header.\n\n"
+                       "Requests carry JSON bodies of 64 MB and 524,288 values at most, with their length: a body "
+                       "without length is refused with 411, a longer one with 413, another type with 415. GET, HEAD, "
+                       "DELETE and OPTIONS take no body (400). An answer being written whose model has no memory left "
+                       "for its keys and values ends with the error code out_of_memory.",
         "license": {"name": "Boost Software License 1.0", "url": "https://www.boost.org/LICENSE_1_0.txt"},
         "contact": {"name": "Cydral Technology", "url": "https://github.com/Cydral/Dlib-Transformer-extensions"}},
     "servers": [{"url": "/"}],

@@ -231,6 +231,9 @@ namespace albireo
         std::vector<std::unique_ptr<chunk>> chunks;
         std::atomic<uint64_t> received{0};
         std::atomic<bool> cancel{false};
+        // Cancelled by the user, set under m_: the progress and the partial file are dropped,
+        // where a stop of the service keeps them for the next start.
+        std::atomic<bool> abandoned{false};
         std::string state = "queued";
         user_error error;
         double speed = 0;
@@ -241,7 +244,26 @@ namespace albireo
     model_manager::model_manager(store& db, const std::string& models_dir, const std::string& catalog_url)
         : db_(db), dir_(models_dir), catalog_url_(catalog_url)
     {
-        make_dirs(dir_);
+        /*
+            The service writes, renames and deletes the model files with its rights: only
+            SYSTEM and the administrators may change the folder (secure_folder()).  A folder
+            that cannot be made so leaves the models to the folder of the data.
+        */
+        std::string error;
+        if (!secure_folder(dir_, error))
+        {
+            const std::string fallback = join_path(data_dir(), "models");
+            log_error("models: " + error + "; the models go to " + fallback);
+            dir_ = fallback;
+            if (!secure_folder(dir_, error))
+            {
+                log_error("models: " + error);
+                make_dirs(dir_);
+            }
+        }
+        // The folder by its own path: a link placed later on its way shows (direct_path()).
+        const std::string resolved = final_path(dir_);
+        if (!resolved.empty()) dir_ = resolved;
         catalog_ = json::parse_or_null(db_.value("catalog", "{}"));
         if (!catalog_.is_object()) catalog_ = json::object();
     }
@@ -620,16 +642,20 @@ namespace albireo
         }
 
         std::lock_guard<std::mutex> lock(m_);
+        // The worker of an earlier download of the model, which may still take m_ in its last
+        // steps, is joined by the new worker before it starts.
+        std::thread previous;
         auto it = jobs_.find(id);
         if (it != jobs_.end())
         {
             if (it->second->state == "downloading" || it->second->state == "verifying" || it->second->state == "queued")
                 return true;
-            if (it->second->worker.joinable()) it->second->worker.join();
+            previous = std::move(it->second->worker);
         }
         jobs_[id] = j;
         j->started = now_unix();
-        j->worker = std::thread([this, j]() {
+        j->worker = std::thread([this, j, before = std::move(previous)]() mutable {
+            if (before.joinable()) before.join();
             try
             {
                 run_job(j);
@@ -654,22 +680,31 @@ namespace albireo
         j->id = id;
         j->state = "error";
         j->error = error;
-        std::lock_guard<std::mutex> lock(m_);
-        auto it = jobs_.find(id);
-        if (it != jobs_.end())
+        std::thread previous;
         {
-            const std::string& s = it->second->state;
-            if (s == "downloading" || s == "verifying" || s == "queued") return;
-            if (it->second->worker.joinable()) it->second->worker.join();
+            std::lock_guard<std::mutex> lock(m_);
+            auto it = jobs_.find(id);
+            if (it != jobs_.end())
+            {
+                const std::string& s = it->second->state;
+                if (s == "downloading" || s == "verifying" || s == "queued") return;
+                previous = std::move(it->second->worker);
+            }
+            jobs_[id] = j;
         }
-        jobs_[id] = j;
+        // The worker of the download that ended, joined outside m_, which its last steps may take.
+        if (previous.joinable()) previous.join();
     }
 
     void model_manager::cancel_download(const std::string& id)
     {
         std::lock_guard<std::mutex> lock(m_);
         auto it = jobs_.find(id);
-        if (it != jobs_.end()) it->second->cancel = true;
+        if (it != jobs_.end())
+        {
+            it->second->abandoned = true;
+            it->second->cancel = true;
+        }
         db_.remove_download_state(id);
     }
 
@@ -715,13 +750,16 @@ namespace albireo
             j->state = s;
             j->error = e;
         };
+        // The progress is written under m_, where cancel_download() removes it, so that a
+        // download cancelled by the user never comes back at the next start.
         auto save = [&]() {
             json st = json::object();
             st["sha256"] = j->entry["sha256"];
             json done = json::array();
             for (const auto& c : j->chunks) done.push_back(static_cast<unsigned long long>(c->done.load()));
             st["done"] = done;
-            db_.set_download_state(j->id, st);
+            std::lock_guard<std::mutex> lock(m_);
+            if (!j->abandoned) db_.set_download_state(j->id, st);
         };
 
         log_info("models: downloading " + j->id + " (" + std::to_string(j->total >> 20) + " MB, "
@@ -867,7 +905,7 @@ namespace albireo
             if (j->cancel)
             {
                 set_state("cancelled");
-                if (db_.download_state(j->id).is_null()) remove_file(j->partial);
+                if (j->abandoned) remove_file(j->partial);
                 log_info("models: download of " + j->id + " cancelled");
                 return;
             }
@@ -886,15 +924,18 @@ namespace albireo
                 // Stopped during the check: the file is kept and checked again at the
                 // next start, unless the download itself was cancelled.
                 set_state("cancelled");
-                if (db_.download_state(j->id).is_null()) remove_file(j->partial);
+                if (j->abandoned) remove_file(j->partial);
                 return;
             }
             if (sha == j->entry["sha256"].as_string())
             {
                 std::string error;
-                if (!rename_file(j->partial, j->target) ||
-                    !install_file(j->id, j->target, j->entry, sha, "catalog", error))
+                const bool renamed = rename_file(j->partial, j->target);
+                if (!renamed || !install_file(j->id, j->target, j->entry, sha, "catalog", error))
                 {
+                    // A model the database could not record takes its partial name again: the
+                    // next start finds its progress complete, checks it and installs it.
+                    if (renamed) rename_file(j->target, j->partial);
                     if (error.empty()) error = "cannot install " + j->target;
                     set_state("error", user_error().set(error, "download_install").arg("e", error));
                     return;
@@ -954,8 +995,25 @@ namespace albireo
             error = file + " is empty";
             return false;
         }
-        db_.put_model(m);
-        if (installed_cb_) installed_cb_(m);
+        try
+        {
+            db_.put_model(m);
+        }
+        catch (const std::exception& e)
+        {
+            // A database that cannot be written, on a full disk for instance.
+            error = "the model cannot be recorded: " + std::string(e.what());
+            return false;
+        }
+        // The model is installed whatever the functions it receives.
+        try
+        {
+            if (installed_cb_) installed_cb_(m);
+        }
+        catch (const std::exception& e)
+        {
+            log_error("models: " + id + " is installed, its functions are not given: " + e.what());
+        }
         return true;
     }
 
@@ -987,7 +1045,13 @@ namespace albireo
             r["error"] = "not installed";
             return r;
         }
-        const std::string sha = sha256_file(m.file);
+        // The check ends at once when the service stops.
+        const std::string sha = sha256_file(m.file, nullptr, &stopped_);
+        if (stopped_)
+        {
+            r["error"] = "the service stops";
+            return r;
+        }
         r["sha256"] = sha;
         r["local_match"] = !sha.empty() && sha == m.sha256;
         json entry;
@@ -1048,10 +1112,14 @@ namespace albireo
                     ? own + "-import" : own;
             entry.erase("albireo_id");
             entry["id"] = id;
-            // A sidecar description written next to the file, if any.
+            /*
+                A sidecar description written next to the file, read in the import folder
+                only, where the administrators alone place files: elsewhere a link could
+                make the service read a file of another user into the description.
+            */
             std::string side;
-            if (f.size() > 5 && f.substr(f.size() - 5) == ".gguf" &&
-                read_file(f.substr(0, f.size() - 5) + ".json", side, 1u << 20))
+            if (f.size() > 5 && f.substr(f.size() - 5) == ".gguf" && path_inside(f, join_path(data_dir(), "import"))
+                && read_file(f.substr(0, f.size() - 5) + ".json", side, 1u << 20))
             {
                 const json s = json::parse_or_null(side);
                 for (const auto& kv : s.items())
@@ -1063,6 +1131,12 @@ namespace albireo
             error = "invalid identifier";
             return false;
         }
+        // The models folder must still be reached without a link before the service writes in it.
+        if (!direct_path(dir_))
+        {
+            error = "the models folder " + dir_ + " now leads elsewhere through a link";
+            return false;
+        }
         const std::string target = join_path(dir_, id + ".gguf");
         installed_model existing;
         if (db_.find_model(id, existing) && existing.sha256 == sha && file_exists(existing.file))
@@ -1072,7 +1146,9 @@ namespace albireo
         }
         // Moved when asked and when the models folder is on the same volume; copied
         // otherwise, through a temporary name, then checked again.
-        if (target != f && !(move && rename_file(f, target)))
+        const bool moved = target != f && move && rename_file(f, target);
+        const bool copy = target != f && !moved;
+        if (copy)
         {
             const std::string tmp = target + ".partial";
             const bool copied = copy_file(f, tmp, &stopped_);
@@ -1082,9 +1158,18 @@ namespace albireo
                 error = stopped_ ? "the service stops" : "copy failed";
                 return false;
             }
-            if (move) remove_file(f);
         }
-        return install_file(id, target, entry, sha, known ? "catalog" : "import", error);
+        // A model the database cannot record leaves the models folder: the file moved goes
+        // back where it came from, and the copy is deleted.
+        if (!install_file(id, target, entry, sha, known ? "catalog" : "import", error))
+        {
+            if (moved) rename_file(target, f);
+            else if (copy) remove_file(target);
+            return false;
+        }
+        // The source of a copy leaves once the model is recorded.
+        if (copy && move) remove_file(f);
+        return true;
     }
 
     std::vector<installed_model> model_manager::register_builtin(const std::string& dir,
@@ -1113,8 +1198,8 @@ namespace albireo
             d["builtin"] = true;
             installed_model existing;
             const bool known = db_.find_model(id, existing);
-            if (known && existing.source == "builtin" && existing.file == file && existing.sha256 == e["sha256"].as_string()
-                && existing.descriptor == d)
+            if (known && existing.source == "builtin" && existing.file == file
+                && existing.sha256 == e["sha256"].as_string() && existing.descriptor == d)
                 continue;
             installed_model m;
             m.id = id;
@@ -1141,6 +1226,22 @@ namespace albireo
         return added;
     }
 
+    namespace
+    {
+        // Whether an import reads an entry: on Windows, where the service reads with the rights
+        // of the system, a link is left out, since it may lead to the files of another user or
+        // to a share.
+        bool importable(const std::string& p)
+        {
+#if defined(_WIN32)
+            return !is_link(p);
+#else
+            (void)p;
+            return true;
+#endif
+        }
+    }
+
     json model_manager::import_path(const std::string& path, bool move)
     {
         json result = json::object();
@@ -1151,10 +1252,14 @@ namespace albireo
         {
             // The folder and its models subfolder, the layout of an offline bundle.
             for (const std::string& dir : { path, join_path(path, "models") })
+            {
+                if (dir != path && !importable(dir)) continue;
                 for (const auto& n : list_dir(dir))
-                    if (n.size() > 5 && n.substr(n.size() - 5) == ".gguf") files.push_back(join_path(dir, n));
+                    if (n.size() > 5 && n.substr(n.size() - 5) == ".gguf" && importable(join_path(dir, n)))
+                        files.push_back(join_path(dir, n));
+            }
         }
-        else if (file_exists(path))
+        else if (file_exists(path) && importable(path))
         {
             files.push_back(path);
         }

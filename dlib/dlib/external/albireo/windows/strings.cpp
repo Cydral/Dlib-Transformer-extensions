@@ -133,21 +133,21 @@ namespace albireo
             { "models_title", { "Albireo models", "Modèles d'Albireo", "Albireo-Modelle", "Modelli di Albireo",
                 "Modelos de Albireo" } },
             { "models_intro", {
-                "Up to three models answer, one per function; a function without a model uses the general model. "
-                "The inputs of a model decide the attachments of the web application; the document search has its "
-                "own embedding model.",
+                "Up to three models answer, one per function; a function without a model uses the general model, "
+                "else the model that comes with Albireo. The inputs of a model decide the attachments of the web "
+                "application; the document search has its own embedding model.",
                 "Jusqu'à trois modèles répondent, un par fonction ; une fonction sans modèle utilise le modèle "
-                "général. Les entrées d'un modèle décident des pièces jointes de l'application web ; la recherche "
-                "documentaire a son propre modèle d'embeddings.",
+                "général, sinon le modèle livré avec Albireo. Les entrées d'un modèle décident des pièces jointes "
+                "de l'application web ; la recherche documentaire a son propre modèle d'embeddings.",
                 "Bis zu drei Modelle antworten, eines pro Funktion; eine Funktion ohne Modell verwendet das "
-                "allgemeine Modell. Die Eingaben eines Modells bestimmen die Anhänge der Webanwendung; die "
-                "Dokumentensuche hat ihr eigenes Embedding-Modell.",
-                "Fino a tre modelli rispondono, uno per funzione; una funzione senza modello usa il modello generale. "
-                "Gli ingressi di un modello decidono gli allegati dell'applicazione web; la ricerca nei documenti ha "
-                "il proprio modello di embedding.",
-                "Hasta tres modelos responden, uno por función; una función sin modelo usa el modelo general. "
-                "Las entradas de un modelo deciden los adjuntos de la aplicación web; la búsqueda en documentos "
-                "tiene su propio modelo de embeddings." } },
+                "allgemeine Modell, sonst das mit Albireo gelieferte Modell. Die Eingaben eines Modells bestimmen "
+                "die Anhänge der Webanwendung; die Dokumentensuche hat ihr eigenes Embedding-Modell.",
+                "Fino a tre modelli rispondono, uno per funzione; una funzione senza modello usa il modello generale, "
+                "altrimenti il modello fornito con Albireo. Gli ingressi di un modello decidono gli allegati "
+                "dell'applicazione web; la ricerca nei documenti ha il proprio modello di embedding.",
+                "Hasta tres modelos responden, uno por función; una función sin modelo usa el modelo general, si no "
+                "el modelo incluido con Albireo. Las entradas de un modelo deciden los adjuntos de la aplicación "
+                "web; la búsqueda en documentos tiene su propio modelo de embeddings." } },
             { "col_model", { "Model", "Modèle", "Modell", "Modello", "Modelo" } },
             { "col_roles", { "Functions", "Fonctions", "Funktionen", "Funzioni", "Funciones" } },
             { "col_size", { "Size", "Taille", "Größe", "Dimensione", "Tamaño" } },
@@ -166,6 +166,10 @@ namespace albireo
                 "Ricerca nei documenti", "Búsqueda en documentos" } },
             { "role_security", { "Cybersecurity", "Cybersécurité", "Cybersicherheit", "Cybersicurezza",
                 "Ciberseguridad" } },
+            { "role_background", { "Background work", "Tâches de fond", "Hintergrundaufgaben",
+                "Attività in background", "Tareas en segundo plano" } },
+            { "roles_all", { "All functions", "Toutes les fonctions", "Alle Funktionen", "Tutte le funzioni",
+                "Todas las funciones" } },
             { "state_installed", { "Installed", "Installé", "Installiert", "Installato", "Instalado" } },
             { "state_available", { "Available", "Disponible", "Verfügbar", "Disponibile", "Disponible" } },
             { "state_downloading", { "Downloading {p} %", "Téléchargement {p} %", "Download {p} %", "Download {p} %",
@@ -188,6 +192,18 @@ namespace albireo
             { "err_service", { "The Albireo service does not answer ({e}).", "Le service Albireo ne répond pas ({e}).",
                 "Der Albireo-Dienst antwortet nicht ({e}).", "Il servizio Albireo non risponde ({e}).",
                 "El servicio Albireo no responde ({e})." } },
+            { "err_port_unavailable", { "The port {port} is in use or cannot be opened: choose another one.",
+                "Le port {port} est utilisé ou ne peut pas être ouvert : choisissez-en un autre.",
+                "Der Port {port} wird verwendet oder kann nicht geöffnet werden: Wählen Sie einen anderen.",
+                "La porta {port} è in uso o non può essere aperta: sceglietene un'altra.",
+                "El puerto {port} está en uso o no se puede abrir: elija otro." } },
+            { "err_proxy_password", { "The masked password of the proxy applies to its saved address and user only: "
+                "type the password again.", "Le mot de passe masqué du proxy ne vaut que pour l'adresse et "
+                "l'utilisateur enregistrés : saisissez à nouveau le mot de passe.", "Das maskierte Kennwort des "
+                "Proxys gilt nur für die gespeicherte Adresse und den gespeicherten Benutzer: Geben Sie das Kennwort "
+                "erneut ein.", "La password mascherata del proxy vale solo per l'indirizzo e l'utente salvati: "
+                "digitate di nuovo la password.", "La contraseña oculta del proxy solo sirve para la dirección y el "
+                "usuario guardados: escriba de nuevo la contraseña." } },
             { "err_not_in_catalog", { "{m} is not in the catalog.", "{m} ne figure pas dans le catalogue.",
                 "{m} ist nicht im Katalog.", "{m} non è nel catalogo.", "{m} no está en el catálogo." } },
             { "err_catalog_entry", { "The catalog entry of {m} is not valid; update the catalog.",
@@ -458,6 +474,11 @@ namespace albireo
                 "Leer: Einstellungen des Systems; none: direkte Verbindung; oder http://Host:Port",
                 "Vuoto: impostazioni del sistema; none: connessione diretta; oppure http://host:porta",
                 "Vacío: ajustes del sistema; none: conexión directa; o http://host:puerto" } },
+            { "proxy_mask_hint", { "******** keeps the saved password while the address and the user stay the same.",
+                "******** conserve le mot de passe enregistré tant que l'adresse et l'utilisateur restent les mêmes.",
+                "******** behält das gespeicherte Kennwort, solange Adresse und Benutzer gleich bleiben.",
+                "******** conserva la password salvata finché indirizzo e utente restano gli stessi.",
+                "******** conserva la contraseña guardada mientras la dirección y el usuario no cambien." } },
             { "lang_auto", { "Same as Windows", "Comme Windows", "Wie Windows", "Come Windows", "Como Windows" } },
             { "lbl_auto_updates", { "Check for updates when the service starts",
                 "Rechercher les mises à jour au démarrage du service", "Beim Start des Dienstes nach Updates suchen",
@@ -565,6 +586,30 @@ namespace albireo
             { "folder_programs", { "Programs", "Programmes", "Programme", "Programmi", "Programas" } },
             { "folder_models", { "Models", "Modèles", "Modelle", "Modelli", "Modelos" } },
             { "browse", { "Browse…", "Parcourir…", "Durchsuchen…", "Sfoglia…", "Examinar…" } },
+            { "folder_not_local", { "{d} is not a folder of a drive of this computer.",
+                "{d} n'est pas un dossier d'un lecteur de cet ordinateur.",
+                "{d} ist kein Ordner eines Laufwerks dieses Computers.",
+                "{d} non è una cartella di un'unità di questo computer.",
+                "{d} no es una carpeta de una unidad de este equipo." } },
+            { "folder_system", { "{d} is the root of a drive, or a folder of Windows or of the users: choose a folder "
+                "of its own for Albireo.", "{d} est la racine d'un lecteur, ou un dossier de Windows ou des "
+                "utilisateurs : choisissez un dossier propre à Albireo.", "{d} ist das Stammverzeichnis eines "
+                "Laufwerks oder ein Ordner von Windows oder der Benutzer: Wählen Sie einen eigenen Ordner für "
+                "Albireo.", "{d} è la radice di un'unità, o una cartella di Windows o degli utenti: scegliete una "
+                "cartella dedicata ad Albireo.", "{d} es la raíz de una unidad, o una carpeta de Windows o de los "
+                "usuarios: elija una carpeta propia para Albireo." } },
+            { "folder_not_empty", { "{d} already holds other files: choose a new or empty folder.",
+                "{d} contient déjà d'autres fichiers : choisissez un dossier nouveau ou vide.",
+                "{d} enthält bereits andere Dateien: Wählen Sie einen neuen oder leeren Ordner.",
+                "{d} contiene già altri file: scegliete una cartella nuova o vuota.",
+                "{d} ya contiene otros archivos: elija una carpeta nueva o vacía." } },
+            { "folder_foreign", { "{d} belongs to another user, or a link made by another user leads to it: choose "
+                "another folder.", "{d} appartient à un autre utilisateur, ou un lien créé par un autre utilisateur "
+                "y mène : choisissez un autre dossier.", "{d} gehört einem anderen Benutzer, oder ein symbolischer "
+                "Link eines anderen Benutzers führt dorthin: Wählen Sie einen anderen Ordner.", "{d} appartiene a un "
+                "altro utente, oppure vi conduce un collegamento simbolico creato da un altro utente: scegliete "
+                "un'altra cartella.", "{d} pertenece a otro usuario, o un enlace creado por otro usuario lleva a "
+                "ella: elija otra carpeta." } },
             { "space_required", { "Space required by the programs: {s}", "Espace nécessaire aux programmes : {s}",
                 "Speicherbedarf der Programme: {s}", "Spazio richiesto dai programmi: {s}",
                 "Espacio necesario para los programas: {s}" } },
@@ -643,6 +688,11 @@ namespace albireo
                 "impostazioni di questo computer e all'applicazione web.",
                 "Albireo funciona como servicio. Su icono en el área de notificación da acceso a los modelos, a los "
                 "ajustes de este equipo y a la aplicación web." } },
+            { "bundle_notice", { "The offline bundle next to the installer was not copied whole: {e}",
+                "Le paquet hors ligne placé à côté du programme d'installation n'a pas été copié entièrement : {e}",
+                "Das Offline-Paket neben dem Installationsprogramm wurde nicht vollständig kopiert: {e}",
+                "Il pacchetto offline accanto al programma di installazione non è stato copiato per intero: {e}",
+                "El paquete sin conexión junto al programa de instalación no se copió por completo: {e}" } },
             { "opt_launch", { "Open Albireo now", "Ouvrir Albireo maintenant", "Albireo jetzt öffnen",
                 "Apri Albireo ora", "Abrir Albireo ahora" } },
             { "btn_back", { "< Back", "< Précédent", "< Zurück", "< Indietro", "< Atrás" } },
@@ -684,11 +734,20 @@ namespace albireo
             { "admin_required", { "Administrator rights are required.", "Les droits d'administrateur sont nécessaires.",
                 "Administratorrechte sind erforderlich.", "Sono necessari i diritti di amministratore.",
                 "Se necesitan derechos de administrador." } },
-            { "reboot_note", { "Some files were in use; they will be replaced at the next restart of Windows.",
-                "Certains fichiers étaient utilisés ; ils seront remplacés au prochain redémarrage de Windows.",
-                "Einige Dateien waren in Verwendung; sie werden beim nächsten Windows-Neustart ersetzt.",
-                "Alcuni file erano in uso; verranno sostituiti al prossimo riavvio di Windows.",
-                "Algunos archivos estaban en uso; se reemplazarán en el próximo reinicio de Windows." } },
+            { "not_installed", { "Albireo is not installed on this computer.",
+                "Albireo n'est pas installé sur cet ordinateur.", "Albireo ist auf diesem Computer nicht installiert.",
+                "Albireo non è installato su questo computer.", "Albireo no está instalado en este equipo." } },
+            { "no_payload", { "This copy of the installer, kept in the folder of Albireo, only uninstalls it. To "
+                "install or update Albireo, start the installer you downloaded.", "Cette copie du programme "
+                "d'installation, conservée dans le dossier d'Albireo, sert uniquement à le désinstaller. Pour "
+                "installer ou mettre à jour Albireo, lancez le programme d'installation téléchargé.", "Diese Kopie "
+                "des Installationsprogramms im Ordner von Albireo dient nur zur Deinstallation. Starten Sie zum "
+                "Installieren oder Aktualisieren von Albireo das heruntergeladene Installationsprogramm.", "Questa "
+                "copia del programma di installazione, conservata nella cartella di Albireo, serve solo a "
+                "disinstallarlo. Per installare o aggiornare Albireo, avviate il programma di installazione "
+                "scaricato.", "Esta copia del programa de instalación, guardada en la carpeta de Albireo, solo sirve "
+                "para desinstalarlo. Para instalar o actualizar Albireo, inicie el programa de instalación que "
+                "descargó." } },
         };
 
         int lang_index = 0;

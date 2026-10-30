@@ -5,8 +5,9 @@ Writes the update feed of Albireo for a new version.
 
     python3 make_feed.py <output feed.json> <version> <installer> <address of the installer> [<notes.json>]
 
-The installer is the albireo-setup.exe of the version, the address the one it is published
-at, a release asset of the repository for instance:
+The installer is the albireo-setup.exe of the version, which must carry that version in its
+version resource, the address the one it is published at, a release asset of the repository
+for instance:
 
     https://github.com/<owner>/<repository>/releases/download/albireo-v<version>/albireo-setup-<version>.exe
 
@@ -102,6 +103,18 @@ def installer_version(path):
     return "%d.%d.%d" % (ms >> 16, ms & 0xFFFF, ls >> 16)
 
 
+def check_installer(path, version):
+    """Raises ValueError unless the installer path carries the version resource of version."""
+    try:
+        built = installer_version(path)
+    except struct.error:
+        built = None
+    if built is None:
+        raise ValueError("%s carries no version resource: it is not an installer of Albireo" % path)
+    if built != version:
+        raise ValueError("%s installs version %s, not %s" % (path, built, version))
+
+
 def read_notes(notes_path, output, version):
     """The notes of notes_path, else those the feed at output gives the same version, else
     a default text.  Raises ValueError for notes without an English text."""
@@ -129,9 +142,7 @@ def make_feed(version, installer, url, notes, size=None, sha256=None):
         raise ValueError("the version must have the form 1.2.3")
     if not url.startswith("https://"):
         raise ValueError("the address of the installer must be an https address")
-    built = installer_version(installer)
-    if built is not None and built != version:
-        raise ValueError("%s installs version %s, not %s" % (installer, built, version))
+    check_installer(installer, version)
     return {
         "product": "Albireo",
         "channels": {

@@ -48,6 +48,15 @@ function store(name, mode) {
   return db.transaction(name, mode).objectStore(name);
 }
 
+// The end of a transaction.
+function completed(tx) {
+  return new Promise((resolve, reject) => {
+    tx.oncomplete = resolve;
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error);
+  });
+}
+
 export function uid() {
   const a = new Uint8Array(12);
   crypto.getRandomValues(a);
@@ -69,6 +78,24 @@ export async function getConversation(id) {
 export async function putConversation(c) {
   await open();
   return request(store('conversations', 'readwrite').put(c));
+}
+
+/*
+    Changes stored discussions in place, in one transaction, so that the messages another tab
+    saved meanwhile stay: fn(record) changes the record read from the database and returns
+    true to save it.  The discussion of id only, when id is given.
+*/
+export async function updateConversations(fn, id) {
+  await open();
+  const tx = db.transaction('conversations', 'readwrite');
+  const r = tx.objectStore('conversations').openCursor(id == null ? null : IDBKeyRange.only(id));
+  r.onsuccess = () => {
+    const c = r.result;
+    if (!c) return;
+    if (fn(c.value)) c.update(c.value);
+    c.continue();
+  };
+  await completed(tx);
 }
 
 export async function deleteConversation(id) {
@@ -125,6 +152,22 @@ export async function putChunks(records) {
 export async function chunksOf(owner) {
   await open();
   return request(store('chunks', 'readonly').index('owner').getAll(owner));
+}
+
+// The documents that have passages: one {owner, doc} per document, read from one passage of each.
+export async function chunkDocuments() {
+  await open();
+  const tx = db.transaction('chunks', 'readonly');
+  const out = [];
+  const r = tx.objectStore('chunks').index('doc').openCursor(null, 'nextunique');
+  r.onsuccess = () => {
+    const c = r.result;
+    if (!c) return;
+    out.push({ owner: c.value.owner, doc: c.value.doc });
+    c.continue();
+  };
+  await completed(tx);
+  return out;
 }
 
 // Deletes the passages of an owner ('owner') or of a document ('doc').

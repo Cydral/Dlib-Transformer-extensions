@@ -211,6 +211,21 @@ function forget(owner) {
 }
 
 /*
+    The removals of the documents and of their owners, counted: an indexing that started
+    before the removal of its document, of its owner or of everything writes no passage.
+*/
+const removals = new Map();
+let removalsOfAll = 0;
+
+function removalStamp(owner, docId) {
+  return removalsOfAll + (removals.get(owner) || 0) + (removals.get(docId) || 0);
+}
+
+function countRemoval(key) {
+  removals.set(key, (removals.get(key) || 0) + 1);
+}
+
+/*
     The state of the documents of an owner: Map doc -> {passages, vectors, model}, vectors
     counting the passages that hold a vector of the current model.
 */
@@ -229,11 +244,15 @@ export async function status(owner) {
 /*
     Indexes a document {id, name, text} for an owner: its passages, and their vectors when
     the service has an embedding model.  A document already indexed with the current model
-    is left as it is.  onProgress(done, total) follows the vectors computed.  Returns
-    {passages, vectors}.
+    is left as it is.  onProgress(done, total) follows the vectors computed; signal stops the
+    vectors, and the passages are then searched by their words.  A document removed
+    (removeDocument, removeOwner, removeAll) once the indexing started keeps no passage.
+    Returns {passages, vectors}.
 */
 export async function indexDocument(owner, doc, options = {}) {
   const { persistent = true, onProgress = null, signal = null } = options;
+  const stamp = removalStamp(owner, doc.id);
+  const removed = () => removalStamp(owner, doc.id) !== stamp;
   const pieces = chunk(doc.text || '');
   const existing = (await load(owner)).records.filter((r) => r.doc === doc.id);
   const current = model ? model.id : null;
@@ -247,7 +266,7 @@ export async function indexDocument(owner, doc, options = {}) {
   let vectors = 0;
   if (current) {
     for (let i = 0; i < records.length; i += embedBatch) {
-      if (signal && signal.aborted) break;
+      if ((signal && signal.aborted) || removed()) break;
       const batch = records.slice(i, i + embedBatch);
       try {
         const vs = await embed(batch.map((r) => passageText(r.name, r.where, r.text)), signal);
@@ -264,9 +283,17 @@ export async function indexDocument(owner, doc, options = {}) {
       if (onProgress) onProgress(Math.min(i + embedBatch, records.length), records.length);
     }
   }
+  // The removals are checked right before the write, and after it for a removal that came
+  // while the passages were being written.
+  if (removed()) return { passages: 0, vectors: 0 };
   if (persistent) {
     await store.deleteChunks('doc', doc.id);
     await store.putChunks(records.map((r) => Object.assign({}, r, { vector: r.vector ? r.vector.buffer : null })));
+    if (removed()) {
+      await store.deleteChunks('doc', doc.id).catch(() => {});
+      forget(owner);
+      return { passages: 0, vectors: 0 };
+    }
     memory.delete(owner);
   } else {
     const kept = (memory.get(owner) || []).filter((r) => r.doc !== doc.id);
@@ -277,15 +304,25 @@ export async function indexDocument(owner, doc, options = {}) {
 }
 
 export async function removeDocument(owner, docId) {
+  countRemoval(docId);
   if (memory.has(owner)) memory.set(owner, memory.get(owner).filter((r) => r.doc !== docId));
   else await store.deleteChunks('doc', docId).catch(() => {});
   forget(owner);
 }
 
 export async function removeOwner(owner) {
+  countRemoval(owner);
   memory.delete(owner);
   await store.deleteChunks('owner', owner).catch(() => {});
   forget(owner);
+}
+
+// Forgets every passage kept in memory when the database is emptied (store.clearAll); the
+// indexings in progress write none.
+export function removeAll() {
+  ++removalsOfAll;
+  memory.clear();
+  cache.clear();
 }
 
 // The longest end of a that begins b, for the merge of overlapping passages.

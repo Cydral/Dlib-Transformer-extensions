@@ -39,9 +39,10 @@ git push
 `publish_release.py` checks that the installer carries the version of `version.h`, creates the
 release `albireo-v<version>` when it does not exist, attaches the installer as
 `albireo-setup-<version>.exe` (replacing a file of that name whose content differs), and the
-complete installer as `albireo-setup-complete-<version>.exe` when it fits 2 GiB, writes
-`feed.json`, signs it with `albireo-sign`, checks the signature, and reads the beginning of the
-installer back from its public address. Its token of GitHub comes from `GITHUB_TOKEN`, `GH_TOKEN`
+complete installer as `albireo-setup-complete-<version>.exe` when it fits 2 GiB, reads the whole
+installer back from its public address and stops when the address serves another file, then writes
+the new `feed.json` beside the published one, signs it with `albireo-sign`, checks the signature and
+puts the feed and its signature in place together. Its token of GitHub comes from `GITHUB_TOKEN`, `GH_TOKEN`
 or `gh auth token`, with the right to write the contents of the repository; `--dry-run` checks
 everything without publishing. `make_feed.py` writes the feed alone, for an installer published
 by other means.
@@ -88,7 +89,9 @@ python3 dlib/dlib/external/albireo/tools/make_offline_bundle.py <folder> [--mode
 ```
 
 The bundle holds the signed files of this folder, the installer the feed announces and the models
-chosen, the two default models by default; its `README.txt` tells how to install it.
+chosen, the two default models by default; its `README.txt` tells how to install it. The program
+checks the signatures with `albireo-sign` (`--sign`, else `build-albireo/bin`, else the `PATH`) and
+stops when it does not find it, unless `--no-verify` leaves that check to the service.
 
 ## The signing key
 

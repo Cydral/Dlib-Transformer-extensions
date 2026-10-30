@@ -248,6 +248,8 @@ namespace albireo
         std::atomic<unsigned long long> host_us{0};
         std::atomic<unsigned long long> failures{0};
         std::atomic<bool> disabled{false};
+        // The card of the engine (CUDA), -1 for the other backends.
+        int cuda_device = -1;
 
         mutable std::mutex m;
         std::map<std::string, json> routes;   // the choices made, for the statistics
@@ -255,6 +257,28 @@ namespace albireo
         void message(int level, const std::string& text) const
         {
             if (log) log(level, text);
+        }
+
+        /*
+            Makes the card of the engine the current device of the calling thread, CUDA
+            keeping one current device per thread; false when the runtime refuses it.
+        */
+        bool bind_thread() const
+        {
+#if defined(DLIB_USE_CUDA)
+            static thread_local int bound = -1;
+            if (cuda_device < 0 || bound == cuda_device) return true;
+            try
+            {
+                dlib::cuda::set_device(cuda_device);
+            }
+            catch (const std::exception&)
+            {
+                return false;
+            }
+            bound = cuda_device;
+#endif
+            return true;
         }
 
         // Takes bytes of the budget of the copies; false when they do not fit.
@@ -355,7 +379,7 @@ namespace albireo
             const std::function<void()>& host) override
         {
             last_use_ = now_ns();
-            if (n < d_.min_tokens || d_.disabled.load(std::memory_order_relaxed))
+            if (n < d_.min_tokens || d_.disabled.load(std::memory_order_relaxed) || !d_.bind_thread())
             {
                 host_product(host);
                 return;
@@ -801,6 +825,7 @@ namespace albireo
                 throw std::runtime_error(older.empty() ? "no NVIDIA graphics processor was found" : too_old(older));
         }
         dlib::cuda::set_device(dev);
+        d.cuda_device = dev;
         d.name = dlib::cuda::get_device_name(dev);
 
         if (config["v2ram"].as_bool(true) && !dlib::extended_memory_enabled())
@@ -891,6 +916,11 @@ namespace albireo
     std::unique_ptr<matmul_offload> tensor_device::make_offload(const std::string& model)
     {
         return std::unique_ptr<matmul_offload>(new tensor_offload(*impl_, model));
+    }
+
+    bool tensor_device::bind_thread()
+    {
+        return impl_->bind_thread();
     }
 
     json tensor_device::stats() const

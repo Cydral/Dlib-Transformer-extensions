@@ -61,6 +61,29 @@ namespace albireo
                 engine["reason"].as_string());
         }
 
+        /*
+            An argument between quotes for a command line, read back as written: the "\"
+            before a quote are doubled, so that the folder D:\ does not end as D:".
+        */
+        std::wstring quoted_argument(const std::wstring& a)
+        {
+            std::wstring q = L"\"";
+            size_t backslashes = 0;
+            for (wchar_t c : a)
+            {
+                if (c == L'\\')
+                {
+                    ++backslashes;
+                    continue;
+                }
+                q.append(c == L'"' ? backslashes * 2 + 1 : backslashes, L'\\');
+                backslashes = 0;
+                q += c;
+            }
+            q.append(backslashes * 2, L'\\');
+            return q + L"\"";
+        }
+
         class tool_window
         {
             /*!
@@ -266,7 +289,8 @@ namespace albireo
                 list = add(ui::listview(hwnd, IDC_LIST));
                 const char* columns[] = { "col_model", "col_roles", "col_inputs", "col_size", "col_state",
                     "col_active" };
-                const int widths[] = { 220, 165, 110, 80, 140, 180 };
+                // The last column takes the width the others leave (layout).
+                const int widths[] = { 200, 165, 90, 75, 135, 180 };
                 for (int i = 0; i < 6; ++i)
                 {
                     std::wstring text = tr(columns[i]);
@@ -300,15 +324,21 @@ namespace albireo
                 // The actions on the selected model under the list, the window commands at the bottom.
                 const int m = px(16), g = px(8), bh = px(30);
                 // The introduction, then the origin and the state of the catalog.
-                ui::place(intro, m, m, w - 2 * m - px(260), px(58));
+                // Four lines: the introduction and, offline, the origin of the models.
+                ui::place(intro, m, m, w - 2 * m - px(260), px(66));
                 ui::place(space, w - m - px(250), m, px(250), px(36));
-                const int list_top = m + px(64);
+                const int list_top = m + px(72);
                 const int details_h = px(100);
                 const int bottom = h - m - bh;
                 const int status_top = bottom - g - px(20);
                 const int details_top = status_top - g - details_h;
                 const int actions_top = details_top - g - bh;
                 ui::place(list, m, list_top, w - 2 * m, actions_top - g - list_top);
+                RECT inside = {};
+                GetClientRect(list, &inside);
+                int taken = 0;
+                for (int i = 0; i < 5; ++i) taken += ListView_GetColumnWidth(list, i);
+                ListView_SetColumnWidth(list, 5, std::max<int>(px(140), inside.right - taken));
                 int x = m;
                 for (HWND b : { download, activate, deactivate, verify, remove })
                 {
@@ -354,10 +384,22 @@ namespace albireo
                 return s == "downloading" || s == "verifying" || s == "queued";
             }
 
+            // The functions a model serves: the ones chosen for it, and those it serves for
+            // want of a model of their own (the model that comes with Albireo).
             std::vector<std::string> active_roles(const std::string& id) const
             {
                 std::vector<std::string> out;
                 for (const auto& kv : overview["active"].items())
+                    if (kv.second.as_string() == id) out.push_back(kv.first);
+                return out;
+            }
+
+            // The functions chosen for a model, which Deactivate gives back.
+            std::vector<std::string> selected_roles(const std::string& id) const
+            {
+                const json& chosen = overview.contains("selected") ? overview["selected"] : overview["active"];
+                std::vector<std::string> out;
+                for (const auto& kv : chosen.items())
                     if (kv.second.as_string() == id) out.push_back(kv.first);
                 return out;
             }
@@ -430,37 +472,56 @@ namespace albireo
 
             void fill_list()
             {
+                // The same models in the same order keep their rows, and the list its scroll position:
+                // only the texts that changed are written.
+                std::vector<std::string> now;
+                for (const auto& m : overview["models"].elements()) now.push_back(m["id"].as_string());
+                const bool rebuild = now != ids;
+                ids = now;
                 SendMessageW(list, WM_SETREDRAW, FALSE, 0);
-                ListView_DeleteAllItems(list);
-                ids.clear();
+                if (rebuild) ListView_DeleteAllItems(list);
+                auto cell = [this](int row, int column, std::wstring text) {
+                    wchar_t current[512] = {};
+                    ListView_GetItemText(list, row, column, current, 512);
+                    if (text != current) ListView_SetItemText(list, row, column, &text[0]);
+                };
                 int row = 0;
                 for (const auto& m : overview["models"].elements())
                 {
                     const std::string id = m["id"].as_string();
-                    ids.push_back(id);
-                    std::wstring name = widen(m["name"].str(id));
-                    LVITEMW it = {};
-                    it.mask = LVIF_TEXT | LVIF_PARAM;
-                    it.iItem = row;
-                    it.pszText = &name[0];
-                    it.lParam = row;
-                    ListView_InsertItem(list, &it);
+                    if (rebuild)
+                    {
+                        LVITEMW it = {};
+                        it.mask = LVIF_PARAM;
+                        it.iItem = row;
+                        it.lParam = row;
+                        ListView_InsertItem(list, &it);
+                    }
+                    cell(row, 0, widen(m["name"].str(id)));
                     std::wstring roles;
-                    for (const auto& r : m["roles"].elements())
-                        roles += (roles.empty() ? L"" : L", ") + role_name(r.as_string());
-                    ListView_SetItemText(list, row, 1, &roles[0]);
-                    std::wstring inputs = inputs_text(m);
-                    ListView_SetItemText(list, row, 2, &inputs[0]);
-                    unsigned long long size = static_cast<unsigned long long>(m["size"].as_int(0));
-                    std::wstring sz = size ? widen(ui::format_size(size)) : L"";
-                    ListView_SetItemText(list, row, 3, &sz[0]);
-                    std::wstring st = state_text(m);
-                    ListView_SetItemText(list, row, 4, &st[0]);
+                    const json& listed = m["roles"];
+                    if (listed.size() == 3)
+                        roles = tr("roles_all");
+                    else
+                        for (const auto& r : listed.elements())
+                            roles += (roles.empty() ? L"" : L", ") + role_name(r.as_string());
+                    cell(row, 1, roles);
+                    cell(row, 2, inputs_text(m));
+                    const unsigned long long size = static_cast<unsigned long long>(m["size"].as_int(0));
+                    cell(row, 3, size ? widen(ui::format_size(size)) : std::wstring());
+                    cell(row, 4, state_text(m));
                     std::wstring act;
-                    for (const auto& r : active_roles(id)) act += (act.empty() ? L"" : L", ") + role_name(r);
-                    ListView_SetItemText(list, row, 5, &act[0]);
+                    const std::vector<std::string> active = active_roles(id);
+                    if (active.size() == 3)
+                        act = tr("roles_all");
+                    else
+                        for (const auto& r : active) act += (act.empty() ? L"" : L", ") + role_name(r);
+                    // The model that comes with Albireo serves the work in the background.
+                    if (id == overview["background"].as_string())
+                        act += (act.empty() ? L"" : L", ") + tr("role_background");
+                    cell(row, 5, act);
                     const UINT focus = LVIS_SELECTED | LVIS_FOCUSED;
-                    if (id == selected) ListView_SetItemState(list, row, focus, focus);
+                    if (rebuild && id == selected) ListView_SetItemState(list, row, focus, focus);
                     ++row;
                 }
                 SendMessageW(list, WM_SETREDRAW, TRUE, 0);
@@ -517,7 +578,7 @@ namespace albireo
                 ui::enable(download, !busy && m && (dl || (!offline && in_catalog && (!installed || update))));
                 ui::enable(activate, !busy && installed && !dl && !removing);
                 // The document search keeps its embedding model, which another one replaces.
-                ui::enable(deactivate, !busy && installed && !active_roles(selected).empty()
+                ui::enable(deactivate, !busy && installed && !selected_roles(selected).empty()
                     && !embedding_model(selected) && !removing);
                 ui::enable(verify, !busy && installed && !removing);
                 // A model that comes with Albireo stays installed.
@@ -902,6 +963,8 @@ namespace albireo
             HWND open_folder, change_folder, port_label, port, url, lang_label, lang, proxy_label, proxy, updates;
             HWND offline, apply, close, status;
             json st, eng, settings;
+            // The settings an Apply in progress changes, as they were, kept again when it fails.
+            json previous;
             bool loaded = false;
 
             host_window() { min_size = SIZE{ 720, 756 }; }
@@ -1061,6 +1124,8 @@ namespace albireo
                 if (!e["error"].as_string().empty()) line += L"  ·  " + widen(e["error"].as_string());
                 ui::set_text(engine, line);
 
+                // The list is rebuilt out of sight, then shown at once.
+                SendMessageW(engines, WM_SETREDRAW, FALSE, 0);
                 ListView_DeleteAllItems(engines);
                 int row = 0;
                 for (const auto& x : eng["engines"].elements())
@@ -1101,6 +1166,8 @@ namespace albireo
                 const int fit = ListView_GetColumnWidth(engines, 4);
                 ListView_SetColumnWidth(engines, 4, LVSCW_AUTOSIZE_USEHEADER);
                 if (ListView_GetColumnWidth(engines, 4) < fit) ListView_SetColumnWidth(engines, 4, fit);
+                SendMessageW(engines, WM_SETREDRAW, TRUE, 0);
+                InvalidateRect(engines, nullptr, TRUE);
 
                 // V²RAM extends the memory of an NVIDIA card, for the CUDA engine only.
                 bool cuda = false;
@@ -1200,7 +1267,8 @@ namespace albireo
                 ui::enable(apply, true);
                 if (r.contains("error"))
                 {
-                    ui::message(hwnd, widen(r["error"].as_string()), MB_OK | MB_ICONWARNING);
+                    for (const auto& kv : previous.items()) settings[kv.first] = kv.second;
+                    ui::message(hwnd, error_text(r), MB_OK | MB_ICONWARNING);
                     return;
                 }
                 ui::set_text(status, r["restart"].as_bool(false) ? tr("restart_note") : tr("saved"));
@@ -1242,7 +1310,7 @@ namespace albireo
                 return 0;
             }
 
-            void on_command(int id, int) override
+            void on_command(int id, int code) override
             {
                 switch (id)
                 {
@@ -1253,7 +1321,7 @@ namespace albireo
                     if (dir.empty()) break;
                     // The installer changes the folder with the rights it needs.
                     const std::wstring setup = widen(join_path(executable_dir(), "albireo-setup.exe"));
-                    const std::wstring args = L"/models-dir \"" + dir + L"\"";
+                    const std::wstring args = L"/models-dir " + quoted_argument(dir);
                     SHELLEXECUTEINFOW sei = { sizeof(sei) };
                     sei.lpVerb = L"runas";
                     sei.lpFile = setup.c_str();
@@ -1290,14 +1358,26 @@ namespace albireo
                     }
                     ui::enable(apply, false);
                     service_client c = client;
-                    for (const auto& kv : changes.items()) settings[kv.first] = kv.second;
+                    previous = json::object();
+                    for (const auto& kv : changes.items())
+                    {
+                        previous[kv.first] = settings[kv.first];
+                        settings[kv.first] = kv.second;
+                    }
                     request(R_APPLY, [c, changes]() {
                         json r;
                         std::string error;
                         if (!c.send("PUT", "/albireo/v1/settings", changes, r, error))
                         {
-                            r = json::object();
-                            r["error"] = error;
+                            // The code of the error names its text in the language of the window.
+                            const json& answer = r;
+                            json failure = json::object();
+                            failure["error"] = error;
+                            failure["code"] = answer["error"]["code"];
+                            json args = json::object();
+                            args["port"] = changes["port"];
+                            failure["args"] = args;
+                            r = failure;
                         }
                         else if (changes.contains("language"))
                         {
@@ -1311,6 +1391,11 @@ namespace albireo
                 case IDC_H_OFFLINE:
                     ui::enable(updates, !ui::checked(offline));
                     ui::enable(proxy, !ui::checked(offline));
+                    break;
+                case IDC_H_PROXY:
+                    // The service gives the password of the proxy as ********, which keeps it.
+                    if (code == EN_CHANGE && ui::text_of(proxy).find(L"********") != std::wstring::npos)
+                        ui::set_text(status, tr("proxy_mask_hint"));
                     break;
                 case IDC_H_CLOSE: DestroyWindow(hwnd); break;
                 default: break;

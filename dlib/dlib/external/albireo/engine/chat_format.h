@@ -129,10 +129,6 @@ namespace albireo
         // the other control tokens a model may emit are not part of its answer.
         const std::vector<int>& marker_tokens() const { return marker_tokens_; }
 
-        // Whether tokenizing pieces separately is safe for this vocabulary: false for
-        // SentencePiece, whose leading meta-space depends on the position in the text.
-        bool separate_pieces() const { return separate_pieces_; }
-
         /*!
             ensures
                 - Identifies the format of a model from its declared chat template and its
@@ -142,15 +138,13 @@ namespace albireo
         static std::unique_ptr<chat_format> detect(const dlib::hf_tokenizer& tok, const std::string& chat_template);
 
         // Tokenizes a rendered prompt, the markup with control tokens and the text without.
-        static std::vector<int> tokenize(const dlib::hf_tokenizer& tok, const std::vector<prompt_piece>& pieces,
-            bool separate_pieces);
+        static std::vector<int> tokenize(const dlib::hf_tokenizer& tok, const std::vector<prompt_piece>& pieces);
 
     protected:
         void add_markers(const dlib::hf_tokenizer& tok, const std::vector<std::string>& markers);
 
         std::vector<int> stop_tokens_;
         std::vector<int> marker_tokens_;
-        bool separate_pieces_ = true;
     };
 
     // Length of the complete JSON value at the start of text, after optional white space,
