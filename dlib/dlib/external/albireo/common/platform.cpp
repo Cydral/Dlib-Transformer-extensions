@@ -24,6 +24,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <winternl.h>
 #include <shlobj.h>
 #include <aclapi.h>
 #include <bcrypt.h>
@@ -89,9 +90,18 @@ namespace albireo
     std::string data_dir()
     {
 #if defined(_WIN32)
-        // The variable of the machine, which the services receive; that of the user is left out.
+        // The folder the installer recorded, which only the administrators change.
         std::wstring raw(32767, L'\0');
         DWORD type = 0, size = static_cast<DWORD>(raw.size() * sizeof(wchar_t));
+        if (RegGetValueW(HKEY_LOCAL_MACHINE, L"Software\\Albireo", L"DataDir", RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY,
+                nullptr, &raw[0], &size) == ERROR_SUCCESS)
+        {
+            raw.resize(std::min(raw.find(L'\0'), raw.size()));
+            if (!raw.empty()) return narrow(raw);
+            raw.assign(32767, L'\0');
+        }
+        size = static_cast<DWORD>(raw.size() * sizeof(wchar_t));
+        // The variable of the machine, which the services receive; that of the user is left out.
         if (RegGetValueW(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment",
                 L"ALBIREO_HOME", RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND, &type, &raw[0], &size)
             == ERROR_SUCCESS)
@@ -656,6 +666,546 @@ namespace albireo
 #endif
     }
 
+    bool folder_admin_only(const std::string& p)
+    {
+#if defined(_WIN32)
+        // The folder itself, a link not followed.
+        HANDLE h = open_entry(p, READ_CONTROL | FILE_READ_ATTRIBUTES);
+        if (h == INVALID_HANDLE_VALUE) return false;
+        FILE_ATTRIBUTE_TAG_INFO tag = {};
+        PSID owner = nullptr;
+        PACL dacl = nullptr;
+        PSECURITY_DESCRIPTOR sd = nullptr;
+        const bool folder = GetFileInformationByHandleEx(h, FileAttributeTagInfo, &tag, sizeof(tag))
+            && (tag.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT))
+                == FILE_ATTRIBUTE_DIRECTORY;
+        // A missing list of permissions lets every account do everything.
+        bool ok = folder && GetSecurityInfo(h, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &owner, nullptr, &dacl, nullptr, &sd) == ERROR_SUCCESS && dacl && system_sid(owner);
+        CloseHandle(h);
+        const ACCESS_MASK writes = FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA | FILE_DELETE_CHILD
+            | FILE_WRITE_ATTRIBUTES | DELETE | WRITE_DAC | WRITE_OWNER | GENERIC_WRITE | GENERIC_ALL;
+        for (WORD i = 0; ok && i < dacl->AceCount; ++i)
+        {
+            void* entry = nullptr;
+            if (!GetAce(dacl, i, &entry))
+            {
+                ok = false;
+                break;
+            }
+            const ACE_HEADER* header = static_cast<const ACE_HEADER*>(entry);
+            if (header->AceType == ACCESS_DENIED_ACE_TYPE || header->AceType == ACCESS_DENIED_OBJECT_ACE_TYPE
+                || header->AceType == ACCESS_DENIED_CALLBACK_ACE_TYPE
+                || header->AceType == ACCESS_DENIED_CALLBACK_OBJECT_ACE_TYPE)
+                continue;
+            // A grant whose layout gives no account here is taken as a grant to anyone.
+            const bool plain = header->AceType == ACCESS_ALLOWED_ACE_TYPE
+                || header->AceType == ACCESS_ALLOWED_CALLBACK_ACE_TYPE;
+            const ACCESS_ALLOWED_ACE* allowed = static_cast<const ACCESS_ALLOWED_ACE*>(entry);
+            if ((allowed->Mask & writes) == 0) continue;
+            PSID sid = plain ? reinterpret_cast<PSID>(const_cast<DWORD*>(&allowed->SidStart)) : nullptr;
+            // The creator owner of an entry made here, which only these accounts can make.
+            ok = sid && (system_sid(sid) || IsWellKnownSid(sid, WinCreatorOwnerSid));
+        }
+        if (sd) LocalFree(sd);
+        return ok;
+#else
+        (void)p;
+        return true;
+#endif
+    }
+
+#if defined(_WIN32)
+    namespace
+    {
+        // NtCreateFile of ntdll.dll, which opens an entry within an open folder.
+        typedef LONG (NTAPI* nt_create_file_function)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK,
+            PLARGE_INTEGER, ULONG, ULONG, ULONG, ULONG, PVOID, ULONG);
+
+        // Its values (winternl.h), named here since the headers of MinGW and of the SDK define them apart.
+        const ULONG nt_open = 0x00000001;
+        const ULONG nt_folder = 0x00000001;
+        const ULONG nt_sequential = 0x00000004;
+        const ULONG nt_synchronous = 0x00000020;
+        const ULONG nt_not_folder = 0x00000040;
+        const ULONG nt_reparse_point = 0x00200000;
+        const ULONG nt_case_insensitive = 0x00000040;
+        const LONG nt_name_not_found = static_cast<LONG>(0xC0000034);
+        const LONG nt_path_not_found = static_cast<LONG>(0xC000003A);
+
+        nt_create_file_function nt_create_file()
+        {
+            static const nt_create_file_function f = reinterpret_cast<nt_create_file_function>(
+                reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtCreateFile")));
+            return f;
+        }
+
+        // Opens name within the open folder dir; with nt_reparse_point, a reparse point itself.
+        HANDLE open_within(HANDLE dir, const std::wstring& name, ACCESS_MASK access, ULONG share, ULONG options,
+            LONG& status)
+        {
+            const nt_create_file_function create = nt_create_file();
+            status = -1;
+            if (!create || name.empty() || name.size() > 32767) return INVALID_HANDLE_VALUE;
+            UNICODE_STRING text;
+            text.Buffer = const_cast<PWSTR>(name.c_str());
+            text.Length = static_cast<USHORT>(name.size() * sizeof(wchar_t));
+            text.MaximumLength = text.Length;
+            OBJECT_ATTRIBUTES attributes;
+            std::memset(&attributes, 0, sizeof(attributes));
+            attributes.Length = sizeof(attributes);
+            attributes.RootDirectory = dir;
+            attributes.ObjectName = &text;
+            attributes.Attributes = nt_case_insensitive;
+            IO_STATUS_BLOCK io;
+            std::memset(&io, 0, sizeof(io));
+            HANDLE h = nullptr;
+            status = create(&h, access, &attributes, &io, nullptr, 0, share, nt_open, options, nullptr, 0);
+            return status < 0 ? INVALID_HANDLE_VALUE : h;
+        }
+
+        // The volume and the index of an open file, or an empty string.
+        std::string identity_of(HANDLE h)
+        {
+            BY_HANDLE_FILE_INFORMATION info;
+            if (!GetFileInformationByHandle(h, &info)) return std::string();
+            return std::to_string(info.dwVolumeSerialNumber) + ":"
+                + std::to_string((static_cast<uint64_t>(info.nFileIndexHigh) << 32) | info.nFileIndexLow);
+        }
+
+        /*
+            The folder from which path is opened (folder, or the root of the drive of path
+            when folder is empty) and the names of the entries of path below it.  False when
+            path does not lie under it, or holds a name "." or "..", a stream or a wildcard.
+        */
+        bool names_below(const std::string& path, const std::string& folder, std::wstring& base,
+            std::vector<std::wstring>& names)
+        {
+            std::wstring p = widen(path);
+            std::replace(p.begin(), p.end(), L'/', L'\\');
+            while (p.size() > 3 && p.back() == L'\\') p.pop_back();
+            if (folder.empty())
+            {
+                const bool letter = p.size() >= 3 && ((p[0] >= L'A' && p[0] <= L'Z') || (p[0] >= L'a' && p[0] <= L'z'));
+                if (!letter || p[1] != L':' || p[2] != L'\\') return false;
+                base = p.substr(0, 3);
+            }
+            else
+            {
+                base = widen(folder);
+                std::replace(base.begin(), base.end(), L'/', L'\\');
+                while (base.size() > 3 && base.back() == L'\\') base.pop_back();
+            }
+            if (base.empty()) return false;
+            const size_t start = base.back() == L'\\' ? base.size() : base.size() + 1;
+            if (p.size() <= start || !same_text(p.substr(0, base.size()), base) || p[start - 1] != L'\\') return false;
+            names.clear();
+            for (size_t at = start; at <= p.size();)
+            {
+                size_t end = p.find(L'\\', at);
+                if (end == std::wstring::npos) end = p.size();
+                const std::wstring name = p.substr(at, end - at);
+                if (name.empty() || name == L"." || name == L".."
+                    || name.find_first_of(L":*?\"<>|") != std::wstring::npos)
+                    return false;
+                names.push_back(name);
+                at = end + 1;
+            }
+            return !names.empty();
+        }
+
+        /*
+            Opens the entries of path below folder one within the other, a reparse point that
+            names another entry (a link, a junction, a mount point) failing the opening, and
+            returns the handle of the last one: a folder, or a file shared for reading only.
+        */
+        HANDLE open_link_free(const std::string& path, const std::string& folder, bool want_folder, std::string& why)
+        {
+            std::wstring base;
+            std::vector<std::wstring> names;
+            if (!names_below(path, folder, base, names))
+            {
+                why = "invalid";
+                return INVALID_HANDLE_VALUE;
+            }
+            const ACCESS_MASK folder_access = FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+            const ULONG any = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+            HANDLE dir = CreateFileW(base.c_str(), folder_access, any, nullptr, OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+            if (dir == INVALID_HANDLE_VALUE)
+            {
+                why = "missing";
+                return dir;
+            }
+            for (size_t i = 0; i < names.size(); ++i)
+            {
+                const bool file = !want_folder && i + 1 == names.size();
+                const ACCESS_MASK access = file ? GENERIC_READ | SYNCHRONIZE : folder_access;
+                const ULONG share = file ? FILE_SHARE_READ : any;
+                const ULONG options = nt_synchronous | (file ? nt_not_folder | nt_sequential : nt_folder);
+                LONG status = 0;
+                HANDLE next = open_within(dir, names[i], access, share, options | nt_reparse_point, status);
+                FILE_ATTRIBUTE_TAG_INFO tag = {};
+                if (next != INVALID_HANDLE_VALUE && !GetFileInformationByHandleEx(next, FileAttributeTagInfo, &tag,
+                        sizeof(tag)))
+                {
+                    CloseHandle(next);
+                    next = INVALID_HANDLE_VALUE;
+                }
+                if (next != INVALID_HANDLE_VALUE && (tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT))
+                {
+                    if (IsReparseTagNameSurrogate(tag.ReparseTag))
+                    {
+                        CloseHandle(next);
+                        CloseHandle(dir);
+                        why = "link";
+                        return INVALID_HANDLE_VALUE;
+                    }
+                    if (file)
+                    {
+                        /*
+                            A file of a cloud, whose data comes through its reparse point: opened
+                            again through it while the first handle, which refuses the deletion,
+                            keeps the name on the same file.
+                        */
+                        LONG again = 0;
+                        HANDLE data = open_within(dir, names[i], access, share, options, again);
+                        const std::string id = identity_of(next);
+                        CloseHandle(next);
+                        next = data;
+                        if (data != INVALID_HANDLE_VALUE && (id.empty() || identity_of(data) != id))
+                        {
+                            CloseHandle(data);
+                            next = INVALID_HANDLE_VALUE;
+                        }
+                    }
+                }
+                CloseHandle(dir);
+                if (next == INVALID_HANDLE_VALUE)
+                {
+                    why = status == nt_name_not_found || status == nt_path_not_found ? "missing" : "invalid";
+                    return next;
+                }
+                dir = next;
+            }
+            return dir;
+        }
+    }
+#else
+    namespace
+    {
+        // The entries of path below folder, opened one within the other without following a link.
+        int open_link_free(const std::string& path, const std::string& folder, bool want_folder, std::string& why)
+        {
+            std::string base = folder.empty() ? std::string("/") : folder;
+            while (base.size() > 1 && base.back() == '/') base.pop_back();
+            std::string p = path;
+            while (p.size() > 1 && p.back() == '/') p.pop_back();
+            const size_t start = base == "/" ? 1 : base.size() + 1;
+            if (p.size() <= start || p.compare(0, base.size(), base) != 0 || p[start - 1] != '/')
+            {
+                why = "invalid";
+                return -1;
+            }
+            std::vector<std::string> names;
+            for (size_t at = start; at <= p.size();)
+            {
+                size_t end = p.find('/', at);
+                if (end == std::string::npos) end = p.size();
+                const std::string name = p.substr(at, end - at);
+                if (name.empty() || name == "." || name == "..")
+                {
+                    why = "invalid";
+                    return -1;
+                }
+                names.push_back(name);
+                at = end + 1;
+            }
+            int dir = ::open(base.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+            if (dir < 0)
+            {
+                why = "missing";
+                return -1;
+            }
+            for (size_t i = 0; i < names.size(); ++i)
+            {
+                const bool file = !want_folder && i + 1 == names.size();
+                // A pipe or a device opens without waiting, then fails the check of a regular file.
+                const int flags = O_RDONLY | O_NOFOLLOW | O_CLOEXEC | (file ? O_NOCTTY | O_NONBLOCK : O_DIRECTORY);
+                const int next = ::openat(dir, names[i].c_str(), flags);
+                if (next < 0)
+                {
+                    struct stat st;
+                    why = fstatat(dir, names[i].c_str(), &st, AT_SYMLINK_NOFOLLOW) != 0 ? "missing"
+                        : S_ISLNK(st.st_mode) ? "link" : "invalid";
+                    ::close(dir);
+                    return -1;
+                }
+                ::close(dir);
+                dir = next;
+            }
+            return dir;
+        }
+    }
+#endif
+
+    bool link_free_file::open(const std::string& path, const std::string& folder, std::string& why)
+    {
+        close();
+#if defined(_WIN32)
+        const HANDLE h = open_link_free(path, folder, false, why);
+        if (h == INVALID_HANDLE_VALUE) return false;
+        LARGE_INTEGER size;
+        BY_HANDLE_FILE_INFORMATION info;
+        if (!GetFileSizeEx(h, &size) || !GetFileInformationByHandle(h, &info))
+        {
+            CloseHandle(h);
+            why = "invalid";
+            return false;
+        }
+        h_ = h;
+        size_ = static_cast<uint64_t>(size.QuadPart);
+        links_ = info.nNumberOfLinks;
+        identity_ = identity_of(h);
+#else
+        const int fd = open_link_free(path, folder, false, why);
+        if (fd < 0) return false;
+        struct stat st;
+        if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode))
+        {
+            ::close(fd);
+            why = "invalid";
+            return false;
+        }
+        fd_ = fd;
+        size_ = static_cast<uint64_t>(st.st_size);
+        links_ = static_cast<uint32_t>(st.st_nlink);
+        identity_ = std::to_string(static_cast<unsigned long long>(st.st_dev)) + ":"
+            + std::to_string(static_cast<unsigned long long>(st.st_ino));
+#endif
+        return true;
+    }
+
+    bool link_free_file::is_open() const
+    {
+#if defined(_WIN32)
+        return h_ != nullptr;
+#else
+        return fd_ >= 0;
+#endif
+    }
+
+    long long link_free_file::read(char* data, size_t n)
+    {
+        if (!is_open()) return -1;
+#if defined(_WIN32)
+        DWORD got = 0;
+        const DWORD want = static_cast<DWORD>(std::min<size_t>(n, 1u << 30));
+        if (!ReadFile(static_cast<HANDLE>(h_), data, want, &got, nullptr)) return -1;
+        return static_cast<long long>(got);
+#else
+        for (;;)
+        {
+            const ssize_t got = ::read(fd_, data, n);
+            if (got < 0 && errno == EINTR) continue;
+            return got < 0 ? -1 : static_cast<long long>(got);
+        }
+#endif
+    }
+
+    bool link_free_file::seek(uint64_t offset)
+    {
+        if (!is_open()) return false;
+#if defined(_WIN32)
+        LARGE_INTEGER at;
+        at.QuadPart = static_cast<LONGLONG>(offset);
+        return SetFilePointerEx(static_cast<HANDLE>(h_), at, nullptr, FILE_BEGIN) != 0;
+#else
+        return lseek(fd_, static_cast<off_t>(offset), SEEK_SET) == static_cast<off_t>(offset);
+#endif
+    }
+
+    void link_free_file::close()
+    {
+#if defined(_WIN32)
+        if (h_) CloseHandle(static_cast<HANDLE>(h_));
+        h_ = nullptr;
+#else
+        if (fd_ >= 0) ::close(fd_);
+        fd_ = -1;
+#endif
+        size_ = 0;
+        links_ = 0;
+        identity_.clear();
+    }
+
+    bool read_file_link_free(const std::string& path, const std::string& folder, std::string& data,
+        uint64_t max_bytes)
+    {
+        link_free_file f;
+        std::string why;
+        if (!f.open(path, folder, why) || f.size() > max_bytes) return false;
+        data.resize(static_cast<size_t>(f.size()));
+        size_t done = 0;
+        while (done < data.size())
+        {
+            const long long n = f.read(&data[done], data.size() - done);
+            if (n <= 0) return false;
+            done += static_cast<size_t>(n);
+        }
+        return true;
+    }
+
+    bool link_free_folder(const std::string& path, const std::string& folder)
+    {
+        std::string why;
+#if defined(_WIN32)
+        const HANDLE h = open_link_free(path, folder, true, why);
+        if (h == INVALID_HANDLE_VALUE) return false;
+        CloseHandle(h);
+#else
+        const int fd = open_link_free(path, folder, true, why);
+        if (fd < 0) return false;
+        ::close(fd);
+#endif
+        return true;
+    }
+
+    std::string file_identity(const std::string& p)
+    {
+#if defined(_WIN32)
+        HANDLE h = open_entry(p, FILE_READ_ATTRIBUTES);
+        if (h == INVALID_HANDLE_VALUE) return std::string();
+        FILE_ATTRIBUTE_TAG_INFO tag = {};
+        const bool file = GetFileInformationByHandleEx(h, FileAttributeTagInfo, &tag, sizeof(tag))
+            && !(tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+            && !((tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) && IsReparseTagNameSurrogate(tag.ReparseTag));
+        const std::string id = file ? identity_of(h) : std::string();
+        CloseHandle(h);
+        return id;
+#else
+        struct stat st;
+        if (lstat(p.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) return std::string();
+        return std::to_string(static_cast<unsigned long long>(st.st_dev)) + ":"
+            + std::to_string(static_cast<unsigned long long>(st.st_ino));
+#endif
+    }
+
+#if defined(_WIN32)
+    bool handle_at(void* handle, const std::string& path)
+    {
+        std::wstring final(32768, L'\0');
+        const DWORD n = GetFinalPathNameByHandleW(static_cast<HANDLE>(handle), &final[0],
+            static_cast<DWORD>(final.size()), FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+        if (n == 0 || n >= final.size()) return false;
+        final.resize(n);
+        // A file of a share is no file of a local folder.
+        if (final.compare(0, 8, L"\\\\?\\UNC\\") == 0) return false;
+        if (final.compare(0, 4, L"\\\\?\\") == 0) final = final.substr(4);
+        return same_text(final, full_path(path));
+    }
+#else
+    bool handle_at(int fd, const std::string& path)
+    {
+#if defined(__linux__)
+        char buf[4096];
+        const std::string link = "/proc/self/fd/" + std::to_string(fd);
+        const ssize_t n = readlink(link.c_str(), buf, sizeof(buf) - 1);
+        if (n <= 0) return false;
+        buf[n] = 0;
+        return path == buf;
+#else
+        struct stat a, b;
+        return fstat(fd, &a) == 0 && lstat(path.c_str(), &b) == 0 && S_ISREG(b.st_mode) && a.st_dev == b.st_dev
+            && a.st_ino == b.st_ino;
+#endif
+    }
+#endif
+
+    bool new_file::create(const std::string& path)
+    {
+        close();
+        failed_ = false;
+#if defined(_WIN32)
+        // A reparse point at path is taken as the entry it is, which exists already.
+        const HANDLE h = CreateFileW(widen(path).c_str(), GENERIC_WRITE | DELETE, 0, nullptr, CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return false;
+        if (!handle_at(h, path))
+        {
+            // Made through a folder replaced by a link: deleted by its handle, which no link can redirect.
+            FILE_DISPOSITION_INFO remove = {};
+            remove.DeleteFile = TRUE;
+            SetFileInformationByHandle(h, FileDispositionInfo, &remove, sizeof(remove));
+            CloseHandle(h);
+            return false;
+        }
+        h_ = h;
+#else
+        const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0644);
+        if (fd < 0) return false;
+        if (!handle_at(fd, path))
+        {
+            ::close(fd);
+            return false;
+        }
+        fd_ = fd;
+#endif
+        return true;
+    }
+
+    bool new_file::write(const char* data, size_t n)
+    {
+#if defined(_WIN32)
+        while (h_ && !failed_ && n > 0)
+        {
+            DWORD w = 0;
+            const DWORD chunk = static_cast<DWORD>(std::min<size_t>(n, 1u << 30));
+            if (!WriteFile(static_cast<HANDLE>(h_), data, chunk, &w, nullptr) || w == 0)
+            {
+                failed_ = true;
+                break;
+            }
+            data += w;
+            n -= w;
+        }
+        return h_ && !failed_;
+#else
+        while (fd_ >= 0 && !failed_ && n > 0)
+        {
+            const ssize_t w = ::write(fd_, data, n);
+            if (w < 0 && errno == EINTR) continue;
+            if (w <= 0)
+            {
+                failed_ = true;
+                break;
+            }
+            data += w;
+            n -= static_cast<size_t>(w);
+        }
+        return fd_ >= 0 && !failed_;
+#endif
+    }
+
+    bool new_file::close()
+    {
+#if defined(_WIN32)
+        if (!h_) return false;
+        const bool flushed = FlushFileBuffers(static_cast<HANDLE>(h_)) != 0;
+        CloseHandle(static_cast<HANDLE>(h_));
+        h_ = nullptr;
+#else
+        if (fd_ < 0) return false;
+        const bool flushed = fsync(fd_) == 0;
+        const bool closed = ::close(fd_) == 0;
+        fd_ = -1;
+        if (!closed) failed_ = true;
+#endif
+        const bool ok = flushed && !failed_;
+        failed_ = false;
+        return ok;
+    }
+
     bool read_file(const std::string& p, std::string& data, uint64_t max_bytes)
     {
 #if defined(_WIN32)
@@ -991,6 +1541,16 @@ namespace albireo
         }
         return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 #endif
+    }
+
+    void end_process(int code)
+    {
+        std::fflush(nullptr);
+#if defined(_WIN32)
+        // The process ends here, its libraries loaded: no DllMain runs.
+        TerminateProcess(GetCurrentProcess(), static_cast<UINT>(code));
+#endif
+        _exit(code);
     }
 
 }

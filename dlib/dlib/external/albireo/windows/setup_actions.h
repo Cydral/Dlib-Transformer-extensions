@@ -25,6 +25,7 @@ namespace setup
     struct install_options
     {
         std::string program_dir;      // C:\Program Files\Albireo by default
+        std::string data_dir;         // C:\ProgramData\Albireo by default
         std::string models_dir;       // empty: <data>\models
         bool autostart = true;        // the tray at the sign in of every user
         bool desktop_shortcut = false;
@@ -42,13 +43,62 @@ namespace setup
         Why a folder cannot receive the programs (program true) or the models: the key of
         the text that says it (strings.cpp, with {d} for the folder), or an empty string
         when it can.  The folder must be on a local drive, below its root, and neither a
-        folder of Windows or of the users nor one that holds them (it may lie inside
-        them).  The links on its path must belong to SYSTEM or the administrators.  An
-        existing folder of the programs must be empty or hold an installation of Albireo;
-        an existing models folder must belong to SYSTEM or the administrators, or be empty,
-        and hold nothing of another account.
+        folder of Windows or of the users nor one that holds them; the models folder may
+        lie inside them, the folder of the programs may not.  The links on its path must
+        belong to SYSTEM or the administrators, and no other account may rename a folder
+        on the path of the programs (folder_parent_unsafe).  An existing folder of the
+        programs must be empty or hold an installation of Albireo; an existing models
+        folder must belong to SYSTEM or the administrators, or be empty, and hold nothing
+        of another account.
     */
     std::string folder_problem(const std::string& dir, bool program);
+
+    /*
+        Why a folder cannot hold the data (the settings, the database, the logs, the
+        certificates and, by default, the models): the key of the text that says it, or an
+        empty string when it can.  The folder must be on a local fixed drive, below its
+        root, outside the folder of Windows and the folders of the users, holding none of
+        them, and apart from the folder of the programs program_dir; no other account may
+        rename a folder on its path.  An existing folder must be empty, or hold the data of
+        an earlier installation (settings.json, albireo.db) and belong to SYSTEM or the
+        administrators.
+    */
+    std::string data_folder_problem(const std::string& dir, const std::string& program_dir);
+
+    /*
+        Makes the missing folders on the path of dir, below the folder that exists, with
+        the permissions of secure_folder(), so that no other account may rename them and
+        put a folder of its own in the place of dir.
+    */
+    bool secure_parents(const std::string& dir, std::string& error);
+
+    /*
+        The folders of an installation recorded in HKLM\Software\Albireo, which only the
+        administrators change: the data folder, which every program reads first
+        (data_dir()), and a models folder chosen outside the data folder, with whether it
+        was new or empty when chosen, which the uninstaller then removes whole.
+        recorded_data_dir() is empty without a record; default_data_dir() is the folder of
+        the data without a choice, %ProgramData%\Albireo.  forget_folders() deletes the record.
+    */
+    std::string recorded_data_dir();
+    std::string default_data_dir();
+    bool record_data_dir(const std::string& dir, std::string& error);
+    void record_models_dir(const std::string& dir, bool owned);
+    bool models_dir_owned(const std::string& dir);
+    void forget_folders();
+
+    /*
+        Whether the uninstaller may remove a folder whole: a folder on a local drive, below
+        its root, that is neither a folder of Windows or of the users nor one that holds
+        them.
+    */
+    bool removable_folder(const std::string& dir);
+
+    /*
+        The model files the service recorded in its database (albireo.db of the data folder)
+        that lie in folder, with the files of their downloads and imports in progress.
+    */
+    std::vector<std::string> recorded_model_files(const std::string& folder);
 
     // The installation recorded in the registry: folder and version, empty when none.
     std::string installed_dir();
@@ -84,6 +134,18 @@ namespace setup
 
     // Asks the trays of this session to close and waits for them; true when one was open.
     bool close_trays(unsigned timeout_ms);
+
+    /*
+        Waits until no process runs a program of folder, this one aside, for timeout_ms at
+        most, then ends those that remain, in every session, and waits for their end: the
+        trays of the other users, and the children of the service (the probes and the
+        measures of the engines, the restart of the service).  With program, only the
+        processes of that file of folder count.  Returns false when one still runs.
+    */
+    bool end_processes(const std::string& folder, unsigned timeout_ms, const std::string& program = std::string());
+
+    // The version of a program file (its version resource, "1.2.3"), empty without one.
+    std::string program_version(const std::string& path);
 
     // Receives the successive pieces of a file; returns false to stop.
     typedef std::function<bool(const void* data, size_t size)> chunk_writer;
@@ -134,8 +196,22 @@ namespace setup
         bool committed_ = false;
     };
 
-    // Deletes the files left aside by an earlier update.
-    void remove_old_files(const std::string& program_dir);
+    /*
+        Deletes the files an earlier update left aside or unfinished, and the temporary files
+        of a write.  A file in use goes at the next restart of Windows, or, with now_only,
+        stays for a later call.  Returns the number of files that stay.
+    */
+    size_t remove_old_files(const std::string& program_dir, bool now_only = false);
+
+    /*
+        Deletes the files of the engines, the web application and the licenses that an
+        earlier installation placed in program_dir and that the installation just made no
+        longer carries (installed, the paths of the files it placed, as staged_files::targets()
+        gives them), then the folders they leave empty.  The paths compare without case, as
+        Windows names its files; the links stay, with what they lead to, and a file in use
+        goes at the next restart of Windows.
+    */
+    void remove_stale_files(const std::string& program_dir, const std::vector<std::string>& installed);
 
     // Writes this program into the set, without its payload and its models, as the uninstaller.
     bool stage_uninstaller(const std::string& program_dir, staged_files& files, std::string& error);
@@ -192,15 +268,16 @@ namespace setup
         std::string& error);
 
     /*
-        The certificates of the local server: with new_authority, a new installation, the
-        authority found in the data folder is replaced by a new one; renewed tells whether
-        the authority changed.  trust_authority() adds the authority to the trusted roots
-        of the machine once it has checked that it is the one Albireo makes: signed by its
-        own key, named "Albireo Local Authority" and limited to localhost and the loopback
-        addresses.  authority_trusted() tells whether the trusted roots hold an authority
-        of Albireo.
+        The certificates of the local server, which the service makes and renews under its
+        own account (host/certificates.h), so that the key of the server is encrypted for
+        LocalSystem and the key of the authority is never written: a new installation
+        deletes those found in the data folder, an update keeps them.  The choice of trust
+        reaches the service through the settings (trust_authority).  trust_authority() adds
+        the authority of the data folder to the trusted roots of the machine once it has
+        checked that it is the one Albireo makes; authority_trusted() tells whether the
+        trusted roots hold an authority of Albireo; untrust_authority() removes them.
     */
-    bool create_certificates(bool new_authority, bool& renewed, std::string& error);
+    bool prepare_certificates(bool new_installation, std::string& error);
     bool trust_authority(std::string& error);
     bool authority_trusted();
     void untrust_authority();
@@ -234,18 +311,47 @@ namespace setup
         The list of the files of an installation, kept in its folder: write_file_list()
         adds the files given to those it names already; the first list also names the
         programs, engines, web application, licenses and models that an earlier
-        installation left.  remove_installation() removes the files the list names (the
-        same places for an installation older than the list), then the folders left
-        empty, the folder of the programs included.  The running uninstaller is renamed
-        aside; finish_removal() starts, as this program ends, the deletion of that file
-        and of the folder left empty.
+        installation left.
+
+        remove_installation() removes the folder of the programs whole, with what the
+        programs or the user added there, the installer refusing a folder that holds other
+        files: links go alone, without what they lead to, and the folders of keep that lie
+        in it stay, with their parents (the models and the data kept for a later
+        installation).  A folder that removable_folder() refuses only loses the files the
+        list names and the files the programs make there (the files an update set aside or
+        left unfinished, the temporary files of a write).  The running uninstaller stays:
+        finish_removal() starts, as this program ends, a copy of it in a folder of its own
+        of %TEMP%, which waits for the end of this program, deletes the uninstaller and
+        what the folder still holds by the same rules, then the folder, and leaves for the
+        restart of Windows only what stays in use.  remove_installation() returns false
+        when the folder stays, with the folders of keep or the files of a refused folder.
+
+        complete_removal() is that copy, started with /finish-removal; it reads what to do
+        from the file its folder holds, which only an administrator writes.
     */
     void write_file_list(const std::string& program_dir, const std::vector<std::string>& files);
-    void remove_installation(const std::string& program_dir);
+    bool remove_installation(const std::string& program_dir, const std::vector<std::string>& keep);
     void finish_removal();
+    int complete_removal();
+
+    /*
+        The result of the last run of the installer, logs\setup-result.json in the data
+        folder, which the tray reads to tell the user of an update that failed out of sight:
+        operation "installation" or "update", the version installed or kept, ok, and when it
+        failed, the error and whether the previous programs were put back.
+    */
+    void write_result(const std::string& operation, const std::string& previous, bool ok, bool rolled_back,
+        const std::string& error);
 
     // Log of the installer in the data folder; the lines wait until prepare_data_dir().
     void log(const std::string& line);
+
+    /*
+        The lines of the log that still wait for a data folder, which a refused folder or a
+        removal of a copy that was not installed never makes, go to albireo-setup.log of
+        the temporary folder of the account.
+    */
+    void flush_log();
 
 }
 }

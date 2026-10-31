@@ -15,10 +15,14 @@
 */
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <random>
+#include <thread>
 #include <vector>
 
 #include "../engine/qkernels.h"
@@ -256,7 +260,7 @@ namespace
         W.row_bytes = qk_row_bytes(f.type, cols);
         check(W.row_bytes * rows == data.size(), "row bytes");
 
-        for (long tokens : { 1L, 3L, 7L, 8L, 37L, 100L, 150L, 300L })
+        for (long tokens : { 1L, 2L, 3L, 4L, 5L, 7L, 8L, 37L, 100L, 150L, 300L })
         {
             const long xs = cols + 5, ys = rows + 3;
             std::vector<float> X(static_cast<size_t>(tokens * xs));
@@ -301,6 +305,8 @@ namespace
                     const float got = Y[static_cast<size_t>(t * ys + r)];
                     const double tol = 1e-5 * (std::fabs(ref) + 1) + 2e-6 * mag;
                     check(std::fabs(got - ref) <= tol, "matmul", got, ref);
+                    // Each token of a pass gets the result it gets alone, whatever the other tokens.
+                    if (!floats) check(got == ref, "integer product independent of the other tokens", got, ref);
                     check(std::fabs(Y2[static_cast<size_t>(t * ys + r)] - 2 * ref) <= 2 * tol,
                         "matmul accumulate", Y2[static_cast<size_t>(t * ys + r)], 2 * ref);
                 }
@@ -319,6 +325,7 @@ namespace
             if (f.block == 1) test_matmul_case(f, 523, rng, pool);
         }
         std::printf("  matmul: every format, 1 to 300 tokens, integer, float and packed paths, strided, accumulated\n");
+        std::printf("  integer products: each token as computed alone\n");
     }
 
     void test_helpers(std::mt19937& rng)
@@ -400,6 +407,27 @@ namespace
         const float s = qk_exp_shift_sum(neg.data(), 0.0f, static_cast<long>(neg.size()));
         check(neg[0] == 0.0f && neg[1] >= 0.0f && neg[1] < 1e-37f && neg[5] == 0.0f, "exp underflow", neg[0], neg[5]);
         check(std::fabs(s - (1.0 + std::exp(-3.0) + std::exp(-10.0) + std::exp(-50.0))) < 1e-6, "exp underflow sum", s);
+
+        // The gate of the SwiGLU blocks over the range of the activations, and beyond it.
+        {
+            std::uniform_real_distribution<float> wide(-30.0f, 30.0f), unit(-1.0f, 1.0f);
+            const float edges[] = { -200.0f, 200.0f, 0.0f, -1e-20f };
+            const size_t n = 1003;
+            std::vector<float> g(n), u(n);
+            for (size_t i = 0; i < n; ++i)
+            {
+                g[i] = i < 4 ? edges[i] : wide(rng);
+                u[i] = unit(rng);
+            }
+            std::vector<float> got = g;
+            qk_silu_mul(got.data(), u.data(), static_cast<long>(n));
+            for (size_t i = 0; i < n; ++i)
+            {
+                const double x = g[i];
+                const double r = x / (1.0 + std::exp(-x)) * u[i];
+                check(std::fabs(got[i] - r) <= 2e-6 * std::fabs(r) + 1e-30, "silu", got[i], r);
+            }
+        }
         std::printf("  conversions and vector helpers\n");
     }
 
@@ -497,6 +525,36 @@ namespace
         pool.set_spin_time(std::chrono::microseconds(2000));
         std::printf("  thread pool: %d threads\n", pool.size());
     }
+
+    void test_new_pools()
+    {
+        /*
+            A section opened as soon as the pool exists, before the system has run its
+            workers, in which every worker takes part.  A worker that missed it would leave
+            the section waiting for ever, which the watchdog reports.
+        */
+        std::atomic<bool> finished{false};
+        std::thread watchdog([&]() {
+            for (int i = 0; i < 600 && !finished.load(); ++i)
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            if (!finished.load())
+            {
+                std::printf("FAILED: a section opened at the creation of a pool never ended\n");
+                std::fflush(stdout);
+                std::_Exit(1);
+            }
+        });
+        for (int rep = 0; rep < 500; ++rep)
+        {
+            thread_pool fresh(2 + rep % 3);
+            std::atomic<long> count{0};
+            fresh.parallel_for(16, [&](long, int) { count.fetch_add(1); });
+            check(count.load() == 16, "section of a new pool");
+        }
+        finished = true;
+        watchdog.join();
+        std::printf("  new pools: a section at creation\n");
+    }
 }
 
 int main()
@@ -516,6 +574,7 @@ int main()
     test_helpers(rng);
     test_attention_tiles(rng);
     test_pool(pool);
+    test_new_pools();
     if (failures)
     {
         std::printf("%d checks FAILED\n", failures);

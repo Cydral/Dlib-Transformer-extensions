@@ -10,6 +10,7 @@
 #include <thread>
 
 #include "../common/json.h"
+#include "user_error.h"
 
 namespace albireo
 {
@@ -45,6 +46,16 @@ namespace albireo
                 status() gives the state ("idle", "checking", "up_to_date", "downloading",
                 "ready" or "error"), the versions, and the release notes of the feed in
                 every language it has, for the tray to show in its own.
+
+            ERRORS
+                Every error, in the state and in the answers, comes as its English text
+                ("error"), its code ("code") and its values ("args", an object), which the
+                tray gives in the language of the user: update_check {e}, update_record
+                {version}, update_feed_missing {version}, update_feed_missing_folder
+                {folder}, update_signature {file}, update_feed_mismatch {file, version},
+                update_outside {file}, update_installer_mismatch {version},
+                update_feed_invalid, update_download {e}, update_not_ready, update_invalid
+                {version}, update_start {code}, update_package_manager and stopping.
         !*/
     public:
         updater(const std::string& feed_url, const std::string& updates_dir);
@@ -59,19 +70,29 @@ namespace albireo
         /*!
             ensures
                 - Stages the update found in folder: feed.json, feed.json.sig and the
-                  installer the feed names, by its file name.
+                  installer the feed names, by its file name, each read through no link
+                  from base (an empty base: the root of the drive of folder).
                 - Returns {"state": "ready", "version", "installer"} when the update is
                   staged, {"state": "up_to_date", "version"} when the folder holds this
-                  version or an older one, {"error"} otherwise; "installer" names the file
-                  of the installer in folder once the feed is read.
+                  version or an older one, {"error", "code", "args"} otherwise; "installer"
+                  names the file of the installer in folder once the feed is read.
         !*/
-        json import_offline(const std::string& folder);
+        json import_offline(const std::string& folder, const std::string& base);
 
         // The installer of a downloaded update newer than this program, or empty.
         std::string staged_installer() const;
 
-        // Starts the installer of the staged update in its update mode.
-        bool launch_staged(std::string& error);
+        /*!
+            ensures
+                - Returns true when a restart applies the staged update; false otherwise,
+                  with update_not_ready when none is staged, and update_package_manager on
+                  the systems whose package manager applies the updates.
+        !*/
+        bool can_apply(user_error& error) const;
+
+        // Starts the installer of the staged update in its update mode; a failure stays in the
+        // state with its code, unless the service stops.
+        bool launch_staged(user_error& error);
 
     private:
         enum class stage_result { staged, older, failed };
@@ -86,17 +107,17 @@ namespace albireo
                   with error, when the files cannot be written.
         !*/
         stage_result stage(const std::string& version, const std::string& sha, const json& notes,
-            const std::string& feed, const std::string& signature, std::string& error);
+            const std::string& feed, const std::string& signature, user_error& error);
         std::string installer_path(const std::string& version) const;
         // The signed feed of the update of version, kept beside its installer.
         std::string feed_path(const std::string& version) const;
         // Reads the signed feed beside the installer of version: the size and the SHA-256 it
         // gives for the installer; false, with error, when it is missing or altered.
-        bool staged_feed(const std::string& version, uint64_t& size, std::string& sha, std::string& error) const;
+        bool staged_feed(const std::string& version, uint64_t& size, std::string& sha, user_error& error) const;
         // Checks staged.json, read at the start, against the signed feed and the installer.
-        bool check_staged(const json& staged, std::string& error) const;
+        bool check_staged(const json& staged, user_error& error) const;
         // Forgets the staged update, whose files no longer match: the next check stages it again.
-        void drop_staged(const std::string& error);
+        void drop_staged(const user_error& error);
 
         std::string feed_url_;
         std::string dir_;

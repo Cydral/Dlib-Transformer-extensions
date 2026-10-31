@@ -3,6 +3,7 @@
 
 #include "crypto.h"
 
+#include <algorithm>
 #include <fstream>
 #include <vector>
 
@@ -90,6 +91,52 @@ namespace albireo
             if (progress) progress(total);
         }
         return s.hex();
+    }
+
+    std::string sha256_open_file(link_free_file& f, const std::atomic<bool>* cancel)
+    {
+        if (!f.seek(0)) return std::string();
+        sha256_stream s;
+        std::vector<char> buf(1 << 20);
+        uint64_t done = 0;
+        while (done < f.size())
+        {
+            if (cancel && cancel->load()) return std::string();
+            const long long n = f.read(buf.data(),
+                static_cast<size_t>(std::min<uint64_t>(buf.size(), f.size() - done)));
+            if (n <= 0) return std::string();
+            s.update(buf.data(), static_cast<size_t>(n));
+            done += static_cast<uint64_t>(n);
+        }
+        return s.hex();
+    }
+
+    std::string copy_open_file(link_free_file& from, const std::string& to, const std::string& expected,
+        const std::atomic<bool>* cancel)
+    {
+        new_file out;
+        if (!from.seek(0) || !out.create(to)) return std::string();
+        sha256_stream s;
+        std::vector<char> buf(1 << 20);
+        uint64_t done = 0;
+        bool ok = true;
+        while (ok && done < from.size())
+        {
+            const long long n = from.read(buf.data(),
+                static_cast<size_t>(std::min<uint64_t>(buf.size(), from.size() - done)));
+            ok = n > 0 && !(cancel && cancel->load()) && out.write(buf.data(), static_cast<size_t>(n));
+            if (!ok) break;
+            s.update(buf.data(), static_cast<size_t>(n));
+            done += static_cast<uint64_t>(n);
+        }
+        ok = out.close() && ok;
+        const std::string sha = ok ? s.hex() : std::string();
+        if (sha.empty() || (!expected.empty() && sha != expected))
+        {
+            remove_file(to);
+            return std::string();
+        }
+        return sha;
     }
 
     std::string base64_encode(const std::string& data)

@@ -154,6 +154,20 @@ namespace dlib
                   tensor operation that qualifies for the device.
         !*/
 
+        std::string unavailable_reason (
+        );
+        /*!
+            ensures
+                - returns why the devices of DLIB_NPU_DEVICE that are not in use were left out,
+                  as the plugins of OpenVINO report it, separated by "; ": "no NPU device" for a
+                  plugin that finds none, or the message of a plugin that could not start. When
+                  no device is in use, it begins with the reason of that: routing disabled by
+                  DLIB_NPU, an OpenVINO runtime that could not start, or no device found.
+                - returns an empty string when every device listed is in use, and the absence of
+                  DLIB_USE_NPU in a build without it.
+                - The first call initializes the runtime, as is_available() does.
+        !*/
+
         std::string device_name (
         );
         /*!

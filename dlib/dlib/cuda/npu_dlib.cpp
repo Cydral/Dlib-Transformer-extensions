@@ -1780,6 +1780,8 @@ namespace dlib
                 uint32_t single_mask = 0;        // devices that compute in single precision
                 bool any_half = false;           // a device computes in half precision
                 std::string why_unavailable;
+                // The devices of the list left out, with the reason each plugin gave.
+                std::string missing;
                 bool cache_enabled = true;
                 std::string cache_dir;
                 size_t budget = size_t(2048) << 20;
@@ -2073,6 +2075,7 @@ namespace dlib
                     r->devices.push_back(std::move(d));
                 }
 
+                r->missing = missing;
                 if (r->devices.empty())
                 {
                     r->why_unavailable = "no device found among " + r->requested +
@@ -3617,6 +3620,8 @@ namespace dlib
                 for (const auto& d : r.devices)
                     out << "  device   : " << d->name << ", " << d->full_name << ", " << (d->half ? "f16" : "f32")
                         << " exchange, " << (d->single ? "single" : "half") << " precision arithmetic\n";
+                if (!r.missing.empty())
+                    out << "  missing  : " << r.missing << "\n";
                 const int only = r.restricted.load();
                 out << "  routing  : " << (m == static_cast<int>(routing::always) ? "always" :
                                            m == static_cast<int>(routing::never) ? "never" : "automatic")
@@ -3678,6 +3683,13 @@ namespace dlib
         bool is_compiled_in () { return true; }
 
         bool is_available () { return rt().available; }
+
+        std::string unavailable_reason ()
+        {
+            runtime& r = rt();
+            if (r.available) return r.missing;
+            return r.why_unavailable.empty() ? std::string("the runtime was shut down") : r.why_unavailable;
+        }
 
         std::string device_name ()
         {

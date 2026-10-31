@@ -25,10 +25,15 @@
 #endif
 
 #include <dlib/external/httplib/httplib.h>
+#include <mbedtls/build_info.h>
+#include <sqlite3.h>
+#include <zlib.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
@@ -54,6 +59,18 @@ namespace albireo
         // The values of a body, each taking about a hundred bytes once read: more than the
         // 300,000 tokens a request of embeddings may list.
         const size_t max_body_values = size_t(1) << 19;
+        /*
+            The bodies above large_body are read for max_large_bodies requests at once: a body
+            of 64 MB, held and parsed by each of the 64 threads of the server, would take more
+            memory than the computer has.  The count is taken before the body is read and given
+            back once the answer is written, by the same thread (holding_large_body).
+        */
+        const uint64_t large_body = 8u << 20;
+        const int max_large_bodies = 4;
+        std::atomic<int> large_bodies{0};
+        thread_local bool holding_large_body = false;
+        // The events of a streamed answer waiting for a client that reads far slower than the engine writes.
+        const size_t max_backlog = 16384;
 
         const char* const upload_route = "/albireo/v1/models/upload";
 
@@ -164,35 +181,6 @@ namespace albireo
             return o == "https://localhost" + p || o == "https://127.0.0.1" + p || o == "https://[::1]" + p;
         }
 
-        /*
-            The paths the service imports from: local drives and mounted media, never a
-            network share (the service would authenticate to it) nor a device of the system.
-            On Windows the service reads them with the rights of the system: the path must
-            reach its drive through no link, and a folder must hold no link where the import
-            reads, since a junction or a link may lead to a share, to a device or to the
-            files of another user.
-        */
-        bool acceptable_import_path(const std::string& p)
-        {
-#if defined(_WIN32)
-            if (p.size() < 3 || !std::isalpha(static_cast<unsigned char>(p[0])) || p[1] != ':'
-                || (p[2] != '\\' && p[2] != '/'))
-                return false;
-            const UINT drive = GetDriveTypeW(widen(p.substr(0, 2) + "\\").c_str());
-            if (drive != DRIVE_FIXED && drive != DRIVE_REMOVABLE && drive != DRIVE_CDROM && drive != DRIVE_RAMDISK)
-                return false;
-            if (!direct_path(p)) return false;
-            if (dir_exists(p))
-                for (const std::string& dir : { p, join_path(p, "models") })
-                    for (const auto& n : list_dir(dir))
-                        if (is_link(join_path(dir, n))) return false;
-            return true;
-#else
-            return !p.empty() && p[0] == '/' && p.compare(0, 5, "/dev/") != 0 && p.compare(0, 6, "/proc/") != 0
-                && p.compare(0, 5, "/sys/") != 0;
-#endif
-        }
-
         struct event_channel
         {
             std::mutex m;
@@ -215,6 +203,12 @@ namespace albireo
                 e = std::move(q.front());
                 q.pop_front();
                 return true;
+            }
+
+            size_t pending()
+            {
+                std::lock_guard<std::mutex> lock(m);
+                return q.size();
             }
         };
 
@@ -277,6 +271,15 @@ namespace albireo
             if (body["n"].as_int(1) != 1)
             {
                 error = "only one choice per request (n = 1) is supported";
+                return false;
+            }
+            // The range of top_k in the engine, which bounds the value it receives: a value outside it
+            // is refused here, so that the client learns it.
+            const json& top_k = body["top_k"];
+            if (!top_k.is_null() && !(top_k.is_number() && top_k.as_double() >= 0 && top_k.as_double() <= 1024
+                && top_k.as_double() == std::floor(top_k.as_double())))
+            {
+                error = "top_k must be an integer from 0 to 1024, 0 for no limit";
                 return false;
             }
             out = json::object();
@@ -445,9 +448,13 @@ namespace albireo
                         const std::string line = "data: " + c.dump() + "\n\n";
                         return sink.write(line.data(), line.size());
                     };
-                    // A service that stops ends the answers in progress, whose tokens may flow
-                    // without pause.
-                    if (s->stopping())
+                    /*
+                        A service that stops ends the answers in progress, whose tokens may flow
+                        without pause, and a client that reads far slower than the engine writes
+                        ends its own: the events waiting for it stay bounded, and its place in
+                        the engine goes to the other requests.
+                    */
+                    if (s->stopping() || ch->pending() > max_backlog)
                     {
                         s->engine().cancel(id);
                         return false;
@@ -697,6 +704,93 @@ namespace albireo
                 "models come from files (import)", "offline")));
             return true;
         }
+
+        /*
+            The license texts of the installation lie in the licenses folder of the programs: those
+            of the components the programs hold (cmake/payload.cmake) and of the runtimes of the
+            engines.  A text is named by its file, an entry of that folder read through no link.
+        */
+        const uint64_t max_license_bytes = 1u << 20;
+
+        struct license_component
+        {
+            const char* file;
+            const char* name;
+            const char* version;    // the version the service was built with, empty when it has none
+        };
+
+        const license_component license_components[] = {
+            {"albireo.txt", "Albireo", ALBIREO_VERSION},
+            {"dlib.txt", "dlib", ""},
+            {"mbedtls.txt", "Mbed TLS", MBEDTLS_VERSION_STRING},
+            {"cpp-httplib.txt", "cpp-httplib", CPPHTTPLIB_VERSION},
+            {"zlib.txt", "zlib", ZLIB_VERSION},
+            {"sqlite.txt", "SQLite", SQLITE_VERSION},
+            {"openvino-license.txt", "OpenVINO", ""},
+            {"cuda-eula.txt", "CUDA", ""},
+            {"cudnn-license.txt", "cuDNN", ""}
+        };
+
+        // Whether name can be an entry of the licenses folder: no separator, colon, control
+        // character or leading dot, which leaves out "." and "..".
+        bool license_file_name(const std::string& name)
+        {
+            if (name.empty() || name.size() > 255 || name[0] == '.') return false;
+            for (const char ch : name)
+            {
+                const unsigned char c = static_cast<unsigned char>(ch);
+                if (c < 0x20 || c == 0x7f || c == '/' || c == '\\' || c == ':') return false;
+            }
+            return true;
+        }
+
+        // Opens the entry name of the licenses folder through no link: a file of one name only (no
+        // hard link) and of max_license_bytes at most.
+        bool open_license(const std::string& folder, const std::string& name, link_free_file& f)
+        {
+            std::string why;
+            return license_file_name(name) && f.open(join_path(folder, name), folder, why) && f.links() == 1
+                && f.size() <= max_license_bytes;
+        }
+
+        // The license texts of folder: [{"file", "name", "size", "version"}], "version" when known.
+        json license_list(const std::string& folder)
+        {
+            std::vector<std::string> entries = list_dir(folder);
+            std::sort(entries.begin(), entries.end());
+            json list = json::array();
+            for (const auto& file : entries)
+            {
+                link_free_file f;
+                if (!open_license(folder, file, f)) continue;
+                json e = json::object();
+                e["file"] = file;
+                e["name"] = file.substr(0, file.rfind('.'));
+                for (const auto& c : license_components)
+                    if (file == c.file)
+                    {
+                        e["name"] = c.name;
+                        if (*c.version) e["version"] = c.version;
+                    }
+                e["size"] = static_cast<unsigned long long>(f.size());
+                list.push_back(e);
+            }
+            return list;
+        }
+
+        // Reads the whole text of a license opened by open_license().
+        bool read_license(link_free_file& f, std::string& text)
+        {
+            text.resize(static_cast<size_t>(f.size()));
+            size_t done = 0;
+            while (done < text.size())
+            {
+                const long long n = f.read(&text[done], text.size() - done);
+                if (n <= 0) return false;
+                done += static_cast<size_t>(n);
+            }
+            return true;
+        }
     }
 
     void install_routes(httplib::Server& srv, service& svc)
@@ -730,10 +824,32 @@ namespace albireo
                 if (content_length(req) > max_json_body) return refuse(413, "the body is too large");
                 if (content_length(req) > 0 && req.get_header_value("Content-Type").find("application/json") != 0)
                     return refuse(415, "the body must be application/json");
+                // A count this thread kept from a request whose answer was never written is given back.
+                if (holding_large_body)
+                {
+                    holding_large_body = false;
+                    --large_bodies;
+                }
+                if (content_length(req) > large_body)
+                {
+                    if (large_bodies.fetch_add(1) >= max_large_bodies)
+                    {
+                        --large_bodies;
+                        res.set_header("Retry-After", "2");
+                        return refuse(503, "too many large bodies are being read at once: try again");
+                    }
+                    holding_large_body = true;
+                }
             }
             return httplib::Server::HandlerResponse::Unhandled;
         });
         srv.set_post_routing_handler([](const httplib::Request& req, httplib::Response& res) {
+            // The body of the request is read and handled: its count goes back.
+            if (holding_large_body)
+            {
+                holding_large_body = false;
+                --large_bodies;
+            }
             res.set_header("X-Content-Type-Options", "nosniff");
             res.set_header("Referrer-Policy", "no-referrer");
             res.set_header("Cross-Origin-Opener-Policy", "same-origin");
@@ -892,6 +1008,31 @@ namespace albireo
         srv.Get("/albireo/v1/updates", [s](const httplib::Request&, httplib::Response& res) {
             send_json(res, 200, s->updates().status());
         });
+        // The license texts of the installation, read only: their list, and each text by its file.
+        const std::string licenses = join_path(svc.program_dir(), "licenses");
+        srv.Get("/albireo/v1/licenses", [licenses](const httplib::Request&, httplib::Response& res) {
+            send_json(res, 200, license_list(licenses));
+        });
+        srv.Get(R"(/albireo/v1/licenses/(.+))", [licenses](const httplib::Request& req, httplib::Response& res) {
+            const std::string name = req.matches[1];
+            if (!license_file_name(name))
+            {
+                send_error(res, 400, "invalid_request_error", "a license text is named by a file of the licenses "
+                    "folder", "invalid_license");
+                return;
+            }
+            const std::vector<std::string> entries = list_dir(licenses);
+            link_free_file f;
+            std::string text;
+            if (std::find(entries.begin(), entries.end(), name) == entries.end() || !open_license(licenses, name, f)
+                || !read_license(f, text))
+            {
+                send_error(res, 404, "invalid_request_error", "no license text " + name, "license_not_found");
+                return;
+            }
+            res.status = 200;
+            res.set_content(text, "text/plain; charset=utf-8");
+        });
         srv.Post("/albireo/v1/count", [s](const httplib::Request& req, httplib::Response& res) {
             json body;
             if (!parse_body(req, res, body)) return;
@@ -960,23 +1101,28 @@ namespace albireo
             if (ok) o["pending"] = pending;
             send_json(res, ok ? 200 : 400, o);
         });
-        // A folder or a file on a local drive or a medium: models, and the signed catalog
-        // and update of an offline bundle.
+        /*
+            The signed offline bundles and the content of the import folder (service::import_folder()),
+            which the service reads with its own rights: a refusal comes with its code and the path.
+        */
         auto import = [s, admin](const httplib::Request& req, httplib::Response& res) {
             if (!admin(req, res)) return;
             json body;
             if (!parse_body(req, res, body)) return;
-            const std::string path = body["path"].as_string();
-            if (!acceptable_import_path(path))
+            user_error refusal;
+            json r;
+            if (body["path"].is_string()) r = s->import_folder(body["path"].as_string(), refusal);
+            else refusal.set("the body names no path", "import_path_invalid").arg("path", "");
+            if (!refusal.code.empty())
             {
-                send_error(res, 400, "invalid_request_error", "the path must be a local folder or file");
+                send_json(res, 400, ok_result(false, refusal));
                 return;
             }
-            send_json(res, 200, s->import_folder(path));
+            send_json(res, 200, r);
         };
         srv.Post("/albireo/v1/import", import);
         srv.Post("/albireo/v1/models/import", import);
-        // A model file sent by the tray, for the files the service cannot read itself.
+        // A model file sent by the tray, read with the rights of its user, for the files the service never reads.
         srv.Post(upload_route, [s, admin](const httplib::Request& req, httplib::Response& res,
                                     const httplib::ContentReader& reader) {
             if (!admin(req, res)) return;
@@ -995,22 +1141,24 @@ namespace albireo
                 send_error(res, 507, "server_error", "not enough free space in " + dir);
                 return;
             }
+            // A new file of the models folder reached through no link, as every file written there.
             const std::string tmp = join_path(dir, ".transfer-" + random_hex(16) + ".partial");
-            std::ofstream out;
-#if defined(_WIN32)
-            out.open(widen(tmp).c_str(), std::ios::binary | std::ios::trunc);
-#else
-            out.open(tmp, std::ios::binary | std::ios::trunc);
-#endif
+            new_file out;
+            if (!direct_path(dir) || !out.create(tmp))
+            {
+                res.set_header("Connection", "close");
+                send_error(res, 500, "server_error", "cannot create " + tmp);
+                return;
+            }
             sha256_stream hash;
             uint64_t received = 0;
-            const bool ok = out && reader([&](const char* data, size_t n) {
-                out.write(data, static_cast<std::streamsize>(n));
-                hash.update(data, n);
+            bool ok = reader([&](const char* data, size_t n) {
                 received += n;
-                return static_cast<bool>(out) && received <= length && !s->stopping();
+                if (received > length || s->stopping() || !out.write(data, n)) return false;
+                hash.update(data, n);
+                return true;
             });
-            out.close();
+            ok = out.close() && ok;
             if (!ok || received != length)
             {
                 remove_file(tmp);
@@ -1018,8 +1166,9 @@ namespace albireo
                 send_error(res, 400, "invalid_request_error", "the transfer did not complete");
                 return;
             }
+            // A model installed already under another file is a success too ("already").
             const json r = s->models().import_received(tmp, name, hash.hex());
-            send_json(res, r["imported"].empty() ? 400 : 200, r);
+            send_json(res, r["imported"].empty() && r["already"].empty() ? 400 : 200, r);
         });
 
         // The password of the proxy is given as proxy_password_mask (host_settings::to_json()).
@@ -1091,10 +1240,17 @@ namespace albireo
         });
         srv.Post("/albireo/v1/updates/apply", [s, admin](const httplib::Request& req, httplib::Response& res) {
             if (!admin(req, res)) return;
-            // The staged installer runs at the start of the service: a restart applies it.
-            if (s->updates().staged_installer().empty())
+            /*
+                The staged installer runs at the start of the service: a restart applies it,
+                where the installer of Albireo installs the updates.  The refusal comes with
+                its code and its values, as every error of the updates.
+            */
+            user_error error;
+            if (!s->updates().can_apply(error))
             {
-                send_json(res, 400, ok_result(false, "no update is ready"));
+                json o = ok_result(false, error);
+                o["args"] = error.args;
+                send_json(res, error.code == "update_not_ready" ? 400 : 409, o);
                 return;
             }
             send_json(res, 202, ok_result(true));
@@ -1124,10 +1280,14 @@ namespace albireo
         srv.set_file_extension_and_mimetype_mapping("mjs", "text/javascript");
         srv.set_file_extension_and_mimetype_mapping("woff2", "font/woff2");
         srv.set_file_extension_and_mimetype_mapping("webmanifest", "application/manifest+json");
-        srv.set_file_request_handler([](const httplib::Request& req, httplib::Response& res) {
-            // The pages are checked at each load, so that an update shows at once.
-            if (req.path == "/" || (req.path.size() > 5 && req.path.compare(req.path.size() - 5, 5, ".html") == 0))
-                res.set_header("Cache-Control", "no-cache");
+        srv.set_file_request_handler([](const httplib::Request&, httplib::Response& res) {
+            /*
+                Every file of the application is checked at each load, its pages as well as its
+                scripts and styles, so that an update shows at once: without this header, a
+                browser may keep the scripts of the previous version for hours.  The check costs
+                a request answered by 304 Not Modified while the file is unchanged.
+            */
+            res.set_header("Cache-Control", "no-cache");
         });
         srv.Get("/docs", [](const httplib::Request&, httplib::Response& res) { res.set_redirect("/docs/"); });
     }

@@ -24,10 +24,15 @@ async function errorOf(r) {
   return serviceError(r.status + ' ' + r.statusText);
 }
 
-export async function getJSON(url) {
-  const r = await fetch(url, { cache: 'no-store' });
+export async function getJSON(url, signal) {
+  const r = await fetch(url, { cache: 'no-store', signal });
   if (!r.ok) throw await errorOf(r);
   return r.json();
+}
+
+// A signal that ends a request after ms milliseconds, where the browser offers one.
+function timeout(ms) {
+  return typeof AbortSignal.timeout === 'function' ? AbortSignal.timeout(ms) : undefined;
 }
 
 export async function postJSON(url, body, signal) {
@@ -84,8 +89,9 @@ export async function* streamChat(body, signal) {
   }
 }
 
+// The status of the service, which a service that no longer answers leaves unknown after a while.
 export function status() {
-  return getJSON('/albireo/v1/status');
+  return getJSON('/albireo/v1/status', timeout(8000));
 }
 
 export function models(lang) {

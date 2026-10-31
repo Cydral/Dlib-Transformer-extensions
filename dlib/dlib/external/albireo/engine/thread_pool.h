@@ -48,19 +48,27 @@ namespace albireo
         explicit thread_pool(int threads)
         {
             const int n = threads > 0 ? threads : 1;
-            for (int i = 1; i < n; ++i)
-                workers_.emplace_back([this, i]() { worker_loop(i); });
+            /*
+                Every worker starts from generation 0, the generation of a pool without any
+                section, so that a worker takes part in a section opened before the system
+                first runs it.  A thread that cannot be started stops the others.
+            */
+            try
+            {
+                workers_.reserve(static_cast<size_t>(n - 1));
+                for (int i = 1; i < n; ++i)
+                    workers_.emplace_back([this, i]() { worker_loop(i, 0); });
+            }
+            catch (...)
+            {
+                stop_workers();
+                throw;
+            }
         }
 
         ~thread_pool()
         {
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                stop_.store(true, std::memory_order_release);
-                generation_.fetch_add(1, std::memory_order_release);
-            }
-            cv_.notify_all();
-            for (auto& t : workers_) t.join();
+            stop_workers();
         }
 
         thread_pool(const thread_pool&) = delete;
@@ -152,9 +160,19 @@ namespace albireo
             }
         }
 
-        void worker_loop(int thread)
+        void stop_workers()
         {
-            uint64_t seen = generation_.load(std::memory_order_acquire);
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                stop_.store(true, std::memory_order_release);
+                generation_.fetch_add(1, std::memory_order_release);
+            }
+            cv_.notify_all();
+            for (auto& t : workers_) t.join();
+        }
+
+        void worker_loop(int thread, uint64_t seen)
+        {
             for (;;)
             {
                 // Spin for a while, then sleep until the next section.

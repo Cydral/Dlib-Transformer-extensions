@@ -12,14 +12,20 @@ set(ALBIREO_EXTRA_ENGINE_DIRS "" CACHE STRING "Folders of engines built elsewher
 
 set(ui_libraries comctl32 windowscodecs ole32 oleaut32 shell32 uuid advapi32)
 
+set(ALBIREO_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/..)
+
 add_executable(albireo-tray WIN32 tray.cpp tray_windows.cpp ui.cpp strings.cpp service_client.cpp tray.rc)
 target_link_libraries(albireo-tray PRIVATE albireo_common dlib::httplib ${ui_libraries})
 target_compile_options(albireo-tray PRIVATE ${ALBIREO_WARNINGS})
+# The images the resources embed: the Makefile and Ninja generators follow only the files they include.
+set(tray_images about.png mark.png albireo.ico tray.ico tray-busy.ico tray-off.ico tray-update.ico)
+list(TRANSFORM tray_images PREPEND ${ALBIREO_SOURCE_DIR}/resources/)
+set_source_files_properties(tray.rc PROPERTIES OBJECT_DEPENDS "${tray_images}")
 
-set(ALBIREO_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/..)
 set(ALBIREO_WINDOWS_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 set(ALBIREO_PAYLOAD ${CMAKE_BINARY_DIR}/payload/albireo-payload.zip)
-file(GLOB_RECURSE web_files ${ALBIREO_SOURCE_DIR}/web/*)
+# The build checks the list again, so that a file added to or removed from web needs no new configuration.
+file(GLOB_RECURSE web_files CONFIGURE_DEPENDS ${ALBIREO_SOURCE_DIR}/web/*)
 set(processor_engines albireo-engine-cpu albireo-engine-cpu-avx2)
 foreach (e albireo-engine-cpu-avxvnni albireo-engine-cpu-avx512)
    if (TARGET ${e})
@@ -38,12 +44,15 @@ add_custom_target(albireo-payload DEPENDS ${ALBIREO_PAYLOAD})
 add_dependencies(albireo-payload albireo-web)
 
 configure_file(setup.rc.in ${CMAKE_BINARY_DIR}/rc/setup.rc @ONLY)
-set_source_files_properties(${CMAKE_BINARY_DIR}/rc/setup.rc PROPERTIES OBJECT_DEPENDS "${ALBIREO_PAYLOAD}")
+set_source_files_properties(${CMAKE_BINARY_DIR}/rc/setup.rc PROPERTIES OBJECT_DEPENDS
+   "${ALBIREO_PAYLOAD};${ALBIREO_SOURCE_DIR}/resources/setup-side.png;${ALBIREO_SOURCE_DIR}/resources/albireo.ico")
+# The installer reads the database of the service (host/store.cpp) to remove the model files it recorded.
 add_executable(albireo-setup-online WIN32 setup.cpp setup_actions.cpp zip_reader.cpp ui.cpp strings.cpp
-   ${ALBIREO_SOURCE_DIR}/host/certificates.cpp ${ALBIREO_SOURCE_DIR}/host/crypto.cpp ${CMAKE_BINARY_DIR}/rc/setup.rc)
+   ${ALBIREO_SOURCE_DIR}/host/certificates.cpp ${ALBIREO_SOURCE_DIR}/host/crypto.cpp
+   ${ALBIREO_SOURCE_DIR}/host/store.cpp ${CMAKE_BINARY_DIR}/rc/setup.rc)
 add_dependencies(albireo-setup-online albireo-payload)
-target_link_libraries(albireo-setup-online PRIVATE albireo_common albireo_zlib dlib::httplib ${ui_libraries} crypt32
-   ws2_32)
+target_link_libraries(albireo-setup-online PRIVATE albireo_common albireo_sqlite albireo_zlib dlib::httplib
+   ${ui_libraries} crypt32 ws2_32)
 target_compile_options(albireo-setup-online PRIVATE ${ALBIREO_WARNINGS})
 
 # The installer without models, which the updates take, and the complete installer: the

@@ -29,6 +29,14 @@ namespace albireo
         // Loads the library at path (UTF-8); false with the reason in error otherwise.
         bool load(const std::string& path, std::string& error);
         void unload();
+
+        /*
+            Keeps the library in the process: unload() and the destructor then forget it
+            without unloading it.  The engines of the devices stay loaded this way, since
+            the runtimes of OpenVINO and CUDA keep threads that their unloading, run by
+            Windows under its loader lock, would wait for forever.
+        */
+        void keep_loaded() { keep_ = true; }
         bool loaded() const { return handle_ != nullptr; }
         const std::string& path() const { return path_; }
 
@@ -55,6 +63,7 @@ namespace albireo
     private:
         void* handle_ = nullptr;
         std::string path_;
+        bool keep_ = false;
     };
 
     // File name of an engine library of the given variant on this platform:

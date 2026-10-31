@@ -16,7 +16,7 @@
 # folders whose files go into the engines folder of the installation.
 
 cmake_minimum_required(VERSION 3.16)
-project(albireo VERSION 1.0.7 LANGUAGES C CXX)
+project(albireo VERSION 1.0.8 LANGUAGES C CXX)
 
 option(ALBIREO_PROGRAMS "Build the service, the tray, the installer and the processor engines" ON)
 option(ALBIREO_ENGINE_CUDA "Build the engine for NVIDIA graphics processors (dlib built with CUDA)" OFF)
@@ -458,6 +458,15 @@ if (ALBIREO_ENGINE_OPENVINO)
          set(plugin "${CMAKE_SHARED_LIBRARY_PREFIX}openvino_intel_${device}_plugin${CMAKE_SHARED_LIBRARY_SUFFIX}")
          list(APPEND ALBIREO_RUNTIME_EXTRA "${openvino_dir}/${plugin}")
       endforeach()
+      # What the plugins load by name besides: the compiler of the NPU plugin, its loader and
+      # the runtime of its graphs (OpenVINO 2025 and later), the library with which TBB reads
+      # the cores of a hybrid processor, and the table of the tuned kernels of the GPU plugin.
+      foreach (part npu_compiler npu_compiler_loader npu_vm_runtime)
+         list(APPEND ALBIREO_RUNTIME_EXTRA
+            "${openvino_dir}/${CMAKE_SHARED_LIBRARY_PREFIX}openvino_intel_${part}${CMAKE_SHARED_LIBRARY_SUFFIX}")
+      endforeach()
+      list(APPEND ALBIREO_RUNTIME_EXTRA "${openvino_dir}/${CMAKE_SHARED_LIBRARY_PREFIX}tbbbind*"
+         "${openvino_dir}/cache.json")
       foreach (engine ${openvino_engines})
          albireo_device_runtime(${engine})
       endforeach()
@@ -511,7 +520,8 @@ if (ALBIREO_PROGRAMS)
    target_compile_options(albireo-service PRIVATE ${ALBIREO_WARNINGS})
    if (WIN32)
       target_sources(albireo-service PRIVATE resources/service.rc)
-      target_link_libraries(albireo-service PRIVATE winhttp)
+      # crypt32: the key of the server encrypted with DPAPI, the authority in the trusted roots.
+      target_link_libraries(albireo-service PRIVATE winhttp crypt32)
    endif()
 
    # The signatures of the update feed and of the model catalog, for their publisher.
@@ -613,8 +623,14 @@ if (ALBIREO_TESTS AND (ALBIREO_ENGINE_CUDA OR ALBIREO_ENGINE_OPENVINO OR ALBIREO
 endif()
 
 if (ALBIREO_TESTS AND ALBIREO_PROGRAMS)
-   foreach (t test_qkernels test_runtime test_tokenizer engine_chat bench_runtime)
-      if (t STREQUAL "engine_chat")
+   # The files the service writes in its models folder and reads in its imports, with a local server.
+   add_executable(test_host tests/test_host.cpp host/models.cpp host/store.cpp host/http_fetch.cpp host/crypto.cpp)
+   target_link_libraries(test_host PRIVATE albireo_common albireo_sqlite albireo_zlib dlib::httplib)
+   target_compile_options(test_host PRIVATE ${ALBIREO_WARNINGS})
+   albireo_output_dir(test_host ${CMAKE_BINARY_DIR}/tests)
+   # test_model_file: damaged model files; test_engine_api: the C interface of an engine library.
+   foreach (t test_qkernels test_runtime test_tokenizer engine_chat bench_runtime test_model_file test_engine_api)
+      if (t STREQUAL "engine_chat" OR t STREQUAL "test_engine_api")
          add_executable(${t} tests/${t}.cpp)
          target_link_libraries(${t} PRIVATE albireo_common)
       else()
@@ -629,6 +645,10 @@ if (ALBIREO_TESTS AND ALBIREO_PROGRAMS)
       endif()
       albireo_output_dir(${t} ${CMAKE_BINARY_DIR}/tests)
    endforeach()
+   # The chat format of the agents: the prompts with tools, and the tool calls read back.
+   add_executable(test_chat_format tests/test_chat_format.cpp engine/chat_format.cpp)
+   target_include_directories(test_chat_format PRIVATE ${ALBIREO_INCLUDE_DIR})
+   albireo_output_dir(test_chat_format ${CMAKE_BINARY_DIR}/tests)
    # The kernels of the other families: their checks and their speed, on the processors
    # that have their instructions (the others skip them).
    foreach (family avxvnni avx512 vnni256)

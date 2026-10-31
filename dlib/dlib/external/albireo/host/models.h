@@ -39,13 +39,30 @@ namespace albireo
                 match, the parts whose own hash fails are fetched again, once.
 
             OFFLINE INSTALLATION
-                import_path() installs the GGUF files of a folder (and of its "models"
-                subfolder) or a single file, such as a memory card or a disk brought to a
-                machine without network.  A file whose hash is in the catalog takes its
-                entry; another one is described from its own metadata, the identity of a
-                model of Albireo included (albireo.id, albireo.name, albireo.roles,
-                albireo.inputs).  import_catalog() installs a signed catalog brought the
-                same way.
+                import_path() installs the GGUF files of the import folder of the data
+                folder, which only SYSTEM and the administrators fill: the files of a
+                folder (and of its "models" subfolder) or a single file.  A file whose hash
+                is in the catalog takes its entry; another one is described from its own
+                metadata, the identity of a model of Albireo included (albireo.id,
+                albireo.name, albireo.roles, albireo.inputs).  import_bundle() installs the
+                models of a signed offline bundle, wherever it lies: only the files its
+                signed catalog lists, found by their names and checked against their sizes
+                and hashes before anything is copied.  import_catalog() installs a signed
+                catalog brought the same way.
+
+                The files are read through no link (link_free_file), with a single name,
+                so that no import makes the service read the file of another account.  A
+                file whose content is that of an installed model, a model that comes with
+                Albireo included, is not copied again: it is listed under "already".  A
+                file never takes the identifier of a model that comes with Albireo: it is
+                installed as <identifier>-import.
+
+            THE MODELS FOLDER
+                Every file the service writes there (a download, its partial file, an
+                import, a transfer from the tray) is created in the folder reached through
+                no link (direct_path()), checked again right before the file is created,
+                renamed or deleted, and opened without following a link at its own name;
+                a renamed file is checked to be the one written.
 
             MODELS THAT COME WITH ALBIREO
                 register_builtin() records the models of the folder of the programs, which
@@ -67,13 +84,14 @@ namespace albireo
         void refresh_catalog_async();
         /*!
             ensures
-                - Installs the catalog of folder (catalog.json and catalog.json.sig), its
+                - Installs the catalog of folder (catalog.json and catalog.json.sig), read
+                  through no link from base (an empty base: the root of the drive), its
                   signature checked as for a downloaded one, unless the catalog in use was
                   published later.
                 - Returns {"models": number of models} when installed, {"state": "kept"}
                   when the catalog in use is more recent, {"error"} otherwise.
         !*/
-        json import_catalog(const std::string& folder);
+        json import_catalog(const std::string& folder, const std::string& base);
         // The catalog in use: "state" (idle, checking, ok, error), "error", "updated",
         // "models" (their number) and "time" (of the last installation, Unix seconds).
         json catalog_status() const;
@@ -97,14 +115,27 @@ namespace albireo
         // with the catalog.
         json verify(const std::string& id);
         /*!
+            requires
+                - path is base, the import folder, or lies under it.
             ensures
                 - Installs the GGUF files of path: a file, or a folder with its "models"
-                  subfolder.  With move, the files installed leave path: moved into the
-                  models folder, or copied then deleted when it is on another volume.  A
-                  file that cannot be installed stays where it is.
-                - Returns {"imported": identifiers, "errors": messages}.
+                  subfolder, each read through no link from base.  With move, the files
+                  installed, and those installed already, leave path: moved into the models
+                  folder, or copied then deleted when it is on another volume.  A file that
+                  cannot be installed stays where it is.
+                - Returns {"imported": identifiers, "already": identifiers of the installed
+                  models whose content the files repeat, "errors": messages}.
         !*/
-        json import_path(const std::string& path, bool move = false);
+        json import_path(const std::string& path, const std::string& base, bool move = false);
+        /*!
+            ensures
+                - Installs the models of the offline bundle in folder that catalog, its
+                  signed catalog, lists: models/<name> or <name>, the name of its single file
+                  or <identifier>.gguf, read through no link from the root of its drive, with
+                  the size and the hash of the catalog.  The files stay in the bundle.
+                - Returns {"imported", "already", "errors"} as import_path().
+        !*/
+        json import_bundle(const std::string& folder, const json& catalog);
         // Installs a file received by the service (a transfer from the tray), moved into
         // the models folder; sha is the hash computed while it was received.
         json import_received(const std::string& file, const std::string& original_name, const std::string& sha);
@@ -137,8 +168,22 @@ namespace albireo
             std::string& error);
         bool install_file(const std::string& id, const std::string& file, const json& descriptor,
             const std::string& sha, const std::string& source, std::string& error);
-        bool import_file(const std::string& f, const std::string& original_name, const std::string& known_sha,
-            bool move, std::string& id, std::string& error);
+        /*!
+            ensures
+                - Installs the file f, read through no link from base.  Returns true with id
+                  set, and already true when an installed model has its content (no copy is
+                  made, and with move f is deleted).
+        !*/
+        bool import_file(const std::string& f, const std::string& base, const std::string& original_name,
+            const std::string& known_sha, bool move, std::string& id, bool& already, std::string& error);
+        // The installed model whose file has the content of hash sha, the one that comes with Albireo
+        // first, or false.
+        bool installed_with_hash(const std::string& sha, installed_model& m);
+        // The identifier a new file takes: id, or id-import when a model that comes with Albireo holds id.
+        std::string free_identifier(const std::string& id);
+        // Moves the file from to target, a name of the models folder: false when the folder is no longer
+        // reached directly, when the move fails, or when target then names another file than the one moved.
+        bool place(const std::string& from, const std::string& target);
 
         store& db_;
         std::string dir_;

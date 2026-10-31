@@ -4,6 +4,7 @@
 #define ALBIREO_HOST_STORE_H_
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -39,6 +40,12 @@ namespace albireo
 
                 Every function locks the database for its duration, so that the threads
                 of the server, of the downloads and of the engine may share it.
+
+                A failure throws the error of SQLite, which the callers report.  The
+                database held by another program is waited for five seconds.  SQLite opens a
+                file it cannot write read-only, and its connection stays so: a write that
+                fails on it opens the connection again, so that the writes work again as
+                soon as the file can be written.
         !*/
     public:
         explicit store(const std::string& path);
@@ -63,7 +70,13 @@ namespace albireo
         void set_value(const std::string& key, const std::string& v);
 
     private:
+        // Opens the connection and sets its options; m_ is held, or the store is being built.
+        void connect();
+        // Runs a write; a connection that SQLite opened read-only is opened again once.  m_ is held.
+        void writing(const std::function<void()>& work);
+
         std::mutex m_;
+        std::string path_;
         std::unique_ptr<dlib::database> db_;
     };
 

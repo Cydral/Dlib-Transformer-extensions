@@ -49,6 +49,6 @@
   <circle cx="650" cy="82" r="4.6" fill="#f4f8ff"/>
   <path d="M650 46 L652.3 79.7 L686 82 L652.3 84.3 L650 118 L647.7 84.3 L614 82 L647.7 79.7 Z" fill="#dce7ff" fill-opacity="0.45"/>
   <text x="44" y="104" font-family="Segoe UI Variable Display, Segoe UI, system-ui, sans-serif" font-size="46" font-weight="650" fill="#ffffff">Albireo</text>
-  <text x="46" y="138" font-family="Segoe UI, system-ui, sans-serif" font-size="16" fill="#aab2d4">Local intelligence, built on Dlib-Transformer-extensions</text>
+  <text x="46" y="138" font-family="Segoe UI, system-ui, sans-serif" font-size="16" fill="#aab2d4">Local intelligence</text>
   <text x="46" y="164" font-family="Segoe UI, system-ui, sans-serif" font-size="13" fill="#6f789e">β Cygni · a gold and blue double star in the Swan</text>
 </svg>

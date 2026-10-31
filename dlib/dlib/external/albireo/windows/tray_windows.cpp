@@ -9,6 +9,7 @@
 #include <shobjidl.h>
 
 #include <algorithm>
+#include <cstring>
 #include <cwchar>
 #include <map>
 #include <memory>
@@ -48,17 +49,260 @@ namespace albireo
             return tr(key, values);
         }
 
-        // The error of an answer of the service, or of a download.
-        std::wstring error_text(const json& r)
+        // The key of the text of a kind of device: "gpu", "npu", "both" or "cpu".
+        const char* device_key(const std::string& kind)
         {
-            return coded_text("err_", r["code"], r["args"], r["sizes"], r["error"].as_string());
+            return kind == "npu" ? "device_npu" : kind == "both" ? "device_both" : kind == "gpu" ? "device_gpu"
+                : "device_cpu";
         }
 
-        // Why an engine cannot run on this computer.
-        std::wstring reason_text(const json& engine)
+        // The first word all the names share, without its trademark sign: "Intel" for
+        // "Intel(R) AI Boost" and "Intel(R) Graphics".
+        std::string common_vendor(const json& names)
         {
-            return coded_text("why_", engine["reason_code"], engine["reason_args"], json(),
-                engine["reason"].as_string());
+            std::string word;
+            bool first = true;
+            for (const auto& n : names.elements())
+            {
+                const std::string name = n.as_string();
+                std::string w = name.substr(0, name.find(' '));
+                for (const char* mark : { "(R)", "(TM)", "\xC2\xAE", "\xE2\x84\xA2" })
+                    for (size_t p = w.find(mark); p != std::string::npos; p = w.find(mark))
+                        w.erase(p, std::strlen(mark));
+                if (first) word = w;
+                else if (w != word) return std::string();
+                first = false;
+            }
+            return word;
+        }
+
+        // A value of the query of a request: the bytes other than the letters, the digits and
+        // "-._~" as %XX, so that a file name with &, # or + reaches the service whole.
+        std::string query_value(const std::string& s)
+        {
+            const char hex[] = "0123456789ABCDEF";
+            std::string out;
+            for (const char ch : s)
+            {
+                const unsigned char c = static_cast<unsigned char>(ch);
+                const bool plain = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+                    || c == '-' || c == '.' || c == '_' || c == '~';
+                if (plain)
+                {
+                    out += ch;
+                    continue;
+                }
+                out += '%';
+                out += hex[c >> 4];
+                out += hex[c & 15];
+            }
+            return out;
+        }
+    }
+
+    std::wstring error_text(const json& answer)
+    {
+        return coded_text("err_", answer["code"], answer["args"], answer["sizes"], answer["error"].as_string());
+    }
+
+    json failed_answer(const json& answer, const std::string& error)
+    {
+        json r = json::object();
+        r["error"] = error;
+        const json& code = answer["code"].is_string() ? answer["code"] : answer["error"]["code"];
+        if (code.is_string())
+        {
+            r["code"] = code;
+            if (answer["args"].is_object()) r["args"] = answer["args"];
+            if (answer["sizes"].is_object()) r["sizes"] = answer["sizes"];
+        }
+        else if (!answer.is_object())
+        {
+            // The service stopped, or listens on another port.
+            r["code"] = "service";
+            json args = json::object();
+            args["e"] = error;
+            r["args"] = args;
+        }
+        return r;
+    }
+
+    std::wstring reason_text(const json& engine)
+    {
+        return coded_text("why_", engine["reason_code"], engine["reason_args"], json(), engine["reason"].as_string());
+    }
+
+    std::string runtime_name(const std::string& variant)
+    {
+        if (variant == "cuda") return "CUDA";
+        if (variant.compare(0, 8, "openvino") == 0) return "OpenVINO";
+        return variant;
+    }
+
+    std::string engine_name(const std::string& variant)
+    {
+        if (variant == "openvino-avxvnni") return "OpenVINO AVX-VNNI";
+        if (variant == "openvino-avx512") return "OpenVINO AVX-512";
+        return runtime_name(variant);
+    }
+
+    std::wstring choice_label(const json& option)
+    {
+        const std::string kind = option["kind"].as_string();
+        std::string names;
+        if (kind == "both")
+            names = common_vendor(option["names"]);
+        else
+            for (const auto& n : option["names"].elements()) names += (names.empty() ? "" : ", ") + n.as_string();
+        const std::string runtime = runtime_name(option["variant"].as_string());
+        if (names.empty()) return tr("accel_choice_plain", { { "k", tr_utf8(device_key(kind)) }, { "r", runtime } });
+        return tr("accel_choice", { { "k", tr_utf8(device_key(kind)) }, { "n", names }, { "r", runtime } });
+    }
+
+    std::pair<std::string, std::string> choice_settings(const json& option)
+    {
+        const std::string variant = option["variant"].as_string();
+        return std::make_pair(variant == "cuda" ? std::string("cuda") : std::string("openvino"),
+            option["kind"].as_string());
+    }
+
+    namespace
+    {
+        /*
+            The rows of a report list, each one named by a key.  refresh() writes in place the
+            cells whose text changed, so that a list the windows refresh every few seconds is
+            painted where it changes only, and keeps its selection and its scroll position.  A
+            new set of keys fills the list again out of sight, the selected row and the row at
+            the top found again by their keys.
+        */
+        struct list_rows
+        {
+            std::vector<std::string> keys;
+            std::vector<std::vector<std::wstring>> texts;
+            // True while the rows are written: the notifications of the list are then ignored.
+            bool filling = false;
+            // Whether the last refresh() filled the list again, and the columns whose texts it wrote.
+            bool rebuilt = false;
+            std::set<int> changed;
+
+            // The key of the selected row, or an empty string.
+            std::string selected(HWND list) const
+            {
+                const int row = ListView_GetNextItem(list, -1, LVNI_SELECTED);
+                return row >= 0 && row < static_cast<int>(keys.size()) ? keys[static_cast<size_t>(row)] : std::string();
+            }
+
+            void refresh(HWND list, const std::vector<std::string>& now,
+                const std::vector<std::vector<std::wstring>>& cells)
+            {
+                filling = true;
+                rebuilt = false;
+                changed.clear();
+                if (now != keys)
+                {
+                    const std::string chosen = selected(list);
+                    const int top = ListView_GetTopIndex(list);
+                    const std::string top_key = top >= 0 && top < static_cast<int>(keys.size())
+                        ? keys[static_cast<size_t>(top)] : std::string();
+                    const int left = GetScrollPos(list, SB_HORZ);
+                    SendMessageW(list, WM_SETREDRAW, FALSE, 0);
+                    ListView_DeleteAllItems(list);
+                    keys = now;
+                    texts = cells;
+                    int first = -1;
+                    for (size_t row = 0; row < keys.size(); ++row)
+                    {
+                        const int r = static_cast<int>(row);
+                        std::wstring label = texts[row].empty() ? std::wstring() : texts[row][0];
+                        LVITEMW it = {};
+                        it.mask = LVIF_TEXT;
+                        it.iItem = r;
+                        it.pszText = &label[0];
+                        ListView_InsertItem(list, &it);
+                        for (size_t c = 1; c < texts[row].size(); ++c)
+                        {
+                            std::wstring t = texts[row][c];
+                            ListView_SetItemText(list, r, static_cast<int>(c), &t[0]);
+                        }
+                        const UINT focus = LVIS_SELECTED | LVIS_FOCUSED;
+                        if (!chosen.empty() && keys[row] == chosen) ListView_SetItemState(list, r, focus, focus);
+                        if (!top_key.empty() && keys[row] == top_key) first = r;
+                    }
+                    if (first < 0) first = std::min(top, static_cast<int>(keys.size()) - 1);
+                    if (first > 0 || left > 0)
+                    {
+                        RECT item = {};
+                        ListView_GetItemRect(list, 0, &item, LVIR_BOUNDS);
+                        ListView_Scroll(list, left, std::max(0, first) * (item.bottom - item.top));
+                    }
+                    SendMessageW(list, WM_SETREDRAW, TRUE, 0);
+                    InvalidateRect(list, nullptr, TRUE);
+                    rebuilt = true;
+                }
+                else
+                {
+                    for (size_t row = 0; row < keys.size(); ++row)
+                    {
+                        if (texts[row].size() < cells[row].size()) texts[row].resize(cells[row].size());
+                        for (size_t c = 0; c < cells[row].size(); ++c)
+                        {
+                            if (texts[row][c] == cells[row][c]) continue;
+                            texts[row][c] = cells[row][c];
+                            std::wstring t = cells[row][c];
+                            ListView_SetItemText(list, static_cast<int>(row), static_cast<int>(c), &t[0]);
+                            changed.insert(static_cast<int>(c));
+                        }
+                    }
+                }
+                filling = false;
+            }
+        };
+
+        // Sets the width of a column of a list when it differs, which repaints its header.
+        void set_column_width(HWND list, int column, int width)
+        {
+            if (ListView_GetColumnWidth(list, column) != width) ListView_SetColumnWidth(list, column, width);
+        }
+
+        /*
+            The text of the devices of an engine (an element of "engines"): its accelerators
+            with their kind, "NPU Intel(R) AI Boost, GPU Intel(R) Graphics", else the
+            processor it runs on.
+        */
+        std::wstring devices_text(const json& engine)
+        {
+            std::string accelerators, processors;
+            for (const auto& d : engine["devices"].elements())
+            {
+                const std::string type = d["type"].as_string();
+                const std::string name = d["name"].str(d["id"].as_string());
+                if (type == "gpu" || type == "npu")
+                    accelerators += (accelerators.empty() ? "" : ", ") + tr_utf8(device_key(type)) + " " + name;
+                else
+                    processors += (processors.empty() ? "" : ", ") + name;
+            }
+            return widen(accelerators.empty() ? processors : accelerators);
+        }
+
+        /*
+            The text of a measure of the engines: tokens per second, with the kind of the
+            device before it when the engine offers several devices.
+        */
+        std::wstring measures_text(const json& engines, const std::string& variant)
+        {
+            int count = 0;
+            for (const auto& o : engines["options"].elements()) count += o["variant"].as_string() == variant;
+            std::string text;
+            for (const auto& o : engines["options"].elements())
+            {
+                if (o["variant"].as_string() != variant || !o["measure"]["tokens_per_second"].is_number()) continue;
+                char buf[48];
+                snprintf(buf, sizeof(buf), "%.1f tok/s", o["measure"]["tokens_per_second"].as_double());
+                const std::string kind = o["kind"].as_string();
+                const std::string prefix = count > 1 && kind != "cpu" ? tr_utf8(device_key(kind)) + " " : "";
+                text += (text.empty() ? "" : ", ") + prefix + buf;
+            }
+            return widen(text);
         }
 
         /*
@@ -274,7 +518,8 @@ namespace albireo
             HWND intro, space, list, details, progress, status, download, activate, deactivate, verify, remove, import,
                 refresh, close;
             json overview;
-            std::vector<std::string> ids;
+            // The rows of the list, one per model, named by its identifier.
+            list_rows rows;
             std::string selected;
             bool busy = false;
             bool uploading = false;
@@ -338,7 +583,7 @@ namespace albireo
                 GetClientRect(list, &inside);
                 int taken = 0;
                 for (int i = 0; i < 5; ++i) taken += ListView_GetColumnWidth(list, i);
-                ListView_SetColumnWidth(list, 5, std::max<int>(px(140), inside.right - taken));
+                set_column_width(list, 5, std::max<int>(px(140), inside.right - taken));
                 int x = m;
                 for (HWND b : { download, activate, deactivate, verify, remove })
                 {
@@ -411,7 +656,7 @@ namespace albireo
                 request(R_LIST, [c, lang]() {
                     json r;
                     std::string error;
-                    if (!c.get("/albireo/v1/models?lang=" + lang, r, error))
+                    if (!c.poll("/albireo/v1/models?lang=" + lang, r, error))
                     {
                         r = json::object();
                         r["error"] = error;
@@ -472,32 +717,13 @@ namespace albireo
 
             void fill_list()
             {
-                // The same models in the same order keep their rows, and the list its scroll position:
-                // only the texts that changed are written.
+                // The same models in the same order keep their rows: only the texts that changed are
+                // written, and painted again.
                 std::vector<std::string> now;
-                for (const auto& m : overview["models"].elements()) now.push_back(m["id"].as_string());
-                const bool rebuild = now != ids;
-                ids = now;
-                SendMessageW(list, WM_SETREDRAW, FALSE, 0);
-                if (rebuild) ListView_DeleteAllItems(list);
-                auto cell = [this](int row, int column, std::wstring text) {
-                    wchar_t current[512] = {};
-                    ListView_GetItemText(list, row, column, current, 512);
-                    if (text != current) ListView_SetItemText(list, row, column, &text[0]);
-                };
-                int row = 0;
+                std::vector<std::vector<std::wstring>> cells;
                 for (const auto& m : overview["models"].elements())
                 {
                     const std::string id = m["id"].as_string();
-                    if (rebuild)
-                    {
-                        LVITEMW it = {};
-                        it.mask = LVIF_PARAM;
-                        it.iItem = row;
-                        it.lParam = row;
-                        ListView_InsertItem(list, &it);
-                    }
-                    cell(row, 0, widen(m["name"].str(id)));
                     std::wstring roles;
                     const json& listed = m["roles"];
                     if (listed.size() == 3)
@@ -505,11 +731,7 @@ namespace albireo
                     else
                         for (const auto& r : listed.elements())
                             roles += (roles.empty() ? L"" : L", ") + role_name(r.as_string());
-                    cell(row, 1, roles);
-                    cell(row, 2, inputs_text(m));
                     const unsigned long long size = static_cast<unsigned long long>(m["size"].as_int(0));
-                    cell(row, 3, size ? widen(ui::format_size(size)) : std::wstring());
-                    cell(row, 4, state_text(m));
                     std::wstring act;
                     const std::vector<std::string> active = active_roles(id);
                     if (active.size() == 3)
@@ -519,13 +741,22 @@ namespace albireo
                     // The model that comes with Albireo serves the work in the background.
                     if (id == overview["background"].as_string())
                         act += (act.empty() ? L"" : L", ") + tr("role_background");
-                    cell(row, 5, act);
-                    const UINT focus = LVIS_SELECTED | LVIS_FOCUSED;
-                    if (rebuild && id == selected) ListView_SetItemState(list, row, focus, focus);
-                    ++row;
+                    now.push_back(id);
+                    cells.push_back({ widen(m["name"].str(id)), roles, inputs_text(m),
+                        size ? widen(ui::format_size(size)) : std::wstring(), state_text(m), act });
                 }
-                SendMessageW(list, WM_SETREDRAW, TRUE, 0);
-                InvalidateRect(list, nullptr, TRUE);
+                rows.refresh(list, now, cells);
+                // The selected model keeps its selection when the list is filled again.
+                if (rows.rebuilt && !selected.empty() && rows.selected(list) != selected)
+                {
+                    rows.filling = true;
+                    for (size_t i = 0; i < rows.keys.size(); ++i)
+                    {
+                        const UINT focus = LVIS_SELECTED | LVIS_FOCUSED;
+                        if (rows.keys[i] == selected) ListView_SetItemState(list, static_cast<int>(i), focus, focus);
+                    }
+                    rows.filling = false;
+                }
             }
 
             void show_details()
@@ -620,15 +851,7 @@ namespace albireo
                 request(R_ACTION, [c, m, path, body]() {
                     json r;
                     std::string error;
-                    if (!c.send(m.c_str(), path, body, r, error, 120) && !r.contains("code"))
-                    {
-                        r = json::object();
-                        r["error"] = error;
-                        r["code"] = "service";
-                        json args = json::object();
-                        args["e"] = error;
-                        r["args"] = args;
-                    }
+                    if (!c.send(m.c_str(), path, body, r, error, 120)) r = failed_answer(r, error);
                     return r;
                 });
             }
@@ -645,10 +868,24 @@ namespace albireo
                 return std::wstring();
             }
 
-            // What an import installed: the catalog, the models, the update, the errors.
+            /*
+                What an import installed: the catalog, the models, the models installed already
+                (with the file that holds each one for the files sent), the update, the errors.
+            */
             std::wstring import_text(const json& r) const
             {
-                std::wstring text = tr("import_done", { { "n", std::to_string(r["imported"].size()) } });
+                std::wstring text;
+                if (!r["imported"].empty() || r["already"].empty())
+                    text = tr("import_done", { { "n", std::to_string(r["imported"].size()) } });
+                for (const auto& a : r["already"].elements())
+                {
+                    const std::string id = a.is_object() ? a["m"].as_string() : a.as_string();
+                    const json* m = model(id);
+                    const std::string name = m && !(*m)["name"].as_string().empty() ? (*m)["name"].as_string() : id;
+                    text += (text.empty() ? L"" : L"\n") + (a.is_object()
+                        ? tr("import_already_file", { { "f", a["file"].as_string() }, { "m", name } })
+                        : tr("import_already", { { "m", name } }));
+                }
                 const json& c = r["catalog"];
                 if (c["models"].is_number())
                     text += L"\n" + tr("import_catalog", { { "n", std::to_string(c["models"].as_int()) } });
@@ -659,7 +896,7 @@ namespace albireo
                 if (u["state"].as_string() == "ready") text += L"\n" + tr("import_update_ready", { { "v", version } });
                 else if (u["state"].as_string() == "up_to_date")
                     text += L"\n" + tr("import_update_current", { { "v", version } });
-                else if (u["error"].is_string()) text += L"\n" + widen(u["error"].as_string());
+                else if (u["error"].is_string()) text += L"\n" + error_text(u);
                 for (const auto& e : r["errors"].elements()) text += L"\n" + widen(e.as_string());
                 return text;
             }
@@ -752,7 +989,7 @@ namespace albireo
             {
                 HMENU m = CreatePopupMenu();
                 AppendMenuW(m, MF_STRING, IDM_IMPORT_FILES, tr("import_files").c_str());
-                AppendMenuW(m, MF_STRING, IDM_IMPORT_FOLDER, tr("btn_import").c_str());
+                AppendMenuW(m, MF_STRING, IDM_IMPORT_FOLDER, tr("import_folder_menu").c_str());
                 RECT r;
                 GetWindowRect(import, &r);
                 const UINT flags = TPM_RETURNCMD | TPM_LEFTALIGN | TPM_BOTTOMALIGN;
@@ -774,11 +1011,8 @@ namespace albireo
                     json r, body = json::object();
                     body["path"] = path;
                     std::string error;
-                    if (!c.send("POST", "/albireo/v1/import", body, r, error, 3600))
-                    {
-                        r = json::object();
-                        r["error"] = error;
-                    }
+                    // A refusal keeps its code and the path, which its text names.
+                    if (!c.send("POST", "/albireo/v1/import", body, r, error, 3600)) r = failed_answer(r, error);
                     return r;
                 });
             }
@@ -829,13 +1063,13 @@ namespace albireo
                 HWND target = hwnd;
                 ui::run_async(hwnd, WM_RESULT, R_UPLOAD_DONE, [c, files, target]() {
                     json all = json::object();
-                    json imported = json::array(), errors = json::array();
+                    json imported = json::array(), already = json::array(), errors = json::array();
                     for (const auto& f : files)
                     {
                         const std::string name = file_name(f);
                         json r;
                         std::string error;
-                        const bool ok = c.upload("/albireo/v1/models/upload?name=" + name, f,
+                        const bool ok = c.upload("/albireo/v1/models/upload?name=" + query_value(name), f,
                             [target, name](uint64_t done, uint64_t total) {
                                 std::string* msg = new std::string(name);
                                 const WPARAM permille = total ? static_cast<WPARAM>(1000 * done / total) : 0;
@@ -844,11 +1078,22 @@ namespace albireo
                                 return IsWindow(target) != FALSE;
                             }, r, error);
                         if (ok)
+                        {
                             for (const auto& id : r["imported"].elements()) imported.push_back(id);
+                            // A file that holds a model installed already, a success too.
+                            for (const auto& id : r["already"].elements())
+                            {
+                                json a = json::object();
+                                a["file"] = name;
+                                a["m"] = id;
+                                already.push_back(a);
+                            }
+                        }
                         for (const auto& e : r["errors"].elements()) errors.push_back(e);
                         if (!ok && r["errors"].empty()) errors.push_back(name + ": " + error);
                     }
                     all["imported"] = imported;
+                    all["already"] = already;
                     all["errors"] = errors;
                     return all;
                 });
@@ -883,13 +1128,13 @@ namespace albireo
                 if (msg == WM_NOTIFY)
                 {
                     const NMHDR* n = reinterpret_cast<NMHDR*>(lp);
-                    if (n->idFrom == IDC_LIST && n->code == LVN_ITEMCHANGED)
+                    if (n->idFrom == IDC_LIST && n->code == LVN_ITEMCHANGED && !rows.filling)
                     {
                         const NMLISTVIEW* lv = reinterpret_cast<const NMLISTVIEW*>(lp);
-                        const bool known = lv->iItem >= 0 && lv->iItem < static_cast<int>(ids.size());
+                        const bool known = lv->iItem >= 0 && lv->iItem < static_cast<int>(rows.keys.size());
                         if ((lv->uNewState & LVIS_SELECTED) && known)
                         {
-                            selected = ids[static_cast<size_t>(lv->iItem)];
+                            selected = rows.keys[static_cast<size_t>(lv->iItem)];
                             show_details();
                             update_buttons();
                         }
@@ -922,10 +1167,7 @@ namespace albireo
                         json r;
                         std::string error;
                         if (!c.send("POST", "/albireo/v1/models/" + id2 + "/verify", json::object(), r, error, 3600))
-                        {
-                            r = json::object();
-                            r["error"] = error;
-                        }
+                            r = failed_answer(r, error);
                         return r;
                     });
                     break;
@@ -966,6 +1208,9 @@ namespace albireo
             // The settings an Apply in progress changes, as they were, kept again when it fails.
             json previous;
             bool loaded = false;
+            // The rows of the engines, one per library, and the memory the bar shows.
+            list_rows rows;
+            json drawn_memory;
 
             host_window() { min_size = SIZE{ 720, 756 }; }
 
@@ -987,7 +1232,7 @@ namespace albireo
                 // The state comes last: it gives the reason of an engine that cannot run here,
                 // and takes the width of its longest text.
                 const char* columns[] = { "col_engine", "col_version", "col_devices", "col_measure", "col_state" };
-                const int widths[] = { 110, 60, 220, 90, 160 };
+                const int widths[] = { 115, 55, 260, 100, 160 };
                 for (int i = 0; i < 5; ++i)
                 {
                     std::wstring text = tr(columns[i]);
@@ -1032,15 +1277,15 @@ namespace albireo
                 const int inner = w - 2 * m;
                 int y = m;
                 // Computer.
-                ui::place(groups[0], m, y, inner, px(150));
-                ui::place(info_keys, m + px(12), y + px(24), px(150), px(118));
-                ui::place(info_values, m + px(170), y + px(24), inner - px(182), px(118));
-                y += px(150) + g;
-                // Engine.
-                ui::place(groups[1], m, y, inner, px(170));
+                ui::place(groups[0], m, y, inner, px(126));
+                ui::place(info_keys, m + px(12), y + px(24), px(150), px(96));
+                ui::place(info_values, m + px(170), y + px(24), inner - px(182), px(96));
+                y += px(126) + g;
+                // Engine: the list shows the engines of an installation with every device.
+                ui::place(groups[1], m, y, inner, px(194));
                 ui::place(engine, m + px(12), y + px(24), inner - px(24), lh);
-                ui::place(engines, m + px(12), y + px(48), inner - px(24), px(110));
-                y += px(170) + g;
+                ui::place(engines, m + px(12), y + px(48), inner - px(24), px(134));
+                y += px(194) + g;
                 // Extended memory.
                 ui::place(groups[2], m, y, inner, px(118));
                 ui::place(v2ram, m + px(12), y + px(22), inner - px(24), lh);
@@ -1081,14 +1326,14 @@ namespace albireo
                     json r = json::object();
                     std::string error;
                     json s, e, set;
-                    if (!c.get("/albireo/v1/status", s, error))
+                    if (!c.poll("/albireo/v1/status", s, error))
                     {
                         r["error"] = error;
                         return r;
                     }
                     r["status"] = s;
-                    if (c.get("/albireo/v1/engines", e, error)) r["engines"] = e;
-                    if (c.get("/albireo/v1/settings", set, error)) r["settings"] = set;
+                    if (c.poll("/albireo/v1/engines", e, error)) r["engines"] = e;
+                    if (c.poll("/albireo/v1/settings", set, error)) r["settings"] = set;
                     return r;
                 });
             }
@@ -1110,11 +1355,21 @@ namespace albireo
                 ui::set_text(info_keys, keys);
                 ui::set_text(info_values, widen(values));
 
+                // The engine in use, with the device of its choice.
                 const json& e = st["engine"];
-                std::string current = e["variant"].as_string();
-                if (!e["device"].as_string().empty()) current += " (" + e["device"].as_string() + ")";
+                std::wstring current = widen(e["variant"].as_string());
+                bool named = false;
+                for (const auto& o : eng["options"].elements())
+                {
+                    const std::string kind = o["kind"].as_string();
+                    if (!o["current"].as_bool(false) || kind.empty() || kind == "cpu") continue;
+                    current += L"  ·  " + choice_label(o);
+                    named = true;
+                }
+                if (!named && !e["device"].as_string().empty())
+                    current += L" (" + widen(e["device"].as_string()) + L")";
                 const double tps = e["stats"]["generation_tokens_per_second"].as_double(0);
-                std::wstring line = tr("lbl_engine") + L": " + widen(current);
+                std::wstring line = tr("lbl_engine") + L": " + current;
                 if (tps > 0.05)
                 {
                     char buf[32];
@@ -1124,50 +1379,29 @@ namespace albireo
                 if (!e["error"].as_string().empty()) line += L"  ·  " + widen(e["error"].as_string());
                 ui::set_text(engine, line);
 
-                // The list is rebuilt out of sight, then shown at once.
-                SendMessageW(engines, WM_SETREDRAW, FALSE, 0);
-                ListView_DeleteAllItems(engines);
-                int row = 0;
+                /*
+                    The engines, their devices and their state: the reason of an engine that
+                    cannot run here, and the devices that the runtime of an engine left out.
+                    The rows are written in place, so that the list is painted where it changes.
+                */
+                std::vector<std::string> paths;
+                std::vector<std::vector<std::wstring>> cells;
                 for (const auto& x : eng["engines"].elements())
                 {
-                    std::wstring name = widen(x["variant"].as_string());
-                    LVITEMW it = {};
-                    it.mask = LVIF_TEXT;
-                    it.iItem = row;
-                    it.pszText = &name[0];
-                    ListView_InsertItem(engines, &it);
-                    std::wstring v = widen(x["version"].as_string());
-                    ListView_SetItemText(engines, row, 1, &v[0]);
-                    std::string devs;
-                    for (const auto& d : x["devices"].elements())
-                        devs += (devs.empty() ? "" : ", ") + d["name"].as_string();
-                    std::wstring dv = widen(devs);
-                    ListView_SetItemText(engines, row, 2, &dv[0]);
-                    std::wstring state = x["current"].as_bool(false) ? tr("in_use")
-                        : x["usable"].as_bool(false) ? tr("usable") : tr("unavailable");
-                    if (!x["usable"].as_bool(false) && x["reason"].is_string())
+                    const bool usable = x["usable"].as_bool(false);
+                    std::wstring state = x["current"].as_bool(false) ? tr("in_use") : usable ? tr("usable")
+                        : tr("unavailable");
+                    if (!usable && (x["reason"].is_string() || x["reason_code"].is_string()))
                         state += L": " + reason_text(x);
-                    ListView_SetItemText(engines, row, 4, &state[0]);
-                    std::string measure;
-                    for (const auto& o : eng["options"].elements())
-                        if (o["variant"].as_string() == x["variant"].as_string()
-                            && o["measure"]["tokens_per_second"].is_number())
-                        {
-                            char buf[48];
-                            snprintf(buf, sizeof(buf), "%.1f tok/s", o["measure"]["tokens_per_second"].as_double());
-                            measure += (measure.empty() ? "" : ", ") + std::string(buf);
-                        }
-                    std::wstring ms = widen(measure);
-                    ListView_SetItemText(engines, row, 3, &ms[0]);
-                    ++row;
+                    if (usable && !x["missing"].as_string().empty())
+                        state += L"  ·  " + tr("devices_left_out", { { "m", x["missing"].as_string() } });
+                    const std::string variant = x["variant"].as_string();
+                    paths.push_back(x["path"].str(variant));
+                    cells.push_back({ widen(variant), widen(x["version"].as_string()), devices_text(x),
+                        measures_text(eng, variant), state });
                 }
-                // The state takes the width of its longest text, or the rest of the list.
-                ListView_SetColumnWidth(engines, 4, LVSCW_AUTOSIZE);
-                const int fit = ListView_GetColumnWidth(engines, 4);
-                ListView_SetColumnWidth(engines, 4, LVSCW_AUTOSIZE_USEHEADER);
-                if (ListView_GetColumnWidth(engines, 4) < fit) ListView_SetColumnWidth(engines, 4, fit);
-                SendMessageW(engines, WM_SETREDRAW, TRUE, 0);
-                InvalidateRect(engines, nullptr, TRUE);
+                rows.refresh(engines, paths, cells);
+                if (rows.rebuilt || rows.changed.count(4)) fit_state_column();
 
                 // V²RAM extends the memory of an NVIDIA card, for the CUDA engine only.
                 bool cuda = false;
@@ -1195,7 +1429,12 @@ namespace albireo
                 {
                     ui::set_text(legend, tr("v2ram_none"));
                 }
-                InvalidateRect(bar, nullptr, TRUE);
+                // The bar is painted again when the memory it shows changes; it covers its whole surface.
+                if (mem != drawn_memory)
+                {
+                    drawn_memory = mem;
+                    InvalidateRect(bar, nullptr, FALSE);
+                }
                 ui::set_text(folder, widen(st["models_dir"].as_string()));
                 ui::set_text(url, widen(st["url"].as_string()));
 
@@ -1220,6 +1459,19 @@ namespace albireo
                     ui::enable(proxy, !off);
                     ui::set_text(proxy, widen(settings["proxy"].as_string()));
                 }
+            }
+
+            // The state takes the width of its longest text, or the rest of the list.
+            void fit_state_column()
+            {
+                int fit = ListView_GetStringWidth(engines, tr("col_state").c_str());
+                for (const auto& row : rows.texts)
+                    if (row.size() > 4) fit = std::max(fit, ListView_GetStringWidth(engines, row[4].c_str()));
+                RECT inside = {};
+                GetClientRect(engines, &inside);
+                int taken = 0;
+                for (int i = 0; i < 4; ++i) taken += ListView_GetColumnWidth(engines, i);
+                set_column_width(engines, 4, std::max(fit + px(16), static_cast<int>(inside.right) - taken));
             }
 
             void draw_bar(const DRAWITEMSTRUCT* d)
@@ -1420,9 +1672,9 @@ namespace albireo
                 title = add(ui::label(hwnd, widen(ALBIREO_FULL_NAME), IDC_A_TITLE), ui::font_kind::title);
                 const std::wstring body = tr("about_version", { { "v", ALBIREO_VERSION }, { "e", ALBIREO_EDITION } })
                     + L"\n\n"
-                    + tr("about_built") + L"\n" + tr("about_created", { { "a", ALBIREO_AUTHOR_NAME } }) + L"\n"
-                    + tr("about_company", { { "c", ALBIREO_COMPANY_NAME } }) + L"\n\n" + tr("about_license") + L"\n"
-                    + widen(ALBIREO_COPYRIGHT);
+                    + tr("about_built") + L"\n"
+                    + tr("about_created", { { "a", ALBIREO_AUTHOR_NAME " (" ALBIREO_AUTHOR_EMAIL ")" } }) + L"\n\n"
+                    + tr("about_license") + L"\n" + widen(ALBIREO_COPYRIGHT);
                 text = add(ui::label(hwnd, body, IDC_A_TEXT));
                 project = add(ui::button(hwnd, tr("btn_project"), IDC_A_PROJECT));
                 docs = add(ui::button(hwnd, tr("tray_docs"), IDC_A_DOCS));
@@ -1493,6 +1745,8 @@ namespace albireo
             }
             T* t = new T();
             t->client = client;
+            // The window polls the service on a kept connection of its own, beside that of the icon.
+            t->client.own_connection();
             if (!t->create(title, w, h, resizable)) delete t;
         }
     }

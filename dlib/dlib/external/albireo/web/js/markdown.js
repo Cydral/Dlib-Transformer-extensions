@@ -5,7 +5,8 @@
     Markdown of the answers: GitHub flavoured markdown, code highlighted by highlight.js,
     formulas typeset by KaTeX between $...$, $$...$$, \(...\) and \[...\].  The HTML a
     model writes outside of code is shown as text, and the result is sanitized before it
-    reaches the page; images from other origins are blocked by the policy of the server.
+    reaches the page.  An answer loads nothing from another origin, and shows an image of
+    another origin as a link to it, which the browser follows only when the user does.
 */
 
 import { Marked } from '../vendor/marked/marked.esm.js';
@@ -14,6 +15,16 @@ import { icon } from './icons.js';
 
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+// Whether a URL names the origin of the application, or data the page holds (data:, blob:).
+function localSource(url) {
+  try {
+    const u = new URL(String(url), document.baseURI);
+    return u.origin === location.origin || u.protocol === 'data:' || u.protocol === 'blob:';
+  } catch (e) {
+    return false;
+  }
 }
 
 function tex(text, display) {
@@ -93,6 +104,13 @@ marked.use({
     },
     html({ text }) {
       return escapeHtml(text);
+    },
+    // An image of the application or of data keeps the default rendering; another one becomes a link.
+    image({ href, title, text, tokens }) {
+      if (localSource(href)) return false;
+      const label = tokens ? this.parser.parseInline(tokens, this.parser.textRenderer) : text;
+      return '<a href="' + escapeHtml(href) + '"' + (title ? ' title="' + escapeHtml(title) + '"' : '') + '>' +
+        escapeHtml(label || href) + '</a>';
     }
   }
 });
@@ -101,6 +119,12 @@ DOMPurify.addHook('afterSanitizeAttributes', (node) => {
   if (node.tagName === 'A') {
     node.setAttribute('target', '_blank');
     node.setAttribute('rel', 'noopener noreferrer');
+  }
+  // The attributes that load a resource keep the origin of the application, whatever wrote them.
+  if (!node.hasAttribute) return;
+  if (node.hasAttribute('srcset')) node.removeAttribute('srcset');
+  for (const name of ['src', 'poster', 'background']) {
+    if (node.hasAttribute(name) && !localSource(node.getAttribute(name))) node.removeAttribute(name);
   }
 });
 

@@ -1,0 +1,104 @@
+{
+  "description": "Third-party components of the web application. tools/update_web_vendor.sh writes their versions.",
+  "components": [
+    {
+      "id": "marked",
+      "name": "marked",
+      "version": "18.1.1",
+      "package": "marked",
+      "license": "MIT",
+      "license_name": "MIT License",
+      "license_files": [
+        "vendor/marked/LICENSE"
+      ],
+      "files": "vendor/marked",
+      "source": "https://github.com/markedjs/marked",
+      "role": "Turns the Markdown of the answers into HTML"
+    },
+    {
+      "id": "dompurify",
+      "name": "DOMPurify",
+      "version": "3.4.17",
+      "package": "dompurify",
+      "license": "(MPL-2.0 OR Apache-2.0)",
+      "license_name": "Apache License 2.0 or Mozilla Public License 2.0",
+      "license_files": [
+        "vendor/dompurify/LICENSE"
+      ],
+      "files": "vendor/dompurify",
+      "source": "https://github.com/cure53/DOMPurify",
+      "role": "Removes from the HTML of the answers what could run code"
+    },
+    {
+      "id": "highlight",
+      "name": "highlight.js",
+      "version": "11.12.0",
+      "package": "@highlightjs/cdn-assets",
+      "license": "BSD-3-Clause",
+      "license_name": "BSD 3-Clause License",
+      "license_files": [
+        "vendor/highlight/LICENSE"
+      ],
+      "files": "vendor/highlight",
+      "source": "https://github.com/highlightjs/highlight.js",
+      "role": "Colors the code of the answers"
+    },
+    {
+      "id": "katex",
+      "name": "KaTeX",
+      "version": "0.19.0",
+      "package": "katex",
+      "license": "MIT",
+      "license_name": "MIT License",
+      "license_files": [
+        "vendor/katex/LICENSE"
+      ],
+      "files": "vendor/katex",
+      "source": "https://github.com/KaTeX/KaTeX",
+      "role": "Draws the mathematical formulas"
+    },
+    {
+      "id": "pdfjs",
+      "name": "PDF.js",
+      "version": "6.4.299",
+      "package": "pdfjs-dist",
+      "license": "Apache-2.0",
+      "license_name": "Apache License 2.0",
+      "license_files": [
+        "vendor/pdfjs/LICENSE"
+      ],
+      "files": "vendor/pdfjs",
+      "source": "https://github.com/mozilla/pdf.js",
+      "role": "Reads the text of the PDF documents"
+    },
+    {
+      "id": "cmaps",
+      "name": "CMaps of PDF.js",
+      "version": "6.4.299",
+      "package": "pdfjs-dist",
+      "license": "BSD-3-Clause",
+      "license_name": "BSD 3-Clause License (Adobe)",
+      "license_files": [
+        "vendor/pdfjs/cmaps/LICENSE"
+      ],
+      "files": "vendor/pdfjs/cmaps",
+      "source": "https://github.com/adobe-type-tools/cmap-resources",
+      "role": "Gives the text of the Chinese, Japanese and Korean fonts that a PDF names without embedding them"
+    },
+    {
+      "id": "swagger",
+      "name": "Swagger UI",
+      "version": "5.33.2",
+      "package": "swagger-ui-dist",
+      "license": "Apache-2.0",
+      "license_name": "Apache License 2.0",
+      "license_files": [
+        "docs/LICENSE",
+        "docs/NOTICE"
+      ],
+      "files": "docs",
+      "source": "https://github.com/swagger-api/swagger-ui",
+      "role": "Shows the interactive documentation of the interface"
+    }
+  ]
+}

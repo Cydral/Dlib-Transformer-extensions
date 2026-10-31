@@ -9,7 +9,7 @@ machine, and nothing asks for an account.
 
 ![A discussion in the web application of Albireo, answered by the model that comes with it](docs/images/chat.png)
 
-Albireo is published by Cydral Technology and was created by Aldric Pierrain. Its name is that
+Albireo was created by Aldric Pierrain (cydraltechnology@gmail.com). Its name is that
 of a double star of the constellation Cygnus, one gold and one blue, which its icon draws. This
 version is the Community Edition: the installer, the About windows of the icon and of the web
 application, the description of the interface and the list of the programs of Windows name it
@@ -38,7 +38,16 @@ application, the description of the interface and the list of the programs of Wi
 
 - **Chat** in the web application, with the discussions kept in the browser (IndexedDB), an
   incognito mode that keeps them in memory only, a search over the discussions, and the reasoning
-  of the models that reason shown while they think, then folded once the answer starts.
+  of the models that reason shown while they think, then folded once the answer starts. Each
+  question and each answer keeps its time, shown beside its buttons ("3 hours ago" during a day,
+  then the short date with its hours and minutes); a past question can be asked again at the end
+  of the discussion, and a question edited restarts the discussion from it, what followed it
+  deleted. The buttons of an answer act once the answer is written, and the Stop button pulses
+  while it is prepared and written. The model that comes with Albireo names each discussion in
+  the language of its first question, the first words standing for the title until it arrives,
+  and keeps a memory of the user, written in the language of the interface whatever the language
+  of the discussions. The application asks the browser to keep its database, and its settings
+  show whether the browser does and the room used, with the advice of a regular export otherwise.
 - **Documents** attached to a message or to a project: Word, Excel, PowerPoint, OpenDocument,
   PDF, RTF, HTML, text, CSV, Markdown and source code. The browser extracts the text of every page
   of a document, of every sheet of a workbook in the order of its tabs, and of every slide of a
@@ -55,7 +64,11 @@ application, the description of the interface and the list of the programs of Wi
   for the search, both retrieved and converted by the build (see
   [Models that come with Albireo](#models-that-come-with-albireo)).
 - **Agent mode**: the model calls tools that run in the page (calculator, JavaScript in a
-  sandboxed frame, outline, reading and search of the documents), up to eight steps per answer.
+  sandboxed frame, outline, reading and search of the documents, search of the other
+  discussions, date, files to download), up to eight steps per answer. While the mode is on, the
+  tools are listed under the prompt, with a help next to its button; each step of an answer shows
+  its tool, its arguments, its result, its state and its duration. The calculator reads the
+  percentages ("17,5 % de 2 340"), the decimal commas and the thousands written with spaces.
 - **Several conversations at once**: the requests of every client are computed together, one
   forward pass serving the next token of each, and the keys and values of a finished request stay
   cached so that the next turn of a conversation starts where the previous one ended.
@@ -64,8 +77,8 @@ application, the description of the interface and the list of the programs of Wi
   documentation as a Swagger page at `/docs/`.
 - **Engines for each kind of processor**: portable, AVX2, AVX-VNNI, AVX-512, Intel NPU and
   integrated GPU through OpenVINO, NVIDIA GPU through CUDA, behind a single C interface. The
-  service measures them on the machine and runs the fastest, and the icon menu can force the NPU,
-  the GPU or both while a processor engine runs.
+  service measures them on the machine and runs the fastest, and the Accelerator menu of the
+  icon chooses the automatic choice, the processor alone, or a device by its name.
 - **Models from a signed catalog**, downloaded in parallel parts, checked against their hashes,
   or imported from a disk or a memory card.
 - **Updates** announced by a signed feed, attached to the GitHub releases of the repository,
@@ -137,6 +150,14 @@ of a device takes seconds to start.
 The forward pass ([`engine/cpu_runtime.cpp`](engine/cpu_runtime.cpp)) keeps the weights in the
 memory mapping of the GGUF file, in their quantized form, and multiplies them with kernels that
 quantize the activations to 8 bits per block, so that a generated token reads each weight once.
+When several answers are written together, the Q4_K and Q6_K kernels of AVX2 and AVX-512 compute
+two to four tokens for each weight they unpack, each token with the arithmetic it would get
+alone: with four answers at once, a step takes 32 to 40 % less time (Qwen3 0.6B and 1.7B, two
+cores). A pass of eight tokens or more computes in single precision, with a packed matrix product
+from 32 tokens with AVX-512 and from 256 tokens with AVX2; the work buffers lie on lines of 64
+bytes. These paths keep each result within the tolerances of the tests, and the numbers of a pass
+depend on its size: at temperature 0, the first answer to a prompt, whose last token is read
+within the whole prompt, may differ from the next ones, which take the prompt from the cache.
 The keys and values live in half precision in pages of 256 positions, one sequence per request;
 the conversations that start with the same text share the full pages of that text, and a sequence
 copies a shared page before writing in it.
@@ -194,14 +215,20 @@ requests are served, and is shown as being deleted until then.
 and, for development, in a console with `--console`. It:
 
 - describes each engine library in a child process (`--probe-engine`), so that a library that
-  cannot load leaves the service running, and measures them the same way (`--bench-engine`);
+  cannot load leaves the service running, and measures them the same way (`--bench-engine`); a
+  description takes 60 seconds at most, and its log line gives the devices each engine found and,
+  for those its runtime left out, the reason that runtime gives (the message of each plugin of
+  OpenVINO, for instance);
 - starts the chosen engine and the active models, and serves `https://localhost:<port>/` with
-  cpp-httplib and Mbed TLS, with a certificate issued by its own authority, which the installer adds
-  to the trusted roots of the machine;
+  cpp-httplib and Mbed TLS, with a certificate issued by its own authority, which it adds to the
+  trusted roots of the machine when the installation chose so (see [Security](#security));
 - keeps its settings in `settings.json`, the models, the downloads and the usage in an SQLite
   database, and its log in `logs\service.log`;
 - restarts itself when a setting requires it, in a new process once the engine of a device has
-  run, since that library stays loaded with the threads of its runtime.
+  run, since that library stays loaded with the threads of its runtime. A process that loaded the
+  engine of a device, the child processes of the descriptions and of the measures included, ends
+  without unloading it: Windows unloads a library under its loader lock, where the plugins of
+  OpenVINO would wait forever for threads of their runtime.
 
 The server answers as soon as its port is open: the engines are described and the chosen one
 starts in the background, then the active models load. Until then `/api/status` gives the state
@@ -226,13 +253,24 @@ from the icon during a start opens once the service answers. The service gives i
 ([`host/user_error.h`](host/user_error.h)), and the engines the reasons for which they cannot run
 (`reason_code`), which the windows explain in the language of the interface; a default model
 that could not be downloaded shows its download in error, with the reason, in the Models window.
-The settings of the extended memory apply to the CUDA engine and are grayed without it, and the
-Accelerator menu says why it offers no choice: no engine of a device installed, or none that runs
-on this computer. `albireo-setup.exe` carries the programs as a ZIP payload, installs them
+The settings of the extended memory apply to the CUDA engine and are grayed without it. The
+Accelerator menu always offers the automatic choice and the processor alone, then one entry per
+device the engines found, named after it and its runtime ("GPU NVIDIA GeForce RTX 5070 Ti Laptop
+GPU (CUDA)", "GPU Intel(R) Graphics (OpenVINO)", "NPU Intel(R) AI Boost (OpenVINO)", "NPU + GPU
+Intel (OpenVINO)"), which sets the engine and the accelerator of the settings; a device engine
+that cannot run here, or a device its runtime left out, shows grayed with its reason, as the
+window of the computer does. The window of the computer, the Models window and the menu update
+their lists in place, without flicker, and the tray keeps its connection to the service between
+two polls. `albireo-setup.exe` carries the programs as a ZIP payload, installs them
 with a wizard or silently, registers the service and the entry of Apps & Features, and removes them.
 The web application ([`web/`](web)) is plain ES modules with its libraries in
 [`web/vendor`](web/vendor), served by the service with a content security policy that allows no
-other origin.
+other origin. The browser checks every file of the application at each load (`Cache-Control:
+no-cache`, answered by 304 while the file is unchanged), so that the pages and the scripts of an
+update show at once. The application runs without any network: it loads nothing from another
+origin, its fonts, styles, scripts, the character maps of pdf.js and the page of the interface
+(`/docs/`) included, and an image that the markdown of an answer would take from another site is
+shown as a link.
 
 ### Documents and context
 
@@ -242,6 +280,15 @@ browser within 256 MiB of extracted XML per document (an entry that expands more
 is refused), and PDF goes through pdf.js. The text marks each page, slide and sheet with a line that
 starts with `## `, which names the passages of the search and lets the tools of the agent read a
 document part by part. Nothing leaves the browser but the text placed in the messages.
+
+PDF files are read by the legacy build of pdf.js, which runs in Edge and Chrome 125 and later,
+with the character maps of Adobe for the fonts of Chinese, Japanese and Korean that the files do
+not embed ([`web/vendor/pdfjs`](web/vendor/pdfjs)). A file encrypted with an empty password reads
+like any other; a file protected by a password, or damaged, is refused with a message. Albireo
+recognizes no characters in images: a PDF made of images only, such as a scan, is refused with a
+dialog that says so, and a PDF where some pages hold images only is added with a notice of the
+number of these pages, whose text is missing. The same rules apply to the files attached to a
+question and to the knowledge of a project.
 
 The search ([`web/js/rag.js`](web/js/rag.js)) cuts the documents into passages of 1,200
 characters overlapping by 240, named after their document and their part. The embedding model of
@@ -294,9 +341,14 @@ The memory of the discussions holds short notes on the user (profession, project
 the way to answer). It reads the questions it has not read yet, each discussion from its mark, in
 one pass once they are enough (three questions or 1,200 characters) and the user has been quiet
 for 20 seconds, at the opening of the application included: the background model writes the new
-facts only, in the language of the interface, which join the memory unless it holds them already
-in other words, and the memory is rewritten as a whole only when it outgrows its size (120 words),
-or else loses its oldest lines.
+facts only, in the language of the interface whatever the language of the discussions, which join
+the memory unless it holds them already in other words, and the memory is rewritten as a whole
+only when it outgrows its size (120 words), or else loses its oldest lines. The facts written in
+another language are rewritten first in the language of the interface, and a change of that
+language plans an update. A new fact joins only when it comes with the words of the user it
+rests on, which the application finds in the questions read, in a sentence that asks nothing,
+three words or 12 characters at least, each quote serving one fact: on the questions of the
+tests, the facts invented by the model that comes with Albireo went from 7 of 16 to none of 9.
 A notification, which disappears by itself, says how many facts joined, and a new question stops
 an update in progress, which comes back once the user is quiet again. One tab updates the memory
 at a time, by a lease of three minutes in the database of the browser: a tab closed in the middle
@@ -309,14 +361,27 @@ the settings keep it, and the lines that hold a password, a key or a payment num
 the memory unless they do. A discussion receives the memory as it was when it started, so that its
 prompt keeps the same beginning; the private discussions neither read nor feed it. The settings
 show the memory, let the user edit it, turn it off and reset it. The background model also names
-each discussion from its first question, unless the user renames it.
+each discussion from its first question, in the language of that question, unless the user
+renames it: the first words of the question stand for the title until it arrives, a title that
+repeats the question is asked again in other words, and a title that could not be written (a
+model that loads, a service away, a page reloaded) is asked again for two minutes, then at the
+next opening of the application. One tab names a discussion at a time.
 
 The lists of the side panel show the 20 most recent projects and discussions; the search window
 of each finds the others, the words in any case and accents, complete or not, in the titles first,
 then in the content (questions, answers, descriptions, instructions and documents of the projects),
 and shows where it found them. Each answer exports to Markdown or JSON with its question, as the
 whole discussion does. The interface takes the language of Albireo, set in the window of the
-computer, unless its own settings choose another.
+computer, unless its own settings choose another. The Generation tab of the settings gives the
+temperature, `top_p`, `top_k` and the length of the answers, each with a sentence that says what
+it changes; a value left on automatic keeps the choice of the service, and the work in the
+background keeps its own values.
+
+The page of the third-party components, opened from About, lists the components of the web
+application ([`web/vendor/components.json`](web/vendor/components.json), which
+[`tools/update_web_vendor.sh`](tools/update_web_vendor.sh) keeps up to date with their versions),
+those of the programs and of the engines, from the `licenses` folder of the installation, and the
+installed models, each with its version, its role and its license, whose text opens in the page.
 
 ## Source tree
 
@@ -338,9 +403,15 @@ Requirements: Visual Studio 2022, or the Build Tools for Visual Studio 2022, wit
 and CMake 3.21 or later (the C++ CMake tools of the workload serve, the script finds them outside
 the PATH), and about 6 GB of free space for the models that come with Albireo, their cache and the
 complete installer. The OpenVINO engines need the runtime of OpenVINO (`python -m pip install openvino`, or
-the archive with `INTEL_OPENVINO_DIR` set); the CUDA engine needs the CUDA toolkit 12.8 or later
-and cuDNN 9. Without Visual Studio, the installer of the CUDA toolkit adds its integration to the
-Build Tools.
+the archive with `INTEL_OPENVINO_DIR` set); the CUDA engine needs the CUDA toolkit 12.8 or later,
+its integration with Visual Studio and cuDNN 9. Without Visual Studio, the installer of the CUDA
+toolkit adds its integration to the Build Tools.
+
+The build machine needs no NVIDIA card. The CUDA toolkit installs and compiles without one: a
+custom installation without the driver, which keeps the CUDA components and the Visual Studio
+Integration, then cuDNN 9 from its installer or its archive. nvcc compiles the engine for every
+architecture of the table below, and only its tests on a card are skipped. A build machine with
+the toolkit thus produces an installer that carries every engine, whatever its own hardware.
 
 dlib is configured for one device per build tree, so the engines of the devices are built in their
 own trees and join the installer through `ALBIREO_EXTRA_ENGINE_DIRS`. The script
@@ -348,14 +419,18 @@ own trees and join the installer through `ALBIREO_EXTRA_ENGINE_DIRS`. The script
 repository:
 
 ```
-powershell -ExecutionPolicy Bypass -File dlib\dlib\external\albireo\tools\build_windows.ps1 -Cuda
+powershell -ExecutionPolicy Bypass -File dlib\dlib\external\albireo\tools\build_windows.ps1
 ```
 
 The OpenVINO engines are built by default, so that every installation reaches the NPU and the
 graphics processor of an Intel machine; the script stops with a message when the runtime of
 OpenVINO is missing, and `-NoOpenVINO` builds without these engines (`-OpenVINO`, which earlier
-versions required, is still accepted). The CUDA engine stays optional: on a machine with a
-supported NVIDIA card, the service prefers it, since the card takes every product. A build tree
+versions required, is still accepted). The CUDA engine is built as soon as the toolkit, its
+integration with Visual Studio and cuDNN are found; without them, the script says which one is
+missing and goes on without the engine. `-Cuda` makes their absence an error and `-NoCuda` leaves
+the engine out. On a machine with a supported NVIDIA card, the service prefers the CUDA engine in
+its automatic choice, since the card takes every product. The engines of CUDA, with cuBLAS and
+cuDNN, add several hundred megabytes to the installers. A build tree
 configured by a Visual Studio installation removed since, such as Visual Studio Community
 replaced by the Build Tools, is deleted and configured again. `-NoBuiltinModels` builds without
 the models that come with Albireo and `-ModelCache <folder>` puts their cache on another drive.
@@ -376,8 +451,10 @@ cmake --build build-albireo --config Release
 The installers are `build-albireo\bin\albireo-setup.exe`, complete with the models that come with
 Albireo, and `build-albireo\bin\albireo-setup-online.exe`, the one of the updates; the script
 prints their size and SHA-256. The device trees copy beside their engine
-the libraries it loads (OpenVINO with the plugins of the NPU and of the GPU, or the runtime of CUDA,
-cuBLAS and the parts of cuDNN the engine uses, with the Visual C++ runtime) and their licenses,
+the libraries it loads (OpenVINO with the plugins of the NPU and of the GPU, the compiler of the
+NPU plugin and the runtime of its graphs, the table of the tuned kernels of the GPU plugin and the
+library with which TBB reads the cores of a hybrid processor, or the runtime of CUDA, cuBLAS and
+the parts of cuDNN the engine uses, with the Visual C++ runtime) and their licenses,
 which the installer places in its `licenses` folder; the same libraries go beside
 `tests\test_offload.exe`, with the CPU plugin of OpenVINO for a machine without NPU or Intel
 graphics, and the test then runs from its folder. The random numbers and the solvers of
@@ -444,6 +521,10 @@ cmake --build build-albireo-win -j
 | `test_runtime`   | the logits of a model against `tests/reference_forward.py`, and the same results whatever the cut of the batches |
 | `test_tokenizer` | the tokenizer of a GGUF file against reference token sequences                     |
 | `test_offload`   | the products of a device against the processor kernels, the small budget path and the measured routing |
+| `test_model_file` | a small Qwen3 model built in memory and 140 damaged forms of it, which the loader must all refuse without allocating more than 256 MB |
+| `test_engine_api` | the refusals of the C interface, three threads of requests with cancellations under the pressure of the keys and values, the unloading and the destruction during requests, one final event per request |
+| `test_chat_format` | the prompts of the agent mode, the marker tokens and the parsing of the tool calls, whole or cut in pieces |
+| `test_host`      | the files of the downloads and of the imports through no link, the refusals of the import route, the copies of models already installed |
 | `engine_chat`    | drives an engine library through its C interface: chat, tools, reasoning, parallel requests, embeddings compared with a reference |
 | `bench_runtime`  | tokens per second of the prompt and of the generation, also as `bench_runtime_avxvnni` and `bench_runtime_avx512` |
 
@@ -459,8 +540,10 @@ powershell -ExecutionPolicy Bypass -File dlib\dlib\external\albireo\tools\test_w
 
 They take `~/models/Qwen3-0.6B-Q4_K_M.gguf` and `~/models/Qwen3-Embedding-0.6B-Q8_0.gguf` by
 default and skip the steps whose model or build tree is missing. The Linux script runs a service
-offline in a data folder of its own, imports the model and asks a question through the OpenAI
-interface; the Windows script asks the installed service a question and the vectors of two texts,
+offline in a data folder of its own, on the port `ALBIREO_TEST_PORT` (18443 by default), sends it
+the model through the upload route, checks that the route of the paths refuses a plain file, runs
+the tests of the service (`test_host`) and asks a question through the OpenAI interface; the
+Windows script asks the installed service a question and the vectors of two texts,
 and tests the OpenVINO and CUDA engines when their trees exist (`-Device GPU` or `-Device NPU`
 for `test_offload`, CPU by default). Their exit code is the number of failed steps.
 
@@ -471,19 +554,28 @@ with Albireo and installs a computer that answers at once, without network. `alb
 is the same program without them: the updates take it, and on a new computer the service
 downloads the default models of the catalog.
 
-The wizard asks for the language, the license, the folders of the programs and of the models, the
-options (start with Windows, desktop shortcut, trust of the local certificate, download of the
-default model, which the complete installer does not need, port), then installs, registers the
-service and starts the tray. The command line covers the other cases; the options it does not
-give keep the values of the installation in place:
+The wizard asks for the language, the license, the folders of the programs, of the data and of
+the models, the options (start with Windows, desktop shortcut, trust of the local certificate,
+download of the default model, which the complete installer does not need, port), then installs,
+registers the service and starts the tray. The command line covers the other cases; the options
+it does not give keep the values of the installation in place:
 
 ```
-albireo-setup /silent [/dir <folder>] [/models <folder>] [/port <port>]
-albireo-setup /uninstall [/silent] [/purge]
+albireo-setup /silent [/dir <folder>] [/data-dir <folder>] [/models <folder>] [/port <port>] [/offline]
+albireo-setup /uninstall [/silent] [/keep-data]
 albireo-setup /models-dir <folder>
 albireo-setup /service start|stop|restart
 albireo-setup /lang en|fr|de|it|es
 ```
+
+The data folder, `C:\ProgramData\Albireo` by default, may be placed elsewhere at the
+installation. Its place is recorded for the machine (`DataDir` under `HKLM\Software\Albireo`,
+which the programs read before the system variable `ALBIREO_HOME`), with the place of the models
+(`ModelsDir`) and whether the installer made that folder (`ModelsDirOwned`), so that the
+service, the tray, the updates and the uninstallation find them; an update keeps them. A silent installation that
+refuses a folder says why in `%TEMP%\albireo-setup.log` and leaves nothing behind, and the end of
+each installation, update or removal is written in `<data>\logs\setup-result.json`, which a
+tray restarted by the installer reports (`--setup-result`).
 
 The installer started from an offline bundle (see [Computers without network](#computers-without-network))
 copies into the import folder, which the service reads at its first start, the catalog of the
@@ -491,14 +583,28 @@ bundle when it bears the signature of Albireo and the models this catalog lists,
 against its hash. The option "This computer has no Internet access" of the wizard, or `/offline`,
 sets the service offline from the start.
 
-The folders of the programs and of the models must lie on a local drive; the installer refuses a
-drive root, the folders of Windows and of the users, a folder that holds them, a link made by
-another account, and a program folder that is neither empty nor an installation of Albireo. It
-gives the folders it creates or takes over the rights of the data folder (writing for the
-administrators and the service only), and records the files it installs in `albireo-files.json`:
-the uninstallation deletes these files, then the folders left empty, and keeps the other files.
-The copy of the installer kept in the folder of the programs only uninstalls, and the installer
-refuses to uninstall when no installation is registered.
+The folders of the programs, of the data and of the models must lie on a local fixed drive; the
+installer refuses a drive root, the folders of Windows and of the users, a folder that holds
+them, a link made by another account, a folder on whose path another account could rename a
+folder (`folder_parent_unsafe`), and a program or data folder that is neither empty nor an
+installation of Albireo, or that lies inside Windows or the profiles of the users. It gives the
+folders it creates or takes over, and the parent folders it creates, the rights of the data
+folder (writing for the administrators and the service only), and records the files it installs
+in `albireo-files.json`.
+
+The uninstallation stops the tray of every session, the service and the programs of the
+installation folder, removes the trust of the local authority and the certificates, then
+deletes the whole installation folder, the files added there since included, and itself, through
+a copy that ends the work once it has quit. It then deletes the whole data folder, unless the
+box of the uninstallation page, or `/keep-data`, keeps the models, the settings and the logs for
+a later installation, which finds them again (`/purge`, which earlier versions needed, is
+accepted and is the default). A models
+folder placed elsewhere goes whole when the installer made it or found it empty, else only the
+models Albireo put there. The uninstallation removes only the folders recorded at the
+installation, never a drive root or a folder of Windows or of the users, and takes the links
+and junctions it finds away without following them. The copy of the installer kept in the folder
+of the programs only uninstalls, and the installer refuses to uninstall when no installation is
+registered.
 
 ### Updates
 
@@ -511,7 +617,9 @@ rewritten in place. A newer version in place is left as it is. `/silent` updates
 the options given joining the settings, and `/update /silent` is the update the service starts.
 The installer checks the free space before it stops the service, writes every new file beside
 the old one, then swaps them all; a failure puts the previous files back and restarts the
-service that was running, whose recovery actions are suspended during the update.
+service that was running, whose recovery actions are suspended during the update. Once the new
+files are in place, the files of the engines, of the web application and of the licenses that the
+new version no longer carries are deleted, with the folders they leave empty.
 The models that come with Albireo are copied only when they differ from those in place, their
 hash checked; an update by the installer without models keeps them.
 
@@ -570,7 +678,25 @@ of `/v1/embeddings` takes `albireo-embedding`.
 | `GET /albireo/v1/models?lang=fr`         | catalog and installed models                              |
 | `GET /albireo/v1/engines`                | engine libraries, options and measures                    |
 | `POST /albireo/v1/count`                 | tokens of a conversation for a model                      |
+| `GET /albireo/v1/licenses`               | license texts of the `licenses` folder of the installation, with the versions the service knows |
+| `GET /albireo/v1/licenses/<file>`        | one of these texts, 1 MB at most, a file of that folder only |
 | `/docs/`                                 | Swagger page of the interface                             |
+
+The sampling of every model goes through the sampler of Albireo, whatever the architecture of
+the model and the engine: `temperature`, `top_p`, `top_k`, `min_p` and the penalties apply the
+same way to all of them. `top_k`, 40 by default (20 for a model of the ChatML format while it
+reasons), keeps the most likely tokens, at most 1,024 even with 0; a value outside 0 to 1024, or
+one that is not a whole number, is refused with 400. At temperature 0, the most likely token is
+taken, which `top_k` 1 gives too. The engine refuses the other values out of their bounds:
+`temperature` 0 to 10,000, `top_p` and `min_p` 0 to 1, `repeat_penalty` above 0 and up to 100,
+`presence_penalty`, `frequency_penalty` and the values of `logit_bias` -100 to 100, each stop
+sequence 1,024 bytes at most. A pass that the memory of the system cannot hold ends its requests
+with `out_of_memory` and gives back the pages of the cache.
+
+With `tools`, the calls a model writes in the form of its template come back as `tool_calls`,
+whole, with the arguments as the model wrote them, a line break left raw in a string repaired;
+the parser of Qwen3 also takes a call between code fences, several objects in one call, a closing
+character in excess and a call left open at the end of the answer.
 
 The administration routes (`/albireo/v1/settings`, `/albireo/v1/models/<id>/download`,
 `/activate`, `/deactivate`, `DELETE /albireo/v1/models/<id>`, `/verify`, `/import`,
@@ -618,10 +744,23 @@ it computes a language model, then takes the hidden state of the last token of e
 normalized, as its vector (`pooling_type` 3 of the GGUF file); its keys and values are given back
 as soon as each text is read.
 
-A model can also be imported from any GGUF file: the Models window sends it to the service, or
-the service imports the files placed in `<data>\import`. A file prepared by the build of Albireo
-keeps its identity (`albireo.id`, `albireo.name`, `albireo.roles`, `albireo.inputs` in its
-metadata).
+A model can also be imported from any GGUF file: the Models window sends it to the service
+(`/albireo/v1/models/upload`), read with the rights of the user who chose it, or the service
+imports the files placed in `<data>\import`. A file prepared by the build of Albireo keeps its
+identity (`albireo.id`, `albireo.name`, `albireo.roles`, `albireo.inputs` in its metadata). A file
+whose content is the one of a model already installed or of a model that comes with Albireo is not
+copied again: the answer lists it under `already` and it leaves the import folder. A file never
+takes the identifier of a model that comes with Albireo (it becomes `<id>-import`), and the
+download of such a model is refused (`builtin_installed`).
+
+The route `/albireo/v1/import` reads a folder given by its path only when it is the import folder,
+or a signed offline bundle, whose files are read by name, size and hash as its catalog lists them
+before anything is copied. Every other path is refused with a code (`import_use_upload` for a
+plain file, `import_path_relative`, `import_path_network`, `import_path_device`,
+`import_path_invalid`), and a folder that is neither gives the same answer whatever it holds
+(`import_not_bundle`), so that the service, which reads every file of the machine, reveals
+nothing of the folders of another account. The files are opened folder by folder from a trusted
+folder, through no link, junction or mount point, and a hard link is refused.
 
 The Models window lists the language models, with their functions, their inputs and their state;
 the embedding model serves the document search and is given apart (`embedding_models` of
@@ -761,20 +900,56 @@ size and its SHA-256, and run it in update mode at their next start.
 - The service listens on `127.0.0.1` only, refuses the requests whose `Host` is not local
   (421) and those whose `Origin` is another site (403), takes JSON bodies only, of 64 MB and
   524,288 values at most, and no body on `GET`, `HEAD`, `DELETE` and `OPTIONS`, and answers with
-  `nosniff`, `no-referrer`, a content security policy and frame protections.
-- The administration routes compare the token in constant time; the token, the private key of
-  the certificate and the password of the proxy are files with restricted rights, and the data
-  folder grants writing to the administrators and the service only.
+  `nosniff`, `no-referrer`, a content security policy and frame protections. It reads at most four
+  bodies above 8 MB at once (503 with `Retry-After` beyond), waits 30 seconds at most for a
+  client that reads or writes, serves 64 connections at once with 128 more waiting, and ends a
+  stream whose client lets more than 16,384 events wait.
+- The administration routes compare the token in constant time; the token and the password of
+  the proxy are files with restricted rights, and the data folder grants writing to the
+  administrators and the service only: on Windows, the service secures it again at each start,
+  and the import folder too when another account could write in it.
+- A database the service cannot open as SQLite is set aside as `albireo.db.corrupt-<time>`, and
+  a new one records again the models of the models folder; a database opened read only is opened
+  again at the next write that fails, and a database locked by another program is waited for 5
+  seconds: the service recovers without a restart once the cause is gone.
+- The certificate of the local server comes from an authority of this computer alone, made by
+  the service under LocalSystem with an ECDSA P-256 key, whose name constraints limit it to
+  `localhost`, `127.0.0.0/8` and `::1`: Windows and the browsers refuse any certificate it would
+  sign for another site. Its private key signs the certificate of the server once, in memory,
+  and is never written. Both certificates last 397 days; 30 days before their end, or when the
+  key of the server does not open, the service makes a new authority and a new certificate and
+  replaces the authority in the trusted roots of the machine, after checking its constraints,
+  when the installation chose to trust it. The private key of the server is encrypted with
+  DPAPI for the LocalSystem account, in a file that SYSTEM and the administrators alone may open:
+  a copy of that file opens under no other account and on no other computer. The service
+  decrypts it in memory for the TLS server, without a file in clear. An update keeps the
+  certificates and their trust, deletes the key of the authority of a version before 1.0.8 and
+  encrypts its key of the server; an uninstallation removes the authority from the trusted roots
+  and deletes the certificates and the keys.
 - A staged update keeps the signed feed that announced it beside its installer; the service checks
   the version, the path, the size and the SHA-256 of the installer against it again, the file held
   open, right before running it.
-- The feed, the catalog and every downloaded file are checked against signatures and hashes;
-  imports read only GGUF files from local folders.
+- The feed, the catalog and every downloaded file are checked against signatures and hashes. The
+  files of the models folder, of the import folder, of the downloads and of the updates are
+  opened and created through no link, junction or mount point, their path checked again before
+  each opening, renaming and deletion; the route of the paths reads only the import folder and
+  the signed offline bundles (see [Models](#models)). Every error of the updates carries a code
+  with its values (`update_signature`, `update_installer_mismatch`, `update_package_manager`...),
+  which the tray explains in the language of the user.
 - The JavaScript the agent mode runs executes in a sandboxed frame of opaque origin, in a worker
   stopped after 15 s; the page builds its own copy of each answer of the frame, with checked and
   shortened fields, and gives up on a frame silent for 20 s.
 - The engine libraries are loaded from the `engines` folder of the installation, with their
   dependencies searched in that folder first.
+- A model file is read within bounds, checked before anything is allocated: 2^20 entries and
+  arrays of 2^24 values at most in the GGUF file, an alignment that is a power of two up to 65,536,
+  1,024 layers at most and no more than its tensors, 1,024 heads, a width of 2^17, a feed-forward
+  width of 2^20, heads of 4,096 values, a context of 2^26 positions, a vocabulary of 2^24 tokens,
+  4,096 experts, the tokens of beginning and end within the vocabulary, each integer checked
+  before it narrows and each real finite. The options of a load and the settings of the engine
+  are numbers within bounds too (a context of 2^26 positions, 256 sequences, 65,536 tokens per
+  pass, 2^24 MB of keys and values at most). A file outside these bounds is refused at once,
+  whatever it declares.
 
 ## Data folders
 
@@ -787,11 +962,13 @@ size and its SHA-256, and run it in update mode at their next start.
 | `C:\ProgramData\Albireo\albireo.db`    | installed models, downloads, usage, catalog                   |
 | `C:\ProgramData\Albireo\models`        | models (or the folder chosen at installation)                |
 | `C:\ProgramData\Albireo\import`        | offline bundles and models, installed within a minute        |
-| `C:\ProgramData\Albireo\certificates`  | local authority and certificate of the server                |
+| `C:\ProgramData\Albireo\certificates`  | certificates of the local authority and of the server, key of the server encrypted for LocalSystem |
 | `C:\ProgramData\Albireo\engine-cache`  | compiled graphs of OpenVINO, file of the extended memory     |
 | `C:\ProgramData\Albireo\logs`          | logs of the service and of the installer                     |
 | `C:\ProgramData\Albireo\updates`       | installer of the next version, with the signed feed that announced it |
 
-`ALBIREO_HOME` replaces the data folder. On Windows it is read from the environment of the
-machine (the system variables), which the service receives; the variable of a user's own
-environment is ignored.
+The data folder is the one the installer recorded (`DataDir` under `HKLM\Software\Albireo`),
+`C:\ProgramData\Albireo` by default, which may be chosen at the installation; `ALBIREO_HOME`
+replaces it when no folder is recorded, and for the development on Linux. On Windows the
+variable is read from the environment of the machine (the system variables), which the service
+receives; the variable of a user's own environment is ignored.

@@ -13,9 +13,23 @@
 #include <mbedtls/entropy.h>
 #include <mbedtls/oid.h>
 #include <mbedtls/pk.h>
+#include <mbedtls/platform_util.h>
 #include <mbedtls/sha256.h>
 #include <mbedtls/x509_crt.h>
 #include <psa/crypto.h>
+
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <wincrypt.h>
+#include <dpapi.h>
+#include <cwchar>
+#endif
 
 #include "../common/log.h"
 #include "../common/platform.h"
@@ -25,6 +39,11 @@ namespace albireo
 
     namespace
     {
+        // The validity of both certificates, and the time before their end when they are renewed.
+        const long validity_days = 397;
+        const long long renewal_seconds = 86400LL * 30;
+        const char* const authority_name = "CN=Albireo Local Authority,O=Cydral Technology,C=FR";
+
         struct random_source
         {
             mbedtls_entropy_context entropy;
@@ -46,6 +65,16 @@ namespace albireo
             }
         };
 
+        // A key of mbedtls, freed with its secret erased (mbedtls_pk_free) on every path.
+        struct pk_key
+        {
+            mbedtls_pk_context ctx;
+            pk_key() { mbedtls_pk_init(&ctx); }
+            ~pk_key() { mbedtls_pk_free(&ctx); }
+            pk_key(const pk_key&) = delete;
+            pk_key& operator=(const pk_key&) = delete;
+        };
+
         std::string time_string(std::time_t t)
         {
             std::tm tm;
@@ -59,24 +88,20 @@ namespace albireo
             return buf;
         }
 
-        bool generate_key(mbedtls_pk_context& key, random_source& rng, std::string& pem)
+        bool generate_key(mbedtls_pk_context& key, random_source& rng)
         {
             if (mbedtls_pk_setup(&key, mbedtls_pk_info_from_type(MBEDTLS_PK_ECKEY)) != 0) return false;
-            if (mbedtls_ecp_gen_key(MBEDTLS_ECP_DP_SECP256R1, mbedtls_pk_ec(key), mbedtls_ctr_drbg_random,
-                &rng.drbg) != 0)
-                return false;
-            std::vector<unsigned char> buf(4096);
-            if (mbedtls_pk_write_key_pem(&key, buf.data(), buf.size()) != 0) return false;
-            pem = reinterpret_cast<const char*>(buf.data());
-            return true;
+            return mbedtls_ecp_gen_key(MBEDTLS_ECP_DP_SECP256R1, mbedtls_pk_ec(key), mbedtls_ctr_drbg_random,
+                &rng.drbg) == 0;
         }
 
-        bool load_key(mbedtls_pk_context& key, const std::string& path, random_source& rng)
+        bool key_pem(mbedtls_pk_context& key, std::string& pem)
         {
-            std::string pem;
-            if (!read_file(path, pem)) return false;
-            return mbedtls_pk_parse_key(&key, reinterpret_cast<const unsigned char*>(pem.c_str()), pem.size() + 1,
-                nullptr, 0, mbedtls_ctr_drbg_random, &rng.drbg) == 0;
+            std::vector<unsigned char> buf(4096);
+            const bool ok = mbedtls_pk_write_key_pem(&key, buf.data(), buf.size()) == 0;
+            if (ok) pem = reinterpret_cast<const char*>(buf.data());
+            mbedtls_platform_zeroize(buf.data(), buf.size());
+            return ok;
         }
 
         // Seconds until a certificate expires, negative when it cannot be read.
@@ -107,6 +132,23 @@ namespace albireo
             return left;
         }
 
+        // Whether a private key in PEM form is the one of the certificate of a PEM file.
+        bool key_matches(const std::string& key, const std::string& cert_path, random_source& rng)
+        {
+            std::string pem;
+            if (!read_file(cert_path, pem)) return false;
+            mbedtls_x509_crt crt;
+            mbedtls_x509_crt_init(&crt);
+            pk_key k;
+            const bool ok =
+                mbedtls_x509_crt_parse(&crt, reinterpret_cast<const unsigned char*>(pem.c_str()), pem.size() + 1) == 0
+                && mbedtls_pk_parse_key(&k.ctx, reinterpret_cast<const unsigned char*>(key.c_str()), key.size() + 1,
+                    nullptr, 0, mbedtls_ctr_drbg_random, &rng.drbg) == 0
+                && mbedtls_pk_check_pair(&crt.pk, &k.ctx, mbedtls_ctr_drbg_random, &rng.drbg) == 0;
+            mbedtls_x509_crt_free(&crt);
+            return ok;
+        }
+
         void der_append(std::vector<unsigned char>& out, unsigned char tag, const std::vector<unsigned char>& content)
         {
             out.push_back(tag);
@@ -124,8 +166,8 @@ namespace albireo
 
         /*  The name constraints of the local authority (RFC 5280 4.2.1.10): it may only
             certify localhost, the loopback addresses of IPv4 and ::1.  The authority is
-            trusted by the whole machine, and the constraint is what keeps its key from
-            ever vouching for another site, whatever happens to that key.  */
+            trusted by the whole machine, and the constraint is what keeps a certificate it
+            signed from ever vouching for another site.  */
         std::vector<unsigned char> loopback_name_constraints()
         {
             std::vector<unsigned char> subtrees, subtree, name;
@@ -229,6 +271,80 @@ namespace albireo
             mbedtls_x509write_crt_free(&crt);
             return ok;
         }
+
+        // The form of the private key in its file: encrypted for this account on Windows.
+        bool seal_key(const std::string& pem, std::string& data)
+        {
+#if defined(_WIN32)
+            DATA_BLOB in;
+            in.cbData = static_cast<DWORD>(pem.size());
+            in.pbData = reinterpret_cast<BYTE*>(const_cast<char*>(pem.data()));
+            DATA_BLOB out = {};
+            if (!CryptProtectData(&in, L"Albireo server key", nullptr, nullptr, nullptr, CRYPTPROTECT_UI_FORBIDDEN,
+                    &out))
+                return false;
+            data.assign(reinterpret_cast<const char*>(out.pbData), out.cbData);
+            LocalFree(out.pbData);
+            return true;
+#else
+            data = pem;
+            return true;
+#endif
+        }
+
+        bool open_key(const std::string& data, std::string& pem)
+        {
+#if defined(_WIN32)
+            DATA_BLOB in;
+            in.cbData = static_cast<DWORD>(data.size());
+            in.pbData = reinterpret_cast<BYTE*>(const_cast<char*>(data.data()));
+            DATA_BLOB out = {};
+            if (!CryptUnprotectData(&in, nullptr, nullptr, nullptr, nullptr, CRYPTPROTECT_UI_FORBIDDEN, &out))
+                return false;
+            pem.assign(reinterpret_cast<const char*>(out.pbData), out.cbData);
+            SecureZeroMemory(out.pbData, out.cbData);
+            LocalFree(out.pbData);
+            return true;
+#else
+            pem = data;
+            return true;
+#endif
+        }
+
+        bool write_key(const std::string& path, const std::string& pem)
+        {
+            std::string data;
+            const bool ok = seal_key(pem, data) && write_file_restricted(path, data);
+            wipe_secret(data);
+            return ok;
+        }
+
+        /*
+            The files of the versions before 1.0.8: the key of their authority, which is
+            never kept now, and on Windows the key of the server in clear, which moves into
+            its encrypted file.
+        */
+        void migrate(const certificate_files& f)
+        {
+            if (file_exists(f.ca_key))
+            {
+                if (remove_file(f.ca_key)) log_info("certificates: the key of the earlier local authority is deleted");
+                else log_warning("certificates: the key of the earlier local authority cannot be deleted");
+            }
+            if (f.plain_key == f.server_key || !file_exists(f.plain_key)) return;
+            std::string pem;
+            if (!file_exists(f.server_key) && read_file(f.plain_key, pem, 64 * 1024)
+                && pem.compare(0, 11, "-----BEGIN ") == 0 && write_key(f.server_key, pem))
+                log_info("certificates: the key of the server is now encrypted for the account of the service");
+            wipe_secret(pem);
+            remove_file(f.plain_key);
+        }
+    }
+
+    void wipe_secret(std::string& s)
+    {
+        if (!s.empty()) mbedtls_platform_zeroize(&s[0], s.size());
+        s.clear();
     }
 
     certificate_files certificate_paths(const std::string& dir)
@@ -237,12 +353,26 @@ namespace albireo
         f.ca_cert = join_path(dir, "albireo-authority.crt");
         f.ca_key = join_path(dir, "albireo-authority.key");
         f.server_cert = join_path(dir, "albireo-server.crt");
-        f.server_key = join_path(dir, "albireo-server.key");
+        f.plain_key = join_path(dir, "albireo-server.key");
+#if defined(_WIN32)
+        f.server_key = join_path(dir, "albireo-server.key.protected");
+#else
+        f.server_key = f.plain_key;
+#endif
         return f;
     }
 
-    bool ensure_certificates(const std::string& dir, std::string& error)
+    bool read_server_key(const std::string& dir, std::string& pem)
     {
+        std::string data;
+        const bool ok = read_file(certificate_paths(dir).server_key, data, 64 * 1024) && open_key(data, pem);
+        wipe_secret(data);
+        return ok && !pem.empty();
+    }
+
+    bool ensure_certificates(const std::string& dir, bool& renewed, std::string& error)
+    {
+        renewed = false;
         psa_crypto_init();
         const certificate_files f = certificate_paths(dir);
         if (!make_dirs(dir))
@@ -256,49 +386,52 @@ namespace albireo
             error = "no entropy source";
             return false;
         }
+        migrate(f);
 
-        static const char* ca_name = "CN=Albireo Local Authority,O=Cydral Technology,C=FR";
-        mbedtls_pk_context ca_key;
-        mbedtls_pk_init(&ca_key);
-        bool new_ca = false;
-        if (!(file_exists(f.ca_cert) && file_exists(f.ca_key) && load_key(ca_key, f.ca_key, rng)
-              && seconds_left(f.ca_cert) > 86400LL * 60))
+        // The certificates in place serve while they have time left and the key opens and matches.
+        if (file_exists(f.ca_cert) && file_exists(f.server_cert) && seconds_left(f.ca_cert) > renewal_seconds
+            && seconds_left(f.server_cert) > renewal_seconds)
         {
-            mbedtls_pk_free(&ca_key);
-            mbedtls_pk_init(&ca_key);
-            std::string key_pem, crt_pem;
-            if (!generate_key(ca_key, rng, key_pem) ||
-                !write_certificate(ca_key, ca_key, ca_name, ca_name, true, 3650, rng, crt_pem) ||
-                !write_file_restricted(f.ca_key, key_pem) || !write_file_atomic(f.ca_cert, crt_pem))
-            {
-                mbedtls_pk_free(&ca_key);
-                error = "cannot create the local certification authority";
-                return false;
-            }
-            new_ca = true;
-            log_info("certificates: new local authority " + f.ca_cert);
+            std::string pem;
+            const bool ok = read_server_key(dir, pem) && key_matches(pem, f.server_cert, rng);
+            wipe_secret(pem);
+            if (ok) return true;
+            log_warning("certificates: the key of the server cannot be read here, new certificates are made");
         }
 
-        if (new_ca || !file_exists(f.server_cert) || !file_exists(f.server_key)
-            || seconds_left(f.server_cert) < 86400LL * 30)
+        // A new authority signs a new certificate of the server, then its key is gone.
+        std::string ca_pem, server_pem, key_text;
+        bool ok = false;
         {
-            mbedtls_pk_context key;
-            mbedtls_pk_init(&key);
-            std::string key_pem, crt_pem;
-            const bool ok = generate_key(key, rng, key_pem) &&
-                write_certificate(key, ca_key, "CN=localhost,O=Cydral Technology", ca_name, false, 397, rng, crt_pem) &&
-                write_file_restricted(f.server_key, key_pem) && write_file_atomic(f.server_cert, crt_pem);
-            mbedtls_pk_free(&key);
-            if (!ok)
-            {
-                mbedtls_pk_free(&ca_key);
-                error = "cannot issue the certificate of the local server";
-                return false;
-            }
-            log_info("certificates: new server certificate " + f.server_cert);
+            pk_key ca_key, key;
+            ok = generate_key(ca_key.ctx, rng) && generate_key(key.ctx, rng)
+                && write_certificate(ca_key.ctx, ca_key.ctx, authority_name, authority_name, true, validity_days + 1,
+                    rng, ca_pem)
+                && write_certificate(key.ctx, ca_key.ctx, "CN=localhost,O=Cydral Technology", authority_name, false,
+                    validity_days, rng, server_pem)
+                && key_pem(key.ctx, key_text);
         }
-        mbedtls_pk_free(&ca_key);
+        // The key first, then the certificate of the server, then the one of the authority.
+        ok = ok && write_key(f.server_key, key_text) && write_file_atomic(f.server_cert, server_pem)
+            && write_file_atomic(f.ca_cert, ca_pem);
+        wipe_secret(key_text);
+        if (!ok)
+        {
+            error = "cannot create the certificates of the local server in " + dir;
+            return false;
+        }
+        renewed = true;
+        log_info("certificates: new local authority and server certificate in " + dir);
         return true;
+    }
+
+    bool remove_certificate_files(const std::string& dir)
+    {
+        const certificate_files f = certificate_paths(dir);
+        bool ok = true;
+        for (const std::string& p : { f.server_key, f.plain_key, f.ca_key, f.server_cert, f.ca_cert })
+            if (file_exists(p) && !remove_file(p)) ok = false;
+        return ok;
     }
 
     std::string certificate_der(const std::string& pem_path)
@@ -329,5 +462,130 @@ namespace albireo
         }
         return out;
     }
+
+#if defined(_WIN32)
+    namespace
+    {
+        // Whether name constraints permit localhost and the loopback addresses, and nothing else.
+        bool loopback_only(const CERT_EXTENSION* extension)
+        {
+            CERT_NAME_CONSTRAINTS_INFO* info = nullptr;
+            DWORD size = 0;
+            if (!CryptDecodeObjectEx(X509_ASN_ENCODING, X509_NAME_CONSTRAINTS, extension->Value.pbData,
+                    extension->Value.cbData, CRYPT_DECODE_ALLOC_FLAG, nullptr, &info, &size))
+                return false;
+            // 127.0.0.0/8 and ::1/128, each address followed by its mask.
+            const BYTE v4[8] = { 127, 0, 0, 0, 255, 0, 0, 0 };
+            BYTE v6[32] = {};
+            v6[15] = 1;
+            std::memset(v6 + 16, 0xFF, 16);
+            bool ok = info->cPermittedSubtree > 0;
+            for (DWORD i = 0; ok && i < info->cPermittedSubtree; ++i)
+            {
+                const CERT_ALT_NAME_ENTRY& name = info->rgPermittedSubtree[i].Base;
+                const CRYPT_DATA_BLOB& ip = name.IPAddress;
+                if (name.dwAltNameChoice == CERT_ALT_NAME_DNS_NAME)
+                    ok = name.pwszDNSName && _wcsicmp(name.pwszDNSName, L"localhost") == 0;
+                else if (name.dwAltNameChoice == CERT_ALT_NAME_IP_ADDRESS)
+                    ok = (ip.cbData == sizeof(v4) && std::memcmp(ip.pbData, v4, sizeof(v4)) == 0)
+                        || (ip.cbData == sizeof(v6) && std::memcmp(ip.pbData, v6, sizeof(v6)) == 0);
+                else
+                    ok = false;
+            }
+            LocalFree(info);
+            return ok;
+        }
+
+        /*
+            Whether a certificate is the authority that Albireo makes: signed by its own key,
+            named "Albireo Local Authority", and limited by its name constraints to localhost
+            and the loopback addresses, so that the trust of the machine never reaches
+            another site.
+        */
+        bool local_authority(const std::string& der)
+        {
+            PCCERT_CONTEXT c = CertCreateCertificateContext(X509_ASN_ENCODING,
+                reinterpret_cast<const BYTE*>(der.data()), static_cast<DWORD>(der.size()));
+            if (!c) return false;
+            void* self = const_cast<CERT_CONTEXT*>(c);
+            wchar_t name[128] = {};
+            bool ok = CryptVerifyCertificateSignatureEx(0, X509_ASN_ENCODING, CRYPT_VERIFY_CERT_SIGN_SUBJECT_CERT,
+                    self, CRYPT_VERIFY_CERT_SIGN_ISSUER_CERT, self, 0, nullptr)
+                && CertGetNameStringW(c, CERT_NAME_ATTR_TYPE, 0, const_cast<char*>(szOID_COMMON_NAME), name, 128) > 1
+                && std::wcscmp(name, L"Albireo Local Authority") == 0;
+            const CERT_EXTENSION* constraints = ok ? CertFindExtension(szOID_NAME_CONSTRAINTS,
+                c->pCertInfo->cExtension, c->pCertInfo->rgExtension) : nullptr;
+            ok = ok && constraints && loopback_only(constraints);
+            CertFreeCertificateContext(c);
+            return ok;
+        }
+
+        void remove_authority_certificates(HCERTSTORE store)
+        {
+            for (;;)
+            {
+                PCCERT_CONTEXT c = CertFindCertificateInStore(store, X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, 0,
+                    CERT_FIND_SUBJECT_STR_W, L"Albireo Local Authority", nullptr);
+                if (!c) break;
+                CertDeleteCertificateFromStore(c);
+            }
+        }
+
+        std::string system_error(const char* what)
+        {
+            return std::string(what) + " (error " + std::to_string(GetLastError()) + ")";
+        }
+    }
+
+    bool authority_trusted()
+    {
+        HCERTSTORE store = CertOpenStore(CERT_STORE_PROV_SYSTEM_W, 0, 0,
+            CERT_SYSTEM_STORE_LOCAL_MACHINE | CERT_STORE_OPEN_EXISTING_FLAG | CERT_STORE_READONLY_FLAG, L"ROOT");
+        if (!store) return false;
+        PCCERT_CONTEXT c = CertFindCertificateInStore(store, X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, 0,
+            CERT_FIND_SUBJECT_STR_W, L"Albireo Local Authority", nullptr);
+        if (c) CertFreeCertificateContext(c);
+        CertCloseStore(store, 0);
+        return c != nullptr;
+    }
+
+    bool trust_authority(const std::string& dir, std::string& error)
+    {
+        const std::string der = certificate_der(certificate_paths(dir).ca_cert);
+        if (der.empty())
+        {
+            error = "the certificate of the local authority cannot be read";
+            return false;
+        }
+        if (!local_authority(der))
+        {
+            error = "the certificate of the local authority is not one that Albireo makes; it is not trusted";
+            return false;
+        }
+        HCERTSTORE store = CertOpenStore(CERT_STORE_PROV_SYSTEM_W, 0, 0,
+            CERT_SYSTEM_STORE_LOCAL_MACHINE | CERT_STORE_OPEN_EXISTING_FLAG, L"ROOT");
+        if (!store)
+        {
+            error = system_error("cannot open the trusted roots of the machine");
+            return false;
+        }
+        remove_authority_certificates(store);
+        const bool ok = CertAddEncodedCertificateToStore(store, X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+            reinterpret_cast<const BYTE*>(der.data()), static_cast<DWORD>(der.size()), CERT_STORE_ADD_REPLACE_EXISTING,
+            nullptr) != FALSE;
+        if (!ok) error = system_error("cannot add the local authority to the trusted roots");
+        CertCloseStore(store, 0);
+        return ok;
+    }
+
+    void untrust_authority()
+    {
+        HCERTSTORE store = CertOpenStore(CERT_STORE_PROV_SYSTEM_W, 0, 0,
+            CERT_SYSTEM_STORE_LOCAL_MACHINE | CERT_STORE_OPEN_EXISTING_FLAG, L"ROOT");
+        if (!store) return;
+        remove_authority_certificates(store);
+        CertCloseStore(store, 0);
+    }
+#endif
 
 }

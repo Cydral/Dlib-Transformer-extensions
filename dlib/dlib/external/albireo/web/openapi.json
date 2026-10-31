@@ -2,14 +2,15 @@
  "openapi": "3.0.3",
  "info": {
   "title": "Albireo Community Edition local interface",
-  "version": "1.0.7",
+  "version": "1.0.8",
   "description": "The interface of the Albireo service, served on https://localhost (port 8443 unless changed in the tray). The routes under /v1 follow the OpenAI interface, so that its client libraries work with base_url https://localhost:8443/v1 and any API key. The functions albireo-general, albireo-code and albireo-security name the models activated in the tray, albireo-background the model that comes with Albireo, which the web application uses for its work in the background, and albireo-embedding the embedding model of the search in documents.\n\nThe administration routes require the token of the data folder of the service (admin.token) in the X-Albireo-Admin header.\n\nRequests carry JSON bodies of 64 MB and 524,288 values at most, with their length: a body without length is refused with 411, a longer one with 413, another type with 415. GET, HEAD, DELETE and OPTIONS take no body (400). An answer being written whose model has no memory left for its keys and values ends with the error code out_of_memory.",
   "license": {
    "name": "Boost Software License 1.0",
    "url": "https://www.boost.org/LICENSE_1_0.txt"
   },
   "contact": {
-   "name": "Cydral Technology",
+   "name": "Aldric Pierrain",
+   "email": "cydraltechnology@gmail.com",
    "url": "https://github.com/Cydral/Dlib-Transformer-extensions"
   }
  },
@@ -392,6 +393,13 @@
              },
              "description": {
               "type": "string"
+             },
+             "publisher": {
+              "type": "string"
+             },
+             "license": {
+              "type": "string",
+              "description": "The license of the entry of the model in the catalog, or in the manifest of the models that come with Albireo; absent for a file imported without an entry."
              }
             }
            }
@@ -421,6 +429,13 @@
              },
              "size": {
               "type": "integer"
+             },
+             "publisher": {
+              "type": "string"
+             },
+             "license": {
+              "type": "string",
+              "description": "As for the language models."
              }
             }
            },
@@ -504,7 +519,7 @@
       "content": {
        "application/json": {
         "schema": {
-         "type": "object"
+         "$ref": "#/components/schemas/Engines"
         }
        }
       }
@@ -524,7 +539,100 @@
       "content": {
        "application/json": {
         "schema": {
-         "type": "object"
+         "$ref": "#/components/schemas/UpdateState"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/albireo/v1/licenses": {
+   "get": {
+    "tags": [
+     "Service"
+    ],
+    "summary": "License texts of the installation",
+    "description": "The texts of the licenses folder of the programs, which the installer fills: those of the components of the programs (Albireo, dlib, Mbed TLS, cpp-httplib, zlib, SQLite) and of the runtimes of the engines (OpenVINO, CUDA, cuDNN). The list is empty without that folder, as in a build folder. The components of the web application are listed by /vendor/components.json.",
+    "responses": {
+     "200": {
+      "description": "The texts, by the names of their files",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "array",
+         "items": {
+          "type": "object",
+          "properties": {
+           "file": {
+            "type": "string",
+            "example": "mbedtls.txt"
+           },
+           "name": {
+            "type": "string",
+            "example": "Mbed TLS"
+           },
+           "size": {
+            "type": "integer"
+           },
+           "version": {
+            "type": "string",
+            "description": "The version the service was built with, when it knows it."
+           }
+          }
+         }
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/albireo/v1/licenses/{file}": {
+   "get": {
+    "tags": [
+     "Service"
+    ],
+    "summary": "A license text of the installation",
+    "description": "Only the files the folder lists, read through no link: a link, a file with several names (hard links) or a text of more than 1 MB is not served.",
+    "parameters": [
+     {
+      "name": "file",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string"
+      },
+      "description": "A file listed by /albireo/v1/licenses."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "The text",
+      "content": {
+       "text/plain": {
+        "schema": {
+         "type": "string"
+        }
+       }
+      }
+     },
+     "400": {
+      "description": "A name with a separator, a colon, a control character or a leading dot (code invalid_license)",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "404": {
+      "description": "No such text (code license_not_found)",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
         }
        }
       }
@@ -1018,8 +1126,8 @@
       "adminToken": []
      }
     ],
-    "summary": "Imports an offline bundle, or the GGUF files of a local folder or file",
-    "description": "For a computer without network: a memory card or a disk brought to the machine. A folder may hold a signed catalog (catalog.json and catalog.json.sig), GGUF files, also in its models subfolder, and a signed update (feed.json, feed.json.sig and the installer it names), as tools/make_offline_bundle.py prepares them. An older catalog never replaces a newer one, and the update is installed at the next start of the service.",
+    "summary": "Imports a signed offline bundle, or the content of the import folder",
+    "description": "For a computer without network: a memory card or a disk brought to the machine. The service reads with its own rights, so that it accepts two kinds of paths: a signed offline bundle on a local drive (a folder whose catalog.json or feed.json bears the signature of Albireo, as tools/make_offline_bundle.py prepares it), of which it reads only the signed files, the models the signed catalog lists, by their names, sizes and hashes, and the installer the signed feed names; and a folder or a file of the import folder of the data folder. Every file is read through no link. A model file of the user is sent through /albireo/v1/models/upload. An older catalog never replaces a newer one, a model installed already is listed under already, and the update is installed at the next start of the service.",
     "requestBody": {
      "required": true,
      "content": {
@@ -1052,6 +1160,13 @@
             "type": "string"
            }
           },
+          "already": {
+           "type": "array",
+           "items": {
+            "type": "string"
+           },
+           "description": "The installed models whose content the files repeat."
+          },
           "errors": {
            "type": "array",
            "items": {
@@ -1062,9 +1177,42 @@
            "type": "object"
           },
           "update": {
-           "type": "object"
+           "$ref": "#/components/schemas/UpdateState"
           }
          }
+        }
+       }
+      }
+     },
+     "400": {
+      "description": "The path is refused before anything of it is read; the code is the same whether a folder outside the import folder is missing, unreadable, unsigned or reached through a link (import_not_bundle)",
+      "content": {
+       "application/json": {
+        "schema": {
+         "allOf": [
+          {
+           "$ref": "#/components/schemas/Refusal"
+          },
+          {
+           "type": "object",
+           "properties": {
+            "code": {
+             "type": "string",
+             "enum": [
+              "import_path_relative",
+              "import_path_network",
+              "import_path_device",
+              "import_path_invalid",
+              "import_use_upload",
+              "import_not_bundle",
+              "import_not_found",
+              "import_path_link",
+              "import_folder_insecure"
+             ]
+            }
+           }
+          }
+         ]
         }
        }
       }
@@ -1108,6 +1256,39 @@
        "application/json": {
         "schema": {
          "type": "object"
+        }
+       }
+      }
+     },
+     "400": {
+      "description": "Refused",
+      "content": {
+       "application/json": {
+        "schema": {
+         "allOf": [
+          {
+           "$ref": "#/components/schemas/Refusal"
+          },
+          {
+           "type": "object",
+           "properties": {
+            "code": {
+             "type": "string",
+             "enum": [
+              "import_path_relative",
+              "import_path_network",
+              "import_path_device",
+              "import_path_invalid",
+              "import_use_upload",
+              "import_not_bundle",
+              "import_not_found",
+              "import_path_link",
+              "import_folder_insecure"
+             ]
+            }
+           }
+          }
+         ]
         }
        }
       }
@@ -1267,7 +1448,7 @@
       "content": {
        "application/json": {
         "schema": {
-         "type": "object"
+         "$ref": "#/components/schemas/UpdateState"
         }
        }
       }
@@ -1319,6 +1500,26 @@
            "type": "string"
           }
          }
+        }
+       }
+      }
+     },
+     "400": {
+      "description": "No update is ready (code update_not_ready)",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Refusal"
+        }
+       }
+      }
+     },
+     "409": {
+      "description": "The package manager of the system applies the updates (code update_package_manager)",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Refusal"
         }
        }
       }
@@ -1569,7 +1770,9 @@
      "top_k": {
       "type": "integer",
       "minimum": 0,
-      "description": "Candidates kept, 1024 at most; 0 for none."
+      "maximum": 1024,
+      "default": 40,
+      "description": "Keeps the k most likely tokens, among which top_p and min_p then choose; 0 sets no limit, and the 1024 most likely tokens are kept. Without it, 40, or 20 for a model of the ChatML format that reasons. A value outside 0 to 1024 is refused (400). Without effect at temperature 0, which takes the most likely token."
      },
      "min_p": {
       "type": "number"
@@ -2147,6 +2350,239 @@
      "proxy": {
       "type": "string",
       "description": "Proxy of the downloads: empty for the proxy of the system, none for a direct connection, or http://[user:password@]host:port.  The settings give the password as ********; that value sent back keeps the stored password when the user, the host and the port stay the same, and is refused (code proxy_password) otherwise."
+     }
+    }
+   },
+   "Engines": {
+    "type": "object",
+    "properties": {
+     "starting": {
+      "type": "boolean",
+      "description": "True while the engines are being described."
+     },
+     "engines": {
+      "type": "array",
+      "items": {
+       "type": "object",
+       "properties": {
+        "variant": {
+         "type": "string"
+        },
+        "path": {
+         "type": "string"
+        },
+        "usable": {
+         "type": "boolean"
+        },
+        "version": {
+         "type": "string"
+        },
+        "build": {
+         "type": "string"
+        },
+        "current": {
+         "type": "boolean"
+        },
+        "devices": {
+         "type": "array",
+         "items": {
+          "type": "object",
+          "properties": {
+           "type": {
+            "type": "string",
+            "enum": [
+             "cpu",
+             "gpu",
+             "npu"
+            ]
+           },
+           "id": {
+            "type": "string"
+           },
+           "name": {
+            "type": "string"
+           }
+          }
+         }
+        },
+        "reason": {
+         "type": "string",
+         "description": "Why the engine cannot run here, in English."
+        },
+        "reason_code": {
+         "type": "string",
+         "description": "The code of the reason: isa_avx2, isa_avx_vnni, isa_avx512, no_nvidia_driver, old_nvidia_driver, no_nvidia_card, old_nvidia_card, no_intel_device, intel_device_unusable, library_failed, probe_timeout."
+        },
+        "reason_args": {
+         "type": "object",
+         "additionalProperties": {
+          "type": "string"
+         }
+        },
+        "missing": {
+         "type": "string",
+         "description": "For an engine that runs: why its runtime left out the other devices it looks for, such as the message of a plugin of OpenVINO."
+        }
+       }
+      }
+     },
+     "options": {
+      "type": "array",
+      "description": "The choices of engine and device.",
+      "items": {
+       "type": "object",
+       "properties": {
+        "key": {
+         "type": "string",
+         "example": "openvino:gpu"
+        },
+        "variant": {
+         "type": "string"
+        },
+        "device": {
+         "type": "string"
+        },
+        "current": {
+         "type": "boolean"
+        },
+        "kind": {
+         "type": "string",
+         "enum": [
+          "cpu",
+          "gpu",
+          "npu",
+          "both"
+         ]
+        },
+        "names": {
+         "type": "array",
+         "items": {
+          "type": "string"
+         },
+         "description": "The names of the devices of the choice."
+        },
+        "measure": {
+         "type": "object",
+         "description": "The last measure of the choice."
+        }
+       }
+      }
+     },
+     "current": {
+      "type": "string",
+      "description": "The key of the choice in use."
+     },
+     "setting": {
+      "type": "string"
+     },
+     "accelerator": {
+      "type": "string"
+     },
+     "accelerators_available": {
+      "type": "boolean"
+     },
+     "accelerators_reason": {
+      "type": "string",
+      "enum": [
+       "not_installed",
+       "unusable"
+      ]
+     }
+    }
+   },
+   "UpdateState": {
+    "type": "object",
+    "description": "The updates: their state, the versions, the notes by language, and an error with its code and its values, which the tray translates.",
+    "properties": {
+     "state": {
+      "type": "string",
+      "enum": [
+       "idle",
+       "checking",
+       "up_to_date",
+       "downloading",
+       "ready",
+       "error"
+      ]
+     },
+     "current": {
+      "type": "string"
+     },
+     "latest": {
+      "type": "string"
+     },
+     "file": {
+      "type": "string"
+     },
+     "notes": {
+      "type": "object",
+      "additionalProperties": {
+       "type": "string"
+      }
+     },
+     "received": {
+      "type": "integer"
+     },
+     "total": {
+      "type": "integer"
+     },
+     "checked_at": {
+      "type": "integer"
+     },
+     "error": {
+      "type": "string",
+      "description": "The error in English."
+     },
+     "code": {
+      "type": "string",
+      "enum": [
+       "update_check",
+       "update_record",
+       "update_feed_missing",
+       "update_feed_missing_folder",
+       "update_signature",
+       "update_feed_mismatch",
+       "update_outside",
+       "update_installer_mismatch",
+       "update_feed_invalid",
+       "update_download",
+       "update_not_ready",
+       "update_invalid",
+       "update_start",
+       "update_package_manager",
+       "stopping"
+      ],
+      "description": "update_check {e}, update_record {version}, update_feed_missing {version}, update_feed_missing_folder {folder}, update_signature {file}, update_feed_mismatch {file, version}, update_outside {file}, update_installer_mismatch {version}, update_feed_invalid, update_download {e}, update_not_ready, update_invalid {version}, update_start {code}, update_package_manager, stopping."
+     },
+     "args": {
+      "type": "object",
+      "additionalProperties": {
+       "type": "string"
+      }
+     }
+    }
+   },
+   "Refusal": {
+    "type": "object",
+    "description": "A refused operation, with the code of its reason and its values.",
+    "properties": {
+     "ok": {
+      "type": "boolean",
+      "enum": [
+       false
+      ]
+     },
+     "error": {
+      "type": "string"
+     },
+     "code": {
+      "type": "string"
+     },
+     "args": {
+      "type": "object",
+      "additionalProperties": {
+       "type": "string"
+      }
      }
     }
    }

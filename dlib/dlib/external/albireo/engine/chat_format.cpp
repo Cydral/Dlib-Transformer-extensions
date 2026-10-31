@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -145,12 +146,106 @@ namespace albireo
         }
 
         // The arguments of a call as JSON text: an object given as a string is kept as
-        // written, an empty one becomes {}.
+        // written, an empty one becomes {}, and an object is written as the templates write
+        // it (json.dumps), with a space after each separator.
         std::string arguments_text(const json& args)
         {
             if (args.is_string()) return args.as_string().empty() ? std::string("{}") : args.as_string();
             if (args.is_null()) return "{}";
-            return args.dump();
+            return args.dump_formatted();
+        }
+
+        /*
+            Parses the JSON of a tool call as a model writes it.  The models write the code
+            and the texts they pass to a tool with raw line breaks and tabs in its strings,
+            which the grammar forbids.  When the text does not parse as it is, these characters
+            are escaped and the result parsed again, and repaired receives it.
+        */
+        bool parse_call_json(const std::string& text, json& out, std::string& repaired)
+        {
+            repaired.clear();
+            if (json::parse(text, out)) return true;
+            static const char hex[] = "0123456789abcdef";
+            std::string fixed;
+            fixed.reserve(text.size() + 16);
+            bool in_string = false, changed = false;
+            for (size_t i = 0; i < text.size(); ++i)
+            {
+                const char c = text[i];
+                if (in_string)
+                {
+                    if (c == '\\' && i + 1 < text.size())
+                    {
+                        fixed += c;
+                        fixed += text[++i];
+                        continue;
+                    }
+                    if (c == '"')
+                    {
+                        in_string = false;
+                    }
+                    else if (static_cast<unsigned char>(c) < 0x20)
+                    {
+                        changed = true;
+                        if (c == '\n') fixed += "\\n";
+                        else if (c == '\r') fixed += "\\r";
+                        else if (c == '\t') fixed += "\\t";
+                        else
+                        {
+                            fixed += "\\u00";
+                            fixed += hex[(c >> 4) & 15];
+                            fixed += hex[c & 15];
+                        }
+                        continue;
+                    }
+                }
+                else if (c == '"')
+                {
+                    in_string = true;
+                }
+                fixed += c;
+            }
+            if (!changed || !json::parse(fixed, out)) return false;
+            repaired.swap(fixed);
+            return true;
+        }
+
+        /*
+            The text of the value of member key in the JSON object written in text, or of
+            the member of its "function" object, as written; empty when it has none.  A
+            model writes the arguments of a call as it was trained to, which this keeps.
+        */
+        std::string member_text(const std::string& text, const std::string& key)
+        {
+            auto skip = [&](size_t i) {
+                while (i < text.size() && std::isspace(static_cast<unsigned char>(text[i]))) ++i;
+                return i;
+            };
+            size_t i = skip(0);
+            if (i >= text.size() || text[i] != '{') return std::string();
+            i = skip(i + 1);
+            while (i < text.size() && text[i] == '"')
+            {
+                const size_t name_length = json_extent(text, i);
+                if (name_length == 0) return std::string();
+                json name;
+                if (!json::parse(text.substr(i, name_length), name)) return std::string();
+                i = skip(i + name_length);
+                if (i >= text.size() || text[i] != ':') return std::string();
+                const size_t value_start = skip(i + 1);
+                const size_t value_length = json_extent(text, value_start);
+                if (value_length == 0) return std::string();
+                const std::string value = text.substr(value_start, value_length);
+                if (name.as_string() == key) return value;
+                if (name.as_string() == "function")
+                {
+                    const std::string inner = member_text(value, key);
+                    if (!inner.empty()) return inner;
+                }
+                i = skip(value_start + value_length);
+                if (i < text.size() && text[i] == ',') i = skip(i + 1);
+            }
+            return std::string();
         }
 
         /*  The string literal a template assigns to a variable, as in
@@ -296,13 +391,63 @@ namespace albireo
                 events.push_back(e);
             }
 
-            bool emit_call_object(const json& j, std::vector<output_event>& events)
+            /*
+                A call given as an object {"name", "arguments"} or {"function": {...}}; text,
+                when given, is the object as the model wrote it, whose arguments are then
+                passed on as written when they are an object.
+            */
+            bool emit_call_object(const json& j, std::vector<output_event>& events, const std::string& text = "")
             {
                 const json& fn = j.contains("function") ? j["function"] : j;
                 const std::string name = fn["name"].as_string();
                 if (name.empty()) return false;
-                const json& args = fn.contains("arguments") ? fn["arguments"] : fn["parameters"];
-                emit_call(name, arguments_text(args), events);
+                const char* key = fn.contains("arguments") ? "arguments" : "parameters";
+                const json& args = fn[key];
+                std::string written;
+                if (args.is_object() && !text.empty())
+                {
+                    written = strip_spaces(member_text(text, key));
+                    json check;
+                    if (!json::parse(written, check) || !(check == args)) written.clear();
+                }
+                emit_call(name, written.empty() ? arguments_text(args) : written, events);
+                return true;
+            }
+
+            /*
+                The calls of the text between two call markers, a JSON object or several in a
+                row, possibly in a fenced block.  The closing braces a model writes beyond its
+                last object, after code with braces of its own, are left aside.  False, emitting
+                nothing, when the text holds anything else.
+            */
+            bool emit_calls(const std::string& body, std::vector<output_event>& events)
+            {
+                std::string text = strip_spaces(body);
+                if (starts_with(text, "```"))
+                {
+                    const size_t line = text.find('\n');
+                    text = line == std::string::npos ? std::string() : text.substr(line + 1);
+                    text = strip_spaces(text);
+                    if (ends_with(text, "```")) text = strip_spaces(text.substr(0, text.size() - 3));
+                }
+                std::vector<output_event> calls;
+                size_t pos = 0;
+                while (pos < text.size())
+                {
+                    if (!calls.empty() && text.find_first_not_of("}] \n\r\t", pos) == std::string::npos) break;
+                    const size_t n = json_extent(text, pos);
+                    if (n == 0 || text[pos] != '{') return false;
+                    std::string one = text.substr(pos, n);
+                    json j;
+                    std::string repaired;
+                    if (!parse_call_json(one, j, repaired) || !j.is_object()) return false;
+                    if (!repaired.empty()) one.swap(repaired);
+                    if (!emit_call_object(j, calls, one)) return false;
+                    pos += n;
+                    while (pos < text.size() && std::isspace(static_cast<unsigned char>(text[pos]))) ++pos;
+                }
+                if (calls.empty()) return false;
+                events.insert(events.end(), calls.begin(), calls.end());
                 return true;
             }
 
@@ -426,12 +571,17 @@ namespace albireo
                     const size_t p = buffer_.find(c_.call_close);
                     if (p == std::string::npos)
                     {
-                        if (final) { emit(output_kind::content, call_prefix_ + buffer_, events); buffer_.clear(); }
+                        // A model may end its turn after the object, without the closing marker.
+                        if (final)
+                        {
+                            if (!emit_calls(buffer_, events))
+                                emit(output_kind::content, call_prefix_ + buffer_, events);
+                            buffer_.clear();
+                        }
                         return false;
                     }
                     const std::string body = buffer_.substr(0, p);
-                    json j;
-                    if (!json::parse(strip_spaces(body), j) || !j.is_object() || !emit_call_object(j, events))
+                    if (!emit_calls(body, events))
                         emit(output_kind::content, call_prefix_ + body + c_.call_close, events);
                     buffer_.erase(0, p + c_.call_close.size());
                     state_ = state::content;

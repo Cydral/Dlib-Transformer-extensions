@@ -16,12 +16,17 @@ export const definitions = [
     type: 'function',
     function: {
       name: 'calculator',
-      description: 'Evaluates an arithmetic expression exactly as written and returns its value. Supports + - * / % ^, ' +
-        'parentheses, and the functions sqrt, cbrt, abs, exp, ln, log10, log2, sin, cos, tan, asin, acos, atan, ' +
+      description: 'Evaluates an arithmetic expression exactly as written and returns its value. Supports + - * / ^, ' +
+        'parentheses, percentages ("17.5% of 2340", "2340 * 17.5%"), mod for the remainder of a division, ' +
+        'and the functions sqrt, cbrt, abs, exp, ln, log10, log2, sin, cos, tan, asin, acos, atan, ' +
         'floor, ceil, round, min, max, pow, and the constants pi and e.',
       parameters: {
         type: 'object',
-        properties: { expression: { type: 'string', description: 'The expression, for example "(3.5 + 2) * 4 ^ 2".' } },
+        properties: {
+          expression: {
+            type: 'string', description: 'The expression, for example "(3.5 + 2) * 4 ^ 2" or "17.5% of 2340".'
+          }
+        },
         required: ['expression']
       }
     }
@@ -131,9 +136,40 @@ export const agentInstructions = 'You can call tools. Call a tool when it gives 
   'document, list its parts, then read them one after the other), earlier work with search_discussions. ' +
   'After the tool results, answer the user directly.';
 
-// Arithmetic without eval: a recursive descent over numbers, operators and functions.
+/*
+    An expression in the notation the calculator reads.  The signs of multiplication, division and
+    subtraction become *, / and -, the groups of thousands written with spaces join ("2 340"), a
+    comma between two digits outside of the arguments of a function is a decimal comma ("17,5"),
+    and the word that follows a percentage in the languages of the interface ("17.5% of 2340",
+    "17,5 % de 2 340") becomes a product.
+*/
+function normalizeExpression(text) {
+  const s = String(text).replace(/\*\*/g, '^').replace(/[×·]/g, '*').replace(/÷/g, '/').replace(/[−–]/g, '-')
+    .replace(/[   ]/g, ' ')
+    .replace(/%\s*(of|de|du|des|von|vom|der|di|del|della|dello|dei|delle)(?![\p{L}\p{N}_])/giu, '%*')
+    .replace(/(\d) (?=\d{3}(?!\d))/g, '$1');
+  let out = '';
+  // For each open parenthesis, true when it opens the arguments of a function.
+  const calls = [];
+  for (let k = 0; k < s.length; ++k) {
+    const c = s[k];
+    if (c === '(') calls.push(/[A-Za-z_][A-Za-z0-9_]*\s*$/.test(out));
+    else if (c === ')') calls.pop();
+    else if (c === ',' && !calls[calls.length - 1] && /\d$/.test(out) && /\d/.test(s[k + 1] || '')) {
+      out += '.';
+      continue;
+    }
+    out += c;
+  }
+  return out;
+}
+
+/*
+    Arithmetic without eval: a recursive descent over numbers, operators and functions.  A % after
+    a value is a percentage, unless a value follows it, which makes it the remainder of a division.
+*/
 function calculate(expression) {
-  const s = String(expression).replace(/\*\*/g, '^').replace(/×/g, '*').replace(/÷/g, '/').replace(/,/g, '.');
+  const s = normalizeExpression(expression);
   let i = 0;
   const functions = {
     sqrt: Math.sqrt, cbrt: Math.cbrt, abs: Math.abs, exp: Math.exp, ln: Math.log, log: Math.log10, log10: Math.log10,
@@ -185,18 +221,30 @@ function calculate(expression) {
     fail('number expected');
     return NaN;
   }
+  // True when the % at the position is a percentage, followed by nothing, an operator or a parenthesis.
+  function percentage() {
+    if (s[i] !== '%') return false;
+    let j = i + 1;
+    while (j < s.length && /\s/.test(s[j])) ++j;
+    return j >= s.length || /[)+\-*\/^%,;!]/.test(s[j]);
+  }
   function postfix() {
     let v = primary();
-    space();
-    while (s[i] === '!') {
-      ++i;
-      if (v < 0 || v > 170 || v !== Math.floor(v)) fail('factorial of a non-integer');
-      let f = 1;
-      for (let k = 2; k <= v; ++k) f *= k;
-      v = f;
+    for (;;) {
       space();
+      if (s[i] === '!') {
+        ++i;
+        if (v < 0 || v > 170 || v !== Math.floor(v)) fail('factorial of a non-integer');
+        let f = 1;
+        for (let k = 2; k <= v; ++k) f *= k;
+        v = f;
+      } else if (percentage()) {
+        ++i;
+        v /= 100;
+      } else {
+        return v;
+      }
     }
-    return v;
   }
   function power() {
     const base = postfix();
@@ -209,7 +257,18 @@ function calculate(expression) {
     for (;;) {
       space();
       const c = s[i];
-      if (c === '*') { ++i; v *= power(); } else if (c === '/') { ++i; v /= power(); } else if (c === '%') { ++i; v %= power(); } else return v;
+      if (c === '*') {
+        ++i;
+        v *= power();
+      } else if (c === '/') {
+        ++i;
+        v /= power();
+      } else if (c === '%' || /^mod(?![A-Za-z0-9_])/i.test(s.slice(i, i + 4))) {
+        i += c === '%' ? 1 : 3;
+        v %= power();
+      } else {
+        return v;
+      }
     }
   }
   function sum() {
@@ -245,7 +304,8 @@ function sandbox() {
     frame.className = 'sandbox-frame';
     frame.src = 'sandbox.html';
     window.addEventListener('message', (e) => {
-      if (!frame || e.source !== frame.contentWindow) return;
+      // The frame has an opaque origin, which its messages carry as "null".
+      if (!frame || e.source !== frame.contentWindow || e.origin !== 'null') return;
       const d = e.data !== null && typeof e.data === 'object' ? e.data : {};
       // The frame says it is ready in a message of its own, without the id of a run.
       if (d.id === undefined) {

@@ -5,7 +5,7 @@
     the devices, each in its own build tree, then the service, the tray, the processor
     engines and the installer, which carries all the engines.
 
-        powershell -ExecutionPolicy Bypass -File build_windows.ps1 [-NoOpenVINO] [-Cuda]
+        powershell -ExecutionPolicy Bypass -File build_windows.ps1 [-NoOpenVINO] [-Cuda | -NoCuda]
             [-CudaVersion 12.9] [-Cudnn <folder of cuDNN>] [-CudaArchitectures <list>]
             [-NoBuiltinModels] [-ModelCache <folder>] [-Tests] [-Jobs <n>]
 
@@ -15,9 +15,16 @@
     built by default, so that every installation can use the NPU and the graphics
     processor of Intel: they need the runtime of OpenVINO (python -m pip install openvino,
     or the archive with INTEL_OPENVINO_DIR set).  -NoOpenVINO leaves them out, and
-    -OpenVINO, which earlier versions needed, is still accepted.  -Cuda needs the CUDA
-    toolkit 12.8 or later and cuDNN 9; with the Build Tools, the CUDA integration of the
-    toolkit installer goes to the Build Tools when Visual Studio is absent.
+    -OpenVINO, which earlier versions needed, is still accepted.
+
+    The CUDA engine is built when this computer has the CUDA toolkit 12.8 or later, its
+    integration with Visual Studio and cuDNN 9, and no NVIDIA card is needed for it: the
+    toolkit installs and compiles without one (custom installation, without the driver).
+    Without them, the build goes on without the CUDA engine and says what is missing;
+    -Cuda makes their absence an error, and -NoCuda leaves the engine out.  With the
+    Build Tools, the CUDA integration of the toolkit installer goes to the Build Tools
+    when Visual Studio is absent.  cuDNN is found in C:\Program Files\NVIDIA\CUDNN, where
+    its installer puts it, or in the folder -Cudnn names (an extracted archive).
 
     -CudaVersion picks one of several installed toolkits, and -Cudnn the folder of one cuDNN
     installation (C:\Program Files\NVIDIA\CUDNN\v9.11 for instance).  Without
@@ -48,6 +55,7 @@ param(
     [switch]$NoOpenVINO,
     [switch]$OpenVINO,
     [switch]$Cuda,
+    [switch]$NoCuda,
     [string]$CudaVersion = "",
     [string]$Cudnn = "",
     [string]$CudaArchitectures = "",
@@ -149,6 +157,50 @@ function Find-CudnnFile([string]$under, [string]$name, [string]$major) {
     return $found[0].FullName.Replace('\', '/')
 }
 
+# The CUDA toolkit of -CudaVersion, else that of CUDA_PATH: its folder when its compiler is there.
+function Find-CudaToolkit {
+    $toolkit = $env:CUDA_PATH
+    if ($CudaVersion) {
+        $toolkit = [Environment]::GetEnvironmentVariable("CUDA_PATH_V" + $CudaVersion.Replace('.', '_'))
+    }
+    if ($toolkit -and (Test-Path (Join-Path $toolkit "bin\nvcc.exe"))) { return $toolkit }
+    return $null
+}
+
+# The integration of the toolkit with Visual Studio or its Build Tools, which the CUDA projects of
+# CMake need: the files "CUDA <version>.props" among the build customizations of MSBuild.
+function Test-CudaIntegration {
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+    if (-not (Test-Path $vswhere)) { return $false }
+    $pattern = if ($CudaVersion) { "CUDA $CudaVersion.props" } else { "CUDA *.props" }
+    $installations = @(& $vswhere -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+        -property installationPath)
+    foreach ($vs in $installations) {
+        $folder = Join-Path $vs "MSBuild\Microsoft\VC\v170\BuildCustomizations"
+        if (@(Get-ChildItem -Path $folder -Filter $pattern -ErrorAction SilentlyContinue).Count -gt 0) { return $true }
+    }
+    return $false
+}
+
+# The folder of cuDNN: that of -Cudnn, else the one of its installer, else the toolkit itself,
+# the first that holds its header and its library.
+function Find-Cudnn([string]$toolkit, [string]$major) {
+    $folders = @((Join-Path $env:ProgramFiles "NVIDIA\CUDNN"), $toolkit)
+    if ($Cudnn) { $folders = @($Cudnn) }
+    foreach ($folder in $folders) {
+        if (-not $folder -or -not (Test-Path $folder)) { continue }
+        try {
+            Find-CudnnFile $folder "cudnn.h" $major | Out-Null
+            Find-CudnnFile $folder "cudnn.lib" $major | Out-Null
+            return $folder
+        }
+        catch {
+            continue
+        }
+    }
+    return $null
+}
+
 $extra = @()
 if (-not $NoOpenVINO) {
     if (-not (Test-OpenVINO)) {
@@ -163,29 +215,52 @@ if (-not $NoOpenVINO) {
     Invoke-Step "building the OpenVINO engine" (@("--build", $tree, "--config", "Release") + $parallel)
     $extra += (Join-Path $tree "bin\engines")
 }
-if ($Cuda) {
+# The CUDA engine, when this computer has what it needs to compile it; a card is not needed.
+$toolkit = $null
+$cudnnFolder = $null
+$major = ""
+$buildCuda = $false
+if ($Cuda -and $NoCuda) { throw "-Cuda and -NoCuda exclude each other" }
+if (-not $NoCuda) {
+    $toolkit = Find-CudaToolkit
+    if ($CudaVersion) { $major = $CudaVersion.Split('.')[0] }
+    elseif ($toolkit -and ($toolkit -match 'v([0-9]+)\.')) { $major = $Matches[1] }
+    $missing = @()
+    if (-not $toolkit) {
+        if ($CudaVersion) { $missing += "the CUDA toolkit $CudaVersion" }
+        else { $missing += "the CUDA toolkit 12.8 or later (CUDA_PATH)" }
+    }
+    else {
+        if (-not (Test-CudaIntegration)) {
+            $missing += ("the integration of CUDA with Visual Studio (Visual Studio Integration in the " +
+                "toolkit installer)")
+        }
+        $cudnnFolder = Find-Cudnn $toolkit $major
+        if (-not $cudnnFolder) { $missing += "cuDNN 9 (its installer, or -Cudnn with the folder of its archive)" }
+    }
+    if ($missing.Count -eq 0) {
+        $buildCuda = $true
+    }
+    elseif ($Cuda) {
+        throw ("the CUDA engine needs " + ($missing -join ", "))
+    }
+    else {
+        Write-Warning ("no CUDA engine in this build, this computer lacks " + ($missing -join ", ") +
+            ". The toolkit installs without an NVIDIA card; -NoCuda leaves the engine out without this message.")
+    }
+}
+if ($buildCuda) {
     $tree = Join-Path $root "build-albireo-cuda"
     Reset-StaleTree $tree
-    $options = @("-DALBIREO_PROGRAMS=OFF", "-DALBIREO_ENGINE_CUDA=ON", "-DALBIREO_TESTS=$testing")
+    $options = @("-DALBIREO_PROGRAMS=OFF", "-DALBIREO_ENGINE_CUDA=ON", "-DALBIREO_TESTS=$testing",
+        "-DCUDAToolkit_ROOT=$($toolkit.Replace('\', '/'))")
+    # The CUDA integration of Visual Studio of the version asked for.
     $toolset = @()
-    $major = ""
-    if ($CudaVersion) {
-        # The CUDA integration of Visual Studio and the toolkit CMake searches, of that version.
-        $variable = "CUDA_PATH_V" + $CudaVersion.Replace('.', '_')
-        $toolkit = [Environment]::GetEnvironmentVariable($variable)
-        if (-not $toolkit) { throw "CUDA $CudaVersion is not installed ($variable is not set)" }
-        $toolset = @("-T", "cuda=$CudaVersion")
-        $options += "-DCUDAToolkit_ROOT=$($toolkit.Replace('\', '/'))"
-        $major = $CudaVersion.Split('.')[0]
-    }
-    elseif ($env:CUDA_PATH -match 'v([0-9]+)\.') {
-        $major = $Matches[1]
-    }
-    if ($Cudnn) {
-        $header = Find-CudnnFile $Cudnn "cudnn.h" $major
-        $options += "-DCUDNN_INCLUDE_PATH=$(Split-Path $header -Parent)".Replace('\', '/')
-        $options += "-DCUDNN_LIBRARY_PATH=$(Find-CudnnFile $Cudnn 'cudnn.lib' $major)"
-    }
+    if ($CudaVersion) { $toolset = @("-T", "cuda=$CudaVersion") }
+    $header = Find-CudnnFile $cudnnFolder "cudnn.h" $major
+    $options += "-DCUDNN_INCLUDE_PATH=$(Split-Path $header -Parent)".Replace('\', '/')
+    $options += "-DCUDNN_LIBRARY_PATH=$(Find-CudnnFile $cudnnFolder 'cudnn.lib' $major)"
+    Write-Host "== CUDA engine: toolkit $toolkit, cuDNN $(Split-Path $header -Parent)"
     if ($CudaArchitectures) { $options += "-DCMAKE_CUDA_ARCHITECTURES=$CudaArchitectures" }
     Invoke-Step "configuring the CUDA engine" (@("-S", $source, "-B", $tree) + $generator + $toolset + $options)
     Clear-Engines $tree

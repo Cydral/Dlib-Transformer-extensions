@@ -58,9 +58,9 @@ function estimateTokens(text) {
 }
 
 const defaults = {
-  theme: 'auto', language: 'auto', userName: '', defaultRole: 'general', temperature: null, topP: null,
+  theme: 'auto', language: 'auto', userName: '', defaultRole: 'general', temperature: null, topP: null, topK: null,
   maxTokens: 0, sendOnEnter: true, systemPrompt: '', lastReasoning: false, lastAgent: false, sidebar: true,
-  memoryEnabled: true, memorySensitive: false, memory: '', memoryUpdated: 0
+  memoryEnabled: true, memorySensitive: false, memory: '', memoryUpdated: 0, memoryLanguage: '', storagePersisted: null
 };
 
 // The memory of the discussions: short notes on the user, which the model writes from the
@@ -134,10 +134,43 @@ function formatNumber(n) {
   return new Intl.NumberFormat(language()).format(n);
 }
 
+// A short duration, such as the time a tool took, in milliseconds below one second.
+function formatShortDuration(ms) {
+  if (ms < 1000) return Math.max(1, Math.round(ms)) + ' ms';
+  if (ms >= 60000) return formatDuration(ms);
+  const n = new Intl.NumberFormat(language(), { minimumFractionDigits: 1, maximumFractionDigits: 1 });
+  return n.format(ms / 1000) + ' s';
+}
+
 function toast(message, error, ms) {
-  const el = h('div', { class: 'toast' + (error ? ' error' : '') }, message);
+  if (!ui.toasts) return;
+  const el = h('div', { class: 'toast' + (error ? ' error' : ''), role: error ? 'alert' : 'status' }, message);
   ui.toasts.append(el);
   setTimeout(() => el.remove(), ms || (error ? 6000 : 2600));
+}
+
+// Copies a text to the clipboard, and tells whether it could.
+function copyText(text) {
+  const failed = () => toast(t('copyFailed'), true);
+  try {
+    navigator.clipboard.writeText(String(text || '')).then(() => toast(t('copied')), failed);
+  } catch (e) {
+    // The clipboard is out of reach outside of a secure page.
+    failed();
+  }
+}
+
+/*
+    A change the database of the browser refused, for instance on a full disk.  The user is told
+    at most once every few seconds, and the work goes on with the copies in memory.
+*/
+let storageWarned = 0;
+
+function storageFailed(e) {
+  console.warn('Albireo: the database of the browser refused a change', e);
+  if (Date.now() - storageWarned < 15000) return;
+  storageWarned = Date.now();
+  toast(t(e && e.name === 'QuotaExceededError' ? 'errStorageFull' : 'errStorage'), true);
 }
 
 function download(name, content, type) {
@@ -149,12 +182,15 @@ function download(name, content, type) {
   setTimeout(() => URL.revokeObjectURL(url), 5000);
 }
 
+/*
+    The type of a file the agent created.  The pages, images and scripts a browser would run are
+    given as plain data, so that the file is saved and never opened in the origin of the application.
+*/
 function mimeOf(name) {
   const ext = name.toLowerCase().split('.').pop();
   return {
-    md: 'text/markdown', csv: 'text/csv', json: 'application/json', html: 'text/html', xml: 'application/xml',
-    js: 'text/javascript', py: 'text/x-python', svg: 'image/svg+xml'
-  }[ext] || 'text/plain';
+    md: 'text/markdown', csv: 'text/csv', json: 'application/json', py: 'text/x-python', txt: 'text/plain'
+  }[ext] || 'application/octet-stream';
 }
 
 // Theme and language.
@@ -177,16 +213,19 @@ function applyLanguage() {
   setLanguage(own && own !== 'auto' ? own : system && system !== 'auto' ? system : null);
 }
 
+// Saves a setting and tells the other tabs; a setting the database refuses stays for this visit.
 async function saveSetting(key, value) {
   state.settings[key] = value;
-  await store.setSetting(key, value);
+  await store.setSetting(key, value).catch(storageFailed);
   broadcast({ type: 'setting', key, value });
+  if (/^memory/.test(key) && ui.memoryView) ui.memoryView();
 }
 
 /*
-    The tabs of the application tell each other the settings they change and the reset of the
-    memory, so that the settings of each stay current: by a BroadcastChannel, else by the
-    storage event of localStorage.
+    The tabs of the application tell each other the settings they change, the reset of the
+    memory, the discussions and the projects they save or delete, and the discussions they are
+    answering, so that each tab shows the current state at once.  The messages go by a
+    BroadcastChannel, else by the storage event of localStorage.
 */
 let channel = null;
 try {
@@ -218,11 +257,210 @@ function receive(message) {
   if (!message || typeof message !== 'object') return;
   if (message.type === 'setting' && Object.prototype.hasOwnProperty.call(defaults, message.key)) {
     state.settings[message.key] = message.value;
-    // The language follows at the next status of the service (refreshStatus).
-    if (message.key === 'theme') applyTheme();
+    settingChanged(message.key);
   } else if (message.type === 'memoryReset') {
     forgetMemory();
+  } else if (message.type === 'conversation' && typeof message.id === 'string') {
+    syncConversation(message.id);
+  } else if (message.type === 'deleted' && typeof message.id === 'string') {
+    conversationDeleted(message.id);
+  } else if (message.type === 'cleared') {
+    everythingDeleted();
+  } else if (message.type === 'lists') {
+    syncLists();
+  } else if (message.type === 'busy' && typeof message.id === 'string' && typeof message.tab === 'string') {
+    busyElsewhere(message.id, message.tab, !!message.busy);
   }
+}
+
+// Shows a setting changed in this tab or in another one.
+function settingChanged(key) {
+  if (key === 'theme') applyTheme();
+  else if (key === 'language') languageChanged().catch(() => {});
+  else if (key === 'userName' || key === 'defaultRole') refreshViews();
+  if (/^memory/.test(key) && ui.memoryView) ui.memoryView();
+}
+
+/*
+    Applies the language of the interface after a change of the setting here or in another tab, or
+    of the language of Albireo.  The texts are drawn again, and the memory is written in the new
+    language at its next update.  force draws them again even when the language stays.
+*/
+async function languageChanged(force) {
+  const before = language();
+  applyLanguage();
+  if (language() === before && !force) return;
+  state.catalog = await api.models(language()).catch(() => state.catalog);
+  buildLayout();
+  renderAll();
+  if (language() !== before) rememberLater();
+}
+
+/*
+    Draws again the side panel, the top bar, the composer, the status line, and the pages without
+    messages (welcome, project) unless the user is typing in them, so that they show the state of
+    the discussions and of the projects.  The messages of the discussion shown stay as they are.
+*/
+function refreshViews() {
+  if (!ui.sideScroll) return;
+  renderSidebar();
+  if (!ui.topbar.contains(document.activeElement)) renderTopbar();
+  renderComposerState();
+  renderStatusLine();
+  const page = state.view === 'project' || (state.view === 'chat' && state.current && !state.current.messages.length);
+  if (page && !editingIn(ui.content)) renderMain();
+}
+
+// True when the user is typing in a field of el.
+function editingIn(el) {
+  const a = document.activeElement;
+  return !!(a && el && el.contains(a) && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA' || a.isContentEditable));
+}
+
+// The messages of a discussion as they are drawn, to tell whether a saved copy changes the thread.
+function threadKey(c) {
+  const messages = (c && c.messages) || [];
+  const last = messages[messages.length - 1];
+  const steps = last && last.steps
+    ? last.steps.map((s) => (s.content || '').length + '.' + (s.toolCalls || []).length) : [];
+  const ended = last && (last.error || last.cancelled) ? 1 : 0;
+  return messages.map((m) => m.id).join(',') + '|' + steps.join(',') + '|' + ended + '|' + (c.contextStart || 0);
+}
+
+// The fields of a discussion another tab may change while this one answers in it.
+const sharedFields = ['title', 'titleSource', 'pinned', 'projectId'];
+
+// The discussions to read again from the database, each once after a burst of messages.
+const syncTimers = new Map();
+
+function syncConversation(id) {
+  clearTimeout(syncTimers.get(id));
+  syncTimers.set(id, setTimeout(() => {
+    syncTimers.delete(id);
+    applyStored(id).catch(storageFailed);
+  }, 50));
+}
+
+/*
+    Takes the copy of a discussion another tab saved.  The discussion this tab is answering keeps
+    its messages and takes the title, the pin and the project; the one shown otherwise takes the
+    saved copy whole, and its messages are drawn again when they changed.
+*/
+async function applyStored(id) {
+  if (deleted.has(id)) return;
+  const stored = await store.getConversation(id);
+  if (!stored) {
+    if (state.conversations.some((x) => x.id === id)) conversationDeleted(id);
+    return;
+  }
+  let copy = stored;
+  const shown = state.current && state.current.id === id ? state.current : null;
+  let redraw = false;
+  // A question being edited keeps the copy it belongs to.
+  if (shown && (state.busyId === id || editingIn(ui.content) || (ui.thread && ui.thread.querySelector('textarea')))) {
+    for (const k of sharedFields) shown[k] = stored[k];
+    copy = shown;
+  } else if (shown) {
+    redraw = threadKey(shown) !== threadKey(stored);
+    state.current = stored;
+  }
+  const i = state.conversations.findIndex((x) => x.id === id);
+  if (i >= 0) state.conversations[i] = copy;
+  else state.conversations.unshift(copy);
+  state.conversations.sort((a, b) => b.updated - a.updated);
+  if (redraw && state.view === 'chat') renderMain();
+  refreshViews();
+}
+
+// Forgets a discussion deleted in another tab, stops its answer in progress here, and never saves it again.
+function conversationDeleted(id) {
+  deleted.add(id);
+  othersBusy.delete(id);
+  state.conversations = state.conversations.filter((x) => x.id !== id);
+  if (state.current && state.current.id === id) {
+    if (state.busy) stopGeneration();
+    go('#/');
+  } else {
+    refreshViews();
+  }
+}
+
+// Every discussion and every project deleted in another tab.
+function everythingDeleted() {
+  for (const c of state.conversations) deleted.add(c.id);
+  if (state.current && state.current.messages.length && !state.current.incognito) deleted.add(state.current.id);
+  if (state.busy) stopGeneration();
+  cancelIndex();
+  rag.removeAll();
+  syncLists().then(() => go('#/'));
+}
+
+/*
+    The lists read again from the database, after an import or a change of the projects in another
+    tab, once for a burst of messages.  The discussion shown stays the copy of this tab.
+*/
+let listsSync = null;
+
+function syncLists() {
+  if (!listsSync) {
+    listsSync = new Promise((resolve) => setTimeout(resolve, 50)).then(async () => {
+      listsSync = null;
+      await reloadLists().catch(storageFailed);
+      const c = state.current;
+      const i = c ? state.conversations.findIndex((x) => x.id === c.id) : -1;
+      if (i >= 0) state.conversations[i] = c;
+      // A discussion whose project another tab deleted leaves it, as the stored discussions did.
+      if (c && c.projectId && !projectById(c.projectId)) c.projectId = null;
+      refreshViews();
+    });
+  }
+  return listsSync;
+}
+
+/*
+    The discussions other tabs are answering: id -> {tab, until}.  A tab says it again every
+    busyBeat milliseconds while it answers, so that the mark of a tab closed meanwhile expires.
+*/
+const othersBusy = new Map();
+const busyBeat = 20000;
+
+function busyElsewhere(id, tab, busy) {
+  if (busy) othersBusy.set(id, { tab, until: Date.now() + 3 * busyBeat });
+  else if (othersBusy.has(id) && othersBusy.get(id).tab === tab) othersBusy.delete(id);
+  if (state.current && state.current.id === id) {
+    renderComposerState();
+    lockThread();
+  }
+}
+
+// True when another tab is answering in the discussion c.
+function answeredElsewhere(c) {
+  const mark = c ? othersBusy.get(c.id) : null;
+  if (mark && mark.until < Date.now()) othersBusy.delete(c.id);
+  return !!(mark && mark.until >= Date.now());
+}
+
+// Forgets the marks of the tabs that stopped saying they answer; true when one expired.
+function expireBusy() {
+  let expired = false;
+  for (const [id, mark] of othersBusy) {
+    if (mark.until >= Date.now()) continue;
+    othersBusy.delete(id);
+    expired = true;
+  }
+  return expired;
+}
+
+let busyTimer = 0;
+
+// Tells the other tabs that this tab answers, or no longer answers, in the discussion c.
+function announceBusy(c, busy) {
+  clearInterval(busyTimer);
+  busyTimer = 0;
+  if (!c || c.incognito) return;
+  const say = () => broadcast({ type: 'busy', id: c.id, tab: tabId, busy });
+  say();
+  if (busy) busyTimer = setInterval(say, busyBeat);
 }
 
 // Service status and models.
@@ -290,10 +528,15 @@ function backgroundContext() {
 }
 
 // The text the background model writes for an instruction and a message.
-async function backgroundText(system, user, maxTokens, signal) {
+function backgroundText(system, user, maxTokens, signal) {
+  return backgroundChat([{ role: 'system', content: system }, { role: 'user', content: user }], maxTokens, signal);
+}
+
+// The text the background model writes after a list of messages.
+async function backgroundChat(messages, maxTokens, signal, temperature) {
   const body = {
-    model: backgroundModel, reasoning: false, temperature: 0.2, max_tokens: maxTokens,
-    messages: [{ role: 'system', content: system }, { role: 'user', content: user }]
+    model: backgroundModel, reasoning: false, temperature: temperature == null ? 0.2 : temperature,
+    max_tokens: maxTokens, messages
   };
   let text = '';
   let finish = null;
@@ -306,24 +549,33 @@ async function backgroundText(system, user, maxTokens, signal) {
   return { text: text.trim(), finish };
 }
 
-async function refreshStatus() {
+// The reading of the status in progress, which the calls made meanwhile share.
+let statusPoll = null;
+
+function refreshStatus() {
+  if (!statusPoll) statusPoll = pollStatus().finally(() => { statusPoll = null; });
+  return statusPoll;
+}
+
+/*
+    Reads the status of the service, with the models of the functions, which the window of the
+    notification area may change, and whether the service answers.  A change draws the displays
+    that show it again at once, and the return of the service resumes the titles left waiting.
+*/
+async function pollStatus() {
   let changed = false;
+  let back = false;
   try {
     const s = await api.status();
-    const before = state.status ? JSON.stringify([state.status.active, state.status.loaded_models]) : '';
-    changed = before !== JSON.stringify([s.active, s.loaded_models]);
-    const before_language = language();
+    const key = (x) => JSON.stringify([x.active, x.loaded_models, x.state, x.background]);
+    changed = !state.status || key(state.status) !== key(s);
+    back = state.statusError;
     state.status = s;
     state.statusError = false;
-    // A language chosen in Albireo meanwhile, which this interface follows.
-    applyLanguage();
-    if (language() !== before_language) {
-      state.catalog = await api.models(language()).catch(() => state.catalog);
-      buildLayout();
-      renderAll();
-    }
-    if (ui.hint) ui.hint.textContent = hintText();
     if (changed || !state.catalog) state.catalog = await api.models(language()).catch(() => state.catalog);
+    // A language chosen in Albireo meanwhile, which this interface follows.
+    await languageChanged();
+    if (ui.hint) ui.hint.textContent = hintText();
     // The embedding model of the document search; the documents not yet given vectors are
     // indexed once it is there.
     const embedder = (s.loaded_models || []).find((m) => m.embedding && s.active && m.id === s.active.embedding);
@@ -334,12 +586,13 @@ async function refreshStatus() {
     changed = !state.statusError;
     state.statusError = true;
   }
-  if (changed && state.current) {
-    renderTopbar();
-    renderComposerState();
-    if (state.view === 'chat' && !state.current.messages.length && !state.busy) renderMain();
+  if ((changed || back || expireBusy()) && state.current) {
+    refreshViews();
+    lockThread();
+  } else {
+    renderStatusLine();
   }
-  renderStatusLine();
+  if (back) namePending();
 }
 
 function renderStatusLine() {
@@ -405,10 +658,89 @@ function queryTerms(query) {
   return fold(query).split(/\s+/).filter(Boolean);
 }
 
+// The languages of the interface, named in English for the instructions of the model.
+const languageNames = { en: 'English', fr: 'French', de: 'German', it: 'Italian', es: 'Spanish' };
+
+// Frequent short words of each language, without accents, and letters that mostly belong to one.
+const languageWords = {
+  en: 'the a an and or but of to in on at for with from by about is are was were be been am it its this that these '
+    + 'those what how why which who when where can could would should will you your i my me we our they their he she '
+    + 'his her do does did not no please write explain tell give name list make show find use works prefers likes '
+    + 'uses wants as one line if than then also there',
+  fr: 'le la les un une des du de et ou mais est sont etait suis es que qui quoi comment pourquoi quel quelle quels '
+    + 'quelles quand dans pour avec sans sur sous par chez je tu il elle nous vous ils elles mon ma mes ton ta tes son '
+    + 'sa ses notre votre leur ce cet cette ces au aux en pas ne plus tres peux peut faire fais explique ecris calcule '
+    + 'donne dis resume liste c l d j qu n aime prefere utilise travaille veut souhaite comme ligne me se si non',
+  de: 'der die das den dem des ein eine einen einem einer und oder aber ist sind was war bin nicht kein keine ich du '
+    + 'er sie es wir ihr mein meine dein wie warum welche welcher welches wann wo mit fur auf von vom zu zum zur im '
+    + 'in bei aus nach uber kann konnen bitte erklare schreibe berechne gib zeige als also auch noch sehr arbeitet '
+    + 'bevorzugt mag nutzt verwendet mochte zeile',
+  it: 'il lo la gli le un una uno di del della dei delle degli e o ma che chi come cosa perche quale quali quando dove '
+    + 'per con su tra fra nel nella nei sono sei mi ti ci non piu molto puoi spiegami spiega scrivi calcola dammi '
+    + 'dimmi lavora preferisce usa vuole riga tu me se si',
+  es: 'el la los las un una unos unas de del y o pero que quien como cual cuales cuando donde por para con sin sobre '
+    + 'entre en es son soy estoy mi tu su no muy puedes explica explicame escribe calcula dame dime trabaja prefiere '
+    + 'usa quiere linea me se si'
+};
+const languageLetters = { fr: /[çœêâîôûë]/g, de: /[äöüß]/g, es: /[ñ¿¡áíóú]/g, it: /[ìò]/g };
+let languageIndex = null;
+
+/*
+    The language of a text among those of the interface, from its frequent short words and its
+    letters, or null when the text is too short or too mixed to tell.  strict asks for a clearer
+    lead of one language over the others.
+*/
+function textLanguage(text, strict) {
+  if (!languageIndex) {
+    languageIndex = new Map();
+    for (const [code, words] of Object.entries(languageWords)) {
+      for (const w of new Set(words.split(' '))) languageIndex.set(w, (languageIndex.get(w) || []).concat([code]));
+    }
+  }
+  const score = { en: 0, fr: 0, de: 0, it: 0, es: 0 };
+  const lower = String(text || '').toLowerCase();
+  for (const w of fold(lower).split(/[^a-z]+/)) {
+    const codes = languageIndex.get(w);
+    if (codes) for (const code of codes) score[code] += 1 / codes.length;
+  }
+  for (const [code, re] of Object.entries(languageLetters)) {
+    score[code] += Math.min(2, (lower.match(re) || []).length / 2);
+  }
+  const ranked = Object.entries(score).sort((a, b) => b[1] - a[1]);
+  const floor = strict ? 2 : 1.5;
+  return ranked[0][1] >= floor && ranked[0][1] >= floor * ranked[1][1] ? ranked[0][0] : null;
+}
+
+/*
+    The folded texts of the search, kept with the text they were made from (WeakMap: message or
+    discussion -> {text, folded}), so that a search folds only what changed since the last one.
+*/
+const messageFolds = new WeakMap();
+const titleFolds = new WeakMap();
+
+function foldedOf(cache, owner, text) {
+  const hit = cache.get(owner);
+  if (hit && hit.text === text) return hit.folded;
+  const folded = fold(text);
+  cache.set(owner, { text, folded });
+  return folded;
+}
+
+// The text of the messages of a discussion, and its folded form made of the folded messages.
+function conversationFolded(c) {
+  const messages = c.messages || [];
+  const texts = messages.map(messageText);
+  return { text: texts.join('\n'), folded: messages.map((m, i) => foldedOf(messageFolds, m, texts[i])).join('\n') };
+}
+
 // The first position of a term of terms in text, or -1 when one of them is missing.  A term
 // matches the beginning, the middle or the end of a word.
 function findTerms(text, terms) {
-  const f = fold(text);
+  return findFolded(fold(text), terms);
+}
+
+// findTerms for a text already folded.
+function findFolded(f, terms) {
   let first = -1;
   for (const term of terms) {
     const i = f.indexOf(term);
@@ -468,7 +800,7 @@ function searchConversations(query, limit) {
   const contents = [];
   for (const c of state.conversations) {
     const title = c.title || '';
-    const at = findTerms(title, terms);
+    const at = findFolded(foldedOf(titleFolds, c, title), terms);
     if (at >= 0) {
       titles.push({ conversation: c, where: 'title', at, text: title });
       continue;
@@ -477,17 +809,16 @@ function searchConversations(query, limit) {
     let hit = null;
     for (const m of c.messages || []) {
       const text = messageText(m);
-      const i = findTerms(text, terms);
+      const i = findFolded(foldedOf(messageFolds, m, text), terms);
       if (i >= 0) {
         hit = { conversation: c, where: m.role === 'user' ? 'question' : 'answer', at: i, text, created: m.created };
         break;
       }
     }
     if (!hit) {
-      const all = (c.messages || []).map(messageText).join('\n');
-      if (findTerms(all, terms) >= 0) {
-        const f = fold(all);
-        hit = { conversation: c, where: 'messages', at: f.indexOf(terms[0]), text: all };
+      const all = conversationFolded(c);
+      if (findFolded(all.folded, terms) >= 0) {
+        hit = { conversation: c, where: 'messages', at: all.folded.indexOf(terms[0]), text: all.text };
       }
     }
     if (hit) contents.push(hit);
@@ -521,13 +852,21 @@ function searchProjects(query, limit) {
       names.push({ project: p, where: 'name', at, text: p.name });
       continue;
     }
-    const fields = [['description', p.description, ''], ['instructions', p.instructions, '']];
-    for (const f of p.files || []) fields.push(['document', f.name + '\n' + (f.text || ''), f.name]);
-    for (const c of state.conversations) {
-      if (c.projectId === p.id) fields.push(['discussion', (c.title || '') + '\n' + conversationText(c), c.title || t('untitled')]);
+    // Each field with its folded text, the long ones folded once (foldedOf).
+    const fields = [['description', p.description || '', ''], ['instructions', p.instructions || '', '']]
+      .map(([where, text, label]) => [where, text, label, fold(text)]);
+    for (const f of p.files || []) {
+      const text = f.name + '\n' + (f.text || '');
+      fields.push(['document', text, f.name, foldedOf(messageFolds, f, text)]);
     }
-    for (const [where, text, label] of fields) {
-      const i = findTerms(text, terms);
+    for (const c of state.conversations) {
+      if (c.projectId !== p.id) continue;
+      const all = conversationFolded(c);
+      fields.push(['discussion', (c.title || '') + '\n' + all.text, c.title || t('untitled'),
+        fold(c.title || '') + '\n' + all.folded]);
+    }
+    for (const [where, text, label, folded] of fields) {
+      const i = findFolded(folded, terms);
       if (i >= 0) {
         contents.push({ project: p, where, at: i, text, label });
         break;
@@ -536,12 +875,6 @@ function searchProjects(query, limit) {
   }
   const byActivity = (a, b) => projectActivity(b.project) - projectActivity(a.project);
   return names.sort(byActivity).concat(contents.sort(byActivity)).slice(0, limit || 100);
-}
-
-function conversationText(c) {
-  const parts = [];
-  for (const m of c.messages || []) parts.push(messageText(m));
-  return parts.join('\n');
 }
 
 /*
@@ -678,6 +1011,11 @@ function renderSidebar() {
   }
 }
 
+// True when the discussion c is being answered, in this tab or in another one.
+function answering(c) {
+  return !!c && (state.busyId === c.id || answeredElsewhere(c));
+}
+
 function conversationItem(c) {
   const p = c.projectId ? projectById(c.projectId) : null;
   const active = state.view === 'chat' && state.current && state.current.id === c.id;
@@ -685,6 +1023,7 @@ function conversationItem(c) {
     p ? h('span', { class: 'dot', title: p.name, style: { background: p.color || projectColors[0] } })
       : h('span', { html: icon(roleIcons[c.role] || 'chat') }),
     h('span', { class: 'label' }, c.title || t('untitled')),
+    answering(c) ? h('span', { class: 'spinner small', title: t('answering'), 'aria-label': t('answering') }) : null,
     c.pinned ? h('span', { class: 'pin', html: icon('pin') }) : null,
     h('button', {
       class: 'more', type: 'button', title: '…', html: icon('more'),
@@ -698,12 +1037,29 @@ function showMenu(anchor, entries) {
   for (const e of entries) {
     if (e === '-') { menu.append(h('div', { class: 'sep' })); continue; }
     if (e.head) { menu.append(h('div', { class: 'head' }, e.head)); continue; }
+    // An entry that does not apply in the current state shows why, and does nothing.
     menu.append(h('div', {
-      class: 'entry' + (e.danger ? ' danger' : '') + (e.checked ? ' checked' : ''), role: 'menuitem',
-      onclick: () => { closeMenu(); e.action(); }
+      class: 'entry' + (e.danger ? ' danger' : '') + (e.checked ? ' checked' : '') + (e.disabled ? ' disabled' : ''),
+      role: 'menuitem', 'aria-disabled': e.disabled ? 'true' : null, title: e.disabled ? e.hint : null,
+      onclick: () => {
+        if (e.disabled) return;
+        closeMenu();
+        e.action();
+      }
     }, e.icon ? h('span', { html: icon(e.icon) }) : null,
     h('span', null, e.label, e.desc ? h('span', { class: 'desc' }, e.desc) : null)));
   }
+  placeMenu(menu, anchor);
+}
+
+// A panel of explanations under a button, which closes as a menu does.
+function showPopover(anchor, children) {
+  closeMenu();
+  placeMenu(h('div', { class: 'menu popover', role: 'dialog' }, children), anchor);
+}
+
+// Shows a menu or a panel under its anchor, above it when the window lacks room below.
+function placeMenu(menu, anchor) {
   document.body.append(menu);
   const r = anchor.getBoundingClientRect();
   const mw = menu.offsetWidth, mh = menu.offsetHeight;
@@ -713,17 +1069,39 @@ function showMenu(anchor, entries) {
   menu.style.left = Math.max(8, x) + 'px';
   menu.style.top = y + 'px';
   ui.menu = menu;
-  setTimeout(() => document.addEventListener('mousedown', outsideMenu), 0);
+  // The listeners follow the click that opened the menu, unless the menu closed meanwhile.
+  setTimeout(() => {
+    if (ui.menu !== menu) return;
+    document.addEventListener('mousedown', outsideMenu);
+    document.addEventListener('keydown', escapeMenu);
+  }, 0);
 }
 
 function outsideMenu(e) {
   if (ui.menu && !ui.menu.contains(e.target)) closeMenu();
 }
 
+function escapeMenu(e) {
+  if (e.key === 'Escape') closeMenu();
+}
+
 function closeMenu() {
   if (ui.menu) ui.menu.remove();
   ui.menu = null;
   document.removeEventListener('mousedown', outsideMenu);
+  document.removeEventListener('keydown', escapeMenu);
+}
+
+// What the agent mode does, and the tools it may call, each with what it is for.
+function agentHelp(anchor) {
+  showPopover(anchor, [
+    h('div', { class: 'head' }, t('agentHelpTitle')),
+    h('p', null, t('agentHelp')),
+    h('div', { class: 'popover-tools' }, tools.definitions.map((d) => h('div', { class: 'popover-tool' },
+      h('span', { html: icon(toolIcons[d.function.name] || 'tool') }),
+      h('span', null, h('b', null, toolLabel(d.function.name)),
+        h('span', { class: 'desc' }, t('toolHint_' + d.function.name))))))
+  ]);
 }
 
 // The open discussion is the copy that answers and saves: an action of the sidebar on it
@@ -734,24 +1112,39 @@ function liveCopy(c) {
 
 function conversationMenu(entry, anchor) {
   const c = liveCopy(entry);
+  // The export waits for the answer in progress, which it would hold in part.
+  const busy = answering(c);
+  const hint = t('afterAnswer');
   showMenu(anchor, [
-    { label: t('rename'), icon: 'edit', action: () => renameConversation(c) },
-    { label: c.pinned ? t('unpin') : t('pin'), icon: 'pin', action: () => togglePin(c) },
-    { label: t('moveToProject'), icon: 'move', action: () => moveMenu(c, anchor) },
-    c.projectId ? { label: t('removeFromProject'), icon: 'detach', action: () => setProject(c, null) } : null,
+    { label: t('rename'), icon: 'edit', action: () => renameConversation(liveCopy(c)) },
+    { label: c.pinned ? t('unpin') : t('pin'), icon: 'pin', action: () => togglePin(liveCopy(c)) },
+    { label: t('moveToProject'), icon: 'move', action: () => moveMenu(liveCopy(c), anchor) },
+    c.projectId ? { label: t('removeFromProject'), icon: 'detach', action: () => setProject(liveCopy(c), null) } : null,
     '-',
-    { label: t('exportMarkdown'), icon: 'download', action: () => exportConversation(c, 'md') },
-    { label: t('exportJson'), icon: 'archive', action: () => exportConversation(c, 'json') },
+    { label: t('exportMarkdown'), icon: 'download', disabled: busy, hint,
+      action: () => exportConversation(liveCopy(c), 'md') },
+    { label: t('exportJson'), icon: 'archive', disabled: busy, hint,
+      action: () => exportConversation(liveCopy(c), 'json') },
     '-',
-    { label: t('delete'), icon: 'trash', danger: true, action: () => removeConversation(c) }
+    { label: t('delete'), icon: 'trash', danger: true, action: () => removeConversation(liveCopy(c)) }
   ].filter(Boolean));
 }
 
 function moveMenu(c, anchor) {
   const entries = [{ head: t('moveTo') }];
-  for (const p of state.projects) entries.push({ label: p.name, icon: 'folder', checked: c.projectId === p.id, action: () => setProject(c, p.id) });
-  entries.push('-', { label: t('newProject'), icon: 'plus', action: async () => { const p = await newProject(true); if (p) await setProject(c, p.id); } });
-  if (c.projectId) entries.push({ label: t('none'), icon: 'detach', action: () => setProject(c, null) });
+  for (const p of state.projects) {
+    entries.push({
+      label: p.name, icon: 'folder', checked: c.projectId === p.id, action: () => setProject(liveCopy(c), p.id)
+    });
+  }
+  entries.push('-', {
+    label: t('newProject'), icon: 'plus',
+    action: async () => {
+      const p = await newProject(true);
+      if (p) await setProject(liveCopy(c), p.id);
+    }
+  });
+  if (c.projectId) entries.push({ label: t('none'), icon: 'detach', action: () => setProject(liveCopy(c), null) });
   showMenu(anchor, entries);
 }
 
@@ -759,39 +1152,57 @@ function moveMenu(c, anchor) {
 // title, a summary, the marks of the memory) does not save them again.
 const deleted = new Set();
 
+/*
+    Saves a discussion and tells the other tabs.  Returns false when there is nothing to save, or
+    when the database refused it, the user being told; the copy in memory then stays the one of
+    this tab.
+*/
 async function persist(c) {
-  if (!c || c.incognito || deleted.has(c.id)) return;
-  await store.putConversation(c);
+  if (!c || c.incognito || deleted.has(c.id)) return false;
+  // The answer being written is saved once it ends, whole.
+  const record = c.messages.includes(liveTurn)
+    ? Object.assign({}, c, { messages: c.messages.filter((x) => x !== liveTurn) }) : c;
+  try {
+    await store.putConversation(record);
+    // A deletion that came while the discussion was being saved stays.
+    if (deleted.has(c.id)) {
+      await store.deleteConversation(c.id);
+      return false;
+    }
+  } catch (e) {
+    storageFailed(e);
+    return false;
+  }
   const i = state.conversations.findIndex((x) => x.id === c.id);
   if (i >= 0) state.conversations[i] = c;
   else state.conversations.unshift(c);
   state.conversations.sort((a, b) => b.updated - a.updated);
+  broadcast({ type: 'conversation', id: c.id });
+  return true;
 }
 
 async function renameConversation(c) {
   const name = await promptDialog(t('rename'), c.title || '');
-  if (name == null) return;
-  c.title = name.trim() || c.title;
+  if (name == null || !name.trim()) return;
+  const live = liveCopy(c);
+  live.title = name.trim();
   // A title of the user stays: the model no longer names the discussion.
-  c.titleSource = 'user';
-  await persist(c);
-  renderSidebar();
-  if (state.current && state.current.id === c.id) renderTopbar();
+  live.titleSource = 'user';
+  await persist(live);
+  refreshViews();
 }
 
 async function togglePin(c) {
   c.pinned = !c.pinned;
   await persist(c);
-  renderSidebar();
+  refreshViews();
 }
 
 async function setProject(c, projectId) {
   c.projectId = projectId;
-  if (c.incognito) { renderTopbar(); return; }
-  await persist(c);
-  renderSidebar();
-  if (state.current && state.current.id === c.id) renderTopbar();
-  if (state.view === 'project') renderMain();
+  // A discussion without messages, not stored yet, takes the project with its first question.
+  if (c.messages.length) await persist(c);
+  refreshViews();
 }
 
 async function removeConversation(c) {
@@ -800,16 +1211,20 @@ async function removeConversation(c) {
   deleted.add(c.id);
   // The answer in progress stops, and the passages of the documents leave the memory of the
   // search with those of the database.
-  if (state.busy && state.current && state.current.id === c.id) stopGeneration();
-  await forgetOwner(c.id);
-  await store.deleteConversation(c.id);
+  if (state.busy && state.busyId === c.id) stopGeneration();
+  await forgetOwner(c.id).catch(() => {});
+  await store.deleteConversation(c.id).catch(storageFailed);
+  broadcast({ type: 'deleted', id: c.id });
   state.conversations = state.conversations.filter((x) => x.id !== c.id);
   if (state.current && state.current.id === c.id) go('#/');
-  else renderSidebar();
+  else refreshViews();
 }
 
+// The name of the file of a discussion, its title without the characters a file name cannot hold.
 function fileName(c) {
-  return (c.title || 'discussion').replace(/[\\/:*?"<>|]+/g, '_').slice(0, 80);
+  const name = (c.title || '').replace(/[\\/:*?"<>|\u0000-\u001f\u007f]+/g, '_')
+    .replace(/^[\s.]+|[\s.]+$/g, '').slice(0, 80);
+  return name || 'discussion';
 }
 
 // The messages of a discussion in Markdown, under its title.
@@ -858,16 +1273,25 @@ function exportAnswer(c, index, format) {
   context follows the messages that remain.
 */
 async function deleteQuestion(c, index) {
-  if (state.busy) return;
+  if (threadLocked()) return;
+  const id = c.messages[index] && c.messages[index].id;
   if (!await confirmDialog(t('deleteQuestionTitle'), t('deleteQuestionText'))) return;
+  // The discussion as it is once the deletion is confirmed, which another tab may have changed.
+  c = liveCopy(c);
+  index = c.messages.findIndex((x) => x.id === id);
+  if (index < 0 || threadLocked()) return;
   // A compression in progress moves the start of the discussion: it ends first.
   if (compactions.has(c.id)) await compactions.get(c.id).catch(() => {});
   const m = c.messages[index];
   let end = index + 1;
   while (end < c.messages.length && c.messages[end].role !== 'user') ++end;
-  for (const a of (m && m.attachments) || []) if (a.mode === 'search') forgetDocument(c.id, a.id);
   const removed = end - index;
+  // The documents of the question leave the search, unless another question, a replay, shares them.
+  const others = attachmentIds(c.messages.slice(0, index).concat(c.messages.slice(end)));
+  for (const a of (m && m.attachments) || []) if (a.mode === 'search' && !others.has(a.id)) forgetDocument(c.id, a.id);
   c.messages.splice(index, removed);
+  // The memory reads again from the question that took its place.
+  if ((c.memoryMark || 0) > index) c.memoryMark = Math.max(index, (c.memoryMark || 0) - removed);
   const start = c.contextStart || 0;
   if (start >= end) c.contextStart = start - removed;
   else if (start > index) c.contextStart = index;
@@ -876,7 +1300,15 @@ async function deleteQuestion(c, index) {
   if (c.summary && index < start) await rewriteSummary(c);
   c.updated = Date.now();
   await persist(c);
-  renderMain();
+  if (state.current === c) renderMain();
+  refreshViews();
+}
+
+// The documents attached to the questions of a list of messages, by their ids.
+function attachmentIds(messages) {
+  const ids = new Set();
+  for (const x of messages) for (const a of x.attachments || []) ids.add(a.id);
+  return ids;
 }
 
 async function rewriteSummary(c) {
@@ -1008,9 +1440,15 @@ async function newProject(silent) {
     id: store.uid(), name: name.trim(), description: '', instructions: '', files: [],
     color: projectColors[state.projects.length % projectColors.length], created: Date.now(), updated: Date.now()
   };
-  await store.putProject(p);
-  await reloadLists();
-  renderSidebar();
+  try {
+    await store.putProject(p);
+  } catch (e) {
+    storageFailed(e);
+    return null;
+  }
+  state.projects = state.projects.concat([p]).sort((a, b) => a.name.localeCompare(b.name));
+  broadcast({ type: 'lists' });
+  refreshViews();
   if (!silent) go('#/p/' + p.id);
   return p;
 }
@@ -1022,14 +1460,29 @@ function renderProject(p) {
   const description = h('input', { value: p.description || '' });
   const instructions = h('textarea', { rows: 8 });
   instructions.value = p.instructions || '';
+  const heading = h('h2', null, h('span', { class: 'dot', style: { background: p.color } }), h('span', null, p.name));
+  const sub = h('p', { class: 'sub' }, p.description || '');
+  // The name, the description and the color show at once in the page, the top bar, the side
+  // panel and the other tabs.
   const save = async () => {
     p.name = name.value.trim() || p.name;
     p.description = description.value;
     p.instructions = instructions.value;
     p.updated = Date.now();
-    await store.putProject(p);
-    await reloadLists();
+    try {
+      await store.putProject(p);
+    } catch (e) {
+      storageFailed(e);
+    }
+    const i = state.projects.findIndex((x) => x.id === p.id);
+    if (i >= 0) state.projects[i] = p;
+    state.projects.sort((a, b) => a.name.localeCompare(b.name));
+    heading.lastChild.textContent = p.name;
+    heading.firstChild.style.background = p.color;
+    sub.textContent = p.description || '';
+    broadcast({ type: 'lists' });
     renderSidebar();
+    renderTopbar();
   };
   for (const el of [name, description, instructions]) el.addEventListener('change', save);
   const colors = h('div', { class: 'colors' });
@@ -1081,9 +1534,7 @@ function renderProject(p) {
   }
   if (!convs.length) convList.append(h('div', { class: 'empty-note' }, t('noDiscussions')));
 
-  main.replaceChildren(h('div', { class: 'page' },
-    h('h2', null, h('span', { class: 'dot', style: { width: '14px', height: '14px', borderRadius: '50%', display: 'inline-block', background: p.color } }), p.name),
-    h('p', { class: 'sub' }, p.description || ''),
+  main.replaceChildren(h('div', { class: 'page' }, heading, sub,
     h('div', { class: 'buttons', style: { marginBottom: '16px' } },
       h('button', { class: 'button primary', type: 'button', onclick: () => newChat(p.id), html: icon('plus') + '<span>' + escapeHtml(t('startInProject')) + '</span>' })),
     h('div', { class: 'card' },
@@ -1105,10 +1556,11 @@ function renderProject(p) {
           if (!await confirmDialog(t('deleteProject'), t('deleteProjectText', { name: p.name }))) return;
           // The documents leave the search, in memory and in the database, and the discussion
           // shown leaves the project as the stored ones do.
-          await forgetOwner(p.id);
-          await store.deleteProject(p.id);
+          await forgetOwner(p.id).catch(() => {});
+          await store.deleteProject(p.id).catch(storageFailed);
           if (state.current && state.current.projectId === p.id) state.current.projectId = null;
-          await reloadLists();
+          await reloadLists().catch(storageFailed);
+          broadcast({ type: 'lists' });
           go('#/');
         }
       }))));
@@ -1118,9 +1570,12 @@ function renderProject(p) {
 /*
     Reads the files attached for the model of role (the documents of a project for none):
     the documents become text; an image or a sound is attached only when the model reads it.
+    A PDF whose pages are images without text, a scan, is left out with a dialog; a PDF some
+    of whose pages are such images is added with a notice that counts them.
 */
 async function readFiles(files, role) {
   const out = [];
+  const scans = [];
   const inputs = role ? roleInputs(role) : ['text'];
   for (const f of files) {
     if (f.size > maxFileBytes) {
@@ -1137,15 +1592,35 @@ async function readFiles(files, role) {
     try {
       const r = await extractText(f);
       out.push({ id: store.uid(), name: f.name, size: f.size, format: r.format, text: r.text, added: Date.now() });
+      if (r.unreadablePages) {
+        toast(t(r.unreadablePages === 1 ? 'pdfPageWithoutText' : 'pdfPagesWithoutText',
+          { name: f.name, n: r.unreadablePages, total: r.pages }), false, 9000);
+      }
     } catch (e) {
-      if (e.message === 'unsupported') toast(t('unsupported', { name: f.name }), true);
+      if (e.message === 'pdf-images') scans.push(f.name);
+      else if (e.message === 'unsupported') toast(t('unsupported', { name: f.name }), true);
       else if (e.message === 'legacy') toast(t('legacyFormat', { name: f.name }), true);
       else if (e.message === 'too-large') toast(t('tooLarge', { name: f.name, size: formatSize(f.size), limit: formatSize(maxFileBytes) }), true);
       else if (e.message === 'too-large-content') toast(t('tooLargeContent', { name: f.name }), true);
+      else if (e.message === 'pdf-password') toast(t('pdfPassword', { name: f.name }), true, 9000);
+      else if (e.message === 'pdf-invalid') toast(t('pdfInvalid', { name: f.name }), true);
+      else if (e.message === 'pdf-reader') toast(t('pdfReader', { name: f.name }), true, 12000);
       else toast(t('readFailed', { name: f.name, error: e.message }), true);
     }
   }
+  for (const name of scans) scanDialog(name);
   return out;
+}
+
+// The dialog that tells a PDF of images was not added, shown once the previous one is closed.
+let scanDialogs = Promise.resolve();
+
+function scanDialog(name) {
+  scanDialogs = scanDialogs.then(() => dialog((box, close) => {
+    box.append(h('h2', { html: icon('image') + escapeHtml(t('pdfImagesTitle')) }),
+      h('p', null, t('pdfImagesText', { name })), h('div', { class: 'actions' },
+        h('button', { class: 'button primary', type: 'button', onclick: () => close(true) }, t('close'))));
+  }, true));
 }
 
 // Conversations.
@@ -1172,14 +1647,22 @@ function go(hash) {
   else location.hash = hash;
 }
 
+/*
+    The count of the navigations.  A discussion read from the database is shown only when no
+    later navigation took over meanwhile.
+*/
+let routeSequence = 0;
+
 async function route() {
   closeMenu();
+  const sequence = ++routeSequence;
   const hash = location.hash || '#/';
   let m;
   if ((m = /^#\/c\/([0-9a-f]+)$/.exec(hash))) {
     if (!(state.current && state.current.id === m[1])) {
       if (state.busy) stopGeneration();
-      const c = await store.getConversation(m[1]);
+      const c = deleted.has(m[1]) ? null : await store.getConversation(m[1]).catch(() => null);
+      if (sequence !== routeSequence) return;
       if (!c) { go('#/'); return; }
       state.current = c;
       state.incognito = false;
@@ -1189,6 +1672,8 @@ async function route() {
   } else if ((m = /^#\/p\/([0-9a-f]+)$/.exec(hash))) {
     state.view = 'project';
     state.projectId = m[1];
+  } else if (hash === '#/licenses') {
+    state.view = 'licenses';
   } else {
     state.view = 'chat';
     if (!state.current || state.current.messages.length || (state.current.incognito !== state.incognito)) {
@@ -1219,19 +1704,26 @@ function renderTopbar() {
     bar.append(h('div', { class: 'title' }, p ? p.name : ''));
     return;
   }
+  if (state.view === 'licenses') {
+    bar.append(h('div', { class: 'title' }, t('licensesTitle')));
+    return;
+  }
   const c = state.current;
   const title = h('div', { class: 'title', contenteditable: c && c.messages.length ? 'true' : 'false', spellcheck: 'false' },
     c && c.title ? c.title : t('untitled'));
   title.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); title.blur(); } });
   title.addEventListener('blur', async () => {
     if (!c || !c.messages.length) return;
+    const live = liveCopy(c);
     const v = title.textContent.trim();
-    if (v && v !== c.title) {
-      c.title = v;
+    if (v && v !== live.title) {
+      live.title = v;
       // A title of the user stays: the model no longer names the discussion.
-      c.titleSource = 'user';
-      await persist(c);
-      renderSidebar();
+      live.titleSource = 'user';
+      await persist(live);
+      refreshViews();
+    } else if (!v) {
+      title.textContent = live.title || t('untitled');
     }
   });
   bar.append(title);
@@ -1267,14 +1759,13 @@ function roleMenu(anchor) {
     entries.push({
       label: t('role_' + r), icon: roleIcons[r], checked: c.role === r,
       desc: t('roleHint_' + r) + (model ? ' · ' + (own ? modelName(model) : t('roleShared')) : ''),
+      // An answer in progress keeps the function it started with; the next question takes this one.
       action: async () => {
-        c.role = r;
+        const live = liveCopy(c);
+        live.role = r;
         await saveSetting('defaultRole', r);
-        if (c.messages.length) await persist(c);
-        renderTopbar();
-        renderComposerState();
-        if (!c.messages.length) renderMain();
-        renderStatusLine();
+        if (live.messages.length) await persist(live);
+        refreshViews();
       }
     });
   }
@@ -1287,11 +1778,20 @@ function toggleSidebar() {
 }
 
 function renderMain() {
+  stopClock();
   if (state.view === 'project') {
     const p = projectById(state.projectId);
     ui.composerWrap.classList.add('hidden');
+    ui.thread = null;
     if (p) renderProject(p);
-    else ui.content.replaceChildren();
+    // A project deleted meanwhile, in this tab or in another one, leaves its page.
+    else go('#/');
+    return;
+  }
+  if (state.view === 'licenses') {
+    ui.composerWrap.classList.add('hidden');
+    ui.thread = null;
+    renderLicenses();
     return;
   }
   ui.composerWrap.classList.remove('hidden');
@@ -1304,6 +1804,8 @@ function renderMain() {
   c.messages.forEach((m, i) => thread.append(messageElement(c, m, i, i === c.messages.length - 1)));
   ui.content.replaceChildren(thread);
   ui.thread = thread;
+  showElsewhere();
+  startClock();
   scrollToEnd(true);
 }
 
@@ -1319,12 +1821,17 @@ function renderWelcome() {
     }, h('b', null, title), h('span', null, prompt)));
   }
   const p = c.projectId ? projectById(c.projectId) : null;
-  const notice = !state.statusError && state.status && !roleModel(c.role) ? h('div', { class: 'error-box' }, t('noModel')) : null;
+  let notice = null;
+  if (state.statusError) notice = h('div', { class: 'error-box' }, t('serviceDown'));
+  else if (state.status && !roleModel(c.role)) notice = h('div', { class: 'error-box' }, t('noModel'));
+  // With the agent on, what it does and the tools it has.
+  const agent = c.agent && roleCapabilities(c.role).tools
+    ? h('div', { class: 'agent-note' }, h('span', { html: icon('tool') }), h('span', null, t('agentHelp'))) : null;
   ui.content.replaceChildren(h('div', { class: 'welcome' },
     h('img', { class: 'hero', src: 'img/albireo-mark.svg', alt: '' }),
     h('h1', { html: escapeHtml(t('welcome', { name })).replace('Albireo', '<span>Albireo</span>') }),
     h('p', null, p ? t('newProjectDiscussion', { name: p.name }) : t('welcomeSub')),
-    notice, suggestions));
+    notice, agent, suggestions));
   ui.thread = null;
 }
 
@@ -1365,16 +1872,119 @@ function userElement(c, m, index, last) {
   }
   const bubble = h('div', { class: 'bubble' }, m.content);
   el.append(bubble);
-  el.append(h('div', { class: 'meta' },
-    iconButton('copy', t('copy'), () => { navigator.clipboard.writeText(m.content); toast(t('copied')); }),
-    iconButton('edit', t('edit'), () => editMessage(c, m, index, el)),
-    iconButton('trash', t('deleteQuestion'), () => deleteQuestion(c, index))));
+  // The time of the question shows before its buttons, which appear when the pointer is over it.
+  el.append(h('div', { class: 'meta' }, timeElement(m),
+    iconButton('copy', t('copy'), () => copyText(m.content)),
+    lockable(iconButton('history', t('replayQuestion'), () => replayQuestion(c, m)), 'busy'),
+    lockable(iconButton('edit', t('edit'), () => editMessage(c, m, index, el)), 'busy'),
+    lockable(iconButton('trash', t('deleteQuestion'), () => deleteQuestion(c, index)), 'busy')));
   return el;
+}
+
+/*
+    The time of a message in the language of the interface: relative within a day ("5 minutes
+    ago", "just now" within a minute), the short date and the time beyond, the full date and time
+    in its tooltip.  A message saved without its time shows none.
+*/
+function timeText(ts) {
+  const age = Date.now() - ts;
+  if (age < 60000) return t('justNow');
+  if (age < 86400000) {
+    const relative = new Intl.RelativeTimeFormat(language(), { numeric: 'auto' });
+    return age < 3600000 ? relative.format(-Math.floor(age / 60000), 'minute')
+      : relative.format(-Math.floor(age / 3600000), 'hour');
+  }
+  return new Intl.DateTimeFormat(language(), { dateStyle: 'short', timeStyle: 'short' }).format(new Date(ts));
+}
+
+function timeElement(m) {
+  if (typeof m.created !== 'number' || !Number.isFinite(m.created)) return null;
+  const full = new Intl.DateTimeFormat(language(), { dateStyle: 'full', timeStyle: 'medium' })
+    .format(new Date(m.created));
+  return h('time', { class: 'msg-time', datetime: new Date(m.created).toISOString(), title: full,
+    'data-time': String(m.created) }, timeText(m.created));
+}
+
+// The relative times of the thread shown, written again every minute while it stays shown.
+let clockTimer = 0;
+
+function startClock() {
+  clearInterval(clockTimer);
+  clockTimer = setInterval(() => {
+    if (!ui.thread || !ui.thread.isConnected) {
+      stopClock();
+      return;
+    }
+    for (const el of ui.thread.querySelectorAll('.msg-time[data-time]')) {
+      el.textContent = timeText(Number(el.dataset.time));
+    }
+  }, 60000);
+}
+
+function stopClock() {
+  clearInterval(clockTimer);
+  clockTimer = 0;
+}
+
+/*
+    Asks a question of the thread again: the same question, with its documents, joins the end of
+    the discussion as a new question, which the model answers there.  The earlier exchange stays
+    as it is, and the documents keep their passages, which the two questions share.
+*/
+async function replayQuestion(c, m) {
+  const live = liveCopy(c);
+  if (threadLocked() || state.current !== live) return;
+  await sendMessage(m.content || '', (m.attachments || []).map((a) => Object.assign({}, a)));
+}
+
+/*
+    The buttons that change a discussion wait while it is being answered, here or in another tab
+    (kind 'busy'), and the buttons of an answer wait until it is written (kind 'turn').  They stay
+    disabled meanwhile, and say why.
+*/
+function threadLocked() {
+  return state.busy || answeredElsewhere(state.current);
+}
+
+// Marks a button of kind 'busy', or of kind 'turn' for an answer that live tells is being written.
+function lockable(button, kind, live) {
+  button.dataset.lock = kind;
+  button.dataset.title = button.title;
+  applyLock(button, kind === 'turn' ? !!live : threadLocked());
+  return button;
+}
+
+function applyLock(button, locked) {
+  button.disabled = locked;
+  button.title = locked ? t('afterAnswer') : button.dataset.title;
+}
+
+// Gives the buttons of the thread shown the state of its discussion.
+function lockThread() {
+  if (!ui.content) return;
+  const busy = threadLocked();
+  for (const b of ui.content.querySelectorAll('button[data-lock]')) {
+    applyLock(b, b.dataset.lock === 'turn' ? !!(liveTurn && b.closest('.message.live')) : busy);
+  }
+  showElsewhere();
+}
+
+// The note at the end of the thread while another tab answers in its discussion.
+function showElsewhere() {
+  if (!ui.thread || !ui.thread.isConnected) return;
+  const note = ui.thread.querySelector(':scope > .elsewhere');
+  const on = !state.busy && answeredElsewhere(state.current);
+  if (on && !note) {
+    const spin = h('span', { class: 'spinner' });
+    ui.thread.append(h('div', { class: 'progress-line elsewhere' }, spin, t('busyElsewhere')));
+  } else if (!on && note) {
+    note.remove();
+  }
 }
 
 // Edits a question: its text, and its attached documents, which can be removed or added.
 function editMessage(c, m, index, el) {
-  if (state.busy) return;
+  if (threadLocked()) return;
   let attachments = (m.attachments || []).slice();
   const area = h('textarea', { style: { width: '100%', minHeight: '90px', borderRadius: '12px', padding: '10px', border: '1px solid var(--border-strong)', background: 'var(--bg-input)' } });
   area.value = m.content;
@@ -1400,19 +2010,24 @@ function editMessage(c, m, index, el) {
     h('button', {
       class: 'button primary', type: 'button',
       onclick: async () => {
-        if (state.busy) return;
+        if (threadLocked()) return;
         const text = area.value.trim();
         if (!text && !attachments.length) return;
         if (compactions.has(c.id)) await compactions.get(c.id).catch(() => {});
         // A question sent meanwhile is being answered: the messages stay as they are.
-        if (state.busy) return;
-        // The documents no longer attached, to this question or to the questions after it,
-        // which leave with it, leave the search of the discussion.
-        const kept = new Set(attachments.map((a) => a.id));
+        if (threadLocked() || state.current !== c) return;
+        /*
+            The documents no longer attached, to this question or to the questions after it,
+            which leave with it, leave the search of the discussion, unless an earlier question
+            shares them.  The memory reads the discussion again from the edited question.
+        */
+        const kept = attachmentIds(c.messages.slice(0, index));
+        for (const a of attachments) kept.add(a.id);
         for (const x of c.messages.slice(index)) {
           for (const a of x.attachments || []) if (!kept.has(a.id) && a.mode === 'search') forgetDocument(c.id, a.id);
         }
         c.messages = c.messages.slice(0, index);
+        if ((c.memoryMark || 0) > index) c.memoryMark = index;
         if ((c.contextStart || 0) > index) {
           // The exchanges come back into the context, without the summary of what follows.
           c.contextStart = 0;
@@ -1432,20 +2047,29 @@ function editMessage(c, m, index, el) {
   area.focus();
 }
 
+// The text of an answer, as it is when it is copied.
+function answerText(m) {
+  return (m.steps || []).map((s) => s.content || '').join('\n\n').trim();
+}
+
 function assistantElement(c, m, index, last) {
-  const el = h('div', { class: 'message assistant' + (last ? ' last' : '') });
+  const live = m === liveTurn;
+  const el = h('div', { class: 'message assistant' + (last ? ' last' : '') + (live ? ' live' : '') });
   const bubble = h('div', { class: 'bubble' });
   el.append(bubble);
-  fillAssistant(bubble, m, m === liveTurn);
+  fillAssistant(bubble, m, live);
+  // The buttons of an answer wait until it is written; regenerate also waits for the discussion.
   const meta = h('div', { class: 'meta' });
-  const text = (m.steps || []).map((s) => s.content || '').join('\n\n').trim();
-  meta.append(iconButton('copy', t('copy'), () => { navigator.clipboard.writeText(text); toast(t('copied')); }));
-  if (last) meta.append(iconButton('refresh', t('regenerate'), () => regenerate(c)));
-  const exporter = iconButton('download', t('exportAnswer'), () => showMenu(exporter, [
-    { label: t('exportMarkdown'), icon: 'download', action: () => exportAnswer(c, index, 'md') },
-    { label: t('exportJson'), icon: 'archive', action: () => exportAnswer(c, index, 'json') }
-  ]));
+  meta.append(lockable(iconButton('copy', t('copy'), () => copyText(answerText(m))), 'turn', live));
+  if (last) meta.append(lockable(iconButton('refresh', t('regenerate'), () => regenerate(liveCopy(c))), 'busy'));
+  const exporter = lockable(iconButton('download', t('exportAnswer'), () => showMenu(exporter, [
+    { label: t('exportMarkdown'), icon: 'download', action: () => exportAnswer(liveCopy(c), index, 'md') },
+    { label: t('exportJson'), icon: 'archive', action: () => exportAnswer(liveCopy(c), index, 'json') }
+  ])), 'turn', live);
   meta.append(exporter);
+  // The time of the answer shows after its buttons.
+  const when = timeElement(m);
+  if (when) meta.append(when);
   const stats = statsText(m);
   if (stats) meta.append(h('span', { class: 'stats' }, stats));
   el.append(meta);
@@ -1461,38 +2085,81 @@ function statsText(m) {
   return parts.join(' · ');
 }
 
-// Fills the body of an answer: per step, its reasoning, its text and its tool calls.
+// The HTML of the finished texts of the answers, with the text it was made from (WeakMap: step
+// -> {text, html}), so that a thread is drawn again without parsing its answers again.
+const markdownCache = new WeakMap();
+
+function stepHtml(s, live) {
+  if (live) return renderMarkdown(s.content, true);
+  const hit = markdownCache.get(s);
+  if (hit && hit.text === s.content) return hit.html;
+  const html = renderMarkdown(s.content, false);
+  markdownCache.set(s, { text: s.content, html });
+  return html;
+}
+
+// What a step shows, to tell whether it must be drawn again while the answer is written.
+function stepKey(s, active) {
+  const calls = (s.toolCalls || []).map((tc) => [tc.status, tc.ok, (tc.arguments || '').length,
+    tc.result == null ? -1 : tc.result.length, tc.ms || 0, !!tc.file]);
+  return JSON.stringify([active, (s.reasoning || '').length, (s.content || '').length, calls]);
+}
+
+function stepElement(s, active, firstTool) {
+  const el = h('div', { class: 'step' });
+  if (s.reasoning) el.append(thinkingElement(s, active && !s.content && !(s.toolCalls || []).length));
+  if (s.content) {
+    const md = h('div', { class: 'md' + (active ? ' cursor-host' : ''), html: stepHtml(s, active) });
+    attachCodeButtons(md, t('copy'));
+    el.append(md);
+  }
+  (s.toolCalls || []).forEach((tc, j) => el.append(toolElement(tc, firstTool + j + 1)));
+  return el;
+}
+
+/*
+    Fills the body of an answer: per step, its reasoning, its text and its tool calls, then the
+    notes on its state.  While the answer is written, the steps already drawn that did not change
+    stay as they are, and only the step being written is drawn again.
+*/
 function fillAssistant(bubble, m, live) {
-  bubble.replaceChildren();
   const steps = m.steps || [];
+  const drawn = Array.from(bubble.children).filter((x) => x.classList.contains('step'));
+  for (const x of Array.from(bubble.children)) if (!x.classList.contains('step')) x.remove();
+  let tools = 0;
   steps.forEach((s, k) => {
-    const activeStep = live && k === steps.length - 1;
-    if (s.reasoning) bubble.append(thinkingElement(s, activeStep && !s.content && !(s.toolCalls || []).length));
-    if (s.content) {
-      const md = h('div', { class: 'md' + (activeStep && live ? ' cursor-host' : ''), html: renderMarkdown(s.content, live) });
-      attachCodeButtons(md, t('copy'));
-      bubble.append(md);
-    }
-    for (const tc of s.toolCalls || []) bubble.append(toolElement(tc));
+    const active = live && k === steps.length - 1;
+    const key = stepKey(s, active);
+    const first = tools;
+    tools += (s.toolCalls || []).length;
+    const old = drawn[k];
+    if (old && old.dataset.key === key) return;
+    const el = stepElement(s, active, first);
+    el.dataset.key = key;
+    if (old) old.replaceWith(el);
+    else bubble.append(el);
   });
+  for (let k = steps.length; k < drawn.length; ++k) drawn[k].remove();
+  const note = (...children) => bubble.append(h('div', { class: 'progress-line' }, ...children));
   if (live && m.progress && m.progress.prompt_total > 256 && m.progress.prompt_done < m.progress.prompt_total) {
     const pct = Math.floor(100 * m.progress.prompt_done / m.progress.prompt_total);
-    bubble.append(h('div', { class: 'progress-line' }, h('span', { class: 'spinner' }),
-      t('readingContext', { p: pct }), h('div', { class: 'bar' }, h('div', { style: { width: pct + '%' } }))));
+    note(h('span', { class: 'spinner' }), t('readingContext', { p: pct }),
+      h('div', { class: 'bar' }, h('div', { style: { width: pct + '%' } })));
+  } else if (live && m.compacting) {
+    note(h('span', { class: 'spinner' }), h('span', { class: 'shimmer' }, t('compacting')));
+  } else if (live && m.preparing) {
+    note(h('span', { class: 'spinner' }), h('span', { class: 'shimmer' }, t('preparingContext')));
   } else if (live && !steps.some((s) => s.content || s.reasoning || (s.toolCalls || []).length)) {
-    bubble.append(h('div', { class: 'progress-line' }, h('span', { class: 'spinner' }), h('span', { class: 'shimmer' }, t('thinking') + '…')));
+    note(h('span', { class: 'spinner' }), h('span', { class: 'shimmer' }, t('thinking') + '…'));
   }
-  if (live && m.compacting) {
-    bubble.append(h('div', { class: 'progress-line' }, h('span', { class: 'spinner' }), h('span', { class: 'shimmer' }, t('compacting'))));
-  }
-  if (m.compacted) bubble.append(h('div', { class: 'progress-line' }, h('span', { html: icon('info') }), t('contextCompacted')));
-  else if (m.trimmed) bubble.append(h('div', { class: 'progress-line' }, h('span', { html: icon('info') }), t('contextTrimmed')));
+  if (m.compacted) note(h('span', { html: icon('info') }), t('contextCompacted'));
+  else if (m.trimmed) note(h('span', { html: icon('info') }), t('contextTrimmed'));
   if (m.error) bubble.append(h('div', { class: 'error-box' }, t('errorPrefix', { message: m.error })));
-  if (m.cancelled) bubble.append(h('div', { class: 'progress-line' }, t('cancelled')));
+  if (m.cancelled) note(t('cancelled'));
   if (!live && !m.error && !m.cancelled && !steps.some((s) => s.content || (s.toolCalls || []).length)) {
-    bubble.append(h('div', { class: 'progress-line' }, t('emptyAnswer')));
+    note(t('emptyAnswer'));
   }
-  if (m.agentLimit) bubble.append(h('div', { class: 'progress-line' }, t('agentLimit', { n: maxAgentSteps })));
+  if (m.agentLimit) note(t('agentLimit', { n: maxAgentSteps }));
 }
 
 function thinkingElement(s, live) {
@@ -1511,29 +2178,76 @@ function thinkingElement(s, live) {
 }
 
 const toolIcons = {
-  calculator: 'calc', run_javascript: 'terminal', search_documents: 'search', read_document: 'book',
-  search_discussions: 'history', current_datetime: 'clock', create_file: 'file'
+  calculator: 'calc', run_javascript: 'terminal', search_documents: 'search', document_outline: 'archive',
+  read_document: 'book', search_discussions: 'history', current_datetime: 'clock', create_file: 'file'
 };
 
-function toolElement(tc) {
-  const d = h('details', { class: 'tool-call' });
+// The name of a tool in the language of the interface, its own name for a tool without one.
+function toolLabel(name) {
+  const key = 'tool_' + name;
+  const label = t(key);
+  return label === key ? String(name || '') : label;
+}
+
+// The words that sum up the arguments of a tool call, for the line of the call.
+function toolBrief(tc) {
+  let a = null;
+  try {
+    a = JSON.parse(tc.arguments || '{}');
+  } catch (e) {
+    return String(tc.arguments || '').replace(/\s+/g, ' ').slice(0, 160);
+  }
+  if (!a || typeof a !== 'object') return '';
+  const text = (v) => (typeof v === 'string' ? v : v == null ? '' : JSON.stringify(v));
+  const quoted = (v) => (v ? '"' + text(v) + '"' : '');
+  switch (tc.name) {
+    case 'calculator': return text(a.expression);
+    case 'run_javascript': {
+      const lines = text(a.code).trim().split('\n');
+      return lines[0] + (lines.length > 1 ? ' …' : '');
+    }
+    case 'search_documents': case 'search_discussions': return quoted(a.query);
+    case 'read_document': return [a.name, a.part].filter(Boolean).map(text).join(' · ');
+    case 'document_outline': case 'create_file': return text(a.name);
+    default: return Object.values(a).map(text).join(', ').slice(0, 160);
+  }
+}
+
+// The state of a tool call: being written by the model, running, done, failed or stopped.
+function toolState(tc) {
+  if (tc.status === 'pending') return { cls: 'pending', label: t('toolPending'), spin: true };
+  if (tc.status === 'running') return { cls: 'running', label: t('toolRunning'), spin: true };
+  const time = tc.ms != null ? ' · ' + formatShortDuration(tc.ms) : '';
+  if (tc.status === 'stopped') return { cls: 'stopped', label: t('toolStopped') + time };
+  return tc.ok === false ? { cls: 'error', label: t('toolError') + time } : { cls: 'ok', label: t('toolDone') + time };
+}
+
+/*
+    A tool call of the agent, with its number in the answer, the name of the tool in the language
+    of the interface, the words of its arguments, a short result on the same line, its state and
+    its duration.  Unfolded, it shows its arguments and its whole result.
+*/
+function toolElement(tc, number) {
+  const st = toolState(tc);
+  const d = h('details', { class: 'tool-call ' + st.cls });
   const open = !!tc.open;
   if (open) d.open = true;
   d.addEventListener('toggle', () => { if (d.open !== open) tc.open = d.open; });
-  let brief = '';
-  try {
-    const a = JSON.parse(tc.arguments || '{}');
-    brief = a.expression || a.query || a.name || (a.code ? a.code.split('\n')[0] : '') || '';
-  } catch (e) {
-    brief = tc.arguments || '';
-  }
-  const stateLabel = tc.status === 'running' ? h('span', { class: 'spinner' })
-    : h('span', { class: 'state ' + (tc.ok === false ? 'error' : 'ok') }, tc.ok === false ? t('toolError') : t('toolDone'));
+  const brief = toolBrief(tc);
+  // The value of a result of the interpreter shows without its arrow.
+  const result = tc.result == null ? '' : String(tc.result).trim().replace(/^=> /, '');
+  // A result of one short line shows on the line of the call.
+  const inline = st.cls === 'ok' && result && result.length <= 60 && !result.includes('\n') ? result : '';
   let args = tc.arguments || '';
   try { args = JSON.stringify(JSON.parse(args), null, 2); } catch (e) { /* kept as sent */ }
-  d.append(h('summary', null, h('span', { html: icon(toolIcons[tc.name] || 'tool', 'tool-icon') }),
-    h('span', { class: 'tool-name' }, tc.name), h('span', { class: 'tool-brief' }, brief), stateLabel),
-  h('div', { class: 'io' }, h('h6', null, t('toolInput')), h('pre', null, h('code', null, args)),
+  d.append(h('summary', { title: tc.name },
+    number ? h('span', { class: 'tool-number' }, String(number)) : null,
+    h('span', { html: icon(toolIcons[tc.name] || 'tool', 'tool-icon') }),
+    h('span', { class: 'tool-name' }, toolLabel(tc.name)),
+    h('span', { class: 'tool-brief' }, brief, inline ? h('span', { class: 'tool-result' }, ' → ' + inline) : null),
+    h('span', { class: 'state ' + st.cls }, st.spin ? h('span', { class: 'spinner small' }) : null, st.label),
+    h('span', { html: icon('chevron', 'chev') })),
+  h('div', { class: 'io' }, h('h6', null, t('toolInput') + ' · ' + tc.name), h('pre', null, h('code', null, args)),
     tc.result != null ? [h('h6', null, t('toolOutput')), h('pre', null, h('code', null, tc.result))] : null));
   const wrap = h('div', null, d);
   if (tc.file) {
@@ -1552,10 +2266,16 @@ function renderComposerState() {
   if (!ui.input) return;
   const c = state.current;
   const caps = roleCapabilities(c ? c.role : 'general');
-  ui.reasonButton.classList.toggle('on', !!(c && c.reasoning && caps.reasoning));
+  const reasoning = !!(c && c.reasoning && caps.reasoning);
+  const agent = !!(c && c.agent && caps.tools);
+  ui.reasonButton.classList.toggle('on', reasoning);
+  ui.reasonButton.setAttribute('aria-pressed', String(reasoning));
   ui.reasonButton.disabled = !caps.reasoning;
-  ui.agentButton.classList.toggle('on', !!(c && c.agent && caps.tools));
+  ui.agentButton.classList.toggle('on', agent);
+  ui.agentButton.setAttribute('aria-pressed', String(agent));
   ui.agentButton.disabled = !caps.tools;
+  // With the agent on, the tools it may call show under the prompt.
+  ui.agentTools.classList.toggle('hidden', !agent);
   // The attachments the model of the function reads.
   const role = c ? c.role : 'general';
   if (ui.fileInput) ui.fileInput.accept = acceptFor(role);
@@ -1564,10 +2284,13 @@ function renderComposerState() {
     ui.attachButton.title = hint;
     ui.attachButton.setAttribute('aria-label', hint);
   }
+  // A discussion another tab is answering takes its next question once that answer is written.
+  const elsewhere = !state.busy && answeredElsewhere(c);
   ui.sendButton.classList.toggle('stop', state.busy);
   ui.sendButton.innerHTML = icon(state.busy ? 'stop' : 'send');
-  ui.sendButton.title = state.busy ? t('stop') : t('send');
-  ui.sendButton.disabled = !state.busy && !ui.input.value.trim() && !state.pending.length;
+  ui.sendButton.title = state.busy ? t('stop') : elsewhere ? t('busyElsewhere') : t('send');
+  ui.sendButton.setAttribute('aria-label', ui.sendButton.title);
+  ui.sendButton.disabled = sendDisabled();
   const p = c && c.projectId ? projectById(c.projectId) : null;
   ui.input.placeholder = p ? t('placeholderProject', { project: p.name }) : t('placeholder');
   ui.pendingBox.replaceChildren(...state.pending.map((a) => attachmentChip(a, true, () => {
@@ -1577,10 +2300,20 @@ function renderComposerState() {
   ui.pendingBox.classList.toggle('hidden', !state.pending.length);
 }
 
+/*
+    True when the send button can do nothing, without a question or while another tab answers in
+    the discussion.  While this tab answers, the button stops the answer.
+*/
+function sendDisabled() {
+  if (state.busy) return false;
+  if (answeredElsewhere(state.current)) return true;
+  return !ui.input.value.trim() && !state.pending.length;
+}
+
 function autoGrow() {
   ui.input.style.height = 'auto';
   ui.input.style.height = Math.min(ui.input.scrollHeight, 260) + 'px';
-  ui.sendButton.disabled = !state.busy && !ui.input.value.trim() && !state.pending.length;
+  ui.sendButton.disabled = sendDisabled();
 }
 
 async function addPending(files) {
@@ -1595,8 +2328,8 @@ function stopGeneration() {
 
 async function onSend() {
   if (state.busy) { stopGeneration(); return; }
+  if (sendDisabled()) return;
   const text = ui.input.value.trim();
-  if (!text && !state.pending.length) return;
   const attachments = state.pending;
   state.pending = [];
   ui.input.value = '';
@@ -1605,20 +2338,32 @@ async function onSend() {
 }
 
 /*
-    Starts an answer: the composer offers to stop it, and the questions wait for its end.
-    Returns the controller that stops it.
+    Starts an answer in the discussion c.  The composer offers to stop it, the buttons that change
+    the discussion wait, the other tabs know it, and the questions wait for its end.  Returns the
+    controller that stops it.
 */
-function beginTurn() {
+function beginTurn(c) {
   state.busy = true;
+  state.busyId = c.id;
   state.abort = new AbortController();
+  announceBusy(c, true);
   renderComposerState();
+  lockThread();
   return state.abort;
 }
 
+// A new answer of the discussion c, drawn live from now on.
+function newTurn(c) {
+  const turn = { id: store.uid(), role: 'assistant', steps: [], created: Date.now(), model: roleModel(c.role) || '' };
+  c.messages.push(turn);
+  liveTurn = turn;
+  return turn;
+}
+
 async function sendMessage(text, attachments) {
-  if (state.busy) return;
   const c = state.current;
-  const abort = beginTurn();
+  if (state.busy || answeredElsewhere(c)) return;
+  const abort = beginTurn(c);
   const m = { id: store.uid(), role: 'user', content: text, attachments: attachments || [], created: Date.now() };
   // The update of the memory gives way to the question, and comes back once the user is quiet.
   if (memoryAbort) memoryAbort.abort();
@@ -1628,28 +2373,39 @@ async function sendMessage(text, attachments) {
     c.memory = state.settings.memory;
   }
   attachmentModes(c, m);
-  if (!c.title) c.title = provisionalTitle(m);
+  /*
+      The beginning of the first question stands for the title until the model writes one, and
+      the title of a discussion whose first question is edited stays.
+  */
+  if (c.messages.length === 1 && !c.title) {
+    c.title = provisionalTitle(m);
+    c.titleSource = 'question';
+  }
   c.updated = Date.now();
+  // The answer shows at once, its buttons disabled, while its context is prepared.
+  const turn = newTurn(c);
+  turn.preparing = true;
   try {
-    // The question shows at once, and is saved before its documents are indexed (pruneIndex).
+    // The question is saved before its documents are indexed (pruneIndex).
     renderMain();
-    renderTopbar();
     await persist(c);
     if (!c.incognito && state.current === c && location.hash !== '#/c/' + c.id) history.replaceState(null, '', '#/c/' + c.id);
-    renderSidebar();
+    refreshViews();
     await prepareQuestion(c, m, abort.signal);
     await persist(c);
   } catch (e) {
     // A question that could not be saved is answered all the same, and saved with its answer.
   }
-  await runTurn(c, abort);
+  turn.preparing = false;
+  await runTurn(c, abort, turn);
 }
 
 async function regenerate(c) {
-  if (state.busy) return;
+  if (state.busy || answeredElsewhere(c)) return;
   while (c.messages.length && c.messages[c.messages.length - 1].role === 'assistant') c.messages.pop();
   if (!c.messages.length) return;
-  await runTurn(c, beginTurn());
+  const abort = beginTurn(c);
+  await runTurn(c, abort, newTurn(c));
 }
 
 // How the model reads the documents of a question: whole while they fit in their share of the
@@ -1740,7 +2496,8 @@ function documentsOf(c) {
   return docs;
 }
 
-function systemPrompt(c, contextTokens) {
+// The system message of a discussion; agent tells whether the tools come with the question.
+function systemPrompt(c, contextTokens, agent) {
   const parts = [];
   const now = new Date();
   parts.push('Current date: ' + now.toLocaleDateString('en-CA') + ' (' + now.toLocaleDateString(language(), { weekday: 'long' }) + ').');
@@ -1765,10 +2522,10 @@ function systemPrompt(c, contextTokens) {
       parts.push('The project holds ' + files.length + ' documents, too long to be read whole: '
         + files.map((f) => f.name + ' (' + f.format + ')').join(', ') + '. The excerpts of these documents closest to '
         + 'each question come with it, in <excerpts>; say so when they do not hold the answer.'
-        + (c.agent ? ' Use search_documents, document_outline and read_document to read more of them.' : ''));
+        + (agent ? ' Use search_documents, document_outline and read_document to read more of them.' : ''));
     }
   }
-  if (c.agent) parts.push(tools.agentInstructions);
+  if (agent) parts.push(tools.agentInstructions);
   return parts.join('\n\n');
 }
 
@@ -1883,8 +2640,8 @@ function summaryInstructions(words) {
     + 'place of these exchanges. Keep, in the order they came: the facts, figures, names, decisions and '
     + 'conclusions; the requests, preferences and constraints of the user; the code, commands and values that may '
     + 'be needed again, in short; the documents by their names; the questions left open. Leave out greetings, '
-    + 'repetitions and reasoning. Write in the language of the exchanges, as a compact list of points, in at most '
-    + words + ' words.';
+    + 'repetitions and reasoning. Write in the language of the latest exchanges, as a compact list of points, in at '
+    + 'most ' + words + ' words.';
 }
 
 // A summary written by the background model from the previous one and a transcript.
@@ -1987,9 +2744,10 @@ function nextStart(c, build, scale, room) {
     When the last question alone does not fit, the oldest texts lose their beginnings,
     at the end of a sentence: the summary first, then the documents of the questions, then
     the questions.  The system message and the last question always stay.  onCompact tells
-    when a compression starts.  Returns {messages, trimmed, compacted, context, tokens}.
+    when a compression starts, and model names the model the tokens are counted for.  Returns
+    {messages, trimmed, compacted, context, tokens}.
 */
-async function fitContext(c, build, toolDefs, reserve, signal, onCompact) {
+async function fitContext(c, build, toolDefs, reserve, signal, onCompact, model) {
   let trimmed = false;
   let compacted = false;
   if (compactions.has(c.id)) {
@@ -2001,7 +2759,7 @@ async function fitContext(c, build, toolDefs, reserve, signal, onCompact) {
     const list = build(cuts);
     let r;
     try {
-      r = await api.count('albireo-' + c.role, list, toolDefs);
+      r = await api.count(model || 'albireo-' + c.role, list, toolDefs);
     } catch (e) {
       return { messages: list, trimmed, compacted, context: 0 };
     }
@@ -2066,10 +2824,12 @@ function shortenOldest(c, cuts, excess) {
 let liveTurn = null;
 
 /*
-    The answer in progress is drawn again at most once every renderInterval milliseconds, in
-    the next frame, while its discussion is the one shown.
+    The answer in progress is drawn again in the next frame, while its discussion is the one
+    shown, at most once every renderInterval milliseconds, and less often when a drawing takes
+    long, so that a long answer leaves the page responsive.
 */
 const renderInterval = 100;
+let renderSpacing = renderInterval;
 let renderTimer = 0;
 let renderFrame = 0;
 let renderedAt = 0;
@@ -2078,18 +2838,21 @@ function scheduleRender(c, m) {
   if (renderTimer || renderFrame) return;
   const draw = () => {
     renderFrame = 0;
-    renderedAt = performance.now();
+    const t0 = performance.now();
+    renderedAt = t0;
     const el = answerElement(c, m);
     if (!el) return;
     const bubble = el.querySelector('.bubble');
     const thought = bubble.querySelector('.thinking.live .thought');
     const keepScroll = thought ? thought.scrollHeight - thought.scrollTop - thought.clientHeight < 40 : true;
+    const top = thought ? thought.scrollTop : 0;
     fillAssistant(bubble, m, true);
     const t2 = bubble.querySelector('.thinking.live .thought');
-    if (t2 && keepScroll) t2.scrollTop = t2.scrollHeight;
+    if (t2) t2.scrollTop = keepScroll ? t2.scrollHeight : top;
     scrollToEnd(false);
+    renderSpacing = Math.min(1000, Math.max(renderInterval, 4 * (performance.now() - t0)));
   };
-  const wait = renderInterval - (performance.now() - renderedAt);
+  const wait = renderSpacing - (performance.now() - renderedAt);
   if (wait > 0) {
     renderTimer = setTimeout(() => {
       renderTimer = 0;
@@ -2120,23 +2883,25 @@ function answerElement(c, m) {
     Answers the last question of c; abort, from beginTurn, stops the answer.  The answer is
     drawn while c is the discussion shown, and saved with it at its end.
 */
-async function runTurn(c, abort) {
-  const model = roleModel(c.role);
-  const turn = { id: store.uid(), role: 'assistant', steps: [], created: Date.now(), model: model || '' };
-  c.messages.push(turn);
-  liveTurn = turn;
+async function runTurn(c, abort, turn) {
+  // The function, the reasoning and the agent of the answer stay those of its start.
+  const role = c.role;
+  const model = roleModel(role);
+  turn.model = model || '';
   const signal = abort.signal;
-  const caps = roleCapabilities(c.role);
-  const useTools = c.agent && caps.tools;
+  const caps = roleCapabilities(role);
+  const reasoning = !!(c.reasoning && caps.reasoning);
+  const useTools = !!(c.agent && caps.tools);
   const toolDefs = useTools ? tools.definitions : null;
   try {
-    if (state.current === c) renderMain();
+    if (state.current === c && !answerElement(c, turn)) renderMain();
+    else scheduleRender(c, turn);
     if (signal.aborted) throw new DOMException('The answer was stopped.', 'AbortError');
     if (!model) throw new Error(t('noModel'));
     for (let step = 0; step < maxAgentSteps; ++step) {
       const s = { reasoning: '', content: '', toolCalls: [] };
       turn.steps.push(s);
-      const system = systemPrompt(c, caps.context || 8192);
+      const system = systemPrompt(c, caps.context || 8192, useTools);
       // The conversation, with the steps of this answer already done (the agent's).
       const build = (cuts) => apiMessages(Object.assign({}, c, {
         messages: c.messages.slice(0, -1).concat([Object.assign({}, turn, { steps: turn.steps.slice(0, -1) })])
@@ -2144,7 +2909,7 @@ async function runTurn(c, abort) {
       const fitted = await fitContext(c, build, toolDefs, state.settings.maxTokens || 2048, signal, () => {
         turn.compacting = true;
         scheduleRender(c, turn);
-      });
+      }, 'albireo-' + role);
       turn.compacting = false;
       if (fitted.trimmed) turn.trimmed = true;
       if (fitted.compacted) turn.compacted = true;
@@ -2152,12 +2917,11 @@ async function runTurn(c, abort) {
         turn.contextTokens = fitted.context;
         turn.promptTokens = fitted.tokens;
       }
-      const body = {
-        model: 'albireo-' + c.role, messages: fitted.messages, reasoning: !!(c.reasoning && caps.reasoning)
-      };
+      const body = { model: 'albireo-' + role, messages: fitted.messages, reasoning };
       if (toolDefs) body.tools = toolDefs;
       if (state.settings.temperature != null) body.temperature = state.settings.temperature;
       if (state.settings.topP != null) body.top_p = state.settings.topP;
+      if (state.settings.topK != null) body.top_k = state.settings.topK;
       if (state.settings.maxTokens > 0) body.max_tokens = state.settings.maxTokens;
       let finish = null;
       for await (const ev of api.streamChat(body, signal)) {
@@ -2200,9 +2964,11 @@ async function runTurn(c, abort) {
       if (s.reasoningStart && !s.reasoningMs) s.reasoningMs = Date.now() - s.reasoningStart;
       delete s.reasoningStart;
       if (!(useTools && s.toolCalls.length && (finish === 'tool_calls' || finish === 'stop'))) break;
-      // The tools of the step run, then the model continues with their results.
+      // The tools of the step run, each timed, then the model continues with their results.
       for (const tc of s.toolCalls) {
+        if (signal.aborted) throw new DOMException('The answer was stopped.', 'AbortError');
         tc.status = 'running';
+        tc.started = Date.now();
         scheduleRender(c, turn);
         const r = await tools.run(tc.name, tc.arguments, {
           documents: documentsOf(c),
@@ -2213,7 +2979,10 @@ async function runTurn(c, abort) {
           createFile: (name, content) => ({ name, content }),
           signal
         });
-        tc.status = 'done';
+        tc.ms = Date.now() - tc.started;
+        delete tc.started;
+        // A call the stop of the answer ended keeps what it returned, as stopped.
+        tc.status = signal.aborted ? 'stopped' : 'done';
         tc.ok = r.ok;
         tc.result = r.text;
         if (r.file) tc.file = r.file;
@@ -2228,24 +2997,34 @@ async function runTurn(c, abort) {
   } finally {
     cancelRender();
     liveTurn = null;
-    for (const s of turn.steps) delete s.reasoningStart;
+    // The calls an answer stopped or failed before running stay as stopped, without a result.
+    for (const s of turn.steps) {
+      delete s.reasoningStart;
+      for (const tc of s.toolCalls || []) {
+        if (tc.status === 'done') continue;
+        tc.status = 'stopped';
+        delete tc.started;
+        delete tc.index;
+      }
+    }
     turn.progress = null;
     turn.compacting = false;
+    turn.preparing = false;
     state.busy = false;
+    state.busyId = null;
     state.abort = null;
+    announceBusy(c, false);
     c.updated = Date.now();
-    await persist(c).catch(() => {});
+    await persist(c);
     if (state.current === c) renderMain();
-    renderComposerState();
-    renderSidebar();
+    else lockThread();
+    refreshViews();
   }
-  if (!turn.error && !turn.cancelled && !deleted.has(c.id)) {
-    // A discussion still named after its first question receives a title from the model, also
-    // one left "pending" by a tab that closed while naming it.
-    const first = c.messages.find((m) => m.role === 'user');
-    if ((!c.titleSource || c.titleSource === 'pending') && !naming.has(c.id) && first && c.title === provisionalTitle(first)) {
-      nameConversation(c);
-    }
+  if (deleted.has(c.id)) return;
+  // A discussion still named after its first question receives a title from the model, whatever
+  // the end of its answer, since the title follows the question.
+  if (needsTitle(c)) nameConversation(c);
+  if (!turn.error && !turn.cancelled) {
     compactLater(c, turn);
     if (!c.incognito) rememberLater();
   }
@@ -2259,7 +3038,9 @@ async function runTurn(c, abort) {
     as a whole only when it outgrows its size.  One tab updates it at a time, by a lease that
     expires: a tab closed in the middle of an update holds nothing, and the questions it was
     reading are read again by the next update, since the marks move only once the memory is
-    saved.
+    saved.  The memory is written in the language of the interface, whatever the languages of
+    the discussions, and an update first rewrites in it the facts written in another language,
+    after a change of the language among others.
 */
 const memoryBatchQuestions = 3;
 const memoryBatchChars = 1200;
@@ -2285,28 +3066,133 @@ function sensitiveRule(sensitive) {
       + 'or philosophical opinions, sexual orientation, private matters, and information about other people. ';
 }
 
-// The language the memory is written in: the one of the interface.
+/*
+    The language the memory is written in, named in English for the model.  It is the one of the
+    interface, whatever the languages of the discussions the memory learns from.
+*/
 function memoryLanguage() {
-  return { en: 'English', fr: 'French', de: 'German', it: 'Italian', es: 'Spanish' }[language()] || 'English';
+  return languageNames[language()] || 'English';
 }
 
-// The new facts the questions teach, which join the memory.
+/*
+    The two facts of the example of the delta in each language of the interface, for a message in
+    French (in English for an interface in French), so that the example shows a fact in the language
+    of the interface beside the words of the user in their own language.
+*/
+const memoryExamples = {
+  en: ['Works as a nurse in Lyon', 'Prefers short answers'],
+  fr: ['Travaille comme infirmière à Lyon', 'Préfère les réponses courtes'],
+  de: ['Arbeitet als Krankenpflegerin in Lyon', 'Bevorzugt kurze Antworten'],
+  it: ['Lavora come infermiera a Lione', 'Preferisce risposte brevi'],
+  es: ['Trabaja como enfermera en Lyon', 'Prefiere respuestas cortas']
+};
+
+/*
+    The new facts the questions teach, which join the memory, each followed by the words of the user
+    that say it, which the update checks in the questions it read (groundedFacts).
+*/
 function memoryDeltaInstructions(words, sensitive) {
+  const code = memoryExamples[language()] ? language() : 'en';
+  const [a, b] = memoryExamples[code];
+  const english = code === 'fr';
+  const message = english ? 'I am a nurse in Lyon and I prefer short answers. What does triage mean?'
+    : 'Je suis infirmière à Lyon et je préfère les réponses courtes. Que veut dire triage ?';
+  const [qa, qb] = english ? ['I am a nurse in Lyon', 'I prefer short answers']
+    : ['Je suis infirmière à Lyon', 'je préfère les réponses courtes'];
   return 'You keep a short memory about the user for the future discussions of an assistant. From the new messages '
     + 'of the user, write the lasting facts about the user that the memory does not hold yet: profession, projects, '
     + 'preferences, habits of work, the way they want to be answered. A topic the user asks about once teaches '
-    + 'nothing lasting: keep what the user says about themselves. Leave out what serves one discussion only, the '
-    + 'content of documents, and what the memory already holds, even in other words. ' + sensitiveRule(sensitive)
-    + 'Write each new fact in your own words, as a short line that starts with "- ", without copying the messages, '
-    + 'in at most ' + words + ' words in all. When there is no new fact, answer NONE. Write in ' + memoryLanguage()
-    + '.';
+    + 'nothing lasting: keep only what the user says about themselves. Leave out what serves one discussion only, '
+    + 'the content of documents, and what the memory already holds, even in other words. ' + sensitiveRule(sensitive)
+    + 'Write each new fact on a line of its own: "- ", the fact in a few words in ' + memoryLanguage() + ', " | ", '
+    + 'then the statement of the user that says it, copied exactly as the user wrote it, in its language, between '
+    + 'double quotes; a question of the user states no fact. A fact the user did not state in so many words is left '
+    + 'out. The facts take at most ' + words + ' words in all. For example, for the message "' + message + '":\n'
+    + '- ' + a + ' | "' + qa + '"\n'
+    + '- ' + b + ' | "' + qb + '"\n'
+    + 'When there is no new fact, answer NONE.';
+}
+
+/*
+    The words of a text as the memory compares a quote of the user with the questions: lower case,
+    one kind of apostrophe, without double quotes, the spaces reduced to one.
+*/
+function evidenceText(text) {
+  return String(text || '').toLowerCase().replace(/[\u2018\u2019\u201a\u201b\u2032`\u00b4]/g, '\'')
+    .replace(/["\u201c\u201d\u201e\u201f\u00ab\u00bb\u2033]/g, '').replace(/\s+/g, ' ').trim();
+}
+
+/*
+    Whether the words of a quote, normalized, appear in the questions read, normalized too, with 3
+    words or 12 characters at least within a part of a sentence that asks nothing.  The parts end at
+    the marks that end a sentence, at colons and at semicolons, and a part that ends with a question
+    mark supports no fact, as in "One line: what is RAII?".
+*/
+function statedIn(quote, where) {
+  const at = quote ? where.indexOf(quote) : -1;
+  if (at < 0) return false;
+  const end = at + quote.length;
+  for (const s of where.matchAll(/[^.!?:;\u2026]+[.!?:;\u2026]*/g)) {
+    const from = Math.max(at, s.index);
+    const to = Math.min(end, s.index + s[0].length);
+    if (from >= to || /\?\s*$/.test(s[0])) continue;
+    const part = where.slice(from, to).replace(/[.!?;:,\u2026]+$/, '').trim();
+    if (part.split(' ').filter(Boolean).length >= 3 || part.length >= 12) return true;
+  }
+  return false;
+}
+
+/*
+    The new facts of a delta that the questions read by the update support.  Each line holds a fact,
+    " | " and the words of the user that say it, which must lie in a statement of the questions read
+    (statedIn).  The words of the user support one fact, and a later fact that cites them again is
+    left out.  The facts keep no quote.  Returns {facts, proposed, discarded}.
+*/
+function groundedFacts(text, read, sensitive) {
+  const where = evidenceText(read);
+  const cited = new Set();
+  const facts = [];
+  let proposed = 0;
+  let discarded = 0;
+  for (const raw of String(text || '').split('\n')) {
+    const line = raw.trim();
+    if (!/^[-*\u2022]\s*\S/.test(line)) continue;
+    ++proposed;
+    const m = /^[-*\u2022]\s*(.+?)\s*\|\s*(.+)$/.exec(line);
+    const quote = m ? evidenceText(m[2]).replace(/[.!?;:,\u2026]+$/, '').trim() : '';
+    if (!m || !m[1].trim() || cited.has(quote) || !statedIn(quote, where)) {
+      ++discarded;
+      continue;
+    }
+    cited.add(quote);
+    facts.push(...memoryLineList('- ' + m[1].trim(), sensitive));
+  }
+  return { facts, proposed, discarded };
 }
 
 // The memory rewritten within its size, when the new facts made it outgrow it.
 function memoryCompactInstructions(words, sensitive) {
   return 'You keep a short memory about the user for the future discussions of an assistant. Rewrite it in at most '
     + words + ' words: merge the lines that say the same thing, keep the most lasting facts, the newest last, each '
-    + 'as a short line that starts with "- ". ' + sensitiveRule(sensitive) + 'Write in ' + memoryLanguage() + '.';
+    + 'as a short line that starts with "- ". ' + sensitiveRule(sensitive) + 'Write every line in ' + memoryLanguage()
+    + ', the lines written in another language included.';
+}
+
+// The memory written again in the language of the interface, each of its facts kept.
+function memoryTranslateInstructions() {
+  return 'You keep a short memory about the user for the future discussions of an assistant. Rewrite the memory in '
+    + memoryLanguage() + ': translate the lines written in another language, keep the lines already written in '
+    + memoryLanguage() + ' as they are, keep every fact and the order of the lines, one short line per fact that '
+    + 'starts with "- ". Answer with the lines alone.';
+}
+
+// True when a line of a memory is written in another language than the one of the interface.
+function memoryForeign(text) {
+  const target = language();
+  return memoryLineList(text, true).some((l) => {
+    const found = textLanguage(l.slice(2), true);
+    return !!found && found !== target;
+  });
 }
 
 // The credentials, keys and payment identifiers, which the memory keeps only when the settings
@@ -2372,17 +3258,12 @@ function pendingMemory() {
 }
 
 // The lease of this tab on the memory: false when another tab holds it and it has not expired.
-async function takeMemoryLease() {
-  const settings = await store.getSettings();
-  const lease = settings.memoryLease;
-  if (lease && lease.owner !== tabId && lease.until > Date.now()) return false;
-  await store.setSetting('memoryLease', { owner: tabId, until: Date.now() + memoryLeaseMs });
-  return true;
+function takeMemoryLease() {
+  return store.claimLease('memoryLease', tabId, Date.now() + memoryLeaseMs);
 }
 
-async function releaseMemoryLease() {
-  const settings = await store.getSettings().catch(() => ({}));
-  if (settings.memoryLease && settings.memoryLease.owner === tabId) await store.setSetting('memoryLease', null);
+function releaseMemoryLease() {
+  return store.releaseLease('memoryLease', tabId);
 }
 
 // The copies of a discussion in this tab: the one shown and the one of the lists.
@@ -2408,13 +3289,16 @@ async function markRead(items) {
     };
     await store.updateConversations(mark, item.id).catch(() => {});
     copiesOf(item.id).forEach(mark);
+    broadcast({ type: 'conversation', id: item.id });
   }
 }
 
 // The memory and its settings as stored, which another tab may have changed.
 async function storedMemory() {
   const s = Object.assign({}, defaults, await store.getSettings());
-  return { enabled: !!s.memoryEnabled, sensitive: !!s.memorySensitive, memory: s.memory || '' };
+  return {
+    enabled: !!s.memoryEnabled, sensitive: !!s.memorySensitive, memory: s.memory || '', language: s.memoryLanguage
+  };
 }
 
 // The copies of the discussions in this tab, after a reset of the memory in this tab or in another one.
@@ -2438,8 +3322,14 @@ function forgetMemory() {
 async function updateMemory(force) {
   if (memoryRunning || !state.settings.memoryEnabled || state.incognito) return;
   const pending = pendingMemory();
-  if (!pending.items.length) return;
-  if (!force && pending.questions < memoryBatchQuestions && pending.chars < memoryBatchChars) return;
+  const enough = pending.items.length > 0
+    && (force || pending.questions >= memoryBatchQuestions || pending.chars >= memoryBatchChars);
+  // A memory written in another language than the one of the interface is rewritten in it, with
+  // new questions to read or without them.
+  const memory = state.settings.memory || '';
+  const foreign = !!memory && (memoryForeign(memory)
+    || (!!state.settings.memoryLanguage && state.settings.memoryLanguage !== language()));
+  if (!enough && !foreign) return;
   // The answer in progress comes first.
   if (state.busy) {
     rememberLater();
@@ -2459,6 +3349,7 @@ async function updateMemory(force) {
     const context = backgroundContext();
     const words = memoryLimitWords(context);
     const current = stored.memory;
+    const target = language();
     // True when the memory was reset, edited or turned off meanwhile, in this tab or in another
     // one, as stored now: the update is then dropped.
     const changed = async () => {
@@ -2466,38 +3357,65 @@ async function updateMemory(force) {
       return !now.enabled || now.memory !== current;
     };
     let lines = memoryLineList(current, true);
+    let rewritten = false;
+    /*
+        The facts written in another language are rewritten in the language of the interface
+        first, so that the new facts are compared with them in one language.  A rewriting that
+        lost facts is left out, and the next update tries again.
+    */
+    if (lines.length && (memoryForeign(current) || (!!stored.language && stored.language !== target))) {
+      const r = await backgroundText(memoryTranslateInstructions(),
+        '<memory>\n' + lines.join('\n') + '\n</memory>\n\nRewrite every line in ' + memoryLanguage() + '.',
+        Math.ceil(wordCount(lines) * 2.5) + 32, signal).catch((e) => {
+        if (e.name === 'AbortError') throw e;
+        return null;
+      });
+      if (await changed()) return;
+      const translated = r ? memoryLineList(r.text, true) : [];
+      if (translated.length >= Math.ceil(lines.length * 0.7)) {
+        lines = translated;
+        rewritten = true;
+      }
+    }
     let added = 0;
-    if (pending.chars >= 40) {
+    if (enough && pending.chars >= 40) {
       // What the user wrote: the memory is about the user, and the answers would fill it with
       // what the assistant said.
       const asked = [];
       for (const item of pending.items) for (const a of item.asked) asked.push('User: ' + keepStart(a, 1500));
+      // The questions as the model reads them, in which the words of each new fact are looked for.
+      const read = keepEnd(asked.join('\n\n'), Math.floor(context * 3.6 * 0.5));
       const r = await backgroundText(memoryDeltaInstructions(words, sensitive),
-        '<memory>\n' + (current || '(empty)') + '\n</memory>\n\n<messages>\n'
-          + keepEnd(asked.join('\n\n'), Math.floor(context * 3.6 * 0.5)) + '\n</messages>',
-        Math.ceil(words * 1.6) + 16, signal);
+        '<memory>\n' + (lines.join('\n') || '(empty)') + '\n</memory>\n\n<messages>\n' + read
+          + '\n</messages>\n\nWrite the new facts in ' + memoryLanguage() + ', each with the words of the user.',
+        Math.ceil(words * 3.2) + 32, signal);
       if (await changed()) return;
-      for (const fact of memoryLineList(r.text, sensitive)) {
+      const delta = groundedFacts(r.text, read, sensitive);
+      console.info('Albireo: memory: ' + delta.proposed + ' facts proposed, ' + delta.discarded
+        + ' left out, unsupported by the words of the user');
+      for (const fact of delta.facts) {
         if (lines.some((l) => sameFact(l, fact))) continue;
         lines.push(fact);
         ++added;
       }
       if (added && wordCount(lines) > words) {
-        const rewritten = await backgroundText(memoryCompactInstructions(words, sensitive),
+        const compact = await backgroundText(memoryCompactInstructions(words, sensitive),
           '<memory>\n' + lines.join('\n') + '\n</memory>', Math.ceil(words * 2.2) + 16, signal).catch(() => null);
         if (signal.aborted) return;
         if (await changed()) return;
-        const compacted = rewritten ? memoryLineList(rewritten.text, sensitive) : [];
+        const compacted = compact ? memoryLineList(compact.text, sensitive) : [];
         if (compacted.length && wordCount(compacted) <= words * 1.2) lines = compacted;
         while (lines.length > 1 && wordCount(lines) > words) lines = lines.slice(1);
       }
-      if (added) {
-        await saveSetting('memory', lines.join('\n'));
-        await saveSetting('memoryUpdated', Date.now());
-      }
     }
-    await markRead(pending.items);
+    if (added || rewritten) {
+      await saveSetting('memory', lines.join('\n'));
+      await saveSetting('memoryUpdated', Date.now());
+      await saveSetting('memoryLanguage', target);
+    }
+    if (enough) await markRead(pending.items);
     if (added) toast(t(added === 1 ? 'memoryLearnedOne' : 'memoryLearned', { n: added }), false, 4500);
+    else if (rewritten) toast(t('memoryRewritten'), false, 4500);
   } finally {
     memoryRunning = false;
     memoryAbort = null;
@@ -2532,44 +3450,173 @@ function cleanTitle(text) {
   return title.length > 70 ? keepStart(title, 70).replace(/\s*\u2026$/, '') : title;
 }
 
-// The discussions this tab is naming.  The mark stays out of the discussions, so that none is
-// saved with it: a discussion whose tab closed while it was named is named by a later answer.
+// True when a discussion still bears the beginning of its first question as its title.
+function needsTitle(c) {
+  if (!c || deleted.has(c.id) || c.titleSource === 'user' || c.titleSource === 'model') return false;
+  const first = (c.messages || []).find((m) => m.role === 'user');
+  if (!first) return false;
+  if (c.titleSource === 'question' || c.titleSource === 'pending') return true;
+  return !c.title || c.title === provisionalTitle(first);
+}
+
+/*
+    Examples of titles, one per language of the interface, which show a small model that a title
+    names the topic of the message in a few words and in its language, without its answer or its
+    first words.
+*/
+const titleExamples = [
+  ['English', 'I\'m a nurse in Leeds. In one line, what is triage?', 'Meaning of triage'],
+  ['French', 'Peux-tu m\'expliquer comment fonctionne la photosynthèse ?', 'Fonctionnement de la photosynthèse'],
+  ['German', 'Berechne 15 % von 80 und erkläre den Rechenweg.', 'Prozentrechnung mit Rechenweg'],
+  ['Spanish', 'Escribe un poema corto sobre el mar.', 'Poema sobre el mar'],
+  ['Italian', 'Come faccio a invertire una lista collegata in Java?', 'Inversione di una lista in Java']
+];
+
+/*
+    The request of a title, with the examples as earlier exchanges, then the question with the name
+    of its language when it can be told.  again asks for other words than those of the question.
+*/
+function titleMessages(question, again) {
+  const code = textLanguage(question);
+  const name = code ? languageNames[code] : 'the language of the message';
+  const out = [{
+    role: 'system',
+    content: 'You give a short title to a discussion from its first message. The title names the topic in two to six '
+      + 'words, as a noun phrase, in the language given. It never answers the message and never copies it. '
+      + 'Answer with the title alone.'
+  }];
+  for (const [language, message, title] of titleExamples) {
+    out.push({ role: 'user', content: 'Language: ' + language + '\nMessage: ' + message },
+      { role: 'assistant', content: title });
+  }
+  out.push({
+    role: 'user',
+    content: 'Language: ' + name + '\nMessage: ' + question
+      + (again ? '\nThe title uses other words than the message: it names the kind of request.' : '')
+  });
+  return out;
+}
+
+// The words of a text as the titles are compared, folded and cut to their first five letters.
+function titleWords(text) {
+  return fold(text).split(/[^\p{L}\p{N}]+/u).filter(Boolean).map((w) => w.slice(0, 5));
+}
+
+/*
+    True when a title is empty, holds more than ten words, or repeats the first words of a question
+    of three words or more, in other forms ("Calculer 17,5 %" for "Calcule 17,5 %").
+*/
+function poorTitle(title, question) {
+  const words = titleWords(title);
+  if (!words.length || words.length > 10) return true;
+  const asked = titleWords(question);
+  return asked.length >= 3 && words.join(' ') === asked.slice(0, words.length).join(' ');
+}
+
+/*
+    The title the background model writes for a question, asked a second time with other words
+    when the first one only repeats the question.
+*/
+async function askTitle(question) {
+  const first = cleanTitle((await backgroundChat(titleMessages(question, false), 24)).text);
+  if (!poorTitle(first, question)) return first;
+  const second = cleanTitle((await backgroundChat(titleMessages(question, true), 24, null, 0.7)).text);
+  return poorTitle(second, question) && first ? first : second;
+}
+
+/*
+    The errors after which the request of a title is sent again, while the service starts, while
+    its model loads or is missing, or while the service does not answer.
+*/
+function retryable(e) {
+  if (e instanceof TypeError) return true;
+  return ['starting', 'model_loading', 'unloaded', 'model_not_found'].includes(e && e.code)
+    || /^5\d\d\b/.test(String(e && e.message));
+}
+
+// The pauses between the attempts of a title, in seconds, about two minutes in all.
+const titleRetries = [2, 4, 8, 15, 30, 30, 30];
+
+// True when the service answers and has a model, which a title needs.
+function serviceReady() {
+  return !!state.status && !state.statusError && state.status.state !== 'starting' && !!roleModel('general');
+}
+
+/*
+    Runs fn under a lock the tabs share, so that one tab only does the work; does nothing when
+    another tab holds it.  Where the browser has no such locks, fn runs.
+*/
+function exclusive(name, fn) {
+  if (!navigator.locks || typeof navigator.locks.request !== 'function') return fn();
+  return navigator.locks.request(name, { ifAvailable: true }, (lock) => (lock ? fn() : null));
+}
+
+/*
+    The discussions this tab is naming.  The mark stays out of the discussions, so that none is
+    saved with it, and a discussion whose tab closed while it was named is named at a later visit.
+*/
 const naming = new Set();
 
 /*
-    Names a discussion after its first question: the background model writes a short title,
-    which replaces the beginning of the question that served until then, unless the user
-    renames the discussion meanwhile.
+    Names a discussion after its first question.  The background model writes a short title, in
+    the language of the question, which replaces the beginning of the question that stood for it
+    until then, unless the user renames the discussion meanwhile.  The request waits for the
+    service and its model, and is sent again after an error that passes, a bounded number of
+    times; it does not depend on the discussion shown, nor on the questions that follow.  The
+    title shows at once in the side panel, the top bar and the other tabs.
 */
 async function nameConversation(c) {
-  const first = c.messages.find((m) => m.role === 'user');
-  if (!first) return;
+  if (naming.has(c.id)) return;
   naming.add(c.id);
   try {
-    const question = keepStart((first.content || '') + ((first.attachments || []).length
-      ? '\n(' + first.attachments.map((a) => a.name).join(', ') + ')' : ''), 1500);
-    let text = '';
-    try {
-      // A small model given the question alone tends to answer it: the request frames it.
-      text = (await backgroundText('You write the titles of discussions. Answer with the title only: two to six words '
-        + 'separated by spaces, in the language of the question, without quotes, emoji, code formatting or final '
-        + 'punctuation. Never answer the question.',
-        'Question: ' + question + '\n\nTitle of the discussion that starts with this question:', 24)).text;
-    } catch (e) {
-      text = '';
-    }
-    const title = cleanTitle(text);
-    const now = await currentVersion(c).catch(() => null);
-    if (!now || now.titleSource === 'user' || now.titleSource === 'model') return;
-    // Without a title, the beginning of the question stays, and the next answer tries again.
-    if (!title) return;
-    now.title = title;
-    now.titleSource = 'model';
-    await persist(now).catch(() => {});
-    renderSidebar();
-    if (state.current && state.current.id === now.id) renderTopbar();
+    await exclusive('albireo-title-' + c.id, async () => {
+      for (let attempt = 0; attempt <= titleRetries.length; ++attempt) {
+        if (attempt) await new Promise((r) => setTimeout(r, titleRetries[attempt - 1] * 1000));
+        const now = await currentVersion(c).catch(() => null);
+        if (!needsTitle(now)) return;
+        if (!serviceReady()) continue;
+        const first = now.messages.find((m) => m.role === 'user');
+        const question = keepStart((first.content || '') + ((first.attachments || []).length
+          ? '\n(' + first.attachments.map((a) => a.name).join(', ') + ')' : ''), 1500);
+        let title = '';
+        try {
+          title = await askTitle(question);
+        } catch (e) {
+          if (retryable(e)) continue;
+          return;
+        }
+        // Without a title, the beginning of the question stays, and a later answer tries again.
+        const latest = await currentVersion(c).catch(() => null);
+        if (!title || !needsTitle(latest)) return;
+        latest.title = title;
+        latest.titleSource = 'model';
+        await persist(latest);
+        refreshViews();
+        return;
+      }
+    });
   } finally {
     naming.delete(c.id);
+  }
+}
+
+/*
+    Names the stored discussions that a closed tab, a reload or a service out of reach left with
+    the beginning of their question as title, the most recent first, one after the other.
+*/
+let namingPending = false;
+
+async function namePending() {
+  if (namingPending || state.incognito) return;
+  namingPending = true;
+  try {
+    const waiting = state.conversations.filter((c) => needsTitle(c) && c.messages.some((m) => m.role === 'assistant'));
+    for (const c of waiting.slice(0, 5)) {
+      if (!serviceReady()) break;
+      await nameConversation(c);
+    }
+  } finally {
+    namingPending = false;
   }
 }
 
@@ -2584,7 +3631,7 @@ function compactLater(c, turn) {
   const room = context - Math.min(state.settings.maxTokens || 2048, Math.floor(context / 2));
   const used = (turn.promptTokens || 0) + ((turn.usage && turn.usage.completion_tokens) || 0);
   if (used < compactShare * room) return;
-  const system = systemPrompt(c, context);
+  const system = systemPrompt(c, context, !!(c.agent && roleCapabilities(c.role).tools));
   const build = () => apiMessages(c, system);
   const size = build().reduce((n, m) => n + JSON.stringify(m).length, 0);
   const scale = used / Math.max(1, size);
@@ -2651,18 +3698,19 @@ function settingsDialog(initialTab) {
     const body = h('div');
     const show = (tab) => {
       for (const b of tabBar.children) b.classList.toggle('on', b.dataset.tab === tab);
+      ui.memoryView = null;
       body.replaceChildren();
       if (tab === 'general') generalTab(body, close);
       else if (tab === 'model') modelTab(body);
       else if (tab === 'memoryTab') memoryTab(body);
       else if (tab === 'data') dataTab(body, close);
-      else aboutTab(body);
+      else aboutTab(body, close);
     };
     for (const tab of tabs) tabBar.append(h('button', { type: 'button', 'data-tab': tab, onclick: () => show(tab) }, t(tab)));
     box.append(h('h2', { html: icon('gear') + escapeHtml(t('settings')) }), tabBar, body,
       h('div', { class: 'actions' }, h('button', { class: 'button primary', type: 'button', onclick: () => close(true) }, t('close'))));
     show(initialTab || 'general');
-  });
+  }).then(() => { ui.memoryView = null; });
 }
 
 function field(label, control, help) {
@@ -2677,17 +3725,22 @@ function generalTab(body, close) {
     languages.map((l) => h('option', { value: l.code, selected: state.settings.language === l.code }, l.name)));
   lang.addEventListener('change', async () => {
     await saveSetting('language', lang.value);
-    applyLanguage();
     close(true);
-    state.catalog = await api.models(language()).catch(() => state.catalog);
-    buildLayout();
-    renderAll();
+    await languageChanged(true);
     settingsDialog('general');
   });
   const name = h('input', { value: state.settings.userName || '' });
-  name.addEventListener('change', () => saveSetting('userName', name.value.trim()));
+  name.addEventListener('change', async () => {
+    await saveSetting('userName', name.value.trim());
+    refreshViews();
+  });
   const role = h('select', null, roles.map((r) => h('option', { value: r, selected: state.settings.defaultRole === r }, t('role_' + r))));
-  role.addEventListener('change', () => saveSetting('defaultRole', role.value));
+  // A new discussion, without messages yet, takes the default function at once.
+  role.addEventListener('change', async () => {
+    await saveSetting('defaultRole', role.value);
+    if (state.current && !state.current.messages.length) state.current.role = role.value;
+    refreshViews();
+  });
   const enter = h('input', { type: 'checkbox', checked: state.settings.sendOnEnter });
   enter.addEventListener('change', () => saveSetting('sendOnEnter', enter.checked));
   const sys = h('textarea', { rows: 4 });
@@ -2710,10 +3763,39 @@ function modelTab(body) {
     }, t('maxTokensAuto'));
     return h('div', { class: 'inline' }, input, out, reset);
   };
+  /*
+      top-k: a slider and its value, which may also be typed, from 0 (no limit) to 1024, the bounds of the
+      service; empty, the service takes its own value.
+  */
+  const topK = () => {
+    const value = state.settings.topK;
+    const range = h('input', { type: 'range', min: 0, max: 1024, step: 1, value: value == null ? 40 : value,
+      'aria-label': t('topK') });
+    const number = h('input', { type: 'number', class: 'top-k', min: 0, max: 1024, step: 1, 'aria-label': t('topK'),
+      value: value == null ? '' : String(value), placeholder: t('maxTokensAuto') });
+    range.addEventListener('input', () => { number.value = range.value; });
+    range.addEventListener('change', () => saveSetting('topK', parseInt(range.value, 10)));
+    number.addEventListener('change', () => {
+      const typed = parseInt(number.value, 10);
+      const v = number.value.trim() === '' || Number.isNaN(typed) ? null : Math.max(0, Math.min(1024, typed));
+      number.value = v == null ? '' : String(v);
+      if (v != null) range.value = v;
+      saveSetting('topK', v);
+    });
+    const reset = h('button', {
+      class: 'button', type: 'button', onclick: async () => {
+        await saveSetting('topK', null);
+        number.value = '';
+        range.value = 40;
+      }
+    }, t('maxTokensAuto'));
+    return h('div', { class: 'inline' }, range, number, reset);
+  };
   const max = h('input', { type: 'number', min: 0, max: 131072, step: 256, value: state.settings.maxTokens || 0 });
   max.addEventListener('change', () => saveSetting('maxTokens', Math.max(0, parseInt(max.value, 10) || 0)));
   body.append(field(t('temperature'), slider('temperature', 0, 2, 0.05, 0.7), t('temperatureHelp')),
-    field(t('topP'), slider('topP', 0.05, 1, 0.05, 0.95)), field(t('maxTokens'), max, '0 = ' + t('maxTokensAuto')));
+    field(t('topP'), slider('topP', 0.05, 1, 0.05, 0.95), t('topPHelp')), field(t('topK'), topK(), t('topKHelp')),
+    field(t('maxTokens'), max, '0 = ' + t('maxTokensAuto')));
 }
 
 // The memory of the discussions: its use, its content, which the user may edit, and its reset.
@@ -2746,6 +3828,15 @@ function memoryTab(body) {
     showSize();
   });
   sensitive.disabled = text.disabled = !enabled.checked;
+  // The memory as an update or another tab changes it, unless the user is writing in it.
+  ui.memoryView = () => {
+    if (!text.isConnected) return;
+    enabled.checked = !!state.settings.memoryEnabled;
+    sensitive.checked = !!state.settings.memorySensitive;
+    sensitive.disabled = text.disabled = !enabled.checked;
+    if (document.activeElement !== text) text.value = state.settings.memory || '';
+    showSize();
+  };
   body.append(h('p', null, t('memoryIntro')),
     h('div', { class: 'field' }, h('label', { class: 'inline' }, enabled, ' ', t('memoryEnabled'))),
     h('div', { class: 'field' }, h('label', { class: 'inline' }, sensitive, ' ', t('memorySensitive')),
@@ -2783,8 +3874,8 @@ function dataTab(body, close) {
       const r = await store.importAll(data);
       // A discussion deleted earlier comes back with the import, and is saved again.
       for (const c of data.conversations) if (c && typeof c.id === 'string') deleted.delete(c.id);
-      await reloadLists();
-      renderSidebar();
+      broadcast({ type: 'lists' });
+      await syncLists();
       toast(t('imported', { n: r.conversations, p: r.projects }));
       indexProjects();
     } catch (e) {
@@ -2792,11 +3883,19 @@ function dataTab(body, close) {
     }
     input.value = '';
   });
-  body.append(h('p', null, t('storageUsage', { n: state.conversations.length, p: state.projects.length })),
+  const storage = h('div', { class: 'storage-state' });
+  body.append(h('p', null, t('storageUsage', { n: state.conversations.length, p: state.projects.length })), storage,
     h('div', { class: 'buttons' },
       h('button', {
         class: 'button', type: 'button', html: icon('download') + '<span>' + escapeHtml(t('exportAll')) + '</span>',
-        onclick: async () => download('albireo-' + new Date().toISOString().slice(0, 10) + '.json', JSON.stringify(await store.exportAll()), 'application/json')
+        onclick: async () => {
+          try {
+            const data = JSON.stringify(await store.exportAll());
+            download('albireo-' + new Date().toISOString().slice(0, 10) + '.json', data, 'application/json');
+          } catch (e) {
+            storageFailed(e);
+          }
+        }
       }),
       h('button', { class: 'button', type: 'button', html: icon('upload') + '<span>' + escapeHtml(t('importAll')) + '</span>', onclick: () => input.click() }),
       input,
@@ -2811,12 +3910,59 @@ function dataTab(body, close) {
           if (state.busy) stopGeneration();
           cancelIndex();
           rag.removeAll();
-          await store.clearAll();
-          await reloadLists();
+          await store.clearAll().catch(storageFailed);
+          broadcast({ type: 'cleared' });
+          await reloadLists().catch(storageFailed);
           close(true);
           go('#/');
         }
       })));
+  showStorage(storage);
+}
+
+/*
+    Asks the browser to keep the database of the application when the disk runs short, once the
+    database is open, when it is not kept yet.  The answer, which the browser gives without asking
+    the user, stays in the settings (storagePersisted) and shows in the Data tab of the settings.
+*/
+async function requestPersistence() {
+  const s = navigator.storage;
+  if (!s || typeof s.persisted !== 'function' || typeof s.persist !== 'function') return;
+  try {
+    let kept = await s.persisted();
+    if (!kept) kept = await s.persist();
+    if (state.settings.storagePersisted !== kept) await saveSetting('storagePersisted', kept);
+  } catch (e) {
+    // The browser keeps its answer to itself; the Data tab shows what it tells then.
+  }
+}
+
+/*
+    The state of the storage of this browser, kept or not, with the space used and the space
+    available, and the advice to export the data regularly when the browser may delete them.
+*/
+async function showStorage(el) {
+  const s = navigator.storage;
+  let kept = state.settings.storagePersisted;
+  let estimate = null;
+  try {
+    if (s && typeof s.persisted === 'function') kept = await s.persisted();
+  } catch (e) {
+    // The last answer stays.
+  }
+  try {
+    if (s && typeof s.estimate === 'function') estimate = await s.estimate();
+  } catch (e) {
+    estimate = null;
+  }
+  if (typeof kept === 'boolean' && kept !== state.settings.storagePersisted) saveSetting('storagePersisted', kept);
+  const parts = [t(kept === true ? 'storagePersistent' : kept === false ? 'storageNotPersistent' : 'storageUnknown')];
+  if (estimate && estimate.quota) {
+    parts.push(t('storageEstimate', { used: formatSize(estimate.usage || 0), quota: formatSize(estimate.quota) }));
+  }
+  el.dataset.persistent = String(kept);
+  el.replaceChildren(h('p', null, h('b', null, t('storageState')), ' ', parts.join(' · ')),
+    kept === true ? null : h('p', { class: 'help storage-hint' }, h('span', { html: icon('info') }), t('storageHint')));
 }
 
 function memoryBar(stats) {
@@ -2834,7 +3980,7 @@ function memoryBar(stats) {
     h('span', { style: { '--c': 'var(--incognito)' } }, t('vramStore') + ' ' + formatSize(v.store_bytes || 0))));
 }
 
-async function aboutTab(body) {
+async function aboutTab(body, close) {
   const s = state.status || {};
   const art = h('div', { class: 'about-art' }, h('img', { src: 'img/about.svg', alt: '' }));
   const kv = h('div', { class: 'kv' });
@@ -2875,10 +4021,137 @@ async function aboutTab(body) {
   } catch (e) {
     // Usage figures are optional.
   }
-  body.append(h('p', { style: { marginTop: '14px' } }, t('createdBy', { author: s.author || 'Aldric Pierrain' }) + ' · ' +
-    t('publishedBy', { company: s.company || 'Cydral Technology' })),
+  body.append(h('p', { style: { marginTop: '14px' } }, t('createdBy', {
+    author: (s.author || 'Aldric Pierrain') + ' (' + (s.email || 'cydraltechnology@gmail.com') + ')'
+  }) + ' · ' + (s.copyright || 'Copyright (C) 2026 Cydral Technology')),
   h('p', null, h('a', { href: s.project || 'https://github.com/Cydral/Dlib-Transformer-extensions', target: '_blank', rel: 'noopener' }, 'Dlib-Transformer-extensions'),
-    ' · ', h('a', { href: '/docs/', target: '_blank' }, t('apiDocs')), ' · ', h('a', { href: 'vendor/README.txt', target: '_blank' }, t('thirdParty'))));
+    ' · ', h('a', { href: '/docs/', target: '_blank' }, t('apiDocs')), ' · ',
+    h('a', { href: '#/licenses', onclick: () => close(true) }, t('thirdParty'))));
+}
+
+/*
+    The page of the components and of their licenses: those of the web application, which
+    vendor/components.json lists; those of the programs and of the engines, whose texts the
+    installer copies into the licenses folder of the programs; and the installed models, with
+    the license of their entry in the catalog.  A text opens in the page, under its line.
+*/
+let licensesSequence = 0;
+
+// The role and the license of each text of the licenses folder, by its file.
+const programTexts = {
+  'albireo.txt': ['albireo', 'Boost Software License 1.0'], 'dlib.txt': ['dlib', 'Boost Software License 1.0'],
+  'mbedtls.txt': ['mbedtls', 'Apache License 2.0 or GPL 2.0 or later'], 'cpp-httplib.txt': ['httplib', 'MIT License'],
+  'zlib.txt': ['zlib', 'zlib License'], 'sqlite.txt': ['sqlite', null],
+  'openvino-license.txt': ['openvino', 'Apache License 2.0'], 'cuda-eula.txt': ['cuda', 'NVIDIA CUDA EULA'],
+  'cudnn-license.txt': ['cudnn', 'NVIDIA cuDNN License Agreement']
+};
+
+async function licenseText(url) {
+  const r = await fetch(url, { cache: 'no-store' });
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  return r.text();
+}
+
+function licenseHead(columns) {
+  return h('div', { class: 'lic-row lic-head', 'aria-hidden': 'true' }, columns.map((c) => h('div', null, c)),
+    h('div'));
+}
+
+/*
+    A line of the page of the licenses: its cells, then a button that opens its texts under it
+    when load is given, load returning [[file, text]...], or the element action.
+*/
+function licenseRow(cells, load, action) {
+  const box = h('div', { class: 'lic-text hidden' });
+  let loaded = false;
+  let button = null;
+  if (load) {
+    button = h('button', {
+      class: 'button small', type: 'button', 'aria-expanded': 'false',
+      html: icon('chevron') + '<span>' + escapeHtml(t('licenseShow')) + '</span>'
+    });
+    button.addEventListener('click', async () => {
+      const open = box.classList.toggle('hidden') === false;
+      button.setAttribute('aria-expanded', String(open));
+      button.classList.toggle('open', open);
+      if (!open || loaded) return;
+      loaded = true;
+      box.replaceChildren(h('div', { class: 'empty-note' }, t('licenseLoading')));
+      try {
+        const parts = await load();
+        box.replaceChildren(...parts.flatMap(([file, text]) => [parts.length > 1 ? h('div', { class: 'lic-file' }, file)
+          : null, h('pre', null, text)]).filter(Boolean));
+      } catch (e) {
+        loaded = false;
+        box.replaceChildren(h('div', { class: 'error-box' }, t('licenseReadFailed')));
+      }
+    });
+  }
+  return [h('div', { class: 'lic-row' }, cells.map(([cls, v]) => h('div', { class: cls }, v)),
+    h('div', { class: 'lic-action' }, button || action)), box];
+}
+
+async function renderLicenses() {
+  const sequence = ++licensesSequence;
+  const head = [h('h2', { html: icon('book') + escapeHtml(t('licensesTitle')) }),
+    h('p', { class: 'sub' }, t('licensesIntro'))];
+  ui.content.replaceChildren(h('div', { class: 'page licenses' }, head,
+    h('div', { class: 'empty-note' }, t('licenseLoading'))));
+  const [web, programs, models] = await Promise.all([
+    api.getJSON('/vendor/components.json').catch(() => null),
+    api.getJSON('/albireo/v1/licenses').catch(() => null),
+    api.models(language()).catch(() => null)
+  ]);
+  if (sequence !== licensesSequence || state.view !== 'licenses') return;
+  const columns = [t('licenseComponent'), t('licenseVersion'), t('licenseRole'), t('licenseName')];
+  const card = (iconName, title, help, rows, empty) => h('div', { class: 'card' },
+    h('h3', { html: icon(iconName) + escapeHtml(title) }), help ? h('p', { class: 'help' }, help) : null,
+    rows.length ? h('div', { class: 'lic-table' }, rows) : h('div', { class: 'empty-note' }, empty));
+
+  // The web application, from the list its updates keep.
+  const webRows = [];
+  for (const c of (web && Array.isArray(web.components)) ? web.components : []) {
+    const key = 'component_' + c.id;
+    webRows.push(licenseRow([['lic-name', c.name], ['lic-version', c.version || '-'],
+      ['lic-role', t(key) === key ? c.role || '' : t(key)], ['lic-license', c.license_name || c.license || '-']],
+    () => Promise.all((c.license_files || []).map(async (f) => [f, await licenseText('/' + f)]))));
+  }
+  if (webRows.length) webRows.unshift(licenseHead(columns));
+
+  // The programs and the engines, from the licenses folder of the installation.
+  const programRows = [];
+  for (const p of Array.isArray(programs) ? programs : []) {
+    const [id, license] = programTexts[p.file] || ['runtime', '-'];
+    programRows.push(licenseRow([['lic-name', p.name || p.file], ['lic-version', p.version || '-'],
+      ['lic-role', t('program_' + id)], ['lic-license', license === null ? t('licensePublicDomain') : license]],
+    () => licenseText('/albireo/v1/licenses/' + encodeURIComponent(p.file)).then((text) => [[p.file, text]])));
+  }
+  if (programRows.length) programRows.unshift(licenseHead(columns));
+
+  // The installed models, the language models then the embedding models, with the functions they serve.
+  const modelRows = [];
+  const active = (models && models.active) || {};
+  const installed = models
+    ? (models.models || []).filter((m) => m.installed).concat(models.embedding_models || []) : [];
+  for (const m of installed) {
+    const functions = roles.concat(['embedding']).filter((r) => active[r] === m.id).map((r) => t('role_' + r));
+    const source = /^https:\/\//.test(m.source || '') ? h('a', {
+      class: 'button small', href: m.source, target: '_blank', rel: 'noopener',
+      html: icon('external') + '<span>' + escapeHtml(t('licenseSource')) + '</span>'
+    }) : null;
+    modelRows.push(licenseRow([['lic-name', m.name || m.id], ['lic-version', m.publisher || '-'],
+      ['lic-role', functions.join(', ') || '-'], ['lic-license', m.license || t('licenseNotStated')]], null, source));
+  }
+  if (modelRows.length) {
+    modelRows.unshift(licenseHead([t('licenseModel'), t('licensePublisher'), t('licenseFunctions'), t('licenseName')]));
+  }
+
+  ui.content.replaceChildren(h('div', { class: 'page licenses' }, head,
+    card('code', t('licensesWeb'), t('licensesWebHelp'), webRows, t('licenseReadFailed')),
+    card('cpu', t('licensesPrograms'), programRows.length ? t('licensesProgramsHelp') : null, programRows,
+      programs ? t('licensesProgramsNone') : t('serviceDown')),
+    card('spark', t('licensesModels'), t('licensesModelsHelp'), modelRows,
+      models ? t('licensesModelsNone') : t('serviceDown'))));
 }
 
 // The line under the composer: what the answers are; the version and the copyright are in About.
@@ -2889,6 +4162,8 @@ function hintText() {
 // Layout.
 function buildLayout() {
   const app = document.getElementById('app');
+  // The question being typed stays when the layout is built again in another language.
+  const draft = ui.input ? ui.input.value : '';
   app.replaceChildren();
   ui.sidebar = h('aside', { class: 'sidebar' + (state.settings.sidebar === false ? ' collapsed' : '') });
   ui.sideScroll = h('div', { class: 'side-scroll' });
@@ -2932,6 +4207,7 @@ function buildLayout() {
   ui.banner = h('div', { class: 'banner hidden', html: icon('incognito') + '<span>' + escapeHtml(t('incognitoBanner')) + '</span>' });
   ui.content = h('div', { class: 'scroller' });
   ui.input = h('textarea', { rows: 1, 'aria-label': t('placeholder') });
+  ui.input.value = draft;
   ui.input.addEventListener('input', autoGrow);
   ui.input.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && state.settings.sendOnEnter) {
@@ -2951,9 +4227,10 @@ function buildLayout() {
     onclick: async () => {
       const c = state.current;
       c.reasoning = !c.reasoning;
+      renderComposerState();
       await saveSetting('lastReasoning', c.reasoning);
       if (c.messages.length) await persist(c);
-      renderComposerState();
+      refreshViews();
     }
   });
   ui.agentButton = h('button', {
@@ -2961,16 +4238,29 @@ function buildLayout() {
     onclick: async () => {
       const c = state.current;
       c.agent = !c.agent;
+      renderComposerState();
       await saveSetting('lastAgent', c.agent);
       if (c.messages.length) await persist(c);
-      renderComposerState();
+      refreshViews();
     }
   });
+  // What the agent mode does, from a button beside it, and the tools it may call, under the prompt.
+  ui.agentHelp = h('button', {
+    class: 'help-button', type: 'button', title: t('agentHelpTitle'), 'aria-label': t('agentHelpTitle'),
+    html: icon('info'), onclick: (e) => agentHelp(e.currentTarget)
+  });
+  ui.agentTools = h('div', { class: 'agent-tools hidden', role: 'list', 'aria-label': t('agentTools') },
+    h('span', { class: 'label' }, t('agentTools')),
+    tools.definitions.map((d) => h('span', {
+      class: 'tool-chip', role: 'listitem', tabindex: '0', title: t('toolHint_' + d.function.name),
+      html: icon(toolIcons[d.function.name] || 'tool') + '<span>' + escapeHtml(toolLabel(d.function.name)) + '</span>'
+    })));
   ui.sendButton = h('button', { class: 'send', type: 'button', onclick: onSend });
   ui.pendingBox = h('div', { class: 'composer-attachments hidden' });
   ui.attachButton = iconButton('clip', t('attach'), () => fileInput.click());
-  const composer = h('div', { class: 'composer' }, ui.pendingBox, ui.input, h('div', { class: 'row' },
-    ui.attachButton, fileInput, ui.reasonButton, ui.agentButton, h('span', { class: 'grow' }), ui.sendButton));
+  const composer = h('div', { class: 'composer' }, ui.pendingBox, ui.input, ui.agentTools, h('div', { class: 'row' },
+    ui.attachButton, fileInput, ui.reasonButton, ui.agentButton, ui.agentHelp, h('span', { class: 'grow' }),
+    ui.sendButton));
   for (const ev of ['dragenter', 'dragover']) composer.addEventListener(ev, (e) => { e.preventDefault(); composer.classList.add('drag'); });
   for (const ev of ['dragleave', 'drop']) composer.addEventListener(ev, () => composer.classList.remove('drag'));
   composer.addEventListener('drop', (e) => {
@@ -2985,9 +4275,23 @@ function buildLayout() {
 }
 
 async function init() {
+  // A failure the code does not handle is logged, and a refusal of the database is told.
+  window.addEventListener('unhandledrejection', (e) => {
+    const r = e.reason;
+    if (r && r.name === 'AbortError') {
+      e.preventDefault();
+      return;
+    }
+    console.warn('Albireo: an operation failed', r);
+    if (r && (r.name === 'QuotaExceededError' || r.name === 'UnknownError' || r.name === 'InvalidStateError')) {
+      storageFailed(r);
+    }
+  });
   try {
     await store.open();
     state.settings = Object.assign({}, defaults, await store.getSettings());
+    // The browser is asked to keep the database, without waiting for its answer.
+    requestPersistence();
   } catch (e) {
     // Without IndexedDB (a private window of some browsers) the application keeps its
     // data in memory, as in an incognito discussion.
@@ -3008,9 +4312,17 @@ async function init() {
   await route();
   await refreshStatus();
   setInterval(refreshStatus, 4000);
-  // The questions an earlier visit left to the memory, once the service answers.
+  /*
+      The questions an earlier visit left to the memory, once the service answers, and the titles
+      it left to write.
+  */
   rememberLater();
-  window.addEventListener('pagehide', () => { if (memoryRunning) releaseMemoryLease().catch(() => {}); });
+  namePending();
+  // A tab that closes gives back the lease of the memory and tells that it no longer answers.
+  window.addEventListener('pagehide', () => {
+    if (memoryRunning) releaseMemoryLease().catch(() => {});
+    if (state.busyId) broadcast({ type: 'busy', id: state.busyId, tab: tabId, busy: false });
+  });
 }
 
 init();

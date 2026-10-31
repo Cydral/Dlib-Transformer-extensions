@@ -19,6 +19,7 @@
 
 #include "gguf_reader_abstract.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -99,7 +100,13 @@ namespace dlib
         int64_t as_int() const
         {
             if (type == gguf_type::FLOAT32 || type == gguf_type::FLOAT64)
+            {
+                // Saturated, since the conversion of a value beyond the range of int64 is undefined.
+                if (!(d == d)) return 0;
+                if (d >= 9.2e18) return INT64_MAX;
+                if (d <= -9.2e18) return INT64_MIN;
                 return static_cast<int64_t>(d);
+            }
             return i;
         }
         double as_double() const
@@ -182,9 +189,13 @@ namespace dlib
 
             const uint64_t tensor_count = read_raw<uint64_t>();
             const uint64_t kv_count = read_raw<uint64_t>();
-            // Every entry takes several bytes, so counts beyond the size of the container
-            // can only come from a damaged file.
-            if (tensor_count > size_ || kv_count > size_)
+            /* A metadata entry takes 13 bytes at least (the length of its key, its type and a
+               value of one byte) and a tensor descriptor 32 (the length of its name, one
+               dimension, its type and its offset); larger counts come from a damaged file, as
+               do counts beyond 2^20, far above those of the published models, which bound the
+               memory of the parsed header whatever the size of the file. */
+            if (tensor_count > remaining() / 32 || kv_count > remaining() / 13
+                || tensor_count > max_entries || kv_count > max_entries)
                 throw std::runtime_error("gguf_reader: corrupt header (entry counts exceed the file size)");
 
             for (uint64_t k = 0; k < kv_count; ++k)
@@ -195,10 +206,14 @@ namespace dlib
             }
 
             if (has("general.alignment"))
-                alignment_ = static_cast<uint64_t>(at("general.alignment").as_int());
-            if (alignment_ == 0) alignment_ = 32;
+            {
+                const int64_t a = at("general.alignment").as_int();
+                if (a <= 0 || a > 65536 || (a & (a - 1)) != 0)
+                    throw std::runtime_error("gguf_reader: invalid alignment " + std::to_string(a));
+                alignment_ = static_cast<uint64_t>(a);
+            }
 
-            tensors_.reserve(static_cast<size_t>(tensor_count));
+            tensors_.reserve(static_cast<size_t>(std::min<uint64_t>(tensor_count, 1 << 16)));
             for (uint64_t t = 0; t < tensor_count; ++t)
             {
                 gguf_tensor_info info;
@@ -285,6 +300,9 @@ namespace dlib
     private:
         static uint64_t align_up(uint64_t x, uint64_t a) { return (x + a - 1) / a * a; }
 
+        static const uint64_t max_entries = uint64_t(1) << 20;
+        static const uint64_t max_array_elements = uint64_t(1) << 24;
+
         template <typename T> T read_raw()
         {
             T x{};
@@ -309,6 +327,19 @@ namespace dlib
             if (!in_) throw std::runtime_error("gguf_reader: unexpected end of file in string");
             pos_ += len;
             return str;
+        }
+
+        // Bytes of a scalar of type t in the file, 0 for the strings, arrays and unknown types.
+        static uint64_t scalar_size(gguf_type t)
+        {
+            switch (t)
+            {
+            case gguf_type::UINT8: case gguf_type::INT8: case gguf_type::BOOL: return 1;
+            case gguf_type::UINT16: case gguf_type::INT16: return 2;
+            case gguf_type::UINT32: case gguf_type::INT32: case gguf_type::FLOAT32: return 4;
+            case gguf_type::UINT64: case gguf_type::INT64: case gguf_type::FLOAT64: return 8;
+            default: return 0;
+            }
         }
 
         void read_scalar_into(gguf_value& v, gguf_type t)
@@ -341,17 +372,26 @@ namespace dlib
             const gguf_type et = static_cast<gguf_type>(read_raw<uint32_t>());
             const uint64_t n = read_raw<uint64_t>();
             v.array_type = et;
-            if (n > remaining())
+            // The smallest size of an element in the file; a string holds at least its length.
+            const uint64_t least = et == gguf_type::STRING ? 8 : scalar_size(et);
+            if (least == 0) throw std::runtime_error("gguf_reader: invalid array element type");
+            /* An array of more than 2^24 elements, sixty-four times the largest vocabularies,
+               comes from a damaged file, whose elements, empty strings or zeros, would take
+               several times the size of the file in memory. */
+            if (n > remaining() / least || n > max_array_elements)
                 throw std::runtime_error("gguf_reader: array length exceeds the file size");
+            /* The memory follows the elements actually read, and a declared length within the
+               file reserves a bounded amount at first. */
+            const size_t reserved = static_cast<size_t>(std::min<uint64_t>(n, 1 << 20));
 
             if (et == gguf_type::STRING)
             {
-                v.arr_str.reserve(static_cast<size_t>(n));
+                v.arr_str.reserve(reserved);
                 for (uint64_t k = 0; k < n; ++k) v.arr_str.push_back(read_string());
             }
             else if (et == gguf_type::FLOAT32 || et == gguf_type::FLOAT64)
             {
-                v.arr_float.reserve(static_cast<size_t>(n));
+                v.arr_float.reserve(reserved);
                 gguf_value tmp;
                 for (uint64_t k = 0; k < n; ++k) { read_scalar_into(tmp, et); v.arr_float.push_back(tmp.d); }
             }
@@ -361,7 +401,7 @@ namespace dlib
             }
             else
             {
-                v.arr_int.reserve(static_cast<size_t>(n));
+                v.arr_int.reserve(reserved);
                 gguf_value tmp;
                 for (uint64_t k = 0; k < n; ++k) { read_scalar_into(tmp, et); v.arr_int.push_back(tmp.i); }
             }

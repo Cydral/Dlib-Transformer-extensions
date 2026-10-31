@@ -119,12 +119,16 @@ namespace albireo
     void engine_library::unload()
     {
         if (!handle_) return;
+        if (!keep_)
+        {
 #if defined(_WIN32)
-        FreeLibrary(static_cast<HMODULE>(handle_));
+            FreeLibrary(static_cast<HMODULE>(handle_));
 #else
-        dlclose(handle_);
+            dlclose(handle_);
 #endif
+        }
         handle_ = nullptr;
+        keep_ = false;
         path_.clear();
         abi_version = nullptr;
         describe = nullptr;

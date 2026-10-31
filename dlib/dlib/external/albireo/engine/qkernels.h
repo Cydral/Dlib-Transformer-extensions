@@ -5,6 +5,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <new>
 #include <string>
 #include <vector>
 
@@ -74,6 +76,46 @@ namespace albireo
 
     // Expands one weight row to floats (reference path and embedding lookup).
     void qk_dequantize_row(dlib::ggml_type t, const uint8_t* w, float* dst, long n);
+
+    /*!
+        An allocator whose blocks start on 64 bytes, the size of a cache line and of a vector
+        of AVX-512.  The buffers of the activations and of the attention use it: a row whose
+        length is a multiple of 16 floats then starts on a line, and no vector load of the
+        kernels reads two lines at once, which costs up to twice the time of a load within one.
+    !*/
+    template <typename T>
+    struct aligned_allocator
+    {
+        typedef T value_type;
+
+        aligned_allocator() noexcept {}
+        template <typename U> aligned_allocator(const aligned_allocator<U>&) noexcept {}
+
+        T* allocate(size_t n)
+        {
+            if (n > (static_cast<size_t>(-1) - 128) / sizeof(T)) throw std::bad_alloc();
+            // The address returned by operator new is kept just before the aligned block.
+            char* raw = static_cast<char*>(::operator new(n * sizeof(T) + 64 + sizeof(void*)));
+            const uintptr_t first = reinterpret_cast<uintptr_t>(raw) + sizeof(void*);
+            char* p = raw + sizeof(void*) + (64 - first % 64) % 64;
+            std::memcpy(p - sizeof(void*), &raw, sizeof(void*));
+            return reinterpret_cast<T*>(p);
+        }
+
+        void deallocate(T* p, size_t) noexcept
+        {
+            void* raw;
+            std::memcpy(&raw, reinterpret_cast<char*>(p) - sizeof(void*), sizeof(void*));
+            ::operator delete(raw);
+        }
+    };
+
+    template <typename T, typename U>
+    bool operator==(const aligned_allocator<T>&, const aligned_allocator<U>&) { return true; }
+    template <typename T, typename U>
+    bool operator!=(const aligned_allocator<T>&, const aligned_allocator<U>&) { return false; }
+
+    typedef std::vector<float, aligned_allocator<float>> aligned_floats;
 
     /*!
         Scratch memory a thread reuses between products, so that a token allocates nothing.
@@ -162,6 +204,8 @@ namespace albireo
     float qk_max(const float* x, long n);
     // x[i] = exp(x[i] - m), returns the sum of the results.
     float qk_exp_shift_sum(float* x, float m, long n);
+    // g[i] = silu(g[i]) * u[i], the gate of a SwiGLU block, silu(x) = x / (1 + exp(-x)).
+    void qk_silu_mul(float* g, const float* u, long n);
 
     /*!
         The attention by tiles of the processor runtime.  A tile holds rows of queries, the

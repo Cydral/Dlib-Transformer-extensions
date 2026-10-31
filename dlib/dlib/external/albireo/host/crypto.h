@@ -40,6 +40,26 @@ namespace albireo
     std::string sha256_file(const std::string& path, const std::function<void(uint64_t)>& progress = nullptr,
         const std::atomic<bool>* cancel = nullptr);
 
+    class link_free_file;
+
+    /*!
+        ensures
+            - Returns the SHA-256 of the size() bytes of an open file from its start, or an
+              empty string when they cannot be read or when cancel becomes true.
+    !*/
+    std::string sha256_open_file(link_free_file& f, const std::atomic<bool>* cancel = nullptr);
+
+    /*!
+        ensures
+            - Copies the size() bytes of an open file from its start into to, a new file
+              (new_file), and returns the SHA-256 of what was written.
+            - Returns an empty string, and removes to, when the copy fails or is cancelled, or
+              when expected is given and differs from that hash.  A name to taken already is
+              left as it is.
+    !*/
+    std::string copy_open_file(link_free_file& from, const std::string& to, const std::string& expected,
+        const std::atomic<bool>* cancel = nullptr);
+
     /*!
         ensures
             - Checks an ECDSA P-256 signature with SHA-256 (DER encoded, given in base64)

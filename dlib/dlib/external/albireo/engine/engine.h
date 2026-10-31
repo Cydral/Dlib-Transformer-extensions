@@ -93,6 +93,7 @@ namespace albireo
         void requeue_preempted(loaded_model& m);
         void drop_cancelled(loaded_model& m);
         void abandon(loaded_model& m, const std::string& code, const std::string& message);
+        void trim_after_failure(loaded_model& m);
         void trim_idle(const std::vector<std::shared_ptr<loaded_model>>& models);
         void handle_token(loaded_model& m, request_state& r, int token);
         void emit_text(loaded_model& m, request_state& r, const std::string& text);

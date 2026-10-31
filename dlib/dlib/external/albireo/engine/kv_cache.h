@@ -45,6 +45,9 @@ namespace albireo
         {
             if (n_layers <= 0 || n_kv_heads <= 0 || head_dim <= 0 || block_positions <= 0)
                 throw std::invalid_argument("kv_pool: invalid geometry");
+            // A block of 2^40 halves at most, whose size in bytes stays far from overflowing.
+            const double halves = static_cast<double>(n_layers) * n_kv_heads * block_positions * head_dim;
+            if (halves > 1099511627776.0) throw std::invalid_argument("kv_pool: blocks too large");
             // Keys then values, each layers x heads x positions x head_dim halves.
             half_per_kind_ = static_cast<size_t>(layers_) * heads_ * positions_ * head_dim_;
             block_bytes_ = 2 * half_per_kind_ * sizeof(uint16_t);

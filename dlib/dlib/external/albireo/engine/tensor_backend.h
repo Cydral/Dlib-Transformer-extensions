@@ -101,6 +101,9 @@ namespace albireo
                 - Returns the devices this build can use on this machine, in the form of the
                   "devices" of engine_api.h, and sets reason when there is none, with its
                   code and the values of the code in args (engine_api.h, "reason_code").
+                - When devices are found, sets reason, without a code, to why the other
+                  devices the backend looks for were left out (engine_api.h, "missing"), or
+                  leaves it empty.
                 - Fills backend with the name of the backend ("cuda", "openvino", "dlib")
                   and runtime with the version of its runtime, when known.
         !*/

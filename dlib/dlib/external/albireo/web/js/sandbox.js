@@ -91,8 +91,21 @@
       return { id: id, ok: false, logs: [], error: 'The result of the code could not be read.' };
     }
   };
+  /*
+      The application that frames this page is served from the origin of the address of this
+      page, while the sandbox gives this page an opaque origin of its own.  The code comes from
+      that application only, and the results go to it only.
+  */
+  var appOrigin = '*';
+  try {
+    appOrigin = new URL(location.href).origin;
+  } catch (err) {
+    appOrigin = '*';
+  }
+  if (!/^https?:/.test(appOrigin)) appOrigin = '*';
   window.addEventListener('message', function (e) {
     if (e.source !== window.parent || !e.data || typeof e.data.code !== 'string') return;
+    if (appOrigin !== '*' && e.origin !== appOrigin) return;
     var id = e.data.id;
     var worker = new Worker(url);
     var finished = false;
@@ -101,7 +114,7 @@
       finished = true;
       clearTimeout(timer);
       worker.terminate();
-      window.parent.postMessage(reply(id, data), '*');
+      window.parent.postMessage(reply(id, data), appOrigin);
     };
     var timer = setTimeout(function () {
       finish({ ok: false, logs: [], error: 'The code did not finish within the time limit.' });
@@ -114,5 +127,5 @@
     };
     worker.postMessage({ code: e.data.code });
   });
-  window.parent.postMessage({ ready: true }, '*');
+  window.parent.postMessage({ ready: true }, appOrigin);
 })();

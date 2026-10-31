@@ -6,14 +6,16 @@
 
         albireo-setup                       the installation wizard, or the update wizard
                                             when Albireo is installed
-        albireo-setup /silent [/dir <folder>] [/models <folder>] [/port <port>] [/offline]
-                                            installation without questions; over an
+        albireo-setup /silent [/dir <folder>] [/data-dir <folder>] [/models <folder>] [/port <port>]
+                      [/offline]            installation without questions; over an
                                             installation, an update that keeps everything but
                                             the options given; /offline for a computer
                                             without Internet access
         albireo-setup /update /silent       update started by the service (keeps everything)
-        albireo-setup /uninstall [/silent] [/purge]
-                                            removal; /purge also deletes models and settings
+        albireo-setup /uninstall [/silent] [/keep-data]
+                                            removal of the programs and of the data, the
+                                            models and the settings staying with /keep-data
+                                            (/purge, accepted, is the default)
         albireo-setup /models-dir <folder>  moves the models folder (asked by the tray)
         albireo-setup /service start|stop|restart
         albireo-setup /lang <code>          language of the wizard: en, fr, de, it, es
@@ -26,8 +28,9 @@
     stays: the settings, the models, the certificates and their trust, the token of the
     tray, the shortcuts and the start of the icon.  The new files are written beside the
     files in place, then take their places together; when a step fails, the previous
-    files come back and the service starts again.  A newer version in place is left as
-    it is.  An offline bundle
+    files come back and the service starts again.  Once the new files stay, those of the
+    engines, the web application and the licenses that this version no longer carries
+    are deleted.  A newer version in place is left as it is.  An offline bundle
     (tools/make_offline_bundle.py) puts the installer next to a signed catalog and a
     "models" folder, on a memory card for instance: the models the catalog lists are
     imported at the first start of the service, for the computers without network.
@@ -49,6 +52,7 @@
 
 #include "../common/platform.h"
 #include "../common/version.h"
+#include "../host/certificates.h"
 #include "resource.h"
 #include "setup_actions.h"
 #include "strings.h"
@@ -152,6 +156,7 @@ namespace albireo
             std::string error;
             std::string notice;
             bool icons_closed = false;   // icons of this session closed for the copy
+            bool rolled_back = false;    // the previous programs were put back after a failure
         };
 
         // The text of a problem of a folder (setup::folder_problem()), in the language of the wizard.
@@ -183,15 +188,41 @@ namespace albireo
                 error = folder_text(problem, o.program_dir);
                 return false;
             }
-            if (!secure_folder(o.program_dir, error)) return false;
-            if (o.models_dir.empty() || o.models_dir == setup::default_models_dir()) return true;
+            if (!setup::secure_parents(o.program_dir, error) || !secure_folder(o.program_dir, error)) return false;
+            if (o.models_dir.empty() || o.models_dir == setup::default_models_dir())
+            {
+                setup::record_models_dir(std::string(), false);
+                return true;
+            }
             const std::string models_problem = setup::folder_problem(o.models_dir, false);
             if (!models_problem.empty())
             {
                 error = folder_text(models_problem, o.models_dir);
                 return false;
             }
-            return secure_folder(o.models_dir, error);
+            // A models folder new or empty when chosen goes whole with Albireo.
+            const bool owned = !dir_exists(o.models_dir) || list_dir(o.models_dir).empty();
+            if (!secure_folder(o.models_dir, error)) return false;
+            setup::record_models_dir(o.models_dir, owned);
+            return true;
+        }
+
+        /*
+            The data folder of the installation, recorded in the registry for every program
+            before anything is written there: the folder chosen for a new installation, which
+            must serve (setup::data_folder_problem()), and the folder in use for an update.
+        */
+        bool record_data_folder(const setup::install_options& o, bool update, std::string& error)
+        {
+            if (update) return !setup::recorded_data_dir().empty() || setup::record_data_dir(data_dir(), error);
+            const std::string dir = o.data_dir.empty() ? setup::default_data_dir() : o.data_dir;
+            const std::string problem = setup::data_folder_problem(dir, o.program_dir);
+            if (!problem.empty())
+            {
+                error = folder_text(problem, dir);
+                return false;
+            }
+            return setup::record_data_dir(dir, error);
         }
 
         // The programs, the models that come with the complete installer and the uninstaller, staged.
@@ -225,16 +256,14 @@ namespace albireo
                 progress(800 + static_cast<int>(total ? 50 * done / total : 0), tr("step_files", { { "f", f } }), true);
             };
             if (!setup::stage_bundle(copying, report.notice)) setup::log("offline bundle: " + report.notice);
+            /*
+                The service makes the certificates at its start, under its own account, and puts
+                its authority in the trusted roots as settings.json says (write_settings()); an
+                update keeps the certificates and their trust.
+            */
             progress(850, tr("step_certificates"), false);
-            bool renewed = false;
-            if (!setup::create_certificates(!update, renewed, error)) return false;
-            // An update trusts the authority made anew in place of one that Windows trusted.
-            const bool trust = update ? renewed && setup::authority_trusted() : o.trust_certificate;
-            if (trust && !setup::trust_authority(error))
-            {
-                setup::log("trust of the local authority: " + error);
-                error.clear();
-            }
+            if (!setup::prepare_certificates(!update, error)) return false;
+            if (!update && !o.trust_certificate) setup::untrust_authority();
             progress(900, tr("step_service"), false);
             if (!setup::register_service(o.program_dir, error)) return false;
             // The size of the installation, with the models that came with it, now or before.
@@ -252,6 +281,23 @@ namespace albireo
         }
 
         /*
+            Whether the programs placed in dir are those of this installer: an installer built
+            from other sources would otherwise record its version over other programs.
+        */
+        bool programs_match(const std::string& dir, std::string& error)
+        {
+            for (const char* name : { "albireo-service.exe", "albireo-tray.exe" })
+            {
+                const std::string version = setup::program_version(join_path(dir, name));
+                if (version.empty() || version == ALBIREO_VERSION) continue;
+                error = std::string(name) + " of this installer is version " + version + ", not " + ALBIREO_VERSION
+                    + ": the installer was built from other sources";
+                return false;
+            }
+            return true;
+        }
+
+        /*
             Installs the programs, or updates them when update is true: the settings, the
             certificates and their trust, the shortcuts and the start of the icon then stay
             as they are.  close_icons closes the icons of the users first; the update started
@@ -260,13 +306,14 @@ namespace albireo
             anything stops; when a later step fails, the previous programs come back and the
             service starts again if it was running.
         */
-        bool perform_install(const setup::install_options& o, bool update, bool close_icons,
+        bool install_programs(const setup::install_options& o, bool update, bool close_icons,
             const progress_fn& progress, install_report& report)
         {
             std::string& error = report.error;
-            if (!setup::prepare_data_dir(error)) return false;
+            if (!record_data_folder(o, update, error) || !setup::prepare_data_dir(error)) return false;
             const std::string what = update ? "update" : "installation";
-            setup::log(what + " of " + ALBIREO_VERSION + " in " + o.program_dir + ", port " + std::to_string(o.port));
+            setup::log(what + " of " + ALBIREO_VERSION + " in " + o.program_dir + ", data in " + data_dir() + ", port "
+                + std::to_string(o.port));
             if (!prepare_folders(o, update, error)) return false;
             // The new files stay beside those they replace until the end of the copy.
             const setup::builtin_overlay overlay = setup::read_builtin_overlay(executable_path());
@@ -288,14 +335,17 @@ namespace albireo
             setup::stop_service(60000, error);
             error.clear();
             if (close_icons) report.icons_closed = setup::close_trays(10000);
+            // The children of the service that outlive it, the probe of an engine for instance.
+            setup::end_processes(o.program_dir, 5000, "albireo-service.exe");
             setup::staged_files files;
             const bool copied = stage_programs(o.program_dir, overlay.present(), files, progress, error)
-                && files.commit(error);
+                && files.commit(error) && programs_match(o.program_dir, error);
             if (!copied || !configure(o, update, progress, report))
             {
                 // The previous programs come back, and the service as it was.
                 setup::log("the previous programs are put back: " + error);
                 files.rollback();
+                report.rolled_back = true;
                 std::string e;
                 if (!had_service) setup::remove_service(e);
                 setup::restore_recovery();
@@ -303,6 +353,8 @@ namespace albireo
                 return false;
             }
             files.finish();
+            // What an earlier version placed and this one no longer carries goes once the change stays.
+            setup::remove_stale_files(o.program_dir, files.targets());
             setup::write_file_list(o.program_dir, files.targets());
             progress(950, tr("step_start"), false);
             // A service started meanwhile runs the previous programs: it stops first.
@@ -315,30 +367,125 @@ namespace albireo
             return true;
         }
 
-        // Removes the installation registered on this computer; false when there is none.
-        bool perform_uninstall(bool purge, const progress_fn& progress, std::string& error)
+        /*
+            install_programs(), and the record of its result in the log and for the tray
+            (setup::write_result()), which tells the user of an update made out of sight that
+            failed.
+        */
+        bool perform_install(const setup::install_options& o, bool update, bool close_icons,
+            const progress_fn& progress, install_report& report)
         {
+            const std::string previous = setup::installed_version();
+            const std::string recorded = setup::recorded_data_dir();
+            const bool ok = install_programs(o, update, close_icons, progress, report);
+            const std::string what = update ? "update" : "installation";
+            if (!ok)
+            {
+                setup::log(what + " failed: " + report.error);
+                if (report.rolled_back && update) setup::log("version " + previous + " is in place again");
+                else if (report.rolled_back) setup::log("the files copied are removed");
+            }
+            setup::write_result(what, previous, ok, report.rolled_back, report.error);
+            /*
+                A new installation that failed leaves the record of the folders as it found it,
+                unless its programs stay registered, as when only the start of the service
+                failed: they keep the folders they use, which their uninstaller removes.
+            */
+            if (!ok && !update && previous.empty() && setup::installed_version().empty())
+            {
+                std::string e;
+                if (recorded.empty()) setup::forget_folders();
+                else setup::record_data_dir(recorded, e);
+            }
+            return ok;
+        }
+
+        // The keys and the certificates of the local server, which leave with the programs, then their folder.
+        void remove_certificates()
+        {
+            const std::string dir = join_path(data_dir(), "certificates");
+            if (!remove_certificate_files(dir)) setup::log("a certificate or a key of " + dir + " cannot be deleted");
+            RemoveDirectoryW(widen(dir).c_str());
+        }
+
+        /*
+            The models folder chosen outside the data folder: whole when it was new or empty
+            when chosen, otherwise the model files the service recorded there, then the folder
+            when nothing else stays in it.
+        */
+        void remove_models_folder(const std::string& models)
+        {
+            if (setup::models_dir_owned(models) && setup::removable_folder(models))
+            {
+                setup::log("removal of the models folder " + models);
+                setup::remove_folder(models);
+                return;
+            }
+            const std::vector<std::string> files = setup::recorded_model_files(models);
+            setup::log("removal of the " + std::to_string(files.size()) + " files of models of " + models);
+            for (const auto& f : files) remove_file(f);
+            RemoveDirectoryW(widen(models).c_str());
+        }
+
+        /*
+            Removes the installation registered on this computer; false when there is none.
+            The folder of the programs and the data folder go whole, with the models folder
+            (remove_models_folder()); with keep_data, the data and the models stay for a later
+            installation, without the certificates, the keys, the token of the tray and the
+            caches.
+        */
+        bool perform_uninstall(bool keep_data, const progress_fn& progress, install_report& report)
+        {
+            std::string& error = report.error;
             const std::string dir = setup::installed_dir();
             if (dir.empty())
             {
                 error = narrow(tr("not_installed"));
                 return false;
             }
+            // The folders read before anything goes: the record of the data folder leaves last.
+            const std::string data = data_dir();
+            std::string text;
+            const std::string chosen = read_file(join_path(data, "settings.json"), text, 1u << 20)
+                ? json::parse_or_null(text)["models_dir"].as_string() : std::string();
+            const std::string models = chosen.empty() ? join_path(data, "models") : chosen;
             std::string e;
-            if (dir_exists(data_dir())) setup::prepare_data_dir(e);
-            setup::log("uninstallation from " + dir);
+            if (dir_exists(data)) setup::prepare_data_dir(e);
+            setup::log("uninstallation from " + dir + (keep_data ? ", the data kept in " : ", with the data of ")
+                + data);
             progress(100, tr("step_stop"), false);
             setup::remove_service(e);
             setup::close_trays(10000);
+            // The other programs of the folder: the icons of the other sessions, the children of the service.
+            setup::end_processes(dir, 5000);
             progress(400, tr("uninstall_progress"), false);
             setup::set_autostart(dir, false);
             setup::remove_shortcuts();
             setup::untrust_authority();
+            remove_certificates();
             setup::remove_uninstall();
-            // The files of the installation only, and its folder once empty.
-            setup::remove_installation(dir);
+            std::vector<std::string> keep;
+            if (keep_data) keep = { data, models };
+            else if (!path_inside(models, data)) remove_models_folder(models);
+            if (!setup::remove_installation(dir, keep)) report.notice = narrow(tr("uninstall_kept", { { "d", dir } }));
             progress(800, tr("uninstall_progress"), false);
-            if (purge) setup::remove_folder(data_dir());
+            if (keep_data)
+            {
+                // The secrets and the caches go: a new installation makes them again.
+                remove_file(join_path(data, "admin.token"));
+                for (const char* cache : { "engine-cache", "updates" }) setup::remove_folder(join_path(data, cache));
+            }
+            else if (setup::removable_folder(data))
+            {
+                setup::log("removal of the data folder " + data);
+                setup::remove_folder(data);
+                setup::forget_folders();
+            }
+            else
+            {
+                setup::log("the data folder " + data + " is a folder of the system: it stays");
+                setup::forget_folders();
+            }
             progress(1000, tr("step_done"), false);
             return true;
         }
@@ -350,7 +497,8 @@ namespace albireo
             IDC_TITLE = 100, IDC_TEXT, IDC_LANG_LABEL, IDC_LANG, IDC_LICENSE, IDC_ACCEPT, IDC_DIR_LABEL, IDC_DIR,
             IDC_DIR_BROWSE, IDC_MODELS_LABEL, IDC_MODELS, IDC_MODELS_BROWSE, IDC_SPACE, IDC_SPACE_NOTE, IDC_AUTOSTART,
             IDC_DESKTOP, IDC_TRUST, IDC_DEFAULT_MODEL, IDC_PORT_LABEL, IDC_PORT, IDC_STEP, IDC_PROGRESS, IDC_DETAIL,
-            IDC_LAUNCH, IDC_PURGE, IDC_BACK, IDC_NEXT, IDC_CANCEL, IDC_OFFLINE
+            IDC_LAUNCH, IDC_KEEP_DATA, IDC_BACK, IDC_NEXT, IDC_CANCEL, IDC_OFFLINE, IDC_DATA_LABEL, IDC_DATA,
+            IDC_DATA_BROWSE
         };
 
         struct wizard
@@ -370,6 +518,10 @@ namespace albireo
             std::string notice;
             // The icons of this session were closed for the copy.
             bool icons_closed = false;
+            // The previous programs were put back after a failure.
+            bool rolled_back = false;
+            // The data folder typed last, which the models folder of the data folder follows.
+            std::wstring data_text;
             std::string previous_version;
             // Albireo is installed: the wizard updates it, or leaves a newer version alone.
             bool update = false;
@@ -406,10 +558,16 @@ namespace albireo
         bool folders_accepted()
         {
             const std::string programs = narrow(ui::text_of(ctl(IDC_DIR)));
+            const std::string data = narrow(ui::text_of(ctl(IDC_DATA)));
             const std::string models = narrow(ui::text_of(ctl(IDC_MODELS)));
             std::string dir = programs;
             std::string problem = setup::folder_problem(programs, true);
-            if (problem.empty() && !models.empty() && models != setup::default_models_dir())
+            if (problem.empty())
+            {
+                dir = data;
+                problem = setup::data_folder_problem(data, programs);
+            }
+            if (problem.empty() && !models.empty() && models != join_path(data, "models"))
             {
                 dir = models;
                 problem = setup::folder_problem(models, false);
@@ -426,8 +584,10 @@ namespace albireo
             ui::set_text(ctl(IDC_LANG_LABEL), tr("lbl_language"));
             ui::set_text(ctl(IDC_ACCEPT), tr("license_accept"));
             ui::set_text(ctl(IDC_DIR_LABEL), tr("folder_programs"));
+            ui::set_text(ctl(IDC_DATA_LABEL), tr("folder_data"));
             ui::set_text(ctl(IDC_MODELS_LABEL), tr("folder_models"));
             ui::set_text(ctl(IDC_DIR_BROWSE), tr("browse"));
+            ui::set_text(ctl(IDC_DATA_BROWSE), tr("browse"));
             ui::set_text(ctl(IDC_MODELS_BROWSE), tr("browse"));
             ui::set_text(ctl(IDC_SPACE_NOTE), tr("space_models"));
             ui::set_text(ctl(IDC_AUTOSTART), tr("opt_autostart"));
@@ -437,18 +597,25 @@ namespace albireo
             ui::set_text(ctl(IDC_OFFLINE), tr("opt_offline"));
             ui::set_text(ctl(IDC_PORT_LABEL), tr("opt_port"));
             ui::set_text(ctl(IDC_LAUNCH), tr("opt_launch"));
-            ui::set_text(ctl(IDC_PURGE), tr("uninstall_data"));
+            ui::set_text(ctl(IDC_KEEP_DATA), tr("uninstall_keep_data"));
             ui::set_text(ctl(IDC_BACK), tr("btn_back"));
             ui::set_text(ctl(IDC_CANCEL), tr("btn_cancel"));
+        }
+
+        // The text of the uninstallation page follows the choice of keeping the models and the settings.
+        std::wstring uninstall_text()
+        {
+            return tr(ui::checked(ctl(IDC_KEEP_DATA)) ? "uninstall_text_keep" : "uninstall_text") + L"\n\n"
+                + tr("uninstall_browser");
         }
 
         void show_page(page p)
         {
             wz.current = p;
             const std::vector<int> all = { IDC_TEXT, IDC_LANG_LABEL, IDC_LANG, IDC_LICENSE, IDC_ACCEPT, IDC_DIR_LABEL,
-                IDC_DIR, IDC_DIR_BROWSE, IDC_MODELS_LABEL, IDC_MODELS, IDC_MODELS_BROWSE, IDC_SPACE, IDC_SPACE_NOTE,
-                IDC_AUTOSTART, IDC_DESKTOP, IDC_TRUST, IDC_DEFAULT_MODEL, IDC_OFFLINE, IDC_PORT_LABEL, IDC_PORT,
-                IDC_STEP, IDC_PROGRESS, IDC_DETAIL, IDC_LAUNCH, IDC_PURGE };
+                IDC_DIR, IDC_DIR_BROWSE, IDC_DATA_LABEL, IDC_DATA, IDC_DATA_BROWSE, IDC_MODELS_LABEL, IDC_MODELS,
+                IDC_MODELS_BROWSE, IDC_SPACE, IDC_SPACE_NOTE, IDC_AUTOSTART, IDC_DESKTOP, IDC_TRUST, IDC_DEFAULT_MODEL,
+                IDC_OFFLINE, IDC_PORT_LABEL, IDC_PORT, IDC_STEP, IDC_PROGRESS, IDC_DETAIL, IDC_LAUNCH, IDC_KEEP_DATA };
             std::vector<int> visible;
             std::wstring title, text;
             switch (p)
@@ -472,8 +639,8 @@ namespace albireo
                 break;
             case P_FOLDERS:
                 title = tr("folder_title");
-                visible = { IDC_DIR_LABEL, IDC_DIR, IDC_DIR_BROWSE, IDC_MODELS_LABEL, IDC_MODELS, IDC_MODELS_BROWSE,
-                    IDC_SPACE, IDC_SPACE_NOTE };
+                visible = { IDC_DIR_LABEL, IDC_DIR, IDC_DIR_BROWSE, IDC_DATA_LABEL, IDC_DATA, IDC_DATA_BROWSE,
+                    IDC_MODELS_LABEL, IDC_MODELS, IDC_MODELS_BROWSE, IDC_SPACE, IDC_SPACE_NOTE };
                 break;
             case P_OPTIONS:
                 title = tr("options_title");
@@ -493,11 +660,15 @@ namespace albireo
                     text = wz.succeeded
                         ? tr("update_done_text", { { "v", ALBIREO_VERSION }, { "o", wz.previous_version } })
                         : tr("update_failed", { { "e", wz.error } });
+                    // A failed update says that the previous version is back in place.
+                    if (!wz.succeeded && wz.rolled_back)
+                        text += L"\n\n" + tr("update_rolled_back", { { "o", wz.previous_version } });
                 }
                 else
                 {
                     title = wz.succeeded ? tr("finish_title") : tr("error_title");
                     text = wz.succeeded ? tr("finish_text") : tr("error_failed", { { "e", wz.error } });
+                    if (!wz.succeeded && wz.rolled_back) text += L"\n\n" + tr("install_rolled_back");
                 }
                 if (wz.succeeded && !wz.notice.empty()) text += L"\n\n" + tr("bundle_notice", { { "e", wz.notice } });
                 visible = { IDC_TEXT };
@@ -505,12 +676,14 @@ namespace albireo
                 break;
             case P_UNINSTALL:
                 title = tr("uninstall_title");
-                text = tr("uninstall_text") + L"\n\n" + tr("uninstall_browser");
-                visible = { IDC_TEXT, IDC_PURGE };
+                text = uninstall_text();
+                visible = { IDC_TEXT, IDC_KEEP_DATA };
                 break;
             case P_REMOVED:
                 title = tr("uninstall_title");
                 text = wz.succeeded ? tr("uninstall_done") : widen(wz.error);
+                // The folder of the programs that stays with the folders kept.
+                if (wz.succeeded && !wz.notice.empty()) text += L"\n\n" + widen(wz.notice);
                 visible = { IDC_TEXT };
                 break;
             }
@@ -559,18 +732,22 @@ namespace albireo
             ui::place(ctl(IDC_TEXT), x, y, cw, px(170));
             ui::place(ctl(IDC_LANG_LABEL), x, y + px(190), px(120), px(22));
             ui::place(ctl(IDC_LANG), x + px(126), y + px(186), px(200), px(200));
-            ui::place(ctl(IDC_PURGE), x, y + px(150), cw, px(40));
+            ui::place(ctl(IDC_KEEP_DATA), x, y + px(150), cw, px(40));
             ui::place(ctl(IDC_LAUNCH), x, y + px(150), cw, px(24));
             ui::place(ctl(IDC_LICENSE), x, y, cw, by - px(56) - y);
             ui::place(ctl(IDC_ACCEPT), x, by - px(44), cw, px(24));
-            ui::place(ctl(IDC_DIR_LABEL), x, y, cw, px(20));
-            ui::place(ctl(IDC_DIR), x, y + px(22), cw - px(110), px(26));
-            ui::place(ctl(IDC_DIR_BROWSE), x + cw - px(100), y + px(21), px(100), px(28));
-            ui::place(ctl(IDC_MODELS_LABEL), x, y + px(66), cw, px(20));
-            ui::place(ctl(IDC_MODELS), x, y + px(88), cw - px(110), px(26));
-            ui::place(ctl(IDC_MODELS_BROWSE), x + cw - px(100), y + px(87), px(100), px(28));
-            ui::place(ctl(IDC_SPACE), x, y + px(136), cw, px(64));
-            ui::place(ctl(IDC_SPACE_NOTE), x, y + px(204), cw, px(40));
+            // The folders of the programs, of the data and of the models, then the space of the drive.
+            const int fields[] = { IDC_DIR_LABEL, IDC_DIR, IDC_DIR_BROWSE, IDC_DATA_LABEL, IDC_DATA, IDC_DATA_BROWSE,
+                IDC_MODELS_LABEL, IDC_MODELS, IDC_MODELS_BROWSE };
+            for (int i = 0; i < 3; ++i)
+            {
+                const int fy = y + px(60) * i;
+                ui::place(ctl(fields[3 * i]), x, fy, cw, px(20));
+                ui::place(ctl(fields[3 * i + 1]), x, fy + px(22), cw - px(110), px(26));
+                ui::place(ctl(fields[3 * i + 2]), x + cw - px(100), fy + px(21), px(100), px(28));
+            }
+            ui::place(ctl(IDC_SPACE), x, y + px(186), cw, px(64));
+            ui::place(ctl(IDC_SPACE_NOTE), x, y + px(254), cw, px(40));
             int oy = y;
             for (int id : { IDC_AUTOSTART, IDC_DESKTOP, IDC_TRUST, IDC_DEFAULT_MODEL, IDC_OFFLINE })
             {
@@ -616,11 +793,15 @@ namespace albireo
             add(IDC_DIR_LABEL, ui::label(wz.hwnd, L"", IDC_DIR_LABEL), ui::font_kind::bold);
             add(IDC_DIR, ui::edit(wz.hwnd, widen(current.program_dir), IDC_DIR));
             add(IDC_DIR_BROWSE, ui::button(wz.hwnd, L"", IDC_DIR_BROWSE));
+            add(IDC_DATA_LABEL, ui::label(wz.hwnd, L"", IDC_DATA_LABEL), ui::font_kind::bold);
+            wz.data_text = widen(current.data_dir);
+            add(IDC_DATA, ui::edit(wz.hwnd, wz.data_text, IDC_DATA));
+            add(IDC_DATA_BROWSE, ui::button(wz.hwnd, L"", IDC_DATA_BROWSE));
             if (!wz.previous_version.empty())
             {
-                // An update replaces the programs in their folder.
-                SendMessageW(ctl(IDC_DIR), EM_SETREADONLY, TRUE, 0);
-                ui::enable(ctl(IDC_DIR_BROWSE), false);
+                // An update replaces the programs in their folder, and keeps the data in its own.
+                for (int id : { IDC_DIR, IDC_DATA }) SendMessageW(ctl(id), EM_SETREADONLY, TRUE, 0);
+                for (int id : { IDC_DIR_BROWSE, IDC_DATA_BROWSE }) ui::enable(ctl(id), false);
             }
             add(IDC_MODELS_LABEL, ui::label(wz.hwnd, L"", IDC_MODELS_LABEL), ui::font_kind::bold);
             add(IDC_MODELS, ui::edit(wz.hwnd, widen(current.models_dir), IDC_MODELS));
@@ -640,7 +821,7 @@ namespace albireo
             add(IDC_PROGRESS, ui::progress(wz.hwnd, IDC_PROGRESS));
             add(IDC_DETAIL, ui::label(wz.hwnd, L"", IDC_DETAIL, SS_PATHELLIPSIS), ui::font_kind::note);
             add(IDC_LAUNCH, ui::checkbox(wz.hwnd, L"", IDC_LAUNCH, true));
-            add(IDC_PURGE, ui::checkbox(wz.hwnd, L"", IDC_PURGE, false));
+            add(IDC_KEEP_DATA, ui::checkbox(wz.hwnd, L"", IDC_KEEP_DATA, false));
             add(IDC_BACK, ui::button(wz.hwnd, L"", IDC_BACK));
             add(IDC_NEXT, ui::button(wz.hwnd, L"", IDC_NEXT, BS_DEFPUSHBUTTON));
             add(IDC_CANCEL, ui::button(wz.hwnd, L"", IDC_CANCEL));
@@ -662,11 +843,11 @@ namespace albireo
             };
             if (wz.uninstall)
             {
-                const bool purge = ui::checked(ctl(IDC_PURGE));
-                std::thread([target, purge, progress]() {
+                const bool keep_data = ui::checked(ctl(IDC_KEEP_DATA));
+                std::thread([target, keep_data, progress]() {
                     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
                     install_report* r = new install_report();
-                    const bool ok = perform_uninstall(purge, progress, r->error);
+                    const bool ok = perform_uninstall(keep_data, progress, *r);
                     CoUninitialize();
                     if (!PostMessageW(target, WM_DONE, ok ? 1 : 0, reinterpret_cast<LPARAM>(r))) delete r;
                 }).detach();
@@ -677,7 +858,10 @@ namespace albireo
             if (!update)
             {
                 o.program_dir = narrow(ui::text_of(ctl(IDC_DIR)));
+                o.data_dir = narrow(ui::text_of(ctl(IDC_DATA)));
                 o.models_dir = narrow(ui::text_of(ctl(IDC_MODELS)));
+                // The models folder of the data folder is the default one.
+                if (o.models_dir == join_path(o.data_dir, "models")) o.models_dir.clear();
                 o.autostart = ui::checked(ctl(IDC_AUTOSTART));
                 o.desktop_shortcut = ui::checked(ctl(IDC_DESKTOP));
                 o.trust_certificate = ui::checked(ctl(IDC_TRUST));
@@ -690,7 +874,6 @@ namespace albireo
                 CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
                 install_report* r = new install_report();
                 const bool ok = perform_install(o, update, true, progress, *r);
-                if (!ok) setup::log("failed: " + r->error);
                 CoUninitialize();
                 if (!PostMessageW(target, WM_DONE, ok ? 1 : 0, reinterpret_cast<LPARAM>(r))) delete r;
             }).detach();
@@ -790,18 +973,33 @@ namespace albireo
                 case IDC_OFFLINE:
                     ui::enable(ctl(IDC_DEFAULT_MODEL), !ui::checked(ctl(IDC_OFFLINE)));
                     return 0;
+                case IDC_KEEP_DATA:
+                    if (wz.current == P_UNINSTALL) ui::set_text(ctl(IDC_TEXT), uninstall_text());
+                    return 0;
                 case IDC_DIR:
                     if (HIWORD(wp) == EN_CHANGE && wz.current == P_FOLDERS) SetTimer(w, TIMER_SPACE, 400, nullptr);
                     return 0;
+                case IDC_DATA:
+                    if (HIWORD(wp) == EN_CHANGE)
+                    {
+                        // The models folder of the data folder follows it.
+                        const std::wstring data = ui::text_of(ctl(IDC_DATA));
+                        if (ui::text_of(ctl(IDC_MODELS)) == widen(join_path(narrow(wz.data_text), "models")))
+                            ui::set_text(ctl(IDC_MODELS), widen(join_path(narrow(data), "models")));
+                        wz.data_text = data;
+                    }
+                    return 0;
                 case IDC_DIR_BROWSE:
+                case IDC_DATA_BROWSE:
                 case IDC_MODELS_BROWSE:
                 {
-                    const int target = LOWORD(wp) == IDC_DIR_BROWSE ? IDC_DIR : IDC_MODELS;
+                    const int target = LOWORD(wp) == IDC_DIR_BROWSE ? IDC_DIR : LOWORD(wp) == IDC_DATA_BROWSE ? IDC_DATA
+                        : IDC_MODELS;
                     std::wstring d = ui::choose_folder(w, ui::text_of(ctl(target)));
                     if (!d.empty())
                     {
-                        // A program folder chosen by the user gets its own Albireo subfolder.
-                        if (target == IDC_DIR && file_name(narrow(d)) != "Albireo")
+                        // A folder of the programs or of the data chosen by the user gets its own Albireo subfolder.
+                        if (target != IDC_MODELS && file_name(narrow(d)) != "Albireo")
                             d = widen(join_path(narrow(d), "Albireo"));
                         ui::set_text(ctl(target), d);
                         update_space();
@@ -860,6 +1058,7 @@ namespace albireo
                     wz.error = r->error;
                     wz.notice = r->notice;
                     wz.icons_closed = r->icons_closed;
+                    wz.rolled_back = r->rolled_back;
                     delete r;
                 }
                 show_page(wz.uninstall ? P_REMOVED : P_FINISH);
@@ -976,17 +1175,29 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
     // program, which may be a folder of downloads.
     SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32);
     using namespace albireo;
+    // The current folder never holds the folder of the programs, which the uninstaller removes.
+    wchar_t system[MAX_PATH];
+    const UINT length = GetSystemDirectoryW(system, MAX_PATH);
+    if (length > 0 && length < MAX_PATH) SetCurrentDirectoryW(system);
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     std::vector<std::wstring> args;
     for (int i = 1; argv && i < argc; ++i) args.push_back(argv[i]);
     if (argv) LocalFree(argv);
 
+    // The copy of the uninstaller that finishes the removal of the folder of the programs.
+    if (has_arg(args, L"/finish-removal")) return setup::complete_removal();
+
     const std::wstring lang = arg_after(args, L"/lang");
     set_language(lang.empty() ? "auto" : narrow(lang));
     ui::init();
     const bool silent = has_arg(args, L"/silent");
     std::string error;
+    // The lines of the log that no data folder received go to the temporary folder at the end.
+    struct log_flush
+    {
+        ~log_flush() { setup::flush_log(); }
+    } flush_at_exit;
 
     const std::wstring svc = arg_after(args, L"/service");
     if (!svc.empty())
@@ -1007,6 +1218,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
         */
         const std::string dir = narrow(models);
         const bool custom = dir != setup::default_models_dir();
+        // A folder new or empty when chosen goes whole with Albireo.
+        const bool owned = custom && (!dir_exists(dir) || list_dir(dir).empty());
         std::string reason;
         if (!setup::prepare_data_dir(error))
         {
@@ -1030,6 +1243,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
         if (!s.is_object()) s = json::object();
         s["models_dir"] = dir == setup::default_models_dir() ? std::string() : dir;
         write_file_atomic(path, s.dump_formatted(2) + "\n");
+        setup::record_models_dir(custom ? dir : std::string(), owned);
         setup::log("models folder: " + dir);
         setup::stop_service(60000, error);
         return setup::start_service(error) ? 0 : 1;
@@ -1043,12 +1257,25 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
         const bool ok = perform_install(o, true, false, [](int, const std::wstring&, bool) {}, report);
         if (!ok)
         {
-            setup::log("update failed: " + report.error);
             // The service starts again on its previous programs.
             std::string e2;
             setup::start_service(e2);
+            return 1;
         }
-        return ok ? 0 : 1;
+        /*
+            The icons stay open during this update: the programs they run are set aside and
+            go once each icon starts again from its new program, which it does when it sees
+            the new version of the service, within two minutes.
+        */
+        size_t left = setup::remove_old_files(o.program_dir, true);
+        for (int i = 0; i < 120 && left > 0; ++i)
+        {
+            Sleep(1000);
+            left = setup::remove_old_files(o.program_dir, true);
+        }
+        if (left > 0)
+            setup::log(std::to_string(left) + " files set aside stay in use, they go at the next restart of Windows");
+        return 0;
     }
 
     /*
@@ -1066,9 +1293,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
         int code = 0;
         if (silent)
         {
-            if (!perform_uninstall(has_arg(args, L"/purge"), [](int, const std::wstring&, bool) {}, error))
+            // The data goes with the programs, unless /keep-data keeps it; /purge says the same.
+            install_report report;
+            if (!perform_uninstall(has_arg(args, L"/keep-data"), [](int, const std::wstring&, bool) {}, report))
             {
-                setup::log("uninstallation: " + error);
+                setup::log("uninstallation: " + report.error);
                 code = 1;
             }
         }
@@ -1088,12 +1317,20 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
 
     if (silent)
     {
-        setup::prepare_data_dir(error);
+        std::string version, installed;
+        const bool update = installed_in_place(version, installed);
+        // An update keeps its data folder; a new installation takes the folder given, else the default one.
+        const std::wstring data = arg_after(args, L"/data-dir");
+        const bool chosen_data = !data.empty() && !update;
+        /*
+            The log starts in the data folder in place; a new installation makes its data folder
+            once the folders given serve (install_programs()), so that a refusal leaves nothing.
+        */
+        if (update) setup::prepare_data_dir(error);
         error.clear();
         // The options not given keep the values of the installation in place.
         setup::install_options o = setup::installed_options();
-        std::string version, installed;
-        const bool update = installed_in_place(version, installed);
+        if (chosen_data) o.data_dir = narrow(data);
         if (update && compare_versions(version, ALBIREO_VERSION) > 0)
         {
             setup::log("Albireo " + version + " is installed, newer than " + ALBIREO_VERSION + ": nothing done");
@@ -1109,6 +1346,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
             o.models_dir = narrow(m);
             options = true;
         }
+        // The models folder of the data folder is the default one, also for a data folder given.
+        if ((chosen_data && m.empty()) || o.models_dir == join_path(o.data_dir, "models")) o.models_dir.clear();
         if (has_arg(args, L"/offline"))
         {
             o.offline = true;
@@ -1130,7 +1369,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
         // The folders given must serve before anything changes.
         std::string folder = o.program_dir;
         std::string problem = update ? std::string() : setup::folder_problem(folder, true);
-        if (problem.empty() && !m.empty() && o.models_dir != setup::default_models_dir())
+        if (problem.empty() && !update)
+        {
+            folder = o.data_dir;
+            problem = setup::data_folder_problem(folder, o.program_dir);
+        }
+        if (problem.empty() && !m.empty() && o.models_dir != join_path(o.data_dir, "models"))
         {
             folder = o.models_dir;
             problem = setup::folder_problem(folder, false);
@@ -1148,10 +1392,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
         }
         install_report report;
         const bool ok = perform_install(o, update, true, [](int, const std::wstring&, bool) {}, report);
-        if (!ok) setup::log("failed: " + report.error);
-        // The icons closed for the copy start again, with the rights of their user.
+        // The icons closed for the copy start again, with the rights of their user; after a
+        // failure, the icon tells it, since no window of the installer does.
         const std::string tray = join_path(o.program_dir, "albireo-tray.exe");
-        if (report.icons_closed && file_exists(tray)) setup::launch_unelevated(tray, "");
+        if (report.icons_closed && file_exists(tray)) setup::launch_unelevated(tray, ok ? "" : "--setup-result");
         return ok ? 0 : 1;
     }
     return run_wizard(instance, false);

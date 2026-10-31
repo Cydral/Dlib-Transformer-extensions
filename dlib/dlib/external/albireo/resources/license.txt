@@ -1,6 +1,7 @@
 Albireo
 Copyright (C) 2026 Cydral Technology
-Created by Aldric Pierrain, built on the Dlib-Transformer-extensions library.
+Created by Aldric Pierrain (cydraltechnology@gmail.com), based on the open source
+Dlib-Transformer-extensions library.
 
 Albireo is distributed under the Boost Software License, Version 1.0:
 

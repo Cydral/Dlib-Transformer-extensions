@@ -26,6 +26,7 @@
 #include <shlguid.h>
 #include <aclapi.h>
 #include <sddl.h>
+#include <tlhelp32.h>
 #include <wincrypt.h>
 
 #include <algorithm>
@@ -49,6 +50,7 @@
 #include "../common/version.h"
 #include "../host/certificates.h"
 #include "../host/crypto.h"
+#include "../host/store.h"
 #include "resource.h"
 
 namespace albireo
@@ -149,17 +151,6 @@ namespace setup
             return ok;
         }
 
-        void remove_authority_certificates(HCERTSTORE store)
-        {
-            for (;;)
-            {
-                PCCERT_CONTEXT c = CertFindCertificateInStore(store, X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, 0,
-                    CERT_FIND_SUBJECT_STR_W, L"Albireo Local Authority", nullptr);
-                if (!c) break;
-                CertDeleteCertificateFromStore(c);
-            }
-        }
-
         // Compares two paths as the file systems of Windows do, letters in either case.
         bool same_text(const std::wstring& a, const std::wstring& b)
         {
@@ -172,6 +163,125 @@ namespace setup
         {
             return path.size() >= folder.size() && same_text(path.substr(0, folder.size()), folder)
                 && (path.size() == folder.size() || path[folder.size()] == L'\\');
+        }
+
+        // The full path of a folder, without "\" at its end.
+        std::wstring full_folder(const std::string& dir)
+        {
+            std::wstring full(32768, L'\0');
+            const DWORD n = GetFullPathNameW(widen(dir).c_str(), static_cast<DWORD>(full.size()), &full[0], nullptr);
+            full.resize(n > 0 && n < full.size() ? n : 0);
+            if (full.empty()) full = widen(dir);
+            while (full.size() > 3 && (full.back() == L'\\' || full.back() == L'/')) full.pop_back();
+            return full;
+        }
+
+        // The folders of Windows and of the users, which no folder of Albireo may be or hold.
+        std::vector<std::string> system_folders()
+        {
+            static const KNOWNFOLDERID* const ids[] = { &FOLDERID_Windows, &FOLDERID_ProgramFiles,
+                &FOLDERID_ProgramFilesX86, &FOLDERID_ProgramFilesCommon, &FOLDERID_ProgramData, &FOLDERID_UserProfiles,
+                &FOLDERID_Public, &FOLDERID_Profile, &FOLDERID_Desktop, &FOLDERID_Documents, &FOLDERID_Downloads,
+                &FOLDERID_LocalAppData, &FOLDERID_RoamingAppData };
+            std::vector<std::string> folders;
+            for (const KNOWNFOLDERID* id : ids) folders.push_back(known_folder(*id, ""));
+            return folders;
+        }
+
+        // Whether folder (a full path) is a drive root, or is or holds a folder of Windows or of the users.
+        bool system_or_root(const std::wstring& folder)
+        {
+            if (folder.size() <= 3) return true;
+            for (const auto& f : system_folders())
+                if (!f.empty() && same_or_inside(full_folder(f), folder)) return true;
+            return false;
+        }
+
+        // Whether folder (a full path) lies in the folder of Windows or in the folders of the users.
+        bool inside_windows_or_users(const std::wstring& folder)
+        {
+            for (const KNOWNFOLDERID* id : { &FOLDERID_Windows, &FOLDERID_UserProfiles, &FOLDERID_Profile })
+            {
+                const std::string f = known_folder(*id, "");
+                if (!f.empty() && same_or_inside(folder, full_folder(f))) return true;
+            }
+            return false;
+        }
+
+        // SYSTEM, the administrators, TrustedInstaller, and the account that runs this program.
+        bool trusted_account(PSID sid)
+        {
+            if (!sid || !IsValidSid(sid)) return false;
+            if (IsWellKnownSid(sid, WinLocalSystemSid) || IsWellKnownSid(sid, WinBuiltinAdministratorsSid)) return true;
+            LPWSTR text = nullptr;
+            bool installer = false;
+            if (ConvertSidToStringSidW(sid, &text))
+            {
+                installer = std::wcscmp(text, L"S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464") == 0;
+                LocalFree(text);
+            }
+            if (installer) return true;
+            HANDLE token = nullptr;
+            if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return false;
+            alignas(TOKEN_USER) BYTE user[sizeof(TOKEN_USER) + SECURITY_MAX_SID_SIZE];
+            DWORD size = 0;
+            const bool same = GetTokenInformation(token, TokenUser, user, sizeof(user), &size)
+                && EqualSid(reinterpret_cast<TOKEN_USER*>(user)->User.Sid, sid);
+            CloseHandle(token);
+            return same;
+        }
+
+        /*
+            Whether another account than those of trusted_account() may rename folder (a full
+            path), or what it holds, and put a folder of its own in its place: as its owner,
+            or through a right over its permissions, its deletion or the deletion of what it
+            holds.  For a drive root, only the deletion of what it holds counts.
+        */
+        bool movable_by_others(const std::wstring& folder)
+        {
+            const bool root = folder.size() <= 3;
+            PSID owner = nullptr;
+            PACL dacl = nullptr;
+            PSECURITY_DESCRIPTOR sd = nullptr;
+            if (GetNamedSecurityInfoW(folder.c_str(), SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION
+                    | DACL_SECURITY_INFORMATION, &owner, nullptr, &dacl, nullptr, &sd) != ERROR_SUCCESS)
+                return true;
+            // A missing list of permissions gives every right to every account.
+            bool others = !dacl || (!root && !trusted_account(owner));
+            const ACCESS_MASK moves = root ? FILE_DELETE_CHILD | GENERIC_ALL
+                : DELETE | FILE_DELETE_CHILD | WRITE_DAC | WRITE_OWNER | GENERIC_ALL;
+            for (WORD i = 0; !others && i < dacl->AceCount; ++i)
+            {
+                void* ace = nullptr;
+                if (!GetAce(dacl, i, &ace))
+                {
+                    others = true;
+                    break;
+                }
+                // The entries that pass only to what the folder holds, and the denials, change nothing here.
+                const ACE_HEADER* h = static_cast<const ACE_HEADER*>(ace);
+                if (h->AceType != ACCESS_ALLOWED_ACE_TYPE || (h->AceFlags & INHERIT_ONLY_ACE)) continue;
+                ACCESS_ALLOWED_ACE* allowed = static_cast<ACCESS_ALLOWED_ACE*>(ace);
+                others = (allowed->Mask & moves) != 0 && !trusted_account(&allowed->SidStart);
+            }
+            LocalFree(sd);
+            return others;
+        }
+
+        // Whether a folder that exists on the path of folder (a full path), its drive root
+        // included, lets another account put a folder of its own in the place of the next one.
+        bool movable_parents(const std::wstring& folder)
+        {
+            if (movable_by_others(folder.substr(0, 3))) return true;
+            for (size_t at = 3; at < folder.size(); ++at)
+            {
+                if (folder[at] != L'\\') continue;
+                const std::wstring parent = folder.substr(0, at);
+                // The folders to come are made as secure_parents() makes them.
+                if (!dir_exists(narrow(parent))) break;
+                if (movable_by_others(parent)) return true;
+            }
+            return false;
         }
 
         // The restarts after a failure: twice, then the service stays stopped; the count resets daily.
@@ -213,15 +323,13 @@ namespace setup
         full.resize(n);
         while (full.size() > 3 && full.back() == L'\\') full.pop_back();
         if (full.size() <= 3) return "folder_system";
-        // The folders of Windows and of the users, and those that hold them.
-        static const KNOWNFOLDERID* const system_folders[] = { &FOLDERID_Windows, &FOLDERID_ProgramFiles,
-            &FOLDERID_ProgramFilesX86, &FOLDERID_ProgramFilesCommon, &FOLDERID_ProgramData, &FOLDERID_UserProfiles,
-            &FOLDERID_Public, &FOLDERID_Profile, &FOLDERID_Desktop, &FOLDERID_Documents, &FOLDERID_Downloads,
-            &FOLDERID_LocalAppData, &FOLDERID_RoamingAppData };
-        std::vector<std::string> folders = { data_dir() };
-        for (const KNOWNFOLDERID* id : system_folders) folders.push_back(known_folder(*id, ""));
+        // The folders of Windows and of the users, the data folder, and those that hold them.
+        std::vector<std::string> folders = system_folders();
+        folders.push_back(data_dir());
         for (const auto& f : folders)
             if (!f.empty() && same_or_inside(widen(f), full)) return "folder_system";
+        // The programs of the service stay out of the folder of Windows and of the folders of the users.
+        if (program && inside_windows_or_users(full)) return "folder_system";
         // The links on its path, as secure_folder() accepts them.
         for (size_t at = 3; at <= full.size(); ++at)
         {
@@ -229,6 +337,8 @@ namespace setup
             const std::string prefix = narrow(full.substr(0, at));
             if (is_link(prefix) && !owned_by_system(prefix)) return "folder_foreign";
         }
+        // Another account that may rename a folder on its path could put programs of its own in their place.
+        if (program && movable_parents(full)) return "folder_parent_unsafe";
         const std::string path = narrow(full);
         if (!dir_exists(path)) return file_exists(path) ? "folder_not_empty" : std::string();
         const bool empty = list_dir(path).empty();
@@ -239,6 +349,169 @@ namespace setup
         if (program && !empty && !albireo) return "folder_not_empty";
         if (!empty && !owned_by_system(final_path(path))) return "folder_foreign";
         return std::string();
+    }
+
+    std::string data_folder_problem(const std::string& dir, const std::string& program_dir)
+    {
+        if (dir.size() < 3 || !std::isalpha(static_cast<unsigned char>(dir[0])) || dir[1] != ':'
+            || (dir[2] != '\\' && dir[2] != '/'))
+            return "folder_not_local";
+        // The data stays on a fixed drive: neither a removable drive nor a network share.
+        const UINT drive = GetDriveTypeW(widen(dir.substr(0, 2) + "\\").c_str());
+        if (drive != DRIVE_FIXED) return drive == DRIVE_NO_ROOT_DIR ? "folder_not_local" : "folder_not_fixed";
+        const std::wstring full = full_folder(dir);
+        if (system_or_root(full) || inside_windows_or_users(full)) return "folder_system";
+        if (!program_dir.empty())
+        {
+            const std::wstring programs = full_folder(program_dir);
+            if (same_or_inside(full, programs) || same_or_inside(programs, full)) return "folder_overlap";
+        }
+        // The links on its path, as secure_folder() accepts them.
+        for (size_t at = 3; at <= full.size(); ++at)
+        {
+            if (at < full.size() && full[at] != L'\\') continue;
+            const std::string prefix = narrow(full.substr(0, at));
+            if (is_link(prefix) && !owned_by_system(prefix)) return "folder_foreign";
+        }
+        // Another account that may rename a folder on its path could put its own data in its place.
+        if (movable_parents(full)) return "folder_parent_unsafe";
+        const std::string path = narrow(full);
+        if (!dir_exists(path)) return file_exists(path) ? "folder_not_empty" : std::string();
+        if (list_dir(path).empty()) return std::string();
+        // The data of an earlier installation, kept for this one.
+        const bool albireo = file_exists(join_path(path, "settings.json"))
+            || file_exists(join_path(path, "albireo.db"));
+        if (!albireo) return "folder_not_empty";
+        if (!owned_by_system(final_path(path))) return "folder_foreign";
+        return std::string();
+    }
+
+    bool secure_parents(const std::string& dir, std::string& error)
+    {
+        const std::wstring full = full_folder(dir);
+        for (size_t at = 3; at < full.size(); ++at)
+        {
+            if (full[at] != L'\\') continue;
+            const std::string parent = narrow(full.substr(0, at));
+            if (!dir_exists(parent) && !secure_folder(parent, error)) return false;
+        }
+        return true;
+    }
+
+    namespace
+    {
+        const wchar_t albireo_key[] = L"Software\\Albireo";
+
+        bool write_registry_string(const wchar_t* name, const std::wstring& value)
+        {
+            HKEY k = nullptr;
+            if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, albireo_key, 0, nullptr, 0, KEY_WRITE | KEY_WOW64_64KEY, nullptr,
+                    &k, nullptr) != ERROR_SUCCESS)
+                return false;
+            const bool ok = RegSetValueExW(k, name, 0, REG_SZ, reinterpret_cast<const BYTE*>(value.c_str()),
+                static_cast<DWORD>((value.size() + 1) * sizeof(wchar_t))) == ERROR_SUCCESS;
+            RegCloseKey(k);
+            return ok;
+        }
+    }
+
+    std::string recorded_data_dir()
+    {
+        return narrow(registry_string(HKEY_LOCAL_MACHINE, albireo_key, L"DataDir"));
+    }
+
+    std::string default_data_dir()
+    {
+        return join_path(known_folder(FOLDERID_ProgramData, "C:\\ProgramData"), "Albireo");
+    }
+
+    bool record_data_dir(const std::string& dir, std::string& error)
+    {
+        if (write_registry_string(L"DataDir", full_folder(dir))) return true;
+        error = last_error("cannot record the data folder in the registry");
+        return false;
+    }
+
+    void record_models_dir(const std::string& dir, bool owned)
+    {
+        // Only the models folder chosen outside the data folder is recorded.
+        HKEY k = nullptr;
+        if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, albireo_key, 0, nullptr, 0, KEY_WRITE | KEY_WOW64_64KEY, nullptr, &k,
+                nullptr) != ERROR_SUCCESS)
+            return;
+        if (dir.empty() || path_inside(dir, data_dir()))
+        {
+            RegDeleteValueW(k, L"ModelsDir");
+            RegDeleteValueW(k, L"ModelsDirOwned");
+        }
+        else
+        {
+            const std::wstring w = full_folder(dir);
+            const DWORD flag = owned ? 1 : 0;
+            RegSetValueExW(k, L"ModelsDir", 0, REG_SZ, reinterpret_cast<const BYTE*>(w.c_str()),
+                static_cast<DWORD>((w.size() + 1) * sizeof(wchar_t)));
+            RegSetValueExW(k, L"ModelsDirOwned", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&flag), sizeof(flag));
+        }
+        RegCloseKey(k);
+    }
+
+    bool models_dir_owned(const std::string& dir)
+    {
+        DWORD owned = 0, size = sizeof(owned);
+        const bool found = RegGetValueW(HKEY_LOCAL_MACHINE, albireo_key, L"ModelsDirOwned",
+            RRF_RT_REG_DWORD | RRF_SUBKEY_WOW6464KEY, nullptr, &owned, &size) == ERROR_SUCCESS;
+        const std::wstring recorded = registry_string(HKEY_LOCAL_MACHINE, albireo_key, L"ModelsDir");
+        return found && owned == 1 && !recorded.empty() && same_text(recorded, full_folder(dir));
+    }
+
+    void forget_folders()
+    {
+        RegDeleteKeyExW(HKEY_LOCAL_MACHINE, albireo_key, KEY_WOW64_64KEY, 0);
+    }
+
+    bool removable_folder(const std::string& dir)
+    {
+        if (dir.size() < 3 || !std::isalpha(static_cast<unsigned char>(dir[0])) || dir[1] != ':'
+            || (dir[2] != '\\' && dir[2] != '/'))
+            return false;
+        const UINT drive = GetDriveTypeW(widen(dir.substr(0, 2) + "\\").c_str());
+        if (drive != DRIVE_FIXED && drive != DRIVE_REMOVABLE && drive != DRIVE_RAMDISK) return false;
+        return !system_or_root(full_folder(dir));
+    }
+
+    std::vector<std::string> recorded_model_files(const std::string& folder)
+    {
+        std::vector<std::string> out;
+        const std::string db = join_path(data_dir(), "albireo.db");
+        if (!file_exists(db)) return out;
+        const std::wstring dir = full_folder(folder);
+        try
+        {
+            store s(db);
+            for (const auto& m : s.models())
+            {
+                const std::wstring file = full_folder(m.file);
+                if (!same_or_inside(file, dir) || same_text(file, dir)) continue;
+                out.push_back(narrow(file));
+                out.push_back(narrow(file) + ".partial");
+            }
+            // A download in progress writes <identifier>.gguf.partial in the models folder.
+            for (const auto& id : s.pending_downloads())
+                if (!id.empty() && id.find_first_of("/\\:") == std::string::npos && id.find("..") == std::string::npos)
+                    out.push_back(join_path(folder, id + ".gguf.partial"));
+        }
+        catch (const std::exception& e)
+        {
+            log(std::string("the database of the models cannot be read: ") + e.what());
+        }
+        // The imports and the transfers in progress, which the service names so.
+        for (const auto& name : list_dir(folder))
+        {
+            const bool partial = name.size() > 8 && name.compare(name.size() - 8, 8, ".partial") == 0;
+            if (partial && (name.compare(0, 8, ".import-") == 0 || name.compare(0, 10, ".transfer-") == 0))
+                out.push_back(join_path(folder, name));
+        }
+        return out;
     }
 
     std::string installed_dir()
@@ -256,6 +529,8 @@ namespace setup
         install_options o;
         const std::string dir = installed_dir();
         o.program_dir = dir.empty() ? default_program_dir() : dir;
+        // The data folder recorded by an installation, in place or kept by its uninstallation.
+        o.data_dir = data_dir();
         o.models_dir = default_models_dir();
         std::string text;
         if (read_file(join_path(data_dir(), "settings.json"), text, 1u << 20))
@@ -441,19 +716,115 @@ namespace setup
 
     namespace
     {
+        // The processes, of every session, whose program lies in folder (or is folder\program), this one aside.
+        std::vector<DWORD> processes_in(const std::wstring& folder, const std::string& program)
+        {
+            std::vector<DWORD> out;
+            HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if (snap == INVALID_HANDLE_VALUE) return out;
+            const std::wstring file = program.empty() ? std::wstring() : folder + L"\\" + widen(program);
+            PROCESSENTRY32W e = {};
+            e.dwSize = sizeof(e);
+            for (BOOL more = Process32FirstW(snap, &e); more; more = Process32NextW(snap, &e))
+            {
+                if (e.th32ProcessID == 0 || e.th32ProcessID == GetCurrentProcessId()) continue;
+                HANDLE p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, e.th32ProcessID);
+                if (!p) continue;
+                std::wstring image(32768, L'\0');
+                DWORD n = static_cast<DWORD>(image.size());
+                if (QueryFullProcessImageNameW(p, 0, &image[0], &n))
+                {
+                    image.resize(n);
+                    if (file.empty() ? same_or_inside(image, folder) : same_text(image, file))
+                        out.push_back(e.th32ProcessID);
+                }
+                CloseHandle(p);
+            }
+            CloseHandle(snap);
+            return out;
+        }
+
+        // The right of the administrators to end the processes of the other accounts.
+        void enable_debug_privilege()
+        {
+            HANDLE token = nullptr;
+            if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) return;
+            TOKEN_PRIVILEGES tp = {};
+            tp.PrivilegeCount = 1;
+            tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+            if (LookupPrivilegeValueW(nullptr, L"SeDebugPrivilege", &tp.Privileges[0].Luid))
+                AdjustTokenPrivileges(token, FALSE, &tp, sizeof(tp), nullptr, nullptr);
+            CloseHandle(token);
+        }
+    }
+
+    bool end_processes(const std::string& folder, unsigned timeout_ms, const std::string& program)
+    {
+        const std::wstring dir = full_folder(folder);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+        std::vector<DWORD> left = processes_in(dir, program);
+        while (!left.empty() && std::chrono::steady_clock::now() < deadline)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            left = processes_in(dir, program);
+        }
+        if (left.empty()) return true;
+        enable_debug_privilege();
+        for (DWORD pid : left)
+        {
+            HANDLE p = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pid);
+            if (!p) continue;
+            log("the process " + std::to_string(pid) + " of " + narrow(dir) + " is ended");
+            TerminateProcess(p, 1);
+            WaitForSingleObject(p, 5000);
+            CloseHandle(p);
+        }
+        left = processes_in(dir, program);
+        for (DWORD pid : left) log("the process " + std::to_string(pid) + " of " + narrow(dir) + " still runs");
+        return left.empty();
+    }
+
+    std::string program_version(const std::string& path)
+    {
+        const DWORD flags = LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE;
+        HMODULE m = LoadLibraryExW(widen(path).c_str(), nullptr, flags);
+        if (!m) return std::string();
+        HRSRC r = FindResourceW(m, MAKEINTRESOURCEW(VS_VERSION_INFO), RT_VERSION);
+        HGLOBAL g = r ? LoadResource(m, r) : nullptr;
+        const BYTE* data = g ? static_cast<const BYTE*>(LockResource(g)) : nullptr;
+        const DWORD size = r ? SizeofResource(m, r) : 0;
+        std::string version;
+        // The fixed part of the version starts with its signature, on a boundary of 4 bytes.
+        for (DWORD at = 0; data && at + sizeof(VS_FIXEDFILEINFO) <= size && version.empty(); at += 4)
+        {
+            VS_FIXEDFILEINFO info;
+            std::memcpy(&info, data + at, sizeof(info));
+            if (info.dwSignature != 0xFEEF04BD) continue;
+            version = std::to_string(HIWORD(info.dwFileVersionMS)) + "." + std::to_string(LOWORD(info.dwFileVersionMS))
+                + "." + std::to_string(HIWORD(info.dwFileVersionLS));
+        }
+        FreeLibrary(m);
+        return version;
+    }
+
+    namespace
+    {
         /*
             Renames a file, trying again for five seconds: a file that a scanner or an
             indexer reads is released soon.  A running program may be renamed.
         */
         bool move_file(const std::string& from, const std::string& to)
         {
+            DWORD e = ERROR_SUCCESS;
             for (int attempt = 0; attempt < 20; ++attempt)
             {
                 if (MoveFileExW(widen(from).c_str(), widen(to).c_str(), MOVEFILE_WRITE_THROUGH)) return true;
-                const DWORD e = GetLastError();
+                e = GetLastError();
                 if (e != ERROR_SHARING_VIOLATION && e != ERROR_ACCESS_DENIED && e != ERROR_LOCK_VIOLATION) return false;
                 std::this_thread::sleep_for(std::chrono::milliseconds(250));
             }
+            // The error of the last attempt, which the waits may clear, for the message of the caller.
+            SetLastError(e);
             return false;
         }
 
@@ -462,6 +833,12 @@ namespace setup
         void delete_file(const std::string& p)
         {
             if (DeleteFileW(widen(p).c_str()) || GetLastError() == ERROR_FILE_NOT_FOUND) return;
+            // A file marked read only loses the mark first.
+            const DWORD attributes = GetFileAttributesW(widen(p).c_str());
+            if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_READONLY)
+                && SetFileAttributesW(widen(p).c_str(), attributes & ~FILE_ATTRIBUTE_READONLY)
+                && DeleteFileW(widen(p).c_str()))
+                return;
             std::string doomed = p;
             if (p.find(".old-") == std::string::npos)
             {
@@ -596,17 +973,48 @@ namespace setup
         return out;
     }
 
-    void remove_old_files(const std::string& program_dir)
+    namespace
     {
+        // Whether name ends with tag followed by the 8 hexadecimal digits of random_hex(8).
+        bool ends_with_mark(const std::string& name, const char* tag)
+        {
+            const size_t n = std::strlen(tag);
+            if (name.size() < n + 8 || name.compare(name.size() - n - 8, n, tag) != 0) return false;
+            for (size_t i = name.size() - 8; i < name.size(); ++i)
+                if (!std::isxdigit(static_cast<unsigned char>(name[i]))) return false;
+            return true;
+        }
+
+        /*
+            The files the programs make in their folder: those an update sets aside
+            (name.old-<random>) or leaves unfinished (name.new), and the temporary files of
+            a write (name.tmp-<random>).
+        */
+        bool program_made(const std::string& name)
+        {
+            const bool unfinished = name.size() > 4 && name.compare(name.size() - 4, 4, ".new") == 0;
+            return unfinished || ends_with_mark(name, ".old-") || ends_with_mark(name, ".tmp-");
+        }
+    }
+
+    size_t remove_old_files(const std::string& program_dir, bool now_only)
+    {
+        size_t left = 0;
         for (const auto& name : list_dir(program_dir))
         {
             const std::string p = join_path(program_dir, name);
-            const bool aside = name.find(".old-") != std::string::npos;
-            const bool unfinished = name.size() > 4 && name.substr(name.size() - 4) == ".new";
             if (is_link(p)) continue;
-            if (dir_exists(p)) remove_old_files(p);
-            else if (aside || unfinished) remove_file(p);
+            if (dir_exists(p))
+            {
+                left += remove_old_files(p, now_only);
+                continue;
+            }
+            if (!program_made(name)) continue;
+            if (!now_only) delete_file(p);
+            else DeleteFileW(widen(p).c_str());
+            if (file_exists(p)) ++left;
         }
+        return left;
     }
 
     namespace
@@ -940,7 +1348,7 @@ namespace setup
             }
             log("the data folder, made by another account, is renamed " + aside);
         }
-        if (!secure_folder(dir, error, !content_checked)) return false;
+        if (!secure_parents(dir, error) || !secure_folder(dir, error, !content_checked)) return false;
         for (const char* sub : { "logs", "import", "certificates" }) make_dirs(join_path(dir, sub));
         std::lock_guard<std::mutex> lock(log_m);
         log_ready = true;
@@ -962,6 +1370,8 @@ namespace setup
         s["models_dir"] = o.models_dir.empty() || o.models_dir == default_models_dir() ? std::string() : o.models_dir;
         s["default_model"] = o.default_model;
         s["offline"] = o.offline;
+        // The service puts its authority in the trusted roots according to this choice.
+        s["trust_authority"] = o.trust_certificate;
         if (!write_file_atomic(path, s.dump_formatted(2) + "\n"))
         {
             error = "cannot write " + path;
@@ -1053,131 +1463,31 @@ namespace setup
         return false;
     }
 
-    namespace
+    bool prepare_certificates(bool new_installation, std::string& error)
     {
-        // Whether name constraints permit localhost and the loopback addresses, and nothing else.
-        bool loopback_only(const CERT_EXTENSION* extension)
-        {
-            CERT_NAME_CONSTRAINTS_INFO* info = nullptr;
-            DWORD size = 0;
-            if (!CryptDecodeObjectEx(X509_ASN_ENCODING, X509_NAME_CONSTRAINTS, extension->Value.pbData,
-                    extension->Value.cbData, CRYPT_DECODE_ALLOC_FLAG, nullptr, &info, &size))
-                return false;
-            // 127.0.0.0/8 and ::1/128, each address followed by its mask.
-            const BYTE v4[8] = { 127, 0, 0, 0, 255, 0, 0, 0 };
-            BYTE v6[32] = {};
-            v6[15] = 1;
-            std::memset(v6 + 16, 0xFF, 16);
-            bool ok = info->cPermittedSubtree > 0;
-            for (DWORD i = 0; ok && i < info->cPermittedSubtree; ++i)
-            {
-                const CERT_ALT_NAME_ENTRY& name = info->rgPermittedSubtree[i].Base;
-                const CRYPT_DATA_BLOB& ip = name.IPAddress;
-                if (name.dwAltNameChoice == CERT_ALT_NAME_DNS_NAME)
-                    ok = name.pwszDNSName && _wcsicmp(name.pwszDNSName, L"localhost") == 0;
-                else if (name.dwAltNameChoice == CERT_ALT_NAME_IP_ADDRESS)
-                    ok = (ip.cbData == sizeof(v4) && std::memcmp(ip.pbData, v4, sizeof(v4)) == 0)
-                        || (ip.cbData == sizeof(v6) && std::memcmp(ip.pbData, v6, sizeof(v6)) == 0);
-                else
-                    ok = false;
-            }
-            LocalFree(info);
-            return ok;
-        }
-
-        /*
-            Whether a certificate is the authority that Albireo makes (host/certificates.cpp):
-            signed by its own key, named "Albireo Local Authority", and limited by its name
-            constraints to localhost and the loopback addresses, so that the trust of the
-            machine never reaches another site.
-        */
-        bool local_authority(const std::string& der)
-        {
-            PCCERT_CONTEXT c = CertCreateCertificateContext(X509_ASN_ENCODING,
-                reinterpret_cast<const BYTE*>(der.data()), static_cast<DWORD>(der.size()));
-            if (!c) return false;
-            void* self = const_cast<CERT_CONTEXT*>(c);
-            wchar_t name[128] = {};
-            bool ok = CryptVerifyCertificateSignatureEx(0, X509_ASN_ENCODING, CRYPT_VERIFY_CERT_SIGN_SUBJECT_CERT,
-                    self, CRYPT_VERIFY_CERT_SIGN_ISSUER_CERT, self, 0, nullptr)
-                && CertGetNameStringW(c, CERT_NAME_ATTR_TYPE, 0, const_cast<char*>(szOID_COMMON_NAME), name, 128) > 1
-                && std::wcscmp(name, L"Albireo Local Authority") == 0;
-            const CERT_EXTENSION* constraints = ok ? CertFindExtension(szOID_NAME_CONSTRAINTS,
-                c->pCertInfo->cExtension, c->pCertInfo->rgExtension) : nullptr;
-            ok = ok && constraints && loopback_only(constraints);
-            CertFreeCertificateContext(c);
-            return ok;
-        }
-    }
-
-    bool create_certificates(bool new_authority, bool& renewed, std::string& error)
-    {
+        // A new installation lets the service make its own authority: none found in the folder stays.
         const std::string dir = join_path(data_dir(), "certificates");
-        const certificate_files f = certificate_paths(dir);
-        const std::string before = certificate_thumbprint(f.ca_cert);
-        if (new_authority)
+        if (new_installation && !remove_certificate_files(dir))
         {
-            // A new installation makes its own authority: none found in the folder is kept.
-            for (const std::string& p : { f.ca_cert, f.ca_key, f.server_cert, f.server_key })
-                if (file_exists(p) && !remove_file(p))
-                {
-                    error = last_error(("cannot replace " + p).c_str());
-                    return false;
-                }
+            error = last_error(("cannot replace the certificates of " + dir).c_str());
+            return false;
         }
-        if (!ensure_certificates(dir, error)) return false;
-        renewed = certificate_thumbprint(f.ca_cert) != before;
         return true;
     }
 
     bool authority_trusted()
     {
-        HCERTSTORE store = CertOpenStore(CERT_STORE_PROV_SYSTEM_W, 0, 0,
-            CERT_SYSTEM_STORE_LOCAL_MACHINE | CERT_STORE_OPEN_EXISTING_FLAG | CERT_STORE_READONLY_FLAG, L"ROOT");
-        if (!store) return false;
-        PCCERT_CONTEXT c = CertFindCertificateInStore(store, X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, 0,
-            CERT_FIND_SUBJECT_STR_W, L"Albireo Local Authority", nullptr);
-        if (c) CertFreeCertificateContext(c);
-        CertCloseStore(store, 0);
-        return c != nullptr;
+        return albireo::authority_trusted();
     }
 
     bool trust_authority(std::string& error)
     {
-        const std::string der = certificate_der(certificate_paths(join_path(data_dir(), "certificates")).ca_cert);
-        if (der.empty())
-        {
-            error = "the certificate of the local authority cannot be read";
-            return false;
-        }
-        if (!local_authority(der))
-        {
-            error = "the certificate of the local authority is not one that Albireo makes; it is not trusted";
-            return false;
-        }
-        HCERTSTORE store = CertOpenStore(CERT_STORE_PROV_SYSTEM_W, 0, 0,
-            CERT_SYSTEM_STORE_LOCAL_MACHINE | CERT_STORE_OPEN_EXISTING_FLAG, L"ROOT");
-        if (!store)
-        {
-            error = last_error("cannot open the trusted roots of the machine");
-            return false;
-        }
-        remove_authority_certificates(store);
-        const bool ok = CertAddEncodedCertificateToStore(store, X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
-            reinterpret_cast<const BYTE*>(der.data()), static_cast<DWORD>(der.size()), CERT_STORE_ADD_REPLACE_EXISTING,
-            nullptr) != FALSE;
-        if (!ok) error = last_error("cannot add the local authority to the trusted roots");
-        CertCloseStore(store, 0);
-        return ok;
+        return albireo::trust_authority(join_path(data_dir(), "certificates"), error);
     }
 
     void untrust_authority()
     {
-        HCERTSTORE store = CertOpenStore(CERT_STORE_PROV_SYSTEM_W, 0, 0,
-            CERT_SYSTEM_STORE_LOCAL_MACHINE | CERT_STORE_OPEN_EXISTING_FLAG, L"ROOT");
-        if (!store) return;
-        remove_authority_certificates(store);
-        CertCloseStore(store, 0);
+        albireo::untrust_authority();
     }
 
     bool register_uninstall(const std::string& program_dir, uint64_t size_bytes, std::string& error)
@@ -1200,14 +1510,14 @@ namespace setup
         const std::wstring setup = L"\"" + widen(join_path(program_dir, "albireo-setup.exe")) + L"\"";
         str(L"DisplayName", widen(ALBIREO_FULL_NAME));
         str(L"DisplayVersion", widen(ALBIREO_VERSION));
-        str(L"Publisher", widen(ALBIREO_COMPANY_NAME));
+        str(L"Publisher", widen(ALBIREO_AUTHOR_NAME));
         str(L"DisplayIcon", widen(join_path(program_dir, "albireo-tray.exe")) + L",0");
         str(L"InstallLocation", dir);
         str(L"UninstallString", setup + L" /uninstall");
         str(L"QuietUninstallString", setup + L" /uninstall /silent");
         str(L"URLInfoAbout", widen(ALBIREO_PROJECT_URL));
         str(L"HelpLink", widen(ALBIREO_PROJECT_URL));
-        str(L"Comments", L"Local language models, built on Dlib-Transformer-extensions");
+        str(L"Comments", L"Local language models, based on the open source Dlib-Transformer-extensions library");
         time_t now = time(nullptr);
         tm t;
         gmtime_s(&t, &now);
@@ -1406,6 +1716,37 @@ namespace setup
             }
         }
 
+        // The folders and the files of Albireo at the top of a folder of programs.
+        const char* const albireo_folders[] = { "engines", "web", "licenses", "models" };
+
+        bool albireo_entry(const std::string& name)
+        {
+            for (const char* f : { "engines", "web", "licenses", "models", "albireo-service.exe", "albireo-tray.exe",
+                     "albireo-setup.exe", file_list_name })
+                if (_stricmp(name.c_str(), f) == 0) return true;
+            return false;
+        }
+
+        /*
+            Whether an entry at the top of the folder of the programs stays after its removal:
+            a folder of keep or a folder that holds one, and, when the folder does not go
+            whole (all false), what is neither Albireo's nor made by its programs.
+        */
+        bool stays(const std::string& name, const std::wstring& path, bool all, const std::vector<std::wstring>& keep)
+        {
+            for (const auto& k : keep)
+                if (same_or_inside(k, path)) return true;
+            return !all && !program_made(name) && !albireo_entry(name);
+        }
+
+        // Whether the folder of the programs holds an entry that stays, or one that does not.
+        bool holds(const std::string& folder, bool all, const std::vector<std::wstring>& keep, bool staying)
+        {
+            for (const auto& name : list_dir(folder))
+                if (stays(name, full_folder(join_path(folder, name)), all, keep) == staying) return true;
+            return false;
+        }
+
         // The files of Albireo in a folder of programs, known by their places: its programs, and
         // the files of its engines, web application, licenses and models.
         std::vector<std::string> albireo_files(const std::string& program_dir)
@@ -1413,13 +1754,123 @@ namespace setup
             std::vector<std::string> files;
             for (const char* name : { "albireo-service.exe", "albireo-tray.exe", "albireo-setup.exe" })
                 if (file_exists(join_path(program_dir, name))) files.push_back(name);
-            for (const char* folder : { "engines", "web", "licenses", "models" })
+            for (const char* folder : albireo_folders)
                 if (!is_link(join_path(program_dir, folder))) collect_files(program_dir, folder, files);
             return files;
         }
 
-        // The uninstaller that runs, renamed aside, and its folder, removed once it ends.
-        std::string running_aside, running_dir;
+        // Removes the folders under dir that hold nothing, deepest first, without following the links.
+        void remove_empty_folders(const std::string& dir)
+        {
+            for (const auto& name : list_dir(dir))
+            {
+                const std::string p = join_path(dir, name);
+                if (is_link(p) || !dir_exists(p)) continue;
+                remove_empty_folders(p);
+                RemoveDirectoryW(widen(p).c_str());
+            }
+        }
+
+        // A path as Windows compares it: "\" between its parts.
+        std::wstring windows_path(const std::string& p)
+        {
+            std::wstring w = widen(p);
+            std::replace(w.begin(), w.end(), L'/', L'\\');
+            return w;
+        }
+
+        /*
+            Removes what folder holds by the rules of remove_installation(): everything with
+            all, otherwise the files the programs make, and at the top of the folder of the
+            programs the content of the folders of Albireo.  The folders of keep, and the
+            file skip, stay; the folders left empty go.  With last, a file in use goes at the
+            next restart of Windows; otherwise it stays for a later pass.
+        */
+        void clear_folder(const std::string& folder, bool all, bool top, const std::vector<std::wstring>& keep,
+            const std::wstring& skip, bool last)
+        {
+            for (const auto& name : list_dir(folder))
+            {
+                const std::string p = join_path(folder, name);
+                const std::wstring w = full_folder(p);
+                if (same_text(w, skip)
+                    || std::any_of(keep.begin(), keep.end(), [&](const std::wstring& k) { return same_text(w, k); }))
+                    continue;
+                if (is_link(p))
+                {
+                    if (all) remove_link(p);
+                    continue;
+                }
+                if (dir_exists(p))
+                {
+                    bool albireo = false;
+                    for (const char* f : albireo_folders) albireo = albireo || (top && _stricmp(name.c_str(), f) == 0);
+                    // A folder of the user, in a folder of the programs that does not go whole, stays.
+                    if (!all && !albireo) continue;
+                    clear_folder(p, true, false, keep, skip, last);
+                    RemoveDirectoryW(w.c_str());
+                    continue;
+                }
+                if (!all && !program_made(name) && !(top && albireo_entry(name))) continue;
+                if (last) delete_file(p);
+                else if (!DeleteFileW(w.c_str()) && GetLastError() == ERROR_ACCESS_DENIED)
+                {
+                    SetFileAttributesW(w.c_str(), FILE_ATTRIBUTE_NORMAL);
+                    DeleteFileW(w.c_str());
+                }
+            }
+        }
+
+        /*
+            The removal that the copy of the uninstaller finishes once the uninstaller ends:
+            the folder of the programs, the uninstaller in it, whether the folder goes whole,
+            and the folders that stay.
+        */
+        struct removal_plan
+        {
+            std::string program_dir;
+            std::string uninstaller;
+            bool all = false;
+            std::vector<std::string> keep;
+        };
+        removal_plan pending_removal;
+        bool removal_pending = false;
+
+        // The folder of the system programs, from which the helper processes start.
+        std::wstring system_folder()
+        {
+            wchar_t buf[MAX_PATH];
+            const UINT n = GetSystemDirectoryW(buf, MAX_PATH);
+            return std::wstring(buf, n < MAX_PATH ? n : 0);
+        }
+
+        /*
+            Deletes file and then folder once the process that runs file ends: cmd and ping
+            of System32, by their full paths and from System32, try once a second for half a
+            minute.  cmd expands %name% even between quotes: such paths wait for the restart
+            of Windows, for which both are recorded first.
+        */
+        void delete_after_exit(const std::string& file, const std::string& folder)
+        {
+            MoveFileExW(widen(file).c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
+            MoveFileExW(widen(folder).c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
+            const std::wstring system = system_folder();
+            const std::wstring f = widen(file), d = widen(folder);
+            if (system.empty() || (f + d).find(L'%') != std::wstring::npos) return;
+            const std::wstring cmd_exe = system + L"\\cmd.exe";
+            std::wstring cmd = L"\"" + cmd_exe + L"\" /d /s /c \"for /l %i in (1,1,30) do (del /f /q \"" + f
+                + L"\" 2>nul & if not exist \"" + f + L"\" (rd \"" + d + L"\" 2>nul & exit) & \"" + system
+                + L"\\PING.EXE\" -n 2 127.0.0.1 >nul)\"";
+            STARTUPINFOW si = {};
+            si.cb = sizeof(si);
+            PROCESS_INFORMATION pi = {};
+            if (CreateProcessW(cmd_exe.c_str(), &cmd[0], nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr,
+                    system.c_str(), &si, &pi))
+            {
+                CloseHandle(pi.hThread);
+                CloseHandle(pi.hProcess);
+            }
+        }
     }
 
     void remove_folder(const std::string& path)
@@ -1464,81 +1915,242 @@ namespace setup
             log("cannot write the list of the files of " + program_dir);
     }
 
-    void remove_installation(const std::string& program_dir)
+    void remove_stale_files(const std::string& program_dir, const std::vector<std::string>& installed)
+    {
+        std::vector<std::wstring> placed;
+        for (const auto& f : installed) placed.push_back(windows_path(f));
+        for (const char* folder : { "engines", "web", "licenses" })
+        {
+            const std::string top = join_path(program_dir, folder);
+            if (is_link(top) || !dir_exists(top)) continue;
+            std::vector<std::string> found;
+            collect_files(program_dir, folder, found);
+            for (const auto& rel : found)
+            {
+                const std::string p = join_path(program_dir, rel);
+                // remove_old_files() deletes the files an update set aside or left unfinished.
+                if (is_link(p) || program_made(file_name(p))) continue;
+                const std::wstring w = windows_path(p);
+                if (std::any_of(placed.begin(), placed.end(), [&](const std::wstring& t) { return same_text(t, w); }))
+                    continue;
+                delete_file(p);
+                log("removed, no longer part of Albireo: " + rel);
+            }
+            remove_empty_folders(top);
+        }
+    }
+
+    bool remove_installation(const std::string& program_dir, const std::vector<std::string>& keep)
     {
         bool found = false;
         std::vector<std::string> files = listed_files(program_dir, found);
         // An installation older than the list: the files of Albireo, known by their places.
         if (!found) files = albireo_files(program_dir);
         files.push_back(file_list_name);
-        remove_old_files(program_dir);
-        const std::wstring self = widen(executable_path());
-        std::set<std::string> folders;
+        const std::wstring dir = full_folder(program_dir);
+        // The folder goes whole, unless it is a drive root or a folder of Windows or of the users.
+        bool all = removable_folder(program_dir);
+        if (!all) log("the folder " + program_dir + " is a folder of the system: only the files of Albireo go");
+        std::vector<std::wstring> kept;
+        for (const auto& k : keep)
+        {
+            const std::wstring w = full_folder(k);
+            if (k.empty() || !same_or_inside(w, dir)) continue;
+            // The folder of the programs kept whole keeps what Albireo did not install.
+            if (same_text(w, dir)) all = false;
+            else kept.push_back(w);
+        }
+        const std::wstring self = full_folder(executable_path());
+        const bool inside = same_or_inside(self, dir);
+        // A copy of the uninstaller of the folder finishes the removal once it ends: a file in use
+        // goes at the restart of Windows only when nothing comes after this pass.
+        const bool last = !inside;
+        log("removal of " + program_dir);
         for (const auto& rel : files)
         {
-            for (std::string d = parent_path(rel); !d.empty(); d = parent_path(d)) folders.insert(d);
             const std::string p = join_path(program_dir, rel);
-            if (is_link(p))
-            {
-                remove_link(p);
-            }
-            else if (_wcsicmp(widen(p).c_str(), self.c_str()) == 0)
-            {
-                // The running uninstaller goes aside, then away once it ends (finish_removal()).
-                const std::string aside = p + ".old-" + random_hex(8);
-                if (!MoveFileExW(widen(p).c_str(), widen(aside).c_str(), 0)) continue;
-                MoveFileExW(widen(aside).c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
-                running_aside = aside;
-                running_dir = program_dir;
-            }
-            else
-            {
-                delete_file(p);
-            }
+            if (same_text(full_folder(p), self)) continue;
+            if (is_link(p)) remove_link(p);
+            else if (file_exists(p)) delete_file(p);
         }
-        // The folders left empty, the deepest first, then the folder of the programs.
-        std::vector<std::string> ordered(folders.begin(), folders.end());
-        std::sort(ordered.begin(), ordered.end(),
-            [](const std::string& a, const std::string& b) { return a.size() > b.size(); });
-        for (const auto& d : ordered) RemoveDirectoryW(widen(join_path(program_dir, d)).c_str());
-        if (!RemoveDirectoryW(widen(program_dir).c_str()) && running_dir.empty())
-            log("the folder " + program_dir + " keeps files that Albireo did not install");
+        clear_folder(program_dir, all, true, kept, self, last);
+        const bool removed = RemoveDirectoryW(dir.c_str()) != 0 || !dir_exists(program_dir);
+        const bool others = !removed && holds(program_dir, all, kept, true);
+        if (others) log("the folder " + program_dir + " stays with the folders kept, or with other files");
+        if (!removed && inside)
+        {
+            pending_removal.program_dir = program_dir;
+            pending_removal.uninstaller = narrow(self);
+            pending_removal.all = all;
+            pending_removal.keep.clear();
+            for (const auto& k : kept) pending_removal.keep.push_back(narrow(k));
+            removal_pending = true;
+        }
+        else if (!removed)
+        {
+            // The last resort: what stays in use goes at the restart of Windows, then the folder if empty.
+            MoveFileExW(dir.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
+        }
+        return !others;
     }
 
     void finish_removal()
     {
-        if (running_aside.empty()) return;
-        // The folder goes at the next restart of Windows if it is empty then.
-        MoveFileExW(widen(running_dir).c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
-        wchar_t buf[MAX_PATH];
-        const UINT n = GetSystemDirectoryW(buf, MAX_PATH);
-        const std::wstring system(buf, n < MAX_PATH ? n : 0);
-        const std::wstring file = widen(running_aside), dir = widen(running_dir);
-        // cmd expands %name% even between quotes: such paths wait for the restart.
-        if (system.empty() || (file + dir).find(L'%') != std::wstring::npos) return;
+        if (!removal_pending) return;
+        removal_pending = false;
+        const removal_plan& plan = pending_removal;
         /*
-            cmd and ping of System32, by their full paths and from System32, try once a
-            second for half a minute to delete the uninstaller, which ends right after this
-            call, then remove its folder when it is empty.
+            The copy of the uninstaller and the removal it finishes, in a folder of its own of
+            %TEMP% that only SYSTEM and the administrators change: the copy, started from
+            there, loads nothing that another account placed beside it.
         */
-        const std::wstring cmd_exe = system + L"\\cmd.exe";
-        std::wstring cmd = L"\"" + cmd_exe + L"\" /d /s /c \"for /l %i in (1,1,30) do (del /f /q \"" + file
-            + L"\" 2>nul & if not exist \"" + file + L"\" (rd \"" + dir + L"\" 2>nul & exit) & \"" + system
-            + L"\\PING.EXE\" -n 2 127.0.0.1 >nul)\"";
-        STARTUPINFOW si = { sizeof(si) };
-        PROCESS_INFORMATION pi = {};
-        if (CreateProcessW(cmd_exe.c_str(), &cmd[0], nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr,
-                system.c_str(), &si, &pi))
+        std::wstring temp(MAX_PATH + 1, L'\0');
+        const DWORD n = GetTempPathW(static_cast<DWORD>(temp.size()), &temp[0]);
+        temp.resize(n > 0 && n < temp.size() ? n : 0);
+        const std::string folder = temp.empty() ? std::string() : join_path(narrow(temp), "albireo-uninstall-"
+            + random_hex(8));
+        const std::string copy = join_path(folder, "albireo-setup.exe");
+        json doc = json::object();
+        doc["program_dir"] = plan.program_dir;
+        doc["uninstaller"] = plan.uninstaller;
+        doc["all"] = plan.all;
+        json keep = json::array();
+        for (const auto& k : plan.keep) keep.push_back(k);
+        doc["keep"] = keep;
+        doc["parent"] = static_cast<long long>(GetCurrentProcessId());
+        std::string error;
+        bool started = false;
+        if (!folder.empty() && !dir_exists(folder) && secure_folder(folder, error)
+            && CopyFileW(widen(executable_path()).c_str(), widen(copy).c_str(), TRUE)
+            && write_file_atomic(join_path(folder, "removal.json"), doc.dump()))
         {
-            CloseHandle(pi.hThread);
-            CloseHandle(pi.hProcess);
+            const std::wstring system = system_folder();
+            std::wstring cmd = L"\"" + widen(copy) + L"\" /finish-removal";
+            STARTUPINFOW si = {};
+            si.cb = sizeof(si);
+            PROCESS_INFORMATION pi = {};
+            const wchar_t* from = system.empty() ? nullptr : system.c_str();
+            started = CreateProcessW(widen(copy).c_str(), &cmd[0], nullptr, nullptr, FALSE,
+                    DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB, nullptr, from, &si, &pi)
+                || CreateProcessW(widen(copy).c_str(), &cmd[0], nullptr, nullptr, FALSE,
+                    DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP, nullptr, from, &si, &pi);
+            if (started)
+            {
+                CloseHandle(pi.hThread);
+                CloseHandle(pi.hProcess);
+            }
         }
+        if (started)
+        {
+            log("the removal of " + plan.program_dir + " ends after the uninstaller, from " + folder);
+            return;
+        }
+        // The last resort: the files in use, the uninstaller and the folder go at the restart of Windows.
+        log("the removal of " + plan.program_dir + " ends at the next restart of Windows" + (error.empty() ? ""
+            : ": " + error));
+        if (!folder.empty() && dir_exists(folder)) remove_folder(folder);
+        std::vector<std::wstring> kept;
+        for (const auto& k : plan.keep) kept.push_back(widen(k));
+        clear_folder(plan.program_dir, plan.all, true, kept, widen(plan.uninstaller), true);
+        MoveFileExW(widen(plan.uninstaller).c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
+        MoveFileExW(widen(plan.program_dir).c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
+    }
+
+    int complete_removal()
+    {
+        // The plan lies beside this copy, in a folder that only SYSTEM and the administrators change.
+        const std::string folder = executable_dir();
+        const std::string plan_path = join_path(folder, "removal.json");
+        std::string text;
+        if (!owned_by_system(folder) || !read_file(plan_path, text, 1u << 20)) return 1;
+        const json plan = json::parse_or_null(text);
+        const std::string program_dir = plan["program_dir"].as_string();
+        const std::string uninstaller = plan["uninstaller"].as_string();
+        const std::wstring dir = full_folder(program_dir);
+        if (program_dir.empty() || !same_or_inside(full_folder(uninstaller), dir) || same_text(full_folder(uninstaller),
+                dir))
+            return 1;
+        {
+            // The lines go to the log of the data folder when it is still there.
+            std::lock_guard<std::mutex> lock(log_m);
+            log_ready = dir_exists(join_path(data_dir(), "logs"));
+        }
+        const DWORD parent = static_cast<DWORD>(plan["parent"].as_int(0));
+        HANDLE p = parent ? OpenProcess(SYNCHRONIZE, FALSE, parent) : nullptr;
+        if (p)
+        {
+            WaitForSingleObject(p, 120000);
+            CloseHandle(p);
+        }
+        std::vector<std::wstring> kept;
+        for (const auto& k : plan["keep"].elements()) kept.push_back(full_folder(k.as_string()));
+        const bool all = plan["all"].as_bool(false) && removable_folder(program_dir);
+        // Once a second for half a minute, while a file stays in use; then the restart of Windows.
+        bool removed = false;
+        for (int attempt = 0; attempt < 30 && !removed; ++attempt)
+        {
+            if (attempt > 0) std::this_thread::sleep_for(std::chrono::seconds(1));
+            const bool last = attempt == 29;
+            if (file_exists(uninstaller))
+            {
+                if (last) delete_file(uninstaller);
+                else DeleteFileW(widen(uninstaller).c_str());
+            }
+            clear_folder(program_dir, all, true, kept, std::wstring(), last);
+            removed = RemoveDirectoryW(dir.c_str()) != 0 || !dir_exists(program_dir);
+            // Only what stays for good is left: the folders kept, or the files of a folder of the system.
+            if (!removed && !holds(program_dir, all, kept, false)) break;
+        }
+        if (removed) log("the folder " + program_dir + " is removed");
+        else if (holds(program_dir, all, kept, true))
+            log("the folder " + program_dir + " stays with the folders kept, or with other files");
+        else
+        {
+            log("the folder " + program_dir + " goes at the next restart of Windows");
+            MoveFileExW(dir.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
+        }
+        // This copy and its folder go once it ends.
+        remove_file(plan_path);
+        delete_after_exit(executable_path(), folder);
+        return 0;
+    }
+
+    void write_result(const std::string& operation, const std::string& previous, bool ok, bool rolled_back,
+        const std::string& error)
+    {
+        const std::string logs = join_path(data_dir(), "logs");
+        if (!dir_exists(logs)) return;
+        json r = json::object();
+        r["time"] = static_cast<long long>(now_unix());
+        r["operation"] = operation;
+        r["version"] = ALBIREO_VERSION;
+        r["previous"] = previous;
+        r["ok"] = ok;
+        if (!ok)
+        {
+            r["rolled_back"] = rolled_back;
+            r["error"] = error;
+        }
+        write_file_atomic(join_path(logs, "setup-result.json"), r.dump_formatted(2) + "\n");
     }
 
     void log(const std::string& line)
     {
         std::lock_guard<std::mutex> lock(log_m);
         append_log(iso_time(now_unix()) + " " + line + "\n");
+    }
+
+    void flush_log()
+    {
+        std::lock_guard<std::mutex> lock(log_m);
+        if (log_ready || log_waiting.empty()) return;
+        wchar_t temp[MAX_PATH + 1];
+        const DWORD n = GetTempPathW(MAX_PATH + 1, temp);
+        if (n == 0 || n > MAX_PATH) return;
+        std::ofstream out(widen(join_path(narrow(std::wstring(temp, n)), "albireo-setup.log")).c_str(),
+            std::ios::app | std::ios::binary);
+        out << log_waiting;
+        log_waiting.clear();
     }
 
 }

@@ -19,7 +19,8 @@
     A restart normally happens within the process.  Once the engine of a device has run,
     whose library stays loaded, the service restarts in a new process instead: as a
     Windows service, through a copy of the program started with --restart-service, which
-    waits for the service to stop and starts it again.
+    waits for the service to stop and starts it again.  A process that loaded the engine of
+    a device, the probes included, ends without unloading it (end_process()).
 */
 
 #if defined(_WIN32) && !defined(_WIN32_WINNT)
@@ -65,6 +66,14 @@ namespace
 
     // Returned by serve() when the restart needs a new process.
     const int restart_process = 75;
+
+    // The exit code of the program, which ends without unloading the engine of a device
+    // once one has run (engine_host::pinned_engine_started()).
+    int finish(int code)
+    {
+        if (albireo::engine_host::pinned_engine_started()) albireo::end_process(code);
+        return code;
+    }
 
     void request_stop()
     {
@@ -328,9 +337,10 @@ int main(int argc, char** argv)
     for (int i = 0; i < argc; ++i) args.push_back(argv[i]);
 #endif
 
-    if (args.size() >= 3 && args[1] == "--probe-engine") return albireo::service::probe_engine(args[2]);
+    // The probes end as soon as their result is written, the engine they loaded still in memory.
+    if (args.size() >= 3 && args[1] == "--probe-engine") albireo::end_process(albireo::service::probe_engine(args[2]));
     if (args.size() >= 5 && args[1] == "--bench-engine")
-        return albireo::service::benchmark_engine(args[2], args[3], args[4]);
+        albireo::end_process(albireo::service::benchmark_engine(args[2], args[3], args[4]));
     if (args.size() >= 2 && args[1] == "--version")
     {
         std::cout << ALBIREO_FULL_NAME << " " << ALBIREO_VERSION << std::endl;
@@ -342,11 +352,11 @@ int main(int argc, char** argv)
     if (!console)
     {
         SERVICE_TABLE_ENTRYW table[] = { { const_cast<LPWSTR>(service_name), service_main }, { nullptr, nullptr } };
-        if (StartServiceCtrlDispatcherW(table)) return 0;
+        if (StartServiceCtrlDispatcherW(table)) return finish(0);
         if (GetLastError() != ERROR_FAILED_SERVICE_CONTROLLER_CONNECT) return 1;
     }
 #else
     (void)console;
 #endif
-    return run_console(args);
+    return finish(run_console(args));
 }

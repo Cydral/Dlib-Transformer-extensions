@@ -37,6 +37,17 @@ offline_reply = {"409": reply("Refused in offline mode", {"type": "object", "pro
 model_id = {"name": "id", "in": "path", "required": True, "schema": {"type": "string", "pattern": "^[A-Za-z0-9._-]+$"},
             "description": "Identifier of the model, as listed by /albireo/v1/models."}
 ok = {"type": "object", "properties": {"ok": {"type": "boolean"}, "error": {"type": "string"}}}
+# The codes of the errors of the updates (host/updater.h), and of the refusals of the imports by path
+# (service::import_folder() in host/service.h).
+update_codes = ["update_check", "update_record", "update_feed_missing", "update_feed_missing_folder",
+                "update_signature", "update_feed_mismatch", "update_outside", "update_installer_mismatch",
+                "update_feed_invalid", "update_download", "update_not_ready", "update_invalid", "update_start",
+                "update_package_manager", "stopping"]
+import_codes = ["import_path_relative", "import_path_network", "import_path_device", "import_path_invalid",
+                "import_use_upload", "import_not_bundle", "import_not_found", "import_path_link",
+                "import_folder_insecure"]
+import_refusal = {"allOf": [ref("Refusal"), {"type": "object", "properties": {"code": {"type": "string",
+                  "enum": import_codes}}}]}
 
 schemas = {
     "Error": {"type": "object", "properties": {"error": {"type": "object", "properties": {
@@ -69,7 +80,11 @@ schemas = {
         "max_completion_tokens": {"type": "integer"},
         "temperature": {"type": "number", "minimum": 0, "maximum": 2},
         "top_p": {"type": "number"},
-        "top_k": {"type": "integer", "minimum": 0, "description": "Candidates kept, 1024 at most; 0 for none."},
+        "top_k": {"type": "integer", "minimum": 0, "maximum": 1024, "default": 40,
+                  "description": "Keeps the k most likely tokens, among which top_p and min_p then choose; 0 sets "
+                                 "no limit, and the 1024 most likely tokens are kept. Without it, 40, or 20 for a "
+                                 "model of the ChatML format that reasons. A value outside 0 to 1024 is refused "
+                                 "(400). Without effect at temperature 0, which takes the most likely token."},
         "min_p": {"type": "number"},
         "presence_penalty": {"type": "number"}, "frequency_penalty": {"type": "number"},
         "repeat_penalty": {"type": "number"}, "repeat_last_n": {"type": "integer"},
@@ -181,6 +196,51 @@ schemas = {
                                  "connection, or http://[user:password@]host:port.  The settings give the password "
                                  "as ********; that value sent back keeps the stored password when the user, the "
                                  "host and the port stay the same, and is refused (code proxy_password) otherwise."}}},
+    "Engines": {"type": "object", "properties": {
+        "starting": {"type": "boolean", "description": "True while the engines are being described."},
+        "engines": {"type": "array", "items": {"type": "object", "properties": {
+            "variant": {"type": "string"}, "path": {"type": "string"}, "usable": {"type": "boolean"},
+            "version": {"type": "string"}, "build": {"type": "string"}, "current": {"type": "boolean"},
+            "devices": {"type": "array", "items": {"type": "object", "properties": {
+                "type": {"type": "string", "enum": ["cpu", "gpu", "npu"]}, "id": {"type": "string"},
+                "name": {"type": "string"}}}},
+            "reason": {"type": "string", "description": "Why the engine cannot run here, in English."},
+            "reason_code": {"type": "string", "description": "The code of the reason: isa_avx2, isa_avx_vnni, "
+                            "isa_avx512, no_nvidia_driver, old_nvidia_driver, no_nvidia_card, old_nvidia_card, "
+                            "no_intel_device, intel_device_unusable, library_failed, probe_timeout."},
+            "reason_args": {"type": "object", "additionalProperties": {"type": "string"}},
+            "missing": {"type": "string", "description": "For an engine that runs: why its runtime left out the "
+                        "other devices it looks for, such as the message of a plugin of OpenVINO."}}}},
+        "options": {"type": "array", "description": "The choices of engine and device.", "items": {
+            "type": "object", "properties": {
+                "key": {"type": "string", "example": "openvino:gpu"}, "variant": {"type": "string"},
+                "device": {"type": "string"}, "current": {"type": "boolean"},
+                "kind": {"type": "string", "enum": ["cpu", "gpu", "npu", "both"]},
+                "names": {"type": "array", "items": {"type": "string"},
+                          "description": "The names of the devices of the choice."},
+                "measure": {"type": "object", "description": "The last measure of the choice."}}}},
+        "current": {"type": "string", "description": "The key of the choice in use."},
+        "setting": {"type": "string"}, "accelerator": {"type": "string"},
+        "accelerators_available": {"type": "boolean"},
+        "accelerators_reason": {"type": "string", "enum": ["not_installed", "unusable"]}}},
+    "UpdateState": {"type": "object", "description": "The updates: their state, the versions, the notes by language, "
+                    "and an error with its code and its values, which the tray translates.", "properties": {
+        "state": {"type": "string", "enum": ["idle", "checking", "up_to_date", "downloading", "ready", "error"]},
+        "current": {"type": "string"}, "latest": {"type": "string"}, "file": {"type": "string"},
+        "notes": {"type": "object", "additionalProperties": {"type": "string"}},
+        "received": {"type": "integer"}, "total": {"type": "integer"}, "checked_at": {"type": "integer"},
+        "error": {"type": "string", "description": "The error in English."},
+        "code": {"type": "string", "enum": update_codes,
+                 "description": "update_check {e}, update_record {version}, update_feed_missing {version}, "
+                                "update_feed_missing_folder {folder}, update_signature {file}, update_feed_mismatch "
+                                "{file, version}, update_outside {file}, update_installer_mismatch {version}, "
+                                "update_feed_invalid, update_download {e}, update_not_ready, update_invalid "
+                                "{version}, update_start {code}, update_package_manager, stopping."},
+        "args": {"type": "object", "additionalProperties": {"type": "string"}}}},
+    "Refusal": {"type": "object", "description": "A refused operation, with the code of its reason and its values.",
+                "properties": {"ok": {"type": "boolean", "enum": [False]}, "error": {"type": "string"},
+                               "code": {"type": "string"},
+                               "args": {"type": "object", "additionalProperties": {"type": "string"}}}},
 }
 
 paths = {
@@ -244,12 +304,17 @@ paths = {
                 "installed": {"type": "boolean"},
                 "builtin": {"type": "boolean", "description": "Comes with Albireo: it cannot be deleted."},
                 "size": {"type": "integer"}, "quantization": {"type": "string"},
-                "description": {"type": "string"}}}},
+                "description": {"type": "string"}, "publisher": {"type": "string"},
+                "license": {"type": "string", "description": "The license of the entry of the model in the catalog, "
+                            "or in the manifest of the models that come with Albireo; absent for a file imported "
+                            "without an entry."}}}},
             "background": {"type": "string", "description": "The model of albireo-background, empty without one."},
             "embedding_models": {"type": "array", "items": {"type": "object", "properties": {
                 "id": {"type": "string"}, "name": {"type": "string"},
                 "source": {"type": "string", "enum": ["builtin", "catalog", "import"]},
-                "size": {"type": "integer"}}}, "description": "The installed embedding models."},
+                "size": {"type": "integer"}, "publisher": {"type": "string"},
+                "license": {"type": "string", "description": "As for the language models."}}},
+                "description": "The installed embedding models."},
             "downloads": {"type": "array", "items": {"type": "object"}},
             "active": {"type": "object", "additionalProperties": {"type": "string"},
                        "description": "The model of each function, as in the status."},
@@ -262,9 +327,32 @@ paths = {
     "/albireo/v1/usage": {"get": {"tags": ["Service"], "summary": "Usage per day over 30 days",
                                   "responses": {"200": reply("The figures", {"type": "object"})}}},
     "/albireo/v1/engines": {"get": {"tags": ["Service"], "summary": "Engines found, their devices and measures",
-                                    "responses": {"200": reply("The engines", {"type": "object"})}}},
+                                    "responses": {"200": reply("The engines", ref("Engines"))}}},
     "/albireo/v1/updates": {"get": {"tags": ["Service"], "summary": "State of the updates",
-                                    "responses": {"200": reply("The state", {"type": "object"})}}},
+                                    "responses": {"200": reply("The state", ref("UpdateState"))}}},
+    "/albireo/v1/licenses": {"get": {
+        "tags": ["Service"], "summary": "License texts of the installation",
+        "description": "The texts of the licenses folder of the programs, which the installer fills: those of the "
+                       "components of the programs (Albireo, dlib, Mbed TLS, cpp-httplib, zlib, SQLite) and of the "
+                       "runtimes of the engines (OpenVINO, CUDA, cuDNN). The list is empty without that folder, as "
+                       "in a build folder. The components of the web application are listed by "
+                       "/vendor/components.json.",
+        "responses": {"200": reply("The texts, by the names of their files", {"type": "array", "items": {
+            "type": "object", "properties": {
+                "file": {"type": "string", "example": "mbedtls.txt"},
+                "name": {"type": "string", "example": "Mbed TLS"}, "size": {"type": "integer"},
+                "version": {"type": "string", "description": "The version the service was built with, when it "
+                            "knows it."}}}})}}},
+    "/albireo/v1/licenses/{file}": {"get": {
+        "tags": ["Service"], "summary": "A license text of the installation",
+        "description": "Only the files the folder lists, read through no link: a link, a file with several names "
+                       "(hard links) or a text of more than 1 MB is not served.",
+        "parameters": [{"name": "file", "in": "path", "required": True, "schema": {"type": "string"},
+                        "description": "A file listed by /albireo/v1/licenses."}],
+        "responses": {"200": {"description": "The text", "content": {"text/plain": {"schema": {"type": "string"}}}},
+                      "400": reply("A name with a separator, a colon, a control character or a leading dot (code "
+                                   "invalid_license)", ref("Error")),
+                      "404": reply("No such text (code license_not_found)", ref("Error"))}}},
     "/albireo/v1/count": {"post": {
         "tags": ["Service"], "summary": "Tokens of messages, or of a text, for a model",
         "requestBody": json_body({"type": "object", "properties": {
@@ -309,21 +397,32 @@ paths = {
             "ok": {"type": "boolean"}, "pending": {"type": "boolean"}}}), "400": reply("Refused", ok)}}},
     "/albireo/v1/import": {"post": {
         "tags": ["Administration"], "security": admin,
-        "summary": "Imports an offline bundle, or the GGUF files of a local folder or file",
-        "description": "For a computer without network: a memory card or a disk brought to the machine. A folder "
-                       "may hold a signed catalog (catalog.json and catalog.json.sig), GGUF files, also in its "
-                       "models subfolder, and a signed update (feed.json, feed.json.sig and the installer it "
-                       "names), as tools/make_offline_bundle.py prepares them. An older catalog never replaces a "
-                       "newer one, and the update is installed at the next start of the service.",
+        "summary": "Imports a signed offline bundle, or the content of the import folder",
+        "description": "For a computer without network: a memory card or a disk brought to the machine. The "
+                       "service reads with its own rights, so that it accepts two kinds of paths: a signed offline "
+                       "bundle on a local drive (a folder whose catalog.json or feed.json bears the signature of "
+                       "Albireo, as tools/make_offline_bundle.py prepares it), of which it reads only the signed "
+                       "files, the models the signed catalog lists, by their names, sizes and hashes, and the "
+                       "installer the signed feed names; and a folder or a file of the import folder of the data "
+                       "folder. Every file is read through no link. A model file of the user is sent through "
+                       "/albireo/v1/models/upload. An older catalog never replaces a newer one, a model installed "
+                       "already is listed under already, and the update is installed at the next start of the "
+                       "service.",
         "requestBody": json_body({"type": "object", "required": ["path"], "properties": {"path": {"type": "string"}}}),
         "responses": {"200": reply("Imported models, catalog, update and errors", {"type": "object", "properties": {
             "imported": {"type": "array", "items": {"type": "string"}},
+            "already": {"type": "array", "items": {"type": "string"},
+                        "description": "The installed models whose content the files repeat."},
             "errors": {"type": "array", "items": {"type": "string"}},
-            "catalog": {"type": "object"}, "update": {"type": "object"}}})}}},
+            "catalog": {"type": "object"}, "update": ref("UpdateState")}}),
+                      "400": reply("The path is refused before anything of it is read; the code is the same "
+                                   "whether a folder outside the import folder is missing, unreadable, unsigned or "
+                                   "reached through a link (import_not_bundle)", import_refusal)}}},
     "/albireo/v1/models/import": {"post": {
         "tags": ["Administration"], "security": admin, "summary": "Same as /albireo/v1/import",
         "requestBody": json_body({"type": "object", "required": ["path"], "properties": {"path": {"type": "string"}}}),
-        "responses": {"200": reply("Imported files and errors", {"type": "object"})}}},
+        "responses": {"200": reply("Imported files and errors", {"type": "object"}),
+                      "400": reply("Refused", import_refusal)}}},
     "/albireo/v1/models/upload": {"post": {
         "tags": ["Administration"], "security": admin, "summary": "Installs a GGUF file sent in the body",
         "parameters": [{"name": "name", "in": "query", "required": True, "schema": {"type": "string"}}],
@@ -344,11 +443,16 @@ paths = {
                                            ref("Error"))}}},
     "/albireo/v1/updates/check": {"post": {"tags": ["Administration"], "security": admin,
                                            "summary": "Checks for an update and downloads it, in the background",
-                                           "responses": dict({"202": reply("State", {"type": "object"})},
+                                           "responses": dict({"202": reply("State", ref("UpdateState"))},
                                                              **offline_reply)}},
     "/albireo/v1/updates/apply": {"post": {"tags": ["Administration"], "security": admin,
                                            "summary": "Restarts the service to install a downloaded update",
-                                           "responses": {"202": reply("Restarting", ok)}}},
+                                           "responses": {"202": reply("Restarting", ok),
+                                                         "400": reply("No update is ready (code update_not_ready)",
+                                                                      ref("Refusal")),
+                                                         "409": reply("The package manager of the system applies "
+                                                                      "the updates (code update_package_manager)",
+                                                                      ref("Refusal"))}}},
     "/albireo/v1/restart": {"post": {"tags": ["Administration"], "security": admin, "summary": "Restarts the service",
                                      "responses": {"202": reply("Restarting", ok)}}},
     "/albireo/v1/engines/benchmark": {"post": {"tags": ["Administration"], "security": admin,
@@ -381,7 +485,8 @@ doc = {
                        "DELETE and OPTIONS take no body (400). An answer being written whose model has no memory left "
                        "for its keys and values ends with the error code out_of_memory.",
         "license": {"name": "Boost Software License 1.0", "url": "https://www.boost.org/LICENSE_1_0.txt"},
-        "contact": {"name": "Cydral Technology", "url": "https://github.com/Cydral/Dlib-Transformer-extensions"}},
+        "contact": {"name": "Aldric Pierrain", "email": "cydraltechnology@gmail.com",
+                    "url": "https://github.com/Cydral/Dlib-Transformer-extensions"}},
     "servers": [{"url": "/"}],
     "tags": [{"name": "OpenAI", "description": "Compatible with the OpenAI interface"},
              {"name": "Service", "description": "State of the service"},

@@ -38,13 +38,20 @@ namespace albireo
             { "accel_auto", { "Automatic", "Automatique", "Automatisch", "Automatico", "Automático" } },
             { "accel_none", { "Processor only", "Processeur uniquement", "Nur Prozessor", "Solo processore",
                 "Solo procesador" } },
-            { "accel_npu", { "Neural processor (NPU)", "Processeur neuronal (NPU)", "Neuronaler Prozessor (NPU)",
-                "Processore neurale (NPU)", "Procesador neuronal (NPU)" } },
-            { "accel_gpu", { "Graphics processor (GPU)", "Processeur graphique (GPU)", "Grafikprozessor (GPU)",
-                "Processore grafico (GPU)", "Procesador gráfico (GPU)" } },
-            { "accel_both", { "NPU or GPU, the fastest measured", "NPU ou GPU, le plus rapide mesuré",
-                "NPU oder GPU, der schnellste gemessene", "NPU o GPU, il più veloce misurato",
-                "NPU o GPU, el más rápido medido" } },
+            // A device of an engine: {k} its kind, {n} the names of its devices, {r} its runtime.
+            { "accel_choice", { "{k} {n} ({r})", "{k} {n} ({r})", "{k} {n} ({r})", "{k} {n} ({r})",
+                "{k} {n} ({r})" } },
+            { "accel_choice_plain", { "{k} ({r})", "{k} ({r})", "{k} ({r})", "{k} ({r})", "{k} ({r})" } },
+            { "device_gpu", { "GPU", "GPU", "GPU", "GPU", "GPU" } },
+            { "device_npu", { "NPU", "NPU", "NPU", "NPU", "NPU" } },
+            { "device_both", { "NPU + GPU", "NPU + GPU", "NPU + GPU", "NPU + GPU", "NPU + GPU" } },
+            { "device_cpu", { "Processor", "Processeur", "Prozessor", "Processore", "Procesador" } },
+            { "accel_cannot_run", { "{r} cannot run here: {why}", "{r} ne peut pas fonctionner ici : {why}",
+                "{r} kann hier nicht laufen: {why}", "{r} non può funzionare qui: {why}",
+                "{r} no puede funcionar aquí: {why}" } },
+            { "accel_left_out", { "{r} left devices out: {m}", "{r} a écarté des périphériques : {m}",
+                "{r} hat Geräte ausgelassen: {m}", "{r} ha escluso dei dispositivi: {m}",
+                "{r} dejó fuera dispositivos: {m}" } },
             { "accel_measure", { "Measure the engines", "Mesurer les moteurs", "Engines messen", "Misura i motori",
                 "Medir los motores" } },
             { "accel_not_installed", { "No accelerator engine installed: OpenVINO (Intel NPU and graphics) or CUDA "
@@ -52,16 +59,6 @@ namespace albireo
                 "Keine Beschleuniger-Engine installiert: OpenVINO (Intel-NPU und -Grafik) oder CUDA (NVIDIA)",
                 "Nessun motore di accelerazione installato: OpenVINO (NPU e grafica Intel) o CUDA (NVIDIA)",
                 "Ningún motor de aceleración instalado: OpenVINO (NPU y gráficos Intel) o CUDA (NVIDIA)" } },
-            { "accel_unusable", { "The accelerator engines of this installation cannot run here (see This computer)",
-                "Les moteurs d'accélération de cette installation ne peuvent pas fonctionner ici (voir Cet "
-                "ordinateur)", "Die Beschleuniger-Engines dieser Installation können hier nicht laufen (siehe "
-                "Dieser Computer)", "I motori di accelerazione di questa installazione non possono funzionare qui "
-                "(vedere Questo computer)", "Los motores de aceleración de esta instalación no pueden funcionar aquí "
-                "(véase Este equipo)" } },
-            { "accel_cpu_only", { "Available while the processor engine runs",
-                "Disponible lorsque le moteur processeur est actif", "Verfügbar, solange die Prozessor-Engine läuft",
-                "Disponibile quando è attivo il motore del processore",
-                "Disponible mientras funciona el motor del procesador" } },
             { "tray_updates", { "Check for updates", "Rechercher des mises à jour", "Nach Updates suchen",
                 "Cerca aggiornamenti", "Buscar actualizaciones" } },
             { "tray_install_update", { "Install version {v} and restart", "Installer la version {v} et redémarrer",
@@ -111,6 +108,20 @@ namespace albireo
             { "notify_update_error", { "The update check failed: {e}", "La recherche de mise à jour a échoué : {e}",
                 "Die Update-Suche ist fehlgeschlagen: {e}", "La ricerca di aggiornamenti non è riuscita: {e}",
                 "La búsqueda de actualizaciones falló: {e}" } },
+            // An update made by the installer out of sight that failed ({v} the version it brought,
+            // {o} the version in place, {e} the error).
+            { "notify_update_failed_title", { "Update failed", "Échec de la mise à jour",
+                "Aktualisierung fehlgeschlagen", "Aggiornamento non riuscito", "Actualización fallida" } },
+            { "notify_update_rolled_back", { "The update to version {v} failed and Albireo {o} was put back in "
+                "place: {e}", "La mise à jour vers la version {v} a échoué et Albireo {o} a été remis en place : {e}",
+                "Die Aktualisierung auf Version {v} ist fehlgeschlagen, Albireo {o} wurde wiederhergestellt: {e}",
+                "L'aggiornamento alla versione {v} non è riuscito ed è stato ripristinato Albireo {o}: {e}",
+                "La actualización a la versión {v} falló y se restableció Albireo {o}: {e}" } },
+            { "notify_update_failed", { "The update to version {v} failed: {e}",
+                "La mise à jour vers la version {v} a échoué : {e}",
+                "Die Aktualisierung auf Version {v} ist fehlgeschlagen: {e}",
+                "L'aggiornamento alla versione {v} non è riuscito: {e}",
+                "La actualización a la versión {v} falló: {e}" } },
             { "notify_installed", { "{m} is installed.", "{m} est installé.", "{m} ist installiert.",
                 "{m} è installato.", "{m} está instalado." } },
             { "notify_failed", { "The download of {m} failed: {e}", "Le téléchargement de {m} a échoué : {e}",
@@ -261,6 +272,10 @@ namespace albireo
                 "Modellen überlassen, aber nicht gelöscht werden.", "{m} è fornito con Albireo: può lasciare le sue "
                 "funzioni ad altri modelli, non può essere eliminato.", "{m} se incluye con Albireo: puede dejar sus "
                 "funciones a otros modelos, no se puede eliminar." } },
+            { "err_builtin_installed", { "{m} comes with Albireo and is installed already.",
+                "{m} est livré avec Albireo et déjà installé.",
+                "{m} wird mit Albireo ausgeliefert und ist bereits installiert.",
+                "{m} è fornito con Albireo ed è già installato.", "{m} se incluye con Albireo y ya está instalado." } },
             { "err_delete_failed", { "{m} could not be deleted: its file is in use or protected ({file}).",
                 "{m} n'a pas pu être supprimé : son fichier est utilisé ou protégé ({file}).",
                 "{m} konnte nicht gelöscht werden: Seine Datei ist in Gebrauch oder geschützt ({file}).",
@@ -283,6 +298,131 @@ namespace albireo
                 "Le modèle téléchargé n'a pas pu être installé : {e}",
                 "Das heruntergeladene Modell konnte nicht installiert werden: {e}",
                 "Il modello scaricato non è stato installato: {e}", "El modelo descargado no se pudo instalar: {e}" } },
+            // The refusals of the imports by path, by their code ({path}: the path asked for).
+            { "err_import_path_relative", { "The path {path} is relative: an import names a folder by its full path.",
+                "Le chemin {path} est relatif : un import désigne un dossier par son chemin complet.",
+                "Der Pfad {path} ist relativ: Ein Import nennt einen Ordner mit seinem vollständigen Pfad.",
+                "Il percorso {path} è relativo: un'importazione indica una cartella con il suo percorso completo.",
+                "La ruta {path} es relativa: una importación indica una carpeta con su ruta completa." } },
+            { "err_import_path_network", { "{path} is on a network drive or share: the imports read the local drives "
+                "only.", "{path} se trouve sur un lecteur ou un partage réseau : les imports ne lisent que les disques "
+                "locaux.", "{path} liegt auf einem Netzlaufwerk oder einer Netzwerkfreigabe: Importe lesen nur lokale "
+                "Laufwerke.", "{path} si trova su un'unità o una condivisione di rete: le importazioni leggono solo i "
+                "dischi locali.", "{path} está en una unidad o un recurso compartido de red: las importaciones solo "
+                "leen las unidades locales." } },
+            { "err_import_path_device", { "{path} names a device or a namespace of the system: the imports read "
+                "folders of the local drives only.", "{path} désigne un périphérique ou un espace de noms du "
+                "système : les imports ne lisent que des dossiers des disques locaux.", "{path} bezeichnet ein Gerät "
+                "oder einen Namensraum des Systems: Importe lesen nur Ordner lokaler Laufwerke.", "{path} indica un "
+                "dispositivo o uno spazio dei nomi del sistema: le importazioni leggono solo cartelle dei dischi "
+                "locali.", "{path} designa un dispositivo o un espacio de nombres del sistema: las importaciones solo "
+                "leen carpetas de las unidades locales." } },
+            { "err_import_path_invalid", { "The path {path} is not valid for an import.",
+                "Le chemin {path} n'est pas valide pour un import.",
+                "Der Pfad {path} ist für einen Import nicht gültig.",
+                "Il percorso {path} non è valido per un'importazione.",
+                "La ruta {path} no es válida para una importación." } },
+            { "err_import_use_upload", { "{path} is a model file: send it with Import…, then Model files (*.gguf).",
+                "{path} est un fichier de modèle : envoyez-le avec Importer…, puis Fichiers de modèle (*.gguf).",
+                "{path} ist eine Modelldatei: Senden Sie sie mit Importieren… und dann Modelldateien (*.gguf).",
+                "{path} è un file di modello: inviatelo con Importa…, poi File di modello (*.gguf).",
+                "{path} es un archivo de modelo: envíelo con Importar… y luego Archivos de modelo (*.gguf)." } },
+            { "err_import_not_found", { "{path} is not found in the import folder.",
+                "{path} est introuvable dans le dossier d'import.", "{path} wurde im Importordner nicht gefunden.",
+                "{path} non si trova nella cartella di importazione.",
+                "{path} no se encuentra en la carpeta de importación." } },
+            { "err_import_path_link", { "{path} is reached through a link, which the imports never follow.",
+                "{path} est atteint par un lien, que les imports ne suivent jamais.",
+                "{path} wird über eine Verknüpfung erreicht, der Importe nie folgen.",
+                "{path} è raggiunto tramite un collegamento, che le importazioni non seguono mai.",
+                "{path} se alcanza mediante un enlace, que las importaciones nunca siguen." } },
+            { "err_import_folder_insecure", { "The import folder lets other accounts than the administrators write in "
+                "it and cannot be secured: nothing is imported from it.", "Le dossier d'import permet à d'autres "
+                "comptes que les administrateurs d'y écrire et ne peut pas être sécurisé : rien n'en est importé.",
+                "In den Importordner können andere Konten als die Administratoren schreiben, und er lässt sich nicht "
+                "absichern: Aus ihm wird nichts importiert.", "La cartella di importazione consente di scrivere ad "
+                "account diversi dagli amministratori e non può essere protetta: non se ne importa nulla.", "La "
+                "carpeta de importación permite escribir a cuentas distintas de los administradores y no se puede "
+                "proteger: no se importa nada de ella." } },
+            { "err_import_not_bundle", { "{path} is no signed offline bundle of Albireo on a local drive (catalog.json "
+                "and catalog.json.sig, or feed.json and feed.json.sig). Model files are sent with Import…, then Model "
+                "files (*.gguf).", "{path} n'est pas un paquet hors ligne signé d'Albireo sur un disque local "
+                "(catalog.json et catalog.json.sig, ou feed.json et feed.json.sig). Les fichiers de modèle s'envoient "
+                "avec Importer…, puis Fichiers de modèle (*.gguf).", "{path} ist kein signiertes Offline-Paket von "
+                "Albireo auf einem lokalen Laufwerk (catalog.json und catalog.json.sig oder feed.json und "
+                "feed.json.sig). Modelldateien werden mit Importieren… und dann Modelldateien (*.gguf) gesendet.",
+                "{path} non è un pacchetto offline firmato di Albireo su un disco locale (catalog.json e "
+                "catalog.json.sig, oppure feed.json e feed.json.sig). I file di modello si inviano con Importa…, poi "
+                "File di modello (*.gguf).", "{path} no es un paquete sin conexión firmado de Albireo en una unidad "
+                "local (catalog.json y catalog.json.sig, o feed.json y feed.json.sig). Los archivos de modelo se "
+                "envían con Importar… y luego Archivos de modelo (*.gguf)." } },
+            // The errors of the updates, by their code.
+            { "err_update_check", { "The update check failed: {e}", "La recherche de mise à jour a échoué : {e}",
+                "Die Update-Suche ist fehlgeschlagen: {e}", "La ricerca di aggiornamenti non è riuscita: {e}",
+                "La búsqueda de actualizaciones falló: {e}" } },
+            { "err_update_record", { "The update to version {version} cannot be recorded in the updates folder.",
+                "La mise à jour vers la version {version} ne peut pas être enregistrée dans le dossier des mises à "
+                "jour.", "Die Aktualisierung auf Version {version} kann nicht im Update-Ordner gespeichert werden.",
+                "L'aggiornamento alla versione {version} non può essere registrato nella cartella degli "
+                "aggiornamenti.", "La actualización a la versión {version} no se puede registrar en la carpeta de "
+                "actualizaciones." } },
+            { "err_update_feed_missing", { "No signed update feed lies beside the installer of version {version}.",
+                "Aucun flux de mise à jour signé n'accompagne le programme d'installation de la version {version}.",
+                "Neben dem Installationsprogramm der Version {version} liegt kein signierter Update-Feed.",
+                "Accanto al programma di installazione della versione {version} non c'è alcun feed di aggiornamento "
+                "firmato.", "Junto al programa de instalación de la versión {version} no hay ningún canal de "
+                "actualización firmado." } },
+            { "err_update_feed_missing_folder", { "{folder} holds no signed update feed (feed.json and feed.json.sig).",
+                "{folder} ne contient aucun flux de mise à jour signé (feed.json et feed.json.sig).",
+                "{folder} enthält keinen signierten Update-Feed (feed.json und feed.json.sig).",
+                "{folder} non contiene alcun feed di aggiornamento firmato (feed.json e feed.json.sig).",
+                "{folder} no contiene ningún canal de actualización firmado (feed.json y feed.json.sig)." } },
+            { "err_update_signature", { "The signature of {file} is not valid.",
+                "La signature de {file} n'est pas valide.", "Die Signatur von {file} ist ungültig.",
+                "La firma di {file} non è valida.", "La firma de {file} no es válida." } },
+            { "err_update_feed_mismatch", { "{file} does not describe the installer of version {version}.",
+                "{file} ne décrit pas le programme d'installation de la version {version}.",
+                "{file} beschreibt nicht das Installationsprogramm der Version {version}.",
+                "{file} non descrive il programma di installazione della versione {version}.",
+                "{file} no describe el programa de instalación de la versión {version}." } },
+            { "err_update_outside", { "The installer of the update {file} lies outside the updates folder.",
+                "Le programme d'installation de la mise à jour {file} se trouve hors du dossier des mises à jour.",
+                "Das Installationsprogramm der Aktualisierung {file} liegt außerhalb des Update-Ordners.",
+                "Il programma di installazione dell'aggiornamento {file} si trova fuori dalla cartella degli "
+                "aggiornamenti.", "El programa de instalación de la actualización {file} está fuera de la carpeta de "
+                "actualizaciones." } },
+            { "err_update_installer_mismatch", { "The installer of version {version} does not match its signed feed.",
+                "Le programme d'installation de la version {version} ne correspond pas à son flux signé.",
+                "Das Installationsprogramm der Version {version} entspricht nicht seinem signierten Feed.",
+                "Il programma di installazione della versione {version} non corrisponde al suo feed firmato.",
+                "El programa de instalación de la versión {version} no coincide con su canal firmado." } },
+            { "err_update_feed_invalid", { "The update feed is incomplete or names no version.",
+                "Le flux des mises à jour est incomplet ou n'indique aucune version.",
+                "Der Update-Feed ist unvollständig oder nennt keine Version.",
+                "Il feed degli aggiornamenti è incompleto o non indica alcuna versione.",
+                "El canal de actualizaciones está incompleto o no indica ninguna versión." } },
+            { "err_update_download", { "The download of the update failed: {e}",
+                "Le téléchargement de la mise à jour a échoué : {e}",
+                "Der Download der Aktualisierung ist fehlgeschlagen: {e}",
+                "Il download dell'aggiornamento non è riuscito: {e}", "La descarga de la actualización falló: {e}" } },
+            { "err_update_not_ready", { "No update is ready.", "Aucune mise à jour n'est prête.",
+                "Keine Aktualisierung ist bereit.", "Nessun aggiornamento è pronto.",
+                "No hay ninguna actualización lista." } },
+            { "err_update_invalid", { "The version {version} of the update is not valid.",
+                "La version {version} de la mise à jour n'est pas valide.",
+                "Die Version {version} der Aktualisierung ist ungültig.",
+                "La versione {version} dell'aggiornamento non è valida.",
+                "La versión {version} de la actualización no es válida." } },
+            { "err_update_start", { "The installer of the update cannot be started (error {code}).",
+                "Le programme d'installation de la mise à jour ne peut pas être démarré (erreur {code}).",
+                "Das Installationsprogramm der Aktualisierung kann nicht gestartet werden (Fehler {code}).",
+                "Il programma di installazione dell'aggiornamento non può essere avviato (errore {code}).",
+                "El programa de instalación de la actualización no se puede iniciar (error {code})." } },
+            { "err_update_package_manager", { "On this system, the package manager applies the updates.",
+                "Sur ce système, le gestionnaire de paquets applique les mises à jour.",
+                "Auf diesem System wendet die Paketverwaltung die Aktualisierungen an.",
+                "Su questo sistema, il gestore dei pacchetti applica gli aggiornamenti.",
+                "En este sistema, el gestor de paquetes aplica las actualizaciones." } },
             // Why an engine cannot run on this computer, by its code.
             { "why_isa_avx2", { "the processor lacks AVX2, FMA or F16C", "le processeur ne dispose pas d'AVX2, FMA "
                 "ou F16C", "dem Prozessor fehlen AVX2, FMA oder F16C", "il processore non dispone di AVX2, FMA o F16C",
@@ -321,10 +461,20 @@ namespace albireo
                 "graphique Intel n'a été trouvé", "keine NPU und kein Intel-Grafikprozessor gefunden",
                 "nessuna NPU né processore grafico Intel trovato",
                 "no se ha encontrado ninguna NPU ni procesador gráfico Intel" } },
+            { "why_intel_device_unusable", { "no NPU or Intel graphics processor could be used: {detail}",
+                "aucun NPU ni processeur graphique Intel n'a pu être utilisé : {detail}",
+                "keine NPU und kein Intel-Grafikprozessor nutzbar: {detail}",
+                "nessuna NPU né processore grafico Intel utilizzabile: {detail}",
+                "no se ha podido usar ninguna NPU ni procesador gráfico Intel: {detail}" } },
             { "why_library_failed", { "the library could not be loaded (code {code})", "la bibliothèque n'a pas pu "
                 "être chargée (code {code})", "die Bibliothek konnte nicht geladen werden (Code {code})",
                 "la libreria non è stata caricata (codice {code})",
                 "no se pudo cargar la biblioteca (código {code})" } },
+            { "why_probe_timeout", { "the engine did not describe itself within {seconds} seconds",
+                "le moteur ne s'est pas décrit en {seconds} secondes",
+                "die Engine hat sich nicht innerhalb von {seconds} Sekunden beschrieben",
+                "il motore non si è descritto entro {seconds} secondi",
+                "el motor no se describió en {seconds} segundos" } },
             { "state_update", { "Update available", "Mise à jour disponible", "Update verfügbar",
                 "Aggiornamento disponibile", "Actualización disponible" } },
             { "btn_download", { "Download", "Télécharger", "Herunterladen", "Scarica", "Descargar" } },
@@ -340,8 +490,20 @@ namespace albireo
                 "Aggiorna il catalogo", "Actualizar el catálogo" } },
             { "import_files", { "Model files (*.gguf)", "Fichiers de modèle (*.gguf)", "Modelldateien (*.gguf)",
                 "File di modello (*.gguf)", "Archivos de modelo (*.gguf)" } },
+            { "import_folder_menu", { "Offline bundle or import folder…", "Paquet hors ligne ou dossier d'import…",
+                "Offline-Paket oder Importordner…", "Pacchetto offline o cartella di importazione…",
+                "Paquete sin conexión o carpeta de importación…" } },
             { "import_done", { "{n} models imported.", "{n} modèles importés.", "{n} Modelle importiert.",
                 "{n} modelli importati.", "{n} modelos importados." } },
+            { "import_already", { "{m} is installed already: it is not copied again.",
+                "{m} est déjà installé : il n'est pas copié à nouveau.",
+                "{m} ist bereits installiert: Es wird nicht erneut kopiert.",
+                "{m} è già installato: non viene copiato di nuovo.", "{m} ya está instalado: no se copia de nuevo." } },
+            { "import_already_file", { "{f} holds {m}, installed already: it is not copied again.",
+                "{f} contient {m}, déjà installé : il n'est pas copié à nouveau.",
+                "{f} enthält {m}, das bereits installiert ist: Es wird nicht erneut kopiert.",
+                "{f} contiene {m}, già installato: non viene copiato di nuovo.",
+                "{f} contiene {m}, ya instalado: no se copia de nuevo." } },
             { "import_progress", { "Importing {f}… {p} %", "Import de {f}… {p} %", "{f} wird importiert… {p} %",
                 "Importazione di {f}… {p} %", "Importando {f}… {p} %" } },
             { "import_catalog", { "Catalog installed: {n} models.", "Catalogue installé : {n} modèles.",
@@ -440,6 +602,8 @@ namespace albireo
             { "usable", { "usable", "utilisable", "verwendbar", "utilizzabile", "utilizable" } },
             { "in_use", { "in use", "utilisé", "in Verwendung", "in uso", "en uso" } },
             { "unavailable", { "unavailable", "indisponible", "nicht verfügbar", "non disponibile", "no disponible" } },
+            { "devices_left_out", { "devices left out: {m}", "périphériques écartés : {m}",
+                "ausgelassene Geräte: {m}", "dispositivi esclusi: {m}", "dispositivos descartados: {m}" } },
             { "lbl_v2ram", { "Extend the graphics memory with the system memory and the disk (V²RAM)",
                 "Étendre la mémoire graphique avec la mémoire système et le disque (V²RAM)",
                 "Grafikspeicher mit Arbeitsspeicher und Datenträger erweitern (V²RAM)",
@@ -503,15 +667,13 @@ namespace albireo
                 "Acerca de Albireo" } },
             { "about_version", { "{e}, version {v}", "{e}, version {v}", "{e}, Version {v}", "{e}, versione {v}",
                 "{e}, versión {v}" } },
-            { "about_built", { "Built on the Dlib-Transformer-extensions library",
-                "Construit sur la bibliothèque Dlib-Transformer-extensions",
-                "Entwickelt auf der Bibliothek Dlib-Transformer-extensions",
-                "Costruito sulla libreria Dlib-Transformer-extensions",
-                "Construido sobre la biblioteca Dlib-Transformer-extensions" } },
+            { "about_built", { "Based on the open source Dlib-Transformer-extensions library",
+                "Reposant sur la bibliothèque open source Dlib-Transformer-extensions",
+                "Basiert auf der Open-Source-Bibliothek Dlib-Transformer-extensions",
+                "Basato sulla libreria open source Dlib-Transformer-extensions",
+                "Basado en la biblioteca de código abierto Dlib-Transformer-extensions" } },
             { "about_created", { "Created by {a}", "Créé par {a}", "Erstellt von {a}", "Creato da {a}",
                 "Creado por {a}" } },
-            { "about_company", { "Published by {c}", "Édité par {c}", "Herausgegeben von {c}", "Pubblicato da {c}",
-                "Publicado por {c}" } },
             { "about_license", { "Distributed under the Boost Software License 1.0. Each model keeps its own license.",
                 "Distribué sous la licence Boost Software License 1.0. Chaque modèle conserve sa propre licence.",
                 "Vertrieben unter der Boost Software License 1.0. Jedes Modell behält seine eigene Lizenz.",
@@ -577,6 +739,17 @@ namespace albireo
             { "update_failed", { "The update failed: {e}", "La mise à jour a échoué : {e}",
                 "Die Aktualisierung ist fehlgeschlagen: {e}", "L'aggiornamento non è riuscito: {e}",
                 "La actualización falló: {e}" } },
+            { "update_rolled_back", { "The programs of Albireo {o} were put back in place, and its service started "
+                "again.", "Les programmes d'Albireo {o} ont été remis en place et son service a redémarré.",
+                "Die Programme von Albireo {o} wurden wiederhergestellt, und sein Dienst wurde neu gestartet.",
+                "I programmi di Albireo {o} sono stati ripristinati e il suo servizio è stato riavviato.",
+                "Los programas de Albireo {o} se restablecieron y su servicio se reinició." } },
+            { "install_rolled_back", { "The files copied were removed: this computer is as it was before the "
+                "installation.", "Les fichiers copiés ont été supprimés : cet ordinateur est tel qu'avant "
+                "l'installation.", "Die kopierten Dateien wurden entfernt: Dieser Computer ist wieder wie vor der "
+                "Installation.", "I file copiati sono stati rimossi: questo computer è tornato com'era prima "
+                "dell'installazione.", "Los archivos copiados se eliminaron: este equipo está como antes de la "
+                "instalación." } },
             { "license_title", { "License", "Licence", "Lizenz", "Licenza", "Licencia" } },
             { "license_accept", { "I accept the terms of the license", "J'accepte les termes de la licence",
                 "Ich akzeptiere die Lizenzbedingungen", "Accetto i termini della licenza",
@@ -584,8 +757,24 @@ namespace albireo
             { "folder_title", { "Installation folder", "Dossier d'installation", "Installationsordner",
                 "Cartella di installazione", "Carpeta de instalación" } },
             { "folder_programs", { "Programs", "Programmes", "Programme", "Programmi", "Programas" } },
+            { "folder_data", { "Data: settings, logs, certificates and, by default, the models",
+                "Données : réglages, journaux, certificats et, par défaut, les modèles",
+                "Daten: Einstellungen, Protokolle, Zertifikate und standardmäßig die Modelle",
+                "Dati: impostazioni, log, certificati e, per impostazione predefinita, i modelli",
+                "Datos: ajustes, registros, certificados y, por defecto, los modelos" } },
             { "folder_models", { "Models", "Modèles", "Modelle", "Modelli", "Modelos" } },
             { "browse", { "Browse…", "Parcourir…", "Durchsuchen…", "Sfoglia…", "Examinar…" } },
+            { "folder_not_fixed", { "{d} lies on a removable drive or on a network drive: choose a folder of a fixed "
+                "drive of this computer.", "{d} se trouve sur un lecteur amovible ou réseau : choisissez un dossier "
+                "d'un disque fixe de cet ordinateur.", "{d} liegt auf einem Wechsel- oder Netzlaufwerk: Wählen Sie "
+                "einen Ordner auf einem festen Laufwerk dieses Computers.", "{d} si trova su un'unità rimovibile o di "
+                "rete: scegliete una cartella di un disco fisso di questo computer.", "{d} está en una unidad "
+                "extraíble o de red: elija una carpeta de un disco fijo de este equipo." } },
+            { "folder_overlap", { "{d} lies in the folder of the programs, or holds it: choose a folder apart.",
+                "{d} se trouve dans le dossier des programmes, ou le contient : choisissez un dossier distinct.",
+                "{d} liegt im Ordner der Programme oder enthält ihn: Wählen Sie einen getrennten Ordner.",
+                "{d} si trova nella cartella dei programmi, o la contiene: scegliete una cartella separata.",
+                "{d} está en la carpeta de los programas, o la contiene: elija una carpeta aparte." } },
             { "folder_not_local", { "{d} is not a folder of a drive of this computer.",
                 "{d} n'est pas un dossier d'un lecteur de cet ordinateur.",
                 "{d} ist kein Ordner eines Laufwerks dieses Computers.",
@@ -610,6 +799,19 @@ namespace albireo
                 "altro utente, oppure vi conduce un collegamento simbolico creato da un altro utente: scegliete "
                 "un'altra cartella.", "{d} pertenece a otro usuario, o un enlace creado por otro usuario lleva a "
                 "ella: elija otra carpeta." } },
+            { "folder_parent_unsafe", { "Accounts other than the administrators may rename a folder that holds {d} "
+                "and put a folder of their own in its place: choose a folder in Program Files or in ProgramData, or "
+                "a new folder at the root of a drive.", "Des comptes autres que les administrateurs peuvent renommer "
+                "un dossier qui contient {d} et mettre un dossier à eux à sa place : choisissez un dossier dans "
+                "Program Files ou dans ProgramData, ou un nouveau dossier à la racine d'un lecteur.", "Andere Konten "
+                "als die Administratoren können einen Ordner umbenennen, der {d} enthält, und einen eigenen Ordner "
+                "an seine Stelle setzen: Wählen Sie einen Ordner in Program Files oder in ProgramData oder einen "
+                "neuen Ordner im Stammverzeichnis eines Laufwerks.", "Account diversi dagli amministratori possono "
+                "rinominare una cartella che contiene {d} e mettere al suo posto una cartella propria: scegliete una "
+                "cartella in Program Files o in ProgramData, oppure una nuova cartella nella radice di un'unità.",
+                "Cuentas distintas de los administradores pueden cambiar el nombre de una carpeta que contiene {d} y "
+                "poner una carpeta propia en su lugar: elija una carpeta en Program Files o en ProgramData, o una "
+                "carpeta nueva en la raíz de una unidad." } },
             { "space_required", { "Space required by the programs: {s}", "Espace nécessaire aux programmes : {s}",
                 "Speicherbedarf der Programme: {s}", "Spazio richiesto dai programmi: {s}",
                 "Espacio necesario para los programas: {s}" } },
@@ -711,16 +913,27 @@ namespace albireo
                 "La instalación falló: {e}" } },
             { "uninstall_title", { "Uninstall Albireo", "Désinstaller Albireo", "Albireo deinstallieren",
                 "Disinstalla Albireo", "Desinstalar Albireo" } },
-            { "uninstall_text", { "Albireo, its service and its notification icon will be removed from this computer.",
-                "Albireo, son service et son icône de notification seront retirés de cet ordinateur.",
-                "Albireo, sein Dienst und sein Infobereich-Symbol werden von diesem Computer entfernt.",
-                "Albireo, il suo servizio e la sua icona di notifica verranno rimossi da questo computer.",
-                "Albireo, su servicio y su icono de notificación se eliminarán de este equipo." } },
-            { "uninstall_data", { "Also delete the models, the settings and the logs",
-                "Supprimer aussi les modèles, les réglages et les journaux",
-                "Auch die Modelle, die Einstellungen und die Protokolle löschen",
-                "Elimina anche i modelli, le impostazioni e i log",
-                "Eliminar también los modelos, los ajustes y los registros" } },
+            { "uninstall_text", { "Albireo, its service, its notification icon, its models, its settings and its "
+                "logs will be removed from this computer.", "Albireo, son service, son icône de notification, ses "
+                "modèles, ses réglages et ses journaux seront retirés de cet ordinateur.", "Albireo, sein Dienst, "
+                "sein Infobereich-Symbol, seine Modelle, seine Einstellungen und seine Protokolle werden von diesem "
+                "Computer entfernt.", "Albireo, il suo servizio, la sua icona di notifica, i suoi modelli, le sue "
+                "impostazioni e i suoi log verranno rimossi da questo computer.", "Albireo, su servicio, su icono de "
+                "notificación, sus modelos, sus ajustes y sus registros se eliminarán de este equipo." } },
+            { "uninstall_text_keep", { "Albireo, its service and its notification icon will be removed from this "
+                "computer. Its models and its settings stay for a later installation.", "Albireo, son service et son "
+                "icône de notification seront retirés de cet ordinateur. Ses modèles et ses réglages restent pour une "
+                "installation ultérieure.", "Albireo, sein Dienst und sein Infobereich-Symbol werden von diesem "
+                "Computer entfernt. Seine Modelle und seine Einstellungen bleiben für eine spätere Installation "
+                "erhalten.", "Albireo, il suo servizio e la sua icona di notifica verranno rimossi da questo "
+                "computer. I suoi modelli e le sue impostazioni restano per un'installazione successiva.", "Albireo, "
+                "su servicio y su icono de notificación se eliminarán de este equipo. Sus modelos y sus ajustes se "
+                "conservan para una instalación posterior." } },
+            { "uninstall_keep_data", { "Keep the models and the settings for a later installation",
+                "Conserver les modèles et les réglages pour une installation ultérieure",
+                "Modelle und Einstellungen für eine spätere Installation behalten",
+                "Conserva i modelli e le impostazioni per un'installazione successiva",
+                "Conservar los modelos y los ajustes para una instalación posterior" } },
             { "uninstall_browser", { "The discussions are kept by each browser; Albireo does not store them.",
                 "Les discussions sont conservées par chaque navigateur ; Albireo ne les stocke pas.",
                 "Die Unterhaltungen werden von jedem Browser gespeichert; Albireo speichert sie nicht.",
@@ -729,6 +942,11 @@ namespace albireo
             { "uninstall_done", { "Albireo was removed from this computer.", "Albireo a été retiré de cet ordinateur.",
                 "Albireo wurde von diesem Computer entfernt.", "Albireo è stato rimosso da questo computer.",
                 "Albireo se eliminó de este equipo." } },
+            { "uninstall_kept", { "The folder {d} stays, with the models and the data you keep in it.",
+                "Le dossier {d} reste en place, avec les modèles et les données que vous y conservez.",
+                "Der Ordner {d} bleibt bestehen, mit den Modellen und Daten, die Sie darin behalten.",
+                "La cartella {d} resta al suo posto, con i modelli e i dati che vi conservate.",
+                "La carpeta {d} se mantiene, con los modelos y los datos que conserva en ella." } },
             { "uninstall_progress", { "Removing Albireo", "Suppression d'Albireo", "Albireo wird entfernt",
                 "Rimozione di Albireo", "Eliminando Albireo" } },
             { "admin_required", { "Administrator rights are required.", "Les droits d'administrateur sont nécessaires.",

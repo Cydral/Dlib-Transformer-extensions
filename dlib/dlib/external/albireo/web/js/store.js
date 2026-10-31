@@ -20,8 +20,29 @@ function request(r) {
   });
 }
 
-export async function open() {
-  if (db) return db;
+// The opening in progress, which the calls made meanwhile share.
+let opening = null;
+
+export function open() {
+  if (db) return Promise.resolve(db);
+  if (!opening) {
+    opening = connect().then((d) => {
+      /*
+          When a newer version of the application upgrades the database in another tab, this tab
+          lets it go and opens it again at its next access.
+      */
+      d.onversionchange = () => {
+        d.close();
+        if (db === d) db = null;
+      };
+      db = d;
+      return d;
+    }).finally(() => { opening = null; });
+  }
+  return opening;
+}
+
+async function connect() {
   const r = indexedDB.open(DB_NAME, DB_VERSION);
   r.onupgradeneeded = () => {
     const d = r.result;
@@ -40,8 +61,7 @@ export async function open() {
       c.createIndex('doc', 'doc');
     }
   };
-  db = await request(r);
-  return db;
+  return request(r);
 }
 
 function store(name, mode) {
@@ -123,16 +143,22 @@ export async function putProject(p) {
 
 export async function deleteProject(id) {
   await open();
-  // The discussions of the project stay, outside of any project.
-  const convs = await allConversations();
-  for (const c of convs) {
-    if (c.projectId === id) {
-      c.projectId = null;
-      await putConversation(c);
-    }
-  }
+  /*
+      The discussions of the project stay, outside of any project.  They change in place, in one
+      transaction with the deletion of the project, through the index of their projects.
+  */
+  const tx = db.transaction(['conversations', 'projects'], 'readwrite');
+  const r = tx.objectStore('conversations').index('project').openCursor(IDBKeyRange.only(id));
+  r.onsuccess = () => {
+    const c = r.result;
+    if (!c) return;
+    c.value.projectId = null;
+    c.update(c.value);
+    c.continue();
+  };
+  tx.objectStore('projects').delete(id);
+  await completed(tx);
   await deleteChunks('owner', id);
-  return request(store('projects', 'readwrite').delete(id));
 }
 
 // The passages of the document search.
@@ -199,6 +225,39 @@ export async function getSettings() {
 export async function setSetting(key, value) {
   await open();
   return request(store('settings', 'readwrite').put({ key, value }));
+}
+
+/*
+    Takes the lease of key for owner until the time until, in one transaction, so that two tabs
+    never both take it.  Returns true when the lease was free, expired or already held by owner.
+*/
+export async function claimLease(key, owner, until) {
+  await open();
+  const tx = db.transaction('settings', 'readwrite');
+  const s = tx.objectStore('settings');
+  let taken = false;
+  const r = s.get(key);
+  r.onsuccess = () => {
+    const lease = r.result && r.result.value;
+    if (lease && lease.owner !== owner && lease.until > Date.now()) return;
+    s.put({ key, value: { owner, until } });
+    taken = true;
+  };
+  await completed(tx);
+  return taken;
+}
+
+// Gives the lease of key back, when owner holds it.
+export async function releaseLease(key, owner) {
+  await open();
+  const tx = db.transaction('settings', 'readwrite');
+  const s = tx.objectStore('settings');
+  const r = s.get(key);
+  r.onsuccess = () => {
+    const lease = r.result && r.result.value;
+    if (lease && lease.owner === owner) s.put({ key, value: null });
+  };
+  await completed(tx);
 }
 
 export async function exportAll() {

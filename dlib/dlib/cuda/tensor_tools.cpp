@@ -56,6 +56,7 @@ namespace dlib
     {
         bool is_compiled_in () { return false; }
         bool is_available () { return false; }
+        std::string unavailable_reason () { return "dlib was built without DLIB_USE_NPU"; }
         std::string device_name () { return std::string(); }
         std::vector<std::string> device_names () { return std::vector<std::string>(); }
         bool uses_half_precision () { return false; }

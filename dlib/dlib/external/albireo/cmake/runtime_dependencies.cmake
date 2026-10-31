@@ -10,7 +10,8 @@
 # DIRS lists the folders where the libraries are searched, such as the bin folder of the
 # CUDA toolkit or the libs folder of OpenVINO.  EXTRA lists the libraries the engine loads
 # by name while it runs, which no import table shows: the plugins of OpenVINO, the parts of
-# cuDNN, the runtime of the compiler.  Their own dependencies are copied as well.  EXCLUDE
+# cuDNN, the runtime of the compiler.  Their own dependencies are copied as well, and the
+# data files of the list, such as the kernel table of the GPU plugin, as they are.  EXCLUDE
 # lists the names of the libraries left out, those the engine loads on first use only.
 
 if (NOT ENGINE OR NOT DEST)
@@ -27,6 +28,14 @@ foreach (pattern IN LISTS extra)
       list(APPEND extra_files ${matches})
    endif()
 endforeach()
+# The data files among them, such as the table of the kernels of the GPU plugin of OpenVINO,
+# are copied without a search of their dependencies, which only the libraries have.
+set(extra_libraries)
+foreach (f IN LISTS extra_files)
+   if (f MATCHES "\\.(dll|so|dylib)(\\.[0-9]+)*$")
+      list(APPEND extra_libraries "${f}")
+   endif()
+endforeach()
 
 # The engine is read from a folder of its own.  Windows looks for the libraries of a file
 # in its folder first: read in place after an earlier build, the engine would lead to the
@@ -40,7 +49,7 @@ file(MAKE_DIRECTORY "${scan}")
 file(COPY "${ENGINE}" DESTINATION "${scan}")
 
 file(GET_RUNTIME_DEPENDENCIES
-   LIBRARIES "${scan}/${engine_name}" ${extra_files}
+   LIBRARIES "${scan}/${engine_name}" ${extra_libraries}
    RESOLVED_DEPENDENCIES_VAR resolved
    UNRESOLVED_DEPENDENCIES_VAR unresolved
    CONFLICTING_DEPENDENCIES_PREFIX conflicting

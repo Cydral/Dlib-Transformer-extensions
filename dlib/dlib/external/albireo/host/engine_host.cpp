@@ -119,30 +119,55 @@ namespace albireo
             if (c.description.is_object()) continue;
             engine_candidate* p = &c;
             probes.emplace_back([p, &probe_program]() {
+                const unsigned limit_ms = 60000;
                 std::string output;
-                const int code = run_process(probe_program, { "--probe-engine", p->path }, &output, 60000);
+                const auto started = std::chrono::steady_clock::now();
+                const int code = run_process(probe_program, { "--probe-engine", p->path }, &output, limit_ms);
+                const long long elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - started).count();
                 // The description is the last line the probe prints.
                 p->description = last_json_line(output);
                 p->usable = code == 0 && p->description["usable"].as_bool(false);
                 if (!p->usable && !p->description.contains("reason"))
                 {
                     if (!p->description.is_object()) p->description = json::object();
-                    p->description["reason"] = code == 0 ? std::string("not usable")
-                        : "the library could not be loaded (code " + std::to_string(code) + ")";
-                    if (code != 0)
+                    json args = json::object();
+                    if (code == -1 && elapsed >= static_cast<long long>(limit_ms))
                     {
-                        p->description["reason_code"] = "library_failed";
-                        json args = json::object();
-                        args["code"] = std::to_string(code);
-                        p->description["reason_args"] = args;
+                        // The runtime of a device that never answers, such as a driver that waits.
+                        p->description["reason"] = "the engine did not describe itself within "
+                            + std::to_string(limit_ms / 1000) + " seconds";
+                        p->description["reason_code"] = "probe_timeout";
+                        args["seconds"] = std::to_string(limit_ms / 1000);
                     }
+                    else
+                    {
+                        p->description["reason"] = code == 0 ? std::string("not usable")
+                            : "the library could not be loaded (code " + std::to_string(code) + ")";
+                        if (code != 0) p->description["reason_code"] = "library_failed";
+                        args["code"] = std::to_string(code);
+                    }
+                    if (p->description.contains("reason_code")) p->description["reason_args"] = args;
                 }
+                if (elapsed >= 5000)
+                    log_warning("engines: " + p->variant + " took " + std::to_string(elapsed / 1000)
+                        + " s to describe itself");
             });
         }
         for (auto& t : probes) t.join();
         for (const auto& c : out)
-            log_info("engines: " + c.variant + " "
-                + (c.usable ? std::string("usable") : "not usable: " + c.description["reason"].as_string()));
+        {
+            // The devices each engine found, and those its runtime left out with their reason.
+            std::string devices;
+            for (const auto& d : c.description["devices"].elements())
+                if (d["type"].as_string() != "cpu" || d.contains("id"))
+                    devices += (devices.empty() ? "" : ", ") + d["name"].as_string();
+            std::string line = "engines: " + c.variant + " "
+                + (c.usable ? std::string("usable") : "not usable: " + c.description["reason"].as_string());
+            if (c.usable && !devices.empty()) line += ", devices: " + devices;
+            if (c.description["missing"].is_string()) line += ", left out: " + c.description["missing"].as_string();
+            log_info(line);
+        }
         return out;
     }
 
@@ -185,7 +210,12 @@ namespace albireo
         std::unique_lock<std::shared_timed_mutex> life(life_);
         std::unique_ptr<engine_library> lib(new engine_library());
         if (!lib->load(c.path, error)) return false;
-        if (c.description["pinned"].as_bool(false)) pinned_started = true;
+        if (c.description["pinned"].as_bool(false))
+        {
+            // The library of a device stays loaded until the process ends (main.cpp).
+            pinned_started = true;
+            lib->keep_loaded();
+        }
         char err[2048] = { 0 };
         albireo_engine* e = lib->create(config.dump().c_str(), &engine_host::on_log, nullptr, err, sizeof(err));
         if (!e)

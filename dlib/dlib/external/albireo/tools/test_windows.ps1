@@ -15,7 +15,8 @@
     and a question to the OpenVINO engine; with the CUDA tree, a question to the CUDA engine
     when the machine has a card it supports; the embedding model; the models that come with
     Albireo, prepared by the build, and a question to their language model; then the
-    installed service, unless -NoService, once it has started: its state, its models, those
+    installed service, unless -NoService, once it has started: its state, its models, its
+    engines, each described within its time limit, with the devices they found, the models
     that came with it, a question and the vectors of two texts through the OpenAI interface.
     The exit code is the number of failed steps.
 #>
@@ -206,6 +207,16 @@ if (-not $NoService) {
             $models = Invoke-RestMethod -Uri "$base/v1/models" -TimeoutSec 10
             $names = @($models.data | ForEach-Object { $_.id })
             Add-Result "service models" "PASS" ($names -join ", ") 0
+            # The engines of the service, each described within its time limit, with their devices.
+            $engines = Invoke-RestMethod -Uri "$base/albireo/v1/engines" -TimeoutSec 30
+            $stuck = @($engines.engines | Where-Object { $_.reason_code -in @("probe_timeout", "library_failed") } |
+                ForEach-Object { $_.variant })
+            $devices = @($engines.engines | Where-Object { $_.usable } | ForEach-Object {
+                $engine = $_
+                $found = @($engine.devices | Where-Object { $_.type -ne "cpu" } | ForEach-Object { $_.name })
+                if ($found.Count -gt 0) { "$($engine.variant): $($found -join ' + ')" } })
+            if ($stuck.Count -gt 0) { Add-Result "service engines" "FAIL" ("not described: " + ($stuck -join ", ")) 0 }
+            else { Add-Result "service engines" "PASS" ("current $($engines.current); " + ($devices -join "; ")) 0 }
             $listed = Invoke-RestMethod -Uri "$base/albireo/v1/models?lang=en" -TimeoutSec 30
             $came = @($listed.models | Where-Object { $_.builtin } | ForEach-Object { $_.id }) +
                 @($listed.embedding_models | Where-Object { $_.source -eq "builtin" } | ForEach-Object { $_.id })

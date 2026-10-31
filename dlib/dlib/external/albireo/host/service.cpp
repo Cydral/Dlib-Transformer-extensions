@@ -10,6 +10,7 @@
 #include "service.h"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -24,6 +25,7 @@
 #include "../common/system_info.h"
 #include "../common/version.h"
 #include "certificates.h"
+#include "crypto.h"
 #include "http_fetch.h"
 
 namespace albireo
@@ -66,6 +68,134 @@ namespace albireo
             for (const auto& r : descriptor["roles"].elements())
                 if (r.as_string() == role) return true;
             return false;
+        }
+
+        // The names of a path between its separators.
+        std::vector<std::string> path_names(const std::string& p)
+        {
+#if defined(_WIN32)
+            const char* const separators = "\\/";
+#else
+            const char* const separators = "/";
+#endif
+            std::vector<std::string> names;
+            for (size_t at = 0; at <= p.size();)
+            {
+                size_t end = p.find_first_of(separators, at);
+                if (end == std::string::npos) end = p.size();
+                if (end > at) names.push_back(p.substr(at, end - at));
+                at = end + 1;
+            }
+            return names;
+        }
+
+        bool same_name(const std::string& a, const std::string& b)
+        {
+#if defined(_WIN32)
+            const std::wstring x = widen(a), y = widen(b);
+            return CompareStringOrdinal(x.c_str(), static_cast<int>(x.size()), y.c_str(), static_cast<int>(y.size()),
+                TRUE) == CSTR_EQUAL;
+#else
+            return a == b;
+#endif
+        }
+
+        /*
+            Whether path, as written, is folder or lies under it, the letters of the names
+            compared in either case on Windows; within receives folder followed by the names
+            of path beyond it.  The file system is not read.
+        */
+        bool path_under(const std::string& path, const std::string& folder, std::string& within)
+        {
+            const std::vector<std::string> p = path_names(path), f = path_names(folder);
+            if (f.empty() || p.size() < f.size()) return false;
+            for (size_t i = 0; i < f.size(); ++i)
+                if (!same_name(p[i], f[i])) return false;
+            within = folder;
+            for (size_t i = f.size(); i < p.size(); ++i) within = join_path(within, p[i]);
+            return true;
+        }
+
+        /*
+            The code of a path that the imports by path refuse from its text alone, or an
+            empty string: relative, on a share, a device or a namespace of the system, or
+            invalid.  The file system is not read, so that nothing is revealed of it.
+        */
+        std::string path_problem(const std::string& p)
+        {
+            if (p.empty() || p.size() > 4096) return "import_path_invalid";
+            for (char c : p)
+                if (static_cast<unsigned char>(c) < 0x20) return "import_path_invalid";
+#if defined(_WIN32)
+            const bool separator = p[0] == '\\' || p[0] == '/';
+            if (p.size() >= 2 && separator && (p[1] == '\\' || p[1] == '/'))
+            {
+                // \\?\ and \\.\ name the namespaces of the system, \\server\share a share.
+                if (p.size() >= 3 && (p[2] == '?' || p[2] == '.')) return "import_path_device";
+                return "import_path_network";
+            }
+            if (p.compare(0, 4, "\\??\\") == 0) return "import_path_device";
+            const bool letter = (p[0] >= 'A' && p[0] <= 'Z') || (p[0] >= 'a' && p[0] <= 'z');
+            if (p.size() < 3 || !letter || p[1] != ':' || (p[2] != '\\' && p[2] != '/')) return "import_path_relative";
+            // A stream (file:stream) or a wildcard.
+            if (p.find_first_of(":*?\"<>|", 2) != std::string::npos) return "import_path_invalid";
+            const std::vector<std::string> names = path_names(p.substr(3));
+            for (const auto& n : names)
+            {
+                if (n == "." || n == "..") return "import_path_invalid";
+                // The names of devices, which Windows opens as devices in any folder: CON, NUL, COM1...
+                std::string stem = n.substr(0, n.find('.'));
+                while (!stem.empty() && stem.back() == ' ') stem.pop_back();
+                for (char& c : stem) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                const bool numbered = stem.size() == 4
+                    && (stem.compare(0, 3, "COM") == 0 || stem.compare(0, 3, "LPT") == 0) && stem[3] >= '0'
+                    && stem[3] <= '9';
+                if (numbered || stem == "CON" || stem == "PRN" || stem == "AUX" || stem == "NUL" || stem == "CONIN$"
+                    || stem == "CONOUT$")
+                    return "import_path_device";
+            }
+            if (GetDriveTypeW(widen(p.substr(0, 2) + "\\").c_str()) == DRIVE_REMOTE) return "import_path_network";
+#else
+            if (p[0] != '/') return "import_path_relative";
+            if (p.compare(0, 2, "//") == 0) return "import_path_network";
+            for (const auto& n : path_names(p))
+                if (n == "." || n == "..") return "import_path_invalid";
+            const std::vector<std::string> names = path_names(p);
+            if (!names.empty() && (names[0] == "dev" || names[0] == "proc" || names[0] == "sys"))
+                return "import_path_device";
+#endif
+            return std::string();
+        }
+
+        /*
+            The certificates of the local server (certificates.h), and on Windows the trust
+            of a new authority: it takes the place of the authority the machine trusted, or
+            follows the choice of the installation (host_settings::trust_authority).
+        */
+        bool prepare_certificates(const std::string& dir, int trust_choice, bool& renewed, std::string& error)
+        {
+#if defined(_WIN32)
+            const bool was_trusted = authority_trusted();
+#endif
+            if (!ensure_certificates(dir, renewed, error)) return false;
+#if defined(_WIN32)
+            if (renewed && (trust_choice > 0 || (trust_choice < 0 && was_trusted)))
+            {
+                std::string e;
+                if (trust_authority(dir, e))
+                    log_info("certificates: the new local authority is trusted by this computer");
+                else
+                    log_warning("certificates: " + e);
+            }
+            else if (renewed && was_trusted)
+            {
+                // Not trusted by the choice of the installation: the earlier authority leaves.
+                untrust_authority();
+            }
+#else
+            (void)trust_choice;
+#endif
+            return true;
         }
 
         // The options of the socket the server listens on.
@@ -254,11 +384,25 @@ namespace albireo
     bool service::run(std::string& error)
     {
         started_at_ = now_unix();
+#if defined(_WIN32)
+        /*
+            The data folder holds the settings, the token, the keys, the logs and the import
+            folder, which the service reads and writes with the rights of the system: only
+            SYSTEM and the administrators may change it, whoever created it (secure_folder()).
+        */
+        std::string insecure;
+        if (!secure_folder(data_dir_, insecure))
+        {
+            error = "the data folder cannot be secured: " + insecure;
+            return false;
+        }
+#else
         if (!make_dirs(data_dir_))
         {
             error = "cannot create the data folder " + data_dir_;
             return false;
         }
+#endif
         const std::string logs = join_path(data_dir_, "logs");
         make_dirs(logs);
         log_file::instance().open(join_path(logs, "service.log"));
@@ -273,14 +417,46 @@ namespace albireo
         port_ = st.port;
         apply_network_settings(st);
 
+        const std::string db_path = join_path(data_dir_, "albireo.db");
         try
         {
-            db_.reset(new store(join_path(data_dir_, "albireo.db")));
+            db_.reset(new store(db_path));
         }
         catch (const std::exception& e)
         {
-            error = std::string("the database cannot be opened: ") + e.what();
-            return false;
+            /*
+                A file that is no database, or a damaged one, never opens again by itself: it is
+                kept aside under a name of its own, and a new database starts, in which the
+                models of the models folder are recorded again (background_loop()).  The other
+                failures, a file read-only, held by another program or on a full disk, may pass:
+                the start fails, and the next attempt tries again.
+            */
+            const std::string what = e.what();
+            if (what.find("not a database") == std::string::npos && what.find("malformed") == std::string::npos)
+            {
+                error = "the database cannot be opened: " + what;
+                return false;
+            }
+            const std::string aside = db_path + ".corrupt-" + std::to_string(now_unix());
+            log_error("service: the database " + db_path + " is damaged (" + what + "): it is kept as " + aside
+                + ", and a new database records again the models of the models folder");
+            if (!rename_file(db_path, aside))
+            {
+                error = "the database " + db_path + " is damaged and cannot be set aside";
+                return false;
+            }
+            for (const char* part : { "-wal", "-shm" })
+                if (file_exists(db_path + part)) rename_file(db_path + part, aside + part);
+            try
+            {
+                db_.reset(new store(db_path));
+                database_restarted_ = true;
+            }
+            catch (const std::exception& again)
+            {
+                error = std::string("the database cannot be opened: ") + again.what();
+                return false;
+            }
         }
 
         // The token of the administration interface, read by the tray.
@@ -298,7 +474,8 @@ namespace albireo
         admin_token_ = trim(token);
 
         const std::string cert_dir = join_path(data_dir_, "certificates");
-        if (!ensure_certificates(cert_dir, error)) return false;
+        bool renewed = false;
+        if (!prepare_certificates(cert_dir, st.trust_authority, renewed, error)) return false;
 
         // An update downloaded earlier is applied before anything else starts.
         {
@@ -309,7 +486,7 @@ namespace albireo
         }
         if (!updater_->staged_installer().empty() && !stopping_)
         {
-            std::string e;
+            user_error e;
             if (updater_->launch_staged(e))
             {
                 update_started_ = true;
@@ -317,7 +494,7 @@ namespace albireo
                     + " is started, the service stops for the update");
                 return true;
             }
-            if (!e.empty()) log_warning("updates: " + e);
+            if (!e.text.empty()) log_warning("updates: " + e.text);
         }
 
         {
@@ -331,23 +508,48 @@ namespace albireo
         register_builtin_models();
 
         // The engines start in the background (start_engines()), once the server answers.
-        const certificate_files certs = certificate_paths(cert_dir);
+        // The key of the server reaches the TLS server from memory, decrypted here only.
+        std::string cert_pem, key_pem;
+        if (!read_file(certificate_paths(cert_dir).server_cert, cert_pem) || !read_server_key(cert_dir, key_pem))
+        {
+            wipe_secret(key_pem);
+            error = "the certificate or the key of the local server cannot be read in " + cert_dir;
+            return false;
+        }
         {
             std::lock_guard<std::mutex> lock(server_m_);
-            if (stopping_) return true;
-            server_.reset(new httplib::SSLServer(certs.server_cert.c_str(), certs.server_key.c_str()));
+            if (stopping_)
+            {
+                wipe_secret(key_pem);
+                return true;
+            }
+            httplib::SSLServer::PemMemory pem = {};
+            pem.cert_pem = cert_pem.c_str();
+            pem.cert_pem_len = cert_pem.size();
+            pem.key_pem = key_pem.c_str();
+            pem.key_pem_len = key_pem.size();
+            server_.reset(new httplib::SSLServer(pem));
         }
+        wipe_secret(key_pem);
         if (!server_->is_valid())
         {
             error = "the TLS configuration of the server failed";
             return false;
         }
-        // The limits of the bodies are those of each route (server.cpp).
+        /*
+            The limits of the bodies are those of each route (server.cpp).  A wait for a client
+            lasts 30 seconds at most, during its TLS handshake, its request or the writing of an
+            answer: a client that stalls frees its thread and the place of its request in the
+            engine.  Eight threads serve the connections, up to 64 while they are busy, since a
+            streamed answer holds its thread; 128 connections at most wait for one, and the next
+            ones are closed at once, so that a flood of connections holds a bounded number of
+            sockets.
+        */
         server_->set_payload_max_length(0);
         server_->set_keep_alive_timeout(30);
-        server_->set_read_timeout(120);
-        server_->set_write_timeout(120);
-        server_->new_task_queue = []() { return new httplib::ThreadPool(8, 64); };
+        server_->set_read_timeout(30);
+        server_->set_write_timeout(30);
+        server_->new_task_queue = []() { return new httplib::ThreadPool(8, 64, 128); };
         set_listen_options(*server_);
         if (!server_->bind_to_port("127.0.0.1", port_))
         {
@@ -615,6 +817,14 @@ namespace albireo
         };
         attempt("network", [&]() { network(settings_->get()); });
         attempt("engines", [&]() { start_engines(); });
+        // A database started anew records the models of the models folder again, before they load.
+        if (database_restarted_)
+            attempt("models folder", [&]() {
+                const json r = models_->import_path(models_->models_dir(), models_->models_dir(), true);
+                log_info("models: " + std::to_string(r["imported"].size()) + " models of " + models_->models_dir()
+                    + " recorded again");
+                for (const auto& e : r["errors"].elements()) log_warning("models: " + e.as_string());
+            });
         attempt("models", [&]() { load_active_models(); });
         models_ready_ = true;
         if (stopping_) return;
@@ -650,12 +860,11 @@ namespace albireo
                 next_certificate = now + certificate_period;
                 attempt("certificates", [&]() {
                     const std::string cert_dir = join_path(data_dir_, "certificates");
-                    const std::string before = certificate_thumbprint(certificate_paths(cert_dir).server_cert);
+                    bool renewed = false;
                     std::string error;
-                    if (ensure_certificates(cert_dir, error)
-                        && certificate_thumbprint(certificate_paths(cert_dir).server_cert) != before)
+                    if (prepare_certificates(cert_dir, settings_->get().trust_authority, renewed, error) && renewed)
                     {
-                        log_info("certificates: the server certificate was renewed, restart");
+                        log_info("certificates: the certificates were renewed, restart");
                         request_restart();
                     }
                 });
@@ -676,19 +885,32 @@ namespace albireo
         const std::string inbox = join_path(data_dir_, "import");
         if (!dir_exists(inbox)) return;
         std::lock_guard<std::mutex> serial(import_m_);
+        std::string insecure;
+        if (!secure_inbox(insecure))
+        {
+            log_error("models: import folder: " + insecure + "; nothing is imported from it");
+            return;
+        }
+        // The models subfolder is read when it is reached through no link; a link is never opened.
         const std::string sub = join_path(inbox, "models");
+        std::vector<std::string> dirs = { inbox };
+        if (link_free_folder(sub, inbox)) dirs.push_back(sub);
         // A copy in progress: the folder waits for the next pass.
-        for (const std::string& dir : { inbox, sub })
+        for (const std::string& dir : dirs)
             for (const auto& n : list_dir(dir))
-                if (file_being_written(join_path(dir, n))) return;
+            {
+                const std::string p = join_path(dir, n);
+                if (!is_link(p) && file_being_written(p)) return;
+            }
+        // What cannot be installed is renamed aside, a link as itself.
         auto set_aside = [](const std::string& f) {
-            if (file_exists(f)) rename_file(f, f + ".rejected");
+            if (file_exists(f) || is_link(f)) rename_file(f, f + ".rejected");
         };
 
         const std::string catalog = join_path(inbox, "catalog.json");
-        if (file_exists(catalog) && file_exists(catalog + ".sig"))
+        if ((file_exists(catalog) || is_link(catalog)) && (file_exists(catalog + ".sig") || is_link(catalog + ".sig")))
         {
-            const json r = models_->import_catalog(inbox);
+            const json r = models_->import_catalog(inbox, inbox);
             if (r.contains("error"))
             {
                 log_warning("models: import folder: " + r["error"].as_string());
@@ -702,16 +924,17 @@ namespace albireo
             }
         }
 
-        for (const std::string& dir : { inbox, sub })
+        for (const std::string& dir : dirs)
             for (const auto& n : list_dir(dir))
             {
                 if (stopping_) return;
                 if (!ends_with(n, ".gguf")) continue;
                 const std::string f = join_path(dir, n);
                 const std::string side = f.substr(0, f.size() - 5) + ".json";
-                const json r = models_->import_path(f, true);
+                const json r = models_->import_path(f, inbox, true);
                 for (const auto& e : r["errors"].elements()) log_warning("models: import folder: " + e.as_string());
-                if (!r["imported"].empty()) remove_file(side);
+                // A file installed already, a model that comes with Albireo say, left the folder too.
+                if (!r["imported"].empty() || !r["already"].empty()) remove_file(side);
                 else if (!stopping_)
                 {
                     set_aside(f);
@@ -720,13 +943,15 @@ namespace albireo
             }
 
         const std::string feed = join_path(inbox, "feed.json");
-        if (file_exists(feed) && file_exists(feed + ".sig") && !stopping_)
+        if ((file_exists(feed) || is_link(feed)) && (file_exists(feed + ".sig") || is_link(feed + ".sig"))
+            && !stopping_)
         {
-            const json r = updater_->import_offline(inbox);
+            const json r = updater_->import_offline(inbox, inbox);
             const std::string installer = r["installer"].as_string();
             const std::string source = installer.empty() ? std::string() : join_path(inbox, installer);
-            // The installer the feed names may still be on its way.
-            if (r.contains("error") && !source.empty() && !file_exists(source)) return;
+            // The installer the feed names may still be on its way, and a stop leaves the files to the next start.
+            if (r.contains("error") && !source.empty() && !file_exists(source) && !is_link(source)) return;
+            if (r["code"].as_string() == "stopping") return;
             if (r.contains("error"))
             {
                 log_warning("updates: import folder: " + r["error"].as_string());
@@ -743,19 +968,115 @@ namespace albireo
         }
     }
 
-    json service::import_folder(const std::string& path)
+    bool service::secure_inbox(std::string& error)
+    {
+        const std::string inbox = join_path(data_dir_, "import");
+        if (folder_admin_only(inbox)) return true;
+        /*
+            Another account may write in the import folder, which the service reads with the
+            rights of the system: the folder receives the permissions of the data folder,
+            and what other accounts placed in it is set aside (secure_folder()).
+        */
+        log_warning("models: the import folder " + inbox + " lets other accounts than the administrators write in "
+            "it: it is secured, and what they placed is set aside");
+        return secure_folder(inbox, error, true);
+    }
+
+    json service::import_folder(const std::string& path, user_error& refusal)
     {
         std::lock_guard<std::mutex> serial(import_m_);
+        auto refuse = [&](const std::string& code, const std::string& english) {
+            refusal.set(english, code).arg("path", path);
+            log_warning("import: " + english);
+            return json::object();
+        };
+        // The refusals that the text of the path decides, before anything is read.
+        const std::string problem = path_problem(path);
+        if (problem == "import_path_relative")
+            return refuse(problem, "the path " + path + " is relative: an import names a folder by its full path");
+        if (problem == "import_path_network")
+            return refuse(problem, "the path " + path + " is on a network share: an import reads local drives only");
+        if (problem == "import_path_device")
+            return refuse(problem, "the path " + path + " names a device or a namespace of the system");
+        if (!problem.empty())
+            return refuse(problem, "the path " + path + " is not valid for an import: it holds a stream, a wildcard, "
+                "a control character or a name . or ..");
+
         json result = json::object();
-        const bool folder = dir_exists(path);
-        if (folder && file_exists(join_path(path, "catalog.json")))
-            result["catalog"] = models_->import_catalog(path);
-        const json r = models_->import_path(path);
-        result["imported"] = r["imported"];
-        result["errors"] = r["errors"];
-        if (folder && file_exists(join_path(path, "feed.json")))
-            result["update"] = updater_->import_offline(path);
-        log_info("import: " + path + ", " + std::to_string(r["imported"].size()) + " models");
+        const std::string inbox = join_path(data_dir_, "import");
+        std::string within;
+        if (path_under(path, inbox, within))
+        {
+            // The import folder, which only SYSTEM and the administrators fill.
+            std::string insecure;
+            if (dir_exists(inbox) && !secure_inbox(insecure))
+                return refuse("import_folder_insecure", "the import folder lets other accounts than the administrators "
+                    "write in it and cannot be secured: " + insecure);
+            const bool whole = within == inbox;
+            const bool folder = whole ? dir_exists(inbox) : link_free_folder(within, inbox);
+            if (!folder)
+            {
+                link_free_file probe;
+                std::string why;
+                if (whole || !probe.open(within, inbox, why))
+                {
+                    if (why == "link")
+                        return refuse("import_path_link", "the path " + path + " is reached through a link, which "
+                            "imports never follow");
+                    return refuse("import_not_found", "the path " + path + " is not found in the import folder");
+                }
+            }
+            if (folder && file_exists(join_path(within, "catalog.json")))
+                result["catalog"] = models_->import_catalog(within, inbox);
+            const json r = models_->import_path(within, inbox, false);
+            result["imported"] = r["imported"];
+            result["already"] = r["already"];
+            result["errors"] = r["errors"];
+            if (folder && file_exists(join_path(within, "feed.json")))
+                result["update"] = updater_->import_offline(within, inbox);
+            log_info("import: " + path + ", " + std::to_string(r["imported"].size()) + " models");
+            return result;
+        }
+
+        // Elsewhere, a signed offline bundle only; a model file of a user comes through the upload route.
+        if (path.size() > 5 && same_name(path.substr(path.size() - 5), ".gguf"))
+            return refuse("import_use_upload", "a model file outside the import folder is sent to the service by its "
+                "user: Import..., then Model files (*.gguf), in the Models window, or the route "
+                "/albireo/v1/models/upload");
+        /*
+            The signed files decide, read through no link from the root of the drive; the
+            answer is the same whether the folder is missing, unreadable, unsigned or reached
+            through a link, so that it reveals nothing of a folder of another account.
+        */
+        std::string catalog_body, catalog_sig, feed_body, feed_sig;
+        const bool catalog = read_file_link_free(join_path(path, "catalog.json"), std::string(), catalog_body,
+                16u << 20)
+            && read_file_link_free(join_path(path, "catalog.json.sig"), std::string(), catalog_sig, 4096);
+        const bool feed = read_file_link_free(join_path(path, "feed.json"), std::string(), feed_body, 1u << 20)
+            && read_file_link_free(join_path(path, "feed.json.sig"), std::string(), feed_sig, 4096);
+        const bool signed_catalog = catalog && verify_signature(catalog_body, catalog_sig, feed_public_key_pem);
+        const bool signed_feed = feed && verify_signature(feed_body, feed_sig, feed_public_key_pem);
+        if (!signed_catalog && !signed_feed)
+            return refuse("import_not_bundle", "the path " + path + " is no signed offline bundle of a local drive "
+                "reached through no link: a folder with catalog.json and catalog.json.sig, or feed.json and "
+                "feed.json.sig, signed by Albireo");
+        result["imported"] = json::array();
+        result["already"] = json::array();
+        result["errors"] = json::array();
+        if (catalog)
+        {
+            result["catalog"] = models_->import_catalog(path, std::string());
+            // The models the signed catalog lists, whatever catalog stays in use.
+            if (signed_catalog)
+            {
+                const json r = models_->import_bundle(path, json::parse_or_null(catalog_body));
+                result["imported"] = r["imported"];
+                result["already"] = r["already"];
+                result["errors"] = r["errors"];
+            }
+        }
+        if (feed) result["update"] = updater_->import_offline(path, std::string());
+        log_info("import: offline bundle " + path + ", " + std::to_string(result["imported"].size()) + " models");
         return result;
     }
 
@@ -1292,8 +1613,8 @@ namespace albireo
         s["product"] = ALBIREO_PRODUCT_NAME;
         s["edition"] = ALBIREO_EDITION;
         s["version"] = ALBIREO_VERSION;
-        s["company"] = ALBIREO_COMPANY_NAME;
         s["author"] = ALBIREO_AUTHOR_NAME;
+        s["email"] = ALBIREO_AUTHOR_EMAIL;
         s["copyright"] = ALBIREO_COPYRIGHT;
         s["project"] = ALBIREO_PROJECT_URL;
         s["started_at"] = static_cast<long long>(started_at_);
@@ -1407,6 +1728,7 @@ namespace albireo
             j["version"] = c.description["version"];
             j["build"] = c.description["build"];
             j["devices"] = c.description["devices"];
+            if (c.description["missing"].is_string()) j["missing"] = c.description["missing"];
             if (!c.usable)
             {
                 j["reason"] = c.description["reason"];
@@ -1428,6 +1750,20 @@ namespace albireo
             j["device"] = o.device;
             j["current"] = o.key == choice_.key;
             j["measure"] = st.engine_benchmarks[o.key];
+            // The kind of the choice and the names of its devices, which the menus show.
+            const std::string kind = o.key == "cuda" || o.key == "openvino:gpu" ? "gpu"
+                : o.key == "openvino:npu" ? "npu" : o.key == "openvino:both" ? "both" : "cpu";
+            j["kind"] = kind;
+            json names = json::array();
+            for (const auto& d : o.candidate->description["devices"].elements())
+            {
+                const std::string type = d["type"].as_string();
+                const bool wanted = kind == "both" ? (type == "npu" || type == "gpu")
+                    : o.key == "openvino:cpu" ? (type == "cpu" && d.contains("id")) : type == kind;
+                if (wanted && (kind != "cpu" || o.key == "openvino:cpu" || names.empty()))
+                    names.push_back(d["name"]);
+            }
+            j["names"] = names;
             options.push_back(j);
         }
         json out = json::object();
@@ -1541,6 +1877,9 @@ namespace albireo
             std::cout << d.dump() << std::endl;
             return 2;
         }
+        // The runtime of a device starts with the description; the process that ends after it
+        // (main.cpp) leaves the library loaded.
+        lib.keep_loaded();
         d = lib.description();
         if (!d.is_object())
         {
@@ -1563,6 +1902,7 @@ namespace albireo
         engine_library lib;
         std::string error;
         if (!lib.load(path, error)) return fail(error);
+        lib.keep_loaded();
         char err[2048] = { 0 };
         albireo_engine* e = lib.create(config.c_str(), nullptr, nullptr, err, sizeof(err));
         if (!e) return fail(err);

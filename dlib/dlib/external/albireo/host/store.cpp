@@ -13,13 +13,10 @@
 namespace albireo
 {
 
-    store::store(const std::string& path)
+    store::store(const std::string& path) : path_(path)
     {
         make_dirs(parent_path(path));
-        db_.reset(new dlib::database(path));
-        db_->exec("PRAGMA journal_mode=WAL");
-        db_->exec("PRAGMA synchronous=NORMAL");
-        db_->exec("PRAGMA foreign_keys=ON");
+        connect();
         db_->exec(
             "CREATE TABLE IF NOT EXISTS models ("
             " id TEXT PRIMARY KEY, name TEXT NOT NULL, file TEXT NOT NULL, size INTEGER NOT NULL,"
@@ -36,6 +33,36 @@ namespace albireo
     }
 
     store::~store() {}
+
+    void store::connect()
+    {
+        db_.reset(new dlib::database(path_));
+        /*
+            A database that another program holds a moment, a backup or a copy of the file say,
+            is waited for up to five seconds before an operation fails, and the next
+            operations find it free again.
+        */
+        db_->exec("PRAGMA busy_timeout=5000");
+        db_->exec("PRAGMA journal_mode=WAL");
+        db_->exec("PRAGMA synchronous=NORMAL");
+        db_->exec("PRAGMA foreign_keys=ON");
+    }
+
+    void store::writing(const std::function<void()>& work)
+    {
+        try
+        {
+            work();
+        }
+        catch (const std::exception& e)
+        {
+            // A connection that SQLite opened read-only, once the file can be written again.
+            if (std::string(e.what()).find("readonly") == std::string::npos) throw;
+            connect();
+            work();
+            log_info("store: " + path_ + " is written again");
+        }
+    }
 
     std::vector<installed_model> store::models()
     {
@@ -75,35 +102,41 @@ namespace albireo
     void store::put_model(const installed_model& m)
     {
         std::lock_guard<std::mutex> lock(m_);
-        dlib::statement st(*db_, "INSERT OR REPLACE INTO models (id, name, file, size, sha256, source, installed_at, "
-            "verified_at, descriptor) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
-        st.bind(1, m.id);
-        st.bind(2, m.name);
-        st.bind(3, m.file);
-        st.bind_int64(4, static_cast<dlib::int64>(m.size));
-        st.bind(5, m.sha256);
-        st.bind(6, m.source);
-        st.bind_int64(7, m.installed_at);
-        st.bind_int64(8, m.verified_at);
-        st.bind(9, m.descriptor.dump());
-        st.exec();
+        writing([&]() {
+            dlib::statement st(*db_, "INSERT OR REPLACE INTO models (id, name, file, size, sha256, source, "
+                "installed_at, verified_at, descriptor) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
+            st.bind(1, m.id);
+            st.bind(2, m.name);
+            st.bind(3, m.file);
+            st.bind_int64(4, static_cast<dlib::int64>(m.size));
+            st.bind(5, m.sha256);
+            st.bind(6, m.source);
+            st.bind_int64(7, m.installed_at);
+            st.bind_int64(8, m.verified_at);
+            st.bind(9, m.descriptor.dump());
+            st.exec();
+        });
     }
 
     void store::remove_model(const std::string& id)
     {
         std::lock_guard<std::mutex> lock(m_);
-        dlib::statement st(*db_, "DELETE FROM models WHERE id = ?");
-        st.bind(1, id);
-        st.exec();
+        writing([&]() {
+            dlib::statement st(*db_, "DELETE FROM models WHERE id = ?");
+            st.bind(1, id);
+            st.exec();
+        });
     }
 
     void store::set_verified(const std::string& id, int64_t when)
     {
         std::lock_guard<std::mutex> lock(m_);
-        dlib::statement st(*db_, "UPDATE models SET verified_at = ? WHERE id = ?");
-        st.bind_int64(1, when);
-        st.bind(2, id);
-        st.exec();
+        writing([&]() {
+            dlib::statement st(*db_, "UPDATE models SET verified_at = ? WHERE id = ?");
+            st.bind_int64(1, when);
+            st.bind(2, id);
+            st.exec();
+        });
     }
 
     json store::download_state(const std::string& id)
@@ -119,19 +152,23 @@ namespace albireo
     void store::set_download_state(const std::string& id, const json& state)
     {
         std::lock_guard<std::mutex> lock(m_);
-        dlib::statement st(*db_, "INSERT OR REPLACE INTO downloads (id, state, updated_at) VALUES (?, ?, ?)");
-        st.bind(1, id);
-        st.bind(2, state.dump());
-        st.bind_int64(3, now_unix());
-        st.exec();
+        writing([&]() {
+            dlib::statement st(*db_, "INSERT OR REPLACE INTO downloads (id, state, updated_at) VALUES (?, ?, ?)");
+            st.bind(1, id);
+            st.bind(2, state.dump());
+            st.bind_int64(3, now_unix());
+            st.exec();
+        });
     }
 
     void store::remove_download_state(const std::string& id)
     {
         std::lock_guard<std::mutex> lock(m_);
-        dlib::statement st(*db_, "DELETE FROM downloads WHERE id = ?");
-        st.bind(1, id);
-        st.exec();
+        writing([&]() {
+            dlib::statement st(*db_, "DELETE FROM downloads WHERE id = ?");
+            st.bind(1, id);
+            st.exec();
+        });
     }
 
     std::vector<std::string> store::pending_downloads()
@@ -148,15 +185,18 @@ namespace albireo
     {
         const std::string day = iso_time(now_unix()).substr(0, 10);
         std::lock_guard<std::mutex> lock(m_);
-        dlib::statement st(*db_,
-            "INSERT INTO usage (day, prompt_tokens, generated_tokens, requests) VALUES (?, ?, ?, ?) "
-            "ON CONFLICT(day) DO UPDATE SET prompt_tokens = prompt_tokens + excluded.prompt_tokens, "
-            "generated_tokens = generated_tokens + excluded.generated_tokens, requests = requests + excluded.requests");
-        st.bind(1, day);
-        st.bind_int64(2, prompt_tokens);
-        st.bind_int64(3, generated_tokens);
-        st.bind_int64(4, requests);
-        st.exec();
+        writing([&]() {
+            dlib::statement st(*db_,
+                "INSERT INTO usage (day, prompt_tokens, generated_tokens, requests) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(day) DO UPDATE SET prompt_tokens = prompt_tokens + excluded.prompt_tokens, "
+                "generated_tokens = generated_tokens + excluded.generated_tokens, "
+                "requests = requests + excluded.requests");
+            st.bind(1, day);
+            st.bind_int64(2, prompt_tokens);
+            st.bind_int64(3, generated_tokens);
+            st.bind_int64(4, requests);
+            st.exec();
+        });
     }
 
     json store::usage(int days)
@@ -192,10 +232,12 @@ namespace albireo
     void store::set_value(const std::string& key, const std::string& v)
     {
         std::lock_guard<std::mutex> lock(m_);
-        dlib::statement st(*db_, "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)");
-        st.bind(1, key);
-        st.bind(2, v);
-        st.exec();
+        writing([&]() {
+            dlib::statement st(*db_, "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)");
+            st.bind(1, key);
+            st.bind(2, v);
+            st.exec();
+        });
     }
 
 }

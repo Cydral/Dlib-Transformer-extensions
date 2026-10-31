@@ -179,16 +179,39 @@ namespace albireo
 
         /*!
             ensures
-                - Installs what a folder brought to the machine holds, such as an offline
-                  bundle (tools/make_offline_bundle.py): its signed catalog (catalog.json
-                  and catalog.json.sig) first, so that the models take their entries, then
-                  its models (*.gguf, in the folder and in its "models" subfolder), then
-                  its signed update (feed.json, feed.json.sig and the installer).  A path
-                  to a single GGUF file installs that file.
-                - Returns {"imported", "errors"} as model_manager::import_path(), with
-                  "catalog" and "update" when the folder holds them.
+                - Installs what path holds, for the route of the imports by path.  The
+                  service reads with its own rights, those of the system on Windows, so that
+                  path is accepted in two cases only, a file of another account being never
+                  read, hashed, listed nor revealed:
+                    - a folder or a file of the import folder of the data folder, which only
+                      SYSTEM and the administrators fill: its signed catalog, its models
+                      (*.gguf, in the folder and in its "models" subfolder) and its signed
+                      update, as scan_inbox() installs them, the files staying in place;
+                    - a signed offline bundle (tools/make_offline_bundle.py) on a local
+                      drive: a folder whose catalog.json or feed.json bears the signature
+                      of Albireo.  Its catalog, the models that catalog lists (found by
+                      their names, sizes and hashes, model_manager::import_bundle()) and its
+                      update are installed; no other file of the folder is read.
+                  Every file is read through no link.  A model file of the user goes to the
+                  service through the upload route, read with the rights of the user.
+                - Returns {"imported", "already", "errors"} as model_manager::import_path(),
+                  with "catalog" and "update" when the folder holds them.
+                - Refuses path, with refusal set and an empty result, when it is relative
+                  (code import_path_relative), on a network share or drive
+                  (import_path_network), a device or a path of the system namespaces
+                  (import_path_device), invalid (import_path_invalid: a stream, a wildcard, a
+                  control character, a name "." or ".."), a model file outside the import
+                  folder (import_use_upload), outside the import folder and no signed
+                  offline bundle reached through no link (import_not_bundle: the same code
+                  whether the folder is missing, unreadable, unsigned or reached through a
+                  link, so that the answer reveals nothing of a folder of another account),
+                  missing in the import folder (import_not_found), reached through a link
+                  in the import folder (import_path_link), or when the import folder lets
+                  other accounts than the administrators write in it and cannot be
+                  secured (import_folder_insecure).  Each refusal names the path in its
+                  arguments ("path").
         !*/
-        json import_folder(const std::string& path);
+        json import_folder(const std::string& path, user_error& refusal);
 
         // Applies the network settings at once: the proxy, and the offline mode, which
         // ends the requests in progress.
@@ -218,6 +241,9 @@ namespace albireo
         // window shows as the error of its download until a download starts.
         void note_default_failure(const json& entry, const user_error& error, const std::string& what);
         void scan_inbox();
+        // Whether the import folder lets only the administrators write in it: secured again, its content
+        // checked, when it does not; false with error when it cannot be.
+        bool secure_inbox(std::string& error);
         void on_installed(const installed_model& m);
         static bool is_embedding(const installed_model& m);
         bool load_model(const installed_model& m, std::string& error);
@@ -251,6 +277,8 @@ namespace albireo
         std::string background_model_;
         std::atomic<bool> engines_ready_{false};
         std::atomic<bool> models_ready_{false};
+        // Set by run() when a damaged database was set aside and a new one started.
+        bool database_restarted_ = false;
 
         // Guards the server, the model manager and the updater while run() creates and
         // releases them, for stop(), which a thread of the system may call at any time.

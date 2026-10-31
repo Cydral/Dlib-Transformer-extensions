@@ -897,7 +897,7 @@ namespace albireo
             : d.forced < 0 ? dlib::npu::routing::never : dlib::npu::routing::automatic);
         if (!dlib::npu::is_available())
             throw std::runtime_error("no NPU or Intel graphics processor was found"
-                + (device.empty() ? std::string() : " for '" + device + "'"));
+                + (device.empty() ? std::string() : " for '" + device + "'") + ": " + dlib::npu::unavailable_reason());
         d.name = dlib::npu::device_name() + " (OpenVINO " + dlib::npu::runtime_version() + ")";
         d.message(ALBIREO_LOG_INFO, "device: " + d.name + ", weights in single precision up to " + megabytes(d.budget));
 #else
@@ -1062,12 +1062,17 @@ namespace albireo
 #elif defined(DLIB_USE_NPU)
         backend = "openvino";
         runtime = "OpenVINO " + dlib::npu::runtime_version();
+        // Why the plugins of OpenVINO left a device out, as they report it: the reason of an
+        // engine that cannot run, else the devices missing beside those found.
+        const std::string why = dlib::npu::unavailable_reason();
         if (!dlib::npu::is_available())
         {
-            reason = "no NPU or Intel graphics processor was found";
-            code = "no_intel_device";
+            reason = "no NPU or Intel graphics processor was found" + (why.empty() ? std::string() : ": " + why);
+            code = why.empty() ? "no_intel_device" : "intel_device_unusable";
+            if (!why.empty()) args["detail"] = why;
             return devices;
         }
+        reason = why;
         // "NPU, Intel(R) AI Boost + GPU, Intel(R) Graphics"
         const std::string all = dlib::npu::device_name();
         size_t start = 0;

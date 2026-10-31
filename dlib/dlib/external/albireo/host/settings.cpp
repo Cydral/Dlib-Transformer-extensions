@@ -85,6 +85,7 @@ namespace albireo
         j["update_feed"] = update_feed;
         j["catalog_url"] = catalog_url;
         j["engine_benchmarks"] = engine_benchmarks;
+        if (trust_authority >= 0) j["trust_authority"] = trust_authority > 0;
         return j;
     }
 
@@ -120,6 +121,7 @@ namespace albireo
         update_feed = j["update_feed"].str(d.update_feed);
         catalog_url = j["catalog_url"].str(d.catalog_url);
         engine_benchmarks = j["engine_benchmarks"].is_object() ? j["engine_benchmarks"] : json::object();
+        trust_authority = j["trust_authority"].is_bool() ? (j["trust_authority"].as_bool() ? 1 : 0) : d.trust_authority;
     }
 
     std::string host_settings::effective_models_dir() const

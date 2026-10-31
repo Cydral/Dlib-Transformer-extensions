@@ -670,33 +670,125 @@ async function odfText(zip) {
   return out.join('\n');
 }
 
+/*
+    PDF, read by pdf.js in its worker.  pdf.js reads the CMaps of the CJK fonts that a file
+    names without embedding them from its folder (cMapUrl).  Its standard fonts and its
+    WebAssembly decoders of images only draw pages and stay out (standardFontDataUrl and
+    wasmUrl unset, useWasm off), so that the reading requests the CMaps only.  A page holds
+    readable text from minPageChars letters and digits on; below, it holds a page number or a
+    stamp.
+*/
+const pdfjsFolder = new URL('../vendor/pdfjs/', import.meta.url).href;
+const minPageChars = 10;
+// The operators of pdf.js that draw an image.
+const imageOperators = ['paintImageXObject', 'paintInlineImageXObject', 'paintImageMaskXObject',
+  'paintImageXObjectRepeat', 'paintImageMaskXObjectRepeat', 'paintImageMaskXObjectGroup',
+  'paintInlineImageXObjectGroup'];
 let pdfjs = null;
 
-async function pdfText(buffer) {
+// pdf.js, loaded at the first PDF; "pdf-reader" when this browser cannot run it.
+async function pdfLibrary() {
   if (!pdfjs) {
-    pdfjs = await import('../vendor/pdfjs/pdf.min.mjs');
-    pdfjs.GlobalWorkerOptions.workerSrc = new URL('../vendor/pdfjs/pdf.worker.min.mjs', import.meta.url).href;
-  }
-  const doc = await pdfjs.getDocument({ data: new Uint8Array(buffer), isEvalSupported: false, useSystemFonts: true }).promise;
-  const pages = [];
-  let total = 0;
-  for (let i = 1; i <= doc.numPages; ++i) {
-    const page = await doc.getPage(i);
-    const content = await page.getTextContent();
-    let s = '';
-    for (const item of content.items) {
-      if (typeof item.str !== 'string') continue;
-      s += item.str;
-      if (item.hasEOL) s += '\n';
-      else if (item.str && !item.str.endsWith(' ')) s += ' ';
+    let lib;
+    try {
+      lib = await import('../vendor/pdfjs/pdf.min.mjs');
+    } catch (e) {
+      console.warn('Albireo: pdf.js cannot run in this browser', e);
+      throw new Error('pdf-reader');
     }
-    pages.push('## Page ' + i + '\n' + s.trim());
-    total += s.length;
-    page.cleanup();
-    if (total > maxTextChars) break;
+    lib.GlobalWorkerOptions.workerSrc = pdfjsFolder + 'pdf.worker.min.mjs';
+    pdfjs = lib;
   }
-  await doc.destroy();
-  return pages.join('\n\n');
+  return pdfjs;
+}
+
+// The reason pdf.js gives for a file it cannot open, as extractText() names it.
+function pdfOpenError(e) {
+  const name = e && e.name;
+  if (name === 'PasswordException') return new Error('pdf-password');
+  if (name === 'InvalidPDFException') return new Error('pdf-invalid');
+  // The worker of pdf.js, then the same script in the page, could not start.
+  if (/fake worker/i.test(String(e && e.message))) return new Error('pdf-reader');
+  return e;
+}
+
+// Whether a page of a document, given by its number, draws an image; false for a page pdf.js cannot read.
+async function drawsImage(doc, number, imageOps) {
+  let page = null;
+  try {
+    page = await doc.getPage(number);
+    const ops = await page.getOperatorList();
+    return ops.fnArray.some((fn) => imageOps.has(fn));
+  } catch (e) {
+    return false;
+  } finally {
+    if (page) page.cleanup();
+  }
+}
+
+/*
+    The text of a PDF, one "## Page" part per page: {text, pages, unreadablePages}, the pages
+    without readable text that draw images counted in unreadablePages.  A PDF none of whose
+    pages holds readable text throws "pdf-images" when it holds no text at all or when its
+    pages draw images, as a scan does, whose text lies in the pixels of its images.
+*/
+async function pdfText(buffer) {
+  const lib = await pdfLibrary();
+  const imageOps = new Set(imageOperators.map((name) => lib.OPS[name]).filter((op) => op !== undefined));
+  const task = lib.getDocument({
+    data: new Uint8Array(buffer), cMapUrl: pdfjsFolder + 'cmaps/', cMapPacked: true, useSystemFonts: true,
+    useWasm: false, verbosity: lib.VerbosityLevel.ERRORS
+  });
+  try {
+    let doc;
+    try {
+      doc = await task.promise;
+    } catch (e) {
+      throw pdfOpenError(e);
+    }
+    if (!doc.numPages) throw new Error('pdf-invalid');
+    const pages = [];
+    // The pages without readable text, and the letters and digits of the document.
+    const textless = [];
+    let total = 0, chars = 0;
+    for (let i = 1; i <= doc.numPages && total <= maxTextChars; ++i) {
+      const page = await doc.getPage(i);
+      try {
+        const content = await page.getTextContent();
+        let s = '';
+        for (const item of content.items) {
+          if (typeof item.str !== 'string') continue;
+          s += item.str;
+          if (item.hasEOL) s += '\n';
+          else if (item.str && !item.str.endsWith(' ')) s += ' ';
+        }
+        const n = s.replace(/[^\p{L}\p{N}]+/gu, '').length;
+        chars += n;
+        if (n < minPageChars) textless.push(i);
+        pages.push('## Page ' + i + '\n' + s.trim());
+        total += s.length;
+      } finally {
+        page.cleanup();
+      }
+    }
+    // The operators of the pages are read only for the pages without text.
+    let unreadable = 0;
+    if (textless.length === pages.length) {
+      if (!chars) throw new Error('pdf-images');
+      for (const i of textless) if (await drawsImage(doc, i, imageOps)) throw new Error('pdf-images');
+    } else {
+      for (const i of textless) if (await drawsImage(doc, i, imageOps)) ++unreadable;
+    }
+    return { text: pages.join('\n\n'), pages: doc.numPages, unreadablePages: unreadable };
+  } finally {
+    await task.destroy();
+  }
+}
+
+// Whether bytes are those of a PDF, which start with "%PDF-" whatever the name of the file.
+function isPdf(bytes) {
+  return bytes.length >= 5 && bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46
+    && bytes[4] === 0x2d;
 }
 
 function rtfText(s) {
@@ -711,9 +803,12 @@ function htmlText(s) {
 }
 
 /*
-    The text of a file: {text, format}, or an exception whose message says why it cannot
-    be read: too-large, too-large-content (an archive too large once decompressed), legacy
-    (an Office format before 2007), unsupported.
+    The text of a file: {text, format}, with for a PDF its number of pages and the number of
+    its pages without readable text that draw images (pages, unreadablePages).  Or an exception
+    whose message says why it cannot be read: too-large, too-large-content (an archive too large
+    once decompressed), legacy (an Office format before 2007), unsupported, pdf-images (a PDF
+    whose pages are images without text, a scan), pdf-password (a PDF that opens with a
+    password only), pdf-invalid (a damaged PDF), pdf-reader (pdf.js cannot run in this browser).
 */
 export async function extractText(file) {
   if (file.size > maxFileBytes) throw new Error('too-large');
@@ -727,8 +822,10 @@ export async function extractText(file) {
   else if (ext === 'pptx' || ext === 'pptm' || ext === 'ppsx' || ext === 'potx') text = await pptxText(await unzip(buffer));
   else if (ext === 'xlsx' || ext === 'xlsm' || ext === 'xltx') text = await xlsxText(await unzip(buffer));
   else if (ext === 'odt' || ext === 'ods' || ext === 'odp') text = await odfText(await unzip(buffer));
-  else if (ext === 'pdf') text = await pdfText(buffer);
-  else if (ext === 'rtf') text = rtfText(decodeText(bytes));
+  else if (ext === 'pdf' || isPdf(bytes)) {
+    const r = await pdfText(buffer);
+    return { text: r.text.slice(0, maxTextChars), format: 'PDF', pages: r.pages, unreadablePages: r.unreadablePages };
+  } else if (ext === 'rtf') text = rtfText(decodeText(bytes));
   else if (ext === 'html' || ext === 'htm' || ext === 'xhtml') text = htmlText(decodeText(bytes));
   else if (textExtensions.has(ext) || (file.type || '').startsWith('text/') || !looksBinary(bytes)) {
     text = decodeText(bytes);

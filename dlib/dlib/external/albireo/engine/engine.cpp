@@ -165,7 +165,9 @@ namespace albireo
                     d.id = t["id"].as_string();
                     const json& f = t["function"];
                     d.name = f["name"].as_string();
-                    d.arguments = f["arguments"].is_string() ? f["arguments"].as_string() : f["arguments"].dump();
+                    // An object is written as the templates write it, with a space after each separator.
+                    d.arguments = f["arguments"].is_string() ? f["arguments"].as_string()
+                        : f["arguments"].is_null() ? std::string("{}") : f["arguments"].dump_formatted();
                     c.tool_calls.push_back(d);
                 }
                 out.push_back(c);
@@ -275,7 +277,8 @@ namespace albireo
         if (threads_ <= 0) threads_ = cpu.physical_cores;
         threads_ = std::max(1, std::min(threads_, cpu.logical_cores));
         pool_.reset(new thread_pool(threads_));
-        pool_->set_spin_time(std::chrono::microseconds(settings_["spin_us"].as_int(2000)));
+        // A spin of a tenth of a second at most, since a longer one keeps the processor busy between passes.
+        pool_->set_spin_time(std::chrono::microseconds(bounded(settings_["spin_us"], 2000, 0, 100000)));
         log(ALBIREO_LOG_INFO, std::string("engine ") + ALBIREO_ENGINE_VARIANT + " " + ALBIREO_VERSION + ", "
             + std::to_string(threads_) + " threads, kernels " + qk_isa());
 #ifdef ALBIREO_TENSOR_BACKEND
@@ -391,6 +394,10 @@ namespace albireo
                 reason_code = why_code;
                 reason_args = why_args;
             }
+            else if (!why.empty())
+            {
+                d["missing"] = why;
+            }
         }
 #endif
         d["devices"] = devices;
@@ -420,6 +427,9 @@ namespace albireo
         m->tok.load_from_gguf(m->file->reader());
         if (static_cast<long>(m->tok.size()) != m->cfg.vocab)
             throw std::runtime_error("the vocabulary and the output layer of the model disagree");
+        // The tokens the engine adds or stops on must be tokens of the vocabulary.
+        if (m->tok.bos_id() >= m->cfg.vocab || m->tok.eos_id() >= m->cfg.vocab)
+            throw std::runtime_error("the tokenizer of the model names a special token outside its vocabulary");
         m->format = chat_format::detect(m->tok, m->cfg.chat_template);
 
         // An embedding model reads passages and questions of a few hundred tokens, many
@@ -429,17 +439,34 @@ namespace albireo
         if (embedding && m->cfg.pooling != 3)
             throw std::runtime_error("this embedding model pools its hidden states by a method the engine does not "
                 "implement (the engine takes the state of the last token)");
-        long ctx = options["context"].as_int(embedding ? 0 : settings_["context"].as_int(0));
+        /*
+            The settings of the model, its options or those of the engine, within bounds read
+            before any narrowing (long has 32 bits on Windows), which are a context of 2^26
+            positions, 256 sequences, passes of 65536 tokens and 2^24 MB of keys and values.
+        */
+        auto setting = [&](const char* key, long long def, long long lo, long long hi) {
+            const json& v = options.contains(key) ? options[key] : settings_[key];
+            if (v.is_null()) return def;
+            if (!v.is_number()) throw std::invalid_argument(std::string("the setting ") + key + " must be a number");
+            const double x = v.as_double();
+            if (!(x >= static_cast<double>(lo) && x <= static_cast<double>(hi)))
+                throw std::invalid_argument(std::string("the setting ") + key + " must lie between "
+                    + std::to_string(lo) + " and " + std::to_string(hi));
+            return v.as_int(def);
+        };
+        long ctx = embedding && !options.contains("context") ? 0
+            : static_cast<long>(setting("context", 0, 0, 1 << 26));
         if (ctx <= 0) ctx = std::min<long>(m->cfg.ctx_train, embedding ? 8192 : 32768);
         const long limit = m->cfg.ctx_train > 0 ? std::max<long>(m->cfg.ctx_train, 256) : ctx;
         m->context = std::max<long>(256, std::min<long>(ctx, limit));
-        m->max_sequences = std::max<long>(1, options["max_sequences"].as_int(
-            embedding ? 8 : settings_["max_sequences"].as_int(8)));
-        m->batch_tokens = std::max<long>(16, options["batch_tokens"].as_int(
-            embedding ? 256 : settings_["batch_tokens"].as_int(512)));
+        m->max_sequences = embedding && !options.contains("max_sequences") ? 8
+            : std::max<long>(1, static_cast<long>(setting("max_sequences", 8, 0, 256)));
+        m->batch_tokens = embedding && !options.contains("batch_tokens") ? 256
+            : std::max<long>(16, static_cast<long>(setting("batch_tokens", 512, 0, 65536)));
 
         const size_t per_token = 2 * static_cast<size_t>(m->cfg.n_layers) * m->cfg.kv_dim() * sizeof(uint16_t);
-        size_t kv = static_cast<size_t>(options["kv_mb"].as_int(embedding ? 0 : settings_["kv_mb"].as_int(0))) << 20;
+        size_t kv = (embedding && !options.contains("kv_mb") ? size_t(0)
+            : static_cast<size_t>(setting("kv_mb", 0, 0, 1 << 24))) << 20;
         if (kv == 0 && embedding)
         {
             // One input of the whole context.
@@ -639,11 +666,13 @@ namespace albireo
         // token for a mass that temperature and top-p leave aside.
         sp.top_k = static_cast<int>(bounded(req["top_k"], chatml_reasoning ? 20 : 40, 0, 1024));
         sp.min_p = static_cast<float>(req["min_p"].as_double(0.0));
-        sp.repeat_penalty =
-            static_cast<float>(req["repeat_penalty"].as_double(req["repetition_penalty"].as_double(1.0)));
+        const double repeat_penalty = req["repeat_penalty"].as_double(req["repetition_penalty"].as_double(1.0));
+        sp.repeat_penalty = static_cast<float>(repeat_penalty);
         sp.repeat_last_n = static_cast<int>(bounded(req["repeat_last_n"], 64, -1, 1 << 20));
-        sp.presence_penalty = static_cast<float>(req["presence_penalty"].as_double(0.0));
-        sp.frequency_penalty = static_cast<float>(req["frequency_penalty"].as_double(0.0));
+        const double presence = req["presence_penalty"].as_double(0.0);
+        const double frequency = req["frequency_penalty"].as_double(0.0);
+        sp.presence_penalty = static_cast<float>(presence);
+        sp.frequency_penalty = static_cast<float>(frequency);
         sp.seed = static_cast<uint64_t>(req["seed"].as_int(0));
         for (const auto& b : req["logit_bias"].items())
         {
@@ -651,9 +680,19 @@ namespace albireo
             const long long token = std::strtoll(b.first.c_str(), &end, 10);
             if (end == b.first.c_str() || *end != '\0' || token < 0 || token >= m->cfg.vocab)
                 throw std::invalid_argument("logit_bias holds an invalid token identifier");
-            sp.logit_bias[static_cast<int>(token)] = static_cast<float>(b.second.as_double(0.0));
+            // The range of the OpenAI interface, -100 (banned) to 100 (forced).
+            const double bias = b.second.as_double(0.0);
+            if (!b.second.is_number() || !(bias >= -100.0 && bias <= 100.0))
+                throw std::invalid_argument("logit_bias values must be numbers between -100 and 100");
+            sp.logit_bias[static_cast<int>(token)] = static_cast<float>(bias);
         }
-        if (sp.temperature < 0 || sp.top_p < 0 || sp.top_p > 1 || sp.min_p < 0 || sp.min_p > 1)
+        /*
+            The JSON numbers may be infinite, so every parameter is checked against a finite
+            range, which keeps the logits finite.
+        */
+        if (!(sp.temperature >= 0 && sp.temperature <= 1e4) || !(sp.top_p >= 0 && sp.top_p <= 1)
+            || !(sp.min_p >= 0 && sp.min_p <= 1) || !(repeat_penalty > 0 && repeat_penalty <= 100)
+            || !(presence >= -100 && presence <= 100) || !(frequency >= -100 && frequency <= 100))
             throw std::invalid_argument("sampling parameters out of range");
         r->smp.reset(new sampler(sp));
 
@@ -666,6 +705,9 @@ namespace albireo
         for (const auto& s : req["stop"].elements())
             if (s.is_string() && !s.as_string().empty()) r->stops.push_back(s.as_string());
         if (r->stops.size() > 16) throw std::invalid_argument("at most 16 stop sequences");
+        // Each token compares the end of the answer with the stop sequences, whose length is bounded for that.
+        for (const auto& s : r->stops)
+            if (s.size() > 1024) throw std::invalid_argument("a stop sequence holds 1024 bytes at most");
 
         std::lock_guard<std::mutex> lock(mutex_);
         if (stop_) throw std::runtime_error("the engine is stopping");
@@ -917,6 +959,16 @@ namespace albireo
                         if (idle) m->runtime->trim_memory();
                     }
                 }
+                catch (const std::bad_alloc&)
+                {
+                    /*
+                        The system ran out of memory during the pass.  Its requests end with the
+                        code of a full memory of keys and values, and the free blocks go back to
+                        the system, so that the next requests find room.
+                    */
+                    abandon(*m, "out_of_memory", "the system has no memory left for this request");
+                    trim_after_failure(*m);
+                }
                 catch (const std::exception& e)
                 {
                     try
@@ -933,6 +985,17 @@ namespace albireo
                     abandon(*m, "internal", "unknown error");
                 }
             }
+        }
+    }
+
+    void engine::trim_after_failure(loaded_model& m)
+    {
+        try
+        {
+            m.runtime->trim_memory();
+        }
+        catch (...)
+        {
         }
     }
 
@@ -1031,11 +1094,15 @@ namespace albireo
         for (const auto& r : m.active)
             if (r->ph == request_state::phase::waiting) back.push_back(r);
         if (back.empty()) return;
+        // Back in the queue before they leave the active requests, so that a failure of the
+        // insertion leaves them where abandon() finds them.
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            m.waiting.insert(m.waiting.begin(), back.begin(), back.end());
+        }
         m.active.erase(std::remove_if(m.active.begin(), m.active.end(),
             [](const std::shared_ptr<request_state>& r) { return r->ph == request_state::phase::waiting; }),
             m.active.end());
-        std::lock_guard<std::mutex> lock(mutex_);
-        m.waiting.insert(m.waiting.begin(), back.begin(), back.end());
     }
 
     void engine::admit(loaded_model& m)
@@ -1046,22 +1113,27 @@ namespace albireo
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 if (m.waiting.empty() || static_cast<long>(m.active.size()) >= m.max_sequences) return;
+                // Room for the request among the active ones before it leaves the queue, so that
+                // an exception from here on ends it with the others (abandon).
+                m.active.reserve(m.active.size() + 1);
                 r = m.waiting.front();
                 m.waiting.pop_front();
             }
+            m.active.push_back(r);
             if (r->is_cancelled())
             {
                 finish(m, *r, "cancelled");
+                m.active.pop_back();
                 continue;
             }
             r->started = clock_type::now();
             if (!assign_sequence(m, *r))
             {
                 fail(*r, "out_of_memory", "no memory left for the keys and values of this request");
+                m.active.pop_back();
                 continue;
             }
             r->ph = request_state::phase::prefill;
-            m.active.push_back(r);
             if (r->cached > 0)
             {
                 json p = json::object();

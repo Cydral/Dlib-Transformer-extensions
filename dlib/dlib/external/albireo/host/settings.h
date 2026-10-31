@@ -60,6 +60,12 @@ namespace albireo
         std::string catalog_url =
             "https://raw.githubusercontent.com/Cydral/Dlib-Transformer-extensions/main/dist/albireo/catalog.json";
         json engine_benchmarks = json::object();     // variant -> measured tokens per second
+        /*
+            The choice of the installation for the local authority in the trusted roots of
+            the machine: 1 trusted, 0 not, -1 unknown (an installation before 1.0.8), where a
+            new authority follows the trust of the one it replaces (certificates.h).
+        */
+        int trust_authority = -1;
 
         // The settings as settings.json and the administration interface give them, the
         // password of the proxy masked.

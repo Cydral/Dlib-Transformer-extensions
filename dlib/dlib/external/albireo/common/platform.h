@@ -32,7 +32,8 @@ namespace albireo
         $ALBIREO_HOME when it is set, otherwise %ProgramData%\Albireo on Windows and
         ~/.local/share/albireo elsewhere.  On Windows the variable is read from the
         environment of the machine, the one the services receive: the variable of a user
-        steers neither the installer nor the icon away from the service.
+        steers neither the installer nor the icon away from the service.  The folder the
+        installer records (DataDir of HKLM\Software\Albireo) comes first.
     */
     std::string data_dir();
 
@@ -98,6 +99,112 @@ namespace albireo
     */
     bool secure_folder(const std::string& p, std::string& error, bool check_content = false);
 
+    /*
+        Whether only SYSTEM and the administrators can change what the folder p holds: p is
+        a folder and no link, its owner is one of the accounts of owned_by_system(), and no
+        entry of its permissions lets another account write in it, delete in it or change
+        its permissions, whether the entry applies to p or to what it holds.  Always true
+        elsewhere than on Windows.
+    */
+    bool folder_admin_only(const std::string& p);
+
+    class link_free_file
+    {
+        /*!
+            WHAT THIS OBJECT REPRESENTS
+                A file opened for reading through no link.  Each folder on the way from a
+                trusted folder to the file is opened within the folder before it, and the
+                file within the last one; a symbolic link, a junction or a mount point among
+                them, the file included, fails the opening, so that a link placed or swapped
+                while the file opens never leads elsewhere.  On Windows the file is shared
+                for reading only while it is open: what is read is what was checked.
+        !*/
+    public:
+        link_free_file() {}
+        ~link_free_file() { close(); }
+        link_free_file(const link_free_file&) = delete;
+        link_free_file& operator=(const link_free_file&) = delete;
+
+        /*!
+            ensures
+                - Opens path, which lies under folder.  folder itself is opened as its path
+                  leads, links included; an empty folder stands for the root of the drive of
+                  path.
+                - Returns false otherwise, with why: "link" (a link on the way, the file
+                  included), "missing", or "invalid" (path outside folder, a name "." or "..",
+                  an entry that is no regular file, or another error).
+        !*/
+        bool open(const std::string& path, const std::string& folder, std::string& why);
+        bool is_open() const;
+        uint64_t size() const { return size_; }
+        // The number of names of the file: more than one for a file with hard links.
+        uint32_t links() const { return links_; }
+        // The volume and the index of the file, equal for two names of the same file.
+        const std::string& identity() const { return identity_; }
+        // Reads up to n bytes; returns the bytes read, 0 at the end of the file, -1 on an error.
+        long long read(char* data, size_t n);
+        bool seek(uint64_t offset);
+        void close();
+
+    private:
+#if defined(_WIN32)
+        void* h_ = nullptr;
+#else
+        int fd_ = -1;
+#endif
+        uint64_t size_ = 0;
+        uint32_t links_ = 0;
+        std::string identity_;
+    };
+
+    // Reads a file of at most max_bytes through no link, as link_free_file opens it.
+    bool read_file_link_free(const std::string& path, const std::string& folder, std::string& data,
+        uint64_t max_bytes);
+
+    // Whether the folder path, under folder, is reached through no link, as link_free_file opens a file.
+    bool link_free_folder(const std::string& path, const std::string& folder);
+
+    // The identity of the file p itself, a link not followed, as link_free_file::identity() gives it, or
+    // an empty string for a link, a folder or a missing entry.
+    std::string file_identity(const std::string& p);
+
+    // Whether an open file, a handle on Windows and a descriptor elsewhere, lies at path reached through
+    // no link: a folder of path replaced by a link after a check shows.
+#if defined(_WIN32)
+    bool handle_at(void* handle, const std::string& path);
+#else
+    bool handle_at(int fd, const std::string& path);
+#endif
+
+    class new_file
+    {
+        /*!
+            WHAT THIS OBJECT REPRESENTS
+                A file created for writing that must not exist yet: a name taken meanwhile,
+                by a link for instance, fails the creation, so that the writes stay in the
+                file created.  A file that close() does not complete is left to the caller,
+                which removes it.
+        !*/
+    public:
+        new_file() {}
+        ~new_file() { close(); }
+        new_file(const new_file&) = delete;
+        new_file& operator=(const new_file&) = delete;
+
+        bool create(const std::string& path);
+        bool write(const char* data, size_t n);
+        // Writes the data to the disk and closes the file; false when a write or the flush failed.
+        bool close();
+
+    private:
+#if defined(_WIN32)
+        void* h_ = nullptr;
+#else
+        int fd_ = -1;
+#endif
+        bool failed_ = false;
+    };
+
     bool read_file(const std::string& p, std::string& data, uint64_t max_bytes = 256u << 20);
     // Writes through a temporary file renamed over the target, so that a crash never
     // leaves a half written file behind.
@@ -130,6 +237,15 @@ namespace albireo
     */
     int run_process(const std::string& program, const std::vector<std::string>& args, std::string* output = nullptr,
         unsigned timeout_ms = 60000, const std::atomic<bool>* stop = nullptr);
+
+    /*
+        Ends the process with code once its standard outputs are flushed, without unloading
+        its libraries and without the destructors of its static objects.  A process that
+        loaded the engine of a device ends this way: the runtime of OpenVINO or of CUDA would
+        otherwise be torn down while its library unloads, which Windows does under its loader
+        lock, where the runtime waits for threads that cannot end.
+    */
+    [[noreturn]] void end_process(int code);
 
 }
 

@@ -109,7 +109,7 @@ namespace albireo
         // The buffers of one thread of the attention.
         struct attention_work
         {
-            std::vector<float> q, s, o, max, sum, scratch;
+            aligned_floats q, s, o, max, sum, scratch;
         };
 
         void rms_norm_rows(const float* x, const float* gamma, float* y, long rows, long width, float eps);
@@ -140,8 +140,11 @@ namespace albireo
         long rope_positions_ = 0;
 
         // Work buffers, reused from one pass to the next.
-        std::vector<float> x_, xn_, q_, k_, v_, ctx_, tmp_, gate_, up_;
-        std::vector<float> router_logits_, hidden_out_;
+        aligned_floats x_, xn_, q_, k_, v_, ctx_, tmp_, gate_, up_;
+        aligned_floats router_logits_, expert_x_, expert_gate_, expert_up_, expert_y_;
+        std::vector<float> hidden_out_, router_probs_;
+        std::vector<long> router_order_;
+        std::vector<std::vector<std::pair<long, float>>> routed_;
         std::vector<qk_scratch> scratch_;
         std::vector<attention_work> attention_work_;
         std::vector<attention_tile> tiles_;

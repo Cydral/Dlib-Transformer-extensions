@@ -15,8 +15,6 @@ namespace albireo
 
     namespace
     {
-        inline float silu(float x) { return x / (1.0f + std::exp(-x)); }
-
         float yarn_corr_dim(long n_dims, double n_ctx_orig, double n_rot, double base)
         {
             return static_cast<float>(n_dims * std::log(n_ctx_orig / (n_rot * 2.0 * 3.14159265358979323846))
@@ -388,8 +386,14 @@ namespace albireo
         router_logits_.resize(static_cast<size_t>(T * n_exp));
         product(L.router, xn_.data(), T, d, router_logits_.data(), n_exp);
 
-        std::vector<std::vector<std::pair<long, float>>> routed(static_cast<size_t>(n_exp));
-        std::vector<float> probs(static_cast<size_t>(n_exp));
+        // The lists of the experts keep their memory from one layer and one pass to the next.
+        std::vector<std::vector<std::pair<long, float>>>& routed = routed_;
+        routed.resize(static_cast<size_t>(n_exp));
+        for (auto& list : routed) list.clear();
+        std::vector<float>& probs = router_probs_;
+        probs.resize(static_cast<size_t>(n_exp));
+        std::vector<long>& order = router_order_;
+        order.resize(static_cast<size_t>(n_exp));
         for (long t = 0; t < T; ++t)
         {
             const float* row = router_logits_.data() + t * n_exp;
@@ -401,7 +405,6 @@ namespace albireo
                 sum += probs[static_cast<size_t>(e)];
             }
             for (auto& p : probs) p /= sum;
-            std::vector<long> order(static_cast<size_t>(n_exp));
             for (long e = 0; e < n_exp; ++e) order[static_cast<size_t>(e)] = e;
             std::partial_sort(order.begin(), order.begin() + top_k, order.end(),
                 [&](long a, long b) { return probs[static_cast<size_t>(a)] > probs[static_cast<size_t>(b)]; });
@@ -417,7 +420,10 @@ namespace albireo
         }
 
         tmp_.assign(static_cast<size_t>(T * d), 0.0f);
-        std::vector<float> xe, ge, ue, ye;
+        aligned_floats& xe = expert_x_;
+        aligned_floats& ge = expert_gate_;
+        aligned_floats& ue = expert_up_;
+        aligned_floats& ye = expert_y_;
         const qk_path path = T >= qk_float_product_tokens ? qk_path::floats : qk_path::integer;
         for (long e = 0; e < n_exp; ++e)
         {
@@ -431,7 +437,7 @@ namespace albireo
             ue.resize(static_cast<size_t>(m * df));
             product(L.e_gate[static_cast<size_t>(e)], xe.data(), m, d, ge.data(), df, path);
             product(L.e_up[static_cast<size_t>(e)], xe.data(), m, d, ue.data(), df, path);
-            for (size_t i = 0; i < ge.size(); ++i) ge[i] = silu(ge[i]) * ue[i];
+            qk_silu_mul(ge.data(), ue.data(), static_cast<long>(ge.size()));
             ye.resize(static_cast<size_t>(m * d));
             product(L.e_down[static_cast<size_t>(e)], ge.data(), m, df, ye.data(), d, path);
             for (long i = 0; i < m; ++i)
@@ -555,10 +561,7 @@ namespace albireo
                 product(L.w_gate, xn_.data(), T, d, gate_.data(), df);
                 product(L.w_up, xn_.data(), T, d, up_.data(), df);
                 const long n = T * df;
-                auto gated = [&](long a, long b) {
-                    for (size_t i = static_cast<size_t>(a); i < static_cast<size_t>(b); ++i)
-                        gate_[i] = silu(gate_[i]) * up_[i];
-                };
+                auto gated = [&](long a, long b) { qk_silu_mul(gate_.data() + a, up_.data() + a, b - a); };
                 if (n >= 65536)
                     pool_.parallel_for((n + 4095) / 4096, [&](long c, int) {
                         gated(c * 4096, std::min(n, c * 4096 + 4096));

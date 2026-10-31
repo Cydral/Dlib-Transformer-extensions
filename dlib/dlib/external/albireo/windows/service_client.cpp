@@ -9,16 +9,33 @@
 
 #include "service_client.h"
 
+#include <chrono>
 #include <cstdio>
 #include <memory>
+#include <mutex>
 
 #include "../common/platform.h"
 
 namespace albireo
 {
 
+    struct service_client::kept_connection
+    {
+        std::mutex m;
+        std::unique_ptr<httplib::SSLClient> client;
+        // The port and the authority the connection was opened for, and its last use.
+        int port = 0;
+        std::string ca;
+        std::chrono::steady_clock::time_point used;
+        unsigned long long opened = 0;
+    };
+
     namespace
     {
+        // The time a kept connection stays open without a request, below the 30 seconds after
+        // which the service closes it.
+        const std::chrono::seconds kept_idle_limit(20);
+
         std::string trim(const std::string& s)
         {
             const size_t b = s.find_first_not_of(" \t\r\n");
@@ -57,9 +74,52 @@ namespace albireo
         }
     }
 
-    service_client::service_client()
+    service_client::service_client() : kept_(std::make_shared<kept_connection>())
     {
         reload();
+    }
+
+    void service_client::own_connection()
+    {
+        kept_ = std::make_shared<kept_connection>();
+    }
+
+    unsigned long long service_client::poll_connections() const
+    {
+        std::lock_guard<std::mutex> lock(kept_->m);
+        return kept_->opened;
+    }
+
+    bool service_client::poll(const std::string& path, json& out, std::string& error, int timeout_seconds) const
+    {
+        kept_connection& k = *kept_;
+        std::lock_guard<std::mutex> lock(k.m);
+        // A connection unused for too long, or opened for another port or authority, closes first.
+        const auto now = std::chrono::steady_clock::now();
+        if (k.client && (k.port != port_ || k.ca != ca_path_ || now - k.used > kept_idle_limit)) k.client.reset();
+        httplib::Headers h = { { "X-Albireo-Admin", token_ } };
+        httplib::Result r;
+        for (int attempt = 0; attempt < 2; ++attempt)
+        {
+            if (!k.client)
+            {
+                k.client = make_client(port_, ca_path_, timeout_seconds);
+                k.client->set_keep_alive(true);
+                k.port = port_;
+                k.ca = ca_path_;
+            }
+            k.client->set_read_timeout(timeout_seconds);
+            k.client->set_write_timeout(timeout_seconds);
+            const bool reused = k.client->is_socket_open() != 0;
+            if (!reused) ++k.opened;
+            r = k.client->Get(path, h);
+            k.used = std::chrono::steady_clock::now();
+            if (r) break;
+            // A restart of the service, or a new authority, takes a new connection.
+            k.client.reset();
+            if (!reused) break;
+        }
+        return finish(r, out, error);
     }
 
     void service_client::reload()

@@ -257,7 +257,7 @@ a { color: var(--blue); }
 }
 .tool-call > summary::-webkit-details-marker { display: none; }
 .tool-call .tool-icon { width: 16px; height: 16px; color: var(--blue); }
-.tool-call .tool-name { font-family: var(--mono); font-size: 12.5px; font-weight: 600; }
+.tool-call .tool-name { font-weight: 600; white-space: nowrap; }
 .tool-call .tool-brief { color: var(--text-faint); flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 12.5px; }
 .tool-call .state { font-size: 12px; color: var(--text-faint); }
 .tool-call .state.ok { color: var(--success); }
@@ -453,3 +453,127 @@ mark { background: var(--mark); color: inherit; border-radius: 3px; padding: 0 1
   flex: 0 0 auto; font-size: 11px; padding: 1px 8px; border-radius: 999px; background: var(--bg-active); color: var(--text-soft);
 }
 .search-result .excerpt { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* The buttons and the entries that wait for the end of an answer. */
+.message .meta button:disabled { cursor: not-allowed; }
+.message:hover .meta button:disabled, .message.last .meta button:disabled { opacity: 0.3; }
+.message .meta button:disabled:hover { background: transparent; color: var(--text-faint); }
+.menu .entry.disabled { opacity: 0.45; cursor: not-allowed; }
+.menu .entry.disabled:hover { background: transparent; }
+.spinner.small { width: 11px; height: 11px; border-width: 2px; flex: 0 0 11px; }
+.item .spinner.small { margin-left: 2px; }
+
+/* The steps of the agent, with their number, tool, arguments, short result, state and duration. */
+.tool-call .tool-number {
+  flex: 0 0 auto; min-width: 20px; height: 20px; padding: 0 5px; border-radius: 10px; background: var(--bg-active);
+  color: var(--text-soft); font-size: 11.5px; font-weight: 650; display: inline-flex; align-items: center;
+  justify-content: center;
+}
+.tool-call .tool-result { color: var(--text); font-weight: 600; }
+.tool-call .state { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.tool-call .state.running, .tool-call .state.pending { color: var(--blue); }
+.tool-call .state.stopped { color: var(--text-faint); font-style: italic; }
+.tool-call.error { border-color: color-mix(in srgb, var(--danger) 35%, var(--border)); }
+.tool-call.running, .tool-call.pending { border-color: color-mix(in srgb, var(--blue) 40%, var(--border)); }
+.tool-call > summary .chev {
+  width: 14px; height: 14px; flex: 0 0 14px; color: var(--text-faint); transition: transform 0.15s;
+}
+.tool-call[open] > summary .chev { transform: rotate(180deg); }
+
+/* The tools of the agent under the prompt, and the explanation of the agent mode. */
+.agent-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; padding: 2px 4px 8px; }
+.agent-tools .label { font-size: 11.5px; color: var(--text-faint); margin-right: 2px; }
+.tool-chip {
+  display: inline-flex; align-items: center; gap: 4px; height: 22px; padding: 0 8px; border-radius: 999px;
+  border: 1px solid var(--border); background: var(--bg-hover); color: var(--text-soft); font-size: 11.5px;
+  cursor: help;
+}
+.tool-chip svg { width: 12px; height: 12px; color: var(--blue); }
+.tool-chip:focus-visible { outline: 2px solid var(--blue); outline-offset: 1px; }
+.help-button {
+  width: 28px; height: 28px; border-radius: 50%; border: none; background: transparent; color: var(--text-faint);
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.help-button:hover { background: var(--bg-hover); color: var(--text); }
+.help-button svg { width: 16px; height: 16px; }
+.menu.popover { max-width: 420px; padding: 10px 12px; cursor: default; }
+.menu.popover p { margin: 4px 0 10px; font-size: 13.5px; color: var(--text-soft); }
+.popover-tools { display: flex; flex-direction: column; gap: 6px; }
+.popover-tool { display: flex; gap: 8px; align-items: flex-start; font-size: 13px; }
+.popover-tool svg { width: 15px; height: 15px; margin-top: 2px; color: var(--blue); flex: 0 0 15px; }
+.popover-tool .desc { display: block; color: var(--text-faint); font-size: 12px; }
+.agent-note {
+  display: flex; gap: 10px; align-items: flex-start; text-align: left; margin: -8px auto 18px; max-width: 620px;
+  padding: 10px 14px; border-radius: 12px; border: 1px solid var(--border); background: var(--bg-elevated);
+  color: var(--text-soft); font-size: 13.5px;
+}
+.agent-note svg { width: 16px; height: 16px; margin-top: 2px; color: var(--blue); flex: 0 0 16px; }
+.welcome .error-box { margin: 0 auto 18px; max-width: 620px; }
+
+/* The page of a project, and the state of the storage of the browser. */
+.page h2 .dot { width: 14px; height: 14px; border-radius: 50%; display: inline-block; flex: 0 0 14px; }
+.storage-state p { margin: 0 0 8px; font-size: 13.5px; }
+.storage-state .storage-hint {
+  display: flex; gap: 8px; align-items: flex-start; color: var(--text-soft); font-size: 12.5px; padding: 8px 10px;
+  border-radius: 10px; background: color-mix(in srgb, var(--gold) 12%, transparent);
+}
+.storage-state .storage-hint svg {
+  width: 15px; height: 15px; flex: 0 0 15px; margin-top: 1px; color: var(--gold-strong);
+}
+
+/* The time of a message, shown with its buttons: before them for a question, after them for an answer. */
+.message .msg-time {
+  font-size: 11.5px; color: var(--text-faint); white-space: nowrap; opacity: 0; transition: opacity 0.15s;
+}
+.message:hover .msg-time, .message.last .msg-time { opacity: 1; }
+.message.user .msg-time { margin-right: 4px; }
+.message.assistant .msg-time { margin-left: 4px; }
+
+/* The stop button, while an answer is prepared or written, carries a ring that pulses gently. */
+.send.stop { position: relative; }
+.send.stop::after {
+  content: ""; position: absolute; inset: -3px; border-radius: 15px; pointer-events: none;
+  animation: stop-pulse 1.6s ease-out infinite;
+}
+@keyframes stop-pulse {
+  0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--danger) 55%, transparent); }
+  70% { box-shadow: 0 0 0 7px color-mix(in srgb, var(--danger) 0%, transparent); }
+  100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--danger) 0%, transparent); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .send.stop::after { animation: none; box-shadow: 0 0 0 2px color-mix(in srgb, var(--danger) 45%, transparent); }
+}
+
+/* The page of the components and of their licenses, whose texts open under their lines. */
+.lic-table { display: flex; flex-direction: column; gap: 4px; margin-top: 4px; }
+.lic-row {
+  display: grid; align-items: center; gap: 4px 12px; padding: 8px 10px; border-radius: 10px;
+  grid-template-columns: minmax(110px, 1.1fr) minmax(64px, 0.55fr) minmax(150px, 2fr) minmax(110px, 1.25fr) 160px;
+  border: 1px solid var(--border); background: var(--bg); font-size: 13.5px;
+}
+.lic-row.lic-head {
+  padding: 0 10px; border-color: transparent; background: none; color: var(--text-faint); font-size: 12px;
+}
+.lic-name { font-weight: 600; overflow-wrap: anywhere; }
+.lic-version, .lic-role, .lic-license { color: var(--text-soft); overflow-wrap: anywhere; }
+.lic-version { font-variant-numeric: tabular-nums; }
+.lic-action { display: flex; justify-content: flex-end; }
+.button.small { height: 30px; padding: 0 10px; gap: 5px; font-size: 12.5px; color: inherit; text-decoration: none; }
+.button.small svg { width: 13px; height: 13px; transition: transform 0.15s; }
+.button.small.open svg { transform: rotate(180deg); }
+.lic-text pre {
+  margin: 0 0 6px; max-height: 360px; overflow: auto; padding: 12px 14px; border-radius: 10px;
+  border: 1px solid var(--border); background: var(--bg-code); font-family: var(--mono); font-size: 12px;
+  line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere;
+}
+.lic-file { margin: 6px 2px 4px; font-family: var(--mono); font-size: 12px; color: var(--text-faint); }
+.field input.top-k { width: 136px; flex: 0 0 auto; }
+@media (max-width: 760px) {
+  .lic-row { grid-template-columns: 1fr auto; }
+  .lic-row.lic-head { display: none; }
+  .lic-row .lic-version, .lic-row .lic-role, .lic-row .lic-license { grid-column: 1 / -1; }
+  .lic-row .lic-action { grid-column: 2; grid-row: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .button.small svg { transition: none; }
+}

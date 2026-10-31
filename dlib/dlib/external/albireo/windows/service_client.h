@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 
 #include "../common/json.h"
@@ -19,8 +20,19 @@ namespace albireo
                 The connection of the tray to the local service: HTTPS to localhost on the
                 port of the settings, the server certificate checked against the local
                 authority of the data folder, and the administration token of the data
-                folder sent with every request.  Each call opens its own connection, so
-                that calls may run on several threads at once.
+                folder sent with every request.  get(), send() and upload() open a
+                connection of their own at each call, so that calls may run on several
+                threads at once.
+
+            KEPT CONNECTION
+                poll() sends its requests on one connection kept open between its calls,
+                so that the periodic polls pay the TLS handshake once.  The copies of an
+                object share that connection, which serves one call at a time: a call of
+                another thread waits for the call in progress.  The connection closes
+                once it stays unused for 20 seconds, and opens again after a failure, a
+                restart of the service or a change of the port.  own_connection() gives
+                a copy a kept connection of its own, for a window that polls beside the
+                icon.
         !*/
     public:
         service_client();
@@ -40,11 +52,21 @@ namespace albireo
         bool upload(const std::string& path, const std::string& file,
             const std::function<bool(uint64_t, uint64_t)>& progress, json& out, std::string& error) const;
 
+        // A GET on the kept connection; a failure on a connection kept from an earlier call
+        // is tried once more on a new connection.
+        bool poll(const std::string& path, json& out, std::string& error, int timeout_seconds = 10) const;
+        void own_connection();
+        // The connections poll() opened since the creation of the kept connection.
+        unsigned long long poll_connections() const;
+
     private:
+        struct kept_connection;
+
         std::string data_dir_;
         std::string ca_path_;
         std::string token_;
         int port_ = 8443;
+        std::shared_ptr<kept_connection> kept_;
     };
 
 }

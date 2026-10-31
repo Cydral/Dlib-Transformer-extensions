@@ -8,9 +8,10 @@
 #
 # Defaults: build-albireo at the root of the repository, ~/models/Qwen3-0.6B-Q4_K_M.gguf and
 # ~/models/Qwen3-Embedding-0.6B-Q8_0.gguf.  The steps whose model is missing are skipped.
-# The service runs offline in a data folder of its own, on port 18443, imports the model,
-# answers a question through the OpenAI interface and stops.  The exit code is the number of
-# failed steps.
+# The service runs offline in a data folder of its own, on port 18443 (ALBIREO_TEST_PORT, and
+# the next port for the local server of test_host), receives the model as the tray sends it,
+# refuses it by its path, answers a question through the OpenAI interface and stops.  The
+# exit code is the number of failed steps.
 
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -18,6 +19,7 @@ ROOT=$(cd "$HERE/../../../../.." && pwd)
 BUILD=${1:-$ROOT/build-albireo}
 MODEL=${2:-$HOME/models/Qwen3-0.6B-Q4_K_M.gguf}
 EMBEDDING=${3:-$HOME/models/Qwen3-Embedding-0.6B-Q8_0.gguf}
+PORT=${ALBIREO_TEST_PORT:-18443}
 QUESTION="What is the capital of France? Answer in one sentence."
 WORK=$(mktemp -d)
 RESULTS=()
@@ -70,6 +72,25 @@ for family in "" _avxvnni _avx512 _vnni256; do
   fi
 done
 
+# Damaged model files, the chat format of the agents and the C interface of an engine under
+# concurrent requests, on tiny models the tests write in the work folder.
+if [ -x "$BUILD/tests/test_model_file" ]; then
+  step "damaged model files" "all checks passed" "$BUILD/tests/test_model_file" "$WORK"
+else skip "damaged model files" "no $BUILD/tests/test_model_file"
+fi
+if [ -x "$BUILD/tests/test_chat_format" ]; then step "chat format" "all checks passed" "$BUILD/tests/test_chat_format"
+else skip "chat format" "no $BUILD/tests/test_chat_format"
+fi
+if [ -x "$BUILD/tests/test_engine_api" ] && [ -f "$ENGINES/libalbireo-engine-cpu.so" ]; then
+  step "engine interface" "all checks passed" "$BUILD/tests/test_engine_api" "$ENGINES/libalbireo-engine-cpu.so" "$WORK"
+else skip "engine interface" "no $BUILD/tests/test_engine_api or no portable engine"
+fi
+# The files the service writes in its models folder and reads in its imports.
+if [ -x "$BUILD/tests/test_host" ]; then
+  step "models folder and imports" "all checks passed" "$BUILD/tests/test_host" "$WORK" $((PORT + 1))
+else skip "models folder and imports" "no $BUILD/tests/test_host"
+fi
+
 for variant in cpu-avx512 cpu-avxvnni cpu-avx2 cpu; do
   lib=$ENGINES/libalbireo-engine-$variant.so
   if [ ! -f "$lib" ]; then skip "engine $variant" "no $lib"
@@ -92,26 +113,36 @@ SERVICE=$BUILD/bin/albireo-service
 if [ -x "$SERVICE" ] && [ -f "$MODEL" ]; then
   HOME_DIR=$WORK/home
   mkdir -p "$HOME_DIR"
-  echo '{"port": 18443, "offline": true, "check_updates": false, "default_model": false}' > "$HOME_DIR/settings.json"
+  echo "{\"port\": $PORT, \"offline\": true, \"check_updates\": false, \"default_model\": false}" \
+    > "$HOME_DIR/settings.json"
   ALBIREO_HOME=$HOME_DIR "$SERVICE" --console > "$WORK/service.log" 2>&1 &
   PID=$!
   START=$(now)
   for i in $(seq 1 300); do
-    curl -sk --max-time 1 https://localhost:18443/albireo/v1/status -o /dev/null && break
+    curl -sk --max-time 1 https://localhost:$PORT/albireo/v1/status -o /dev/null && break
     sleep 0.1
   done
-  if curl -sk --max-time 2 https://localhost:18443/albireo/v1/status | grep -q '"offline":true'; then
-    record "service start" PASS "offline, https://localhost:18443" "$(elapsed "$START")"
+  if curl -sk --max-time 2 https://localhost:$PORT/albireo/v1/status | grep -q '"offline":true'; then
+    record "service start" PASS "offline, https://localhost:$PORT" "$(elapsed "$START")"
     TOKEN=$(cat "$HOME_DIR/admin.token")
-    step "service import" '"imported":\["' curl -sk --max-time 300 -X POST -H "X-Albireo-Admin: $TOKEN" \
-      -H "Content-Type: application/json" -d "{\"path\": \"$MODEL\"}" https://localhost:18443/albireo/v1/import
+    # The license texts of the installation, none in a build folder, and a name outside their folder refused.
+    step "service licenses" '^\[(\]|\{"file")' curl -sk --max-time 5 https://localhost:$PORT/albireo/v1/licenses
+    step "service license refusal" '"code":"invalid_license"' curl -sk --max-time 5 --path-as-is \
+      "https://localhost:$PORT/albireo/v1/licenses/../settings.json"
+    # A model of the user is not read by its path: the tray sends it, read with the rights of the user.
+    step "service import refusal" '"code":"import_use_upload"' curl -sk --max-time 30 -X POST \
+      -H "X-Albireo-Admin: $TOKEN" -H "Content-Type: application/json" -d "{\"path\": \"$MODEL\"}" \
+      https://localhost:$PORT/albireo/v1/import
+    step "service import" '"imported":\["' curl -sk --max-time 600 -X POST -H "X-Albireo-Admin: $TOKEN" \
+      -H "Content-Type: application/octet-stream" -H "Expect:" -T "$MODEL" \
+      "https://localhost:$PORT/albireo/v1/models/upload?name=$(basename "$MODEL")"
     for i in $(seq 1 300); do
-      curl -sk --max-time 1 https://localhost:18443/v1/models | grep -q albireo-general && break
+      curl -sk --max-time 1 https://localhost:$PORT/v1/models | grep -q albireo-general && break
       sleep 0.2
     done
     BODY="{\"model\": \"albireo-general\", \"reasoning\": false, \"max_tokens\": 40,"
     BODY="$BODY \"messages\": [{\"role\": \"user\", \"content\": \"$QUESTION\"}]}"
-    step "service chat" "Paris" curl -sk --max-time 300 https://localhost:18443/v1/chat/completions \
+    step "service chat" "Paris" curl -sk --max-time 300 https://localhost:$PORT/v1/chat/completions \
       -H "Content-Type: application/json" -d "$BODY"
   else
     record "service start" FAIL "no answer, log in $WORK/service.log" 0.0

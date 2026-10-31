@@ -7,6 +7,8 @@
         albireo-tray                    shows the icon (started at sign in)
         albireo-tray --open             opens the web application, starting the icon if needed
         albireo-tray --show <window>    opens a window of the icon: models, host or about
+        albireo-tray --setup-result     started again by the installer after an installation
+                                        made without its window: notifies its failure
 
     The icon follows the service: its state (running, generating, stopped, update ready),
     its tooltip (model, engine, speed), and the notifications of the updates and of the
@@ -25,11 +27,15 @@
 
 #include <shellapi.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <cwchar>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "../common/platform.h"
 #include "../common/version.h"
@@ -51,11 +57,11 @@ namespace albireo
         const UINT WM_SHOW_WINDOW = WM_APP + 5;
         const UINT_PTR TIMER_POLL = 1;
 
+        // The choices of the devices of the menu take CMD_ACCEL_CHOICE and the identifiers after it.
         enum command_id
         {
-            CMD_OPEN = 100, CMD_MODELS, CMD_HOST, CMD_ACCEL_AUTO, CMD_ACCEL_NONE, CMD_ACCEL_NPU, CMD_ACCEL_GPU,
-            CMD_ACCEL_BOTH, CMD_MEASURE, CMD_CHECK_UPDATES, CMD_INSTALL_UPDATE, CMD_RESTART, CMD_START_SERVICE,
-            CMD_DOCS, CMD_ABOUT, CMD_QUIT
+            CMD_OPEN = 100, CMD_MODELS, CMD_HOST, CMD_ACCEL_AUTO, CMD_ACCEL_NONE, CMD_MEASURE, CMD_CHECK_UPDATES,
+            CMD_INSTALL_UPDATE, CMD_RESTART, CMD_START_SERVICE, CMD_DOCS, CMD_ABOUT, CMD_QUIT, CMD_ACCEL_CHOICE = 300
         };
 
         enum action_tag { ACT_SETTINGS = 1, ACT_MEASURE, ACT_CHECK, ACT_APPLY_UPDATE, ACT_RESTART };
@@ -89,6 +95,16 @@ namespace albireo
             ULONGLONG engines_at = 0;
             // The period of the polls: short while something changes, long otherwise.
             UINT poll_ms = 2000;
+            // The settings {engine, accelerator} of the choices of devices of the menu shown last.
+            std::vector<std::pair<std::string, std::string>> choices;
+            // When the icon started (seconds since 1970), and the result of the installer it read
+            // last: an update that failed after the start of the icon is notified.
+            int64_t started = 0;
+            int64_t setup_result_time = 0;
+            ULONGLONG setup_result_checked = 0;
+            // Started again by the installer that closed it (--setup-result): the failure of
+            // that run is notified, although the installer wrote it before the icon started.
+            bool report_setup_result = false;
         } tray;
 
         /*
@@ -196,10 +212,35 @@ namespace albireo
             return id;
         }
 
-        bool cpu_engine()
+        // The error of the updates: the text of its code, else the English text of the service.
+        std::wstring update_error_text(const json& up)
         {
-            const std::string key = tray.status["engine"]["key"].as_string();
-            return key.compare(0, 3, "cpu") == 0 || key.empty();
+            const std::string code = up["code"].as_string();
+            if (!code.empty() && has_text("err_" + code)) return error_text(up);
+            return tr("notify_update_error", { { "e", up["error"].as_string() } });
+        }
+
+        /*
+            The result of the last run of the installer, which it writes for the updates it
+            makes out of sight (logs\setup-result.json in the data folder): an update that
+            failed after the start of the icon is notified, with the version put back.
+        */
+        void check_setup_result()
+        {
+            const ULONGLONG now = GetTickCount64();
+            if (tray.setup_result_checked && now - tray.setup_result_checked < 10000) return;
+            tray.setup_result_checked = now;
+            std::string text;
+            const std::string path = join_path(join_path(tray.client.data_dir(), "logs"), "setup-result.json");
+            if (!read_file(path, text, 1u << 16)) return;
+            const json r = json::parse_or_null(text);
+            const int64_t time = r["time"].as_int(0);
+            if (time <= tray.setup_result_time) return;
+            tray.setup_result_time = time;
+            if ((time < tray.started && !tray.report_setup_result) || r["ok"].as_bool(true)) return;
+            const char* key = r["rolled_back"].as_bool(false) ? "notify_update_rolled_back" : "notify_update_failed";
+            notify(tr("notify_update_failed_title"), tr(key, { { "v", r["version"].as_string() },
+                { "o", r["previous"].as_string() }, { "e", r["error"].as_string() } }));
         }
 
         void poll()
@@ -211,11 +252,12 @@ namespace albireo
             const ULONGLONG now = GetTickCount64();
             const bool with_engines = !tray.online || tray.engines_at == 0 || now - tray.engines_at >= 30000;
             if (with_engines) tray.engines_at = now;
+            // The polls share a connection kept open between them (service_client::poll()).
             ui::run_async(tray.hwnd, WM_STATUS, 0, [c, with_engines]() {
                 json r = json::object();
                 std::string error;
                 json status;
-                if (!c.get("/albireo/v1/status", status, error, 5))
+                if (!c.poll("/albireo/v1/status", status, error, 5))
                 {
                     r["error"] = error;
                     r["service"] = service_manager_state();
@@ -223,7 +265,7 @@ namespace albireo
                 }
                 r["status"] = status;
                 json engines;
-                if (with_engines && c.get("/albireo/v1/engines", engines, error, 5)) r["engines"] = engines;
+                if (with_engines && c.poll("/albireo/v1/engines", engines, error, 5)) r["engines"] = engines;
                 return r;
             });
         }
@@ -347,6 +389,7 @@ namespace albireo
                 set_tooltip(tr(tip));
                 tray.client.reload();
                 set_poll_period(2000);
+                check_setup_result();
                 return;
             }
             tray.silent_since = 0;
@@ -412,9 +455,9 @@ namespace albireo
             {
                 tray.check_requested = false;
                 if (state == "up_to_date") notify(L"Albireo", tr("notify_uptodate"));
-                else if (state == "error")
-                    notify(L"Albireo", tr("notify_update_error", { { "e", up["error"].as_string() } }));
+                else if (state == "error") notify(L"Albireo", update_error_text(up));
             }
+            check_setup_result();
 
             // Downloads that finished since the last poll.
             bool downloading = false;
@@ -427,7 +470,13 @@ namespace albireo
                 {
                     if (st == "done") notify(L"Albireo", tr("notify_installed", { { "m", id } }));
                     else if (st == "error")
-                        notify(L"Albireo", tr("notify_failed", { { "m", id }, { "e", d["error"].as_string() } }));
+                    {
+                        // The text of the code of the failure, or the error of the transfer itself.
+                        std::string why = d["code"].as_string() == "download_failed" ? d["args"]["e"].as_string()
+                            : narrow(error_text(d));
+                        if (why.empty()) why = d["error"].as_string();
+                        notify(L"Albireo", tr("notify_failed", { { "m", id }, { "e", why } }));
+                    }
                 }
                 tray.download_states[id] = st;
                 downloading = downloading || st == "downloading" || st == "verifying" || st == "queued";
@@ -446,11 +495,7 @@ namespace albireo
             ui::run_async(tray.hwnd, WM_ACTION_DONE, ACT_SETTINGS, [c, changes]() {
                 json out;
                 std::string error;
-                if (!c.send("PUT", "/albireo/v1/settings", changes, out, error))
-                {
-                    out = json::object();
-                    out["error"] = error;
-                }
+                if (!c.send("PUT", "/albireo/v1/settings", changes, out, error)) out = failed_answer(out, error);
                 return out;
             });
         }
@@ -461,11 +506,7 @@ namespace albireo
             ui::run_async(tray.hwnd, WM_ACTION_DONE, tag, [c, path, timeout]() {
                 json out;
                 std::string error;
-                if (!c.send("POST", path, json::object(), out, error, timeout))
-                {
-                    out = json::object();
-                    out["error"] = error;
-                }
+                if (!c.send("POST", path, json::object(), out, error, timeout)) out = failed_answer(out, error);
                 return out;
             });
         }
@@ -477,7 +518,9 @@ namespace albireo
             set_poll_period(2000);
             if (r->contains("error") && !(*r)["error"].as_string().empty() && tag != ACT_MEASURE)
             {
-                ui::message(nullptr, widen((*r)["error"].as_string()), MB_OK | MB_ICONWARNING);
+                // The errors of the updates and of the settings come with a code, explained in the
+                // language of the icon.
+                ui::message(nullptr, error_text(*r), MB_OK | MB_ICONWARNING);
                 return;
             }
             switch (tag)
@@ -524,6 +567,87 @@ namespace albireo
             ui::open_url(widen(tray.client.base_url()));
         }
 
+        // A text of a menu, whose & are doubled: the menus take & for the mark of a shortcut.
+        std::wstring menu_label(const std::wstring& text)
+        {
+            std::wstring out;
+            for (wchar_t c : text)
+            {
+                if (c == L'&') out += L'&';
+                out += c;
+            }
+            return out;
+        }
+
+        /*
+            The menu of the accelerator: the automatic choice, the processor alone, one choice
+            per device the engines offer, named by its devices and its runtime, then, grayed,
+            why an engine of a device cannot run here and which devices the runtime of an
+            engine left out.  The check mark follows the settings; settings that name none of
+            the choices, an accelerator with the automatic engine for instance, mark the choice
+            in use.
+        */
+        HMENU accelerator_menu(bool on)
+        {
+            HMENU acc = CreatePopupMenu();
+            const json& eng = tray.engines;
+            const std::string engine = eng["setting"].str("auto");
+            const std::string accelerator = eng["accelerator"].str("auto");
+            const bool automatic = engine == "auto" || engine == "best";
+            tray.choices.clear();
+            std::vector<std::wstring> labels;
+            int marked = -1, in_use = -1;
+            for (const auto& o : eng["options"].elements())
+            {
+                const std::string kind = o["kind"].as_string();
+                if (kind != "gpu" && kind != "npu" && kind != "both") continue;
+                const std::pair<std::string, std::string> settings = choice_settings(o);
+                const int index = static_cast<int>(tray.choices.size());
+                if (settings.first == engine && settings.second == accelerator) marked = index;
+                if (o["current"].as_bool(false)) in_use = index;
+                tray.choices.push_back(settings);
+                labels.push_back(choice_label(o));
+            }
+            const bool auto_marked = automatic && accelerator == "auto";
+            const bool none_marked = (automatic && accelerator == "none") || engine.compare(0, 3, "cpu") == 0;
+            if (marked < 0 && !auto_marked && !none_marked) marked = in_use;
+            const UINT enabled = on ? 0 : MF_GRAYED;
+            AppendMenuW(acc, MF_STRING | enabled | (auto_marked ? MF_CHECKED : 0), CMD_ACCEL_AUTO,
+                tr("accel_auto").c_str());
+            AppendMenuW(acc, MF_STRING | enabled | (none_marked ? MF_CHECKED : 0), CMD_ACCEL_NONE,
+                tr("accel_none").c_str());
+            if (!labels.empty()) AppendMenuW(acc, MF_SEPARATOR, 0, nullptr);
+            for (size_t i = 0; i < labels.size(); ++i)
+                AppendMenuW(acc, MF_STRING | enabled | (static_cast<int>(i) == marked ? MF_CHECKED : 0),
+                    CMD_ACCEL_CHOICE + static_cast<UINT>(i), menu_label(labels[i]).c_str());
+            // Why the engines of the devices offer no choice, or fewer choices than their devices.
+            std::vector<std::wstring> notes;
+            for (const auto& x : eng["engines"].elements())
+            {
+                const std::string variant = x["variant"].as_string();
+                if (variant != "cuda" && variant.compare(0, 8, "openvino") != 0) continue;
+                std::wstring note;
+                const std::wstring why = reason_text(x);
+                if (!x["usable"].as_bool(false) && !why.empty())
+                    note = tr("accel_cannot_run", { { "r", engine_name(variant) }, { "why", narrow(why) } });
+                else if (x["usable"].as_bool(false) && !x["missing"].as_string().empty())
+                    note = tr("accel_left_out", { { "r", runtime_name(variant) }, { "m", x["missing"].as_string() } });
+                if (!note.empty() && std::find(notes.begin(), notes.end(), note) == notes.end()) notes.push_back(note);
+            }
+            if (notes.empty() && eng["accelerators_reason"].as_string() == "not_installed")
+                notes.push_back(tr("accel_not_installed"));
+            if (!notes.empty() && labels.empty()) AppendMenuW(acc, MF_SEPARATOR, 0, nullptr);
+            // A long reason ends with an ellipsis; This computer gives it whole.
+            for (const auto& n : notes)
+            {
+                const std::wstring shown = n.size() > 110 ? n.substr(0, 109) + L"…" : n;
+                AppendMenuW(acc, MF_STRING | MF_GRAYED, 0, menu_label(shown).c_str());
+            }
+            AppendMenuW(acc, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(acc, MF_STRING | enabled, CMD_MEASURE, tr("accel_measure").c_str());
+            return acc;
+        }
+
         void show_menu()
         {
             HMENU m = CreatePopupMenu();
@@ -534,55 +658,21 @@ namespace albireo
             AppendMenuW(m, MF_STRING | (on ? 0 : MF_GRAYED), CMD_MODELS, tr("tray_models").c_str());
             AppendMenuW(m, MF_STRING | (on ? 0 : MF_GRAYED), CMD_HOST, tr("tray_host").c_str());
 
-            // The accelerators may be forced while the processor engine runs.
-            HMENU acc = CreatePopupMenu();
-            const std::string setting = tray.engines["accelerator"].str("auto");
-            const bool available = tray.engines["accelerators_available"].as_bool(false);
-            const bool allowed = on && available && (cpu_engine() || setting != "auto");
-            struct item { int id; const char* key; const char* value; };
-            const item items[] = { { CMD_ACCEL_AUTO, "accel_auto", "auto" }, { CMD_ACCEL_NONE, "accel_none", "none" },
-                { CMD_ACCEL_NPU, "accel_npu", "npu" }, { CMD_ACCEL_GPU, "accel_gpu", "gpu" },
-                { CMD_ACCEL_BOTH, "accel_both", "both" } };
-            for (const auto& it : items)
-            {
-                bool has = true;
-                const std::string v = it.value;
-                if (v == "npu" || v == "gpu" || v == "both")
-                {
-                    has = false;
-                    for (const auto& o : tray.engines["options"].elements())
-                    {
-                        const std::string k = o["key"].as_string();
-                        const bool npu = k == "openvino:npu";
-                        const bool gpu = k == "cuda" || k == "openvino:gpu";
-                        if ((v == "npu" && npu) || (v == "gpu" && gpu) || (v == "both" && (npu || gpu)))
-                            has = true;
-                    }
-                }
-                AppendMenuW(acc, MF_STRING | (allowed && has ? 0 : MF_GRAYED) | (setting == v ? MF_CHECKED : 0), it.id,
-                    tr(it.key).c_str());
-            }
-            if (on && !available)
-            {
-                // Why the choices are grayed: no engine of a device, or none that runs here.
-                const bool unusable = tray.engines["accelerators_reason"].as_string() == "unusable";
-                AppendMenuW(acc, MF_SEPARATOR, 0, nullptr);
-                const char* why = unusable ? "accel_unusable" : "accel_not_installed";
-                AppendMenuW(acc, MF_STRING | MF_GRAYED, 0, tr(why).c_str());
-            }
-            AppendMenuW(acc, MF_SEPARATOR, 0, nullptr);
-            AppendMenuW(acc, MF_STRING | (on ? 0 : MF_GRAYED), CMD_MEASURE, tr("accel_measure").c_str());
-            if (!cpu_engine() && setting == "auto")
-            {
-                AppendMenuW(acc, MF_SEPARATOR, 0, nullptr);
-                AppendMenuW(acc, MF_STRING | MF_GRAYED, 0, tr("accel_cpu_only").c_str());
-            }
+            HMENU acc = accelerator_menu(on);
             AppendMenuW(m, MF_POPUP | (on ? 0 : MF_GRAYED), reinterpret_cast<UINT_PTR>(acc), tr("tray_accel").c_str());
             AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
             // Offline, an update comes from a folder (Models, Import).
-            const bool offline = tray.status["offline"].as_bool(false);
+            const json& status = tray.status;
+            const bool offline = status["offline"].as_bool(false);
             AppendMenuW(m, MF_STRING | (on && !offline ? 0 : MF_GRAYED), CMD_CHECK_UPDATES, tr("tray_updates").c_str());
-            const json& up = tray.status["updates"];
+            const json& up = status["updates"];
+            if (on && up["state"].as_string() == "error")
+            {
+                // The error of the last check or of the last download, under the command.
+                std::wstring why = update_error_text(up);
+                if (why.size() > 160) why = why.substr(0, 159) + L"…";
+                AppendMenuW(m, MF_STRING | MF_GRAYED, 0, menu_label(why).c_str());
+            }
             if (on && up["state"].as_string() == "ready")
                 AppendMenuW(m, MF_STRING, CMD_INSTALL_UPDATE,
                     tr("tray_install_update", { { "v", up["latest"].as_string() } }).c_str());
@@ -612,11 +702,13 @@ namespace albireo
             case CMD_OPEN: open_app(); break;
             case CMD_MODELS: show_models_window(tray.client); break;
             case CMD_HOST: show_host_window(tray.client); break;
-            case CMD_ACCEL_AUTO: changes["accelerator"] = "auto"; put_settings(changes); break;
-            case CMD_ACCEL_NONE: changes["accelerator"] = "none"; put_settings(changes); break;
-            case CMD_ACCEL_NPU: changes["accelerator"] = "npu"; put_settings(changes); break;
-            case CMD_ACCEL_GPU: changes["accelerator"] = "gpu"; put_settings(changes); break;
-            case CMD_ACCEL_BOTH: changes["accelerator"] = "both"; put_settings(changes); break;
+            case CMD_ACCEL_AUTO:
+            case CMD_ACCEL_NONE:
+                // The automatic engine, with every device or with the processor alone.
+                changes["engine"] = "auto";
+                changes["accelerator"] = id == CMD_ACCEL_AUTO ? "auto" : "none";
+                put_settings(changes);
+                break;
             case CMD_MEASURE: post_action("/albireo/v1/engines/benchmark", ACT_MEASURE, 3600); break;
             case CMD_CHECK_UPDATES: post_action("/albireo/v1/updates/check", ACT_CHECK, 30); break;
             case CMD_INSTALL_UPDATE: post_action("/albireo/v1/updates/apply", ACT_APPLY_UPDATE, 30); break;
@@ -630,7 +722,16 @@ namespace albireo
             case CMD_DOCS: ui::open_url(widen(tray.client.base_url() + "docs/")); break;
             case CMD_ABOUT: show_about_window(tray.client); break;
             case CMD_QUIT: DestroyWindow(tray.hwnd); break;
-            default: break;
+            default:
+                // A device of an engine: its engine and its accelerator.
+                if (id >= CMD_ACCEL_CHOICE && id < CMD_ACCEL_CHOICE + static_cast<int>(tray.choices.size()))
+                {
+                    const auto& choice = tray.choices[static_cast<size_t>(id - CMD_ACCEL_CHOICE)];
+                    changes["engine"] = choice.first;
+                    changes["accelerator"] = choice.second;
+                    put_settings(changes);
+                }
+                break;
             }
         }
 
@@ -742,6 +843,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int)
 
     set_language(language_setting());
     ui::init();
+    tray.started = now_unix();
+    tray.report_setup_result = args.find(L"--setup-result") != std::wstring::npos;
 
     WNDCLASSEXW wc = { sizeof(wc) };
     wc.lpfnWndProc = proc;
