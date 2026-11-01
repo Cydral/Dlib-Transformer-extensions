@@ -305,7 +305,8 @@ namespace albireo
             tagged_object,   // <tool_call>{"name":..,"arguments":..}</tool_call>
             mistral,         // [TOOL_CALLS]name[ARGS]{...} or [TOOL_CALLS][{...}]
             json_list,       // <|tool_call|>[{"name":..,"arguments":..}]
-            whole_json       // the whole answer is {"name":..,"parameters":..}
+            whole_json,      // the whole answer is {"name":..,"parameters":..}
+            xml_function     // <tool_call><function=name><parameter=key>value</parameter></function></tool_call>
         };
 
         struct parser_config
@@ -315,6 +316,7 @@ namespace albireo
             call_style calls = call_style::none;
             std::string call_open, call_close;
             std::string call_open_alt;   // a second spelling of the opening marker
+            json tools;                  // the definitions of the tools, for the types of the XML parameters
         };
 
         class tag_parser : public output_parser
@@ -323,6 +325,10 @@ namespace albireo
             explicit tag_parser(const parser_config& c) : c_(c)
             {
                 state_ = c_.starts_in_reasoning ? state::reasoning : state::content;
+                // A reasoning the prompt opens loses its leading line breaks, and the opening
+                // marker a model writes again.
+                strip_leading_ = c_.starts_in_reasoning;
+                reopen_ = c_.starts_in_reasoning;
                 if (!c_.think_open.empty()) opens_.push_back(c_.think_open);
                 if (!c_.call_open.empty()) opens_.push_back(c_.call_open);
                 if (!c_.call_open_alt.empty()) opens_.push_back(c_.call_open_alt);
@@ -451,6 +457,91 @@ namespace albireo
                 return true;
             }
 
+            // The type the definition of a tool gives to one of its parameters, or "".
+            std::string parameter_type(const std::string& function, const std::string& key) const
+            {
+                for (const auto& t : c_.tools.elements())
+                {
+                    const json& fn = t.contains("function") ? t["function"] : t;
+                    if (fn["name"].as_string() == function)
+                        return fn["parameters"]["properties"][key]["type"].as_string();
+                }
+                return std::string();
+            }
+
+            /*
+                The value of a parameter of the XML form: a string when the definition of the
+                tool declares a string, else the JSON value the text spells, with True, False
+                and None as Python writes them, else the text as a string.
+            */
+            json xml_value(const std::string& function, const std::string& key, const std::string& text) const
+            {
+                const std::string type = parameter_type(function, key);
+                if (type == "string") return json(text);
+                const std::string t = strip_spaces(text);
+                if (t == "True") return json(true);
+                if (t == "False") return json(false);
+                if (t == "None") return json();
+                json v;
+                if (!t.empty() && json::parse(t, v)) return v;
+                return json(text);
+            }
+
+            /*
+                The calls of the text between two call markers in the XML form of Granite 4.2
+                and Qwen3-Coder: <function=name> elements that hold <parameter=key> elements,
+                whose value is the text between their markers, less the line break after the
+                opening marker and the one before the closing marker.  A model may stop before
+                the closing marker of its last function.  False, emitting nothing, when the text
+                holds anything else.
+            */
+            bool emit_xml_calls(const std::string& body, std::vector<output_event>& events)
+            {
+                static const std::string fn_open = "<function=", fn_close = "</function>";
+                static const std::string par_open = "<parameter=", par_close = "</parameter>";
+                std::vector<output_event> calls;
+                size_t pos = 0;
+                while (pos < body.size())
+                {
+                    const size_t f = body.find(fn_open, pos);
+                    if (f == std::string::npos || !strip_spaces(body.substr(pos, f - pos)).empty()) break;
+                    const size_t name_end = body.find('>', f);
+                    if (name_end == std::string::npos) return false;
+                    const size_t name_at = f + fn_open.size();
+                    const std::string name = strip_spaces(body.substr(name_at, name_end - name_at));
+                    if (name.empty() || name.find_first_of("<\n") != std::string::npos) return false;
+                    const size_t close = body.find(fn_close, name_end);
+                    const size_t stop = close == std::string::npos ? body.size() : close;
+                    json args = json::object();
+                    size_t q = name_end + 1;
+                    for (;;)
+                    {
+                        const size_t a = body.find(par_open, q);
+                        if (a == std::string::npos || a >= stop)
+                        {
+                            if (!strip_spaces(body.substr(q, stop - q)).empty()) return false;
+                            break;
+                        }
+                        if (!strip_spaces(body.substr(q, a - q)).empty()) return false;
+                        const size_t key_end = body.find('>', a);
+                        const size_t b = key_end == std::string::npos ? key_end : body.find(par_close, key_end);
+                        if (b == std::string::npos || b > stop) return false;
+                        const size_t key_at = a + par_open.size();
+                        const std::string key = strip_spaces(body.substr(key_at, key_end - key_at));
+                        std::string value = body.substr(key_end + 1, b - key_end - 1);
+                        if (!value.empty() && value[0] == '\n') value.erase(0, 1);
+                        if (!value.empty() && value.back() == '\n') value.pop_back();
+                        args[key] = xml_value(name, key, value);
+                        q = b + par_close.size();
+                    }
+                    emit_call(name, args.dump_formatted(), calls);
+                    pos = close == std::string::npos ? body.size() : close + fn_close.size();
+                }
+                if (calls.empty() || !strip_spaces(body.substr(std::min(pos, body.size()))).empty()) return false;
+                events.insert(events.end(), calls.begin(), calls.end());
+                return true;
+            }
+
             bool emit_whole_json(const std::string& text, std::vector<output_event>& events)
             {
                 std::string t = strip_spaces(text);
@@ -536,6 +627,19 @@ namespace albireo
                             const size_t a = buffer_.find_first_not_of('\n');
                             if (a == std::string::npos) { if (final) buffer_.clear(); return; }
                             buffer_.erase(0, a);
+                            if (reopen_)
+                            {
+                                const std::string& open = c_.think_open;
+                                const bool partial = buffer_.size() < open.size()
+                                    && open.compare(0, buffer_.size(), buffer_) == 0;
+                                if (!final && partial) return;
+                                reopen_ = false;
+                                if (starts_with(buffer_, open))
+                                {
+                                    buffer_.erase(0, open.size());
+                                    continue;
+                                }
+                            }
                             strip_leading_ = false;
                         }
                         const size_t p = buffer_.find(c_.think_close);
@@ -566,22 +670,23 @@ namespace albireo
             // Consumes one call from buffer_; false when more text is needed.
             bool parse_call(std::vector<output_event>& events, bool final)
             {
-                if (c_.calls == call_style::tagged_object)
+                if (c_.calls == call_style::tagged_object || c_.calls == call_style::xml_function)
                 {
+                    const bool xml = c_.calls == call_style::xml_function;
                     const size_t p = buffer_.find(c_.call_close);
                     if (p == std::string::npos)
                     {
                         // A model may end its turn after the object, without the closing marker.
                         if (final)
                         {
-                            if (!emit_calls(buffer_, events))
+                            if (!(xml ? emit_xml_calls(buffer_, events) : emit_calls(buffer_, events)))
                                 emit(output_kind::content, call_prefix_ + buffer_, events);
                             buffer_.clear();
                         }
                         return false;
                     }
                     const std::string body = buffer_.substr(0, p);
-                    if (!emit_calls(body, events))
+                    if (!(xml ? emit_xml_calls(body, events) : emit_calls(body, events)))
                         emit(output_kind::content, call_prefix_ + body + c_.call_close, events);
                     buffer_.erase(0, p + c_.call_close.size());
                     state_ = state::content;
@@ -647,6 +752,7 @@ namespace albireo
             std::string held_;
             bool decided_whole_ = false;
             bool strip_leading_ = false;
+            bool reopen_ = false;
             bool skip_content_newlines_ = false;
         };
     }
@@ -672,6 +778,8 @@ namespace albireo
                 const std::string smollm = "You are a helpful AI assistant named SmolLM, trained by Hugging Face";
                 if (tmpl.find(qwen) != std::string::npos) default_system_ = qwen;
                 else if (tmpl.find(smollm) != std::string::npos) default_system_ = smollm;
+                // The templates that trim the text of the messages (EuroLLM).
+                trims_ = tmpl.find("message['content'] | trim") != std::string::npos;
                 add_markers(tok, { "<think>", "</think>", "<tool_call>", "</tool_call>" });
             }
 
@@ -685,10 +793,11 @@ namespace albireo
                 piece_writer w{ out };
                 const bool has_system = !messages.empty() && messages[0].role == "system";
                 const bool tools = tools_ && opt.tools.is_array() && !opt.tools.empty();
+                auto body = [this](const std::string& s) { return trims_ ? strip_spaces(s) : s; };
                 if (tools)
                 {
                     w.markup("<|im_start|>system\n");
-                    if (has_system) { w.text(messages[0].content); w.markup("\n\n"); }
+                    if (has_system) { w.text(body(messages[0].content)); w.markup("\n\n"); }
                     else if (!default_system_.empty()) { w.markup(default_system_); w.markup("\n\n"); }
                     w.markup("# Tools\n\nYou may call one or more functions to assist with the user query.\n\n"
                         "You are provided with function signatures within <tools></tools> XML tags:\n<tools>");
@@ -704,7 +813,7 @@ namespace albireo
                 else if (has_system)
                 {
                     w.markup("<|im_start|>system\n");
-                    w.text(messages[0].content);
+                    w.text(body(messages[0].content));
                     w.markup("<|im_end|>\n");
                 }
                 else if (!default_system_.empty())
@@ -732,12 +841,12 @@ namespace albireo
                     if (m.role == "user" || (m.role == "system" && i != 0))
                     {
                         w.markup("<|im_start|>" + m.role + "\n");
-                        w.text(m.content);
+                        w.text(body(m.content));
                         w.markup("<|im_end|>\n");
                     }
                     else if (m.role == "assistant")
                     {
-                        std::string content = m.content;
+                        std::string content = body(m.content);
                         std::string reasoning = m.reasoning;
                         if (reasoning.empty())
                         {
@@ -789,7 +898,12 @@ namespace albireo
                 if (opt.add_generation_prompt)
                 {
                     w.markup("<|im_start|>assistant\n");
-                    if (always_thinks_) w.markup("<think>\n");
+                    /*
+                        A template that always opens the reasoning (the thinking variants) gets
+                        an empty reasoning when the request asks for none, as the switchable
+                        templates write it, so that the model answers at once.
+                    */
+                    if (always_thinks_) w.markup(opt.reasoning ? "<think>\n" : "<think>\n\n</think>\n\n");
                     else if (switchable_ && !opt.reasoning) w.markup("<think>\n\n</think>\n\n");
                 }
             }
@@ -801,7 +915,7 @@ namespace albireo
                 {
                     c.think_open = "<think>";
                     c.think_close = "</think>";
-                    c.starts_in_reasoning = always_thinks_ && opt.add_generation_prompt;
+                    c.starts_in_reasoning = always_thinks_ && opt.add_generation_prompt && opt.reasoning;
                 }
                 if (tools_ && opt.tools.is_array() && !opt.tools.empty())
                 {
@@ -816,6 +930,7 @@ namespace albireo
             bool tools_ = false;
             bool always_thinks_ = false;
             bool switchable_ = false;
+            bool trims_ = false;
             std::string default_system_;
         };
 
@@ -1111,7 +1226,333 @@ namespace albireo
 
         };
 
+        // Granite 4.2
+
+        /*
+            The ChatML of Granite 4.2: a system turn in every prompt, the tools in a <tools>
+            element of it with calls in the XML form (<function=name> and <parameter=key>
+            elements in <tool_call>), and a reasoning that the prompt opens with "<think>\n"
+            or closes at once with "<think></think>".  The assistant turns before the last
+            query keep their answer only.
+        */
+        class granite4_format : public chat_format
+        {
+        public:
+            explicit granite4_format(const dlib::hf_tokenizer& tok)
+            {
+                for (const char* t : { "<|im_end|>", "<|end_of_text|>" })
+                {
+                    const int id = tok.token_id(t);
+                    if (id >= 0) stop_tokens_.push_back(id);
+                }
+                add_markers(tok, { "<think>", "</think>", "<tool_call>", "</tool_call>" });
+            }
+
+            const char* name() const override { return "granite4"; }
+            bool supports_tools() const override { return true; }
+            bool supports_reasoning() const override { return true; }
+
+            void render(const std::vector<chat_message>& messages, const render_options& opt,
+                std::vector<prompt_piece>& out) const override
+            {
+                piece_writer w{ out };
+                const bool tools = opt.tools.is_array() && !opt.tools.empty();
+                const bool has_system = !messages.empty() && messages[0].role == "system";
+                const size_t first = has_system ? 1 : 0;
+                w.markup("<|im_start|>system\n");
+                if (has_system) w.text(messages[0].content);
+                if (tools)
+                {
+                    if (has_system && !messages[0].content.empty()) w.markup("\n\n");
+                    w.markup("# Tools\n\nYou have access to the following functions:\n\n<tools>");
+                    for (const auto& t : opt.tools.elements())
+                    {
+                        json fn = t.contains("function") ? t["function"] : t;
+                        if (fn["defer_loading"].as_bool(false)) continue;
+                        fn.erase("defer_loading");
+                        fn.erase("strict");
+                        w.markup("\n");
+                        w.text(fn.dump_formatted());
+                    }
+                    w.markup("\n</tools>\n\nIf you choose to call a function ONLY reply in the following format "
+                        "with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n"
+                        "<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\n"
+                        "This is the value for the second "
+                        "parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n"
+                        "<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner "
+                        "<function=...></function> block must be nested within <tool_call></tool_call> XML tags\n"
+                        "- Required parameters MUST be specified\n- You may provide optional reasoning for your "
+                        "function call in natural language BEFORE the function call, but NOT after\n- If there is no "
+                        "function call available, answer the question like normal with your current knowledge and do "
+                        "not tell the user about function calls\n</IMPORTANT>");
+                }
+                w.markup("<|im_end|>\n");
+
+                size_t last_user = std::string::npos;
+                for (size_t i = first; i < messages.size(); ++i)
+                    if (messages[i].role == "user") last_user = i;
+
+                for (size_t i = first; i < messages.size(); ++i)
+                {
+                    const chat_message& m = messages[i];
+                    if (m.role == "assistant")
+                    {
+                        const bool earlier = last_user != std::string::npos && i < last_user;
+                        const bool given = !strip_spaces(m.reasoning).empty();
+                        const size_t open = m.content.find("<think>");
+                        const size_t close = m.content.rfind("</think>");
+                        w.markup("<|im_start|>assistant\n");
+                        if (!m.tool_calls.empty())
+                        {
+                            if (earlier)
+                            {
+                                // The text after the reasoning, or before a reasoning left open.
+                                std::string c = m.content;
+                                if (!given && close != std::string::npos) c = c.substr(close + 8);
+                                else if (!given && open != std::string::npos) c = c.substr(0, open);
+                                w.markup("<think></think>");
+                                w.text(strip_spaces(c));
+                            }
+                            else
+                            {
+                                write_answer(w, m, given, open, close);
+                            }
+                            w.markup("\n");
+                            for (const auto& call : m.tool_calls)
+                            {
+                                w.markup("<tool_call>\n<function=");
+                                w.text(call.name);
+                                w.markup(">\n");
+                                const json args = json::parse_or_null(call.arguments);
+                                for (const auto& kv : args.items())
+                                {
+                                    w.markup("<parameter=");
+                                    w.text(kv.first);
+                                    w.markup(">\n");
+                                    w.text(python_text(kv.second));
+                                    w.markup("\n</parameter>\n");
+                                }
+                                w.markup("</function>\n</tool_call>\n");
+                            }
+                            w.markup("<|im_end|>\n");
+                            continue;
+                        }
+                        const bool none = open == std::string::npos && close == std::string::npos;
+                        const bool both = open != std::string::npos && close != std::string::npos;
+                        if (earlier && (given || none || both))
+                        {
+                            // The earlier answers keep the text after their reasoning.
+                            std::string c = close != std::string::npos ? m.content.substr(close + 8)
+                                : given ? "\n" + m.content : m.content;
+                            w.markup("<think></think>");
+                            w.text(rstrip(c));
+                        }
+                        else
+                        {
+                            write_answer(w, m, given, open, close);
+                        }
+                        w.markup("<|im_end|>\n");
+                    }
+                    else if (m.role == "tool")
+                    {
+                        if (i > first && messages[i - 1].role != "tool") w.markup("<|im_start|>user\n");
+                        w.markup("<tool_response>\n");
+                        w.text(m.content);
+                        w.markup("\n</tool_response>\n");
+                        if (i + 1 == messages.size() || messages[i + 1].role != "tool") w.markup("<|im_end|>\n");
+                    }
+                    else
+                    {
+                        w.markup("<|im_start|>" + m.role + "\n");
+                        w.text(m.content);
+                        w.markup("<|im_end|>\n");
+                    }
+                }
+                if (opt.add_generation_prompt)
+                    w.markup(opt.reasoning ? "<|im_start|>assistant\n<think>\n"
+                        : "<|im_start|>assistant\n<think></think>");
+            }
+
+            std::unique_ptr<output_parser> make_parser(const render_options& opt) const override
+            {
+                parser_config c;
+                c.think_open = "<think>";
+                c.think_close = "</think>";
+                c.starts_in_reasoning = opt.add_generation_prompt && opt.reasoning;
+                if (opt.tools.is_array() && !opt.tools.empty())
+                {
+                    c.calls = call_style::xml_function;
+                    c.call_open = "<tool_call>";
+                    c.call_close = "</tool_call>";
+                    c.tools = opt.tools;
+                }
+                return std::unique_ptr<output_parser>(new tag_parser(c));
+            }
+
+        private:
+            // A value as the string filter of the templates writes it: str() of Python for the
+            // strings, numbers and constants, JSON for the objects and the arrays.
+            static std::string python_text(const json& v)
+            {
+                if (v.is_string()) return v.as_string();
+                if (v.is_bool()) return v.as_bool() ? "True" : "False";
+                if (v.is_null()) return "None";
+                return v.dump_formatted();
+            }
+
+            static std::string rstrip(std::string s)
+            {
+                while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) s.pop_back();
+                return s;
+            }
+
+            /*
+                The answer of the turn being worked on, trimmed as the template trims it: the
+                reasoning given apart between its markers, an empty reasoning before an answer
+                that has none, or the content as the model wrote it.
+            */
+            static void write_answer(piece_writer& w, const chat_message& m, bool given, size_t open, size_t close)
+            {
+                if (given)
+                {
+                    w.markup("<think>\n");
+                    w.text(m.reasoning);
+                    const std::string c = rstrip(m.content);
+                    w.markup(c.empty() ? "\n</think>" : "\n</think>\n");
+                    w.text(c);
+                }
+                else if (open == std::string::npos && close == std::string::npos)
+                {
+                    w.markup("<think></think>");
+                    w.text(rstrip(m.content));
+                }
+                else
+                {
+                    w.text(strip_spaces(m.content));
+                }
+            }
+        };
+
+        /*
+            The format of Foundation-Sec-8B-Reasoning: <|system|>, <|user|> and <|assistant|>
+            each open a turn, the first two followed by a line break, and the answers end with
+            the end of text token.  The template gives its own system prompt when the
+            conversation has none, and keeps of the earlier answers the text after their
+            reasoning.  The other roles are left out, as the template leaves them.
+        */
+        class foundation_sec_format : public chat_format
+        {
+        public:
+            foundation_sec_format(const dlib::hf_tokenizer& tok, const std::string& tmpl)
+            {
+                for (const char* t : { "<|end_of_text|>", "<|eot_id|>" })
+                {
+                    const int id = tok.token_id(t);
+                    if (id >= 0) stop_tokens_.push_back(id);
+                }
+                bos_ = tok.bos_id() >= 0 ? tok.id_to_token(tok.bos_id()) : std::string();
+                eos_ = tok.eos_id() >= 0 ? tok.id_to_token(tok.eos_id()) : std::string("<|end_of_text|>");
+                // The system prompt of the template, in the branch without a system message.
+                const size_t branch = tmpl.find("if not has_system");
+                const size_t open = branch == std::string::npos ? branch : tmpl.find("<|system|>", branch);
+                const size_t end = open == std::string::npos ? open : tmpl.find("{%", open);
+                if (end != std::string::npos) default_system_ = strip_spaces(tmpl.substr(open + 10, end - open - 10));
+                add_markers(tok, { "<think>", "</think>" });
+            }
+
+            const char* name() const override { return "foundation-sec"; }
+            bool supports_tools() const override { return false; }
+            bool supports_reasoning() const override { return true; }
+
+            void render(const std::vector<chat_message>& messages, const render_options& opt,
+                std::vector<prompt_piece>& out) const override
+            {
+                piece_writer w{ out };
+                w.markup(bos_);
+                const bool has_system = !messages.empty() && messages[0].role == "system";
+                if (!has_system && !default_system_.empty()) w.markup("<|system|>\n" + default_system_);
+                for (size_t i = 0; i < messages.size(); ++i)
+                {
+                    const chat_message& m = messages[i];
+                    if (i == 0 && has_system)
+                    {
+                        w.markup("<|system|>\n");
+                        w.text(m.content);
+                    }
+                    else if (m.role == "user")
+                    {
+                        w.markup("<|user|>\n");
+                        w.text(m.content);
+                    }
+                    else if (m.role == "assistant")
+                    {
+                        std::string content = strip_spaces(m.content);
+                        const size_t close = content.rfind("</think>");
+                        if (i + 1 < messages.size() && close != std::string::npos)
+                            content = strip_spaces(content.substr(close + 8));
+                        w.markup("<|assistant|>");
+                        w.text(content);
+                        w.markup(eos_);
+                    }
+                }
+                if (opt.add_generation_prompt) w.markup("<|assistant|>");
+            }
+
+            std::unique_ptr<output_parser> make_parser(const render_options& opt) const override
+            {
+                parser_config c;
+                c.think_open = "<think>";
+                c.think_close = "</think>";
+                c.starts_in_reasoning = opt.add_generation_prompt;
+                return std::unique_ptr<output_parser>(new tag_parser(c));
+            }
+
+        private:
+            std::string bos_, eos_, default_system_;
+        };
+
         // Plain
+
+        /*
+            The format of Phi-4-mini: each message between <|role|> and <|end|>, with no line
+            break, and <|assistant|> to let the model answer.  The tool messages are given as
+            the user turns that carry their results; the tools themselves are not offered.
+        */
+        class phi_format : public chat_format
+        {
+        public:
+            explicit phi_format(const dlib::hf_tokenizer& tok)
+            {
+                for (const char* t : { "<|end|>", "<|endoftext|>" })
+                {
+                    const int id = tok.token_id(t);
+                    if (id >= 0) stop_tokens_.push_back(id);
+                }
+            }
+
+            const char* name() const override { return "phi"; }
+            bool supports_tools() const override { return false; }
+            bool supports_reasoning() const override { return false; }
+
+            void render(const std::vector<chat_message>& messages, const render_options& opt,
+                std::vector<prompt_piece>& out) const override
+            {
+                piece_writer w{ out };
+                for (const auto& m : messages)
+                {
+                    const std::string role = m.role == "system" || m.role == "assistant" ? m.role : std::string("user");
+                    w.markup("<|" + role + "|>");
+                    w.text(m.content);
+                    w.markup("<|end|>");
+                }
+                if (opt.add_generation_prompt) w.markup("<|assistant|>");
+            }
+
+            std::unique_ptr<output_parser> make_parser(const render_options&) const override
+            {
+                return std::unique_ptr<output_parser>(new tag_parser(parser_config()));
+            }
+        };
 
         class plain_format : public chat_format
         {
@@ -1164,8 +1605,17 @@ namespace albireo
             return std::unique_ptr<chat_format>(new llama3_format(tok, tmpl));
         if (has("<|start_of_role|>") && tok.token_id("<|start_of_role|>") >= 0)
             return std::unique_ptr<chat_format>(new granite_format(tok, tmpl));
-        if (tok.token_id("<|im_start|>") >= 0 && tok.token_id("<|im_end|>") >= 0)
+        const bool chatml = tok.token_id("<|im_start|>") >= 0 && tok.token_id("<|im_end|>") >= 0;
+        if (chatml && has("<function=") && has("<think></think>"))
+            return std::unique_ptr<chat_format>(new granite4_format(tok));
+        if (chatml)
             return std::unique_ptr<chat_format>(new chatml_format(tok, tmpl));
+        if (has("'<|' + message['role'] + '|>'") && has("<|end|>") && tok.token_id("<|end|>") >= 0
+            && tok.token_id("<|assistant|>") >= 0)
+            return std::unique_ptr<chat_format>(new phi_format(tok));
+        if (has("<|system|>") && has("<|user|>") && has("<|assistant|>") && !has("<|end|>")
+            && tok.token_id("<|system|>") >= 0 && tok.token_id("<|user|>") >= 0 && tok.token_id("<|assistant|>") >= 0)
+            return std::unique_ptr<chat_format>(new foundation_sec_format(tok, tmpl));
         // A file published without its template: the control tokens of the vocabulary name
         // the family of the model.
         if (tmpl.empty())
@@ -1186,17 +1636,15 @@ namespace albireo
             The markup is searched for control tokens; the text between two of them, markup
             and messages together, is encoded in one go so that the pre-tokenizer sees it as
             the reference tokenizer would see the whole prompt.  The text of the messages is
-            never searched for control tokens.  A SentencePiece vocabulary puts its leading
-            space before the first stretch of text only, as when the whole prompt is encoded
-            at once.
+            never searched for control tokens.  A SentencePiece vocabulary that adds a leading
+            space puts it before each of these stretches, as the reference tokenizers do when
+            they split a prompt on its control tokens (the Prepend normalizer of EuroLLM).
         */
         std::vector<int> ids;
         std::string pending;
-        bool first_text = true;
         auto flush = [&]() {
             if (pending.empty()) return;
-            const std::vector<int> part = tok.encode(pending, false, false, false, first_text);
-            first_text = false;
+            const std::vector<int> part = tok.encode(pending, false, false, false, true);
             ids.insert(ids.end(), part.begin(), part.end());
             pending.clear();
         };

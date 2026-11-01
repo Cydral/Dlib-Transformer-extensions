@@ -55,9 +55,10 @@ keeps the models that came with an earlier complete installer.
 ## Updating the catalog
 
 The list of models is in `dlib/dlib/external/albireo/tools/make_catalog.py`: identifiers,
-functions (general, code, security, embedding), descriptions in the five languages, licenses, and
-the file of each model on the Hugging Face hub. The script asks the hub for the commit, the size and
-the hash of each file and writes the catalog:
+functions (general, code, security, embedding), publishers, inputs (text, image), descriptions in
+the five languages, licenses, and the file of each model on the Hugging Face hub, with the projector
+of a model that reads images. The script asks the hub for the commit, the size and the hash of each
+file and writes the catalog:
 
 ```
 python3 dlib/dlib/external/albireo/tools/make_catalog.py dist/albireo/catalog.json

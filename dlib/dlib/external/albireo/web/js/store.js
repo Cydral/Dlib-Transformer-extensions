@@ -5,12 +5,12 @@
     The data of the application, kept in the IndexedDB database of this browser for the
     origin of the local server: the discussions with their messages, the projects with
     their instructions and documents, the passages of the documents with their vectors for
-    the document search, and the preferences.  Nothing is sent anywhere; an incognito
-    discussion never reaches this module.
+    the document search, the images of the discussions and of the projects, and the
+    preferences.  Nothing is sent anywhere; an incognito discussion never reaches this module.
 */
 
 const DB_NAME = 'albireo';
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 let db = null;
 
 function request(r) {
@@ -59,6 +59,12 @@ async function connect() {
       const c = d.createObjectStore('chunks', { keyPath: 'id' });
       c.createIndex('owner', 'owner');
       c.createIndex('doc', 'doc');
+    }
+    // The images of the discussions and of the projects (images.js): {id, owner, name, type, size, width,
+    // height, added, blob, thumb}, the image and its thumbnail as Blobs.
+    if (!d.objectStoreNames.contains('images')) {
+      const i = d.createObjectStore('images', { keyPath: 'id' });
+      i.createIndex('owner', 'owner');
     }
   };
   return request(r);
@@ -121,6 +127,7 @@ export async function updateConversations(fn, id) {
 export async function deleteConversation(id) {
   await open();
   await deleteChunks('owner', id);
+  await deleteImages(id);
   return request(store('conversations', 'readwrite').delete(id));
 }
 
@@ -159,6 +166,7 @@ export async function deleteProject(id) {
   tx.objectStore('projects').delete(id);
   await completed(tx);
   await deleteChunks('owner', id);
+  await deleteImages(id);
 }
 
 // The passages of the document search.
@@ -214,6 +222,99 @@ export async function deleteChunks(index, key) {
   });
 }
 
+// The images.
+export async function putImages(records) {
+  await open();
+  if (!records.length) return;
+  const tx = db.transaction('images', 'readwrite');
+  const s = tx.objectStore('images');
+  for (const r of records) s.put(r);
+  await completed(tx);
+}
+
+export async function getImage(id) {
+  await open();
+  return request(store('images', 'readonly').get(id));
+}
+
+// The images of an owner, or of every owner: [{owner, id}], read from the index without the images.
+export async function imageKeys(owner) {
+  await open();
+  const tx = db.transaction('images', 'readonly');
+  const out = [];
+  const r = tx.objectStore('images').index('owner').openKeyCursor(owner == null ? null : IDBKeyRange.only(owner));
+  r.onsuccess = () => {
+    const c = r.result;
+    if (!c) return;
+    out.push({ owner: c.key, id: c.primaryKey });
+    c.continue();
+  };
+  await completed(tx);
+  return out;
+}
+
+// Deletes the images of an owner.
+export async function deleteImages(owner) {
+  await open();
+  const tx = db.transaction('images', 'readwrite');
+  const s = tx.objectStore('images');
+  const r = s.index('owner').openKeyCursor(IDBKeyRange.only(owner));
+  r.onsuccess = () => {
+    const c = r.result;
+    if (!c) return;
+    s.delete(c.primaryKey);
+    c.continue();
+  };
+  await completed(tx);
+}
+
+export async function deleteImageIds(ids) {
+  await open();
+  if (!ids.length) return;
+  const tx = db.transaction('images', 'readwrite');
+  const s = tx.objectStore('images');
+  for (const id of ids) s.delete(id);
+  await completed(tx);
+}
+
+// The images stored: {count, bytes}, the bytes of the images and of their thumbnails.
+export async function imageUsage() {
+  await open();
+  const tx = db.transaction('images', 'readonly');
+  let count = 0, bytes = 0;
+  const r = tx.objectStore('images').openCursor();
+  r.onsuccess = () => {
+    const c = r.result;
+    if (!c) return;
+    count += 1;
+    for (const b of [c.value.blob, c.value.thumb]) if (b instanceof Blob) bytes += b.size;
+    c.continue();
+  };
+  await completed(tx);
+  return { count, bytes };
+}
+
+// A Blob as a data URL ("data:image/jpeg;base64,...").
+export function dataUrlOf(blob) {
+  return new Promise((resolve) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(typeof reader.result === 'string' ? reader.result : null);
+    reader.onerror = () => resolve(null);
+    reader.readAsDataURL(blob);
+  });
+}
+
+// The Blob of a data URL of an image, decoded here, since the page reads no address outside its origin; null for
+// another text.
+function blobOfDataUrl(text) {
+  const m = /^data:(image\/[a-z0-9.+-]+);base64,([A-Za-z0-9+/=]*)$/i.exec(String(text || ''));
+  if (!m) return null;
+  const bin = atob(m[2]);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; ++i) bytes[i] = bin.charCodeAt(i);
+  return new Blob([bytes], { type: m[1].toLowerCase() });
+}
+
 export async function getSettings() {
   await open();
   const rows = await request(store('settings', 'readonly').getAll());
@@ -260,10 +361,22 @@ export async function releaseLease(key, owner) {
   await completed(tx);
 }
 
+// Everything stored, the images as data URLs.
 export async function exportAll() {
+  await open();
+  const records = await request(store('images', 'readonly').getAll());
+  const pictures = [];
+  for (const r of records) {
+    if (!(r.blob instanceof Blob)) continue;
+    const { blob, thumb, ...rest } = r;
+    pictures.push(Object.assign(rest, {
+      data: await dataUrlOf(blob), thumbnail: thumb instanceof Blob ? await dataUrlOf(thumb) : null
+    }));
+  }
   return {
     format: 'albireo-export', version: 1, exported: Date.now(),
-    conversations: await allConversations(), projects: await allProjects(), settings: await getSettings()
+    conversations: await allConversations(), projects: await allProjects(), settings: await getSettings(),
+    images: pictures
   };
 }
 
@@ -282,7 +395,19 @@ export async function importAll(data) {
       ++p;
     }
   }
-  return { conversations: n, projects: p };
+  // The images, each with the owner it belongs to; an export without images (an earlier version) has none.
+  const pictures = [];
+  for (const x of Array.isArray(data.images) ? data.images : []) {
+    if (!x || typeof x.id !== 'string' || typeof x.owner !== 'string') continue;
+    const blob = blobOfDataUrl(x.data);
+    if (!blob) continue;
+    const record = Object.assign({}, x, { blob, thumb: blobOfDataUrl(x.thumbnail) || blob });
+    delete record.data;
+    delete record.thumbnail;
+    pictures.push(record);
+  }
+  await putImages(pictures);
+  return { conversations: n, projects: p, images: pictures.length };
 }
 
 export async function clearAll() {
@@ -290,4 +415,5 @@ export async function clearAll() {
   await request(store('conversations', 'readwrite').clear());
   await request(store('projects', 'readwrite').clear());
   await request(store('chunks', 'readwrite').clear());
+  await request(store('images', 'readwrite').clear());
 }

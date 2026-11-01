@@ -89,7 +89,7 @@ const texts = {
     serviceDown: 'The Albireo service does not answer.', modelLoading: 'The model is loading…',
     serviceStarting: 'Albireo is starting…',
     instructions: 'Instructions', instructionsHelp: 'Given to the model at the start of every discussion of this project.',
-    knowledge: 'Knowledge', knowledgeHelp: 'Documents the model reads in the discussions of this project.',
+    knowledge: 'Knowledge', knowledgeHelp: 'Documents and images the model reads in the discussions of this project.',
     addFiles: 'Add files', projectName: 'Name', description: 'Description', color: 'Color', deleteProject: 'Delete the project',
     deleteProjectText: 'The project "{name}" and its documents will be deleted; its discussions are kept outside of it.',
     projectDiscussions: 'Discussions of the project', startInProject: 'New discussion in this project',
@@ -109,7 +109,7 @@ const texts = {
     systemPromptHelp: 'Added to every discussion, for instance your role or the style you prefer.',
     exportAll: 'Export everything', importAll: 'Import', clearAll: 'Delete all discussions and projects',
     clearAllText: 'Every discussion and every project stored in this browser will be deleted.',
-    storageUsage: 'Stored in this browser: {n} discussions, {p} projects.', imported: '{n} discussions and {p} projects imported.',
+    storageUsage: 'Stored in this browser: {n} discussions, {p} projects, {i} images ({size}).', imported: '{n} discussions and {p} projects imported.',
     importFailed: 'This file is not an Albireo export.',
     engine: 'Engine', speed: 'Speed', tokensPerSecond: '{n} tokens/s', version: 'Version', service: 'Service',
     memory: 'Memory', processor: 'Processor', models: 'Models', usage: 'Usage over 30 days', requests: 'Requests',
@@ -141,6 +141,42 @@ const texts = {
       'version of Microsoft Edge or Google Chrome, then reload the page.',
     searchedDocument: 'searched', removeAttachment: 'Remove this document',
     indexingDocument: 'Indexing {name} for the search…',
+    imagesNotAdded: 'Not added: {names}. The context of a discussion holds at most {max} images; places left in ' +
+      'this one: {left}. The images of the oldest exchanges leave the context once the discussion summarizes them, ' +
+      'which frees their places.',
+    projectImagesNotAdded: 'Not added: {names}. A project holds at most {max} images; places left in this one: {left}.',
+    replayImagesFull: 'Images of this question: {n}; places left in the context of this discussion: {left} of {max}. ' +
+      'The images of the oldest exchanges leave the context once the discussion summarizes them.',
+    imagePlaces: 'image places left in the context: {left} of {max}',
+    imageCountTitle: 'Images in the context of this discussion, those waiting to be sent included: {n} of {max} at most',
+    imageOpen: 'Open the image {name}', removeImage: 'Remove this image', previousImage: 'Previous image',
+    nextImage: 'Next image',
+    imageOutside: 'Outside the context: this exchange was summarized or left out, and the model no longer receives ' +
+      'this image.',
+    imageMissing: 'This image is not available in this browser.',
+    imageUnreadable: '{name} cannot be read as an image by this browser. Save it as PNG or JPEG, then attach it ' +
+      'again.',
+    imagesNamed: 'The model of this function ({model}) reads text only: it receives the images of this discussion ' +
+      'as their names.',
+    pastedImage: 'Pasted image {date}',
+    projectImages: 'Images', projectImagesCount: 'Images of the project: {n} of {max} at most',
+    knowledgeImagesHelp: 'The model that comes with Albireo describes each image in the language of the interface: ' +
+      'the kind of image, its visible text, its elements and its data. The description joins the search of the ' +
+      'project, and a model that reads images also receives the image when a question finds its description.',
+    imageDescribing: 'Description in progress…', imageDescribed: 'Description ready',
+    imageDescriptionFailed: 'Description failed',
+    imageDescriptionFailedHint: 'The model could not describe this image: its name stands for its description ' +
+      'until a new attempt, made once the model is available or with the Retry button.',
+    found_image: 'In the image {name}',
+    scanOffer: '{name} contains only images, such as scanned pages, and the model of this function reads images: ' +
+      'its pages can be attached as images. Pages: {pages}; image places left in the context of this discussion: ' +
+      '{left}.',
+    scanFirstPages: 'The pages attached go from page 1 to page {n}.',
+    scanAttach: 'Attach the pages as images',
+    scanNoRoom: '{name} contains only images, such as scanned pages. Its pages could be attached as images, but ' +
+      'the context of this discussion has no image place left ({max} at most). The images of the oldest exchanges ' +
+      'leave the context once the discussion summarizes them.',
+    scanPageName: '{name}, page {n}', scanRendering: 'Drawing the pages of {name}…',
     stepsCount: '{n} steps', agentLimit: 'The agent stopped after {n} steps.',
     aboutText: 'Albireo Community Edition runs language models locally, on the processor, the graphics processor or the neural processor of this computer, based on the open source Dlib-Transformer-extensions library.',
     createdBy: 'Created by {author}', license: 'License',
@@ -174,6 +210,8 @@ const texts = {
     program_httplib: 'Local web server and downloads', program_zlib: 'Data compression',
     program_sqlite: 'Database of the service', program_openvino: 'Engine for Intel processors, graphics cards and NPUs',
     program_cuda: 'Runtime of NVIDIA graphics cards', program_cudnn: 'Neural network library of NVIDIA',
+    program_libpng: 'Reading of the PNG images by the engines',
+    program_libjpeg: 'Reading of the JPEG images by the engines',
     program_runtime: 'Runtime of an engine',
     errorPrefix: 'Error: {message}', retry: 'Retry', cancelled: 'Stopped.', emptyAnswer: '(no answer)',
     filesInProject: '{n} documents', characters: '{n} characters', newProjectDiscussion: 'New discussion in {name}',
@@ -279,7 +317,7 @@ const texts = {
     serviceDown: 'Le service Albireo ne répond pas.', modelLoading: 'Chargement du modèle…',
     serviceStarting: 'Démarrage d\'Albireo…',
     instructions: 'Instructions', instructionsHelp: 'Données au modèle au début de chaque discussion de ce projet.',
-    knowledge: 'Connaissances', knowledgeHelp: 'Documents que le modèle lit dans les discussions de ce projet.',
+    knowledge: 'Connaissances', knowledgeHelp: 'Documents et images que le modèle lit dans les discussions de ce projet.',
     addFiles: 'Ajouter des fichiers', projectName: 'Nom', description: 'Description', color: 'Couleur',
     deleteProject: 'Supprimer le projet',
     deleteProjectText: 'Le projet « {name} » et ses documents seront supprimés ; ses discussions sont conservées hors projet.',
@@ -300,7 +338,7 @@ const texts = {
     systemPromptHelp: 'Ajoutées à chaque discussion, par exemple votre fonction ou le style que vous préférez.',
     exportAll: 'Tout exporter', importAll: 'Importer', clearAll: 'Supprimer toutes les discussions et tous les projets',
     clearAllText: 'Toutes les discussions et tous les projets enregistrés dans ce navigateur seront supprimés.',
-    storageUsage: 'Enregistrés dans ce navigateur : {n} discussions, {p} projets.', imported: '{n} discussions et {p} projets importés.',
+    storageUsage: 'Enregistrés dans ce navigateur : {n} discussions, {p} projets, {i} images ({size}).', imported: '{n} discussions et {p} projets importés.',
     importFailed: 'Ce fichier n\'est pas un export Albireo.',
     engine: 'Moteur', speed: 'Vitesse', tokensPerSecond: '{n} jetons/s', version: 'Version', service: 'Service',
     memory: 'Mémoire', processor: 'Processeur', models: 'Modèles', usage: 'Utilisation sur 30 jours', requests: 'Requêtes',
@@ -332,6 +370,44 @@ const texts = {
       'Utilisez une version récente de Microsoft Edge ou de Google Chrome, puis rechargez la page.',
     searchedDocument: 'consulté par recherche', removeAttachment: 'Retirer ce document',
     indexingDocument: 'Indexation de {name} pour la recherche…',
+    imagesNotAdded: 'Non ajoutées : {names}. Le contexte d\'une discussion contient au plus {max} images ; places ' +
+      'restantes dans celle-ci : {left}. Les images des échanges les plus anciens quittent le contexte une fois que ' +
+      'la discussion les résume, ce qui libère leurs places.',
+    projectImagesNotAdded: 'Non ajoutées : {names}. Un projet contient au plus {max} images ; places restantes dans ' +
+      'celui-ci : {left}.',
+    replayImagesFull: 'Images de cette question : {n} ; places restantes dans le contexte de cette discussion : ' +
+      '{left} sur {max}. Les images des échanges les plus anciens quittent le contexte une fois que la discussion ' +
+      'les résume.',
+    imagePlaces: 'places d\'images restantes dans le contexte : {left} sur {max}',
+    imageCountTitle: 'Images dans le contexte de cette discussion, celles en attente d\'envoi comprises : {n} sur ' +
+      '{max} au plus',
+    imageOpen: 'Ouvrir l\'image {name}', removeImage: 'Retirer cette image', previousImage: 'Image précédente',
+    nextImage: 'Image suivante',
+    imageOutside: 'Hors du contexte : cet échange a été résumé ou écarté, et le modèle ne reçoit plus cette image.',
+    imageMissing: 'Cette image n\'est pas disponible dans ce navigateur.',
+    imageUnreadable: 'Ce navigateur ne peut pas lire {name} comme une image. Enregistrez-la en PNG ou en JPEG, ' +
+      'puis joignez-la de nouveau.',
+    imagesNamed: 'Le modèle de cette fonction ({model}) ne lit que du texte : il reçoit les images de cette ' +
+      'discussion sous la forme de leurs noms.',
+    pastedImage: 'Image collée {date}',
+    projectImages: 'Images', projectImagesCount: 'Images du projet : {n} sur {max} au plus',
+    knowledgeImagesHelp: 'Le modèle livré avec Albireo décrit chaque image dans la langue de l\'interface : le type ' +
+      'd\'image, son texte visible, ses éléments et ses données. La description rejoint la recherche du projet, et ' +
+      'un modèle qui lit les images reçoit aussi l\'image quand une question trouve sa description.',
+    imageDescribing: 'Description en cours…', imageDescribed: 'Description prête',
+    imageDescriptionFailed: 'Échec de la description',
+    imageDescriptionFailedHint: 'Le modèle n\'a pas pu décrire cette image : son nom tient lieu de description ' +
+      'jusqu\'à une nouvelle tentative, faite dès que le modèle est disponible ou avec le bouton Réessayer.',
+    found_image: 'Dans l\'image « {name} »',
+    scanOffer: '{name} ne contient que des images, comme des pages numérisées, et le modèle de cette fonction lit ' +
+      'les images : ses pages peuvent être jointes comme images. Pages : {pages} ; places d\'images restantes dans ' +
+      'le contexte de cette discussion : {left}.',
+    scanFirstPages: 'Les pages jointes vont de la page 1 à la page {n}.',
+    scanAttach: 'Joindre les pages comme images',
+    scanNoRoom: '{name} ne contient que des images, comme des pages numérisées. Ses pages pourraient être jointes ' +
+      'comme images, mais le contexte de cette discussion n\'a plus de place d\'image ({max} au plus). Les images ' +
+      'des échanges les plus anciens quittent le contexte une fois que la discussion les résume.',
+    scanPageName: '{name}, page {n}', scanRendering: 'Rendu des pages de {name}…',
     stepsCount: '{n} étapes', agentLimit: 'L\'agent s\'est arrêté après {n} étapes.',
     aboutText: 'Albireo Community Edition exécute des modèles de langage localement, sur le processeur, le processeur graphique ou le processeur neuronal de cet ordinateur, en reposant sur la bibliothèque open source Dlib-Transformer-extensions.',
     createdBy: 'Créé par {author}', license: 'Licence',
@@ -368,6 +444,8 @@ const texts = {
     program_openvino: 'Moteur des processeurs, cartes graphiques et NPU Intel',
     program_cuda: 'Environnement d\'exécution des cartes graphiques NVIDIA',
     program_cudnn: 'Bibliothèque de réseaux de neurones de NVIDIA',
+    program_libpng: 'Lecture des images PNG par les moteurs',
+    program_libjpeg: 'Lecture des images JPEG par les moteurs',
     program_runtime: 'Environnement d\'exécution d\'un moteur',
     errorPrefix: 'Erreur : {message}', retry: 'Réessayer', cancelled: 'Interrompu.', emptyAnswer: '(aucune réponse)',
     filesInProject: '{n} documents', characters: '{n} caractères', newProjectDiscussion: 'Nouvelle discussion dans {name}',
@@ -471,7 +549,7 @@ const texts = {
     serviceDown: 'Der Albireo-Dienst antwortet nicht.', modelLoading: 'Das Modell wird geladen…',
     serviceStarting: 'Albireo startet…',
     instructions: 'Anweisungen', instructionsHelp: 'Werden dem Modell zu Beginn jeder Unterhaltung dieses Projekts gegeben.',
-    knowledge: 'Wissen', knowledgeHelp: 'Dokumente, die das Modell in den Unterhaltungen dieses Projekts liest.',
+    knowledge: 'Wissen', knowledgeHelp: 'Dokumente und Bilder, die das Modell in den Unterhaltungen dieses Projekts liest.',
     addFiles: 'Dateien hinzufügen', projectName: 'Name', description: 'Beschreibung', color: 'Farbe', deleteProject: 'Projekt löschen',
     deleteProjectText: 'Das Projekt „{name}“ und seine Dokumente werden gelöscht; seine Unterhaltungen bleiben außerhalb erhalten.',
     projectDiscussions: 'Unterhaltungen des Projekts', startInProject: 'Neue Unterhaltung in diesem Projekt',
@@ -491,7 +569,7 @@ const texts = {
     systemPromptHelp: 'Werden jeder Unterhaltung hinzugefügt, zum Beispiel Ihre Rolle oder Ihr bevorzugter Stil.',
     exportAll: 'Alles exportieren', importAll: 'Importieren', clearAll: 'Alle Unterhaltungen und Projekte löschen',
     clearAllText: 'Alle in diesem Browser gespeicherten Unterhaltungen und Projekte werden gelöscht.',
-    storageUsage: 'In diesem Browser gespeichert: {n} Unterhaltungen, {p} Projekte.', imported: '{n} Unterhaltungen und {p} Projekte importiert.',
+    storageUsage: 'In diesem Browser gespeichert: {n} Unterhaltungen, {p} Projekte, {i} Bilder ({size}).', imported: '{n} Unterhaltungen und {p} Projekte importiert.',
     importFailed: 'Diese Datei ist kein Albireo-Export.',
     engine: 'Engine', speed: 'Geschwindigkeit', tokensPerSecond: '{n} Token/s', version: 'Version', service: 'Dienst',
     memory: 'Arbeitsspeicher', processor: 'Prozessor', models: 'Modelle', usage: 'Nutzung der letzten 30 Tage', requests: 'Anfragen',
@@ -523,6 +601,45 @@ const texts = {
       'Verwenden Sie eine aktuelle Version von Microsoft Edge oder Google Chrome und laden Sie die Seite neu.',
     searchedDocument: 'durchsucht', removeAttachment: 'Dieses Dokument entfernen',
     indexingDocument: '{name} wird für die Suche indexiert…',
+    imagesNotAdded: 'Nicht hinzugefügt: {names}. Der Kontext einer Unterhaltung enthält höchstens {max} Bilder; ' +
+      'freie Plätze in dieser: {left}. Die Bilder der ältesten Beiträge verlassen den Kontext, sobald die ' +
+      'Unterhaltung sie zusammenfasst, und geben ihre Plätze frei.',
+    projectImagesNotAdded: 'Nicht hinzugefügt: {names}. Ein Projekt enthält höchstens {max} Bilder; freie Plätze in ' +
+      'diesem: {left}.',
+    replayImagesFull: 'Bilder dieser Frage: {n}; freie Plätze im Kontext dieser Unterhaltung: {left} von {max}. Die ' +
+      'Bilder der ältesten Beiträge verlassen den Kontext, sobald die Unterhaltung sie zusammenfasst.',
+    imagePlaces: 'freie Bildplätze im Kontext: {left} von {max}',
+    imageCountTitle: 'Bilder im Kontext dieser Unterhaltung, einschließlich der noch nicht gesendeten: {n} von ' +
+      'höchstens {max}',
+    imageOpen: 'Bild {name} öffnen', removeImage: 'Dieses Bild entfernen', previousImage: 'Vorheriges Bild',
+    nextImage: 'Nächstes Bild',
+    imageOutside: 'Außerhalb des Kontexts: Dieser Beitrag wurde zusammengefasst oder weggelassen, und das Modell ' +
+      'erhält dieses Bild nicht mehr.',
+    imageMissing: 'Dieses Bild ist in diesem Browser nicht verfügbar.',
+    imageUnreadable: 'Dieser Browser kann {name} nicht als Bild lesen. Speichern Sie es als PNG oder JPEG und hängen ' +
+      'Sie es erneut an.',
+    imagesNamed: 'Das Modell dieser Funktion ({model}) liest nur Text: Es erhält die Bilder dieser Unterhaltung als ' +
+      'ihre Namen.',
+    pastedImage: 'Eingefügtes Bild {date}',
+    projectImages: 'Bilder', projectImagesCount: 'Bilder des Projekts: {n} von höchstens {max}',
+    knowledgeImagesHelp: 'Das mit Albireo gelieferte Modell beschreibt jedes Bild in der Sprache der Oberfläche: die ' +
+      'Art des Bildes, seinen sichtbaren Text, seine Elemente und seine Daten. Die Beschreibung fließt in die Suche ' +
+      'des Projekts ein, und ein Modell, das Bilder liest, erhält auch das Bild, wenn eine Frage seine Beschreibung ' +
+      'findet.',
+    imageDescribing: 'Beschreibung läuft…', imageDescribed: 'Beschreibung fertig',
+    imageDescriptionFailed: 'Beschreibung fehlgeschlagen',
+    imageDescriptionFailedHint: 'Das Modell konnte dieses Bild nicht beschreiben: Sein Name ersetzt die Beschreibung ' +
+      'bis zu einem neuen Versuch, sobald das Modell verfügbar ist oder mit der Schaltfläche Erneut versuchen.',
+    found_image: 'Im Bild „{name}“',
+    scanOffer: '{name} enthält nur Bilder, etwa eingescannte Seiten, und das Modell dieser Funktion liest Bilder: ' +
+      'Seine Seiten können als Bilder angehängt werden. Seiten: {pages}; freie Bildplätze im Kontext dieser ' +
+      'Unterhaltung: {left}.',
+    scanFirstPages: 'Angehängt werden die Seiten 1 bis {n}.',
+    scanAttach: 'Seiten als Bilder anhängen',
+    scanNoRoom: '{name} enthält nur Bilder, etwa eingescannte Seiten. Seine Seiten könnten als Bilder angehängt ' +
+      'werden, aber der Kontext dieser Unterhaltung hat keinen freien Bildplatz mehr (höchstens {max}). Die Bilder ' +
+      'der ältesten Beiträge verlassen den Kontext, sobald die Unterhaltung sie zusammenfasst.',
+    scanPageName: '{name}, Seite {n}', scanRendering: 'Die Seiten von {name} werden gezeichnet…',
     stepsCount: '{n} Schritte', agentLimit: 'Der Agent hat nach {n} Schritten angehalten.',
     aboutText: 'Albireo Community Edition führt Sprachmodelle lokal aus, auf dem Prozessor, dem Grafikprozessor oder dem neuronalen Prozessor dieses Computers, auf Basis der Open-Source-Bibliothek Dlib-Transformer-extensions.',
     createdBy: 'Erstellt von {author}', license: 'Lizenz',
@@ -556,6 +673,8 @@ const texts = {
     program_httplib: 'Lokaler Webserver und Downloads', program_zlib: 'Datenkompression',
     program_sqlite: 'Datenbank des Dienstes', program_openvino: 'Engine für Intel-Prozessoren, -Grafikkarten und -NPUs',
     program_cuda: 'Laufzeitumgebung der NVIDIA-Grafikkarten', program_cudnn: 'Bibliothek neuronaler Netze von NVIDIA',
+    program_libpng: 'Lesen der PNG-Bilder durch die Engines',
+    program_libjpeg: 'Lesen der JPEG-Bilder durch die Engines',
     program_runtime: 'Laufzeitumgebung einer Engine',
     errorPrefix: 'Fehler: {message}', retry: 'Erneut versuchen', cancelled: 'Angehalten.', emptyAnswer: '(keine Antwort)',
     filesInProject: '{n} Dokumente', characters: '{n} Zeichen', newProjectDiscussion: 'Neue Unterhaltung in {name}',
@@ -658,7 +777,7 @@ const texts = {
     serviceDown: 'Il servizio Albireo non risponde.', modelLoading: 'Caricamento del modello…',
     serviceStarting: 'Avvio di Albireo…',
     instructions: 'Istruzioni', instructionsHelp: 'Fornite al modello all\'inizio di ogni conversazione di questo progetto.',
-    knowledge: 'Conoscenze', knowledgeHelp: 'Documenti che il modello legge nelle conversazioni di questo progetto.',
+    knowledge: 'Conoscenze', knowledgeHelp: 'Documenti e immagini che il modello legge nelle conversazioni di questo progetto.',
     addFiles: 'Aggiungi file', projectName: 'Nome', description: 'Descrizione', color: 'Colore', deleteProject: 'Elimina il progetto',
     deleteProjectText: 'Il progetto «{name}» e i suoi documenti saranno eliminati; le sue conversazioni restano fuori dal progetto.',
     projectDiscussions: 'Conversazioni del progetto', startInProject: 'Nuova conversazione in questo progetto',
@@ -678,7 +797,7 @@ const texts = {
     systemPromptHelp: 'Aggiunte a ogni conversazione, ad esempio il tuo ruolo o lo stile che preferisci.',
     exportAll: 'Esporta tutto', importAll: 'Importa', clearAll: 'Elimina tutte le conversazioni e tutti i progetti',
     clearAllText: 'Tutte le conversazioni e tutti i progetti salvati in questo browser saranno eliminati.',
-    storageUsage: 'Salvati in questo browser: {n} conversazioni, {p} progetti.', imported: '{n} conversazioni e {p} progetti importati.',
+    storageUsage: 'Salvati in questo browser: {n} conversazioni, {p} progetti, {i} immagini ({size}).', imported: '{n} conversazioni e {p} progetti importati.',
     importFailed: 'Questo file non è un\'esportazione di Albireo.',
     engine: 'Motore', speed: 'Velocità', tokensPerSecond: '{n} token/s', version: 'Versione', service: 'Servizio',
     memory: 'Memoria', processor: 'Processore', models: 'Modelli', usage: 'Utilizzo negli ultimi 30 giorni', requests: 'Richieste',
@@ -710,6 +829,44 @@ const texts = {
       'una versione recente di Microsoft Edge o di Google Chrome, poi ricarica la pagina.',
     searchedDocument: 'consultato tramite ricerca', removeAttachment: 'Rimuovi questo documento',
     indexingDocument: 'Indicizzazione di {name} per la ricerca…',
+    imagesNotAdded: 'Non aggiunte: {names}. Il contesto di una conversazione contiene al massimo {max} immagini; ' +
+      'posti liberi in questa: {left}. Le immagini degli scambi più vecchi lasciano il contesto quando la ' +
+      'conversazione li riassume, liberando i loro posti.',
+    projectImagesNotAdded: 'Non aggiunte: {names}. Un progetto contiene al massimo {max} immagini; posti liberi in ' +
+      'questo: {left}.',
+    replayImagesFull: 'Immagini di questa domanda: {n}; posti liberi nel contesto di questa conversazione: {left} ' +
+      'su {max}. Le immagini degli scambi più vecchi lasciano il contesto quando la conversazione li riassume.',
+    imagePlaces: 'posti liberi per immagini nel contesto: {left} su {max}',
+    imageCountTitle: 'Immagini nel contesto di questa conversazione, comprese quelle in attesa di invio: {n} su ' +
+      '{max} al massimo',
+    imageOpen: 'Apri l\'immagine {name}', removeImage: 'Rimuovi questa immagine', previousImage: 'Immagine precedente',
+    nextImage: 'Immagine successiva',
+    imageOutside: 'Fuori dal contesto: questo scambio è stato riassunto o escluso, e il modello non riceve più ' +
+      'questa immagine.',
+    imageMissing: 'Questa immagine non è disponibile in questo browser.',
+    imageUnreadable: 'Questo browser non può leggere {name} come immagine. Salvala in PNG o JPEG, poi allegala di ' +
+      'nuovo.',
+    imagesNamed: 'Il modello di questa funzione ({model}) legge solo testo: riceve le immagini di questa ' +
+      'conversazione sotto forma dei loro nomi.',
+    pastedImage: 'Immagine incollata {date}',
+    projectImages: 'Immagini', projectImagesCount: 'Immagini del progetto: {n} su {max} al massimo',
+    knowledgeImagesHelp: 'Il modello fornito con Albireo descrive ogni immagine nella lingua dell\'interfaccia: il ' +
+      'tipo di immagine, il testo visibile, gli elementi e i dati. La descrizione entra nella ricerca del progetto, ' +
+      'e un modello che legge le immagini riceve anche l\'immagine quando una domanda trova la sua descrizione.',
+    imageDescribing: 'Descrizione in corso…', imageDescribed: 'Descrizione pronta',
+    imageDescriptionFailed: 'Descrizione non riuscita',
+    imageDescriptionFailedHint: 'Il modello non ha potuto descrivere questa immagine: il suo nome sostituisce la ' +
+      'descrizione fino a un nuovo tentativo, fatto appena il modello è disponibile o con il pulsante Riprova.',
+    found_image: 'Nell\'immagine «{name}»',
+    scanOffer: '{name} contiene solo immagini, come pagine scansionate, e il modello di questa funzione legge le ' +
+      'immagini: le sue pagine possono essere allegate come immagini. Pagine: {pages}; posti liberi per immagini nel ' +
+      'contesto di questa conversazione: {left}.',
+    scanFirstPages: 'Le pagine allegate vanno dalla pagina 1 alla pagina {n}.',
+    scanAttach: 'Allega le pagine come immagini',
+    scanNoRoom: '{name} contiene solo immagini, come pagine scansionate. Le sue pagine potrebbero essere allegate ' +
+      'come immagini, ma il contesto di questa conversazione non ha più posti per immagini ({max} al massimo). Le ' +
+      'immagini degli scambi più vecchi lasciano il contesto quando la conversazione li riassume.',
+    scanPageName: '{name}, pagina {n}', scanRendering: 'Disegno delle pagine di {name}…',
     stepsCount: '{n} passaggi', agentLimit: 'L\'agente si è fermato dopo {n} passaggi.',
     aboutText: 'Albireo Community Edition esegue modelli linguistici in locale, sul processore, sul processore grafico o sul processore neurale di questo computer, basandosi sulla libreria open source Dlib-Transformer-extensions.',
     createdBy: 'Creato da {author}', license: 'Licenza',
@@ -744,6 +901,8 @@ const texts = {
     program_openvino: 'Motore per processori, schede grafiche e NPU Intel',
     program_cuda: 'Ambiente di esecuzione delle schede grafiche NVIDIA',
     program_cudnn: 'Libreria di reti neurali di NVIDIA', program_runtime: 'Ambiente di esecuzione di un motore',
+    program_libpng: 'Lettura delle immagini PNG da parte dei motori',
+    program_libjpeg: 'Lettura delle immagini JPEG da parte dei motori',
     errorPrefix: 'Errore: {message}', retry: 'Riprova', cancelled: 'Interrotto.', emptyAnswer: '(nessuna risposta)',
     filesInProject: '{n} documenti', characters: '{n} caratteri', newProjectDiscussion: 'Nuova conversazione in {name}',
     moveTo: 'Sposta in', none: 'Nessuno', searchIn: 'Cerca nelle conversazioni', share: 'Condividi', addToProject: 'Aggiungi a un progetto',
@@ -845,7 +1004,7 @@ const texts = {
     serviceDown: 'El servicio Albireo no responde.', modelLoading: 'Cargando el modelo…',
     serviceStarting: 'Iniciando Albireo…',
     instructions: 'Instrucciones', instructionsHelp: 'Se dan al modelo al comienzo de cada conversación de este proyecto.',
-    knowledge: 'Conocimientos', knowledgeHelp: 'Documentos que el modelo lee en las conversaciones de este proyecto.',
+    knowledge: 'Conocimientos', knowledgeHelp: 'Documentos e imágenes que el modelo lee en las conversaciones de este proyecto.',
     addFiles: 'Añadir archivos', projectName: 'Nombre', description: 'Descripción', color: 'Color', deleteProject: 'Eliminar el proyecto',
     deleteProjectText: 'El proyecto «{name}» y sus documentos se eliminarán; sus conversaciones se conservan fuera de él.',
     projectDiscussions: 'Conversaciones del proyecto', startInProject: 'Nueva conversación en este proyecto',
@@ -865,7 +1024,7 @@ const texts = {
     systemPromptHelp: 'Se añaden a cada conversación, por ejemplo tu función o el estilo que prefieres.',
     exportAll: 'Exportar todo', importAll: 'Importar', clearAll: 'Eliminar todas las conversaciones y proyectos',
     clearAllText: 'Se eliminarán todas las conversaciones y todos los proyectos guardados en este navegador.',
-    storageUsage: 'Guardado en este navegador: {n} conversaciones, {p} proyectos.', imported: '{n} conversaciones y {p} proyectos importados.',
+    storageUsage: 'Guardado en este navegador: {n} conversaciones, {p} proyectos, {i} imágenes ({size}).', imported: '{n} conversaciones y {p} proyectos importados.',
     importFailed: 'Este archivo no es una exportación de Albireo.',
     engine: 'Motor', speed: 'Velocidad', tokensPerSecond: '{n} tokens/s', version: 'Versión', service: 'Servicio',
     memory: 'Memoria', processor: 'Procesador', models: 'Modelos', usage: 'Uso en 30 días', requests: 'Solicitudes',
@@ -897,6 +1056,42 @@ const texts = {
       'versión reciente de Microsoft Edge o de Google Chrome y vuelva a cargar la página.',
     searchedDocument: 'consultado por búsqueda', removeAttachment: 'Quitar este documento',
     indexingDocument: 'Indexando {name} para la búsqueda…',
+    imagesNotAdded: 'No añadidas: {names}. El contexto de una conversación contiene como máximo {max} imágenes; ' +
+      'plazas libres en esta: {left}. Las imágenes de los intercambios más antiguos salen del contexto cuando la ' +
+      'conversación los resume, lo que libera sus plazas.',
+    projectImagesNotAdded: 'No añadidas: {names}. Un proyecto contiene como máximo {max} imágenes; plazas libres en ' +
+      'este: {left}.',
+    replayImagesFull: 'Imágenes de esta pregunta: {n}; plazas libres en el contexto de esta conversación: {left} de ' +
+      '{max}. Las imágenes de los intercambios más antiguos salen del contexto cuando la conversación los resume.',
+    imagePlaces: 'plazas libres para imágenes en el contexto: {left} de {max}',
+    imageCountTitle: 'Imágenes en el contexto de esta conversación, incluidas las pendientes de envío: {n} de ' +
+      '{max} como máximo',
+    imageOpen: 'Abrir la imagen {name}', removeImage: 'Quitar esta imagen', previousImage: 'Imagen anterior',
+    nextImage: 'Imagen siguiente',
+    imageOutside: 'Fuera del contexto: este intercambio se resumió u omitió, y el modelo ya no recibe esta imagen.',
+    imageMissing: 'Esta imagen no está disponible en este navegador.',
+    imageUnreadable: 'Este navegador no puede leer {name} como imagen. Guárdela en PNG o JPEG y adjúntela de nuevo.',
+    imagesNamed: 'El modelo de esta función ({model}) solo lee texto: recibe las imágenes de esta conversación como ' +
+      'sus nombres.',
+    pastedImage: 'Imagen pegada {date}',
+    projectImages: 'Imágenes', projectImagesCount: 'Imágenes del proyecto: {n} de {max} como máximo',
+    knowledgeImagesHelp: 'El modelo incluido con Albireo describe cada imagen en el idioma de la interfaz: el tipo de ' +
+      'imagen, su texto visible, sus elementos y sus datos. La descripción se suma a la búsqueda del proyecto, y un ' +
+      'modelo que lee imágenes también recibe la imagen cuando una pregunta encuentra su descripción.',
+    imageDescribing: 'Descripción en curso…', imageDescribed: 'Descripción lista',
+    imageDescriptionFailed: 'La descripción falló',
+    imageDescriptionFailedHint: 'El modelo no pudo describir esta imagen: su nombre sustituye a la descripción hasta ' +
+      'un nuevo intento, que se hace en cuanto el modelo está disponible o con el botón Reintentar.',
+    found_image: 'En la imagen «{name}»',
+    scanOffer: '{name} solo contiene imágenes, como páginas escaneadas, y el modelo de esta función lee imágenes: ' +
+      'sus páginas se pueden adjuntar como imágenes. Páginas: {pages}; plazas libres para imágenes en el contexto de ' +
+      'esta conversación: {left}.',
+    scanFirstPages: 'Las páginas adjuntas van de la página 1 a la página {n}.',
+    scanAttach: 'Adjuntar las páginas como imágenes',
+    scanNoRoom: '{name} solo contiene imágenes, como páginas escaneadas. Sus páginas podrían adjuntarse como ' +
+      'imágenes, pero el contexto de esta conversación ya no tiene plazas para imágenes ({max} como máximo). Las ' +
+      'imágenes de los intercambios más antiguos salen del contexto cuando la conversación los resume.',
+    scanPageName: '{name}, página {n}', scanRendering: 'Dibujando las páginas de {name}…',
     stepsCount: '{n} pasos', agentLimit: 'El agente se detuvo tras {n} pasos.',
     aboutText: 'Albireo Community Edition ejecuta modelos de lenguaje localmente, en el procesador, el procesador gráfico o el procesador neuronal de este ordenador, basándose en la biblioteca de código abierto Dlib-Transformer-extensions.',
     createdBy: 'Creado por {author}', license: 'Licencia',
@@ -931,6 +1126,8 @@ const texts = {
     program_openvino: 'Motor para procesadores, tarjetas gráficas y NPU de Intel',
     program_cuda: 'Entorno de ejecución de las tarjetas gráficas NVIDIA',
     program_cudnn: 'Biblioteca de redes neuronales de NVIDIA', program_runtime: 'Entorno de ejecución de un motor',
+    program_libpng: 'Lectura de las imágenes PNG por los motores',
+    program_libjpeg: 'Lectura de las imágenes JPEG por los motores',
     errorPrefix: 'Error: {message}', retry: 'Reintentar', cancelled: 'Detenido.', emptyAnswer: '(sin respuesta)',
     filesInProject: '{n} documentos', characters: '{n} caracteres', newProjectDiscussion: 'Nueva conversación en {name}',
     moveTo: 'Mover a', none: 'Ninguno', searchIn: 'Buscar en las conversaciones', share: 'Compartir', addToProject: 'Añadir a un proyecto',

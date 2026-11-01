@@ -18,14 +18,16 @@ namespace albireo
         In an installation they lie in the "models" folder of the programs, with their
         manifest builtin.json, which the service reads at each start: builtin_manifest_name
         in builtin_models_folder.  The manifest is {"format": 1, "version", "models": [...]},
-        each model with the fields of a catalog entry and "file", "size" and "sha256".
+        each model with the fields of a catalog entry and "file", "size" and "sha256"; a model
+        that reads images has a "projector" with its own "file", "size" and "sha256", the file
+        of its image encoder.
 
         The complete installer carries them after the sections of its program, as an overlay
         that Windows does not map:
 
-            the files of the models, one after the other
-            the manifest, each model with "offset", the position of its file from the start
-                of the overlay
+            the files of the models, one after the other, each followed by its projector
+            the manifest, each model and each projector with "offset", the position of its
+                file from the start of the overlay
             zeros, so that the overlay ends on a multiple of 8 bytes
             builtin_trailer
 

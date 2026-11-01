@@ -21,6 +21,15 @@
 
         The documents of a project that do not fit whole, and the large documents attached
         to a message, are searched (rag.js): the excerpts closest to the question join it.
+
+    THE IMAGES
+        A question may carry images, for a model that reads them (images.js).  They go before
+        its text while the question stays in the context, maxContextImages at most for the
+        discussion: the images of the exchanges that a compression summarized leave the
+        context with them and free their places.  The images of a project are described by
+        the background model, and their descriptions are searched with its documents; a
+        question that finds one receives the image with it.  A model that reads text only
+        receives the names of the images.
 */
 
 import { t, setLanguage, language, languages } from './i18n.js';
@@ -28,9 +37,10 @@ import { icon } from './icons.js';
 import * as store from './store.js';
 import { renderMarkdown, attachCodeButtons, escapeHtml } from './markdown.js';
 import * as api from './api.js';
-import { extractText, maxFileBytes, extension, searchPassages, documentAccept, fileKind } from './documents.js';
+import { extractText, maxFileBytes, extension, searchPassages, documentAccept, fileKind, pdfPages } from './documents.js';
 import * as rag from './rag.js';
 import * as tools from './tools.js';
+import * as images from './images.js';
 
 const roles = ['general', 'code', 'security'];
 const roleIcons = { general: 'compass', code: 'code', security: 'shield' };
@@ -51,6 +61,14 @@ const keptShare = 0.6;
 const compactShare = 0.8;
 // The summary of the exchanges that left the context takes at most this share of the room.
 const summaryShare = 0.15;
+/*
+    The images the context of a discussion holds at most, those of its project that a question receives with their
+    descriptions, the most relevant first, and those a project holds.  A request of the service carries 16 images
+    at most.
+*/
+const maxContextImages = 10;
+const maxQuestionProjectImages = 4;
+const maxProjectImages = 10;
 
 // Tokens of a text, estimated from its characters.
 function estimateTokens(text) {
@@ -392,6 +410,7 @@ function everythingDeleted() {
   if (state.busy) stopGeneration();
   cancelIndex();
   rag.removeAll();
+  images.removeAll();
   syncLists().then(() => go('#/'));
 }
 
@@ -486,22 +505,36 @@ function loadedModel(id) {
   return list.find((m) => m.id === id) || null;
 }
 
-// What the model of a role reads: "text", and "image" or "audio" for the models that read
-// them; the attachments follow.
-function roleInputs(role) {
-  const m = modelInfo(roleModel(role));
+// What a model reads: "text", and "image" or "audio" for the models that read them, as the
+// engine or the catalog tells.
+function modelInputs(id) {
+  const loaded = loadedModel(id);
+  if (loaded && Array.isArray(loaded.inputs) && loaded.inputs.length) return loaded.inputs;
+  const m = modelInfo(id);
   return m && Array.isArray(m.inputs) && m.inputs.length ? m.inputs : ['text'];
+}
+
+// What the model of a role reads; the attachments follow.
+function roleInputs(role) {
+  return modelInputs(roleModel(role));
+}
+
+function readsImages(role) {
+  return roleInputs(role).includes('image');
 }
 
 function inputsLabel(inputs) {
   return inputs.map((i) => t('input_' + i)).join(', ');
 }
 
-// The file picker of a role: the documents, read as text, and the media its model reads.
-function acceptFor(role) {
+/*
+    The file picker of a role: the documents, read as text, and the media its model reads, the
+    images while room, the places left for them, is not 0.
+*/
+function acceptFor(role, room) {
   const inputs = roleInputs(role);
   let accept = documentAccept();
-  if (inputs.includes('image')) accept += ',image/*';
+  if (inputs.includes('image') && room !== 0) accept += ',image/*';
   if (inputs.includes('audio')) accept += ',audio/*';
   return accept;
 }
@@ -525,6 +558,12 @@ function backgroundContext() {
   const s = state.status;
   const loaded = s && s.background ? loadedModel(s.background) : null;
   return (loaded && loaded.context) || roleCapabilities('general').context || 8192;
+}
+
+// True when the background model reads images, which the descriptions of the images of the projects need.
+function backgroundReadsImages() {
+  const s = state.status;
+  return modelInputs((s && s.background) || roleModel('general')).includes('image');
 }
 
 // The text the background model writes for an instruction and a message.
@@ -573,6 +612,8 @@ async function pollStatus() {
     state.status = s;
     state.statusError = false;
     if (changed || !state.catalog) state.catalog = await api.models(language()).catch(() => state.catalog);
+    // The tokens of the images were measured for the models of the functions as they were.
+    if (changed) imageTokenCache.clear();
     // A language chosen in Albireo meanwhile, which this interface follows.
     await languageChanged();
     if (ui.hint) ui.hint.textContent = hintText();
@@ -593,6 +634,7 @@ async function pollStatus() {
     renderStatusLine();
   }
   if (back) namePending();
+  if (back || changed) describePending();
 }
 
 function renderStatusLine() {
@@ -837,9 +879,10 @@ function projectActivity(p) {
 
 /*
     The projects that hold every term of a query, as searchConversations: those whose name
-    holds them first, then those whose description, instructions, documents or discussions
-    hold them.  where: 'name', 'description', 'instructions', 'document' or 'discussion',
-    with the name of the document or the title of the discussion in label.
+    holds them first, then those whose description, instructions, documents, images or
+    discussions hold them.  where: 'name', 'description', 'instructions', 'document', 'image'
+    or 'discussion', with the name of the document or of the image or the title of the
+    discussion in label.
 */
 function searchProjects(query, limit) {
   const terms = queryTerms(query);
@@ -858,6 +901,10 @@ function searchProjects(query, limit) {
     for (const f of p.files || []) {
       const text = f.name + '\n' + (f.text || '');
       fields.push(['document', text, f.name, foldedOf(messageFolds, f, text)]);
+    }
+    for (const img of p.images || []) {
+      const text = img.name + '\n' + (img.description || '');
+      fields.push(['image', text, img.name, foldedOf(messageFolds, img, text)]);
     }
     for (const c of state.conversations) {
       if (c.projectId !== p.id) continue;
@@ -1214,6 +1261,7 @@ async function removeConversation(c) {
   if (state.busy && state.busyId === c.id) stopGeneration();
   await forgetOwner(c.id).catch(() => {});
   await store.deleteConversation(c.id).catch(storageFailed);
+  await images.removeOwner(c.id).catch(() => {});
   broadcast({ type: 'deleted', id: c.id });
   state.conversations = state.conversations.filter((x) => x.id !== c.id);
   if (state.current && state.current.id === c.id) go('#/');
@@ -1234,6 +1282,9 @@ function markdownOf(title, messages) {
     if (m.role === 'user') {
       lines.push('## ' + (state.settings.userName || 'User'), '', m.content || '');
       for (const a of m.attachments || []) lines.push('', '> ' + a.name + ' (' + formatSize(a.size || 0) + ')');
+      for (const img of m.images || []) {
+        lines.push('', '> ' + img.name + ' (' + img.width + ' × ' + img.height + ', ' + formatSize(img.size || 0) + ')');
+      }
     } else {
       lines.push('## Albireo', '');
       for (const s of m.steps || []) {
@@ -1286,9 +1337,11 @@ async function deleteQuestion(c, index) {
   let end = index + 1;
   while (end < c.messages.length && c.messages[end].role !== 'user') ++end;
   const removed = end - index;
-  // The documents of the question leave the search, unless another question, a replay, shares them.
+  // The documents and the images of the question leave, unless another question, a replay, shares them.
   const others = attachmentIds(c.messages.slice(0, index).concat(c.messages.slice(end)));
   for (const a of (m && m.attachments) || []) if (a.mode === 'search' && !others.has(a.id)) forgetDocument(c.id, a.id);
+  const otherImages = imageIds(c.messages.slice(0, index).concat(c.messages.slice(end)));
+  const gone = ((m && m.images) || []).filter((img) => !otherImages.has(img.id)).map((img) => img.id);
   c.messages.splice(index, removed);
   // The memory reads again from the question that took its place.
   if ((c.memoryMark || 0) > index) c.memoryMark = Math.max(index, (c.memoryMark || 0) - removed);
@@ -1300,6 +1353,7 @@ async function deleteQuestion(c, index) {
   if (c.summary && index < start) await rewriteSummary(c);
   c.updated = Date.now();
   await persist(c);
+  await images.remove(gone).catch(() => {});
   if (state.current === c) renderMain();
   refreshViews();
 }
@@ -1383,7 +1437,9 @@ function forgetOwner(owner) {
 async function pruneIndex(indexed) {
   if (!indexed.length) return;
   const documents = new Map();
-  for (const p of state.projects) documents.set(p.id, new Set((p.files || []).map((f) => f.id)));
+  for (const p of state.projects) {
+    documents.set(p.id, new Set((p.files || []).map((f) => f.id).concat((p.images || []).map((x) => x.id))));
+  }
   for (const c of state.conversations) {
     const ids = new Set();
     for (const m of c.messages || []) for (const a of m.attachments || []) ids.add(a.id);
@@ -1393,6 +1449,19 @@ async function pruneIndex(indexed) {
     const ids = documents.get(owner);
     if (!ids || !ids.has(doc)) await rag.removeDocument(owner, doc);
   }
+}
+
+/*
+    Deletes the stored images that neither a discussion nor a project refers to any longer, such as
+    those of a question deleted in a tab closed meanwhile.  listed are the images of the database,
+    read before the lists (images.prune).
+*/
+function pruneImages(listed) {
+  if (!listed.length) return Promise.resolve(0);
+  const references = new Map();
+  for (const p of state.projects) references.set(p.id, new Set((p.images || []).map((x) => x.id)));
+  for (const c of state.conversations) references.set(c.id, imageIds(c.messages || []));
+  return images.prune(listed, references);
 }
 
 // The state of a document on the page of its project.
@@ -1416,10 +1485,15 @@ function showIndexing(docId) {
 async function indexProjects() {
   for (const p of state.projects) {
     const st = await rag.status(p.id).catch(() => new Map());
+    const model = rag.embeddingModel();
     for (const f of p.files || []) {
       const s2 = st.get(f.id);
-      const model = rag.embeddingModel();
       if (!s2 || (model && s2.vectors < s2.passages)) queueIndex(p.id, f, true);
+    }
+    // An image joins the search once its description is written, or has failed.
+    for (const img of p.images || []) {
+      const s2 = st.get(img.id);
+      if (img.state !== 'pending' && (!s2 || (model && s2.vectors < s2.passages))) queueIndex(p.id, imageDocument(img), true);
     }
   }
 }
@@ -1430,6 +1504,175 @@ function knowledgeMode(p, contextTokens) {
   if (!files.length) return 'none';
   const total = files.reduce((n, f) => n + estimateTokens(f.text), 0);
   return total <= knowledgeShare * (contextTokens || 8192) ? 'whole' : 'search';
+}
+
+/*
+    The descriptions of the images of the projects, which the background model writes one at a
+    time (describeImage): image -> project, for the images waiting or being described by this tab.
+*/
+const describing = new Map();
+let describeQueue = Promise.resolve();
+
+// The text of an image of a project for the search: its description, else its name.
+function imageDocument(img) {
+  return { id: img.id, name: img.name, text: img.description || img.name };
+}
+
+function queueDescription(projectId, imageId) {
+  if (describing.has(imageId)) return;
+  describing.set(imageId, projectId);
+  showProjectImage(projectId, imageId);
+  describeQueue = describeQueue.then(() => describeImage(projectId, imageId)).catch(() => {}).then(() => {
+    describing.delete(imageId);
+    showProjectImage(projectId, imageId);
+  });
+}
+
+// Asks the description of an image again, from the button of its line.
+async function retryDescription(projectId, imageId) {
+  if (await updateProjectImage(projectId, imageId, { state: 'pending' })) queueDescription(projectId, imageId);
+}
+
+/*
+    Describes the images of the projects that have no description: those whose description failed,
+    and those a closed tab left in progress, once the service answers with a background model that
+    reads images.
+*/
+function describePending() {
+  if (!serviceReady() || !backgroundReadsImages()) return;
+  for (const p of state.projects) {
+    for (const img of p.images || []) if (img.state !== 'ready') queueDescription(p.id, img.id);
+  }
+}
+
+// The request of the description of an image, written in the language of the interface.
+function describeMessages(url, name) {
+  const lang = languageNames[language()] || 'English';
+  return [{
+    role: 'system',
+    content: 'You describe images for the document search of a project. Write in ' + lang + ', as plain text without '
+      + 'introduction, in at most 220 words: first the kind of image (photograph, screenshot, chart, diagram, table, '
+      + 'scanned document, drawing...) and its subject, in one sentence; then the visible text, transcribed exactly '
+      + 'as written, in its own language; then the elements and the data the image shows: objects, places, values, '
+      + 'labels, axes and trends. Describe only what is visible.'
+  }, {
+    role: 'user',
+    content: [{ type: 'image_url', image_url: { url, detail: 'auto' } },
+      { type: 'text', text: 'Describe this image ("' + name + '") in ' + lang + '.' }]
+  }];
+}
+
+// A description as the model writes it, without a heading, within 4,000 characters.
+function cleanDescription(text) {
+  const s = String(text || '').replace(/^\s*(description|beschreibung|descrizione|descripci[oó]n)\s*:\s*/i, '').trim();
+  return s.length > 4000 ? keepStart(s, 4000) : s;
+}
+
+/*
+    Changes an image of a project in the copy of this tab, which its page shows and saves, and in
+    the stored project, read again so that the changes of the other tabs stay.  Returns the image,
+    null when the project or the image was removed meanwhile.
+*/
+async function updateProjectImage(projectId, imageId, change) {
+  const p = projectById(projectId);
+  const img = p && (p.images || []).find((x) => x.id === imageId);
+  if (!img) return null;
+  const stored = await store.getProject(projectId).catch(() => null);
+  const kept = stored && (stored.images || []).find((x) => x.id === imageId);
+  if (stored && !kept) return null;
+  Object.assign(img, change);
+  try {
+    if (kept) Object.assign(kept, change);
+    await store.putProject(stored || p);
+  } catch (e) {
+    storageFailed(e);
+  }
+  broadcast({ type: 'lists' });
+  showProjectImage(projectId, imageId);
+  return img;
+}
+
+/*
+    Asks the background model for the description of an image of a project, in the language of the
+    interface: the kind of image, its visible text, its elements and its data.  The description is
+    kept with the image and takes its place in the search of the project.  Without a background
+    model that reads images, or after an error, the name of the image stands for its description,
+    and the description is asked again later (describePending) or with the button of the image.
+    One tab describes an image at a time.
+*/
+async function describeImage(projectId, imageId) {
+  await exclusive('albireo-describe-' + imageId, async () => {
+    const p = projectById(projectId);
+    const img = p && (p.images || []).find((x) => x.id === imageId);
+    if (!img) return;
+    // Another tab may have described it meanwhile.
+    const stored = await store.getProject(projectId).catch(() => null);
+    const kept = stored && (stored.images || []).find((x) => x.id === imageId);
+    if (kept && kept.state === 'ready') {
+      Object.assign(img, kept);
+      return;
+    }
+    let text = '';
+    if (serviceReady() && backgroundReadsImages()) {
+      const url = await images.dataUrl(imageId).catch(() => null);
+      if (url) {
+        try {
+          text = cleanDescription((await backgroundChat(describeMessages(url, img.name), 1024, null, 0.2)).text);
+        } catch (e) {
+          console.warn('Albireo: the description of an image failed', e);
+          text = '';
+        }
+      }
+    }
+    // The earlier passages of the image leave the search before its new state is saved, so that a tab closed
+    // meanwhile leaves the image to index again (indexProjects).
+    await forgetDocument(projectId, imageId).catch(() => {});
+    const saved = await updateProjectImage(projectId, imageId, text
+      ? { state: 'ready', description: text, language: language() } : { state: 'failed', description: '' });
+    if (saved) queueIndex(projectId, imageDocument(saved), true);
+  });
+}
+
+// The state of the description of an image of a project: {cls, label, spin, retry}.
+function imageState(img) {
+  if (describing.has(img.id) || img.state === 'pending') return { cls: 'pending', label: t('imageDescribing'), spin: true };
+  if (img.state === 'ready') return { cls: 'ready', label: t('imageDescribed') };
+  return { cls: 'failed', label: t('imageDescriptionFailed'), retry: true };
+}
+
+/*
+    The line of an image on the page of its project: its thumbnail, its name and its size, the
+    state of its description (in progress, ready, failed with the button that asks it again), the
+    description, and the button that removes the image.
+*/
+function projectImageRow(p, img) {
+  const st = imageState(img);
+  const row = h('div', { class: 'row image-row', 'data-project-image': img.id },
+    imageThumb(img, { list: p.images || [] }),
+    h('div', { class: 'image-text' },
+      h('div', { class: 'image-name' }, h('span', { class: 'label' }, img.name),
+        h('span', { class: 'faint' }, img.width + ' × ' + img.height + ' · ' + formatSize(img.size || 0))),
+      h('div', { class: 'image-state ' + st.cls, title: st.retry ? t('imageDescriptionFailedHint') : null },
+        st.spin ? h('span', { class: 'spinner small' }) : h('span', { html: icon(st.retry ? 'info' : 'check') }),
+        h('span', null, st.label),
+        st.retry ? h('button', {
+          class: 'button small', type: 'button', onclick: () => retryDescription(p.id, img.id)
+        }, t('retry')) : null),
+      img.state === 'ready' && img.description
+        ? h('p', { class: 'image-description', title: img.description }, img.description) : null),
+    iconButton('trash', t('delete'), () => {
+      if (ui.projectPage && ui.projectPage.id === p.id) ui.projectPage.removeImage(img);
+    }));
+  return row;
+}
+
+// Shows the state of an image on the page of its project, when it is shown.
+function showProjectImage(projectId, imageId) {
+  if (state.view !== 'project' || state.projectId !== projectId || !ui.content) return;
+  const p = projectById(projectId);
+  const img = p && (p.images || []).find((x) => x.id === imageId);
+  const row = ui.content.querySelector('[data-project-image="' + imageId + '"]');
+  if (row && img) row.replaceWith(projectImageRow(p, img));
 }
 
 // Projects.
@@ -1492,14 +1735,30 @@ function renderProject(p) {
       onclick: async () => { p.color = col; await save(); renderProject(p); }
     }));
   }
-  const fileInput = h('input', { type: 'file', multiple: true, class: 'hidden', accept: documentAccept() });
+  // The documents and the images, maxProjectImages of them at most: the documents are indexed, the images described.
+  const places = () => Math.max(0, maxProjectImages - (p.images || []).length);
+  const fileInput = h('input', {
+    type: 'file', multiple: true, class: 'hidden', accept: documentAccept() + (places() ? ',image/*' : '')
+  });
   fileInput.addEventListener('change', async () => {
-    const added = await readFiles(Array.from(fileInput.files));
-    p.files = (p.files || []).concat(added);
+    const files = Array.from(fileInput.files);
     fileInput.value = '';
+    const added = await readFiles(files, null, places());
+    const docs = added.filter((a) => a.kind !== 'image');
+    const pictures = added.filter((a) => a.kind === 'image')
+      .map((a) => Object.assign(imageRecord(a), { state: 'pending', description: '' }));
+    p.files = (p.files || []).concat(docs);
+    if (pictures.length) p.images = (p.images || []).concat(pictures);
     await save();
+    // The images are stored once the project that holds them is (pruneImages).
+    try {
+      await images.keep(p.id, pictures, true);
+    } catch (e) {
+      storageFailed(e);
+    }
     renderProject(p);
-    for (const f of added) queueIndex(p.id, f, true);
+    for (const f of docs) queueIndex(p.id, f, true);
+    for (const img of pictures) queueDescription(p.id, img.id);
   });
   const fileList = h('div', { class: 'list' });
   for (const f of p.files || []) {
@@ -1516,6 +1775,25 @@ function renderProject(p) {
       })));
     indexText(p.id, f.id).then((text) => { indexState.textContent = text; });
   }
+  // The images, each with the state of its description.
+  ui.projectPage = {
+    id: p.id,
+    removeImage: async (img) => {
+      const removed = forgetDocument(p.id, img.id);
+      p.images = (p.images || []).filter((x) => x.id !== img.id);
+      await save();
+      await removed;
+      await images.remove([img.id]);
+      renderProject(p);
+    }
+  };
+  const pictures = p.images || [];
+  const imagesBlock = h('div', { class: 'knowledge-images' },
+    h('div', { class: 'images-head' }, h('span', { html: icon('image') }), h('span', null, t('projectImages')),
+      h('span', { class: 'count', title: t('projectImagesCount', { n: pictures.length, max: maxProjectImages }) },
+        pictures.length + ' / ' + maxProjectImages)),
+    h('p', { class: 'help' }, t('knowledgeImagesHelp')),
+    pictures.length ? h('div', { class: 'list image-list' }, pictures.map((img) => projectImageRow(p, img))) : null);
   // The share of the context the documents take, and how the model reads them.
   const contextTokens = roleCapabilities('general').context || 0;
   const totalTokens = (p.files || []).reduce((n, f) => n + estimateTokens(f.text), 0);
@@ -1544,7 +1822,7 @@ function renderProject(p) {
     h('div', { class: 'card' }, h('h3', { html: icon('edit') + escapeHtml(t('instructions')) }),
       h('p', { class: 'help' }, t('instructionsHelp')), h('div', { class: 'field' }, instructions)),
     h('div', { class: 'card' }, h('h3', { html: icon('book') + escapeHtml(t('knowledge')) }),
-      h('p', { class: 'help' }, t('knowledgeHelp')), capacity, fileList,
+      h('p', { class: 'help' }, t('knowledgeHelp')), capacity, fileList, imagesBlock,
       h('div', { class: 'buttons', style: { marginTop: '10px' } },
         h('button', { class: 'button', type: 'button', onclick: () => fileInput.click(), html: icon('upload') + '<span>' + escapeHtml(t('addFiles')) + '</span>' }),
         fileInput)),
@@ -1558,6 +1836,7 @@ function renderProject(p) {
           // shown leaves the project as the stored ones do.
           await forgetOwner(p.id).catch(() => {});
           await store.deleteProject(p.id).catch(storageFailed);
+          await images.removeOwner(p.id).catch(() => {});
           if (state.current && state.current.projectId === p.id) state.current.projectId = null;
           await reloadLists().catch(storageFailed);
           broadcast({ type: 'lists' });
@@ -1568,15 +1847,20 @@ function renderProject(p) {
 
 // Files.
 /*
-    Reads the files attached for the model of role (the documents of a project for none):
-    the documents become text; an image or a sound is attached only when the model reads it.
-    A PDF whose pages are images without text, a scan, is left out with a dialog; a PDF some
-    of whose pages are such images is added with a notice that counts them.
+    Reads the files attached for the model of role (the documents and the images of a project
+    for none): the documents become text; an image is attached when the model reads images,
+    always to a project, and prepared (images.js) within room places, the images beyond them
+    refused with a message that says why; a sound is attached only when the model reads it.  A
+    PDF whose pages are images without text, a scan, is left out with a dialog, or offered as
+    images of its pages to a model that reads images; a PDF some of whose pages are such images
+    is added with a notice that counts them.  The images come back with kind 'image'.
 */
-async function readFiles(files, role) {
+async function readFiles(files, role, room) {
   const out = [];
   const scans = [];
-  const inputs = role ? roleInputs(role) : ['text'];
+  const refused = [];
+  const inputs = role ? roleInputs(role) : ['text', 'image'];
+  let left = room || 0;
   for (const f of files) {
     if (f.size > maxFileBytes) {
       toast(t('tooLarge', { name: f.name, size: formatSize(f.size), limit: formatSize(maxFileBytes) }), true);
@@ -1589,6 +1873,19 @@ async function readFiles(files, role) {
         : t('unsupported', { name: f.name }), true);
       continue;
     }
+    if (kind === 'image') {
+      if (left <= 0) {
+        refused.push(f.name);
+        continue;
+      }
+      try {
+        out.push(Object.assign({ kind: 'image' }, await images.prepare(f)));
+        --left;
+      } catch (e) {
+        toast(t('imageUnreadable', { name: f.name }), true);
+      }
+      continue;
+    }
     try {
       const r = await extractText(f);
       out.push({ id: store.uid(), name: f.name, size: f.size, format: r.format, text: r.text, added: Date.now() });
@@ -1597,7 +1894,7 @@ async function readFiles(files, role) {
           { name: f.name, n: r.unreadablePages, total: r.pages }), false, 9000);
       }
     } catch (e) {
-      if (e.message === 'pdf-images') scans.push(f.name);
+      if (e.message === 'pdf-images') scans.push({ file: f, pages: e.pages || 0 });
       else if (e.message === 'unsupported') toast(t('unsupported', { name: f.name }), true);
       else if (e.message === 'legacy') toast(t('legacyFormat', { name: f.name }), true);
       else if (e.message === 'too-large') toast(t('tooLarge', { name: f.name, size: formatSize(f.size), limit: formatSize(maxFileBytes) }), true);
@@ -1608,8 +1905,53 @@ async function readFiles(files, role) {
       else toast(t('readFailed', { name: f.name, error: e.message }), true);
     }
   }
-  for (const name of scans) scanDialog(name);
+  if (refused.length) toast(imageLimitText(refused, left, !role), true, 10000);
+  for (const scan of scans) {
+    if (role && inputs.includes('image')) {
+      const pages = await scanPages(scan, left);
+      out.push(...pages);
+      left -= pages.length;
+    } else {
+      scanDialog(scan.file.name);
+    }
+  }
   return out;
+}
+
+/*
+    Offers to attach the pages of a scanned PDF as images, to a model that reads them, within the
+    places left for images: the pages are drawn by pdf.js, their longest side at images.maxSide
+    pixels, the first ones when the places do not cover them all.  Returns the images of the
+    pages, none when the user declines or when no place is left, which the dialog says.
+*/
+async function scanPages(scan, left) {
+  const name = scan.file.name;
+  const count = Math.min(scan.pages || left, left);
+  const accepted = await dialog((box, close) => {
+    const text = left > 0 ? t('scanOffer', { name, pages: scan.pages || '?', left })
+      + (scan.pages > left ? ' ' + t('scanFirstPages', { n: count }) : '')
+      : t('scanNoRoom', { name, max: maxContextImages });
+    box.append(h('h2', { html: icon('image') + escapeHtml(t('pdfImagesTitle')) }), h('p', null, text),
+      h('div', { class: 'actions' }, left > 0 ? [
+        h('button', { class: 'button', type: 'button', onclick: () => close(false) }, t('cancel')),
+        h('button', { class: 'button primary', type: 'button', onclick: () => close(true) }, t('scanAttach'))
+      ] : h('button', { class: 'button primary', type: 'button', onclick: () => close(false) }, t('close'))));
+  }, true);
+  if (!accepted || count <= 0) return [];
+  toast(t('scanRendering', { name }));
+  try {
+    const r = await pdfPages(scan.file, images.maxSide, count);
+    const out = [];
+    const base = name.replace(/\.pdf$/i, '');
+    for (let i = 0; i < r.canvases.length; ++i) {
+      const meta = await images.prepareCanvas(r.canvases[i], t('scanPageName', { name: base, n: i + 1 }));
+      out.push(Object.assign({ kind: 'image' }, meta));
+    }
+    return out;
+  } catch (e) {
+    toast(t('readFailed', { name, error: e.message }), true);
+    return [];
+  }
 }
 
 // The dialog that tells a PDF of images was not added, shown once the previous one is closed.
@@ -1623,6 +1965,205 @@ function scanDialog(name) {
   }, true));
 }
 
+// Images.
+// The ids of the images of the questions of a list of messages.
+function imageIds(messages) {
+  const ids = new Set();
+  for (const x of messages) for (const img of x.images || []) ids.add(img.id);
+  return ids;
+}
+
+// The images of the questions of c from the message from on, the start of its context by default.
+function contextImages(c, from) {
+  let n = 0;
+  if (!c) return n;
+  for (let i = from == null ? c.contextStart || 0 : from; i < c.messages.length; ++i) {
+    n += (c.messages[i].images || []).length;
+  }
+  return n;
+}
+
+function pendingImageCount() {
+  return state.pending.filter((a) => a.kind === 'image').length;
+}
+
+// The places left for images in the context of c, the images waiting in the composer taken.
+function imageRoom(c) {
+  return c ? Math.max(0, maxContextImages - contextImages(c) - pendingImageCount()) : 0;
+}
+
+// Why images were not added: their names, the limit of a discussion or of a project, and the places left.
+function imageLimitText(names, left, project) {
+  return t(project ? 'projectImagesNotAdded' : 'imagesNotAdded',
+    { names: names.join(', '), max: project ? maxProjectImages : maxContextImages, left: Math.max(0, left) });
+}
+
+// The description of an image as a question or a project keeps it.
+function imageRecord(a) {
+  return { id: a.id, name: a.name, type: a.type, size: a.size, width: a.width, height: a.height, added: a.added };
+}
+
+function imageLabel(img) {
+  return img.name + ' · ' + img.width + ' × ' + img.height + ' · ' + formatSize(img.size || 0);
+}
+
+// The tooltip of a thumbnail, with the reason why its image no longer reaches the model.
+function thumbTitle(button, outside) {
+  button.classList.toggle('outside', outside);
+  button.title = button.dataset.label + (outside ? '\n' + t('imageOutside') : '');
+  button.setAttribute('aria-label', t('imageOpen', { name: button.dataset.name }) + (outside ? '. ' + t('imageOutside') : ''));
+}
+
+/*
+    The thumbnail of an image, a button that opens it in the viewer.  options: list, the images the
+    viewer goes through; outside, for an image whose exchange left the context, shown dimmed;
+    onremove, which adds the button that removes the image.
+*/
+function imageThumb(img, options) {
+  const o = options || {};
+  const list = o.list || [img];
+  const pic = h('img', { alt: '', draggable: 'false' });
+  const button = h('button', { type: 'button', class: 'image-thumb', onclick: () => openViewer(list, list.indexOf(img), button) },
+    pic);
+  button.dataset.image = img.id;
+  button.dataset.name = img.name;
+  button.dataset.label = imageLabel(img);
+  thumbTitle(button, !!o.outside);
+  images.thumbUrl(img.id).then((url) => {
+    if (url) {
+      pic.src = url;
+      return;
+    }
+    // An image this browser does not hold, such as one whose storage failed.
+    button.classList.add('missing');
+    button.dataset.label = img.name + ' · ' + t('imageMissing');
+    thumbTitle(button, !!o.outside);
+    pic.replaceWith(h('span', { html: icon('image') }));
+  });
+  if (!o.onremove) return button;
+  return h('span', { class: 'image-pending' }, button, h('button', {
+    type: 'button', class: 'image-remove', title: t('removeImage'), 'aria-label': t('removeImage') + ': ' + img.name,
+    html: icon('close'), onclick: o.onremove
+  }));
+}
+
+/*
+    Shows images whole over the page, from the one at index in list.  Escape, a click beside the
+    image and the close button close the viewer, the arrows go through the images, and the focus
+    stays in the viewer, then goes back to opener.
+*/
+function openViewer(list, index, opener) {
+  closeMenu();
+  let at = Math.max(0, index);
+  let sequence = 0;
+  const pic = h('img', { class: 'viewer-image', alt: '' });
+  const missing = h('div', { class: 'viewer-missing hidden' }, h('span', { html: icon('image') }), t('imageMissing'));
+  const name = h('span', { class: 'viewer-name' });
+  const info = h('span', { class: 'viewer-info' });
+  const stage = h('div', { class: 'viewer-stage' }, pic, missing);
+  const buttons = [];
+  const show = async (k) => {
+    at = (k + list.length) % list.length;
+    const img = list[at];
+    const mine = ++sequence;
+    name.textContent = img.name;
+    info.textContent = img.width + ' × ' + img.height + ' · ' + formatSize(img.size || 0)
+      + (list.length > 1 ? ' · ' + (at + 1) + ' / ' + list.length : '');
+    box.setAttribute('aria-label', img.name);
+    pic.alt = img.name;
+    const url = await images.fullUrl(img.id);
+    if (mine !== sequence) return;
+    pic.classList.toggle('hidden', !url);
+    missing.classList.toggle('hidden', !!url);
+    if (url) pic.src = url;
+    else pic.removeAttribute('src');
+  };
+  if (list.length > 1) {
+    buttons.push(iconButton('chevron', t('previousImage'), () => show(at - 1), 'icon-button viewer-prev'),
+      iconButton('chevron', t('nextImage'), () => show(at + 1), 'icon-button viewer-next'));
+  }
+  const closeButton = iconButton('close', t('close'), () => done(), 'icon-button viewer-close');
+  buttons.push(closeButton);
+  const box = h('div', { class: 'viewer', role: 'dialog', 'aria-modal': 'true', tabindex: '-1' },
+    h('div', { class: 'viewer-bar' }, h('span', { class: 'viewer-title' }, name, info), buttons), stage);
+  const overlay = h('div', { class: 'overlay viewer-overlay' }, box);
+  // The keys reach the viewer first, wherever the focus is, and go no further.
+  const onKey = (e) => {
+    if (e.key === 'Escape') done();
+    else if (e.key === 'ArrowLeft' && list.length > 1) show(at - 1);
+    else if (e.key === 'ArrowRight' && list.length > 1) show(at + 1);
+    else if (e.key === 'Tab') {
+      const i = buttons.indexOf(document.activeElement);
+      buttons[i < 0 ? 0 : (i + (e.shiftKey ? buttons.length - 1 : 1)) % buttons.length].focus();
+    } else return;
+    e.preventDefault();
+    e.stopPropagation();
+  };
+  const done = () => {
+    document.removeEventListener('keydown', onKey, true);
+    overlay.remove();
+    if (opener && opener.isConnected) opener.focus();
+  };
+  overlay.addEventListener('mousedown', (e) => {
+    if (e.target === overlay || e.target === stage) done();
+  });
+  document.addEventListener('keydown', onKey, true);
+  document.body.append(overlay);
+  show(at);
+  closeButton.focus();
+}
+
+// Dims the images of the questions that left the context, in the thread shown.
+function markOutside() {
+  const c = state.current;
+  if (!c || !ui.thread || !ui.thread.isConnected) return;
+  const start = c.contextStart || 0;
+  for (const el of ui.thread.querySelectorAll('.message.user[data-index]')) {
+    const outside = Number(el.dataset.index) < start;
+    for (const b of el.querySelectorAll('.image-thumb')) thumbTitle(b, outside);
+  }
+}
+
+/*
+    The files of a paste.  An image of the clipboard, a screenshot for instance, takes a name with
+    the time of the paste instead of the one the browser gives all of them.
+*/
+function pastedFiles(e) {
+  const files = Array.from(e.clipboardData ? e.clipboardData.files : []);
+  const d = new Date();
+  const pad = (n) => String(n).padStart(2, '0');
+  const date = d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + ' ' + pad(d.getHours()) + '.'
+    + pad(d.getMinutes()) + '.' + pad(d.getSeconds());
+  return files.map((f, i) => {
+    if (fileKind(f) !== 'image' || !/^(image\.[a-z0-9]+)?$/i.test(f.name || '')) return f;
+    const ext = ((f.type || '').split('/')[1] || 'png').replace('jpeg', 'jpg');
+    const name = t('pastedImage', { date }) + (files.length > 1 ? ' (' + (i + 1) + ')' : '') + '.' + ext;
+    return new File([f], name, { type: f.type, lastModified: f.lastModified });
+  });
+}
+
+// Empties the composer, the images prepared for it forgotten.
+function clearPending() {
+  images.drop(state.pending.filter((a) => a.kind === 'image').map((a) => a.id));
+  state.pending = [];
+}
+
+// The discussion shown gives way to another one: an incognito discussion, which no list keeps, takes its images out of memory.
+function forgetIncognito() {
+  const c = state.current;
+  if (c && c.incognito && c.messages.length) images.removeOwner(c.id).catch(() => {});
+}
+
+// Keeps the images of a question of c, in the database of the browser, or in memory for an incognito discussion.
+async function keepImages(c, list) {
+  if (!list || !list.length) return;
+  try {
+    await images.keep(c.id, list, !c.incognito);
+  } catch (e) {
+    storageFailed(e);
+  }
+}
+
 // Conversations.
 function newConversation(projectId) {
   return {
@@ -1634,8 +2175,9 @@ function newConversation(projectId) {
 
 function newChat(projectId) {
   if (state.busy) stopGeneration();
+  forgetIncognito();
+  clearPending();
   state.current = newConversation(projectId);
-  state.pending = [];
   state.view = 'chat';
   if (location.hash !== '#/') history.pushState(null, '', '#/');
   renderAll();
@@ -1664,9 +2206,10 @@ async function route() {
       const c = deleted.has(m[1]) ? null : await store.getConversation(m[1]).catch(() => null);
       if (sequence !== routeSequence) return;
       if (!c) { go('#/'); return; }
+      forgetIncognito();
+      clearPending();
       state.current = c;
       state.incognito = false;
-      state.pending = [];
     }
     state.view = 'chat';
   } else if ((m = /^#\/p\/([0-9a-f]+)$/.exec(hash))) {
@@ -1678,6 +2221,7 @@ async function route() {
     state.view = 'chat';
     if (!state.current || state.current.messages.length || (state.current.incognito !== state.incognito)) {
       if (state.busy) stopGeneration();
+      forgetIncognito();
       state.current = newConversation(null);
     }
   }
@@ -1867,15 +2411,22 @@ function attachmentChip(a, removable, onremove) {
 
 function userElement(c, m, index, last) {
   const el = h('div', { class: 'message user' + (last ? ' last' : '') });
+  el.dataset.index = index;
+  // The images of a question that left the context show dimmed: the model no longer receives them.
+  const pictures = m.images || [];
+  if (pictures.length) {
+    const outside = index < (c.contextStart || 0);
+    el.append(h('div', { class: 'attachments image-thumbs' }, pictures.map((img) => imageThumb(img, { list: pictures, outside }))));
+  }
   if (m.attachments && m.attachments.length) {
     el.append(h('div', { class: 'attachments' }, m.attachments.map((a) => attachmentChip(a))));
   }
-  const bubble = h('div', { class: 'bubble' }, m.content);
-  el.append(bubble);
+  // A question made of images alone shows no empty bubble.
+  if (m.content || !pictures.length) el.append(h('div', { class: 'bubble' }, m.content));
   // The time of the question shows before its buttons, which appear when the pointer is over it.
   el.append(h('div', { class: 'meta' }, timeElement(m),
     iconButton('copy', t('copy'), () => copyText(m.content)),
-    lockable(iconButton('history', t('replayQuestion'), () => replayQuestion(c, m)), 'busy'),
+    lockable(iconButton('history', t('replayQuestion'), () => replayQuestion(c, m)), 'replay', pictures.length),
     lockable(iconButton('edit', t('edit'), () => editMessage(c, m, index, el)), 'busy'),
     lockable(iconButton('trash', t('deleteQuestion'), () => deleteQuestion(c, index)), 'busy')));
   return el;
@@ -1927,36 +2478,64 @@ function stopClock() {
 }
 
 /*
-    Asks a question of the thread again: the same question, with its documents, joins the end of
-    the discussion as a new question, which the model answers there.  The earlier exchange stays
-    as it is, and the documents keep their passages, which the two questions share.
+    Asks a question of the thread again: the same question, with its documents and its images,
+    joins the end of the discussion as a new question, which the model answers there.  The earlier
+    exchange stays as it is, the documents keep their passages and the images their Blobs, which
+    the two questions share; the images take places in the context again.
 */
 async function replayQuestion(c, m) {
   const live = liveCopy(c);
   if (threadLocked() || state.current !== live) return;
-  await sendMessage(m.content || '', (m.attachments || []).map((a) => Object.assign({}, a)));
+  const pictures = m.images || [];
+  if (pictures.length > imageRoom(live)) {
+    toast(replayLimitText(pictures.length), true, 10000);
+    return;
+  }
+  await sendMessage(m.content || '', (m.attachments || []).map((a) => Object.assign({}, a))
+    .concat(pictures.map((img) => Object.assign({ kind: 'image' }, img))));
+}
+
+// Why a question with n images cannot be asked again: the places left for images in the context.
+function replayLimitText(n) {
+  return t('replayImagesFull', { n, left: imageRoom(state.current), max: maxContextImages });
 }
 
 /*
     The buttons that change a discussion wait while it is being answered, here or in another tab
-    (kind 'busy'), and the buttons of an answer wait until it is written (kind 'turn').  They stay
-    disabled meanwhile, and say why.
+    (kind 'busy'), the buttons of an answer wait until it is written (kind 'turn'), and the button
+    that asks a question again also waits for places for its images in the context (kind
+    'replay').  They stay disabled meanwhile, and say why.
 */
 function threadLocked() {
   return state.busy || answeredElsewhere(state.current);
 }
 
-// Marks a button of kind 'busy', or of kind 'turn' for an answer that live tells is being written.
+/*
+    Marks a button of kind 'busy', of kind 'turn' for an answer that live tells is being written,
+    or of kind 'replay' for a question with live images.
+*/
 function lockable(button, kind, live) {
   button.dataset.lock = kind;
   button.dataset.title = button.title;
-  applyLock(button, kind === 'turn' ? !!live : threadLocked());
+  if (kind === 'replay') button.dataset.images = String(live || 0);
+  lockButton(button, kind === 'turn' ? !!live : threadLocked());
   return button;
 }
 
-function applyLock(button, locked) {
+function lockButton(button, busy) {
+  if (button.dataset.lock === 'replay' && !busy) {
+    const n = Number(button.dataset.images || 0);
+    if (n > imageRoom(state.current)) {
+      applyLock(button, true, replayLimitText(n));
+      return;
+    }
+  }
+  applyLock(button, busy);
+}
+
+function applyLock(button, locked, reason) {
   button.disabled = locked;
-  button.title = locked ? t('afterAnswer') : button.dataset.title;
+  button.title = locked ? reason || t('afterAnswer') : button.dataset.title;
 }
 
 // Gives the buttons of the thread shown the state of its discussion.
@@ -1964,7 +2543,7 @@ function lockThread() {
   if (!ui.content) return;
   const busy = threadLocked();
   for (const b of ui.content.querySelectorAll('button[data-lock]')) {
-    applyLock(b, b.dataset.lock === 'turn' ? !!(liveTurn && b.closest('.message.live')) : busy);
+    lockButton(b, b.dataset.lock === 'turn' ? !!(liveTurn && b.closest('.message.live')) : busy);
   }
   showElsewhere();
 }
@@ -1982,31 +2561,65 @@ function showElsewhere() {
   }
 }
 
-// Edits a question: its text, and its attached documents, which can be removed or added.
+// Edits a question: its text, and its attached documents and images, which can be removed or added.
 function editMessage(c, m, index, el) {
   if (threadLocked()) return;
-  let attachments = (m.attachments || []).slice();
+  let attachments = (m.attachments || []).concat((m.images || []).map((img) => Object.assign({ kind: 'image' }, img)));
+  // The images prepared for this edition, forgotten when it is cancelled.
+  const prepared = new Set();
+  /*
+      The places for the images of the edited question: the questions after it leave, the exchanges
+      before it come back into the context when it was summarized, and the images waiting in the
+      composer keep theirs.
+  */
+  const places = () => maxContextImages - pendingImageCount()
+    - (contextImages(c, (c.contextStart || 0) > index ? 0 : c.contextStart || 0) - contextImages(c, index));
+  const room = () => Math.max(0, places() - attachments.filter((a) => a.kind === 'image').length);
   const area = h('textarea', { style: { width: '100%', minHeight: '90px', borderRadius: '12px', padding: '10px', border: '1px solid var(--border-strong)', background: 'var(--bg-input)' } });
   area.value = m.content;
   const chips = h('div', { class: 'attachments', style: { justifyContent: 'flex-start', marginBottom: '6px' } });
+  const fileInput = h('input', { type: 'file', multiple: true, class: 'hidden' });
+  const remove = (a) => {
+    attachments = attachments.filter((x) => x !== a);
+    if (prepared.has(a.id)) images.drop([a.id]);
+    showChips();
+  };
   const showChips = () => {
-    chips.replaceChildren(...attachments.map((a) => attachmentChip(a, true, () => {
-      attachments = attachments.filter((x) => x !== a);
-      showChips();
-    })));
+    const pictures = attachments.filter((a) => a.kind === 'image');
+    chips.replaceChildren(...pictures.map((a) => imageThumb(a, { list: pictures, onremove: () => remove(a) })),
+      ...attachments.filter((a) => a.kind !== 'image').map((a) => attachmentChip(a, true, () => remove(a))));
+    fileInput.accept = acceptFor(c.role, room());
+  };
+  const add = async (files) => {
+    const added = await readFiles(files, c.role, room());
+    for (const a of added) if (a.kind === 'image') prepared.add(a.id);
+    attachments = attachments.concat(added);
+    showChips();
   };
   showChips();
-  const fileInput = h('input', { type: 'file', multiple: true, class: 'hidden', accept: acceptFor(c.role) });
-  fileInput.addEventListener('change', async () => {
-    attachments = attachments.concat(await readFiles(Array.from(fileInput.files), c.role));
+  fileInput.addEventListener('change', () => {
+    const files = Array.from(fileInput.files);
     fileInput.value = '';
-    showChips();
+    add(files);
+  });
+  area.addEventListener('paste', (e) => {
+    const files = pastedFiles(e);
+    if (files.length) {
+      e.preventDefault();
+      add(files);
+    }
   });
   const box = h('div', { style: { width: '85%' } }, chips, area, h('div', { class: 'buttons', style: { justifyContent: 'flex-end', marginTop: '6px' } },
     h('button', { class: 'button', type: 'button', onclick: () => fileInput.click(), html: icon('clip') + '<span>' + escapeHtml(t('attach')) + '</span>' }),
     fileInput,
     h('span', { class: 'grow' }),
-    h('button', { class: 'button', type: 'button', onclick: () => renderMain() }, t('cancel')),
+    h('button', {
+      class: 'button', type: 'button',
+      onclick: () => {
+        images.drop(Array.from(prepared));
+        renderMain();
+      }
+    }, t('cancel')),
     h('button', {
       class: 'button primary', type: 'button',
       onclick: async () => {
@@ -2016,6 +2629,13 @@ function editMessage(c, m, index, el) {
         if (compactions.has(c.id)) await compactions.get(c.id).catch(() => {});
         // A question sent meanwhile is being answered: the messages stay as they are.
         if (threadLocked() || state.current !== c) return;
+        // The images keep to the places of the context, which another tab may have taken meanwhile.
+        const pictures = attachments.filter((a) => a.kind === 'image');
+        const left = places();
+        if (pictures.length > left) {
+          toast(imageLimitText(pictures.slice(Math.max(0, left)).map((a) => a.name), left), true, 10000);
+          return;
+        }
         /*
             The documents no longer attached, to this question or to the questions after it,
             which leave with it, leave the search of the discussion, unless an earlier question
@@ -2023,9 +2643,15 @@ function editMessage(c, m, index, el) {
         */
         const kept = attachmentIds(c.messages.slice(0, index));
         for (const a of attachments) kept.add(a.id);
+        // The images of the questions that leave go too, unless a question kept or the edited one holds them.
+        const keptImages = imageIds(c.messages.slice(0, index));
+        for (const a of pictures) keptImages.add(a.id);
+        const gone = [];
         for (const x of c.messages.slice(index)) {
           for (const a of x.attachments || []) if (!kept.has(a.id) && a.mode === 'search') forgetDocument(c.id, a.id);
+          for (const img of x.images || []) if (!keptImages.has(img.id)) gone.push(img.id);
         }
+        images.remove(gone).catch(() => {});
         c.messages = c.messages.slice(0, index);
         if ((c.memoryMark || 0) > index) c.memoryMark = index;
         if ((c.contextStart || 0) > index) {
@@ -2037,11 +2663,10 @@ function editMessage(c, m, index, el) {
       }
     }, t('send'))));
   box.addEventListener('dragover', (e) => e.preventDefault());
-  box.addEventListener('drop', async (e) => {
+  box.addEventListener('drop', (e) => {
     e.preventDefault();
     if (!e.dataTransfer || !e.dataTransfer.files.length) return;
-    attachments = attachments.concat(await readFiles(Array.from(e.dataTransfer.files), c.role));
-    showChips();
+    add(Array.from(e.dataTransfer.files));
   });
   el.replaceChildren(box);
   area.focus();
@@ -2154,6 +2779,7 @@ function fillAssistant(bubble, m, live) {
   }
   if (m.compacted) note(h('span', { html: icon('info') }), t('contextCompacted'));
   else if (m.trimmed) note(h('span', { html: icon('info') }), t('contextTrimmed'));
+  if (m.imagesNamed) note(h('span', { html: icon('image') }), t('imagesNamed', { model: modelName(m.model) }));
   if (m.error) bubble.append(h('div', { class: 'error-box' }, t('errorPrefix', { message: m.error })));
   if (m.cancelled) note(t('cancelled'));
   if (!live && !m.error && !m.cancelled && !steps.some((s) => s.content || (s.toolCalls || []).length)) {
@@ -2276,11 +2902,13 @@ function renderComposerState() {
   ui.agentButton.disabled = !caps.tools;
   // With the agent on, the tools it may call show under the prompt.
   ui.agentTools.classList.toggle('hidden', !agent);
-  // The attachments the model of the function reads.
+  // The attachments the model of the function reads, the images while the context has places for them.
   const role = c ? c.role : 'general';
-  if (ui.fileInput) ui.fileInput.accept = acceptFor(role);
+  const room = imageRoom(c);
+  if (ui.fileInput) ui.fileInput.accept = acceptFor(role, room);
   if (ui.attachButton) {
-    const hint = t('attachInputs', { inputs: inputsLabel(roleInputs(role)) });
+    let hint = t('attachInputs', { inputs: inputsLabel(roleInputs(role)) });
+    if (readsImages(role)) hint += ' · ' + t('imagePlaces', { left: room, max: maxContextImages });
     ui.attachButton.title = hint;
     ui.attachButton.setAttribute('aria-label', hint);
   }
@@ -2293,11 +2921,23 @@ function renderComposerState() {
   ui.sendButton.disabled = sendDisabled();
   const p = c && c.projectId ? projectById(c.projectId) : null;
   ui.input.placeholder = p ? t('placeholderProject', { project: p.name }) : t('placeholder');
-  ui.pendingBox.replaceChildren(...state.pending.map((a) => attachmentChip(a, true, () => {
-    state.pending = state.pending.filter((x) => x !== a);
-    renderComposerState();
-  })));
+  // The images waiting, then the documents; the images show how many the context holds with them.
+  const pictures = state.pending.filter((a) => a.kind === 'image');
+  const count = pictures.length ? maxContextImages - room : 0;
+  ui.pendingBox.replaceChildren(...pictures.map((a) => imageThumb(a, { list: pictures, onremove: () => removePending(a) })),
+    ...state.pending.filter((a) => a.kind !== 'image').map((a) => attachmentChip(a, true, () => removePending(a))),
+    pictures.length ? h('span', { class: 'image-count', title: t('imageCountTitle', { n: count, max: maxContextImages }) },
+      count + ' / ' + maxContextImages) : null);
   ui.pendingBox.classList.toggle('hidden', !state.pending.length);
+}
+
+// Takes an attachment out of the composer; the places of an image go back to the context.
+function removePending(a) {
+  state.pending = state.pending.filter((x) => x !== a);
+  if (a.kind === 'image') images.drop([a.id]);
+  renderComposerState();
+  lockThread();
+  if (ui.input) ui.input.focus();
 }
 
 /*
@@ -2316,10 +2956,29 @@ function autoGrow() {
   ui.sendButton.disabled = sendDisabled();
 }
 
+/*
+    Adds files to the composer of the discussion shown, the images within the places its context
+    has left.  The files read while another discussion took its place are forgotten.
+*/
 async function addPending(files) {
-  const added = await readFiles(files, state.current ? state.current.role : 'general');
+  const c = state.current;
+  let added = await readFiles(files, c ? c.role : 'general', imageRoom(c));
+  if (state.current !== c) {
+    images.drop(added.filter((a) => a.kind === 'image').map((a) => a.id));
+    return;
+  }
+  // Two additions read together keep to the places as well.
+  const room = imageRoom(c);
+  const pictures = added.filter((a) => a.kind === 'image');
+  if (pictures.length > room) {
+    const extra = pictures.slice(room);
+    images.drop(extra.map((a) => a.id));
+    added = added.filter((a) => !extra.includes(a));
+    toast(imageLimitText(extra.map((a) => a.name), 0), true, 10000);
+  }
   state.pending = state.pending.concat(added);
   renderComposerState();
+  lockThread();
 }
 
 function stopGeneration() {
@@ -2329,6 +2988,13 @@ function stopGeneration() {
 async function onSend() {
   if (state.busy) { stopGeneration(); return; }
   if (sendDisabled()) return;
+  // The images keep to the places of the context, which another tab may have taken meanwhile.
+  const pictures = state.pending.filter((a) => a.kind === 'image');
+  const left = maxContextImages - contextImages(state.current);
+  if (pictures.length > left) {
+    toast(imageLimitText(pictures.slice(Math.max(0, left)).map((a) => a.name), left), true, 10000);
+    return;
+  }
   const text = ui.input.value.trim();
   const attachments = state.pending;
   state.pending = [];
@@ -2364,7 +3030,12 @@ async function sendMessage(text, attachments) {
   const c = state.current;
   if (state.busy || answeredElsewhere(c)) return;
   const abort = beginTurn(c);
-  const m = { id: store.uid(), role: 'user', content: text, attachments: attachments || [], created: Date.now() };
+  const all = attachments || [];
+  const m = {
+    id: store.uid(), role: 'user', content: text, attachments: all.filter((a) => a.kind !== 'image'), created: Date.now()
+  };
+  const pictures = all.filter((a) => a.kind === 'image').map(imageRecord);
+  if (pictures.length) m.images = pictures;
   // The update of the memory gives way to the question, and comes back once the user is quiet.
   if (memoryAbort) memoryAbort.abort();
   c.messages.push(m);
@@ -2386,9 +3057,11 @@ async function sendMessage(text, attachments) {
   const turn = newTurn(c);
   turn.preparing = true;
   try {
-    // The question is saved before its documents are indexed (pruneIndex).
+    // The question is saved before its documents are indexed (pruneIndex) and before its images are stored
+    // (pruneImages).
     renderMain();
     await persist(c);
+    await keepImages(c, pictures);
     if (!c.incognito && state.current === c && location.hash !== '#/c/' + c.id) history.replaceState(null, '', '#/c/' + c.id);
     refreshViews();
     await prepareQuestion(c, m, abort.signal);
@@ -2441,8 +3114,16 @@ async function prepareQuestion(c, m, signal) {
     }
   }
   const p = c.projectId ? projectById(c.projectId) : null;
+  // The descriptions of the images of the project are searched, even when its documents are read whole.
+  const pictures = new Map(((p && p.images) || []).map((x) => [x.id, x]));
+  let skip = null;
   if (p && knowledgeMode(p, contextTokens) === 'search') owners.unshift(p.id);
+  else if (p && pictures.size) {
+    owners.unshift(p.id);
+    skip = new Set((p.files || []).map((f) => f.id));
+  }
   m.context = '';
+  delete m.projectImages;
   if (!owners.length) return;
   // A short question takes the previous one with it: "and in 2025?" is searched with what
   // it continues.
@@ -2453,10 +3134,15 @@ async function prepareQuestion(c, m, signal) {
   }
   if (!question.trim()) question = (m.attachments || []).map((a) => a.name).join(' ');
   try {
-    const hits = await rag.search(owners, question, { budget: Math.floor(excerptShare * contextTokens * 3.6), signal });
+    const hits = await rag.search(owners, question, { budget: Math.floor(excerptShare * contextTokens * 3.6), signal, skip });
     if (hits.length) {
-      m.context = '<excerpts>\n' + hits.map((x) => '<excerpt document="' + x.name + '"'
-        + (x.where ? ' location="' + x.where + '"' : '') + '>\n' + x.text + '\n</excerpt>').join('\n') + '\n</excerpts>';
+      m.context = '<excerpts>\n' + hits.map((x) => (pictures.has(x.doc) ? '<excerpt image="' + x.name + '"'
+        : '<excerpt document="' + x.name + '"' + (x.where ? ' location="' + x.where + '"' : '')) + '>\n' + x.text
+        + '\n</excerpt>').join('\n') + '\n</excerpts>';
+      // The images whose descriptions were found come with the question, the most relevant first.
+      const found = hits.filter((x) => pictures.has(x.doc)).sort((a, b) => b.score - a.score)
+        .slice(0, maxQuestionProjectImages).map((x) => imageRecord(pictures.get(x.doc)));
+      if (found.length) m.projectImages = found;
     }
   } catch (e) {
     m.context = '';
@@ -2471,7 +3157,7 @@ async function prepareQuestion(c, m, signal) {
 async function searchDocumentsOf(c, query, limit) {
   const owners = [];
   const p = c.projectId ? projectById(c.projectId) : null;
-  if (p && (p.files || []).length) owners.push(p.id);
+  if (p && ((p.files || []).length || (p.images || []).length)) owners.push(p.id);
   const whole = [];
   let searched = false;
   for (const m of c.messages) {
@@ -2492,6 +3178,7 @@ function documentsOf(c) {
   const docs = [];
   const p = c.projectId ? projectById(c.projectId) : null;
   if (p) for (const f of p.files || []) docs.push({ name: f.name, text: f.text });
+  if (p) for (const img of p.images || []) docs.push({ name: img.name, text: imageDocument(img).text });
   for (const m of c.messages) if (m.role === 'user') for (const a of m.attachments || []) docs.push({ name: a.name, text: a.text });
   return docs;
 }
@@ -2524,6 +3211,12 @@ function systemPrompt(c, contextTokens, agent) {
         + 'each question come with it, in <excerpts>; say so when they do not hold the answer.'
         + (agent ? ' Use search_documents, document_outline and read_document to read more of them.' : ''));
     }
+    const pictures = p.images || [];
+    if (pictures.length) {
+      parts.push('Images of the project: ' + pictures.map((x) => x.name).join(', ') + '. The description of an image '
+        + 'comes with the questions it relates to, in <excerpt image="...">, and the image itself with it when you '
+        + 'read images.');
+    }
   }
   if (agent) parts.push(tools.agentInstructions);
   return parts.join('\n\n');
@@ -2548,22 +3241,69 @@ function userContent(m, cuts) {
   return s + cut(m.id, m.content || '');
 }
 
-function apiMessages(c, system, cuts) {
+// The parts of the requests that carry an image, with the description of the image, for the estimates of the fitting.
+const imageParts = new WeakMap();
+
+function imagePart(url, img) {
+  const part = { type: 'image_url', image_url: { url, detail: 'auto' } };
+  imageParts.set(part, img);
+  return part;
+}
+
+// The images of a list of messages the model receives, "message/position": the newest maxContextImages of them.
+function sentImages(messages) {
+  const out = new Set();
+  for (let i = messages.length - 1; i >= 0; --i) {
+    const list = messages[i].images || [];
+    for (let k = list.length - 1; k >= 0; --k) {
+      if (out.size >= maxContextImages) return out;
+      out.add(messages[i].id + '/' + k);
+    }
+  }
+  return out;
+}
+
+/*
+    The messages of a request.  media gives the images: read, whether the model reads images, and
+    url(id), the data URL of an image, null when this browser does not hold it.  The images of a
+    question go before its text, the newest maxContextImages of the discussion, and the images of
+    the project found for the last question come with it; a model that reads text only, a request
+    without media, and the images missing receive their names ("[Image: name]").
+*/
+function apiMessages(c, system, cuts, media) {
   const out = [];
   if (system) out.push({ role: 'system', content: system });
   // The exchanges before contextStart left the context in an earlier question; their summary
   // comes with the first question that stays.
   const start = c.contextStart || 0;
+  const messages = c.messages.slice(start);
+  const read = !!(media && media.read);
+  const sent = read ? sentImages(messages) : null;
+  let last = null;
+  for (const m of messages) if (m.role === 'user') last = m;
   let summary = start > 0 && c.summary && c.summary.text ? c.summary.text : '';
   if (summary && cuts && cuts.summary != null) summary = keepEnd(summary, cuts.summary);
-  for (const m of c.messages.slice(start)) {
+  for (const m of messages) {
     if (m.role === 'user') {
-      let content = userContent(m, cuts);
+      const parts = [];
+      const named = [];
+      (m.images || []).forEach((img, k) => {
+        const url = sent && sent.has(m.id + '/' + k) ? media.url(img.id) : null;
+        if (url != null) parts.push(imagePart(url, img));
+        else named.push('[Image: ' + img.name + ']');
+      });
+      if (read && m === last) {
+        for (const img of (m.projectImages || []).slice(0, maxQuestionProjectImages)) {
+          const url = media.url(img.id);
+          if (url != null) parts.push(imagePart(url, img));
+        }
+      }
+      let content = [named.join('\n'), userContent(m, cuts)].filter(Boolean).join('\n\n');
       if (summary) {
         content = '<summary_of_the_earlier_discussion>\n' + summary + '\n</summary_of_the_earlier_discussion>\n\n' + content;
         summary = '';
       }
-      out.push({ role: 'user', content });
+      out.push({ role: 'user', content: parts.length ? parts.concat(content ? [{ type: 'text', text: content }] : []) : content });
       continue;
     }
     for (const s of m.steps || []) {
@@ -2579,6 +3319,105 @@ function apiMessages(c, system, cuts) {
     }
   }
   return out;
+}
+
+/*
+    The images the request of a question of c carries, as data URLs read from their Blobs when it
+    is sent: those of the questions of its context and those of the project found for its last
+    question, for a model of role that reads images.  Returns {read, url(id)}, url giving null for
+    an image this browser does not hold.
+*/
+async function requestMedia(c, role) {
+  const read = readsImages(role);
+  const urls = new Map();
+  if (read) {
+    const ids = imageIds(c.messages.slice(c.contextStart || 0));
+    const questions = c.messages.filter((x) => x.role === 'user');
+    const last = questions[questions.length - 1];
+    for (const img of (last && last.projectImages) || []) ids.add(img.id);
+    for (const id of ids) urls.set(id, await images.dataUrl(id).catch(() => null));
+  }
+  return { read, url: (id) => urls.get(id) || null };
+}
+
+// The images of the estimates, which hold no data: the fitting weighs them by their tokens.
+function estimateMedia(role) {
+  return { read: readsImages(role), url: () => '' };
+}
+
+// The tokens of each image for a model, measured by the service: model -> Map(image -> tokens).
+const imageTokenCache = new Map();
+
+// The tokens of an image for a model, as measured, else from its size: one token per 32 by 32 pixels.
+function imageTokens(model, img) {
+  const known = imageTokenCache.get(model);
+  if (known && known.has(img.id)) return known.get(img.id);
+  return Math.ceil((img.width || 512) / 32) * Math.ceil((img.height || 512) / 32) + 2;
+}
+
+/*
+    Measures with the service the tokens of the images of a list of messages that it has not
+    measured yet for model: the tokens of a question that holds the image, less those of the same
+    question without it.  An image the service cannot count keeps its estimate.
+*/
+async function measureImages(model, list) {
+  let known = imageTokenCache.get(model);
+  if (!known) imageTokenCache.set(model, known = new Map());
+  const parts = [];
+  for (const m of list) {
+    if (!Array.isArray(m.content)) continue;
+    for (const part of m.content) {
+      const img = imageParts.get(part);
+      if (img && !known.has(img.id) && part.image_url.url) parts.push([img, part]);
+    }
+  }
+  if (!parts.length) return;
+  const base = await api.count(model, [{ role: 'user', content: '.' }]).catch(() => null);
+  if (!base || typeof base.tokens !== 'number') return;
+  for (const [img, part] of parts) {
+    if (known.has(img.id)) continue;
+    const r = await api.count(model, [{ role: 'user', content: [part, { type: 'text', text: '.' }] }]).catch(() => null);
+    if (r && typeof r.tokens === 'number') known.set(img.id, Math.max(1, r.tokens - base.tokens));
+  }
+}
+
+/*
+    The weight of a list of messages for the estimates of the fitting: {chars, tokens}, the
+    characters of its texts and the tokens of its images (imageTokens) for model.
+*/
+function weigh(list, model) {
+  let chars = 0;
+  let tokens = 0;
+  for (const m of list) {
+    if (!Array.isArray(m.content)) {
+      chars += JSON.stringify(m).length;
+      continue;
+    }
+    chars += JSON.stringify(Object.assign({}, m, { content: '' })).length;
+    for (const part of m.content) {
+      const img = imageParts.get(part);
+      if (img) tokens += imageTokens(model, img);
+      else chars += JSON.stringify(part).length;
+    }
+  }
+  return { chars, tokens };
+}
+
+/*
+    The estimate of the tokens of lists of messages, from a list measured at tokens: its images by
+    their tokens, its texts by their characters, scaled.  Returns {scale, of(list)}, scale giving
+    the tokens per character of the texts.
+*/
+function tokenEstimate(list, tokens, model) {
+  const w = weigh(list, model);
+  const scale = Math.max(0.02, (tokens - Math.min(w.tokens, 0.9 * tokens)) / Math.max(1, w.chars));
+  return {
+    scale,
+    of: (msgs) => {
+      const x = weigh(msgs, model);
+      return x.chars * scale + x.tokens;
+    }
+  };
 }
 
 // Where text may be cut: after the end of a sentence followed by a space, or a blank line.
@@ -2612,14 +3451,17 @@ function keepStart(text, max) {
   return head.slice(0, end).trim() + ' \u2026';
 }
 
-// The exchanges as plain text, for their summary: the questions with the names of their
-// documents, the answers without their reasoning, the results of the tools in short.
+// The exchanges as plain text, for their summary: the questions with their images named
+// ("[Image: name]") and the names of their documents, the answers without their reasoning, the
+// results of the tools in short.
 function transcriptOf(messages) {
   const lines = [];
   for (const m of messages) {
     if (m.role === 'user') {
       const docs = (m.attachments || []).map((a) => a.name);
-      lines.push('User: ' + (m.content || '') + (docs.length ? '\n(documents: ' + docs.join(', ') + ')' : ''));
+      const pictures = (m.images || []).map((img) => '[Image: ' + img.name + ']');
+      lines.push('User: ' + (pictures.length ? pictures.join(' ') + '\n' : '') + (m.content || '')
+        + (docs.length ? '\n(documents: ' + docs.join(', ') + ')' : ''));
       continue;
     }
     const parts = [];
@@ -2639,9 +3481,9 @@ function summaryInstructions(words) {
     + 'when there is one, together with the new exchanges, into a single summary that the assistant will read in '
     + 'place of these exchanges. Keep, in the order they came: the facts, figures, names, decisions and '
     + 'conclusions; the requests, preferences and constraints of the user; the code, commands and values that may '
-    + 'be needed again, in short; the documents by their names; the questions left open. Leave out greetings, '
-    + 'repetitions and reasoning. Write in the language of the latest exchanges, as a compact list of points, in at '
-    + 'most ' + words + ' words.';
+    + 'be needed again, in short; the documents and the images by their names; the questions left open. Leave out '
+    + 'greetings, repetitions and reasoning. Write in the language of the latest exchanges, as a compact list of '
+    + 'points, in at most ' + words + ' words.';
 }
 
 // A summary written by the background model from the previous one and a transcript.
@@ -2708,9 +3550,10 @@ const compactions = new Map();   // discussion -> its compression in the backgro
 /*
     The start of a discussion that leaves to the exchanges after it keptShare of the room of
     the context: the first question after the current start for which the conversation built
-    by build fits, the last question at most.  Returns -1 when no question can leave.
+    by build fits, its tokens given by estimate, the last question at most.  Returns -1 when no
+    question can leave.
 */
-function nextStart(c, build, scale, room) {
+function nextStart(c, build, estimate, room) {
   const from = c.contextStart || 0;
   const users = [];
   for (let i = from + 1; i < c.messages.length; ++i) if (c.messages[i].role === 'user') users.push(i);
@@ -2719,12 +3562,11 @@ function nextStart(c, build, scale, room) {
   const lastUser = c.messages.map((m) => m.role).lastIndexOf('user');
   const candidates = users.filter((i) => i <= lastUser);
   if (!candidates.length) return -1;
-  const size = (msgs) => msgs.reduce((n, m) => n + JSON.stringify(m).length, 0);
   const saved = c.contextStart;
   let next = candidates[candidates.length - 1];
   for (const i of candidates) {
     c.contextStart = i;
-    if (size(build()) * scale <= keptShare * room) {
+    if (estimate(build()) <= keptShare * room) {
       next = i;
       break;
     }
@@ -2755,21 +3597,25 @@ async function fitContext(c, build, toolDefs, reserve, signal, onCompact, model)
     await compactions.get(c.id).catch(() => {});
   }
   const cuts = { summary: null, texts: new Map() };
+  const counted = model || 'albireo-' + c.role;
   for (let attempt = 0; attempt < 12; ++attempt) {
     const list = build(cuts);
+    // The images the service has not measured yet for this model, once.
+    if (!attempt) await measureImages(counted, list);
     let r;
     try {
-      r = await api.count(model || 'albireo-' + c.role, list, toolDefs);
+      r = await api.count(counted, list, toolDefs);
     } catch (e) {
       return { messages: list, trimmed, compacted, context: 0 };
     }
     if (!r || typeof r.tokens !== 'number' || !r.context) return { messages: list, trimmed, compacted, context: 0 };
     const room = r.context - Math.min(reserve, Math.floor(r.context / 2));
     if (r.tokens <= room) return { messages: list, trimmed, compacted, context: r.context, tokens: r.tokens };
-    // The tokens of a list of messages, from their characters scaled to the measure.
-    const size = (msgs) => msgs.reduce((n, m) => n + JSON.stringify(m).length, 0);
-    const scale = r.tokens / Math.max(1, size(list));
-    const next = nextStart(c, () => build(cuts), scale, room);
+    // The tokens of a list of messages: its images by their tokens, its texts from their characters scaled to the
+    // measure.
+    const estimate = tokenEstimate(list, r.tokens, counted);
+    const scale = estimate.scale;
+    const next = nextStart(c, () => build(cuts), estimate.of, room);
     if (next > (c.contextStart || 0)) {
       try {
         if (onCompact) onCompact();
@@ -2898,6 +3744,14 @@ async function runTurn(c, abort, turn) {
     else scheduleRender(c, turn);
     if (signal.aborted) throw new DOMException('The answer was stopped.', 'AbortError');
     if (!model) throw new Error(t('noModel'));
+    // The images of the context as data URLs for a model that reads them; a model that reads text only receives
+    // their names, which the discussion tells once.
+    const media = await requestMedia(c, role);
+    if (!media.read && contextImages(c) && !c.imagesNamed) {
+      c.imagesNamed = true;
+      turn.imagesNamed = true;
+      toast(t('imagesNamed', { model: modelName(model) }), false, 9000);
+    }
     for (let step = 0; step < maxAgentSteps; ++step) {
       const s = { reasoning: '', content: '', toolCalls: [] };
       turn.steps.push(s);
@@ -2905,7 +3759,7 @@ async function runTurn(c, abort, turn) {
       // The conversation, with the steps of this answer already done (the agent's).
       const build = (cuts) => apiMessages(Object.assign({}, c, {
         messages: c.messages.slice(0, -1).concat([Object.assign({}, turn, { steps: turn.steps.slice(0, -1) })])
-      }), system, cuts);
+      }), system, cuts, media);
       const fitted = await fitContext(c, build, toolDefs, state.settings.maxTokens || 2048, signal, () => {
         turn.compacting = true;
         scheduleRender(c, turn);
@@ -3435,7 +4289,7 @@ function errorText(e) {
 
 // The title of a discussion until the model names it: the beginning of its first question.
 function provisionalTitle(m) {
-  const first = m.content || ((m.attachments || [])[0] || {}).name || t('untitled');
+  const first = m.content || ((m.attachments || [])[0] || (m.images || [])[0] || {}).name || t('untitled');
   return first.replace(/\s+/g, ' ').slice(0, 70);
 }
 
@@ -3576,8 +4430,8 @@ async function nameConversation(c) {
         if (!needsTitle(now)) return;
         if (!serviceReady()) continue;
         const first = now.messages.find((m) => m.role === 'user');
-        const question = keepStart((first.content || '') + ((first.attachments || []).length
-          ? '\n(' + first.attachments.map((a) => a.name).join(', ') + ')' : ''), 1500);
+        const names = (first.attachments || []).concat(first.images || []).map((a) => a.name);
+        const question = keepStart((first.content || '') + (names.length ? '\n(' + names.join(', ') + ')' : ''), 1500);
         let title = '';
         try {
           title = await askTitle(question);
@@ -3632,16 +4486,16 @@ function compactLater(c, turn) {
   const used = (turn.promptTokens || 0) + ((turn.usage && turn.usage.completion_tokens) || 0);
   if (used < compactShare * room) return;
   const system = systemPrompt(c, context, !!(c.agent && roleCapabilities(c.role).tools));
-  const build = () => apiMessages(c, system);
-  const size = build().reduce((n, m) => n + JSON.stringify(m).length, 0);
-  const scale = used / Math.max(1, size);
+  const media = estimateMedia(c.role);
+  const build = () => apiMessages(c, system, null, media);
+  const estimate = tokenEstimate(build(), used, 'albireo-' + c.role);
   // The questions after the start, the last one included: the next question comes after it.
   const saved = c.messages;
   c.messages = saved.concat([{ id: 'next', role: 'user', content: '' }]);
-  const next = nextStart(c, build, scale, room);
+  const next = nextStart(c, build, estimate.of, room);
   c.messages = saved;
   if (next <= (c.contextStart || 0)) return;
-  const job = compact(c, c.contextStart || 0, next, room, scale, null)
+  const job = compact(c, c.contextStart || 0, next, room, estimate.scale, null)
     .then(async (r) => {
       // The summary goes to the discussion as it is now, when its compressed messages are
       // still the same.
@@ -3650,6 +4504,12 @@ function compactLater(c, turn) {
       if (!now || !last || last.id !== r.last || (now.contextStart || 0) > r.to) return;
       applyCompaction(now, r);
       await persist(now);
+      // The images of the exchanges summarized left the context: their places go to new ones.
+      if (state.current === now) {
+        markOutside();
+        renderComposerState();
+        lockThread();
+      }
     })
     .catch(() => {})
     .finally(() => compactions.delete(c.id));
@@ -3878,13 +4738,23 @@ function dataTab(body, close) {
       await syncLists();
       toast(t('imported', { n: r.conversations, p: r.projects }));
       indexProjects();
+      describePending();
     } catch (e) {
       toast(t('importFailed'), true);
     }
     input.value = '';
   });
   const storage = h('div', { class: 'storage-state' });
-  body.append(h('p', null, t('storageUsage', { n: state.conversations.length, p: state.projects.length })), storage,
+  // The discussions, the projects and the images stored, with the room the images take.
+  const stored = h('p', { class: 'storage-usage' });
+  const showUsage = (u) => {
+    stored.textContent = t('storageUsage', {
+      n: state.conversations.length, p: state.projects.length, i: u.count, size: formatSize(u.bytes)
+    });
+  };
+  showUsage({ count: 0, bytes: 0 });
+  images.usage().then(showUsage).catch(() => {});
+  body.append(stored, storage,
     h('div', { class: 'buttons' },
       h('button', {
         class: 'button', type: 'button', html: icon('download') + '<span>' + escapeHtml(t('exportAll')) + '</span>',
@@ -3910,6 +4780,7 @@ function dataTab(body, close) {
           if (state.busy) stopGeneration();
           cancelIndex();
           rag.removeAll();
+          images.removeAll();
           await store.clearAll().catch(storageFailed);
           broadcast({ type: 'cleared' });
           await reloadLists().catch(storageFailed);
@@ -4042,6 +4913,7 @@ const programTexts = {
   'albireo.txt': ['albireo', 'Boost Software License 1.0'], 'dlib.txt': ['dlib', 'Boost Software License 1.0'],
   'mbedtls.txt': ['mbedtls', 'Apache License 2.0 or GPL 2.0 or later'], 'cpp-httplib.txt': ['httplib', 'MIT License'],
   'zlib.txt': ['zlib', 'zlib License'], 'sqlite.txt': ['sqlite', null],
+  'libpng.txt': ['libpng', 'PNG Reference Library License 2'], 'libjpeg.txt': ['libjpeg', 'IJG License'],
   'openvino-license.txt': ['openvino', 'Apache License 2.0'], 'cuda-eula.txt': ['cuda', 'NVIDIA CUDA EULA'],
   'cudnn-license.txt': ['cudnn', 'NVIDIA cuDNN License Agreement']
 };
@@ -4182,6 +5054,7 @@ function buildLayout() {
     onclick: () => {
       state.incognito = !state.incognito;
       if (state.busy) stopGeneration();
+      forgetIncognito();
       state.current = newConversation(null);
       state.view = 'chat';
       if (location.hash !== '#/') history.pushState(null, '', '#/');
@@ -4216,7 +5089,7 @@ function buildLayout() {
     }
   });
   ui.input.addEventListener('paste', (e) => {
-    const files = Array.from(e.clipboardData ? e.clipboardData.files : []);
+    const files = pastedFiles(e);
     if (files.length) { e.preventDefault(); addPending(files); }
   });
   const fileInput = h('input', { type: 'file', multiple: true, class: 'hidden' });
@@ -4306,7 +5179,11 @@ async function init() {
   // The documents that have passages, listed before the lists are read (pruneIndex), which
   // prunes them only once the lists are read whole.
   const indexed = state.incognito ? [] : await store.chunkDocuments().catch(() => []);
-  if (await reloadLists().then(() => true, () => false)) pruneIndex(indexed).catch(() => {});
+  const pictures = state.incognito ? [] : await store.imageKeys().catch(() => []);
+  if (await reloadLists().then(() => true, () => false)) {
+    pruneIndex(indexed).catch(() => {});
+    pruneImages(pictures).catch(() => {});
+  }
   buildLayout();
   window.addEventListener('hashchange', route);
   await route();
@@ -4318,6 +5195,7 @@ async function init() {
   */
   rememberLater();
   namePending();
+  describePending();
   // A tab that closes gives back the lease of the memory and tells that it no longer answers.
   window.addEventListener('pagehide', () => {
     if (memoryRunning) releaseMemoryLease().catch(() => {});

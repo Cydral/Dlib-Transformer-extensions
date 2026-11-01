@@ -33,10 +33,11 @@ namespace albireo
                 The numerical path follows the reference implementations of the
                 supported families: pre-normalization residual blocks with RMS norms,
                 grouped-query attention with rotary positions (consecutive pairs or
-                halves, with linear, YaRN or llama 3 frequency adjustments), optional QKV
-                biases and per-head QK normalization, SwiGLU feed-forward blocks or
-                mixtures of SwiGLU experts, and the global scale factors of the families
-                that declare them.
+                halves, with linear, YaRN, llama 3 or LongRoPE frequency adjustments),
+                optional QKV biases and per-head QK normalization, SwiGLU feed-forward
+                blocks or mixtures of SwiGLU experts, and the global scale factors of the
+                families that declare them.  The fused matrices of phi3 (attn_qkv, and
+                ffn_up with the gate) are used as row ranges, one product per range.
 
                 Attention runs over the paged keys of each sequence directly, by tiles: a
                 task takes the heads that share one key/value head for up to tile_rows
@@ -48,6 +49,13 @@ namespace albireo
 
                 With a matmul_offload, the products with the weight matrices go through it,
                 and it decides, product by product, whether a device computes them.
+
+                A batch that gives the rotary positions of its tokens (forward_batch::
+                positions) rotates each pair of a head by the position component its
+                section names (model_config::rope_sections), and the rows it gives as
+                embeddings take them in place of the embedding table, their DeepStack
+                slices being added to their hidden states after the first layers.  A batch
+                without them runs the path of the text models unchanged.
         !*/
     public:
         cpu_runtime(std::shared_ptr<model_file> file, const model_config& config, thread_pool& pool,
@@ -82,6 +90,15 @@ namespace albireo
         // Hands the products of the following passes to a device.
         void set_offload(std::unique_ptr<matmul_offload> offload) { offload_ = std::move(offload); }
 
+        /*!
+            requires
+                - no forward pass has run, or the rotary divisors stay the same.
+            ensures
+                - Chooses the rotary divisors of a model with LongRoPE for sequences of up to
+                  positions tokens (select_rope_factors()).
+        !*/
+        void set_context(long positions);
+
         const std::vector<float>& hidden() const override { return hidden_out_; }
 
     private:
@@ -115,6 +132,15 @@ namespace albireo
         void rms_norm_rows(const float* x, const float* gamma, float* y, long rows, long width, float eps);
         void ensure_rope(long positions);
         void apply_rope(float* rows, long n_rows, long n_heads, const std::vector<long>& positions);
+        // The rotation of the tokens of a batch that gives their positions: the cosines and
+        // sines of every pair of each token, gathered once per pass (prepare_given_positions),
+        // then applied to the queries and keys of every layer.
+        void prepare_given_positions(const forward_batch& batch, long T);
+        void apply_given_rope(float* rows, long n_rows, long n_heads);
+        // The rows of the batch that come from an encoder: their embeddings, and the slice of
+        // a DeepStack layer added after it.
+        void check_given_embeddings(const forward_batch& batch, long T) const;
+        void add_given_embeddings(const forward_batch& batch, long slice);
         void attention(long layer, const forward_batch& batch, const std::vector<long>& positions);
         void moe_ffn(const layer& L, long n_tokens);
         void embed(const std::vector<int>& tokens);
@@ -138,6 +164,10 @@ namespace albireo
         // Rotary tables: cos and sin for every position computed so far.
         std::vector<float> rope_cos_, rope_sin_;
         long rope_positions_ = 0;
+        // The position component of each rotary pair (0 time, 1 row, 2 column), and the
+        // cosines and sines of the tokens of a batch that gives their positions.
+        std::vector<int> pair_component_;
+        std::vector<float> given_cos_, given_sin_;
 
         // Work buffers, reused from one pass to the next.
         aligned_floats x_, xn_, q_, k_, v_, ctx_, tmp_, gate_, up_;

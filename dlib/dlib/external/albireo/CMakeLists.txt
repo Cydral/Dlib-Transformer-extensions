@@ -124,15 +124,44 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
    set(ALBIREO_WARNINGS -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers)
 endif()
 
+# zlib from dlib/external, for the programs and the image decoders of the engines.
+set(zlib_dir ${ALBIREO_DLIB_DIR}/external/zlib)
+add_library(albireo_zlib STATIC ${zlib_dir}/adler32.c ${zlib_dir}/compress.c ${zlib_dir}/crc32.c
+   ${zlib_dir}/deflate.c ${zlib_dir}/infback.c ${zlib_dir}/inffast.c ${zlib_dir}/inflate.c ${zlib_dir}/inftrees.c
+   ${zlib_dir}/trees.c ${zlib_dir}/uncompr.c ${zlib_dir}/zutil.c)
+target_include_directories(albireo_zlib PUBLIC ${zlib_dir})
+
+# The PNG and JPEG decoders of the engines, which read the images of the requests: the copies
+# of libpng and libjpeg that dlib bundles, compiled into every engine, whatever the system holds.
+set(png_dir ${ALBIREO_DLIB_DIR}/external/libpng)
+set(jpeg_dir ${ALBIREO_DLIB_DIR}/external/libjpeg)
+add_library(albireo_image STATIC
+   ${png_dir}/png.c ${png_dir}/pngerror.c ${png_dir}/pngget.c ${png_dir}/pngmem.c ${png_dir}/pngpread.c
+   ${png_dir}/pngread.c ${png_dir}/pngrio.c ${png_dir}/pngrtran.c ${png_dir}/pngrutil.c ${png_dir}/pngset.c
+   ${png_dir}/pngtrans.c ${png_dir}/pngwio.c ${png_dir}/pngwrite.c ${png_dir}/pngwtran.c ${png_dir}/pngwutil.c
+   ${jpeg_dir}/jaricom.c ${jpeg_dir}/jcomapi.c ${jpeg_dir}/jdapimin.c ${jpeg_dir}/jdapistd.c ${jpeg_dir}/jdarith.c
+   ${jpeg_dir}/jdatasrc.c ${jpeg_dir}/jdcoefct.c ${jpeg_dir}/jdcolor.c ${jpeg_dir}/jddctmgr.c ${jpeg_dir}/jdhuff.c
+   ${jpeg_dir}/jdinput.c ${jpeg_dir}/jdmainct.c ${jpeg_dir}/jdmarker.c ${jpeg_dir}/jdmaster.c ${jpeg_dir}/jdmerge.c
+   ${jpeg_dir}/jdpostct.c ${jpeg_dir}/jdsample.c ${jpeg_dir}/jerror.c ${jpeg_dir}/jidctflt.c ${jpeg_dir}/jidctfst.c
+   ${jpeg_dir}/jidctint.c ${jpeg_dir}/jmemmgr.c ${jpeg_dir}/jmemnobs.c ${jpeg_dir}/jquant1.c ${jpeg_dir}/jquant2.c
+   ${jpeg_dir}/jutils.c)
+target_include_directories(albireo_image PRIVATE ${png_dir} ${jpeg_dir})
+target_link_libraries(albireo_image PUBLIC albireo_zlib)
+# Compiled into the shared engines, whose own symbols alone are visible.
+set_target_properties(albireo_zlib albireo_image PROPERTIES POSITION_INDEPENDENT_CODE ON
+   C_VISIBILITY_PRESET hidden)
+
 # Inference engines.
 set(ALBIREO_ENGINE_SOURCES
    engine/chat_format.cpp
    engine/cpu_runtime.cpp
    engine/engine.cpp
    engine/engine_api.cpp
+   engine/image_input.cpp
    engine/model_config.cpp
    engine/model_file.cpp
    engine/sampler.cpp
+   engine/vision_encoder.cpp
    common/system_info.cpp)
 
 # The instructions of the processor engines.  An engine of the AVX2 family is built for AVX2,
@@ -196,6 +225,7 @@ function(albireo_engine variant kernels)
    target_include_directories(${target} PRIVATE ${ALBIREO_INCLUDE_DIR})
    target_compile_definitions(${target} PRIVATE ALBIREO_ENGINE_BUILD ALBIREO_ENGINE_VARIANT="${variant}")
    target_compile_options(${target} PRIVATE ${ALBIREO_WARNINGS})
+   target_link_libraries(${target} PRIVATE albireo_image)
    set_target_properties(${target} PROPERTIES
       C_VISIBILITY_PRESET hidden CXX_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN ON
       LIBRARY_OUTPUT_DIRECTORY ${ALBIREO_ENGINE_DIR}
@@ -485,7 +515,7 @@ if (ALBIREO_ENGINE_DLIB)
 endif()
 
 if (ALBIREO_PROGRAMS)
-   # Libraries compiled into the programs: SQLite and zlib from dlib/external.
+   # Libraries compiled into the programs: SQLite and zlib (above) from dlib/external.
    add_library(albireo_sqlite STATIC ${ALBIREO_DLIB_DIR}/external/sqlite/sqlite3.c)
    target_include_directories(albireo_sqlite PUBLIC ${ALBIREO_DLIB_DIR}/external/sqlite)
    target_compile_definitions(albireo_sqlite PRIVATE SQLITE_THREADSAFE=1 SQLITE_DQS=0 SQLITE_DEFAULT_MEMSTATUS=0
@@ -494,12 +524,6 @@ if (ALBIREO_PROGRAMS)
    if (NOT WIN32)
       target_link_libraries(albireo_sqlite PUBLIC ${CMAKE_DL_LIBS} m)
    endif()
-
-   set(zlib_dir ${ALBIREO_DLIB_DIR}/external/zlib)
-   add_library(albireo_zlib STATIC ${zlib_dir}/adler32.c ${zlib_dir}/compress.c ${zlib_dir}/crc32.c
-      ${zlib_dir}/deflate.c ${zlib_dir}/infback.c ${zlib_dir}/inffast.c ${zlib_dir}/inflate.c ${zlib_dir}/inftrees.c
-      ${zlib_dir}/trees.c ${zlib_dir}/uncompr.c ${zlib_dir}/zutil.c)
-   target_include_directories(albireo_zlib PUBLIC ${zlib_dir})
 
    # Code shared by the service, the tray and the installer.
    add_library(albireo_common STATIC common/log.cpp common/platform.cpp common/system_info.cpp

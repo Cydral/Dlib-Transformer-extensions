@@ -109,6 +109,14 @@ namespace albireo
                   [THINK] for reasoning.
                 - llama3: Llama 3.x, with JSON tool calls.
                 - granite: Granite 3, with <|tool_call|> followed by a JSON list.
+                - granite4: Granite 4.2, ChatML with a system turn in every prompt, tool
+                  calls in the XML form (<function=name> and <parameter=key> elements in
+                  <tool_call>) and a reasoning closed at once by "<think></think>" when the
+                  request asks for none.
+                - phi: Phi-4-mini, each message between <|role|> and <|end|>.
+                - foundation-sec: Foundation-Sec-8B-Reasoning, turns opened by <|system|>,
+                  <|user|> and <|assistant|>, answers ended by the end of text token, and a
+                  reasoning the model always writes before its answer.
         !*/
     public:
         virtual ~chat_format() {}

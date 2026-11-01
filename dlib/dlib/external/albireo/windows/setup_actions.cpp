@@ -1122,6 +1122,36 @@ namespace setup
         }
     }
 
+    namespace
+    {
+        // A file of the models that come with an installer: the file of a model, or its projector.
+        struct builtin_file
+        {
+            std::string name;
+            std::string sha;
+            uint64_t size = 0;
+            int64_t offset = -1;
+        };
+
+        // The files a manifest of the models lists: each model file, then its projector when it has one.
+        std::vector<builtin_file> builtin_files(const json& manifest)
+        {
+            std::vector<builtin_file> out;
+            for (const auto& m : manifest["models"].elements())
+                for (const json* e : { &m, &m["projector"] })
+                {
+                    if (!e->is_object()) continue;
+                    builtin_file f;
+                    f.name = (*e)["file"].as_string();
+                    f.sha = (*e)["sha256"].as_string();
+                    f.size = static_cast<uint64_t>((*e)["size"].as_int(0));
+                    f.offset = (*e)["offset"].is_number() ? static_cast<int64_t>((*e)["offset"].as_int(-1)) : -1;
+                    out.push_back(f);
+                }
+            return out;
+        }
+    }
+
     builtin_overlay read_builtin_overlay(const std::string& installer)
     {
         builtin_overlay o;
@@ -1145,15 +1175,14 @@ namespace setup
             const uint64_t start = tail - t.overlay_size;
             std::string text(static_cast<size_t>(t.manifest_size), '\0');
             if (!read_at(f.get(), start + t.manifest_offset, &text[0], text.size())) break;
-            json manifest = json::parse_or_null(text);
+            const json manifest = json::parse_or_null(text);
             uint64_t total = 0;
             bool valid = manifest["models"].is_array();
-            for (const auto& m : manifest["models"].elements())
+            for (const builtin_file& b : builtin_files(manifest))
             {
-                const uint64_t at = static_cast<uint64_t>(m["offset"].as_int(-1));
-                const uint64_t length = static_cast<uint64_t>(m["size"].as_int(-1));
-                valid = valid && m["offset"].is_number() && m["size"].is_number() && at + length <= t.manifest_offset;
-                total += length;
+                valid = valid && b.offset >= 0 && b.size > 0
+                    && static_cast<uint64_t>(b.offset) + b.size <= t.manifest_offset;
+                total += b.size;
             }
             if (!valid) break;
             o.start = start;
@@ -1173,18 +1202,17 @@ namespace setup
             const json before = read_file(join_path(dir, builtin_manifest_name), text, 16u << 20)
                 ? json::parse_or_null(text) : json();
             std::map<std::string, std::string> had;
-            for (const auto& m : before["models"].elements()) had[m["file"].as_string()] = m["sha256"].as_string();
+            for (const builtin_file& b : builtin_files(before)) had[b.name] = b.sha;
             return had;
         }
 
         // Whether a model file of the installer is in place already, the same, and kept.
-        bool builtin_in_place(const std::map<std::string, std::string>& had, const std::string& dir, const json& m)
+        bool builtin_in_place(const std::map<std::string, std::string>& had, const std::string& dir,
+            const builtin_file& b)
         {
-            const std::string name = m["file"].as_string();
-            const std::string target = join_path(dir, name);
-            const auto it = had.find(name);
-            return it != had.end() && it->second == m["sha256"].as_string() && file_exists(target)
-                && file_size(target) == static_cast<uint64_t>(m["size"].as_int(0));
+            const std::string target = join_path(dir, b.name);
+            const auto it = had.find(b.name);
+            return it != had.end() && it->second == b.sha && file_exists(target) && file_size(target) == b.size;
         }
     }
 
@@ -1194,8 +1222,8 @@ namespace setup
         const std::string dir = join_path(program_dir, builtin_models_folder);
         const std::map<std::string, std::string> had = installed_builtin_models(dir);
         uint64_t bytes = 0;
-        for (const auto& m : o.manifest["models"].elements())
-            if (!builtin_in_place(had, dir, m)) bytes += static_cast<uint64_t>(m["size"].as_int(0));
+        for (const builtin_file& b : builtin_files(o.manifest))
+            if (!builtin_in_place(had, dir, b)) bytes += b.size;
         return bytes;
     }
 
@@ -1214,24 +1242,28 @@ namespace setup
             error = "cannot read " + installer;
             return false;
         }
+        // The manifest the installation keeps: the positions of the files in the installer leave it.
         json manifest = o.manifest;
+        for (auto& m : manifest["models"].elements())
+        {
+            m.erase("offset");
+            if (m.contains("projector")) m["projector"].erase("offset");
+        }
         std::set<std::string> names;
         uint64_t done = 0;
         std::vector<char> b(1u << 20);
-        for (auto& m : manifest["models"].elements())
+        for (const builtin_file& f : builtin_files(o.manifest))
         {
-            const std::string name = m["file"].as_string();
-            const uint64_t size = static_cast<uint64_t>(m["size"].as_int(0));
-            const std::string sha = m["sha256"].as_string();
-            const uint64_t at = o.start + static_cast<uint64_t>(m["offset"].as_int(0));
-            m.erase("offset");
+            const std::string& name = f.name;
+            const uint64_t size = f.size;
+            const uint64_t at = o.start + static_cast<uint64_t>(f.offset);
             if (name.empty() || name.find_first_of("/\\:") != std::string::npos || name.find("..") != std::string::npos)
             {
                 error = "invalid file name in the models of the installer: " + name;
                 return false;
             }
             names.insert(name);
-            if (builtin_in_place(had, dir, m))
+            if (builtin_in_place(had, dir, f))
             {
                 log("model " + name + ": already installed");
                 done += size;
@@ -1258,7 +1290,7 @@ namespace setup
                 return true;
             };
             if (!files.write(join_path(dir, name), copy, error)) return false;
-            if (hash.hex() != sha)
+            if (hash.hex() != f.sha)
             {
                 error = "the model " + name + " of the installer is damaged";
                 return false;

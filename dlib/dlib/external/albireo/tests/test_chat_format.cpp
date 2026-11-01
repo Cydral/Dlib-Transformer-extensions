@@ -32,7 +32,10 @@ namespace
     }
 
     // A byte-level vocabulary with the control tokens of ChatML and the markers of Qwen3.
-    dlib::hf_tokenizer tokenizer()
+    dlib::hf_tokenizer tokenizer(
+        const std::vector<std::string>& control = { "<|endoftext|>", "<|im_start|>", "<|im_end|>" },
+        const std::vector<std::string>& markers = { "<tool_call>", "</tool_call>", "<tool_response>",
+            "</tool_response>", "<think>", "</think>" })
     {
         dlib::hf_tokenizer::vocab_data v;
         v.family = dlib::hf_tokenizer::kind::bpe;
@@ -52,18 +55,21 @@ namespace
             v.tokens.push_back(s);
             v.types.push_back(dlib::hf_tokenizer::TT_NORMAL);
         }
-        for (const char* t : { "<|endoftext|>", "<|im_start|>", "<|im_end|>" })
+        for (const auto& t : control)
         {
             v.tokens.push_back(t);
             v.types.push_back(dlib::hf_tokenizer::TT_CONTROL);
         }
-        for (const char* t : { "<tool_call>", "</tool_call>", "<tool_response>", "</tool_response>", "<think>",
-            "</think>" })
+        for (const auto& t : markers)
         {
             v.tokens.push_back(t);
             v.types.push_back(dlib::hf_tokenizer::TT_USER_DEFINED);
         }
-        v.eos_id = 258;
+        for (size_t i = 0; i < control.size(); ++i)
+        {
+            if (control[i] == "<|begin_of_text|>") v.bos_id = 256 + static_cast<int>(i);
+            if (control[i] == "<|im_end|>" || control[i] == "<|end_of_text|>") v.eos_id = 256 + static_cast<int>(i);
+        }
         dlib::hf_tokenizer tok;
         tok.load(v);
         return tok;
@@ -237,6 +243,141 @@ int main()
         const std::string unfinished = "Here: <tool_call>{\"name\": \"calculator\", \"arguments\": {\"expr";
         const parsed q = read_all_ways(*f, opt, unfinished, "an unfinished call");
         expect(q.calls.empty() && q.content == unfinished, "unfinished call kept as text: " + q.content);
+    }
+
+    // A template that always opens the reasoning (the thinking variants of Qwen3 and Qwen3-VL).
+    {
+        const std::unique_ptr<chat_format> t = chat_format::detect(tok, "{{- '<|im_start|>assistant\\n<think>\\n' }}");
+        expect(t->supports_reasoning(), "thinking template detected");
+        std::vector<chat_message> m(1);
+        m[0].role = "user";
+        m[0].content = "Capital of France?";
+        render_options off;
+        expect(render(*t, m, off) == "<|im_start|>user\nCapital of France?<|im_end|>\n<|im_start|>assistant\n"
+            "<think>\n\n</think>\n\n", "an empty reasoning when the request asks for none");
+        render_options on;
+        on.reasoning = true;
+        expect(render(*t, m, on) == "<|im_start|>user\nCapital of France?<|im_end|>\n<|im_start|>assistant\n"
+            "<think>\n", "the reasoning opened by the prompt");
+        const parsed p = read_all_ways(*t, on, "\nThe capital is Paris.\n</think>\n\nParis.", "opened reasoning");
+        expect(p.reasoning == "The capital is Paris." && p.content == "Paris.", "reasoning then answer: "
+            + p.reasoning + " / " + p.content);
+        const parsed q = read_all_ways(*t, off, "Paris.", "no reasoning");
+        expect(q.reasoning.empty() && q.content == "Paris.", "answer without reasoning: " + q.content);
+    }
+
+    // Granite 4.2: ChatML with the XML form of the calls.
+    {
+        const std::unique_ptr<chat_format> g = chat_format::detect(tok,
+            "{{- '<tool_call>\\n<function=' ~ tool_call.name ~ '>\\n' -}}"
+            "{{- '<|im_start|>assistant\\n<think></think>' }}");
+        expect(std::string(g->name()) == "granite4" && g->supports_tools() && g->supports_reasoning(),
+            "Granite 4.2 detected");
+        render_options gopt;
+        gopt.tools = json::parse_or_null("[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", "
+            "\"description\": \"Weather of a city.\", \"parameters\": {\"type\": \"object\", \"properties\": "
+            "{\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"metric\": {\"type\": "
+            "\"boolean\"}}, \"required\": [\"city\"]}}}]");
+        std::vector<chat_message> m(6);
+        m[0].role = "system";
+        m[0].content = "You are a helpful assistant.";
+        m[1].role = "user";
+        m[1].content = "What is the weather in Paris?";
+        m[2].role = "assistant";
+        tool_call_data c;
+        c.id = "call_1";
+        c.name = "get_weather";
+        c.arguments = "{\"city\": \"Paris\", \"days\": 2, \"metric\": true}";
+        m[2].tool_calls.push_back(c);
+        m[3].role = "tool";
+        m[3].content = "{\"temperature\": 12}";
+        m[4].role = "assistant";
+        m[4].content = "It is 12 degrees in Paris.";
+        m[5].role = "user";
+        m[5].content = "And in Rome?";
+        // As the template of granite-4.2-3b-GGUF writes it.
+        const std::string expected = "<|im_start|>system\nYou are a helpful assistant.\n\n# Tools\n\nYou have access "
+            "to the following functions:\n\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Weather of a "
+            "city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, "
+            "\"days\": {\"type\": \"integer\"}, \"metric\": {\"type\": \"boolean\"}}, \"required\": [\"city\"]}}\n"
+            "</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n"
+            "<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n"
+            "<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple "
+            "lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow "
+            "the specified format: an inner <function=...></function> block must be nested within "
+            "<tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional "
+            "reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If "
+            "there is no function call available, answer the question like normal with your current knowledge and "
+            "do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWhat is the "
+            "weather in Paris?<|im_end|>\n<|im_start|>assistant\n<think></think>\n<tool_call>\n"
+            "<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=days>\n2\n</parameter>\n"
+            "<parameter=metric>\nTrue\n</parameter>\n</function>\n</tool_call>\n<|im_end|>\n<|im_start|>user\n"
+            "<tool_response>\n{\"temperature\": 12}\n</tool_response>\n<|im_end|>\n<|im_start|>assistant\n"
+            "<think></think>It is 12 degrees in Paris.<|im_end|>\n<|im_start|>user\nAnd in Rome?<|im_end|>\n"
+            "<|im_start|>assistant\n<think></think>";
+        const std::string got = render(*g, m, gopt);
+        expect(got == expected, "Granite 4.2 prompt:\n" + got);
+
+        const parsed p = read_all_ways(*g, gopt, "\n<tool_call>\n<function=get_weather>\n<parameter=city>\n123\n"
+            "</parameter>\n<parameter=days>\n3\n</parameter>\n<parameter=metric>\nFalse\n</parameter>\n</function>\n"
+            "</tool_call>", "an XML call");
+        expect(p.calls.size() == 1, "one XML call");
+        if (p.calls.size() == 1)
+            expect(p.calls[0].name == "get_weather" && p.calls[0].arguments ==
+                "{\"city\": \"123\", \"days\": 3, \"metric\": false}", "XML arguments typed: " + p.calls[0].arguments);
+        const parsed open = read_all_ways(*g, gopt, "<tool_call>\n<function=get_weather>\n<parameter=city>\nRome\n"
+            "</parameter>\n", "an XML call left open");
+        expect(open.calls.size() == 1 && open.content.empty(), "an XML call without its closing markers");
+        const std::string text = "Use <tool_call>no function</tool_call> here.";
+        const parsed none = read_all_ways(*g, gopt, text, "no XML call");
+        expect(none.calls.empty() && none.content == text, "text kept: " + none.content);
+    }
+
+    // Foundation-Sec-8B-Reasoning: <|system|>, <|user|>, <|assistant|> turns, an answer after the reasoning.
+    {
+        const dlib::hf_tokenizer ftok = tokenizer({ "<|begin_of_text|>", "<|end_of_text|>", "<|system|>",
+            "<|user|>", "<|assistant|>" }, { "<think>", "</think>" });
+        const std::string ftmpl = "{{ bos_token }}{%- if not has_system %}\n<|system|>\nYou are Metis.\n\n"
+            "{%- endif %}<|user|>\n<|assistant|>";
+        const std::unique_ptr<chat_format> f2 = chat_format::detect(ftok, ftmpl);
+        expect(std::string(f2->name()) == "foundation-sec" && f2->supports_reasoning(), "Foundation-Sec detected");
+        std::vector<chat_message> m(4);
+        m[0].role = "system";
+        m[0].content = "You are a security analyst.";
+        m[1].role = "user";
+        m[1].content = "What is XSS?";
+        m[2].role = "assistant";
+        m[2].content = "<think>\nThe user asks.\n</think>\n\nCross-site scripting is an injection.  ";
+        m[3].role = "user";
+        m[3].content = "Give an example.";
+        render_options fopt;
+        expect(render(*f2, m, fopt) == "<|begin_of_text|><|system|>\nYou are a security analyst.<|user|>\nWhat is "
+            "XSS?<|assistant|>Cross-site scripting is an injection.<|end_of_text|><|user|>\nGive an example."
+            "<|assistant|>", "Foundation-Sec prompt");
+        std::vector<chat_message> q(m.begin() + 3, m.end());
+        expect(render(*f2, q, fopt) == "<|begin_of_text|><|system|>\nYou are Metis.<|user|>\nGive an example."
+            "<|assistant|>", "the system prompt of the template");
+        const parsed p = read_all_ways(*f2, fopt, "\nThe user wants an example.</think>\n\n<script>", "reasoning");
+        expect(p.reasoning == "The user wants an example." && p.content == "<script>", "reasoning, answer: "
+            + p.reasoning + " / " + p.content);
+        const parsed r = read_all_ways(*f2, fopt, "<think>\nShort.\n</think>\nDone.", "reasoning opened again");
+        expect(r.reasoning == "Short." && r.content == "Done.", "opening marker written again: " + r.reasoning);
+    }
+
+    // Phi-4-mini.
+    {
+        const dlib::hf_tokenizer ptok = tokenizer({ "<|endoftext|>", "<|system|>", "<|user|>", "<|assistant|>",
+            "<|end|>" }, {});
+        const std::unique_ptr<chat_format> p = chat_format::detect(ptok,
+            "{{ '<|' + message['role'] + '|>' + message['content'] + '<|end|>' }}");
+        expect(std::string(p->name()) == "phi" && !p->supports_tools(), "Phi detected");
+        std::vector<chat_message> m(2);
+        m[0].role = "system";
+        m[0].content = "Be brief.";
+        m[1].role = "user";
+        m[1].content = "Hi";
+        render_options popt;
+        expect(render(*p, m, popt) == "<|system|>Be brief.<|end|><|user|>Hi<|end|><|assistant|>", "Phi prompt");
     }
 
     if (failures)

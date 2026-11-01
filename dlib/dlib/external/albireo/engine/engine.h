@@ -83,6 +83,8 @@ namespace albireo
     private:
         void run();
         bool step(const std::shared_ptr<loaded_model>& m, long budget);
+        // Runs a slice of the encoding of the image a prompt of m waits for.
+        void advance_encoding(loaded_model& m);
         uint64_t submit_embeddings(const std::shared_ptr<loaded_model>& m, const json& request, event_sink sink);
         void complete_part(loaded_model& m, request_state& r, const float* hidden);
         void end_job(embedding_job& job, const std::string& code, const std::string& message);

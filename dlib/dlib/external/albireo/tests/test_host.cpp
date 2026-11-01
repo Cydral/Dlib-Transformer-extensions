@@ -255,6 +255,9 @@ int main(int argc, char** argv)
         entry["name"] = "Base";
         entry["file"] = "base.gguf";
         entry["sha256"] = albireo::sha256_hex(own);
+        // The file of the catalog the build made it from.
+        const std::string source = blob(140000, 'o');
+        entry["source_sha256"] = albireo::sha256_hex(source);
         json listed = json::array();
         listed.push_back(entry);
         json manifest = json::object();
@@ -266,12 +269,26 @@ int main(int argc, char** argv)
         catalog["updated"] = "2026-10-30T00:00:00Z";
         json list = json::array();
         list.push_back(catalog_entry("base-albireo", newer, base_url + "/none.bin"));
+        list.push_back(catalog_entry("base", source, base_url + "/source.bin"));
         catalog["models"] = list;
         db.set_value("catalog", catalog.dump());
         const std::string models2 = albireo::join_path(work, "models-2");
         albireo::model_manager m(db, models2, "");
-        std::vector<std::string> removed;
+        std::vector<albireo::installed_model> removed;
         m.register_builtin(builtin, removed);
+
+        // The entry of the file the model of Albireo was made from: the model of Albireo stands for it.
+        const json view = m.overview("en");
+        bool listed_source = false, listed_builtin = false;
+        for (const auto& x : view["models"].elements())
+        {
+            listed_source = listed_source || x["id"].as_string() == "base";
+            listed_builtin = listed_builtin || x["id"].as_string() == "base-albireo";
+        }
+        check(!listed_source && listed_builtin, "the catalog entry a model of Albireo stands for is not listed");
+        albireo::user_error carried;
+        check(!m.start_download("base", carried) && carried.code == "builtin_installed",
+            "the download of the file a model of Albireo carries is refused");
 
         // The same content in the import folder: not copied, not recorded again, removed from the folder.
         const std::string copy = albireo::join_path(inbox, "base-albireo.gguf");

@@ -90,9 +90,12 @@ namespace dlib
             llama3,       // (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
             qwen2,        // the same with \p{N} one digit at a time (Qwen 2 and 3)
             qwen35,       // qwen2 with the marks \p{M} taken as letters (Qwen 3.5)
-            tekken        // [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|
+            tekken,       // [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|
                           // [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|
                           // \p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+  (Mistral)
+            gpt4o         // [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|
+                          // [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|
+                          // \p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+  (o200k: Phi 4 mini)
         };
 
         /*  The family of a tokenizer.ggml.pre name.  exact is false for the names this
@@ -112,6 +115,8 @@ namespace dlib
                 return pre_family::llama3;
             if (pre == "tekken")
                 return pre_family::tekken;
+            if (pre == "gpt-4o")
+                return pre_family::gpt4o;
             if (pre == "smollm" || pre == "starcoder" || pre == "command-r" || pre == "codeshell" ||
                 pre == "exaone" || pre == "minerva")
                 return pre_family::gpt2_digits;
@@ -285,11 +290,13 @@ namespace dlib
         {
             const size_t n = t.cp.size();
             if (t.cp[i] != '\'' || i + 1 >= n) return i;
-            const uint32_t a = any_case ? ascii_lower(t.cp[i + 1]) : t.cp[i + 1];
+            // The case folding of the expressions also maps the long s (U+017F) to s.
+            auto fold = [any_case](uint32_t c) { return !any_case ? c : c == 0x17F ? uint32_t('s') : ascii_lower(c); };
+            const uint32_t a = fold(t.cp[i + 1]);
             if (a == 's' || a == 't' || a == 'm' || a == 'd') return i + 2;
             if (i + 2 < n)
             {
-                const uint32_t b = any_case ? ascii_lower(t.cp[i + 2]) : t.cp[i + 2];
+                const uint32_t b = fold(t.cp[i + 2]);
                 if ((a == 'r' && b == 'e') || (a == 'v' && b == 'e') || (a == 'l' && b == 'l')) return i + 3;
             }
             return i;
@@ -376,13 +383,19 @@ namespace dlib
             return match_spaces_gpt2(t, i);
         }
 
-        // The tekken pattern at i.
-        inline size_t match_tekken(const cp_class_cache& t, size_t i)
+        /*  The tekken and gpt4o patterns at i, which split the letters by case: U is the
+            class [\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}] and W the class [\p{Ll}\p{Lm}\p{Lo}\p{M}],
+            which share the modifier and other letters and the marks.  gpt4o adds the
+            contractions of English, in any case, after the letters of the two first
+            alternatives, and takes up to three digits per piece where tekken takes one.  */
+        inline size_t match_cased(const cp_class_cache& t, size_t i, bool contractions, size_t max_digits)
         {
             using namespace hf_unicode;
             const size_t n = t.cp.size();
             auto upper = [&](size_t k) { const char_class c = t.cls[k]; return c == Lu || c == Lt || c == Lm || c == Lo || c == M; };
             auto lower = [&](size_t k) { const char_class c = t.cls[k]; return c == Ll || c == Lm || c == Lo || c == M; };
+            // (?i:'s|'t|'re|'ve|'m|'ll|'d)? after the letters that end at e.
+            auto suffix = [&](size_t e) { return contractions && e < n ? match_contraction(t, e, true) : e; };
             const bool lead = !is_nl(t.cp[i]) && !is_letter(t.cls[i]) && t.cls[i] != N;
 
             // [^\r\n\p{L}\p{N}]?U*W+ : the longest run of U that leaves a W after it.
@@ -399,7 +412,7 @@ namespace dlib
                     {
                         size_t e = k + 1;
                         while (e < n && lower(e)) ++e;
-                        return e;
+                        return suffix(e);
                     }
                 }
             }
@@ -413,10 +426,16 @@ namespace dlib
                     size_t e = s + 1;
                     while (e < n && upper(e)) ++e;
                     while (e < n && lower(e)) ++e;
-                    return e;
+                    return suffix(e);
                 }
             }
-            if (t.cls[i] == N) return i + 1;
+            // \p{N} or \p{N}{1,3}
+            if (t.cls[i] == N)
+            {
+                size_t e = i + 1;
+                while (e < n && e - i < max_digits && t.cls[e] == N) ++e;
+                return e;
+            }
             //  ?[^\s\p{L}\p{N}]+[\r\n/]*
             auto punct = [&](size_t k) { return !is_white_space(t.cp[k]) && !is_letter(t.cls[k]) && t.cls[k] != N; };
             const size_t s = (t.cp[i] == ' ' && i + 1 < n && punct(i + 1)) ? i + 1 : i;
@@ -473,7 +492,8 @@ namespace dlib
                 case pre_family::llama3: e = match_gpt4_style(t, i, 3, false); break;
                 case pre_family::qwen2: e = match_gpt4_style(t, i, 1, false); break;
                 case pre_family::qwen35: e = match_gpt4_style(t, i, 1, true); break;
-                case pre_family::tekken: e = match_tekken(t, i); break;
+                case pre_family::tekken: e = match_cased(t, i, false, 1); break;
+                case pre_family::gpt4o: e = match_cased(t, i, true, 3); break;
                 }
                 if (e <= i) e = i + 1;
                 pieces.emplace_back(t.off[i], t.off[e]);

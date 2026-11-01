@@ -58,9 +58,10 @@ namespace albireo
         const std::string a = c.arch;
 
         const bool llama_like = a == "llama" || a == "mistral" || a == "mistral3" || a == "granite";
-        const bool qwen_like = a == "qwen2" || a == "qwen3";
-        const bool moe_arch = a == "mixtral" || a == "granitemoe" || a == "qwen3moe";
-        if (!llama_like && !qwen_like && !moe_arch)
+        const bool qwen_like = a == "qwen2" || a == "qwen3" || a == "qwen3vl";
+        const bool moe_arch = a == "mixtral" || a == "granitemoe" || a == "qwen3moe" || a == "qwen3vlmoe";
+        const bool phi = a == "phi3";
+        if (!llama_like && !qwen_like && !moe_arch && !phi)
             throw std::runtime_error("the architecture '" + a + "' is not supported by this engine");
 
         if (!g.has(a + ".block_count") || !g.has(a + ".attention.head_count") || !g.has(a + ".embedding_length"))
@@ -98,7 +99,7 @@ namespace albireo
         if (c.rms_eps < 0) throw std::runtime_error("the model metadata holds a negative normalization epsilon");
 
         // Rotary embedding.
-        c.rope = qwen_like || a == "qwen3moe" ? rope_style::neox : rope_style::norm;
+        c.rope = qwen_like || a == "qwen3moe" || a == "qwen3vlmoe" || phi ? rope_style::neox : rope_style::norm;
         c.rope_dims = bounded_int(g, a + ".rope.dimension_count", c.head_dim, 0, max_head_dim);
         if (c.rope_dims <= 0 || c.rope_dims > c.head_dim || c.rope_dims % 2 != 0)
             throw std::runtime_error("unsupported rotary dimension count");
@@ -134,6 +135,57 @@ namespace albireo
         }
         f.optional_floats("rope_freqs.weight", static_cast<size_t>(c.rope_dims / 2), c.rope_freq_factors);
 
+        /*
+            LongRoPE: the divisors of the original context and those of a longer one, which
+            rope_freqs.weight overrides when a file holds both, as in llama.cpp; and the
+            magnitude of cos and sin, which llama.cpp applies to every architecture.
+        */
+        const size_t pairs = static_cast<size_t>(c.rope_dims / 2);
+        const bool short_factors = f.optional_floats("rope_factors_short.weight", pairs, c.rope_factors_short);
+        const bool long_factors = f.optional_floats("rope_factors_long.weight", pairs, c.rope_factors_long);
+        if (short_factors != long_factors)
+            throw std::runtime_error("the model holds one of rope_factors_short and rope_factors_long without the "
+                "other");
+        if (!c.rope_freq_factors.empty())
+        {
+            c.rope_factors_short.clear();
+            c.rope_factors_long.clear();
+        }
+        for (const std::vector<float>* set : { &c.rope_factors_short, &c.rope_factors_long })
+            for (float v : *set)
+                if (!(v > 0.0f) || !std::isfinite(v))
+                    throw std::runtime_error("the model holds an invalid LongRoPE divisor");
+        if (!c.rope_factors_long.empty())
+        {
+            c.rope_orig_ctx = bounded_int(g, a + ".rope.scaling.original_context_length", c.ctx_train, 1, max_context);
+            select_rope_factors(c, c.ctx_train);
+        }
+        c.rope_attn_factor = finite_double(g, a + ".rope.scaling.attn_factor", 1.0);
+        if (!(c.rope_attn_factor > 0.0))
+            throw std::runtime_error("the model metadata holds an invalid rotary attention factor");
+
+        if (a == "qwen3vl" || a == "qwen3vlmoe")
+        {
+            // Time, row and column sections of the rotary pairs, a fourth one unused, which
+            // cover the pairs of a head as the interleaved layout of the reference expects.
+            const std::string key = a + ".rope.dimension_sections";
+            if (!g.has(key) || !g.at(key).is_array() || g.at(key).arr_int.size() < 3 || g.at(key).arr_int.size() > 4)
+                throw std::runtime_error("the model metadata lacks the sections of its multimodal rotary positions");
+            const std::vector<int64_t>& s = g.at(key).arr_int;
+            int64_t sum = 0;
+            for (size_t k = 0; k < 3; ++k)
+            {
+                if (s[k] < 0 || s[k] > c.rope_dims / 2)
+                    throw std::runtime_error("the model metadata holds an invalid " + key);
+                sum += s[k];
+                c.rope_sections.push_back(static_cast<int>(s[k]));
+            }
+            if (sum != c.rope_dims / 2 || (s.size() == 4 && s[3] != 0))
+                throw std::runtime_error("the sections of the multimodal rotary positions do not cover the rotary "
+                    "pairs of a head");
+            c.n_deepstack = bounded_int(g, a + ".n_deepstack_layers", 0, 0, c.n_layers);
+        }
+
         c.attn_temp_scale = finite_double(g, a + ".attention.temperature_scale", 0.0);
         if (c.attn_temp_scale != 0.0)
         {
@@ -145,6 +197,8 @@ namespace albireo
         c.qkv_bias = f.has("blk.0.attn_q.bias");
         c.qk_norm = f.has("blk.0.attn_q_norm.weight");
         c.tied_embeddings = !f.has("output.weight");
+        c.fused_qkv = f.has("blk.0.attn_qkv.weight");
+        c.fused_gate_up = phi;
 
         if (a == "granite" || a == "granitemoe")
         {
@@ -181,6 +235,12 @@ namespace albireo
         return c;
     }
 
+    void select_rope_factors(model_config& c, long context)
+    {
+        if (c.rope_factors_long.empty()) return;
+        c.rope_freq_factors = context > c.rope_orig_ctx ? c.rope_factors_long : c.rope_factors_short;
+    }
+
     std::string describe(const model_config& c)
     {
         std::ostringstream o;
@@ -192,7 +252,14 @@ namespace albireo
           << ", rope " << (c.rope == rope_style::neox ? "neox" : "norm") << " base " << c.rope_base;
         if (c.yarn) o << " yarn x" << 1.0 / c.rope_freq_scale;
         else if (c.rope_freq_scale != 1.0) o << " linear x" << 1.0 / c.rope_freq_scale;
-        if (!c.rope_freq_factors.empty()) o << " with frequency factors";
+        if (c.rope_dims != c.head_dim) o << " on " << c.rope_dims << " dimensions";
+        if (!c.rope_factors_long.empty())
+            o << " longrope " << (c.rope_freq_factors == c.rope_factors_long ? "long" : "short") << " factors";
+        else if (!c.rope_freq_factors.empty()) o << " with frequency factors";
+        if (c.multimodal_rope())
+            o << ", multimodal rope sections " << c.rope_sections[0] << "/" << c.rope_sections[1] << "/"
+              << c.rope_sections[2] << " interleaved";
+        if (c.n_deepstack > 0) o << ", deepstack inputs at " << c.n_deepstack << " layers";
         if (c.qkv_bias) o << ", qkv bias";
         if (c.qk_norm) o << ", qk norm";
         if (c.tied_embeddings) o << ", tied embeddings";

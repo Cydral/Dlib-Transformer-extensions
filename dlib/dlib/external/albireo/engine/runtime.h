@@ -31,6 +31,21 @@ namespace albireo
                 last token of each segment that ends a prompt or continues a generation.
                 With hidden_only, the pass stops at their normalized hidden states, which
                 is what an embedding model returns.
+
+                positions, when it is not empty, holds the rotary positions of the tokens,
+                position_components values per token: time, row and column.  When it is
+                empty, every component of a token is the slot it takes in its sequence.
+                The models with multimodal rotary positions (model_config::rope_sections)
+                give the tokens of an image the rows and columns of its grid, so that their
+                positions run apart from their slots; the slots stay consecutive, and the
+                attention lets a token see the slots up to its own.  The other models
+                rotate by the time component.
+
+                embedding_rows lists the tokens whose input comes from an encoder instead
+                of the embedding table: the token at row embedding_rows[i] of the batch
+                reads config().input_width() floats from embeddings, starting at
+                i * config().input_width(), its embedding followed by the slices that a
+                model with DeepStack adds to its hidden state after its first layers.
         !*/
         struct segment
         {
@@ -39,10 +54,15 @@ namespace albireo
             long count = 0;
         };
 
+        static const long position_components = 3;
+
         std::vector<int> tokens;
         std::vector<segment> segments;
         std::vector<long> logit_rows;
         bool hidden_only = false;
+        std::vector<long> positions;
+        std::vector<long> embedding_rows;
+        std::vector<float> embeddings;
 
         void clear()
         {
@@ -50,6 +70,9 @@ namespace albireo
             segments.clear();
             logit_rows.clear();
             hidden_only = false;
+            positions.clear();
+            embedding_rows.clear();
+            embeddings.clear();
         }
     };
 

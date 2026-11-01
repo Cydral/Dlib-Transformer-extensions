@@ -794,6 +794,26 @@ namespace
               { "\xc2\xa0nbsp", "\xe3\x80\x80ideo", "\xe2\x80\x89thin" } },
             { hf_tok_impl::pre_family::tekken, "x  \n  y\n\n  \n z",
               { "x", "  \n", " ", " y", "\n\n  \n", " z" } },
+            { hf_tok_impl::pre_family::gpt4o, "Hello world! It's DON'T 'LL you'd",
+              { "Hello", " world", "!", " It's", " DON'T", " '", "LL", " you'd" } },
+            { hf_tok_impl::pre_family::gpt4o, "  two spaces, three   then\n\n\nnewlines \r\n tab\there  ",
+              { " ", " two", " spaces", ",", " three", "  ", " then", "\n\n\n", "newlines", " \r\n", " tab", "\there", "  " } },
+            { hf_tok_impl::pre_family::gpt4o, "camelCaseName HTTPServer iPhone XMLHttp \xc3\x89""COLE \xc3\x89""cole \xc7\x85""emal",
+              { "camel", "Case", "Name", " HTTPServer", " i", "Phone", " XMLHttp", " \xc3\x89""COLE", " \xc3\x89""cole", " \xc7\x85""emal" } },
+            { hf_tok_impl::pre_family::gpt4o, "Numbers 1234567 and 3.14, x2 \xe2\x85\xab \xc2\xbd \xc2\xb2",
+              { "Numbers", " ", "123", "456", "7", " and", " ", "3", ".", "14", ",", " x", "2", " ", "\xe2\x85\xab", " ", "\xc2\xbd", " ", "\xc2\xb2" } },
+            { hf_tok_impl::pre_family::gpt4o, "Ponctuation...!!! (x) [y] {z} a/b/c\n// comment\n",
+              { "Ponctuation", "...!!!", " (", "x", ")", " [", "y", "]", " {", "z", "}", " a", "/b", "/c", "\n", "//", " comment", "\n" } },
+            { hf_tok_impl::pre_family::gpt4o, "\xe4\xb8\xad\xe6\x96\x87\xe6\xa8\xa1\xe5\x9e\x8b\xe6\x8e\xa8\xe7\x90\x86\xef\xbc\x8c\xe3\x81\x93\xe3\x82\x93\xe3\x81\xab\xe3\x81\xa1\xe3\x81\xaf\xe3\x80\x82\xed\x95\x9c\xea\xb5\xad\xec\x96\xb4 \xd9\x85\xd8\xb1\xd8\xad\xd8\xa8\xd8\xa7 \xe0\xa4\xa8\xe0\xa4\xae\xe0\xa4\xb8\xe0\xa5\x8d\xe0\xa4\xa4\xe0\xa5\x87",
+              { "\xe4\xb8\xad\xe6\x96\x87\xe6\xa8\xa1\xe5\x9e\x8b\xe6\x8e\xa8\xe7\x90\x86", "\xef\xbc\x8c\xe3\x81\x93\xe3\x82\x93\xe3\x81\xab\xe3\x81\xa1\xe3\x81\xaf", "\xe3\x80\x82\xed\x95\x9c\xea\xb5\xad\xec\x96\xb4", " \xd9\x85\xd8\xb1\xd8\xad\xd8\xa8\xd8\xa7", " \xe0\xa4\xa8\xe0\xa4\xae\xe0\xa4\xb8\xe0\xa5\x8d\xe0\xa4\xa4\xe0\xa5\x87" } },
+            { hf_tok_impl::pre_family::gpt4o, "e\xcc\x81 a\xcc\x80\xcc\x88 \xcc\x81x Z\xcc\xb5lgo",
+              { "e\xcc\x81", " a\xcc\x80\xcc\x88", " \xcc\x81x", " Z\xcc\xb5lgo" } },
+            { hf_tok_impl::pre_family::gpt4o, "emoji \xf0\x9f\x98\x80\xf0\x9f\x9a\x80 ok \xf0\x9f\x91\x8d\xf0\x9f\x8f\xbd",
+              { "emoji", " \xf0\x9f\x98\x80\xf0\x9f\x9a\x80", " ok", " \xf0\x9f\x91\x8d\xf0\x9f\x8f\xbd" } },
+            { hf_tok_impl::pre_family::gpt4o, "\xc2\xa0nbsp\xe3\x80\x80ideo\xe2\x80\x89thin",
+              { "\xc2\xa0nbsp", "\xe3\x80\x80ideo", "\xe2\x80\x89thin" } },
+            { hf_tok_impl::pre_family::gpt4o, "x  \n  y\n\n  \n z",
+              { "x", "  \n", " ", " y", "\n\n  \n", " z" } },
         };
         std::vector<std::pair<size_t, size_t>> spans;
         for (const auto& c : cases)
@@ -810,6 +830,8 @@ namespace
         DLIB_TEST(hf_tok_impl::pre_family_of("qwen2", exact) == hf_tok_impl::pre_family::qwen2 && exact);
         DLIB_TEST(hf_tok_impl::pre_family_of("llama-bpe", exact) == hf_tok_impl::pre_family::llama3 && exact);
         DLIB_TEST(hf_tok_impl::pre_family_of("tekken", exact) == hf_tok_impl::pre_family::tekken && exact);
+        DLIB_TEST(hf_tok_impl::pre_family_of("gpt-4o", exact) == hf_tok_impl::pre_family::gpt4o && exact);
+        DLIB_TEST(hf_tok_impl::pre_family_of("granite-docling", exact) == hf_tok_impl::pre_family::gpt2 && exact);
         DLIB_TEST(hf_tok_impl::pre_family_of("smollm", exact) == hf_tok_impl::pre_family::gpt2_digits && exact);
         DLIB_TEST(hf_tok_impl::pre_family_of("unknown-vocab", exact) == hf_tok_impl::pre_family::qwen2 && !exact);
 

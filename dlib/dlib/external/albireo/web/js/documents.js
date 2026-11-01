@@ -726,11 +726,19 @@ async function drawsImage(doc, number, imageOps) {
   }
 }
 
+// The error of a PDF made of images, with its number of pages.
+function imagesError(pages) {
+  const e = new Error('pdf-images');
+  e.pages = pages;
+  return e;
+}
+
 /*
     The text of a PDF, one "## Page" part per page: {text, pages, unreadablePages}, the pages
     without readable text that draw images counted in unreadablePages.  A PDF none of whose
-    pages holds readable text throws "pdf-images" when it holds no text at all or when its
-    pages draw images, as a scan does, whose text lies in the pixels of its images.
+    pages holds readable text throws "pdf-images", with its number of pages in pages, when it
+    holds no text at all or when its pages draw images, as a scan does, whose text lies in the
+    pixels of its images.
 */
 async function pdfText(buffer) {
   const lib = await pdfLibrary();
@@ -774,12 +782,51 @@ async function pdfText(buffer) {
     // The operators of the pages are read only for the pages without text.
     let unreadable = 0;
     if (textless.length === pages.length) {
-      if (!chars) throw new Error('pdf-images');
-      for (const i of textless) if (await drawsImage(doc, i, imageOps)) throw new Error('pdf-images');
+      if (!chars) throw imagesError(doc.numPages);
+      for (const i of textless) if (await drawsImage(doc, i, imageOps)) throw imagesError(doc.numPages);
     } else {
       for (const i of textless) if (await drawsImage(doc, i, imageOps)) ++unreadable;
     }
     return { text: pages.join('\n\n'), pages: doc.numPages, unreadablePages: unreadable };
+  } finally {
+    await task.destroy();
+  }
+}
+
+/*
+    Draws the first pages of a PDF, limit of them at most, each in a canvas whose longest side
+    is side pixels, on a white page: {canvases, pages}, pages counting all the pages of the
+    file.  The pages of a scan become images this way, for a model that reads them.
+*/
+export async function pdfPages(file, side, limit) {
+  const lib = await pdfLibrary();
+  const task = lib.getDocument({
+    data: new Uint8Array(await file.arrayBuffer()), cMapUrl: pdfjsFolder + 'cmaps/', cMapPacked: true,
+    useSystemFonts: true, useWasm: false, verbosity: lib.VerbosityLevel.ERRORS
+  });
+  try {
+    let doc;
+    try {
+      doc = await task.promise;
+    } catch (e) {
+      throw pdfOpenError(e);
+    }
+    const canvases = [];
+    for (let i = 1; i <= Math.min(doc.numPages, limit); ++i) {
+      const page = await doc.getPage(i);
+      try {
+        const base = page.getViewport({ scale: 1 });
+        const viewport = page.getViewport({ scale: side / Math.max(base.width, base.height) });
+        const canvas = document.createElement('canvas');
+        canvas.width = Math.max(1, Math.round(viewport.width));
+        canvas.height = Math.max(1, Math.round(viewport.height));
+        await page.render({ canvas, viewport, background: '#ffffff' }).promise;
+        canvases.push(canvas);
+      } finally {
+        page.cleanup();
+      }
+    }
+    return { canvases, pages: doc.numPages };
   } finally {
     await task.destroy();
   }
@@ -807,8 +854,9 @@ function htmlText(s) {
     its pages without readable text that draw images (pages, unreadablePages).  Or an exception
     whose message says why it cannot be read: too-large, too-large-content (an archive too large
     once decompressed), legacy (an Office format before 2007), unsupported, pdf-images (a PDF
-    whose pages are images without text, a scan), pdf-password (a PDF that opens with a
-    password only), pdf-invalid (a damaged PDF), pdf-reader (pdf.js cannot run in this browser).
+    whose pages are images without text, a scan, with its number of pages in pages),
+    pdf-password (a PDF that opens with a password only), pdf-invalid (a damaged PDF),
+    pdf-reader (pdf.js cannot run in this browser).
 */
 export async function extractText(file) {
   if (file.size > maxFileBytes) throw new Error('too-large');

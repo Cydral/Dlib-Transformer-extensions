@@ -2806,4 +2806,391 @@ namespace albireo
         }
     }
 
+    // Encoders
+
+    void qk_layer_norm(const float* x, const float* gamma, const float* beta, float* y, long n, float eps)
+    {
+        float sum = 0.0f;
+        long i = 0;
+#if ALBIREO_QK_AVX2
+        __m256 s0 = _mm256_setzero_ps(), s1 = _mm256_setzero_ps();
+        for (; i + 16 <= n; i += 16)
+        {
+            s0 = _mm256_add_ps(s0, _mm256_loadu_ps(x + i));
+            s1 = _mm256_add_ps(s1, _mm256_loadu_ps(x + i + 8));
+        }
+        sum = hsum_ps(_mm256_add_ps(s0, s1));
+#endif
+        for (; i < n; ++i) sum += x[i];
+        const float mean = sum / static_cast<float>(n);
+        float squares = 0.0f;
+        i = 0;
+#if ALBIREO_QK_AVX2
+        const __m256 mv = _mm256_set1_ps(mean);
+        s0 = _mm256_setzero_ps();
+        s1 = _mm256_setzero_ps();
+        for (; i + 16 <= n; i += 16)
+        {
+            const __m256 d0 = _mm256_sub_ps(_mm256_loadu_ps(x + i), mv);
+            const __m256 d1 = _mm256_sub_ps(_mm256_loadu_ps(x + i + 8), mv);
+            s0 = _mm256_fmadd_ps(d0, d0, s0);
+            s1 = _mm256_fmadd_ps(d1, d1, s1);
+        }
+        squares = hsum_ps(_mm256_add_ps(s0, s1));
+#endif
+        for (; i < n; ++i) squares += (x[i] - mean) * (x[i] - mean);
+        const float inv = 1.0f / std::sqrt(squares / static_cast<float>(n) + eps);
+        i = 0;
+#if ALBIREO_QK_AVX2
+        const __m256 iv = _mm256_set1_ps(inv);
+        for (; i + 8 <= n; i += 8)
+        {
+            const __m256 d = _mm256_mul_ps(_mm256_sub_ps(_mm256_loadu_ps(x + i), mv), iv);
+            _mm256_storeu_ps(y + i, _mm256_fmadd_ps(d, _mm256_loadu_ps(gamma + i), _mm256_loadu_ps(beta + i)));
+        }
+#endif
+        for (; i < n; ++i) y[i] = (x[i] - mean) * inv * gamma[i] + beta[i];
+    }
+
+    void qk_gelu_tanh(float* x, long n)
+    {
+        const float c = 0.7978845608028654f;   // sqrt(2 / pi)
+        const float a = 0.044715f;
+        long i = 0;
+#if ALBIREO_QK_AVX2
+        // -2u == x (-2c - 2ca x^2)
+        const __m256 c1 = _mm256_set1_ps(-2.0f * c), c3 = _mm256_set1_ps(-2.0f * c * a);
+        const __m256 one = _mm256_set1_ps(1.0f);
+        for (; i + 8 <= n; i += 8)
+        {
+            const __m256 v = _mm256_loadu_ps(x + i);
+            const __m256 t = _mm256_mul_ps(v, _mm256_fmadd_ps(c3, _mm256_mul_ps(v, v), c1));
+            _mm256_storeu_ps(x + i, _mm256_div_ps(v, _mm256_add_ps(one, exp256_ps(t))));
+        }
+#endif
+        for (; i < n; ++i)
+        {
+            const float v = x[i];
+            x[i] = v / (1.0f + std::exp(-2.0f * c * (v + a * v * v * v)));
+        }
+    }
+
+    namespace
+    {
+        // erf(z) for z >= 0 after Abramowitz and Stegun 7.1.26: 1 - t P(t) exp(-z^2) with
+        // t = 1 / (1 + p z), within 1.5e-7.
+        const float erf_p = 0.3275911f;
+        const float erf_a1 = 0.254829592f, erf_a2 = -0.284496736f, erf_a3 = 1.421413741f;
+        const float erf_a4 = -1.453152027f, erf_a5 = 1.061405429f;
+
+        inline float erf_positive(float z)
+        {
+            const float t = 1.0f / (1.0f + erf_p * z);
+            const float poly = t * (erf_a1 + t * (erf_a2 + t * (erf_a3 + t * (erf_a4 + t * erf_a5))));
+            return 1.0f - poly * std::exp(-z * z);
+        }
+    }
+
+    void qk_gelu_erf(float* x, long n)
+    {
+        const float s = 0.7071067811865476f;   // 1 / sqrt(2)
+        long i = 0;
+#if ALBIREO_QK_AVX2
+        const __m256 sign = _mm256_set1_ps(-0.0f);
+        const __m256 one = _mm256_set1_ps(1.0f), half = _mm256_set1_ps(0.5f), sv = _mm256_set1_ps(s);
+        const __m256 pv = _mm256_set1_ps(erf_p);
+        for (; i + 8 <= n; i += 8)
+        {
+            const __m256 v = _mm256_loadu_ps(x + i);
+            const __m256 z = _mm256_mul_ps(_mm256_andnot_ps(sign, v), sv);
+            const __m256 t = _mm256_div_ps(one, _mm256_fmadd_ps(pv, z, one));
+            __m256 poly = _mm256_fmadd_ps(_mm256_set1_ps(erf_a5), t, _mm256_set1_ps(erf_a4));
+            poly = _mm256_fmadd_ps(poly, t, _mm256_set1_ps(erf_a3));
+            poly = _mm256_fmadd_ps(poly, t, _mm256_set1_ps(erf_a2));
+            poly = _mm256_fmadd_ps(poly, t, _mm256_set1_ps(erf_a1));
+            poly = _mm256_mul_ps(poly, t);
+            const __m256 e = exp256_ps(_mm256_xor_ps(_mm256_mul_ps(z, z), sign));
+            // erf(|v| / sqrt(2)), then the sign of v.
+            const __m256 erf_abs = _mm256_fnmadd_ps(poly, e, one);
+            const __m256 erf_v = _mm256_or_ps(erf_abs, _mm256_and_ps(v, sign));
+            _mm256_storeu_ps(x + i, _mm256_mul_ps(_mm256_mul_ps(half, v), _mm256_add_ps(one, erf_v)));
+        }
+#endif
+        for (; i < n; ++i)
+        {
+            const float v = x[i];
+            const float e = erf_positive(std::fabs(v) * s);
+            x[i] = 0.5f * v * (1.0f + (v < 0.0f ? -e : e));
+        }
+    }
+
+    void qk_add(float* y, const float* x, long n)
+    {
+        long i = 0;
+#if ALBIREO_QK_AVX2
+        for (; i + 8 <= n; i += 8)
+            _mm256_storeu_ps(y + i, _mm256_add_ps(_mm256_loadu_ps(y + i), _mm256_loadu_ps(x + i)));
+#endif
+        for (; i < n; ++i) y[i] += x[i];
+    }
+
+    namespace
+    {
+        // The keys of the encoder attention read at a time: the scores of a tile of queries
+        // against them take 32 kilobytes.
+        const long encoder_block_keys = 128;
+
+#if ALBIREO_QK_AVX512
+        inline __mmask16 lanes(long left)
+        {
+            return left >= 16 ? static_cast<__mmask16>(0xFFFF)
+                : left <= 0 ? static_cast<__mmask16>(0) : static_cast<__mmask16>((1u << left) - 1u);
+        }
+#endif
+
+        /*
+            S[r * lds + j] = sum over d < hd of Q[r * hd + d] * Kt[d * ldk + j], for R rows and the
+            n keys of a group: up to 32 with AVX-512, exactly 16 with AVX2, any number otherwise.
+            Each key of Kt is read once for the R rows, without any horizontal sum.
+        */
+        template <int R>
+        void encoder_scores_group(const float* Q, long hd, const float* Kt, long ldk, long n, float* S, long lds)
+        {
+#if ALBIREO_QK_AVX512
+            const __mmask16 m0 = lanes(n), m1 = lanes(n - 16);
+            __m512 a0[R], a1[R];
+            for (int r = 0; r < R; ++r) a0[r] = a1[r] = _mm512_setzero_ps();
+            for (long d = 0; d < hd; ++d)
+            {
+                const float* k = Kt + d * ldk;
+                const __m512 k0 = _mm512_maskz_loadu_ps(m0, k);
+                const __m512 k1 = _mm512_maskz_loadu_ps(m1, k + 16);
+                for (int r = 0; r < R; ++r)
+                {
+                    const __m512 q = _mm512_set1_ps(Q[r * hd + d]);
+                    a0[r] = _mm512_fmadd_ps(q, k0, a0[r]);
+                    a1[r] = _mm512_fmadd_ps(q, k1, a1[r]);
+                }
+            }
+            for (int r = 0; r < R; ++r)
+            {
+                _mm512_mask_storeu_ps(S + r * lds, m0, a0[r]);
+                _mm512_mask_storeu_ps(S + r * lds + 16, m1, a1[r]);
+            }
+#elif ALBIREO_QK_AVX2
+            (void)n;
+            __m256 a0[R], a1[R];
+            for (int r = 0; r < R; ++r) a0[r] = a1[r] = _mm256_setzero_ps();
+            for (long d = 0; d < hd; ++d)
+            {
+                const float* k = Kt + d * ldk;
+                const __m256 k0 = _mm256_loadu_ps(k);
+                const __m256 k1 = _mm256_loadu_ps(k + 8);
+                for (int r = 0; r < R; ++r)
+                {
+                    const __m256 q = _mm256_broadcast_ss(Q + r * hd + d);
+                    a0[r] = _mm256_fmadd_ps(q, k0, a0[r]);
+                    a1[r] = _mm256_fmadd_ps(q, k1, a1[r]);
+                }
+            }
+            for (int r = 0; r < R; ++r)
+            {
+                _mm256_storeu_ps(S + r * lds, a0[r]);
+                _mm256_storeu_ps(S + r * lds + 8, a1[r]);
+            }
+#else
+            for (int r = 0; r < R; ++r)
+                for (long j = 0; j < n; ++j)
+                {
+                    float t = 0.0f;
+                    for (long d = 0; d < hd; ++d) t += Q[r * hd + d] * Kt[d * ldk + j];
+                    S[r * lds + j] = t;
+                }
+#endif
+        }
+
+        void encoder_scores(const float* Q, long rows, long hd, const float* Kt, long ldk, long n, float* S, long lds)
+        {
+#if ALBIREO_QK_AVX512
+            const long G = 32;
+#else
+            const long G = 16;
+#endif
+            for (long r = 0; r < rows; r += 6)
+            {
+                const long R = std::min<long>(6, rows - r);
+                const float* q = Q + r * hd;
+                for (long j = 0; j < n; j += G)
+                {
+                    const long g = std::min(G, n - j);
+                    float* s = S + r * lds + j;
+#if ALBIREO_QK_AVX2 && !ALBIREO_QK_AVX512
+                    if (g < G)
+                    {
+                        // The last keys of a block, fewer than a vector pair.
+                        for (long i = 0; i < R; ++i)
+                            for (long c = 0; c < g; ++c)
+                            {
+                                float t = 0.0f;
+                                for (long d = 0; d < hd; ++d) t += q[i * hd + d] * Kt[d * ldk + j + c];
+                                s[i * lds + c] = t;
+                            }
+                        continue;
+                    }
+#endif
+                    switch (R)
+                    {
+                    case 6: encoder_scores_group<6>(q, hd, Kt + j, ldk, g, s, lds); break;
+                    case 5: encoder_scores_group<5>(q, hd, Kt + j, ldk, g, s, lds); break;
+                    case 4: encoder_scores_group<4>(q, hd, Kt + j, ldk, g, s, lds); break;
+                    case 3: encoder_scores_group<3>(q, hd, Kt + j, ldk, g, s, lds); break;
+                    case 2: encoder_scores_group<2>(q, hd, Kt + j, ldk, g, s, lds); break;
+                    default: encoder_scores_group<1>(q, hd, Kt + j, ldk, g, s, lds); break;
+                    }
+                }
+            }
+        }
+
+        /*
+            O[r * ldo + i] += sum over j < n of P[r * lds + j] * V[j * ldv + i], for R rows and
+            the w dimensions of a group: up to 64 with AVX-512, exactly 32 with AVX2, any number
+            otherwise.  Each row of V is read once for the R rows.
+        */
+        template <int R>
+        void encoder_values_group(const float* P, long lds, const float* V, long ldv, long n, long w, float* O,
+            long ldo)
+        {
+#if ALBIREO_QK_AVX512
+            __mmask16 m[4];
+            for (int c = 0; c < 4; ++c) m[c] = lanes(w - 16 * c);
+            __m512 a[R][4];
+            for (int r = 0; r < R; ++r)
+                for (int c = 0; c < 4; ++c) a[r][c] = _mm512_maskz_loadu_ps(m[c], O + r * ldo + 16 * c);
+            for (long j = 0; j < n; ++j)
+            {
+                const float* v = V + j * ldv;
+                __m512 x[4];
+                for (int c = 0; c < 4; ++c) x[c] = _mm512_maskz_loadu_ps(m[c], v + 16 * c);
+                for (int r = 0; r < R; ++r)
+                {
+                    const __m512 p = _mm512_set1_ps(P[r * lds + j]);
+                    for (int c = 0; c < 4; ++c) a[r][c] = _mm512_fmadd_ps(p, x[c], a[r][c]);
+                }
+            }
+            for (int r = 0; r < R; ++r)
+                for (int c = 0; c < 4; ++c) _mm512_mask_storeu_ps(O + r * ldo + 16 * c, m[c], a[r][c]);
+#elif ALBIREO_QK_AVX2
+            (void)w;
+            __m256 a[R][4];
+            for (int r = 0; r < R; ++r)
+                for (int c = 0; c < 4; ++c) a[r][c] = _mm256_loadu_ps(O + r * ldo + 8 * c);
+            for (long j = 0; j < n; ++j)
+            {
+                const float* v = V + j * ldv;
+                __m256 x[4];
+                for (int c = 0; c < 4; ++c) x[c] = _mm256_loadu_ps(v + 8 * c);
+                for (int r = 0; r < R; ++r)
+                {
+                    const __m256 p = _mm256_broadcast_ss(P + r * lds + j);
+                    for (int c = 0; c < 4; ++c) a[r][c] = _mm256_fmadd_ps(p, x[c], a[r][c]);
+                }
+            }
+            for (int r = 0; r < R; ++r)
+                for (int c = 0; c < 4; ++c) _mm256_storeu_ps(O + r * ldo + 8 * c, a[r][c]);
+#else
+            for (int r = 0; r < R; ++r)
+                for (long j = 0; j < n; ++j)
+                {
+                    const float p = P[r * lds + j];
+                    for (long i = 0; i < w; ++i) O[r * ldo + i] += p * V[j * ldv + i];
+                }
+#endif
+        }
+
+        void encoder_values(const float* P, long lds, long rows, const float* V, long ldv, long n, long hd, float* O,
+            long ldo)
+        {
+#if ALBIREO_QK_AVX512
+            const long RG = 6, W = 64;
+#elif ALBIREO_QK_AVX2
+            const long RG = 2, W = 32;
+#else
+            const long RG = 1, W = hd;
+#endif
+            for (long r = 0; r < rows; r += RG)
+            {
+                const long R = std::min(RG, rows - r);
+                for (long i = 0; i < hd; i += W)
+                {
+                    const long w = std::min(W, hd - i);
+                    const float* p = P + r * lds;
+                    float* o = O + r * ldo + i;
+#if ALBIREO_QK_AVX2 && !ALBIREO_QK_AVX512
+                    if (w < W)
+                    {
+                        for (long e = 0; e < R; ++e)
+                            for (long j = 0; j < n; ++j)
+                                for (long c = 0; c < w; ++c) o[e * ldo + c] += p[e * lds + j] * V[j * ldv + i + c];
+                        continue;
+                    }
+#endif
+                    switch (R)
+                    {
+#if ALBIREO_QK_AVX512
+                    case 6: encoder_values_group<6>(p, lds, V + i, ldv, n, w, o, ldo); break;
+                    case 5: encoder_values_group<5>(p, lds, V + i, ldv, n, w, o, ldo); break;
+                    case 4: encoder_values_group<4>(p, lds, V + i, ldv, n, w, o, ldo); break;
+                    case 3: encoder_values_group<3>(p, lds, V + i, ldv, n, w, o, ldo); break;
+#endif
+#if ALBIREO_QK_AVX2
+                    case 2: encoder_values_group<2>(p, lds, V + i, ldv, n, w, o, ldo); break;
+#endif
+                    default: encoder_values_group<1>(p, lds, V + i, ldv, n, w, o, ldo); break;
+                    }
+                }
+            }
+        }
+    }
+
+    long qk_encoder_attention_work(long)
+    {
+        return qk_encoder_tile_rows * encoder_block_keys + 2 * qk_encoder_tile_rows;
+    }
+
+    void qk_encoder_attention(const float* Q, long rows, const float* Kt, long ldk, const float* V, long ldv, long m,
+        long hd, float* O, long ldo, float* work)
+    {
+        const long B = encoder_block_keys;
+        float* S = work;
+        float* top = work + qk_encoder_tile_rows * B;
+        float* sum = top + qk_encoder_tile_rows;
+        for (long r = 0; r < rows; ++r)
+        {
+            std::fill(O + r * ldo, O + r * ldo + hd, 0.0f);
+            top[r] = -INFINITY;
+            sum[r] = 0.0f;
+        }
+        for (long j0 = 0; j0 < m; j0 += B)
+        {
+            const long b = std::min(B, m - j0);
+            encoder_scores(Q, rows, hd, Kt + j0, ldk, b, S, B);
+            for (long r = 0; r < rows; ++r)
+            {
+                float* s = S + r * B;
+                const float mx = std::max(top[r], qk_max(s, b));
+                if (mx > top[r] && sum[r] > 0.0f)
+                {
+                    // A larger maximum: what the row gathered so far shrinks.
+                    const float shrink = std::exp(top[r] - mx);
+                    sum[r] *= shrink;
+                    qk_scale(O + r * ldo, shrink, hd);
+                }
+                top[r] = mx;
+                sum[r] += qk_exp_shift_sum(s, mx, b);
+            }
+            encoder_values(S, B, rows, V + j0 * ldv, ldv, b, hd, O, ldo);
+        }
+        for (long r = 0; r < rows; ++r) qk_scale(O + r * ldo, 1.0f / sum[r], hd);
+    }
+
 }

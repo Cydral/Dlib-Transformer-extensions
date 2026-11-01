@@ -30,6 +30,9 @@ configure_file(${DLIB_DIR}/external/mbedtls/LICENSE ${STAGE}/licenses/mbedtls.tx
 configure_file(${DLIB_DIR}/external/httplib/LICENSE ${STAGE}/licenses/cpp-httplib.txt COPYONLY)
 configure_file(${DLIB_DIR}/external/zlib/README ${STAGE}/licenses/zlib.txt COPYONLY)
 configure_file(${DLIB_DIR}/external/sqlite/README.txt ${STAGE}/licenses/sqlite.txt COPYONLY)
+# The image decoders the engines hold; the notice of the Independent JPEG Group goes with the programs.
+configure_file(${DLIB_DIR}/external/libpng/LICENSE ${STAGE}/licenses/libpng.txt COPYONLY)
+configure_file(${DLIB_DIR}/external/libjpeg/README ${STAGE}/licenses/libjpeg.txt COPYONLY)
 
 file(GLOB entries RELATIVE ${STAGE} ${STAGE}/*)
 file(REMOVE ${OUTPUT})

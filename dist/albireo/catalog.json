@@ -1,47 +1,68 @@
 {
   "format": 1,
-  "updated": "2026-10-30T18:11:31Z",
+  "updated": "2026-11-01T08:56:56Z",
   "models": [
     {
-      "id": "qwen3-4b",
-      "name": "Qwen3 4B",
-      "publisher": "Qwen",
+      "id": "qwen3-vl-4b-thinking",
+      "name": "Qwen3-VL 4B Thinking",
+      "publisher": "Alibaba",
       "quantization": "Q4_K_M",
       "roles": [
-        "general"
+        "general",
+        "code",
+        "security"
+      ],
+      "inputs": [
+        "text",
+        "image"
       ],
       "default": true,
       "tools": true,
       "reasoning": true,
       "license": "Apache-2.0",
       "description": {
-        "en": "General assistant for conversation, writing, analysis and tool use. It can reason step by step before answering. It runs on most computers with 8 GB of memory.",
-        "fr": "Assistant généraliste pour la conversation, la rédaction, l'analyse et l'usage d'outils. Il peut raisonner étape par étape avant de répondre. Il fonctionne sur la plupart des ordinateurs dotés de 8 Go de mémoire.",
-        "de": "Allgemeiner Assistent für Gespräche, Texte, Analysen und Werkzeugnutzung. Er kann vor der Antwort Schritt für Schritt nachdenken. Er läuft auf den meisten Computern mit 8 GB Arbeitsspeicher.",
-        "it": "Assistente generale per conversazione, scrittura, analisi e uso di strumenti. Può ragionare passo dopo passo prima di rispondere. Funziona sulla maggior parte dei computer con 8 GB di memoria.",
-        "es": "Asistente general para conversación, redacción, análisis y uso de herramientas. Puede razonar paso a paso antes de responder. Funciona en la mayoría de los ordenadores con 8 GB de memoria."
+        "en": "Multimodal assistant that reads images and text and reasons step by step before answering: conversation, documents, screenshots, diagrams, code and security. Albireo installs it by default, for computers with 8 GB of memory.",
+        "fr": "Assistant multimodal qui lit les images et le texte et raisonne étape par étape avant de répondre : discussion, documents, captures d'écran, schémas, code et sécurité. Albireo l'installe par défaut, pour les ordinateurs dotés de 8 Go de mémoire.",
+        "de": "Multimodaler Assistent, der Bilder und Text liest und vor der Antwort Schritt für Schritt nachdenkt: Gespräche, Dokumente, Bildschirmfotos, Diagramme, Code und Sicherheit. Albireo installiert ihn standardmäßig, für Computer mit 8 GB Arbeitsspeicher.",
+        "it": "Assistente multimodale che legge immagini e testo e ragiona passo dopo passo prima di rispondere: conversazione, documenti, schermate, schemi, codice e sicurezza. Albireo lo installa per impostazione predefinita, per computer con 8 GB di memoria.",
+        "es": "Asistente multimodal que lee imágenes y texto y razona paso a paso antes de responder: conversación, documentos, capturas de pantalla, diagramas, código y seguridad. Albireo lo instala por defecto, para ordenadores con 8 GB de memoria."
       },
-      "arch": "qwen3",
+      "arch": "qwen3vl",
       "parameters": 4022468096,
-      "context": 40960,
-      "source": "https://huggingface.co/Qwen/Qwen3-4B-GGUF",
-      "size": 2497280256,
-      "sha256": "7485fe6f11af29433bc51cab58009521f205840f5b4ae3a32fa7f92e8534fdf5",
+      "context": 262144,
+      "source": "https://huggingface.co/Qwen/Qwen3-VL-4B-Thinking-GGUF",
+      "size": 2497281472,
+      "sha256": "474ecaf1284aa6ff3273fb796c3cba55d2ee33ec0d8c63464fbd84500a9a462d",
       "files": [
         {
-          "url": "https://huggingface.co/Qwen/Qwen3-4B-GGUF/resolve/bc640142c66e1fdd12af0bd68f40445458f3869b/Qwen3-4B-Q4_K_M.gguf",
-          "size": 2497280256,
-          "sha256": "7485fe6f11af29433bc51cab58009521f205840f5b4ae3a32fa7f92e8534fdf5"
+          "url": "https://huggingface.co/Qwen/Qwen3-VL-4B-Thinking-GGUF/resolve/a55c03cbb1dad5a0c678efa066a8dbccf5a8d30e/Qwen3VL-4B-Thinking-Q4_K_M.gguf",
+          "size": 2497281472,
+          "sha256": "474ecaf1284aa6ff3273fb796c3cba55d2ee33ec0d8c63464fbd84500a9a462d"
         }
-      ]
+      ],
+      "projector": {
+        "quantization": "Q8_0",
+        "size": 453974176,
+        "sha256": "6b71c77c50944ec5d058d58ef39b687897567bea2a721ce49def98941db2cb96",
+        "files": [
+          {
+            "url": "https://huggingface.co/Qwen/Qwen3-VL-4B-Thinking-GGUF/resolve/a55c03cbb1dad5a0c678efa066a8dbccf5a8d30e/mmproj-Qwen3VL-4B-Thinking-Q8_0.gguf",
+            "size": 453974176,
+            "sha256": "6b71c77c50944ec5d058d58ef39b687897567bea2a721ce49def98941db2cb96"
+          }
+        ]
+      }
     },
     {
       "id": "qwen3-embedding-0.6b",
       "name": "Qwen3 Embedding 0.6B",
-      "publisher": "Qwen",
+      "publisher": "Alibaba",
       "quantization": "Q8_0",
       "roles": [
         "embedding"
+      ],
+      "inputs": [
+        "text"
       ],
       "default": true,
       "embedding": true,
@@ -71,6 +92,286 @@
       ]
     },
     {
+      "id": "qwen3-vl-2b-instruct",
+      "name": "Qwen3-VL 2B Instruct",
+      "publisher": "Alibaba",
+      "quantization": "Q4_K_M",
+      "roles": [
+        "general"
+      ],
+      "inputs": [
+        "text",
+        "image"
+      ],
+      "tools": true,
+      "reasoning": false,
+      "license": "Apache-2.0",
+      "description": {
+        "en": "Compact multimodal model for the text of images and scanned documents, screenshots and short answers. Its size lets it answer quickly on any computer; its answers on text are less deep than those of the larger models.",
+        "fr": "Modèle multimodal compact pour le texte des images et des documents numérisés, les captures d'écran et les réponses courtes. Sa taille lui permet de répondre rapidement sur tout ordinateur ; ses réponses sur le texte sont moins approfondies que celles des modèles plus grands.",
+        "de": "Kompaktes multimodales Modell für den Text von Bildern und gescannten Dokumenten, Bildschirmfotos und kurze Antworten. Seine Größe erlaubt schnelle Antworten auf jedem Computer; seine Antworten zu Texten sind weniger tief als die der größeren Modelle.",
+        "it": "Modello multimodale compatto per il testo di immagini e documenti scansionati, schermate e risposte brevi. Le sue dimensioni gli permettono di rispondere rapidamente su qualsiasi computer; le sue risposte sui testi sono meno approfondite di quelle dei modelli più grandi.",
+        "es": "Modelo multimodal compacto para el texto de imágenes y documentos escaneados, capturas de pantalla y respuestas breves. Su tamaño le permite responder rápidamente en cualquier ordenador; sus respuestas sobre textos son menos profundas que las de los modelos más grandes."
+      },
+      "arch": "qwen3vl",
+      "parameters": 1720574976,
+      "context": 262144,
+      "source": "https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct-GGUF",
+      "size": 1107409952,
+      "sha256": "089d75c52f4b7ffc56ba998ffc50aae89fcafc755f9e7208aacca281dca6c2ae",
+      "files": [
+        {
+          "url": "https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct-GGUF/resolve/52d6c8ffea26cc873ac5ad116f8631268d7eb503/Qwen3VL-2B-Instruct-Q4_K_M.gguf",
+          "size": 1107409952,
+          "sha256": "089d75c52f4b7ffc56ba998ffc50aae89fcafc755f9e7208aacca281dca6c2ae"
+        }
+      ],
+      "projector": {
+        "quantization": "Q8_0",
+        "size": 445053216,
+        "sha256": "f9a68fabba69c3b81e153367b2c7521030b0fa8bb0de400c9599c8e6725f9c82",
+        "files": [
+          {
+            "url": "https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct-GGUF/resolve/52d6c8ffea26cc873ac5ad116f8631268d7eb503/mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf",
+            "size": 445053216,
+            "sha256": "f9a68fabba69c3b81e153367b2c7521030b0fa8bb0de400c9599c8e6725f9c82"
+          }
+        ]
+      }
+    },
+    {
+      "id": "qwen3-vl-4b-instruct",
+      "name": "Qwen3-VL 4B Instruct",
+      "publisher": "Alibaba",
+      "quantization": "Q4_K_M",
+      "roles": [
+        "general",
+        "code"
+      ],
+      "inputs": [
+        "text",
+        "image"
+      ],
+      "tools": true,
+      "reasoning": false,
+      "license": "Apache-2.0",
+      "description": {
+        "en": "Multimodal assistant that reads images and text and answers directly, without a reasoning phase: description and reading of images, scanned documents and screenshots, conversation, writing and code. It runs on computers with 8 GB of memory.",
+        "fr": "Assistant multimodal qui lit les images et le texte et répond directement, sans phase de raisonnement : description et lecture d'images, de documents numérisés et de captures d'écran, discussion, rédaction et code. Il fonctionne sur les ordinateurs dotés de 8 Go de mémoire.",
+        "de": "Multimodaler Assistent, der Bilder und Text liest und direkt antwortet, ohne Denkphase: Beschreibung und Lesen von Bildern, gescannten Dokumenten und Bildschirmfotos, Gespräche, Texte und Code. Er läuft auf Computern mit 8 GB Arbeitsspeicher.",
+        "it": "Assistente multimodale che legge immagini e testo e risponde direttamente, senza fase di ragionamento: descrizione e lettura di immagini, documenti scansionati e schermate, conversazione, scrittura e codice. Funziona su computer con 8 GB di memoria.",
+        "es": "Asistente multimodal que lee imágenes y texto y responde directamente, sin fase de razonamiento: descripción y lectura de imágenes, documentos escaneados y capturas de pantalla, conversación, redacción y código. Funciona en ordenadores con 8 GB de memoria."
+      },
+      "arch": "qwen3vl",
+      "parameters": 4022468096,
+      "context": 262144,
+      "source": "https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct-GGUF",
+      "size": 2497281664,
+      "sha256": "66358cb18bb6b3b1b6675aa412c7a88ef01d228f481184d13668e5201c730a0a",
+      "files": [
+        {
+          "url": "https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct-GGUF/resolve/1cd86afb9a95c410a6038ab3b40d8b578c892266/Qwen3VL-4B-Instruct-Q4_K_M.gguf",
+          "size": 2497281664,
+          "sha256": "66358cb18bb6b3b1b6675aa412c7a88ef01d228f481184d13668e5201c730a0a"
+        }
+      ],
+      "projector": {
+        "quantization": "Q8_0",
+        "size": 453974304,
+        "sha256": "30ba2c7dd3127a4561b6cba9d13d0f711c91bdb38742e2f56d73c8cb596bd06d",
+        "files": [
+          {
+            "url": "https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct-GGUF/resolve/1cd86afb9a95c410a6038ab3b40d8b578c892266/mmproj-Qwen3VL-4B-Instruct-Q8_0.gguf",
+            "size": 453974304,
+            "sha256": "30ba2c7dd3127a4561b6cba9d13d0f711c91bdb38742e2f56d73c8cb596bd06d"
+          }
+        ]
+      }
+    },
+    {
+      "id": "qwen3-vl-8b-instruct",
+      "name": "Qwen3-VL 8B Instruct",
+      "publisher": "Alibaba",
+      "quantization": "Q4_K_M",
+      "roles": [
+        "general",
+        "code",
+        "security"
+      ],
+      "inputs": [
+        "text",
+        "image"
+      ],
+      "tools": true,
+      "reasoning": false,
+      "license": "Apache-2.0",
+      "description": {
+        "en": "Larger multimodal assistant that answers directly: reading of documents, tables and screenshots, analysis of images and diagrams, questions of code and security. For computers with 16 GB of memory or a graphics processor.",
+        "fr": "Assistant multimodal plus grand qui répond directement : lecture de documents, de tableaux et de captures d'écran, analyse d'images et de schémas, questions de code et de sécurité. Pour les ordinateurs dotés de 16 Go de mémoire ou d'un processeur graphique.",
+        "de": "Größerer multimodaler Assistent, der direkt antwortet: Lesen von Dokumenten, Tabellen und Bildschirmfotos, Analyse von Bildern und Diagrammen, Fragen zu Code und Sicherheit. Für Computer mit 16 GB Arbeitsspeicher oder einem Grafikprozessor.",
+        "it": "Assistente multimodale più grande che risponde direttamente: lettura di documenti, tabelle e schermate, analisi di immagini e schemi, domande di codice e sicurezza. Per computer con 16 GB di memoria o un processore grafico.",
+        "es": "Asistente multimodal más grande que responde directamente: lectura de documentos, tablas y capturas de pantalla, análisis de imágenes y diagramas, preguntas de código y seguridad. Para ordenadores con 16 GB de memoria o un procesador gráfico."
+      },
+      "arch": "qwen3vl",
+      "parameters": 8190735360,
+      "context": 262144,
+      "source": "https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct-GGUF",
+      "size": 5027784800,
+      "sha256": "67d1659bfe71b89d50b45a4ad1a9e5b997e5bb16ce5da66a6a6167abd569e9e2",
+      "files": [
+        {
+          "url": "https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct-GGUF/resolve/f982a07559d4a2f6c8744d840bf6fccab30eea96/Qwen3VL-8B-Instruct-Q4_K_M.gguf",
+          "size": 5027784800,
+          "sha256": "67d1659bfe71b89d50b45a4ad1a9e5b997e5bb16ce5da66a6a6167abd569e9e2"
+        }
+      ],
+      "projector": {
+        "quantization": "Q8_0",
+        "size": 752289728,
+        "sha256": "c6ba85508d82f42590e6eb77d5340369ab6fecf107a7561d809523d8aa5f3bfd",
+        "files": [
+          {
+            "url": "https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct-GGUF/resolve/f982a07559d4a2f6c8744d840bf6fccab30eea96/mmproj-Qwen3VL-8B-Instruct-Q8_0.gguf",
+            "size": 752289728,
+            "sha256": "c6ba85508d82f42590e6eb77d5340369ab6fecf107a7561d809523d8aa5f3bfd"
+          }
+        ]
+      }
+    },
+    {
+      "id": "qwen3-vl-8b-thinking",
+      "name": "Qwen3-VL 8B Thinking",
+      "publisher": "Alibaba",
+      "quantization": "Q4_K_M",
+      "roles": [
+        "general",
+        "code",
+        "security"
+      ],
+      "inputs": [
+        "text",
+        "image"
+      ],
+      "tools": true,
+      "reasoning": true,
+      "license": "Apache-2.0",
+      "description": {
+        "en": "Larger multimodal assistant that reasons step by step before answering, for the hardest questions on images, code and security: logs and diagrams in screenshots, architectures, mathematics. For computers with 16 GB of memory or a graphics processor.",
+        "fr": "Assistant multimodal plus grand qui raisonne étape par étape avant de répondre, pour les questions les plus difficiles sur les images, le code et la sécurité : journaux et schémas en captures d'écran, architectures, mathématiques. Pour les ordinateurs dotés de 16 Go de mémoire ou d'un processeur graphique.",
+        "de": "Größerer multimodaler Assistent, der vor der Antwort Schritt für Schritt nachdenkt, für die schwierigsten Fragen zu Bildern, Code und Sicherheit: Protokolle und Diagramme in Bildschirmfotos, Architekturen, Mathematik. Für Computer mit 16 GB Arbeitsspeicher oder einem Grafikprozessor.",
+        "it": "Assistente multimodale più grande che ragiona passo dopo passo prima di rispondere, per le domande più difficili su immagini, codice e sicurezza: log e schemi in schermate, architetture, matematica. Per computer con 16 GB di memoria o un processore grafico.",
+        "es": "Asistente multimodal más grande que razona paso a paso antes de responder, para las preguntas más difíciles sobre imágenes, código y seguridad: registros y diagramas en capturas de pantalla, arquitecturas, matemáticas. Para ordenadores con 16 GB de memoria o un procesador gráfico."
+      },
+      "arch": "qwen3vl",
+      "parameters": 8190735360,
+      "context": 262144,
+      "source": "https://huggingface.co/Qwen/Qwen3-VL-8B-Thinking-GGUF",
+      "size": 5027784704,
+      "sha256": "9e54ca761ab1eb0e8bf9eddae356fd3535b910b3bf3e38e10c914f42cf8751cb",
+      "files": [
+        {
+          "url": "https://huggingface.co/Qwen/Qwen3-VL-8B-Thinking-GGUF/resolve/bca5838231f8cc1303cf8810afffcfbdc41bc75a/Qwen3VL-8B-Thinking-Q4_K_M.gguf",
+          "size": 5027784704,
+          "sha256": "9e54ca761ab1eb0e8bf9eddae356fd3535b910b3bf3e38e10c914f42cf8751cb"
+        }
+      ],
+      "projector": {
+        "quantization": "Q8_0",
+        "size": 752289728,
+        "sha256": "c6aebeb17ab596dda1976629ea4ed1bdb94d506fd198630eb8567ae11cfb4684",
+        "files": [
+          {
+            "url": "https://huggingface.co/Qwen/Qwen3-VL-8B-Thinking-GGUF/resolve/bca5838231f8cc1303cf8810afffcfbdc41bc75a/mmproj-Qwen3VL-8B-Thinking-Q8_0.gguf",
+            "size": 752289728,
+            "sha256": "c6aebeb17ab596dda1976629ea4ed1bdb94d506fd198630eb8567ae11cfb4684"
+          }
+        ]
+      }
+    },
+    {
+      "id": "eurovlm-9b-preview",
+      "name": "EuroVLM 9B Preview",
+      "publisher": "EuroLLM consortium",
+      "quantization": "Q4_K_M",
+      "roles": [
+        "general"
+      ],
+      "inputs": [
+        "text",
+        "image"
+      ],
+      "tools": false,
+      "reasoning": false,
+      "license": "Apache-2.0",
+      "description": {
+        "en": "Preview of the European vision-language model built on EuroLLM 9B: description of images and documents, and answers about them, in the 24 official languages of the European Union and 11 other languages. Its publishers give it as a version still under development. It answers directly, for computers with 16 GB of memory.",
+        "fr": "Préversion du modèle vision-langage européen construit sur EuroLLM 9B : description d'images et de documents, et réponses à leur sujet, dans les 24 langues officielles de l'Union européenne et 11 autres langues. Ses éditeurs la présentent comme une version encore en développement. Il répond directement, pour les ordinateurs dotés de 16 Go de mémoire.",
+        "de": "Vorabversion des europäischen Bild-Sprach-Modells auf der Grundlage von EuroLLM 9B: Beschreibung von Bildern und Dokumenten und Antworten dazu in den 24 Amtssprachen der Europäischen Union und 11 weiteren Sprachen. Seine Herausgeber stellen es als Version in Entwicklung vor. Es antwortet direkt, für Computer mit 16 GB Arbeitsspeicher.",
+        "it": "Anteprima del modello visione-linguaggio europeo basato su EuroLLM 9B: descrizione di immagini e documenti, e risposte su di essi, nelle 24 lingue ufficiali dell'Unione europea e in altre 11 lingue. I suoi autori la presentano come una versione ancora in sviluppo. Risponde direttamente, per computer con 16 GB di memoria.",
+        "es": "Versión preliminar del modelo de visión y lenguaje europeo construido sobre EuroLLM 9B: descripción de imágenes y documentos, y respuestas sobre ellos, en las 24 lenguas oficiales de la Unión Europea y en otras 11 lenguas. Sus autores la presentan como una versión aún en desarrollo. Responde directamente, para ordenadores con 16 GB de memoria."
+      },
+      "arch": "llama",
+      "parameters": 9152327680,
+      "context": 32768,
+      "source": "https://huggingface.co/nyuuzyou/EuroVLM-9B-Preview-GGUF",
+      "size": 5582843488,
+      "sha256": "b7599750f8a2e8c3f2e125e74a3713de4d6366f25fbece74dbe939e5c5395a34",
+      "files": [
+        {
+          "url": "https://huggingface.co/nyuuzyou/EuroVLM-9B-Preview-GGUF/resolve/9f76d4d41e850685f52bea05bdb8a1a71ef0a7f4/EuroVLM-9B-Preview-Q4_K_M.gguf",
+          "size": 5582843488,
+          "sha256": "b7599750f8a2e8c3f2e125e74a3713de4d6366f25fbece74dbe939e5c5395a34"
+        }
+      ],
+      "projector": {
+        "quantization": "F16",
+        "size": 839321504,
+        "sha256": "94e1b071e6d445951813887e6046fe6e9565ffcdeddacea05c37d5b7a7348348",
+        "files": [
+          {
+            "url": "https://huggingface.co/nyuuzyou/EuroVLM-9B-Preview-GGUF/resolve/9f76d4d41e850685f52bea05bdb8a1a71ef0a7f4/mmproj-model-f16.gguf",
+            "size": 839321504,
+            "sha256": "94e1b071e6d445951813887e6046fe6e9565ffcdeddacea05c37d5b7a7348348"
+          }
+        ]
+      }
+    },
+    {
+      "id": "phi-4-mini",
+      "name": "Phi-4-mini",
+      "publisher": "Microsoft",
+      "quantization": "Q4_K_M",
+      "roles": [
+        "general"
+      ],
+      "inputs": [
+        "text"
+      ],
+      "tools": false,
+      "reasoning": false,
+      "license": "MIT",
+      "description": {
+        "en": "Compact general assistant from Microsoft for conversation, writing and mathematics, in English and some twenty other languages, with a context of 128K tokens. It answers directly, without a reasoning phase, and runs on computers with 8 GB of memory.",
+        "fr": "Assistant généraliste compact de Microsoft pour la discussion, la rédaction et les mathématiques, en anglais et dans une vingtaine d'autres langues, avec un contexte de 128K jetons. Il répond directement, sans phase de raisonnement, et fonctionne sur les ordinateurs dotés de 8 Go de mémoire.",
+        "de": "Kompakter allgemeiner Assistent von Microsoft für Gespräche, Texte und Mathematik, auf Englisch und in rund zwanzig weiteren Sprachen, mit einem Kontext von 128K Token. Er antwortet direkt, ohne Denkphase, und läuft auf Computern mit 8 GB Arbeitsspeicher.",
+        "it": "Assistente generale compatto di Microsoft per conversazione, scrittura e matematica, in inglese e in una ventina di altre lingue, con un contesto di 128K token. Risponde direttamente, senza fase di ragionamento, e funziona su computer con 8 GB di memoria.",
+        "es": "Asistente general compacto de Microsoft para conversación, redacción y matemáticas, en inglés y en una veintena de otras lenguas, con un contexto de 128K tokens. Responde directamente, sin fase de razonamiento, y funciona en ordenadores con 8 GB de memoria."
+      },
+      "arch": "phi3",
+      "parameters": 3836021856,
+      "context": 131072,
+      "source": "https://huggingface.co/bartowski/microsoft_Phi-4-mini-instruct-GGUF",
+      "size": 2491874688,
+      "sha256": "01999f17c39cc3074afae5e9c539bc82d45f2dd7faa3917c66cbef76fce8c0c2",
+      "files": [
+        {
+          "url": "https://huggingface.co/bartowski/microsoft_Phi-4-mini-instruct-GGUF/resolve/7ff82c2aaa4dde30121698a973765f39be5288c0/microsoft_Phi-4-mini-instruct-Q4_K_M.gguf",
+          "size": 2491874688,
+          "sha256": "01999f17c39cc3074afae5e9c539bc82d45f2dd7faa3917c66cbef76fce8c0c2"
+        }
+      ]
+    },
+    {
       "id": "ministral-3-3b",
       "name": "Ministral 3 3B",
       "publisher": "Mistral AI",
@@ -78,15 +379,18 @@
       "roles": [
         "general"
       ],
+      "inputs": [
+        "text"
+      ],
       "tools": true,
       "reasoning": false,
       "license": "Apache-2.0",
       "description": {
-        "en": "General assistant from Mistral AI, trained on many European languages. It uses tools and answers directly, without a reasoning phase.",
-        "fr": "Assistant généraliste de Mistral AI, entraîné sur de nombreuses langues européennes, dont le français. Il utilise des outils et répond directement, sans phase de raisonnement.",
-        "de": "Allgemeiner Assistent von Mistral AI, trainiert auf vielen europäischen Sprachen, darunter Deutsch. Er nutzt Werkzeuge und antwortet direkt, ohne Denkphase.",
-        "it": "Assistente generale di Mistral AI, addestrato su molte lingue europee, tra cui l'italiano. Usa strumenti e risponde direttamente, senza fase di ragionamento.",
-        "es": "Asistente general de Mistral AI, entrenado en muchas lenguas europeas, entre ellas el español. Usa herramientas y responde directamente, sin fase de razonamiento."
+        "en": "General assistant from Mistral AI, developed in partnership with NVIDIA and trained on many European languages, with a context of 256K tokens. It uses tools and answers directly, without a reasoning phase, on computers with 8 GB of memory. Albireo gives it text only.",
+        "fr": "Assistant généraliste de Mistral AI, développé en partenariat avec NVIDIA et entraîné sur de nombreuses langues européennes, avec un contexte de 256K jetons. Il utilise des outils et répond directement, sans phase de raisonnement, sur les ordinateurs dotés de 8 Go de mémoire. Albireo ne lui confie que du texte.",
+        "de": "Allgemeiner Assistent von Mistral AI, in Partnerschaft mit NVIDIA entwickelt und auf vielen europäischen Sprachen trainiert, mit einem Kontext von 256K Token. Er nutzt Werkzeuge und antwortet direkt, ohne Denkphase, auf Computern mit 8 GB Arbeitsspeicher. Albireo gibt ihm nur Text.",
+        "it": "Assistente generale di Mistral AI, sviluppato in collaborazione con NVIDIA e addestrato su molte lingue europee, con un contesto di 256K token. Usa strumenti e risponde direttamente, senza fase di ragionamento, su computer con 8 GB di memoria. Albireo gli affida solo testo.",
+        "es": "Asistente general de Mistral AI, desarrollado en colaboración con NVIDIA y entrenado en muchas lenguas europeas, con un contexto de 256K tokens. Usa herramientas y responde directamente, sin fase de razonamiento, en ordenadores con 8 GB de memoria. Albireo solo le confía texto."
       },
       "arch": "mistral3",
       "parameters": 3429006336,
@@ -103,54 +407,169 @@
       ]
     },
     {
-      "id": "llama-3.2-3b",
-      "name": "Llama 3.2 3B",
-      "publisher": "Meta",
+      "id": "ministral-3-8b",
+      "name": "Ministral 3 8B",
+      "publisher": "Mistral AI",
       "quantization": "Q4_K_M",
       "roles": [
         "general"
       ],
+      "inputs": [
+        "text"
+      ],
       "tools": true,
       "reasoning": false,
-      "license": "Llama 3.2 Community License, Built with Llama",
+      "license": "Apache-2.0",
       "description": {
-        "en": "General assistant from Meta, trained for English, French, German, Italian, Spanish, Portuguese, Hindi and Thai, with tool use and a context of 128K tokens. It answers directly, without a reasoning phase, and runs on computers with 8 GB of memory.",
-        "fr": "Assistant généraliste de Meta, entraîné pour l'anglais, le français, l'allemand, l'italien, l'espagnol, le portugais, l'hindi et le thaï, avec usage d'outils et un contexte de 128K jetons. Il répond directement, sans phase de raisonnement, et fonctionne sur les ordinateurs dotés de 8 Go de mémoire.",
-        "de": "Allgemeiner Assistent von Meta, trainiert für Englisch, Französisch, Deutsch, Italienisch, Spanisch, Portugiesisch, Hindi und Thai, mit Werkzeugnutzung und einem Kontext von 128K Token. Er antwortet direkt, ohne Denkphase, und läuft auf Computern mit 8 GB Arbeitsspeicher.",
-        "it": "Assistente generale di Meta, addestrato per inglese, francese, tedesco, italiano, spagnolo, portoghese, hindi e thailandese, con uso di strumenti e un contesto di 128K token. Risponde direttamente, senza fase di ragionamento, e funziona su computer con 8 GB di memoria.",
-        "es": "Asistente general de Meta, entrenado para inglés, francés, alemán, italiano, español, portugués, hindi y tailandés, con uso de herramientas y un contexto de 128K tokens. Responde directamente, sin fase de razonamiento, y funciona en ordenadores con 8 GB de memoria."
+        "en": "Larger general assistant from Mistral AI, developed in partnership with NVIDIA and trained on many European languages, with a context of 256K tokens. It uses tools and answers directly, for computers with 16 GB of memory or a graphics processor. Albireo gives it text only.",
+        "fr": "Assistant généraliste plus grand de Mistral AI, développé en partenariat avec NVIDIA et entraîné sur de nombreuses langues européennes, avec un contexte de 256K jetons. Il utilise des outils et répond directement, pour les ordinateurs dotés de 16 Go de mémoire ou d'un processeur graphique. Albireo ne lui confie que du texte.",
+        "de": "Größerer allgemeiner Assistent von Mistral AI, in Partnerschaft mit NVIDIA entwickelt und auf vielen europäischen Sprachen trainiert, mit einem Kontext von 256K Token. Er nutzt Werkzeuge und antwortet direkt, für Computer mit 16 GB Arbeitsspeicher oder einem Grafikprozessor. Albireo gibt ihm nur Text.",
+        "it": "Assistente generale più grande di Mistral AI, sviluppato in collaborazione con NVIDIA e addestrato su molte lingue europee, con un contesto di 256K token. Usa strumenti e risponde direttamente, per computer con 16 GB di memoria o un processore grafico. Albireo gli affida solo testo.",
+        "es": "Asistente general más grande de Mistral AI, desarrollado en colaboración con NVIDIA y entrenado en muchas lenguas europeas, con un contexto de 256K tokens. Usa herramientas y responde directamente, para ordenadores con 16 GB de memoria o un procesador gráfico. Albireo solo le confía texto."
       },
-      "arch": "llama",
-      "parameters": 3212749888,
-      "context": 131072,
-      "source": "https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF",
-      "size": 2019377696,
-      "sha256": "6c1a2b41161032677be168d354123594c0e6e67d2b9227c84f296ad037c728ff",
+      "arch": "mistral3",
+      "parameters": 8489553920,
+      "context": 262144,
+      "source": "https://huggingface.co/mistralai/Ministral-3-8B-Instruct-2512-GGUF",
+      "size": 5198911904,
+      "sha256": "33e7a72cf5e6e2cfc2f2847075acc013d68bba023e35310cef86b5cf8fdca761",
       "files": [
         {
-          "url": "https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/5ab33fa94d1d04e903623ae72c95d1696f09f9e8/Llama-3.2-3B-Instruct-Q4_K_M.gguf",
-          "size": 2019377696,
-          "sha256": "6c1a2b41161032677be168d354123594c0e6e67d2b9227c84f296ad037c728ff"
+          "url": "https://huggingface.co/mistralai/Ministral-3-8B-Instruct-2512-GGUF/resolve/0102285ad796bd99af90f58de616092e5630e970/Ministral-3-8B-Instruct-2512-Q4_K_M.gguf",
+          "size": 5198911904,
+          "sha256": "33e7a72cf5e6e2cfc2f2847075acc013d68bba023e35310cef86b5cf8fdca761"
+        }
+      ]
+    },
+    {
+      "id": "eurollm-9b",
+      "name": "EuroLLM 9B Instruct",
+      "publisher": "EuroLLM consortium",
+      "quantization": "Q4_K_M",
+      "roles": [
+        "general"
+      ],
+      "inputs": [
+        "text"
+      ],
+      "tools": false,
+      "reasoning": false,
+      "license": "Apache-2.0",
+      "description": {
+        "en": "European assistant trained on the 24 official languages of the European Union and 11 other languages, for writing, translation and conversation in these languages, with a context of 32K tokens. It answers directly, without a reasoning phase, and suits code and mathematics less. For computers with 16 GB of memory.",
+        "fr": "Assistant européen entraîné sur les 24 langues officielles de l'Union européenne et 11 autres langues, pour la rédaction, la traduction et la discussion dans ces langues, avec un contexte de 32K jetons. Il répond directement, sans phase de raisonnement, et convient moins au code et aux mathématiques. Pour les ordinateurs dotés de 16 Go de mémoire.",
+        "de": "Europäischer Assistent, trainiert auf den 24 Amtssprachen der Europäischen Union und 11 weiteren Sprachen, für Texte, Übersetzungen und Gespräche in diesen Sprachen, mit einem Kontext von 32K Token. Er antwortet direkt, ohne Denkphase, und eignet sich weniger für Code und Mathematik. Für Computer mit 16 GB Arbeitsspeicher.",
+        "it": "Assistente europeo addestrato sulle 24 lingue ufficiali dell'Unione europea e su altre 11 lingue, per scrittura, traduzione e conversazione in queste lingue, con un contesto di 32K token. Risponde direttamente, senza fase di ragionamento, ed è meno adatto al codice e alla matematica. Per computer con 16 GB di memoria.",
+        "es": "Asistente europeo entrenado en las 24 lenguas oficiales de la Unión Europea y en otras 11 lenguas, para redacción, traducción y conversación en estas lenguas, con un contexto de 32K tokens. Responde directamente, sin fase de razonamiento, y es menos adecuado para el código y las matemáticas. Para ordenadores con 16 GB de memoria."
+      },
+      "arch": "llama",
+      "parameters": 9152319488,
+      "context": 32768,
+      "source": "https://huggingface.co/mradermacher/EuroLLM-9B-Instruct-2512-GGUF",
+      "size": 5582838912,
+      "sha256": "fe9b50d4ba67eb0131f1ceeaab2e56ea8fb6b2bbc37391d3219c791c3b140a28",
+      "files": [
+        {
+          "url": "https://huggingface.co/mradermacher/EuroLLM-9B-Instruct-2512-GGUF/resolve/5138603fccb9dc1f35c25cfd1a4981a78617e9ff/EuroLLM-9B-Instruct-2512.Q4_K_M.gguf",
+          "size": 5582838912,
+          "sha256": "fe9b50d4ba67eb0131f1ceeaab2e56ea8fb6b2bbc37391d3219c791c3b140a28"
+        }
+      ]
+    },
+    {
+      "id": "granite-4.2-3b",
+      "name": "Granite 4.2 3B",
+      "publisher": "IBM",
+      "quantization": "Q4_K_M",
+      "roles": [
+        "general",
+        "code"
+      ],
+      "inputs": [
+        "text"
+      ],
+      "tools": true,
+      "reasoning": true,
+      "license": "Apache-2.0",
+      "description": {
+        "en": "IBM model for business tasks, code and tool use, which can reason step by step before answering, with a context of 128K tokens. It runs on computers with 8 GB of memory.",
+        "fr": "Modèle d'IBM pour les tâches d'entreprise, le code et l'usage d'outils, qui peut raisonner étape par étape avant de répondre, avec un contexte de 128K jetons. Il fonctionne sur les ordinateurs dotés de 8 Go de mémoire.",
+        "de": "IBM-Modell für Unternehmensaufgaben, Code und Werkzeugnutzung, das vor der Antwort Schritt für Schritt nachdenken kann, mit einem Kontext von 128K Token. Es läuft auf Computern mit 8 GB Arbeitsspeicher.",
+        "it": "Modello di IBM per attività aziendali, codice e uso di strumenti, che può ragionare passo dopo passo prima di rispondere, con un contesto di 128K token. Funziona su computer con 8 GB di memoria.",
+        "es": "Modelo de IBM para tareas empresariales, código y uso de herramientas, que puede razonar paso a paso antes de responder, con un contexto de 128K tokens. Funciona en ordenadores con 8 GB de memoria."
+      },
+      "arch": "granite",
+      "parameters": 3659737600,
+      "context": 131072,
+      "source": "https://huggingface.co/ibm-granite/granite-4.2-3b-GGUF",
+      "size": 2244011552,
+      "sha256": "e0406663965846ae22a403456eb826ccce5f450840491f71952f18a7cb78e7d5",
+      "files": [
+        {
+          "url": "https://huggingface.co/ibm-granite/granite-4.2-3b-GGUF/resolve/c40945d71cd90f249a56985e8155551a9188dc30/granite-4.2-3b-Q4_K_M.gguf",
+          "size": 2244011552,
+          "sha256": "e0406663965846ae22a403456eb826ccce5f450840491f71952f18a7cb78e7d5"
+        }
+      ]
+    },
+    {
+      "id": "granite-4.2-8b",
+      "name": "Granite 4.2 8B",
+      "publisher": "IBM",
+      "quantization": "Q4_K_M",
+      "roles": [
+        "general",
+        "code"
+      ],
+      "inputs": [
+        "text"
+      ],
+      "tools": true,
+      "reasoning": true,
+      "license": "Apache-2.0",
+      "description": {
+        "en": "Larger IBM model for business tasks, documents, code and tool use, which can reason step by step before answering, with a context of 128K tokens, for computers with 16 GB of memory or a graphics processor.",
+        "fr": "Modèle d'IBM plus grand pour les tâches d'entreprise, les documents, le code et l'usage d'outils, qui peut raisonner étape par étape avant de répondre, avec un contexte de 128K jetons, pour les ordinateurs dotés de 16 Go de mémoire ou d'un processeur graphique.",
+        "de": "Größeres IBM-Modell für Unternehmensaufgaben, Dokumente, Code und Werkzeugnutzung, das vor der Antwort Schritt für Schritt nachdenken kann, mit einem Kontext von 128K Token, für Computer mit 16 GB Arbeitsspeicher oder einem Grafikprozessor.",
+        "it": "Modello di IBM più grande per attività aziendali, documenti, codice e uso di strumenti, che può ragionare passo dopo passo prima di rispondere, con un contesto di 128K token, per computer con 16 GB di memoria o un processore grafico.",
+        "es": "Modelo de IBM más grande para tareas empresariales, documentos, código y uso de herramientas, que puede razonar paso a paso antes de responder, con un contexto de 128K tokens, para ordenadores con 16 GB de memoria o un procesador gráfico."
+      },
+      "arch": "granite",
+      "parameters": 8791592960,
+      "context": 131072,
+      "source": "https://huggingface.co/ibm-granite/granite-4.2-8b-GGUF",
+      "size": 5347917952,
+      "sha256": "16a9369d0805f80b7377d25d87f937a90c05dc04ad79173a52001e42c9aab311",
+      "files": [
+        {
+          "url": "https://huggingface.co/ibm-granite/granite-4.2-8b-GGUF/resolve/93f3f6a8938ee922b784cf4e5b4203cd3428df8f/granite-4.2-8b-Q4_K_M.gguf",
+          "size": 5347917952,
+          "sha256": "16a9369d0805f80b7377d25d87f937a90c05dc04ad79173a52001e42c9aab311"
         }
       ]
     },
     {
       "id": "qwen3-8b",
       "name": "Qwen3 8B",
-      "publisher": "Qwen",
+      "publisher": "Alibaba",
       "quantization": "Q4_K_M",
       "roles": [
-        "general"
+        "general",
+        "code",
+        "security"
+      ],
+      "inputs": [
+        "text"
       ],
       "tools": true,
       "reasoning": true,
       "license": "Apache-2.0",
       "description": {
-        "en": "Larger general assistant with step by step reasoning and tool use, for computers with 16 GB of memory or a graphics processor.",
-        "fr": "Assistant généraliste plus grand, avec raisonnement étape par étape et usage d'outils, pour les ordinateurs dotés de 16 Go de mémoire ou d'un processeur graphique.",
-        "de": "Größerer allgemeiner Assistent mit schrittweisem Denken und Werkzeugnutzung, für Computer mit 16 GB Arbeitsspeicher oder einem Grafikprozessor.",
-        "it": "Assistente generale più grande, con ragionamento passo dopo passo e uso di strumenti, per computer con 16 GB di memoria o un processore grafico.",
-        "es": "Asistente general más grande, con razonamiento paso a paso y uso de herramientas, para ordenadores con 16 GB de memoria o un procesador gráfico."
+        "en": "Larger general assistant with step by step reasoning and tool use, at ease with code and with the knowledge of cybersecurity, for computers with 16 GB of memory or a graphics processor.",
+        "fr": "Assistant généraliste plus grand, avec raisonnement étape par étape et usage d'outils, à l'aise avec le code et les connaissances en cybersécurité, pour les ordinateurs dotés de 16 Go de mémoire ou d'un processeur graphique.",
+        "de": "Größerer allgemeiner Assistent mit schrittweisem Denken und Werkzeugnutzung, sicher im Code und im Wissen der Cybersicherheit, für Computer mit 16 GB Arbeitsspeicher oder einem Grafikprozessor.",
+        "it": "Assistente generale più grande, con ragionamento passo dopo passo e uso di strumenti, a suo agio con il codice e le conoscenze di cybersicurezza, per computer con 16 GB di memoria o un processore grafico.",
+        "es": "Asistente general más grande, con razonamiento paso a paso y uso de herramientas, cómodo con el código y los conocimientos de ciberseguridad, para ordenadores con 16 GB de memoria o un procesador gráfico."
       },
       "arch": "qwen3",
       "parameters": 8190735360,
@@ -169,10 +588,15 @@
     {
       "id": "qwen3-30b-a3b",
       "name": "Qwen3 30B A3B",
-      "publisher": "Qwen",
+      "publisher": "Alibaba",
       "quantization": "Q4_K_M",
       "roles": [
-        "general"
+        "general",
+        "code",
+        "security"
+      ],
+      "inputs": [
+        "text"
       ],
       "tools": true,
       "reasoning": true,
@@ -201,10 +625,13 @@
     {
       "id": "qwen2.5-coder-1.5b",
       "name": "Qwen2.5 Coder 1.5B",
-      "publisher": "Qwen",
+      "publisher": "Alibaba",
       "quantization": "Q4_K_M",
       "roles": [
         "code"
+      ],
+      "inputs": [
+        "text"
       ],
       "tools": true,
       "reasoning": false,
@@ -233,10 +660,13 @@
     {
       "id": "qwen2.5-coder-7b",
       "name": "Qwen2.5 Coder 7B",
-      "publisher": "Qwen",
+      "publisher": "Alibaba",
       "quantization": "Q4_K_M",
       "roles": [
         "code"
+      ],
+      "inputs": [
+        "text"
       ],
       "tools": true,
       "reasoning": false,
@@ -263,78 +693,15 @@
       ]
     },
     {
-      "id": "granite-3.3-2b",
-      "name": "Granite 3.3 2B",
-      "publisher": "IBM",
-      "quantization": "Q4_K_M",
-      "roles": [
-        "general",
-        "code"
-      ],
-      "tools": true,
-      "reasoning": false,
-      "license": "Apache-2.0",
-      "description": {
-        "en": "IBM model for business tasks: summaries, extraction, classification, code and tool use, with a context of 128K tokens.",
-        "fr": "Modèle d'IBM pour les tâches d'entreprise : résumés, extraction, classification, code et usage d'outils, avec un contexte de 128K jetons.",
-        "de": "IBM-Modell für Unternehmensaufgaben: Zusammenfassungen, Extraktion, Klassifizierung, Code und Werkzeugnutzung, mit einem Kontext von 128K Token.",
-        "it": "Modello di IBM per le attività aziendali: riassunti, estrazione, classificazione, codice e uso di strumenti, con un contesto di 128K token.",
-        "es": "Modelo de IBM para tareas empresariales: resúmenes, extracción, clasificación, código y uso de herramientas, con un contexto de 128K tokens."
-      },
-      "arch": "granite",
-      "parameters": 2533539840,
-      "context": 131072,
-      "source": "https://huggingface.co/ibm-granite/granite-3.3-2b-instruct-GGUF",
-      "size": 1545303328,
-      "sha256": "ac71e9e32c0bea919b409c5918f69ca74339854b0319c5065e4e9fb6d95c4852",
-      "files": [
-        {
-          "url": "https://huggingface.co/ibm-granite/granite-3.3-2b-instruct-GGUF/resolve/7cdf86ccd1f1bb3491c9b7017b033f2e51367397/granite-3.3-2b-instruct-Q4_K_M.gguf",
-          "size": 1545303328,
-          "sha256": "ac71e9e32c0bea919b409c5918f69ca74339854b0319c5065e4e9fb6d95c4852"
-        }
-      ]
-    },
-    {
-      "id": "granite-3.3-8b",
-      "name": "Granite 3.3 8B",
-      "publisher": "IBM",
-      "quantization": "Q4_K_M",
-      "roles": [
-        "general",
-        "code"
-      ],
-      "tools": true,
-      "reasoning": false,
-      "license": "Apache-2.0",
-      "description": {
-        "en": "Larger IBM model for business tasks, documents and code, with tool use and a context of 128K tokens, for computers with 16 GB of memory.",
-        "fr": "Modèle d'IBM plus grand pour les tâches d'entreprise, les documents et le code, avec usage d'outils et un contexte de 128K jetons, pour les ordinateurs dotés de 16 Go de mémoire.",
-        "de": "Größeres IBM-Modell für Unternehmensaufgaben, Dokumente und Code, mit Werkzeugnutzung und einem Kontext von 128K Token, für Computer mit 16 GB Arbeitsspeicher.",
-        "it": "Modello di IBM più grande per attività aziendali, documenti e codice, con uso di strumenti e un contesto di 128K token, per computer con 16 GB di memoria.",
-        "es": "Modelo de IBM más grande para tareas empresariales, documentos y código, con uso de herramientas y un contexto de 128K tokens, para ordenadores con 16 GB de memoria."
-      },
-      "arch": "granite",
-      "parameters": 8170864640,
-      "context": 131072,
-      "source": "https://huggingface.co/ibm-granite/granite-3.3-8b-instruct-GGUF",
-      "size": 4942873344,
-      "sha256": "77bcee066a76dcdd10d0d123c87e32c8ec2c74e31b6ffd87ebee49c9ac215dca",
-      "files": [
-        {
-          "url": "https://huggingface.co/ibm-granite/granite-3.3-8b-instruct-GGUF/resolve/e40e9dd739c7be00fa965c16ce167088190ce114/granite-3.3-8b-instruct-Q4_K_M.gguf",
-          "size": 4942873344,
-          "sha256": "77bcee066a76dcdd10d0d123c87e32c8ec2c74e31b6ffd87ebee49c9ac215dca"
-        }
-      ]
-    },
-    {
       "id": "foundation-sec-8b",
       "name": "Foundation-Sec 1.1 8B",
-      "publisher": "Cisco Foundation AI",
+      "publisher": "Cisco",
       "quantization": "Q4_K_M",
       "roles": [
         "security"
+      ],
+      "inputs": [
+        "text"
       ],
       "tools": false,
       "reasoning": false,
@@ -357,6 +724,41 @@
           "url": "https://huggingface.co/fdtn-ai/Foundation-Sec-1.1-8B-Instruct-Q4_K_M-GGUF/resolve/0b58da4736f799f3cb5bbaffb8a39025f1c4e5df/foundation-sec-1.1-8b-instruct-q4_k_m.gguf",
           "size": 4920780160,
           "sha256": "5813d725b38f0da1eac34486e44b70b0f728c2e2881c96873def69e76f8421ed"
+        }
+      ]
+    },
+    {
+      "id": "foundation-sec-8b-reasoning",
+      "name": "Foundation-Sec 8B Reasoning",
+      "publisher": "Cisco",
+      "quantization": "Q4_K_M",
+      "roles": [
+        "security"
+      ],
+      "inputs": [
+        "text"
+      ],
+      "tools": false,
+      "reasoning": true,
+      "license": "Llama 3.1 Community License; Apache-2.0 for the changes of Cisco",
+      "description": {
+        "en": "Cybersecurity assistant that reasons step by step before answering: threat intelligence, mapping of vulnerabilities to weaknesses (CVE, CWE) and to attack techniques, analysis of alerts and configurations. It always reasons and answers in English, for computers with 16 GB of memory or a graphics processor.",
+        "fr": "Assistant de cybersécurité qui raisonne étape par étape avant de répondre : renseignement sur les menaces, rattachement des vulnérabilités aux faiblesses (CVE, CWE) et aux techniques d'attaque, analyse d'alertes et de configurations. Il raisonne toujours et répond en anglais, pour les ordinateurs dotés de 16 Go de mémoire ou d'un processeur graphique.",
+        "de": "Cybersicherheitsassistent, der vor der Antwort Schritt für Schritt nachdenkt: Bedrohungsinformationen, Zuordnung von Schwachstellen zu Schwächen (CVE, CWE) und zu Angriffstechniken, Analyse von Alarmen und Konfigurationen. Er denkt immer nach und antwortet auf Englisch, für Computer mit 16 GB Arbeitsspeicher oder einem Grafikprozessor.",
+        "it": "Assistente di cybersicurezza che ragiona passo dopo passo prima di rispondere: threat intelligence, associazione delle vulnerabilità alle debolezze (CVE, CWE) e alle tecniche di attacco, analisi di allarmi e configurazioni. Ragiona sempre e risponde in inglese, per computer con 16 GB di memoria o un processore grafico.",
+        "es": "Asistente de ciberseguridad que razona paso a paso antes de responder: inteligencia de amenazas, asociación de las vulnerabilidades con las debilidades (CVE, CWE) y las técnicas de ataque, análisis de alertas y configuraciones. Siempre razona y responde en inglés, para ordenadores con 16 GB de memoria o un procesador gráfico."
+      },
+      "arch": "llama",
+      "parameters": 8030425152,
+      "context": 131072,
+      "source": "https://huggingface.co/fdtn-ai/Foundation-Sec-8B-Reasoning-Q4_K_M-GGUF",
+      "size": 4920851232,
+      "sha256": "7a61e41b1ca1b339d41caf3001ea7832469d866e7c52a23980a1e95cbf5cd58b",
+      "files": [
+        {
+          "url": "https://huggingface.co/fdtn-ai/Foundation-Sec-8B-Reasoning-Q4_K_M-GGUF/resolve/4a04f7b19513ff9f672169b8fe4288000ab87b07/foundation-sec-8b-reasoning-q4_k_m.gguf",
+          "size": 4920851232,
+          "sha256": "7a61e41b1ca1b339d41caf3001ea7832469d866e7c52a23980a1e95cbf5cd58b"
         }
       ]
     }

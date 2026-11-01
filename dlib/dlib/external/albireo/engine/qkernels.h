@@ -226,6 +226,47 @@ namespace albireo
     void qk_attention_values(const float* P, long lds, long rows, const uint16_t* V, long m, long hd, float* O,
         float* scratch);
 
+    /*!
+        The vector helpers of the image encoders, whose blocks normalize with a mean and a
+        bias and activate with GELU.
+
+        qk_layer_norm() ensures:
+            - y[i] == (x[i] - mean) / sqrt(var + eps) * gamma[i] + beta[i] for i < n, mean and
+              var being the mean of x and the mean of its squared deviations.  x and y may be
+              the same row.
+        qk_gelu_tanh() ensures:
+            - x[i] == x[i] / (1 + exp(-2 u)) with u == sqrt(2 / pi) * (x[i] + 0.044715 x[i]^3),
+              which is 0.5 x[i] (1 + tanh(u)), the tanh approximation of GELU.
+        qk_gelu_erf() ensures:
+            - x[i] == 0.5 x[i] (1 + erf(x[i] / sqrt(2))), the exact GELU, with erf within 1.5e-7
+              (Abramowitz and Stegun 7.1.26).
+        qk_add() ensures:
+            - y[i] += x[i] for i < n.
+    !*/
+    void qk_layer_norm(const float* x, const float* gamma, const float* beta, float* y, long n, float eps);
+    void qk_gelu_tanh(float* x, long n);
+    void qk_gelu_erf(float* x, long n);
+    void qk_add(float* y, const float* x, long n);
+
+    /*!
+        The attention of an encoder, whose tokens all see each other, for a tile of query rows
+        of one head: O = softmax(Q K^T) V.
+
+        Q holds rows rows of hd floats, already scaled; Kt holds the keys transposed, hd rows
+        of m floats, ldk floats apart, so that the scores of a row of queries against a run of
+        keys are vector products; V holds m rows of hd floats, ldv floats apart; O receives
+        rows rows of hd floats, ldo floats apart.  The keys are read by blocks with a running
+        maximum and sum, so that the work memory does not grow with m.
+
+        requires
+            - 0 < rows <= qk_encoder_tile_rows
+            - work holds qk_encoder_attention_work(hd) floats private to the caller
+    !*/
+    const long qk_encoder_tile_rows = 64;
+    long qk_encoder_attention_work(long hd);
+    void qk_encoder_attention(const float* Q, long rows, const float* Kt, long ldk, const float* V, long ldv, long m,
+        long hd, float* O, long ldo, float* work);
+
 }
 
 #endif // ALBIREO_ENGINE_QKERNELS_H_

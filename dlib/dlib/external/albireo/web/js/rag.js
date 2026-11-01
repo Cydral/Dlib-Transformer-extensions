@@ -335,15 +335,17 @@ function overlap(a, b) {
 /*
     The excerpts of the documents of owners closest to a question:
     [{doc, name, where, text, score}], in the order of the documents, within budget
-    characters, limit passages at most.
+    characters, limit passages at most.  skip, a Set of documents, leaves them out of the
+    search, such as the documents of a project the model reads whole.
 */
 export async function search(owners, question, options = {}) {
-  const { limit = 12, budget = 12000, signal = null } = options;
+  const { limit = 12, budget = 12000, signal = null, skip = null } = options;
   const all = [];
   const sparse = [];
   for (const o of owners) {
     const entry = await load(o);
     for (let i = 0; i < entry.records.length; ++i) {
+      if (skip && skip.has(entry.records[i].doc)) continue;
       all.push(entry.records[i]);
       sparse.push(entry.sparse[i]);
     }

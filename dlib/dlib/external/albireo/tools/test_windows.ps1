@@ -68,6 +68,9 @@ function Invoke-Check([string]$step, [string]$pattern, [string]$program, [string
 
 $haveModel = Test-Path $Model
 $chat = Join-Path $main "tests\engine_chat.exe"
+# The engine steps run engine_chat.exe, which build_windows.ps1 -Tests builds.
+$haveChat = Test-Path $chat
+$noChat = "no $chat (build_windows.ps1 -Tests)"
 
 # The kernels of each family of processors, skipped by the processors without their instructions.
 foreach ($family in @("", "_avxvnni", "_avx512")) {
@@ -86,6 +89,7 @@ foreach ($variant in @("cpu-avx512", "cpu-avxvnni", "cpu-avx2", "cpu")) {
     $engine = Join-Path $main "bin\engines\albireo-engine-$variant.dll"
     if (-not $haveModel) { Add-Result "engine $variant" "SKIP" "no $Model" 0; continue }
     if (-not (Test-Path $engine)) { Add-Result "engine $variant" "SKIP" "no $engine" 0; continue }
+    if (-not $haveChat) { Add-Result "engine $variant" "SKIP" $noChat 0; continue }
     $description = (& $chat $engine --describe 2>&1 | ForEach-Object { "$_" }) -join "`n"
     if ($LASTEXITCODE -eq 3) {
         $reason = if ($description -match "lacks ([^(]*)") { "lacks $($Matches[1])" } else { "not usable here" }
@@ -106,6 +110,7 @@ if ((Test-Path $ovEngine) -and $haveModel) {
     foreach ($variant in @("openvino-avx512", "openvino-avxvnni", "openvino")) {
         $engine = Join-Path $openvino "bin\engines\albireo-engine-$variant.dll"
         if (-not (Test-Path $engine)) { Add-Result "engine $variant" "SKIP" "no $engine" 0; continue }
+        if (-not $haveChat) { Add-Result "engine $variant" "SKIP" $noChat 0; continue }
         $description = (& $chat $engine --describe 2>&1 | ForEach-Object { "$_" }) -join "`n"
         if ($LASTEXITCODE -eq 3 -and $description -match "lacks ([^(]*)") {
             Add-Result "engine $variant" "SKIP" "lacks $($Matches[1])" 0
@@ -121,7 +126,10 @@ else {
 }
 
 $cudaEngine = Join-Path $cuda "bin\engines\albireo-engine-cuda.dll"
-if ((Test-Path $cudaEngine) -and $haveModel) {
+if ((Test-Path $cudaEngine) -and $haveModel -and -not $haveChat) {
+    Add-Result "engine cuda" "SKIP" $noChat 0
+}
+elseif ((Test-Path $cudaEngine) -and $haveModel) {
     # A machine without a supported card: the engine says so in its description.
     $description = & $chat $cudaEngine $Model --max 1 "Hello" 2>&1 | ForEach-Object { "$_" } |
         Where-Object { $_ -match '^\{' } | Select-Object -First 1

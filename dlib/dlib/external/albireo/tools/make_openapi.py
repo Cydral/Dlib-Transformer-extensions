@@ -57,13 +57,28 @@ schemas = {
         "type": "object", "required": ["role"],
         "properties": {
             "role": {"type": "string", "enum": ["system", "developer", "user", "assistant", "tool"]},
-            "content": {"description": "Text, or a list of parts of type text.",
-                        "oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "object"}}],
+            "content": {"description": "Text, or a list of parts: text parts, and for a model that reads images "
+                                       "(inputs of /v1/models) image_url parts, 16 images per request at most.",
+                        "oneOf": [{"type": "string"}, {"type": "array", "items": ref("ContentPart")}],
                         "nullable": True},
             "reasoning_content": {"type": "string", "description": "Reasoning of an earlier assistant message."},
             "tool_calls": {"type": "array", "items": ref("ToolCall")},
             "tool_call_id": {"type": "string", "description": "For a tool message: the call it answers."},
             "name": {"type": "string"}}},
+    "ContentPart": {"type": "object", "required": ["type"], "properties": {
+        "type": {"type": "string", "enum": ["text", "image_url"]},
+        "text": {"type": "string"},
+        "image_url": {"type": "object", "required": ["url"], "properties": {
+            "url": {"type": "string", "description": "A PNG or JPEG file as a data URL, data:image/png;base64,... or "
+                    "data:image/jpeg;base64,...; the service fetches no address (code invalid_image_url), reads no "
+                    "other format (invalid_image_format), and refuses more than 20 MB, 8192 pixels on a side or "
+                    "40 megapixels."},
+            "detail": {"type": "string", "enum": ["low", "auto", "high"], "default": "auto",
+                       "description": "The tokens an image takes at most: for Qwen3-VL 256, 576 or 1024 tokens of "
+                                      "32 pixels square; for a LLaVA-NeXT model (EuroVLM) the whole image and 1, 2 or "
+                                      "4 tiles of 384 pixels."}}}},
+        "description": "A part of the content of a message. A model that reads text only refuses the images (code "
+                       "image_input_not_supported), and a request carries 16 images at most (too_many_images)."},
     "ToolCall": {"type": "object", "properties": {
         "index": {"type": "integer", "description": "Position of the call, in the chunks of a stream."},
         "id": {"type": "string"}, "type": {"type": "string", "enum": ["function"]},
@@ -97,10 +112,11 @@ schemas = {
         "type": "object", "required": ["messages"],
         "properties": {
             "model": {"type": "string",
-                      "description": "A model identifier, a function (albireo-general, albireo-code, albireo-security), "
-                                     "albireo-background or auto. A function without a model of its own is served by "
-                                     "the general model; albireo-background, the work done in the background (titles, "
-                                     "summaries, memory), by the model that comes with Albireo, else the general one.",
+                      "description": "A model identifier, a function (albireo-general, albireo-code, "
+                                     "albireo-security), albireo-background or auto. A function without a model "
+                                     "of its own is served by the general model; albireo-background, the work done "
+                                     "in the background (titles, summaries, memory), by the model that comes with "
+                                     "Albireo, else the general one.",
                       "example": "albireo-general"},
             "messages": {"type": "array", "items": ref("Message")},
             "stream": {"type": "boolean", "default": False},
@@ -174,7 +190,14 @@ schemas = {
         "type": "object", "properties": {"id": {"type": "string"}, "object": {"type": "string"},
                                          "owned_by": {"type": "string"},
                                          "roles": {"type": "array", "items": {"type": "string"}},
-                                         "alias_of": {"type": "string"}}}}}},
+                                         "alias_of": {"type": "string"},
+                                         "inputs": {"type": "array", "items": {"type": "string",
+                                                                              "enum": ["text", "image", "audio"]},
+                                                    "description": "What the model reads, text and images; an "
+                                                                   "alias gives those of its model."},
+                                         "publisher": {"type": "string",
+                                                       "description": "The company that made the model, empty when "
+                                                                      "unknown."}}}}}},
     "Settings": {"type": "object", "description": "Settings the tray may change; a change of port, engine or memory "
                  "restarts the service.", "properties": {
         "port": {"type": "integer", "minimum": 1024, "maximum": 65535},
@@ -304,6 +327,13 @@ paths = {
                 "installed": {"type": "boolean"},
                 "builtin": {"type": "boolean", "description": "Comes with Albireo: it cannot be deleted."},
                 "size": {"type": "integer"}, "quantization": {"type": "string"},
+                "total_size": {"type": "integer", "description": "The bytes of the files of the model, its "
+                               "projector included."},
+                "projector": {"type": "object", "description": "The image encoder of a model that reads images, a "
+                              "second file downloaded with the decoder: its size, SHA-256 and quantization, and "
+                              "its file once installed.", "properties": {
+                                  "file": {"type": "string"}, "size": {"type": "integer"},
+                                  "sha256": {"type": "string"}, "quantization": {"type": "string"}}},
                 "description": {"type": "string"}, "publisher": {"type": "string"},
                 "license": {"type": "string", "description": "The license of the entry of the model in the catalog, "
                             "or in the manifest of the models that come with Albireo; absent for a file imported "
@@ -316,6 +346,11 @@ paths = {
                 "license": {"type": "string", "description": "As for the language models."}}},
                 "description": "The installed embedding models."},
             "downloads": {"type": "array", "items": {"type": "object"}},
+            "pending_projectors": {"type": "array", "description": "The projectors imported without their decoder, "
+                                   "which wait for it.", "items": {"type": "object", "properties": {
+                                       "name": {"type": "string"}, "size": {"type": "integer"},
+                                       "sha256": {"type": "string"}, "projector_type": {"type": "string"},
+                                       "projection_width": {"type": "integer"}}}},
             "active": {"type": "object", "additionalProperties": {"type": "string"},
                        "description": "The model of each function, as in the status."},
             "selected": {"type": "object", "additionalProperties": {"type": "string"},

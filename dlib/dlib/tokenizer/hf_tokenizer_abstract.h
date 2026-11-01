@@ -39,16 +39,17 @@ namespace dlib
                     are exact.
 
                   - Byte-level BPE (kind::bpe): used by Llama 3, Qwen, Mistral (tekken),
-                    Granite, SmolLM and GPT-2/NeoX-style models. decode is exact. encode
-                    applies the pre-tokenizer of the vocabulary, selected by the name the
-                    GGUF container reports (tokenizer.ggml.pre), then the BPE merges in rank
-                    order. The pre-tokenizers of the gpt2, llama3, qwen2, qwen35 and tekken
-                    families, and gpt2 with isolated digits, are exact equivalents of their
-                    regular expressions, Unicode classes included; an unknown name receives
-                    the qwen2 pattern and exact_pretokenizer() returns false. The Qwen
-                    vocabularies also receive the canonical composition (NFC) their reference
-                    tokenizer applies, and the llama3 and tekken ones take a piece that is a
-                    token as a whole (ignore_merges).
+                    Phi 4 mini (gpt-4o), Granite, SmolLM and GPT-2/NeoX-style models. decode
+                    is exact. encode applies the pre-tokenizer of the vocabulary, selected by
+                    the name the GGUF container reports (tokenizer.ggml.pre), then the BPE
+                    merges in rank order. The pre-tokenizers of the gpt2, llama3, qwen2,
+                    qwen35, tekken and gpt-4o families, and gpt2 with isolated digits, are
+                    exact equivalents of their regular expressions, Unicode classes included
+                    (the upper and lower case classes of the letters for tekken and gpt-4o);
+                    an unknown name receives the qwen2 pattern and exact_pretokenizer()
+                    returns false. The Qwen vocabularies also receive the canonical
+                    composition (NFC) their reference tokenizer applies, and the llama3 and
+                    tekken ones take a piece that is a token as a whole (ignore_merges).
 
                 Special tokens (those flagged as control or user-defined in the vocabulary,
                 such as begin/end-of-sequence or chat-template markers) are recognized inside

@@ -3,6 +3,7 @@
 
 #include "store.h"
 
+#include <algorithm>
 #include <ctime>
 
 #include <dlib/sqlite.h>
@@ -21,7 +22,28 @@ namespace albireo
             "CREATE TABLE IF NOT EXISTS models ("
             " id TEXT PRIMARY KEY, name TEXT NOT NULL, file TEXT NOT NULL, size INTEGER NOT NULL,"
             " sha256 TEXT NOT NULL, source TEXT NOT NULL, installed_at INTEGER NOT NULL,"
-            " verified_at INTEGER NOT NULL DEFAULT 0, descriptor TEXT NOT NULL DEFAULT '{}')");
+            " verified_at INTEGER NOT NULL DEFAULT 0, descriptor TEXT NOT NULL DEFAULT '{}',"
+            " projector TEXT NOT NULL DEFAULT '', projector_size INTEGER NOT NULL DEFAULT 0,"
+            " projector_sha256 TEXT NOT NULL DEFAULT '')");
+        // The columns of the projectors, which the databases of the earlier versions lack.
+        std::vector<std::string> columns;
+        {
+            dlib::statement st(*db_, "PRAGMA table_info(models)");
+            st.exec();
+            while (st.move_next()) columns.push_back(st.get_column_as_text(1));
+        }
+        const char* const added[][2] = { { "projector", "TEXT NOT NULL DEFAULT ''" },
+            { "projector_size", "INTEGER NOT NULL DEFAULT 0" }, { "projector_sha256", "TEXT NOT NULL DEFAULT ''" } };
+        for (const auto& c : added)
+            if (std::find(columns.begin(), columns.end(), c[0]) == columns.end())
+            {
+                db_->exec(std::string("ALTER TABLE models ADD COLUMN ") + c[0] + " " + c[1]);
+                log_info(std::string("store: the column ") + c[0] + " is added to the models of " + path_);
+            }
+        db_->exec(
+            "CREATE TABLE IF NOT EXISTS projectors ("
+            " sha256 TEXT PRIMARY KEY, file TEXT NOT NULL, size INTEGER NOT NULL, name TEXT NOT NULL,"
+            " descriptor TEXT NOT NULL DEFAULT '{}', received_at INTEGER NOT NULL)");
         db_->exec(
             "CREATE TABLE IF NOT EXISTS downloads ("
             " id TEXT PRIMARY KEY, state TEXT NOT NULL, updated_at INTEGER NOT NULL)");
@@ -68,8 +90,8 @@ namespace albireo
     {
         std::lock_guard<std::mutex> lock(m_);
         std::vector<installed_model> out;
-        dlib::statement st(*db_, "SELECT id, name, file, size, sha256, source, installed_at, verified_at, descriptor "
-            "FROM models ORDER BY name");
+        dlib::statement st(*db_, "SELECT id, name, file, size, sha256, source, installed_at, verified_at, descriptor, "
+            "projector, projector_size, projector_sha256 FROM models ORDER BY name");
         st.exec();
         while (st.move_next())
         {
@@ -83,6 +105,9 @@ namespace albireo
             m.installed_at = st.get_column_as_int64(6);
             m.verified_at = st.get_column_as_int64(7);
             m.descriptor = json::parse_or_null(st.get_column_as_text(8));
+            m.projector = st.get_column_as_text(9);
+            m.projector_size = static_cast<uint64_t>(st.get_column_as_int64(10));
+            m.projector_sha256 = st.get_column_as_text(11);
             out.push_back(m);
         }
         return out;
@@ -104,7 +129,8 @@ namespace albireo
         std::lock_guard<std::mutex> lock(m_);
         writing([&]() {
             dlib::statement st(*db_, "INSERT OR REPLACE INTO models (id, name, file, size, sha256, source, "
-                "installed_at, verified_at, descriptor) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
+                "installed_at, verified_at, descriptor, projector, projector_size, projector_sha256) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
             st.bind(1, m.id);
             st.bind(2, m.name);
             st.bind(3, m.file);
@@ -114,6 +140,56 @@ namespace albireo
             st.bind_int64(7, m.installed_at);
             st.bind_int64(8, m.verified_at);
             st.bind(9, m.descriptor.dump());
+            st.bind(10, m.projector);
+            st.bind_int64(11, static_cast<dlib::int64>(m.projector_size));
+            st.bind(12, m.projector_sha256);
+            st.exec();
+        });
+    }
+
+    std::vector<pending_projector> store::projectors()
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        std::vector<pending_projector> out;
+        dlib::statement st(*db_, "SELECT sha256, file, size, name, descriptor, received_at FROM projectors "
+            "ORDER BY received_at");
+        st.exec();
+        while (st.move_next())
+        {
+            pending_projector p;
+            p.sha256 = st.get_column_as_text(0);
+            p.file = st.get_column_as_text(1);
+            p.size = static_cast<uint64_t>(st.get_column_as_int64(2));
+            p.name = st.get_column_as_text(3);
+            p.descriptor = json::parse_or_null(st.get_column_as_text(4));
+            p.received_at = st.get_column_as_int64(5);
+            out.push_back(p);
+        }
+        return out;
+    }
+
+    void store::put_projector(const pending_projector& p)
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        writing([&]() {
+            dlib::statement st(*db_, "INSERT OR REPLACE INTO projectors (sha256, file, size, name, descriptor, "
+                "received_at) VALUES (?, ?, ?, ?, ?, ?)");
+            st.bind(1, p.sha256);
+            st.bind(2, p.file);
+            st.bind_int64(3, static_cast<dlib::int64>(p.size));
+            st.bind(4, p.name);
+            st.bind(5, p.descriptor.dump());
+            st.bind_int64(6, p.received_at);
+            st.exec();
+        });
+    }
+
+    void store::remove_projector(const std::string& sha256)
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        writing([&]() {
+            dlib::statement st(*db_, "DELETE FROM projectors WHERE sha256 = ?");
+            st.bind(1, sha256);
             st.exec();
         });
     }

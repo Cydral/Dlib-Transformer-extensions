@@ -7,7 +7,7 @@ with the OpenAI one, a web application served by that service, an icon in the no
 to manage it, and an installer. The conversations, the documents and the models stay on the
 machine, and nothing asks for an account.
 
-![A discussion in the web application of Albireo, answered by the model that comes with it](docs/images/chat.png)
+![A question about a chart in the web application of Albireo, answered by the model that comes with it](docs/images/chat.png)
 
 Albireo was created by Aldric Pierrain (cydraltechnology@gmail.com). Its name is that
 of a double star of the constellation Cygnus, one gold and one blue, which its icon draws. This
@@ -53,16 +53,23 @@ application, the description of the interface and the list of the programs of Wi
   of a document, of every sheet of a workbook in the order of its tabs, and of every slide of a
   presentation in the order of the show. Each file appears as a thumbnail with its format, which
   can be removed before sending, and the edition of a question keeps, removes or adds its files.
+- **Images** given to the models that read them: a question carries PNG or JPEG images (the
+  browser converts the other formats it shows), attached, pasted or dropped, shown as thumbnails
+  that open whole in a viewer, ten at most in the context of a discussion, the images of the
+  exchanges that a compression summarized leaving the context with them. A project holds ten
+  images, which the model that comes with Albireo describes in the background; their descriptions
+  are searched with its documents, and a question that finds one receives the image, four at most.
+  A model that reads text only receives the names of the images.
 - **Projects**: discussions grouped with instructions and documents that form their shared
   context, read whole when they fit, searched otherwise by meaning and by words, the search and
   its index running in the browser (see [Documents and context](#documents-and-context)).
 - **Three functions**, general, code and security, each served by a language model of the
   catalog, chosen in the Models window or by the service when a model arrives, and an embedding
   model for the search in documents, which the service installs in every case.
-- **Models that come with Albireo**: the complete installer carries Qwen3-1.7B-albireo, which
-  serves the three functions as soon as Albireo is installed, and Qwen3-Embedding-0.6B-albireo
-  for the search, both retrieved and converted by the build (see
-  [Models that come with Albireo](#models-that-come-with-albireo)).
+- **Models that come with Albireo**: the complete installer carries Qwen3-VL-4B-Thinking-albireo,
+  which reads images and text, reasons when asked, and serves the three functions as soon as
+  Albireo is installed, and Qwen3-Embedding-0.6B-albireo for the search, both retrieved and
+  checked by the build (see [Models that come with Albireo](#models-that-come-with-albireo)).
 - **Agent mode**: the model calls tools that run in the page (calculator, JavaScript in a
   sandboxed frame, outline, reading and search of the documents, search of the other
   discussions, date, files to download), up to eight steps per answer. While the mode is on, the
@@ -73,8 +80,8 @@ application, the description of the interface and the list of the programs of Wi
   forward pass serving the next token of each, and the keys and values of a finished request stay
   cached so that the next turn of a conversation starts where the previous one ended.
 - **An interface for other programs**: `/v1/chat/completions`, `/v1/completions`,
-  `/v1/embeddings` and `/v1/models` follow the OpenAI interface, streaming included, with its
-  documentation as a Swagger page at `/docs/`.
+  `/v1/embeddings` and `/v1/models` follow the OpenAI interface, streaming and images included,
+  with its documentation as a Swagger page at `/docs/`.
 - **Engines for each kind of processor**: portable, AVX2, AVX-VNNI, AVX-512, Intel NPU and
   integrated GPU through OpenVINO, NVIDIA GPU through CUDA, behind a single C interface. The
   service measures them on the machine and runs the fastest, and the Accelerator menu of the
@@ -91,12 +98,12 @@ application, the description of the interface and the list of the programs of Wi
 ## Screenshots
 
 The web application served by the service, the windows of the icon and the installer, with the
-model that comes with Albireo (Qwen3-1.7B-albireo) on a processor of two cores.
+model that comes with Albireo (Qwen3-VL-4B-Thinking-albireo) on a processor of two cores.
 
 | | |
 |---|---|
 | ![The page of a project](docs/images/project.png) | ![A discussion of the project](docs/images/project-chat.png) |
-| A project: its instructions, its documents and its discussions | A discussion of the project, which cites the policy given as a document |
+| A project: its instructions, its documents and its images with their descriptions | A discussion of the project, which cites the policy and the scan given as an image |
 | ![Code in the dark theme](docs/images/code-dark.png) | ![The memory of the discussions](docs/images/memory.png) |
 | Code, in the dark theme | The memory of the discussions, written in the background |
 | ![The Models window](docs/images/models.png) | ![The About tab](docs/images/about.png) |
@@ -209,6 +216,53 @@ end with the unloading). The window shows it as unloading meanwhile; activated a
 leaves, the model stays loaded. A model deleted while it answers is deleted the same way, once its
 requests are served, and is shown as being deleted until then.
 
+The conversation formats are written natively ([`engine/chat_format.cpp`](engine/chat_format.cpp)),
+the chat template of a model naming its format: ChatML (Qwen2.5, Qwen3, Qwen3-VL, EuroLLM, with
+the reasoning between `<think>` and `</think>`), Mistral (Ministral 3), Llama 3, Granite 3,
+Granite 4.2 (ChatML with the tool calls in the XML form `<function=...>`), Phi-4-mini and the
+format of Foundation-Sec-8B-Reasoning. The tests compare the prompts with those of the reference
+templates rendered by Jinja, byte for byte. A model that always reasons, such as the Thinking
+variants of Qwen3-VL, answers at once when the request asks for no reasoning: the prompt then
+closes its reasoning before it starts, as the switchable templates do. The tokenizer of dlib reads
+the byte-level BPE vocabularies, with the pre-tokenizers of GPT-2, Llama 3, Qwen2, tekken and
+GPT-4o (Phi-4-mini) among others, and the SentencePiece ones (EuroLLM), whose leading space it
+puts after each control token as the reference tokenizers do; the token identifiers of the tests
+are those of llama.cpp.
+
+### Images
+
+A model reads images when its decoder takes the tokens of an image encoder, the projector: a
+second GGUF file (`mmproj`, architecture `clip`) that the catalog downloads with the decoder and
+that the engine loads with it (option `projector` of the model). The engine reads two families
+([`engine/vision_encoder.cpp`](engine/vision_encoder.cpp)):
+
+- Qwen3-VL (projector `qwen3vl_merger`): the image, resized to multiples of 32 pixels, is cut into
+  patches of 16 pixels, merged by squares of four into the tokens of the decoder; the learned
+  positions are interpolated to the grid of the patches, and each head of the attention rotates
+  its pairs by the row and the column of its patch. The decoder places these tokens by
+  multimodal rotary positions (time, row, column) and adds the outputs of three DeepStack mergers
+  to its hidden states after its first layers. The detail of an image gives the tokens it takes
+  at most: 256 (`low`), 576 (`auto`) or 1024 (`high`).
+- LLaVA-NeXT (projector `mlp` with pinpoints, EuroVLM): a SigLIP encoder reads the whole image
+  resized to 384 pixels square, then the tiles of 384 pixels of the image resized into the
+  resolution of the pinpoints that keeps the most of it, its aspect ratio kept; the tokens are
+  those of the whole image, then the grid of the tiles without its black bands, each row ended by
+  a newline embedding. The detail of an image gives the tiles it takes at most, and its tokens: 1
+  tile and 1,485 tokens (`low`), 2 and 2,241 (`auto`) or 4 and 3,753 (`high`).
+
+The service reads nothing from the network or the disk for a request: an image comes as a data
+URL of a PNG or JPEG file (20 MB, 8,192 pixels on a side and 40 megapixels at most), decoded by
+the libpng and libjpeg copies of dlib, its EXIF orientation applied and its transparency
+composited onto white, then resized as the reference preprocessing does (the bicubic filter of
+Pillow for Qwen3-VL, its bilinear filter for LLaVA-NeXT, in fixed point). A request carries 16
+images at most. The encoding of an image runs between the passes of the other requests, by
+slices of a tenth of a second while answers are being written, and is kept by the digest of its
+pixels (256 MB of encodings per model): the next turns of a discussion read the image without
+encoding it again, and the tokens of the image enter the cache of the prompts under keys made of
+that digest, so that a conversation that repeats its images takes their keys and values from the
+cache. On two cores, Qwen3-VL-2B encodes an image of 576 tokens in 9.4 s (llama.cpp: 9.1 s) and
+describes it as llama.cpp does at temperature 0.
+
 ### Service
 
 `albireo-service.exe` runs as the Windows service `Albireo` (LocalSystem, delayed automatic start)
@@ -259,9 +313,13 @@ device the engines found, named after it and its runtime ("GPU NVIDIA GeForce RT
 GPU (CUDA)", "GPU Intel(R) Graphics (OpenVINO)", "NPU Intel(R) AI Boost (OpenVINO)", "NPU + GPU
 Intel (OpenVINO)"), which sets the engine and the accelerator of the settings; a device engine
 that cannot run here, or a device its runtime left out, shows grayed with its reason, as the
-window of the computer does. The window of the computer, the Models window and the menu update
-their lists in place, without flicker, and the tray keeps its connection to the service between
-two polls. `albireo-setup.exe` carries the programs as a ZIP payload, installs them
+window of the computer does. The Models window gives for each model its name, the company that
+made it, its functions, what it reads, the size of its files (a projector included) and its
+state; a click on the title of a column sorts the list by it, an arrow showing the order, which a
+second click reverses and which the next start keeps (`HKCU\Software\Albireo`), the models
+ranked alike staying in the order of the catalog. The window of the computer, the Models window
+and the menu update their lists in place, without flicker, and the tray keeps its connection to
+the service between two polls. `albireo-setup.exe` carries the programs as a ZIP payload, installs them
 with a wizard or silently, registers the service and the entry of Apps & Features, and removes them.
 The web application ([`web/`](web)) is plain ES modules with its libraries in
 [`web/vendor`](web/vendor), served by the service with a content security policy that allows no
@@ -284,11 +342,22 @@ document part by part. Nothing leaves the browser but the text placed in the mes
 PDF files are read by the legacy build of pdf.js, which runs in Edge and Chrome 125 and later,
 with the character maps of Adobe for the fonts of Chinese, Japanese and Korean that the files do
 not embed ([`web/vendor/pdfjs`](web/vendor/pdfjs)). A file encrypted with an empty password reads
-like any other; a file protected by a password, or damaged, is refused with a message. Albireo
-recognizes no characters in images: a PDF made of images only, such as a scan, is refused with a
-dialog that says so, and a PDF where some pages hold images only is added with a notice of the
-number of these pages, whose text is missing. The same rules apply to the files attached to a
-question and to the knowledge of a project.
+like any other; a file protected by a password, or damaged, is refused with a message. A PDF made
+of images only, such as a scan, has no text to extract: for a model that reads images, the
+application offers to attach its pages as images, within the places the discussion has left; for
+another model, a dialog says that its text cannot be read. A PDF where some pages hold images only
+is added with a notice of the number of these pages, whose text is missing. The same rules apply
+to the files attached to a question and to the knowledge of a project.
+
+The images of a question ([`web/js/images.js`](web/js/images.js)) are reduced in the browser to
+1,536 pixels on their longest side at most and kept in its database; the message gives them before
+its text. A discussion keeps ten images at most in its context: the composer shows the places left,
+and the images of the exchanges that a compression summarized leave the context with them and
+free their places. The images of a project, ten at most, are described by the background model as
+they arrive, their kind and subject in a sentence, then the text they show; these descriptions
+are searched with the documents, and a question whose excerpts come from an image receives the
+image itself, four at most, when its model reads images. A model that reads text only receives
+the names of the images.
 
 The search ([`web/js/rag.js`](web/js/rag.js)) cuts the documents into passages of 1,200
 characters overlapping by 240, named after their document and their part. The embedding model of
@@ -523,9 +592,9 @@ cmake --build build-albireo-win -j
 | `test_offload`   | the products of a device against the processor kernels, the small budget path and the measured routing |
 | `test_model_file` | a small Qwen3 model built in memory and 140 damaged forms of it, which the loader must all refuse without allocating more than 256 MB |
 | `test_engine_api` | the refusals of the C interface, three threads of requests with cancellations under the pressure of the keys and values, the unloading and the destruction during requests, one final event per request |
-| `test_chat_format` | the prompts of the agent mode, the marker tokens and the parsing of the tool calls, whole or cut in pieces |
+| `test_chat_format` | the prompts of the agent mode and of each chat format against those of its template rendered by Jinja, the marker tokens and the parsing of the tool calls, whole or cut in pieces |
 | `test_host`      | the files of the downloads and of the imports through no link, the refusals of the import route, the copies of models already installed |
-| `engine_chat`    | drives an engine library through its C interface: chat, tools, reasoning, parallel requests, embeddings compared with a reference |
+| `engine_chat`    | drives an engine library through its C interface: chat, images with their projector (`--image`, `--detail`), tools, reasoning, parallel requests, embeddings compared with a reference |
 | `bench_runtime`  | tokens per second of the prompt and of the generation, also as `bench_runtime_avxvnni` and `bench_runtime_avx512` |
 
 `test_offload model.gguf CPU` validates the OpenVINO engine on a machine without NPU, with the CPU
@@ -671,7 +740,7 @@ of `/v1/embeddings` takes `albireo-embedding`.
 | Route                                    | Use                                                       |
 |------------------------------------------|-----------------------------------------------------------|
 | `GET /v1/models`                         | loaded models and the aliases of the functions, `albireo-background` included |
-| `POST /v1/chat/completions`              | chat, streaming, tools, `reasoning_content`               |
+| `POST /v1/chat/completions`              | chat, streaming, tools, `reasoning_content`, images       |
 | `POST /v1/completions`                   | completion of a prompt                                    |
 | `POST /v1/embeddings`                    | vectors of texts, float or base64, `dimensions` to shorten them |
 | `GET /albireo/v1/status`                 | host, engine, statistics, models, downloads, updates      |
@@ -696,7 +765,14 @@ with `out_of_memory` and gives back the pages of the cache.
 With `tools`, the calls a model writes in the form of its template come back as `tool_calls`,
 whole, with the arguments as the model wrote them, a line break left raw in a string repaired;
 the parser of Qwen3 also takes a call between code fences, several objects in one call, a closing
-character in excess and a call left open at the end of the answer.
+character in excess and a call left open at the end of the answer. The calls of Granite 4.2, in
+the XML form, come back as JSON arguments, each value typed by the definition of the tool.
+
+A message of a model that reads images (`inputs` of `/v1/models`) takes parts `image_url`, whose
+`url` is a data URL of a PNG or JPEG file and whose `detail` is `low`, `auto` or `high`. The
+service fetches no address (`invalid_image_url`), reads no other format
+(`invalid_image_format`), refuses more than 16 images in a request (`too_many_images`) and the
+images sent to a model that reads text only (`image_input_not_supported`).
 
 The administration routes (`/albireo/v1/settings`, `/albireo/v1/models/<id>/download`,
 `/activate`, `/deactivate`, `DELETE /albireo/v1/models/<id>`, `/verify`, `/import`,
@@ -712,25 +788,59 @@ which the windows explain in the language of the user.
 ## Models
 
 The catalog ([`dist/albireo/catalog.json`](../../../../dist/albireo/catalog.json)) lists models of
-the architectures the engine supports (llama, mistral, mistral3, granite, granitemoe, qwen2, qwen3,
-qwen3moe, mixtral), with their functions, their descriptions in the five languages, their license,
-and the address, size and SHA-256 of each file. [`tools/make_catalog.py`](tools/make_catalog.py)
-writes it from the Hugging Face hub, the addresses pinned to a commit so that a file never changes
-under its hash.
+the architectures the engine supports (llama, mistral, mistral3, granite, granitemoe, phi3, qwen2,
+qwen3, qwen3moe, qwen3vl, qwen3vlmoe, mixtral), with their functions, the company or the
+consortium that made them, what they read, their descriptions in the five languages, their
+license, and the address, size and SHA-256 of each file, the projector of a model that reads
+images included. [`tools/make_catalog.py`](tools/make_catalog.py) writes it from the Hugging Face
+hub, the addresses pinned to a commit so that a file never changes under its hash. The sizes
+below count the decoder and its projector.
 
-| Model                  | Functions       | Size    | License                                  |
-|------------------------|-----------------|---------|------------------------------------------|
-| Qwen3 4B (default)     | general         | 2.50 GB | Apache-2.0                               |
-| Qwen3 Embedding 0.6B (default) | embedding | 0.64 GB | Apache-2.0                             |
-| Ministral 3 3B         | general         | 2.15 GB | Apache-2.0                               |
-| Llama 3.2 3B           | general         | 2.02 GB | Llama 3.2 Community License, Built with Llama |
-| Qwen3 8B               | general         | 5.03 GB | Apache-2.0                               |
-| Qwen3 30B A3B          | general         | 18.56 GB | Apache-2.0                              |
-| Qwen2.5 Coder 1.5B     | code            | 1.12 GB | Apache-2.0                               |
-| Qwen2.5 Coder 7B       | code            | 4.68 GB | Apache-2.0                               |
-| Granite 3.3 2B         | general, code   | 1.55 GB | Apache-2.0                               |
-| Granite 3.3 8B         | general, code   | 4.94 GB | Apache-2.0                               |
-| Foundation-Sec 1.1 8B  | security        | 4.92 GB | Llama 3.1 Community License              |
+| Model                          | Publisher          | Functions               | Inputs        | Size     | License |
+|--------------------------------|--------------------|-------------------------|---------------|----------|---------|
+| Qwen3-VL 4B Thinking (default) | Alibaba            | general, code, security | text, image   | 2.95 GB  | Apache-2.0 |
+| Qwen3 Embedding 0.6B (default) | Alibaba            | embedding               | text          | 0.64 GB  | Apache-2.0 |
+| Qwen3-VL 2B Instruct           | Alibaba            | general                 | text, image   | 1.55 GB  | Apache-2.0 |
+| Qwen3-VL 4B Instruct           | Alibaba            | general, code           | text, image   | 2.95 GB  | Apache-2.0 |
+| Qwen3-VL 8B Instruct           | Alibaba            | general, code, security | text, image   | 5.78 GB  | Apache-2.0 |
+| Qwen3-VL 8B Thinking           | Alibaba            | general, code, security | text, image   | 5.78 GB  | Apache-2.0 |
+| EuroVLM 9B Preview             | EuroLLM consortium | general                 | text, image   | 6.42 GB  | Apache-2.0 |
+| Phi-4-mini                     | Microsoft          | general                 | text          | 2.49 GB  | MIT |
+| Ministral 3 3B                 | Mistral AI         | general                 | text          | 2.15 GB  | Apache-2.0 |
+| Ministral 3 8B                 | Mistral AI         | general                 | text          | 5.20 GB  | Apache-2.0 |
+| EuroLLM 9B Instruct            | EuroLLM consortium | general                 | text          | 5.58 GB  | Apache-2.0 |
+| Granite 4.2 3B                 | IBM                | general, code           | text          | 2.24 GB  | Apache-2.0 |
+| Granite 4.2 8B                 | IBM                | general, code           | text          | 5.35 GB  | Apache-2.0 |
+| Qwen3 8B                       | Alibaba            | general, code, security | text          | 5.03 GB  | Apache-2.0 |
+| Qwen3 30B A3B                  | Alibaba            | general, code, security | text          | 18.56 GB | Apache-2.0 |
+| Qwen2.5 Coder 1.5B             | Alibaba            | code                    | text          | 1.12 GB  | Apache-2.0 |
+| Qwen2.5 Coder 7B               | Alibaba            | code                    | text          | 4.68 GB  | Apache-2.0 |
+| Foundation-Sec 1.1 8B          | Cisco              | security                | text          | 4.92 GB  | Llama 3.1 Community License |
+| Foundation-Sec 8B Reasoning    | Cisco              | security                | text          | 4.92 GB  | Llama 3.1 Community License |
+
+The list gives each function models that read images and models that read text, from 2 to 6 GB
+for the computers of 8 and 16 GB of memory, and one mixture of experts for those of 24 GB:
+
+| Function | Text and images | Text |
+|----------|-----------------|------|
+| General  | Qwen3-VL 2B, 4B and 8B, EuroVLM 9B | Phi-4-mini, Ministral 3 3B and 8B, EuroLLM 9B, Granite 4.2 3B and 8B, Qwen3 8B, Qwen3 30B A3B |
+| Code     | Qwen3-VL 4B (Thinking and Instruct), Qwen3-VL 8B (Instruct and Thinking) | Granite 4.2 3B and 8B, Qwen2.5 Coder 1.5B and 7B, Qwen3 8B, Qwen3 30B A3B |
+| Security | Qwen3-VL 4B Thinking, Qwen3-VL 8B (Instruct and Thinking) | Foundation-Sec 1.1 8B and 8B Reasoning, Qwen3 8B, Qwen3 30B A3B |
+
+The choices follow the published measures: Qwen3-VL gives the best scores of the models that read
+images and that the engine runs (MMMU 67.4 for the 4B Instruct, 74.1 for the 8B Thinking, OCRBench
+881 and 896); Granite 4.2 gives the best scores of reasoning and code under 6 GB (LiveCodeBench v6
+69.7 for the 3B and 73.2 for the 8B); Foundation-Sec 8B Reasoning maps the vulnerabilities to their
+weaknesses best among the models of 8B (CTIBench-RCM 0.753), and Qwen3 8B leads them on the
+knowledge of security (CyberMetric-2000 0.903, SecEval 0.886, measured by Cisco). Ministral 3,
+which Mistral AI trained in partnership with NVIDIA, and Phi-4-mini, the latest small model of
+Microsoft with a standard decoder, read text in Albireo, which has no encoder for the images of
+Ministral 3. EuroLLM 9B Instruct translates and writes the 24 official languages of the European
+Union best of the list (FLORES 88.9), and EuroVLM 9B Preview, built on it, reads images in these
+languages; its publishers give it as a preview version. The models that need another kind of
+decoder (Gated DeltaNet or Mamba hybrids such as Qwen3.5 and the Nemotron 3 of NVIDIA, Gemma 4) or
+more than 24 GB (Kimi K3 of Moonshot AI, whose GGUF files take 594 GB at least) stay outside the
+list.
 
 Without the models that come with the complete installer, the service downloads the default
 language model at its first start, unless the installation said otherwise, and the default
@@ -768,8 +878,11 @@ the embedding model serves the document search and is given apart (`embedding_mo
 models that read them, text when the catalog does not say) decide the attachments of the web
 application: the documents, whose text the browser extracts, go to every model, and an image or
 a sound only to a model that reads it; the attachment button of each conversation names the inputs
-of the model of its function, and the file picker offers what it reads. The engine reads text
-today, so every listed model has the input `text`.
+of the model of its function, and the file picker offers what it reads. A model that reads images
+comes as two files, the decoder and its projector, which the Models window counts together. A
+projector imported alone waits for its decoder (`pending_projectors`), then goes with the decoder
+whose catalog entry names its SHA-256, else with the decoder of an architecture that reads images
+whose width is the width of its tokens, the closest names deciding between several.
 
 ## Models that come with Albireo
 
@@ -777,10 +890,10 @@ today, so every listed model has the input `text`.
 installer carries, the file each one comes from, pinned to a commit with its size and its SHA-256,
 and the quantization Albireo ships:
 
-| Model                        | From                                   | Shipped        | Functions               |
-|------------------------------|----------------------------------------|----------------|-------------------------|
-| Qwen3-1.7B-albireo           | Qwen3-1.7B-Q8_0.gguf of Qwen, 1.83 GB  | Q4_K_M, 1.11 GB | general, code, security |
-| Qwen3-Embedding-0.6B-albireo | Qwen3-Embedding-0.6B-Q8_0.gguf, 0.64 GB | Q8_0, 0.64 GB | document search         |
+| Model                        | From                                                     | Shipped         | Functions               |
+|------------------------------|----------------------------------------------------------|-----------------|-------------------------|
+| Qwen3-VL-4B-Thinking-albireo | Qwen3VL-4B-Thinking-Q4_K_M.gguf of Qwen, 2.50 GB, and its projector mmproj-Qwen3VL-4B-Thinking-Q8_0.gguf, 0.45 GB | Q4_K_M and Q8_0, 2.95 GB | general, code, security |
+| Qwen3-Embedding-0.6B-albireo | Qwen3-Embedding-0.6B-Q8_0.gguf, 0.64 GB                  | Q8_0, 0.64 GB   | document search         |
 
 The build retrieves and converts them as the import example of dlib reads a GGUF file
 ([`examples/slm_gguf_import_ex.cpp`](../../../../examples/slm_gguf_import_ex.cpp)), with the code
@@ -796,20 +909,22 @@ of the engine:
    resolves its geometry as the engine does, which rejects an architecture or a configuration the
    engine does not run, checks that its tokenizer gives back a text it encoded and that the engine
    recognizes its chat template;
-3. it converts the model: the weights of Qwen3 1.7B are quantized again from Q8_0 to the Q4_K_M
-   mix of the GGUF format (Q4_K, with Q6_K for the shared embeddings, the values of the attention
-   and the down projections of the first and last eighths of the layers and of one layer in three
-   between them), with the search and the mix of the reference quantizer of the format, whose
-   output it matches byte for byte; the first and last rows of each matrix are checked against their
-   source. The metadata receive the identity of the model in Albireo;
+3. it converts the model: a model published in Q8_0 is quantized again to the Q4_K_M mix of the
+   GGUF format (Q4_K, with Q6_K for the shared embeddings, the values of the attention and the
+   down projections of the first and last eighths of the layers and of one layer in three between
+   them), with the search and the mix of the reference quantizer of the format, whose output it
+   matches byte for byte, and the first and last rows of each matrix are checked against their
+   source; a model published in Q4_K_M, as Qwen3-VL-4B-Thinking is, keeps its weights. The
+   metadata receive the identity of the model in Albireo. The projector of a model that reads
+   images is checked against its SHA-256, read by the image encoder of the engine and installed
+   beside its model (`<id>.mmproj.gguf`);
 4. the converted file is read and checked again, then kept in the cache under the name of its
    conversion, so that the next builds reuse it; it reaches `bin/models` of the build tree by a
    hard link, with its manifest `builtin.json`, and the complete installer as the overlay that
    follows its program ([`common/builtin_models.h`](common/builtin_models.h)).
 
-The conversion takes a few minutes and the cache holds about 4.2 GB, the downloaded files and the
-converted ones. The Q4_K_M model is 1.7 times faster than the Q8_0 it comes from on a processor,
-its generation being bound by the reading of the weights. `-DALBIREO_BUILTIN_MODELS=OFF`, or
+The conversion takes a few minutes and the cache holds about 6.8 GB, the downloaded files and the
+converted ones; the complete installer weighs about 3.6 GB. `-DALBIREO_BUILTIN_MODELS=OFF`, or
 `-NoBuiltinModels` of `build_windows.ps1`, builds without them; a cross build gives
 `ALBIREO_BUILTIN_TOOL`, the `albireo-builtin` of the build machine.
 
@@ -817,8 +932,11 @@ The installer copies the models to the `models` folder of the programs, checks t
 writes their manifest last; the service registers them at each start (source `builtin`, the
 suffix `-albireo` in their names). A model that comes with Albireo takes the functions no model
 holds, which on a new computer means every function; it can leave them to other models, and it
-cannot be deleted (code `builtin_model`). The language model among them serves the work in the
-background (`albireo-background`) and stays loaded whatever the functions. Albireo runs these models with its own engine, the
+cannot be deleted (code `builtin_model`). The catalog entry of the file it was made from
+(`source_sha256` of the manifest) leaves the Models window and its download is refused
+(`builtin_installed`): the model that comes with Albireo stands for it. The language model among
+them serves the work in the background (`albireo-background`) and stays loaded whatever the
+functions. Albireo runs these models with its own engine, the
 quantized kernels over the mapped file, as every other model: the compiled networks of dlib
 (`slm_gguf_import_ex --convert`) compute in single precision and remain the tool of training and
 fine tuning.
@@ -875,7 +993,9 @@ without models, the one of the updates: it checks that the installer carries the
 back whole from its public address, writes the feed with its address, size and SHA-256, signs it
 and checks the signature, then puts the feed and its signature in place and prints the commands
 that push them; it stops without touching the feed when the public address serves another file. `--complete` also attaches the complete installer, as
-`albireo-setup-complete-<version>.exe`, when it fits the 2 GiB of a release file:
+`albireo-setup-complete-<version>.exe`, when it fits the 2 GiB of a release file. The complete
+installer of 1.0.8, with Qwen3-VL-4B-Thinking-albireo, exceeds them (3.6 GB): the script says so
+and leaves it to the offline bundles (see [Computers without network](#computers-without-network)):
 
 ```
 python3 dlib/dlib/external/albireo/tools/publish_release.py build-albireo/bin/albireo-setup-online.exe --complete build-albireo/bin/albireo-setup.exe --key ~/keys/albireo-feed-signing.key --notes notes.json

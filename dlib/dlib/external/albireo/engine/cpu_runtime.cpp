@@ -26,6 +26,15 @@ namespace albireo
             const float y = (static_cast<float>(i0 / 2) - low) / std::max(0.001f, high - low);
             return 1.0f - std::min(1.0f, std::max(0.0f, y));
         }
+
+        // The rows [first, first + count) of a matrix, as a matrix of their own in its memory.
+        weight_matrix row_slice(const weight_matrix& w, long first, long count)
+        {
+            weight_matrix s = w;
+            s.data = w.data + static_cast<size_t>(first) * w.row_bytes;
+            s.rows = count;
+            return s;
+        }
     }
 
     cpu_runtime::cpu_runtime(std::shared_ptr<model_file> file, const model_config& config, thread_pool& pool,
@@ -45,9 +54,20 @@ namespace albireo
             const std::string p = "blk." + std::to_string(i) + ".";
             layer& L = layers_[static_cast<size_t>(i)];
             L.attn_norm = f.floats(p + "attn_norm.weight", static_cast<size_t>(d));
-            L.wq = f.matrix(p + "attn_q.weight", qd, d);
-            L.wk = f.matrix(p + "attn_k.weight", kvd, d);
-            L.wv = f.matrix(p + "attn_v.weight", kvd, d);
+            if (cfg_.fused_qkv)
+            {
+                // Three views of one matrix: every product still goes through product().
+                const weight_matrix qkv = f.matrix(p + "attn_qkv.weight", qd + 2 * kvd, d);
+                L.wq = row_slice(qkv, 0, qd);
+                L.wk = row_slice(qkv, qd, kvd);
+                L.wv = row_slice(qkv, qd + kvd, kvd);
+            }
+            else
+            {
+                L.wq = f.matrix(p + "attn_q.weight", qd, d);
+                L.wk = f.matrix(p + "attn_k.weight", kvd, d);
+                L.wv = f.matrix(p + "attn_v.weight", kvd, d);
+            }
             L.wo = f.matrix(p + "attn_output.weight", d, qd);
             f.optional_floats(p + "attn_q.bias", static_cast<size_t>(qd), L.bq);
             f.optional_floats(p + "attn_k.bias", static_cast<size_t>(kvd), L.bk);
@@ -74,6 +94,14 @@ namespace albireo
                     L.e_down.push_back(f.expert_matrix(p + "ffn_down_exps.weight", d, df, e, n_exp));
                 }
             }
+            else if (cfg_.fused_gate_up)
+            {
+                // The rows of the gate, then those of the up projection.
+                const weight_matrix gate_up = f.matrix(p + "ffn_up.weight", 2 * cfg_.d_ffn, d);
+                L.w_gate = row_slice(gate_up, 0, cfg_.d_ffn);
+                L.w_up = row_slice(gate_up, cfg_.d_ffn, cfg_.d_ffn);
+                L.w_down = f.matrix(p + "ffn_down.weight", d, cfg_.d_ffn);
+            }
             else
             {
                 L.w_gate = f.matrix(p + "ffn_gate.weight", cfg_.d_ffn, d);
@@ -96,6 +124,29 @@ namespace albireo
             w.max.resize(rows);
             w.sum.resize(rows);
             w.scratch.resize(static_cast<size_t>(qk_attention_scratch(hd)));
+        }
+
+        // The position component of each rotary pair: the time, except the pairs of the row
+        // and column sections, interleaved as the reference implementation of Qwen3-VL lays
+        // them out.
+        pair_component_.assign(static_cast<size_t>(cfg_.rope_dims / 2), 0);
+        if (cfg_.multimodal_rope())
+            for (long j = 0; j < cfg_.rope_dims / 2; ++j)
+            {
+                if (j % 3 == 1 && j < 3 * cfg_.rope_sections[1]) pair_component_[static_cast<size_t>(j)] = 1;
+                else if (j % 3 == 2 && j < 3 * cfg_.rope_sections[2]) pair_component_[static_cast<size_t>(j)] = 2;
+            }
+    }
+
+    void cpu_runtime::set_context(long positions)
+    {
+        std::vector<float> previous = cfg_.rope_freq_factors;
+        select_rope_factors(cfg_, positions);
+        if (cfg_.rope_freq_factors == previous) return;
+        if (rope_positions_ > 0)
+        {
+            cfg_.rope_freq_factors.swap(previous);
+            throw std::logic_error("cpu_runtime: the rotary divisors cannot change once positions are computed");
         }
     }
 
@@ -191,6 +242,7 @@ namespace albireo
             high = std::min(static_cast<float>(n_dims - 1), std::ceil(slow));
         }
         const float freq_scale = static_cast<float>(cfg_.rope_freq_scale);
+        const float attn_factor = static_cast<float>(cfg_.rope_attn_factor);
         for (long pos = rope_positions_; pos < target; ++pos)
         {
             double theta_pow = 1.0;
@@ -200,12 +252,12 @@ namespace albireo
                 if (!cfg_.rope_freq_factors.empty()) theta_extrap /= cfg_.rope_freq_factors[static_cast<size_t>(i)];
                 const float theta_interp = freq_scale * theta_extrap;
                 float theta = theta_interp;
-                float mscale = 1.0f;
+                float mscale = attn_factor;
                 if (cfg_.yarn)
                 {
                     const float mix = yarn_ramp(low, high, 2 * i) * static_cast<float>(cfg_.yarn_ext_factor);
                     theta = theta_interp * (1.0f - mix) + theta_extrap * mix;
-                    mscale = static_cast<float>(cfg_.yarn_attn_factor);
+                    mscale = static_cast<float>(cfg_.yarn_attn_factor * cfg_.rope_attn_factor);
                 }
                 rope_cos_[static_cast<size_t>(pos * half + i)] = std::cos(theta) * mscale;
                 rope_sin_[static_cast<size_t>(pos * half + i)] = std::sin(theta) * mscale;
@@ -250,6 +302,86 @@ namespace albireo
             pool_.parallel_for(n_rows, [&](long t, int) { one(t); });
         else
             for (long t = 0; t < n_rows; ++t) one(t);
+    }
+
+    void cpu_runtime::prepare_given_positions(const forward_batch& batch, long T)
+    {
+        const long half = cfg_.rope_dims / 2;
+        const long C = forward_batch::position_components;
+        given_cos_.resize(static_cast<size_t>(T * half));
+        given_sin_.resize(static_cast<size_t>(T * half));
+        for (long t = 0; t < T; ++t)
+        {
+            const long* p = batch.positions.data() + t * C;
+            float* c = given_cos_.data() + t * half;
+            float* s = given_sin_.data() + t * half;
+            for (long i = 0; i < half; ++i)
+            {
+                const size_t at = static_cast<size_t>(p[pair_component_[static_cast<size_t>(i)]] * half + i);
+                c[i] = rope_cos_[at];
+                s[i] = rope_sin_[at];
+            }
+        }
+    }
+
+    void cpu_runtime::apply_given_rope(float* rows, long n_rows, long n_heads)
+    {
+        const long hd = cfg_.head_dim;
+        const long half = cfg_.rope_dims / 2;
+        const bool neox = cfg_.rope == rope_style::neox;
+        auto one = [&](long t) {
+            const float* c = given_cos_.data() + t * half;
+            const float* s = given_sin_.data() + t * half;
+            for (long h = 0; h < n_heads; ++h)
+            {
+                float* x = rows + (t * n_heads + h) * hd;
+                if (neox)
+                {
+                    for (long i = 0; i < half; ++i)
+                    {
+                        const float x0 = x[i], x1 = x[i + half];
+                        x[i] = x0 * c[i] - x1 * s[i];
+                        x[i + half] = x0 * s[i] + x1 * c[i];
+                    }
+                }
+                else
+                {
+                    for (long i = 0; i < half; ++i)
+                    {
+                        const float x0 = x[2 * i], x1 = x[2 * i + 1];
+                        x[2 * i] = x0 * c[i] - x1 * s[i];
+                        x[2 * i + 1] = x0 * s[i] + x1 * c[i];
+                    }
+                }
+            }
+        };
+        if (n_rows >= 16)
+            pool_.parallel_for(n_rows, [&](long t, int) { one(t); });
+        else
+            for (long t = 0; t < n_rows; ++t) one(t);
+    }
+
+    void cpu_runtime::check_given_embeddings(const forward_batch& batch, long T) const
+    {
+        const size_t W = static_cast<size_t>(cfg_.input_width());
+        if (batch.embeddings.size() != batch.embedding_rows.size() * W)
+            throw std::runtime_error("cpu_runtime: the embeddings of the batch do not match its rows");
+        for (long r : batch.embedding_rows)
+            if (r < 0 || r >= T) throw std::runtime_error("cpu_runtime: an embedding row lies outside the batch");
+    }
+
+    void cpu_runtime::add_given_embeddings(const forward_batch& batch, long slice)
+    {
+        // Slice 0 replaces the embedding of the token; slice k is added after layer k - 1.
+        const long d = cfg_.d_model;
+        const long W = cfg_.input_width();
+        for (size_t i = 0; i < batch.embedding_rows.size(); ++i)
+        {
+            float* dst = x_.data() + batch.embedding_rows[i] * d;
+            const float* src = batch.embeddings.data() + static_cast<long>(i) * W + slice * d;
+            if (slice == 0) std::memcpy(dst, src, sizeof(float) * static_cast<size_t>(d));
+            else for (long j = 0; j < d; ++j) dst[j] += src[j];
+        }
     }
 
     void cpu_runtime::product(const weight_matrix& W, const float* X, long n, long x_stride, float* Y, long y_stride,
@@ -483,9 +615,24 @@ namespace albireo
                 max_pos = std::max(max_pos, seq.length + j);
             }
         }
+        // The positions and the embeddings the batch gives, for the tokens of images.
+        const bool given = !batch.positions.empty();
+        if (given)
+        {
+            if (static_cast<long>(batch.positions.size()) != T * forward_batch::position_components)
+                throw std::runtime_error("cpu_runtime: the batch gives positions for other tokens than its own");
+            for (long p : batch.positions)
+            {
+                if (p < 0) throw std::runtime_error("cpu_runtime: the batch gives a negative position");
+                max_pos = std::max(max_pos, p);
+            }
+        }
+        if (!batch.embedding_rows.empty()) check_given_embeddings(batch, T);
         ensure_rope(max_pos + 1);
+        if (given) prepare_given_positions(batch, T);
 
         embed(batch.tokens);
+        if (!batch.embedding_rows.empty()) add_given_embeddings(batch, 0);
         xn_.resize(static_cast<size_t>(T * d));
         q_.resize(static_cast<size_t>(T * qd));
         k_.resize(static_cast<size_t>(T * kvd));
@@ -513,8 +660,16 @@ namespace albireo
                 rms_norm_rows(q_.data(), L.q_norm.data(), q_.data(), T * H, hd, eps);
                 rms_norm_rows(k_.data(), L.k_norm.data(), k_.data(), T * KVH, hd, eps);
             }
-            apply_rope(q_.data(), T, H, positions_);
-            apply_rope(k_.data(), T, KVH, positions_);
+            if (given)
+            {
+                apply_given_rope(q_.data(), T, H);
+                apply_given_rope(k_.data(), T, KVH);
+            }
+            else
+            {
+                apply_rope(q_.data(), T, H, positions_);
+                apply_rope(k_.data(), T, KVH, positions_);
+            }
             if (cfg_.attn_temp_scale != 0.0)
                 for (long t = 0; t < T; ++t)
                 {
@@ -571,6 +726,7 @@ namespace albireo
                 product(L.w_down, gate_.data(), T, df, tmp_.data(), d);
             }
             for (size_t i = 0; i < x_.size(); ++i) x_[i] += rs * tmp_[i];
+            if (li < cfg_.n_deepstack && !batch.embedding_rows.empty()) add_given_embeddings(batch, li + 1);
         }
 
         for (const auto& s : batch.segments)

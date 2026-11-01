@@ -577,3 +577,72 @@ mark { background: var(--mark); color: inherit; border-radius: 3px; padding: 0 1
 @media (prefers-reduced-motion: reduce) {
   .button.small svg { transition: none; }
 }
+
+/* The images: thumbnails in the questions, in the composer and on the page of a project, and the viewer that
+   shows an image whole. */
+.image-thumb {
+  position: relative; display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto;
+  width: 96px; height: 96px; padding: 0; border-radius: 12px; border: 1px solid var(--border);
+  background: var(--bg-elevated); overflow: hidden; cursor: zoom-in;
+}
+.image-thumb img { display: block; width: 100%; height: 100%; object-fit: cover; }
+.image-thumb:hover { border-color: var(--blue); }
+.image-thumb.outside { opacity: 0.45; filter: grayscale(0.7); border-style: dashed; }
+.image-thumb.missing { cursor: default; color: var(--text-faint); background: var(--bg-hover); }
+.image-thumb.missing svg { width: 26px; height: 26px; }
+.attachments.image-thumbs { gap: 8px; max-width: 85%; }
+.message.user .image-thumb { width: auto; height: 120px; min-width: 64px; max-width: 220px; }
+.message.user .image-thumb img { width: auto; max-width: 220px; }
+.message.user .image-thumb.missing { width: 120px; }
+.composer-attachments { align-items: center; padding-top: 4px; }
+.image-pending { position: relative; display: inline-flex; }
+.composer-attachments .image-thumb { width: 56px; height: 56px; border-radius: 10px; }
+.image-remove {
+  position: absolute; top: -6px; right: -6px; width: 20px; height: 20px; padding: 0; border-radius: 50%;
+  border: 1px solid var(--border-strong); background: var(--bg-elevated); color: var(--text-soft);
+  display: inline-flex; align-items: center; justify-content: center; box-shadow: 0 1px 3px rgba(20, 26, 60, 0.15);
+}
+.image-remove:hover { color: var(--danger); border-color: var(--danger); }
+.image-remove svg { width: 12px; height: 12px; }
+.image-count { margin-left: 2px; font-size: 12px; color: var(--text-faint); font-variant-numeric: tabular-nums; }
+.knowledge-images { margin-top: 14px; }
+.images-head { display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 600; margin-bottom: 2px; }
+.images-head svg { width: 16px; height: 16px; flex: 0 0 16px; color: var(--text-soft); }
+.images-head .count {
+  margin-left: auto; font-size: 12.5px; font-weight: 500; color: var(--text-faint); font-variant-numeric: tabular-nums;
+}
+.list .row.image-row { align-items: flex-start; }
+.image-row .image-thumb { width: 64px; height: 64px; border-radius: 10px; }
+.image-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.image-name { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.list .row .image-name .label { flex: 0 1 auto; font-weight: 600; }
+.image-name .faint { white-space: nowrap; }
+.image-state { display: flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--text-faint); }
+.list .row .image-state svg { width: 14px; height: 14px; flex: 0 0 14px; color: currentColor; }
+.image-state.pending { color: var(--blue); }
+.image-state.ready { color: var(--success); }
+.image-state.failed { color: var(--danger); }
+.image-state .button.small { height: 26px; margin-left: 4px; }
+.image-description {
+  margin: 2px 0 0; font-size: 13px; color: var(--text-soft); white-space: pre-line; overflow: hidden;
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 4; line-clamp: 4;
+}
+.viewer-overlay { background: rgba(6, 9, 22, 0.84); padding: 14px; }
+.viewer { width: 100%; height: 100%; display: flex; flex-direction: column; outline: none; }
+.viewer-bar { display: flex; align-items: center; gap: 4px; padding: 0 2px 10px; color: #e8ebf7; }
+.viewer-title { flex: 1; min-width: 0; display: flex; align-items: baseline; gap: 10px; overflow: hidden; }
+.viewer-name { font-weight: 600; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.viewer-info { font-size: 12.5px; color: rgba(232, 235, 247, 0.7); white-space: nowrap; }
+.viewer-bar .icon-button { color: #e8ebf7; }
+.viewer-bar .icon-button:hover { background: rgba(255, 255, 255, 0.12); color: #ffffff; }
+.viewer-prev svg { transform: rotate(90deg); }
+.viewer-next svg { transform: rotate(-90deg); }
+.viewer-stage { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; }
+.viewer-image {
+  max-width: 100%; max-height: 100%; object-fit: contain; border-radius: 6px; background: #ffffff;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+}
+.viewer-missing {
+  display: flex; flex-direction: column; align-items: center; gap: 10px; color: rgba(232, 235, 247, 0.8);
+}
+.viewer-missing svg { width: 48px; height: 48px; }

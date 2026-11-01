@@ -147,6 +147,15 @@ namespace albireo
         std::string resolve_embedding_model(const std::string& requested);
         /*!
             ensures
+                - Returns, for each model loaded in the engine, {"inputs", "publisher"}: the
+                  inputs the engine reads for it as its "models" query reports them ("text",
+                  and "image" for a model loaded with its projector), "text" alone when the
+                  engine does not say, and the company that made the model, from its entry,
+                  empty when unknown.
+        !*/
+        std::map<std::string, json> loaded_traits();
+        /*!
+            ensures
                 - Gives the function role to the model id, loading it when needed.  The
                   model the function used before leaves the engine once its requests are
                   served, unless another function uses it.  A model activated while it
@@ -194,8 +203,9 @@ namespace albireo
                       update are installed; no other file of the folder is read.
                   Every file is read through no link.  A model file of the user goes to the
                   service through the upload route, read with the rights of the user.
-                - Returns {"imported", "already", "errors"} as model_manager::import_path(),
-                  with "catalog" and "update" when the folder holds them.
+                - Returns {"imported", "already", "pending", "errors"} as
+                  model_manager::import_path(), with "catalog" and "update" when the folder
+                  holds them.
                 - Refuses path, with refusal set and an empty result, when it is relative
                   (code import_path_relative), on a network share or drive
                   (import_path_network), a device or a path of the system namespaces
@@ -233,8 +243,16 @@ namespace albireo
         // Describes the engines next to the service and starts the one of the settings, a
         // processor engine when it fails; then engines_ready_ becomes true.
         void start_engines();
-        // Registers the models that come with Albireo, in the folder of the programs: a new
-        // one takes the functions no model holds, those of a model that left are freed.
+        /*!
+            ensures
+                - Registers the models that come with Albireo, in the folder of the programs.
+                  A new one that takes the place of a model of its kind (a language model,
+                  or an embedding model) that no longer comes with Albireo receives the
+                  functions of that model, as an update that changes the model that comes
+                  with Albireo does; another new one takes the functions no model holds.  The
+                  functions of a model that left without a successor are freed.
+                - The first language model among them serves the work in the background.
+        !*/
         void register_builtin_models();
         void ensure_default_model();
         // Logs why a default model of the catalog could not be downloaded, which the Models
@@ -244,16 +262,29 @@ namespace albireo
         // Whether the import folder lets only the administrators write in it: secured again, its content
         // checked, when it does not; false with error when it cannot be.
         bool secure_inbox(std::string& error);
+        /*!
+            ensures
+                - Gives a model that arrives the functions its entry names that no model
+                  holds, and the general one when it is free.  A model of the engine whose
+                  files changed, a projector given to it say, loads again once its requests
+                  are served (retire() with reload).
+        !*/
         void on_installed(const installed_model& m);
         static bool is_embedding(const installed_model& m);
+        // Loads a model into the engine, with its projector when it has one (options "projector").
         bool load_model(const installed_model& m, std::string& error);
         /*!
             ensures
                 - Unloads the model id on a thread of its own once its requests are served
                   (engine_host::unload_model), so that the function it held passes at once
                   to the model that replaces it.
+                - With reload, the model loads again from its record once it left the engine,
+                  when a function or the work in the background still uses it; the model of
+                  the work in the background is then unloaded too.
         !*/
-        void retire(const std::string& id);
+        void retire(const std::string& id, bool reload = false);
+        // Loads the model id again after its reload, when a function or the work in the background uses it.
+        void reload_model(const std::string& id);
         // Waits for the model id to finish unloading, when it is.
         void wait_retired(const std::string& id);
         json engine_config(const host_settings& s, const std::string& device) const;
@@ -302,6 +333,8 @@ namespace albireo
         std::condition_variable retire_cv_;
         std::set<std::string> retiring_;
         std::set<std::string> removing_;
+        // The models that load again once they left the engine (retire() with reload).
+        std::set<std::string> reloading_;
         std::vector<std::thread> retirers_;
         // The retirers that ended, joined by the next retirement.
         std::vector<std::thread::id> ended_retirers_;

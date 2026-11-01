@@ -6,12 +6,37 @@
 #
 #   cmake -DMANIFEST=<resources/builtin_models.json> -DCACHE=<folder> -P builtin_models.cmake
 #
-# A file already in the cache is kept; albireo-builtin then checks its hash before it
-# converts it.  The downloads go through the proxy of the https_proxy variable, when set.
+# A model gives the file it is converted from ("from") and, for a model that reads images,
+# its projector ("projector"), which Albireo ships as published.  A file already in the
+# cache is kept; albireo-builtin then checks its hash before it uses it.  The downloads go
+# through the proxy of the https_proxy variable, when set.
 
 if (CMAKE_VERSION VERSION_LESS 3.19)
    message(FATAL_ERROR "the models that come with Albireo need CMake 3.19 or later")
 endif()
+
+# Downloads url into the cache as <sha>.gguf, unless a file of that size is there already.
+function(albireo_cache_file label url sha size)
+   set(target "${CACHE}/${sha}.gguf")
+   if (EXISTS "${target}")
+      file(SIZE "${target}" have)
+      if (have EQUAL size)
+         return()
+      endif()
+      file(REMOVE "${target}")
+   endif()
+   message(STATUS "Downloading ${label}: ${url}")
+   file(DOWNLOAD "${url}" "${target}.partial" EXPECTED_HASH SHA256=${sha} SHOW_PROGRESS TLS_VERIFY ON
+      STATUS status)
+   list(GET status 0 code)
+   if (NOT code EQUAL 0)
+      list(GET status 1 text)
+      file(REMOVE "${target}.partial")
+      message(FATAL_ERROR "${label} could not be downloaded from ${url}: ${text}")
+   endif()
+   file(RENAME "${target}.partial" "${target}")
+endfunction()
+
 file(READ "${MANIFEST}" manifest)
 string(JSON count LENGTH "${manifest}" models)
 file(MAKE_DIRECTORY "${CACHE}")
@@ -21,22 +46,12 @@ foreach (i RANGE ${last})
    string(JSON url GET "${manifest}" models ${i} from url)
    string(JSON sha GET "${manifest}" models ${i} from sha256)
    string(JSON size GET "${manifest}" models ${i} from size)
-   set(target "${CACHE}/${sha}.gguf")
-   if (EXISTS "${target}")
-      file(SIZE "${target}" have)
-      if (have EQUAL size)
-         continue()
-      endif()
-      file(REMOVE "${target}")
+   albireo_cache_file("${id}" "${url}" "${sha}" "${size}")
+   string(JSON projector ERROR_VARIABLE none GET "${manifest}" models ${i} projector)
+   if (NOT none)
+      string(JSON url GET "${projector}" url)
+      string(JSON sha GET "${projector}" sha256)
+      string(JSON size GET "${projector}" size)
+      albireo_cache_file("the projector of ${id}" "${url}" "${sha}" "${size}")
    endif()
-   message(STATUS "Downloading ${id}: ${url}")
-   file(DOWNLOAD "${url}" "${target}.partial" EXPECTED_HASH SHA256=${sha} SHOW_PROGRESS TLS_VERIFY ON
-      STATUS status)
-   list(GET status 0 code)
-   if (NOT code EQUAL 0)
-      list(GET status 1 text)
-      file(REMOVE "${target}.partial")
-      message(FATAL_ERROR "${id} could not be downloaded from ${url}: ${text}")
-   endif()
-   file(RENAME "${target}.partial" "${target}")
 endforeach()

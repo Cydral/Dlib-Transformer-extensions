@@ -179,6 +179,190 @@ namespace albireo
             if (why == "missing") return "not found";
             return "not a regular file";
         }
+
+        bool ends_with(const std::string& s, const std::string& tail)
+        {
+            return s.size() >= tail.size() && s.compare(s.size() - tail.size(), tail.size(), tail) == 0;
+        }
+
+        std::string lower(std::string s)
+        {
+            for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            return s;
+        }
+
+        // The name of a projector of the models folder: <identifier>.mmproj.gguf.
+        const char* const projector_suffix = ".mmproj.gguf";
+
+        // Whether a part of a file name names a quantization: Q4_K_M, IQ4_NL, Q8_0, F16, BF16...
+        bool quantization_name(const std::string& s)
+        {
+            if (s == "f16" || s == "f32" || s == "bf16" || s == "f64") return true;
+            const size_t at = s.compare(0, 2, "iq") == 0 ? 2 : s.compare(0, 1, "q") == 0 ? 1 : 0;
+            if (at == 0 || at >= s.size() || !std::isdigit(static_cast<unsigned char>(s[at]))) return false;
+            for (size_t i = at; i < s.size(); ++i)
+                if (!std::isalnum(static_cast<unsigned char>(s[i])) && s[i] != '_') return false;
+            return true;
+        }
+
+        /*
+            The name a projector and its decoder share: the file name in lower case without its
+            extension, the prefix or the suffix "mmproj" and the quantization, its letters and
+            digits alone.  "mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf" and
+            "Qwen3VL-2B-Instruct-Q4_K_M.gguf" both give "qwen3vl2binstruct".
+        */
+        std::string name_stem(const std::string& file)
+        {
+            std::string s = lower(file_name(file));
+            if (ends_with(s, ".gguf")) s.resize(s.size() - 5);
+            for (const char* tail : { ".mmproj", "-mmproj", "_mmproj" })
+                if (ends_with(s, tail)) s.resize(s.size() - std::strlen(tail));
+            if (s.compare(0, 6, "mmproj") == 0 && s.size() > 6 && (s[6] == '-' || s[6] == '_' || s[6] == '.'))
+                s = s.substr(7);
+            for (size_t i = s.size(); i-- > 0;)
+                if ((s[i] == '-' || s[i] == '_' || s[i] == '.') && quantization_name(s.substr(i + 1)))
+                {
+                    s.resize(i);
+                    break;
+                }
+            std::string out;
+            for (char c : s)
+                if (std::isalnum(static_cast<unsigned char>(c))) out += c;
+            return out;
+        }
+
+        // The letters and digits of a name in lower case, which general.name compares by.
+        std::string plain_name_of(const std::string& name)
+        {
+            std::string out;
+            for (char c : lower(name))
+                if (std::isalnum(static_cast<unsigned char>(c))) out += c;
+            return out;
+        }
+
+        /*
+            How close the names of a projector and of a decoder are: the same general.name in both
+            headers, then the same stem of their file names, then the length of the common
+            beginning of these stems.
+        */
+        long name_closeness(const pairing_file& projector, const pairing_file& decoder)
+        {
+            long score = 0;
+            const std::string a = plain_name_of(projector.description["gguf_name"].as_string());
+            const std::string b = plain_name_of(decoder.description["gguf_name"].as_string());
+            if (!a.empty() && a == b) score += 1 << 20;
+            const std::string x = name_stem(projector.name), y = name_stem(decoder.name);
+            if (!x.empty() && x == y) return score + (1 << 16);
+            size_t common = 0;
+            while (common < x.size() && common < y.size() && x[common] == y[common]) ++common;
+            return score + static_cast<long>(std::min<size_t>(common, 0xFFFF));
+        }
+
+        json text_inputs()
+        {
+            json inputs = json::array();
+            inputs.push_back("text");
+            return inputs;
+        }
+
+        /*
+            The inputs named by list, "text" first, with "image" when image is true and without it
+            otherwise; the other inputs (audio) as listed.
+        */
+        json inputs_with(const json& list, bool image)
+        {
+            json out = text_inputs();
+            if (image) out.push_back("image");
+            for (const auto& s : list.elements())
+            {
+                const std::string v = s.as_string();
+                if (v.empty() || v == "text" || v == "image") continue;
+                bool seen = false;
+                for (const auto& o : out.elements()) seen = seen || o.as_string() == v;
+                if (!seen) out.push_back(v);
+            }
+            return out;
+        }
+
+        /*
+            The model that comes with Albireo whose file is that of the catalog entry, made from it by
+            the build of Albireo under another identifier: its manifest gives the hash of the file it
+            was made from (source_sha256).  Null when there is none.
+        */
+        const installed_model* builtin_carrier(const std::vector<installed_model>& installed, const json& entry)
+        {
+            const std::string sha = entry["sha256"].as_string();
+            if (sha.empty()) return nullptr;
+            for (const auto& m : installed)
+                if (m.source == "builtin" && m.descriptor["source_sha256"].as_string() == sha) return &m;
+            return nullptr;
+        }
+    }
+
+    bool reads_images(const std::string& arch)
+    {
+        return arch == "qwen3vl" || arch == "qwen3vlmoe";
+    }
+
+    json model_inputs(const installed_model& m)
+    {
+        return inputs_with(m.descriptor["inputs"], !m.projector.empty());
+    }
+
+    json entry_inputs(const json& entry)
+    {
+        bool image = false;
+        for (const auto& s : entry["inputs"].elements()) image = image || s.as_string() == "image";
+        return inputs_with(entry["inputs"], image && entry["projector"].is_object());
+    }
+
+    std::vector<int> pair_projectors(const std::vector<pairing_file>& decoders,
+        const std::vector<pairing_file>& projectors)
+    {
+        std::vector<int> pair(projectors.size(), -1);
+        std::vector<bool> taken(decoders.size(), false);
+        // The hashes of the catalog first.
+        for (size_t p = 0; p < projectors.size(); ++p)
+            for (size_t d = 0; d < decoders.size() && pair[p] < 0; ++d)
+                if (!taken[d] && !projectors[p].sha256.empty()
+                    && decoders[d].expected_projector == projectors[p].sha256)
+                {
+                    pair[p] = static_cast<int>(d);
+                    taken[d] = true;
+                }
+        // Then the widths of the headers, and the names among several decoders.
+        for (size_t p = 0; p < projectors.size(); ++p)
+        {
+            if (pair[p] >= 0) continue;
+            const long long width = projectors[p].description["projection_width"].as_int(0);
+            if (width <= 0) continue;
+            long best = -1;
+            int chosen = -1;
+            bool tie = false;
+            for (size_t d = 0; d < decoders.size(); ++d)
+            {
+                const json& dd = decoders[d].description;
+                const bool images = dd["reads_images"].as_bool(reads_images(dd["arch"].as_string()));
+                if (taken[d] || !images || dd["projection_width"].as_int(0) != width) continue;
+                const long score = name_closeness(projectors[p], decoders[d]);
+                if (score > best)
+                {
+                    best = score;
+                    chosen = static_cast<int>(d);
+                    tie = false;
+                }
+                else if (score == best)
+                {
+                    tie = true;
+                }
+            }
+            if (chosen >= 0 && !tie)
+            {
+                pair[p] = chosen;
+                taken[static_cast<size_t>(chosen)] = true;
+            }
+        }
+        return pair;
     }
 
     json describe_gguf(const std::string& path)
@@ -189,9 +373,12 @@ namespace albireo
             dlib::gguf_reader g(path);
             const std::string arch = g.get_str("general.architecture", "");
             d["name"] = g.get_str("general.name", file_name(path));
+            d["gguf_name"] = g.get_str("general.name", "");
             d["arch"] = arch;
-            d["context"] = static_cast<long long>(g.get_int(arch + ".context_length", 0));
-            d["experts"] = static_cast<long long>(g.get_int(arch + ".expert_count", 0));
+            // The company that made the model, when its header names it.
+            const std::string publisher = !g.get_str("general.organization", "").empty()
+                ? g.get_str("general.organization") : g.get_str("general.author", "");
+            if (!publisher.empty()) d["publisher"] = publisher;
             uint64_t params = 0;
             std::map<std::string, uint64_t> by_type;
             for (const auto& t : g.tensors())
@@ -208,6 +395,45 @@ namespace albireo
             for (const auto& kv : by_type)
                 if (kv.second > most) { most = kv.second; q = kv.first; }
             d["quantization"] = names.count(q) ? names.at(q) : q;
+            // The widths of the vision tokens, bounded so that a damaged header gives no width.
+            auto width_of = [](int64_t width, int64_t layers) -> long long {
+                if (width <= 0 || width > (int64_t(1) << 20) || layers < 0 || layers > 256) return 0;
+                return static_cast<long long>(width * (1 + layers));
+            };
+            if (arch == "clip")
+            {
+                // A projector: the vision encoder of a model that reads images, and the
+                // projection of its output into the embeddings of the decoder.
+                d["projector"] = true;
+                d["projector_type"] = g.get_str("clip.projector_type", "");
+                d["vision"] = g.get_int("clip.has_vision_encoder", 1) != 0;
+                int64_t deepstack = 0;
+                if (g.has("clip.vision.is_deepstack_layers"))
+                    for (int64_t v : g.at("clip.vision.is_deepstack_layers").arr_int) deepstack += v != 0 ? 1 : 0;
+                long long width = width_of(g.get_int("clip.vision.projection_dim", 0), deepstack);
+                // A LLaVA projector names no projection width: its last layer gives it.
+                for (const char* last : { "mm.2.weight", "mm.0.weight" })
+                {
+                    const dlib::gguf_tensor_info* t = width > 0 ? nullptr : g.find_tensor(last);
+                    if (t && t->dims.size() >= 2) width = width_of(static_cast<int64_t>(t->dims[1]), 0);
+                }
+                d["projection_width"] = width;
+                d["image_size"] = static_cast<long long>(g.get_int("clip.vision.image_size", 0));
+                return d;
+            }
+            d["context"] = static_cast<long long>(g.get_int(arch + ".context_length", 0));
+            d["experts"] = static_cast<long long>(g.get_int(arch + ".expert_count", 0));
+            // A decoder that reads images: Qwen3-VL, or a LLaVA decoder, whose vocabulary holds <image>.
+            bool images = reads_images(arch);
+            if (!images && g.has("tokenizer.ggml.tokens"))
+            {
+                const std::vector<std::string>& tokens = g.at("tokenizer.ggml.tokens").arr_str;
+                images = std::find(tokens.begin(), tokens.end(), "<image>") != tokens.end();
+            }
+            d["reads_images"] = images;
+            if (images)
+                d["projection_width"] = width_of(g.get_int(arch + ".embedding_length", 0),
+                    g.get_int(arch + ".n_deepstack_layers", 0));
             const std::string tmpl = g.get_str("tokenizer.chat_template", "");
             // An embedding model declares how it pools its states; it serves the document
             // search and nothing else.
@@ -259,12 +485,22 @@ namespace albireo
             std::atomic<uint64_t> done{0};   // bytes of the resource received
             bool gzip = false;
             uint64_t output = 0;      // bytes the part produces (gzip: decompressed size)
-            size_t part = 0;
+            size_t part = 0;          // the part of its file
+            size_t file = 0;          // 0: the decoder, 1: the projector
+        };
+
+        // A file of the model: the decoder, and the projector of a model that reads images.
+        struct output_file
+        {
+            std::string target, partial;
+            uint64_t size = 0;
+            std::string sha256;
+            json parts;               // the "files" of the catalog: url, size, sha256
         };
 
         std::string id;
         json entry;
-        std::string target, partial;
+        std::vector<output_file> files;
         uint64_t total = 0;
         std::vector<std::unique_ptr<chunk>> chunks;
         std::atomic<uint64_t> received{0};
@@ -477,6 +713,33 @@ namespace albireo
                 if (r.as_string() == "embedding") return true;
             return false;
         };
+        /*
+            What the installation of a model adds to its entry: its file, its projector, its
+            hashes, the inputs it reads (text, and image with its projector) and the bytes of
+            its files.
+        */
+        auto installed_fields = [](json& m, const installed_model& im) {
+            const json& d = im.descriptor;
+            m["installed"] = true;
+            m["file"] = im.file;
+            m["local_sha256"] = im.sha256;
+            m["verified_at"] = static_cast<long long>(im.verified_at);
+            m["inputs"] = model_inputs(im);
+            if (im.projector.empty())
+            {
+                m.erase("projector");
+            }
+            else
+            {
+                json p = d["projector"].is_object() ? d["projector"] : json::object();
+                p.erase("files");
+                p["file"] = im.projector;
+                p["size"] = static_cast<unsigned long long>(im.projector_size);
+                p["sha256"] = im.projector_sha256;
+                m["projector"] = p;
+            }
+            m["total_size"] = static_cast<unsigned long long>(im.size + im.projector_size);
+        };
         // The models that come with Albireo first, in the order of their manifest.
         for (const auto& im : installed)
         {
@@ -485,29 +748,33 @@ namespace albireo
             m["id"] = im.id;
             m["name"] = im.name;
             m["description"] = localized(m["description"], language);
-            m["installed"] = true;
-            m["file"] = im.file;
             m["size"] = static_cast<unsigned long long>(im.size);
-            m["local_sha256"] = im.sha256;
-            m["verified_at"] = static_cast<long long>(im.verified_at);
+            installed_fields(m, im);
             seen[im.id] = true;
             out.push_back(m);
         }
         for (const auto& e : cat["models"].elements())
         {
             if (embedding(e)) continue;
+            // The entry a model that comes with Albireo stands for, unless installed under its own identifier.
+            const std::string eid = e["id"].as_string();
+            bool own = false;
+            for (const auto& im : installed) own = own || im.id == eid;
+            if (!own && builtin_carrier(installed, e)) continue;
             json m = e;
             m["description"] = localized(e["description"], language);
             m["installed"] = false;
+            m["inputs"] = entry_inputs(e);
+            m["total_size"] = static_cast<unsigned long long>(e["size"].as_int(0) + e["projector"]["size"].as_int(0));
             const std::string id = e["id"].as_string();
             for (const auto& im : installed)
                 if (im.id == id)
                 {
-                    m["installed"] = true;
-                    m["file"] = im.file;
-                    m["local_sha256"] = im.sha256;
-                    m["verified_at"] = static_cast<long long>(im.verified_at);
-                    m["up_to_date"] = im.sha256 == e["sha256"].as_string();
+                    installed_fields(m, im);
+                    // Up to date: the files of the entry, the projector it names included.
+                    const std::string wanted = e["projector"]["sha256"].as_string();
+                    m["up_to_date"] = im.sha256 == e["sha256"].as_string()
+                        && (wanted.empty() || im.projector_sha256 == wanted);
                 }
             seen[id] = true;
             out.push_back(m);
@@ -519,22 +786,15 @@ namespace albireo
             m["id"] = im.id;
             if (!m.contains("name")) m["name"] = im.name;
             m["description"] = localized(m["description"], language);
-            m["installed"] = true;
-            m["file"] = im.file;
             m["size"] = static_cast<unsigned long long>(im.size);
-            m["local_sha256"] = im.sha256;
             m["source"] = im.source;
+            installed_fields(m, im);
             out.push_back(m);
         }
-        // The inputs a model reads (text, image, audio), text when its entry does not say.
-        json embedders = json::array();
+        // The company that made each model, empty when neither its entry nor its header names it.
         for (auto& m : out.elements())
-            if (!m["inputs"].is_array() || m["inputs"].size() == 0)
-            {
-                json inputs = json::array();
-                inputs.push_back("text");
-                m["inputs"] = inputs;
-            }
+            if (!m["publisher"].is_string()) m["publisher"] = "";
+        json embedders = json::array();
         for (const auto& im : installed)
         {
             if (!embedding(im.descriptor)) continue;
@@ -543,15 +803,30 @@ namespace albireo
             e["name"] = im.name;
             e["source"] = im.source;
             e["size"] = static_cast<unsigned long long>(im.size);
+            e["inputs"] = text_inputs();
             // The license and the publisher of its entry in the catalog or in the manifest, as for
             // the language models.
+            e["publisher"] = "";
             for (const char* k : {"license", "publisher"})
                 if (im.descriptor.contains(k)) e[k] = im.descriptor[k];
             embedders.push_back(e);
         }
+        // The projectors waiting for their decoders.
+        json pending = json::array();
+        for (const auto& p : db_.projectors())
+        {
+            json j = json::object();
+            j["name"] = p.name;
+            j["size"] = static_cast<unsigned long long>(p.size);
+            j["sha256"] = p.sha256;
+            j["projector_type"] = p.descriptor["projector_type"];
+            j["projection_width"] = p.descriptor["projection_width"];
+            pending.push_back(j);
+        }
         json result = json::object();
         result["models"] = out;
         result["embedding_models"] = embedders;
+        result["pending_projectors"] = pending;
         result["downloads"] = downloads();
         const json cs = catalog_status();
         result["catalog_time"] = cs["time"];
@@ -606,84 +881,130 @@ namespace albireo
                 .arg("m", name);
             return false;
         }
+        // The file of the entry is the one a model that comes with Albireo carries under another name.
+        const std::vector<installed_model> installed = db_.models();
+        const installed_model* carrier = builtin_carrier(installed, entry);
+        if (carrier)
+        {
+            db_.remove_download_state(id);
+            error.set("the model '" + id + "' comes with Albireo as " + carrier->name, "builtin_installed")
+                .arg("m", carrier->name);
+            return false;
+        }
         std::shared_ptr<job> j(new job());
         j->id = id;
         j->entry = entry;
-        j->target = join_path(dir_, id + ".gguf");
-        j->partial = j->target + ".partial";
+        // The decoder, and the projector of a model that reads images, each in a partial file of its own.
+        const json& e = j->entry;
+        job::output_file decoder;
+        decoder.target = join_path(dir_, id + ".gguf");
+        decoder.partial = decoder.target + ".partial";
+        decoder.sha256 = e["sha256"].as_string();
+        decoder.parts = e["files"];
+        j->files.push_back(decoder);
+        if (e["projector"].is_object())
+        {
+            job::output_file projector;
+            projector.target = join_path(dir_, id + projector_suffix);
+            projector.partial = projector.target + ".partial";
+            projector.sha256 = e["projector"]["sha256"].as_string();
+            projector.parts = e["projector"]["files"];
+            if (projector.sha256.size() != 64 || projector.parts.size() == 0)
+            {
+                error.set("the catalog entry of '" + id + "' lists an invalid projector", "catalog_entry")
+                    .arg("m", name);
+                return false;
+            }
+            j->files.push_back(projector);
+        }
 
         // Parts, then segments of the uncompressed parts.
         const uint64_t segment = 64ull << 20;
-        uint64_t offset = 0;
-        size_t part = 0;
-        for (const auto& f : entry["files"].elements())
+        for (size_t fi = 0; fi < j->files.size(); ++fi)
         {
-            const std::string url = f["url"].as_string();
-            const uint64_t size = static_cast<uint64_t>(f["size"].as_int(0));
-            const bool gz = f["compression"].as_string() == "gzip";
-            if (url.empty() || size == 0)
+            job::output_file& out = j->files[fi];
+            uint64_t offset = 0;
+            size_t part = 0;
+            for (const auto& f : static_cast<const json&>(out.parts).elements())
             {
-                error.set("the catalog entry of '" + id + "' lists an invalid file", "catalog_entry").arg("m", name);
-                return false;
-            }
-            if (gz)
-            {
-                std::unique_ptr<job::chunk> c(new job::chunk());
-                c->url = url;
-                c->from = 0;
-                c->length = static_cast<uint64_t>(f["compressed_size"].as_int(0));
-                c->offset = offset;
-                c->gzip = true;
-                c->output = size;
-                c->part = part;
-                if (c->length == 0)
+                const std::string url = f["url"].as_string();
+                const uint64_t size = static_cast<uint64_t>(f["size"].as_int(0));
+                const bool gz = f["compression"].as_string() == "gzip";
+                if (url.empty() || size == 0)
                 {
-                    error.set("the catalog entry of '" + id + "' gives no compressed size", "catalog_entry")
+                    error.set("the catalog entry of '" + id + "' lists an invalid file", "catalog_entry")
                         .arg("m", name);
                     return false;
                 }
-                j->chunks.push_back(std::move(c));
-            }
-            else
-            {
-                for (uint64_t s = 0; s < size; s += segment)
+                if (gz)
                 {
                     std::unique_ptr<job::chunk> c(new job::chunk());
                     c->url = url;
-                    c->from = s;
-                    c->length = std::min(segment, size - s);
-                    c->offset = offset + s;
-                    c->output = c->length;
+                    c->from = 0;
+                    c->length = static_cast<uint64_t>(f["compressed_size"].as_int(0));
+                    c->offset = offset;
+                    c->gzip = true;
+                    c->output = size;
                     c->part = part;
+                    c->file = fi;
+                    if (c->length == 0)
+                    {
+                        error.set("the catalog entry of '" + id + "' gives no compressed size", "catalog_entry")
+                            .arg("m", name);
+                        return false;
+                    }
                     j->chunks.push_back(std::move(c));
                 }
+                else
+                {
+                    for (uint64_t s = 0; s < size; s += segment)
+                    {
+                        std::unique_ptr<job::chunk> c(new job::chunk());
+                        c->url = url;
+                        c->from = s;
+                        c->length = std::min(segment, size - s);
+                        c->offset = offset + s;
+                        c->output = c->length;
+                        c->part = part;
+                        c->file = fi;
+                        j->chunks.push_back(std::move(c));
+                    }
+                }
+                offset += size;
+                ++part;
             }
-            offset += size;
-            ++part;
+            // The size of the file, when the entry gives it, is that of its parts.
+            const long long declared = fi == 0 ? e["size"].as_int(-1) : e["projector"]["size"].as_int(-1);
+            if ((declared >= 0 && static_cast<uint64_t>(declared) != offset) || offset == 0)
+            {
+                error.set("the sizes of the parts of '" + id + "' do not add up to the size of the model",
+                    "catalog_entry").arg("m", name);
+                return false;
+            }
+            out.size = offset;
+            j->total += offset;
         }
-        j->total = offset;
-        if (static_cast<uint64_t>(entry["size"].as_int(static_cast<long long>(offset))) != offset)
-        {
-            error.set("the sizes of the parts of '" + id + "' do not add up to the size of the model", "catalog_entry")
-                .arg("m", name);
-            return false;
-        }
-        // The model, and room kept free for the system and the other programs.
+        // The files of the model, and room kept free for the system and the other programs.
+        const uint64_t total = j->total;
         const uint64_t room = free_disk_space(dir_);
-        const uint64_t reserve = offset / 20 + (256ull << 20);
-        if (room < offset + reserve && !file_exists(j->partial))
+        const uint64_t reserve = total / 20 + (256ull << 20);
+        if (room < total + reserve && !file_exists(j->files[0].partial))
         {
-            error.set("not enough disk space for " + id + ": " + std::to_string((offset + reserve) >> 20)
-                + " MB needed (" + std::to_string(offset >> 20) + " MB for the model, " + std::to_string(reserve >> 20)
+            error.set("not enough disk space for " + id + ": " + std::to_string((total + reserve) >> 20)
+                + " MB needed (" + std::to_string(total >> 20) + " MB for the model, " + std::to_string(reserve >> 20)
                 + " MB kept free), " + std::to_string(room >> 20) + " MB available", "disk_space")
-                .arg("m", name).size("needed", offset + reserve).size("model", offset).size("reserve", reserve)
+                .arg("m", name).size("needed", total + reserve).size("model", total).size("reserve", reserve)
                 .size("available", room);
             return false;
         }
 
-        // Resume what a previous run received.
+        // Resume what a previous run received, when the files of the catalog are the same.
         const json saved = db_.download_state(id);
-        if (saved.is_object() && saved["sha256"].as_string() == entry["sha256"].as_string() && file_exists(j->partial)
+        bool partials = true;
+        for (const auto& f : j->files) partials = partials && file_exists(f.partial);
+        const std::string saved_projector = j->files.size() > 1 ? j->files[1].sha256 : std::string();
+        if (saved.is_object() && saved["sha256"].as_string() == e["sha256"].as_string()
+            && saved["projector_sha256"].as_string() == saved_projector && partials
             && saved["done"].size() == j->chunks.size())
         {
             for (size_t i = 0; i < j->chunks.size(); ++i)
@@ -773,7 +1094,12 @@ namespace albireo
             it->second->state = "cancelled";
             it->second->error = user_error();
         }
-        if (safe_id(id) && direct_path(dir_)) remove_file(join_path(dir_, id + ".gguf.partial"));
+        // The partial files of the decoder and of the projector.
+        if (safe_id(id) && direct_path(dir_))
+        {
+            remove_file(join_path(dir_, id + ".gguf.partial"));
+            remove_file(join_path(dir_, id + projector_suffix + std::string(".partial")));
+        }
     }
 
     void model_manager::resume_pending()
@@ -820,36 +1146,45 @@ namespace albireo
             j->state = s;
             j->error = e;
         };
-        // The partial file goes only from the models folder reached through no link.
-        auto drop_partial = [&]() {
-            if (direct_path(dir_)) remove_file(j->partial);
+        // The partial files go only from the models folder reached through no link.
+        auto drop_partials = [&]() {
+            if (!direct_path(dir_)) return;
+            for (const auto& f : j->files) remove_file(f.partial);
         };
         // The progress is written under m_, where cancel_download() removes it, so that a
         // download cancelled by the user never comes back at the next start.
         auto save = [&]() {
+            const json& e = j->entry;
             json st = json::object();
-            st["sha256"] = j->entry["sha256"];
+            st["sha256"] = e["sha256"];
+            st["projector_sha256"] = j->files.size() > 1 ? j->files[1].sha256 : std::string();
             json done = json::array();
             for (const auto& c : j->chunks) done.push_back(static_cast<unsigned long long>(c->done.load()));
             st["done"] = done;
             std::lock_guard<std::mutex> lock(m_);
             if (!j->abandoned) db_.set_download_state(j->id, st);
         };
+        const bool with_projector = j->files.size() > 1;
 
         log_info("models: downloading " + j->id + " (" + std::to_string(j->total >> 20) + " MB, "
-            + std::to_string(j->chunks.size()) + " segments)");
+            + std::to_string(j->chunks.size()) + " segments" + (with_projector ? ", with its projector)" : ")"));
         for (int round = 0; round < 2; ++round)
         {
             set_state("downloading");
-            random_access_file file;
-            // The models folder checked again right before the file opens, which then checks its own path.
-            if (!direct_path(dir_) || !file.open(j->partial, j->total))
+            // A partial file per file of the model, the models folder checked again right before each
+            // opens, which then checks its own path.
+            std::vector<std::unique_ptr<random_access_file>> outputs;
+            for (const auto& f : j->files)
             {
-                set_state("error", user_error().set("cannot create " + j->partial, "download_file")
-                    .arg("file", j->partial));
-                log_error("models: download of " + j->id + ": " + j->partial + " cannot be created in the models "
-                    "folder reached through no link");
-                return;
+                outputs.emplace_back(new random_access_file());
+                if (!direct_path(dir_) || !outputs.back()->open(f.partial, f.size))
+                {
+                    set_state("error", user_error().set("cannot create " + f.partial, "download_file")
+                        .arg("file", f.partial));
+                    log_error("models: download of " + j->id + ": " + f.partial + " cannot be created in the models "
+                        "folder reached through no link");
+                    return;
+                }
             }
             save();
 
@@ -869,6 +1204,7 @@ namespace albireo
                         cp = j->chunks[next++].get();
                     }
                     job::chunk& c = *cp;
+                    random_access_file& file = *outputs[c.file];
                     std::string error;
                     bool ok = false;
                     for (int attempt = 0; attempt < 4 && !ok && !j->cancel; ++attempt)
@@ -977,12 +1313,12 @@ namespace albireo
                 }
             }
             for (auto& t : threads) t.join();
-            file.close();
+            for (auto& o : outputs) o->close();
 
             if (j->cancel)
             {
                 set_state("cancelled");
-                if (j->abandoned) drop_partial();
+                if (j->abandoned) drop_partials();
                 log_info("models: download of " + j->id + " cancelled");
                 return;
             }
@@ -991,77 +1327,95 @@ namespace albireo
             {
                 set_state("error", user_error().set(failure, "download_failed").arg("e", failure));
                 log_error("models: download of " + j->id + " failed: " + failure);
-                // A cancellation that came while the download failed drops its partial file all the same.
-                if (j->abandoned) drop_partial();
+                // A cancellation that came while the download failed drops its partial files all the same.
+                if (j->abandoned) drop_partials();
                 return;
             }
 
             set_state("verifying");
-            // The file written, read through no link from the models folder; it is closed before
-            // it is renamed or deleted, which its handle would refuse on Windows.
-            link_free_file written;
-            std::string why;
-            const bool readable = direct_path(dir_) && written.open(j->partial, dir_, why) && written.links() == 1;
-            const std::string sha = readable ? sha256_open_file(written, &j->cancel) : std::string();
-            if (j->cancel)
+            /*
+                Each file written, read through no link from the models folder, is checked against
+                its own hash; it is closed before it is renamed or deleted, which its handle would
+                refuse on Windows.  The parts whose own hash fails are fetched again, once.
+            */
+            std::vector<std::string> shas(j->files.size());
+            bool all_match = true;
+            bool any = false;
+            for (size_t fi = 0; fi < j->files.size(); ++fi)
             {
-                // Stopped during the check: the file is kept and checked again at the
-                // next start, unless the download itself was cancelled.
-                written.close();
-                set_state("cancelled");
-                if (j->abandoned) drop_partial();
-                log_info("models: download of " + j->id + " cancelled during its check");
-                return;
-            }
-            if (!readable)
-            {
-                set_state("error", user_error().set("cannot read " + j->partial, "download_file")
-                    .arg("file", j->partial));
-                log_error("models: download of " + j->id + ": " + j->partial + " is no longer the file written");
-                return;
-            }
-            if (sha == j->entry["sha256"].as_string())
-            {
-                written.close();
-                std::string error;
-                const bool placed = place(j->partial, j->target);
-                if (!placed || !install_file(j->id, j->target, j->entry, sha, "catalog", error))
+                const job::output_file& f = j->files[fi];
+                link_free_file written;
+                std::string why;
+                const bool readable = direct_path(dir_) && written.open(f.partial, dir_, why) && written.links() == 1;
+                shas[fi] = readable ? sha256_open_file(written, &j->cancel) : std::string();
+                if (j->cancel)
                 {
-                    // A model the database could not record takes its partial name again: the
-                    // next start finds its progress complete, checks it and installs it.
-                    if (placed) place(j->target, j->partial);
-                    if (error.empty()) error = "cannot install " + j->target;
+                    // Stopped during the check: the files are kept and checked again at the
+                    // next start, unless the download itself was cancelled.
+                    written.close();
+                    set_state("cancelled");
+                    if (j->abandoned) drop_partials();
+                    log_info("models: download of " + j->id + " cancelled during its check");
+                    return;
+                }
+                if (!readable)
+                {
+                    set_state("error", user_error().set("cannot read " + f.partial, "download_file")
+                        .arg("file", f.partial));
+                    log_error("models: download of " + j->id + ": " + f.partial + " is no longer the file written");
+                    return;
+                }
+                if (shas[fi] == f.sha256) continue;
+                all_match = false;
+                uint64_t offset = 0;
+                size_t part = 0;
+                for (const auto& p : static_cast<const json&>(f.parts).elements())
+                {
+                    const uint64_t size = static_cast<uint64_t>(p["size"].as_int(0));
+                    const std::string expected = p["sha256"].as_string();
+                    if (round == 0 && !expected.empty() && sha256_range(written, offset, size) != expected)
+                    {
+                        for (auto& c : j->chunks)
+                            if (c->file == fi && c->part == part)
+                            {
+                                j->received -= c->gzip ? c->output : c->done.load();
+                                c->done = 0;
+                            }
+                        any = true;
+                        log_warning("models: part " + std::to_string(part) + " of " + (fi == 0 ? std::string()
+                            : std::string("the projector of ")) + j->id + " is corrupt, fetched again");
+                    }
+                    offset += size;
+                    ++part;
+                }
+            }
+            if (all_match)
+            {
+                /*
+                    The files take their names together, the decoder first.  When one cannot, or
+                    when the database cannot record the model, those placed take their partial
+                    names again: the next start finds the progress complete, checks the files and
+                    installs them.
+                */
+                std::string error;
+                size_t placed = 0;
+                while (placed < j->files.size() && place(j->files[placed].partial, j->files[placed].target)) ++placed;
+                if (placed < j->files.size() || !install_file(j->id, j->files[0].target, j->entry, shas[0], "catalog",
+                        with_projector ? j->files[1].target : std::string(), with_projector ? shas[1] : std::string(),
+                        error))
+                {
+                    for (size_t i = 0; i < placed; ++i) place(j->files[i].target, j->files[i].partial);
+                    if (error.empty())
+                        error = "cannot install " + j->files[std::min(placed, j->files.size() - 1)].target;
                     set_state("error", user_error().set(error, "download_install").arg("e", error));
                     log_error("models: download of " + j->id + ": " + error);
                     return;
                 }
                 db_.remove_download_state(j->id);
+                if (with_projector) drop_pending_copy(shas[1]);
                 set_state("done");
-                log_info("models: " + j->id + " installed");
+                log_info("models: " + j->id + " installed" + (with_projector ? ", with its projector" : ""));
                 return;
-            }
-
-            // The parts whose own hash fails are fetched again, once.
-            bool any = false;
-            uint64_t offset = 0;
-            size_t part = 0;
-            for (const auto& f : j->entry["files"].elements())
-            {
-                const uint64_t size = static_cast<uint64_t>(f["size"].as_int(0));
-                const std::string expected = f["sha256"].as_string();
-                if (round == 0 && !expected.empty() && sha256_range(written, offset, size) != expected)
-                {
-                    for (auto& c : j->chunks)
-                        if (c->part == part)
-                        {
-                            j->received -= c->gzip ? c->output : c->done.load();
-                            c->done = 0;
-                        }
-                    any = true;
-                    log_warning("models: part " + std::to_string(part) + " of " + j->id + " is corrupt, fetched again");
-                }
-                offset += size;
-                ++part;
             }
             if (!any) break;
         }
@@ -1069,11 +1423,12 @@ namespace albireo
             "download_hash"));
         log_error("models: " + j->id + " does not match its hash");
         db_.remove_download_state(j->id);
-        drop_partial();
+        drop_partials();
     }
 
     bool model_manager::install_file(const std::string& id, const std::string& file, const json& descriptor,
-        const std::string& sha, const std::string& source, std::string& error)
+        const std::string& sha, const std::string& source, const std::string& projector,
+        const std::string& projector_sha, std::string& error)
     {
         installed_model m;
         m.id = id;
@@ -1085,9 +1440,17 @@ namespace albireo
         m.installed_at = now_unix();
         m.verified_at = now_unix();
         m.descriptor = descriptor;
+        m.projector = projector;
+        m.projector_size = projector.empty() ? 0 : file_size(projector);
+        m.projector_sha256 = projector.empty() ? std::string() : projector_sha;
         if (m.size == 0)
         {
             error = file + " is empty";
+            return false;
+        }
+        if (!projector.empty() && m.projector_size == 0)
+        {
+            error = projector + " is empty";
             return false;
         }
         try
@@ -1128,16 +1491,20 @@ namespace albireo
             return false;
         }
         // A file of the models folder is deleted only through the folder reached without a link.
-        if (parent_path(m.file) == dir_ && !direct_path(dir_))
-        {
-            error = "the models folder " + dir_ + " now leads elsewhere through a link";
-            return false;
-        }
+        for (const std::string& f : { m.file, m.projector })
+            if (!f.empty() && parent_path(f) == dir_ && !direct_path(dir_))
+            {
+                error = "the models folder " + dir_ + " now leads elsewhere through a link";
+                return false;
+            }
         if (file_exists(m.file) && !remove_file(m.file))
         {
             error = "cannot delete " + m.file + " (in use?)";
             return false;
         }
+        // The projector goes with its decoder.
+        if (!m.projector.empty() && file_exists(m.projector) && !remove_file(m.projector))
+            log_warning("models: the projector " + m.projector + " of " + id + " cannot be deleted");
         db_.remove_model(id);
         log_info("models: " + id + " removed");
         return true;
@@ -1155,20 +1522,36 @@ namespace albireo
         }
         // The check ends at once when the service stops.
         const std::string sha = sha256_file(m.file, nullptr, &stopped_);
+        const std::string projector_sha = m.projector.empty() ? std::string()
+            : sha256_file(m.projector, nullptr, &stopped_);
         if (stopped_)
         {
             r["error"] = "the service stops";
             return r;
         }
+        const bool decoder_match = !sha.empty() && sha == m.sha256;
+        const bool projector_match = m.projector.empty()
+            || (!projector_sha.empty() && projector_sha == m.projector_sha256);
         r["sha256"] = sha;
-        r["local_match"] = !sha.empty() && sha == m.sha256;
-        json entry;
-        if (catalog_entry(id, entry))
+        if (!m.projector.empty())
         {
+            r["projector_sha256"] = projector_sha;
+            r["projector_match"] = projector_match;
+        }
+        r["local_match"] = decoder_match && projector_match;
+        json found;
+        if (catalog_entry(id, found))
+        {
+            const json& entry = found;
             r["catalog_sha256"] = entry["sha256"];
             r["catalog_match"] = sha == entry["sha256"].as_string();
+            if (entry["projector"].is_object())
+            {
+                r["catalog_projector_sha256"] = entry["projector"]["sha256"];
+                r["catalog_projector_match"] = projector_sha == entry["projector"]["sha256"].as_string();
+            }
         }
-        if (!sha.empty() && sha == m.sha256) db_.set_verified(id, now_unix());
+        if (decoder_match && projector_match) db_.set_verified(id, now_unix());
         return r;
     }
 
@@ -1184,50 +1567,464 @@ namespace albireo
         return found;
     }
 
+    bool model_manager::projector_with_hash(const std::string& sha, std::string& holder, std::string& path)
+    {
+        holder.clear();
+        path.clear();
+        for (const auto& x : db_.models())
+            if (!x.projector.empty() && x.projector_sha256 == sha && file_exists(x.projector))
+            {
+                holder = x.id;
+                path = x.projector;
+                return true;
+            }
+        for (const auto& p : db_.projectors())
+            if (p.sha256 == sha && file_exists(p.file))
+            {
+                path = p.file;
+                return true;
+            }
+        return false;
+    }
+
+    std::string model_manager::catalog_projector(const std::string& decoder_sha) const
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        const json& catalog = catalog_;
+        for (const auto& e : catalog["models"].elements())
+            if (e["sha256"].as_string() == decoder_sha) return e["projector"]["sha256"].as_string();
+        return std::string();
+    }
+
+    void model_manager::drop_pending_copy(const std::string& sha)
+    {
+        try
+        {
+            for (const auto& p : db_.projectors())
+            {
+                if (p.sha256 != sha) continue;
+                if (parent_path(p.file) == dir_ && direct_path(dir_)) remove_file(p.file);
+                db_.remove_projector(sha);
+                log_info("models: the pending projector " + p.name + " is installed with its model");
+            }
+        }
+        catch (const std::exception& e)
+        {
+            log_warning(std::string("models: the pending projectors cannot be read: ") + e.what());
+        }
+    }
+
+    bool model_manager::take_pending(const pending_projector& pending, const std::string& target)
+    {
+        if (parent_path(pending.file) != dir_ || file_size(pending.file) != pending.size
+            || !place(pending.file, target))
+        {
+            log_warning("models: the pending projector " + pending.file + " cannot be taken");
+            return false;
+        }
+        try
+        {
+            db_.remove_projector(pending.sha256);
+        }
+        catch (const std::exception& e)
+        {
+            place(target, pending.file);
+            log_warning("models: the pending projector " + pending.file + " cannot be taken: " + e.what());
+            return false;
+        }
+        return true;
+    }
+
+    void model_manager::return_pending(const pending_projector& pending, const std::string& target)
+    {
+        if (!place(target, pending.file)) return;
+        try
+        {
+            db_.put_projector(pending);
+        }
+        catch (const std::exception& e)
+        {
+            log_warning("models: the pending projector " + pending.file + " cannot be recorded again: " + e.what());
+        }
+    }
+
     std::string model_manager::free_identifier(const std::string& id)
     {
         installed_model holder;
         return db_.find_model(id, holder) && holder.source == "builtin" ? id + "-import" : id;
     }
 
-    bool model_manager::import_file(const std::string& f, const std::string& base, const std::string& original_name,
-        const std::string& known_sha, bool move, std::string& id, bool& already, std::string& error)
+    struct model_manager::import_item
     {
-        already = false;
+        std::string path;           // where the file lies
+        std::string base;           // the trusted folder it is read from, empty for the root of its drive
+        std::string name;           // the name it came under
+        std::string sha256;
+        json description;           // describe_gguf()
+        bool projector = false;
+        std::unique_ptr<link_free_file> file;   // open from inspect() until the file is placed
+        std::string identity;
+        // The outcome: "imported", "already", "pending" or "error"; the model concerned; the error.
+        std::string result;
+        std::string id;
+        std::string error;
+    };
+
+    namespace
+    {
+        bool lacks_projector(const installed_model& m)
+        {
+            return m.projector.empty() || !file_exists(m.projector);
+        }
+
+        bool embedding_entry(const json& d)
+        {
+            if (d["embedding"].as_bool(false)) return true;
+            for (const auto& r : d["roles"].elements())
+                if (r.as_string() == "embedding") return true;
+            return false;
+        }
+    }
+
+    bool model_manager::inspect(import_item& item, const std::string& known_sha)
+    {
         /*
             The file itself, reached through no link from base and with a single name: a link
             or a second name would lead the service, which reads with the rights of the
             system, to the file of another account.
         */
-        link_free_file source;
+        item.file.reset(new link_free_file());
         std::string why;
-        if (!source.open(f, base, why))
+        if (!item.file->open(item.path, item.base, why))
         {
-            error = unreadable_reason(why);
+            item.error = unreadable_reason(why);
             return false;
         }
-        if (source.links() != 1)
+        if (item.file->links() != 1)
         {
-            error = "the file has several names (hard links), which imports never read";
+            item.file->close();
+            item.error = "the file has several names (hard links), which imports never read";
             return false;
         }
-        const std::string sha = known_sha.empty() ? sha256_open_file(source, &stopped_) : known_sha;
-        if (sha.empty())
+        item.identity = item.file->identity();
+        item.sha256 = known_sha.empty() ? sha256_open_file(*item.file, &stopped_) : known_sha;
+        if (item.sha256.empty())
         {
-            error = stopped_ ? "the service stops" : "unreadable";
+            item.file->close();
+            item.error = stopped_ ? "the service stops" : "unreadable";
             return false;
         }
-        // A file that repeats an installed model, one that comes with Albireo included, is not copied again.
-        installed_model same;
-        if (installed_with_hash(sha, same))
+        item.description = describe_gguf(item.path);
+        // A projector by its header, or by the hash a catalog entry gives its projector.
+        bool listed = false;
         {
-            id = same.id;
-            already = true;
+            std::lock_guard<std::mutex> lock(m_);
+            const json& catalog = catalog_;
+            for (const auto& e : catalog["models"].elements())
+                listed = listed || e["projector"]["sha256"].as_string() == item.sha256;
+        }
+        const json& description = item.description;
+        item.projector = description["projector"].as_bool(false) || listed;
+        return true;
+    }
+
+    namespace
+    {
+        pairing_file pairing_of_pending(const pending_projector& p)
+        {
+            pairing_file f;
+            f.name = p.name;
+            f.sha256 = p.sha256;
+            f.description = p.descriptor;
+            return f;
+        }
+    }
+
+    void model_manager::import_items(std::vector<import_item>& items, bool move)
+    {
+        auto fail = [](import_item& it, const std::string& error) {
+            it.result = "error";
+            it.error = error;
+            if (it.file) it.file->close();
+        };
+        auto pairing_of = [this](const import_item& it) {
+            pairing_file f;
+            f.name = file_name(it.name);
+            f.sha256 = it.sha256;
+            f.description = it.description;
+            if (!it.projector) f.expected_projector = catalog_projector(it.sha256);
+            return f;
+        };
+        // The files that could not be read, the decoders and the projectors.
+        std::vector<size_t> decoders, projectors;
+        for (size_t i = 0; i < items.size(); ++i)
+        {
+            import_item& it = items[i];
+            if (!it.error.empty())
+                fail(it, it.error);
+            else if (it.projector && !static_cast<const json&>(it.description)["vision"].as_bool(true))
+                fail(it, "the projector holds no vision encoder, and Albireo reads images only");
+            else if (it.projector)
+                projectors.push_back(i);
+            else
+                decoders.push_back(i);
+        }
+        // A projector installed already, or pending, is not copied again; with move, its file leaves the folder.
+        std::vector<size_t> free_projectors;
+        for (size_t i : projectors)
+        {
+            import_item& p = items[i];
+            std::string holder, path;
+            if (!projector_with_hash(p.sha256, holder, path))
+            {
+                free_projectors.push_back(i);
+                continue;
+            }
+            p.result = "already";
+            p.id = holder;
+            p.file->close();
+            if (move && p.identity != file_identity(path)) remove_file(p.path);
+            log_info("models: " + p.name + " holds the projector " + (holder.empty() ? std::string("waiting for its "
+                "decoder") : "of " + holder) + ", installed already: not copied again");
+        }
+        // The projectors of the files go with their decoders.
+        std::vector<pairing_file> dp, pp;
+        for (size_t i : decoders) dp.push_back(pairing_of(items[i]));
+        for (size_t i : free_projectors) pp.push_back(pairing_of(items[i]));
+        const std::vector<int> pairs = pair_projectors(dp, pp);
+        std::vector<int> projector_of(items.size(), -1);
+        for (size_t k = 0; k < pairs.size(); ++k)
+            if (pairs[k] >= 0)
+                projector_of[decoders[static_cast<size_t>(pairs[k])]] = static_cast<int>(free_projectors[k]);
+
+        for (size_t i : decoders)
+        {
+            if (stopped_) break;
+            import_item& d = items[i];
+            import_item* p = projector_of[i] >= 0 ? &items[static_cast<size_t>(projector_of[i])] : nullptr;
+            std::string error;
+            // A file that repeats an installed model, one that comes with Albireo included, is not copied again.
+            installed_model same;
+            if (installed_with_hash(d.sha256, same))
+            {
+                d.result = "already";
+                d.id = same.id;
+                d.file->close();
+                if (move && d.identity != file_identity(same.file)) remove_file(d.path);
+                log_info("models: " + d.name + " holds " + same.id + ", installed already: not copied again"
+                    + (move ? ", removed from its folder" : ""));
+                // Its projector comes from the folder when the installed model lacks one.
+                if (p && lacks_projector(same) && same.source != "builtin" && parent_path(same.file) == dir_)
+                {
+                    if (attach_projector(*p, same, move, error))
+                    {
+                        p->result = "imported";
+                        p->id = same.id;
+                    }
+                    else
+                    {
+                        fail(*p, error);
+                    }
+                }
+                continue;
+            }
+            // Without a projector among the files, a pending projector it goes with.
+            pending_projector pending;
+            bool with_pending = false;
+            if (!p) with_pending = pending_for(d, pending);
+            if (import_decoder(d, p, with_pending ? &pending : nullptr, move, error))
+            {
+                d.result = "imported";
+                if (p)
+                {
+                    p->result = "imported";
+                    p->id = d.id;
+                }
+                log_info("models: imported " + d.id + " from " + d.name + (p ? ", with the projector " + p->name
+                    : with_pending ? ", with the projector " + pending.name : std::string()));
+            }
+            else
+            {
+                fail(d, error);
+                if (p) fail(*p, "its decoder " + file_name(d.name) + " cannot be installed: " + error);
+            }
+        }
+        // The other projectors go to an installed decoder that lacks one, or wait for theirs.
+        for (size_t i : free_projectors)
+        {
+            if (stopped_) break;
+            import_item& p = items[i];
+            if (!p.result.empty()) continue;
+            std::string error;
+            installed_model target;
+            if (installed_for(p, target))
+            {
+                if (attach_projector(p, target, move, error))
+                {
+                    p.result = "imported";
+                    p.id = target.id;
+                }
+                else
+                {
+                    fail(p, error);
+                }
+            }
+            else if (keep_pending(p, move, error))
+            {
+                p.result = "pending";
+            }
+            else
+            {
+                fail(p, error);
+            }
+        }
+        for (auto& it : items)
+            if (it.file) it.file->close();
+    }
+
+    json model_manager::import_result(const std::vector<import_item>& items)
+    {
+        json imported = json::array();
+        json already = json::array();
+        json pending = json::array();
+        json errors = json::array();
+        json files = json::array();
+        auto add = [](json& list, const std::string& v) {
+            for (const auto& x : static_cast<const json&>(list).elements())
+                if (x.as_string() == v) return;
+            list.push_back(v);
+        };
+        for (const auto& it : items)
+        {
+            json f = json::object();
+            f["file"] = it.name;
+            f["result"] = it.result;
+            if (!it.id.empty()) f["id"] = it.id;
+            files.push_back(f);
+            if (it.result == "imported") add(imported, it.id);
+            else if (it.result == "already" && !it.id.empty()) add(already, it.id);
+            // A projector that waits, received again.
+            else if (it.result == "already" || it.result == "pending") add(pending, file_name(it.name));
+            else if (it.result == "error") errors.push_back(it.name + ": " + it.error);
+        }
+        json result = json::object();
+        result["imported"] = imported;
+        result["already"] = already;
+        result["pending"] = pending;
+        result["errors"] = errors;
+        result["files"] = files;
+        return result;
+    }
+
+    bool model_manager::put_file(link_free_file& source, const std::string& path, const std::string& base,
+        const std::string& sha, bool move, const std::string& target, placement& how, std::string& error)
+    {
+        how = placement();
+        // A file of the models folder at its own name, recorded again where it lies (a database started anew).
+        how.in_place = !source.identity().empty() && file_identity(target) == source.identity();
+        /*
+            Moved when asked and when the models folder is on the same volume, as the file
+            checked above; copied otherwise from the file opened above, through a new
+            temporary name, and checked against the hash as it is written.
+        */
+        if (move && !how.in_place)
+        {
             const std::string identity = source.identity();
             source.close();
-            if (move && identity != file_identity(same.file)) remove_file(f);
-            return true;
+            how.moved = file_identity(path) == identity && place(path, target);
+            std::string why;
+            if (!how.moved && !source.open(path, base, why))
+            {
+                error = unreadable_reason(why);
+                return false;
+            }
         }
+        how.copied = !how.moved && !how.in_place;
+        if (how.copied)
+        {
+            const std::string tmp = join_path(dir_, ".import-" + random_hex(16) + ".partial");
+            if (copy_open_file(source, tmp, sha, &stopped_).empty() || !place(tmp, target))
+            {
+                remove_file(tmp);
+                source.close();
+                how.copied = false;
+                error = stopped_ ? "the service stops" : "copy failed";
+                return false;
+            }
+        }
+        source.close();
+        return true;
+    }
+
+    void model_manager::undo_put(const std::string& path, const std::string& target, const placement& how)
+    {
+        if (how.moved) rename_file(target, path);
+        else if (how.copied) remove_file(target);
+    }
+
+    bool model_manager::pending_for(import_item& d, pending_projector& found)
+    {
+        std::vector<pending_projector> list;
+        for (const auto& p : db_.projectors())
+            if (parent_path(p.file) == dir_ && file_size(p.file) == p.size) list.push_back(p);
+        if (list.empty()) return false;
+        // The header of a file of a bundle, read here only, once pending projectors exist.
+        if (!d.description.is_object()) d.description = describe_gguf(d.path);
+        pairing_file f;
+        f.name = file_name(d.name);
+        f.sha256 = d.sha256;
+        f.description = d.description;
+        f.expected_projector = catalog_projector(d.sha256);
+        std::vector<pairing_file> pp;
+        for (const auto& p : list) pp.push_back(pairing_of_pending(p));
+        const std::vector<int> pairs = pair_projectors(std::vector<pairing_file>(1, f), pp);
+        for (size_t k = 0; k < pairs.size(); ++k)
+            if (pairs[k] == 0)
+            {
+                found = list[k];
+                return true;
+            }
+        return false;
+    }
+
+    bool model_manager::installed_for(const import_item& p, installed_model& found)
+    {
+        // The installed decoders of the models folder that lack a projector and may read images.
+        std::vector<installed_model> candidates;
+        std::vector<pairing_file> dp;
+        for (const auto& m : db_.models())
+        {
+            if (m.source == "builtin" || parent_path(m.file) != dir_ || !lacks_projector(m) || !file_exists(m.file)
+                || embedding_entry(m.descriptor))
+                continue;
+            pairing_file f;
+            f.name = file_name(m.file);
+            f.sha256 = m.sha256;
+            const json& d = m.descriptor;
+            f.expected_projector = d["projector"]["sha256"].as_string();
+            if (f.expected_projector.empty()) f.expected_projector = catalog_projector(m.sha256);
+            // An entry that names neither a projector nor an architecture that reads images is left out unread.
+            if (f.expected_projector.empty() && d["arch"].is_string()
+                && !d["reads_images"].as_bool(reads_images(d["arch"].as_string())))
+                continue;
+            f.description = describe_gguf(m.file);
+            candidates.push_back(m);
+            dp.push_back(f);
+        }
+        if (candidates.empty()) return false;
+        pairing_file f;
+        f.name = file_name(p.name);
+        f.sha256 = p.sha256;
+        f.description = p.description;
+        const std::vector<int> pairs = pair_projectors(dp, std::vector<pairing_file>(1, f));
+        if (pairs[0] < 0) return false;
+        found = candidates[static_cast<size_t>(pairs[0])];
+        return true;
+    }
+
+    bool model_manager::import_decoder(import_item& d, import_item* p, const pending_projector* pending, bool move,
+        std::string& error)
+    {
         // A catalog entry with this hash gives the identifier and the description.
         json entry;
         bool known = false;
@@ -1235,43 +2032,49 @@ namespace albireo
             std::lock_guard<std::mutex> lock(m_);
             const json& catalog = catalog_;
             for (const auto& e : catalog["models"].elements())
-                if (e["sha256"].as_string() == sha)
+                if (e["sha256"].as_string() == d.sha256)
                 {
                     entry = e;
                     known = true;
                 }
         }
+        std::string id;
         if (known)
         {
-            id = entry["id"].as_string();
+            id = static_cast<const json&>(entry)["id"].as_string();
         }
         else
         {
-            entry = describe_gguf(f);
-            if (entry.contains("error"))
+            if (d.description.contains("error"))
             {
-                error = entry["error"].as_string();
+                error = d.description["error"].as_string();
                 return false;
             }
-            std::string name = file_name(original_name);
+            entry = d.description;
+            std::string name = file_name(d.name);
             if (name.size() > 5 && name.substr(name.size() - 5) == ".gguf") name = name.substr(0, name.size() - 5);
             for (char& c : name)
                 if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '-' || c == '_' || c == '.')) c = '-';
             // A model of Albireo keeps its identifier.
-            const std::string own = entry["albireo_id"].as_string();
+            const std::string own = static_cast<const json&>(entry)["albireo_id"].as_string();
             id = own.empty() ? name : own;
             entry.erase("albireo_id");
+            // The fields of the header that only the pairing reads.
+            entry.erase("gguf_name");
+            entry.erase("projection_width");
             /*
                 A sidecar description written next to the file, read in the import folder
                 only, where the administrators alone place files, and through no link.
             */
             std::string side;
-            if (f.size() > 5 && f.substr(f.size() - 5) == ".gguf" && base == join_path(data_dir(), "import")
-                && read_file_link_free(f.substr(0, f.size() - 5) + ".json", base, side, 1u << 20))
+            const std::string& f = d.path;
+            if (f.size() > 5 && f.substr(f.size() - 5) == ".gguf" && d.base == join_path(data_dir(), "import")
+                && read_file_link_free(f.substr(0, f.size() - 5) + ".json", d.base, side, 1u << 20))
             {
                 const json s = json::parse_or_null(side);
                 for (const auto& kv : s.items())
-                    if (kv.first != "id" && kv.first != "files" && kv.first != "sha256") entry[kv.first] = kv.second;
+                    if (kv.first != "id" && kv.first != "files" && kv.first != "sha256" && kv.first != "projector")
+                        entry[kv.first] = kv.second;
             }
         }
         // Another file never takes the identifier of a model that comes with Albireo.
@@ -1289,65 +2092,141 @@ namespace albireo
             return false;
         }
         const std::string target = join_path(dir_, id + ".gguf");
-        // A file of the models folder at its own name, recorded again where it lies (a database started anew).
-        const bool in_place = !source.identity().empty() && file_identity(target) == source.identity();
-        /*
-            Moved when asked and when the models folder is on the same volume, as the file
-            checked above; copied otherwise from the file opened above, through a new
-            temporary name, and checked against the hash as it is written.
-        */
-        bool moved = false;
-        if (move && !in_place)
+        placement dh;
+        if (!put_file(*d.file, d.path, d.base, d.sha256, move, target, dh, error)) return false;
+        // The projector takes the name of the model: from the files, or from the pending projectors.
+        std::string projector, projector_sha;
+        placement ph;
+        if (p)
         {
-            const std::string identity = source.identity();
-            source.close();
-            moved = file_identity(f) == identity && place(f, target);
-            if (!moved && !source.open(f, base, why))
+            projector = join_path(dir_, id + projector_suffix);
+            projector_sha = p->sha256;
+            if (!put_file(*p->file, p->path, p->base, p->sha256, move, projector, ph, error))
             {
-                error = unreadable_reason(why);
+                undo_put(d.path, target, dh);
                 return false;
             }
         }
-        const bool copy = !moved && !in_place;
-        if (copy)
+        else if (pending)
         {
-            const std::string tmp = join_path(dir_, ".import-" + random_hex(16) + ".partial");
-            if (copy_open_file(source, tmp, sha, &stopped_).empty() || !place(tmp, target))
+            projector = join_path(dir_, id + projector_suffix);
+            projector_sha = pending->sha256;
+            // A pending projector that cannot be taken stays pending: the model reads text only.
+            if (!take_pending(*pending, projector))
             {
-                remove_file(tmp);
-                error = stopped_ ? "the service stops" : "copy failed";
-                return false;
+                projector.clear();
+                projector_sha.clear();
+                pending = nullptr;
             }
         }
-        source.close();
-        // A model the database cannot record leaves the models folder: the file moved goes
-        // back where it came from, and the copy is deleted.
-        if (!install_file(id, target, entry, sha, known ? "catalog" : "import", error))
+        if (!install_file(id, target, entry, d.sha256, known ? "catalog" : "import", projector, projector_sha, error))
         {
-            if (moved) rename_file(target, f);
-            else if (copy) remove_file(target);
+            // A model the database cannot record leaves the models folder: the files moved go
+            // back where they came from, the copies are deleted, a pending projector waits again.
+            undo_put(d.path, target, dh);
+            if (p) undo_put(p->path, projector, ph);
+            if (pending) return_pending(*pending, projector);
             return false;
         }
-        // The source of a copy leaves once the model is recorded.
-        if (copy && move) remove_file(f);
+        d.id = id;
+        // The sources of the copies leave once the model is recorded.
+        if (move && dh.copied) remove_file(d.path);
+        if (p && move && ph.copied) remove_file(p->path);
+        return true;
+    }
+
+    bool model_manager::attach_projector(import_item& p, const installed_model& m, bool move, std::string& error)
+    {
+        if (!direct_path(dir_))
+        {
+            error = "the models folder " + dir_ + " now leads elsewhere through a link";
+            return false;
+        }
+        const std::string target = join_path(dir_, m.id + projector_suffix);
+        placement how;
+        if (!put_file(*p.file, p.path, p.base, p.sha256, move, target, how, error)) return false;
+        installed_model updated = m;
+        updated.projector = target;
+        updated.projector_size = file_size(target);
+        updated.projector_sha256 = p.sha256;
+        try
+        {
+            db_.put_model(updated);
+        }
+        catch (const std::exception& e)
+        {
+            undo_put(p.path, target, how);
+            error = "the projector cannot be recorded: " + std::string(e.what());
+            return false;
+        }
+        if (move && how.copied) remove_file(p.path);
+        log_info("models: " + m.id + " receives the projector " + file_name(p.name) + " and reads images");
+        // The model, loaded already, loads again with its projector.
+        try
+        {
+            if (installed_cb_) installed_cb_(updated);
+        }
+        catch (const std::exception& e)
+        {
+            log_error("models: " + m.id + " has its projector, the service is not told: " + e.what());
+        }
+        return true;
+    }
+
+    bool model_manager::keep_pending(import_item& p, bool move, std::string& error)
+    {
+        if (p.description.contains("error"))
+        {
+            error = p.description["error"].as_string();
+            return false;
+        }
+        if (!direct_path(dir_))
+        {
+            error = "the models folder " + dir_ + " now leads elsewhere through a link";
+            return false;
+        }
+        const std::string target = join_path(dir_, ".pending-" + p.sha256.substr(0, 16) + projector_suffix);
+        placement how;
+        if (!put_file(*p.file, p.path, p.base, p.sha256, move, target, how, error)) return false;
+        pending_projector pp;
+        pp.sha256 = p.sha256;
+        pp.file = target;
+        pp.size = file_size(target);
+        pp.name = file_name(p.name);
+        pp.descriptor = p.description;
+        pp.received_at = now_unix();
+        try
+        {
+            db_.put_projector(pp);
+        }
+        catch (const std::exception& e)
+        {
+            undo_put(p.path, target, how);
+            error = "the projector cannot be recorded: " + std::string(e.what());
+            return false;
+        }
+        if (move && how.copied) remove_file(p.path);
+        log_info("models: the projector " + pp.name + " waits for its decoder, in " + target);
         return true;
     }
 
     std::vector<installed_model> model_manager::register_builtin(const std::string& dir,
-        std::vector<std::string>& removed)
+        std::vector<installed_model>& removed)
     {
         std::vector<installed_model> added;
         std::string text;
         const json manifest = read_file(join_path(dir, builtin_manifest_name), text, 16u << 20)
             ? json::parse_or_null(text) : json();
+        auto plain = [](const std::string& name) {
+            return !name.empty() && name.find_first_of("/\\:") == std::string::npos;
+        };
         std::set<std::string> listed;
         for (const auto& e : manifest["models"].elements())
         {
             const std::string id = e["id"].as_string();
             const std::string name = e["file"].as_string();
             const std::string file = join_path(dir, name);
-            const bool plain = !name.empty() && name.find_first_of("/\\:") == std::string::npos;
-            if (!safe_id(id) || !plain || !file_exists(file))
+            if (!safe_id(id) || !plain(name) || !file_exists(file))
             {
                 log_warning("models: the model " + id + " of " + builtin_manifest_name + " is missing from " + dir);
                 continue;
@@ -1357,10 +2236,31 @@ namespace albireo
             d.erase("file");
             d.erase("offset");
             d["builtin"] = true;
+            // The projector of a model that reads images lies beside it; without it, the model reads text only.
+            std::string projector, projector_sha;
+            const json& p = e["projector"];
+            if (p.is_object())
+            {
+                json pd = p;
+                pd.erase("file");
+                pd.erase("offset");
+                d["projector"] = pd;
+                const std::string pname = p["file"].as_string();
+                if (plain(pname) && file_exists(join_path(dir, pname)))
+                {
+                    projector = join_path(dir, pname);
+                    projector_sha = p["sha256"].as_string();
+                }
+                else
+                {
+                    log_warning("models: the projector of " + id + " is missing from " + dir + ": it reads text only");
+                }
+            }
             installed_model existing;
             const bool known = db_.find_model(id, existing);
             if (known && existing.source == "builtin" && existing.file == file
-                && existing.sha256 == e["sha256"].as_string() && existing.descriptor == d)
+                && existing.sha256 == e["sha256"].as_string() && existing.descriptor == d
+                && existing.projector == projector && existing.projector_sha256 == projector_sha)
                 continue;
             installed_model m;
             m.id = id;
@@ -1370,18 +2270,23 @@ namespace albireo
             m.sha256 = e["sha256"].as_string();
             m.source = "builtin";
             m.installed_at = known ? existing.installed_at : now_unix();
-            // The installer checked the hash of the file it wrote.
-            m.verified_at = known && existing.sha256 == m.sha256 ? existing.verified_at : now_unix();
+            m.projector = projector;
+            m.projector_size = projector.empty() ? 0 : file_size(projector);
+            m.projector_sha256 = projector_sha;
+            // The installer checked the hashes of the files it wrote.
+            m.verified_at = known && existing.sha256 == m.sha256 && existing.projector_sha256 == m.projector_sha256
+                ? existing.verified_at : now_unix();
             m.descriptor = d;
             db_.put_model(m);
             if (!known) added.push_back(m);
-            log_info("models: " + id + " comes with Albireo, in " + file);
+            log_info("models: " + id + " comes with Albireo, in " + file + (projector.empty() ? std::string()
+                : ", with its projector " + projector));
         }
         for (const auto& m : db_.models())
         {
             if (m.source != "builtin" || listed.count(m.id)) continue;
             db_.remove_model(m.id);
-            removed.push_back(m.id);
+            removed.push_back(m);
             log_info("models: " + m.id + " no longer comes with Albireo");
         }
         return added;
@@ -1389,15 +2294,11 @@ namespace albireo
 
     json model_manager::import_path(const std::string& path, const std::string& base, bool move)
     {
-        json result = json::object();
-        json imported = json::array();
-        json already = json::array();
-        json errors = json::array();
         std::vector<std::string> files;
         // The import folder itself, or a folder under it reached through no link.
         if (path == base ? dir_exists(path) : link_free_folder(path, base))
         {
-            // The folder and its models subfolder, the layout of an offline bundle; import_file()
+            // The folder and its models subfolder, the layout of an offline bundle; inspect()
             // refuses the links among them.
             for (const std::string& dir : { path, join_path(path, "models") })
             {
@@ -1410,38 +2311,64 @@ namespace albireo
         {
             files.push_back(path);
         }
+        std::vector<import_item> items;
         for (const auto& f : files)
         {
             if (stopped_) break;
-            std::string id, error;
-            bool repeated = false;
-            if (!import_file(f, base, f, std::string(), move, id, repeated, error))
-            {
-                errors.push_back(f + ": " + error);
-                continue;
-            }
-            if (repeated)
-            {
-                already.push_back(id);
-                log_info("models: " + f + " holds " + id + ", installed already: not copied again"
-                    + (move ? ", removed from the import folder" : ""));
-                continue;
-            }
-            imported.push_back(id);
-            log_info("models: imported " + id + " from " + f);
+            import_item it;
+            it.path = f;
+            it.base = base;
+            it.name = f;
+            inspect(it, std::string());
+            items.push_back(std::move(it));
         }
-        result["imported"] = imported;
-        result["already"] = already;
-        result["errors"] = errors;
-        return result;
+        import_items(items, move);
+        return import_result(items);
+    }
+
+    bool model_manager::bundle_file(const std::string& folder, const json& parts, const std::string& fallback,
+        const std::string& sha, uint64_t size, import_item& out)
+    {
+        // The names under which tools/make_offline_bundle.py places a file: no other file is read.
+        std::vector<std::string> names;
+        if (parts.size() == 1) names.push_back(file_name(parts[0]["url"].as_string()));
+        names.push_back(fallback);
+        out.file.reset(new link_free_file());
+        std::string why, refused;
+        for (const std::string& dir : { join_path(folder, "models"), folder })
+            for (const auto& name : names)
+            {
+                if (out.file->is_open() || !plain_name(name)) continue;
+                const std::string p = join_path(dir, name);
+                if (out.file->open(p, std::string(), why)) out.path = p;
+                else if (why == "link" && refused.empty()) refused = p;
+            }
+        if (!out.file->is_open())
+        {
+            if (!refused.empty())
+            {
+                out.name = refused;
+                out.error = unreadable_reason("link");
+            }
+            return false;
+        }
+        out.name = out.path;
+        out.base = std::string();
+        out.identity = out.file->identity();
+        // Its size first, then its hash, before anything is copied.
+        if (out.file->size() != size || out.file->links() != 1 || sha256_open_file(*out.file, &stopped_) != sha)
+        {
+            out.file->close();
+            out.error = stopped_ ? std::string("the service stops") : "does not match the catalog of the bundle";
+            return false;
+        }
+        out.sha256 = sha;
+        return true;
     }
 
     json model_manager::import_bundle(const std::string& folder, const json& catalog)
     {
-        json result = json::object();
-        json imported = json::array();
-        json already = json::array();
-        json errors = json::array();
+        std::vector<import_item> items;
         for (const auto& e : catalog["models"].elements())
         {
             if (stopped_) break;
@@ -1449,96 +2376,150 @@ namespace albireo
             const std::string sha = e["sha256"].as_string();
             const uint64_t size = static_cast<uint64_t>(e["size"].as_int(0));
             if (!safe_id(listed) || sha.size() != 64 || size == 0) continue;
-            // The names under which tools/make_offline_bundle.py places a model: no other file is read.
-            std::vector<std::string> names;
-            if (e["files"].size() == 1) names.push_back(file_name(e["files"][0]["url"].as_string()));
-            names.push_back(listed + ".gguf");
-            link_free_file source;
-            std::string where, why, refused;
-            for (const std::string& dir : { join_path(folder, "models"), folder })
-                for (const auto& name : names)
+            import_item d;
+            if (!bundle_file(folder, e["files"], listed + ".gguf", sha, size, d))
+            {
+                if (!d.error.empty())
                 {
-                    if (source.is_open() || !plain_name(name)) continue;
-                    const std::string p = join_path(dir, name);
-                    if (source.open(p, std::string(), why)) where = p;
-                    else if (why == "link" && refused.empty()) refused = p;
+                    d.result = "error";
+                    if (d.error != unreadable_reason("link")) d.error += " (the model " + listed + ")";
+                    items.push_back(std::move(d));
                 }
-            if (!source.is_open())
-            {
-                if (!refused.empty()) errors.push_back(refused + ": " + unreadable_reason("link"));
                 continue;
             }
-            // Its size first, then its hash, before anything is copied.
-            if (source.size() != size || source.links() != 1 || sha256_open_file(source, &stopped_) != sha)
+            // The projector the entry names, when the bundle holds it.
+            import_item p;
+            bool with_projector = false;
+            const json& pe = e["projector"];
+            const std::string projector_sha = pe["sha256"].as_string();
+            const uint64_t projector_size = static_cast<uint64_t>(pe["size"].as_int(0));
+            if (pe.is_object() && projector_sha.size() == 64 && projector_size > 0)
             {
-                errors.push_back(where + ": " + (stopped_ ? std::string("the service stops")
-                    : "does not match the model " + listed + " of the catalog of the bundle"));
-                continue;
+                with_projector = bundle_file(folder, pe["files"], listed + projector_suffix, projector_sha,
+                    projector_size, p);
+                std::string holder, path;
+                if (with_projector && projector_with_hash(projector_sha, holder, path))
+                {
+                    // Installed already, or pending.
+                    p.file->close();
+                    p.result = "already";
+                    p.id = holder;
+                    with_projector = false;
+                }
+                else if (!with_projector && !p.error.empty())
+                {
+                    p.result = "error";
+                }
             }
+            std::string error;
             installed_model same;
             if (installed_with_hash(sha, same))
             {
-                already.push_back(same.id);
-                log_info("models: " + where + " holds " + same.id + ", installed already: not copied again");
-                continue;
+                d.file->close();
+                d.result = "already";
+                d.id = same.id;
+                log_info("models: " + d.path + " holds " + same.id + ", installed already: not copied again");
+                // The projector of the bundle goes to the installed decoder when it lacks one.
+                if (with_projector && lacks_projector(same) && same.source != "builtin"
+                    && parent_path(same.file) == dir_)
+                {
+                    if (attach_projector(p, same, false, error))
+                    {
+                        p.result = "imported";
+                        p.id = same.id;
+                    }
+                    else
+                    {
+                        p.result = "error";
+                        p.error = error;
+                    }
+                }
             }
-            // The entry of the catalog in use when it describes this file, else that of the bundle.
-            json entry;
-            if (!catalog_entry(listed, entry) || entry["sha256"].as_string() != sha) entry = e;
-            const std::string id = free_identifier(listed);
-            entry["id"] = id;
-            const std::string target = join_path(dir_, id + ".gguf");
-            const std::string tmp = join_path(dir_, ".import-" + random_hex(16) + ".partial");
-            std::string error;
-            if (!direct_path(dir_) || copy_open_file(source, tmp, sha, &stopped_).empty() || !place(tmp, target))
+            else
             {
-                remove_file(tmp);
-                errors.push_back(where + ": " + (stopped_ ? std::string("the service stops") : "copy failed"));
-                continue;
+                // The entry of the catalog in use when it describes this file, else that of the bundle.
+                json found;
+                const bool current = catalog_entry(listed, found) && static_cast<const json&>(found)["sha256"]
+                    .as_string() == sha;
+                json entry = current ? found : e;
+                const std::string id = free_identifier(listed);
+                entry["id"] = id;
+                const std::string target = join_path(dir_, id + ".gguf");
+                const std::string projector = join_path(dir_, id + projector_suffix);
+                placement dh, ph;
+                pending_projector pending;
+                const bool with_pending = !with_projector && pending_for(d, pending);
+                bool ok = direct_path(dir_) && put_file(*d.file, d.path, std::string(), sha, false, target, dh, error);
+                if (ok && with_projector
+                    && !put_file(*p.file, p.path, std::string(), projector_sha, false, projector, ph, error))
+                {
+                    undo_put(d.path, target, dh);
+                    ok = false;
+                }
+                const bool taken = ok && with_pending && take_pending(pending, projector);
+                const std::string kept = with_projector || taken ? projector : std::string();
+                const std::string kept_sha = with_projector ? projector_sha : taken ? pending.sha256 : std::string();
+                if (ok && !install_file(id, target, entry, sha, "catalog", kept, kept_sha, error))
+                {
+                    undo_put(d.path, target, dh);
+                    if (with_projector) undo_put(p.path, projector, ph);
+                    if (taken) return_pending(pending, projector);
+                    ok = false;
+                }
+                if (ok)
+                {
+                    d.result = "imported";
+                    d.id = id;
+                    if (with_projector)
+                    {
+                        p.result = "imported";
+                        p.id = id;
+                    }
+                    log_info("models: imported " + id + " from the offline bundle " + d.path
+                        + (with_projector ? ", with its projector " + p.path : std::string()));
+                }
+                else
+                {
+                    d.result = "error";
+                    d.error = stopped_ ? std::string("the service stops") : error.empty() ? std::string("copy failed")
+                        : error;
+                    if (with_projector)
+                    {
+                        p.result = "error";
+                        p.error = d.error;
+                    }
+                }
             }
-            source.close();
-            if (!install_file(id, target, entry, sha, "catalog", error))
-            {
-                remove_file(target);
-                errors.push_back(where + ": " + error);
-                continue;
-            }
-            imported.push_back(id);
-            log_info("models: imported " + id + " from the offline bundle " + where);
+            if (d.file) d.file->close();
+            if (p.file) p.file->close();
+            items.push_back(std::move(d));
+            if (!p.result.empty()) items.push_back(std::move(p));
         }
-        result["imported"] = imported;
-        result["already"] = already;
-        result["errors"] = errors;
+        json result = import_result(items);
+        result.erase("files");
         return result;
     }
 
     json model_manager::import_received(const std::string& file, const std::string& original_name,
         const std::string& sha)
     {
-        json result = json::object();
-        json imported = json::array();
-        json already = json::array();
-        json errors = json::array();
-        std::string id, error;
-        bool repeated = false;
-        if (!import_file(file, dir_, original_name, sha, true, id, repeated, error))
+        std::vector<import_item> items(1);
+        import_item& it = items[0];
+        it.path = file;
+        it.base = dir_;
+        it.name = original_name;
+        inspect(it, sha);
+        import_items(items, true);
+        if (it.result.empty())
         {
-            remove_file(file);
-            errors.push_back(original_name + ": " + error);
+            it.result = "error";
+            it.error = "the service stops";
         }
-        else if (repeated)
-        {
-            already.push_back(id);
-            log_info("models: the transfer of " + original_name + " holds " + id + ", installed already");
-        }
-        else
-        {
-            imported.push_back(id);
-            log_info("models: imported " + id + " from a transfer of " + original_name);
-        }
-        result["imported"] = imported;
-        result["already"] = already;
-        result["errors"] = errors;
+        // A file that cannot be installed leaves the models folder.
+        if (it.result == "error") remove_file(file);
+        else if (it.result == "imported") log_info("models: the transfer of " + original_name + " installed " + it.id);
+        json result = import_result(items);
+        result.erase("files");
         return result;
     }
 

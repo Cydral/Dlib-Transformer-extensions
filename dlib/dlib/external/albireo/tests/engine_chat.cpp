@@ -23,6 +23,10 @@
         --device NAME        device of the OpenVINO engine (NPU, GPU, NPU,GPU) or number of
                              the card of the CUDA engine
         --routing MODE       auto, device (every product on the device) or host
+        --projector FILE     image encoder of a model that reads images (mmproj GGUF)
+        --image FILE         a PNG or JPEG image given before each question, as a data URL;
+                             repeat it for several images
+        --detail LEVEL       low, auto or high: the tokens the images take at most
         --threads N, --context N
 
     Prints the reasoning in brackets, the answer, the tool calls, then the statistics of
@@ -258,6 +262,34 @@ namespace
     }
 }
 
+// The base64 form of bytes, for the data URLs of the images.
+static std::string base64(const std::string& bytes)
+{
+    static const char* const digits = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve((bytes.size() + 2) / 3 * 4);
+    size_t i = 0;
+    for (; i + 2 < bytes.size(); i += 3)
+    {
+        const unsigned v = (static_cast<unsigned char>(bytes[i]) << 16)
+            | (static_cast<unsigned char>(bytes[i + 1]) << 8) | static_cast<unsigned char>(bytes[i + 2]);
+        out += digits[(v >> 18) & 63];
+        out += digits[(v >> 12) & 63];
+        out += digits[(v >> 6) & 63];
+        out += digits[v & 63];
+    }
+    if (i < bytes.size())
+    {
+        unsigned v = static_cast<unsigned char>(bytes[i]) << 16;
+        if (i + 1 < bytes.size()) v |= static_cast<unsigned char>(bytes[i + 1]) << 8;
+        out += digits[(v >> 18) & 63];
+        out += digits[(v >> 12) & 63];
+        out += i + 1 < bytes.size() ? digits[(v >> 6) & 63] : '=';
+        out += '=';
+    }
+    return out;
+}
+
 int main(int argc, char** argv)
 {
 #if defined(_WIN32)
@@ -290,7 +322,8 @@ int main(int argc, char** argv)
     int threads = 0;
     long context = 4096;
     std::vector<std::string> questions;
-    std::string system, device, routing, reference;
+    std::string system, device, routing, reference, projector, detail;
+    std::vector<std::string> images;
     for (int i = 3; i < argc; ++i)
     {
         const std::string a = argv[i];
@@ -307,6 +340,9 @@ int main(int argc, char** argv)
         else if (a == "--device" && i + 1 < argc) device = argv[++i];
         else if (a == "--routing" && i + 1 < argc) routing = argv[++i];
         else if (a == "--reference" && i + 1 < argc) reference = argv[++i];
+        else if (a == "--projector" && i + 1 < argc) projector = argv[++i];
+        else if (a == "--image" && i + 1 < argc) images.push_back(argv[++i]);
+        else if (a == "--detail" && i + 1 < argc) detail = argv[++i];
         else questions.push_back(a);
     }
 
@@ -354,6 +390,7 @@ int main(int argc, char** argv)
     }
     json options = json::object();
     options["context"] = context;
+    if (!projector.empty()) options["projector"] = projector;
     if (lib.load_model(e, "m", argv[2], options.dump().c_str(), err, sizeof(err)) != ALBIREO_OK)
     {
         std::printf("load: %s\n", err);
@@ -413,6 +450,38 @@ int main(int argc, char** argv)
         json msg = json::object();
         msg["role"] = "user";
         msg["content"] = questions[q];
+        if (!images.empty())
+        {
+            // The images first, then the question, as data URLs.
+            json parts = json::array();
+            for (const auto& path : images)
+            {
+                std::FILE* f = std::fopen(path.c_str(), "rb");
+                if (!f)
+                {
+                    std::printf("cannot read %s\n", path.c_str());
+                    return 1;
+                }
+                std::string bytes;
+                char buf[65536];
+                size_t n = 0;
+                while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) bytes.append(buf, n);
+                std::fclose(f);
+                const bool png = bytes.size() > 4 && bytes.compare(1, 3, "PNG") == 0;
+                json part = json::object();
+                part["type"] = "image_url";
+                json url = json::object();
+                url["url"] = std::string(png ? "data:image/png;base64," : "data:image/jpeg;base64,") + base64(bytes);
+                if (!detail.empty()) url["detail"] = detail;
+                part["image_url"] = url;
+                parts.push_back(part);
+            }
+            json text = json::object();
+            text["type"] = "text";
+            text["text"] = questions[q];
+            parts.push_back(text);
+            msg["content"] = parts;
+        }
         json req = json::object();
         req["model"] = "m";
         if (turns)

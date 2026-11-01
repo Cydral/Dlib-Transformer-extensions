@@ -111,6 +111,8 @@ namespace dlib
 #    define WIN32_LEAN_AND_MEAN
 #  endif
 #  include <windows.h>
+// FSCTL_SET_SPARSE, which WIN32_LEAN_AND_MEAN leaves out of windows.h.
+#  include <winioctl.h>
 #  include <process.h>
 #else
 #  include <fcntl.h>

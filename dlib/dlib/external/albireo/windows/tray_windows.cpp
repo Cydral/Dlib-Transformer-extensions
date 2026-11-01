@@ -229,11 +229,17 @@ namespace albireo
                         if (!top_key.empty() && keys[row] == top_key) first = r;
                     }
                     if (first < 0) first = std::min(top, static_cast<int>(keys.size()) - 1);
-                    if (first > 0 || left > 0)
+                    /*
+                        The scroll position can hold while the rows are replaced out of sight: the
+                        list scrolls from where the new rows are, the left edge of the first one
+                        giving the horizontal position, to the row and the position kept.
+                    */
+                    RECT item = {};
+                    if (ListView_GetItemRect(list, 0, &item, LVIR_BOUNDS))
                     {
-                        RECT item = {};
-                        ListView_GetItemRect(list, 0, &item, LVIR_BOUNDS);
-                        ListView_Scroll(list, left, std::max(0, first) * (item.bottom - item.top));
+                        const int dx = left + static_cast<int>(item.left);
+                        const int dy = (std::max(0, first) - ListView_GetTopIndex(list)) * (item.bottom - item.top);
+                        if (dx != 0 || dy != 0) ListView_Scroll(list, dx, dy);
                     }
                     SendMessageW(list, WM_SETREDRAW, TRUE, 0);
                     InvalidateRect(list, nullptr, TRUE);
@@ -502,6 +508,70 @@ namespace albireo
             return tr(("role_" + role).c_str());
         }
 
+        /*
+            The order of two texts for the user: the collation of the locale of the user, without
+            regard to case, the numbers in the texts compared by their values ("Qwen3 8B" before
+            "Qwen3 30B A3B").  Negative, zero or positive.
+        */
+        int compare_text(const std::wstring& a, const std::wstring& b)
+        {
+            const int r = CompareStringEx(LOCALE_NAME_USER_DEFAULT, LINGUISTIC_IGNORECASE | SORT_DIGITSASNUMBERS,
+                a.c_str(), static_cast<int>(a.size()), b.c_str(), static_cast<int>(b.size()), nullptr, nullptr, 0);
+            return r ? r - CSTR_EQUAL : a.compare(b);
+        }
+
+        // The columns of the list of the models: the key of their title, and the name that keeps the
+        // order of the list for the next start.
+        enum { COL_MODEL, COL_PUBLISHER, COL_ROLES, COL_INPUTS, COL_SIZE, COL_STATE, COL_ACTIVE, COLUMN_COUNT };
+        const char* const column_titles[COLUMN_COUNT] = { "col_model", "col_publisher", "col_roles", "col_inputs",
+            "col_size", "col_state", "col_active" };
+        const wchar_t* const column_names[COLUMN_COUNT] = { L"model", L"publisher", L"functions", L"inputs", L"size",
+            L"state", L"active" };
+
+        /*
+            The order of the list of the models: the column the user sorted it by, -1 for the order
+            of the catalog, and its direction.  It holds while the tray runs; the values
+            ModelsSortColumn and ModelsSortDescending of HKCU\Software\Albireo keep it for the next
+            start.
+        */
+        struct list_order
+        {
+            int column = -1;
+            bool descending = false;
+        };
+
+        const wchar_t user_key[] = L"Software\\Albireo";
+
+        list_order& models_order()
+        {
+            static list_order order;
+            static bool read = false;
+            if (read) return order;
+            read = true;
+            wchar_t name[32] = {};
+            DWORD size = sizeof(name);
+            if (RegGetValueW(HKEY_CURRENT_USER, user_key, L"ModelsSortColumn", RRF_RT_REG_SZ, nullptr, name, &size)
+                    != ERROR_SUCCESS)
+                return order;
+            for (int c = 0; c < COLUMN_COUNT; ++c)
+                if (std::wcscmp(name, column_names[c]) == 0) order.column = c;
+            DWORD down = 0;
+            size = sizeof(down);
+            if (RegGetValueW(HKEY_CURRENT_USER, user_key, L"ModelsSortDescending", RRF_RT_REG_DWORD, nullptr, &down,
+                    &size) == ERROR_SUCCESS)
+                order.descending = order.column >= 0 && down != 0;
+            return order;
+        }
+
+        void save_models_order(const list_order& order)
+        {
+            const wchar_t* name = column_names[order.column];
+            const DWORD down = order.descending ? 1 : 0;
+            RegSetKeyValueW(HKEY_CURRENT_USER, user_key, L"ModelsSortColumn", REG_SZ, name,
+                static_cast<DWORD>((std::wcslen(name) + 1) * sizeof(wchar_t)));
+            RegSetKeyValueW(HKEY_CURRENT_USER, user_key, L"ModelsSortDescending", REG_DWORD, &down, sizeof(down));
+        }
+
         // The models window.
         enum
         {
@@ -524,6 +594,9 @@ namespace albireo
             bool busy = false;
             bool uploading = false;
             bool showing_download = false;   // the status line shows the progress of a download
+            // Whether the columns took the widths of their texts, and the width the texts of the last column need.
+            bool fitted = false;
+            int last_fit = 0;
 
             models_window() { min_size = SIZE{ 760, 520 }; }
 
@@ -532,13 +605,12 @@ namespace albireo
                 intro = add(ui::label(hwnd, tr("models_intro"), IDC_INTRO, SS_LEFT), ui::font_kind::normal);
                 space = add(ui::label(hwnd, L"", IDC_SPACE, SS_RIGHT), ui::font_kind::note);
                 list = add(ui::listview(hwnd, IDC_LIST));
-                const char* columns[] = { "col_model", "col_roles", "col_inputs", "col_size", "col_state",
-                    "col_active" };
-                // The last column takes the width the others leave (layout).
-                const int widths[] = { 200, 165, 90, 75, 135, 180 };
-                for (int i = 0; i < 6; ++i)
+                // The widths until the first rows come; the columns then take the widths of their texts
+                // (fit_columns), and the last one the width the others leave (layout).
+                const int widths[COLUMN_COUNT] = { 170, 120, 130, 90, 75, 130, 140 };
+                for (int i = 0; i < COLUMN_COUNT; ++i)
                 {
-                    std::wstring text = tr(columns[i]);
+                    std::wstring text = tr(column_titles[i]);
                     LVCOLUMNW c = {};
                     c.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
                     c.pszText = &text[0];
@@ -546,6 +618,8 @@ namespace albireo
                     c.iSubItem = i;
                     ListView_InsertColumn(list, i, &c);
                 }
+                last_fit = px(widths[COLUMN_COUNT - 1]);
+                show_sort_arrow();
                 const DWORD reader = ES_MULTILINE | ES_READONLY | WS_VSCROLL | ES_AUTOVSCROLL;
                 details = add(ui::edit(hwnd, L"", IDC_DETAILS, reader));
                 progress = add(ui::progress(hwnd, IDC_PROGRESS));
@@ -582,8 +656,8 @@ namespace albireo
                 RECT inside = {};
                 GetClientRect(list, &inside);
                 int taken = 0;
-                for (int i = 0; i < 5; ++i) taken += ListView_GetColumnWidth(list, i);
-                set_column_width(list, 5, std::max<int>(px(140), inside.right - taken));
+                for (int i = 0; i < COLUMN_COUNT - 1; ++i) taken += ListView_GetColumnWidth(list, i);
+                set_column_width(list, COLUMN_COUNT - 1, std::max<int>(last_fit, inside.right - taken));
                 int x = m;
                 for (HWND b : { download, activate, deactivate, verify, remove })
                 {
@@ -700,27 +774,56 @@ namespace albireo
                 return tr("state_available");
             }
 
-            // What a model reads: text, images, sound; the attachments of the web
-            // application follow them.
+            /*
+                The rank of a model in the order of the states: the models installed and active first,
+                then the models installed, the downloads in progress, the downloads that failed, and the
+                models available.
+            */
+            int state_rank(const json& m) const
+            {
+                const std::string id = m["id"].as_string();
+                if (m["installed"].as_bool(false))
+                    return active_roles(id).empty() && id != overview["background"].as_string() ? 1 : 0;
+                if (downloading(id)) return 2;
+                const json* d = download_of(id);
+                return d && (*d)["state"].as_string() == "error" ? 3 : 4;
+            }
+
+            // What a model reads, the text first, then the images and the sound; the attachments of
+            // the web application follow them.
             std::wstring inputs_text(const json& m) const
             {
+                std::vector<std::string> kinds;
+                for (const auto& i : m["inputs"].elements()) kinds.push_back(i.as_string());
+                if (kinds.empty()) kinds.push_back("text");
+                const char* const known[][2] = { { "text", "input_text" }, { "image", "input_image" },
+                    { "audio", "input_audio" } };
                 std::wstring text;
-                for (const auto& i : m["inputs"].elements())
-                {
-                    const std::string kind = i.as_string();
-                    const std::wstring name = kind == "image" ? tr("input_image") : kind == "audio" ? tr("input_audio")
-                        : kind == "text" ? tr("input_text") : widen(kind);
-                    text += (text.empty() ? L"" : L", ") + name;
-                }
-                return text.empty() ? tr("input_text") : text;
+                for (const auto& k : known)
+                    if (std::find(kinds.begin(), kinds.end(), k[0]) != kinds.end())
+                        text += (text.empty() ? L"" : L", ") + tr(k[1]);
+                for (const auto& kind : kinds)
+                    if (kind != "text" && kind != "image" && kind != "audio")
+                        text += (text.empty() ? L"" : L", ") + widen(kind);
+                return text;
             }
 
             void fill_list()
             {
-                // The same models in the same order keep their rows: only the texts that changed are
-                // written, and painted again.
-                std::vector<std::string> now;
-                std::vector<std::vector<std::wstring>> cells;
+                /*
+                    One row per model, in the order of the catalog, or sorted by the column the user
+                    chose, the models it ranks alike in the order of the catalog.  The same models in
+                    the same order keep their rows: only the texts that changed are written, and painted
+                    again.
+                */
+                struct model_row
+                {
+                    std::string id;
+                    std::vector<std::wstring> cells;
+                    unsigned long long size;
+                    int rank;
+                };
+                std::vector<model_row> found;
                 for (const auto& m : overview["models"].elements())
                 {
                     const std::string id = m["id"].as_string();
@@ -731,7 +834,9 @@ namespace albireo
                     else
                         for (const auto& r : listed.elements())
                             roles += (roles.empty() ? L"" : L", ") + role_name(r.as_string());
-                    const unsigned long long size = static_cast<unsigned long long>(m["size"].as_int(0));
+                    // The decoder and the projector of a model that reads images.
+                    const unsigned long long size = static_cast<unsigned long long>(m["total_size"].as_int(
+                        m["size"].as_int(0)));
                     std::wstring act;
                     const std::vector<std::string> active = active_roles(id);
                     if (active.size() == 3)
@@ -741,9 +846,26 @@ namespace albireo
                     // The model that comes with Albireo serves the work in the background.
                     if (id == overview["background"].as_string())
                         act += (act.empty() ? L"" : L", ") + tr("role_background");
-                    now.push_back(id);
-                    cells.push_back({ widen(m["name"].str(id)), roles, inputs_text(m),
-                        size ? widen(ui::format_size(size)) : std::wstring(), state_text(m), act });
+                    found.push_back({ id, { widen(m["name"].str(id)), widen(m["publisher"].as_string()), roles,
+                        inputs_text(m), size ? widen(ui::format_size(size)) : std::wstring(), state_text(m), act },
+                        size, state_rank(m) });
+                }
+                const list_order order = models_order();
+                if (order.column >= 0)
+                    std::stable_sort(found.begin(), found.end(), [&order](const model_row& a, const model_row& b) {
+                        const int c = order.column;
+                        int d = 0;
+                        if (c == COL_SIZE) d = (a.size > b.size) - (a.size < b.size);
+                        else if (c == COL_STATE) d = a.rank - b.rank;
+                        else d = compare_text(a.cells[static_cast<size_t>(c)], b.cells[static_cast<size_t>(c)]);
+                        return order.descending ? d > 0 : d < 0;
+                    });
+                std::vector<std::string> now;
+                std::vector<std::vector<std::wstring>> cells;
+                for (auto& r : found)
+                {
+                    now.push_back(r.id);
+                    cells.push_back(std::move(r.cells));
                 }
                 rows.refresh(list, now, cells);
                 // The selected model keeps its selection when the list is filled again.
@@ -757,6 +879,83 @@ namespace albireo
                     }
                     rows.filling = false;
                 }
+                if (!fitted || rows.rebuilt || !rows.changed.empty()) fit_columns();
+            }
+
+            /*
+                The widths of the columns: when the first rows come, each one takes the width of its
+                title, with the arrow of the sorted column, and of its texts, the name and the developer
+                within a limit; afterwards a column widens when its texts need more, so that a width the
+                user chose holds.  The last column takes the width the others leave, at least that of its
+                texts (layout).
+            */
+            void fit_columns()
+            {
+                for (int c = 0; c < COLUMN_COUNT; ++c)
+                {
+                    const std::wstring title = tr(column_titles[c]);
+                    const int arrow = c == models_order().column ? px(20) : 0;
+                    int fit = ListView_GetStringWidth(list, title.c_str()) + px(16) + arrow;
+                    for (const auto& row : rows.texts)
+                    {
+                        if (row.size() <= static_cast<size_t>(c)) continue;
+                        const int text = ListView_GetStringWidth(list, row[static_cast<size_t>(c)].c_str());
+                        fit = std::max(fit, text + px(16));
+                    }
+                    if (c == COL_MODEL) fit = std::min(fit, px(260));
+                    if (c == COL_PUBLISHER) fit = std::min(fit, px(180));
+                    if (c == COLUMN_COUNT - 1) last_fit = fit;
+                    else if (!fitted || fit > ListView_GetColumnWidth(list, c)) set_column_width(list, c, fit);
+                }
+                fitted = true;
+                RECT rc;
+                GetClientRect(hwnd, &rc);
+                layout(rc.right, rc.bottom);
+            }
+
+            // The arrow of the sorted column in its title: up for the ascending order, down for the
+            // descending one.
+            void show_sort_arrow()
+            {
+                const list_order order = models_order();
+                HWND header = ListView_GetHeader(list);
+                for (int c = 0; c < COLUMN_COUNT; ++c)
+                {
+                    HDITEMW item = {};
+                    item.mask = HDI_FORMAT;
+                    if (!Header_GetItem(header, c, &item)) continue;
+                    int format = item.fmt & ~(HDF_SORTUP | HDF_SORTDOWN);
+                    if (c == order.column) format |= order.descending ? HDF_SORTDOWN : HDF_SORTUP;
+                    if (format == item.fmt) continue;
+                    item.fmt = format;
+                    Header_SetItem(header, c, &item);
+                }
+            }
+
+            // A click on the title of a column sorts the list by it, ascending, then descending at
+            // the next click.
+            void sort_by(int column)
+            {
+                if (column < 0 || column >= COLUMN_COUNT) return;
+                list_order& order = models_order();
+                order.descending = column == order.column && !order.descending;
+                order.column = column;
+                save_models_order(order);
+                show_sort_arrow();
+                fill_list();
+                // The title of the sorted column takes the room of its arrow.
+                fit_columns();
+                // The sorted list shows its first rows, down to the selected model; the horizontal
+                // position holds.
+                const int row = ListView_GetNextItem(list, -1, LVNI_SELECTED);
+                const int page = std::max(1, ListView_GetCountPerPage(list));
+                RECT item = {};
+                if (!ListView_GetItemRect(list, 0, &item, LVIR_BOUNDS)) return;
+                const int top = row >= page ? row - page + 1 : 0;
+                SendMessageW(list, WM_SETREDRAW, FALSE, 0);
+                ListView_Scroll(list, 0, (top - ListView_GetTopIndex(list)) * (item.bottom - item.top));
+                SendMessageW(list, WM_SETREDRAW, TRUE, 0);
+                InvalidateRect(list, nullptr, TRUE);
             }
 
             void show_details()
@@ -774,6 +973,7 @@ namespace albireo
                 auto line = [&](const char* key, const std::string& v) {
                     if (!v.empty()) text += tr_utf8(key) + ": " + v + "\r\n";
                 };
+                line("lbl_publisher", (*m)["publisher"].as_string());
                 if ((*m)["parameters"].as_int(0) > 0)
                 {
                     char buf[32];
@@ -1139,9 +1339,16 @@ namespace albireo
                             update_buttons();
                         }
                     }
+                    else if (n->idFrom == IDC_LIST && n->code == LVN_COLUMNCLICK)
+                    {
+                        sort_by(reinterpret_cast<const NMLISTVIEW*>(lp)->iSubItem);
+                    }
                     handled = true;
                     return 0;
                 }
+                // At another resolution the texts take other widths: the columns fit them again at the
+                // next rows.
+                if (msg == WM_DPICHANGED) fitted = false;
                 return 0;
             }
 
@@ -1753,7 +1960,8 @@ namespace albireo
 
     void show_models_window(const service_client& client)
     {
-        show<models_window>(client, tr("models_title"), 900, 620, true);
+        // Wide enough for the seven columns of the list without a horizontal scroll bar.
+        show<models_window>(client, tr("models_title"), 1040, 620, true);
     }
 
     void show_host_window(const service_client& client)

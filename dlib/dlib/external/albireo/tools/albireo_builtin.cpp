@@ -8,15 +8,21 @@
             [--setup <albireo-setup-online.exe> --setup-out <albireo-setup.exe>] [--threads <n>]
 
     The manifest (resources/builtin_models.json) names each model, the file it comes from,
-    with its address, its size and its SHA-256, and the quantization Albireo ships.  The
-    build downloads the files into the cache, named by their hash (cmake/builtin_models.cmake);
-    this program then works on them as the import example of dlib does on a GGUF file
-    (examples/slm_gguf_import_ex.cpp), with the code the engine runs:
+    with its address, its size and its SHA-256, and the quantization Albireo ships; a model
+    that reads images also names its projector ("projector": the mmproj file that holds its
+    vision encoder, shipped as published).  The build downloads the files into the cache,
+    named by their hash (cmake/builtin_models.cmake); this program then works on them as the
+    import example of dlib does on a GGUF file (examples/slm_gguf_import_ex.cpp), with the
+    code the engine runs:
 
       - the file is read (gguf_reader) and its geometry resolved (model_config), which
         rejects an architecture or a configuration the engine does not run;
       - its tokenizer must give back a text it encoded, and a model that converses must
         come with a chat template the engine recognizes;
+      - the projector, checked against its hash, must be a vision projector (general.
+        architecture "clip") whose output has the width the decoder takes:
+        clip.vision.projection_dim * (1 + its deepstack layers) equal to
+        embedding_length * (1 + n_deepstack_layers) of the decoder;
       - the model is converted: its weights are quantized again when the manifest asks for
         another quantization than the published one, and its metadata receive its identity
         in Albireo (albireo.id, albireo.name, albireo.roles, albireo.inputs,
@@ -26,9 +32,10 @@
 
     The converted files stay in the cache, named after the conversion, so that a new build
     reuses them.  --models-out gives them to a folder with their manifest builtin.json (the
-    "models" folder of the programs of a build tree), by hard links when the folder is on
-    the volume of the cache; --setup appends them to a copy of the installer without models,
-    as the overlay of common/builtin_models.h, the complete installer.
+    "models" folder of the programs of a build tree), <id>.gguf and the projector
+    <id>.mmproj.gguf, by hard links when the folder is on the volume of the cache; --setup
+    appends them to a copy of the installer without models, as the overlay of
+    common/builtin_models.h, the complete installer.
 
     QUANTIZATION
         The Q4_K_M mix of the GGUF format: the matrices in Q4_K (blocks of 256 weights in 8
@@ -559,12 +566,14 @@ namespace
         uint64_t offset = 0;
     };
 
-    std::vector<tensor_plan> plan_tensors(const dlib::gguf_reader& r, const std::string& quantization, int n_layers)
+    std::vector<tensor_plan> plan_tensors(const dlib::gguf_reader& r, const std::string& quantization,
+        const std::string& published, int n_layers)
     {
         std::vector<const gguf_tensor_info*> order;
         for (const auto& t : r.tensors()) order.push_back(&t);
         std::sort(order.begin(), order.end(), tensor_before);
-        const bool requantize = quantization == "Q4_K_M";
+        // A file published in the quantization Albireo ships keeps its tensors as they are.
+        const bool requantize = quantization == "Q4_K_M" && published != quantization;
         bool tied = true;
         int n_attn_v = 0;
         for (const auto* t : order)
@@ -740,6 +749,7 @@ namespace
         std::string quantization;  // the one shipped
         std::string key;           // names the conversion
         std::string converted;     // the converted file in the cache
+        std::string projector;     // the projector in the cache, shipped as published; empty without one
     };
 
     // The rows of a tensor as floats, from its bytes.
@@ -855,7 +865,8 @@ namespace
                 + ", is not a power of two between 1 and 65536");
         const std::string arch = r.get_str("general.architecture");
         const int n_layers = static_cast<int>(r.get_int(arch + ".block_count"));
-        const std::vector<tensor_plan> plan = plan_tensors(r, m.quantization, n_layers);
+        const std::vector<tensor_plan> plan = plan_tensors(r, m.quantization,
+            m.desc["from"]["quantization"].as_string(), n_layers);
         bool changed = false;
         for (const auto& p : plan) changed = changed || p.type != p.src->type;
 
@@ -1019,6 +1030,41 @@ namespace
         return info;
     }
 
+    /*
+        Checks a projector against the decoder it goes with: a vision projector (general.
+        architecture "clip" with a vision encoder) whose output, clip.vision.projection_dim
+        wide with as many more widths as it has deepstack layers, has the width of the vision
+        tokens the decoder takes, embedding_length * (1 + n_deepstack_layers).  Returns its
+        type and that width.
+    */
+    json check_projector(const std::string& projector, const std::string& decoder)
+    {
+        const dlib::gguf_reader p(projector);
+        if (p.get_str("general.architecture") != "clip")
+            throw std::runtime_error(projector + " is not a projector (general.architecture is not clip)");
+        if (p.get_int("clip.has_vision_encoder", 1) == 0)
+            throw std::runtime_error(projector + " holds no vision encoder");
+        int64_t deepstack = 0;
+        if (p.has("clip.vision.is_deepstack_layers"))
+            for (int64_t v : p.at("clip.vision.is_deepstack_layers").arr_int) deepstack += v != 0 ? 1 : 0;
+        int64_t width = p.get_int("clip.vision.projection_dim", 0) * (1 + deepstack);
+        // A LLaVA projector names no projection width: its last layer gives it.
+        const dlib::gguf_tensor_info* last = p.find_tensor("mm.2.weight");
+        if (width <= 0 && last && last->dims.size() >= 2) width = static_cast<int64_t>(last->dims[1]);
+        const dlib::gguf_reader d(decoder);
+        const std::string arch = d.get_str("general.architecture");
+        const int64_t wanted = d.get_int(arch + ".embedding_length", 0)
+            * (1 + d.get_int(arch + ".n_deepstack_layers", 0));
+        if (width <= 0 || width != wanted)
+            throw std::runtime_error("the projector gives vision tokens of width " + std::to_string(width) + ", the "
+                + arch + " decoder takes " + std::to_string(wanted));
+        json info = json::object();
+        info["projector_type"] = p.get_str("clip.projector_type");
+        info["projection_width"] = static_cast<long long>(width);
+        info["image_size"] = static_cast<long long>(p.get_int("clip.vision.image_size", 0));
+        return info;
+    }
+
     // ---- The manifest and the files
 
     std::string conversion_key(const json& desc, const std::string& source_sha, const std::string& quantization)
@@ -1067,16 +1113,24 @@ namespace
         std::fclose(in);
         if (!copied) throw std::runtime_error("cannot copy " + setup);
         uint64_t at = 0;
-        for (size_t i = 0; i < models.size(); ++i)
-        {
-            std::FILE* m = open_file(models[i].converted, "rb");
-            if (!m) throw std::runtime_error("cannot read " + models[i].converted);
-            const uint64_t size = file_size(models[i].converted);
+        // Appends file to the overlay and returns its position in it.
+        auto append = [&](const std::string& file) {
+            std::FILE* m = open_file(file, "rb");
+            if (!m) throw std::runtime_error("cannot read " + file);
+            const uint64_t size = file_size(file);
             const bool ok = copy_range(m, size, out);
             std::fclose(m);
-            if (!ok) throw std::runtime_error("cannot append " + models[i].converted);
-            manifest["models"].elements()[i]["offset"] = static_cast<unsigned long long>(at);
+            if (!ok) throw std::runtime_error("cannot append " + file);
+            const uint64_t where = at;
             at += size;
+            return where;
+        };
+        for (size_t i = 0; i < models.size(); ++i)
+        {
+            json& entry = manifest["models"].elements()[i];
+            entry["offset"] = static_cast<unsigned long long>(append(models[i].converted));
+            if (!models[i].projector.empty())
+                entry["projector"]["offset"] = static_cast<unsigned long long>(append(models[i].projector));
         }
         const std::string text = manifest.dump();
         builtin_trailer trailer;
@@ -1186,6 +1240,30 @@ namespace
             std::cout << "  " << file_name(m.converted) << ", " << info["size"].as_int(0) << " bytes, "
                       << info["format"].as_string() << "\n";
 
+            // The projector of a model that reads images, shipped as published.
+            json projector_entry;
+            const json& pd = d["projector"];
+            if (pd.is_object())
+            {
+                const std::string psha = pd["sha256"].as_string();
+                m.projector = join_path(cache, psha + ".gguf");
+                if (!file_exists(m.projector))
+                    throw std::runtime_error(m.id + ": " + m.projector + " is missing (cmake/builtin_models.cmake "
+                        "downloads it)");
+                std::cout << "  checking " << m.projector << "\n";
+                if (psha.empty() || sha256_file(m.projector) != psha)
+                    throw std::runtime_error(m.id + ": the SHA-256 of " + m.projector + " differs from the manifest");
+                const json pinfo = check_projector(m.projector, m.converted);
+                std::cout << "  projector " << pinfo["projector_type"].as_string() << ", vision tokens of width "
+                          << pinfo["projection_width"].as_int(0) << "\n";
+                projector_entry = json::object();
+                projector_entry["file"] = m.id + ".mmproj.gguf";
+                projector_entry["size"] = static_cast<unsigned long long>(file_size(m.projector));
+                projector_entry["sha256"] = psha;
+                projector_entry["quantization"] = pd["quantization"];
+                projector_entry["source_url"] = pd["url"];
+            }
+
             json e = d;
             e.erase("from");
             e["quantization"] = m.quantization;
@@ -1197,6 +1275,8 @@ namespace
             e["sha256"] = info["sha256"];
             e["source_sha256"] = m.source_sha;
             e["source_url"] = d["from"]["url"];
+            e.erase("projector");
+            if (projector_entry.is_object()) e["projector"] = projector_entry;
             out["models"].push_back(e);
             models.push_back(m);
         }
@@ -1206,8 +1286,11 @@ namespace
             const std::string dir = args["models-out"];
             make_dirs(dir);
             for (const auto& m : models)
-                if (!link_or_copy(m.converted, join_path(dir, m.id + ".gguf")))
+            {
+                if (!link_or_copy(m.converted, join_path(dir, m.id + ".gguf"))
+                    || (!m.projector.empty() && !link_or_copy(m.projector, join_path(dir, m.id + ".mmproj.gguf"))))
                     throw std::runtime_error("cannot place " + m.id + " in " + dir);
+            }
             if (!write_file_atomic(join_path(dir, builtin_manifest_name), out.dump_formatted(2) + "\n"))
                 throw std::runtime_error("cannot write the manifest in " + dir);
             std::cout << "models in " << dir << "\n";

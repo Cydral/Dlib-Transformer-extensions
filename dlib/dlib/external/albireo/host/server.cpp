@@ -80,15 +80,15 @@ namespace albireo
             res.set_content(j.dump(), "application/json; charset=utf-8");
         }
 
-        // The error body of the OpenAI interface.
+        // The error body of the OpenAI interface, param naming the member of the request it concerns.
         void send_error(httplib::Response& res, int status, const std::string& type, const std::string& message,
-            const std::string& code = std::string())
+            const std::string& code = std::string(), const std::string& param = std::string())
         {
             json e = json::object();
             json inner = json::object();
             inner["message"] = message;
             inner["type"] = type;
-            inner["param"] = nullptr;
+            inner["param"] = param.empty() ? json() : json(param);
             inner["code"] = code.empty() ? json() : json(code);
             e["error"] = inner;
             send_json(res, status, e);
@@ -294,6 +294,84 @@ namespace albireo
             return true;
         }
 
+        // The images of a request at most, which the engine reads into the prompt.
+        const size_t max_images = 16;
+
+        // A request refused before it reaches the engine, in the form of the OpenAI interface.
+        struct refusal
+        {
+            std::string message;
+            std::string code;
+            std::string param;
+        };
+
+        /*
+            The parts of the messages beyond text: "image_url", an image given as a data URL of a
+            PNG or JPEG file, since the service fetches nothing (a computer without network reads
+            the same requests), max_images at most, and "input_audio".  Counts them; returns false
+            with the refusal of the first part that cannot be read.
+        */
+        bool check_media(const json& messages, size_t& images, size_t& sounds, refusal& r)
+        {
+            images = 0;
+            sounds = 0;
+            for (size_t i = 0; i < messages.size(); ++i)
+            {
+                const json& content = messages[i]["content"];
+                for (size_t k = 0; k < content.size() && content.is_array(); ++k)
+                {
+                    const json& part = content[k];
+                    const std::string kind = part["type"].as_string();
+                    const std::string at = "messages[" + std::to_string(i) + "].content[" + std::to_string(k) + "]";
+                    if (kind == "input_audio") ++sounds;
+                    if (kind != "image_url") continue;
+                    ++images;
+                    const json& image = part["image_url"];
+                    const std::string url = image.is_string() ? image.as_string() : image["url"].as_string();
+                    if (lower(url.substr(0, 5)) != "data:")
+                    {
+                        r.message = "the service fetches no image: an image is given in the request as a data URL, "
+                            "data:image/png;base64,... or data:image/jpeg;base64,...";
+                        r.code = "invalid_image_url";
+                        r.param = at + ".image_url.url";
+                        return false;
+                    }
+                    // data:<media type>;base64,<data>, of a PNG or JPEG file by its first bytes.
+                    const size_t comma = url.find(',');
+                    const std::string header = lower(url.substr(5, comma == std::string::npos ? 0 : comma - 5));
+                    const std::string data = comma == std::string::npos ? std::string() : url.substr(comma + 1, 16);
+                    const std::string bytes = base64_decode(data.substr(0, data.size() / 4 * 4));
+                    const bool png = bytes.compare(0, 8, std::string("\x89PNG\r\n\x1a\n", 8)) == 0;
+                    const bool jpeg = bytes.compare(0, 3, std::string("\xFF\xD8\xFF", 3)) == 0;
+                    if ((header != "image/png;base64" || !png) && (header != "image/jpeg;base64" || !jpeg))
+                    {
+                        r.message = "an image is a PNG or JPEG file in base64: data:image/png;base64,... or "
+                            "data:image/jpeg;base64,...";
+                        r.code = "invalid_image_format";
+                        r.param = at + ".image_url.url";
+                        return false;
+                    }
+                    const std::string detail = image["detail"].as_string();
+                    if (!detail.empty() && detail != "auto" && detail != "low" && detail != "high")
+                    {
+                        r.message = "the detail of an image is auto, low or high";
+                        r.code = "invalid_value";
+                        r.param = at + ".image_url.detail";
+                        return false;
+                    }
+                }
+            }
+            if (images > max_images)
+            {
+                r.message = "a request carries " + std::to_string(max_images) + " images at most, this one "
+                    + std::to_string(images);
+                r.code = "too_many_images";
+                r.param = "messages";
+                return false;
+            }
+            return true;
+        }
+
         json usage_of(const json& done)
         {
             const json& u = done["usage"];
@@ -338,6 +416,42 @@ namespace albireo
             {
                 send_error(res, 400, "invalid_request_error", "messages must be an array");
                 return;
+            }
+            if (chat)
+            {
+                // The images and the sounds go to a model that reads them, as the engine loaded it.
+                const json& r = request;
+                size_t images = 0, sounds = 0;
+                refusal refused;
+                if (!check_media(r["messages"], images, sounds, refused))
+                {
+                    send_error(res, 400, "invalid_request_error", refused.message, refused.code, refused.param);
+                    return;
+                }
+                if (images > 0 || sounds > 0)
+                {
+                    bool image = false, audio = false;
+                    const std::map<std::string, json> traits = svc.loaded_traits();
+                    const auto t = traits.find(r["model"].as_string());
+                    if (t != traits.end())
+                        for (const auto& s : t->second["inputs"].elements())
+                        {
+                            image = image || s.as_string() == "image";
+                            audio = audio || s.as_string() == "audio";
+                        }
+                    if (images > 0 && !image)
+                    {
+                        send_error(res, 400, "invalid_request_error", "the model " + model_name + " reads text only: "
+                            "the images go to a model that reads them", "image_input_not_supported", "messages");
+                        return;
+                    }
+                    if (sounds > 0 && !audio)
+                    {
+                        send_error(res, 400, "invalid_request_error", "the model " + model_name + " reads no sound",
+                            "audio_input_not_supported", "messages");
+                        return;
+                    }
+                }
             }
             if (!chat && !request["prompt"].is_string())
             {
@@ -726,6 +840,8 @@ namespace albireo
             {"cpp-httplib.txt", "cpp-httplib", CPPHTTPLIB_VERSION},
             {"zlib.txt", "zlib", ZLIB_VERSION},
             {"sqlite.txt", "SQLite", SQLITE_VERSION},
+            {"libpng.txt", "libpng", ""},
+            {"libjpeg.txt", "libjpeg (Independent JPEG Group)", ""},
             {"openvino-license.txt", "OpenVINO", ""},
             {"cuda-eula.txt", "CUDA", ""},
             {"cudnn-license.txt", "cuDNN", ""}
@@ -912,6 +1028,15 @@ namespace albireo
             json list = json::array();
             const host_settings st = s->settings().get();
             const long long now = static_cast<long long>(now_unix());
+            // What each model reads and the company that made it; an alias gives those of its model.
+            const std::map<std::string, json> traits = s->loaded_traits();
+            auto add_traits = [&traits](json& m, const std::string& id) {
+                const auto t = traits.find(id);
+                json inputs = json::array();
+                inputs.push_back("text");
+                m["inputs"] = t != traits.end() ? t->second["inputs"] : inputs;
+                m["publisher"] = t != traits.end() ? t->second["publisher"] : json("");
+            };
             for (const auto& id : s->engine().loaded_models())
             {
                 json m = json::object();
@@ -923,6 +1048,7 @@ namespace albireo
                 for (const auto& kv : st.active)
                     if (kv.second == id) roles.push_back(kv.first);
                 m["roles"] = roles;
+                add_traits(m, id);
                 list.push_back(m);
             }
             for (const char* role : model_roles)
@@ -935,6 +1061,7 @@ namespace albireo
                 m["created"] = now;
                 m["owned_by"] = "albireo";
                 m["alias_of"] = target;
+                add_traits(m, target);
                 list.push_back(m);
             }
             const std::string background = s->resolve_model("background");
@@ -946,6 +1073,7 @@ namespace albireo
                 m["created"] = now;
                 m["owned_by"] = "albireo";
                 m["alias_of"] = background;
+                add_traits(m, background);
                 list.push_back(m);
             }
             const std::string embedder = s->resolve_embedding_model(std::string());
@@ -957,6 +1085,7 @@ namespace albireo
                 m["created"] = now;
                 m["owned_by"] = "albireo";
                 m["alias_of"] = embedder;
+                add_traits(m, embedder);
                 list.push_back(m);
             }
             json out = json::object();
@@ -1166,9 +1295,10 @@ namespace albireo
                 send_error(res, 400, "invalid_request_error", "the transfer did not complete");
                 return;
             }
-            // A model installed already under another file is a success too ("already").
+            // A model installed already under another file is a success too ("already"), as a
+            // projector kept until its decoder comes ("pending").
             const json r = s->models().import_received(tmp, name, hash.hex());
-            send_json(res, r["imported"].empty() && r["already"].empty() ? 400 : 200, r);
+            send_json(res, r["imported"].empty() && r["already"].empty() && r["pending"].empty() ? 400 : 200, r);
         });
 
         // The password of the proxy is given as proxy_password_mask (host_settings::to_json()).

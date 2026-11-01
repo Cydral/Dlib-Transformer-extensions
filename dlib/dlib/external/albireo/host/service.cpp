@@ -924,23 +924,35 @@ namespace albireo
             }
         }
 
+        /*
+            The models of the folder and of its models subfolder in one import, so that each
+            projector goes with its decoder.  A file installed, installed already (a model that
+            comes with Albireo say) or kept as a pending projector left the folder; one that
+            could not be installed is set aside with its sidecar description.
+        */
+        bool models = false;
         for (const std::string& dir : dirs)
-            for (const auto& n : list_dir(dir))
+            for (const auto& n : list_dir(dir)) models = models || ends_with(n, ".gguf");
+        if (models && !stopping_)
+        {
+            const json r = models_->import_path(inbox, inbox, true);
+            for (const auto& e : r["errors"].elements()) log_warning("models: import folder: " + e.as_string());
+            for (const auto& f : r["files"].elements())
             {
-                if (stopping_) return;
-                if (!ends_with(n, ".gguf")) continue;
-                const std::string f = join_path(dir, n);
-                const std::string side = f.substr(0, f.size() - 5) + ".json";
-                const json r = models_->import_path(f, inbox, true);
-                for (const auto& e : r["errors"].elements()) log_warning("models: import folder: " + e.as_string());
-                // A file installed already, a model that comes with Albireo say, left the folder too.
-                if (!r["imported"].empty() || !r["already"].empty()) remove_file(side);
+                const std::string file = f["file"].as_string();
+                const std::string result = f["result"].as_string();
+                // A file the import did not reach, the service stopping, stays for the next start.
+                if (!ends_with(file, ".gguf") || result.empty()) continue;
+                const std::string side = file.substr(0, file.size() - 5) + ".json";
+                if (result != "error") remove_file(side);
                 else if (!stopping_)
                 {
-                    set_aside(f);
+                    set_aside(file);
                     set_aside(side);
                 }
             }
+        }
+        if (stopping_) return;
 
         const std::string feed = join_path(inbox, "feed.json");
         if ((file_exists(feed) || is_link(feed)) && (file_exists(feed + ".sig") || is_link(feed + ".sig"))
@@ -1031,6 +1043,7 @@ namespace albireo
             const json r = models_->import_path(within, inbox, false);
             result["imported"] = r["imported"];
             result["already"] = r["already"];
+            result["pending"] = r["pending"];
             result["errors"] = r["errors"];
             if (folder && file_exists(join_path(within, "feed.json")))
                 result["update"] = updater_->import_offline(within, inbox);
@@ -1062,16 +1075,18 @@ namespace albireo
                 "feed.json.sig, signed by Albireo");
         result["imported"] = json::array();
         result["already"] = json::array();
+        result["pending"] = json::array();
         result["errors"] = json::array();
         if (catalog)
         {
             result["catalog"] = models_->import_catalog(path, std::string());
-            // The models the signed catalog lists, whatever catalog stays in use.
+            // The models the signed catalog lists, with their projectors, whatever catalog stays in use.
             if (signed_catalog)
             {
                 const json r = models_->import_bundle(path, json::parse_or_null(catalog_body));
                 result["imported"] = r["imported"];
                 result["already"] = r["already"];
+                result["pending"] = r["pending"];
                 result["errors"] = r["errors"];
             }
         }
@@ -1087,22 +1102,54 @@ namespace albireo
 
     void service::register_builtin_models()
     {
-        std::vector<std::string> removed;
+        std::vector<installed_model> removed;
         const std::vector<installed_model> added =
             models_->register_builtin(join_path(program_dir_, builtin_models_folder), removed);
+        /*
+            A model that no longer comes with Albireo leaves its functions to the new model of
+            its kind, a language model to a language model and an embedding model to an
+            embedding model: an update that changes the model that comes with Albireo keeps the
+            functions where the user had them.
+        */
+        std::map<std::string, std::string> successor;
+        std::set<std::string> successors;
+        for (const auto& r : removed)
+            for (const auto& a : added)
+                if (is_embedding(a) == is_embedding(r) && !successors.count(a.id))
+                {
+                    successor[r.id] = a.id;
+                    successors.insert(a.id);
+                    log_info("models: " + a.id + " takes the place of " + r.id);
+                    break;
+                }
         if (!removed.empty())
         {
             settings_->update([&](host_settings& s) {
                 for (auto it = s.active.begin(); it != s.active.end();)
                 {
-                    if (std::find(removed.begin(), removed.end(), it->second) != removed.end()) it = s.active.erase(it);
-                    else ++it;
+                    const auto next = successor.find(it->second);
+                    const bool left = std::find_if(removed.begin(), removed.end(),
+                        [&](const installed_model& r) { return r.id == it->second; }) != removed.end();
+                    if (next != successor.end())
+                    {
+                        it->second = next->second;
+                        ++it;
+                    }
+                    else if (left)
+                    {
+                        it = s.active.erase(it);
+                    }
+                    else
+                    {
+                        ++it;
+                    }
                 }
             });
         }
         // The engine is not started yet: the functions are given now, the models load with
         // the others.
-        for (const auto& m : added) on_installed(m);
+        for (const auto& m : added)
+            if (!successors.count(m.id)) on_installed(m);
         // The language model that comes with Albireo serves the work in the background.
         background_model_.clear();
         for (const auto& m : db_->models())
@@ -1187,6 +1234,13 @@ namespace albireo
     void service::on_installed(const installed_model& m)
     {
         if (stopping_) return;
+        // A model of the engine whose files changed, a projector given to it say, loads again with them.
+        const std::vector<std::string> loaded = engine_.loaded_models();
+        if (std::find(loaded.begin(), loaded.end(), m.id) != loaded.end())
+        {
+            log_info("models: " + m.id + " loads again with its files once its requests are served");
+            retire(m.id, true);
+        }
         if (is_embedding(m))
         {
             // The first embedding model serves the document search.
@@ -1227,6 +1281,13 @@ namespace albireo
             if (st.context > 0) options["context"] = st.context;
             options["max_sequences"] = st.max_sequences;
             if (st.kv_mb > 0) options["kv_mb"] = st.kv_mb;
+        }
+        // The vision encoder of a model that reads images.
+        if (!m.projector.empty())
+        {
+            if (file_exists(m.projector)) options["projector"] = m.projector;
+            else
+                log_warning("models: the projector " + m.projector + " of " + m.id + " is missing: it reads text only");
         }
         const bool ok = engine_.load_model(m.id, m.file, options, error);
         std::lock_guard<std::mutex> lock(m_);
@@ -1337,10 +1398,10 @@ namespace albireo
         return true;
     }
 
-    void service::retire(const std::string& id)
+    void service::retire(const std::string& id, bool reload)
     {
-        // The model of the work in the background stays loaded without functions.
-        if (!background_model_.empty() && id == background_model_) return;
+        // The model of the work in the background stays loaded without functions; it leaves to load again only.
+        if (!reload && !background_model_.empty() && id == background_model_) return;
         std::lock_guard<std::mutex> lock(retire_m_);
         // The threads of the retirements that ended, which take this lock no more.
         for (const auto& ended : ended_retirers_)
@@ -1352,7 +1413,10 @@ namespace albireo
             retirers_.erase(t);
         }
         ended_retirers_.clear();
-        if (stopping_ || !retiring_.insert(id).second) return;
+        if (stopping_) return;
+        // A model leaving already loads again once it left, when it is still used then.
+        if (reload) reloading_.insert(id);
+        if (!retiring_.insert(id).second) return;
         {
             std::lock_guard<std::mutex> state(m_);
             load_state_[id] = removing_.count(id) != 0 ? "removing" : "unloading";
@@ -1394,6 +1458,21 @@ namespace albireo
                     std::lock_guard<std::mutex> server(server_m_);
                     if (models_ && !models_->remove(id, error)) log_warning("models: " + error);
                 }
+                /*
+                    A model that left to load again with its files: the activations that wait for
+                    the end of its retirement go first, then it loads when a function or the work
+                    in the background still uses it.
+                */
+                bool again = false;
+                {
+                    std::lock_guard<std::mutex> l(retire_m_);
+                    again = reloading_.erase(id) != 0;
+                }
+                if (again && unloaded)
+                {
+                    retire_cv_.notify_all();
+                    reload_model(id);
+                }
             }
             catch (const std::exception& e)
             {
@@ -1403,6 +1482,7 @@ namespace albireo
                 std::lock_guard<std::mutex> l(retire_m_);
                 removing_.erase(id);
                 retiring_.erase(id);
+                reloading_.erase(id);
                 std::lock_guard<std::mutex> state(m_);
                 load_state_.erase(id);
             }
@@ -1412,6 +1492,23 @@ namespace albireo
             }
             retire_cv_.notify_all();
         });
+    }
+
+    void service::reload_model(const std::string& id)
+    {
+        // Serialized with the activations, which load the models too.
+        std::lock_guard<std::mutex> serial(models_m_);
+        if (stopping_ || !engine_.running()) return;
+        const host_settings st = settings_->get();
+        bool used = id == background_model_;
+        for (const auto& kv : st.active) used = used || kv.second == id;
+        const std::vector<std::string> loaded = engine_.loaded_models();
+        installed_model m;
+        if (!used || std::find(loaded.begin(), loaded.end(), id) != loaded.end() || !db_->find_model(id, m)
+            || !file_exists(m.file))
+            return;
+        std::string error;
+        load_model(m, error);
     }
 
     json service::leaving_models()
@@ -1589,6 +1686,29 @@ namespace albireo
         }
         const auto it = st.active.find(embedding_role);
         return it != st.active.end() && is_loaded(it->second) ? it->second : std::string();
+    }
+
+    std::map<std::string, json> service::loaded_traits()
+    {
+        std::map<std::string, json> out;
+        json query = json::object();
+        query["op"] = "models";
+        const json answer = engine_.running() ? engine_.query(query) : json();
+        for (const auto& id : engine_.loaded_models())
+        {
+            // The inputs the engine reads for the model: text alone unless its query says more.
+            json inputs = json::array();
+            inputs.push_back("text");
+            for (const auto& m : answer["models"].elements())
+                if (m["id"].as_string() == id && m["inputs"].is_array() && m["inputs"].size() > 0) inputs = m["inputs"];
+            json t = json::object();
+            t["inputs"] = inputs;
+            installed_model record;
+            const json& entry = record.descriptor;
+            t["publisher"] = db_->find_model(id, record) ? entry["publisher"].str() : std::string();
+            out[id] = t;
+        }
+        return out;
     }
 
     void service::record_usage(long prompt_tokens, long generated_tokens)

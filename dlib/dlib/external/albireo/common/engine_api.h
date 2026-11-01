@@ -122,7 +122,11 @@ ALBIREO_ENGINE_EXPORT void ALBIREO_ENGINE_CALL albireo_engine_destroy(albireo_en
 /* Loads the GGUF model at path (UTF-8) under the identifier model_id.  options_json may
    override the context length and other settings for this model.  The context never exceeds
    the positions the memory of the keys and values holds ("kv_mb", or the automatic budget);
-   the "models" query gives the context in force. */
+   the "models" query gives the context in force.  "projector" names the GGUF file of the
+   image encoder of a model that reads images (an mmproj file of Qwen3-VL or of LLaVA-NeXT);
+   a model file that holds its vision tensors needs none.  The "models" query then gives
+   "inputs" ["text","image"], "image_tokens" {"min","low","auto","high"} (the tokens an image
+   takes at most with each detail), "images_per_request" and "projector_bytes". */
 ALBIREO_ENGINE_EXPORT int ALBIREO_ENGINE_CALL albireo_engine_load_model(albireo_engine* engine,
     const char* model_id, const char* path, const char* options_json, char* error, size_t error_capacity);
 
@@ -146,9 +150,11 @@ ALBIREO_ENGINE_EXPORT int ALBIREO_ENGINE_CALL albireo_engine_query(albireo_engin
      "temperature", "top_p", "top_k", "min_p", "presence_penalty", "frequency_penalty",
      "repeat_penalty", "repeat_last_n", "seed", "stop", "logit_bias".
    "top_k" is limited to 1024, and the keys of "logit_bias" must be token identifiers of the
-   vocabulary.  Its events are CONTENT, REASONING, TOOL_CALL and PROGRESS, then DONE, or ERROR
-   with the code "out_of_memory" when the answers being written fill the memory of the keys
-   and values.
+   vocabulary.  A model loaded with its projector reads the parts "image_url" of the messages,
+   {"url": a data URL of a PNG or JPEG file, "detail": "low", "auto" or "high"}, 16 at most;
+   another model refuses them.  Its events are CONTENT, REASONING, TOOL_CALL and PROGRESS, then
+   DONE, or ERROR with the code "out_of_memory" when the answers being written fill the memory
+   of the keys and values.
 
    An embedding model takes "model", "input" (a text, a list of texts, a list of token
    identifiers or a list of such lists, 2048 inputs at most) and "dimensions" (0 or absent

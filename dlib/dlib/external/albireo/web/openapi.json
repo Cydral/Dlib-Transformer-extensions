@@ -391,6 +391,28 @@
              "quantization": {
               "type": "string"
              },
+             "total_size": {
+              "type": "integer",
+              "description": "The bytes of the files of the model, its projector included."
+             },
+             "projector": {
+              "type": "object",
+              "description": "The image encoder of a model that reads images, a second file downloaded with the decoder: its size, SHA-256 and quantization, and its file once installed.",
+              "properties": {
+               "file": {
+                "type": "string"
+               },
+               "size": {
+                "type": "integer"
+               },
+               "sha256": {
+                "type": "string"
+               },
+               "quantization": {
+                "type": "string"
+               }
+              }
+             },
              "description": {
               "type": "string"
              },
@@ -445,6 +467,30 @@
            "type": "array",
            "items": {
             "type": "object"
+           }
+          },
+          "pending_projectors": {
+           "type": "array",
+           "description": "The projectors imported without their decoder, which wait for it.",
+           "items": {
+            "type": "object",
+            "properties": {
+             "name": {
+              "type": "string"
+             },
+             "size": {
+              "type": "integer"
+             },
+             "sha256": {
+              "type": "string"
+             },
+             "projector_type": {
+              "type": "string"
+             },
+             "projection_width": {
+              "type": "integer"
+             }
+            }
            }
           },
           "active": {
@@ -1653,7 +1699,7 @@
       ]
      },
      "content": {
-      "description": "Text, or a list of parts of type text.",
+      "description": "Text, or a list of parts: text parts, and for a model that reads images (inputs of /v1/models) image_url parts, 16 images per request at most.",
       "oneOf": [
        {
         "type": "string"
@@ -1661,7 +1707,7 @@
        {
         "type": "array",
         "items": {
-         "type": "object"
+         "$ref": "#/components/schemas/ContentPart"
         }
        }
       ],
@@ -1685,6 +1731,47 @@
       "type": "string"
      }
     }
+   },
+   "ContentPart": {
+    "type": "object",
+    "required": [
+     "type"
+    ],
+    "properties": {
+     "type": {
+      "type": "string",
+      "enum": [
+       "text",
+       "image_url"
+      ]
+     },
+     "text": {
+      "type": "string"
+     },
+     "image_url": {
+      "type": "object",
+      "required": [
+       "url"
+      ],
+      "properties": {
+       "url": {
+        "type": "string",
+        "description": "A PNG or JPEG file as a data URL, data:image/png;base64,... or data:image/jpeg;base64,...; the service fetches no address (code invalid_image_url), reads no other format (invalid_image_format), and refuses more than 20 MB, 8192 pixels on a side or 40 megapixels."
+       },
+       "detail": {
+        "type": "string",
+        "enum": [
+         "low",
+         "auto",
+         "high"
+        ],
+        "default": "auto",
+        "description": "The tokens an image takes at most: for Qwen3-VL 256, 576 or 1024 tokens of 32 pixels square; for a LLaVA-NeXT model (EuroVLM) the whole image and 1, 2 or 4 tiles of 384 pixels."
+       }
+      }
+     }
+    },
+    "description": "A part of the content of a message. A model that reads text only refuses the images (code image_input_not_supported), and a request carries 16 images at most (too_many_images)."
    },
    "ToolCall": {
     "type": "object",
@@ -2265,6 +2352,22 @@
         },
         "alias_of": {
          "type": "string"
+        },
+        "inputs": {
+         "type": "array",
+         "items": {
+          "type": "string",
+          "enum": [
+           "text",
+           "image",
+           "audio"
+          ]
+         },
+         "description": "What the model reads, text and images; an alias gives those of its model."
+        },
+        "publisher": {
+         "type": "string",
+         "description": "The company that made the model, empty when unknown."
         }
        }
       }

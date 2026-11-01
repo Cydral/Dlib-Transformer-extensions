@@ -24,10 +24,28 @@ namespace albireo
         std::string file;            // absolute path of the GGUF file
         uint64_t size = 0;
         std::string sha256;          // of the file as installed
-        std::string source;          // "catalog" or "import"
+        std::string source;          // "catalog", "import" or "builtin"
         int64_t installed_at = 0;
-        int64_t verified_at = 0;     // last successful check of the hash
+        int64_t verified_at = 0;     // last successful check of the hashes
         json descriptor;             // the catalog entry, or what the import learned
+        // The projector of a model that reads images (an mmproj file, general.architecture
+        // "clip", which holds the vision encoder): its absolute path, its size and its SHA-256.
+        // Empty for a model that reads text only.
+        std::string projector;
+        uint64_t projector_size = 0;
+        std::string projector_sha256;
+    };
+
+    // A projector that arrived without its decoder, kept in the models folder until a
+    // decoder it goes with is installed.
+    struct pending_projector
+    {
+        std::string sha256;
+        std::string file;            // absolute path, in the models folder
+        uint64_t size = 0;
+        std::string name;            // the name of the file it came from
+        json descriptor;             // describe_gguf()
+        int64_t received_at = 0;
     };
 
     class store
@@ -35,8 +53,12 @@ namespace albireo
         /*!
             WHAT THIS OBJECT REPRESENTS
                 The database of the service (SQLite, in the data folder): the installed
-                models, the state of the downloads, so that an interrupted one resumes
-                where it stopped, the daily usage figures and a few named values.
+                models with their projectors, the projectors waiting for their decoders,
+                the state of the downloads, so that an interrupted one resumes where it
+                stopped, the daily usage figures and a few named values.
+
+                A database of an earlier version receives the columns of the projectors
+                when it opens.
 
                 Every function locks the database for its duration, so that the threads
                 of the server, of the downloads and of the engine may share it.
@@ -56,6 +78,11 @@ namespace albireo
         void put_model(const installed_model& m);
         void remove_model(const std::string& id);
         void set_verified(const std::string& id, int64_t when);
+
+        // The projectors waiting for their decoders, oldest first.
+        std::vector<pending_projector> projectors();
+        void put_projector(const pending_projector& p);
+        void remove_projector(const std::string& sha256);
 
         // Download jobs: the parts received so far are recorded by index.
         json download_state(const std::string& id);
