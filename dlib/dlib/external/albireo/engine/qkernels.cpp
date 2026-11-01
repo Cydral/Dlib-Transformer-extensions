@@ -1361,6 +1361,129 @@ namespace albireo
             }
             return hsum_ps(acc);
         }
+
+        /*
+            The products of one row of weights with NT rows of activations, the blocks of
+            weights unpacked once for all of them.  Each row of activations goes through the
+            operations of the kernel of one row above in the same order: its result is the
+            one of that kernel, bit for bit.
+        */
+        template <int NT>
+        void dot_q4_K_vnni_rows(const uint8_t* w, const block_q8_K* const* y, long n, float* out)
+        {
+            const __m256i m4 = _mm256_set1_epi8(0x0F);
+            __m256 acc[NT];
+            __m128 acc_m[NT];
+            for (int t = 0; t < NT; ++t)
+            {
+                acc[t] = _mm256_setzero_ps();
+                acc_m[t] = _mm_setzero_ps();
+            }
+            for (long b = 0; b < n / 256; ++b, w += 144)
+            {
+                const float wd = h2f(w), wmin = h2f(w + 2);
+                uint32_t utmp[4];
+                unpack_k4_scales(w + 4, utmp);
+                const __m256i mins_and_scales = _mm256_cvtepu8_epi16(
+                    _mm_set_epi32(static_cast<int>(utmp[3]), static_cast<int>(utmp[2]),
+                                  static_cast<int>(utmp[1]), static_cast<int>(utmp[0])));
+                const __m128i mins = _mm256_extracti128_si256(mins_and_scales, 1);
+                const __m128i sc128 = _mm256_extracti128_si256(mins_and_scales, 0);
+                const __m256i scales = _mm256_set_m128i(sc128, sc128);
+                __m256i sumi[NT];
+                for (int t = 0; t < NT; ++t)
+                {
+                    const __m256i q8sums = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(y[t][b].bsums));
+                    const __m128i q8s = _mm_hadd_epi16(_mm256_extracti128_si256(q8sums, 0),
+                                                       _mm256_extracti128_si256(q8sums, 1));
+                    const __m128i prod = _mm_madd_epi16(mins, q8s);
+                    acc_m[t] = _mm_fmadd_ps(_mm_set1_ps(-y[t][b].d * wmin), _mm_cvtepi32_ps(prod), acc_m[t]);
+                    sumi[t] = _mm256_setzero_si256();
+                }
+                const uint8_t* q4 = w + 16;
+                for (int j = 0; j < 4; ++j)
+                {
+                    const __m256i scale_l = _mm256_shuffle_epi8(scales, scale_shuffle_k4(2 * j));
+                    const __m256i scale_h = _mm256_shuffle_epi8(scales, scale_shuffle_k4(2 * j + 1));
+                    const __m256i q4bits = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q4 + 32 * j));
+                    const __m256i q4l = _mm256_and_si256(q4bits, m4);
+                    const __m256i q4h = _mm256_and_si256(_mm256_srli_epi16(q4bits, 4), m4);
+                    for (int t = 0; t < NT; ++t)
+                    {
+                        const int8_t* q8 = y[t][b].qs + 64 * j;
+                        const __m256i q8l = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q8));
+                        const __m256i q8h = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q8 + 32));
+                        sumi[t] = dpwssd(sumi[t], scale_l, _mm256_maddubs_epi16(q4l, q8l));
+                        sumi[t] = dpwssd(sumi[t], scale_h, _mm256_maddubs_epi16(q4h, q8h));
+                    }
+                }
+                for (int t = 0; t < NT; ++t)
+                    acc[t] = _mm256_fmadd_ps(_mm256_set1_ps(y[t][b].d * wd), _mm256_cvtepi32_ps(sumi[t]), acc[t]);
+            }
+            for (int t = 0; t < NT; ++t)
+            {
+                __m128 m = _mm_add_ps(acc_m[t], _mm_movehl_ps(acc_m[t], acc_m[t]));
+                m = _mm_add_ss(m, _mm_movehdup_ps(m));
+                out[t] = hsum_ps(acc[t]) + _mm_cvtss_f32(m);
+            }
+        }
+
+        template <int NT>
+        void dot_q6_K_vnni_rows(const uint8_t* w, const block_q8_K* const* y, long n, float* out)
+        {
+            const __m256i m4 = _mm256_set1_epi8(0x0F);
+            const __m256i m2 = _mm256_set1_epi8(3);
+            __m256 acc[NT];
+            for (int t = 0; t < NT; ++t) acc[t] = _mm256_setzero_ps();
+            for (long b = 0; b < n / 256; ++b, w += 210)
+            {
+                const float wd = h2f(w + 208);
+                const uint8_t* q4 = w;
+                const uint8_t* qh = w + 128;
+                const __m128i scales = _mm_loadu_si128(reinterpret_cast<const __m128i*>(w + 192));
+                __m256i sumi[NT];
+                for (int t = 0; t < NT; ++t) sumi[t] = _mm256_setzero_si256();
+                for (int j = 0; j < 2; ++j)
+                {
+                    const int is = 8 * j;
+                    const __m256i sc0 = _mm256_cvtepi8_epi16(_mm_shuffle_epi8(scales, scale_shuffle_q6(is + 0)));
+                    const __m256i sc1 = _mm256_cvtepi8_epi16(_mm_shuffle_epi8(scales, scale_shuffle_q6(is + 2)));
+                    const __m256i sc2 = _mm256_cvtepi8_epi16(_mm_shuffle_epi8(scales, scale_shuffle_q6(is + 4)));
+                    const __m256i sc3 = _mm256_cvtepi8_epi16(_mm_shuffle_epi8(scales, scale_shuffle_q6(is + 6)));
+                    const __m256i q4bits1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q4 + 64 * j));
+                    const __m256i q4bits2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q4 + 64 * j + 32));
+                    const __m256i q4bitsH = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qh + 32 * j));
+                    const __m256i q4h_0 = _mm256_slli_epi16(_mm256_and_si256(q4bitsH, m2), 4);
+                    const __m256i q4h_1 = _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(q4bitsH, 2), m2), 4);
+                    const __m256i q4h_2 = _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(q4bitsH, 4), m2), 4);
+                    const __m256i q4h_3 = _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(q4bitsH, 6), m2), 4);
+                    const __m256i q4_0 = _mm256_or_si256(_mm256_and_si256(q4bits1, m4), q4h_0);
+                    const __m256i q4_1 = _mm256_or_si256(_mm256_and_si256(q4bits2, m4), q4h_1);
+                    const __m256i q4_2 = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(q4bits1, 4), m4), q4h_2);
+                    const __m256i q4_3 = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(q4bits2, 4), m4), q4h_3);
+                    for (int t = 0; t < NT; ++t)
+                    {
+                        const int8_t* a = y[t][b].qs + 128 * j;
+                        sumi[t] = dpwssd(sumi[t], sc0,
+                            _mm256_maddubs_epi16(q4_0, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a))));
+                        sumi[t] = dpwssd(sumi[t], sc1,
+                            _mm256_maddubs_epi16(q4_1, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a + 32))));
+                        sumi[t] = dpwssd(sumi[t], sc2,
+                            _mm256_maddubs_epi16(q4_2, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a + 64))));
+                        sumi[t] = dpwssd(sumi[t], sc3,
+                            _mm256_maddubs_epi16(q4_3, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a + 96))));
+                    }
+                }
+                for (int t = 0; t < NT; ++t)
+                {
+                    const __m256i offset = _mm256_madd_epi16(_mm256_cvtepi8_epi16(scales),
+                        _mm256_loadu_si256(reinterpret_cast<const __m256i*>(y[t][b].bsums)));
+                    sumi[t] = _mm256_sub_epi32(sumi[t], _mm256_slli_epi32(offset, 5));
+                    acc[t] = _mm256_fmadd_ps(_mm256_set1_ps(y[t][b].d * wd), _mm256_cvtepi32_ps(sumi[t]), acc[t]);
+                }
+            }
+            for (int t = 0; t < NT; ++t) out[t] = hsum_ps(acc[t]);
+        }
 #endif
     }
 #endif
@@ -1806,13 +1929,15 @@ namespace albireo
         */
         void dot_rows(ggml_type t, const uint8_t* w, const uint8_t* const* act, long nt, long n, float* out)
         {
-#if ALBIREO_QK_AVX512 || (ALBIREO_QK_AVX2 && !ALBIREO_QK_VNNI)
+#if ALBIREO_QK_AVX2
             if (nt >= 2 && (t == ggml_type::Q4_K || t == ggml_type::Q6_K))
             {
                 const block_q8_K* y[4];
                 for (long i = 0; i < nt; ++i) y[i] = reinterpret_cast<const block_q8_K*>(act[i]);
 #if ALBIREO_QK_AVX512
 #define ALBIREO_QK_ROWS(type, k) dot_##type##_avx512_rows<k>(w, y, n, out)
+#elif ALBIREO_QK_VNNI
+#define ALBIREO_QK_ROWS(type, k) dot_##type##_vnni_rows<k>(w, y, n, out)
 #else
 #define ALBIREO_QK_ROWS(type, k) dot_##type##_avx2_rows<k>(w, y, n, out)
 #endif
@@ -1834,6 +1959,61 @@ namespace albireo
 #endif
             for (long i = 0; i < nt; ++i) out[i] = qk_dot(t, w, act[i], n);
         }
+
+#if ALBIREO_QK_AVX2
+        // The eight bytes of v from byte 8 * part, signed, times s.
+        inline __m256 scaled_bytes(__m256i v, int part, __m256 s)
+        {
+            const __m128i half = part < 2 ? _mm256_castsi256_si128(v) : _mm256_extracti128_si256(v, 1);
+            const __m128i bytes = part % 2 == 0 ? half : _mm_srli_si128(half, 8);
+            return _mm256_mul_ps(s, _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(bytes)));
+        }
+
+        /*
+            A block of Q6_K expanded to floats, 32 values per vector of bytes: the values of
+            gguf_dq_q6_K(), bit for bit, each one the product of the scale of its group of 16,
+            d times the signed scale, by its signed 6-bit value.
+        */
+        void dequantize_q6_K_avx2(const uint8_t* p, float* y)
+        {
+            const uint8_t* ql = p;
+            const uint8_t* qh = p + 128;
+            const int8_t* sc = reinterpret_cast<const int8_t*>(p + 192);
+            const float d = h2f(p + 208);
+            const __m256i m4 = _mm256_set1_epi8(0x0F);
+            const __m256i m2 = _mm256_set1_epi8(0x03);
+            const __m256i offset = _mm256_set1_epi8(32);
+            for (int half = 0; half < 2; ++half)
+            {
+                const __m256i l0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ql));
+                const __m256i l1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ql + 32));
+                const __m256i h = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qh));
+                // The low four bits, then the two high bits moved to bits 4 and 5.
+                __m256i q[4];
+                q[0] = _mm256_or_si256(_mm256_and_si256(l0, m4), _mm256_slli_epi16(_mm256_and_si256(h, m2), 4));
+                q[1] = _mm256_or_si256(_mm256_and_si256(l1, m4),
+                    _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(h, 2), m2), 4));
+                q[2] = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(l0, 4), m4),
+                    _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(h, 4), m2), 4));
+                q[3] = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(l1, 4), m4),
+                    _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(h, 6), m2), 4));
+                for (int k = 0; k < 4; ++k)
+                {
+                    const __m256i v = _mm256_sub_epi8(q[k], offset);
+                    const __m256 s0 = _mm256_set1_ps(d * sc[2 * k]);
+                    const __m256 s1 = _mm256_set1_ps(d * sc[2 * k + 1]);
+                    float* o = y + 128 * half + 32 * k;
+                    _mm256_storeu_ps(o, scaled_bytes(v, 0, s0));
+                    _mm256_storeu_ps(o + 8, scaled_bytes(v, 1, s0));
+                    _mm256_storeu_ps(o + 16, scaled_bytes(v, 2, s1));
+                    _mm256_storeu_ps(o + 24, scaled_bytes(v, 3, s1));
+                }
+                ql += 64;
+                qh += 32;
+                sc += 8;
+            }
+        }
+#endif
     }
 
     void qk_dequantize_row(ggml_type t, const uint8_t* w, float* dst, long n)
@@ -1863,7 +2043,16 @@ namespace albireo
         case ggml_type::Q3_K: fn = dlib::gguf_dq_q3_K; qk = 256; bytes = 110; break;
         case ggml_type::Q4_K: fn = dlib::gguf_dq_q4_K; qk = 256; bytes = 144; break;
         case ggml_type::Q5_K: fn = dlib::gguf_dq_q5_K; qk = 256; bytes = 176; break;
-        case ggml_type::Q6_K: fn = dlib::gguf_dq_q6_K; qk = 256; bytes = 210; break;
+        case ggml_type::Q6_K:
+#if ALBIREO_QK_AVX2
+            // The reference loop reads its scales lane by lane and expands ten times slower.
+            fn = dequantize_q6_K_avx2;
+#else
+            fn = dlib::gguf_dq_q6_K;
+#endif
+            qk = 256;
+            bytes = 210;
+            break;
         default:
             throw std::runtime_error("qk_dequantize_row: unsupported tensor type "
                 + std::to_string(static_cast<unsigned>(t)));

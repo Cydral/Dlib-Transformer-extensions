@@ -17,6 +17,9 @@
         --temperature T      0 for the most likely tokens
         --parallel           submits every question at once instead of one after the other
         --turns              chains the questions as the turns of one conversation
+        --pause SECONDS      waits between the turns, as a user reads the answer (the engine
+                             reads the history of the answer meanwhile)
+        --no-warm            does not read the histories ahead ("warm_history": false)
         --tools              offers a weather tool to the model
         --system TEXT        system message of the conversations
         --render FILE        prints the prompt the model receives for the conversation of FILE,
@@ -321,7 +324,8 @@ int main(int argc, char** argv)
     std::string reasoning = "";
     long max_tokens = 256;
     double temperature = 0.0;
-    bool parallel = false, turns = false, tools = false;
+    bool parallel = false, turns = false, tools = false, warm = true;
+    double pause = 0;
     int threads = 0;
     long context = 4096;
     std::vector<std::string> questions;
@@ -335,6 +339,8 @@ int main(int argc, char** argv)
         else if (a == "--temperature" && i + 1 < argc) temperature = std::atof(argv[++i]);
         else if (a == "--parallel") parallel = true;
         else if (a == "--turns") turns = true;
+        else if (a == "--pause" && i + 1 < argc) pause = std::atof(argv[++i]);
+        else if (a == "--no-warm") warm = false;
         else if (a == "--tools") tools = true;
         else if (a == "--system" && i + 1 < argc) system = argv[++i];
         else if (a == "--render" && i + 1 < argc) ++i;
@@ -420,6 +426,7 @@ int main(int argc, char** argv)
     // routing of the products (auto, device, host).
     if (!device.empty()) config["device"] = device;
     if (!routing.empty()) config["routing"] = routing;
+    if (!warm) config["warm_history"] = false;
     char err[1024] = { 0 };
     albireo_engine* e = lib.create(config.dump().c_str(), render_mode ? nullptr : on_log, nullptr, err, sizeof(err));
     if (!e)
@@ -541,7 +548,10 @@ int main(int argc, char** argv)
                 json answer = json::object();
                 answer["role"] = "assistant";
                 answer["content"] = p->content;
+                if (!p->reasoning.empty()) answer["reasoning_content"] = p->reasoning;
                 conversation.push_back(answer);
+                if (pause > 0 && q + 1 < questions.size())
+                    std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<long long>(pause * 1000)));
             }
         }
         all.push_back(std::move(p));

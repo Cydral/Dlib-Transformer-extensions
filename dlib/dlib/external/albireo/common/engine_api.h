@@ -113,6 +113,10 @@ ALBIREO_ENGINE_EXPORT int ALBIREO_ENGINE_CALL albireo_engine_describe(char* json
 
 /* Starts an engine.  config_json holds the settings of the host (threads, context length,
    number of sequences, memory budgets, devices); missing members take their defaults.
+   "warm_history" (true by default) reads the history of each answer of a chat request in the
+   background once the answer ends, as the next request of the conversation renders it, so that
+   this request computes its new message only; the "stats" query counts these tokens per model
+   in "warmed_total", and the reads in progress in "warming".
    Returns NULL on failure, with the reason in error. */
 ALBIREO_ENGINE_EXPORT albireo_engine* ALBIREO_ENGINE_CALL albireo_engine_create(const char* config_json,
     albireo_log_callback log, void* log_user, char* error, size_t error_capacity);

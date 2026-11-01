@@ -195,10 +195,22 @@ def fill_models(a):
     return 0
 
 
+def verify(signer, path):
+    """Checks the signature of path, and names the ends of line a checkout converted when it fails."""
+    if subprocess.run([signer, "verify", path], stdout=subprocess.DEVNULL).returncode == 0:
+        return
+    with open(path, "rb") as f:
+        converted = b"\r\n" in f.read()
+    raise RuntimeError("the signature of %s does not verify%s" % (path, (
+        ": the file has CRLF ends of line, which a checkout with core.autocrlf gives it; delete it, then "
+        "git checkout -- dist/albireo (dist/albireo/.gitattributes keeps the signed files as they are)")
+        if converted else ""))
+
+
 def fill_dist(a):
     signer = publish_release.find_signer(a.sign)
     for name in ("feed.json", "catalog.json"):
-        subprocess.run([signer, "verify", os.path.join(a.dist, name)], check=True, stdout=subprocess.DEVNULL)
+        verify(signer, os.path.join(a.dist, name))
     stable = load(a.dist, "feed.json")["channels"]["stable"]
     installer = stable["installer"]
     version = stable["version"]

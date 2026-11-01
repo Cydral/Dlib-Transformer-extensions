@@ -55,6 +55,17 @@ namespace albireo
         // the updates and the models come from files (import folder, removable media).
         bool offline = false;
         std::string proxy;                      // "": the proxy of the system, "none", or http://host:port
+        /*
+            The web access of the agent mode (web_access.h): the routes through which the web
+            application searches the web and reads its pages, turned off by web_access = false.
+            web_search names the provider of the search: "wikipedia", "brave" (the Brave Search
+            API, with its key web_search_key), "searxng" (the instance at web_search_url) or
+            "none".  The key is kept apart, as the password of the proxy.
+        */
+        bool web_access = true;
+        std::string web_search = "wikipedia";
+        std::string web_search_url;
+        std::string web_search_key;
         std::string update_feed =
             "https://raw.githubusercontent.com/Cydral/Dlib-Transformer-extensions/main/dist/albireo/feed.json";
         std::string catalog_url =
@@ -73,8 +84,12 @@ namespace albireo
         */
         int trust_authority = -1;
 
-        // The settings as settings.json and the administration interface give them, the
-        // password of the proxy masked.
+        /*
+            The settings as settings.json and the administration interface give them: the
+            password of the proxy masked, and web_search_key_set, true or false, in place of
+            the key of the search, which no document gives.  from_json() takes web_search_key
+            when j holds it and keeps the key in place otherwise.
+        */
         json to_json() const;
         void from_json(const json& j);
         std::string effective_models_dir() const;
@@ -93,7 +108,9 @@ namespace albireo
                 password of the proxy as proxy_password_mask.  The proxy with its password
                 is kept in proxy.secret beside it, which only the service and the
                 administrators read.  A password found in settings.json, written by an
-                earlier version or by hand, moves to proxy.secret at once.
+                earlier version or by hand, moves to proxy.secret at once.  The key of the
+                search (web_search_key) is kept the same way in web_search.secret, and a key
+                written by hand in settings.json moves there at once.
         !*/
     public:
         explicit settings_store(const std::string& path);

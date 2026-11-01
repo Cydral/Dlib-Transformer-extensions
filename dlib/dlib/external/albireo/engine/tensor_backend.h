@@ -46,7 +46,10 @@ namespace albireo
 
                 On a CUDA device, the extended memory of dlib (V²RAM) lets the copies exceed
                 the memory of the card: the blocks that do not fit move to the memory of the
-                host or to a file, and come back ahead of their use.
+                host or to a file, and come back ahead of their use.  Once the copies exceed
+                the memory of the card, the products of fewer than qk_float_product_tokens
+                tokens, the generated tokens, stay on the processor: their matrices would cross
+                the bus at each pass.  Only the rows of a product cross the bus, each way.
 
             CONFIGURATION
                 The object the engine receives at its creation (engine_api.h), of which this

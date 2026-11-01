@@ -18,6 +18,8 @@
 import * as store from './store.js';
 
 export const maxSide = 1536;
+// The size of an image file at most, checked before the file is read.
+export const maxImageBytes = 15 * 1024 * 1024;
 const thumbSide = 192;
 const jpegQuality = 0.9;
 const thumbQuality = 0.82;
@@ -99,9 +101,11 @@ function metaOf(name, r, source) {
     Prepares an image file: decoded by the browser with its orientation, scaled, encoded, and
     held by this tab until it is kept (keep) or dropped (drop).  Returns its description
     {id, name, type, size, width, height, added, source: {type, size, width, height}}, or throws
+    "image-too-large" for a file of more than maxImageBytes, before it is read, and
     "image-unreadable" when the browser cannot decode the file (HEIC or TIFF for instance).
 */
 export async function prepare(file, name) {
+  if (file.size > maxImageBytes) throw new Error('image-too-large');
   let bitmap;
   try {
     bitmap = await createImageBitmap(file, { imageOrientation: 'from-image' });

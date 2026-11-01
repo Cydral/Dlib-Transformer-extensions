@@ -84,7 +84,11 @@ a { color: var(--blue); }
   transition: margin-left 0.2s ease;
 }
 .sidebar.collapsed { margin-left: calc(-1 * var(--sidebar)); }
-.main { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; position: relative; }
+/* --composer-room: the height of the composer over the bottom of the thread, which the application measures. */
+.main {
+  flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; position: relative;
+  --composer-room: 140px;
+}
 
 /* Sidebar */
 .brand { display: flex; align-items: center; gap: 10px; padding: 16px 16px 10px; }
@@ -157,11 +161,11 @@ a { color: var(--blue); }
 .footer-buttons svg { width: 15px; height: 15px; }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
 
-/* Top bar */
+/* Top bar.  It lies above the thread, over the plain background of the page: it takes that background without a
+   blur, which the compositor would compute again at each frame of an animation. */
 .topbar {
   height: 56px; flex: 0 0 56px; display: flex; align-items: center; gap: 10px; padding: 0 16px;
-  border-bottom: 1px solid var(--border); background: color-mix(in srgb, var(--bg) 85%, transparent);
-  backdrop-filter: blur(8px);
+  border-bottom: 1px solid var(--border); background: var(--bg);
 }
 .topbar .title {
   flex: 1; min-width: 0; font-weight: 600; font-size: 15.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
@@ -182,8 +186,9 @@ a { color: var(--blue); }
 .role-picker > button { font-weight: 600; color: var(--text); }
 
 /* Conversation */
-.scroller { flex: 1; overflow-y: auto; min-height: 0; scroll-behavior: auto; }
-.thread { max-width: 860px; margin: 0 auto; padding: 24px 24px 160px; }
+/* An opaque scroller scrolls in the compositor of the browser, without painting its content again. */
+.scroller { flex: 1; overflow-y: auto; min-height: 0; scroll-behavior: auto; background: var(--bg); }
+.thread { max-width: 860px; margin: 0 auto; padding: 24px 24px calc(var(--composer-room) + 24px); }
 .message { margin: 0 0 22px; display: flex; flex-direction: column; }
 .message.user { align-items: flex-end; }
 .message.user .bubble {
@@ -244,12 +249,9 @@ a { color: var(--blue); }
   padding: 4px 14px 12px 38px; color: var(--text-soft); font-size: 13.5px; white-space: pre-wrap;
   border-top: 1px dashed var(--border); max-height: 420px; overflow-y: auto;
 }
-.shimmer {
-  background: linear-gradient(90deg, var(--text-soft) 0%, var(--text-faint) 40%, var(--text-soft) 80%);
-  background-size: 200% 100%; -webkit-background-clip: text; background-clip: text; color: transparent;
-  animation: shimmer 1.8s linear infinite;
-}
-@keyframes shimmer { from { background-position: 200% 0; } to { background-position: 0 0; } }
+/* The texts that wait pulse in opacity, which the compositor animates without painting them at each frame. */
+.shimmer { color: var(--text-soft); animation: shimmer 1.8s ease-in-out infinite; }
+@keyframes shimmer { 0%, 100% { opacity: 1; } 50% { opacity: 0.45; } }
 @keyframes spin { to { transform: rotate(360deg); } }
 .tool-call { border: 1px solid var(--border); border-radius: 12px; margin: 8px 0; background: var(--bg-elevated); overflow: hidden; }
 .tool-call > summary {
@@ -259,6 +261,9 @@ a { color: var(--blue); }
 .tool-call .tool-icon { width: 16px; height: 16px; color: var(--blue); }
 .tool-call .tool-name { font-weight: 600; white-space: nowrap; }
 .tool-call .tool-brief { color: var(--text-faint); flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 12.5px; }
+/* The address a call of fetch_page read, which opens in a new tab. */
+.tool-call .tool-brief a { color: var(--blue); text-decoration: none; }
+.tool-call .tool-brief a:hover, .tool-call .tool-brief a:focus-visible { text-decoration: underline; }
 .tool-call .state { font-size: 12px; color: var(--text-faint); }
 .tool-call .state.ok { color: var(--success); }
 .tool-call .state.error { color: var(--danger); }
@@ -268,7 +273,7 @@ a { color: var(--blue); }
 .spinner { width: 14px; height: 14px; border: 2px solid var(--border-strong); border-top-color: var(--blue); border-radius: 50%; animation: spin 0.8s linear infinite; }
 .progress-line { display: flex; align-items: center; gap: 10px; color: var(--text-faint); font-size: 13px; margin: 4px 0 10px; }
 .progress-line .bar { flex: 0 0 160px; height: 4px; border-radius: 4px; background: var(--border); overflow: hidden; }
-.progress-line .bar > div { height: 100%; background: var(--accent); width: 0; transition: width 0.2s; }
+.progress-line .bar > div { height: 100%; background: var(--accent); width: 0; }
 .error-box { border: 1px solid color-mix(in srgb, var(--danger) 40%, transparent); background: color-mix(in srgb, var(--danger) 8%, transparent); color: var(--danger); padding: 8px 12px; border-radius: 10px; font-size: 13.5px; margin: 6px 0; }
 
 /* Markdown */
@@ -297,7 +302,7 @@ a { color: var(--blue); }
 .cursor::after { content: ""; display: inline-block; width: 8px; height: 16px; margin-left: 2px; vertical-align: -2px; background: var(--blue); border-radius: 2px; animation: pulse 1s infinite; }
 
 /* Welcome */
-.welcome { max-width: 760px; margin: 0 auto; padding: 9vh 24px 160px; text-align: center; }
+.welcome { max-width: 760px; margin: 0 auto; padding: 9vh 24px calc(var(--composer-room) + 24px); text-align: center; }
 .welcome .hero { width: 92px; height: 92px; margin: 0 auto 14px; filter: drop-shadow(0 10px 30px rgba(61, 107, 255, 0.35)); }
 .welcome h1 { font-family: var(--font-display); font-size: 30px; font-weight: 650; margin: 6px 0 4px; }
 .welcome h1 span { background: var(--accent); -webkit-background-clip: text; background-clip: text; color: transparent; }
@@ -329,6 +334,15 @@ a { color: var(--blue); }
 .toggle.on { border-color: transparent; background: var(--bg-active); color: var(--blue); font-weight: 600; }
 .toggle.on.reason { background: color-mix(in srgb, var(--gold) 18%, transparent); color: var(--gold-strong); }
 .toggle:disabled { opacity: 0.45; cursor: not-allowed; }
+/* On a phone, the toggles of the composer show their icons alone; their names stay for the screen readers. */
+@media (max-width: 480px) {
+  .composer .row { gap: 4px; }
+  .composer .row .toggle { position: relative; padding: 0 9px; }
+  .composer .row .toggle > span {
+    position: absolute; width: 1px; height: 1px; margin: -1px; overflow: hidden; clip-path: inset(50%);
+    white-space: nowrap;
+  }
+}
 .send {
   width: 38px; height: 38px; border-radius: 12px; border: none; background: var(--text); color: var(--bg);
   display: inline-flex; align-items: center; justify-content: center;
@@ -411,8 +425,18 @@ a { color: var(--blue); }
 .banner svg { width: 16px; height: 16px; }
 .kv { display: grid; grid-template-columns: 160px 1fr; gap: 6px 14px; font-size: 13.5px; }
 .kv div:nth-child(odd) { color: var(--text-faint); }
+/* The tokens of each day, those read under those generated, with the dates of the first and last days under them. */
 .usage-bars { display: flex; align-items: flex-end; gap: 3px; height: 80px; margin-top: 8px; }
-.usage-bars div { flex: 1; background: var(--accent); border-radius: 3px 3px 0 0; min-height: 2px; opacity: 0.85; }
+.usage-day {
+  flex: 1; display: flex; flex-direction: column; min-height: 2px; border-radius: 3px 3px 0 0; overflow: hidden;
+  background: var(--border);
+}
+.usage-day > div { flex-basis: 0; min-height: 0; }
+.usage-day .generated { background: var(--blue); order: 0; }
+.usage-day .read { background: var(--gold); order: 1; }
+.usage-axis {
+  display: flex; justify-content: space-between; margin: 4px 0 6px; font-size: 11.5px; color: var(--text-faint);
+}
 .about-art { border-radius: 14px; overflow: hidden; margin-bottom: 14px; }
 .about-art img { width: 100%; display: block; }
 .mem-bar { display: flex; height: 14px; border-radius: 7px; overflow: hidden; background: var(--border); margin: 6px 0 4px; }
@@ -424,7 +448,7 @@ a { color: var(--blue); }
 @media (max-width: 860px) {
   .sidebar { position: absolute; z-index: 40; height: 100%; box-shadow: var(--shadow); }
   .suggestions { grid-template-columns: 1fr; }
-  .thread { padding: 16px 14px 160px; }
+  .thread { padding: 16px 14px calc(var(--composer-room) + 16px); }
   .composer-wrap { padding: 0 10px 12px; }
 }
 
@@ -496,9 +520,14 @@ mark { background: var(--mark); color: inherit; border-radius: 3px; padding: 0 1
 }
 .help-button:hover { background: var(--bg-hover); color: var(--text); }
 .help-button svg { width: 16px; height: 16px; }
-.menu.popover { max-width: 420px; padding: 10px 12px; cursor: default; }
+.menu.popover {
+  max-width: 420px; max-height: calc(100vh - 16px); overflow-y: auto; padding: 10px 12px; cursor: default;
+}
 .menu.popover p { margin: 4px 0 10px; font-size: 13.5px; color: var(--text-soft); }
-.popover-tools { display: flex; flex-direction: column; gap: 6px; }
+.menu.popover .popover-tools + p { margin-top: 14px; }
+/* The help of the tools lists them in two columns where the window has room for them. */
+.menu.popover:has(.popover-tools) { width: min(620px, calc(100vw - 16px)); max-width: none; }
+.popover-tools { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 6px 16px; }
 .popover-tool { display: flex; gap: 8px; align-items: flex-start; font-size: 13px; }
 .popover-tool svg { width: 15px; height: 15px; margin-top: 2px; color: var(--blue); flex: 0 0 15px; }
 .popover-tool .desc { display: block; color: var(--text-faint); font-size: 12px; }
@@ -529,19 +558,21 @@ mark { background: var(--mark); color: inherit; border-radius: 3px; padding: 0 1
 .message.user .msg-time { margin-right: 4px; }
 .message.assistant .msg-time { margin-left: 4px; }
 
-/* The stop button, while an answer is prepared or written, carries a ring that pulses gently. */
+/* The stop button, while an answer is prepared or written, carries a ring that pulses gently.  The ring grows and
+   fades by transform and opacity, which the compositor animates without painting it at each frame. */
 .send.stop { position: relative; }
 .send.stop::after {
   content: ""; position: absolute; inset: -3px; border-radius: 15px; pointer-events: none;
+  border: 2px solid color-mix(in srgb, var(--danger) 55%, transparent);
   animation: stop-pulse 1.6s ease-out infinite;
 }
 @keyframes stop-pulse {
-  0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--danger) 55%, transparent); }
-  70% { box-shadow: 0 0 0 7px color-mix(in srgb, var(--danger) 0%, transparent); }
-  100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--danger) 0%, transparent); }
+  0% { transform: scale(1); opacity: 1; }
+  70% { transform: scale(1.22); opacity: 0; }
+  100% { transform: scale(1.22); opacity: 0; }
 }
 @media (prefers-reduced-motion: reduce) {
-  .send.stop::after { animation: none; box-shadow: 0 0 0 2px color-mix(in srgb, var(--danger) 45%, transparent); }
+  .send.stop::after { animation: none; border-color: color-mix(in srgb, var(--danger) 45%, transparent); }
 }
 
 /* The page of the components and of their licenses, whose texts open under their lines. */
@@ -649,3 +680,38 @@ mark { background: var(--mark); color: inherit; border-radius: 3px; padding: 0 1
 
 /* The button of an answer read aloud, while it reads: it shows without the pointer over the answer. */
 .message .meta .icon-button[aria-pressed="true"] { color: var(--blue-strong); opacity: 1; }
+
+/* The answers written in the background: a dot at the left of their discussion in the side panel, which blinks while
+   the answer is written, here or in another tab, and stays blue once it is written, until the discussion is opened. */
+.gen-dot {
+  position: absolute; left: 2px; top: 50%; width: 7px; height: 7px; margin-top: -3.5px; border-radius: 50%;
+  background: var(--blue); pointer-events: none;
+}
+.gen-dot.live { animation: pulse 1.1s ease-in-out infinite; }
+@media (prefers-reduced-motion: reduce) {
+  .gen-dot.live { animation: none; opacity: 0.55; }
+}
+
+/* An answer being written is drawn by blocks: the blocks already written stay, the last one is drawn again. */
+.md > .md-block:first-child > *:first-child { margin-top: 0; }
+.md > .md-block:last-child > *:last-child { margin-bottom: 0; }
+
+/* The buttons that go to the start and to the end of the thread, over its bottom right corner and above the composer,
+   shown while the user scrolls. */
+.jump-buttons {
+  position: absolute; right: 22px; bottom: calc(var(--composer-room) + 12px); z-index: 5;
+  display: flex; flex-direction: column; gap: 6px; visibility: hidden; opacity: 0;
+  transition: opacity 0.18s, visibility 0s linear 0.18s;
+}
+.jump-buttons.on { visibility: visible; opacity: 1; transition: opacity 0.18s; }
+.jump-buttons .icon-button {
+  width: 36px; height: 36px; border-radius: 50%; border: 1px solid var(--border-strong);
+  background: var(--bg-elevated); color: var(--text-soft); box-shadow: 0 2px 8px rgba(20, 26, 60, 0.14);
+}
+.jump-buttons .icon-button:hover { color: var(--text); border-color: var(--blue); }
+@media (max-width: 860px) {
+  .jump-buttons { right: 12px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .jump-buttons, .jump-buttons.on { transition: none; }
+}

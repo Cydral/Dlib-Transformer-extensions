@@ -49,6 +49,7 @@
 #include "http_fetch.h"
 #include "service.h"
 #include "speech.h"
+#include "web_access.h"
 
 namespace albireo
 {
@@ -791,7 +792,8 @@ namespace albireo
         bool validate_settings(const json& body, std::string& error)
         {
             static const char* const keys[] = { "port", "language", "engine", "accelerator", "v2ram", "v2ram_max_mb",
-                "device_mb", "threads", "context", "max_sequences", "kv_mb", "check_updates", "offline", "proxy" };
+                "device_mb", "threads", "context", "max_sequences", "kv_mb", "check_updates", "offline", "proxy",
+                "web_access", "web_search", "web_search_url", "web_search_key" };
             for (const auto& kv : body.items())
             {
                 if (std::find_if(std::begin(keys), std::end(keys), [&](const char* k) { return kv.first == k; })
@@ -825,7 +827,24 @@ namespace albireo
                 error = "invalid value for proxy: http://host:port, \"none\" or empty";
                 return false;
             }
-            return one_of("language", { "auto", "en", "fr", "de", "it", "es" })
+            // The provider of the search of the web access, the address of its SearXNG instance and its key.
+            const json& search_url = body["web_search_url"];
+            if (body.contains("web_search_url")
+                && !(search_url.is_string() && valid_web_search_url(search_url.as_string())))
+            {
+                error = "invalid value for web_search_url: an http or https address without user, query or fragment, "
+                    "or empty";
+                return false;
+            }
+            const json& search_key = body["web_search_key"];
+            if (body.contains("web_search_key")
+                && !(search_key.is_string() && valid_web_search_key(search_key.as_string())))
+            {
+                error = "invalid value for web_search_key: 256 printable characters at most, without space, or empty";
+                return false;
+            }
+            return one_of("web_search", { "wikipedia", "brave", "searxng", "none" }) && boolean("web_access")
+                && one_of("language", { "auto", "en", "fr", "de", "it", "es" })
                 && one_of("engine", { "auto", "best", "cpu", "cpu-avx2", "cpu-avxvnni", "cpu-avx512", "openvino",
                     "cuda" })
                 && one_of("accelerator", { "auto", "none", "npu", "gpu", "both" })
@@ -1016,6 +1035,19 @@ namespace albireo
             send_json(res, 409, ok_result(false, user_error().set("offline mode: the catalog, the updates and the "
                 "models come from files (import)", "offline")));
             return true;
+        }
+
+        // The answer of a route of the web access (web_access.h): its body, or its error with its code.
+        void send_web_reply(httplib::Response& res, const web_reply& r)
+        {
+            if (r.status == 200)
+            {
+                send_json(res, 200, r.body);
+                return;
+            }
+            send_error(res, r.status, r.status >= 500 ? "server_error" : "invalid_request_error", r.message, r.code,
+                r.param);
+            if (r.retry_after > 0) res.set_header("Retry-After", std::to_string(r.retry_after));
         }
 
         /*
@@ -1326,9 +1358,12 @@ namespace albireo
             send_json(res, 200, out);
         });
 
-        // Interface of the web application and of the tray.
+        // Interface of the web application and of the tray.  The status tells the web application
+        // whether the web access is available and its provider of search (web_capability()).
         srv.Get("/albireo/v1/status", [s](const httplib::Request&, httplib::Response& res) {
-            send_json(res, 200, s->status());
+            json status = s->status();
+            status["web"] = web_capability(s->settings().get());
+            send_json(res, 200, status);
         });
         srv.Get("/albireo/v1/models", [s](const httplib::Request& req, httplib::Response& res) {
             std::string lang = req.get_param_value("lang");
@@ -1398,6 +1433,21 @@ namespace albireo
             if (q["op"].as_string() == "tokenize" && r["tokens"].is_array())
                 r["tokens"] = static_cast<long long>(r["tokens"].size());
             send_json(res, r.contains("error") ? 400 : 200, r);
+        });
+        /*
+            The web access of the agent mode (web_access.h): local routes of the web application,
+            of the origin of the rest of the interface, refused while the service works offline
+            or once the administrator turned the web access off.
+        */
+        srv.Post("/albireo/v1/web/search", [s](const httplib::Request& req, httplib::Response& res) {
+            json body;
+            if (!parse_body(req, res, body)) return;
+            send_web_reply(res, web_search(body, s->settings().get()));
+        });
+        srv.Post("/albireo/v1/web/fetch", [s](const httplib::Request& req, httplib::Response& res) {
+            json body;
+            if (!parse_body(req, res, body)) return;
+            send_web_reply(res, web_fetch(body, s->settings().get()));
         });
 
         // The catalog is fetched in the background; its state is in /albireo/v1/models.
@@ -1524,7 +1574,8 @@ namespace albireo
             send_json(res, r["imported"].empty() && r["already"].empty() && r["pending"].empty() ? 400 : 200, r);
         });
 
-        // The password of the proxy is given as proxy_password_mask (host_settings::to_json()).
+        // The password of the proxy is given as proxy_password_mask and the key of the search as
+        // web_search_key_set (host_settings::to_json()).
         srv.Get("/albireo/v1/settings", [s, admin](const httplib::Request& req, httplib::Response& res) {
             if (!admin(req, res)) return;
             send_json(res, 200, s->settings().get().to_json());

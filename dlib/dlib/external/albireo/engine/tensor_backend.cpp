@@ -135,6 +135,12 @@ namespace albireo
         }
 
 #ifdef DLIB_USE_CUDA
+        // Throws the error of a call to the runtime of CUDA, after what the call did.
+        void cuda_check(cudaError_t e, const char* what)
+        {
+            if (e != cudaSuccess) throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(e));
+        }
+
         int capability_of(const cudaDeviceProp& p)
         {
             return 10 * p.major + p.minor;
@@ -300,6 +306,8 @@ namespace albireo
         std::atomic<bool> disabled{false};
         // The card of the engine (CUDA), -1 for the other backends.
         int cuda_device = -1;
+        // The bytes of copies the memory of the card holds; beyond, the extended memory moves them over the bus.
+        size_t card_bytes = std::numeric_limits<size_t>::max();
 
         mutable std::mutex m;
         std::map<std::string, json> routes;   // the choices made, for the statistics
@@ -430,6 +438,17 @@ namespace albireo
         {
             last_use_ = now_ns();
             if (n < d_.min_tokens || d_.disabled.load(std::memory_order_relaxed) || !d_.bind_thread())
+            {
+                host_product(host);
+                return;
+            }
+            /*
+                Once the copies exceed the memory of the card, the extended memory brings part of
+                them over the bus for each pass.  A product of a few tokens, as a generated token
+                is, then waits for its matrix longer than the processor takes to compute it from
+                the quantized weights, whatever the measures of the matrices the card holds say.
+            */
+            if (n < qk_float_product_tokens && d_.resident.load(std::memory_order_relaxed) > d_.card_bytes)
             {
                 host_product(host);
                 return;
@@ -582,6 +601,25 @@ namespace albireo
             reserve_buffer(x_, static_cast<size_t>(n) * cols);
             reserve_buffer(y_, static_cast<size_t>(n) * rows);
             dlib::alias_tensor xa(n, cols), ya(n, rows);
+#if defined(DLIB_USE_CUDA)
+            /*
+                The staging tensors keep the size of the largest product, and dlib moves whole
+                blocks: through the views of a product, each one would cross the bus twice, in
+                both directions, as the host or the device writes it.  The rows of the product
+                are written and read here through the device pointers of the tensors instead, and
+                nothing else crosses the bus.  The copies and the product share the default
+                stream of CUDA, which orders them.
+            */
+            float* xd = x_.device_write_only();
+            cuda_check(cudaMemcpy2D(xd, sizeof(float) * cols, X, sizeof(float) * x_stride, sizeof(float) * cols,
+                static_cast<size_t>(n), cudaMemcpyHostToDevice), "copy of the activations to the device");
+            const float* yd = y_.device_write_only();
+            dlib::alias_tensor_instance x = xa(x_);
+            dlib::alias_tensor_instance y = ya(y_);
+            dlib::tt::gemm(0, y, 1, x, false, w, true);
+            cuda_check(cudaMemcpy2D(Y, sizeof(float) * y_stride, yd, sizeof(float) * rows, sizeof(float) * rows,
+                static_cast<size_t>(n), cudaMemcpyDeviceToHost), "copy of the products from the device");
+#else
             dlib::alias_tensor_instance x = xa(x_);
             dlib::alias_tensor_instance y = ya(y_);
             float* xp = x.host_write_only();
@@ -591,6 +629,7 @@ namespace albireo
                 for (long t = 0; t < n; ++t) std::memcpy(xp + t * cols, X + t * x_stride, sizeof(float) * cols);
             dlib::tt::gemm(0, y, 1, x, false, w, true);
             copy_out(y, rows, n, Y, y_stride);
+#endif
         }
 
         static void copy_out(const dlib::tensor& y, long rows, long n, float* Y, long y_stride)
@@ -621,7 +660,15 @@ namespace albireo
             reserve_buffer(w_, values);
             dlib::alias_tensor wa(W.rows, W.cols);
             dlib::alias_tensor_instance staged = wa(w_);
+#if defined(DLIB_USE_CUDA)
+            // The matrix alone crosses the bus, as the rows of the products do (device_gemm()).
+            if (expanded_.size() < values) expanded_.resize(values);
+            expand(W, expanded_.data());
+            cuda_check(cudaMemcpy(w_.device_write_only(), expanded_.data(), sizeof(float) * values,
+                cudaMemcpyHostToDevice), "copy of a matrix to the device");
+#else
             expand(W, staged.host_write_only());
+#endif
             device_gemm(staged, W.rows, W.cols, X, n, x_stride, Y, y_stride);
             return true;
         }
@@ -833,6 +880,8 @@ namespace albireo
         std::unordered_map<const uint8_t*, unsigned long long> refused_;
         std::map<std::tuple<long, long, int>, route> routes_;
         dlib::resizable_tensor x_, y_, w_;
+        // The matrix expanded on the host before it goes to w_ (CUDA).
+        std::vector<float> expanded_;
     };
 
     bool tensor_device::impl::make_room(size_t bytes, const tensor_offload* requester)
@@ -964,6 +1013,7 @@ namespace albireo
             // Every tensor also has a copy in the memory of the host.
             d.budget = std::min(static_cast<size_t>(free_bytes * 0.8), available / 2);
         }
+        if (d.v2ram) d.card_bytes = dlib::get_extended_memory_stats().vram_budget;
         d.message(ALBIREO_LOG_INFO, "device: " + d.name + " through CUDA, " + (d.v2ram ? "extended memory on, " : "")
             + "weights in single precision up to " + megabytes(d.budget));
         d.name += d.v2ram ? " (CUDA, V\xC2\xB2" "RAM)" : " (CUDA)";
@@ -1019,6 +1069,9 @@ namespace albireo
         s["name"] = d.name;
         s["weights_bytes"] = static_cast<unsigned long long>(d.resident.load());
         s["weights_budget"] = static_cast<unsigned long long>(d.budget);
+        // Beyond these bytes of copies, the products of fewer than 8 tokens stay on the processor.
+        if (d.card_bytes != std::numeric_limits<size_t>::max())
+            s["card_bytes"] = static_cast<unsigned long long>(d.card_bytes);
         s["device_products"] = d.device_products.load();
         s["host_products"] = d.host_products.load();
         s["device_seconds"] = d.device_us.load() / 1e6;

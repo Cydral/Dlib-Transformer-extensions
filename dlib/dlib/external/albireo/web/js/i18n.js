@@ -41,7 +41,21 @@ const texts = {
     agentHelp: 'With the agent on, the model can call tools while it answers. It computes, runs code, reads your ' +
       'documents and creates files, then answers with their results. Each call shows in the answer with its input, ' +
       'its result and its duration.',
+    web: 'Web', webAccess: 'Web access', webHint: 'The model may search the web and read web pages',
+    webTools: 'Web tools', webNoTools: 'The model of this function cannot call tools, which the web access needs',
+    webOffline: 'Albireo works offline: the web access is unavailable',
+    webOff: 'The web access is turned off in the settings of the Albireo service',
+    webUnavailable: 'The Albireo service gives no web access',
+    webHelp: 'With Web on, the model can search the web and read web pages and PDF files through the Albireo ' +
+      'service. It reads only the addresses you write in your questions, those of the results of its searches and ' +
+      'the links of the pages it already read. Web starts off in every new discussion.',
+    tool_web_search: 'Web search', tool_fetch_page: 'Page reading',
+    toolHint_web_search: 'Searches the web through the search provider of the Albireo service (Wikipedia by ' +
+      'default) and lists the results with their addresses.',
+    toolHint_fetch_page: 'Reads, part by part, a web page or a PDF file whose address the discussion holds.',
     afterAnswer: 'Available once the answer is written', answering: 'Answering…',
+    unreadAnswer: 'New answer, not read yet', scrollStart: 'Go to the start of the discussion',
+    scrollEnd: 'Go to the end of the discussion',
     busyElsewhere: 'This discussion is being answered in another tab.',
     copyFailed: 'The text could not be copied to the clipboard.',
     errStorage: 'The browser refused to save the change.',
@@ -128,9 +142,12 @@ const texts = {
     errXmlInvalid: 'its content is damaged (invalid XML)',
     engine: 'Engine', speed: 'Speed', tokensPerSecond: '{n} tokens/s', version: 'Version', service: 'Service',
     memory: 'Memory', processor: 'Processor', models: 'Models', usage: 'Usage over 30 days', requests: 'Requests',
+    usageDay: '{date}: {generated} tokens generated, {read} tokens read', usageGenerated: 'Tokens generated',
+    usageRead: 'Tokens read', usageChart: 'Tokens generated and read per day over the last 30 days',
     tokensIn: 'Tokens read', tokensOut: 'Tokens written', vram: 'Graphics memory', v2ram: 'Extended memory (V²RAM)',
     vramResident: 'on the device', vramHost: 'in system memory', vramStore: 'on disk', vramFree: 'free',
     tooLarge: '{name} is too large ({size}); the limit is {limit}.', unsupported: '{name}: this format cannot be read.',
+    imageTooLarge: 'The image {name} is too large ({size}); the limit for an image is {limit}.',
     tooLargeContent: '{name} cannot be read: its content is too large once decompressed.',
     input_text: 'text', input_image: 'images', input_audio: 'sound', input_video: 'video',
     inputRefused: '{name}: the model of this function ({model}) reads {inputs} only; this file cannot be attached.',
@@ -284,7 +301,24 @@ const texts = {
     agentHelp: 'Avec l\'agent activé, le modèle peut appeler des outils pendant sa réponse. Il calcule, exécute du ' +
       'code, lit vos documents et crée des fichiers, puis répond à partir de leurs résultats. Chaque appel apparaît ' +
       'dans la réponse avec son entrée, son résultat et sa durée.',
+    web: 'Web', webAccess: 'Accès au Web', webHint: 'Le modèle peut chercher sur le Web et lire des pages Web',
+    webTools: 'Outils du Web',
+    webNoTools: 'Le modèle de cette fonction ne peut pas appeler d\'outils, ce que demande l\'accès au Web',
+    webOffline: 'Albireo fonctionne hors ligne : l\'accès au Web est indisponible',
+    webOff: 'L\'accès au Web est désactivé dans les paramètres du service Albireo',
+    webUnavailable: 'Le service Albireo ne donne pas d\'accès au Web',
+    webHelp: 'Avec le Web activé, le modèle peut chercher sur le Web et lire des pages Web et des fichiers PDF par ' +
+      'le service Albireo. Il ne lit que les adresses que vous écrivez dans vos questions, celles des résultats de ' +
+      'ses recherches et les liens des pages qu\'il a déjà lues. Le Web est désactivé au début de chaque ' +
+      'nouvelle discussion.',
+    tool_web_search: 'Recherche Web', tool_fetch_page: 'Lecture d\'une page',
+    toolHint_web_search: 'Cherche sur le Web par le fournisseur de recherche du service Albireo (Wikipédia par ' +
+      'défaut) et liste les résultats avec leurs adresses.',
+    toolHint_fetch_page: 'Lit, partie par partie, une page Web ou un fichier PDF dont la discussion contient ' +
+      'l\'adresse.',
     afterAnswer: 'Disponible une fois la réponse écrite', answering: 'Réponse en cours…',
+    unreadAnswer: 'Nouvelle réponse, pas encore lue', scrollStart: 'Aller au début de la discussion',
+    scrollEnd: 'Aller à la fin de la discussion',
     busyElsewhere: 'Cette discussion reçoit une réponse dans un autre onglet.',
     copyFailed: 'Le texte n\'a pas pu être copié dans le presse-papiers.',
     errStorage: 'Le navigateur a refusé d\'enregistrer la modification.',
@@ -373,9 +407,12 @@ const texts = {
     errXmlInvalid: 'son contenu est endommagé (XML non valide)',
     engine: 'Moteur', speed: 'Vitesse', tokensPerSecond: '{n} jetons/s', version: 'Version', service: 'Service',
     memory: 'Mémoire', processor: 'Processeur', models: 'Modèles', usage: 'Utilisation sur 30 jours', requests: 'Requêtes',
+    usageDay: '{date} : {generated} jetons générés, {read} jetons lus', usageGenerated: 'Jetons générés',
+    usageRead: 'Jetons lus', usageChart: 'Jetons générés et lus par jour sur les 30 derniers jours',
     tokensIn: 'Jetons lus', tokensOut: 'Jetons écrits', vram: 'Mémoire graphique', v2ram: 'Mémoire étendue (V²RAM)',
     vramResident: 'sur le périphérique', vramHost: 'en mémoire système', vramStore: 'sur disque', vramFree: 'libre',
     tooLarge: '{name} est trop volumineux ({size}) ; la limite est de {limit}.', unsupported: '{name} : ce format ne peut pas être lu.',
+    imageTooLarge: 'L\'image {name} est trop volumineuse ({size}) ; la limite d\'une image est de {limit}.',
     tooLargeContent: '{name} ne peut pas être lu : son contenu est trop volumineux une fois décompressé.',
     input_text: 'texte', input_image: 'images', input_audio: 'son', input_video: 'vidéo',
     inputRefused: '{name} : le modèle de cette fonction ({model}) ne lit que : {inputs} ; ce fichier ne peut pas être joint.',
@@ -533,7 +570,24 @@ const texts = {
     agentHelp: 'Mit eingeschaltetem Agenten kann das Modell beim Antworten Werkzeuge aufrufen. Es rechnet, führt ' +
       'Code aus, liest Ihre Dokumente und erstellt Dateien und antwortet dann anhand der Ergebnisse. Jeder Aufruf ' +
       'erscheint in der Antwort mit Eingabe, Ergebnis und Dauer.',
+    web: 'Web', webAccess: 'Zugriff auf das Web', webHint: 'Das Modell darf im Web suchen und Webseiten lesen',
+    webTools: 'Web-Werkzeuge',
+    webNoTools: 'Das Modell dieser Funktion kann keine Werkzeuge aufrufen, die der Webzugriff braucht',
+    webOffline: 'Albireo arbeitet offline: Der Webzugriff ist nicht verfügbar',
+    webOff: 'Der Webzugriff ist in den Einstellungen des Albireo-Dienstes ausgeschaltet',
+    webUnavailable: 'Der Albireo-Dienst bietet keinen Webzugriff',
+    webHelp: 'Mit eingeschaltetem Web kann das Modell über den Albireo-Dienst im Web suchen und Webseiten und ' +
+      'PDF-Dateien lesen. Es liest nur die Adressen, die Sie in Ihren Fragen schreiben, die Adressen der Ergebnisse ' +
+      'seiner Suchen und die Links der Seiten, die es bereits gelesen hat. Web ist zu Beginn jeder neuen ' +
+      'Unterhaltung ausgeschaltet.',
+    tool_web_search: 'Websuche', tool_fetch_page: 'Seite lesen',
+    toolHint_web_search: 'Sucht im Web über den Suchanbieter des Albireo-Dienstes (standardmäßig Wikipedia) und ' +
+      'listet die Ergebnisse mit ihren Adressen auf.',
+    toolHint_fetch_page: 'Liest Teil für Teil eine Webseite oder eine PDF-Datei, deren Adresse die Unterhaltung ' +
+      'enthält.',
     afterAnswer: 'Verfügbar, sobald die Antwort geschrieben ist', answering: 'Antwort läuft…',
+    unreadAnswer: 'Neue Antwort, noch nicht gelesen', scrollStart: 'Zum Anfang der Unterhaltung',
+    scrollEnd: 'Zum Ende der Unterhaltung',
     busyElsewhere: 'Diese Unterhaltung wird gerade in einem anderen Tab beantwortet.',
     copyFailed: 'Der Text konnte nicht in die Zwischenablage kopiert werden.',
     errStorage: 'Der Browser hat das Speichern der Änderung abgelehnt.',
@@ -620,9 +674,12 @@ const texts = {
     errXmlInvalid: 'ihr Inhalt ist beschädigt (ungültiges XML)',
     engine: 'Engine', speed: 'Geschwindigkeit', tokensPerSecond: '{n} Token/s', version: 'Version', service: 'Dienst',
     memory: 'Arbeitsspeicher', processor: 'Prozessor', models: 'Modelle', usage: 'Nutzung der letzten 30 Tage', requests: 'Anfragen',
+    usageDay: '{date}: {generated} Token erzeugt, {read} Token gelesen', usageGenerated: 'Erzeugte Token',
+    usageRead: 'Gelesene Token', usageChart: 'Erzeugte und gelesene Token pro Tag in den letzten 30 Tagen',
     tokensIn: 'Gelesene Token', tokensOut: 'Geschriebene Token', vram: 'Grafikspeicher', v2ram: 'Erweiterter Speicher (V²RAM)',
     vramResident: 'auf dem Gerät', vramHost: 'im Arbeitsspeicher', vramStore: 'auf dem Datenträger', vramFree: 'frei',
     tooLarge: '{name} ist zu groß ({size}); die Grenze liegt bei {limit}.', unsupported: '{name}: Dieses Format kann nicht gelesen werden.',
+    imageTooLarge: 'Das Bild {name} ist zu groß ({size}); die Grenze für ein Bild liegt bei {limit}.',
     tooLargeContent: '{name} kann nicht gelesen werden: Der Inhalt ist entpackt zu groß.',
     input_text: 'Text', input_image: 'Bilder', input_audio: 'Ton', input_video: 'Video',
     inputRefused: '{name}: Das Modell dieser Funktion ({model}) liest nur {inputs}; diese Datei kann nicht angehängt werden.',
@@ -777,7 +834,23 @@ const texts = {
     agentHelp: 'Con l\'agente attivo, il modello può chiamare strumenti mentre risponde. Calcola, esegue codice, ' +
       'legge i tuoi documenti e crea file, poi risponde con i loro risultati. Ogni chiamata compare nella risposta ' +
       'con il suo ingresso, il suo risultato e la sua durata.',
+    web: 'Web', webAccess: 'Accesso al Web', webHint: 'Il modello può cercare sul Web e leggere pagine Web',
+    webTools: 'Strumenti del Web',
+    webNoTools: 'Il modello di questa funzione non può chiamare strumenti, che l\'accesso al Web richiede',
+    webOffline: 'Albireo funziona offline: l\'accesso al Web non è disponibile',
+    webOff: 'L\'accesso al Web è disattivato nelle impostazioni del servizio Albireo',
+    webUnavailable: 'Il servizio Albireo non offre l\'accesso al Web',
+    webHelp: 'Con il Web attivo, il modello può cercare sul Web e leggere pagine Web e file PDF tramite il servizio ' +
+      'Albireo. Legge solo gli indirizzi che scrivi nelle tue domande, quelli dei risultati delle sue ricerche e i ' +
+      'link delle pagine che ha già letto. Il Web è disattivato all\'inizio di ogni nuova conversazione.',
+    tool_web_search: 'Ricerca sul Web', tool_fetch_page: 'Lettura di una pagina',
+    toolHint_web_search: 'Cerca sul Web tramite il motore di ricerca del servizio Albireo (Wikipedia per ' +
+      'impostazione predefinita) ed elenca i risultati con i loro indirizzi.',
+    toolHint_fetch_page: 'Legge, parte per parte, una pagina Web o un file PDF il cui indirizzo è nella ' +
+      'conversazione.',
     afterAnswer: 'Disponibile una volta scritta la risposta', answering: 'Risposta in corso…',
+    unreadAnswer: 'Nuova risposta, non ancora letta', scrollStart: 'Vai all\'inizio della conversazione',
+    scrollEnd: 'Vai alla fine della conversazione',
     busyElsewhere: 'Questa conversazione sta ricevendo una risposta in un\'altra scheda.',
     copyFailed: 'Non è stato possibile copiare il testo negli appunti.',
     errStorage: 'Il browser ha rifiutato di salvare la modifica.',
@@ -866,9 +939,12 @@ const texts = {
     errXmlInvalid: 'il suo contenuto è danneggiato (XML non valido)',
     engine: 'Motore', speed: 'Velocità', tokensPerSecond: '{n} token/s', version: 'Versione', service: 'Servizio',
     memory: 'Memoria', processor: 'Processore', models: 'Modelli', usage: 'Utilizzo negli ultimi 30 giorni', requests: 'Richieste',
+    usageDay: '{date}: {generated} token generati, {read} token letti', usageGenerated: 'Token generati',
+    usageRead: 'Token letti', usageChart: 'Token generati e letti al giorno negli ultimi 30 giorni',
     tokensIn: 'Token letti', tokensOut: 'Token scritti', vram: 'Memoria grafica', v2ram: 'Memoria estesa (V²RAM)',
     vramResident: 'sul dispositivo', vramHost: 'nella memoria di sistema', vramStore: 'su disco', vramFree: 'libera',
     tooLarge: '{name} è troppo grande ({size}); il limite è {limit}.', unsupported: '{name}: questo formato non può essere letto.',
+    imageTooLarge: 'L\'immagine {name} è troppo grande ({size}); il limite per un\'immagine è {limit}.',
     tooLargeContent: '{name} non può essere letto: il suo contenuto è troppo grande una volta decompresso.',
     input_text: 'testo', input_image: 'immagini', input_audio: 'audio', input_video: 'video',
     inputRefused: '{name}: il modello di questa funzione ({model}) legge solo {inputs}; questo file non può essere allegato.',
@@ -1022,7 +1098,24 @@ const texts = {
     agentHelp: 'Con el agente activado, el modelo puede llamar a herramientas mientras responde. Calcula, ejecuta ' +
       'código, lee sus documentos y crea archivos, y luego responde con sus resultados. Cada llamada aparece en la ' +
       'respuesta con su entrada, su resultado y su duración.',
+    web: 'Web', webAccess: 'Acceso a la Web', webHint: 'El modelo puede buscar en la Web y leer páginas web',
+    webTools: 'Herramientas web',
+    webNoTools: 'El modelo de esta función no puede llamar a herramientas, que el acceso a la Web necesita',
+    webOffline: 'Albireo funciona sin conexión: el acceso a la Web no está disponible',
+    webOff: 'El acceso a la Web está desactivado en la configuración del servicio Albireo',
+    webUnavailable: 'El servicio Albireo no ofrece acceso a la Web',
+    webHelp: 'Con la Web activada, el modelo puede buscar en la Web y leer páginas web y archivos PDF a través del ' +
+      'servicio Albireo. Solo lee las direcciones que usted escribe en sus preguntas, las de los resultados de la ' +
+      'búsqueda web y los enlaces de las páginas ya leídas. La Web está desactivada al comienzo de cada nueva ' +
+      'conversación.',
+    tool_web_search: 'Búsqueda web', tool_fetch_page: 'Lectura de una página',
+    toolHint_web_search: 'Busca en la Web mediante el proveedor de búsqueda del servicio Albireo (Wikipedia por ' +
+      'defecto) y enumera los resultados con sus direcciones.',
+    toolHint_fetch_page: 'Lee, parte por parte, una página web o un archivo PDF cuya dirección figura en la ' +
+      'conversación.',
     afterAnswer: 'Disponible cuando la respuesta esté escrita', answering: 'Respondiendo…',
+    unreadAnswer: 'Nueva respuesta, aún sin leer', scrollStart: 'Ir al principio de la conversación',
+    scrollEnd: 'Ir al final de la conversación',
     busyElsewhere: 'Esta conversación está recibiendo una respuesta en otra pestaña.',
     copyFailed: 'No se pudo copiar el texto al portapapeles.',
     errStorage: 'El navegador rechazó guardar el cambio.',
@@ -1111,9 +1204,12 @@ const texts = {
     errXmlInvalid: 'su contenido está dañado (XML no válido)',
     engine: 'Motor', speed: 'Velocidad', tokensPerSecond: '{n} tokens/s', version: 'Versión', service: 'Servicio',
     memory: 'Memoria', processor: 'Procesador', models: 'Modelos', usage: 'Uso en 30 días', requests: 'Solicitudes',
+    usageDay: '{date}: {generated} tokens generados, {read} tokens leídos', usageGenerated: 'Tokens generados',
+    usageRead: 'Tokens leídos', usageChart: 'Tokens generados y leídos por día en los últimos 30 días',
     tokensIn: 'Tokens leídos', tokensOut: 'Tokens escritos', vram: 'Memoria gráfica', v2ram: 'Memoria ampliada (V²RAM)',
     vramResident: 'en el dispositivo', vramHost: 'en la memoria del sistema', vramStore: 'en disco', vramFree: 'libre',
     tooLarge: '{name} es demasiado grande ({size}); el límite es {limit}.', unsupported: '{name}: este formato no se puede leer.',
+    imageTooLarge: 'La imagen {name} es demasiado grande ({size}); el límite de una imagen es {limit}.',
     tooLargeContent: '{name} no se puede leer: su contenido es demasiado grande una vez descomprimido.',
     input_text: 'texto', input_image: 'imágenes', input_audio: 'sonido', input_video: 'vídeo',
     inputRefused: '{name}: el modelo de esta función ({model}) solo lee {inputs}; este archivo no se puede adjuntar.',

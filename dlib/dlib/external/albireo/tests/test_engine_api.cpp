@@ -220,6 +220,123 @@ int main(int argc, char** argv)
     }
 
     /*
+        The history of an answer read ahead of the next question.  The answer, 40 letters
+        among a, b, c and d (every other token banned), ends at its length; the engine then
+        reads it as the next request renders it, without the empty reasoning that opened it.
+        The next request finds those tokens cached and computes its question only: its
+        uncached tokens are those of "more" and of the turns around it, fewer than 30, where
+        the answer and its end would add 48 more.
+    */
+    {
+        // The size of the vocabulary: the first identifier the model cannot detokenize.
+        int vocab = 0;
+        for (;; ++vocab)
+        {
+            json answer_json;
+            const std::string q = "{\"op\":\"detokenize\",\"model\":\"m\",\"tokens\":[" + std::to_string(vocab) + "]}";
+            if (lib.run_query(e, json::parse_or_null(q), answer_json) != ALBIREO_OK) break;
+        }
+        json bias = json::object();
+        for (int t = 0; t < vocab; ++t)
+            if (t < 97 || t > 100) bias[std::to_string(t)] = -100;
+        auto ask = [&](const json& messages, int max_tokens, tracker& t, uint64_t& rid) {
+            json req = json::object();
+            req["model"] = "m";
+            req["messages"] = messages;
+            req["max_tokens"] = max_tokens;
+            req["temperature"] = 0;
+            req["reasoning"] = false;
+            req["logit_bias"] = bias;
+            return lib.submit(e, req.dump().c_str(), &on_event, &t, &rid, err, sizeof(err));
+        };
+        auto content = [](const std::string& role, const std::string& text) {
+            json m = json::object();
+            m["role"] = role;
+            m["content"] = text;
+            return m;
+        };
+        // The tokens the warm-ups read so far, and the warm-ups not ended.
+        auto warmed_total = [&](long long& warming) {
+            json stats;
+            lib.run_query(e, json::parse_or_null("{\"op\":\"stats\"}"), stats);
+            const json& s = stats;
+            warming = s["models"][0]["warming"].as_int(1);
+            return s["models"][0]["warmed_total"].as_int(0);
+        };
+        long long warming = 0;
+        const long long before = warmed_total(warming);
+        json messages = json::array();
+        messages.push_back(content("user", "tell me"));
+        tracker first;
+        uint64_t rid = 0;
+        std::string answer;
+        struct collector
+        {
+            tracker* t;
+            std::string* text;
+            static void ALBIREO_ENGINE_CALL on(void* user, int kind, const char* data, size_t size)
+            {
+                collector& c = *static_cast<collector*>(user);
+                if (kind == ALBIREO_EVENT_CONTENT)
+                {
+                    std::lock_guard<std::mutex> lock(c.t->m);
+                    c.text->append(data, size);
+                }
+                on_event(c.t, kind, data, size);
+            }
+        } collect{ &first, &answer };
+        json req = json::object();
+        req["model"] = "m";
+        req["messages"] = messages;
+        req["max_tokens"] = 40;
+        req["temperature"] = 0;
+        req["reasoning"] = false;
+        req["logit_bias"] = bias;
+        expect(lib.submit(e, req.dump().c_str(), &collector::on, &collect, &rid, err, sizeof(err)) == ALBIREO_OK,
+            std::string("the first question of a conversation is accepted: ") + err);
+        expect(wait_final(first, 60), "the first answer ends");
+        expect(answer.size() == 40 && answer.find_first_not_of("abcd") == std::string::npos,
+            "the first answer holds 40 letters a to d: " + answer);
+        // The warm-up reads in the background, and ends with the history.
+        long long warmed = 0;
+        for (int i = 0; i < 300; ++i)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            warmed = warmed_total(warming) - before;
+            if (warmed >= 40 && warming == 0) break;
+        }
+        expect(warmed >= 40, "the history of the answer is read ahead (" + std::to_string(warmed) + " tokens)");
+        messages.push_back(content("assistant", answer));
+        messages.push_back(content("user", "more"));
+        tracker second;
+        expect(ask(messages, 1, second, rid) == ALBIREO_OK, std::string("the next question is accepted: ") + err);
+        expect(wait_final(second, 60), "the next answer ends");
+        {
+            std::lock_guard<std::mutex> lock(second.m);
+            const json f = json::parse_or_null(second.final_json);
+            const long long prompt = f["usage"]["prompt_tokens"].as_int(0);
+            const long long cached = f["usage"]["cached_tokens"].as_int(0);
+            expect(prompt > 48 && prompt - cached < 30, "the next question finds its history cached ("
+                + std::to_string(cached) + " of " + std::to_string(prompt) + " tokens)");
+        }
+        // A question that follows its answer at once takes over the warm-up, and ends once.
+        messages.push_back(content("assistant", "a"));
+        messages.push_back(content("user", "again"));
+        tracker third, fourth;
+        expect(ask(messages, 30, third, rid) == ALBIREO_OK, "a third question is accepted");
+        expect(wait_final(third, 60), "the third answer ends");
+        messages.push_back(content("user", "and again"));
+        expect(ask(messages, 2, fourth, rid) == ALBIREO_OK, "a question at once after an answer is accepted");
+        expect(wait_final(fourth, 60), "the question at once after an answer ends");
+        {
+            std::lock_guard<std::mutex> lock(fourth.m);
+            expect(fourth.finals == 1 && fourth.after_final == 0 && fourth.kind == ALBIREO_EVENT_DONE,
+                "the question at once after an answer ends once");
+        }
+        std::printf("  the history of an answer read ahead of the next question (%lld tokens)\n", warmed);
+    }
+
+    /*
         Three threads submit 30 requests each and cancel a third of them.  The keys and values
         of 1 MB hold 16 blocks of 256 positions for 16 sequences of up to 4 blocks: the answers
         run out of memory and the prompts give theirs back.  The first round runs to its end,

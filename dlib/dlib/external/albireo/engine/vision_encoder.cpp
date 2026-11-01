@@ -454,7 +454,24 @@ namespace albireo
     void vision_encoder::product(const weight_matrix& w, const float* x, long n, long x_stride, float* y, long y_stride,
         bool accumulate)
     {
-        qk_matmul(w, x, n, x_stride, y, y_stride, pool_, scratch_, accumulate, qk_path::automatic);
+        if (!offload_)
+        {
+            qk_matmul(w, x, n, x_stride, y, y_stride, pool_, scratch_, accumulate, qk_path::automatic);
+            return;
+        }
+        if (!accumulate)
+        {
+            offload_->matmul(w, x, n, x_stride, y, y_stride,
+                [&]() { qk_matmul(w, x, n, x_stride, y, y_stride, pool_, scratch_, false, qk_path::automatic); });
+            return;
+        }
+        // The offload writes its products: those added to the rows of y go through sum_.
+        const long rows = w.rows;
+        sum_.resize(static_cast<size_t>(n) * static_cast<size_t>(rows));
+        float* s = sum_.data();
+        offload_->matmul(w, x, n, x_stride, s, rows,
+            [&]() { qk_matmul(w, x, n, x_stride, s, rows, pool_, scratch_, false, qk_path::automatic); });
+        pool_.parallel_for(n, [&](long t, int) { qk_add(y + t * y_stride, s + t * rows, rows); });
     }
 
     weight_matrix vision_encoder::readable(const weight_matrix& m)
@@ -786,6 +803,8 @@ namespace albireo
     std::unique_ptr<vision_encoder::job> vision_encoder::start(const rgb_image& image, const image_plan& plan)
     {
         const auto t0 = std::chrono::steady_clock::now();
+        // The copies of the weights stay on the device until release_work().
+        if (offload_) offload_->set_busy(true);
         std::unique_ptr<job> j(new job());
         if (image.width <= 0 || image.height <= 0
             || image.pixels.size() != static_cast<size_t>(image.width * image.height * 3))
@@ -1165,6 +1184,9 @@ namespace albireo
 
     void vision_encoder::release_work()
     {
+        // The copies of the weights on the device may leave it for the model until the next image.
+        if (offload_) offload_->set_busy(false);
+        aligned_floats().swap(sum_);
         aligned_floats().swap(xn_);
         aligned_floats().swap(qkv_);
         aligned_floats().swap(q_);

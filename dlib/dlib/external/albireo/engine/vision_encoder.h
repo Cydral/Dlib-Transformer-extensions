@@ -9,6 +9,7 @@
 
 #include "image_input.h"
 #include "model_file.h"
+#include "offload.h"
 #include "qkernels.h"
 #include "thread_pool.h"
 
@@ -76,7 +77,11 @@ namespace albireo
                 The products go through the quantized kernels of qkernels.h on the threads of
                 the engine (Q8_0, F16 and F32 weights, and the other types the kernels read),
                 and the attention runs by tiles of queries against blocks of keys
-                (qk_encoder_attention).
+                (qk_encoder_attention).  With a matmul_offload (set_offload()), the products
+                go through it, which computes on its device the shapes the device runs
+                faster; the offload counts as busy from start() to release_work() only, so
+                that its copies of the weights may leave the device for the model between two
+                images.
 
                 An encoding runs a step at a time (advance()): the scheduler of the engine
                 interleaves the blocks of an image with the passes of the other requests.
@@ -201,6 +206,9 @@ namespace albireo
         // Returns the memory of the work buffers to the system.
         void release_work();
 
+        // Hands the products of the following encodings to a device.
+        void set_offload(std::unique_ptr<matmul_offload> offload) { offload_ = std::move(offload); }
+
     private:
         struct block
         {
@@ -273,10 +281,11 @@ namespace albireo
         // The matrices converted when the encoder loads.
         std::vector<std::vector<uint16_t>> owned_;
 
-        // Work buffers.
-        aligned_floats xn_, qkv_, q_, kt_, v_, ctx_, h_, u_, m_;
+        // Work buffers; sum_ receives the products of the device that the encoder adds to its rows.
+        aligned_floats xn_, qkv_, q_, kt_, v_, ctx_, h_, u_, m_, sum_;
         std::vector<aligned_floats> attention_work_;
         qk_scratch scratch_;
+        std::unique_ptr<matmul_offload> offload_;
     };
 
 }

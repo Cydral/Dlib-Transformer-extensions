@@ -5,7 +5,9 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
+#include <vector>
 
 /*
     The downloads of the service: the update feed, the catalog of the models, the
@@ -16,7 +18,13 @@
     ends the requests in progress at their next stage and makes the following ones fail at
     once, so that an unreachable network, as on a machine without Internet access, never
     delays the service.
+
+    The web access of the agent mode (web_access.h) makes its own requests with the same
+    proxy (http_proxy_for()), the same bounded resolution (http_resolve()) and the same
+    cancellation (http_registration).
 */
+
+namespace httplib { class Client; }
 
 namespace albireo
 {
@@ -86,6 +94,46 @@ namespace albireo
     !*/
     bool http_get_range(const std::string& url, uint64_t from, int64_t to,
         const std::function<bool(const char*, size_t)>& receiver, std::string& error, uint64_t* total = nullptr);
+
+    /*!
+        ensures
+            - Gives in host and port the proxy through which the downloads reach origin
+              ("https://host:port"), as set_http_proxy() chooses it, with its user and its
+              password when it has them.
+            - Returns false when origin is reached directly: the setting "none", no proxy of
+              the system, a local address or a host of NO_PROXY.
+    !*/
+    bool http_proxy_for(const std::string& origin, std::string& host, int& port, std::string& user,
+        std::string& password);
+
+    /*!
+        ensures
+            - Gives in addresses the IPv4 and IPv6 addresses of the name host, as text
+              ("93.184.215.14", "2606:2800:21f:cb07:6820:80da:af6b:8b2c"), in the order of the
+              resolver of the system.  On Windows the resolution takes connect_seconds at most
+              and ends at once when the downloads are cancelled.
+            - Returns false with error when the name is not resolved or when the downloads are
+              cancelled.
+    !*/
+    bool http_resolve(const std::string& host, std::vector<std::string>& addresses, std::string& error);
+
+    class http_registration
+    {
+        /*!
+            WHAT THIS OBJECT REPRESENTS
+                The registration of the client of a request while the request runs, so that
+                http_cancel_all() stops it: the downloads of this module register their
+                clients, and so do the requests of the web access (web_access.h).
+        !*/
+    public:
+        explicit http_registration(const std::shared_ptr<httplib::Client>& c);
+        ~http_registration();
+        http_registration(const http_registration&) = delete;
+        http_registration& operator=(const http_registration&) = delete;
+
+    private:
+        std::shared_ptr<httplib::Client> c_;
+    };
 
 }
 

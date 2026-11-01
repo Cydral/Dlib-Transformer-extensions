@@ -40,6 +40,7 @@ import * as api from './api.js';
 import { extractText, maxFileBytes, extension, searchPassages, documentAccept, fileKind, pdfPages } from './documents.js';
 import * as rag from './rag.js';
 import * as tools from './tools.js';
+import * as web from './web.js';
 import * as images from './images.js';
 import * as speech from './speech.js';
 
@@ -54,12 +55,15 @@ const maxAgentSteps = 8;
 const knowledgeShare = 0.3;
 const attachmentShare = 0.25;
 const excerptShare = 0.2;
-// The exchanges kept when the oldest leave: the conversation then takes this share of the
-// room it has, so that it grows again for several questions before the next cut.
-const keptShare = 0.6;
-// An answer after which the discussion takes this share of its room leads to the compression
-// of its oldest exchanges, in the background, before the next question needs it.
-const compactShare = 0.8;
+/*
+    The room of the exchanges is the room of the context less the system message and the tools.  When the oldest
+    exchanges leave, the exchanges kept, with the summary of those that left, take keptShare of that room, so that
+    they grow again for several questions before the next cut.  Once an answer ends, or a discussion is opened, with
+    the exchanges taking compactShare of their room, their oldest part is compressed in the background: the next
+    questions still fit meanwhile, and find the summary written.
+*/
+const keptShare = 0.3;
+const compactShare = 0.5;
 // The summary of the exchanges that left the context takes at most this share of the room.
 const summaryShare = 0.15;
 /*
@@ -82,10 +86,12 @@ const defaults = {
   memoryEnabled: true, memorySensitive: false, memory: '', memoryUpdated: 0, memoryLanguage: '', storagePersisted: null
 };
 
-// The memory of the discussions: short notes on the user, which the model writes from the
-// discussions, private ones excepted, and which each discussion receives at its start.  Its
-// size follows the context of the model: memoryShare of it, memoryWords words at most.
-const memoryWords = 120;
+/*
+    The memory of the discussions: short sentences on the user, one after the other, which the model writes from the
+    discussions, private ones excepted, and which each discussion receives at its start.  Its size follows the
+    context of the model: memoryShare of it, memoryWords words at most.
+*/
+const memoryWords = 200;
 const memoryShare = 0.04;
 
 function memoryLimitWords(contextTokens) {
@@ -101,8 +107,6 @@ const state = {
   projectId: null,
   incognito: false,
   pending: [],
-  busy: false,
-  abort: null,
   status: null,
   catalog: null,
   search: '',
@@ -121,7 +125,13 @@ function h(tag, props, ...children) {
       else if (k === 'html') el.innerHTML = v;
       else if (k === 'text') el.textContent = v;
       else if (k.startsWith('on') && typeof v === 'function') el.addEventListener(k.slice(2), v);
-      else if (k === 'style' && typeof v === 'object') Object.assign(el.style, v);
+      else if (k === 'style' && typeof v === 'object') {
+        // The custom properties ("--c") are set by their name.
+        for (const [name, value] of Object.entries(v)) {
+          if (name.startsWith('--')) el.style.setProperty(name, value);
+          else el.style[name] = value;
+        }
+      }
       else el.setAttribute(k, v === true ? '' : v);
     }
   }
@@ -130,6 +140,11 @@ function h(tag, props, ...children) {
     el.append(c.nodeType ? c : document.createTextNode(String(c)));
   }
   return el;
+}
+
+// Puts children in el in place of its own, the null and false ones left out, as h() leaves them out.
+function fill(el, ...children) {
+  el.replaceChildren(...children.flat(Infinity).filter((c) => c != null && c !== false));
 }
 
 function iconButton(name, title, onclick, cls) {
@@ -141,6 +156,11 @@ function formatSize(n) {
   if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
   if (n < 1073741824) return (n / 1048576).toFixed(1) + ' MB';
   return (n / 1073741824).toFixed(2) + ' GB';
+}
+
+// A limit of size in whole megabytes, "100 MB".
+function formatLimit(n) {
+  return formatNumber(Math.round(n / 1048576)) + ' MB';
 }
 
 function formatDuration(ms) {
@@ -363,9 +383,9 @@ function syncConversation(id) {
 }
 
 /*
-    Takes the copy of a discussion another tab saved.  The discussion this tab is answering keeps
-    its messages and takes the title, the pin and the project; the one shown otherwise takes the
-    saved copy whole, and its messages are drawn again when they changed.
+    Takes the copy of a discussion another tab saved.  A discussion this tab is answering, shown or
+    not, keeps its messages and takes the title, the pin and the project; the one shown otherwise
+    takes the saved copy whole, and its messages are drawn again when they changed.
 */
 async function applyStored(id) {
   if (deleted.has(id)) return;
@@ -376,11 +396,12 @@ async function applyStored(id) {
   }
   let copy = stored;
   const shown = state.current && state.current.id === id ? state.current : null;
+  const live = generations.get(id);
   let redraw = false;
   // A question being edited keeps the copy it belongs to.
-  if (shown && (state.busyId === id || editingIn(ui.content) || (ui.thread && ui.thread.querySelector('textarea')))) {
-    for (const k of sharedFields) shown[k] = stored[k];
-    copy = shown;
+  if (live || (shown && (editingIn(ui.content) || (ui.thread && ui.thread.querySelector('textarea'))))) {
+    copy = live ? live.c : shown;
+    for (const k of sharedFields) copy[k] = stored[k];
   } else if (shown) {
     redraw = threadKey(shown) !== threadKey(stored);
     state.current = stored;
@@ -400,25 +421,28 @@ async function applyStored(id) {
 function conversationDeleted(id) {
   deleted.add(id);
   othersBusy.delete(id);
+  unread.delete(id);
+  stopGeneration(id);
   cancelCompaction(id);
+  cancelWarmup(id);
+  web.forgetPages(id);
   state.conversations = state.conversations.filter((x) => x.id !== id);
-  if (state.current && state.current.id === id) {
-    if (state.busy) stopGeneration();
-    go('#/');
-  } else {
-    refreshViews();
-  }
+  if (state.current && state.current.id === id) go('#/');
+  else refreshViews();
 }
 
 // Every discussion and every project deleted in another tab.
 function everythingDeleted() {
   for (const c of state.conversations) deleted.add(c.id);
   if (state.current && state.current.messages.length && !state.current.incognito) deleted.add(state.current.id);
-  if (state.busy) stopGeneration();
+  for (const g of generations.values()) if (!g.c.incognito) deleted.add(g.c.id);
+  stopAllGenerations();
+  unread.clear();
   cancelIndex();
   cancelBackground();
   rag.removeAll();
   images.removeAll();
+  for (const id of deleted) web.forgetPages(id);
   syncLists().then(() => go('#/'));
 }
 
@@ -445,7 +469,8 @@ function syncProjects() {
 
 /*
     The lists read again from the database, after an import, the deletion of a project or everything
-    deleted in another tab, once for a burst of messages.  The discussion shown stays the copy of this tab.
+    deleted in another tab, once for a burst of messages.  The discussion shown and the discussions this
+    tab is answering stay the copies of this tab.
 */
 let listsSync = null;
 
@@ -454,15 +479,26 @@ function syncLists() {
     listsSync = new Promise((resolve) => setTimeout(resolve, 50)).then(async () => {
       listsSync = null;
       await reloadLists().catch(storageFailed);
-      const c = state.current;
-      const i = c ? state.conversations.findIndex((x) => x.id === c.id) : -1;
-      if (i >= 0) state.conversations[i] = c;
-      // A discussion whose project another tab deleted leaves it, as the stored discussions did.
-      if (c && c.projectId && !projectById(c.projectId)) c.projectId = null;
+      keepOwnCopies();
       refreshViews();
     });
   }
   return listsSync;
+}
+
+/*
+    Puts the copies of this tab, the discussion shown and the discussions it is answering, in the list read from the
+    database in place of the stored ones.  A discussion whose project was deleted leaves it, as the stored discussions
+    did.
+*/
+function keepOwnCopies() {
+  const own = Array.from(generations.values(), (g) => g.c);
+  if (state.current) own.push(state.current);
+  for (const c of own) {
+    const i = state.conversations.findIndex((x) => x.id === c.id);
+    if (i >= 0) state.conversations[i] = c;
+    if (c.projectId && !projectById(c.projectId)) c.projectId = null;
+  }
 }
 
 /*
@@ -473,12 +509,15 @@ const othersBusy = new Map();
 const busyBeat = 20000;
 
 function busyElsewhere(id, tab, busy) {
+  const before = othersBusy.has(id);
   if (busy) othersBusy.set(id, { tab, until: Date.now() + 3 * busyBeat });
   else if (othersBusy.has(id) && othersBusy.get(id).tab === tab) othersBusy.delete(id);
   if (state.current && state.current.id === id) {
     renderComposerState();
     lockThread();
   }
+  // The dot of the discussion in the side panel follows.
+  if (before !== othersBusy.has(id) && ui.sideScroll) renderSidebar();
 }
 
 // True when another tab is answering in the discussion c.
@@ -501,14 +540,22 @@ function expireBusy() {
 
 let busyTimer = 0;
 
-// Tells the other tabs that this tab answers, or no longer answers, in the discussion c.
+/*
+    Tells the other tabs that this tab answers, or no longer answers, in the discussion c, an incognito discussion
+    excepted.  While this tab answers in stored discussions, it says so again for each of them every busyBeat
+    milliseconds.
+*/
 function announceBusy(c, busy) {
-  clearInterval(busyTimer);
-  busyTimer = 0;
-  if (!c || c.incognito) return;
-  const say = () => broadcast({ type: 'busy', id: c.id, tab: tabId, busy });
-  say();
-  if (busy) busyTimer = setInterval(say, busyBeat);
+  if (c && !c.incognito) broadcast({ type: 'busy', id: c.id, tab: tabId, busy });
+  const stored = () => Array.from(generations.values()).filter((g) => !g.c.incognito);
+  if (stored().length && !busyTimer) {
+    busyTimer = setInterval(() => {
+      for (const g of stored()) broadcast({ type: 'busy', id: g.c.id, tab: tabId, busy: true });
+    }, busyBeat);
+  } else if (!stored().length && busyTimer) {
+    clearInterval(busyTimer);
+    busyTimer = 0;
+  }
 }
 
 // Service status and models.
@@ -574,6 +621,34 @@ function roleCapabilities(role) {
   if (loaded) return { reasoning: loaded.reasoning !== false, tools: loaded.tools !== false, context: loaded.context || 0 };
   const m = modelInfo(id);
   return { reasoning: m ? m.reasoning !== false : true, tools: m ? m.tools !== false : true, context: 0 };
+}
+
+/*
+    Why the web access cannot serve a discussion whose model has the capabilities caps, '' when it can: a model that
+    calls no tool, a service set offline, a web access the administrator turned off (the "web" member of the status),
+    or a status without it.
+*/
+function webUnavailable(caps) {
+  if (!caps.tools) return t('webNoTools');
+  const s = state.status;
+  if (!s || !s.web || typeof s.web !== 'object') return t('webUnavailable');
+  if (s.web.available) return '';
+  return s.offline ? t('webOffline') : t('webOff');
+}
+
+/*
+    The tools of the requests of c and the parts of its system message that come with them: those of the agent while
+    it is on, then those of the web while Web is on and the service offers it, web_search when the service names a
+    provider of search.  The list and its order stay the same while the toggles and the provider do not change, so
+    that the beginning of the prompt stays the same from one question to the next.
+*/
+function toolSet(c, caps) {
+  const agent = !!(c.agent && caps.tools);
+  const webOn = !!(c.web && !webUnavailable(caps));
+  const provider = webOn ? state.status.web.search : '';
+  const search = typeof provider === 'string' && provider !== '' && provider !== 'none';
+  const definitions = (agent ? tools.definitions : []).concat(webOn ? web.definitions(search) : []);
+  return { agent, web: webOn, search, definitions: definitions.length ? definitions : null };
 }
 
 /*
@@ -652,7 +727,8 @@ async function pollStatus() {
   let voices = false;
   try {
     const s = await api.status();
-    const key = (x) => JSON.stringify([x.active, x.loaded_models, x.state, x.background]);
+    // The web access and the offline mode change the Web button of the composer and the tools of the next question.
+    const key = (x) => JSON.stringify([x.active, x.loaded_models, x.state, x.background, x.web, x.offline]);
     changed = !state.status || key(state.status) !== key(s);
     back = state.statusError;
     state.status = s;
@@ -1123,17 +1199,23 @@ function renderSidebar() {
 
 // True when the discussion c is being answered, in this tab or in another one.
 function answering(c) {
-  return !!c && (state.busyId === c.id || answeredElsewhere(c));
+  return !!c && (generations.has(c.id) || answeredElsewhere(c));
 }
 
+/*
+    A discussion of the side panel.  At its left, a dot blinks while it is being answered, in this tab or in another
+    one, and stays blue once its answer ended while another discussion was shown, until it is opened.
+*/
 function conversationItem(c) {
   const p = c.projectId ? projectById(c.projectId) : null;
   const active = state.view === 'chat' && state.current && state.current.id === c.id;
+  const mark = answering(c) ? 'live' : unread.has(c.id) ? 'unread' : '';
+  const markText = mark ? t(mark === 'live' ? 'answering' : 'unreadAnswer') : '';
   return h('div', { class: 'item' + (active ? ' active' : ''), onclick: () => go('#/c/' + c.id) },
+    mark ? h('span', { class: 'gen-dot ' + mark, title: markText, role: 'img', 'aria-label': markText }) : null,
     p ? h('span', { class: 'dot', title: p.name, style: { background: p.color || projectColors[0] } })
       : h('span', { html: icon(roleIcons[c.role] || 'chat') }),
     h('span', { class: 'label' }, c.title || t('untitled')),
-    answering(c) ? h('span', { class: 'spinner small', title: t('answering'), 'aria-label': t('answering') }) : null,
     c.pinned ? h('span', { class: 'pin', html: icon('pin') }) : null,
     h('button', {
       class: 'more', type: 'button', title: '…', html: icon('more'),
@@ -1202,21 +1284,27 @@ function closeMenu() {
   document.removeEventListener('keydown', escapeMenu);
 }
 
-// What the agent mode does, and the tools it may call, each with what it is for.
+// What the agent mode and the web access do, and the tools each of them gives the model, with what it is for.
 function agentHelp(anchor) {
+  const row = (name) => h('div', { class: 'popover-tool' },
+    h('span', { html: icon(toolIcons[name] || 'tool') }),
+    h('span', null, h('b', null, toolLabel(name)), h('span', { class: 'desc' }, t('toolHint_' + name))));
   showPopover(anchor, [
     h('div', { class: 'head' }, t('agentHelpTitle')),
     h('p', null, t('agentHelp')),
-    h('div', { class: 'popover-tools' }, tools.definitions.map((d) => h('div', { class: 'popover-tool' },
-      h('span', { html: icon(toolIcons[d.function.name] || 'tool') }),
-      h('span', null, h('b', null, toolLabel(d.function.name)),
-        h('span', { class: 'desc' }, t('toolHint_' + d.function.name))))))
+    h('div', { class: 'popover-tools' }, tools.definitions.map((d) => row(d.function.name))),
+    h('p', null, t('webHelp')),
+    h('div', { class: 'popover-tools' }, web.definitions(true).map((d) => row(d.function.name)))
   ]);
 }
 
-// The open discussion is the copy that answers and saves: an action of the sidebar on it
-// changes that copy, so that the next save keeps the action.
+/*
+    The discussion this tab answers, shown or not, and the open discussion, are the copies that answer and save: an
+    action of the sidebar on them changes that copy, so that the next save keeps the action.
+*/
 function liveCopy(c) {
+  const g = generations.get(c.id);
+  if (g) return g.c;
   return state.current && state.current.id === c.id ? state.current : c;
 }
 
@@ -1270,8 +1358,10 @@ const deleted = new Set();
 async function persist(c) {
   if (!c || c.incognito || deleted.has(c.id)) return false;
   // The answer being written is saved once it ends, whole.
-  const record = c.messages.includes(liveTurn)
-    ? Object.assign({}, c, { messages: c.messages.filter((x) => x !== liveTurn) }) : c;
+  const g = generations.get(c.id);
+  const live = g && g.turn;
+  const record = live && c.messages.includes(live)
+    ? Object.assign({}, c, { messages: c.messages.filter((x) => x !== live) }) : c;
   try {
     await store.putConversation(record);
     // A deletion that came while the discussion was being saved stays.
@@ -1320,10 +1410,14 @@ async function removeConversation(c) {
   const ok = await confirmDialog(t('deleteDiscussion'), t('deleteDiscussionText', { title: c.title || t('untitled') }));
   if (!ok) return;
   deleted.add(c.id);
-  // The answer in progress and the compression of the exchanges stop.  The record of the discussion leaves the
-  // database first, then the passages of its documents, from the memory of the search and from the database.
-  if (state.busy && state.busyId === c.id) stopGeneration();
+  unread.delete(c.id);
+  // The answer in progress, shown or written in the background, and the compression of the exchanges stop.  The
+  // record of the discussion leaves the database first, then the passages of its documents, from the memory of the
+  // search and from the database.
+  stopGeneration(c.id);
   cancelCompaction(c.id);
+  cancelWarmup(c.id);
+  web.forgetPages(c.id);
   await store.deleteConversation(c.id).catch(storageFailed);
   await forgetOwner(c.id).catch(() => {});
   await images.removeOwner(c.id).catch(() => {});
@@ -1442,6 +1536,7 @@ async function rewriteSummary(c) {
   const context = roleCapabilities(c.role).context || 8192;
   const room = context - Math.min(state.settings.maxTokens || 2048, Math.floor(context / 2));
   toast(t('compacting'));
+  cancelWarmup(c.id);
   const abort = new AbortController();
   const done = compact(c, 0, start, room, 1 / 3.6, abort.signal).then((r) => applyCompaction(c, r))
     .catch(() => { c.summary = null; });
@@ -1452,6 +1547,7 @@ async function rewriteSummary(c) {
   } finally {
     if (compactions.get(c.id) === job) compactions.delete(c.id);
   }
+  if (c.summary) warmBeginning(c);
 }
 
 // The document search: the documents being indexed, one at a time in the background.
@@ -1619,6 +1715,7 @@ function cancelDescription(imageId) {
 function cancelBackground() {
   for (const id of Array.from(compactions.keys())) cancelCompaction(id);
   for (const id of Array.from(describeJobs.keys())) cancelDescription(id);
+  for (const id of Array.from(warmups.keys())) cancelWarmup(id);
 }
 
 // The text of an image of a project for the search: its description, else its name.
@@ -1975,7 +2072,9 @@ function renderProject(p) {
           await store.deleteProject(p.id).catch(storageFailed);
           await images.removeOwner(p.id).catch(() => {});
           if (state.current && state.current.projectId === p.id) state.current.projectId = null;
+          for (const g of generations.values()) if (g.c.projectId === p.id) g.c.projectId = null;
           await reloadLists().catch(storageFailed);
+          keepOwnCopies();
           broadcast({ type: 'lists' });
           go('#/');
         }
@@ -1990,7 +2089,9 @@ function renderProject(p) {
     refused with a message that says why; a sound is attached only when the model reads it.  A
     PDF whose pages are images without text, a scan, is left out with a dialog, or offered as
     images of its pages to a model that reads images; a PDF some of whose pages are such images
-    is added with a notice that counts them.  The images come back with kind 'image'.
+    is added with a notice that counts them.  The images come back with kind 'image'.  A document of more than
+    maxFileBytes and an image of more than images.maxImageBytes are refused before they are read, with a message
+    that names the file and the limit.
 */
 async function readFiles(files, role, room) {
   const out = [];
@@ -1999,15 +2100,17 @@ async function readFiles(files, role, room) {
   const inputs = role ? roleInputs(role) : ['text', 'image'];
   let left = room || 0;
   for (const f of files) {
-    if (f.size > maxFileBytes) {
-      toast(t('tooLarge', { name: f.name, size: formatSize(f.size), limit: formatSize(maxFileBytes) }), true);
-      continue;
-    }
     const kind = fileKind(f);
     if (kind !== 'document' && !inputs.includes(kind)) {
       const model = role ? modelName(roleModel(role)) : '';
       toast(role ? t('inputRefused', { name: f.name, model, inputs: inputsLabel(inputs) })
         : t('unsupported', { name: f.name }), true);
+      continue;
+    }
+    const limit = kind === 'image' ? images.maxImageBytes : maxFileBytes;
+    if (f.size > limit) {
+      toast(t(kind === 'image' ? 'imageTooLarge' : 'tooLarge',
+        { name: f.name, size: formatSize(f.size), limit: formatLimit(limit) }), true, 9000);
       continue;
     }
     if (kind === 'image') {
@@ -2034,7 +2137,9 @@ async function readFiles(files, role, room) {
       if (e.message === 'pdf-images') scans.push({ file: f, pages: e.pages || 0 });
       else if (e.message === 'unsupported') toast(t('unsupported', { name: f.name }), true);
       else if (e.message === 'legacy') toast(t('legacyFormat', { name: f.name }), true);
-      else if (e.message === 'too-large') toast(t('tooLarge', { name: f.name, size: formatSize(f.size), limit: formatSize(maxFileBytes) }), true);
+      else if (e.message === 'too-large') {
+        toast(t('tooLarge', { name: f.name, size: formatSize(f.size), limit: formatLimit(maxFileBytes) }), true, 9000);
+      }
       else if (e.message === 'too-large-content') toast(t('tooLargeContent', { name: f.name }), true);
       else if (e.message === 'pdf-password') toast(t('pdfPassword', { name: f.name }), true, 9000);
       else if (e.message === 'pdf-invalid') toast(t('pdfInvalid', { name: f.name }), true);
@@ -2288,12 +2393,14 @@ function clearPending() {
 }
 
 /*
-    The discussion shown gives way to another one: an incognito discussion, which no list keeps, takes its images and
-    the passages of its documents out of memory.
+    The discussion shown gives way to another one: an incognito discussion, which no list keeps, takes its images, the
+    passages of its documents and the web pages it read out of memory.
 */
 function forgetIncognito() {
   const c = state.current;
   if (!c || !c.incognito || !c.messages.length) return;
+  cancelWarmup(c.id);
+  web.forgetPages(c.id);
   images.removeOwner(c.id).catch(() => {});
   forgetOwner(c.id).catch(() => {});
 }
@@ -2308,20 +2415,30 @@ async function keepImages(c, list) {
   }
 }
 
-// Conversations.
+// Conversations.  The web access starts off in every discussion, whatever the previous ones did.
 function newConversation(projectId) {
   return {
     id: store.uid(), title: '', projectId: projectId || null, created: Date.now(), updated: Date.now(), pinned: false,
     role: state.settings.defaultRole || 'general', reasoning: !!state.settings.lastReasoning, agent: !!state.settings.lastAgent,
-    messages: [], incognito: state.incognito
+    web: false, messages: [], incognito: state.incognito
   };
+}
+
+/*
+    The discussion shown gives way to another one.  The answer of a stored discussion goes on in the background; an
+    incognito discussion, which no list keeps, stops its answer, and its images and the passages of its documents
+    leave the memory.
+*/
+function leaveCurrent() {
+  const c = state.current;
+  if (c && c.incognito) stopGeneration(c.id);
+  forgetIncognito();
 }
 
 function newChat(projectId) {
   // The reading aloud ends with the discussion it belongs to, as route() ends it.
   speech.stopReading();
-  if (state.busy) stopGeneration();
-  forgetIncognito();
+  leaveCurrent();
   clearPending();
   state.current = newConversation(projectId);
   state.view = 'chat';
@@ -2350,17 +2467,23 @@ async function route() {
   let m;
   if ((m = /^#\/c\/([0-9a-f]+)$/.exec(hash))) {
     if (!(state.current && state.current.id === m[1])) {
-      if (state.busy) stopGeneration();
-      const c = deleted.has(m[1]) ? null : await store.getConversation(m[1]).catch(() => null);
+      // A discussion this tab is answering in the background is shown with its answer being written.
+      const live = generations.get(m[1]);
+      const c = live ? live.c : deleted.has(m[1]) ? null : await store.getConversation(m[1]).catch(() => null);
       if (sequence !== routeSequence) return;
       if (!c) { go('#/'); return; }
-      forgetIncognito();
+      leaveCurrent();
       clearPending();
       state.current = c;
       state.incognito = false;
       // The searched documents without passages, those of an imported discussion for instance, are indexed.
       indexAttachments(c).catch(() => {});
+      // A discussion whose exchanges take the share of their room that leads to a compression starts it now,
+      // unless another tab is answering in it.
+      if (!live && !answeredElsewhere(c) && serviceReady()) compactLater(c);
     }
+    // The answer written while another discussion was shown is read now.
+    unread.delete(m[1]);
     state.view = 'chat';
   } else if ((m = /^#\/p\/([0-9a-f]+)$/.exec(hash))) {
     state.view = 'project';
@@ -2370,8 +2493,7 @@ async function route() {
   } else {
     state.view = 'chat';
     if (!state.current || state.current.messages.length || (state.current.incognito !== state.incognito)) {
-      if (state.busy) stopGeneration();
-      forgetIncognito();
+      leaveCurrent();
       state.current = newConversation(null);
     }
   }
@@ -2501,6 +2623,8 @@ function releaseHiddenImages() {
 
 function drawMain() {
   stopClock();
+  // The buttons that go to the ends of the thread wait for the next scroll of the user.
+  if (ui.jump) ui.jump.classList.remove('on');
   if (state.view === 'project') {
     const p = projectById(state.projectId);
     ui.composerWrap.classList.add('hidden');
@@ -2557,10 +2681,88 @@ function renderWelcome() {
   ui.thread = null;
 }
 
+/*
+    The thread follows its end while the user leaves it there (ui.stick): an answer being written, and a composer
+    that grows, keep its last lines in view.  The position is written without reading it first; the scrolls the
+    application makes are told apart from those of the user by the position they leave (ui.ownTop).
+*/
 function scrollToEnd(force) {
+  if (!force && !ui.stick) return;
   const s = ui.content;
-  const near = s.scrollHeight - s.scrollTop - s.clientHeight < 160;
-  if (force || near) s.scrollTop = s.scrollHeight;
+  s.scrollTop = s.scrollHeight;
+  ui.ownTop = s.scrollTop;
+  ui.stick = true;
+}
+
+// A scroll of the thread: whether it stays at its end, and, for a scroll of the user, the buttons that go to its ends.
+function threadScrolled() {
+  const s = ui.content;
+  const own = Math.abs(s.scrollTop - ui.ownTop) < 2;
+  if (!own) ui.stick = s.scrollHeight - s.scrollTop - s.clientHeight < 80;
+  if (!own) showJump(true);
+  else if (ui.jump.classList.contains('on')) showJump(false);
+}
+
+/*
+    The buttons that go to the start and to the end of the thread show while the user scrolls a thread longer than the
+    view, each one away from its end, and leave a moment after the scroll unless the pointer or the focus is on them.
+    keep tells that the user scrolls, which shows them again.
+*/
+const jumpDelay = 1600;
+
+function showJump(keep) {
+  const s = ui.content;
+  const thread = state.view === 'chat' && ui.thread && ui.thread.isConnected;
+  const fits = !thread || s.scrollHeight <= s.clientHeight + 4;
+  const atStart = s.scrollTop < 8;
+  const atEnd = s.scrollHeight - s.scrollTop - s.clientHeight < 8;
+  ui.jumpStart.classList.toggle('hidden', fits || atStart);
+  ui.jumpEnd.classList.toggle('hidden', fits || atEnd);
+  const on = !fits && !(atStart && atEnd) && (keep || ui.jump.classList.contains('on'));
+  ui.jump.classList.toggle('on', on);
+  clearTimeout(ui.jumpTimer);
+  if (on) ui.jumpTimer = setTimeout(hideJump, jumpDelay);
+}
+
+function hideJump() {
+  clearTimeout(ui.jumpTimer);
+  if (ui.jump.matches(':hover') || ui.jump.contains(document.activeElement)) {
+    ui.jumpTimer = setTimeout(hideJump, jumpDelay);
+    return;
+  }
+  ui.jump.classList.remove('on');
+}
+
+// Goes at once to the start or to the end of the thread.
+function jumpTo(end) {
+  const s = ui.content;
+  if (end) {
+    scrollToEnd(true);
+  } else {
+    s.scrollTop = 0;
+    ui.ownTop = s.scrollTop;
+    ui.stick = false;
+  }
+  showJump(true);
+}
+
+/*
+    The composer lies over the bottom of the thread: the height it takes, whatever its text, its attachments and the
+    tools of the agent, goes to --composer-room, which the bottom of the thread and the buttons over it leave free.
+    A thread at its end stays at its end.
+*/
+function watchComposer() {
+  if (ui.composerObserver) ui.composerObserver.disconnect();
+  ui.composerObserver = null;
+  if (typeof ResizeObserver !== 'function') return;
+  ui.composerObserver = new ResizeObserver(() => {
+    const height = ui.composerWrap.offsetHeight;
+    if (height === ui.composerHeight) return;
+    ui.composerHeight = height;
+    ui.main.style.setProperty('--composer-room', height + 'px');
+    if (ui.stick && ui.thread && ui.thread.isConnected) scrollToEnd(true);
+  });
+  ui.composerObserver.observe(ui.composerWrap);
 }
 
 function messageElement(c, m, index, last) {
@@ -2590,6 +2792,7 @@ function attachmentChip(a, removable, onremove) {
 function userElement(c, m, index, last) {
   const el = h('div', { class: 'message user' + (last ? ' last' : '') });
   el.dataset.index = index;
+  el.dataset.id = m.id || '';
   // The images of a question that left the context show dimmed: the model no longer receives them.
   const pictures = m.images || [];
   if (pictures.length) {
@@ -2685,7 +2888,7 @@ function replayLimitText(n) {
     'replay').  They stay disabled meanwhile, and say why.
 */
 function threadLocked() {
-  return state.busy || answeredElsewhere(state.current);
+  return busyHere() || answeredElsewhere(state.current);
 }
 
 /*
@@ -2721,7 +2924,7 @@ function lockThread() {
   if (!ui.content) return;
   const busy = threadLocked();
   for (const b of ui.content.querySelectorAll('button[data-lock]')) {
-    lockButton(b, b.dataset.lock === 'turn' ? !!(liveTurn && b.closest('.message.live')) : busy);
+    lockButton(b, b.dataset.lock === 'turn' ? !!b.closest('.message.live') : busy);
   }
   showElsewhere();
 }
@@ -2730,7 +2933,7 @@ function lockThread() {
 function showElsewhere() {
   if (!ui.thread || !ui.thread.isConnected) return;
   const note = ui.thread.querySelector(':scope > .elsewhere');
-  const on = !state.busy && answeredElsewhere(state.current);
+  const on = !busyHere() && answeredElsewhere(state.current);
   if (on && !note) {
     const spin = h('span', { class: 'spinner' });
     ui.thread.append(h('div', { class: 'progress-line elsewhere' }, spin, t('busyElsewhere')));
@@ -2906,9 +3109,14 @@ function toggleReading(m, key) {
   });
 }
 
+/*
+    An answer, with its buttons.  Copy, read aloud and export wait until the answer is written, whether it is shown
+    while it streams or written in the background.
+*/
 function assistantElement(c, m, index, last) {
-  const live = m === liveTurn;
+  const live = liveMessage(c, m);
   const el = h('div', { class: 'message assistant' + (last ? ' last' : '') + (live ? ' live' : '') });
+  el.dataset.id = m.id || '';
   const bubble = h('div', { class: 'bubble' });
   el.append(bubble);
   fillAssistant(bubble, m, live);
@@ -2964,18 +3172,23 @@ function stepHtml(s, live) {
   return html;
 }
 
-// What a step shows, to tell whether it must be drawn again while the answer is written.
+// What a step shows, to tell whether it must be drawn again.
 function stepKey(s, active) {
-  const calls = (s.toolCalls || []).map((tc) => [tc.status, tc.ok, (tc.arguments || '').length,
-    tc.result == null ? -1 : tc.result.length, tc.ms || 0, !!tc.file]);
+  const calls = (s.toolCalls || []).map(toolKey);
   return JSON.stringify([active, (s.reasoning || '').length, (s.content || '').length, calls]);
+}
+
+// What a tool call shows, to tell whether it must be drawn again.
+function toolKey(tc) {
+  return JSON.stringify([tc.status, tc.ok, (tc.arguments || '').length, tc.result == null ? -1 : tc.result.length,
+    tc.ms || 0, !!tc.file]);
 }
 
 function stepElement(s, active, firstTool) {
   const el = h('div', { class: 'step' });
   if (s.reasoning) el.append(thinkingElement(s, active && !s.content && !(s.toolCalls || []).length));
   if (s.content) {
-    const md = h('div', { class: 'md' + (active ? ' cursor-host' : ''), html: stepHtml(s, active) });
+    const md = h('div', { class: 'md', html: stepHtml(s, active) });
     attachCodeButtons(md, t('copy'));
     el.append(md);
   }
@@ -2984,29 +3197,161 @@ function stepElement(s, active, firstTool) {
 }
 
 /*
+    The step of an answer being written, drawn in place.  el is the element the previous drawing made, or null.  The
+    reasoning receives the text that came since then, the text of the answer its new blocks (liveMarkdown), and a
+    tool call is drawn again when its state changes, so that a drawing costs the new tokens only, whatever the length
+    of the answer.  Returns the element of the step.
+*/
+function liveStep(el, s, firstTool) {
+  if (!el || !el.live) {
+    el = h('div', { class: 'step' });
+    el.live = { thinking: null, thinkingLive: false, label: null, text: null, shown: 0, md: null, cut: 0, tail: null,
+      tailText: null, calls: [] };
+  }
+  const st = el.live;
+  const calls = s.toolCalls || [];
+  if (s.reasoning) {
+    const thinking = !s.content && !calls.length;
+    if (!st.thinking || st.thinkingLive !== thinking) {
+      const d = thinkingElement(s, thinking);
+      if (st.thinking) st.thinking.replaceWith(d);
+      else el.prepend(d);
+      st.thinking = d;
+      st.thinkingLive = thinking;
+      st.label = d.querySelector('summary > .label');
+      st.text = d.querySelector('.thought').firstChild;
+      st.shown = s.reasoning.length;
+    } else {
+      if (s.reasoning.length > st.shown) {
+        st.text.appendData(s.reasoning.slice(st.shown));
+        st.shown = s.reasoning.length;
+      }
+      if (thinking) st.label.textContent = thinkingLabel(s);
+    }
+  }
+  if (s.content) {
+    if (!st.md) {
+      st.md = h('div', { class: 'md' });
+      el.insertBefore(st.md, st.calls.length ? st.calls[0].el : null);
+    }
+    liveMarkdown(st, s.content);
+  }
+  calls.forEach((tc, j) => {
+    const key = toolKey(tc);
+    const old = st.calls[j];
+    if (old && old.key === key) return;
+    const wrap = toolElement(tc, firstTool + j + 1);
+    if (old) old.el.replaceWith(wrap);
+    else el.append(wrap);
+    st.calls[j] = { key, el: wrap };
+  });
+  return el;
+}
+
+/*
+    The text of the step being written, drawn by blocks in st.md: the part that later tokens no longer change
+    (settledEnd) is drawn once, block after block, and the rest, the block being written, is drawn again when it
+    changes.  The answer once written is drawn whole again, from its whole text.
+*/
+function liveMarkdown(st, text) {
+  const cut = settledEnd(text, st.cut);
+  if (cut > st.cut) {
+    const block = h('div', { class: 'md-block', html: renderMarkdown(text.slice(st.cut, cut), true) });
+    attachCodeButtons(block, t('copy'));
+    st.md.insertBefore(block, st.tail);
+    st.cut = cut;
+  }
+  const rest = text.slice(st.cut);
+  if (rest === st.tailText) return;
+  if (!st.tail) {
+    st.tail = h('div', { class: 'md-block' });
+    st.md.append(st.tail);
+  }
+  st.tail.innerHTML = renderMarkdown(rest, true);
+  attachCodeButtons(st.tail, t('copy'));
+  st.tailText = rest;
+}
+
+/*
+    The end of the part of a text being written that later tokens no longer change: the start of the last line,
+    after from, that follows a blank line and begins at the margin, outside a code block and outside a formula
+    between $$ or \[ \].  A line that begins with a space may continue a list item, and stays with what follows.
+    Returns from when there is no such line.  The text before from ends outside a code block and a formula.
+*/
+function settledEnd(text, from) {
+  let end = from;
+  let fence = '';
+  let math = false;
+  let blank = false;
+  for (let at = from; at < text.length;) {
+    const nl = text.indexOf('\n', at);
+    const line = text.slice(at, nl < 0 ? text.length : nl);
+    if (!fence && !math && blank && /^\S/.test(line)) end = at;
+    // The last line, not ended yet, only tells where a block starts.
+    if (nl < 0) break;
+    if (fence) {
+      const close = /^\s*(`{3,}|~{3,})\s*$/.exec(line);
+      if (close && close[1][0] === fence[0] && close[1].length >= fence.length) fence = '';
+      blank = false;
+    } else {
+      const open = /^\s*(`{3,}|~{3,})/.exec(line);
+      if (open) {
+        fence = open[1];
+      } else if (((line.match(/\$\$/g) || []).length + (line.match(/\\\[|\\\]/g) || []).length) % 2) {
+        math = !math;
+      }
+      blank = !open && /^\s*$/.test(line);
+    }
+    at = nl + 1;
+  }
+  return end;
+}
+
+/*
     Fills the body of an answer: per step, its reasoning, its text and its tool calls, then the
     notes on its state.  While the answer is written, the steps already drawn that did not change
-    stay as they are, and only the step being written is drawn again.
+    stay as they are, the step being written is drawn in place (liveStep), and the notes change
+    only when what they say changes.
 */
 function fillAssistant(bubble, m, live) {
   const steps = m.steps || [];
   const drawn = Array.from(bubble.children).filter((x) => x.classList.contains('step'));
-  for (const x of Array.from(bubble.children)) if (!x.classList.contains('step')) x.remove();
+  // The steps come before the notes.
+  const place = (el) => bubble.insertBefore(el, bubble.querySelector(':scope > :not(.step)'));
   let tools = 0;
   steps.forEach((s, k) => {
     const active = live && k === steps.length - 1;
-    const key = stepKey(s, active);
     const first = tools;
     tools += (s.toolCalls || []).length;
-    const old = drawn[k];
-    if (old && old.dataset.key === key) return;
-    const el = stepElement(s, active, first);
+    const old = drawn[k] || null;
+    if (active) {
+      const el = liveStep(old, s, first);
+      if (el !== old) {
+        if (old) old.replaceWith(el);
+        else place(el);
+      }
+      return;
+    }
+    const key = stepKey(s, false);
+    if (old && !old.live && old.dataset.key === key) return;
+    const el = stepElement(s, false, first);
     el.dataset.key = key;
     if (old) old.replaceWith(el);
-    else bubble.append(el);
+    else place(el);
   });
   for (let k = steps.length; k < drawn.length; ++k) drawn[k].remove();
-  const note = (...children) => bubble.append(h('div', { class: 'progress-line' }, ...children));
+  const notes = noteElements(m, live, steps);
+  const key = notes.map((x) => x.outerHTML).join('');
+  if (bubble.notesKey === key) return;
+  for (const x of Array.from(bubble.children)) if (!x.classList.contains('step')) x.remove();
+  bubble.append(...notes);
+  bubble.notesKey = key;
+}
+
+// The notes on the state of an answer, under its steps.
+function noteElements(m, live, steps) {
+  const out = [];
+  const note = (...children) => out.push(h('div', { class: 'progress-line' }, ...children));
   if (live && m.progress && m.progress.prompt_total > 256 && m.progress.prompt_done < m.progress.prompt_total) {
     const pct = Math.floor(100 * m.progress.prompt_done / m.progress.prompt_total);
     note(h('span', { class: 'spinner' }), t('readingContext', { p: pct }),
@@ -3021,24 +3366,33 @@ function fillAssistant(bubble, m, live) {
   if (m.compacted) note(h('span', { html: icon('info') }), t('contextCompacted'));
   else if (m.trimmed) note(h('span', { html: icon('info') }), t('contextTrimmed'));
   if (m.imagesNamed) note(h('span', { html: icon('image') }), t('imagesNamed', { model: modelName(m.model) }));
-  if (m.error) bubble.append(h('div', { class: 'error-box' }, t('errorPrefix', { message: m.error })));
+  if (m.error) out.push(h('div', { class: 'error-box' }, t('errorPrefix', { message: m.error })));
   if (m.cancelled) note(t('cancelled'));
   if (!live && !m.error && !m.cancelled && !steps.some((s) => s.content || (s.toolCalls || []).length)) {
     note(t('emptyAnswer'));
   }
   if (m.agentLimit) note(t('agentLimit', { n: maxAgentSteps }));
+  return out;
+}
+
+// The label of a reasoning being written, with the time it has taken.
+function thinkingLabel(s) {
+  return t('thinking') + '…' + (s.reasoningStart ? ' ' + formatDuration(Date.now() - s.reasoningStart) : '');
 }
 
 function thinkingElement(s, live) {
   const d = h('details', { class: 'thinking' + (live ? ' live' : '') });
   // Closed, while the model thinks and afterwards: the user opens it, and it then stays as
   // the user left it.
-  const open = !!s.expanded;
-  if (open) d.open = true;
-  d.addEventListener('toggle', () => { if (d.open !== open) s.expanded = d.open; });
+  if (s.expanded) d.open = true;
+  d.addEventListener('toggle', () => { s.expanded = d.open; });
   let label;
-  if (live) label = h('span', { class: 'shimmer' }, t('thinking') + '…' + (s.reasoningStart ? ' ' + formatDuration(Date.now() - s.reasoningStart) : ''));
-  else label = h('span', null, s.reasoningMs ? t('thoughtFor', { s: formatDuration(s.reasoningMs) }) : t('thoughtBriefly'));
+  if (live) {
+    label = h('span', { class: 'label shimmer' }, thinkingLabel(s));
+  } else {
+    label = h('span', { class: 'label' },
+      s.reasoningMs ? t('thoughtFor', { s: formatDuration(s.reasoningMs) }) : t('thoughtBriefly'));
+  }
   d.append(h('summary', null, h('span', { html: icon('spark', 'spark') }), label, h('span', { html: icon('chevron', 'chev') })),
     h('div', { class: 'thought' }, s.reasoning));
   return d;
@@ -3046,7 +3400,8 @@ function thinkingElement(s, live) {
 
 const toolIcons = {
   calculator: 'calc', run_javascript: 'terminal', search_documents: 'search', document_outline: 'archive',
-  read_document: 'book', search_discussions: 'history', current_datetime: 'clock', create_file: 'file'
+  read_document: 'book', search_discussions: 'history', current_datetime: 'clock', create_file: 'file',
+  web_search: 'globe', fetch_page: 'link'
 };
 
 // The name of a tool in the language of the interface, its own name for a tool without one.
@@ -3073,8 +3428,9 @@ function toolBrief(tc) {
       const lines = text(a.code).trim().split('\n');
       return lines[0] + (lines.length > 1 ? ' …' : '');
     }
-    case 'search_documents': case 'search_discussions': return quoted(a.query);
+    case 'search_documents': case 'search_discussions': case 'web_search': return quoted(a.query);
     case 'read_document': return [a.name, a.part].filter(Boolean).map(text).join(' · ');
+    case 'fetch_page': return [a.url, a.start].filter(Boolean).map(text).join(' · ');
     case 'document_outline': case 'create_file': return text(a.name);
     default: return Object.values(a).map(text).join(', ').slice(0, 160);
   }
@@ -3090,9 +3446,27 @@ function toolState(tc) {
 }
 
 /*
-    A tool call of the agent, with its number in the answer, the name of the tool in the language
-    of the interface, the words of its arguments, a short result on the same line, its state and
-    its duration.  Unfolded, it shows its arguments and its whole result.
+    The words of a call of fetch_page that read its page (tc.web), which the rule of the addresses allowed: the address
+    as a link that opens in a new tab without the page of Albireo as its opener or referrer, then the start of the part
+    read.  null for the other calls, whose words are text.
+*/
+function pageBrief(tc) {
+  const url = tc.name === 'fetch_page' && tc.web ? web.addressKey(tc.web.url) : '';
+  if (!url) return null;
+  let start = 0;
+  try {
+    start = parseInt(JSON.parse(tc.arguments || '{}').start, 10) || 0;
+  } catch (e) {
+    start = 0;
+  }
+  return [h('a', { href: url, target: '_blank', rel: 'noopener noreferrer', title: url }, url),
+    start > 0 ? ' · ' + start : null];
+}
+
+/*
+    A tool call of the agent or of the web, with its number in the answer, the name of the tool in
+    the language of the interface, the words of its arguments, a short result on the same line, its
+    state and its duration.  Unfolded, it shows its arguments and its whole result.
 */
 function toolElement(tc, number) {
   const st = toolState(tc);
@@ -3100,7 +3474,7 @@ function toolElement(tc, number) {
   const open = !!tc.open;
   if (open) d.open = true;
   d.addEventListener('toggle', () => { if (d.open !== open) tc.open = d.open; });
-  const brief = toolBrief(tc);
+  const brief = pageBrief(tc) || toolBrief(tc);
   // The value of a result of the interpreter shows without its arrow.
   const result = tc.result == null ? '' : String(tc.result).trim().replace(/^=> /, '');
   // A result of one short line shows on the line of the call.
@@ -3141,8 +3515,16 @@ function renderComposerState() {
   ui.agentButton.classList.toggle('on', agent);
   ui.agentButton.setAttribute('aria-pressed', String(agent));
   ui.agentButton.disabled = !caps.tools;
-  // With the agent on, the tools it may call show under the prompt.
-  ui.agentTools.classList.toggle('hidden', !agent);
+  // The Web button is off and disabled, with the reason as its title, while the model calls no tool or the service
+  // gives no web access.
+  const reason = webUnavailable(caps);
+  const webOn = !!(c && c.web && !reason);
+  ui.webButton.classList.toggle('on', webOn);
+  ui.webButton.setAttribute('aria-pressed', String(webOn));
+  ui.webButton.disabled = !!reason;
+  ui.webButton.title = reason || t('webHint');
+  // The tools the next question gives the model show under the prompt.
+  renderToolChips(c ? toolSet(c, caps).definitions : null, agent);
   // The attachments the model of the function reads, the images while the context has places for them.
   const role = c ? c.role : 'general';
   const room = imageRoom(c);
@@ -3153,11 +3535,13 @@ function renderComposerState() {
     ui.attachButton.title = hint;
     ui.attachButton.setAttribute('aria-label', hint);
   }
-  // A discussion another tab is answering takes its next question once that answer is written.
-  const elsewhere = !state.busy && answeredElsewhere(c);
-  ui.sendButton.classList.toggle('stop', state.busy);
-  ui.sendButton.innerHTML = icon(state.busy ? 'stop' : 'send');
-  ui.sendButton.title = state.busy ? t('stop') : elsewhere ? t('busyElsewhere') : t('send');
+  // A discussion another tab is answering takes its next question once that answer is written; the answer this tab
+  // writes in the discussion shown can be stopped.
+  const busy = busyHere();
+  const elsewhere = !busy && answeredElsewhere(c);
+  ui.sendButton.classList.toggle('stop', busy);
+  ui.sendButton.innerHTML = icon(busy ? 'stop' : 'send');
+  ui.sendButton.title = busy ? t('stop') : elsewhere ? t('busyElsewhere') : t('send');
   ui.sendButton.setAttribute('aria-label', ui.sendButton.title);
   ui.sendButton.disabled = sendDisabled();
   const p = c && c.projectId ? projectById(c.projectId) : null;
@@ -3165,11 +3549,30 @@ function renderComposerState() {
   // The images waiting, then the documents; the images show how many the context holds with them.
   const pictures = state.pending.filter((a) => a.kind === 'image');
   const count = pictures.length ? maxContextImages - room : 0;
-  ui.pendingBox.replaceChildren(...pictures.map((a) => imageThumb(a, { list: pictures, onremove: () => removePending(a) })),
-    ...state.pending.filter((a) => a.kind !== 'image').map((a) => attachmentChip(a, true, () => removePending(a))),
+  fill(ui.pendingBox, pictures.map((a) => imageThumb(a, { list: pictures, onremove: () => removePending(a) })),
+    state.pending.filter((a) => a.kind !== 'image').map((a) => attachmentChip(a, true, () => removePending(a))),
     pictures.length ? h('span', { class: 'image-count', title: t('imageCountTitle', { n: count, max: maxContextImages }) },
       count + ' / ' + maxContextImages) : null);
   ui.pendingBox.classList.toggle('hidden', !state.pending.length);
+}
+
+/*
+    The tools the next question gives the model, as chips under the prompt, under the label of the agent while it is
+    on and under the one of the web otherwise, hidden without tools.  The chips are drawn again only when their list
+    changes, so that a chip keeps the focus.
+*/
+function renderToolChips(definitions, agent) {
+  const names = (definitions || []).map((d) => d.function.name);
+  ui.agentTools.classList.toggle('hidden', !names.length);
+  const key = (agent ? 'agent:' : 'web:') + names.join(',');
+  if (ui.agentTools.dataset.tools === key) return;
+  ui.agentTools.dataset.tools = key;
+  const label = t(agent ? 'agentTools' : 'webTools');
+  ui.agentTools.setAttribute('aria-label', label);
+  fill(ui.agentTools, h('span', { class: 'label' }, label), names.map((name) => h('span', {
+    class: 'tool-chip', role: 'listitem', tabindex: '0', title: t('toolHint_' + name),
+    html: icon(toolIcons[name] || 'tool') + '<span>' + escapeHtml(toolLabel(name)) + '</span>'
+  })));
 }
 
 // Takes an attachment out of the composer; the places of an image go back to the context.
@@ -3186,7 +3589,7 @@ function removePending(a) {
     the discussion.  While this tab answers, the button stops the answer.
 */
 function sendDisabled() {
-  if (state.busy) return false;
+  if (busyHere()) return false;
   if (answeredElsewhere(state.current)) return true;
   return !ui.input.value.trim() && !state.pending.length;
 }
@@ -3222,12 +3625,45 @@ async function addPending(files) {
   lockThread();
 }
 
-function stopGeneration() {
-  if (state.abort) state.abort.abort();
+/*
+    The answers this tab is writing, one per discussion at most: discussion id -> {c, abort, turn, answering,
+    compaction}.  An answer goes on while another discussion is shown, written into its own discussion, which is
+    saved as usual and which the other tabs follow; the discussion shown draws the answer it holds.  answering tells
+    that the model has started to answer, and compaction holds a compression of the exchanges that ended since then,
+    applied once the answer ends, or when a step of the agent no longer fits without it (fitContext).
+*/
+const generations = new Map();
+// The discussions whose answer ended while another one was shown, marked in the side panel until they are opened.
+const unread = new Set();
+
+// The answer this tab writes in the discussion c, or null.
+function generationOf(c) {
+  return (c && generations.get(c.id)) || null;
+}
+
+// True when this tab writes an answer in the discussion shown.
+function busyHere() {
+  return !!generationOf(state.current);
+}
+
+// True when m is the answer this tab writes in the discussion c.
+function liveMessage(c, m) {
+  const g = generationOf(c);
+  return !!g && g.turn === m;
+}
+
+// Stops the answer this tab writes in the discussion id, the one shown when id is not given.
+function stopGeneration(id) {
+  const g = generations.get(id == null ? state.current && state.current.id : id);
+  if (g) g.abort.abort();
+}
+
+function stopAllGenerations() {
+  for (const g of generations.values()) g.abort.abort();
 }
 
 async function onSend() {
-  if (state.busy) { stopGeneration(); return; }
+  if (busyHere()) { stopGeneration(); return; }
   if (sendDisabled()) return;
   // The images keep to the places of the context, which another tab may have taken meanwhile.
   const pictures = state.pending.filter((a) => a.kind === 'image');
@@ -3245,31 +3681,55 @@ async function onSend() {
 }
 
 /*
-    Starts an answer in the discussion c.  The composer offers to stop it, the buttons that change
-    the discussion wait, the other tabs know it, and the questions wait for its end.  Returns the
-    controller that stops it.
+    Starts an answer in the discussion c.  While c is shown, the composer offers to stop it and the
+    buttons that change the discussion wait; the side panel marks it, the other tabs know it, and the
+    questions of c wait for its end.  Returns the controller that stops it.
 */
 function beginTurn(c) {
-  state.busy = true;
-  state.busyId = c.id;
-  state.abort = new AbortController();
+  const g = { c, abort: new AbortController(), turn: null, answering: false, compaction: null };
+  generations.set(c.id, g);
+  // The question reads the beginning itself: a warm-up of it stops, and the engine keeps what it read.
+  cancelWarmup(c.id);
   announceBusy(c, true);
+  unread.delete(c.id);
   renderComposerState();
   lockThread();
-  return state.abort;
+  if (ui.sideScroll) renderSidebar();
+  return g.abort;
 }
 
 // A new answer of the discussion c, drawn live from now on.
 function newTurn(c) {
   const turn = { id: store.uid(), role: 'assistant', steps: [], created: Date.now(), model: roleModel(c.role) || '' };
   c.messages.push(turn);
-  liveTurn = turn;
+  const g = generations.get(c.id);
+  if (g) g.turn = turn;
   return turn;
+}
+
+// The day of the computer, "2026-11-01".
+function today() {
+  return new Date().toLocaleDateString('en-CA');
+}
+
+// A day as the model receives it, in English as the rest of the instructions: "2026-11-01 (Sunday)".
+function dayText(day) {
+  const at = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(day || ''));
+  if (!at) return String(day || '');
+  const weekday = new Intl.DateTimeFormat('en-US', { weekday: 'long', timeZone: 'UTC' })
+    .format(new Date(Date.UTC(Number(at[1]), Number(at[2]) - 1, Number(at[3]))));
+  return day + ' (' + weekday + ')';
+}
+
+// The last day the model of c was given: the one of the latest question that carries one, else the one of c.
+function lastDay(c) {
+  for (let i = c.messages.length - 1; i >= 0; --i) if (c.messages[i].day) return c.messages[i].day;
+  return c.day || '';
 }
 
 async function sendMessage(text, attachments) {
   const c = state.current;
-  if (state.busy || answeredElsewhere(c)) return;
+  if (generations.has(c.id) || answeredElsewhere(c)) return;
   const abort = beginTurn(c);
   const all = attachments || [];
   const m = {
@@ -3279,6 +3739,14 @@ async function sendMessage(text, attachments) {
   if (pictures.length) m.images = pictures;
   // The update of the memory gives way to the question, and comes back once the user is quiet.
   if (memoryAbort) memoryAbort.abort();
+  /*
+      The system message of a discussion keeps the day it started, so that the prompt of each question keeps the
+      same beginning, which the engine reads once; a question asked on a later day carries the day it is asked, at
+      its own place in the prompt.
+  */
+  const day = today();
+  if (!c.day) c.day = day;
+  else if (day !== lastDay(c)) m.day = day;
   c.messages.push(m);
   // A new discussion starts with the memory as it is now.
   if (c.messages.length === 1 && !c.incognito && state.settings.memoryEnabled && state.settings.memory) {
@@ -3318,14 +3786,17 @@ async function sendMessage(text, attachments) {
 }
 
 async function regenerate(c) {
-  if (state.busy || answeredElsewhere(c)) return;
+  if (generations.has(c.id) || answeredElsewhere(c)) return;
   const removed = [];
   while (c.messages.length && c.messages[c.messages.length - 1].role === 'assistant') removed.unshift(c.messages.pop());
   // The reading aloud of an answer that leaves ends with it: the new answer is drawn in the place of the old one.
   stopReadingOf(c, removed, c.messages.length);
   if (!c.messages.length) return;
   const abort = beginTurn(c);
-  await runTurn(c, abort, newTurn(c));
+  const turn = newTurn(c);
+  // The new answer takes the place of the old one in the thread, its buttons waiting until it is written.
+  if (state.current === c) renderMain();
+  await runTurn(c, abort, turn);
 }
 
 // How the model reads the documents of a question: whole while they fit in their share of the
@@ -3430,11 +3901,16 @@ function documentsOf(c) {
   return docs;
 }
 
-// The system message of a discussion; agent tells whether the tools come with the question.
-function systemPrompt(c, contextTokens, agent) {
+/*
+    The system message of a discussion; set, from toolSet(), tells which tools come with the question, and their
+    instructions close the message, those of the agent, then those of the web.  It holds what stays the same from one
+    question to the next, so that the engine reads it once: the day the discussion started, in English whatever the
+    language of the interface, and the memory as it was then.
+*/
+function systemPrompt(c, contextTokens, set) {
+  const agent = !!(set && set.agent);
   const parts = [];
-  const now = new Date();
-  parts.push('Current date: ' + now.toLocaleDateString('en-CA') + ' (' + now.toLocaleDateString(language(), { weekday: 'long' }) + ').');
+  parts.push('Current date: ' + dayText(c.day || today()) + '.');
   if (state.settings.userName) parts.push('The user is named ' + state.settings.userName + '.');
   if (state.settings.systemPrompt) parts.push(state.settings.systemPrompt);
   // The memory as it was when the discussion started: its prompt keeps the same beginning.
@@ -3466,16 +3942,20 @@ function systemPrompt(c, contextTokens, agent) {
     }
   }
   if (agent) parts.push(tools.agentInstructions);
+  if (set && set.web) parts.push(web.instructions(set.search));
   return parts.join('\n\n');
 }
 
-// The text of a question for the model; cuts (fitContext) shortens the oldest texts.
+/*
+    The text of a question for the model, with the day it was asked when it differs from the day the model knew
+    before it; cuts (fitContext) shortens the oldest texts.
+*/
 function userContent(m, cuts) {
   const cut = (key, text) => {
     const kept = cuts && cuts.texts.get(key);
     return kept == null ? text : keepEnd(text, kept);
   };
-  let s = '';
+  let s = m.day ? 'Current date: ' + dayText(m.day) + '.\n\n' : '';
   for (const a of m.attachments || []) {
     if (a.mode === 'search') {
       s += '<document name="' + a.name + '" format="' + (a.format || '') + '">\n(Too long to be read whole: its excerpts '
@@ -3783,13 +4263,25 @@ function applyCompaction(c, r) {
   c.contextStart = r.to;
 }
 
-// The discussion as it is now, for the work that ends in the background: the one shown, else
-// the one stored.  Null when it was deleted.
+/*
+    The discussion as it is now, for the work that ends in the background: the one this tab is answering, shown or
+    not, else the one shown, else the one stored.  Null when it was deleted.
+*/
 async function currentVersion(c) {
   if (deleted.has(c.id)) return null;
+  const g = generations.get(c.id);
+  if (g) return g.c;
   if (state.current && state.current.id === c.id) return state.current;
   if (c.incognito) return c;
   return (await store.getConversation(c.id)) || null;
+}
+
+// Gives a compression of the exchanges to the discussion c, when the exchanges it compressed are still those of c.
+function settleCompaction(c, r) {
+  const last = c.messages[r.to - 1];
+  if (!last || last.id !== r.last || (c.contextStart || 0) > r.to) return false;
+  applyCompaction(c, r);
+  return true;
 }
 
 /*
@@ -3823,12 +4315,11 @@ function untilDone(promise, signal) {
 }
 
 /*
-    The start of a discussion that leaves to the exchanges after it keptShare of the room of
-    the context: the first question after the current start for which the conversation built
-    by build fits, its tokens given by estimate, the last question at most.  Returns -1 when no
-    question can leave.
+    The start of a discussion that brings the conversation built by build to target tokens at most, its tokens given
+    by estimate: the first question after the current start for which it fits, the last question at most.  Returns
+    -1 when no question can leave.
 */
-function nextStart(c, build, estimate, room) {
+function nextStart(c, build, estimate, target) {
   const from = c.contextStart || 0;
   const users = [];
   for (let i = from + 1; i < c.messages.length; ++i) if (c.messages[i].role === 'user') users.push(i);
@@ -3841,7 +4332,7 @@ function nextStart(c, build, estimate, room) {
   let next = candidates[candidates.length - 1];
   for (const i of candidates) {
     c.contextStart = i;
-    if (estimate(build()) <= keptShare * room) {
+    if (estimate(build()) <= target) {
       next = i;
       break;
     }
@@ -3851,11 +4342,19 @@ function nextStart(c, build, estimate, room) {
 }
 
 /*
+    The tokens a conversation keeps once its oldest exchanges left: the system message and the tools (fixed), and
+    keptShare of the room they leave to the exchanges.
+*/
+function keptTokens(fixed, room) {
+  return fixed + keptShare * Math.max(0, room - fixed);
+}
+
+/*
     Fits the conversation in the context of the model.  When it no longer fits, the oldest
-    exchanges leave in one step, until the conversation takes keptShare of its room, and
-    the point where it now starts stays with the conversation: the following questions
-    start from that same point, so that the engine reuses what it already read, and the
-    next cut comes only after several questions.  The exchanges that leave are compressed
+    exchanges leave in one step, until they take keptShare of the room the system message and
+    the tools leave them, and the point where it now starts stays with the conversation: the
+    following questions start from that same point, so that the engine reuses what it already
+    read, and the next cut comes only after several questions.  The exchanges that leave are compressed
     into the summary of the discussion, which the model receives with the first question
     that stays (compact); the exchanges leave without it when the model cannot write it.
     When the last question alone does not fit, the oldest texts lose their beginnings,
@@ -3865,8 +4364,9 @@ function nextStart(c, build, estimate, room) {
     {messages, trimmed, compacted, context, tokens}.
 
     A compression the background started after an earlier answer (compactLater) is waited for
-    only when the conversation does not fit without it; a summary being written again after a
-    deletion (rewriteSummary) is waited for in every case.  signal ends these waits too.
+    only when the conversation does not fit without it, and one that ended while the answer was
+    written (generations) applies then; a summary being written again after a deletion
+    (rewriteSummary) is waited for in every case.  signal ends these waits too.
 */
 async function fitContext(c, build, toolDefs, reserve, signal, onCompact, model) {
   let trimmed = false;
@@ -3894,20 +4394,34 @@ async function fitContext(c, build, toolDefs, reserve, signal, onCompact, model)
     if (!r || typeof r.tokens !== 'number' || !r.context) return { messages: list, trimmed, compacted, context: 0 };
     const room = r.context - Math.min(reserve, Math.floor(r.context / 2));
     if (r.tokens <= room) return { messages: list, trimmed, compacted, context: r.context, tokens: r.tokens };
-    // The conversation does not fit: the compression in progress moves its start, and it is measured again.
+    // The conversation does not fit: the compression that ended or is in progress moves its start, and it is
+    // measured again.
+    const g = generations.get(c.id);
+    if (g && g.compaction) {
+      const done = g.compaction;
+      g.compaction = null;
+      if (settleCompaction(c, done)) {
+        compacted = true;
+        continue;
+      }
+    }
     const job = compactions.get(c.id);
     if (job && !waited.has(job)) {
       await wait(job);
       continue;
     }
     // The tokens of a list of messages: its images by their tokens, its texts from their characters scaled to the
-    // measure.
+    // measure.  The system message and the tools are measured apart, as they stay.
     const estimate = tokenEstimate(list, r.tokens, counted);
     const scale = estimate.scale;
-    const next = nextStart(c, () => build(cuts), estimate.of, room);
+    const base = await api.count(counted, list.slice(0, 1), toolDefs).catch(() => null);
+    if (signal && signal.aborted) throw new DOMException('The answer was stopped.', 'AbortError');
+    const fixed = base && typeof base.tokens === 'number' ? base.tokens : estimate.of(list.slice(0, 1));
+    const next = nextStart(c, () => build(cuts), estimate.of, keptTokens(fixed, room));
     if (next > (c.contextStart || 0)) {
       try {
         if (onCompact) onCompact();
+        cancelWarmup(c.id);
         applyCompaction(c, await compact(c, c.contextStart || 0, next, room, scale, signal));
         compacted = true;
       } catch (e) {
@@ -3955,13 +4469,11 @@ function shortenOldest(c, cuts, excess) {
   return excess <= 0;
 }
 
-// The answer being written, drawn live.
-let liveTurn = null;
-
 /*
-    The answer in progress is drawn again in the next frame, while its discussion is the one
-    shown, at most once every renderInterval milliseconds, and less often when a drawing takes
-    long, so that a long answer leaves the page responsive.
+    The answer being written in the discussion shown is drawn again in the next frame, at most once
+    every renderInterval milliseconds, and less often when a drawing takes long, so that a long
+    answer leaves the page responsive.  An answer written in the background is drawn whole when its
+    discussion is shown again.
 */
 const renderInterval = 100;
 let renderSpacing = renderInterval;
@@ -3969,22 +4481,15 @@ let renderTimer = 0;
 let renderFrame = 0;
 let renderedAt = 0;
 
-function scheduleRender(c, m) {
-  if (renderTimer || renderFrame) return;
+function scheduleRender(c) {
+  if (state.view !== 'chat' || state.current !== c || renderTimer || renderFrame) return;
   const draw = () => {
     renderFrame = 0;
+    const g = generationOf(state.current);
+    if (!g || !g.turn) return;
     const t0 = performance.now();
     renderedAt = t0;
-    const el = answerElement(c, m);
-    if (!el) return;
-    const bubble = el.querySelector('.bubble');
-    const thought = bubble.querySelector('.thinking.live .thought');
-    const keepScroll = thought ? thought.scrollHeight - thought.scrollTop - thought.clientHeight < 40 : true;
-    const top = thought ? thought.scrollTop : 0;
-    fillAssistant(bubble, m, true);
-    const t2 = bubble.querySelector('.thinking.live .thought');
-    if (t2) t2.scrollTop = keepScroll ? t2.scrollHeight : top;
-    scrollToEnd(false);
+    drawLive(g.c, g.turn);
     renderSpacing = Math.min(1000, Math.max(renderInterval, 4 * (performance.now() - t0)));
   };
   const wait = renderSpacing - (performance.now() - renderedAt);
@@ -3996,6 +4501,22 @@ function scheduleRender(c, m) {
   } else {
     renderFrame = requestAnimationFrame(draw);
   }
+}
+
+/*
+    Draws the answer m of c being written, while c is shown.  The positions of the scrolls are read
+    before the drawing changes the page and written after it, so that the page is laid out once.
+*/
+function drawLive(c, m) {
+  const el = answerElement(c, m);
+  if (!el) return;
+  const bubble = el.querySelector('.bubble');
+  const thought = bubble.querySelector('.thinking.live .thought');
+  const follow = !thought || thought.scrollHeight - thought.scrollTop - thought.clientHeight < 40;
+  fillAssistant(bubble, m, true);
+  const now = bubble.querySelector('.thinking.live .thought');
+  if (now && follow) now.scrollTop = now.scrollHeight;
+  scrollToEnd(false);
 }
 
 // Drops the drawing scheduleRender planned, once the answer is drawn whole.
@@ -4011,14 +4532,17 @@ function answerElement(c, m) {
   if (state.view !== 'chat' || state.current !== c || !ui.thread || !ui.thread.isConnected) return null;
   const index = c.messages.indexOf(m);
   const el = index >= 0 ? ui.thread.children[index] : null;
-  return el && el.dataset.index === String(index) ? el : null;
+  return el && el.dataset.index === String(index) && el.dataset.id === String(m.id || '') ? el : null;
 }
 
 /*
     Answers the last question of c; abort, from beginTurn, stops the answer.  The answer is
-    drawn while c is the discussion shown, and saved with it at its end.
+    drawn while c is the discussion shown, goes on in the background while another one is
+    shown, and is saved with c at its end; an answer that ends while c is not shown marks c in
+    the side panel until it is opened.
 */
 async function runTurn(c, abort, turn) {
+  const g = generationOf(c);
   // The function, the reasoning and the agent of the answer stay those of its start.
   const role = c.role;
   const model = roleModel(role);
@@ -4026,11 +4550,15 @@ async function runTurn(c, abort, turn) {
   const signal = abort.signal;
   const caps = roleCapabilities(role);
   const reasoning = !!(c.reasoning && caps.reasoning);
-  const useTools = !!(c.agent && caps.tools);
-  const toolDefs = useTools ? tools.definitions : null;
+  // The tools of the agent and of the web.  The calls of a step run while one of them is on, and a call of a tool
+  // that the answer does not offer is refused.
+  const set = toolSet(c, caps);
+  const toolDefs = set.definitions;
+  const useTools = !!toolDefs;
+  const offered = new Set((toolDefs || []).map((d) => d.function.name));
   try {
     if (state.current === c && !answerElement(c, turn)) renderMain();
-    else scheduleRender(c, turn);
+    else scheduleRender(c);
     if (signal.aborted) throw new DOMException('The answer was stopped.', 'AbortError');
     if (!model) throw new Error(t('noModel'));
     // The images of the context as data URLs for a model that reads them; a model that reads text only receives
@@ -4044,14 +4572,14 @@ async function runTurn(c, abort, turn) {
     for (let step = 0; step < maxAgentSteps; ++step) {
       const s = { reasoning: '', content: '', toolCalls: [] };
       turn.steps.push(s);
-      const system = systemPrompt(c, caps.context || 8192, useTools);
+      const system = systemPrompt(c, caps.context || 8192, set);
       // The conversation, with the steps of this answer already done (the agent's).
       const build = (cuts) => apiMessages(Object.assign({}, c, {
         messages: c.messages.slice(0, -1).concat([Object.assign({}, turn, { steps: turn.steps.slice(0, -1) })])
       }), system, cuts, media);
       const fitted = await fitContext(c, build, toolDefs, state.settings.maxTokens || 2048, signal, () => {
         turn.compacting = true;
-        scheduleRender(c, turn);
+        scheduleRender(c);
       }, 'albireo-' + role);
       turn.compacting = false;
       if (fitted.trimmed) turn.trimmed = true;
@@ -4067,10 +4595,13 @@ async function runTurn(c, abort, turn) {
       if (state.settings.topK != null) body.top_k = state.settings.topK;
       if (state.settings.maxTokens > 0) body.max_tokens = state.settings.maxTokens;
       let finish = null;
+      // A compression of the exchanges that ends from now on waits for the end of the answer, whose steps keep
+      // the beginning of their prompt.
+      if (g) g.answering = true;
       for await (const ev of api.streamChat(body, signal)) {
         if (ev.type === 'progress') {
           turn.progress = ev.data;
-          scheduleRender(c, turn);
+          scheduleRender(c);
           continue;
         }
         const chunk = ev.data;
@@ -4102,7 +4633,7 @@ async function runTurn(c, abort, turn) {
         }
         if (choice.finish_reason) finish = choice.finish_reason;
         turn.progress = null;
-        scheduleRender(c, turn);
+        scheduleRender(c);
       }
       if (s.reasoningStart && !s.reasoningMs) s.reasoningMs = Date.now() - s.reasoningStart;
       delete s.reasoningStart;
@@ -4112,16 +4643,29 @@ async function runTurn(c, abort, turn) {
         if (signal.aborted) throw new DOMException('The answer was stopped.', 'AbortError');
         tc.status = 'running';
         tc.started = Date.now();
-        scheduleRender(c, turn);
-        const r = await tools.run(tc.name, tc.arguments, {
-          documents: documentsOf(c),
-          searchDocuments: (query, limit) => searchDocumentsOf(c, query, limit),
-          searchDiscussions: async (q) => searchConversations(q, 6).filter((x) => x.conversation.id !== c.id).map((x) => ({
-            title: x.conversation.title, date: new Date(x.conversation.updated).toLocaleDateString(), excerpt: x.excerpt
-          })),
-          createFile: (name, content) => ({ name, content }),
-          signal
-        });
+        scheduleRender(c);
+        let r;
+        if (!offered.has(tc.name)) {
+          r = { ok: false, text: 'The tool ' + tc.name + ' is not available in this answer.' };
+        } else if (web.isTool(tc.name)) {
+          // fetch_page reads the addresses of the discussion as it is when the call runs, the results of the
+          // calls of this answer included.
+          r = await web.run(tc.name, tc.arguments, {
+            id: c.id, language: language(), signal, allowed: () => web.allowedAddresses(c)
+          });
+        } else {
+          r = await tools.run(tc.name, tc.arguments, {
+            documents: documentsOf(c),
+            searchDocuments: (query, limit) => searchDocumentsOf(c, query, limit),
+            searchDiscussions: async (q) => searchConversations(q, 6).filter((x) => x.conversation.id !== c.id)
+              .map((x) => ({
+                title: x.conversation.title, date: new Date(x.conversation.updated).toLocaleDateString(),
+                excerpt: x.excerpt
+              })),
+            createFile: (name, content) => ({ name, content }),
+            signal
+          });
+        }
         tc.ms = Date.now() - tc.started;
         delete tc.started;
         // A call the stop of the answer ended keeps what it returned, as stopped.
@@ -4129,8 +4673,10 @@ async function runTurn(c, abort, turn) {
         tc.ok = r.ok;
         tc.result = r.text;
         if (r.file) tc.file = r.file;
+        // The addresses a web tool adds to the discussion, which fetch_page may read from then on.
+        if (r.web) tc.web = r.web;
         delete tc.index;
-        scheduleRender(c, turn);
+        scheduleRender(c);
       }
       if (step === maxAgentSteps - 1) turn.agentLimit = true;
     }
@@ -4138,8 +4684,7 @@ async function runTurn(c, abort, turn) {
     if (e.name === 'AbortError') turn.cancelled = true;
     else turn.error = errorText(e);
   } finally {
-    cancelRender();
-    liveTurn = null;
+    if (state.current === c) cancelRender();
     // The calls an answer stopped or failed before running stay as stopped, without a result.
     for (const s of turn.steps) {
       delete s.reasoningStart;
@@ -4153,12 +4698,16 @@ async function runTurn(c, abort, turn) {
     turn.progress = null;
     turn.compacting = false;
     turn.preparing = false;
-    state.busy = false;
-    state.busyId = null;
-    state.abort = null;
+    if (g && generations.get(c.id) === g) generations.delete(c.id);
+    // A compression of the exchanges that ended while the answer was written applies now.
+    const settled = !!(g && g.compaction && settleCompaction(c, g.compaction));
     announceBusy(c, false);
     c.updated = Date.now();
     await persist(c);
+    if (settled) warmBeginning(c);
+    if (!(state.view === 'chat' && state.current && state.current.id === c.id) && !c.incognito && !deleted.has(c.id)) {
+      unread.add(c.id);
+    }
     if (state.current === c) renderMain();
     else lockThread();
     refreshViews();
@@ -4168,7 +4717,7 @@ async function runTurn(c, abort, turn) {
   // the end of its answer, since the title follows the question.
   if (needsTitle(c)) nameConversation(c);
   if (!turn.error && !turn.cancelled) {
-    compactLater(c, turn);
+    compactLater(c);
     if (!c.incognito) rememberLater();
   }
 }
@@ -4220,19 +4769,21 @@ function memoryLanguage() {
 /*
     The two facts of the example of the delta in each language of the interface, for a message in
     French (in English for an interface in French), so that the example shows a fact in the language
-    of the interface beside the words of the user in their own language.
+    of the interface beside the words of the user in their own language.  A fact is a short sentence
+    whose subject, the user, is left out.
 */
 const memoryExamples = {
-  en: ['Works as a nurse in Lyon', 'Prefers short answers'],
-  fr: ['Travaille comme infirmière à Lyon', 'Préfère les réponses courtes'],
-  de: ['Arbeitet als Krankenpflegerin in Lyon', 'Bevorzugt kurze Antworten'],
-  it: ['Lavora come infermiera a Lione', 'Preferisce risposte brevi'],
-  es: ['Trabaja como enfermera en Lyon', 'Prefiere respuestas cortas']
+  en: ['Works as a nurse in Lyon.', 'Prefers short answers.'],
+  fr: ['Travaille comme infirmière à Lyon.', 'Préfère les réponses courtes.'],
+  de: ['Arbeitet als Krankenpflegerin in Lyon.', 'Bevorzugt kurze Antworten.'],
+  it: ['Lavora come infermiera a Lione.', 'Preferisce risposte brevi.'],
+  es: ['Trabaja como enfermera en Lyon.', 'Prefiere respuestas cortas.']
 };
 
 /*
     The new facts the questions teach, which join the memory, each followed by the words of the user
-    that say it, which the update checks in the questions it read (groundedFacts).
+    that say it, which the update checks in the questions it read (groundedFacts).  The examples show
+    a message with two facts, and a request, which teaches none.
 */
 function memoryDeltaInstructions(words, sensitive) {
   const code = memoryExamples[language()] ? language() : 'en';
@@ -4242,17 +4793,23 @@ function memoryDeltaInstructions(words, sensitive) {
     : 'Je suis infirmière à Lyon et je préfère les réponses courtes. Que veut dire triage ?';
   const [qa, qb] = english ? ['I am a nurse in Lyon', 'I prefer short answers']
     : ['Je suis infirmière à Lyon', 'je préfère les réponses courtes'];
+  const request = english ? 'Write a Python program that computes the integral of x squared between 0 and 1.'
+    : 'Crée un programme Python pour calculer l\'intégrale de x au carré entre 0 et 1.';
   return 'You keep a short memory about the user for the future discussions of an assistant. From the new messages '
     + 'of the user, write the lasting facts about the user that the memory does not hold yet: profession, projects, '
-    + 'preferences, habits of work, the way they want to be answered. A topic the user asks about once teaches '
-    + 'nothing lasting: keep only what the user says about themselves. Leave out what serves one discussion only, '
-    + 'the content of documents, and what the memory already holds, even in other words. ' + sensitiveRule(sensitive)
-    + 'Write each new fact on a line of its own: "- ", the fact in a few words in ' + memoryLanguage() + ', " | ", '
-    + 'then the statement of the user that says it, copied exactly as the user wrote it, in its language, between '
-    + 'double quotes; a question of the user states no fact. A fact the user did not state in so many words is left '
-    + 'out. The facts take at most ' + words + ' words in all. For example, for the message "' + message + '":\n'
+    + 'preferences, habits of work, the way they want to be answered. A fact says who the user is, what the user '
+    + 'does, uses or wants over time, as the user says it about themselves. A request of the user (write, create, '
+    + 'explain, translate or compute something) and the topic of a question are not facts about the user: leave '
+    + 'them out, whatever their words. Leave out what serves one discussion only, the content of documents, and '
+    + 'what the memory already holds, even in other words. ' + sensitiveRule(sensitive)
+    + 'Write each new fact on a line of its own: "- ", the fact as a short sentence in ' + memoryLanguage()
+    + ' about the user, without naming the user, " | ", then the statement of the user that says it, copied '
+    + 'exactly as the user wrote it, in its language, between double quotes; a question or a request of the user '
+    + 'states no fact. A fact the user did not state in so many words is left out. The facts take at most ' + words
+    + ' words in all. For example, for the message "' + message + '":\n'
     + '- ' + a + ' | "' + qa + '"\n'
     + '- ' + b + ' | "' + qb + '"\n'
+    + 'For the message "' + request + '": NONE\n'
     + 'When there is no new fact, answer NONE.';
 }
 
@@ -4266,14 +4823,69 @@ function evidenceText(text) {
 }
 
 /*
+    The first words of the requests in the languages of the interface, folded (fold): the verbs of the frequent
+    requests in the imperative, and the openings of a polite request.  A statement of the user that starts with one
+    of them asks for a task, which says nothing lasting about the user.
+*/
+const requestOpeners = new Set(('write create make build generate compute calculate explain describe give show '
+  + 'list summarize summarise translate convert fix correct rewrite draft compose draw find search tell help '
+  + 'implement add remove check review solve analyze analyse compare prepare design develop optimize optimise '
+  + 'refactor debug sort define recommend suggest propose estimate extract complete simplify improve update please '
+  + 'can could would '
+  + 'ecris ecrivez cree creez fais faites genere generez calcule calculez explique expliquez decris decrivez donne '
+  + 'donnez montre montrez liste listez resume resumez traduis traduisez convertis convertissez corrige corrigez '
+  + 'reecris reecrivez redige redigez dessine dessinez trouve trouvez cherche cherchez dis dites aide aidez '
+  + 'implemente implementez ajoute ajoutez supprime supprimez verifie verifiez resous resolvez analysez comparez '
+  + 'preparez concois concevez developpe developpez optimisez proposez suggere suggerez completez simplifie '
+  + 'simplifiez ameliore ameliorez peux pourrais pouvez pourriez '
+  + 'schreib schreibe erstelle erstellen mach mache generiere berechne berechnen erklar erklare erklaren beschreibe '
+  + 'gib zeig zeige fasse ubersetze ubersetzen konvertiere korrigiere finde suche sag sage hilf implementiere fuge '
+  + 'entferne prufe uberprufe analysiere vergleiche bereite programmiere entwickle optimiere schlage vereinfache '
+  + 'verbessere kannst konntest konnen bitte '
+  + 'scrivi scrivete crea calcola calcolate spiega spiegate descrivi dammi mostra mostrami elenca riassumi traduci '
+  + 'converti correggi riscrivi disegna trova cerca dimmi aiuta aiutami implementa aggiungi rimuovi togli verifica '
+  + 'controlla risolvi analizza confronta prepara progetta sviluppa ottimizza proponi suggerisci completa semplifica '
+  + 'migliora puoi potresti '
+  + 'escribe escriba haz haga genera calcula explica dame muestra enumera traduce traduzca convierte reescribe '
+  + 'redacta dibuja encuentra busca dime ayuda ayudame agrega anade elimina quita comprueba revisa resuelve analiza '
+  + 'compara disena desarrolla optimiza propon sugiere mejora puedes podrias puede podria').split(' '));
+
+// The pronouns that follow an imperative after a hyphen in French ("écris-moi", "donne-le-moi").
+const requestPronouns = new Set(['moi', 'toi', 'nous', 'vous', 'le', 'la', 'les', 'lui', 'leur', 'en', 'y']);
+
+/*
+    True when a clause asks for a task: its first word, after a polite opening, is a request opener, alone, before
+    the pronouns of a French imperative, or before the pronoun an Italian or Spanish imperative takes at its end
+    ("scrivimi", "explícame").
+*/
+function asksForTask(clause) {
+  const words = fold(clause).replace(/[^\p{L}\s'-]+/gu, ' ').trim().split(/\s+/);
+  let k = 0;
+  if ((words[0] === 'por' && words[1] === 'favor') || (words[0] === 'per' && words[1] === 'favore')) k = 2;
+  if (words[0] === 's\'il' && (words[1] === 'te' || words[1] === 'vous')) k = 3;
+  const w = words[k] || '';
+  if (requestOpeners.has(w)) return true;
+  const parts = w.split('-');
+  if (parts.length > 1 && requestOpeners.has(parts[0]) && parts.slice(1).every((x) => requestPronouns.has(x))) {
+    return true;
+  }
+  const enclitic = /^(\p{L}{3,}?)(?:me|mi|ci|ti|te|lo|la|le|los|las|nos|gli)$/u.exec(w);
+  return !!enclitic && requestOpeners.has(enclitic[1]);
+}
+
+/*
     Whether the words of a quote, normalized, appear in the questions read, normalized too, with 3
     words or 12 characters at least within a part of a sentence that asks nothing.  The parts end at
     the marks that end a sentence, at colons and at semicolons, and a part that ends with a question
-    mark supports no fact, as in "One line: what is RAII?".
+    mark supports no fact, as in "One line: what is RAII?".  A quote whose clause starts with a request
+    ("Write a program that...") supports no fact either (asksForTask).
 */
 function statedIn(quote, where) {
   const at = quote ? where.indexOf(quote) : -1;
   if (at < 0) return false;
+  let clause = at;
+  while (clause > 0 && !/[.!?:;,\u2026]/.test(where[clause - 1])) --clause;
+  if (asksForTask(where.slice(clause, at + quote.length))) return false;
   const end = at + quote.length;
   for (const s of where.matchAll(/[^.!?:;\u2026]+[.!?:;\u2026]*/g)) {
     const from = Math.max(at, s.index);
@@ -4289,7 +4901,7 @@ function statedIn(quote, where) {
     The new facts of a delta that the questions read by the update support.  Each line holds a fact,
     " | " and the words of the user that say it, which must lie in a statement of the questions read
     (statedIn).  The words of the user support one fact, and a later fact that cites them again is
-    left out.  The facts keep no quote.  Returns {facts, proposed, discarded}.
+    left out.  The facts keep no quote, and become sentences.  Returns {facts, proposed, discarded}.
 */
 function groundedFacts(text, read, sensitive) {
   const where = evidenceText(read);
@@ -4308,7 +4920,7 @@ function groundedFacts(text, read, sensitive) {
       continue;
     }
     cited.add(quote);
-    facts.push(...memoryLineList('- ' + m[1].trim(), sensitive));
+    facts.push(...memorySentences(sentenceOf(m[1]), sensitive));
   }
   return { facts, proposed, discarded };
 }
@@ -4316,24 +4928,26 @@ function groundedFacts(text, read, sensitive) {
 // The memory rewritten within its size, when the new facts made it outgrow it.
 function memoryCompactInstructions(words, sensitive) {
   return 'You keep a short memory about the user for the future discussions of an assistant. Rewrite it in at most '
-    + words + ' words: merge the lines that say the same thing, keep the most lasting facts, the newest last, each '
-    + 'as a short line that starts with "- ". ' + sensitiveRule(sensitive) + 'Write every line in ' + memoryLanguage()
-    + ', the lines written in another language included.';
+    + words + ' words, as short sentences one after the other in a single paragraph, without a list, a bullet or a '
+    + 'line break: merge the sentences that say the same thing, keep the most lasting facts about the user, the '
+    + 'newest last, and leave out the requests and the tasks of past discussions. ' + sensitiveRule(sensitive)
+    + 'Write every sentence in ' + memoryLanguage() + ', the sentences written in another language included. '
+    + 'Answer with the paragraph alone.';
 }
 
 // The memory written again in the language of the interface, each of its facts kept.
 function memoryTranslateInstructions() {
   return 'You keep a short memory about the user for the future discussions of an assistant. Rewrite the memory in '
-    + memoryLanguage() + ': translate the lines written in another language, keep the lines already written in '
-    + memoryLanguage() + ' as they are, keep every fact and the order of the lines, one short line per fact that '
-    + 'starts with "- ". Answer with the lines alone.';
+    + memoryLanguage() + ': translate the sentences written in another language, keep the sentences already written '
+    + 'in ' + memoryLanguage() + ' as they are, and keep every fact and their order, as short sentences one after '
+    + 'the other in a single paragraph, without a list or a line break. Answer with the paragraph alone.';
 }
 
-// True when a line of a memory is written in another language than the one of the interface.
+// True when a sentence of a memory is written in another language than the one of the interface.
 function memoryForeign(text) {
   const target = language();
-  return memoryLineList(text, true).some((l) => {
-    const found = textLanguage(l.slice(2), true);
+  return memorySentences(text, true).some((x) => {
+    const found = textLanguage(x, true);
     return !!found && found !== target;
   });
 }
@@ -4348,31 +4962,51 @@ const secretPatterns = [
   /[A-Za-z0-9+\/=_-]{32,}/
 ];
 
-// The lines of a text written by the model, "- " lines only, without the secrets unless the
-// settings keep sensitive information.
-function memoryLineList(text, sensitive) {
-  return String(text || '').split('\n').map((l) => l.trim()).filter((l) => /^[-*\u2022]\s*\S/.test(l))
-    .map((l) => '- ' + l.replace(/^[-*\u2022]\s*/, ''))
-    .filter((l) => sensitive || !secretPatterns.some((re) => re.test(l)));
+// A fact as a sentence of the memory: without the marks of a list or quotes around it, its first letter in capital,
+// with its final point.
+function sentenceOf(text) {
+  let x = String(text || '').replace(/\s+/g, ' ').trim().replace(/^[-*\u2022]\s*/, '')
+    .replace(/^["'\u00ab\u201c\u201e]+|["'\u00bb\u201d]+$/g, '').trim();
+  if (!x) return '';
+  x = x.charAt(0).toLocaleUpperCase() + x.slice(1);
+  return /[.!?\u2026]$/.test(x) ? x : x + '.';
+}
+
+/*
+    The sentences of a memory: the lines of the notes written as a list by an earlier version, each one a sentence,
+    or the sentences of a paragraph, without the secrets unless the settings keep sensitive information.
+*/
+function memorySentences(text, sensitive) {
+  const out = [];
+  for (const line of String(text || '').split('\n').map((l) => l.trim()).filter(Boolean)) {
+    if (/^[-*\u2022]\s*\S/.test(line)) out.push(sentenceOf(line));
+    else for (const x of line.split(/(?<=[.!?\u2026])\s+(?=\S)/)) out.push(sentenceOf(x));
+  }
+  return out.filter((x) => x && (sensitive || !secretPatterns.some((re) => re.test(x))));
 }
 
 const wordCount = (lines) => lines.join(' ').split(/\s+/).filter(Boolean).length;
 
-// The lines of a memory written by the model, within words words: the oldest leave first.
-function memoryLines(text, words, sensitive) {
-  let lines = memoryLineList(text, sensitive);
-  while (lines.length > 1 && wordCount(lines) > words) lines = lines.slice(1);
-  return lines.join('\n');
+// The memory as it is kept: its sentences one after the other, within words words, the oldest leaving first.
+function memoryParagraph(sentences, words) {
+  let list = sentences.slice();
+  while (list.length > 1 && wordCount(list) > words) list = list.slice(1);
+  return list.join(' ');
 }
 
-// The words of a line, for the comparison of two facts: their first five letters, which
+// True when a memory holds notes written as a list, which become sentences (memorySentences).
+function listMemory(text) {
+  return /^\s*[-*\u2022]\s*\S/m.test(String(text || ''));
+}
+
+// The words of a sentence, for the comparison of two facts: their first five letters, which
 // bring the forms of a word together ("courtes", "court").
 function factWords(line) {
   return new Set(line.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^\p{L}\p{N}]+/gu, ' ')
     .split(' ').filter((w) => w.length > 2).map((w) => w.slice(0, 5)));
 }
 
-// True when two lines say nearly the same thing: most of their words are shared.
+// True when two sentences say nearly the same thing: most of their words are shared.
 function sameFact(a, b) {
   const x = factWords(a);
   const y = factWords(b);
@@ -4460,7 +5094,8 @@ function forgetMemory() {
     Updates the memory with the questions it has not read yet, when they are enough or force is
     true: the background model writes the new facts, which join the memory unless it holds them
     already, then the memory is rewritten within its size when it outgrew it, or loses its
-    oldest lines when the rewriting fails.  A notification says how many facts joined.
+    oldest sentences when the rewriting fails.  The memory is kept as short sentences one after
+    the other.  A notification says how many facts joined.
 */
 async function updateMemory(force) {
   if (memoryRunning || !state.settings.memoryEnabled || state.incognito) return;
@@ -4473,8 +5108,8 @@ async function updateMemory(force) {
   const foreign = !!memory && (memoryForeign(memory)
     || (!!state.settings.memoryLanguage && state.settings.memoryLanguage !== language()));
   if (!enough && !foreign) return;
-  // The answer in progress comes first.
-  if (state.busy) {
+  // The answers in progress come first.
+  if (generations.size) {
     rememberLater();
     return;
   }
@@ -4499,7 +5134,8 @@ async function updateMemory(force) {
       const now = await storedMemory();
       return !now.enabled || now.memory !== current;
     };
-    let lines = memoryLineList(current, true);
+    // The notes written as a list by an earlier version become sentences, and are saved as such.
+    let lines = memorySentences(current, true);
     let rewritten = false;
     /*
         The facts written in another language are rewritten in the language of the interface
@@ -4508,13 +5144,13 @@ async function updateMemory(force) {
     */
     if (lines.length && (memoryForeign(current) || (!!stored.language && stored.language !== target))) {
       const r = await backgroundText(memoryTranslateInstructions(),
-        '<memory>\n' + lines.join('\n') + '\n</memory>\n\nRewrite every line in ' + memoryLanguage() + '.',
+        '<memory>\n' + lines.join(' ') + '\n</memory>\n\nRewrite every sentence in ' + memoryLanguage() + '.',
         Math.ceil(wordCount(lines) * 2.5) + 32, signal).catch((e) => {
         if (e.name === 'AbortError') throw e;
         return null;
       });
       if (await changed()) return;
-      const translated = r ? memoryLineList(r.text, true) : [];
+      const translated = r ? memorySentences(r.text, true) : [];
       if (translated.length >= Math.ceil(lines.length * 0.7)) {
         lines = translated;
         rewritten = true;
@@ -4529,7 +5165,7 @@ async function updateMemory(force) {
       // The questions as the model reads them, in which the words of each new fact are looked for.
       const read = keepEnd(asked.join('\n\n'), Math.floor(context * 3.6 * 0.5));
       const r = await backgroundText(memoryDeltaInstructions(words, sensitive),
-        '<memory>\n' + (lines.join('\n') || '(empty)') + '\n</memory>\n\n<messages>\n' + read
+        '<memory>\n' + (lines.join(' ') || '(empty)') + '\n</memory>\n\n<messages>\n' + read
           + '\n</messages>\n\nWrite the new facts in ' + memoryLanguage() + ', each with the words of the user.',
         Math.ceil(words * 3.2) + 32, signal);
       if (await changed()) return;
@@ -4543,16 +5179,16 @@ async function updateMemory(force) {
       }
       if (added && wordCount(lines) > words) {
         const compact = await backgroundText(memoryCompactInstructions(words, sensitive),
-          '<memory>\n' + lines.join('\n') + '\n</memory>', Math.ceil(words * 2.2) + 16, signal).catch(() => null);
+          '<memory>\n' + lines.join(' ') + '\n</memory>', Math.ceil(words * 2.2) + 16, signal).catch(() => null);
         if (signal.aborted) return;
         if (await changed()) return;
-        const compacted = compact ? memoryLineList(compact.text, sensitive) : [];
+        const compacted = compact ? memorySentences(compact.text, sensitive) : [];
         if (compacted.length && wordCount(compacted) <= words * 1.2) lines = compacted;
-        while (lines.length > 1 && wordCount(lines) > words) lines = lines.slice(1);
       }
     }
-    if (added || rewritten) {
-      await saveSetting('memory', lines.join('\n'));
+    // The memory the user wrote may take twice its size, which the facts the model adds bring back to it.
+    if (added || rewritten || listMemory(current)) {
+      await saveSetting('memory', memoryParagraph(lines, added ? words : words * 2));
       await saveSetting('memoryUpdated', Date.now());
       await saveSetting('memoryLanguage', target);
     }
@@ -4789,51 +5425,123 @@ async function namePending() {
 }
 
 /*
-    Compresses the oldest exchanges of a discussion in the background when its last answer
-    filled compactShare of the room of the context: the next question then starts from the
-    summary.  A question that comes before the summary is written waits for it only when it
-    does not fit without it (fitContext).  The job has its own AbortController, which the
-    deletion of the discussion uses (cancelCompaction).
+    Compresses the oldest exchanges of a discussion in the background once they take compactShare of the room the
+    system message and the tools leave them, as the next question will receive them: after an answer, and when the
+    discussion is opened.  The job takes its place in compactions at once, with its own AbortController, which the
+    deletion of the discussion uses (cancelCompaction); a question that comes before the summary is written waits
+    for it only when it does not fit without it (fitContext).  One tab compresses a discussion at a time.
 */
-function compactLater(c, turn) {
-  const context = turn.contextTokens;
-  if (!context || compactions.has(c.id)) return;
-  const room = context - Math.min(state.settings.maxTokens || 2048, Math.floor(context / 2));
-  const used = (turn.promptTokens || 0) + ((turn.usage && turn.usage.completion_tokens) || 0);
-  if (used < compactShare * room) return;
-  const system = systemPrompt(c, context, !!(c.agent && roleCapabilities(c.role).tools));
-  const media = estimateMedia(c.role);
-  const build = () => apiMessages(c, system, null, media);
-  const estimate = tokenEstimate(build(), used, 'albireo-' + c.role);
-  // The questions after the start, the last one included: the next question comes after it.
-  const saved = c.messages;
-  c.messages = saved.concat([{ id: 'next', role: 'user', content: '' }]);
-  const next = nextStart(c, build, estimate.of, room);
-  c.messages = saved;
-  if (next <= (c.contextStart || 0)) return;
+function compactLater(c) {
+  if (!c || !c.messages.length || compactions.has(c.id) || !roleModel(c.role)) return;
   const abort = new AbortController();
-  const done = compact(c, c.contextStart || 0, next, room, estimate.scale, abort.signal)
-    .then(async (r) => {
-      // The summary goes to the discussion as it is now, when its compressed messages are
-      // still the same.
-      const now = await currentVersion(c);
-      const last = now && now.messages[r.to - 1];
-      if (!now || !last || last.id !== r.last || (now.contextStart || 0) > r.to) return;
-      applyCompaction(now, r);
-      await persist(now);
-      // The images of the exchanges summarized left the context: their places go to new ones.
-      if (state.current === now) {
-        markOutside();
-        renderComposerState();
-        lockThread();
-      }
-    })
-    .catch(() => {})
-    .finally(() => {
-      if (compactions.get(c.id) === job) compactions.delete(c.id);
-    });
-  const job = { done, abort, always: false };
+  const job = { done: null, abort, always: false };
+  const work = () => exclusive('albireo-compact-' + c.id, () => compactInBackground(c, abort.signal));
+  job.done = Promise.resolve().then(work).catch(() => {}).finally(() => {
+    if (compactions.get(c.id) === job) compactions.delete(c.id);
+  });
   compactions.set(c.id, job);
+}
+
+/*
+    The work of compactLater, on the messages of c as they are when it starts.  The service measures the text of the
+    conversation, and the system message with the tools apart; the images count by their tokens (imageTokens).  The
+    exchanges that leave are those that bring the conversation back to keptTokens.  The summary goes to the
+    discussion as it is once written, when the exchanges it compressed are still there; an answer being written in
+    the discussion keeps the beginning of its prompt, and the summary applies at its end.
+*/
+async function compactInBackground(c, signal) {
+  const view = Object.assign({}, c, { messages: c.messages.slice() });
+  const role = view.role;
+  const model = 'albireo-' + role;
+  const caps = roleCapabilities(role);
+  const set = toolSet(view, caps);
+  const toolDefs = set.definitions;
+  const system = systemPrompt(view, caps.context || 8192, set);
+  const text = apiMessages(view, system, null, { read: false, url: () => null });
+  const [all, base] = await Promise.all([api.count(model, text, toolDefs),
+    api.count(model, text.slice(0, 1), toolDefs).catch(() => null)]);
+  if (signal.aborted || !all || typeof all.tokens !== 'number' || !all.context) return;
+  const room = all.context - Math.min(state.settings.maxTokens || 2048, Math.floor(all.context / 2));
+  const estimate = tokenEstimate(text, all.tokens, model);
+  const media = estimateMedia(role);
+  const build = () => apiMessages(view, system, null, media);
+  const fixed = base && typeof base.tokens === 'number' ? base.tokens : estimate.of(text.slice(0, 1));
+  if (estimate.of(build()) - fixed < compactShare * Math.max(0, room - fixed)) return;
+  // The questions after the start, the last one included: the next question comes after it.
+  view.messages.push({ id: 'next', role: 'user', content: '' });
+  const next = nextStart(view, build, estimate.of, keptTokens(fixed, room));
+  view.messages.pop();
+  if (next <= (view.contextStart || 0)) return;
+  cancelWarmup(c.id);
+  const r = await compact(view, view.contextStart || 0, next, room, estimate.scale, signal);
+  const now = await currentVersion(c);
+  if (!now) return;
+  const g = generations.get(now.id);
+  if (g && g.answering) {
+    g.compaction = r;
+    return;
+  }
+  if (!settleCompaction(now, r)) return;
+  await persist(now);
+  // The images of the exchanges summarized left the context: their places go to new ones.
+  if (state.current === now) {
+    markOutside();
+    renderComposerState();
+    lockThread();
+  }
+  warmBeginning(now);
+}
+
+/*
+    The warm-ups of the beginning of a discussion after a compression, one per discussion at most: discussion id ->
+    AbortController.  A question sent in the discussion, its deletion and a new compression of it stop the warm-up.
+*/
+const warmups = new Map();
+
+function cancelWarmup(id) {
+  const abort = warmups.get(id);
+  if (!abort) return;
+  warmups.delete(id);
+  abort.abort();
+}
+
+/*
+    Reads ahead, in the background, the beginning of the prompt of the next question of c once a summary changed it:
+    the system message, the summary and the exchanges kept, as the code of a question builds them (apiMessages),
+    followed by a question of one character, so that the engine renders the last answer as a turn of the history, as
+    the next question will.  The request goes to the background model, which the service serves behind the answers,
+    without reasoning and for one token; the engine keeps the keys and values it read, which the next question takes
+    over, and computes then its own tokens only.  The engine reads the history of each answer ahead by itself; the
+    page asks it only after a summary, which changes the beginning.  The request is sent when the background model is
+    the model of the function of c, whose keys and values the next question reads, by the tab that applied the summary,
+    while no answer is written in c.  Its failure is told in the console only.
+*/
+async function warmBeginning(c) {
+  if (!c || deleted.has(c.id) || generations.has(c.id) || !c.messages.length || !serviceReady()) return;
+  const model = roleModel(c.role);
+  const s = state.status;
+  if (!model || ((s && s.background) || roleModel('general')) !== model) return;
+  cancelWarmup(c.id);
+  const abort = new AbortController();
+  warmups.set(c.id, abort);
+  let limit = null;
+  try {
+    const caps = roleCapabilities(c.role);
+    const set = toolSet(c, caps);
+    const media = await requestMedia(c, c.role);
+    if (abort.signal.aborted) return;
+    const next = Object.assign({}, c, { messages: c.messages.concat([{ id: 'next', role: 'user', content: '.' }]) });
+    const body = { model: backgroundModel, reasoning: false, max_tokens: 1, stream: false,
+      messages: apiMessages(next, systemPrompt(c, caps.context || 8192, set), null, media) };
+    if (set.definitions) body.tools = set.definitions;
+    limit = api.limitedSignal(abort.signal, backgroundTimeout);
+    await api.postJSON('/v1/chat/completions', body, limit.signal);
+  } catch (e) {
+    if (!abort.signal.aborted) console.info('Albireo: the beginning of a discussion was not read ahead', e);
+  } finally {
+    if (limit) limit.done();
+    if (warmups.get(c.id) === abort) warmups.delete(c.id);
+  }
 }
 
 // Dialogs.
@@ -5000,9 +5708,9 @@ function memoryTab(body) {
   sensitive.addEventListener('change', () => saveSetting('memorySensitive', sensitive.checked));
   text.addEventListener('input', showSize);
   text.addEventListener('change', async () => {
-    // What the user writes stays, sensitive or not, within twice the size of the memory.
-    await saveSetting('memory', memoryLines(text.value.split('\n').map((l) => l.trim() && !/^[-*\u2022]/.test(l.trim())
-      ? '- ' + l.trim() : l).join('\n'), words * 2, true));
+    // What the user writes stays, sensitive or not, within twice the size of the memory, as sentences one after
+    // the other: a line becomes a sentence.
+    await saveSetting('memory', memoryParagraph(memorySentences(text.value, true), words * 2));
     await saveSetting('memoryUpdated', Date.now());
     text.value = state.settings.memory;
     showSize();
@@ -5101,16 +5809,19 @@ function dataTab(body, close) {
         class: 'button danger', type: 'button', html: icon('trash') + '<span>' + escapeHtml(t('clearAll')) + '</span>',
         onclick: async () => {
           if (!await confirmDialog(t('clearAll'), t('clearAllText'))) return;
-          // The answer in progress and the work of the background model stop, the stored discussions
-          // are not saved again, and the indexing in progress writes no passage.  A new discussion,
-          // not yet stored, stays.
+          // The answers in progress, shown or written in the background, and the work of the background
+          // model stop, the stored discussions are not saved again, and the indexing in progress writes
+          // no passage.  A new discussion, not yet stored, stays.
           for (const c of state.conversations) deleted.add(c.id);
           if (state.current && state.current.messages.length) deleted.add(state.current.id);
-          if (state.busy) stopGeneration();
+          for (const g of generations.values()) deleted.add(g.c.id);
+          stopAllGenerations();
+          unread.clear();
           cancelIndex();
           cancelBackground();
           rag.removeAll();
           images.removeAll();
+          for (const id of deleted) web.forgetPages(id);
           await store.clearAll().catch(storageFailed);
           broadcast({ type: 'cleared' });
           await reloadLists().catch(storageFailed);
@@ -5162,7 +5873,7 @@ async function showStorage(el) {
     parts.push(t('storageEstimate', { used: formatSize(estimate.usage || 0), quota: formatSize(estimate.quota) }));
   }
   el.dataset.persistent = String(kept);
-  el.replaceChildren(h('p', null, h('b', null, t('storageState')), ' ', parts.join(' · ')),
+  fill(el, h('p', null, h('b', null, t('storageState')), ' ', parts.join(' · ')),
     kept === true ? null : h('p', { class: 'help storage-hint' }, h('span', { html: icon('info') }), t('storageHint')));
 }
 
@@ -5207,17 +5918,32 @@ async function aboutTab(body, close) {
   if (mem) body.append(h('h4', null, t('v2ram')), mem);
   try {
     const u = await api.usage();
-    const byDay = new Map((u.days || []).map((d) => [d.day, (d.prompt_tokens || 0) + (d.generated_tokens || 0)]));
+    const byDay = new Map((u.days || []).map((d) => [d.day, d]));
     if (byDay.size) {
-      // The last thirty days, the days without use included.
+      /*
+          The last thirty days, the days without use included, each a bar of the tokens generated over the tokens
+          read, whose tooltip gives its date and its figures in the language of the interface.  The days of the
+          service are those of UTC.
+      */
+      const dateOf = (day) => new Intl.DateTimeFormat(language(), { dateStyle: 'medium', timeZone: 'UTC' })
+        .format(new Date(day + 'T00:00:00Z'));
       const days = [];
       for (let k = 29; k >= 0; --k) {
-        const d = new Date(Date.now() - k * 86400000).toISOString().slice(0, 10);
-        days.push([d, byDay.get(d) || 0]);
+        const day = new Date(Date.now() - k * 86400000).toISOString().slice(0, 10);
+        const d = byDay.get(day) || {};
+        days.push({ day, read: d.prompt_tokens || 0, generated: d.generated_tokens || 0 });
       }
-      const max = Math.max(...days.map((d) => d[1]), 1);
-      body.append(h('h4', null, t('usage')), h('div', { class: 'usage-bars' }, days.map(([day, v]) =>
-        h('div', { style: { height: Math.max(2, 80 * v / max) + 'px', opacity: v ? 0.9 : 0.25 }, title: day + ': ' + formatNumber(v) }))));
+      const max = Math.max(...days.map((d) => d.read + d.generated), 1);
+      body.append(h('h4', null, t('usage')),
+        h('div', { class: 'usage-bars', role: 'img', 'aria-label': t('usageChart') }, days.map((d) => h('div', {
+          class: 'usage-day', style: { height: Math.max(2, 80 * (d.read + d.generated) / max) + 'px' },
+          title: t('usageDay',
+            { date: dateOf(d.day), generated: formatNumber(d.generated), read: formatNumber(d.read) })
+        }, h('div', { class: 'generated', style: { flexGrow: String(d.generated) } }),
+        h('div', { class: 'read', style: { flexGrow: String(d.read) } })))),
+        h('div', { class: 'usage-axis' }, h('span', null, dateOf(days[0].day)), h('span', null, dateOf(days[29].day))),
+        h('div', { class: 'legend' }, h('span', { style: { '--c': 'var(--blue)' } }, t('usageGenerated')),
+          h('span', { style: { '--c': 'var(--gold)' } }, t('usageRead'))));
     }
   } catch (e) {
     // Usage figures are optional.
@@ -5386,8 +6112,7 @@ function buildLayout() {
       state.incognito = !state.incognito;
       // The reading aloud ends with the discussion it belongs to, as route() ends it.
       speech.stopReading();
-      if (state.busy) stopGeneration();
-      forgetIncognito();
+      leaveCurrent();
       state.current = newConversation(null);
       state.view = 'chat';
       if (location.hash !== '#/') history.pushState(null, '', '#/');
@@ -5450,23 +6175,33 @@ function buildLayout() {
       refreshViews();
     }
   });
-  // What the agent mode does, from a button beside it, and the tools it may call, under the prompt.
+  /*
+      The web access of the discussion shown, off in every new discussion: the choice belongs to its discussion and
+      never becomes the default of the next ones.
+  */
+  ui.webButton = h('button', {
+    class: 'toggle web', type: 'button', title: t('webHint'), 'aria-label': t('webAccess'), 'aria-pressed': 'false',
+    html: icon('globe') + '<span>' + escapeHtml(t('web')) + '</span>',
+    onclick: async () => {
+      const c = state.current;
+      c.web = !c.web;
+      renderComposerState();
+      if (c.messages.length) await persist(c);
+      refreshViews();
+    }
+  });
+  // What the agent mode and the web access do, from a button beside them, and the tools they give, under the prompt.
   ui.agentHelp = h('button', {
     class: 'help-button', type: 'button', title: t('agentHelpTitle'), 'aria-label': t('agentHelpTitle'),
     html: icon('info'), onclick: (e) => agentHelp(e.currentTarget)
   });
-  ui.agentTools = h('div', { class: 'agent-tools hidden', role: 'list', 'aria-label': t('agentTools') },
-    h('span', { class: 'label' }, t('agentTools')),
-    tools.definitions.map((d) => h('span', {
-      class: 'tool-chip', role: 'listitem', tabindex: '0', title: t('toolHint_' + d.function.name),
-      html: icon(toolIcons[d.function.name] || 'tool') + '<span>' + escapeHtml(toolLabel(d.function.name)) + '</span>'
-    })));
+  ui.agentTools = h('div', { class: 'agent-tools hidden', role: 'list', 'aria-label': t('agentTools') });
   ui.sendButton = h('button', { class: 'send', type: 'button', onclick: onSend });
   ui.pendingBox = h('div', { class: 'composer-attachments hidden' });
   ui.attachButton = iconButton('clip', t('attach'), () => fileInput.click());
   const composer = h('div', { class: 'composer' }, ui.pendingBox, ui.input, ui.agentTools, h('div', { class: 'row' },
-    ui.attachButton, fileInput, ui.reasonButton, ui.agentButton, ui.agentHelp, h('span', { class: 'grow' }),
-    ui.sendButton));
+    ui.attachButton, fileInput, ui.reasonButton, ui.agentButton, ui.webButton, ui.agentHelp,
+    h('span', { class: 'grow' }), ui.sendButton));
   for (const ev of ['dragenter', 'dragover']) composer.addEventListener(ev, (e) => { e.preventDefault(); composer.classList.add('drag'); });
   for (const ev of ['dragleave', 'drop']) composer.addEventListener(ev, () => composer.classList.remove('drag'));
   composer.addEventListener('drop', (e) => {
@@ -5476,8 +6211,23 @@ function buildLayout() {
   ui.hint = h('div', { class: 'hint' }, hintText());
   ui.composerWrap = h('div', { class: 'composer-wrap' }, composer, ui.hint);
   ui.toasts = h('div', { class: 'toast-zone' });
-  const main = h('main', { class: 'main' }, ui.topbar, ui.banner, ui.content, ui.composerWrap);
-  app.append(ui.sidebar, main, ui.toasts);
+  // The buttons that go to the start and to the end of the thread, over its bottom right corner.
+  ui.jumpStart = iconButton('toStart', t('scrollStart'), () => jumpTo(false), 'icon-button jump-start');
+  ui.jumpEnd = iconButton('toEnd', t('scrollEnd'), () => jumpTo(true), 'icon-button jump-end');
+  ui.jump = h('div', { class: 'jump-buttons' }, ui.jumpStart, ui.jumpEnd);
+  const later = () => {
+    clearTimeout(ui.jumpTimer);
+    ui.jumpTimer = setTimeout(hideJump, jumpDelay);
+  };
+  ui.jump.addEventListener('mouseleave', later);
+  ui.jump.addEventListener('focusout', later);
+  ui.stick = true;
+  ui.ownTop = 0;
+  ui.content.addEventListener('scroll', threadScrolled, { passive: true });
+  ui.main = h('main', { class: 'main' }, ui.topbar, ui.banner, ui.content, ui.jump, ui.composerWrap);
+  app.append(ui.sidebar, ui.main, ui.toasts);
+  ui.composerHeight = -1;
+  watchComposer();
 }
 
 async function init() {
@@ -5497,6 +6247,11 @@ async function init() {
   try {
     await store.open();
     state.settings = Object.assign({}, defaults, await store.getSettings());
+    // The notes of the memory written as a list by an earlier version become sentences one after the other.
+    if (listMemory(state.settings.memory)) {
+      state.settings.memory = memoryParagraph(memorySentences(state.settings.memory, true), memoryWords * 2);
+      await store.setSetting('memory', state.settings.memory);
+    }
     // The browser is asked to keep the database, without waiting for its answer.
     requestPersistence();
   } catch (e) {
@@ -5538,7 +6293,9 @@ async function init() {
   window.addEventListener('pagehide', () => {
     speech.stopReading();
     if (memoryRunning) releaseMemoryLease().catch(() => {});
-    if (state.busyId) broadcast({ type: 'busy', id: state.busyId, tab: tabId, busy: false });
+    for (const g of generations.values()) {
+      if (!g.c.incognito) broadcast({ type: 'busy', id: g.c.id, tab: tabId, busy: false });
+    }
   });
 }
 

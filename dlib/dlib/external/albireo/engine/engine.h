@@ -60,6 +60,14 @@ namespace albireo
                 them over or copies them instead of computing them again.  The cached
                 sequences are dropped, least recently used first, when memory runs short.
 
+                The next turn renders the answer of a chat request otherwise than the
+                tokens the model generated: the formats of the reasoning models drop the
+                reasoning of the earlier turns, and the text of the answer is tokenized
+                again.  Once an answer ends, its history is therefore rendered as the next
+                request will render it and read in the background, while the user reads
+                the answer, so that the next request computes its question only.  The
+                setting "warm_history" (true by default) turns this off.
+
                 An embedding model answers requests whose "input" lists texts: each text
                 is read as a prompt of its own, the texts of every request sharing the
                 passes, and the normalized hidden state of its last token becomes its
@@ -112,6 +120,10 @@ namespace albireo
         void handle_token(loaded_model& m, request_state& r, int token);
         void emit_text(loaded_model& m, request_state& r, const std::string& text);
         void finish(loaded_model& m, request_state& r, const std::string& reason, bool keep_cache = true);
+        // Queues the reading of the history of the answer of r, whose sequence holds the tokens cached.
+        void warm_history(loaded_model& m, const request_state& r, const std::vector<int>& cached);
+        // Ends the warm-ups whose history a waiting request of a client starts with.
+        void yield_warm_ups(loaded_model& m);
         void fail(request_state& r, const std::string& code, const std::string& message);
         void log(int level, const std::string& message);
         json model_info(const loaded_model& m) const;
@@ -126,6 +138,8 @@ namespace albireo
         std::unique_ptr<tensor_device> device_;
 #endif
         int threads_ = 1;
+        // Whether the histories of the answers are read ahead of the next questions.
+        bool warm_history_ = true;
 
         // Serializes the loading of models.
         std::mutex loading_;

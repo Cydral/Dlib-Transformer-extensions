@@ -170,7 +170,8 @@ try {
     }
 
     # The models that come with Albireo: their manifest in the programs of the build, the complete
-    # installer that carries them, and a question to their language model.
+    # installer that carries them, or the file of its models beside it when both would reach the
+    # 4 GiB Windows runs (albireo-setup.models), and a question to their language model.
     $builtinDir = Join-Path $main "bin\models"
     $manifest = Join-Path $builtinDir "builtin.json"
     if (Test-Path $manifest) {
@@ -178,10 +179,23 @@ try {
         $ids = @($builtin.models | ForEach-Object { $_.id })
         $complete = Join-Path $main "bin\albireo-setup.exe"
         $online = Join-Path $main "bin\albireo-setup-online.exe"
+        $beside = Join-Path $main "bin\albireo-setup.models"
+        $bytes = 0
+        foreach ($m in $builtin.models) {
+            $bytes += [int64]$m.size
+            if ($m.projector) { $bytes += [int64]$m.projector.size }
+        }
         $result = "FAIL"
-        if ((Test-Path $complete) -and (Test-Path $online) -and
-            (Get-Item $complete).Length -gt (Get-Item $online).Length) { $result = "PASS" }
-        Add-Result "builtin models" $result ($ids -join ", ") 0
+        $detail = $ids -join ", "
+        if ((Test-Path $complete) -and (Test-Path $online)) {
+            $carried = (Get-Item $complete).Length - (Get-Item $online).Length
+            if (Test-Path $beside) {
+                $carried = (Get-Item $beside).Length
+                $detail += " (beside the installer, in albireo-setup.models)"
+            }
+            if ($carried -gt $bytes) { $result = "PASS" }
+        }
+        Add-Result "builtin models" $result $detail 0
         $language = @($builtin.models | Where-Object { -not $_.embedding } | Select-Object -First 1)
         if ($language.Count -gt 0) {
             Invoke-Check "builtin chat" "Paris" $chat @($avx2, (Join-Path $builtinDir $language[0].file), "--reasoning",

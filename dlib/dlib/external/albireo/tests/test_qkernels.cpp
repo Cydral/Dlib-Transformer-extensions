@@ -25,6 +25,8 @@
 #include <thread>
 #include <vector>
 
+#include <dlib/data_io/gguf_dequantize.h>
+
 #include "../engine/qkernels.h"
 #include "../engine/thread_pool.h"
 
@@ -194,6 +196,28 @@ namespace
                 check(std::fabs(port - ref) / (mag + 1e-12) < 2e-5, "portable kernel", port, ref);
             }
             std::printf("  dot %-7s worst relative error %.3g\n", f.name, worst);
+        }
+    }
+
+    // The expansion of the formats with a vector kernel of their own, bit for bit that of dlib.
+    void test_dequantization(std::mt19937& rng)
+    {
+        for (const fmt& f : formats())
+        {
+            if (f.type != ggml_type::Q6_K) continue;
+            long differ = 0;
+            for (int trial = 0; trial < 50; ++trial)
+            {
+                const long n = trial % 2 == 0 ? 1024 : 1280;
+                const std::vector<uint8_t> w = random_row(f, n, rng);
+                std::vector<float> got(static_cast<size_t>(n)), ref(static_cast<size_t>(n));
+                qk_dequantize_row(f.type, w.data(), got.data(), n);
+                for (long b = 0; b < n / f.block; ++b)
+                    dlib::gguf_dq_q6_K(w.data() + b * f.bytes, ref.data() + b * f.block);
+                if (std::memcmp(got.data(), ref.data(), sizeof(float) * got.size()) != 0) ++differ;
+            }
+            check(differ == 0, "expansion bit for bit with dlib", static_cast<double>(differ), 0);
+            std::printf("  expansion %-7s compared with dlib on 50 rows\n", f.name);
         }
     }
 
@@ -569,6 +593,7 @@ int main()
     std::mt19937 rng(1234);
     thread_pool pool(4);
     test_activation_quantization(rng);
+    test_dequantization(rng);
     test_dots(rng);
     test_matmul(rng, pool);
     test_helpers(rng);

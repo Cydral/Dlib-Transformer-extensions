@@ -330,6 +330,10 @@ namespace albireo
         std::atomic<long> n_idle{0};
         std::atomic<uint64_t> generated{0};
         std::atomic<uint64_t> prompted{0};
+        // The tokens the warm-ups of the histories read, a part of prompted, and the warm-ups
+        // active or waiting, which n_active and the waiting requests of the statistics leave out.
+        std::atomic<uint64_t> warmed{0};
+        std::atomic<long> n_warming{0};
     };
 
     // A request of an embedding model: one vector per input, every input computed as a
@@ -387,6 +391,17 @@ namespace albireo
         // The embedding job this request computes one input of, and the index of the input.
         std::shared_ptr<embedding_job> job;
         long job_index = -1;
+        /*
+            The messages and the options a chat request was rendered with, and the answer and the
+            reasoning it delivered: engine::warm_history() renders them again as the next request
+            of the conversation will.  warm marks a request that reads such a history ahead of
+            that request, without a client: it ends once its prompt is read, its keys and values
+            joining the cached sequences.
+        */
+        std::vector<chat_message> messages;
+        render_options options;
+        std::string answer, thought;
+        bool warm = false;
 
         bool is_cancelled() const { return cancelled || (job && job->cancelled); }
     };
@@ -406,6 +421,8 @@ namespace albireo
         const long prefill_while_answering = 64;
         // The decoded image pixels the requests of one model may hold at once, waiting to be encoded.
         const size_t queued_pixels_budget = size_t(1) << 30;
+        // The tokens a history must leave to compute for a warm-up to read it ahead.
+        const long min_warm_tokens = 16;
 
         // Frees the decoded pixels of an image and takes them off the budget of its model.
         void drop_pixels(loaded_model& m, request_image& im)
@@ -731,6 +748,7 @@ namespace albireo
         pool_.reset(new thread_pool(threads_));
         // A spin of a tenth of a second at most, since a longer one keeps the processor busy between passes.
         pool_->set_spin_time(std::chrono::microseconds(bounded(settings_["spin_us"], 2000, 0, 100000)));
+        warm_history_ = settings_["warm_history"].as_bool(true);
         log(ALBIREO_LOG_INFO, std::string("engine ") + ALBIREO_ENGINE_VARIANT + " " + ALBIREO_VERSION + ", "
             + std::to_string(threads_) + " threads, kernels " + qk_isa());
 #ifdef ALBIREO_TENSOR_BACKEND
@@ -899,6 +917,10 @@ namespace albireo
         if (m->projector)
         {
             m->vision.reset(new vision_encoder(m->projector, *pool_));
+#ifdef ALBIREO_TENSOR_BACKEND
+            // The products of the encoder go to the device as those of the model do, by measure.
+            m->vision->set_offload(device_->make_offload(id + " (images)"));
+#endif
             // Qwen3-VL places the tokens of an image by multimodal rotary positions, a LLaVA-NeXT
             // or a Pixtral decoder by their order.
             const vision_encoder::family kind = m->vision->kind();
@@ -1157,6 +1179,12 @@ namespace albireo
             if (!parts.empty()) prepare_images(*m, parts, true, r->images);
             r->prompt = prompt_tokens(*m, pieces, r->images);
             r->parser = m->format->make_parser(opt);
+            // The conversation of a client, whose history the end of its answer reads ahead.
+            if (warm_history_ && req["priority"].as_string() != "background")
+            {
+                r->messages.swap(messages);
+                r->options = opt;
+            }
         }
         else if (req["prompt"].is_string())
         {
@@ -1464,7 +1492,11 @@ namespace albireo
                     models.push_back(m.second);
                     const bool has_requests = !m.second->waiting.empty() || !m.second->active.empty();
                     busy.push_back(has_requests);
-                    if (!m.second->cfg.is_embedding() && has_requests) answering = true;
+                    // The warm-ups of the histories leave the embedding models their whole passes.
+                    bool clients = false;
+                    for (const auto& r : m.second->waiting) clients = clients || !r->warm;
+                    for (const auto& r : m.second->active) clients = clients || !r->warm;
+                    if (!m.second->cfg.is_embedding() && clients) answering = true;
                 }
             }
             if (!woken)
@@ -1639,8 +1671,16 @@ namespace albireo
         /*
             Gives the memory of a request reading its prompt to the answers being written,
             the request admitted last first: it goes back to the front of the queue
-            (requeue_preempted) and reads its prompt again once there is room.
+            (requeue_preempted) and reads its prompt again once there is room.  A warm-up of a
+            history gives its memory first: it ends, its keys and values joining the cached
+            sequences, which reserve() gives back.
         */
+        for (const auto& w : m.active)
+            if (w.get() != keep && w->warm && w->ph == request_state::phase::prefill)
+            {
+                finish(m, *w, "replaced");
+                return true;
+            }
         for (auto it = m.active.rbegin(); it != m.active.rend(); ++it)
         {
             request_state& r = **it;
@@ -1677,6 +1717,7 @@ namespace albireo
 
     void engine::admit(loaded_model& m)
     {
+        yield_warm_ups(m);
         for (;;)
         {
             std::shared_ptr<request_state> r;
@@ -1686,8 +1727,12 @@ namespace albireo
                 // Room for the request among the active ones before it leaves the queue, so that
                 // an exception from here on ends it with the others (abandon).
                 m.active.reserve(m.active.size() + 1);
-                r = m.waiting.front();
-                m.waiting.pop_front();
+                // The requests of the clients in their order, the warm-ups of the histories after them.
+                auto next = m.waiting.begin();
+                while (next != m.waiting.end() && (*next)->warm) ++next;
+                if (next == m.waiting.end()) next = m.waiting.begin();
+                r = *next;
+                m.waiting.erase(next);
             }
             m.active.push_back(r);
             if (r->is_cancelled())
@@ -1704,6 +1749,13 @@ namespace albireo
                 continue;
             }
             r->ph = request_state::phase::prefill;
+            // A warm-up whose answer left the cached sequences meanwhile would read its whole history: it ends.
+            if (r->warm && static_cast<long>(r->prompt.size()) - r->cached > 2 * r->max_tokens)
+            {
+                finish(m, *r, "replaced");
+                m.active.pop_back();
+                continue;
+            }
             if (r->cached > 0)
             {
                 json p = json::object();
@@ -1878,6 +1930,7 @@ namespace albireo
         if (m.active.empty())
         {
             m.n_active = 0;
+            m.n_warming = 0;
             return false;
         }
         if (m.vision_job) advance_encoding(m);
@@ -1967,7 +2020,8 @@ namespace albireo
         // Adds n tokens of the prompt of r to the pass.
         auto read = [&](request_state& r, long n) {
             const long done = static_cast<long>(r.kv_tokens.size());
-            const bool last = done + n == static_cast<long>(r.prompt.size());
+            // A warm-up needs no logits: it ends with its prompt.
+            const bool last = done + n == static_cast<long>(r.prompt.size()) && !r.warm;
             const long row0 = static_cast<long>(b.tokens.size());
             b.segments.push_back({ r.seq, row0, n });
             if (last) b.logit_rows.push_back(row0 + n - 1);
@@ -1998,24 +2052,34 @@ namespace albireo
             room waits while another request computes in the pass.  When none does, the prompt
             admitted first among those without room takes the memory of the prompts admitted
             after it, or ends when that is not enough, so that two prompts never wait for each
-            other.
+            other.  The warm-ups of the histories read with the budget the prompts of the requests
+            leave, and not while an answer to a user is being written; one without room ends.
         */
-        std::vector<request_state*> reading;    // in the order of admission
+        std::vector<request_state*> reading;    // in the order of admission, the warm-ups last
         for (auto& rp : m.active)
-            if (rp->ph == request_state::phase::prefill) reading.push_back(rp.get());
-        const size_t first = reading.empty() ? 0 : m.prefill_turn++ % reading.size();
+            if (rp->ph == request_state::phase::prefill && !rp->warm) reading.push_back(rp.get());
+        const size_t requests = reading.size();
+        if (!users)
+            for (auto& rp : m.active)
+                if (rp->ph == request_state::phase::prefill && rp->warm) reading.push_back(rp.get());
+        const size_t first = requests == 0 ? 0 : m.prefill_turn++ % requests;
         request_state* blocked = nullptr;
         size_t blocked_at = 0;
         long blocked_n = 0;
         for (size_t k = 0; k < reading.size() && budget > 0; ++k)
         {
-            const size_t at = (first + k) % reading.size();
+            const size_t at = k < requests ? (first + k) % requests : k;
             request_state& r = *reading[at];
             if (r.ph != request_state::phase::prefill) continue;
             const long n = slice(r, budget);
             if (n <= 0) continue;
             if (!reserve(m, r.seq, static_cast<long>(r.kv_tokens.size()) + n))
             {
+                if (r.warm)
+                {
+                    finish(m, r, "replaced");
+                    continue;
+                }
                 if (!blocked || at < blocked_at)
                 {
                     blocked = &r;
@@ -2065,6 +2129,13 @@ namespace albireo
                 const long done = static_cast<long>(r.kv_tokens.size());
                 r.kv_tokens.insert(r.kv_tokens.end(), r.keys.begin() + done, r.keys.begin() + done + w.count);
                 prompt_tokens += w.count;
+                if (r.warm)
+                {
+                    m.warmed += static_cast<uint64_t>(w.count);
+                    // The history read whole: its keys and values join the cached sequences.
+                    if (r.kv_tokens.size() == r.prompt.size()) finish(m, r, "read");
+                    continue;
+                }
                 if (!r.job)
                 {
                     json p = json::object();
@@ -2125,7 +2196,10 @@ namespace albireo
         }
 
         m.active.erase(std::remove_if(m.active.begin(), m.active.end(), request_done), m.active.end());
-        m.n_active = static_cast<long>(m.active.size());
+        long warming = 0;
+        for (const auto& r : m.active) warming += r->warm ? 1 : 0;
+        m.n_active = static_cast<long>(m.active.size()) - warming;
+        m.n_warming = warming;
         m.n_idle = static_cast<long>(m.idle.size());
         return true;
     }
@@ -2163,10 +2237,20 @@ namespace albireo
     {
         void deliver(request_state& r, std::vector<output_event>& events)
         {
+            // The texts of an answer whose history will be read ahead (engine::warm_history()).
+            const bool kept = !r.messages.empty();
             for (auto& e : events)
             {
-                if (e.kind == output_kind::content) r.sink(ALBIREO_EVENT_CONTENT, e.text);
-                else if (e.kind == output_kind::reasoning) r.sink(ALBIREO_EVENT_REASONING, e.text);
+                if (e.kind == output_kind::content)
+                {
+                    if (kept) r.answer += e.text;
+                    r.sink(ALBIREO_EVENT_CONTENT, e.text);
+                }
+                else if (e.kind == output_kind::reasoning)
+                {
+                    if (kept) r.thought += e.text;
+                    r.sink(ALBIREO_EVENT_REASONING, e.text);
+                }
                 else
                 {
                     json c = json::object();
@@ -2268,6 +2352,8 @@ namespace albireo
         done["timings"] = timings;
         r.sink(ALBIREO_EVENT_DONE, done.dump());
 
+        // Whether the sequence of the request joined the cached ones, as the last of them.
+        bool cached = false;
         if (r.seq >= 0)
         {
             if (keep_cache && !r.kv_tokens.empty())
@@ -2277,6 +2363,7 @@ namespace albireo
                 e.tokens.swap(r.kv_tokens);
                 e.stamp = ++m.stamp;
                 m.idle.push_back(std::move(e));
+                cached = true;
                 // A bounded number of cached sequences, the least recently used dropped.
                 const size_t limit = static_cast<size_t>(std::max<long>(4, 2 * m.max_sequences));
                 while (m.idle.size() > limit)
@@ -2294,8 +2381,170 @@ namespace albireo
             }
             r.seq = -1;
         }
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            requests_.erase(r.id);
+        }
+        /*
+            An answer the client keeps, whole or cut at its length: its history is read ahead of
+            the next question.  The cached sequence is the last one, the least recently used
+            others leaving before it.
+        */
+        if (cached && (reason == "stop" || reason == "length") && !r.messages.empty() && r.tool_calls == 0)
+            warm_history(m, r, m.idle.back().tokens);
+    }
+
+    void engine::warm_history(loaded_model& m, const request_state& r, const std::vector<int>& cached)
+    {
+        /*
+            The next request of the conversation renders this answer as a turn of its history,
+            which the formats write otherwise than the tokens the model generated: the templates
+            of the reasoning models drop the reasoning of the earlier turns, those of Qwen 3 the
+            empty reasoning that opens an answer without reasoning, and the text of the answer
+            is tokenized again.  The cached sequence of the request then matches the next prompt
+            up to the start of the answer only, and the next request would read the whole answer
+            again before its first token.  The history is rendered here as that request will
+            render it, with a question of one letter, twice, so that the tokens the two renderings
+            share end where the text of the question begins; a request of its own, in the
+            background and without a client, reads them now, while the user reads the answer.
+            Its keys and values then join the cached sequences, and the next request computes its
+            question only.  A request of a client that starts with this history takes over what
+            the warm-up has read when it arrives (yield_warm_ups()).
+        */
+        if (m.unloading) return;
+        auto w = std::make_shared<request_state>();
+        try
+        {
+            std::vector<chat_message> history = r.messages;
+            chat_message answer;
+            answer.role = "assistant";
+            answer.content = r.answer;
+            answer.reasoning = r.thought;
+            history.push_back(answer);
+            std::vector<int> renderings[2];
+            std::vector<request_image> placed;
+            for (int k = 0; k < 2; ++k)
+            {
+                std::vector<chat_message> next = history;
+                chat_message question;
+                question.role = "user";
+                question.content = k == 0 ? "A" : "B";
+                next.push_back(question);
+                std::vector<prompt_piece> pieces;
+                m.format->render(next, r.options, pieces);
+                std::vector<request_image> images;
+                for (const request_image& im : r.images)
+                {
+                    // The encodings of the images, without their pixels, which the request gave back.
+                    if (!im.features) return;
+                    request_image copy;
+                    copy.digest = im.digest;
+                    copy.grid_w = im.grid_w;
+                    copy.grid_h = im.grid_h;
+                    copy.tokens = im.tokens;
+                    copy.plan = im.plan;
+                    copy.features = im.features;
+                    images.push_back(copy);
+                }
+                renderings[k] = prompt_tokens(m, pieces, images);
+                if (k == 0) placed.swap(images);
+            }
+            const long n = common_prefix(renderings[0], renderings[1]);
+            if (n <= 0 || n >= m.context) return;
+            w->prompt.assign(renderings[0].begin(), renderings[0].begin() + n);
+            for (request_image& im : placed)
+            {
+                if (im.start + im.tokens > n) return;
+                w->images.push_back(im);
+            }
+            finish_prompt(m, *w);
+        }
+        catch (const std::exception&)
+        {
+            // A history the format cannot render again: the next request reads it as it comes.
+            return;
+        }
+        const long known = common_prefix(cached, w->keys);
+        if (static_cast<long>(w->keys.size()) - known < min_warm_tokens) return;
+        w->model_id = m.id;
+        // The tokens the warm-up expects to read, which admit() compares with those it finds cached.
+        w->max_tokens = static_cast<long>(w->keys.size()) - known;
+        w->warm = true;
+        w->background = true;
+        w->submitted = clock_type::now();
+        w->sink = [](int, const std::string&) {};
+        log(ALBIREO_LOG_DEBUG, "model '" + m.id + "': the history of an answer is read ahead of the next question ("
+            + std::to_string(w->keys.size() - known) + " tokens)");
         std::lock_guard<std::mutex> lock(mutex_);
-        requests_.erase(r.id);
+        if (stop_ || m.unloading) return;
+        w->id = next_id_++;
+        requests_[w->id] = w;
+        m.waiting.push_back(w);
+    }
+
+    void engine::yield_warm_ups(loaded_model& m)
+    {
+        /*
+            A warm-up gives way to a request of a client that starts with the history it reads,
+            the next question of its conversation: a warm-up being read ends where it is, its keys
+            and values joining the cached sequences, and a waiting one leaves the queue, so that
+            the request takes over the history at its admission.  The other requests, such as the
+            work in the background of the client, compute beside the warm-ups, which also give
+            their places among the active requests to the requests waiting for one.
+        */
+        std::vector<std::shared_ptr<request_state>> dropped;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            bool warming = false;
+            long clients = 0;
+            for (const auto& w : m.waiting)
+            {
+                warming = warming || w->warm;
+                clients += w->warm ? 0 : 1;
+            }
+            for (const auto& a : m.active) warming = warming || a->warm;
+            if (!warming || clients == 0) return;
+            long places = m.max_sequences - static_cast<long>(m.active.size());
+            /*
+                A request takes over a warm-up when it starts with most of its history, or, once
+                the warm-up holds a sequence, with all the tokens the warm-up found cached, as a
+                request that writes the same answer again does.
+            */
+            auto takes_over = [&](const request_state& warm) {
+                for (const auto& c : m.waiting)
+                {
+                    if (c->warm) continue;
+                    const long shared = common_prefix(c->keys, warm.keys);
+                    if (shared > 0 && (2 * shared >= static_cast<long>(warm.keys.size())
+                        || (warm.seq >= 0 && shared >= warm.cached)))
+                        return true;
+                }
+                return false;
+            };
+            for (auto it = m.waiting.begin(); it != m.waiting.end();)
+            {
+                if ((*it)->warm && takes_over(**it))
+                {
+                    dropped.push_back(*it);
+                    it = m.waiting.erase(it);
+                }
+                else
+                {
+                    ++it;
+                }
+            }
+            for (const auto& a : m.active)
+            {
+                if (!a->warm || a->ph != request_state::phase::prefill) continue;
+                if (takes_over(*a) || places < clients)
+                {
+                    dropped.push_back(a);
+                    ++places;
+                }
+            }
+        }
+        for (const auto& w : dropped) finish(m, *w, "replaced");
+        m.active.erase(std::remove_if(m.active.begin(), m.active.end(), request_done), m.active.end());
     }
 
     void engine::fail(request_state& r, const std::string& code, const std::string& message)
@@ -2360,17 +2609,26 @@ namespace albireo
         for (const auto& kv : models_)
         {
             const loaded_model& m = *kv.second;
+            // The requests of the clients; the warm-ups of the histories apart.
+            long queued = 0, warming = m.n_warming.load();
+            for (const auto& r : m.waiting)
+            {
+                if (r->warm) ++warming;
+                else ++queued;
+            }
             json j = json::object();
             j["id"] = m.id;
             j["active"] = m.n_active.load();
-            j["waiting"] = static_cast<long>(m.waiting.size());
+            j["waiting"] = queued;
+            j["warming"] = warming;
             j["cached_sequences"] = m.n_idle.load();
             j["kv_used"] = static_cast<unsigned long long>(m.runtime->kv_bytes_used());
             j["kv_budget"] = static_cast<unsigned long long>(m.runtime->kv_bytes_budget());
             j["generated_total"] = static_cast<unsigned long long>(m.generated.load());
             j["prompt_total"] = static_cast<unsigned long long>(m.prompted.load());
+            j["warmed_total"] = static_cast<unsigned long long>(m.warmed.load());
             active += m.n_active.load();
-            waiting += static_cast<long>(m.waiting.size());
+            waiting += queued;
             models.push_back(j);
         }
         s["active"] = active;

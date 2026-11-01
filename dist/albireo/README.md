@@ -15,7 +15,9 @@ public folder of pCloud read only, protected by a password built into the servic
 `https://raw.githubusercontent.com/Cydral/Dlib-Transformer-extensions/main/dist/albireo/` when the
 link does not answer or holds no file whose signature verifies. They check each signature (ECDSA
 P-256 over the exact bytes of the file) with the public key built into the programs, and ignore a
-file whose signature fails. A change of one byte of a JSON file therefore needs a new signature.
+file whose signature fails. A change of one byte of a JSON file therefore needs a new signature,
+and `.gitattributes` keeps these files byte for byte on every checkout: Git for Windows would
+otherwise give them CRLF ends of line (`core.autocrlf`), which their signatures do not cover.
 
 The installers lie in the folder `dist` of the public link, as `albireo-setup-online-<version>.exe`,
 the installer of the updates, and `albireo-setup-complete-<version>.exe`, with the models that come

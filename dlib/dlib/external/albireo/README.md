@@ -27,6 +27,7 @@ application, the description of the interface and the list of the programs of Wi
 - [Installation](#installation)
 - [Settings](#settings)
 - [Interfaces](#interfaces)
+- [Web access](#web-access)
 - [Models](#models)
 - [Models that come with Albireo](#models-that-come-with-albireo)
 - [Computers without network](#computers-without-network)
@@ -42,8 +43,13 @@ application, the description of the interface and the list of the programs of Wi
   question and each answer keeps its time, shown beside its buttons ("3 hours ago" during a day,
   then the short date with its hours and minutes); a past question can be asked again at the end
   of the discussion, and a question edited restarts the discussion from it, what followed it
-  deleted. The buttons of an answer act once the answer is written, and the Stop button pulses
-  while it is prepared and written. The model that comes with Albireo names each discussion in
+  deleted. The buttons of an answer act once the answer is written, a regenerated answer
+  included, and the Stop button pulses while it is prepared and written. An answer goes on while
+  another discussion is shown or a new one starts; the side panel marks its discussion with a
+  blinking dot, which turns blue once the answer is written and stays until the discussion is
+  opened, and an incognito discussion stops its answer when it is left. While the user scrolls a
+  discussion longer than the window, two buttons over its bottom right corner go at once to its
+  start and to its end. The model that comes with Albireo names each discussion in
   the language of its first question, the first words standing for the title until it arrives,
   and keeps a memory of the user, written in the language of the interface whatever the language
   of the discussions. The application asks the browser to keep its database, and its settings
@@ -79,9 +85,16 @@ application, the description of the interface and the list of the programs of Wi
   tools are listed under the prompt, with a help next to its button; each step of an answer shows
   its tool, its arguments, its result, its state and its duration. The calculator reads the
   percentages ("17,5 % de 2 340"), the decimal commas and the thousands written with spaces.
+- **Web access**: the Web button of the composer, off in each new discussion, gives the model a
+  search of the web, through Wikipedia, the Brave Search API or a SearXNG instance, and the reading
+  of the pages and PDF files of public addresses, which the service fetches; the model reads only
+  the addresses that the discussion holds (see [Web access](#web-access)).
 - **Several conversations at once**: the requests of every client are computed together, one
   forward pass serving the next token of each, and the keys and values of a finished request stay
-  cached so that the next turn of a conversation starts where the previous one ended.
+  cached so that the next turn of a conversation starts where the previous one ended; once an
+  answer ends, the engine reads its history in the background as the next question renders it,
+  without the reasoning of the earlier turns, so that the next question computes its own tokens
+  only.
 - **An interface for other programs**: `/v1/chat/completions`, `/v1/completions`,
   `/v1/embeddings`, `/v1/audio/speech` and `/v1/models` follow the OpenAI interface, streaming
   and images included, with its documentation as a Swagger page at `/docs/`.
@@ -161,12 +174,13 @@ of a device takes seconds to start.
 The forward pass ([`engine/cpu_runtime.cpp`](engine/cpu_runtime.cpp)) keeps the weights in the
 memory mapping of the GGUF file, in their quantized form, and multiplies them with kernels that
 quantize the activations to 8 bits per block, so that a generated token reads each weight once.
-When several answers are written together, the Q4_K and Q6_K kernels of AVX2 and AVX-512 compute
+When several answers are written together, the Q4_K and Q6_K kernels of AVX2, AVX-VNNI and AVX-512 compute
 two to four tokens for each weight they unpack, each token with the arithmetic it would get
 alone: with four answers at once, a step takes 32 to 40 % less time (Qwen3 0.6B and 1.7B, two
 cores). A pass of eight tokens or more computes in single precision, with a packed matrix product
-from 32 tokens with AVX-512 and from 256 tokens with AVX2; the work buffers lie on lines of 64
-bytes. These paths keep each result within the tolerances of the tests, and the numbers of a pass
+from 32 tokens with AVX-512 and from 256 tokens with AVX2; the weights of Q6_K are expanded by a
+vector kernel of their own, bit for bit with dlib; the work buffers lie on lines of 64 bytes.
+These paths keep each result within the tolerances of the tests, and the numbers of a pass
 depend on its size: at temperature 0, the first answer to a prompt, whose last token is read
 within the whole prompt, may differ from the next ones, which take the prompt from the cache.
 The keys and values live in half precision in pages of 256 positions, one sequence per request;
@@ -196,10 +210,14 @@ all the models fit in a budget:
 - with CUDA, the engine makes these measures itself, on two matrices of each shape, and checks its
   choice at growing intervals; the extended device memory of dlib (V²RAM) lets the copies exceed
   the memory of the card, the blocks that do not fit moving to the memory of the host or to a file
-  and coming back ahead of their use.
+  and coming back ahead of their use. Only the rows of a product cross the bus, and once the copies
+  exceed the memory of the card, the products of fewer than eight tokens, the generated tokens
+  among them, stay on the processor.
 
 The products of a single token often stay on the processor, which serves them from the compact
-weights; the products of the prompts go to the device.
+weights; the products of the prompts go to the device. The image encoder of a model sends its
+products to the device of the engine too, its copies leaving the device for the decoder between
+two images.
 
 The models loaded together share the budget of the device (`device_mb`, automatic by default:
 80 % of the free memory of the card, or the card and the extended memory with V²RAM, a quarter of
@@ -355,7 +373,11 @@ no-cache`, answered by 304 while the file is unchanged), so that the pages and t
 update show at once. The application runs without any network: it loads nothing from another
 origin, its fonts, styles, scripts, the character maps of pdf.js and the page of the interface
 (`/docs/`) included, and an image that the markdown of an answer would take from another site is
-shown as a link.
+shown as a link. The answer being written is drawn ten times a second at most, block by block: the
+blocks already written stay as they are, a code block is highlighted once its fence closes, the
+reasoning receives its new text in place, and the animations of the page change only the opacity
+and the position of their elements, which the compositor of the browser draws without painting the
+page again. The thread keeps its last lines above the composer whatever the height of the composer.
 
 ### Documents and context
 
@@ -374,7 +396,9 @@ of images only, such as a scan, has no text to extract: for a model that reads i
 application offers to attach its pages as images, within the places the discussion has left; for
 another model, a dialog says that its text cannot be read. A PDF where some pages hold images only
 is added with a notice of the number of these pages, whose text is missing. The same rules apply
-to the files attached to a question and to the knowledge of a project.
+to the files attached to a question and to the knowledge of a project. A document of more than
+100 MB and an image of more than 15 MB, attached to a question or added to a project, are refused
+before they are read, with a message that names the file and the limit.
 
 The images of a question ([`web/js/images.js`](web/js/images.js)) are reduced in the browser to
 1,536 pixels on their longest side at most and kept in its database; the message gives them before
@@ -403,47 +427,69 @@ each conversation and computes again only the tokens that differ from what it al
 
 | Part of the prompt | Content | Share of the context |
 |---|---|---|
-| System message | date, instructions, memory, documents of the project read whole | 30% at most, else the project is searched |
-| Memory | short notes on the user, as they were when the discussion started | 4% at most, 120 words |
+| System message | the day the discussion started, instructions, memory, documents of the project read whole | 30% at most, else the project is searched |
+| Memory | short sentences on the user, as they were when the discussion started | 4% at most, 200 words |
 | Summary | the exchanges that left the context, compressed by the model | 15% at most |
 | Attached document | read whole | 25% at most, else indexed and searched |
 | Excerpts of a question | the passages found for it, kept with the message once sent | 20% at most |
-| Exchanges | the conversation | the rest; the oldest leave in one step, down to 60% of the room |
+| Exchanges | the conversation, a question asked on a later day with its date | the rest; the oldest leave in one step, down to 30% of the room left by the system message and the tools |
 
-The beginning of the prompt therefore stays the same from one question to the next: each question
-costs its own tokens only, the conversations of a project share the reading of its documents
-(the engine shares the pages of the cached prefix between the sequences), and the cut of the oldest
-exchanges happens once every several questions. The service serves several sessions at once,
+The system message keeps the day the discussion started, in English, and a question asked on a
+later day carries its own date, so that a discussion continued the next day keeps the beginning
+of its prompt. The beginning of the prompt therefore stays the same from one question to the
+next: each question costs its own tokens only (the engine reads the previous answer, as the
+template renders it in the history, while the user reads it), the conversations of a project
+share the reading of its documents (the engine shares the pages of the cached prefix between the
+sequences), and
+the compression of the oldest exchanges happens once every several questions. On the tests, the
+second question of a discussion found 954 tokens in the cache and read its context in 0.5 s,
+against 6.4 s for the first question. The service serves several sessions at once,
 each with its own context: the requests of every session are computed together, one forward pass
 serving the next token of each.
 
-A discussion has no length limit. Once an answer fills 80% of the room of the context, the
-oldest exchanges are compressed in the background: the background model rewrites the summary of
-the discussion with them, in parts that fit its context, oldest first, keeping the facts, figures, names, decisions,
-requests and open questions, and the discussion then starts with the summary, given with its
-first remaining question. A question that comes before the summary waits for it; a summary that
-cannot be written lets the exchanges leave without it. When the last question alone does not fit,
-the oldest texts lose their beginnings, at the end of a sentence: the summary first, then the
-documents and the texts of the questions. A question deleted from a discussion leaves with its
-answer and the documents attached to it; when it was already compressed, the summary is written
-again without it.
+A discussion has no length limit. Once its exchanges take half of the room left by the system
+message and the tools, as the service counts them after each answer and when the discussion is
+opened, the oldest exchanges are compressed in the background, down to 30% of that room: the
+background model rewrites the summary of the discussion with them, in parts that fit its context,
+oldest first, keeping the facts, figures, names, decisions, requests and open questions, and the
+discussion then starts with the summary, given with its first remaining question. A question that
+comes before the summary waits for it only when it does not fit without it, and a summary written
+while an answer is being written in the discussion applies once that answer ends; a summary that
+cannot be written lets the exchanges leave without it. One tab compresses a discussion at a time.
+When the last question alone does not fit, the oldest texts lose their beginnings, at the end of a
+sentence: the summary first, then the documents and the texts of the questions. A question deleted
+from a discussion leaves with its answer and the documents attached to it; when it was already
+compressed, the summary is written again without it.
+
+A summary changes the beginning of the prompt, which the engine has not read yet. Once it applies
+and no answer is being written in the discussion, the tab that wrote it asks the background model
+for one token after that beginning (system message, summary and exchanges kept, built as the next
+question builds them), so that the engine reads it in the background and the next question
+computes its own tokens only; on the tests, the first question after a summary read 852 of its 869
+tokens from the cache, in 0.8 s instead of 13.8 s. The request is sent only when the background
+model is the model of the function of the discussion; a question, a deletion or a new compression
+of the discussion stops it, and its failure is silent.
 
 The work the application does in the background, the titles, the summaries and the memory, goes
 to the background model: the model that comes with Albireo (`albireo-background`), which the
 service keeps loaded whatever the functions, without reasoning; without it, the general model
 serves it.
 
-The memory of the discussions holds short notes on the user (profession, projects, preferences,
-the way to answer). It reads the questions it has not read yet, each discussion from its mark, in
+The memory of the discussions holds short sentences on the user, one after the other in one
+paragraph (profession, projects, preferences, the way to answer), the lasting facts the user
+states about themselves, without the requests and the topics of the discussions; the notes that
+an earlier version wrote as a list become sentences at the next opening. It reads the questions
+it has not read yet, each discussion from its mark, in
 one pass once they are enough (three questions or 1,200 characters) and the user has been quiet
 for 20 seconds, at the opening of the application included: the background model writes the new
 facts only, in the language of the interface whatever the language of the discussions, which join
 the memory unless it holds them already in other words, and the memory is rewritten as a whole
-only when it outgrows its size (120 words), or else loses its oldest lines. The facts written in
+only when it outgrows its size (200 words), or else loses its oldest sentences. The facts written in
 another language are rewritten first in the language of the interface, and a change of that
 language plans an update. A new fact joins only when it comes with the words of the user it
-rests on, which the application finds in the questions read, in a sentence that asks nothing,
-three words or 12 characters at least, each quote serving one fact: on the questions of the
+rests on, which the application finds in the questions read, in a sentence that asks nothing and
+in a clause that does not start with a request ("Write…", "Crée…", "Explique-moi…"), three words
+or 12 characters at least, each quote serving one fact: on the questions of the
 tests, the facts invented by the model that comes with Albireo went from 7 of 16 to none of 9.
 A notification, which disappears by itself, says how many facts joined, and a new question stops
 an update in progress, which comes back once the user is quiet again. One tab updates the memory
@@ -453,7 +499,7 @@ reads the same questions again, since the marks move only once the memory is sav
 each other the changes of the settings; an update reads the memory again before saving it and
 drops its result when another tab edited, reset or turned off the memory meanwhile. The notes
 leave out sensitive information (health, finances, opinions, identifiers, other people) unless
-the settings keep it, and the lines that hold a password, a key or a payment number never enter
+the settings keep it, and the sentences that hold a password, a key or a payment number never enter
 the memory unless they do. A discussion receives the memory as it was when it started, so that its
 prompt keeps the same beginning; the private discussions neither read nor feed it. The settings
 show the memory, let the user edit it, turn it off and reset it. The background model also names
@@ -466,7 +512,9 @@ next opening of the application. One tab names a discussion at a time.
 The lists of the side panel show the 20 most recent projects and discussions; the search window
 of each finds the others, the words in any case and accents, complete or not, in the titles first,
 then in the content (questions, answers, descriptions, instructions and documents of the projects),
-and shows where it found them. Each answer exports to Markdown or JSON with its question, as the
+and shows where it found them. The About window shows the tokens read and generated each day over
+30 days, each bar giving its date and its figures in the language of the interface. Each answer
+exports to Markdown or JSON with its question, as the
 whole discussion does. The interface takes the language of Albireo, set in the window of the
 computer, unless its own settings choose another. The Generation tab of the settings gives the
 temperature, `top_p`, `top_k` and the length of the answers, each with a sentence that says what
@@ -484,7 +532,7 @@ installed models, each with its version, its role and its license, whose text op
 | Folder                   | Content                                                                      |
 |--------------------------|------------------------------------------------------------------------------|
 | [`engine/`](engine)      | the inference engine: runtime, kernels, scheduler, chat formats, devices      |
-| [`host/`](host)          | the service: server, settings, store, models, updates, certificates           |
+| [`host/`](host)          | the service: server, settings, store, models, updates, certificates, web access |
 | [`common/`](common)      | the C interface of the engines, JSON, logs, platform and processor details    |
 | [`windows/`](windows)    | the tray, the installer, their windows and their texts in five languages      |
 | [`web/`](web)            | the web application, the Swagger page and the OpenAPI description            |
@@ -623,15 +671,15 @@ cmake --build build-albireo-win -j
 
 | Program          | Checks                                                                               |
 |------------------|--------------------------------------------------------------------------------------|
-| `test_qkernels`  | every quantized kernel against its portable version and a reference in floats, and the attention by tiles against a reference in double precision; `test_qkernels_avxvnni` and `test_qkernels_avx512` check the kernels of the other variants, and skip the processors without their instructions, and `test_qkernels_vnni256` (GCC, Clang) runs the 256-bit VNNI kernels through the AVX-512 form of their instructions |
+| `test_qkernels`  | every quantized kernel against its portable version and a reference in floats, the attention by tiles against a reference in double precision, and the expansion of Q6_K bit for bit with dlib; `test_qkernels_avxvnni` and `test_qkernels_avx512` check the kernels of the other variants, and skip the processors without their instructions, and `test_qkernels_vnni256` (GCC, Clang) runs the 256-bit VNNI kernels through the AVX-512 form of their instructions |
 | `test_runtime`   | the logits of a model against `tests/reference_forward.py`, and the same results whatever the cut of the batches |
 | `test_tokenizer` | the tokenizer of a GGUF file against reference token sequences                     |
 | `test_offload`   | the products of a device against the processor kernels, the small budget path and the measured routing |
 | `test_model_file` | a small Qwen3 model built in memory and 144 damaged forms of it (names given twice and tensors off the alignment among them), which the loader must all refuse without allocating more than 256 MB, then a sparse file of more than 2 GiB whose last tensor lies beyond 2 GiB, read mapped and streamed, each value of that tensor checked and the logits compared with those of the same model in a small file |
-| `test_engine_api` | the refusals of the C interface, three threads of requests with cancellations under the pressure of the keys and values, the unloading and the destruction during requests, one final event per request |
+| `test_engine_api` | the refusals of the C interface, three threads of requests with cancellations under the pressure of the keys and values, the unloading and the destruction during requests, one final event per request, and the history of an answer read ahead of the next question |
 | `test_chat_format` | the prompts of the agent mode and of each chat format against those of its template rendered by Jinja, the marker tokens and the parsing of the tool calls, whole or cut in pieces, the calls of Mistral with and without their identifier, the Llama 3 answers that are no call and an earlier answer holding `</think>` |
-| `test_host`      | in a data folder of its own: the files of the downloads and of the imports through no link, the refusals of the import route, the copies of models already installed, the identifiers of the imports, the replacement of a model file, the ranges of the downloads, a damaged database, the public link through a local API of pCloud (its listing, the copies it holds and lacks, a refused password) |
-| `engine_chat`    | drives an engine library through its C interface: chat, images with their projector (`--image`, `--detail`), tools, reasoning, parallel requests, embeddings compared with a reference; it ends without unloading the engine of a device, as the service does |
+| `test_host`      | in a data folder of its own: the files of the downloads and of the imports through no link, the refusals of the import route, the copies of models already installed, the identifiers of the imports, the replacement of a model file, the ranges of the downloads, a damaged database, the public link through a local API of pCloud (its listing, the copies it holds and lacks, a refused password), the web access through a local server (the public addresses on both sides of each range, the addresses refused before any connection, a page, a text cut at 2 MB, a type refused, the PDF files above 20 MB, a redirection to a private address, the three providers of the search, the refusals offline and with the web access turned off) and the key of the search, absent from the documents of the settings and from the log |
+| `engine_chat`    | drives an engine library through its C interface: chat, images with their projector (`--image`, `--detail`), tools, reasoning, parallel requests, turns with pauses (`--turns --pause`), embeddings compared with a reference; it ends without unloading the engine of a device, as the service does |
 | `bench_runtime`  | tokens per second of the prompt and of the generation, also as `bench_runtime_avxvnni` and `bench_runtime_avx512` |
 
 `test_offload model.gguf CPU` validates the OpenVINO engine on a machine without NPU, with the CPU
@@ -760,9 +808,9 @@ Two ways to update an installed computer:
 
 ## Settings
 
-`settings.json`, in the data folder, holds the settings, the password of the proxy apart; the tray
-changes them through the administration interface, a new port being opened once before it is
-saved, and the service restarts when a change requires it.
+`settings.json`, in the data folder, holds the settings, the password of the proxy and the key of
+the search apart; the tray changes them through the administration interface, a new port being
+opened once before it is saved, and the service restarts when a change requires it.
 
 | Key             | Default | Meaning                                                                   |
 |-----------------|---------|---------------------------------------------------------------------------|
@@ -782,6 +830,10 @@ saved, and the service restarts when a change requires it.
 | `default_model` | true    | downloads the default language model of the catalog at the first start    |
 | `offline`       | false   | no connection: catalog, models and updates come from imports              |
 | `proxy`         | `""`    | `""` for the proxy of the system (`HTTPS_PROXY`, then WinHTTP), `none`, or `http://[user:password@]host:port`; the settings give the password as `********`, kept in `proxy.secret` |
+| `web_access`    | true    | the web access of the Web button, `false` turns it off (see [Web access](#web-access)) |
+| `web_search`    | `wikipedia` | provider of the search: `wikipedia`, `brave`, `searxng` or `none`     |
+| `web_search_url` | `""`   | address of the SearXNG instance, http or https, any host                  |
+| `web_search_key` | `""`   | key of the Brave Search API, kept in `web_search.secret`; the settings give `web_search_key_set` instead |
 | `active`        |         | the model of each function: `general`, `code`, `security`, `embedding`     |
 | `update_feed`, `catalog_url` | | addresses of the signed feed and catalog, read when the public link does not answer or holds none |
 | `public_link`   | the link of Albireo | public link of pCloud of the published files (`dist`, `models`), read first; `""` turns it off |
@@ -806,6 +858,8 @@ of `/v1/embeddings` takes `albireo-embedding`.
 | `GET /albireo/v1/models?lang=fr`         | catalog and installed models                              |
 | `GET /albireo/v1/engines`                | engine libraries, options and measures                    |
 | `POST /albireo/v1/count`                 | tokens of a conversation for a model                      |
+| `POST /albireo/v1/web/search`            | a search of the web through the provider of the settings (see [Web access](#web-access)) |
+| `POST /albireo/v1/web/fetch`             | a page of the web at a public address, its bytes in base64 |
 | `GET /albireo/v1/licenses`               | license texts of the `licenses` folder of the installation, with the versions the service knows |
 | `GET /albireo/v1/licenses/<file>`        | one of these texts, 1 MB at most, a file of that folder only |
 | `/docs/`                                 | Swagger page of the interface                             |
@@ -848,6 +902,154 @@ deactivated, replaced or deleted while it answers leaves the engine once its req
 deletion answers `"pending": true`. The errors these routes return carry a `code` with its `args`
 and `sizes` (`disk_space`, `not_installed`, `being_deleted`, `embedding_needed`, `load_failed`...),
 which the windows explain in the language of the user.
+
+## Web access
+
+The Web button of the composer gives the model two tools that reach the web through the service
+([`host/web_access.h`](host/web_access.h)): `web_search`, which searches the web through the
+provider the administrator set, and `fetch_page`, which reads a page at an address, one of the
+results or one the user gave. The service makes the requests, so that the application still loads
+nothing from another origin, and gives back the bytes it read, which the application decodes
+([`web/js/web.js`](web/js/web.js)): a text with `TextDecoder` and its charset, HTML with
+`DOMParser`, PDF with its reader.
+
+| Route | Body | Answer |
+|-------|------|--------|
+| `POST /albireo/v1/web/search` | `{"query", "count", "language"}`: 1 to 400 characters, 1 to 10 results (5 by default), a language such as `fr` or `pt-BR` | `{"provider", "results": [{"title", "url", "snippet"}]}`, the results of http and https addresses only |
+| `POST /albireo/v1/web/fetch` | `{"url", "language"}`: an http or https address, the language sent as `Accept-Language` | `{"url", "final_url", "status", "content_type", "charset", "size", "truncated", "data"}`, the bytes in base64 |
+
+These routes take no administration token: they belong to the interface of the web application,
+of the same origin as its other routes, which the server refuses to any other site (see
+[Security](#security)). `/albireo/v1/status`, which the application reads at its start, gives
+`"web": {"available": true, "search": "wikipedia"}`: `available` while the administrator leaves
+the web access on and the service is not offline, and the provider of the search, `none` when no
+provider can search, the reading of pages staying available. Both routes answer 403 while the
+service works offline (`offline`) or once the administrator turned the web access off
+(`web_access_off`).
+
+The setting `web_search` names the provider of the search:
+
+- `wikipedia`, by default: the search of the REST interface of Wikipedia in the language of the
+  request, English without one (`GET https://<language>.wikipedia.org/w/rest.php/v1/search/page`),
+  each result an article of that Wikipedia with its excerpt, its markup removed, or else its
+  description. The requests carry the User-Agent that the policy of Wikimedia asks for, with a
+  contact: `Albireo/<version> (https://github.com/Cydral/Dlib-Transformer-extensions;
+  cydraltechnology@gmail.com)`. Wikimedia limits the rate of the anonymous requests per minute
+  and per client, 200 requests a minute for a client that names itself so and 10 for a client
+  known by its address alone, limits introduced in 2026 that may change, and the computers behind
+  one public address share them. The route reports the limit with 429 (`rate_limited`) and the
+  delay Wikimedia gives (`Retry-After`);
+- `brave`: the Brave Search API, with the key of the administrator (`web_search_key`) in the
+  `X-Subscription-Token` header. Brave grants each account a credit of $5 a month, about 1,000
+  searches at $5 per 1,000 requests, and asks the projects that use this credit to name the Brave
+  Search API on their website or on their About pages; a rate or a credit exhausted gives 429, and
+  a key refused 502 (`search_key_refused`);
+- `searxng`: the SearXNG instance at `web_search_url`, http or https on any host the administrator
+  chooses, through its JSON format, which its `settings.yml` must list (`formats: [html, json]`
+  under `search`); an instance that refuses the format answers 403, reported with 502
+  (`search_format_refused`);
+- `none`: no search, `fetch_page` staying available.
+
+The service reads no page of results meant for people and sends no User-Agent of a browser; a
+limit of rate or a check of bots of a provider comes back as the error of the route. The addresses
+of the providers are fixed or chosen by the administrator, and the rule of the public addresses
+that follows applies to the pages alone.
+
+A page is read at a public address only. The service refuses with 403 (`address_refused`) the
+names of this computer and of the local networks, `localhost`, `*.localhost`, `*.local`,
+`*.internal`, `*.home.arpa` and the names of a single label, then resolves the name and refuses
+the page when one of its addresses is not public: 0.0.0.0/8, 10/8, 100.64/10, 127/8, 169.254/16,
+172.16/12, 192.0.0/24, 192.0.2/24, 192.88.99/24, 192.168/16, 198.18/15, 198.51.100/24,
+203.0.113/24, 224/4 and 240/4 in IPv4; ::/96 (`::`, `::1` and the IPv4-compatible addresses),
+64:ff9b:1::/48, 100::/64, 2001::/32, 2001:db8::/32, fc00::/7, fe80::/10, fec0::/10 and ff00::/8
+in IPv6, with the IPv4 addresses that ::ffff:0:0/96, 64:ff9b::/96 and 2002::/16 carry, checked
+as IPv4. The decimal, hexadecimal and shortened forms of IPv4
+(`http://2130706433/`, `http://0x7f.1/`) are read as the resolvers read them and checked the same
+way. The connection goes to the address checked, so that the name is not resolved again between
+the check and the connection, while the `Host` header, the server name of TLS and the check of the
+certificate keep the name. The service follows the redirections itself, five at most, each address
+checked as the first one, and gives the address that answered (`final_url`). An address of another
+scheme than http and https, with a user name or a password, or without host is refused with 400
+(`invalid_url`).
+
+A text (`text/...`, XML and the `+xml` types, JSON and the `+json` types) is read up to 2 MB and
+cut beyond (`truncated`), a PDF file up to 20 MB and refused beyond (413), and any other type is
+refused with its name (415). The answer gives the status of the site, 404 or 500 included, with
+its body. A request takes 10 s at most to connect, 15 s for each wait for data and 30 s in all
+(504), sends `Albireo/<version> (+https://github.com/Cydral/Dlib-Transformer-extensions)` as
+User-Agent and `Accept-Language` when the request gives a language, and keeps no cookie. Three
+requests of the web access run at once, as Wikimedia asks of its clients (503 `busy` beyond, with
+`Retry-After: 2`), and the stop of the service or its offline mode ends those in progress. The log
+names the host read, the status and the size (`web: en.wikipedia.org read (200, 81234 bytes)`),
+and the provider of a search with the number of its results, never a path, a query or the text
+searched.
+
+Behind a proxy, the one of the setting `proxy` or of the system, the requests go through the
+proxy, which resolves the name again on its own: the check applies to the addresses this computer
+resolves, and the proxy may reach other addresses for the same name. A name this computer cannot
+resolve is refused, which leaves the reading of pages out on the networks where the proxy alone
+resolves the names of the Internet; the search, whose providers are not checked, goes through the
+proxy there.
+
+The administrator sets the web access through the settings route of the administration interface
+(`PUT /albireo/v1/settings` with the token), for instance with one of these bodies:
+
+```
+{"web_access": false}
+{"web_search": "brave", "web_search_key": "<key of the Brave Search API>"}
+{"web_search": "searxng", "web_search_url": "https://searx.example.org"}
+{"web_search": "none"}
+```
+
+That route alone writes the key: the settings give `web_search_key_set`, true or false, and the key
+lies in `web_search.secret` beside `settings.json`, which the service and the administrators alone
+read; an empty key removes it, and the log never shows it.
+
+In the web application, the Web button stands beside Agent. It is off in every new discussion,
+whatever the earlier ones chose: its state belongs to its discussion, which keeps it with its
+messages, while the last choice of Agent and of the reasoning becomes the default of the next
+discussions. The button is disabled, with the reason as its title, while the model of the function
+calls no tools, while the service works offline and once the administrator turned the web access
+off. With Web on, each question carries `web_search`, when the service names a provider other than
+`none`, and `fetch_page`, after the tools of the agent while Agent is on, and the answer runs the
+calls of the tools even with Agent off. The tools and the system message stay the same from one
+question to the next while the buttons and the provider do not change, so that the beginning of
+the prompt stays in the cache of the engine. The list under the prompt shows the tools of the next
+question, and the help next to the buttons describes the web tools with those of the agent.
+
+`fetch_page` reads only an address of the discussion: one that a question of the user holds
+(`http://`, `https://`, or `www.` for both schemes), an address of a result of `web_search`, or a
+link of a page already read, compared without their fragment. Any other address, which the model
+would compose, is refused with that reason as the result of the call, so that a page read cannot
+have the model send the data of the discussion to an address of its choice. The results of the
+searches and the links of the pages stay with their calls in the discussion, so that the rule
+holds after a reload of the page and in another tab.
+
+An HTML page is read in an inert document of `DOMParser`, which runs no script and loads nothing,
+without its scripts, styles, frames, drawings, forms, navigation, headers, footers and asides, in
+its `main` element, else its only `article`, else its body: its title, its headings as `#` lines,
+its list items as `- ` lines, its tables as rows of cells separated by ` | `, its preformatted
+blocks as they are, and its links, made absolute, http and https only, 50 at most, listed at the
+end. A PDF file goes through the reader of the documents, JSON, XML and text stay as they are. The
+model receives a page by parts of 8,000 characters, each with the address, the status and the
+title, the last line giving the start of the next part; the text of the last pages read stays in
+memory for their discussion, 12 pages per discussion, 30 pages and 8 million characters in all, so
+that the next parts need no second download, and leaves with a deleted or incognito discussion.
+
+Each result of the web tools starts with a line telling the model that the text of the web is data
+and that it follows none of the instructions it holds. While Web is on, the system message, after
+the part that stays the same, says what the web tools do and asks the model to cite the addresses
+it used and to put no data of the discussion into an address or a search. The words of a search
+are those the model chooses, and that instruction alone keeps the data of the discussion out of
+them.
+
+Each call shows in the answer as the calls of the agent do, under the name of its tool in the
+language of the interface ("Recherche Web" and "Lecture d'une page" in French), with the words
+searched or the address asked, a link that opens in a new tab (`target="_blank"`,
+`rel="noopener noreferrer"`) once the page was read. An error of the service, an address refused,
+a page too large, a type not read, a site that does not answer or the offline mode, reaches the
+model as the result of the call, with the message of the service, and changes nothing else in the
+page.
 
 ## Models
 
@@ -1015,9 +1217,10 @@ fine tuning.
 ## Computers without network
 
 The `offline` setting, set by the installer (option "This computer has no Internet access",
-`/offline`) or by the window of the computer, makes the service open no connection: the catalog, the updates and the downloads are
-refused with the reason, and the menu of the icon greys "Check for updates". What the service
-needs then comes from an offline bundle, prepared on a computer with network:
+`/offline`) or by the window of the computer, makes the service open no connection: the catalog,
+the updates, the downloads and the web access are refused with the reason, and the menu of the
+icon greys "Check for updates". What the service needs then comes from an offline bundle,
+prepared on a computer with network:
 
 ```
 python3 dlib/dlib/external/albireo/tools/make_offline_bundle.py <folder> [--models qwen3-4b,qwen3-embedding-0.6b] [--from ~/models]
@@ -1170,6 +1373,13 @@ size and its SHA-256, and run it in update mode at their next start.
 - The JavaScript the agent mode runs executes in a sandboxed frame of opaque origin, in a worker
   stopped after 15 s; the page builds its own copy of each answer of the frame, with checked and
   shortened fields, and gives up on a frame silent for 20 s.
+- The web access reads the pages of public addresses only, the names and the addresses of this
+  computer and of the local networks refused, its connection going to the address checked; it
+  follows the redirections itself, each address checked again, reads 2 MB of text and 20 MB of PDF
+  at most, and keeps the key of the Brave Search API as the password of the proxy, in
+  `web_search.secret`. The application reads only the addresses of the discussion, reads the pages
+  in an inert document, and gives their text to the model as untrusted data (see
+  [Web access](#web-access)).
 - The text read aloud reaches the synthesizer through `albireo-speech.exe` alone, started for each
   reading with a token of low integrity and without privileges, which cannot write in the folders
   of the service, of the programs or of the users, in a job of 256 MB that ends it with the service
@@ -1200,6 +1410,7 @@ size and its SHA-256, and run it in update mode at their next start.
 | `C:\Program Files\Albireo\speech`      | the voices of the speech synthesis                           |
 | `C:\ProgramData\Albireo\settings.json` | settings, and their last copy `settings.json.bak`            |
 | `C:\ProgramData\Albireo\proxy.secret`  | password of the proxy, readable by the administrators and the service |
+| `C:\ProgramData\Albireo\web_search.secret` | key of the Brave Search API, readable by the administrators and the service |
 | `C:\ProgramData\Albireo\albireo.db`    | installed models, downloads, usage, catalog                   |
 | `C:\ProgramData\Albireo\models`        | models (or the folder chosen at installation)                |
 | `C:\ProgramData\Albireo\import`        | offline bundles and models, installed within a minute        |

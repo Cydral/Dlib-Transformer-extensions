@@ -77,19 +77,31 @@ const math = [
 ];
 
 // True while renderMarkdown draws an answer that streams: the code without a language waits
-// for the end of the answer to have its language detected.
+// for the end of the answer to have its language detected, and a code block whose closing
+// fence has not come yet is highlighted once it comes.
 let streaming = false;
+
+// True for a fenced code block whose closing fence is missing, the block being written.
+function openFence(raw) {
+  const text = String(raw || '').replace(/\s+$/, '');
+  const open = /^ {0,3}(`{3,}|~{3,})/.exec(text);
+  if (!open) return false;
+  const lines = text.split('\n');
+  if (lines.length < 2) return true;
+  const last = /^ {0,3}(`{3,}|~{3,})\s*$/.exec(lines[lines.length - 1]);
+  return !(last && last[1][0] === open[1][0] && last[1].length >= open[1].length);
+}
 
 const marked = new Marked({ gfm: true, breaks: false });
 marked.use({
   extensions: math,
   renderer: {
-    code({ text, lang }) {
+    code({ text, lang, raw }) {
       const language = String(lang || '').trim().split(/\s+/)[0].toLowerCase();
       let body = escapeHtml(text);
       const hl = window.hljs;
       // A block marked as plain text or as the output of a program stays as it is.
-      const plain = /^(text|txt|plain|plaintext|output)$/.test(language);
+      const plain = /^(text|txt|plain|plaintext|output)$/.test(language) || (streaming && openFence(raw));
       if (hl && !plain) {
         try {
           if (language && hl.getLanguage(language)) body = hl.highlight(text, { language, ignoreIllegals: true }).value;

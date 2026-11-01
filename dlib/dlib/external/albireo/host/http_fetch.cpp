@@ -339,30 +339,35 @@ namespace albireo
             error = "no answer within " + std::to_string(connect_seconds) + " s";
             return false;
         }
-#endif
+
+        // Releases a resolution that the system ended, with its addresses.
+        void free_lookup(std::unique_ptr<lookup>& l)
+        {
+            if (!l) return;
+            if (l->result) FreeAddrInfoExW(l->result);
+            CloseHandle(l->overlapped.hEvent);
+            l.reset();
+        }
 
         /*
-            Resolves the name of a server and checks that it answers on its port, within
-            connect_seconds for each, giving up at once when the downloads are cancelled.
-            The answer of the resolution stays in the cache of the system, where the client
-            that follows finds it, and its connection, which cannot be interrupted, finds a
-            server that answers.  Elsewhere than on Windows, the client resolves and
-            connects by itself, bounded by connect_seconds.
+            Resolves host within connect_seconds, giving up at once when the downloads are
+            cancelled.  Returns the resolution with its addresses, or null: with error when the
+            name is not resolved, without error when the system lacks the functions of a
+            bounded resolution, the name being then left to the client.
         */
-        bool reach_bounded(const std::string& host, int port, std::string& error)
+        std::unique_ptr<lookup> lookup_bounded(const std::string& host, std::string& error)
         {
-#if defined(_WIN32)
-            if (host == "localhost") return true;
+            error.clear();
             // Functions of Windows 8 and later, absent from the headers of MinGW.
             const HMODULE ws2 = GetModuleHandleW(L"ws2_32.dll");
             const auto cancel = ws2 ? reinterpret_cast<addrinfo_cancel_function>(
                 reinterpret_cast<void*>(GetProcAddress(ws2, "GetAddrInfoExCancel"))) : nullptr;
             const auto overlapped_result = ws2 ? reinterpret_cast<addrinfo_result_function>(
                 reinterpret_cast<void*>(GetProcAddress(ws2, "GetAddrInfoExOverlappedResult"))) : nullptr;
-            if (!cancel || !overlapped_result) return true;
+            if (!cancel || !overlapped_result) return nullptr;
             std::unique_ptr<lookup> l(new lookup());
             l->overlapped.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-            if (!l->overlapped.hEvent) return true;
+            if (!l->overlapped.hEvent) return nullptr;
             ADDRINFOEXW hints = {};
             hints.ai_family = AF_UNSPEC;
             hints.ai_socktype = SOCK_STREAM;
@@ -379,26 +384,41 @@ namespace albireo
                     // The system releases the request once it ends it; a request it does not
                     // end in time is left to it, with its memory.
                     if (WaitForSingleObject(l->overlapped.hEvent, 2000) != WAIT_OBJECT_0) l.release();
-                    else
-                    {
-                        if (l->result) FreeAddrInfoExW(l->result);
-                        CloseHandle(l->overlapped.hEvent);
-                    }
+                    else free_lookup(l);
                     error = w == WAIT_OBJECT_0 + 1 ? cancelled_error()
                         : "the name " + host + " was not resolved within " + std::to_string(connect_seconds) + " s";
-                    return false;
+                    return nullptr;
                 }
                 rc = overlapped_result(&l->overlapped);
             }
-            bool ok = rc == NO_ERROR;
-            if (!ok) error = "the name " + host + " cannot be resolved (error " + std::to_string(rc) + ")";
-            else if (!probe(l->result, port, error))
+            if (rc != NO_ERROR)
             {
-                ok = false;
-                error = host + ":" + std::to_string(port) + ": " + error;
+                error = "the name " + host + " cannot be resolved (error " + std::to_string(rc) + ")";
+                free_lookup(l);
+                return nullptr;
             }
-            if (l->result) FreeAddrInfoExW(l->result);
-            CloseHandle(l->overlapped.hEvent);
+            return l;
+        }
+#endif
+
+        /*
+            Resolves the name of a server and checks that it answers on its port, within
+            connect_seconds for each, giving up at once when the downloads are cancelled.
+            The answer of the resolution stays in the cache of the system, where the client
+            that follows finds it, and its connection, which cannot be interrupted, finds a
+            server that answers.  Elsewhere than on Windows, the client resolves and
+            connects by itself, bounded by connect_seconds.
+        */
+        bool reach_bounded(const std::string& host, int port, std::string& error)
+        {
+#if defined(_WIN32)
+            if (host == "localhost") return true;
+            std::unique_ptr<lookup> l = lookup_bounded(host, error);
+            // Without the functions of a bounded resolution, the client resolves the name.
+            if (!l) return error.empty();
+            const bool ok = probe(l->result, port, error);
+            if (!ok) error = host + ":" + std::to_string(port) + ": " + error;
+            free_lookup(l);
             return ok;
 #else
             (void)host;
@@ -408,26 +428,38 @@ namespace albireo
 #endif
         }
 
-        // Registers the client of a request, so that http_cancel_all() can stop it.
-        class registration
+        // The text of an IPv4 or IPv6 address of a resolution, empty for another family.
+        std::string numeric_address(const sockaddr* a)
         {
-        public:
-            explicit registration(const std::shared_ptr<httplib::Client>& c) : c_(c)
-            {
-                std::lock_guard<std::mutex> lock(active_m);
-                active.insert(c_);
-            }
-            ~registration()
-            {
-                std::lock_guard<std::mutex> lock(active_m);
-                active.erase(c_);
-            }
-            registration(const registration&) = delete;
-            registration& operator=(const registration&) = delete;
+            char text[INET6_ADDRSTRLEN] = {};
+            const void* bytes = nullptr;
+            if (a && a->sa_family == AF_INET) bytes = &reinterpret_cast<const sockaddr_in*>(a)->sin_addr;
+            else if (a && a->sa_family == AF_INET6) bytes = &reinterpret_cast<const sockaddr_in6*>(a)->sin6_addr;
+            if (!bytes || !inet_ntop(a->sa_family, bytes, text, sizeof(text))) return std::string();
+            return text;
+        }
 
-        private:
-            std::shared_ptr<httplib::Client> c_;
-        };
+        // Resolves host with getaddrinfo(), which answers in the time of the resolver of the system.
+        bool resolve_unbounded(const std::string& host, std::vector<std::string>& addresses, std::string& error)
+        {
+            addrinfo hints = {};
+            hints.ai_family = AF_UNSPEC;
+            hints.ai_socktype = SOCK_STREAM;
+            addrinfo* list = nullptr;
+            const int rc = getaddrinfo(host.c_str(), nullptr, &hints, &list);
+            if (rc != 0)
+            {
+                error = "the name " + host + " cannot be resolved (error " + std::to_string(rc) + ")";
+                return false;
+            }
+            for (const addrinfo* a = list; a; a = a->ai_next)
+            {
+                const std::string text = numeric_address(a->ai_addr);
+                if (!text.empty()) addresses.push_back(text);
+            }
+            freeaddrinfo(list);
+            return true;
+        }
 
         // The port of an origin, "https://host:port".
         int port_of(const std::string& origin)
@@ -518,6 +550,71 @@ namespace albireo
         return cancelled;
     }
 
+    http_registration::http_registration(const std::shared_ptr<httplib::Client>& c) : c_(c)
+    {
+        std::lock_guard<std::mutex> lock(active_m);
+        active.insert(c_);
+    }
+
+    http_registration::~http_registration()
+    {
+        std::lock_guard<std::mutex> lock(active_m);
+        active.erase(c_);
+    }
+
+    bool http_proxy_for(const std::string& origin, std::string& host, int& port, std::string& user,
+        std::string& password)
+    {
+        proxy_address p;
+        const std::string proxy = proxy_for(origin);
+        const bool via_proxy = !proxy.empty() && parse_proxy(proxy, p);
+        host = via_proxy ? p.host : std::string();
+        port = via_proxy ? p.port : 0;
+        user = via_proxy ? p.user : std::string();
+        password = via_proxy ? p.password : std::string();
+        return via_proxy;
+    }
+
+    bool http_resolve(const std::string& host, std::vector<std::string>& addresses, std::string& error)
+    {
+        addresses.clear();
+        if (cancelled)
+        {
+            error = cancelled_error();
+            return false;
+        }
+#if defined(_WIN32)
+        std::unique_ptr<lookup> l = lookup_bounded(host, error);
+        if (l)
+        {
+            for (const ADDRINFOEXW* a = l->result; a; a = a->ai_next)
+            {
+                const std::string text = numeric_address(a->ai_addr);
+                if (!text.empty()) addresses.push_back(text);
+            }
+            free_lookup(l);
+        }
+        // Without the functions of a bounded resolution, the resolver of the system answers in its own time.
+        else if (!error.empty() || !resolve_unbounded(host, addresses, error))
+        {
+            return false;
+        }
+#else
+        if (!resolve_unbounded(host, addresses, error)) return false;
+#endif
+        if (cancelled)
+        {
+            error = cancelled_error();
+            return false;
+        }
+        if (addresses.empty())
+        {
+            error = "the name " + host + " has no address";
+            return false;
+        }
+        return true;
+    }
+
     bool http_get(const std::string& url, std::string& body, std::string& error, size_t max_bytes, int timeout_seconds)
     {
         std::string current = url;
@@ -540,7 +637,7 @@ namespace albireo
                 error = url + ": " + error;
                 return false;
             }
-            registration reg(c);
+            http_registration reg(c);
             // A cancellation between the resolution and the registration.
             if (cancelled)
             {
@@ -638,7 +735,7 @@ namespace albireo
                 error = url + ": " + error;
                 return false;
             }
-            registration reg(c);
+            http_registration reg(c);
             if (cancelled)
             {
                 error = cancelled_error();

@@ -273,7 +273,60 @@ schemas = {
                   "description": "Proxy of the downloads: empty for the proxy of the system, none for a direct "
                                  "connection, or http://[user:password@]host:port.  The settings give the password "
                                  "as ********; that value sent back keeps the stored password when the user, the "
-                                 "host and the port stay the same, and is refused (code proxy_password) otherwise."}}},
+                                 "host and the port stay the same, and is refused (code proxy_password) otherwise."},
+        "web_access": {"type": "boolean", "default": True,
+                       "description": "The web access of the agent mode, /albireo/v1/web/search and "
+                                      "/albireo/v1/web/fetch; false turns it off."},
+        "web_search": {"type": "string", "enum": ["wikipedia", "brave", "searxng", "none"], "default": "wikipedia",
+                       "description": "The provider of /albireo/v1/web/search: the REST interface of Wikipedia, the "
+                                      "Brave Search API with web_search_key, the SearXNG instance at web_search_url, "
+                                      "or none."},
+        "web_search_url": {"type": "string", "maxLength": 512,
+                           "description": "The address of the SearXNG instance, http or https, any host, without "
+                                          "user, query or fragment; the instance must allow the JSON format "
+                                          "(search.formats in its settings.yml)."},
+        "web_search_key": {"type": "string", "maxLength": 256, "writeOnly": True,
+                           "description": "The key of the Brave Search API, printable characters without space. "
+                                          "This route writes it and no route gives it back: the settings give "
+                                          "web_search_key_set, and the key lies in web_search.secret, which the "
+                                          "service and the administrators alone read. An empty value removes it."}}},
+    "WebSearchRequest": {"type": "object", "required": ["query"], "properties": {
+        "query": {"type": "string", "minLength": 1, "maxLength": 400,
+                  "description": "The text searched, 1 to 400 characters once the spaces at its ends are removed."},
+        "count": {"type": "integer", "minimum": 1, "maximum": 10, "default": 5, "description": "Results at most."},
+        "language": {"type": "string", "pattern": "^[a-z]{2,3}(-([A-Z]{2}|[0-9]{3}))?$", "example": "fr",
+                     "description": "The language of the results: the site of Wikipedia of that language (en "
+                                    "without one), and the language parameter of SearXNG."}},
+        "example": {"query": "Albireo double star", "count": 5, "language": "en"}},
+    "WebSearchResults": {"type": "object", "properties": {
+        "provider": {"type": "string", "enum": ["wikipedia", "brave", "searxng"]},
+        "results": {"type": "array", "description": "The results whose address is http or https, count at most.",
+                    "items": {"type": "object", "properties": {
+                        "title": {"type": "string"},
+                        "url": {"type": "string", "description": "An http or https address; for Wikipedia, "
+                                "https://<language>.wikipedia.org/wiki/<key of the page>."},
+                        "snippet": {"type": "string", "description": "The excerpt of Wikipedia without its tags "
+                                    "and entities, else the description of the page; the description of Brave "
+                                    "without its tags; the content of SearXNG."}}}}}},
+    "WebFetchRequest": {"type": "object", "required": ["url"], "properties": {
+        "url": {"type": "string", "description": "An http or https address of a public host, without user "
+                "information.", "example": "https://en.wikipedia.org/wiki/Albireo"},
+        "language": {"type": "string", "pattern": "^[a-z]{2,3}(-([A-Z]{2}|[0-9]{3}))?$",
+                     "description": "Sent as Accept-Language."}}},
+    "WebPage": {"type": "object", "properties": {
+        "url": {"type": "string", "description": "The address asked."},
+        "final_url": {"type": "string", "description": "The address that answered, after the redirections."},
+        "status": {"type": "integer", "description": "The status of the site, 4xx and 5xx included, with their "
+                   "body."},
+        "content_type": {"type": "string", "description": "The media type of the Content-Type of the site, in "
+                         "lowercase, without its parameters.", "example": "text/html"},
+        "charset": {"type": "string", "description": "The charset of the Content-Type, empty without one.",
+                    "example": "utf-8"},
+        "size": {"type": "integer", "description": "The bytes read."},
+        "truncated": {"type": "boolean", "description": "True when a text was cut at 2 MB."},
+        "data": {"type": "string", "format": "byte", "description": "The bytes read, in base64: the web "
+                 "application decodes a text with TextDecoder and the charset, HTML with DOMParser, PDF with its "
+                 "reader."}}},
     "Engines": {"type": "object", "properties": {
         "starting": {"type": "boolean", "description": "True while the engines are being described."},
         "engines": {"type": "array", "items": {"type": "object", "properties": {
@@ -429,7 +482,13 @@ paths = {
             "loaded_models": {"type": "array", "items": {"type": "object"},
                               "description": "The models of the engine, with their context and capabilities."},
             "models_state": {"type": "object", "additionalProperties": {"type": "string"},
-                             "description": "loading, ready, unloading, removing, or the error of a load."}}})}}},
+                             "description": "loading, ready, unloading, removing, or the error of a load."},
+            "web": {"type": "object", "description": "The web access of the agent mode, which the web application "
+                    "reads at its start: available while the administrator leaves it on (web_access) and the "
+                    "service is not offline, and the provider of /albireo/v1/web/search, none when the search is "
+                    "unavailable while /albireo/v1/web/fetch stays available.", "properties": {
+                        "available": {"type": "boolean"},
+                        "search": {"type": "string", "enum": ["wikipedia", "brave", "searxng", "none"]}}}}})}}},
     "/albireo/v1/models": {"get": {
         "tags": ["Service"], "summary": "Catalog, installed models, downloads and active models",
         "description": "The language models: those that come with Albireo first (builtin), then the catalog and "
@@ -527,6 +586,64 @@ paths = {
                       "400": reply("The engine refused the count, such as for a model that is not loaded: error "
                                    "gives the reason, as a text", {"type": "object", "properties": {
                                        "error": {"type": "string"}}})}}},
+    "/albireo/v1/web/search": {"post": {
+        "tags": ["Web access"], "summary": "Searches the web through the provider of the settings",
+        "description": "The tool web_search of the agent mode. The provider is the setting web_search: the REST "
+                       "interface of Wikipedia (GET https://<language>.wikipedia.org/w/rest.php/v1/search/page, with "
+                       "a User-Agent that gives a contact, as the policy of Wikimedia asks), the Brave Search API "
+                       "with the key of the administrator, or a SearXNG instance through its JSON format. The log "
+                       "names the provider and the number of results, never the query.",
+        "requestBody": json_body(ref("WebSearchRequest")),
+        "responses": {
+            "200": reply("The results", ref("WebSearchResults")),
+            "400": reply("An invalid query, count or language (codes invalid_query, invalid_count, "
+                         "invalid_language)", ref("Error")),
+            "403": reply("The service works offline (code offline), the administrator turned the web access off "
+                         "(web_access_off), or no provider is set (no_search_provider): web_search none, brave "
+                         "without key or searxng without address", ref("Error")),
+            "429": reply("The provider limits the rate of the requests (code rate_limited): Wikipedia for the "
+                         "anonymous requests, the rate or the monthly credit of the key of Brave, the limiter of "
+                         "SearXNG; Retry-After gives the delay the provider asks for", ref("Error")),
+            "502": reply("The Brave Search API refuses the key (code search_key_refused), the SearXNG instance "
+                         "refuses the JSON format (search_format_refused), the provider gives another answer "
+                         "(search_failed), or cannot be reached (unreachable, tls_failed, proxy_failed)",
+                         ref("Error")),
+            "503": reply("Three requests of the web access run already (code busy, Retry-After: 2), or the service "
+                         "stops (cancelled)", ref("Error")),
+            "504": reply("The provider did not answer in time (code timeout)", ref("Error"))}}},
+    "/albireo/v1/web/fetch": {"post": {
+        "tags": ["Web access"], "summary": "Reads a page of the web at a public address",
+        "description": "The tool fetch_page of the agent mode. The address is http or https, without user "
+                       "information; its host is refused when it names this computer or a local network "
+                       "(localhost, *.localhost, *.local, *.internal, *.home.arpa, a name of a single label) or "
+                       "when one of its addresses is not public (loopback, private, link-local, shared, "
+                       "documentation, multicast and reserved ranges, and the IPv4 addresses that IPv6 embeds), "
+                       "the decimal, hexadecimal and shortened forms of IPv4 included. The connection goes to the "
+                       "address checked, the name keeping the server name of TLS and the check of the certificate. "
+                       "The service follows five redirections at most, each address checked again. A text "
+                       "(text/<subtype>, XML, JSON) is read up to 2 MB and cut beyond (truncated), a PDF file up to "
+                       "20 MB. A request takes 10 s to connect, 15 s for each wait for data and 30 s in all, and "
+                       "keeps no cookie. Behind a proxy, the check applies to the addresses this computer resolves "
+                       "and the proxy resolves the name again. The log names the host, the status and the size, "
+                       "never the path or the query.",
+        "requestBody": json_body(ref("WebFetchRequest")),
+        "responses": {
+            "200": reply("The page, whatever the status of the site", ref("WebPage")),
+            "400": reply("An invalid address (code invalid_url): another scheme, user information, no host, an "
+                         "invalid port; or an invalid language (invalid_language)", ref("Error")),
+            "403": reply("An address that is local or private (code address_refused), the service offline "
+                         "(offline), or the web access turned off (web_access_off)", ref("Error")),
+            "413": reply("A PDF file above 20 MB (code too_large)", ref("Error")),
+            "415": reply("A type other than text/<subtype>, application/xhtml+xml, application/xml, "
+                         "application/<name>+xml, application/json, application/<name>+json and application/pdf "
+                         "(code unsupported_type), named in the message", ref("Error")),
+            "502": reply("The site cannot be reached (code unreachable), its TLS connection fails (tls_failed), the "
+                         "proxy does not open the connection (proxy_failed), more than five redirections "
+                         "(too_many_redirects), or a redirection to an address that is not http or https "
+                         "(invalid_redirect)", ref("Error")),
+            "503": reply("Three requests of the web access run already (code busy, Retry-After: 2), or the service "
+                         "stops (cancelled)", ref("Error")),
+            "504": reply("The site did not answer in time (code timeout)", ref("Error"))}}},
     "/albireo/v1/models/refresh": {"post": {"tags": ["Administration"], "security": admin,
                                             "summary": "Fetches the catalog again, in the background",
                                             "responses": dict({"202": reply("Started", {"type": "object"})},
@@ -606,7 +723,8 @@ paths = {
                                    ref("Error"))}}},
     "/albireo/v1/settings": {
         "get": {"tags": ["Administration"], "security": admin, "summary": "Settings of the service",
-                "responses": {"200": reply("The settings, the password of the proxy given as ********",
+                "responses": {"200": reply("The settings, the password of the proxy given as ******** and the key "
+                                           "of the search as web_search_key_set, true or false",
                                            {"type": "object"})}},
         "put": {"tags": ["Administration"], "security": admin, "summary": "Changes settings",
                 "description": "A new port is opened once before it is saved.",
@@ -687,6 +805,7 @@ doc = {
     "servers": [{"url": "/"}],
     "tags": [{"name": "OpenAI", "description": "Compatible with the OpenAI interface"},
              {"name": "Service", "description": "State of the service"},
+             {"name": "Web access", "description": "The search and the pages of the web for the agent mode"},
              {"name": "Administration", "description": "Routes of the tray, protected by the administration token"}],
     "paths": paths,
     "components": {"schemas": schemas, "securitySchemes": {

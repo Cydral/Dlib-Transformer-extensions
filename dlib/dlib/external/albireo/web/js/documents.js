@@ -15,7 +15,8 @@
     a document part by part with them (outline() and partText()).
 */
 
-export const maxFileBytes = 64 * 1024 * 1024;
+// The size of a document at most, checked before the file is read.
+export const maxFileBytes = 100 * 1024 * 1024;
 export const maxTextChars = 4 * 1024 * 1024;
 // Rows of a sheet kept in the text; the following ones are counted.
 const maxSheetRows = 20000;

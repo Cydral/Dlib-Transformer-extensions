@@ -24,6 +24,15 @@
     fails, and from the official address when the copy has another size, and its errors never
     show the query of a request.  The test works in a data folder of its own (set_data_dir()), never in
     the one of an installed service.
+
+    The web access reads public addresses only: the addresses on both sides of each range that
+    is not public, the addresses refused before any connection (user information, schemes, names
+    of a single label, the names and the numeric forms of the loopback), then, the loopback
+    allowed for the tests, the pages of the local server: a page, a text cut at 2 MB, a type
+    refused, the PDF files above 20 MB refused, a redirection to a private address refused.  The
+    providers of the search answer from the same server with the documents of Wikipedia, of the
+    Brave Search API and of SearXNG.  Both routes refuse to work offline or with the web access
+    turned off, and the key of the search never reaches a document of the settings or the log.
 */
 
 #include <algorithm>
@@ -32,6 +41,7 @@
 #include <cstdio>
 #include <fstream>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -43,12 +53,16 @@
 #include <dlib/external/httplib/httplib.h>
 
 #include "../common/builtin_models.h"
+#include "../common/log.h"
 #include "../common/platform.h"
+#include "../common/version.h"
 #include "../host/crypto.h"
 #include "../host/http_fetch.h"
 #include "../host/models.h"
 #include "../host/public_link.h"
+#include "../host/settings.h"
 #include "../host/store.h"
+#include "../host/web_access.h"
 #include "tiny_gguf.h"
 
 namespace
@@ -273,6 +287,128 @@ int main(int argc, char** argv)
     });
     server.Get("/content/other.bin", [&](const httplib::Request&, httplib::Response& res) {
         res.set_content(short_copy, "application/octet-stream");
+    });
+    /*
+        The pages of the web access: a page, a text of 3 MB, an image, a small PDF file, two PDF
+        files of 21 MB (one announced by its length, one sent in chunks), a page that answers
+        404, redirections to a private address, to a relative address and to themselves, and a
+        page that sends back the headers it received.  The providers of the search answer as
+        the interfaces of Wikipedia, of the Brave Search API and of SearXNG, and keep what they
+        received, which the checks read under seen_m.
+    */
+    const std::string page = "<html><body><p>Albireo &amp; the web</p></body></html>";
+    const std::string large_text = blob(3u << 20, 't');
+    const size_t large_pdf = size_t(21) << 20;
+    server.Get("/web/page.html", [&](const httplib::Request&, httplib::Response& res) {
+        res.set_content(page, "text/html; charset=UTF-8");
+    });
+    server.Get("/web/large.txt", [&](const httplib::Request&, httplib::Response& res) {
+        res.set_content(large_text, "text/plain");
+    });
+    server.Get("/web/image.png", [&](const httplib::Request&, httplib::Response& res) {
+        res.set_content(std::string("\x89PNG\r\n\x1a\n", 8), "image/png");
+    });
+    server.Get("/web/small.pdf", [&](const httplib::Request&, httplib::Response& res) {
+        res.set_content("%PDF-1.4\n%%EOF\n", "application/pdf");
+    });
+    server.Get("/web/large.pdf", [&](const httplib::Request&, httplib::Response& res) {
+        res.set_content_provider(large_pdf, "application/pdf", [](size_t, size_t length, httplib::DataSink& sink) {
+            const std::string chunk(65536, '%');
+            return sink.write(chunk.data(), std::min(length, chunk.size()));
+        });
+    });
+    server.Get("/web/stream.pdf", [&](const httplib::Request&, httplib::Response& res) {
+        res.set_chunked_content_provider("application/pdf", [&](size_t offset, httplib::DataSink& sink) {
+            if (offset >= large_pdf)
+            {
+                sink.done();
+                return true;
+            }
+            const std::string chunk(65536, '%');
+            return sink.write(chunk.data(), chunk.size());
+        });
+    });
+    server.Get("/web/missing", [&](const httplib::Request&, httplib::Response& res) {
+        res.status = 404;
+        res.set_content("<p>no such page</p>", "text/html");
+    });
+    server.Get("/web/to-private", [&](const httplib::Request&, httplib::Response& res) {
+        res.set_redirect("http://192.168.1.10/admin");
+    });
+    server.Get("/web/relative", [&](const httplib::Request&, httplib::Response& res) {
+        res.set_redirect("./sub/../page.html?from=relative");
+    });
+    server.Get("/web/loop", [&](const httplib::Request&, httplib::Response& res) {
+        res.set_redirect("/web/loop");
+    });
+    server.Get("/web/headers", [&](const httplib::Request& req, httplib::Response& res) {
+        res.set_content(req.get_header_value("User-Agent") + "\n" + req.get_header_value("Accept-Language") + "\n"
+            + req.get_header_value("Cookie"), "text/plain; charset=\"utf-8\"");
+    });
+    std::mutex seen_m;
+    std::string seen_agent, seen_query, seen_count, seen_key, seen_format, seen_language;
+    auto keep_seen = [&](const httplib::Request& req, const char* count_name) {
+        std::lock_guard<std::mutex> lock(seen_m);
+        seen_agent = req.get_header_value("User-Agent");
+        seen_query = req.get_param_value("q");
+        seen_count = req.get_param_value(count_name);
+        seen_key = req.get_header_value("X-Subscription-Token");
+        seen_format = req.get_param_value("format");
+        seen_language = req.get_param_value("language");
+    };
+    server.Get("/w/rest.php/v1/search/page", [&](const httplib::Request& req, httplib::Response& res) {
+        keep_seen(req, "limit");
+        if (req.get_param_value("q") == "too many")
+        {
+            res.status = 429;
+            res.set_header("Retry-After", "30");
+            res.set_content("You are making too many requests to the API.", "text/plain");
+            return;
+        }
+        res.set_content("{\"pages\": [{\"id\": 736, \"key\": \"Albert_Einstein\", \"title\": \"Albert Einstein\", "
+            "\"excerpt\": \"<span class=\\\"searchmatch\\\">Albert</span> Einstein was a &quot;physicist&quot;\", "
+            "\"matched_title\": null, \"description\": \"German-born physicist\"}, {\"id\": 9411, \"key\": "
+            "\"Einstein_(crater)\", \"title\": \"Einstein (crater)\", \"excerpt\": \"\", \"description\": "
+            "\"Lunar crater\"}]}", "application/json");
+    });
+    server.Get("/res/v1/web/search", [&](const httplib::Request& req, httplib::Response& res) {
+        keep_seen(req, "count");
+        const std::string key = req.get_header_value("X-Subscription-Token");
+        if (key == "revoked-key")
+        {
+            res.status = 401;
+            res.set_content("{\"type\": \"ErrorResponse\"}", "application/json");
+            return;
+        }
+        if (key != "test-key")
+        {
+            res.status = 422;
+            res.set_content("{\"type\": \"ErrorResponse\", \"error\": {\"status\": 422, \"code\": "
+                "\"SUBSCRIPTION_TOKEN_INVALID\", \"detail\": \"The provided subscription token is invalid.\"}}",
+                "application/json");
+            return;
+        }
+        res.set_content("{\"type\": \"search\", \"web\": {\"type\": \"search\", \"results\": [{\"title\": "
+            "\"Brave &amp; Albireo\", \"url\": \"https://example.org/a\", \"description\": \"A <strong>local</strong> "
+            "model\"}, {\"title\": \"Files\", \"url\": \"ftp://example.org/b\", \"description\": \"left out\"}, "
+            "{\"title\": \"Second\", \"url\": \"http://example.org/c\", \"description\": \"plain\"}]}}",
+            "application/json");
+    });
+    server.Get("/searxng/search", [&](const httplib::Request& req, httplib::Response& res) {
+        keep_seen(req, "pageno");
+        if (req.get_param_value("format") != "json")
+        {
+            res.status = 403;
+            return;
+        }
+        res.set_content("{\"query\": \"x\", \"number_of_results\": 0, \"results\": [{\"url\": "
+            "\"https://searx.example/1\", \"title\": \"One\", \"content\": \"first   result\", "
+            "\"engine\": \"wikipedia\"}, {\"url\": \"javascript:alert(1)\", \"title\": \"Script\", "
+            "\"content\": \"left out\"}]}", "application/json");
+    });
+    server.Get("/closed/search", [&](const httplib::Request&, httplib::Response& res) {
+        res.status = 403;
+        res.set_content("Forbidden", "text/html");
     });
     if (!server.bind_to_port("127.0.0.1", port))
     {
@@ -662,6 +798,310 @@ int main(int argc, char** argv)
         bool temporary = false;
         for (const auto& n : albireo::list_dir(work)) temporary = temporary || n.find("atomic.txt.tmp-") == 0;
         check(!temporary, "no temporary file is left");
+    }
+
+    {
+        // The public addresses: those that follow and precede each range that is not public, and its bounds.
+        const char* const public_addresses[] = {
+            "1.0.0.0", "9.255.255.255", "11.0.0.0", "100.63.255.255", "100.128.0.0", "126.255.255.255",
+            "128.0.0.0", "169.253.255.255", "169.255.0.0", "172.15.255.255", "172.32.0.0", "191.255.255.255",
+            "192.0.1.0", "192.0.1.255", "192.0.3.0", "192.88.98.255", "192.88.100.0", "192.167.255.255",
+            "192.169.0.0", "198.17.255.255", "198.20.0.0", "198.51.99.255", "198.51.101.0", "203.0.112.255",
+            "203.0.114.0", "223.255.255.255", "8.8.8.8", "::1:0:0", "ff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+            "100:0:0:1::", "2001:db7:ffff:ffff:ffff:ffff:ffff:ffff", "2001:db9::", "2000:ffff:ffff:ffff::",
+            "2001:1::", "64:ff9b:0:ffff:ffff:ffff:ffff:ffff", "64:ff9b:2::",
+            "fbff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", "fe00::", "fe7f:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+            "::fffe:ffff:ffff", "::1:0:0:0", "::ffff:8.8.8.8", "64:ff9a:ffff:ffff:ffff:ffff:ffff:ffff",
+            "64:ff9b::1:0:0", "64:ff9b::808:808", "2001:ffff:ffff:ffff:ffff:ffff:ffff:ffff", "2003::",
+            "2002:808:808::", "2606:4700:4700::1111"
+        };
+        const char* const private_addresses[] = {
+            "0.0.0.0", "0.255.255.255", "10.0.0.0", "10.255.255.255", "100.64.0.0", "100.127.255.255",
+            "127.0.0.0", "127.255.255.255", "169.254.0.0", "169.254.255.255", "172.16.0.0", "172.31.255.255",
+            "192.0.0.0", "192.0.0.255", "192.0.2.0", "192.0.2.255", "192.88.99.0", "192.88.99.255",
+            "192.168.0.0", "192.168.255.255", "198.18.0.0", "198.19.255.255", "198.51.100.0", "198.51.100.255",
+            "203.0.113.0", "203.0.113.255", "224.0.0.0", "239.255.255.255", "240.0.0.0", "255.255.255.255",
+            "::", "::1", "100::", "100::ffff:ffff:ffff:ffff", "2001:db8::", "2001:db8:ffff:ffff:ffff:ffff:ffff:ffff",
+            "fc00::", "fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", "fe80::", "febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+            "fec0::", "feff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", "ff00::", "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+            "::ffff:0.0.0.0", "::ffff:127.0.0.1", "::ffff:10.1.2.3", "::ffff:192.168.1.1", "64:ff9b::7f00:1",
+            "64:ff9b::a00:1", "2002:7f00:1::", "2002:c0a8:101::1", "2002:a9fe:1::", "::2", "::7f00:1",
+            "::ffff:ffff", "64:ff9b:1::", "64:ff9b:1::a00:1", "64:ff9b:1:ffff:ffff:ffff:ffff:ffff", "2001::",
+            "2001::1", "2001:0:ffff:ffff:ffff:ffff:ffff:ffff"
+        };
+        std::string wrong;
+        for (const char* a : public_addresses)
+            if (!albireo::public_address(a)) wrong += std::string(" ") + a;
+        check(wrong.empty(), "the addresses beside the ranges that are not public are public" + wrong);
+        wrong.clear();
+        for (const char* a : private_addresses)
+            if (albireo::public_address(a)) wrong += std::string(" ") + a;
+        check(wrong.empty(), "the addresses of the ranges that are not public are not" + wrong);
+        check(!albireo::public_address("example.org") && !albireo::public_address("127.1")
+            && !albireo::public_address(""), "a text that is no address is not public");
+
+        // The addresses refused before any connection: 400 for an invalid one, 403 for a local or private one.
+        albireo::host_settings web;
+        auto fetch = [&](const std::string& url, const albireo::host_settings& s, const std::string& language) {
+            json request = json::object();
+            request["url"] = url;
+            if (!language.empty()) request["language"] = language;
+            return albireo::web_fetch(request, s);
+        };
+        struct refusal
+        {
+            std::string url;
+            int status;
+        };
+        const refusal refusals[] = {
+            {"ftp://example.org/file", 400}, {"file:///etc/passwd", 400}, {"javascript:alert(1)", 400},
+            {"http://user:secret@example.org/", 400}, {"http://user@example.org/", 400}, {"http:///no-host", 400},
+            {"http://exa mple.org/", 400}, {"http://999.1.1.1/", 400}, {"http://example.org:99999/", 400},
+            {"https://intranet/", 403}, {"http://localhost/", 403}, {"http://LOCALHOST./", 403},
+            {"http://app.localhost:8080/", 403}, {"http://printer.local/", 403}, {"http://db.internal/", 403},
+            {"http://nas.home.arpa/", 403}, {"http://2130706433/", 403}, {"http://0x7f.1/", 403},
+            {"http://127.1/", 403}, {"http://017700000001/", 403}, {"http://[::1]/", 403},
+            {"http://[::ffff:127.0.0.1]/", 403}, {"http://[::ffff:7f00:1]/", 403}, {"http://10.0.0.1/", 403},
+            {"http://[fe80::1]/", 403}, {"http://169.254.169.254/latest/meta-data/", 403},
+            {base_url + "/web/page.html", 403}
+        };
+        for (const auto& r : refusals)
+        {
+            const albireo::web_reply reply = fetch(r.url, web, "");
+            check(reply.status == r.status, "the address " + r.url + " is refused with " + std::to_string(r.status)
+                + " (" + std::to_string(reply.status) + " " + reply.code + ": " + reply.message + ")");
+        }
+        const albireo::web_reply local = fetch("http://[::ffff:127.0.0.1]/", web, "");
+        check(local.code == "address_refused" && local.message == "the address of [::ffff:127.0.0.1] is local or "
+            "private, which the web access of Albireo does not read",
+            "a refusal names the host (" + local.message + ")");
+
+        // The service offline and the web access turned off refuse both routes; the capability follows.
+        albireo::host_settings offline = web, off = web, none = web, brave = web, searxng = web;
+        offline.offline = true;
+        off.web_access = false;
+        none.web_search = "none";
+        brave.web_search = "brave";
+        searxng.web_search = "searxng";
+        json search_request = json::object();
+        search_request["query"] = "Einstein relativit\xc3\xa9";
+        albireo::web_reply reply = fetch("https://example.org/", offline, "");
+        check(reply.status == 403 && reply.code == "offline", "a page is refused offline (" + reply.message + ")");
+        reply = albireo::web_search(search_request, offline);
+        check(reply.status == 403 && reply.code == "offline", "a search is refused offline");
+        reply = fetch("https://example.org/", off, "");
+        check(reply.status == 403 && reply.code == "web_access_off",
+            "a page is refused with the web access turned off");
+        reply = albireo::web_search(search_request, off);
+        check(reply.status == 403 && reply.code == "web_access_off", "a search is refused with the web access off");
+        reply = albireo::web_search(search_request, none);
+        check(reply.status == 403 && reply.code == "no_search_provider" && reply.message == "no search provider is set",
+            "a search without provider is refused");
+        reply = albireo::web_search(search_request, brave);
+        check(reply.status == 403 && reply.code == "no_search_provider",
+            "the Brave Search API without key is no provider");
+        check(albireo::web_capability(web).dump() == "{\"available\":true,\"search\":\"wikipedia\"}"
+            && albireo::web_capability(offline).dump() == "{\"available\":false,\"search\":\"none\"}"
+            && albireo::web_capability(off).dump() == "{\"available\":false,\"search\":\"none\"}"
+            && albireo::web_capability(brave).dump() == "{\"available\":true,\"search\":\"none\"}"
+            && albireo::web_capability(searxng).dump() == "{\"available\":true,\"search\":\"none\"}",
+            "the capability gives the web access and its provider of search");
+        check(albireo::valid_web_search_url("") && albireo::valid_web_search_url("http://localhost:8888")
+            && albireo::valid_web_search_url("https://searx.example.org/searxng/")
+            && !albireo::valid_web_search_url("ftp://searx.example.org")
+            && !albireo::valid_web_search_url("https://user:pw@searx.example.org")
+            && !albireo::valid_web_search_url("https://searx.example.org/?q=x")
+            && albireo::valid_web_search_key("") && albireo::valid_web_search_key("BSA0123456789abcdef")
+            && !albireo::valid_web_search_key("two words") && !albireo::valid_web_search_key("line\r\nX-Other: 1"),
+            "the settings of the search are checked");
+
+        // The key of the search: given as web_search_key_set, kept in web_search.secret, never in settings.json.
+        const std::string key = "BSA-secret-0123456789";
+        albireo::host_settings keyed = brave;
+        keyed.web_search_key = key;
+        const json document = keyed.to_json();
+        check(document.dump().find(key) == std::string::npos && !document.contains("web_search_key")
+            && document["web_search_key_set"].as_bool() && albireo::web_capability(keyed).dump().find(key)
+            == std::string::npos && albireo::web_capability(keyed)["search"].as_string() == "brave",
+            "a document of the settings gives web_search_key_set and never the key");
+        const std::string folder = albireo::join_path(work, "settings");
+        albireo::make_dirs(folder);
+        const std::string settings_file = albireo::join_path(folder, "settings.json");
+        const std::string key_file = albireo::join_path(folder, "web_search.secret");
+        {
+            albireo::settings_store store(settings_file);
+            store.update([&](albireo::host_settings& s) {
+                s.web_search = "brave";
+                s.web_search_key = key;
+            });
+        }
+        check(read_text(settings_file).find(key) == std::string::npos
+            && read_text(settings_file + ".bak").find(key) == std::string::npos && read_text(key_file) == key,
+            "the key is kept in web_search.secret, outside settings.json and its copy");
+        {
+            albireo::settings_store store(settings_file);
+            albireo::host_settings changed = store.get();
+            json merged = changed.to_json();
+            merged["web_access"] = false;
+            changed.from_json(merged);
+            check(store.get().web_search_key == key && changed.web_search_key == key && !changed.web_access,
+                "the key is read back, and a change of another setting keeps it");
+            store.update([](albireo::host_settings& s) { s.web_search_key.clear(); });
+        }
+        check(!albireo::file_exists(key_file), "a key cleared removes web_search.secret");
+        write_text(settings_file, "{\"web_search\": \"brave\", \"web_search_key\": \"BSA-by-hand-42\"}");
+        {
+            albireo::settings_store store(settings_file);
+            check(store.get().web_search_key == "BSA-by-hand-42" && read_text(key_file) == "BSA-by-hand-42"
+                && read_text(settings_file).find("BSA-by-hand") == std::string::npos,
+                "a key written in settings.json by hand moves to web_search.secret");
+        }
+
+        // The pages of the local server, the loopback allowed for the tests.
+        albireo::web_allow_loopback_for_tests(true);
+        reply = fetch(base_url + "/web/page.html", web, "");
+        const json& b = reply.body;
+        check(reply.status == 200 && b["status"].as_int() == 200 && b["content_type"].as_string() == "text/html"
+            && b["charset"].as_string() == "utf-8" && !b["truncated"].as_bool()
+            && b["size"].as_int() == static_cast<long long>(page.size())
+            && albireo::base64_decode(b["data"].as_string()) == page && b["url"].as_string() == base_url
+            + "/web/page.html" && b["final_url"].as_string() == base_url + "/web/page.html",
+            "a page is read with its status, its type and its bytes (" + reply.message + ")");
+        reply = fetch(base_url + "/web/large.txt", web, "");
+        check(reply.status == 200 && reply.body["truncated"].as_bool() && reply.body["size"].as_int() == (2 << 20)
+            && albireo::base64_decode(reply.body["data"].as_string()) == large_text.substr(0, 2u << 20),
+            "a text is cut at 2 MB (" + reply.message + ")");
+        reply = fetch(base_url + "/web/image.png", web, "");
+        check(reply.status == 415 && reply.code == "unsupported_type" && reply.message.find("image/png")
+            != std::string::npos, "a type the web access does not read is refused (" + reply.message + ")");
+        reply = fetch(base_url + "/web/small.pdf", web, "");
+        check(reply.status == 200 && reply.body["content_type"].as_string() == "application/pdf"
+            && albireo::base64_decode(reply.body["data"].as_string()) == "%PDF-1.4\n%%EOF\n", "a PDF file is read");
+        reply = fetch(base_url + "/web/large.pdf", web, "");
+        check(reply.status == 413 && reply.code == "too_large", "a PDF file announced above 20 MB is refused ("
+            + reply.message + ")");
+        reply = fetch(base_url + "/web/stream.pdf", web, "");
+        check(reply.status == 413 && reply.code == "too_large", "a PDF file that passes 20 MB while it is read is "
+            "refused (" + reply.message + ")");
+        reply = fetch(base_url + "/web/missing", web, "");
+        check(reply.status == 200 && reply.body["status"].as_int() == 404
+            && albireo::base64_decode(reply.body["data"].as_string()) == "<p>no such page</p>",
+            "a page that answers 404 is given with its status and its body");
+        reply = fetch(base_url + "/web/to-private", web, "");
+        check(reply.status == 403 && reply.code == "address_refused" && reply.message.find("192.168.1.10")
+            != std::string::npos, "a redirection to a private address is refused (" + reply.message + ")");
+        reply = fetch(base_url + "/web/relative", web, "");
+        check(reply.status == 200 && reply.body["final_url"].as_string() == base_url + "/web/page.html?from=relative"
+            && albireo::base64_decode(reply.body["data"].as_string()) == page,
+            "a relative redirection is followed to its address (" + reply.message + ")");
+        reply = fetch(base_url + "/web/loop", web, "");
+        check(reply.status == 502 && reply.code == "too_many_redirects",
+            "redirections are followed five times at most");
+        reply = fetch(base_url + "/web/headers", web, "fr-FR");
+        check(reply.status == 200 && albireo::base64_decode(reply.body["data"].as_string()) == std::string("Albireo/")
+            + ALBIREO_VERSION + " (+https://github.com/Cydral/Dlib-Transformer-extensions)\nfr-FR\n",
+            "a page receives the User-Agent of Albireo, the language asked and no cookie");
+        albireo::http_cancel_all("the service stops");
+        reply = fetch(base_url + "/web/page.html", web, "");
+        check(reply.status == 503 && reply.code == "cancelled", "a service that stops ends the reading of pages");
+        albireo::http_restore();
+
+        // The providers of the search, answered by the local server.
+        albireo::web_provider_origin_for_tests(base_url);
+        search_request["count"] = 5;
+        search_request["language"] = "fr";
+        reply = albireo::web_search(search_request, web);
+        const json results = reply.body["results"];
+        check(reply.status == 200 && reply.body["provider"].as_string() == "wikipedia" && results.size() == 2
+            && results[0]["title"].as_string() == "Albert Einstein"
+            && results[0]["url"].as_string() == "https://fr.wikipedia.org/wiki/Albert_Einstein"
+            && results[0]["snippet"].as_string() == "Albert Einstein was a \"physicist\""
+            && results[1]["url"].as_string() == "https://fr.wikipedia.org/wiki/Einstein_(crater)"
+            && results[1]["snippet"].as_string() == "Lunar crater",
+            "Wikipedia gives its pages (" + reply.message + ")");
+        {
+            std::lock_guard<std::mutex> lock(seen_m);
+            check(seen_query == "Einstein relativit\xc3\xa9" && seen_count == "5"
+                && seen_agent == std::string("Albireo/") + ALBIREO_VERSION
+                + " (https://github.com/Cydral/Dlib-Transformer-extensions; cydraltechnology@gmail.com)",
+                "Wikipedia receives the query, the count and the User-Agent with a contact (" + seen_agent + ")");
+        }
+        search_request["query"] = "too many";
+        reply = albireo::web_search(search_request, web);
+        check(reply.status == 429 && reply.code == "rate_limited" && reply.retry_after == 30
+            && reply.message.find("Wikipedia limits the rate") != std::string::npos,
+            "a limit of the rate of Wikipedia is reported with its delay (" + reply.message + ")");
+        brave.web_search_key = "test-key";
+        search_request["query"] = "albireo";
+        search_request["count"] = 3;
+        reply = albireo::web_search(search_request, brave);
+        const json found = reply.body["results"];
+        check(reply.status == 200 && reply.body["provider"].as_string() == "brave" && found.size() == 2
+            && found[0]["title"].as_string() == "Brave & Albireo"
+            && found[0]["url"].as_string() == "https://example.org/a"
+            && found[0]["snippet"].as_string() == "A local model"
+            && found[1]["url"].as_string() == "http://example.org/c",
+            "the Brave Search API gives its results of http and https (" + reply.message + ")");
+        {
+            std::lock_guard<std::mutex> lock(seen_m);
+            check(seen_key == "test-key" && seen_count == "3" && seen_query == "albireo",
+                "the Brave Search API receives the key, the query and the count");
+        }
+        brave.web_search_key = "revoked-key";
+        reply = albireo::web_search(search_request, brave);
+        check(reply.status == 502 && reply.code == "search_key_refused", "a key refused with 401 is reported");
+        brave.web_search_key = "wrong-key";
+        reply = albireo::web_search(search_request, brave);
+        check(reply.status == 502 && reply.code == "search_key_refused", "a key refused as invalid (422) is reported");
+        searxng.web_search_url = base_url + "/searxng/";
+        search_request["language"] = "fr-FR";
+        reply = albireo::web_search(search_request, searxng);
+        const json listed = reply.body["results"];
+        check(reply.status == 200 && reply.body["provider"].as_string() == "searxng" && listed.size() == 1
+            && listed[0]["url"].as_string() == "https://searx.example/1" && listed[0]["snippet"].as_string()
+            == "first result", "SearXNG gives its results of http and https (" + reply.message + ")");
+        {
+            std::lock_guard<std::mutex> lock(seen_m);
+            check(seen_format == "json" && seen_language == "fr-FR",
+                "SearXNG receives the JSON format and the language");
+        }
+        searxng.web_search_url = base_url + "/closed";
+        reply = albireo::web_search(search_request, searxng);
+        check(reply.status == 502 && reply.code == "search_format_refused"
+            && reply.message.find("search.formats") != std::string::npos,
+            "an instance of SearXNG without the JSON format names its setting");
+        json invalid = json::object();
+        invalid["query"] = "   ";
+        const bool empty_refused = albireo::web_search(invalid, web).code == "invalid_query";
+        invalid["query"] = std::string(401, 'q');
+        const bool long_refused = albireo::web_search(invalid, web).code == "invalid_query";
+        std::string four_hundred;
+        for (int i = 0; i < 400; ++i) four_hundred += "\xc3\xa9";
+        invalid["query"] = four_hundred;
+        const bool characters_counted = albireo::web_search(invalid, web).status == 200;
+        invalid["query"] = "ok";
+        invalid["count"] = 11;
+        const bool count_refused = albireo::web_search(invalid, web).code == "invalid_count";
+        invalid["count"] = 2;
+        invalid["language"] = "french";
+        const bool language_refused = albireo::web_search(invalid, web).code == "invalid_language";
+        check(empty_refused && long_refused && characters_counted && count_refused && language_refused,
+            "a query of 1 to 400 characters, a count of 1 to 10 and a code of language are required");
+        albireo::web_provider_origin_for_tests("");
+        albireo::web_allow_loopback_for_tests(false);
+
+        // The log names the hosts read and the providers, never a path, a query or a key.
+        bool leaked = false, read_line = false, search_line = false;
+        for (const auto& line : albireo::log_file::instance().recent())
+        {
+            leaked = leaked || line.find("relativit") != std::string::npos || line.find("test-key") != std::string::npos
+                || line.find("BSA-") != std::string::npos || line.find("/web/") != std::string::npos
+                || line.find("q=") != std::string::npos;
+            read_line = read_line || line.find("web: 127.0.0.1 read (200, ") != std::string::npos;
+            search_line = search_line || line.find("web: search through wikipedia (2 results)") != std::string::npos;
+        }
+        check(!leaked && read_line && search_line, "the log names the hosts and the providers, never a path, a query "
+            "or a key");
     }
 
     server.stop();
