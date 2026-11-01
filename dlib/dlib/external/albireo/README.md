@@ -60,6 +60,9 @@ application, the description of the interface and the list of the programs of Wi
   images, which the model that comes with Albireo describes in the background; their descriptions
   are searched with its documents, and a question that finds one receives the image, four at most.
   A model that reads text only receives the names of the images.
+- **Reading aloud**: each answer has a button that reads it aloud, in English, French, German,
+  Italian or Spanish as its words show, with the speech synthesis that comes with Albireo, which
+  needs no network and no voice of Windows (see [Service](#service)).
 - **Projects**: discussions grouped with instructions and documents that form their shared
   context, read whole when they fit, searched otherwise by meaning and by words, the search and
   its index running in the browser (see [Documents and context](#documents-and-context)).
@@ -80,15 +83,16 @@ application, the description of the interface and the list of the programs of Wi
   forward pass serving the next token of each, and the keys and values of a finished request stay
   cached so that the next turn of a conversation starts where the previous one ended.
 - **An interface for other programs**: `/v1/chat/completions`, `/v1/completions`,
-  `/v1/embeddings` and `/v1/models` follow the OpenAI interface, streaming and images included,
-  with its documentation as a Swagger page at `/docs/`.
+  `/v1/embeddings`, `/v1/audio/speech` and `/v1/models` follow the OpenAI interface, streaming
+  and images included, with its documentation as a Swagger page at `/docs/`.
 - **Engines for each kind of processor**: portable, AVX2, AVX-VNNI, AVX-512, Intel NPU and
   integrated GPU through OpenVINO, NVIDIA GPU through CUDA, behind a single C interface. The
   service measures them on the machine and runs the fastest, and the Accelerator menu of the
   icon chooses the automatic choice, the processor alone, or a device by its name.
-- **Models from a signed catalog**, downloaded in parallel parts, checked against their hashes,
-  or imported from a disk or a memory card.
-- **Updates** announced by a signed feed, attached to the GitHub releases of the repository,
+- **Models from a signed catalog**, downloaded in parallel parts from the public link of the
+  published files of Albireo, else from their official source, checked against their hashes, or
+  imported from a disk or a memory card.
+- **Updates** announced by a signed feed, their installers published in the public link,
   downloaded in the background and installed when the service restarts.
 - **An offline mode** for the computers without network: the service opens no connection, and
   the catalog, the models and the updates come from an offline bundle brought on a disk.
@@ -217,23 +221,23 @@ leaves, the model stays loaded. A model deleted while it answers is deleted the 
 requests are served, and is shown as being deleted until then.
 
 The conversation formats are written natively ([`engine/chat_format.cpp`](engine/chat_format.cpp)),
-the chat template of a model naming its format: ChatML (Qwen2.5, Qwen3, Qwen3-VL, EuroLLM, with
-the reasoning between `<think>` and `</think>`), Mistral (Ministral 3), Llama 3, Granite 3,
-Granite 4.2 (ChatML with the tool calls in the XML form `<function=...>`), Phi-4-mini and the
-format of Foundation-Sec-8B-Reasoning. The tests compare the prompts with those of the reference
-templates rendered by Jinja, byte for byte. A model that always reasons, such as the Thinking
-variants of Qwen3-VL, answers at once when the request asks for no reasoning: the prompt then
-closes its reasoning before it starts, as the switchable templates do. The tokenizer of dlib reads
-the byte-level BPE vocabularies, with the pre-tokenizers of GPT-2, Llama 3, Qwen2, tekken and
-GPT-4o (Phi-4-mini) among others, and the SentencePiece ones (EuroLLM), whose leading space it
-puts after each control token as the reference tokenizers do; the token identifiers of the tests
-are those of llama.cpp.
+the chat template of a model naming its format: ChatML (Qwen2.5, Qwen3, Qwen3-VL, EuroLLM, with the
+reasoning between `<think>` and `</think>`), Mistral (Ministral 3, Devstral Small 2), Llama 3,
+Granite 3, Granite 4.2 (ChatML with the tool calls in the XML form `<function=...>`), Phi-4-mini
+and the format of Foundation-Sec-8B-Reasoning. The tests compare the prompts with those of the
+reference templates rendered by Jinja, byte for byte. A model that always reasons, such as the
+Thinking variants of Qwen3-VL, answers at once when the request asks for no reasoning: the prompt
+then closes its reasoning before it starts, as the switchable templates do. The tokenizer of dlib
+reads the byte-level BPE vocabularies, with the pre-tokenizers of GPT-2, Llama 3, Qwen2, tekken and
+GPT-4o (Phi-4-mini) among others, and the SentencePiece ones (EuroLLM), whose leading space it puts
+after each control token as the reference tokenizers do; the token identifiers of the tests are
+those of llama.cpp.
 
 ### Images
 
 A model reads images when its decoder takes the tokens of an image encoder, the projector: a
 second GGUF file (`mmproj`, architecture `clip`) that the catalog downloads with the decoder and
-that the engine loads with it (option `projector` of the model). The engine reads two families
+that the engine loads with it (option `projector` of the model). The engine reads three families
 ([`engine/vision_encoder.cpp`](engine/vision_encoder.cpp)):
 
 - Qwen3-VL (projector `qwen3vl_merger`): the image, resized to multiples of 32 pixels, is cut into
@@ -249,25 +253,46 @@ that the engine loads with it (option `projector` of the model). The engine read
   those of the whole image, then the grid of the tiles without its black bands, each row ended by
   a newline embedding. The detail of an image gives the tiles it takes at most, and its tokens: 1
   tile and 1,485 tokens (`low`), 2 and 2,241 (`auto`) or 4 and 3,753 (`high`).
+- Pixtral (projector `pixtral`, Ministral 3 and Devstral Small 2): the image, its longest edge
+  brought within 1,540 pixels and its sides rounded up to multiples of 28 pixels, is cut into
+  patches of 14 pixels; each head of the attention rotates its pairs of consecutive dimensions by
+  the row and the column of its patch, the blocks normalize by their root mean square and use a
+  SiLU gate, and the projector merges the squares of four patches into the tokens of the decoder,
+  each row of tokens followed by the `[IMG_BREAK]` embedding and the image by the token
+  `[IMG_END]`. The detail of an image gives the merged tokens it takes at most: 256 (`low`), 576
+  (`auto`) or 1024 (`high`). A message of one text and one image puts the image first, as the
+  chat templates of these models do. The projectors stored in bfloat16 are converted to half
+  precision when they load, which keeps their values.
 
-The service reads nothing from the network or the disk for a request: an image comes as a data
-URL of a PNG or JPEG file (20 MB, 8,192 pixels on a side and 40 megapixels at most), decoded by
-the libpng and libjpeg copies of dlib, its EXIF orientation applied and its transparency
-composited onto white, then resized as the reference preprocessing does (the bicubic filter of
-Pillow for Qwen3-VL, its bilinear filter for LLaVA-NeXT, in fixed point). A request carries 16
-images at most. The encoding of an image runs between the passes of the other requests, by
-slices of a tenth of a second while answers are being written, and is kept by the digest of its
-pixels (256 MB of encodings per model): the next turns of a discussion read the image without
-encoding it again, and the tokens of the image enter the cache of the prompts under keys made of
-that digest, so that a conversation that repeats its images takes their keys and values from the
-cache. On two cores, Qwen3-VL-2B encodes an image of 576 tokens in 9.4 s (llama.cpp: 9.1 s) and
-describes it as llama.cpp does at temperature 0.
+The service reads nothing from the network or the disk for a request: an image comes as a data URL
+of a PNG or JPEG file (20 MB, 8,192 pixels on a side and 40 megapixels at most), decoded by the
+libpng and libjpeg copies of dlib, its EXIF orientation applied and its transparency composited
+onto white, then resized as the reference preprocessing does (the bicubic filter of Pillow for
+Qwen3-VL and Pixtral, its bilinear filter for LLaVA-NeXT, in fixed point). A request carries 16
+images at most. The encoding of an image runs between the passes of the other requests, one block
+of the encoder at a time, so that the answers being written go on after each block (a few seconds
+at most for a large image on two cores), and is kept by the digest of its pixels
+(256 MB of encodings per model): the next turns of a discussion read the image without encoding it
+again, and the tokens of the image enter the cache of the prompts under keys made of that digest,
+so that a conversation that repeats its images takes their keys and values from the cache. On two
+cores, Qwen3-VL-2B encodes an image of 576 tokens in 9.4 s (llama.cpp: 9.1 s) and describes it as
+llama.cpp does at temperature 0; Ministral 3 3B encodes an image of 414 merged tokens in 16.7 s
+(llama.cpp: 14.4 s) and reads its shapes, their colors and its word as llama.cpp does.
 
 ### Service
 
 `albireo-service.exe` runs as the Windows service `Albireo` (LocalSystem, delayed automatic start)
 and, for development, in a console with `--console`. It:
 
+- reads the answers aloud with `albireo-speech.exe`, a program that holds the SVOX Pico
+  synthesizer and nothing else, and its voices of six languages (the `speech` folder of the
+  installation, 6.5 MB). The service starts it for each reading in the `speech` folder, without
+  console, with a token of low integrity and without privileges, in a job bounded to 256 MB that
+  refuses it any child process, so that a fault of the synthesizer never reaches the service;
+  the program loads no library of the windows of Windows, which a process of low integrity
+  started by a service could not initialize. The text it reads keeps the letters, the digits
+  and the usual punctuation alone, so that no markup of the synthesizer reaches it, and two such
+  programs run at a time;
 - describes each engine library in a child process (`--probe-engine`), so that a library that
   cannot load leaves the service running, and measures them the same way (`--bench-engine`); a
   description takes 60 seconds at most, and its log line gives the devices each engine found and,
@@ -285,10 +310,12 @@ and, for development, in a console with `--console`. It:
   OpenVINO would wait forever for threads of their runtime.
 
 The server answers as soon as its port is open: the engines are described and the chosen one
-starts in the background, then the active models load. Until then `/api/status` gives the state
+starts in the background, then the active models load. Until then `/albireo/v1/status` gives the state
 `starting` with the step in progress (`engines`, then `models`), the requests for a model answer
 503 with the code `starting` or `model_loading` and a `Retry-After` header, and the web application
-says that the service is starting. A slow computer, after an installation or at the start of the
+says that the service is starting. A request whose images the engine cannot hold yet, those already
+queued for its model holding the memory kept for them (1 GiB of decoded pixels), answers 503 with
+the code `engine_busy` and a `Retry-After` of 5 seconds. A slow computer, after an installation or at the start of the
 session, thus shows a start in progress instead of a failure.
 
 ### Tray, installer and web application
@@ -506,7 +533,13 @@ the models that come with Albireo and `-ModelCache <folder>` puts their cache on
 `-Tests` adds the test programs, `-Jobs <n>` bounds the compilations run at once on a machine with
 little memory, `-CudaVersion 12.9` picks one of several installed CUDA toolkits, `-Cudnn <folder>`
 one cuDNN installation (`C:\Program Files\NVIDIA\CUDNN\v9.11` for instance), and
-`-CudaArchitectures` replaces the list of architectures of the CUDA engine. The script amounts to:
+`-CudaArchitectures` replaces the list of architectures of the CUDA engine. Of several cuDNN
+versions in `C:\Program Files\NVIDIA\CUDNN`, the script takes the latest before 9.12 that serves
+the toolkit, else the latest; each configuration sets the architectures, the list given or the
+default one, never a list an earlier configuration kept, and the configuration and the end of the
+script warn when the CUDA engine leaves out the GTX 900 and 10 series. After a device tree is
+rebuilt by hand, delete `build-albireo/payload` so that the installer packs its engines again. The
+script amounts to:
 
 ```
 cmake -S dlib/dlib/external/albireo -B build-albireo-ov -G "Visual Studio 17 2022" -A x64 -DALBIREO_PROGRAMS=OFF -DALBIREO_ENGINE_OPENVINO=ON
@@ -528,7 +561,10 @@ which the installer places in its `licenses` folder; the same libraries go besid
 `tests\test_offload.exe`, with the CPU plugin of OpenVINO for a machine without NPU or Intel
 graphics, and the test then runs from its folder. The random numbers and the solvers of
 CUDA, which dlib links and the engine never calls, are loaded on first use only and are left out of
-the installation.
+the installation. The configuration stops when the folder of the OpenVINO runtime or the Visual C++
+runtime of Visual Studio is missing, and the build of a device engine stops when a library the
+installer carries (OpenVINO, TBB, cuDNN, cuBLAS, the CUDA runtime, the Visual C++ runtime) is found
+in none of its folders; with the archive of OpenVINO, TBB comes from `runtime\3rdparty\tbb\bin`.
 
 The CUDA engine carries the machine code of the cards of desktops and laptops from the GeForce GTX
 900 series on, and the intermediate code of the newest architecture, which the driver compiles for
@@ -558,6 +594,7 @@ reported as unusable, with its compute capability, and the other engines serve t
 | `ALBIREO_MODEL_CACHE`     | user cache | downloaded and converted models that come with Albireo         |
 | `ALBIREO_BUILTIN_MANIFEST`| `resources/builtin_models.json` | the models that come with Albireo           |
 | `ALBIREO_BUILTIN_TOOL`    |         | `albireo-builtin` of the build machine, for a cross build         |
+| `ALBIREO_PUBLIC_LINK_PASSWORD_FILE` | `keys/albireo-public-link.txt` of the user's folder | password of the public link, built into the service (see [Publishing a version](#publishing-a-version)) |
 | `ALBIREO_RUNTIME_LICENSES`|         | more license files for the `licenses` folder                      |
 
 The programs link their C and C++ runtime statically and depend on system libraries only; the
@@ -590,11 +627,11 @@ cmake --build build-albireo-win -j
 | `test_runtime`   | the logits of a model against `tests/reference_forward.py`, and the same results whatever the cut of the batches |
 | `test_tokenizer` | the tokenizer of a GGUF file against reference token sequences                     |
 | `test_offload`   | the products of a device against the processor kernels, the small budget path and the measured routing |
-| `test_model_file` | a small Qwen3 model built in memory and 140 damaged forms of it, which the loader must all refuse without allocating more than 256 MB |
+| `test_model_file` | a small Qwen3 model built in memory and 144 damaged forms of it (names given twice and tensors off the alignment among them), which the loader must all refuse without allocating more than 256 MB, then a sparse file of more than 2 GiB whose last tensor lies beyond 2 GiB, read mapped and streamed, each value of that tensor checked and the logits compared with those of the same model in a small file |
 | `test_engine_api` | the refusals of the C interface, three threads of requests with cancellations under the pressure of the keys and values, the unloading and the destruction during requests, one final event per request |
-| `test_chat_format` | the prompts of the agent mode and of each chat format against those of its template rendered by Jinja, the marker tokens and the parsing of the tool calls, whole or cut in pieces |
-| `test_host`      | the files of the downloads and of the imports through no link, the refusals of the import route, the copies of models already installed |
-| `engine_chat`    | drives an engine library through its C interface: chat, images with their projector (`--image`, `--detail`), tools, reasoning, parallel requests, embeddings compared with a reference |
+| `test_chat_format` | the prompts of the agent mode and of each chat format against those of its template rendered by Jinja, the marker tokens and the parsing of the tool calls, whole or cut in pieces, the calls of Mistral with and without their identifier, the Llama 3 answers that are no call and an earlier answer holding `</think>` |
+| `test_host`      | in a data folder of its own: the files of the downloads and of the imports through no link, the refusals of the import route, the copies of models already installed, the identifiers of the imports, the replacement of a model file, the ranges of the downloads, a damaged database, the public link through a local API of pCloud (its listing, the copies it holds and lacks, a refused password) |
+| `engine_chat`    | drives an engine library through its C interface: chat, images with their projector (`--image`, `--detail`), tools, reasoning, parallel requests, embeddings compared with a reference; it ends without unloading the engine of a device, as the service does |
 | `bench_runtime`  | tokens per second of the prompt and of the generation, also as `bench_runtime_avxvnni` and `bench_runtime_avx512` |
 
 `test_offload model.gguf CPU` validates the OpenVINO engine on a machine without NPU, with the CPU
@@ -611,10 +648,13 @@ They take `~/models/Qwen3-0.6B-Q4_K_M.gguf` and `~/models/Qwen3-Embedding-0.6B-Q
 default and skip the steps whose model or build tree is missing. The Linux script runs a service
 offline in a data folder of its own, on the port `ALBIREO_TEST_PORT` (18443 by default), sends it
 the model through the upload route, checks that the route of the paths refuses a plain file, runs
-the tests of the service (`test_host`) and asks a question through the OpenAI interface; the
-Windows script asks the installed service a question and the vectors of two texts,
-and tests the OpenVINO and CUDA engines when their trees exist (`-Device GPU` or `-Device NPU`
-for `test_offload`, CPU by default). Their exit code is the number of failed steps.
+the tests of the service (`test_host`), asks a question through the OpenAI interface and has a
+sentence read aloud; the Windows script asks the installed service a question, the vectors of two
+texts and a sentence read aloud, and tests the OpenVINO and CUDA engines when their trees exist
+(`-Device GPU` or `-Device NPU` for `test_offload`, CPU by default). Both have a sentence read by
+`albireo-speech` of the build tree. The engine steps of the Windows script run with the `PATH` of
+the service, System32 and the Windows folder only; the Linux script gives the service 30 seconds
+to stop, then kills it. Their exit code is the number of failed steps.
 
 ## Installation
 
@@ -642,7 +682,9 @@ installation. Its place is recorded for the machine (`DataDir` under `HKLM\Softw
 which the programs read before the system variable `ALBIREO_HOME`), with the place of the models
 (`ModelsDir`) and whether the installer made that folder (`ModelsDirOwned`), so that the
 service, the tray, the updates and the uninstallation find them; an update keeps them. A silent installation that
-refuses a folder says why in `%TEMP%\albireo-setup.log` and leaves nothing behind, and the end of
+refuses a folder says why in `%TEMP%\albireo-setup.log` and leaves nothing behind; a new installation
+that fails, the start of its service included, removes the folders it created and empties those it
+found empty, its log then going to `%TEMP%\albireo-setup.log`. The end of
 each installation, update or removal is written in `<data>\logs\setup-result.json`, which a
 tray restarted by the installer reports (`--setup-result`).
 
@@ -652,11 +694,13 @@ bundle when it bears the signature of Albireo and the models this catalog lists,
 against its hash. The option "This computer has no Internet access" of the wizard, or `/offline`,
 sets the service offline from the start.
 
-The folders of the programs, of the data and of the models must lie on a local fixed drive; the
-installer refuses a drive root, the folders of Windows and of the users, a folder that holds
-them, a link made by another account, a folder on whose path another account could rename a
-folder (`folder_parent_unsafe`), and a program or data folder that is neither empty nor an
-installation of Albireo, or that lies inside Windows or the profiles of the users. It gives the
+The folder of the data must lie on a local fixed drive, those of the programs and of the models on
+a local drive; the installer refuses a drive root, the folders of Windows and of the users, a
+folder that holds them, a link made by another account, a program or data folder on whose path
+another account could rename a folder (`folder_parent_unsafe`), a program or data folder that is
+neither empty nor an installation of Albireo, or that lies inside Windows or the profiles of the
+users, and a models folder inside the folder of the programs, or that holds it (`folder_overlap`),
+in the wizard as with `/silent /models` and `/models-dir`. It gives the
 folders it creates or takes over, and the parent folders it creates, the rights of the data
 folder (writing for the administrators and the service only), and records the files it installs
 in `albireo-files.json`.
@@ -667,7 +711,8 @@ deletes the whole installation folder, the files added there since included, and
 a copy that ends the work once it has quit. It then deletes the whole data folder, unless the
 box of the uninstallation page, or `/keep-data`, keeps the models, the settings and the logs for
 a later installation, which finds them again (`/purge`, which earlier versions needed, is
-accepted and is the default). A models
+accepted and is the default). The entry of the installed programs is removed last, so that an
+interrupted uninstallation can run again. A models
 folder placed elsewhere goes whole when the installer made it or found it empty, else only the
 models Albireo put there. The uninstallation removes only the folders recorded at the
 installation, never a drive root or a folder of Windows or of the users, and takes the links
@@ -685,10 +730,16 @@ the shortcuts and the start of the icon; the entry of the installed programs and
 rewritten in place. A newer version in place is left as it is. `/silent` updates the same way,
 the options given joining the settings, and `/update /silent` is the update the service starts.
 The installer checks the free space before it stops the service, writes every new file beside
-the old one, then swaps them all; a failure puts the previous files back and restarts the
-service that was running, whose recovery actions are suspended during the update. Once the new
-files are in place, the files of the engines, of the web application and of the licenses that the
-new version no longer carries are deleted, with the folders they leave empty.
+the old one, then swaps them all, setting aside the files of the engines, of the web application,
+of the licenses and of the voices that the new version no longer carries; the new service must
+then run and listen on its port within two minutes. Until then the previous files stay aside, and
+a failure, the start of the new service included, puts them back with the entry of the installed
+programs and restarts the service that was running, whose recovery actions are suspended during
+the update; once the new service answers, the files set aside are deleted, with the folders they
+leave empty. A models folder that an earlier version accepted inside these folders keeps its files.
+An update keeps the start type an administrator chose, and a disabled service stays stopped.
+`/update /silent` updates only an installation in place, never with an older version, and a
+service waiting for its deletion stops the installer before anything changes.
 The models that come with Albireo are copied only when they differ from those in place, their
 hash checked; an update by the installer without models keeps them.
 
@@ -697,8 +748,9 @@ Two ways to update an installed computer:
 - by hand: start the new `albireo-setup.exe`, or `albireo-setup-online.exe`, and follow the
   update wizard;
 - automatically: once a version is published (see [Publishing a version](#publishing-a-version)),
-  the service reads the signed feed at its start and every six hours, downloads the installer
-  without models in the background, checks its size, its SHA-256 and the signature of the feed,
+  the service reads the signed feed at its start and every six hours, in the public link first,
+  downloads the installer without models in the background, from the link first as well, checks
+  its size, its SHA-256 and the signature of the feed,
   and the menu of the icon offers "Install version <version> and restart"; otherwise the update is
   installed at the next start of the service. "Check for updates" asks the feed at once.
 
@@ -716,7 +768,7 @@ saved, and the service restarts when a change requires it.
 | `engine`        | `auto`  | `auto` (fastest measured, else the first usable of cuda, cpu-avx512, cpu-avxvnni, cpu-avx2, cpu), `best` (measured first), or a variant |
 | `accelerator`   | `auto`  | `none`, `npu`, `gpu`, `both`: the device of the engines that have several |
 | `v2ram`         | true    | extended device memory of the CUDA engine                                  |
-| `v2ram_max_mb`  | 0       | size of its file in megabytes, 0 for automatic                            |
+| `v2ram_max_mb`  | 0       | size of its file in megabytes, 0 for automatic; on a volume without sparse files (exFAT, FAT32), the budget and half of the free space at most |
 | `device_mb`     | 0       | memory of the device for the copies of the weights, 0 for automatic       |
 | `threads`       | 0       | threads of the engine, 0 for the physical cores                           |
 | `context`       | 0       | context of the models, 0 for the trained one up to 32768, within `kv_mb`  |
@@ -727,7 +779,8 @@ saved, and the service restarts when a change requires it.
 | `offline`       | false   | no connection: catalog, models and updates come from imports              |
 | `proxy`         | `""`    | `""` for the proxy of the system (`HTTPS_PROXY`, then WinHTTP), `none`, or `http://[user:password@]host:port`; the settings give the password as `********`, kept in `proxy.secret` |
 | `active`        |         | the model of each function: `general`, `code`, `security`, `embedding`     |
-| `update_feed`, `catalog_url` | | addresses of the signed feed and catalog                       |
+| `update_feed`, `catalog_url` | | addresses of the signed feed and catalog, read when the public link does not answer or holds none |
+| `public_link`   | the link of Albireo | public link of pCloud of the published files (`dist`, `models`), read first; `""` turns it off |
 
 ## Interfaces
 
@@ -743,6 +796,8 @@ of `/v1/embeddings` takes `albireo-embedding`.
 | `POST /v1/chat/completions`              | chat, streaming, tools, `reasoning_content`, images       |
 | `POST /v1/completions`                   | completion of a prompt                                    |
 | `POST /v1/embeddings`                    | vectors of texts, float or base64, `dimensions` to shorten them |
+| `POST /v1/audio/speech`                  | a text read aloud, WAVE or PCM, 16-bit mono at 16 kHz     |
+| `GET /albireo/v1/speech/voices`          | voices of the speech synthesis                            |
 | `GET /albireo/v1/status`                 | host, engine, statistics, models, downloads, updates      |
 | `GET /albireo/v1/models?lang=fr`         | catalog and installed models                              |
 | `GET /albireo/v1/engines`                | engine libraries, options and measures                    |
@@ -766,7 +821,11 @@ With `tools`, the calls a model writes in the form of its template come back as 
 whole, with the arguments as the model wrote them, a line break left raw in a string repaired;
 the parser of Qwen3 also takes a call between code fences, several objects in one call, a closing
 character in excess and a call left open at the end of the answer. The calls of Granite 4.2, in
-the XML form, come back as JSON arguments, each value typed by the definition of the tool.
+the XML form, come back as JSON arguments, each value typed by the definition of the tool. The
+calls of the Mistral models keep the identifier the model gives them (`[CALL_ID]`), and arguments
+that are not a JSON object leave the text as the model wrote it. A Llama 3 answer is a call only
+when it is a JSON object, or a list of them, naming tools of the request; any other answer, JSON or
+not, comes back as its text, as the model wrote it.
 
 A message of a model that reads images (`inputs` of `/v1/models`) takes parts `image_url`, whose
 `url` is a data URL of a PNG or JPEG file and whose `detail` is `low`, `auto` or `high`. The
@@ -778,7 +837,8 @@ The administration routes (`/albireo/v1/settings`, `/albireo/v1/models/<id>/down
 `/activate`, `/deactivate`, `DELETE /albireo/v1/models/<id>`, `/verify`, `/import`,
 `/models/upload`, `/updates/check`, `/updates/apply`, `/restart`, `/engines/benchmark`, `/logs`)
 require the header `X-Albireo-Admin` with the token of `admin.token`, which only the
-administrators, the service and the interactive users of the machine can read. A model
+administrators, the service and the interactive users of the machine can read. A measure of the
+engines runs alone: `/engines/benchmark` answers 409 `benchmark_running` meanwhile. A model
 deactivated, replaced or deleted while it answers leaves the engine once its requests are served:
 `/albireo/v1/models` lists it under `leaving` (`unloading` or `removing`) meanwhile, and the
 deletion answers `"pending": true`. The errors these routes return carry a `code` with its `args`
@@ -793,8 +853,11 @@ qwen3, qwen3moe, qwen3vl, qwen3vlmoe, mixtral), with their functions, the compan
 consortium that made them, what they read, their descriptions in the five languages, their
 license, and the address, size and SHA-256 of each file, the projector of a model that reads
 images included. [`tools/make_catalog.py`](tools/make_catalog.py) writes it from the Hugging Face
-hub, the addresses pinned to a commit so that a file never changes under its hash. The sizes
-below count the decoder and its projector.
+hub, the addresses pinned to a commit so that a file never changes under its hash. The service
+downloads each file from its copy in the public link of the published files,
+`models/<identifier>/<file name of its address>`, and from the address of the catalog when the link
+does not answer or does not hold the file at its size; the hashes check both, and the catalog keeps
+the official source of each model. The sizes below count the decoder and its projector.
 
 | Model                          | Publisher          | Functions               | Inputs        | Size     | License |
 |--------------------------------|--------------------|-------------------------|---------------|----------|---------|
@@ -806,8 +869,8 @@ below count the decoder and its projector.
 | Qwen3-VL 8B Thinking           | Alibaba            | general, code, security | text, image   | 5.78 GB  | Apache-2.0 |
 | EuroVLM 9B Preview             | EuroLLM consortium | general                 | text, image   | 6.42 GB  | Apache-2.0 |
 | Phi-4-mini                     | Microsoft          | general                 | text          | 2.49 GB  | MIT |
-| Ministral 3 3B                 | Mistral AI         | general                 | text          | 2.15 GB  | Apache-2.0 |
-| Ministral 3 8B                 | Mistral AI         | general                 | text          | 5.20 GB  | Apache-2.0 |
+| Ministral 3 3B                 | Mistral AI         | general                 | text, image   | 2.99 GB  | Apache-2.0 |
+| Ministral 3 8B                 | Mistral AI         | general                 | text, image   | 6.06 GB  | Apache-2.0 |
 | EuroLLM 9B Instruct            | EuroLLM consortium | general                 | text          | 5.58 GB  | Apache-2.0 |
 | Granite 4.2 3B                 | IBM                | general, code           | text          | 2.24 GB  | Apache-2.0 |
 | Granite 4.2 8B                 | IBM                | general, code           | text          | 5.35 GB  | Apache-2.0 |
@@ -815,16 +878,18 @@ below count the decoder and its projector.
 | Qwen3 30B A3B                  | Alibaba            | general, code, security | text          | 18.56 GB | Apache-2.0 |
 | Qwen2.5 Coder 1.5B             | Alibaba            | code                    | text          | 1.12 GB  | Apache-2.0 |
 | Qwen2.5 Coder 7B               | Alibaba            | code                    | text          | 4.68 GB  | Apache-2.0 |
+| Devstral Small 2               | Mistral AI         | code                    | text, image   | 15.21 GB | Apache-2.0 |
 | Foundation-Sec 1.1 8B          | Cisco              | security                | text          | 4.92 GB  | Llama 3.1 Community License |
 | Foundation-Sec 8B Reasoning    | Cisco              | security                | text          | 4.92 GB  | Llama 3.1 Community License |
 
 The list gives each function models that read images and models that read text, from 2 to 6 GB
-for the computers of 8 and 16 GB of memory, and one mixture of experts for those of 24 GB:
+for the computers of 8 and 16 GB of memory, one mixture of experts for those of 24 GB and a
+programming agent for those of 32 GB:
 
 | Function | Text and images | Text |
 |----------|-----------------|------|
-| General  | Qwen3-VL 2B, 4B and 8B, EuroVLM 9B | Phi-4-mini, Ministral 3 3B and 8B, EuroLLM 9B, Granite 4.2 3B and 8B, Qwen3 8B, Qwen3 30B A3B |
-| Code     | Qwen3-VL 4B (Thinking and Instruct), Qwen3-VL 8B (Instruct and Thinking) | Granite 4.2 3B and 8B, Qwen2.5 Coder 1.5B and 7B, Qwen3 8B, Qwen3 30B A3B |
+| General  | Qwen3-VL 2B, 4B and 8B, Ministral 3 3B and 8B, EuroVLM 9B | Phi-4-mini, EuroLLM 9B, Granite 4.2 3B and 8B, Qwen3 8B, Qwen3 30B A3B |
+| Code     | Qwen3-VL 4B (Thinking and Instruct), Qwen3-VL 8B (Instruct and Thinking), Devstral Small 2 | Granite 4.2 3B and 8B, Qwen2.5 Coder 1.5B and 7B, Qwen3 8B, Qwen3 30B A3B |
 | Security | Qwen3-VL 4B Thinking, Qwen3-VL 8B (Instruct and Thinking) | Foundation-Sec 1.1 8B and 8B Reasoning, Qwen3 8B, Qwen3 30B A3B |
 
 The choices follow the published measures: Qwen3-VL gives the best scores of the models that read
@@ -833,14 +898,12 @@ images and that the engine runs (MMMU 67.4 for the 4B Instruct, 74.1 for the 8B 
 69.7 for the 3B and 73.2 for the 8B); Foundation-Sec 8B Reasoning maps the vulnerabilities to their
 weaknesses best among the models of 8B (CTIBench-RCM 0.753), and Qwen3 8B leads them on the
 knowledge of security (CyberMetric-2000 0.903, SecEval 0.886, measured by Cisco). Ministral 3,
-which Mistral AI trained in partnership with NVIDIA, and Phi-4-mini, the latest small model of
-Microsoft with a standard decoder, read text in Albireo, which has no encoder for the images of
-Ministral 3. EuroLLM 9B Instruct translates and writes the 24 official languages of the European
-Union best of the list (FLORES 88.9), and EuroVLM 9B Preview, built on it, reads images in these
-languages; its publishers give it as a preview version. The models that need another kind of
-decoder (Gated DeltaNet or Mamba hybrids such as Qwen3.5 and the Nemotron 3 of NVIDIA, Gemma 4) or
-more than 24 GB (Kimi K3 of Moonshot AI, whose GGUF files take 594 GB at least) stay outside the
-list.
+which Mistral AI trained in partnership with NVIDIA, reads images through its Pixtral encoder, as
+does Devstral Small 2, the programming agent of 24B of Mistral AI, which reads screenshots and
+diagrams; Phi-4-mini is the latest small model of Microsoft with a standard decoder. EuroLLM 9B
+Instruct translates and writes the 24 official languages of the European Union best of the list
+(FLORES 88.9), and EuroVLM 9B Preview, built on it, reads images in these languages; its
+publishers give it as a preview version.
 
 Without the models that come with the complete installer, the service downloads the default
 language model at its first start, unless the installation said otherwise, and the default
@@ -860,8 +923,9 @@ imports the files placed in `<data>\import`. A file prepared by the build of Alb
 identity (`albireo.id`, `albireo.name`, `albireo.roles`, `albireo.inputs` in its metadata). A file
 whose content is the one of a model already installed or of a model that comes with Albireo is not
 copied again: the answer lists it under `already` and it leaves the import folder. A file never
-takes the identifier of a model that comes with Albireo (it becomes `<id>-import`), and the
-download of such a model is refused (`builtin_installed`).
+takes the identifier of another installed model (it becomes `<id>-import`, `<id>-import-2`...),
+except the newer version of a model of the catalog, which replaces it once the engine has let the
+loaded model go; the download of a model that comes with Albireo is refused (`builtin_installed`).
 
 The route `/albireo/v1/import` reads a folder given by its path only when it is the import folder,
 or a signed offline bundle, whose files are read by name, size and hash as its catalog lists them
@@ -901,8 +965,9 @@ of the engine:
 
 1. [`cmake/builtin_models.cmake`](cmake/builtin_models.cmake) downloads each file once into the
    cache, `%LOCALAPPDATA%\Albireo\build-cache` (`~/.cache/albireo` on Linux, `ALBIREO_MODEL_CACHE`
-   or `-ModelCache` otherwise), named by its SHA-256, which it checks; behind a proxy, the download
-   takes the one of `HTTPS_PROXY`. `build_windows.ps1` first gives the cache the files already on
+   or `-ModelCache` otherwise), named by its SHA-256, which it checks; a file already there is kept
+   only when its size and SHA-256 match, and a download stops after two minutes without data;
+   behind a proxy, the download takes the one of `HTTPS_PROXY`. `build_windows.ps1` first gives the cache the files already on
    the computer, in the models folder of an installation of Albireo or in `$HOME\models`, whose
    SHA-256 matches;
 2. [`tools/albireo_builtin.cpp`](tools/albireo_builtin.cpp) reads it with the GGUF reader of dlib,
@@ -953,8 +1018,8 @@ python3 dlib/dlib/external/albireo/tools/make_offline_bundle.py <folder> [--mode
 ```
 
 The bundle holds the signed catalog and the signed update feed of `dist/albireo`, the installer the
-feed announces, a `models` folder with the models chosen (the two default models when `--models`
-is absent) and a `README.txt`. `--complete build-albireo/bin/albireo-setup.exe` adds the complete
+feed announces, a `models` folder with the models chosen, each model that reads images with its
+projector (the two default models when `--models` is absent) and a `README.txt`. `--complete build-albireo/bin/albireo-setup.exe` adds the complete
 installer, which carries the models that come with Albireo: the bundle then needs no models. Each
 file is checked against the hashes of the signed files when it enters the bundle, and again by the
 service when it installs it; the signatures are checked with `albireo-sign` (`--sign`, else
@@ -982,30 +1047,56 @@ while the service tells the Windows service manager that its stop goes on.
 
 The feed and the catalog live in [`dist/albireo`](../../../../dist/albireo) of the repository, each
 with a detached signature (ECDSA P-256 over its exact bytes) that the programs check with the public
-key built into [`host/crypto.cpp`](host/crypto.cpp). The private key stays with the publisher. The
-programs travel in the installer, which carries the service, the tray, every engine with the
-runtime libraries of its device, and the web application; the installer of each version is a file
-of the GitHub release `albireo-v<version>`.
+key built into [`host/crypto.cpp`](host/crypto.cpp). The private key stays with the publisher;
+`albireo-sign keygen` refuses a path that exists, so that the key of the feed is never replaced, and
+gives the private key to the account that runs it alone. The programs travel in the installer, which
+carries the service, the tray, every engine with the runtime libraries of its device, and the web
+application.
 
-[`tools/publish_release.py`](tools/publish_release.py) publishes a version from its installer
-without models, the one of the updates: it checks that the installer carries the version of
-[`common/version.h`](common/version.h), creates the release, attaches the installer, reads it
-back whole from its public address, writes the feed with its address, size and SHA-256, signs it
-and checks the signature, then puts the feed and its signature in place and prints the commands
-that push them; it stops without touching the feed when the public address serves another file. `--complete` also attaches the complete installer, as
-`albireo-setup-complete-<version>.exe`, when it fits the 2 GiB of a release file. The complete
-installer of 1.0.8, with Qwen3-VL-4B-Thinking-albireo, exceeds them (3.6 GB): the script says so
-and leaves it to the offline bundles (see [Computers without network](#computers-without-network)):
+The published files lie in the public link of Albireo, a public folder of pCloud read only (the
+setting `public_link`, [`host/public_link.h`](host/public_link.h)), protected by a password that
+the service carries. Its folder `dist` holds `feed.json`, `catalog.json`, their signatures, the
+installer of the updates, `albireo-setup-online-<version>.exe`, and the complete installer,
+`albireo-setup-complete-<version>.exe`; its folder `models` holds each file of the catalog at
+`<identifier>/<file name of its official address>`. The service reads the feed, the catalog, the
+installer and the model files there first, through the API of pCloud, and from their official
+addresses (`dist/albireo` on GitHub, the hub of each model) when the link does not answer or does not
+hold the file; the signatures and the hashes check the files of both sources the same way.
+
+The password is read at the configuration from `ALBIREO_PUBLIC_LINK_PASSWORD_FILE`, by default
+`keys\albireo-public-link.txt` in the folder of the user (`~/keys` on Linux), outside the
+repository, and built into the service masked; a service built without that file reaches the link
+without password, which the link refuses while it is protected. The tools of the publisher read the
+same file, or the variable `ALBIREO_PUBLIC_LINK_PASSWORD`.
+
+[`tools/publish_release.py`](tools/publish_release.py) `--public-link` writes the feed of a version
+from its installer without models: it checks that the installer carries the version of
+[`common/version.h`](common/version.h), writes the feed with the name of the installer in the link,
+its size and its SHA-256, signs it, checks the signature, puts the feed and its signature in place
+and prints the commands that push them. [`tools/fill_public_link.py`](tools/fill_public_link.py)
+then fills the local copy of the link, the folder the storage service synchronizes: `dist` copies the
+signed feed and catalog with their signatures, checked with `albireo-sign`, and both installers
+under their names, checked against the feed, the feed last; `models` places the files of the
+catalog, kept when they are in place, copied from the folders of `--from` when a file has their size
+and SHA-256, else downloaded from their official addresses, resumed after a cut and checked; `check`
+reads the listing of the link and reports the files it lacks or holds at another size:
 
 ```
-python3 dlib/dlib/external/albireo/tools/publish_release.py build-albireo/bin/albireo-setup-online.exe --complete build-albireo/bin/albireo-setup.exe --key ~/keys/albireo-feed-signing.key --notes notes.json
+python3 dlib/dlib/external/albireo/tools/publish_release.py build-albireo/bin/albireo-setup-online.exe --public-link --complete build-albireo/bin/albireo-setup.exe --key ~/keys/albireo-feed-signing.key --notes notes.json
+python dlib\dlib\external\albireo\tools\fill_public_link.py dist <copy of the link>\dist --online build-albireo\bin\albireo-setup-online.exe --complete build-albireo\bin\albireo-setup.exe
+python dlib\dlib\external\albireo\tools\fill_public_link.py models <copy of the link>\models --from C:\ProgramData\Albireo\models
+python dlib\dlib\external\albireo\tools\fill_public_link.py check
 ```
 
-The token of GitHub comes from `GITHUB_TOKEN`, `GH_TOKEN` or `gh auth token`. A model published
-outside the hub, a model converted for the engine for instance, is cut into parts of less than
-2 GiB and attached to the release `albireo-models` by [`tools/publish_model.py`](tools/publish_model.py),
-whose output is the entry of the catalog, with the architecture, the parameters and the context
-read from the file:
+Without `--public-link`, the script publishes on GitHub: it creates the release `albireo-v<version>`,
+attaches the installer, reads it back whole from its public address, stops without touching the feed
+when that address serves another file, and writes the feed with the address; `--complete` attaches
+the complete installer when it fits the 2 GiB of a release file, which the complete installer of
+1.0.8, with Qwen3-VL-4B-Thinking-albireo (3.6 GB), exceeds. The token of GitHub comes from
+`GITHUB_TOKEN`, `GH_TOKEN` or `gh auth token`. A model published outside the hub, a model converted
+for the engine for instance, is cut into parts of less than 2 GiB and attached to the release
+`albireo-models` by [`tools/publish_model.py`](tools/publish_model.py), whose output is the entry of
+the catalog, with the architecture, the parameters and the context read from the file:
 
 ```
 python3 dlib/dlib/external/albireo/tools/publish_model.py model.gguf my-model parts --release albireo-models --gzip
@@ -1021,17 +1112,22 @@ size and its SHA-256, and run it in update mode at their next start.
   (421) and those whose `Origin` is another site (403), takes JSON bodies only, of 64 MB and
   524,288 values at most, and no body on `GET`, `HEAD`, `DELETE` and `OPTIONS`, and answers with
   `nosniff`, `no-referrer`, a content security policy and frame protections. It reads at most four
-  bodies above 8 MB at once (503 with `Retry-After` beyond), waits 30 seconds at most for a
-  client that reads or writes, serves 64 connections at once with 128 more waiting, and ends a
-  stream whose client lets more than 16,384 events wait.
+  bodies above 8 MB at once, each counted until its answer is written, and holds about 2 million
+  parsed values at once across the requests (503 `busy` with `Retry-After` beyond), waits 30
+  seconds at most for a client that reads or writes, closes an idle connection after 5 seconds,
+  serves 64 connections at once with 128 more waiting, and ends a stream whose client lets more
+  than 16,384 events wait.
 - The administration routes compare the token in constant time; the token and the password of
   the proxy are files with restricted rights, and the data folder grants writing to the
   administrators and the service only: on Windows, the service secures it again at each start,
   and the import folder too when another account could write in it.
-- A database the service cannot open as SQLite is set aside as `albireo.db.corrupt-<time>`, and
-  a new one records again the models of the models folder; a database opened read only is opened
-  again at the next write that fails, and a database locked by another program is waited for 5
-  seconds: the service recovers without a restart once the cause is gone.
+- A database the service cannot open as SQLite, or whose pages fail the check of its start, is set
+  aside as `albireo.db.corrupt-<time>`, and a new one records again the models of the models
+  folder; a database opened read only is opened again at the next write that fails, and a database
+  locked by another program is waited for 5 seconds: the service recovers without a restart once
+  the cause is gone. The files the service writes reach the disk before they replace the previous
+  ones, and `settings.json` has a copy, `settings.json.bak`, which the service reads when the file
+  is damaged.
 - The certificate of the local server comes from an authority of this computer alone, made by
   the service under LocalSystem with an ECDSA P-256 key, whose name constraints limit it to
   `localhost`, `127.0.0.0/8` and `::1`: Windows and the browsers refuse any certificate it would
@@ -1039,7 +1135,9 @@ size and its SHA-256, and run it in update mode at their next start.
   and is never written. Both certificates last 397 days; 30 days before their end, or when the
   key of the server does not open, the service makes a new authority and a new certificate and
   replaces the authority in the trusted roots of the machine, after checking its constraints,
-  when the installation chose to trust it. The private key of the server is encrypted with
+  when the installation chose to trust it. The authority is limited to the authentication of
+  servers, and an authority whose key a version before 1.0.8 left on the disk is replaced at the
+  start of the service. The private key of the server is encrypted with
   DPAPI for the LocalSystem account, in a file that SYSTEM and the administrators alone may open:
   a copy of that file opens under no other account and on no other computer. The service
   decrypts it in memory for the TLS server, without a file in clear. An update keeps the
@@ -1056,11 +1154,26 @@ size and its SHA-256, and run it in update mode at their next start.
   the signed offline bundles (see [Models](#models)). Every error of the updates carries a code
   with its values (`update_signature`, `update_installer_mismatch`, `update_package_manager`...),
   which the tray explains in the language of the user.
+- The public link brings nothing the signed feed and catalog do not name, at the size and with the
+  SHA-256 they give: a file of the link that differs gives way to its official address. Its
+  password never lies in the repository: the configuration reads it from a file of the publisher
+  and builds it into the service masked, and the messages and the logs leave out the query of every
+  request to the API of pCloud. It keeps the link from being read outside Albireo, not from someone
+  who studies the program.
 - The JavaScript the agent mode runs executes in a sandboxed frame of opaque origin, in a worker
   stopped after 15 s; the page builds its own copy of each answer of the frame, with checked and
   shortened fields, and gives up on a frame silent for 20 s.
+- The text read aloud reaches the synthesizer through `albireo-speech.exe` alone, started for each
+  reading with a token of low integrity and without privileges, which cannot write in the folders
+  of the service, of the programs or of the users, in a job of 256 MB that ends it with the service
+  and refuses it any child process; the text is first reduced to the letters of the Latin scripts,
+  the digits and the usual punctuation, so that no markup of the synthesizer, some of which names
+  files, reaches it.
 - The engine libraries are loaded from the `engines` folder of the installation, with their
-  dependencies searched in that folder first.
+  dependencies searched in that folder first. The service searches the libraries it loads by
+  name in its own folder, in `engines` and in System32 only, never in the `PATH` or in the current
+  folder, and loads the parts of cuDNN from `engines` by their full paths, so that another copy of
+  CUDA, cuDNN or OpenVINO on the machine is never taken.
 - A model file is read within bounds, checked before anything is allocated: 2^20 entries and
   arrays of 2^24 values at most in the GGUF file, an alignment that is a power of two up to 65,536,
   1,024 layers at most and no more than its tensors, 1,024 heads, a width of 2^17, a feed-forward
@@ -1077,7 +1190,8 @@ size and its SHA-256, and run it in update mode at their next start.
 |----------------------------------------|--------------------------------------------------------------|
 | `C:\Program Files\Albireo`             | programs, engines, web application, licenses, `albireo-files.json` |
 | `C:\Program Files\Albireo\models`      | the models that come with Albireo and their `builtin.json`   |
-| `C:\ProgramData\Albireo\settings.json` | settings                                                     |
+| `C:\Program Files\Albireo\speech`      | the voices of the speech synthesis                           |
+| `C:\ProgramData\Albireo\settings.json` | settings, and their last copy `settings.json.bak`            |
 | `C:\ProgramData\Albireo\proxy.secret`  | password of the proxy, readable by the administrators and the service |
 | `C:\ProgramData\Albireo\albireo.db`    | installed models, downloads, usage, catalog                   |
 | `C:\ProgramData\Albireo\models`        | models (or the folder chosen at installation)                |

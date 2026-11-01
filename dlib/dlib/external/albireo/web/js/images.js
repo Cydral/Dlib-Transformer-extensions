@@ -22,7 +22,10 @@ const thumbSide = 192;
 const jpegQuality = 0.9;
 const thumbQuality = 0.82;
 
-// The images of this tab: id -> {blob, thumb, owner, stored}, those prepared and not sent yet included.
+/*
+    The images this tab prepared and has not kept yet: id -> {blob, thumb, owner}.  An image leaves this map once it
+    is kept, in the database or in memory, which then gives it.
+*/
 const held = new Map();
 // The images kept in memory only, those of the incognito discussions: id -> record.
 const memory = new Map();
@@ -110,7 +113,7 @@ export async function prepare(file, name) {
     const r = await encodeImage(bitmap, bitmap.width, bitmap.height, opaque);
     const meta = metaOf(name || file.name || 'image', r,
       { type: file.type || '', size: file.size, width: bitmap.width, height: bitmap.height });
-    held.set(meta.id, { blob: r.blob, thumb: r.thumb, owner: null, stored: false });
+    held.set(meta.id, { blob: r.blob, thumb: r.thumb, owner: null });
     return meta;
   } finally {
     bitmap.close();
@@ -121,7 +124,7 @@ export async function prepare(file, name) {
 export async function prepareCanvas(canvas, name) {
   const r = await encodeImage(canvas, canvas.width, canvas.height, true);
   const meta = metaOf(name, r, { type: 'application/pdf', size: 0, width: canvas.width, height: canvas.height });
-  held.set(meta.id, { blob: r.blob, thumb: r.thumb, owner: null, stored: false });
+  held.set(meta.id, { blob: r.blob, thumb: r.thumb, owner: null });
   return meta;
 }
 
@@ -135,7 +138,7 @@ export async function keep(owner, metas, persistent) {
   const records = [];
   for (const m of metas || []) {
     const h = held.get(m.id);
-    if (!h || h.stored) continue;
+    if (!h) continue;
     h.owner = owner;
     const record = {
       id: m.id, owner, name: m.name, type: m.type, size: m.size, width: m.width, height: m.height,
@@ -144,12 +147,12 @@ export async function keep(owner, metas, persistent) {
     if (persistent) records.push(record);
     else {
       memory.set(m.id, record);
-      h.stored = true;
+      held.delete(m.id);
     }
   }
   if (!records.length) return;
   await store.putImages(records);
-  for (const r of records) held.get(r.id).stored = true;
+  for (const r of records) held.delete(r.id);
 }
 
 // The record of an image: {blob, thumb, ...}, from this tab, from memory or from the database; null when missing.
@@ -212,14 +215,18 @@ function release(id) {
   }
 }
 
-// Forgets the images prepared and not kept, such as those removed from the composer.
+// Forgets the images prepared and not kept, such as those removed from the composer; a kept image stays.
 export function drop(ids) {
   for (const id of ids || []) {
-    const h = held.get(id);
-    if (h && h.stored) continue;
+    if (!held.has(id)) continue;
     held.delete(id);
     release(id);
   }
+}
+
+// Revokes the object URLs of the images whose ids keep does not hold, which the page no longer shows.
+export function releaseExcept(keep) {
+  for (const id of Array.from(urls.keys())) if (!keep.has(id)) release(id);
 }
 
 // Deletes images, wherever they are kept.

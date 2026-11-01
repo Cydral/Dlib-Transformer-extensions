@@ -123,8 +123,9 @@ ALBIREO_ENGINE_EXPORT void ALBIREO_ENGINE_CALL albireo_engine_destroy(albireo_en
    override the context length and other settings for this model.  The context never exceeds
    the positions the memory of the keys and values holds ("kv_mb", or the automatic budget);
    the "models" query gives the context in force.  "projector" names the GGUF file of the
-   image encoder of a model that reads images (an mmproj file of Qwen3-VL or of LLaVA-NeXT);
-   a model file that holds its vision tensors needs none.  The "models" query then gives
+   image encoder of a model that reads images (an mmproj file of Qwen3-VL, of LLaVA-NeXT or of
+   Pixtral, the encoder of Ministral 3 and Devstral Small 2); a model file that holds its
+   vision tensors needs none.  The "models" query then gives
    "inputs" ["text","image"], "image_tokens" {"min","low","auto","high"} (the tokens an image
    takes at most with each detail), "images_per_request" and "projector_bytes". */
 ALBIREO_ENGINE_EXPORT int ALBIREO_ENGINE_CALL albireo_engine_load_model(albireo_engine* engine,
@@ -154,14 +155,20 @@ ALBIREO_ENGINE_EXPORT int ALBIREO_ENGINE_CALL albireo_engine_query(albireo_engin
    {"url": a data URL of a PNG or JPEG file, "detail": "low", "auto" or "high"}, 16 at most;
    another model refuses them.  Its events are CONTENT, REASONING, TOOL_CALL and PROGRESS, then
    DONE, or ERROR with the code "out_of_memory" when the answers being written fill the memory
-   of the keys and values.
+   of the keys and values or when the memory lacks for the encoding of one of its images (the
+   other requests go on).
 
    An embedding model takes "model", "input" (a text, a list of texts, a list of token
    identifiers or a list of such lists, 2048 inputs at most) and "dimensions" (0 or absent
    for the width of the model; otherwise the leading dimensions, normalized again).  Its
    only event is DONE, whose JSON holds "data":[{"index","embedding"}] with each vector as
    the base64 form of its little-endian float32 values at unit length, "dimensions",
-   "usage" and "timings"; or ERROR when any input fails. */
+   "usage" and "timings"; or ERROR when any input fails.  A request cancelled with
+   albireo_engine_cancel() ends, as any other, with DONE and the finish reason "cancelled".
+
+   Returns ALBIREO_E_BUSY for a request the engine refuses for a while: its images would
+   carry the decoded pixels the queued requests of the model hold beyond 1 GiB.  The same
+   request succeeds once these requests are encoded. */
 ALBIREO_ENGINE_EXPORT int ALBIREO_ENGINE_CALL albireo_engine_submit(albireo_engine* engine,
     const char* request_json, albireo_event_callback callback, void* user, uint64_t* request_id,
     char* error, size_t error_capacity);

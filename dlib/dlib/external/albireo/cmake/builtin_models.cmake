@@ -8,26 +8,32 @@
 #
 # A model gives the file it is converted from ("from") and, for a model that reads images,
 # its projector ("projector"), which Albireo ships as published.  A file already in the
-# cache is kept; albireo-builtin then checks its hash before it uses it.  The downloads go
-# through the proxy of the https_proxy variable, when set.
+# cache is kept when its SHA-256 matches, and downloaded again otherwise; albireo-builtin
+# checks the hash again before it uses it.  The downloads go through the proxy of the
+# https_proxy variable, when set, and stop after two minutes without data.
 
 if (CMAKE_VERSION VERSION_LESS 3.19)
    message(FATAL_ERROR "the models that come with Albireo need CMake 3.19 or later")
 endif()
 
-# Downloads url into the cache as <sha>.gguf, unless a file of that size is there already.
+# Downloads url into the cache as <sha>.gguf, unless a file of that size and hash is there already.
 function(albireo_cache_file label url sha size)
    set(target "${CACHE}/${sha}.gguf")
    if (EXISTS "${target}")
       file(SIZE "${target}" have)
       if (have EQUAL size)
-         return()
+         file(SHA256 "${target}" have_sha)
+         string(TOLOWER "${sha}" want_sha)
+         if (have_sha STREQUAL want_sha)
+            return()
+         endif()
+         message(STATUS "${target} does not match its SHA-256: downloaded again")
       endif()
       file(REMOVE "${target}")
    endif()
    message(STATUS "Downloading ${label}: ${url}")
    file(DOWNLOAD "${url}" "${target}.partial" EXPECTED_HASH SHA256=${sha} SHOW_PROGRESS TLS_VERIFY ON
-      STATUS status)
+      INACTIVITY_TIMEOUT 120 STATUS status)
    list(GET status 0 code)
    if (NOT code EQUAL 0)
       list(GET status 1 text)

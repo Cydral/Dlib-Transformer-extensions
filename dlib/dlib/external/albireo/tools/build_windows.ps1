@@ -24,17 +24,19 @@
     -Cuda makes their absence an error, and -NoCuda leaves the engine out.  With the
     Build Tools, the CUDA integration of the toolkit installer goes to the Build Tools
     when Visual Studio is absent.  cuDNN is found in C:\Program Files\NVIDIA\CUDNN, where
-    its installer puts it, or in the folder -Cudnn names (an extracted archive).
+    its installer puts it, or in the folder -Cudnn names (an extracted archive).  Of several
+    versions there, the latest before 9.12 that serves the toolkit is taken, else the latest.
 
     -CudaVersion picks one of several installed toolkits, and -Cudnn the folder of one cuDNN
     installation (C:\Program Files\NVIDIA\CUDNN\v9.11 for instance).  Without
     -CudaArchitectures, the CUDA engine is built for the cards from the GeForce GTX 900
-    series on.  The GTX 900 and 10 series (Maxwell, Pascal) need CUDA 12.8 or 12.9 with
-    cuDNN 9.11 or earlier: CUDA 13 and cuDNN 9.12 start at Turing (GTX 16 and RTX series).
+    series on, whatever an earlier build of the tree was given.  The GTX 900 and 10 series
+    (Maxwell, Pascal) need CUDA 12.8 or 12.9 with cuDNN 9.11 or earlier: CUDA 13 and cuDNN
+    9.12 start at Turing (GTX 16 and RTX series), which a warning repeats at the end.
     -Jobs bounds the number of compilations run at once, for a machine with little memory.
 
     The models that come with Albireo (resources/builtin_models.json) are downloaded once
-    into the cache, %LOCALAPPDATA%\Albireo\build-cache or -ModelCache, about 4.2 GB with
+    into the cache, %LOCALAPPDATA%\Albireo\build-cache or -ModelCache, about 6.8 GB with
     their converted files, then checked, converted and appended to the complete installer.
     A file already on this computer, in the models folder of an installation of Albireo or
     in $HOME\models, joins the cache instead, when its SHA-256 matches.  Behind a proxy, the
@@ -144,17 +146,35 @@ function Test-OpenVINO {
 }
 
 # A file of a cuDNN installation, in the folder of the major version of the toolkit when the
-# installation carries several (include\12.9 and include\13.0 for instance).
-function Find-CudnnFile([string]$under, [string]$name, [string]$major) {
+# installation carries several (include\12.9 and include\13.0 for instance).  With -Strict,
+# only that folder serves.
+function Find-CudnnFile([string]$under, [string]$name, [string]$major, [switch]$Strict) {
     $found = @(Get-ChildItem -Path $under -Recurse -Filter $name -ErrorAction SilentlyContinue |
         Sort-Object FullName -Descending)
     if ($major) {
         $pattern = '\\' + $major + '\.[0-9]+(\\|$)'
         $matching = @($found | Where-Object { $_.DirectoryName -match $pattern })
-        if ($matching.Count -gt 0) { $found = $matching }
+        if ($matching.Count -gt 0 -or $Strict) { $found = $matching }
     }
     if ($found.Count -eq 0) { throw "no $name under $under" }
     return $found[0].FullName.Replace('\', '/')
+}
+
+# The folders of the versions of cuDNN under a folder of its installer (v9.11, v9.14), the
+# latest first; with a toolkit before CUDA 13, those before 9.12 come first, since cuDNN 9.12
+# left the GeForce GTX 900 and 10 series (Maxwell, Pascal).
+function Get-CudnnVersionFolders([string]$under, [string]$major) {
+    $versions = @(Get-ChildItem -LiteralPath $under -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+        if ($_.Name -match '^v?([0-9]+\.[0-9]+)(\.[0-9]+)*$') {
+            [pscustomobject]@{ Path = $_.FullName; Version = [version]$Matches[1] }
+        }
+    } | Sort-Object Version -Descending)
+    if (-not $major -or [int]$major -lt 13) {
+        $before = @($versions | Where-Object { $_.Version -lt [version]"9.12" })
+        $after = @($versions | Where-Object { $_.Version -ge [version]"9.12" })
+        $versions = $before + $after
+    }
+    return @($versions | ForEach-Object { $_.Path })
 }
 
 # The CUDA toolkit of -CudaVersion, else that of CUDA_PATH: its folder when its compiler is there.
@@ -183,10 +203,25 @@ function Test-CudaIntegration {
 }
 
 # The folder of cuDNN: that of -Cudnn, else the one of its installer, else the toolkit itself,
-# the first that holds its header and its library.
+# the first that holds its header and its library.  The folders of its versions come first
+# (Get-CudnnVersionFolders), each one with the files of the major version of the toolkit.
 function Find-Cudnn([string]$toolkit, [string]$major) {
     $folders = @((Join-Path $env:ProgramFiles "NVIDIA\CUDNN"), $toolkit)
     if ($Cudnn) { $folders = @($Cudnn) }
+    $versions = @()
+    foreach ($folder in $folders) {
+        if ($folder -and (Test-Path -LiteralPath $folder)) { $versions += @(Get-CudnnVersionFolders $folder $major) }
+    }
+    foreach ($folder in $versions) {
+        try {
+            Find-CudnnFile $folder "cudnn.h" $major -Strict | Out-Null
+            Find-CudnnFile $folder "cudnn.lib" $major -Strict | Out-Null
+            return $folder
+        }
+        catch {
+            continue
+        }
+    }
     foreach ($folder in $folders) {
         if (-not $folder -or -not (Test-Path $folder)) { continue }
         try {
@@ -199,6 +234,27 @@ function Find-Cudnn([string]$toolkit, [string]$major) {
         }
     }
     return $null
+}
+
+# The oldest compute capability of the CUDA engine of a tree, as ten times its major version
+# plus its minor version, which its configuration records; 0 when unknown.
+function Get-CudaMinimum([string]$tree) {
+    $cache = Join-Path $tree "CMakeCache.txt"
+    if (-not (Test-Path -LiteralPath $cache)) { return 0 }
+    $line = Select-String -LiteralPath $cache -Pattern '^ALBIREO_CUDA_MIN_CC_BUILT:INTERNAL=([0-9]+)$' |
+        Select-Object -First 1
+    if (-not $line) { return 0 }
+    return [int]$line.Matches[0].Groups[1].Value
+}
+
+# The warning given when the CUDA engine leaves out the GeForce GTX 900 and 10 series.
+function Write-CudaWarning([int]$minimum) {
+    $cc = "$([math]::Floor($minimum / 10)).$($minimum % 10)"
+    Write-Warning "THE CUDA ENGINE OF THIS BUILD STARTS AT COMPUTE CAPABILITY $cc."
+    Write-Warning ("It leaves out the GeForce GTX 900 and 10 series (Maxwell 5.x, Pascal 6.1), which the " +
+        "release supports.")
+    Write-Warning ("They need CUDA 12.8 or 12.9 with cuDNN 9.11 or earlier, and the default architectures " +
+        "(no -CudaArchitectures): -CudaVersion 12.9 -Cudnn `"C:\Program Files\NVIDIA\CUDNN\v9.11`" for instance.")
 }
 
 $extra = @()
@@ -220,6 +276,7 @@ $toolkit = $null
 $cudnnFolder = $null
 $major = ""
 $buildCuda = $false
+$cudaMinimum = 0
 if ($Cuda -and $NoCuda) { throw "-Cuda and -NoCuda exclude each other" }
 if (-not $NoCuda) {
     $toolkit = Find-CudaToolkit
@@ -261,8 +318,13 @@ if ($buildCuda) {
     $options += "-DCUDNN_INCLUDE_PATH=$(Split-Path $header -Parent)".Replace('\', '/')
     $options += "-DCUDNN_LIBRARY_PATH=$(Find-CudnnFile $cudnnFolder 'cudnn.lib' $major)"
     Write-Host "== CUDA engine: toolkit $toolkit, cuDNN $(Split-Path $header -Parent)"
+    # The architectures of each build: those given, else the default list of the toolkit, never
+    # the list an earlier configuration of the tree kept.
     if ($CudaArchitectures) { $options += "-DCMAKE_CUDA_ARCHITECTURES=$CudaArchitectures" }
+    else { $options += "-UCMAKE_CUDA_ARCHITECTURES" }
     Invoke-Step "configuring the CUDA engine" (@("-S", $source, "-B", $tree) + $generator + $toolset + $options)
+    $cudaMinimum = Get-CudaMinimum $tree
+    if ($cudaMinimum -gt 61) { Write-CudaWarning $cudaMinimum }
     Clear-Engines $tree
     Invoke-Step "building the CUDA engine" (@("--build", $tree, "--config", "Release") + $parallel)
     $extra += (Join-Path $tree "bin\engines")
@@ -287,7 +349,12 @@ function Import-BuiltinSources([string]$cache, [string[]]$folders) {
         if (-not $found) { continue }
         Write-Host "== $($m.id): $($found.FullName) joins the cache of the models"
         try { New-Item -ItemType HardLink -Path $target -Target $found.FullName -ErrorAction Stop | Out-Null }
-        catch { Copy-Item -Path $found.FullName -Destination $target }
+        catch {
+            # A copy takes the name of the cache once complete: a copy cut short leaves no file of full name.
+            $partial = "$target.partial"
+            Copy-Item -LiteralPath $found.FullName -Destination $partial -Force
+            Move-Item -LiteralPath $partial -Destination $target
+        }
     }
 }
 
@@ -318,3 +385,4 @@ foreach ($name in @("albireo-setup.exe", "albireo-setup-online.exe")) {
     Write-Host "== $setup"
     Write-Host "   $size bytes, SHA-256 $hash"
 }
+if ($cudaMinimum -gt 61) { Write-CudaWarning $cudaMinimum }

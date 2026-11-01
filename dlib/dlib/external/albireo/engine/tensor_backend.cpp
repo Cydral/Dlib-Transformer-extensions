@@ -10,9 +10,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 #include <limits>
 #include <map>
 #include <mutex>
+#include <new>
 #include <sstream>
 #include <stdexcept>
 #include <tuple>
@@ -203,6 +205,54 @@ namespace albireo
         // Thrown for a matrix whose copy does not fit and which is too large to expand at
         // each product: the processor computes its products.
         struct beyond_budget {};
+
+        /*
+            Failures of a shape for lack of device memory after which it stays on the processor,
+            and the products of the shape it waits before the first new attempt, a number that
+            doubles at each failure in a row.
+        */
+        const int max_memory_failures = 4;
+        const unsigned long long memory_retry_calls = 256;
+
+        /*
+            Whether a failure of the device comes from a lack of memory, which the end of
+            another program or the copies another model gives back may end: an allocation
+            refused by the runtime of CUDA ("out of memory"), by cuBLAS ("could not be
+            allocated") or by the extended memory ("cannot place a block").
+        */
+        bool lack_of_memory(const std::exception& e)
+        {
+            if (dynamic_cast<const std::bad_alloc*>(&e)) return true;
+            const std::string what = e.what();
+            for (const char* sign : { "out of memory", "could not be allocated", "cannot place a block" })
+                if (what.find(sign) != std::string::npos) return true;
+            return false;
+        }
+
+#if defined(DLIB_USE_NPU) && !defined(DLIB_USE_CUDA)
+        /*
+            Whether the reason the OpenVINO runtime gives for using no device says only that
+            none of the devices it looked for is present, as in "no device found among NPU,GPU
+            (no NPU device; no GPU device)", rather than that a runtime or a device failed.
+        */
+        bool no_device_present(const std::string& why)
+        {
+            static const std::string head = "no device found among ";
+            if (why.compare(0, head.size(), head) != 0) return false;
+            const size_t open = why.find(" (");
+            if (open == std::string::npos) return true;
+            if (why.back() != ')') return false;
+            const std::string list = why.substr(open + 2, why.size() - open - 3);
+            for (size_t at = 0; at < list.size();)
+            {
+                size_t end = list.find("; ", at);
+                if (end == std::string::npos) end = list.size();
+                if (list.compare(at, 3, "no ") != 0) return false;
+                at = end + 2;
+            }
+            return true;
+        }
+#endif
 
         long long now_ns()
         {
@@ -412,9 +462,15 @@ namespace albireo
             bool decided = false;
             bool on_device = false;
             bool failed = false;
-            // No room for the copies of the shape, until the generation of the device moves.
+            /*
+                No room for the copies of the shape, until the generation of the device moves or,
+                after a lack of device memory, until the products of the shape reach retry_at.
+            */
             bool no_room = false;
             unsigned long long room_generation = 0;
+            unsigned long long retry_at = std::numeric_limits<unsigned long long>::max();
+            // Failures for lack of device memory in a row.
+            int memory_failures = 0;
             unsigned long long calls = 0;
             unsigned long long next_check = 0;
             unsigned long long interval = 64;
@@ -506,10 +562,16 @@ namespace albireo
             return t;
         }
 
+        /*
+            Gives b room for values floats, by half of its size more at least, so that products
+            of growing sizes reallocate it a few times only, but beyond the size asked by no more
+            than the largest matrix expanded at each product.
+        */
         static void reserve_buffer(dlib::resizable_tensor& b, size_t values)
         {
             if (b.size() >= values) return;
-            const size_t grown = std::max(values, b.size() + b.size() / 2);
+            const size_t limit = std::max(values, max_staged_bytes / sizeof(float));
+            const size_t grown = std::min(limit, std::max(values, b.size() + b.size() / 2));
             b.set_size(static_cast<long long>(grown));
         }
 
@@ -593,7 +655,7 @@ namespace albireo
             const std::tuple<long, long, int> key(W.rows, W.cols, token_class(n));
             route& r = routes_[key];
             ++r.calls;
-            if (r.no_room && r.room_generation != d_.generation.load()) r.no_room = false;
+            if (r.no_room && (r.room_generation != d_.generation.load() || r.calls >= r.retry_at)) r.no_room = false;
             bool on_device = false;
             bool check = false;
             if (r.failed || r.no_room || d_.forced < 0)
@@ -619,6 +681,7 @@ namespace albireo
                 try
                 {
                     steady = device_product(W, X, n, x_stride, Y, y_stride);
+                    r.memory_failures = 0;
                 }
                 catch (const beyond_budget&)
                 {
@@ -626,12 +689,16 @@ namespace albireo
                     // the device or a model has no more requests.
                     r.no_room = true;
                     r.room_generation = d_.generation.load();
+                    r.retry_at = std::numeric_limits<unsigned long long>::max();
                     host_product(host);
                     return;
                 }
                 catch (const std::exception& e)
                 {
-                    device_failure(r, W, e.what());
+                    if (lack_of_memory(e) && r.memory_failures < max_memory_failures)
+                        memory_failure(r, W, e.what());
+                    else
+                        device_failure(r, W, e.what());
                     host_product(host);
                     return;
                 }
@@ -682,6 +749,21 @@ namespace albireo
                 if (on_device) add_sample(r.device, r.device_n, seconds);
                 else add_sample(r.host, r.host_n, seconds);
             }
+        }
+
+        /*
+            A product the device could not place for lack of memory: the processor computes the
+            shape until copies leave the device, a model has no more requests, or the products
+            of the shape reach a number that doubles at each such failure in a row.
+        */
+        void memory_failure(route& r, const weight_matrix& W, const std::string& what)
+        {
+            ++r.memory_failures;
+            r.no_room = true;
+            r.room_generation = d_.generation.load();
+            r.retry_at = r.calls + (memory_retry_calls << r.memory_failures);
+            d_.message(ALBIREO_LOG_INFO, "device: no memory for a product of " + std::to_string(W.rows) + "x"
+                + std::to_string(W.cols) + ", the processor computes it for now (" + what + ")");
         }
 
         void device_failure(route& r, const weight_matrix& W, const std::string& what)
@@ -838,9 +920,15 @@ namespace albireo
             }
             if (o.store_path.empty()) o.store_path = dlib::default_extended_memory_store_path();
             o.store_bytes = static_cast<size_t>(std::max<long long>(0, config["v2ram_max_mb"].as_int(0))) << 20;
-            // While the engine is idle, the card goes back to the other programs.
-            o.idle_release_ms = 120000;
-            o.idle_release_keep = 0.5;
+            /*
+                The memory of the card is not given back while the engine is idle.  The idle
+                release of the extended memory evicts blocks on its observation thread, while
+                the scheduler takes the device pointers of the same blocks without its lock: a
+                request that arrives during a release could compute with a buffer already given
+                back.  idle_release_ms stays at 0 until the release runs on the thread that
+                computes.
+            */
+            o.idle_release_ms = 0;
             try
             {
                 d.v2ram = dlib::enable_extended_memory(o);
@@ -1067,9 +1155,19 @@ namespace albireo
         const std::string why = dlib::npu::unavailable_reason();
         if (!dlib::npu::is_available())
         {
-            reason = "no NPU or Intel graphics processor was found" + (why.empty() ? std::string() : ": " + why);
-            code = why.empty() ? "no_intel_device" : "intel_device_unusable";
-            if (!why.empty()) args["detail"] = why;
+            // A machine without the devices gets no_intel_device; a runtime or a plugin that
+            // failed, or the routing disabled by DLIB_NPU, gets the detail of the failure.
+            if (why.empty() || no_device_present(why))
+            {
+                reason = "no NPU or Intel graphics processor was found" + (why.empty() ? std::string() : ": " + why);
+                code = "no_intel_device";
+            }
+            else
+            {
+                reason = "no NPU or Intel graphics processor could be used: " + why;
+                code = "intel_device_unusable";
+                args["detail"] = why;
+            }
             return devices;
         }
         reason = why;

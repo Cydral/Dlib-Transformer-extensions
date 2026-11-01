@@ -303,9 +303,9 @@ namespace albireo
         {
             none,
             tagged_object,   // <tool_call>{"name":..,"arguments":..}</tool_call>
-            mistral,         // [TOOL_CALLS]name[ARGS]{...} or [TOOL_CALLS][{...}]
+            mistral,         // [TOOL_CALLS]name[ARGS]{...}, name[CALL_ID]id[ARGS]{...} or [TOOL_CALLS][{...}]
             json_list,       // <|tool_call|>[{"name":..,"arguments":..}]
-            whole_json,      // the whole answer is {"name":..,"parameters":..}
+            whole_json,      // the whole answer is {"name":..,"parameters":..} naming a tool of the request
             xml_function     // <tool_call><function=name><parameter=key>value</parameter></function></tool_call>
         };
 
@@ -316,7 +316,8 @@ namespace albireo
             call_style calls = call_style::none;
             std::string call_open, call_close;
             std::string call_open_alt;   // a second spelling of the opening marker
-            json tools;                  // the definitions of the tools, for the types of the XML parameters
+            json tools;                  // the definitions of the tools: the types of the XML parameters, the
+                                         // names a whole JSON answer may call
         };
 
         class tag_parser : public output_parser
@@ -345,8 +346,11 @@ namespace albireo
                 process(events, true);
                 if (c_.calls == call_style::whole_json && !held_.empty())
                 {
-                    if (!emit_whole_json(held_, events)) emit(output_kind::content, held_, events);
-                    held_.clear();
+                    // The held answer is a call, or the answer as the model wrote it.
+                    std::string held;
+                    held.swap(held_);
+                    decided_whole_ = true;
+                    if (!emit_whole_json(held, events)) emit(output_kind::content, held, events);
                 }
                 if (!buffer_.empty())
                 {
@@ -365,11 +369,14 @@ namespace albireo
                 if (t.empty()) return;
                 if (k == output_kind::content && c_.calls == call_style::whole_json && !decided_whole_)
                 {
-                    // The answer is held until it is known not to be a call.
+                    // The answer is held until it is known not to be a call, the beginning of the
+                    // python tag included.
+                    static const std::string tag = "<|python_tag|>";
                     held_ += t;
                     const size_t first = held_.find_first_not_of(" \n\r\t");
                     if (first == std::string::npos) return;
-                    if (held_[first] == '{' || starts_with(held_.substr(first), "<|python_tag|>")) return;
+                    const size_t length = std::min(held_.size() - first, tag.size());
+                    if (held_[first] == '{' || held_.compare(first, length, tag, 0, length) == 0) return;
                     decided_whole_ = true;
                     const std::string all = held_;
                     held_.clear();
@@ -387,14 +394,34 @@ namespace albireo
                 events.push_back(e);
             }
 
-            void emit_call(const std::string& name, const std::string& args, std::vector<output_event>& events)
+            /*
+                A call, with the identifier the model gave it when it is one of the identifiers
+                the formats use (letters, digits, '_' and '-', 64 at most), else a new one.
+            */
+            void emit_call(const std::string& name, const std::string& args, std::vector<output_event>& events,
+                const std::string& id = std::string())
             {
+                bool usable = !id.empty() && id.size() <= 64;
+                for (size_t i = 0; usable && i < id.size(); ++i)
+                    usable = std::isalnum(static_cast<unsigned char>(id[i])) || id[i] == '_' || id[i] == '-';
                 output_event e;
                 e.kind = output_kind::tool_call;
-                e.call.id = new_call_id();
+                e.call.id = usable ? id : new_call_id();
                 e.call.name = name;
                 e.call.arguments = args.empty() ? "{}" : args;
                 events.push_back(e);
+            }
+
+            // Whether the definitions of the tools of the request name a function name.
+            bool declared_tool(const std::string& name) const
+            {
+                if (name.empty()) return false;
+                for (const auto& t : c_.tools.elements())
+                {
+                    const json& fn = t.contains("function") ? t["function"] : t;
+                    if (fn["name"].as_string() == name) return true;
+                }
+                return false;
             }
 
             /*
@@ -542,20 +569,34 @@ namespace albireo
                 return true;
             }
 
+            /*
+                The calls of an answer that is a whole JSON value: an object, or a list of
+                objects, each naming one of the tools of the request.  False, emitting nothing,
+                for any other answer, which is then the text of the answer.
+            */
             bool emit_whole_json(const std::string& text, std::vector<output_event>& events)
             {
                 std::string t = strip_spaces(text);
                 if (starts_with(t, "<|python_tag|>")) t = strip_spaces(t.substr(14));
                 json j;
                 if (!json::parse(t, j)) return false;
+                std::vector<const json*> objects;
                 if (j.is_array())
+                    for (const auto& e : j.elements()) objects.push_back(&e);
+                else
+                    objects.push_back(&j);
+                if (objects.empty()) return false;
+                for (const json* e : objects)
                 {
-                    for (const auto& e : j.elements())
-                        if (!e.is_object() || !e["name"].is_string()) return false;
-                    for (const auto& e : j.elements()) emit_call_object(e, events);
-                    return true;
+                    if (!e->is_object()) return false;
+                    const json& fn = e->contains("function") ? (*e)["function"] : *e;
+                    if (!declared_tool(fn["name"].as_string())) return false;
                 }
-                return j.is_object() && emit_call_object(j, events);
+                std::vector<output_event> calls;
+                for (const json* e : objects)
+                    if (!emit_call_object(*e, calls)) return false;
+                events.insert(events.end(), calls.begin(), calls.end());
+                return true;
             }
 
             // Length of the longest suffix of buffer_ that begins one of the markers.
@@ -616,6 +657,7 @@ namespace albireo
                         {
                             state_ = state::call;
                             call_prefix_ = *which;
+                            reset_scans();
                         }
                         continue;
                     }
@@ -673,7 +715,7 @@ namespace albireo
                 if (c_.calls == call_style::tagged_object || c_.calls == call_style::xml_function)
                 {
                     const bool xml = c_.calls == call_style::xml_function;
-                    const size_t p = buffer_.find(c_.call_close);
+                    const size_t p = find_marker(c_.call_close);
                     if (p == std::string::npos)
                     {
                         // A model may end its turn after the object, without the closing marker.
@@ -682,6 +724,7 @@ namespace albireo
                             if (!(xml ? emit_xml_calls(buffer_, events) : emit_calls(buffer_, events)))
                                 emit(output_kind::content, call_prefix_ + buffer_, events);
                             buffer_.clear();
+                            reset_scans();
                         }
                         return false;
                     }
@@ -690,18 +733,26 @@ namespace albireo
                         emit(output_kind::content, call_prefix_ + body + c_.call_close, events);
                     buffer_.erase(0, p + c_.call_close.size());
                     state_ = state::content;
+                    reset_scans();
                     return true;
                 }
                 if (c_.calls == call_style::json_list || (c_.calls == call_style::mistral && starts_json_list()))
                 {
-                    const size_t n = json_extent(buffer_);
+                    const size_t n = value_extent(0);
                     if (n == 0)
                     {
-                        if (final) { emit(output_kind::content, call_prefix_ + buffer_, events); buffer_.clear(); }
+                        if (final)
+                        {
+                            emit(output_kind::content, call_prefix_ + buffer_, events);
+                            buffer_.clear();
+                            reset_scans();
+                        }
                         return false;
                     }
                     json j;
-                    if (json::parse(strip_spaces(buffer_.substr(0, n)), j) && (j.is_array() || j.is_object()))
+                    std::string repaired;
+                    const std::string value = strip_spaces(buffer_.substr(0, n));
+                    if (parse_call_json(value, j, repaired) && (j.is_array() || j.is_object()))
                     {
                         if (j.is_object()) emit_call_object(j, events);
                         else for (const auto& e : j.elements()) if (e.is_object()) emit_call_object(e, events);
@@ -712,29 +763,50 @@ namespace albireo
                     }
                     buffer_.erase(0, n);
                     state_ = state::content;
+                    reset_scans();
                     return true;
                 }
-                // mistral: name[ARGS]{...}
-                static const std::string args_marker = "[ARGS]";
-                const size_t a = buffer_.find(args_marker);
+                // mistral: name[ARGS]{...}, or name[CALL_ID]id[ARGS]{...} with the identifier of the call
+                static const std::string args_marker = "[ARGS]", id_marker = "[CALL_ID]";
+                const size_t a = find_marker(args_marker);
                 if (a == std::string::npos)
                 {
-                    if (final) { emit(output_kind::content, call_prefix_ + buffer_, events); buffer_.clear(); }
+                    if (final)
+                    {
+                        emit(output_kind::content, call_prefix_ + buffer_, events);
+                        buffer_.clear();
+                        reset_scans();
+                    }
                     return false;
                 }
-                const size_t n = json_extent(buffer_, a + args_marker.size());
+                const size_t n = value_extent(a + args_marker.size());
                 if (n == 0)
                 {
-                    if (final) { emit(output_kind::content, call_prefix_ + buffer_, events); buffer_.clear(); }
+                    if (final)
+                    {
+                        emit(output_kind::content, call_prefix_ + buffer_, events);
+                        buffer_.clear();
+                        reset_scans();
+                    }
                     return false;
                 }
-                const std::string name = strip_spaces(buffer_.substr(0, a));
+                std::string name = strip_spaces(buffer_.substr(0, a)), id;
+                const size_t marked = name.find(id_marker);
+                if (marked != std::string::npos)
+                {
+                    id = strip_spaces(name.substr(marked + id_marker.size()));
+                    name = strip_spaces(name.substr(0, marked));
+                }
                 const std::string args = strip_spaces(buffer_.substr(a + args_marker.size(), n));
                 json j;
-                if (!name.empty() && json::parse(args, j)) emit_call(name, args, events);
-                else emit(output_kind::content, call_prefix_ + buffer_.substr(0, a + args_marker.size() + n), events);
+                std::string repaired;
+                if (!name.empty() && parse_call_json(args, j, repaired) && j.is_object())
+                    emit_call(name, repaired.empty() ? args : repaired, events, id);
+                else
+                    emit(output_kind::content, call_prefix_ + buffer_.substr(0, a + args_marker.size() + n), events);
                 buffer_.erase(0, a + args_marker.size() + n);
                 state_ = state::content;
+                reset_scans();
                 return true;
             }
 
@@ -743,6 +815,82 @@ namespace albireo
                 const size_t first = buffer_.find_first_not_of(" \n\r\t");
                 return first != std::string::npos && buffer_[first] == '[';
             }
+
+            /*
+                Position of a marker in buffer_, the search starting where the previous one
+                ended without finding it, since a call grows by a token at a time.
+            */
+            size_t find_marker(const std::string& marker)
+            {
+                const size_t from = scanned_ >= marker.size() ? scanned_ - marker.size() + 1 : 0;
+                const size_t p = buffer_.find(marker, from);
+                if (p == std::string::npos) scanned_ = buffer_.size();
+                return p;
+            }
+
+            /*
+                Length of the complete JSON value at start in buffer_, as json_extent() gives
+                it.  The scan of an object or a list resumes where the previous call left it.
+            */
+            size_t value_extent(size_t start)
+            {
+                if (extent_.start != start)
+                {
+                    extent_ = extent_state();
+                    extent_.start = start;
+                    extent_.pos = start;
+                }
+                if (!extent_.begun)
+                {
+                    size_t i = extent_.pos;
+                    while (i < buffer_.size() && (buffer_[i] == ' ' || buffer_[i] == '\n' || buffer_[i] == '\r'
+                        || buffer_[i] == '\t'))
+                        ++i;
+                    extent_.pos = i;
+                    if (i >= buffer_.size()) return 0;
+                    if (buffer_[i] != '{' && buffer_[i] != '[') return json_extent(buffer_, start);
+                    extent_.begun = true;
+                }
+                for (size_t j = extent_.pos; j < buffer_.size(); ++j)
+                {
+                    const char c = buffer_[j];
+                    if (extent_.escape)
+                    {
+                        extent_.escape = false;
+                        continue;
+                    }
+                    if (extent_.in_string)
+                    {
+                        if (c == '\\') extent_.escape = true;
+                        else if (c == '"') extent_.in_string = false;
+                        continue;
+                    }
+                    if (c == '"') extent_.in_string = true;
+                    else if (c == '{' || c == '[') ++extent_.depth;
+                    else if ((c == '}' || c == ']') && --extent_.depth == 0) return j + 1 - start;
+                }
+                extent_.pos = buffer_.size();
+                return 0;
+            }
+
+            // Forgets the scans of buffer_, whose text changed at its start.
+            void reset_scans()
+            {
+                scanned_ = 0;
+                extent_ = extent_state();
+            }
+
+            // Where the scan of a JSON value at start stopped: its depth, inside a string or after
+            // a backslash of one.
+            struct extent_state
+            {
+                size_t start = std::string::npos;
+                size_t pos = 0;
+                int depth = 0;
+                bool begun = false;
+                bool in_string = false;
+                bool escape = false;
+            };
 
             parser_config c_;
             std::vector<std::string> opens_;
@@ -754,6 +902,9 @@ namespace albireo
             bool strip_leading_ = false;
             bool reopen_ = false;
             bool skip_content_newlines_ = false;
+            // The bytes of buffer_ searched for a marker of the call without finding it.
+            size_t scanned_ = 0;
+            extent_state extent_;
         };
     }
 
@@ -848,7 +999,12 @@ namespace albireo
                     {
                         std::string content = body(m.content);
                         std::string reasoning = m.reasoning;
-                        if (reasoning.empty())
+                        /*
+                            The templates that reason split an answer at its </think> markers, the
+                            reasoning ending at the first and the answer following the last; the
+                            others keep the answer as written.
+                        */
+                        if (reasoning.empty() && supports_reasoning())
                         {
                             const size_t close = content.find("</think>");
                             if (close != std::string::npos)
@@ -858,7 +1014,7 @@ namespace albireo
                                 const size_t open = before.rfind("<think>");
                                 if (open != std::string::npos) before = before.substr(open + 7);
                                 reasoning = lstrip_newlines(before);
-                                content = lstrip_newlines(content.substr(close + 8));
+                                content = lstrip_newlines(content.substr(content.rfind("</think>") + 8));
                             }
                         }
                         w.markup("<|im_start|>assistant\n");
@@ -1132,7 +1288,12 @@ namespace albireo
             std::unique_ptr<output_parser> make_parser(const render_options& opt) const override
             {
                 parser_config c;
-                if (opt.tools.is_array() && !opt.tools.empty()) c.calls = call_style::whole_json;
+                if (opt.tools.is_array() && !opt.tools.empty())
+                {
+                    // A whole answer in JSON is a call only when it names a tool of the request.
+                    c.calls = call_style::whole_json;
+                    c.tools = opt.tools;
+                }
                 return std::unique_ptr<output_parser>(new tag_parser(c));
             }
 

@@ -12,13 +12,38 @@
     of the engine (model_file, read_model_config, the tokenizer and cpu_runtime) and must be
     refused with an exception, without a crash and without any allocation of more than
     256 MB; the intact file must load and compute a pass.
+
+    A copy of more than 2 GiB, whose last tensor lies beyond 2 GiB, the rest a hole that
+    takes no room on the disk, must load as well, through the mapped file and through a
+    file stream: the standard library of Visual Studio counts a stream buffer in an int.
+    The values of that tensor are distinct from those of every other tensor, so that a read
+    at another offset shows: each value read is checked, and the engine must compute the
+    logits of the same model written in a small file.
 */
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <winioctl.h>
+#else
+#include <fcntl.h>
+#include <sys/types.h>
+#include <unistd.h>
+#endif
+
+#include <algorithm>
 #include <atomic>
+#include <cstddef>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <new>
 #include <stdexcept>
 #include <string>
@@ -71,8 +96,9 @@ namespace
         }
     }
 
-    // The loading of the engine, then a pass over a few tokens; the reason of a refusal.
-    std::string load(const std::string& path)
+    // The loading of the engine, then a pass over a few tokens, whose logits go to out when
+    // given; the reason of a refusal.
+    std::string load(const std::string& path, std::vector<float>* out = nullptr)
     {
         try
         {
@@ -94,12 +120,35 @@ namespace
             if (static_cast<long>(logits.size()) != cfg.vocab) return "logits";
             for (float x : logits)
                 if (!std::isfinite(x)) return "non-finite logits";
+            if (out) out->swap(logits);
             return std::string();
         }
         catch (const std::exception& e)
         {
             return std::string("refused: ") + e.what();
         }
+    }
+
+    // Sets the field of the given label in bytes, as tiny_gguf::with() does in a copy.
+    void set_field(const tiny_gguf& model, std::vector<unsigned char>& bytes, const std::string& label, uint64_t value)
+    {
+        const albireo_test::gguf_field* f = model.find(label);
+        expect(f != nullptr, "no field " + label);
+        if (f)
+            for (size_t i = 0; i < f->size; ++i) bytes[f->offset + i] = static_cast<unsigned char>(value >> (8 * i));
+    }
+
+    /*
+        A copy of the file with one character of a string changed in place: the string whose
+        length field bears the label "length " + label, its character at index set to c.
+    */
+    std::vector<unsigned char> renamed(const tiny_gguf& model, const std::string& label, size_t index, char c)
+    {
+        std::vector<unsigned char> b = model.bytes;
+        const albireo_test::gguf_field* f = model.find("length " + label);
+        expect(f != nullptr, "no string " + label);
+        if (f) b[f->offset + f->size + index] = static_cast<unsigned char>(c);
+        return b;
     }
 
     void refused(const tiny_gguf& model, const std::string& name, const std::vector<unsigned char>& bytes,
@@ -110,6 +159,148 @@ namespace
         const std::string r = load(path);
         expect(r.compare(0, 8, "refused:") == 0, name + " loaded (" + (r.empty() ? std::string("no error") : r) + ")");
         expect(large_allocations.load() == before, name + " asked for more than 256 MB");
+    }
+
+    // Writes head at the start of a file and tail at offset at, the bytes between them a hole
+    // that takes no room on the disk (a sparse file on NTFS).
+    bool write_sparse(const std::string& path, const std::vector<unsigned char>& head, uint64_t at,
+        const std::vector<unsigned char>& tail)
+    {
+#ifdef _WIN32
+        HANDLE h = CreateFileA(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return false;
+        DWORD done = 0;
+        DeviceIoControl(h, FSCTL_SET_SPARSE, nullptr, 0, nullptr, 0, &done, nullptr);
+        auto put = [&](uint64_t offset, const std::vector<unsigned char>& b) {
+            LARGE_INTEGER p;
+            p.QuadPart = static_cast<LONGLONG>(offset);
+            DWORD written = 0;
+            return SetFilePointerEx(h, p, nullptr, FILE_BEGIN) != 0
+                && WriteFile(h, b.data(), static_cast<DWORD>(b.size()), &written, nullptr) != 0
+                && written == b.size();
+        };
+        const bool ok = put(0, head) && put(at, tail);
+        return CloseHandle(h) != 0 && ok;
+#else
+        const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0) return false;
+        auto put = [&](uint64_t offset, const std::vector<unsigned char>& b) {
+            return ::pwrite(fd, b.data(), b.size(), static_cast<off_t>(offset)) == static_cast<ssize_t>(b.size());
+        };
+        const bool ok = put(0, head) && put(at, tail);
+        return ::close(fd) == 0 && ok;
+#endif
+    }
+
+    // The bytes of a tensor read by r, or an empty vector with the reason in why.
+    std::vector<uint8_t> tensor_bytes(dlib::gguf_reader& r, const std::string& name, std::string& why)
+    {
+        try
+        {
+            for (const auto& t : r.tensors())
+                if (t.name == name)
+                {
+                    std::vector<uint8_t> raw;
+                    r.read_tensor_raw(t, raw);
+                    return raw;
+                }
+            why = "no tensor " + name;
+        }
+        catch (const std::exception& e)
+        {
+            why = e.what();
+        }
+        return std::vector<uint8_t>();
+    }
+
+    // The value at index k of output_norm.weight in the large file: no other tensor holds it.
+    float pattern(size_t k)
+    {
+        return 0.5f + static_cast<float>(k) / 64.0f;
+    }
+
+    // Whether raw holds the floats pattern(0), pattern(1)... of a tensor of count values.
+    bool holds_pattern(const std::vector<uint8_t>& raw, size_t count)
+    {
+        if (raw.size() != count * sizeof(float)) return false;
+        for (size_t k = 0; k < count; ++k)
+        {
+            float v;
+            std::memcpy(&v, raw.data() + k * sizeof(float), sizeof(float));
+            if (v != pattern(k)) return false;
+        }
+        return true;
+    }
+
+    /*
+        The tiny model with its last tensor, output_norm.weight, filled with the pattern and
+        moved 2 GiB further, read in every way the engine reads it.  The engine must compute
+        the logits of the same model written without the hole.
+    */
+    void large_file(const tiny_gguf& model, const std::string& folder)
+    {
+        const char* field = "offset output_norm.weight";
+        const albireo_test::gguf_field* f = model.find(field);
+        expect(f != nullptr && f->size == 8, std::string("no field ") + field);
+        if (!f) return;
+        uint64_t original = 0;
+        for (size_t i = 0; i < 8; ++i) original |= static_cast<uint64_t>(model.bytes[f->offset + i]) << (8 * i);
+        const size_t start = model.header_end + static_cast<size_t>(original);
+        const size_t count = (model.bytes.size() - start) / sizeof(float);
+        std::vector<unsigned char> bytes = model.bytes;
+        for (size_t k = 0; k < count; ++k)
+        {
+            const float v = pattern(k);
+            std::memcpy(&bytes[start + k * sizeof(float)], &v, sizeof(float));
+        }
+
+        const std::string small_path = folder + "test_model_file_pattern.gguf";
+        std::vector<float> reference;
+        expect(model.save(small_path, bytes), "write " + small_path);
+        const std::string r0 = load(small_path, &reference);
+        std::remove(small_path.c_str());
+        expect(r0.empty(), "the model with the pattern does not load: " + r0);
+
+        const std::string path = folder + "test_model_file_large.gguf";
+        const uint64_t moved = original + (uint64_t(1) << 31);
+        std::vector<unsigned char> head = bytes;
+        set_field(model, head, field, moved);
+        const std::vector<unsigned char> tail(head.begin() + static_cast<std::ptrdiff_t>(start), head.end());
+        head.resize(start);
+        const uint64_t size = model.header_end + moved + tail.size();
+        if (!write_sparse(path, head, model.header_end + moved, tail))
+        {
+            expect(false, "write the file of more than 2 GiB");
+            return;
+        }
+        std::vector<float> logits;
+        const std::string r = load(path, &logits);
+        expect(r.empty(), "the file of more than 2 GiB does not load: " + r);
+        bool same = r.empty() && r0.empty() && logits.size() == reference.size();
+        for (size_t i = 0; same && i < logits.size(); ++i)
+            same = std::fabs(logits[i] - reference[i]) <= 1e-5f * std::max(1.0f, std::fabs(reference[i]));
+        expect(same, "the logits computed from the file of more than 2 GiB differ from those of the small file");
+        try
+        {
+            mapped_file m(path);
+            dlib::gguf_reader mapped(m.data(), m.size());
+            std::string why;
+            expect(mapped.size() == size, "the mapped reader gives " + std::to_string(mapped.size()) + " bytes");
+            expect(holds_pattern(tensor_bytes(mapped, "output_norm.weight", why), count),
+                "the mapped reader does not read the values of the tensor beyond 2 GiB " + why);
+            dlib::gguf_reader stream(path);
+            expect(stream.size() == size, "the file reader gives " + std::to_string(stream.size()) + " bytes");
+            expect(holds_pattern(tensor_bytes(stream, "output_norm.weight", why), count),
+                "the file reader does not read the values of the tensor beyond 2 GiB " + why);
+        }
+        catch (const std::exception& e)
+        {
+            expect(false, std::string("the file of more than 2 GiB is refused: ") + e.what());
+        }
+        std::remove(path.c_str());
+        std::printf("  file of %llu bytes, last tensor beyond 2 GiB: %s\n", static_cast<unsigned long long>(size),
+            !r.empty() ? r.c_str() : same ? "loaded, the values read and the logits checked"
+            : "loaded, other logits");
     }
 }
 
@@ -167,16 +358,29 @@ int main(int argc, char** argv)
     damaged("an unknown tensor type", model.with("type blk.0.attn_q.weight", 99));
     damaged("an unknown metadata type", model.with("vtype qwen3.block_count", 99));
     damaged("an unknown element type", model.with("element type tokenizer.ggml.token_type", 99));
+    // On the alignment, so that the bounds of the data, and not the alignment, refuse it.
     damaged("a tensor at the end of the file", model.with("offset blk.1.ffn_down.weight",
-        model.bytes.size() - model.header_end - 16));
+        (model.bytes.size() - model.header_end) / 32 * 32 - 32));
     damaged("an empty vocabulary", model.with("count tokenizer.ggml.tokens", 0));
     const uint32_t nan = 0x7FC00000u, inf = 0x7F800000u;
     damaged("a rotary base NaN", model.with("kv qwen3.rope.freq_base", nan));
     damaged("an infinite rotary base", model.with("kv qwen3.rope.freq_base", inf));
     damaged("an infinite epsilon", model.with("kv qwen3.attention.layer_norm_rms_epsilon", inf));
+    // Names given twice, which the readers of the file could take for different entries.
+    damaged("a metadata key given twice", renamed(model, "key tokenizer.ggml.eos_token_id", 15, 'b'));
+    damaged("a tensor name given twice", renamed(model, "name blk.0.attn_k.weight", 11, 'q'));
+    // Tensor data off the alignment, and rows that split the blocks of a quantized type.
+    damaged("a tensor off the alignment", model.with("offset token_embd.weight", 4));
+    {
+        std::vector<unsigned char> b = model.with("type blk.0.attn_q.weight", 8);   // Q8_0, blocks of 32
+        set_field(model, b, "dim0 blk.0.attn_q.weight", 80);
+        set_field(model, b, "dim1 blk.0.attn_q.weight", 64);
+        damaged("rows of 80 values in blocks of 32", b);
+    }
 
     std::remove(path.c_str());
     std::printf("  %ld damaged files refused, no allocation beyond %zu MB\n", cases, allocation_limit >> 20);
+    large_file(model, folder);
     if (failures)
     {
         std::printf("%d checks FAILED\n", failures);

@@ -260,7 +260,10 @@ namespace dlib
             throws
                 - std::runtime_error if the file cannot be opened, is not a GGUF file,
                   uses an unsupported container version, is truncated, or contains a
-                  tensor whose element count is not aligned to its type's block size.
+                  tensor whose element count or first dimension is not a multiple of
+                  its type's block size.
+                - std::runtime_error if a metadata key or a tensor name appears twice, or
+                  if the data of a tensor does not start on the alignment of the file.
                 - std::runtime_error if a count, a string length, an array length, a
                   dimension or a tensor extent read from the header exceeds the size of
                   the file, which only a damaged file produces; the check comes before
@@ -280,6 +283,9 @@ namespace dlib
                   file.  A program that maps a model file into its address space can
                   then read the metadata with this object and the tensors in place, at
                   data + data_offset() + t.offset, without copying them.
+                - Blocks of any size are read, those of 2 GiB and more included, with
+                  every standard library: the stream over the block never exposes more
+                  than 1 GiB of it at a time.
                 - read_tensor_raw() copies tensors out of the memory block.
             throws
                 - std::runtime_error under the same conditions as the file constructor.
@@ -384,9 +390,8 @@ namespace dlib
                   name, or nullptr if no such tensor exists.
                 - The pointer remains valid for the lifetime of this object.
             notes
-                - The lookup is a linear scan over the tensor table. GGUF files hold
-                  a few hundred tensors at most, so this is not a bottleneck for the
-                  import and runtime-loading workloads this reader serves.
+                - The lookup goes through an index of the names, built when the header
+                  is parsed: its cost grows with the logarithm of the number of tensors.
         !*/
 
         void read_tensor_raw(
@@ -406,6 +411,39 @@ namespace dlib
     };
 
     // ---------------------------------------------------------------------------------
+
+    int64_t gguf_bounded_int(
+        const gguf_reader& g,
+        const std::string& key,
+        int64_t def,
+        int64_t lo,
+        int64_t hi
+    );
+    /*!
+        ensures
+            - Returns the integer the metadata key holds, def when the key is absent or
+              holds an array (some architectures give a value per layer).
+            - A floating point value is accepted when it is a whole number.
+        throws
+            - std::runtime_error when the value is a string, or a number outside
+              lo .. hi, which only a damaged or forged file holds.
+    !*/
+
+    double gguf_bounded_double(
+        const gguf_reader& g,
+        const std::string& key,
+        double def,
+        double lo,
+        double hi
+    );
+    /*!
+        ensures
+            - Returns the number the metadata key holds, def when the key is absent or
+              holds an array.
+        throws
+            - std::runtime_error when the value is a string, not a finite number, or a
+              number outside lo .. hi.
+    !*/
 
 }
 

@@ -58,7 +58,8 @@ namespace albireo
                 stopped, the daily usage figures and a few named values.
 
                 A database of an earlier version receives the columns of the projectors
-                when it opens.
+                when it opens.  The constructor checks every page of the database (PRAGMA
+                quick_check) and throws an error that names it "malformed" when one fails.
 
                 Every function locks the database for its duration, so that the threads
                 of the server, of the downloads and of the engine may share it.

@@ -49,9 +49,10 @@ namespace setup
         on the path of the programs (folder_parent_unsafe).  An existing folder of the
         programs must be empty or hold an installation of Albireo; an existing models
         folder must belong to SYSTEM or the administrators, or be empty, and hold nothing
-        of another account.
+        of another account.  The models folder lies apart from the folder of the programs
+        program_dir, when given (folder_overlap): an update replaces what that folder holds.
     */
-    std::string folder_problem(const std::string& dir, bool program);
+    std::string folder_problem(const std::string& dir, bool program, const std::string& program_dir = std::string());
 
     /*
         Why a folder cannot hold the data (the settings, the database, the logs, the
@@ -119,10 +120,29 @@ namespace setup
     */
     bool service_exists();
     bool service_running();
+    // Whether the service waits for its deletion, until the programs that hold it close it; error says what to do.
+    bool service_marked_for_deletion(std::string& error);
+    // Whether the service is disabled, by an administrator for instance.
+    bool service_disabled();
     bool stop_service(unsigned timeout_ms, std::string& error);
     bool start_service(std::string& error);
-    // Registers the service, with the restarts the service manager makes after a failure.
-    bool register_service(const std::string& program_dir, std::string& error);
+    /*
+        Waits until the service runs and its process listens on the port of settings.json,
+        which the service rewrites when it falls back on its last port; without the table
+        of the sockets, a connection to the port serves.  A service that stops without an
+        error code meanwhile counts as started: it stops so for an update it starts, or
+        when asked to.  Returns false, with the reason in error, when the service stops
+        with an error code or does not listen within timeout_ms.
+    */
+    bool wait_for_service(unsigned timeout_ms, std::string& error);
+    // Writes the last lines of the log of the service (logs\service.log) into the log of the installer.
+    void log_service_tail();
+    /*
+        Registers the service, with the restarts the service manager makes after a failure.
+        With keep_start_type, a service in place keeps the start chosen for it (an update);
+        otherwise it starts with Windows, after a delay.
+    */
+    bool register_service(const std::string& program_dir, bool keep_start_type, std::string& error);
     /*
         Turns off the restarts after a failure while the programs are replaced, so that a
         service ended by stop_service() does not start again on the files being copied;
@@ -155,12 +175,13 @@ namespace setup
         /*!
             WHAT THIS OBJECT REPRESENTS
                 The files an installation writes, as one change.  Each new file is
-                written beside the file it replaces (name.new); commit() then moves each
-                file replaced aside (name.old-<random>) and each new file into its place.
-                rollback() puts the previous files back and finish() deletes them; the
-                files in use, such as a program running in another session, are deleted
-                at the next restart of Windows.  Destroyed before commit(), the set
-                deletes its new files.
+                written beside the file it replaces (name.new) and flushed to the disk;
+                commit() then moves each file replaced aside (name.old-<random>) and each
+                new file into its place.  rollback() puts the previous files back and
+                finish() deletes them; the files in use, such as a program running in
+                another session, are deleted at the next restart of Windows.  Destroyed
+                before commit(), the set deletes its new files.  The moves are tried again
+                for a few seconds, the time a scanner takes to release a file.
         !*/
     public:
         staged_files() = default;
@@ -173,12 +194,23 @@ namespace setup
             std::string& error);
         // The path of the new file of target, which the caller writes; the file joins the set.
         std::string add(const std::string& target);
-        // A file of the installation that the change removes.
+        /*
+            A file of the installation that the change removes: commit() sets it aside with
+            the files replaced, so that rollback() puts it back.  A file that cannot be set
+            aside stays, and finish() deletes it, at the next restart of Windows when in use.
+        */
         void remove(const std::string& target);
-        // Moves the new files into place; on failure, puts every file back and returns false.
+        /*
+            Moves the new files into place; on failure, puts every file back and returns
+            false, error naming the files that could not be put back, if any.
+        */
         bool commit(std::string& error);
-        // After commit(): puts the previous files back.
-        void rollback();
+        /*
+            After commit(): puts the previous files back.  Returns true when every previous
+            file is in place again (also without a commit, when commit() put them back), else
+            false with the files that stay aside in error.
+        */
+        bool rollback(std::string& error);
         // After commit(): deletes the previous files.
         void finish();
         // The files the set installs.
@@ -190,10 +222,13 @@ namespace setup
             std::string target, fresh, aside;
             bool removal = false;
             bool placed = false;
+            bool kept = false;   // a removed file that could not be set aside
         };
-        void restore(size_t count);
+        bool restore(size_t count, std::string& failed);
         std::vector<entry> entries_;
         bool committed_ = false;
+        // The previous files that a failed commit() could not put back.
+        std::string unrestored_;
     };
 
     /*
@@ -204,14 +239,17 @@ namespace setup
     size_t remove_old_files(const std::string& program_dir, bool now_only = false);
 
     /*
-        Deletes the files of the engines, the web application and the licenses that an
-        earlier installation placed in program_dir and that the installation just made no
-        longer carries (installed, the paths of the files it placed, as staged_files::targets()
-        gives them), then the folders they leave empty.  The paths compare without case, as
-        Windows names its files; the links stay, with what they lead to, and a file in use
-        goes at the next restart of Windows.
+        Adds to the set, as files it removes, the files of the engines, the web application,
+        the licenses and the voices that an earlier installation placed in program_dir and
+        that the set does not install: commit() sets them aside with the files it replaces,
+        rollback() puts them back and finish() deletes them.  The paths compare without case,
+        as Windows names its files; the links stay, with what they lead to, and so do the
+        files of the models folder of settings.json and of the data folder.
     */
-    void remove_stale_files(const std::string& program_dir, const std::vector<std::string>& installed);
+    void stage_stale_files(const std::string& program_dir, staged_files& files);
+
+    // Removes the folders of the engines, the web application, the licenses and the voices that hold nothing.
+    void remove_empty_program_folders(const std::string& program_dir);
 
     // Writes this program into the set, without its payload and its models, as the uninstaller.
     bool stage_uninstaller(const std::string& program_dir, staged_files& files, std::string& error);
@@ -259,10 +297,11 @@ namespace setup
         Copies the offline bundle the installer comes with, on a medium, into the import
         folder of the service, which installs it at its start: the catalog next to the
         installer (catalog.json and catalog.json.sig) when its signature is that of
-        Albireo, and the models of its "models" folder that this catalog lists, each
-        checked against its hash.  progress receives the bytes copied, their total and the
-        name of the file.  Returns false, with the reason in error, when the bundle cannot
-        be copied whole (an unsigned catalog, too little space, a damaged model).
+        Albireo, and the models of its "models" folder that this catalog lists, with their
+        projectors, each checked against its hash.  progress receives the bytes copied,
+        their total and the name of the file.  Returns false, with the reason in error,
+        when the bundle cannot be copied whole (an unsigned catalog, too little space, a
+        damaged model).
     */
     bool stage_bundle(const std::function<void(uint64_t done, uint64_t total, const std::string& file)>& progress,
         std::string& error);
@@ -287,6 +326,25 @@ namespace setup
     void remove_uninstall();
     void set_autostart(const std::string& program_dir, bool on);
 
+    /*
+        The values of the entry of the installed programs, saved before an installation
+        changes it and written back by restore_uninstall_entry() when the installation fails;
+        a snapshot taken without an entry removes the entry.
+    */
+    struct uninstall_entry
+    {
+        struct value
+        {
+            std::wstring name;
+            uint32_t type = 0;
+            std::vector<uint8_t> data;
+        };
+        bool present = false;
+        std::vector<value> values;
+    };
+    uninstall_entry save_uninstall_entry();
+    void restore_uninstall_entry(const uninstall_entry& entry);
+
     // Shortcuts of the Start menu and of the desktop.
     void create_shortcuts(const std::string& program_dir, bool desktop);
     void remove_shortcuts();
@@ -297,9 +355,6 @@ namespace setup
         service), the program is not started.
     */
     bool launch_unelevated(const std::string& program, const std::string& args);
-
-    // Waits until the local server accepts connections.
-    bool wait_for_server(int port, unsigned timeout_ms);
 
     /*
         Removes a folder and its content; a link goes alone, without what it leads to.
@@ -352,6 +407,13 @@ namespace setup
         the temporary folder of the account.
     */
     void flush_log();
+
+    /*
+        Takes back the lines this run wrote in the log of the data folder, which then wait
+        again for flush_log(): called before a data folder that a failed installation made
+        is removed, so that albireo-setup.log of the temporary folder keeps them.
+    */
+    void detach_log();
 
 }
 }

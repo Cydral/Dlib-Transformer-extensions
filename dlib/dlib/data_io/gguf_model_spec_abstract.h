@@ -187,6 +187,11 @@ namespace dlib
               absent.
             - Structural flags (tied_embeddings, qk_norm, quantized) are detected
               from the tensor table, not from the metadata.
+        throws
+            - std::runtime_error when a number of the metadata lies outside the bounds
+              of the published models (gguf_bounded_int(), gguf_bounded_double()):
+              1,024 layers and heads, a width of 2^17, a feed-forward width of 2^20,
+              heads of 4,096 values, 4,096 experts, finite scales.
     !*/
 
     // ---------------------------------------------------------------------------------

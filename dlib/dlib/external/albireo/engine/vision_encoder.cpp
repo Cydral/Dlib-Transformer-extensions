@@ -71,12 +71,15 @@ namespace albireo
             kind_ = family::qwen3vl;
         else if (type == "mlp" && g.has("clip.vision.image_grid_pinpoints"))
             kind_ = family::llava_next;
+        else if (type == "pixtral")
+            kind_ = family::pixtral;
         else
             throw std::runtime_error(type.empty() ? std::string("the file holds no image encoder (clip.projector_type)")
                 : "the image encoder of type '" + type + "' is not supported by this engine, which reads those of "
-                  "Qwen3-VL (qwen3vl_merger) and of LLaVA-NeXT (mlp with pinpoints)");
+                  "Qwen3-VL (qwen3vl_merger), of LLaVA-NeXT (mlp with pinpoints) and of Pixtral (pixtral)");
         if (!present(f)) throw std::runtime_error("the file holds no vision tensors (v.patch_embd.weight)");
         const bool llava = kind_ == family::llava_next;
+        const bool pixtral = kind_ == family::pixtral;
 
         hidden_ = metadata_int(g, "clip.vision.embedding_length", 16, 1 << 14);
         heads_ = metadata_int(g, "clip.vision.attention.head_count", 1, 256);
@@ -84,8 +87,9 @@ namespace albireo
         const long layers = metadata_int(g, "clip.vision.block_count", 1, 256);
         patch_ = metadata_int(g, "clip.vision.patch_size", 1, 64);
         merge_ = llava ? 1 : g.has("clip.vision.spatial_merge_size")
-            ? metadata_int(g, "clip.vision.spatial_merge_size", 1, 8) : 2;
-        if (!llava) out_dim_ = metadata_int(g, "clip.vision.projection_dim", 1, 1 << 17);
+            ? metadata_int(g, "clip.vision.spatial_merge_size", 1, 8) : pixtral ? 1 : 2;
+        // The output width of Pixtral is that of its last layer: its projection_dim names another one.
+        if (kind_ == family::qwen3vl) out_dim_ = metadata_int(g, "clip.vision.projection_dim", 1, 1 << 17);
         const double eps = g.get_double("clip.vision.attention.layer_norm_epsilon", 1e-6);
         if (!(eps >= 0.0 && eps < 1.0)) throw std::runtime_error("the image encoder holds an invalid epsilon");
         eps_ = static_cast<float>(eps);
@@ -113,6 +117,8 @@ namespace albireo
             }
             if (feature_blocks_ < 1) throw std::runtime_error("the image encoder has no block");
             image_size_ = metadata_int(g, "clip.vision.image_size", patch_, 4096);
+            if (!g.has("clip.vision.image_grid_pinpoints"))
+                throw std::runtime_error("the image encoder lacks its pinpoints");
             const std::vector<int64_t>& pins = g.at("clip.vision.image_grid_pinpoints").arr_int;
             if (pins.empty() || pins.size() % 2 != 0)
                 throw std::runtime_error("the pinpoints of the image encoder are not pairs");
@@ -126,6 +132,8 @@ namespace albireo
                 pinpoints_.push_back(std::make_pair(w, h));
             }
         }
+        // The longest edge of an image read by Pixtral.
+        if (pixtral) image_size_ = metadata_int(g, "clip.vision.image_size", factor(), 16384);
         for (int c = 0; c < 3; ++c)
         {
             if (g.has("clip.vision.image_mean") && g.at("clip.vision.image_mean").arr_float.size() == 3)
@@ -162,27 +170,55 @@ namespace albireo
         patch_matrix_.rows = hidden_;
         patch_matrix_.cols = K;
         patch_matrix_.row_bytes = static_cast<size_t>(K) * sizeof(float);
-        patch_b_ = f.floats("v.patch_embd.bias", static_cast<size_t>(hidden_));
+        // Pixtral convolves without a bias.
+        if (pixtral) f.optional_floats("v.patch_embd.bias", static_cast<size_t>(hidden_), patch_b_);
+        else patch_b_ = f.floats("v.patch_embd.bias", static_cast<size_t>(hidden_));
 
-        // The learned positions, a square grid.
-        const tensor_view* pos = f.find("v.position_embd.weight");
-        if (!pos || pos->dims.size() < 2) throw std::runtime_error("missing tensor v.position_embd.weight");
-        const long cells = static_cast<long>(pos->elements() / static_cast<uint64_t>(hidden_));
-        side_ = static_cast<long>(std::lround(std::sqrt(static_cast<double>(cells))));
-        if (side_ < 1 || side_ * side_ != cells) throw std::runtime_error("the position table is not a square grid");
-        if (llava && side_ != image_size_ / patch_)
-            throw std::runtime_error("the position table of the image encoder does not cover its views");
-        const weight_matrix pm = f.matrix("v.position_embd.weight", cells, hidden_);
-        pos_.resize(static_cast<size_t>(cells * hidden_));
-        for (long c = 0; c < cells; ++c)
-            qk_dequantize_row(pm.type, pm.data + static_cast<size_t>(c) * pm.row_bytes, pos_.data() + c * hidden_,
-                hidden_);
+        // The learned positions, a square grid (Pixtral has none: its heads rotate by the rows
+        // and the columns alone).
+        if (!pixtral)
+        {
+            const tensor_view* pos = f.find("v.position_embd.weight");
+            if (!pos || pos->dims.size() < 2) throw std::runtime_error("missing tensor v.position_embd.weight");
+            const long cells = static_cast<long>(pos->elements() / static_cast<uint64_t>(hidden_));
+            side_ = static_cast<long>(std::lround(std::sqrt(static_cast<double>(cells))));
+            if (side_ < 1 || side_ * side_ != cells)
+                throw std::runtime_error("the position table is not a square grid");
+            if (llava && side_ != image_size_ / patch_)
+                throw std::runtime_error("the position table of the image encoder does not cover its views");
+            const weight_matrix pm = f.matrix("v.position_embd.weight", cells, hidden_);
+            pos_.resize(static_cast<size_t>(cells * hidden_));
+            for (long c = 0; c < cells; ++c)
+                qk_dequantize_row(pm.type, pm.data + static_cast<size_t>(c) * pm.row_bytes, pos_.data() + c * hidden_,
+                    hidden_);
+        }
 
-        // Frequencies of the rotary pairs: each axis takes head_dim / 4 of them.
-        const long quarter = llava ? 0 : head_dim_ / 4;
-        for (long i = 0; i < quarter; ++i)
-            inv_freq_.push_back(static_cast<float>(1.0 / std::pow(10000.0, 2.0 * static_cast<double>(i)
-                / static_cast<double>(head_dim_ / 2))));
+        if (kind_ == family::qwen3vl)
+        {
+            // Frequencies of the rotary pairs: each axis takes head_dim / 4 of them.
+            const long quarter = head_dim_ / 4;
+            for (long i = 0; i < quarter; ++i)
+                inv_freq_.push_back(static_cast<float>(1.0 / std::pow(10000.0, 2.0 * static_cast<double>(i)
+                    / static_cast<double>(head_dim_ / 2))));
+        }
+        else if (pixtral)
+        {
+            /*
+                Pair p of a head turns at theta^(-e / head_dim): the pairs of the first half,
+                rotated by the row of the patch, take the even exponents e = 4p, those of the
+                second half, rotated by its column, the odd ones e = 4(p - head_dim / 4) + 2.
+            */
+            const double theta = g.get_double("clip.rope.freq_base", 10000.0);
+            if (!(theta > 1.0 && theta < 1e12))
+                throw std::runtime_error("the image encoder holds an invalid rotary base");
+            const long half = head_dim_ / 2, quarter = head_dim_ / 4;
+            for (long p = 0; p < half; ++p)
+            {
+                const double e = p < quarter ? 4.0 * static_cast<double>(p)
+                    : 4.0 * static_cast<double>(p - quarter) + 2.0;
+                inv_freq_.push_back(static_cast<float>(std::pow(theta, -e / static_cast<double>(head_dim_))));
+            }
+        }
 
         std::vector<bool> deep(static_cast<size_t>(layers), false);
         if (g.has("clip.vision.is_deepstack_layers"))
@@ -202,43 +238,73 @@ namespace albireo
         {
             const std::string p = "v.blk." + std::to_string(i) + ".";
             block b;
+            // Pixtral normalizes by the root mean square: its norms have no bias.
             b.ln1_w = f.floats(p + "ln1.weight", static_cast<size_t>(D));
-            b.ln1_b = f.floats(p + "ln1.bias", static_cast<size_t>(D));
+            if (!pixtral) b.ln1_b = f.floats(p + "ln1.bias", static_cast<size_t>(D));
             b.ln2_w = f.floats(p + "ln2.weight", static_cast<size_t>(D));
-            b.ln2_b = f.floats(p + "ln2.bias", static_cast<size_t>(D));
+            if (!pixtral) b.ln2_b = f.floats(p + "ln2.bias", static_cast<size_t>(D));
             if (f.has(p + "attn_qkv.weight"))
             {
-                b.qkv = f.matrix(p + "attn_qkv.weight", 3 * D, D);
+                b.qkv = readable(f.matrix(p + "attn_qkv.weight", 3 * D, D));
                 b.qkv_b = f.floats(p + "attn_qkv.bias", static_cast<size_t>(3 * D));
                 count(b.qkv);
             }
             else
             {
-                // The queries, keys and values apart (SigLIP), their biases end to end.
+                // The queries, keys and values apart (SigLIP, Pixtral), their biases end to end.
                 b.fused = false;
-                b.q = f.matrix(p + "attn_q.weight", D, D);
-                b.k = f.matrix(p + "attn_k.weight", D, D);
-                b.v = f.matrix(p + "attn_v.weight", D, D);
+                b.q = readable(f.matrix(p + "attn_q.weight", D, D));
+                b.k = readable(f.matrix(p + "attn_k.weight", D, D));
+                b.v = readable(f.matrix(p + "attn_v.weight", D, D));
+                bool any = false;
+                std::vector<float> biases(static_cast<size_t>(3 * D), 0.0f);
+                long at = 0;
                 for (const char* part : { "attn_q.bias", "attn_k.bias", "attn_v.bias" })
                 {
-                    const std::vector<float> bias = f.floats(p + part, static_cast<size_t>(D));
-                    b.qkv_b.insert(b.qkv_b.end(), bias.begin(), bias.end());
+                    std::vector<float> bias;
+                    if (pixtral) any = f.optional_floats(p + part, static_cast<size_t>(D), bias) || any;
+                    else
+                    {
+                        bias = f.floats(p + part, static_cast<size_t>(D));
+                        any = true;
+                    }
+                    if (!bias.empty()) std::copy(bias.begin(), bias.end(), biases.begin() + at);
+                    at += D;
                 }
+                if (any) b.qkv_b.swap(biases);
                 count(b.q);
                 count(b.k);
                 count(b.v);
             }
-            b.out = f.matrix(p + "attn_out.weight", D, D);
-            b.out_b = f.floats(p + "attn_out.bias", static_cast<size_t>(D));
-            // The files of the first conversion tools name the two layers of the feed-forward
-            // part the other way round: the layer that reads the width of the encoder comes first.
-            const tensor_view* up = f.find(p + "ffn_up.weight");
-            const bool swapped = up && !up->dims.empty() && static_cast<long>(up->dims[0]) != D;
-            const std::string first = swapped ? "ffn_down" : "ffn_up", second = swapped ? "ffn_up" : "ffn_down";
-            b.up = f.matrix(p + first + ".weight", ffn_, D);
-            b.up_b = f.floats(p + first + ".bias", static_cast<size_t>(ffn_));
-            b.down = f.matrix(p + second + ".weight", D, ffn_);
-            b.down_b = f.floats(p + second + ".bias", static_cast<size_t>(D));
+            b.out = readable(f.matrix(p + "attn_out.weight", D, D));
+            if (pixtral) f.optional_floats(p + "attn_out.bias", static_cast<size_t>(D), b.out_b);
+            else b.out_b = f.floats(p + "attn_out.bias", static_cast<size_t>(D));
+            if (pixtral)
+            {
+                // A SiLU gate: silu(gate x) * (up x), then the layer down.
+                b.gated = true;
+                b.gate = readable(f.matrix(p + "ffn_gate.weight", ffn_, D));
+                b.up = readable(f.matrix(p + "ffn_up.weight", ffn_, D));
+                b.down = readable(f.matrix(p + "ffn_down.weight", D, ffn_));
+                f.optional_floats(p + "ffn_up.bias", static_cast<size_t>(ffn_), b.up_b);
+                f.optional_floats(p + "ffn_down.bias", static_cast<size_t>(D), b.down_b);
+                if (f.has(p + "ffn_gate.bias"))
+                    throw std::runtime_error("the gate of the image encoder has a bias, which this engine does not "
+                        "read");
+                count(b.gate);
+            }
+            else
+            {
+                // The files of the first conversion tools name the two layers of the feed-forward
+                // part the other way round: the layer that reads the width of the encoder comes first.
+                const tensor_view* up = f.find(p + "ffn_up.weight");
+                const bool swapped = up && !up->dims.empty() && static_cast<long>(up->dims[0]) != D;
+                const std::string first = swapped ? "ffn_down" : "ffn_up", second = swapped ? "ffn_up" : "ffn_down";
+                b.up = readable(f.matrix(p + first + ".weight", ffn_, D));
+                b.up_b = f.floats(p + first + ".bias", static_cast<size_t>(ffn_));
+                b.down = readable(f.matrix(p + second + ".weight", D, ffn_));
+                b.down_b = f.floats(p + second + ".bias", static_cast<size_t>(D));
+            }
             count(b.out);
             count(b.up);
             count(b.down);
@@ -250,9 +316,9 @@ namespace albireo
                 m.after = i;
                 m.norm_w = f.floats(q + "norm.weight", static_cast<size_t>(M4));
                 m.norm_b = f.floats(q + "norm.bias", static_cast<size_t>(M4));
-                m.fc1 = f.matrix(q + "fc1.weight", M4, M4);
+                m.fc1 = readable(f.matrix(q + "fc1.weight", M4, M4));
                 m.fc1_b = f.floats(q + "fc1.bias", static_cast<size_t>(M4));
-                m.fc2 = f.matrix(q + "fc2.weight", out_dim_, M4);
+                m.fc2 = readable(f.matrix(q + "fc2.weight", out_dim_, M4));
                 m.fc2_b = f.floats(q + "fc2.bias", static_cast<size_t>(out_dim_));
                 count(m.fc1);
                 count(m.fc2);
@@ -271,23 +337,78 @@ namespace albireo
             out_dim_ = static_cast<long>(fc2->dims[1]);
             if (middle < 1 || middle > (1 << 17) || out_dim_ < 1 || out_dim_ > (1 << 17))
                 throw std::runtime_error("the projector of the image encoder has an invalid width");
-            final_.fc1 = f.matrix("mm.0.weight", middle, D);
+            final_.fc1 = readable(f.matrix("mm.0.weight", middle, D));
             final_.fc1_b = f.floats("mm.0.bias", static_cast<size_t>(middle));
-            final_.fc2 = f.matrix("mm.2.weight", out_dim_, middle);
+            final_.fc2 = readable(f.matrix("mm.2.weight", out_dim_, middle));
             final_.fc2_b = f.floats("mm.2.bias", static_cast<size_t>(out_dim_));
             if (f.has("model.image_newline")) newline_ = f.floats("model.image_newline", static_cast<size_t>(out_dim_));
+            count(final_.fc1);
+            count(final_.fc2);
+        }
+        else if (pixtral)
+        {
+            // The norm after the patch embedding, then the projector of the merged tokens.
+            f.optional_floats("v.pre_ln.weight", static_cast<size_t>(D), pre_ln_w_);
+            const tensor_view* l1 = f.find("mm.1.weight");
+            const tensor_view* l2 = f.find("mm.2.weight");
+            if (!l1 || !l2 || l1->dims.size() < 2 || l2->dims.size() < 2)
+                throw std::runtime_error("the image encoder lacks the two layers of its projector (mm.1, mm.2)");
+            const long middle = static_cast<long>(l1->dims[1]);
+            out_dim_ = static_cast<long>(l2->dims[1]);
+            if (middle < 1 || middle > (1 << 17) || out_dim_ < 1 || out_dim_ > (1 << 17))
+                throw std::runtime_error("the projector of the image encoder has an invalid width");
+            proj1_ = readable(f.matrix("mm.1.weight", middle, D));
+            proj2_ = readable(f.matrix("mm.2.weight", out_dim_, middle));
+            f.optional_floats("mm.1.bias", static_cast<size_t>(middle), proj1_b_);
+            f.optional_floats("mm.2.bias", static_cast<size_t>(out_dim_), proj2_b_);
+            count(proj1_);
+            count(proj2_);
+            if (merge_ > 1)
+            {
+                /*
+                    The merger reads the patches of a square, merge x merge of them, which the
+                    encoding keeps one after the other; the reference unfolds them channel by
+                    channel (column c * merge^2 + k for the channel c of the patch k of the
+                    square), so its columns are put in the order of the patches.
+                */
+                proj_norm_w_ = f.floats("mm.input_norm.weight", static_cast<size_t>(D));
+                const long m2 = merge_ * merge_;
+                const weight_matrix pm = f.matrix("mm.patch_merger.weight", D, M4);
+                owned_.emplace_back(static_cast<size_t>(D * M4));
+                uint16_t* half = owned_.back().data();
+                // On the loading thread: the threads of the pool may be computing the passes of other models.
+                std::vector<float> row(static_cast<size_t>(M4)), order(static_cast<size_t>(M4));
+                for (long o = 0; o < D; ++o)
+                {
+                    qk_dequantize_row(pm.type, pm.data + static_cast<size_t>(o) * pm.row_bytes, row.data(), M4);
+                    for (long c = 0; c < D; ++c)
+                        for (long k = 0; k < m2; ++k)
+                            order[static_cast<size_t>(k * D + c)] = row[static_cast<size_t>(c * m2 + k)];
+                    qk_float_to_half_row(order.data(), half + o * M4, M4);
+                }
+                patch_merger_.type = dlib::ggml_type::F16;
+                patch_merger_.data = reinterpret_cast<const uint8_t*>(half);
+                patch_merger_.rows = D;
+                patch_merger_.cols = M4;
+                patch_merger_.row_bytes = static_cast<size_t>(M4) * sizeof(uint16_t);
+                count(patch_merger_);
+            }
+            // The decoder reads an [IMG_BREAK] after each row of tokens but the last.
+            if (!f.has("v.token_embd.img_break"))
+                throw std::runtime_error("the image encoder lacks the [IMG_BREAK] embedding (v.token_embd.img_break)");
+            img_break_ = f.floats("v.token_embd.img_break", static_cast<size_t>(out_dim_));
         }
         else
         {
             final_.norm_w = f.floats("v.post_ln.weight", static_cast<size_t>(D));
             final_.norm_b = f.floats("v.post_ln.bias", static_cast<size_t>(D));
-            final_.fc1 = f.matrix("mm.0.weight", M4, M4);
+            final_.fc1 = readable(f.matrix("mm.0.weight", M4, M4));
             final_.fc1_b = f.floats("mm.0.bias", static_cast<size_t>(M4));
-            final_.fc2 = f.matrix("mm.2.weight", out_dim_, M4);
+            final_.fc2 = readable(f.matrix("mm.2.weight", out_dim_, M4));
             final_.fc2_b = f.floats("mm.2.bias", static_cast<size_t>(out_dim_));
+            count(final_.fc1);
+            count(final_.fc2);
         }
-        count(final_.fc1);
-        count(final_.fc2);
         uint64_t most = 0;
         for (const auto& kv : by_type)
         {
@@ -312,6 +433,13 @@ namespace albireo
               << ")";
             return o.str();
         }
+        if (kind_ == family::pixtral)
+        {
+            o << "image encoder Pixtral (" << blocks_.size() << " blocks, width " << hidden_ << ", " << heads_
+              << " heads, patch " << patch_ << ", merge " << merge_ << "x" << merge_ << ", longest edge "
+              << image_size_ << ", output " << out_dim_ << ", [IMG_BREAK], " << weight_type_ << ")";
+            return o.str();
+        }
         o << "image encoder (" << blocks_.size() << " blocks, width " << hidden_ << ", " << heads_ << " heads, patch "
           << patch_ << ", merge " << merge_ << "x" << merge_ << ", positions " << side_ << "x" << side_;
         if (!deepstack_.empty())
@@ -329,9 +457,39 @@ namespace albireo
         qk_matmul(w, x, n, x_stride, y, y_stride, pool_, scratch_, accumulate, qk_path::automatic);
     }
 
+    weight_matrix vision_encoder::readable(const weight_matrix& m)
+    {
+        if (m.type != dlib::ggml_type::BF16 || !m.valid()) return m;
+        owned_.emplace_back(static_cast<size_t>(m.rows) * static_cast<size_t>(m.cols));
+        uint16_t* half = owned_.back().data();
+        // On the loading thread: the threads of the pool may be computing the passes of other models.
+        std::vector<float> row(static_cast<size_t>(m.cols));
+        for (long r = 0; r < m.rows; ++r)
+        {
+            qk_dequantize_row(m.type, m.data + static_cast<size_t>(r) * m.row_bytes, row.data(), m.cols);
+            qk_float_to_half_row(row.data(), half + static_cast<size_t>(r) * static_cast<size_t>(m.cols), m.cols);
+        }
+        weight_matrix c = m;
+        c.type = dlib::ggml_type::F16;
+        c.data = reinterpret_cast<const uint8_t*>(half);
+        c.row_bytes = static_cast<size_t>(m.cols) * sizeof(uint16_t);
+        return c;
+    }
+
     void vision_encoder::layer_norm_rows(const float* x, const std::vector<float>& w, const std::vector<float>& b,
         float* y, long rows, long width)
     {
+        if (b.empty())
+        {
+            // The root mean square norm of Pixtral; x and y may be the same rows.
+            pool_.parallel_for(rows, [&](long r, int) {
+                const float* xr = x + r * width;
+                float* yr = y + r * width;
+                const float s = 1.0f / std::sqrt(qk_dot_f32(xr, xr, width) / static_cast<float>(width) + eps_);
+                for (long i = 0; i < width; ++i) yr[i] = xr[i] * s * w[static_cast<size_t>(i)];
+            });
+            return;
+        }
         pool_.parallel_for(rows, [&](long r, int) {
             qk_layer_norm(x + r * width, w.data(), b.data(), y + r * width, width, eps_);
         });
@@ -340,6 +498,7 @@ namespace albireo
     void vision_encoder::add_bias_rows(float* y, long stride, const std::vector<float>& bias, long rows)
     {
         const long n = static_cast<long>(bias.size());
+        if (n == 0) return;
         pool_.parallel_for(rows, [&](long r, int) { qk_add(y + r * stride, bias.data(), n); });
     }
 
@@ -443,6 +602,41 @@ namespace albireo
             p.tokens = p.grid_w * p.grid_h;
             return p;
         }
+        if (kind_ == family::pixtral)
+        {
+            long most = 576;
+            if (detail == "low") most = 256;
+            else if (detail == "high") most = 1024;
+            else if (!detail.empty() && detail != "auto")
+                throw std::invalid_argument("the detail of an image is \"low\", \"auto\" or \"high\"");
+            /*
+                The reference brings the longest edge within image_size() pixels, the sides
+                floored, then rounds each side up to a multiple of factor() pixels; a grid of
+                more merged tokens than the detail allows shrinks by the same ratio on both
+                sides, floored.
+            */
+            const long f = factor();
+            double w = static_cast<double>(width), h = static_cast<double>(height);
+            const double ratio = std::max(w, h) / static_cast<double>(image_size_);
+            if (ratio > 1.0)
+            {
+                w = std::max(1.0, std::floor(w / ratio));
+                h = std::max(1.0, std::floor(h / ratio));
+            }
+            long gw = (static_cast<long>(w) - 1) / f + 1, gh = (static_cast<long>(h) - 1) / f + 1;
+            if (gw * gh > most)
+            {
+                const double s = std::sqrt(static_cast<double>(most) / static_cast<double>(gw * gh));
+                gw = std::max<long>(1, static_cast<long>(std::floor(static_cast<double>(gw) * s)));
+                gh = std::max<long>(1, static_cast<long>(std::floor(static_cast<double>(gh) * s)));
+            }
+            p.width = gw * f;
+            p.height = gh * f;
+            p.grid_w = gw;
+            p.grid_h = gh;
+            p.tokens = gw * gh + gh - 1;
+            return p;
+        }
         const long tiles = max_tiles(detail);
         if (static_cast<double>(std::max(width, height)) / static_cast<double>(std::min(width, height)) > 200.0)
             throw std::invalid_argument("the sides of the image differ by a ratio over 200");
@@ -469,6 +663,14 @@ namespace albireo
     {
         if (kind_ == family::qwen3vl)
             return detail == "min" ? 64 : detail == "low" ? 256 : detail == "high" ? 1024 : 576;
+        if (kind_ == family::pixtral)
+        {
+            if (detail == "min") return 1;
+            const long most = detail == "low" ? 256 : detail == "high" ? 1024 : 576;
+            // The merged tokens, and an [IMG_BREAK] after each row but the last.
+            const long rows = std::min(most, image_size_ / factor());
+            return most + rows - 1;
+        }
         if (detail == "min") return side_ * side_;
         const long tiles = max_tiles(detail);
         long most = 0;
@@ -489,7 +691,7 @@ namespace albireo
         const long n = j.n_, D = hidden_, K = 3 * patch_ * patch_, half = head_dim_ / 2, quarter = head_dim_ / 4;
         const long m2 = merge_ * merge_;
         const long grid_w = j.pw_ / merge_;
-        const bool rotary = kind_ == family::qwen3vl;
+        const bool rotary = kind_ != family::llava_next;
 
         // The row and column of patch i, the patches taken square by square of merge x merge.
         auto place = [&](long i, long& row, long& col) {
@@ -534,11 +736,24 @@ namespace albireo
             long row, col;
             place(i, row, col);
             float* x = j.x_.data() + i * D;
-            qk_add(x, patch_b_.data(), D);
+            if (!patch_b_.empty()) qk_add(x, patch_b_.data(), D);
             if (!rotary)
             {
                 // A view covers the table of the positions exactly.
                 qk_add(x, pos_.data() + (row * side_ + col) * D, D);
+                return;
+            }
+            if (kind_ == family::pixtral)
+            {
+                // The pairs of the first half turn with the row, those of the second half with the column.
+                float* c = j.cos_.data() + i * half;
+                float* s = j.sin_.data() + i * half;
+                for (long k = 0; k < half; ++k)
+                {
+                    const double a = static_cast<double>(k < quarter ? row : col) * inv_freq_[static_cast<size_t>(k)];
+                    c[k] = static_cast<float>(std::cos(a));
+                    s[k] = static_cast<float>(std::sin(a));
+                }
                 return;
             }
             const float fy = static_cast<float>(row) * ry, fx = static_cast<float>(col) * rx;
@@ -563,6 +778,9 @@ namespace albireo
                 s[quarter + k] = static_cast<float>(std::sin(static_cast<double>(ax)));
             }
         });
+        // Pixtral normalizes the patches before its first block.
+        if (kind_ == family::pixtral && !pre_ln_w_.empty())
+            layer_norm_rows(j.x_.data(), pre_ln_w_, std::vector<float>(), j.x_.data(), n, D);
     }
 
     std::unique_ptr<vision_encoder::job> vision_encoder::start(const rgb_image& image, const image_plan& plan)
@@ -572,7 +790,7 @@ namespace albireo
         if (image.width <= 0 || image.height <= 0
             || image.pixels.size() != static_cast<size_t>(image.width * image.height * 3))
             throw std::invalid_argument("vision_encoder: the image has no pixels");
-        if (kind_ == family::qwen3vl)
+        if (kind_ != family::llava_next)
         {
             const long fct = factor();
             if (image.width % fct != 0 || image.height % fct != 0)
@@ -581,6 +799,7 @@ namespace albireo
             j->grid_w_ = image.width / patch_ / merge_;
             j->grid_h_ = image.height / patch_ / merge_;
             j->tokens_ = j->grid_w_ * j->grid_h_;
+            if (kind_ == family::pixtral) j->tokens_ += j->grid_h_ - 1;
             embed_patches(*j, image);
             j->out_.assign(static_cast<size_t>(j->tokens_ * output_width()), 0.0f);
             j->seconds_ += seconds_since(t0);
@@ -648,7 +867,9 @@ namespace albireo
         const long n = j.n_, D = hidden_, H = heads_, hd = head_dim_, half = hd / 2;
         const long C = std::min(chunk_rows, n);
         const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
-        const bool rotary = kind_ == family::qwen3vl;
+        const bool rotary = kind_ != family::llava_next;
+        // Pixtral turns pairs of consecutive dimensions, Qwen3-VL the dimensions half a head apart.
+        const bool pairs = kind_ == family::pixtral;
         xn_.resize(static_cast<size_t>(C * D));
         qkv_.resize(static_cast<size_t>(C * 3 * D));
         q_.resize(static_cast<size_t>(n * D));
@@ -675,15 +896,29 @@ namespace albireo
                 product(b.k, xn_.data(), rows, D, qkv_.data() + D, 3 * D);
                 product(b.v, xn_.data(), rows, D, qkv_.data() + 2 * D, 3 * D);
             }
-            pool_.parallel_for(rows, [&](long r, int) {
+            auto one = [&](long r) {
                 float* t = qkv_.data() + r * 3 * D;
-                qk_add(t, b.qkv_b.data(), 3 * D);
+                if (!b.qkv_b.empty()) qk_add(t, b.qkv_b.data(), 3 * D);
                 const long p = c0 + r;
                 for (long h = 0; h < H; ++h)
                 {
                     float* q = t + h * hd;
                     float* k = t + D + h * hd;
-                    if (rotary)
+                    if (rotary && pairs)
+                    {
+                        const float* c = j.cos_.data() + p * half;
+                        const float* s = j.sin_.data() + p * half;
+                        for (long i = 0; i < half; ++i)
+                        {
+                            const float q0 = q[2 * i], q1 = q[2 * i + 1];
+                            q[2 * i] = q0 * c[i] - q1 * s[i];
+                            q[2 * i + 1] = q1 * c[i] + q0 * s[i];
+                            const float k0 = k[2 * i], k1 = k[2 * i + 1];
+                            k[2 * i] = k0 * c[i] - k1 * s[i];
+                            k[2 * i + 1] = k1 * c[i] + k0 * s[i];
+                        }
+                    }
+                    else if (rotary)
                     {
                         const float* c = j.cos_.data() + p * half;
                         const float* s = j.sin_.data() + p * half;
@@ -704,6 +939,16 @@ namespace albireo
                     std::memcpy(v_.data() + (h * n + p) * hd, t + 2 * D + h * hd,
                         sizeof(float) * static_cast<size_t>(hd));
                 }
+            };
+            /*
+                Sixteen consecutive patches per task: the keys of a task fill the 64-byte lines
+                of the transposed rows together, instead of each line receiving the writes of
+                the tasks of several threads.
+            */
+            const long group = 16;
+            pool_.parallel_for((rows + group - 1) / group, [&](long g, int) {
+                const long r1 = std::min(rows, (g + 1) * group);
+                for (long r = g * group; r < r1; ++r) one(r);
             });
         }
 
@@ -723,17 +968,31 @@ namespace albireo
 
         // The feed-forward layer, a chunk of patches at a time.
         h_.resize(static_cast<size_t>(C * ffn_));
+        if (b.gated) u_.resize(static_cast<size_t>(C * ffn_));
         for (long c0 = 0; c0 < n; c0 += C)
         {
             const long rows = std::min(C, n - c0);
             float* x = j.x_.data() + c0 * D;
             layer_norm_rows(x, b.ln2_w, b.ln2_b, xn_.data(), rows, D);
-            product(b.up, xn_.data(), rows, D, h_.data(), ffn_);
-            pool_.parallel_for(rows, [&](long r, int) {
-                float* t = h_.data() + r * ffn_;
-                qk_add(t, b.up_b.data(), ffn_);
-                qk_gelu_tanh(t, ffn_);
-            });
+            if (b.gated)
+            {
+                product(b.gate, xn_.data(), rows, D, h_.data(), ffn_);
+                product(b.up, xn_.data(), rows, D, u_.data(), ffn_);
+                pool_.parallel_for(rows, [&](long r, int) {
+                    float* u = u_.data() + r * ffn_;
+                    if (!b.up_b.empty()) qk_add(u, b.up_b.data(), ffn_);
+                    qk_silu_mul(h_.data() + r * ffn_, u, ffn_);
+                });
+            }
+            else
+            {
+                product(b.up, xn_.data(), rows, D, h_.data(), ffn_);
+                pool_.parallel_for(rows, [&](long r, int) {
+                    float* t = h_.data() + r * ffn_;
+                    qk_add(t, b.up_b.data(), ffn_);
+                    qk_gelu_tanh(t, ffn_);
+                });
+            }
             product(b.down, h_.data(), rows, ffn_, x, D, true);
             add_bias_rows(x, D, b.down_b, rows);
         }
@@ -799,6 +1058,47 @@ namespace albireo
         }
     }
 
+    void vision_encoder::project_pixtral(job& j)
+    {
+        /*
+            Each patch normalized, the squares merged (their patches follow one another), then
+            a linear layer, an exact GELU and a linear layer; the rows of the merged grid go to
+            the output each followed, but the last, by the [IMG_BREAK] embedding.
+        */
+        const long n = j.n_, D = hidden_, m2 = merge_ * merge_, T = n / m2, X = proj1_.rows, O = out_dim_;
+        const float* merged = j.x_.data();
+        if (patch_merger_.valid())
+        {
+            m_.resize(static_cast<size_t>(n * D));
+            layer_norm_rows(j.x_.data(), proj_norm_w_, std::vector<float>(), m_.data(), n, D);
+            xn_.resize(static_cast<size_t>(T * D));
+            product(patch_merger_, m_.data(), T, m2 * D, xn_.data(), D);
+            merged = xn_.data();
+        }
+        h_.resize(static_cast<size_t>(T * X));
+        product(proj1_, merged, T, D, h_.data(), X);
+        pool_.parallel_for(T, [&](long t, int) {
+            float* r = h_.data() + t * X;
+            if (!proj1_b_.empty()) qk_add(r, proj1_b_.data(), X);
+            qk_gelu_erf(r, X);
+        });
+        ctx_.resize(static_cast<size_t>(T * O));
+        product(proj2_, h_.data(), T, X, ctx_.data(), O);
+        add_bias_rows(ctx_.data(), O, proj2_b_, T);
+        const long gw = j.grid_w_, gh = j.grid_h_;
+        float* out = j.out_.data();
+        for (long y = 0; y < gh; ++y)
+        {
+            std::memcpy(out, ctx_.data() + y * gw * O, sizeof(float) * static_cast<size_t>(gw * O));
+            out += gw * O;
+            if (y + 1 < gh)
+            {
+                std::memcpy(out, img_break_.data(), sizeof(float) * static_cast<size_t>(O));
+                out += O;
+            }
+        }
+    }
+
     bool vision_encoder::advance(job& j, double seconds)
     {
         const auto t0 = std::chrono::steady_clock::now();
@@ -830,6 +1130,14 @@ namespace albireo
                     std::vector<float>().swap(j.features_);
                     std::vector<rgb_image>().swap(j.views_);
                 }
+            }
+            else if (kind_ == family::pixtral)
+            {
+                project_pixtral(j);
+                j.done_ = true;
+                aligned_floats().swap(j.x_);
+                std::vector<float>().swap(j.cos_);
+                std::vector<float>().swap(j.sin_);
             }
             else
             {
@@ -864,6 +1172,7 @@ namespace albireo
         aligned_floats().swap(v_);
         aligned_floats().swap(ctx_);
         aligned_floats().swap(h_);
+        aligned_floats().swap(u_);
         aligned_floats().swap(m_);
     }
 

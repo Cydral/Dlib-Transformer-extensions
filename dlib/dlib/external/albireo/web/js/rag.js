@@ -32,7 +32,10 @@ let model = null;
 export function setEmbeddingModel(info) {
   const changed = (model && model.id) !== (info && info.id);
   model = info && info.id ? { id: info.id, dimensions: info.dimensions || 0 } : null;
-  if (changed) cache.clear();
+  if (changed) {
+    cache.clear();
+    statuses.clear();
+  }
 }
 
 export function embeddingModel() {
@@ -178,8 +181,13 @@ export function chunk(text) {
 // Owners whose passages stay in memory: the incognito discussions.
 const memory = new Map();
 
-// The passages of each owner, read once: {records, sparse}.
+/*
+    The passages of the owners searched last, read once: owner -> {records, sparse}, sparse (the terms of each
+    passage, for the search by words) built at the first search.  The cache keeps cachedOwners owners at most, the
+    one used least recently leaving first.
+*/
 const cache = new Map();
+const cachedOwners = 8;
 
 async function recordsOf(owner) {
   if (memory.has(owner)) return memory.get(owner);
@@ -191,23 +199,47 @@ async function recordsOf(owner) {
 }
 
 async function load(owner) {
-  if (cache.has(owner)) return cache.get(owner);
+  const hit = cache.get(owner);
+  if (hit) {
+    cache.delete(owner);
+    cache.set(owner, hit);
+    return hit;
+  }
   const records = (await recordsOf(owner)).slice().sort((a, b) => (a.doc < b.doc ? -1 : a.doc > b.doc ? 1 : a.ordinal - b.ordinal));
-  // The terms of each passage, for the search by words.
-  const sparse = records.map((r) => {
-    const tf = new Map();
-    const words = terms(r.text);
-    for (const w of words) tf.set(w, (tf.get(w) || 0) + 1);
-    return { tf, length: words.length };
-  });
   for (const r of records) if (r.vector && !(r.vector instanceof Float32Array)) r.vector = new Float32Array(r.vector);
-  const entry = { records, sparse };
+  const entry = { records, sparse: null };
   cache.set(owner, entry);
+  while (cache.size > cachedOwners) cache.delete(cache.keys().next().value);
   return entry;
 }
 
+// The terms of each passage of a cache entry, computed at its first search by words.
+function sparseOf(entry) {
+  if (!entry.sparse) {
+    entry.sparse = entry.records.map((r) => {
+      const tf = new Map();
+      const words = terms(r.text);
+      for (const w of words) tf.set(w, (tf.get(w) || 0) + 1);
+      return { tf, length: words.length };
+    });
+  }
+  return entry.sparse;
+}
+
+// The passages of the document docId of owner, read without loading the other documents of owner.
+async function documentRecords(owner, docId, persistent) {
+  if (!persistent) return (memory.get(owner) || []).filter((r) => r.doc === docId);
+  const entry = cache.get(owner);
+  if (entry) return entry.records.filter((r) => r.doc === docId);
+  return store.chunksOfDocument(docId).catch(() => []);
+}
+
+// The states of the documents read from the database (status), kept until the passages of their owner change.
+const statuses = new Map();
+
 function forget(owner) {
   cache.delete(owner);
+  statuses.delete(owner);
 }
 
 /*
@@ -227,10 +259,21 @@ function countRemoval(key) {
 
 /*
     The state of the documents of an owner: Map doc -> {passages, vectors, model}, vectors
-    counting the passages that hold a vector of the current model.
+    counting the passages that hold a vector of the current model.  It is read from the
+    passages loaded for the search when they are, else from the database without loading them.
 */
 export async function status(owner) {
-  const { records } = await load(owner);
+  const entry = cache.get(owner);
+  const records = entry ? entry.records : memory.get(owner);
+  if (!records) {
+    if (!statuses.has(owner)) {
+      statuses.set(owner, store.chunkStatus(owner, model ? model.id : null).catch(() => {
+        statuses.delete(owner);
+        return new Map();
+      }));
+    }
+    return statuses.get(owner);
+  }
   const out = new Map();
   for (const r of records) {
     const s = out.get(r.doc) || { passages: 0, vectors: 0, model: r.model };
@@ -254,7 +297,7 @@ export async function indexDocument(owner, doc, options = {}) {
   const stamp = removalStamp(owner, doc.id);
   const removed = () => removalStamp(owner, doc.id) !== stamp;
   const pieces = chunk(doc.text || '');
-  const existing = (await load(owner)).records.filter((r) => r.doc === doc.id);
+  const existing = await documentRecords(owner, doc.id, persistent);
   const current = model ? model.id : null;
   const complete = existing.length === pieces.length && existing.every((r) => r.model === current && (!current || r.vector));
   if (complete && existing.length) return { passages: existing.length, vectors: current ? existing.length : 0 };
@@ -287,8 +330,9 @@ export async function indexDocument(owner, doc, options = {}) {
   // while the passages were being written.
   if (removed()) return { passages: 0, vectors: 0 };
   if (persistent) {
-    await store.deleteChunks('doc', doc.id);
-    await store.putChunks(records.map((r) => Object.assign({}, r, { vector: r.vector ? r.vector.buffer : null })));
+    // The former passages and the new ones are exchanged in one transaction.
+    const stored = records.map((r) => Object.assign({}, r, { vector: r.vector ? r.vector.buffer : null }));
+    await store.replaceChunks(doc.id, stored);
     if (removed()) {
       await store.deleteChunks('doc', doc.id).catch(() => {});
       forget(owner);
@@ -323,6 +367,7 @@ export function removeAll() {
   ++removalsOfAll;
   memory.clear();
   cache.clear();
+  statuses.clear();
 }
 
 // The longest end of a that begins b, for the merge of overlapping passages.
@@ -344,10 +389,11 @@ export async function search(owners, question, options = {}) {
   const sparse = [];
   for (const o of owners) {
     const entry = await load(o);
+    const entrySparse = sparseOf(entry);
     for (let i = 0; i < entry.records.length; ++i) {
       if (skip && skip.has(entry.records[i].doc)) continue;
       all.push(entry.records[i]);
-      sparse.push(entry.sparse[i]);
+      sparse.push(entrySparse[i]);
     }
   }
   if (!all.length || !String(question).trim()) return [];

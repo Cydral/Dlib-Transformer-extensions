@@ -1,13 +1,20 @@
 # Copyright (C) 2026 Cydral Technology (cydraltechnology@gmail.com)
 # License: Boost Software License   See LICENSE.txt for the full license.
 """
-Publishes a version of Albireo: attaches its installers to the GitHub release of the version,
-then writes and signs the update feed that announces it.
+Publishes a version of Albireo: writes and signs the update feed that announces it, the
+installers lying in the folder dist of the public link of the published files (--public-link)
+or attached to the GitHub release of the version.
 
     python3 publish_release.py <albireo-setup-online.exe> --key <private key>
-                               [--complete <albireo-setup.exe>] [--notes <notes.json>]
-                               [--sign <albireo-sign>] [--repo <owner/name>] [--dist <folder>]
-                               [--dry-run]
+                               [--public-link] [--complete <albireo-setup.exe>]
+                               [--notes <notes.json>] [--sign <albireo-sign>]
+                               [--repo <owner/name>] [--dist <folder>] [--dry-run]
+
+With --public-link, the feed names the installer of the updates by its file in the folder dist
+of the public link, albireo-setup-online-<version>.exe, which the services read before any other
+address (host/public_link.h); nothing is sent to GitHub, and fill_public_link.py dist then puts
+the feed, the catalog and both installers in the local copy of the link.  The steps below
+describe the publication on GitHub.
 
 The first installer is the one of the updates, without models (albireo-setup-online.exe of a
 build): the feed announces it, and the installed copies of Albireo download it.  --complete
@@ -123,6 +130,51 @@ def release_notes(version, notes, complete):
     return "\n".join(lines)
 
 
+def check_newer(feed_path, version):
+    """Raises RuntimeError when the feed at feed_path already announces a later version."""
+    try:
+        with open(feed_path, encoding="utf-8") as f:
+            published = json.load(f)["channels"]["stable"]["version"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return
+    if compare(version, published) < 0:
+        raise RuntimeError("the feed already announces %s, later than %s" % (published, version))
+
+
+def publish_in_link(a):
+    """The feed of a version whose installers lie in the folder dist of the public link."""
+    try:
+        version = source_version()
+        feed_path = os.path.join(a.dist, "feed.json")
+        notes = make_feed.read_notes(a.notes, feed_path, version)
+        name = "albireo-setup-online-%s.exe" % version
+        size = os.path.getsize(a.installer)
+        sha = make_feed.sha256_of(a.installer)
+        feed = make_feed.make_feed(version, a.installer, None, notes, size, sha, file=name)
+        check_newer(feed_path, version)
+        if a.complete:
+            make_feed.check_installer(a.complete, version)
+        print("version %s, installer of %d bytes, SHA-256 %s" % (version, size, sha))
+        print("in the public link: dist/%s%s" % (name, ", dist/albireo-setup-complete-%s.exe" % version
+                                                  if a.complete else ""))
+        if a.dry_run:
+            print("dry run: nothing written")
+            return 0
+        if not a.key:
+            raise RuntimeError("--key names the private key that signs the feed")
+        write_signed_feed(feed_path, feed, find_signer(a.sign), a.key)
+    except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as e:
+        print("error: %s" % e, file=sys.stderr)
+        return 1
+    rel = os.path.relpath(feed_path, ROOT).replace(os.sep, "/")
+    print()
+    print("git add %s %s.sig" % (rel, rel))
+    print('git commit -m "Publish version %s of Albireo in its update feed"' % version)
+    print("git push")
+    print("then fill_public_link.py dist <local copy of the link>/dist --online <installer> --complete <installer>")
+    return 0
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("installer")
@@ -133,8 +185,12 @@ def main():
     p.add_argument("--repo", default=github_release.DEFAULT_REPOSITORY)
     p.add_argument("--dist", default=os.path.join(ROOT, "dist", "albireo"))
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--public-link", action="store_true",
+                   help="the installers lie in the folder dist of the public link, not in a GitHub release")
     a = p.parse_args()
 
+    if a.public_link:
+        return publish_in_link(a)
     try:
         version = source_version()
         feed_path = os.path.join(a.dist, "feed.json")
@@ -148,13 +204,7 @@ def main():
         sha = make_feed.sha256_of(a.installer)
         # The feed is checked before anything is published: version, address, notes.
         feed = make_feed.make_feed(version, a.installer, url, notes, size, sha)
-        try:
-            with open(feed_path, encoding="utf-8") as f:
-                published = json.load(f)["channels"]["stable"]["version"]
-            if compare(version, published) < 0:
-                raise RuntimeError("the feed already announces %s, later than %s" % (published, version))
-        except (OSError, ValueError, KeyError, TypeError):
-            pass
+        check_newer(feed_path, version)
         complete = None
         if a.complete:
             make_feed.check_installer(a.complete, version)

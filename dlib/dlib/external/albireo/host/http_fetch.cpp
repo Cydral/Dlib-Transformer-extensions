@@ -609,11 +609,15 @@ namespace albireo
         const std::function<bool(const char*, size_t)>& receiver, std::string& error, uint64_t* total)
     {
         httplib::Headers headers;
-        if (from > 0 || to >= 0)
+        const bool ranged = from > 0 || to >= 0;
+        if (ranged)
         {
             const std::string last = to >= 0 ? std::to_string(to) : std::string();
             headers.emplace("Range", "bytes=" + std::to_string(from) + "-" + last);
         }
+        // The bytes asked for, when the range has an end: the receiver gets no more than them.
+        const bool limited = to >= 0 && static_cast<uint64_t>(to) >= from;
+        const uint64_t wanted = limited ? static_cast<uint64_t>(to) - from + 1 : 0;
         std::string current = url;
         for (int hop = 0; hop <= max_redirections; ++hop)
         {
@@ -641,7 +645,10 @@ namespace albireo
                 return false;
             }
             bool refused_range = false;
+            bool other_range = false;
             bool stopped = false;
+            bool complete = false;
+            uint64_t delivered = 0;
             int status = 0;
             std::string location;
             httplib::Result r;
@@ -655,10 +662,10 @@ namespace albireo
                             location = res.get_header_value("Location");
                             return false;
                         }
+                        const std::string cr = res.get_header_value("Content-Range");
                         if (total)
                         {
                             *total = 0;
-                            const std::string cr = res.get_header_value("Content-Range");
                             const size_t slash = cr.find('/');
                             if (slash != std::string::npos && cr.substr(slash + 1) != "*")
                                 *total = std::strtoull(cr.substr(slash + 1).c_str(), nullptr, 10);
@@ -670,12 +677,33 @@ namespace albireo
                             refused_range = true;
                             return false;
                         }
+                        // A part of the resource starts where it was asked: "bytes <first>-<last>/<size>".
+                        if (ranged && res.status == 206)
+                        {
+                            const size_t unit = cr.find("bytes ");
+                            const std::string first = unit == std::string::npos ? std::string() : cr.substr(unit + 6);
+                            const bool digits = !first.empty() && first[0] >= '0' && first[0] <= '9';
+                            if (!digits || std::strtoull(first.c_str(), nullptr, 10) != from)
+                            {
+                                other_range = true;
+                                return false;
+                            }
+                        }
                         return (res.status == 200 || res.status == 206) && !cancelled;
                     },
                     [&](const char* data, size_t n) {
-                        if (cancelled || !receiver(data, n))
+                        const size_t take = limited ? static_cast<size_t>(std::min<uint64_t>(n, wanted - delivered))
+                            : n;
+                        if (cancelled || (take > 0 && !receiver(data, take)))
                         {
                             stopped = true;
+                            return false;
+                        }
+                        delivered += take;
+                        // The bytes asked for have come: what an answer sends beyond them is not read.
+                        if (limited && delivered >= wanted)
+                        {
+                            complete = true;
                             return false;
                         }
                         return true;
@@ -689,6 +717,7 @@ namespace albireo
                 error = cancelled ? cancelled_error() : std::string("stopped");
                 return false;
             }
+            if (complete) return true;
             if (!location.empty())
             {
                 if (!redirection(current, location, current, error)) return false;
@@ -697,6 +726,11 @@ namespace albireo
             if (refused_range)
             {
                 error = url + ": the server does not resume downloads";
+                return false;
+            }
+            if (other_range)
+            {
+                error = url + ": the server answered with another range than the one asked";
                 return false;
             }
             if (!r)

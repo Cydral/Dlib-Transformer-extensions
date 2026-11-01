@@ -11,6 +11,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -31,6 +32,12 @@ namespace albireo
     // Receives the messages of the engine: a severity of engine_api.h and a text.
     typedef std::function<void(int level, const std::string& message)> log_sink;
 
+    // A request refused for a while, the engine holding what it may hold: ALBIREO_E_BUSY.
+    struct engine_busy : std::runtime_error
+    {
+        explicit engine_busy(const std::string& what) : std::runtime_error(what) {}
+    };
+
     class engine
     {
         /*!
@@ -42,8 +49,10 @@ namespace albireo
                 model, the next token of every request being generated and a slice of the
                 prompts being read, up to a number of tokens per pass, and computes them in
                 a single forward pass: the weights are read once for all the requests, so
-                that serving several conversations costs little more than serving one, and
-                a long prompt never stalls the conversations already answering.
+                that serving several conversations costs little more than serving one.  The
+                prompts take the slices in turn, and while answers are being written, in
+                any model, a pass reads 64 tokens of prompts at most, so that a long prompt
+                delays the tokens of the answers by the time of a short pass.
 
                 The keys and values of a finished request stay in memory with its tokens.
                 A new request that starts with the same tokens, as the next turn of a
@@ -82,12 +91,15 @@ namespace albireo
 
     private:
         void run();
-        bool step(const std::shared_ptr<loaded_model>& m, long budget);
+        // One pass of m; answering tells whether a model writes answers, which caps the prompt tokens of the pass.
+        bool step(const std::shared_ptr<loaded_model>& m, long budget, bool answering);
         // Runs a slice of the encoding of the image a prompt of m waits for.
         void advance_encoding(loaded_model& m);
         uint64_t submit_embeddings(const std::shared_ptr<loaded_model>& m, const json& request, event_sink sink);
         void complete_part(loaded_model& m, request_state& r, const float* hidden);
         void end_job(embedding_job& job, const std::string& code, const std::string& message);
+        // Ends an embedding request its client cancelled: DONE with the reason "cancelled".
+        void cancel_job(embedding_job& job);
         void admit(loaded_model& m);
         bool assign_sequence(loaded_model& m, request_state& r);
         bool reserve(loaded_model& m, int seq, long length);

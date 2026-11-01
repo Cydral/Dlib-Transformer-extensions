@@ -10,14 +10,17 @@
     $HOME\models\Qwen3-0.6B-Q4_K_M.gguf and $HOME\models\Qwen3-Embedding-0.6B-Q8_0.gguf; the
     steps whose model or build tree is missing are skipped.
 
-    Steps: the quantized kernels; a question to each processor engine; with the OpenVINO
-    tree, test_offload on the device of -Device (CPU by default, which every machine has)
-    and a question to the OpenVINO engine; with the CUDA tree, a question to the CUDA engine
-    when the machine has a card it supports; the embedding model; the models that come with
-    Albireo, prepared by the build, and a question to their language model; then the
-    installed service, unless -NoService, once it has started: its state, its models, its
-    engines, each described within its time limit, with the devices they found, the models
-    that came with it, a question and the vectors of two texts through the OpenAI interface.
+    Steps: the quantized kernels; the loading of damaged model files and of a file of more
+    than 2 GiB; a question to each processor engine; with the OpenVINO tree, test_offload on
+    the device of -Device (CPU by default, which every machine has) and a question to the
+    OpenVINO engine; with the CUDA tree, a question to the CUDA engine when the machine has
+    a card it supports; the embedding model; the models that come with Albireo, prepared by
+    the build, and a question to their language model, these engine steps with the PATH of
+    the service, System32 and the Windows folder only; a sentence read aloud by the program
+    of the speech synthesis; then the installed service, unless -NoService, once it has
+    started: its state, its models, its engines, each described within its time limit, with
+    the devices they found, the models that came with it, a question and the vectors of two
+    texts through the OpenAI interface, and a sentence read aloud through its speech route.
     The exit code is the number of failed steps.
 #>
 param(
@@ -85,98 +88,159 @@ foreach ($family in @("", "_avxvnni", "_avx512")) {
     else { Invoke-Check $name "all checks passed" $test @() | Out-Null }
 }
 
-foreach ($variant in @("cpu-avx512", "cpu-avxvnni", "cpu-avx2", "cpu")) {
-    $engine = Join-Path $main "bin\engines\albireo-engine-$variant.dll"
-    if (-not $haveModel) { Add-Result "engine $variant" "SKIP" "no $Model" 0; continue }
-    if (-not (Test-Path $engine)) { Add-Result "engine $variant" "SKIP" "no $engine" 0; continue }
-    if (-not $haveChat) { Add-Result "engine $variant" "SKIP" $noChat 0; continue }
-    $description = (& $chat $engine --describe 2>&1 | ForEach-Object { "$_" }) -join "`n"
-    if ($LASTEXITCODE -eq 3) {
-        $reason = if ($description -match "lacks ([^(]*)") { "lacks $($Matches[1])" } else { "not usable here" }
-        Add-Result "engine $variant" "SKIP" $reason 0
-        continue
-    }
-    Invoke-Check "engine $variant" "Paris" $chat @($engine, $Model, "--reasoning", "off", "--max", "40",
-        $question) | Out-Null
-}
+# The loading of damaged model files and of a model file of more than 2 GiB, mapped and streamed.
+Invoke-Check "model files" "all checks passed" (Join-Path $main "tests\test_model_file.exe") @($logs) | Out-Null
 
-$ovEngine = Join-Path $openvino "bin\engines\albireo-engine-openvino.dll"
-if ((Test-Path $ovEngine) -and $haveModel) {
-    $env:DLIB_NPU_DEVICE = $Device
-    Invoke-Check "offload $Device" "all checks passed" (Join-Path $openvino "tests\test_offload.exe") @($Model,
-        $Device) | Out-Null
-    Remove-Item Env:DLIB_NPU_DEVICE
-    # One OpenVINO engine per family of processor kernels, skipped by the processors that lack them.
-    foreach ($variant in @("openvino-avx512", "openvino-avxvnni", "openvino")) {
-        $engine = Join-Path $openvino "bin\engines\albireo-engine-$variant.dll"
+# The engine steps run with the PATH of a service, System32 and the Windows folder only: the
+# libraries an engine loads by name must come from the folders of Albireo, not from the PATH of
+# this computer.
+$savedPath = $env:PATH
+$env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
+try {
+    foreach ($variant in @("cpu-avx512", "cpu-avxvnni", "cpu-avx2", "cpu")) {
+        $engine = Join-Path $main "bin\engines\albireo-engine-$variant.dll"
+        if (-not $haveModel) { Add-Result "engine $variant" "SKIP" "no $Model" 0; continue }
         if (-not (Test-Path $engine)) { Add-Result "engine $variant" "SKIP" "no $engine" 0; continue }
         if (-not $haveChat) { Add-Result "engine $variant" "SKIP" $noChat 0; continue }
         $description = (& $chat $engine --describe 2>&1 | ForEach-Object { "$_" }) -join "`n"
-        if ($LASTEXITCODE -eq 3 -and $description -match "lacks ([^(]*)") {
-            Add-Result "engine $variant" "SKIP" "lacks $($Matches[1])" 0
+        if ($LASTEXITCODE -eq 3) {
+            $reason = if ($description -match "lacks ([^(]*)") { "lacks $($Matches[1])" } else { "not usable here" }
+            Add-Result "engine $variant" "SKIP" $reason 0
             continue
         }
-        $arguments = @($engine, $Model, "--reasoning", "off", "--max", "40")
-        if ($Device -ne "CPU") { $arguments += @("--device", $Device) }
-        Invoke-Check "engine $variant" "Paris" $chat ($arguments + $question) | Out-Null
-    }
-}
-else {
-    Add-Result "engine openvino" "SKIP" "no OpenVINO tree or no model" 0
-}
-
-$cudaEngine = Join-Path $cuda "bin\engines\albireo-engine-cuda.dll"
-if ((Test-Path $cudaEngine) -and $haveModel -and -not $haveChat) {
-    Add-Result "engine cuda" "SKIP" $noChat 0
-}
-elseif ((Test-Path $cudaEngine) -and $haveModel) {
-    # A machine without a supported card: the engine says so in its description.
-    $description = & $chat $cudaEngine $Model --max 1 "Hello" 2>&1 | ForEach-Object { "$_" } |
-        Where-Object { $_ -match '^\{' } | Select-Object -First 1
-    if ("$description" -match '"usable": *false') {
-        $reason = ""
-        if ("$description" -match '"reason": *"([^"]*)"') { $reason = $Matches[1] }
-        Add-Result "engine cuda" "SKIP" "unusable here: $reason" 0
-    }
-    else {
-        Invoke-Check "engine cuda" "Paris" $chat @($cudaEngine, $Model, "--reasoning", "off", "--max", "40",
+        Invoke-Check "engine $variant" "Paris" $chat @($engine, $Model, "--reasoning", "off", "--max", "40",
             $question) | Out-Null
     }
+
+    $ovEngine = Join-Path $openvino "bin\engines\albireo-engine-openvino.dll"
+    if ((Test-Path $ovEngine) -and $haveModel) {
+        $env:DLIB_NPU_DEVICE = $Device
+        Invoke-Check "offload $Device" "all checks passed" (Join-Path $openvino "tests\test_offload.exe") @($Model,
+            $Device) | Out-Null
+        Remove-Item Env:DLIB_NPU_DEVICE
+        # One OpenVINO engine per family of processor kernels, skipped by the processors that lack them.
+        foreach ($variant in @("openvino-avx512", "openvino-avxvnni", "openvino")) {
+            $engine = Join-Path $openvino "bin\engines\albireo-engine-$variant.dll"
+            if (-not (Test-Path $engine)) { Add-Result "engine $variant" "SKIP" "no $engine" 0; continue }
+            if (-not $haveChat) { Add-Result "engine $variant" "SKIP" $noChat 0; continue }
+            $description = (& $chat $engine --describe 2>&1 | ForEach-Object { "$_" }) -join "`n"
+            if ($LASTEXITCODE -eq 3 -and $description -match "lacks ([^(]*)") {
+                Add-Result "engine $variant" "SKIP" "lacks $($Matches[1])" 0
+                continue
+            }
+            $arguments = @($engine, $Model, "--reasoning", "off", "--max", "40")
+            if ($Device -ne "CPU") { $arguments += @("--device", $Device) }
+            Invoke-Check "engine $variant" "Paris" $chat ($arguments + $question) | Out-Null
+        }
+    }
+    else {
+        Add-Result "engine openvino" "SKIP" "no OpenVINO tree or no model" 0
+    }
+
+    $cudaEngine = Join-Path $cuda "bin\engines\albireo-engine-cuda.dll"
+    if ((Test-Path $cudaEngine) -and $haveModel -and -not $haveChat) {
+        Add-Result "engine cuda" "SKIP" $noChat 0
+    }
+    elseif ((Test-Path $cudaEngine) -and $haveModel) {
+        # A machine without a supported card: the engine says so in its description.
+        $description = & $chat $cudaEngine $Model --max 1 "Hello" 2>&1 | ForEach-Object { "$_" } |
+            Where-Object { $_ -match '^\{' } | Select-Object -First 1
+        if ("$description" -match '"usable": *false') {
+            $reason = ""
+            if ("$description" -match '"reason": *"([^"]*)"') { $reason = $Matches[1] }
+            Add-Result "engine cuda" "SKIP" "unusable here: $reason" 0
+        }
+        else {
+            Invoke-Check "engine cuda" "Paris" $chat @($cudaEngine, $Model, "--reasoning", "off", "--max", "40",
+                $question) | Out-Null
+        }
+    }
+    else {
+        Add-Result "engine cuda" "SKIP" "no CUDA tree or no model" 0
+    }
+
+    $avx2 = Join-Path $main "bin\engines\albireo-engine-cpu-avx2.dll"
+    if (Test-Path $EmbeddingModel) {
+        Invoke-Check "embedding model" "cosine" $chat @($avx2, $EmbeddingModel, "--parallel",
+            "The service runs on this computer.", "Where does the service run?",
+            "The quarterly revenue grew.") | Out-Null
+    }
+    else {
+        Add-Result "embedding model" "SKIP" "no $EmbeddingModel" 0
+    }
+
+    # The models that come with Albireo: their manifest in the programs of the build, the complete
+    # installer that carries them, and a question to their language model.
+    $builtinDir = Join-Path $main "bin\models"
+    $manifest = Join-Path $builtinDir "builtin.json"
+    if (Test-Path $manifest) {
+        $builtin = Get-Content -Raw -Path $manifest | ConvertFrom-Json
+        $ids = @($builtin.models | ForEach-Object { $_.id })
+        $complete = Join-Path $main "bin\albireo-setup.exe"
+        $online = Join-Path $main "bin\albireo-setup-online.exe"
+        $result = "FAIL"
+        if ((Test-Path $complete) -and (Test-Path $online) -and
+            (Get-Item $complete).Length -gt (Get-Item $online).Length) { $result = "PASS" }
+        Add-Result "builtin models" $result ($ids -join ", ") 0
+        $language = @($builtin.models | Where-Object { -not $_.embedding } | Select-Object -First 1)
+        if ($language.Count -gt 0) {
+            Invoke-Check "builtin chat" "Paris" $chat @($avx2, (Join-Path $builtinDir $language[0].file), "--reasoning",
+                "off", "--max", "40", $question) | Out-Null
+        }
+    }
+    else {
+        Add-Result "builtin models" "SKIP" "no $manifest (a build with -NoBuiltinModels)" 0
+    }
 }
-else {
-    Add-Result "engine cuda" "SKIP" "no CUDA tree or no model" 0
+finally {
+    $env:PATH = $savedPath
 }
 
-$avx2 = Join-Path $main "bin\engines\albireo-engine-cpu-avx2.dll"
-if (Test-Path $EmbeddingModel) {
-    Invoke-Check "embedding model" "cosine" $chat @($avx2, $EmbeddingModel, "--parallel",
-        "The service runs on this computer.", "Where does the service run?", "The quarterly revenue grew.") | Out-Null
+# The bytes of a RIFF WAVE file, and the seconds of its samples of 16 bits at 16 kHz.
+function Test-Wave([byte[]]$bytes) {
+    return $bytes.Length -gt 44 -and [System.Text.Encoding]::ASCII.GetString($bytes, 0, 4) -eq "RIFF"
 }
-else {
-    Add-Result "embedding model" "SKIP" "no $EmbeddingModel" 0
-}
+$sentence = "Bonjour, Albireo lit ses r" + [char]0x00E9 + "ponses " + [char]0x00E0 + " voix haute."
 
-# The models that come with Albireo: their manifest in the programs of the build, the complete
-# installer that carries them, and a question to their language model.
-$builtinDir = Join-Path $main "bin\models"
-$manifest = Join-Path $builtinDir "builtin.json"
-if (Test-Path $manifest) {
-    $builtin = Get-Content -Raw -Path $manifest | ConvertFrom-Json
-    $ids = @($builtin.models | ForEach-Object { $_.id })
-    $complete = Join-Path $main "bin\albireo-setup.exe"
-    $online = Join-Path $main "bin\albireo-setup-online.exe"
-    $result = "FAIL"
-    if ((Test-Path $complete) -and (Test-Path $online) -and
-        (Get-Item $complete).Length -gt (Get-Item $online).Length) { $result = "PASS" }
-    Add-Result "builtin models" $result ($ids -join ", ") 0
-    $language = @($builtin.models | Where-Object { -not $_.embedding } | Select-Object -First 1)
-    if ($language.Count -gt 0) {
-        Invoke-Check "builtin chat" "Paris" $chat @($avx2, (Join-Path $builtinDir $language[0].file), "--reasoning",
-            "off", "--max", "40", $question) | Out-Null
+# The program of the speech synthesis alone: a sentence read aloud in the folder of the voices.
+$speaker = Join-Path $main "bin\albireo-speech.exe"
+$voices = Join-Path $main "bin\speech"
+if ((Test-Path $speaker) -and (Test-Path $voices)) {
+    $watch = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        $info = New-Object System.Diagnostics.ProcessStartInfo
+        $info.FileName = $speaker
+        $info.Arguments = "fr-FR 1"
+        $info.WorkingDirectory = $voices
+        $info.UseShellExecute = $false
+        $info.CreateNoWindow = $true
+        $info.RedirectStandardInput = $true
+        $info.RedirectStandardOutput = $true
+        $info.RedirectStandardError = $true
+        $process = [System.Diagnostics.Process]::Start($info)
+        $errors = $process.StandardError.ReadToEndAsync()
+        $text = [System.Text.Encoding]::UTF8.GetBytes($sentence)
+        $process.StandardInput.BaseStream.Write($text, 0, $text.Length)
+        $process.StandardInput.Close()
+        $sound = New-Object System.IO.MemoryStream
+        $process.StandardOutput.BaseStream.CopyTo($sound)
+        $process.WaitForExit()
+        $bytes = $sound.ToArray()
+        if ($process.ExitCode -eq 0 -and (Test-Wave $bytes)) {
+            Add-Result "speech program" "PASS" ("RIFF, {0:N1} s of sound" -f (($bytes.Length - 44) / 32000)) `
+                $watch.Elapsed.TotalSeconds
+        }
+        else {
+            Add-Result "speech program" "FAIL" "exit $($process.ExitCode): $($errors.Result)" `
+                $watch.Elapsed.TotalSeconds
+        }
+    }
+    catch {
+        Add-Result "speech program" "FAIL" "$($_.Exception.Message)" $watch.Elapsed.TotalSeconds
     }
 }
 else {
-    Add-Result "builtin models" "SKIP" "no $manifest (a build with -NoBuiltinModels)" 0
+    Add-Result "speech program" "SKIP" "no $speaker or no $voices" 0
 }
 
 if (-not $NoService) {
@@ -259,6 +323,25 @@ if (-not $NoService) {
             }
             else {
                 Add-Result "service embeddings" "SKIP" "no embedding model active" 0
+            }
+            # The voices of the speech synthesis, then a sentence read aloud by the program the service starts.
+            $watch.Restart()
+            $listed = Invoke-RestMethod -Uri "$base/albireo/v1/speech/voices" -TimeoutSec 10
+            $ids = @($listed.voices | ForEach-Object { $_.id })
+            if ($ids.Count -eq 0) {
+                Add-Result "service speech" "FAIL" "no voice installed" 0
+            }
+            else {
+                $body = [System.Text.Encoding]::UTF8.GetBytes((@{ input = $sentence; voice = "fr-FR" } |
+                    ConvertTo-Json))
+                $wav = Join-Path $logs "service-speech.wav"
+                Invoke-WebRequest -Method Post -Uri "$base/v1/audio/speech" -Body $body -UseBasicParsing `
+                    -ContentType "application/json; charset=utf-8" -OutFile $wav -TimeoutSec 60
+                $bytes = [System.IO.File]::ReadAllBytes($wav)
+                $result = "FAIL"
+                if (Test-Wave $bytes) { $result = "PASS" }
+                Add-Result "service speech" $result ("{0} voices, {1:N1} s of sound" -f $ids.Count,
+                    (($bytes.Length - 44) / 32000)) $watch.Elapsed.TotalSeconds
             }
         }
         catch {

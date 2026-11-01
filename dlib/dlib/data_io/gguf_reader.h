@@ -20,7 +20,9 @@
 #include "gguf_reader_abstract.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <vector>
 #include <map>
@@ -198,11 +200,15 @@ namespace dlib
                 || tensor_count > max_entries || kv_count > max_entries)
                 throw std::runtime_error("gguf_reader: corrupt header (entry counts exceed the file size)");
 
+            // A key or a tensor name given twice comes from a damaged or forged file: its readers
+            // would take different entries for the same name.
             for (uint64_t k = 0; k < kv_count; ++k)
             {
                 std::string key = read_string();
                 gguf_type vt = static_cast<gguf_type>(read_raw<uint32_t>());
-                meta_[key] = read_value(vt);
+                gguf_value v = read_value(vt);
+                if (!meta_.emplace(key, std::move(v)).second)
+                    throw std::runtime_error("gguf_reader: duplicate metadata key '" + key + "'");
             }
 
             if (has("general.alignment"))
@@ -233,12 +239,19 @@ namespace dlib
                 info.type = static_cast<ggml_type>(read_raw<uint32_t>());
                 info.offset = read_raw<uint64_t>();
 
+                // The blocks of a quantized type never straddle two rows, and the data of each
+                // tensor starts on the alignment of the file.
                 const ggml_type_traits tr = get_ggml_type_traits(info.type);
                 const uint64_t n = info.n_elements();
-                if (tr.block_size > 1 && (n % tr.block_size) != 0)
+                if (tr.block_size > 1 && ((n % tr.block_size) != 0 || (info.dims[0] % tr.block_size) != 0))
                     throw std::runtime_error("gguf_reader: element count of '" + info.name
                         + "' is not block-aligned");
+                if (info.offset % alignment_ != 0)
+                    throw std::runtime_error("gguf_reader: tensor '" + info.name
+                        + "' does not start on the alignment of the file");
                 info.nbytes = (n / tr.block_size) * tr.type_size;
+                if (!tensor_index_.emplace(info.name, tensors_.size()).second)
+                    throw std::runtime_error("gguf_reader: duplicate tensor name '" + info.name + "'");
                 tensors_.push_back(std::move(info));
             }
 
@@ -282,8 +295,8 @@ namespace dlib
 
         const gguf_tensor_info* find_tensor(const std::string& name) const
         {
-            for (const auto& t : tensors_) if (t.name == name) return &t;
-            return nullptr;
+            const auto it = tensor_index_.find(name);
+            return it == tensor_index_.end() ? nullptr : &tensors_[it->second];
         }
 
         // Read the raw on-disk bytes of a tensor (possibly quantized) into dst.
@@ -408,30 +421,81 @@ namespace dlib
             return v;
         }
 
-        /* A read-only stream buffer over a block of memory, seekable in both directions. */
+        /* A read-only stream buffer over a block of memory of any size, seekable in both
+           directions.  Its get area is a window of at most 1 GiB of the block, moved by the
+           reads and the seeks: the standard library of Visual Studio counts the characters
+           of a get area in an int, which a get area over a block of 2 GiB or more wraps,
+           so that the end of a large mapped model file could not be reached. */
         class memory_buffer : public std::streambuf
         {
         public:
-            memory_buffer(const char* data, uint64_t size)
+            memory_buffer(const char* data, uint64_t size) : data_(data), size_(size)
             {
-                char* p = const_cast<char*>(data);
-                setg(p, p, p + size);
+                place(0);
             }
         protected:
-            pos_type seekoff(off_type off, std::ios_base::seekdir dir, std::ios_base::openmode) override
+            int_type underflow() override
             {
-                char* target = nullptr;
-                if (dir == std::ios_base::beg) target = eback() + off;
-                else if (dir == std::ios_base::cur) target = gptr() + off;
-                else target = egptr() + off;
-                if (target < eback() || target > egptr()) return pos_type(off_type(-1));
-                setg(eback(), target, egptr());
-                return pos_type(target - eback());
+                const uint64_t at = position();
+                if (at >= size_) return traits_type::eof();
+                place(at);
+                return traits_type::to_int_type(*gptr());
+            }
+            std::streamsize xsgetn(char* s, std::streamsize n) override
+            {
+                const uint64_t at = position();
+                const uint64_t left = at < size_ ? size_ - at : 0;
+                const uint64_t count = n > 0 ? std::min<uint64_t>(left, static_cast<uint64_t>(n)) : 0;
+                if (count != 0) std::memcpy(s, data_ + at, static_cast<size_t>(count));
+                place(at + count);
+                return static_cast<std::streamsize>(count);
+            }
+            std::streamsize showmanyc() override
+            {
+                const uint64_t at = position();
+                return at < size_ ? static_cast<std::streamsize>(size_ - at) : std::streamsize(-1);
+            }
+            pos_type seekoff(off_type off, std::ios_base::seekdir dir, std::ios_base::openmode which) override
+            {
+                if (!(which & std::ios_base::in)) return pos_type(off_type(-1));
+                const uint64_t base = dir == std::ios_base::beg ? 0 : dir == std::ios_base::cur ? position() : size_;
+                uint64_t target = 0;
+                if (off < 0)
+                {
+                    // -(off + 1) + 1 is the magnitude of off, without the overflow of -off.
+                    const uint64_t back = static_cast<uint64_t>(-(off + 1)) + 1;
+                    if (back > base) return pos_type(off_type(-1));
+                    target = base - back;
+                }
+                else
+                {
+                    if (static_cast<uint64_t>(off) > size_ - base) return pos_type(off_type(-1));
+                    target = base + static_cast<uint64_t>(off);
+                }
+                place(target);
+                return pos_type(static_cast<off_type>(target));
             }
             pos_type seekpos(pos_type pos, std::ios_base::openmode which) override
             {
                 return seekoff(off_type(pos), std::ios_base::beg, which);
             }
+        private:
+            uint64_t position() const
+            {
+                return start_ + static_cast<uint64_t>(gptr() - eback());
+            }
+            // Makes the get area the window of the block that starts at offset at.
+            void place(uint64_t at)
+            {
+                const uint64_t window = uint64_t(1) << 30;
+                start_ = at;
+                const uint64_t length = std::min<uint64_t>(size_ - at, window);
+                char* p = const_cast<char*>(data_) + at;
+                setg(p, p, p + length);
+            }
+            const char* data_;
+            uint64_t size_;
+            uint64_t start_ = 0;
         };
 
         std::unique_ptr<std::streambuf> buf_;
@@ -443,7 +507,48 @@ namespace dlib
         uint64_t data_offset_ = 0;
         std::map<std::string, gguf_value> meta_;
         std::vector<gguf_tensor_info> tensors_;
+        std::map<std::string, size_t> tensor_index_;
     };
+
+    /* The metadata a model declares, read within the bounds a sane file respects: a value
+       outside them comes from a damaged or forged file, and a reader that narrowed it into
+       a long or used it as a count would compute nonsense or allocate without limit.  An
+       array, which some architectures give per layer, reads as the default. */
+    inline int64_t gguf_bounded_int(const gguf_reader& g, const std::string& key, int64_t def,
+        int64_t lo, int64_t hi)
+    {
+        if (!g.has(key) || g.at(key).is_array()) return def;
+        const gguf_value& v = g.at(key);
+        if (v.type == gguf_type::STRING)
+            throw std::runtime_error("gguf: metadata '" + key + "' is not a number");
+        if (v.type == gguf_type::FLOAT32 || v.type == gguf_type::FLOAT64)
+        {
+            if (!(v.d >= static_cast<double>(lo) && v.d <= static_cast<double>(hi)) || v.d != std::floor(v.d))
+                throw std::runtime_error("gguf: metadata '" + key + "' is not an integer from "
+                    + std::to_string(lo) + " to " + std::to_string(hi));
+            return static_cast<int64_t>(v.d);
+        }
+        /* The unsigned types of 64 bits arrive as int64: a value of 2^63 or more reads
+           negative and fails the lower bound of every count. */
+        if (v.i < lo || v.i > hi)
+            throw std::runtime_error("gguf: metadata '" + key + "' = " + std::to_string(v.i) + " lies outside "
+                + std::to_string(lo) + " .. " + std::to_string(hi));
+        return v.i;
+    }
+
+    inline double gguf_bounded_double(const gguf_reader& g, const std::string& key, double def,
+        double lo, double hi)
+    {
+        if (!g.has(key) || g.at(key).is_array()) return def;
+        const gguf_value& v = g.at(key);
+        if (v.type == gguf_type::STRING)
+            throw std::runtime_error("gguf: metadata '" + key + "' is not a number");
+        const double x = v.as_double();
+        if (!(x >= lo && x <= hi))
+            throw std::runtime_error("gguf: metadata '" + key + "' is not a finite number from "
+                + std::to_string(lo) + " to " + std::to_string(hi));
+        return x;
+    }
 }
 
 #endif // DLIB_GGUF_READER_H_

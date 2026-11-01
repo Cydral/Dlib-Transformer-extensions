@@ -105,9 +105,12 @@ namespace albireo
                   calls in <tool_call> elements), SmolLM and the other ChatML models.
                 - mistral: the formats of the Mistral models with the tekken vocabulary
                   (Ministral 3, Mistral Small 3, Magistral): [SYSTEM_PROMPT], [INST],
-                  [AVAILABLE_TOOLS], [TOOL_CALLS]name[ARGS]{...}, [TOOL_RESULTS] and
-                  [THINK] for reasoning.
-                - llama3: Llama 3.x, with JSON tool calls.
+                  [AVAILABLE_TOOLS], [TOOL_CALLS]name[ARGS]{...} (name[CALL_ID]id[ARGS]{...}
+                  when the model gives the call an identifier), [TOOL_RESULTS] and [THINK] for
+                  reasoning.
+                - llama3: Llama 3.x, with JSON tool calls: an answer that is a JSON object, or
+                  a list of them, naming tools of the request; any other answer, JSON or not,
+                  is the text of the answer.
                 - granite: Granite 3, with <|tool_call|> followed by a JSON list.
                 - granite4: Granite 4.2, ChatML with a system turn in every prompt, tool
                   calls in the XML form (<function=name> and <parameter=key> elements in

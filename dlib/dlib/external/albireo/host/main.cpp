@@ -9,7 +9,7 @@
         albireo-service --console        in the console, stopped by Ctrl+C
         albireo-service --version
 
-    The service starts itself again in two cases: the arguments below, used for the
+    The service starts itself again with the arguments below, for the
     work that must never take the service down with it.
 
         --probe-engine <library>         prints the description of an engine library
@@ -30,6 +30,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <exception>
 #include <iostream>
 #include <mutex>
 #include <string>
@@ -94,7 +95,20 @@ namespace
                 current = &svc;
             }
             std::string error;
-            const bool ok = !stop_requested && svc.run(error);
+            bool ok = false;
+            try
+            {
+                ok = !stop_requested && svc.run(error);
+            }
+            catch (const std::exception& e)
+            {
+                // An error run() did not report, a database failing under it say: a failed start, tried again.
+                error = std::string("unexpected error: ") + e.what();
+            }
+            catch (...)
+            {
+                error = "unexpected error";
+            }
             {
                 std::lock_guard<std::mutex> lock(current_m);
                 current = nullptr;
@@ -128,15 +142,16 @@ namespace
     SERVICE_STATUS_HANDLE status_handle = nullptr;
     SERVICE_STATUS status = {};
     std::mutex status_m;
+    // Set once the service manager was told that the service stopped: nothing follows that state.
+    std::atomic<bool> reported_stopped{false};
 
     void report(DWORD state, DWORD exit_code = NO_ERROR, DWORD wait_hint = 0)
     {
         std::lock_guard<std::mutex> lock(status_m);
         static DWORD checkpoint = 1;
         // Nothing follows the final state, whatever thread reports late.
-        static bool stopped = false;
-        if (stopped) return;
-        if (state == SERVICE_STOPPED) stopped = true;
+        if (reported_stopped) return;
+        if (state == SERVICE_STOPPED) reported_stopped = true;
         status.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
         status.dwCurrentState = state;
         status.dwWaitHint = wait_hint;
@@ -157,17 +172,18 @@ namespace
     }
 
     /*
-        Tells the service manager, every two seconds, that the stop goes on.  A request to
-        the network still opening its connection, which httplib cannot interrupt, holds the
-        stop for the bounds of its connection (http_fetch.h); the manager then waits rather
-        than report a service that does not answer.
+        Tells the service manager, every two seconds until the service stopped, that the stop
+        goes on.  A request to the network still opening its connection, which httplib cannot
+        interrupt, holds the stop for the bounds of its connection (http_fetch.h), and a model
+        being loaded for the time of its load; the manager then waits rather than report a
+        service that does not answer.
     */
     void report_stop_progress()
     {
         static std::atomic<bool> started{false};
         if (started.exchange(true)) return;
         std::thread([]() {
-            for (int i = 0; i < 60; ++i)
+            while (!reported_stopped)
             {
                 std::this_thread::sleep_for(std::chrono::seconds(2));
                 report(SERVICE_STOP_PENDING, NO_ERROR, 10000);
@@ -324,6 +340,18 @@ namespace
 
 int main(int argc, char** argv)
 {
+#if defined(_WIN32)
+    /*
+        The libraries loaded by name from here on, by this program, by the engines and by the
+        runtimes they load (the parts of cuDNN, the plugins of OpenVINO), are searched in the
+        folder of the program, its engines folder and System32 only: never in the current
+        folder or in the PATH, where other copies of OpenVINO, TBB, CUDA, cuDNN or of the
+        runtime of the compiler may lie.
+    */
+    SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    const std::string engines = albireo::join_path(albireo::executable_dir(), "engines");
+    if (albireo::dir_exists(engines)) AddDllDirectory(albireo::widen(engines).c_str());
+#endif
     std::vector<std::string> args;
 #if defined(_WIN32)
     // The arguments in UTF-8, whatever the code page of the console.

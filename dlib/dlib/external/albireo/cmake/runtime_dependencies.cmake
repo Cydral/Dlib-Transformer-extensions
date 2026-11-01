@@ -13,6 +13,10 @@
 # cuDNN, the runtime of the compiler.  Their own dependencies are copied as well, and the
 # data files of the list, such as the kernel table of the GPU plugin, as they are.  EXCLUDE
 # lists the names of the libraries left out, those the engine loads on first use only.
+#
+# The build stops when a library the installer carries is found in none of these folders:
+# OpenVINO, TBB, cuDNN, cuBLAS, the CUDA runtime or the runtime of the compiler.  Several
+# engines that share DEST, the three OpenVINO engines, copy one after the other.
 
 if (NOT ENGINE OR NOT DEST)
    message(FATAL_ERROR "runtime_dependencies.cmake needs ENGINE and DEST")
@@ -21,10 +25,23 @@ string(REPLACE "|" ";" dirs "${DIRS}")
 string(REPLACE "|" ";" extra "${EXTRA}")
 string(REPLACE "|" ";" exclude "${EXCLUDE}")
 
+# One copy at a time into the folder of the engines, held until this script ends.
+get_filename_component(dest_parent "${DEST}" DIRECTORY)
+file(MAKE_DIRECTORY "${dest_parent}")
+file(LOCK "${dest_parent}/runtime-copy.lock" GUARD PROCESS TIMEOUT 1800 RESULT_VARIABLE lock_result)
+if (NOT lock_result EQUAL 0)
+   message(FATAL_ERROR "the folder ${DEST} stays locked by another copy: ${lock_result}")
+endif()
+
 set(extra_files)
 foreach (pattern IN LISTS extra)
    if (pattern)
       file(GLOB matches "${pattern}")
+      # A library of an exact name that this runtime does not carry, such as a part of the NPU
+      # plugin of another release of OpenVINO, is left out, which the log of the build says.
+      if (NOT matches AND NOT pattern MATCHES "[*?]")
+         message(STATUS "Not found, left out: ${pattern}")
+      endif()
       list(APPEND extra_files ${matches})
    endif()
 endforeach()
@@ -42,7 +59,6 @@ endforeach()
 # copies beside it and the other libraries to the originals, two paths for one name.
 get_filename_component(engine_name "${ENGINE}" NAME)
 get_filename_component(engine_stem "${ENGINE}" NAME_WE)
-get_filename_component(dest_parent "${DEST}" DIRECTORY)
 set(scan "${dest_parent}/runtime-scan-${engine_stem}")
 file(REMOVE_RECURSE "${scan}")
 file(MAKE_DIRECTORY "${scan}")
@@ -68,6 +84,26 @@ foreach (name IN LISTS conflicting_FILENAMES)
    message(STATUS "${name} found in several folders, copied from ${first}")
 endforeach()
 
+# The libraries not found, before anything is copied: those of the driver come with the
+# system of the user, nvcuda.dll for instance, and a runtime that the installer carries stops
+# the build.  Another library is reported.
+set(missing)
+foreach (u IN LISTS unresolved)
+   string(TOLOWER "${u}" name)
+   if (name MATCHES "^(nvcuda|nvml|opencl|ze_loader|ze_intel_.*|libcuda|libopencl)")
+      continue()
+   endif()
+   if (name MATCHES "^(lib)?(openvino|tbb|cudnn|cublas|cudart|msvcp|vcruntime|concrt)")
+      list(APPEND missing "${u}")
+   else()
+      message(WARNING "${ENGINE} needs ${u}, found in none of: ${dirs}")
+   endif()
+endforeach()
+if (missing)
+   string(REPLACE ";" ", " missing "${missing}")
+   message(FATAL_ERROR "${ENGINE} needs ${missing}, found in none of: ${dirs}")
+endif()
+
 # file(COPY) keeps the time of the files, which tells the copies already up to date.
 set(copied 0)
 foreach (f IN LISTS resolved extra_files)
@@ -83,9 +119,3 @@ foreach (f IN LISTS resolved extra_files)
    endif()
 endforeach()
 message(STATUS "Run time libraries of ${ENGINE}: ${copied} copied to ${DEST}")
-foreach (u IN LISTS unresolved)
-   # Libraries of the driver, such as nvcuda.dll, come with the system of the user.
-   if (NOT u MATCHES "^(nvcuda|nvml|OpenCL|ze_loader|ze_intel_.*|libcuda|libOpenCL)")
-      message(WARNING "${ENGINE} needs ${u}, found in none of: ${dirs}")
-   endif()
-endforeach()

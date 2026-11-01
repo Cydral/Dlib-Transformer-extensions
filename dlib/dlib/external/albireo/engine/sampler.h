@@ -21,7 +21,7 @@ namespace albireo
                 servers.  A temperature of 0 selects the most likely token.
         !*/
         float temperature = 0.7f;
-        float top_p = 0.95f;
+        float top_p = 0.95f;          // 1 disables; 0 keeps the most likely candidate
         int top_k = 40;               // 0 disables
         float min_p = 0.05f;          // relative to the most likely token; 0 disables
         float repeat_penalty = 1.0f;  // 1 disables

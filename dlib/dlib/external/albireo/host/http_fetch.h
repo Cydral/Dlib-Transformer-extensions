@@ -79,7 +79,10 @@ namespace albireo
             - total, when given, receives the size of the whole resource when the server
               tells it (Content-Range or Content-Length), 0 otherwise.
             - Fails when the server ignores the range of a request that does not start at
-              0, since appending its answer would corrupt the file.
+              0, or answers with a range that starts elsewhere, since writing its answer
+              would corrupt the file.
+            - With to >= 0, the receiver gets the bytes [from, to] at most: the reading ends
+              once they have come, the answer of a server that ignores the range included.
     !*/
     bool http_get_range(const std::string& url, uint64_t from, int64_t to,
         const std::function<bool(const char*, size_t)>& receiver, std::string& error, uint64_t* total = nullptr);

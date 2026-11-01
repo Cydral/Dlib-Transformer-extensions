@@ -104,9 +104,19 @@ async function inflate(data, limit) {
 }
 
 /*
+    The error of a damaged archive, "zip-invalid", for the errors that its offsets pointing outside the file
+    (RangeError) and its data that does not inflate (TypeError) raise; another error stays.
+*/
+function zipError(e) {
+  return e instanceof RangeError || e instanceof TypeError ? new Error('zip-invalid') : e;
+}
+
+/*
     The entries of a ZIP archive, read on demand.  An entry whose size, declared by the
     central directory or met while it is decompressed, goes beyond the limits of the archive
-    (maxUnzippedBytes for all the entries read, maxRatio) throws "too-large-content".
+    (maxUnzippedBytes for all the entries read, maxRatio) throws "too-large-content"; a file
+    that is not an archive, or a damaged one, throws "zip-invalid", and an entry compressed by
+    another method than deflate "zip-compression".
 */
 async function unzip(buffer) {
   const dv = new DataView(buffer);
@@ -117,24 +127,31 @@ async function unzip(buffer) {
       break;
     }
   }
-  if (end < 0) throw new Error('not a ZIP archive');
+  if (end < 0) throw new Error('zip-invalid');
   const count = dv.getUint16(end + 10, true);
   let p = dv.getUint32(end + 16, true);
   const entries = new Map();
   const names = new TextDecoder();
-  for (let k = 0; k < count && p + 46 <= buffer.byteLength; ++k) {
-    if (dv.getUint32(p, true) !== 0x02014b50) break;
-    const method = dv.getUint16(p + 10, true);
-    const csize = dv.getUint32(p + 20, true);
-    // The size once decompressed; a ZIP64 entry declares 0xffffffff, beyond every limit here.
-    const usize = dv.getUint32(p + 24, true);
-    const nlen = dv.getUint16(p + 28, true);
-    const elen = dv.getUint16(p + 30, true);
-    const clen = dv.getUint16(p + 32, true);
-    const offset = dv.getUint32(p + 42, true);
-    entries.set(names.decode(new Uint8Array(buffer, p + 46, nlen)), { method, csize, usize, offset });
-    p += 46 + nlen + elen + clen;
+  let k = 0;
+  try {
+    for (; k < count && p + 46 <= buffer.byteLength; ++k) {
+      if (dv.getUint32(p, true) !== 0x02014b50) break;
+      const method = dv.getUint16(p + 10, true);
+      const csize = dv.getUint32(p + 20, true);
+      // The size once decompressed; a ZIP64 entry declares 0xffffffff, beyond every limit here.
+      const usize = dv.getUint32(p + 24, true);
+      const nlen = dv.getUint16(p + 28, true);
+      const elen = dv.getUint16(p + 30, true);
+      const clen = dv.getUint16(p + 32, true);
+      const offset = dv.getUint32(p + 42, true);
+      entries.set(names.decode(new Uint8Array(buffer, p + 46, nlen)), { method, csize, usize, offset });
+      p += 46 + nlen + elen + clen;
+    }
+  } catch (e) {
+    throw zipError(e);
   }
+  // A central directory that holds fewer entries than its end record declares is damaged.
+  if (k < count) throw new Error('zip-invalid');
   let used = 0;
   return {
     names: () => Array.from(entries.keys()),
@@ -147,15 +164,16 @@ async function unzip(buffer) {
       const room = maxUnzippedBytes - used;
       const cap = e.method === 0 ? room : Math.min(room, Math.max(ratioFloor, maxRatio * e.csize));
       if ((e.method === 0 ? e.csize : e.usize) > cap) throw new Error('too-large-content');
-      const nlen = dv.getUint16(e.offset + 26, true);
-      const elen = dv.getUint16(e.offset + 28, true);
-      const data = new Uint8Array(buffer, e.offset + 30 + nlen + elen, e.csize);
-      if (e.method === 0) {
-        used += data.length;
-        return decodeText(data);
+      if (e.method !== 0 && e.method !== 8) throw new Error('zip-compression');
+      let bytes;
+      try {
+        const nlen = dv.getUint16(e.offset + 26, true);
+        const elen = dv.getUint16(e.offset + 28, true);
+        const data = new Uint8Array(buffer, e.offset + 30 + nlen + elen, e.csize);
+        bytes = e.method === 0 ? data : await inflate(data, cap);
+      } catch (err) {
+        throw zipError(err);
       }
-      if (e.method !== 8) throw new Error('unsupported compression');
-      const bytes = await inflate(data, cap);
       used += bytes.length;
       return decodeText(bytes);
     }
@@ -164,7 +182,7 @@ async function unzip(buffer) {
 
 function parseXml(text) {
   const doc = new DOMParser().parseFromString(text, 'application/xml');
-  if (doc.getElementsByTagName('parsererror').length) throw new Error('invalid XML');
+  if (doc.getElementsByTagName('parsererror').length) throw new Error('xml-invalid');
   return doc;
 }
 
@@ -856,7 +874,9 @@ function htmlText(s) {
     once decompressed), legacy (an Office format before 2007), unsupported, pdf-images (a PDF
     whose pages are images without text, a scan, with its number of pages in pages),
     pdf-password (a PDF that opens with a password only), pdf-invalid (a damaged PDF),
-    pdf-reader (pdf.js cannot run in this browser).
+    pdf-reader (pdf.js cannot run in this browser), zip-invalid (an Office or OpenDocument file
+    that is not a ZIP archive, or a damaged one), zip-compression (an entry compressed by another
+    method than deflate), xml-invalid (an entry that is not well-formed XML).
 */
 export async function extractText(file) {
   if (file.size > maxFileBytes) throw new Error('too-large');

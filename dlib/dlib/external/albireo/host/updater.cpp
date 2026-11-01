@@ -23,6 +23,7 @@
 #include "../common/version.h"
 #include "crypto.h"
 #include "http_fetch.h"
+#include "public_link.h"
 
 namespace albireo
 {
@@ -282,18 +283,43 @@ namespace albireo
         set("state", "checking");
         set("checked_at", static_cast<long long>(now_unix()));
         std::string body, sig, error;
-        if (!http_get(feed_url_, body, error, 1u << 20) || !http_get(feed_url_ + ".sig", sig, error, 4096))
+        // Where the installer comes from, for the log: empty when it was downloaded before.
+        std::string origin;
+        // The feed of the public link first, then the one of its official address.
+        bool from_link = false;
+        if (public_link_enabled())
         {
-            fail(user_error().set(error, "update_download").arg("e", error));
-            if (!ended()) log_warning("updates: " + error);
-            return;
+            std::string e;
+            from_link = public_link_get("dist/feed.json", body, e, 1u << 20)
+                && public_link_get("dist/feed.json.sig", sig, e, 4096);
+            if (from_link && !verify_signature(body, sig, feed_public_key_pem))
+            {
+                from_link = false;
+                e = "the signature of the feed of the public link is not valid";
+            }
+            if (ended())
+            {
+                settle("idle", user_error());
+                return;
+            }
+            if (!from_link) log_warning("updates: " + about_public_link(e) + "; the feed is read from " + feed_url_);
+            else log_info("updates: feed read from the public link");
         }
-        if (!verify_signature(body, sig, feed_public_key_pem))
+        if (!from_link)
         {
-            fail(user_error().set("the signature of the update feed is not valid", "update_signature")
-                .arg("file", feed_url_));
-            log_error("updates: the signature of the feed is not valid, feed ignored");
-            return;
+            if (!http_get(feed_url_, body, error, 1u << 20) || !http_get(feed_url_ + ".sig", sig, error, 4096))
+            {
+                fail(user_error().set(error, "update_download").arg("e", error));
+                if (!ended()) log_warning("updates: " + error);
+                return;
+            }
+            if (!verify_signature(body, sig, feed_public_key_pem))
+            {
+                fail(user_error().set("the signature of the update feed is not valid", "update_signature")
+                    .arg("file", feed_url_));
+                log_error("updates: the signature of the feed is not valid, feed ignored");
+                return;
+            }
         }
         const json feed = json::parse_or_null(body);
         const json& stable = feed["channels"]["stable"];
@@ -326,10 +352,13 @@ namespace albireo
         set("latest", latest);
         set("notes", notes);
         const json& inst = stable["installer"];
+        // The installer lies in the folder dist of the public link ("file"), on the web ("url"), or both.
         const std::string url = inst["url"].as_string();
+        const std::string in_link = inst["file"].as_string();
         const std::string sha = inst["sha256"].as_string();
         const uint64_t size = static_cast<uint64_t>(inst["size"].as_int(0));
-        if (url.empty() || sha.size() != 64 || size == 0)
+        if ((url.empty() && in_link.empty()) || (!in_link.empty() && !plain_name(in_link)) || sha.size() != 64
+            || size == 0)
         {
             fail(user_error().set("the update feed is incomplete", "update_feed_invalid"));
             return;
@@ -341,41 +370,81 @@ namespace albireo
             set("state", "downloading");
             set("total", static_cast<unsigned long long>(size));
             set("received", 0ull);
-            // The partial file of an earlier check goes: the new one must not exist yet (new_file).
-            const std::string tmp = file + ".partial";
-            remove_file(tmp);
-            new_file out;
-            const bool created = out.create(tmp);
-            uint64_t got = 0;
-            bool too_large = false, unwritten = false;
-            const bool ok = created && http_get_range(url, 0, -1, [&](const char* d, size_t n) {
-                if (got + n > size)
-                {
-                    too_large = true;
-                    return false;
-                }
-                if (!out.write(d, n))
-                {
-                    unwritten = true;
-                    return false;
-                }
-                got += n;
-                set("received", static_cast<unsigned long long>(got));
-                return !cancelled_.load();
-            }, error);
-            const bool closed = out.close();
-            user_error why;
             const user_error unrecorded = user_error().set("the update of version " + latest
                 + " cannot be recorded in " + dir_, "update_record").arg("version", latest);
-            if (!created || unwritten || (ok && !closed)) why = unrecorded;
-            else if (!ok && !too_large) why.set(error, "update_download").arg("e", error);
-            else if (too_large || got != size || sha256_file(tmp, nullptr, &cancelled_) != sha)
-                why.set("the downloaded installer does not match the feed", "update_installer_mismatch")
-                    .arg("version", latest);
-            else if (!rename_file(tmp, file)) why = unrecorded;
-            if (!why.code.empty())
+            const std::string tmp = file + ".partial";
+            /*
+                One download of the installer from address into the partial file, checked against
+                the feed; label, when given, takes the place of the address in the messages.
+            */
+            auto download = [&](const std::string& address, const std::string& label, user_error& why) {
+                // The partial file of an earlier attempt goes: the new one must not exist yet (new_file).
+                remove_file(tmp);
+                set("received", 0ull);
+                new_file out;
+                const bool created = out.create(tmp);
+                uint64_t got = 0;
+                bool too_large = false, unwritten = false;
+                std::string e;
+                const bool ok = created && http_get_range(address, 0, -1, [&](const char* d, size_t n) {
+                    if (got + n > size)
+                    {
+                        too_large = true;
+                        return false;
+                    }
+                    if (!out.write(d, n))
+                    {
+                        unwritten = true;
+                        return false;
+                    }
+                    got += n;
+                    set("received", static_cast<unsigned long long>(got));
+                    return !cancelled_.load();
+                }, e);
+                const bool closed = out.close();
+                const size_t at = label.empty() ? std::string::npos : e.find(address);
+                if (at != std::string::npos) e.replace(at, address.size(), label);
+                why = user_error();
+                if (!created || unwritten || (ok && !closed)) why = unrecorded;
+                else if (!ok && !too_large) why.set(e, "update_download").arg("e", e);
+                else if (too_large || got != size || sha256_file(tmp, nullptr, &cancelled_) != sha)
+                    why.set("the downloaded installer does not match the feed", "update_installer_mismatch")
+                        .arg("version", latest);
+                else if (!rename_file(tmp, file)) why = unrecorded;
+                if (!why.code.empty() && created) remove_file(tmp);
+                return why.code.empty();
+            };
+            user_error why;
+            bool done = false;
+            if (!in_link.empty() && public_link_enabled())
             {
-                if (created) remove_file(tmp);
+                // An address of the cache may have expired: the second attempt asks for a new one.
+                const std::string path = "dist/" + in_link;
+                for (int attempt = 0; attempt < 2 && !done && !ended(); ++attempt)
+                {
+                    std::string address, e;
+                    uint64_t listed = 0;
+                    if (!public_link_file(path, address, listed, e, attempt > 0))
+                    {
+                        why.set(e, "update_download").arg("e", e);
+                        break;
+                    }
+                    done = download(address, "the copy of " + path + " in the public link", why);
+                    if (done) origin = " from the public link";
+                    // A file that cannot be written ends the attempts, from every source.
+                    if (!done && why.code == "update_record") break;
+                }
+                if (!done && !ended() && !url.empty() && why.code != "update_record")
+                    log_warning("updates: " + about_public_link(why.text) + "; the installer comes from " + url);
+            }
+            if (!done && !ended() && !url.empty() && why.code != "update_record")
+            {
+                done = download(url, "", why);
+                if (done) origin = " from " + url;
+            }
+            if (!done)
+            {
+                if (why.code.empty()) why.set("the update feed is incomplete", "update_feed_invalid");
                 fail(why);
                 if (!ended()) log_error("updates: download of " + latest + " failed: " + why.text);
                 return;
@@ -385,7 +454,7 @@ namespace albireo
         switch (stage(latest, sha, notes, body, sig, staging))
         {
         case stage_result::staged:
-            log_info("updates: version " + latest + " downloaded, applied at the next restart");
+            log_info("updates: version " + latest + " downloaded" + origin + ", applied at the next restart");
             break;
         case stage_result::older:
             // A newer version, imported from a medium meanwhile, stays the one installed.
@@ -447,7 +516,9 @@ namespace albireo
         const json& inst = stable["installer"];
         const std::string sha = inst["sha256"].as_string();
         const uint64_t size = static_cast<uint64_t>(inst["size"].as_int(0));
-        const std::string name = file_name(inst["url"].as_string());
+        // The name of the installer in the folder dist of the public link, else the one of its address.
+        const std::string name = inst["file"].is_string() ? inst["file"].as_string()
+            : file_name(inst["url"].as_string());
         const std::string source = join_path(folder, name);
         r["installer"] = name;
         if (sha.size() != 64 || size == 0 || !plain_name(name))

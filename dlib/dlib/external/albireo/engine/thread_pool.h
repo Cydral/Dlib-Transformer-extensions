@@ -38,9 +38,11 @@ namespace albireo
                 parallel_for() splits a range of tasks among the workers and the calling
                 thread, hands them out one at a time through an atomic counter so that
                 uneven tasks balance themselves, and returns once every task is done.
-                Calls are serialized: a single thread drives the pool.  An exception thrown
-                by a task skips the tasks not yet started and reaches the caller once every
-                worker has left the section.
+                The pool runs one section at a time: a thread that calls parallel_for()
+                while another thread's section runs waits until that section ends.  A task
+                must not open a section of its own pool.  An exception thrown by a task
+                skips the tasks not yet started and reaches the caller once every worker
+                has left the section.
         !*/
 
     public:
@@ -96,6 +98,8 @@ namespace albireo
                 for (long t = 0; t < n_tasks; ++t) fn(t, 0);
                 return;
             }
+            // The fields of the section below belong to one caller at a time.
+            std::lock_guard<std::mutex> serial(section_mutex_);
             job_ctx_ = static_cast<void*>(&fn);
             job_fn_ = &invoke<typename std::remove_reference<F>::type>;
             n_tasks_ = n_tasks;
@@ -219,6 +223,8 @@ namespace albireo
         };
 
         std::vector<std::thread> workers_;
+        // Held by the thread whose section runs, for the whole section.
+        std::mutex section_mutex_;
         std::mutex mutex_;
         std::condition_variable cv_;
         std::atomic<uint64_t> generation_{0};

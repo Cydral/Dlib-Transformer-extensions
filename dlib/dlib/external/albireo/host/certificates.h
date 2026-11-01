@@ -26,13 +26,15 @@ namespace albireo
               and ::1, and the private key of that server.
             - The authority signs the certificate of the server once, when both are made,
               and its private key is erased from memory then: it is never written.  Its
-              name constraints limit it to localhost and the loopback addresses.  It is the
-              certificate the trusted roots of the machine receive (trust_authority()), so
-              that the browsers accept the local server without warning.
-            - Both certificates are valid for 397 days.  When less than 30 days remain, or
-              when the key of the server does not read or does not match its certificate, a
-              new authority and a new certificate of the server replace them, and renewed
-              is set to true.
+              name constraints limit it to localhost and the loopback addresses, and its
+              extended key usage to the authentication of servers.  It is the certificate
+              the trusted roots of the machine receive (trust_authority()), so that the
+              browsers accept the local server without warning.
+            - Both certificates are valid for 397 days.  When less than 30 days remain, when
+              the key of the server does not read or does not match its certificate, or when
+              dir holds the key of an authority of a version before 1.0.8, which may have
+              been copied, a new authority and a new certificate of the server replace them,
+              and renewed is set to true.
             - On Windows, the private key of the server is encrypted with DPAPI for the
               account that runs this function, LocalSystem for the service, in a file that
               SYSTEM and the administrators alone may open: a copy of that file serves no

@@ -291,30 +291,31 @@ MODELS = [
         "name": "Ministral 3 3B",
         "publisher": "Mistral AI",
         "hub": ("mistralai/Ministral-3-3B-Instruct-2512-GGUF", "Ministral-3-3B-Instruct-2512-Q4_K_M.gguf"),
+        "projector": ("mistralai/Ministral-3-3B-Instruct-2512-GGUF", "Ministral-3-3B-Instruct-2512-BF16-mmproj.gguf",
+                      "BF16"),
         "quantization": "Q4_K_M",
         "roles": ["general"],
-        "inputs": ["text"],
+        "inputs": ["text", "image"],
         "tools": True,
         "reasoning": False,
         "license": "Apache-2.0",
         "description": {
             "en": "General assistant from Mistral AI, developed in partnership with NVIDIA and trained on many "
-                  "European languages, with a context of 256K tokens. It uses tools and answers directly, without a "
-                  "reasoning phase, on computers with 8 GB of memory. Albireo gives it text only.",
+                  "European languages, with a context of 256K tokens. It reads images, uses tools and answers "
+                  "directly, without a reasoning phase, on computers with 8 GB of memory.",
             "fr": "Assistant généraliste de Mistral AI, développé en partenariat avec NVIDIA et entraîné sur de "
-                  "nombreuses langues européennes, avec un contexte de 256K jetons. Il utilise des outils et répond "
-                  "directement, sans phase de raisonnement, sur les ordinateurs dotés de 8 Go de mémoire. Albireo ne "
-                  "lui confie que du texte.",
+                  "nombreuses langues européennes, avec un contexte de 256K jetons. Il lit les images, utilise des "
+                  "outils et répond directement, sans phase de raisonnement, sur les ordinateurs dotés de 8 Go de "
+                  "mémoire.",
             "de": "Allgemeiner Assistent von Mistral AI, in Partnerschaft mit NVIDIA entwickelt und auf vielen "
-                  "europäischen Sprachen trainiert, mit einem Kontext von 256K Token. Er nutzt Werkzeuge und "
-                  "antwortet direkt, ohne Denkphase, auf Computern mit 8 GB Arbeitsspeicher. Albireo gibt ihm nur "
-                  "Text.",
+                  "europäischen Sprachen trainiert, mit einem Kontext von 256K Token. Er liest Bilder, nutzt "
+                  "Werkzeuge und antwortet direkt, ohne Denkphase, auf Computern mit 8 GB Arbeitsspeicher.",
             "it": "Assistente generale di Mistral AI, sviluppato in collaborazione con NVIDIA e addestrato su molte "
-                  "lingue europee, con un contesto di 256K token. Usa strumenti e risponde direttamente, senza fase "
-                  "di ragionamento, su computer con 8 GB di memoria. Albireo gli affida solo testo.",
+                  "lingue europee, con un contesto di 256K token. Legge le immagini, usa strumenti e risponde "
+                  "direttamente, senza fase di ragionamento, su computer con 8 GB di memoria.",
             "es": "Asistente general de Mistral AI, desarrollado en colaboración con NVIDIA y entrenado en muchas "
-                  "lenguas europeas, con un contexto de 256K tokens. Usa herramientas y responde directamente, sin "
-                  "fase de razonamiento, en ordenadores con 8 GB de memoria. Albireo solo le confía texto.",
+                  "lenguas europeas, con un contexto de 256K tokens. Lee imágenes, usa herramientas y responde "
+                  "directamente, sin fase de razonamiento, en ordenadores con 8 GB de memoria.",
         },
     },
     {
@@ -322,30 +323,31 @@ MODELS = [
         "name": "Ministral 3 8B",
         "publisher": "Mistral AI",
         "hub": ("mistralai/Ministral-3-8B-Instruct-2512-GGUF", "Ministral-3-8B-Instruct-2512-Q4_K_M.gguf"),
+        "projector": ("mistralai/Ministral-3-8B-Instruct-2512-GGUF", "Ministral-3-8B-Instruct-2512-BF16-mmproj.gguf",
+                      "BF16"),
         "quantization": "Q4_K_M",
         "roles": ["general"],
-        "inputs": ["text"],
+        "inputs": ["text", "image"],
         "tools": True,
         "reasoning": False,
         "license": "Apache-2.0",
         "description": {
             "en": "Larger general assistant from Mistral AI, developed in partnership with NVIDIA and trained on many "
-                  "European languages, with a context of 256K tokens. It uses tools and answers directly, for "
-                  "computers with 16 GB of memory or a graphics processor. Albireo gives it text only.",
+                  "European languages, with a context of 256K tokens. It reads images, uses tools and answers "
+                  "directly, for computers with 16 GB of memory or a graphics processor.",
             "fr": "Assistant généraliste plus grand de Mistral AI, développé en partenariat avec NVIDIA et entraîné "
-                  "sur de nombreuses langues européennes, avec un contexte de 256K jetons. Il utilise des outils et "
-                  "répond directement, pour les ordinateurs dotés de 16 Go de mémoire ou d'un processeur graphique. "
-                  "Albireo ne lui confie que du texte.",
+                  "sur de nombreuses langues européennes, avec un contexte de 256K jetons. Il lit les images, utilise "
+                  "des outils et répond directement, pour les ordinateurs dotés de 16 Go de mémoire ou d'un "
+                  "processeur graphique.",
             "de": "Größerer allgemeiner Assistent von Mistral AI, in Partnerschaft mit NVIDIA entwickelt und auf "
-                  "vielen europäischen Sprachen trainiert, mit einem Kontext von 256K Token. Er nutzt Werkzeuge und "
-                  "antwortet direkt, für Computer mit 16 GB Arbeitsspeicher oder einem Grafikprozessor. Albireo gibt "
-                  "ihm nur Text.",
+                  "vielen europäischen Sprachen trainiert, mit einem Kontext von 256K Token. Er liest Bilder, nutzt "
+                  "Werkzeuge und antwortet direkt, für Computer mit 16 GB Arbeitsspeicher oder einem Grafikprozessor.",
             "it": "Assistente generale più grande di Mistral AI, sviluppato in collaborazione con NVIDIA e addestrato "
-                  "su molte lingue europee, con un contesto di 256K token. Usa strumenti e risponde direttamente, per "
-                  "computer con 16 GB di memoria o un processore grafico. Albireo gli affida solo testo.",
+                  "su molte lingue europee, con un contesto di 256K token. Legge le immagini, usa strumenti e risponde "
+                  "direttamente, per computer con 16 GB di memoria o un processore grafico.",
             "es": "Asistente general más grande de Mistral AI, desarrollado en colaboración con NVIDIA y entrenado en "
-                  "muchas lenguas europeas, con un contexto de 256K tokens. Usa herramientas y responde directamente, "
-                  "para ordenadores con 16 GB de memoria o un procesador gráfico. Albireo solo le confía texto.",
+                  "muchas lenguas europeas, con un contexto de 256K tokens. Lee imágenes, usa herramientas y responde "
+                  "directamente, para ordenadores con 16 GB de memoria o un procesador gráfico.",
         },
     },
     {
@@ -539,6 +541,43 @@ MODELS = [
         },
     },
     {
+        "id": "devstral-small-2",
+        "name": "Devstral Small 2",
+        "publisher": "Mistral AI",
+        "hub": ("lmstudio-community/Devstral-Small-2-24B-Instruct-2512-GGUF",
+                "Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf"),
+        "projector": ("lmstudio-community/Devstral-Small-2-24B-Instruct-2512-GGUF",
+                      "mmproj-Devstral-Small-2-24B-Instruct-2512-F16.gguf", "F16"),
+        "quantization": "Q4_K_M",
+        "roles": ["code"],
+        "inputs": ["text", "image"],
+        "tools": True,
+        "reasoning": False,
+        "license": "Apache-2.0",
+        "description": {
+            "en": "Programming agent from Mistral AI with 24 billion parameters, for the tasks that span a whole "
+                  "codebase, the use of tools and the reading of screenshots and diagrams, with a context of 256K "
+                  "tokens. It answers directly, without a reasoning phase, for computers with 32 GB of memory or a "
+                  "graphics processor of 16 GB.",
+            "fr": "Agent de programmation de Mistral AI de 24 milliards de paramètres, pour les tâches qui portent sur "
+                  "tout un code source, l'usage d'outils et la lecture de captures d'écran et de schémas, avec un "
+                  "contexte de 256K jetons. Il répond directement, sans phase de raisonnement, pour les ordinateurs "
+                  "dotés de 32 Go de mémoire ou d'un processeur graphique de 16 Go.",
+            "de": "Programmieragent von Mistral AI mit 24 Milliarden Parametern, für Aufgaben über eine ganze "
+                  "Codebasis, die Nutzung von Werkzeugen und das Lesen von Bildschirmfotos und Diagrammen, mit einem "
+                  "Kontext von 256K Token. Er antwortet direkt, ohne Denkphase, für Computer mit 32 GB "
+                  "Arbeitsspeicher oder einem Grafikprozessor mit 16 GB.",
+            "it": "Agente di programmazione di Mistral AI da 24 miliardi di parametri, per i compiti che riguardano "
+                  "un intero codice sorgente, l'uso di strumenti e la lettura di schermate e diagrammi, con un "
+                  "contesto di 256K token. Risponde direttamente, senza fase di ragionamento, per computer con 32 GB "
+                  "di memoria o un processore grafico da 16 GB.",
+            "es": "Agente de programación de Mistral AI de 24.000 millones de parámetros, para las tareas que abarcan "
+                  "todo un código fuente, el uso de herramientas y la lectura de capturas de pantalla y diagramas, "
+                  "con un contexto de 256K tokens. Responde directamente, sin fase de razonamiento, para ordenadores "
+                  "con 32 GB de memoria o un procesador gráfico de 16 GB.",
+        },
+    },
+    {
         "id": "foundation-sec-8b",
         "name": "Foundation-Sec 1.1 8B",
         "publisher": "Cisco",
@@ -652,27 +691,50 @@ def from_hub(model, cache):
     return out
 
 
+def check(condition, what):
+    """Raises ValueError with what when condition is false: unlike assert, which python -O
+    removes, the check holds however the program runs."""
+    if not condition:
+        raise ValueError(what)
+
+
+def check_models(models):
+    """Checks the list of the models before anything is read from the hub."""
+    for m in models:
+        check(all(r in ROLES for r in m["roles"]), "%s: a role is not one of %s" % (m["id"], ", ".join(ROLES)))
+        check("embedding" not in m["roles"] or (m["roles"] == ["embedding"] and m.get("embedding")),
+              "%s: an embedding model has the embedding role alone and \"embedding\": true" % m["id"])
+        check(set(m["description"]) == {"en", "fr", "de", "it", "es"},
+              "%s: the description has the languages en, fr, de, it and es, and no other" % m["id"])
+        check(m["inputs"][0] == "text" and all(i in INPUTS for i in m["inputs"]),
+              "%s: the inputs start with text and are among %s" % (m["id"], ", ".join(INPUTS)))
+        check(("image" in m["inputs"]) == ("projector" in m),
+              "%s: a model reads images when it names a projector, and only then" % m["id"])
+    ids = [m["id"] for m in models]
+    check(len(ids) == len(set(ids)), "identifiers listed twice: %s"
+          % ", ".join(sorted({i for i in ids if ids.count(i) > 1})))
+    for embedding in (False, True):
+        defaults = [m["id"] for m in models if m.get("default") and ("embedding" in m["roles"]) == embedding]
+        check(len(defaults) == 1, "one default %s model is needed, not %d: %s"
+              % ("embedding" if embedding else "language", len(defaults), ", ".join(defaults) or "none"))
+
+
 def main():
     if len(sys.argv) != 2:
         print(__doc__)
         return 2
+    try:
+        check_models(MODELS)
+    except (ValueError, KeyError, IndexError) as e:
+        print("error: %s" % e, file=sys.stderr)
+        return 1
     models = []
     cache = {}
     for m in MODELS:
-        assert all(r in ROLES for r in m["roles"]), m["id"]
-        assert "embedding" not in m["roles"] or (m["roles"] == ["embedding"] and m.get("embedding")), m["id"]
-        assert set(m["description"]) == {"en", "fr", "de", "it", "es"}, m["id"]
-        assert m["inputs"][0] == "text" and all(i in INPUTS for i in m["inputs"]), m["id"]
-        assert ("image" in m["inputs"]) == ("projector" in m), m["id"]
         models.append(from_hub(m, cache) if "hub" in m else m)
         e = models[-1]
         total = e["size"] + e.get("projector", {}).get("size", 0)
         print("%-28s %-18s %6.2f GB  %s" % (e["id"], e["publisher"], total / 1e9, e["sha256"]))
-    ids = [m["id"] for m in models]
-    assert len(ids) == len(set(ids)), ids
-    for embedding in (False, True):
-        defaults = [m["id"] for m in models if m.get("default") and ("embedding" in m["roles"]) == embedding]
-        assert len(defaults) == 1, defaults
     # The time of publication, which the services compare as a string to keep the newer of
     # two catalogs: the earlier catalogs gave the day alone, which sorts before any time of it.
     updated = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")

@@ -26,10 +26,13 @@ namespace albireo
     {
         /*!
             WHAT THIS OBJECT REPRESENTS
-                The models of the machine and of the catalog: the catalog published on
-                GitHub (a signed JSON document listing the models, their descriptions in
-                each language, their files and their hashes), the installed models, the
-                downloads in progress and the imports from removable media.
+                The models of the machine and of the catalog: the catalog published in the
+                folder dist of the public link (public_link.h) and on GitHub (a signed JSON
+                document listing the models, their descriptions in each language, their
+                files and their hashes, the official source of each model among them), the
+                installed models, the downloads in progress and the imports from removable
+                media.  The catalog of the link is read first, the one of catalog_url when
+                the link does not answer or holds none that verifies.
 
             MODELS THAT READ IMAGES
                 Such a model comes as two GGUF files: its decoder, and a projector
@@ -53,6 +56,13 @@ namespace albireo
                 The model is installed only once both files are in place: a cancellation,
                 a hash that still fails or a model the database cannot record leaves
                 neither file under its final name.
+
+                Each segment comes from the copy of its part in the public link,
+                models/<identifier>/<file name of the address of the part>, when the link
+                holds it at its size: the first attempt with the address of the cache, the
+                second with a new one.  The later attempts, and every attempt when the link
+                holds no such copy, read the address of the catalog.  The hashes check the
+                bytes of both sources the same way.
 
             OFFLINE INSTALLATION
                 import_path() installs the GGUF files of the import folder of the data
@@ -80,7 +90,9 @@ namespace albireo
                 file whose content is that of an installed model or projector, a model that
                 comes with Albireo included, or of a pending projector, is not copied
                 again: it is listed under "already".  A file never takes the identifier of
-                a model that comes with Albireo: it is installed as <identifier>-import.
+                another installed model, unless it is a newer version from the catalog of a
+                model of the catalog: it is installed as <identifier>-import, or
+                <identifier>-import-2 and so on when that one is taken.
 
             THE MODELS FOLDER
                 Every file the service writes there (a download, its partial files, an
@@ -223,6 +235,17 @@ namespace albireo
         // to an installed model.
         void on_installed(std::function<void(const installed_model&)> f) { installed_cb_ = std::move(f); }
 
+        /*!
+            ensures
+                - f(id, place) is called when new files take the names of those of the
+                  installed model id, a newer version downloaded or imported: f runs place,
+                  which renames them, while no program holds the files of id open (the engine
+                  holds those of a loaded model, which Windows refuses to replace), and returns
+                  its result.  Without f, place runs directly.
+        !*/
+        typedef std::function<bool(const std::string&, const std::function<bool()>&)> replace_function;
+        void on_replace(replace_function f) { replace_cb_ = std::move(f); }
+
         // Ends the downloads and the refresh in progress and refuses the following ones:
         // the service stops.  The progress of the downloads is kept for the next start.
         void stop();
@@ -298,9 +321,17 @@ namespace albireo
                   in the models folder: moved when move and when it lies on the volume of the
                   folder, copied otherwise from the open file and checked against sha as it is
                   written.  Closes source; returns false with error when it cannot be placed.
+                - target is a file of the installed model id, when id is not empty: the
+                  renaming then runs through replacing().
         !*/
         bool put_file(link_free_file& source, const std::string& path, const std::string& base,
-            const std::string& sha, bool move, const std::string& target, placement& how, std::string& error);
+            const std::string& sha, bool move, const std::string& target, placement& how, std::string& error,
+            const std::string& id);
+        /*
+            Runs work, which renames new files over those of the model id, through the function
+            of on_replace() when id names an installed model.
+        */
+        bool replacing(const std::string& id, const std::function<bool()>& work);
         // Takes back what put_file() did: the file moved goes back to path, the copy is deleted.
         void undo_put(const std::string& path, const std::string& target, const placement& how);
         // The installed model whose file has the content of hash sha, the one that comes with Albireo
@@ -315,8 +346,13 @@ namespace albireo
         bool projector_with_hash(const std::string& sha, std::string& holder, std::string& path);
         // The SHA-256 of the projector the catalog entry of the decoder of hash sha names, or an empty string.
         std::string catalog_projector(const std::string& decoder_sha) const;
-        // The identifier a new file takes: id, or id-import when a model that comes with Albireo holds id.
-        std::string free_identifier(const std::string& id);
+        /*
+            The identifier a new file takes: id when no model holds it, or when update is true and
+            the model of the catalog that holds it receives the file as its newer version;
+            otherwise id-import, id-import-2, id-import-3..., the first one free, so that a file
+            never takes the place of another model.
+        */
+        std::string free_identifier(const std::string& id, bool update);
         // Moves the file from to target, a name of the models folder: false when the folder is no longer
         // reached directly, when the move fails, or when target then names another file than the one moved.
         bool place(const std::string& from, const std::string& target);
@@ -335,6 +371,7 @@ namespace albireo
         std::atomic<bool> stopped_{false};
         std::map<std::string, std::shared_ptr<job>> jobs_;
         std::function<void(const installed_model&)> installed_cb_;
+        replace_function replace_cb_;
     };
 
     /*!

@@ -37,6 +37,13 @@ namespace albireo
     */
     std::string data_dir();
 
+    /*
+        Makes data_dir() return p in this process from then on.  The test programs call it, so
+        that they never write in the data folder of an installed service; the programs of
+        Albireo never do, and no variable of the environment of a user can do it.
+    */
+    void set_data_dir(const std::string& p);
+
     std::string join_path(const std::string& a, const std::string& b);
     std::string parent_path(const std::string& p);
     std::string file_name(const std::string& p);
@@ -206,8 +213,11 @@ namespace albireo
     };
 
     bool read_file(const std::string& p, std::string& data, uint64_t max_bytes = 256u << 20);
-    // Writes through a temporary file renamed over the target, so that a crash never
-    // leaves a half written file behind.
+    /*
+        Writes through a temporary file whose data reaches the disk before it is renamed over
+        the target, so that a crash or a power cut leaves the old file or the new one, never
+        an empty or half written one.
+    */
     bool write_file_atomic(const std::string& p, const std::string& data);
 
     /*
@@ -231,12 +241,31 @@ namespace albireo
     // Compares versions "1.2.3": negative, zero or positive as a is older, equal or newer.
     int compare_versions(const std::string& a, const std::string& b);
 
+    struct process_options
+    {
+        // Written to the standard input of the program, which closes once it is written.
+        const std::string* input = nullptr;
+        /*
+            On Windows, the program runs without console, with a copy of the token of this
+            process without its privileges and of low integrity, alone in a job that ends it
+            beyond memory_limit bytes and when the job closes, and that refuses it any child
+            process; it does not run when Windows refuses one of these steps.  Elsewhere its
+            address space is bounded by memory_limit, it writes no file and leaves no core
+            file, and on Linux it gains no privilege by running another program.
+        */
+        bool restricted = false;
+        size_t memory_limit = 0;
+        // The folder the program starts in, that of this process when empty.
+        std::string directory;
+    };
+
     /*
         Runs a program with arguments and waits for it; returns its exit code, or -1.  The
         program is ended when it runs beyond timeout_ms, or as soon as stop becomes true.
+        output receives what the program writes to its standard output and error.
     */
     int run_process(const std::string& program, const std::vector<std::string>& args, std::string* output = nullptr,
-        unsigned timeout_ms = 60000, const std::atomic<bool>* stop = nullptr);
+        unsigned timeout_ms = 60000, const std::atomic<bool>* stop = nullptr, const process_options* options = nullptr);
 
     /*
         Ends the process with code once its standard outputs are flushed, without unloading

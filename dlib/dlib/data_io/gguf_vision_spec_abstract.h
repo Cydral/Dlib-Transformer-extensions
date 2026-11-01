@@ -94,6 +94,9 @@ namespace dlib
         throws
             - std::runtime_error when the container is not a vision projector, that is
               when its architecture is not "clip".
+            - std::runtime_error when a number of its geometry lies outside the bounds
+              of the published encoders, or when the mean or the deviation of the
+              pixels is not finite, a deviation being positive.
     !*/
 
 // ----------------------------------------------------------------------------------------

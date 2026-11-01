@@ -20,6 +20,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <winioctl.h>
 #else
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -35,6 +36,7 @@
 #include "../common/platform.h"
 #include "crypto.h"
 #include "http_fetch.h"
+#include "public_link.h"
 
 namespace albireo
 {
@@ -66,6 +68,13 @@ namespace albireo
                     h_ = INVALID_HANDLE_VALUE;
                     return false;
                 }
+                /*
+                    A sparse file: the segments written ahead of the others leave ranges not yet
+                    written, which the system would otherwise fill with zeros before each write
+                    beyond them.  A volume without sparse files refuses it, and the file stays plain.
+                */
+                DWORD unused = 0;
+                DeviceIoControl(h_, FSCTL_SET_SPARSE, nullptr, 0, nullptr, 0, &unused, nullptr);
                 LARGE_INTEGER s;
                 s.QuadPart = static_cast<LONGLONG>(size);
                 LARGE_INTEGER cur;
@@ -410,8 +419,11 @@ namespace albireo
                 int64_t deepstack = 0;
                 if (g.has("clip.vision.is_deepstack_layers"))
                     for (int64_t v : g.at("clip.vision.is_deepstack_layers").arr_int) deepstack += v != 0 ? 1 : 0;
-                long long width = width_of(g.get_int("clip.vision.projection_dim", 0), deepstack);
-                // A LLaVA projector names no projection width: its last layer gives it.
+                // A LLaVA projector names no projection width, and that of a Pixtral projector is
+                // another one: their last layer gives it.
+                const std::string type = d["projector_type"].as_string();
+                long long width = type == "pixtral" ? 0
+                    : width_of(g.get_int("clip.vision.projection_dim", 0), deepstack);
                 for (const char* last : { "mm.2.weight", "mm.0.weight" })
                 {
                     const dlib::gguf_tensor_info* t = width > 0 ? nullptr : g.find_tensor(last);
@@ -423,12 +435,16 @@ namespace albireo
             }
             d["context"] = static_cast<long long>(g.get_int(arch + ".context_length", 0));
             d["experts"] = static_cast<long long>(g.get_int(arch + ".expert_count", 0));
-            // A decoder that reads images: Qwen3-VL, or a LLaVA decoder, whose vocabulary holds <image>.
+            /*
+                A decoder that reads images: Qwen3-VL, a LLaVA decoder, whose vocabulary holds
+                <image>, or a Mistral decoder, whose vocabulary holds [IMG] and [IMG_END].
+            */
             bool images = reads_images(arch);
             if (!images && g.has("tokenizer.ggml.tokens"))
             {
                 const std::vector<std::string>& tokens = g.at("tokenizer.ggml.tokens").arr_str;
-                images = std::find(tokens.begin(), tokens.end(), "<image>") != tokens.end();
+                auto holds = [&](const char* t) { return std::find(tokens.begin(), tokens.end(), t) != tokens.end(); };
+                images = holds("<image>") || (holds("[IMG]") && holds("[IMG_END]"));
             }
             d["reads_images"] = images;
             if (images)
@@ -479,6 +495,8 @@ namespace albireo
         struct chunk
         {
             std::string url;
+            std::string link_path;    // the copy of the resource in the public link (public_link.h)
+            uint64_t resource = 0;    // bytes of the resource
             uint64_t from = 0;        // byte range in the resource
             uint64_t length = 0;      // bytes of the resource (compressed size for gzip)
             uint64_t offset = 0;      // where the bytes go in the file
@@ -505,6 +523,8 @@ namespace albireo
         std::vector<std::unique_ptr<chunk>> chunks;
         std::atomic<uint64_t> received{0};
         std::atomic<bool> cancel{false};
+        // Where the segments came from: the copies of the public link, the official addresses.
+        std::atomic<bool> from_link{false}, from_official{false};
         // Cancelled by the user, set under m_: the progress and the partial file are dropped,
         // where a stop of the service keeps them for the next start.
         std::atomic<bool> abandoned{false};
@@ -609,6 +629,27 @@ namespace albireo
     bool model_manager::refresh_catalog(std::string& error)
     {
         std::string body, sig;
+        // The catalog of the public link first, then the one of its official address.
+        if (public_link_enabled())
+        {
+            std::string e;
+            json result = json::object();
+            if (public_link_get("dist/catalog.json", body, e, 16u << 20)
+                && public_link_get("dist/catalog.json.sig", sig, e, 4096)
+                && install_catalog(body, sig, true, result, e))
+            {
+                log_info("models: catalog read from the public link");
+                return true;
+            }
+            if (http_cancelled())
+            {
+                error = e;
+                return false;
+            }
+            log_warning("models: " + about_public_link(e) + "; the catalog is read from " + catalog_url_);
+            body.clear();
+            sig.clear();
+        }
         if (!http_get(catalog_url_, body, error)) return false;
         if (!http_get(catalog_url_ + ".sig", sig, error, 4096))
         {
@@ -940,8 +981,10 @@ namespace albireo
                 {
                     std::unique_ptr<job::chunk> c(new job::chunk());
                     c->url = url;
+                    c->link_path = public_link_model_path(id, url);
                     c->from = 0;
                     c->length = static_cast<uint64_t>(f["compressed_size"].as_int(0));
+                    c->resource = c->length;
                     c->offset = offset;
                     c->gzip = true;
                     c->output = size;
@@ -961,6 +1004,8 @@ namespace albireo
                     {
                         std::unique_ptr<job::chunk> c(new job::chunk());
                         c->url = url;
+                        c->link_path = public_link_model_path(id, url);
+                        c->resource = size;
                         c->from = s;
                         c->length = std::min(segment, size - s);
                         c->offset = offset + s;
@@ -1213,6 +1258,23 @@ namespace albireo
                         for (int t = 0; t < 20 * attempt && !j->cancel && !http_cancelled(); ++t)
                             std::this_thread::sleep_for(std::chrono::milliseconds(100));
                         if (j->cancel) break;
+                        /*
+                            The copy of the public link for the first two attempts, the second with
+                            a new address, when the link holds the resource at its size; the
+                            official address then, or at once: the hashes of the catalog check
+                            the bytes of either.
+                        */
+                        std::string address = c.url, label;
+                        if (attempt < 2 && !c.link_path.empty() && public_link_enabled())
+                        {
+                            std::string direct, e;
+                            uint64_t listed = 0;
+                            if (public_link_file(c.link_path, direct, listed, e, attempt > 0) && listed == c.resource)
+                            {
+                                address = direct;
+                                label = "the copy of " + c.link_path + " in the public link";
+                            }
+                        }
                         if (c.gzip)
                         {
                             // Inflated as it arrives, written at the offsets of the part.
@@ -1223,7 +1285,7 @@ namespace albireo
                             std::vector<char> out(1 << 20);
                             bool bad = false;
                             uint64_t got_in = 0;
-                            ok = http_get_range(c.url, 0, -1, [&](const char* data, size_t n) {
+                            ok = http_get_range(address, 0, -1, [&](const char* data, size_t n) {
                                 if (j->cancel) return false;
                                 zs.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(data));
                                 zs.avail_in = static_cast<uInt>(n);
@@ -1258,7 +1320,7 @@ namespace albireo
                         }
                         else
                         {
-                            ok = http_get_range(c.url, c.from + c.done, static_cast<int64_t>(c.from + c.length - 1),
+                            ok = http_get_range(address, c.from + c.done, static_cast<int64_t>(c.from + c.length - 1),
                                 [&](const char* data, size_t n) {
                                     if (j->cancel) return false;
                                     const uint64_t done = c.done;
@@ -1270,6 +1332,10 @@ namespace albireo
                                 }, error);
                             ok = ok && c.done == c.length;
                         }
+                        if (ok) (label.empty() ? j->from_official : j->from_link) = true;
+                        // The address of a content server of the link stays out of the messages.
+                        const size_t at = label.empty() ? std::string::npos : error.find(address);
+                        if (at != std::string::npos) error.replace(at, address.size(), label);
                         // The downloads ended for the whole service (it stops, or goes
                         // offline) are not attempted again; they resume later.
                         if (!ok && http_cancelled()) break;
@@ -1399,7 +1465,13 @@ namespace albireo
                 */
                 std::string error;
                 size_t placed = 0;
-                while (placed < j->files.size() && place(j->files[placed].partial, j->files[placed].target)) ++placed;
+                // A newer version of an installed model takes its names while the engine holds no file of it.
+                replacing(j->id, [&]() {
+                    placed = 0;
+                    while (placed < j->files.size() && place(j->files[placed].partial, j->files[placed].target))
+                        ++placed;
+                    return placed == j->files.size();
+                });
                 if (placed < j->files.size() || !install_file(j->id, j->files[0].target, j->entry, shas[0], "catalog",
                         with_projector ? j->files[1].target : std::string(), with_projector ? shas[1] : std::string(),
                         error))
@@ -1414,7 +1486,10 @@ namespace albireo
                 db_.remove_download_state(j->id);
                 if (with_projector) drop_pending_copy(shas[1]);
                 set_state("done");
-                log_info("models: " + j->id + " installed" + (with_projector ? ", with its projector" : ""));
+                const std::string origin = j->from_link && j->from_official ? "the public link and the official "
+                    "addresses" : j->from_link ? "the public link" : "the official addresses";
+                log_info("models: " + j->id + " installed" + (with_projector ? ", with its projector" : "") + ", from "
+                    + origin);
                 return;
             }
             if (!any) break;
@@ -1648,10 +1723,16 @@ namespace albireo
         }
     }
 
-    std::string model_manager::free_identifier(const std::string& id)
+    std::string model_manager::free_identifier(const std::string& id, bool update)
     {
         installed_model holder;
-        return db_.find_model(id, holder) && holder.source == "builtin" ? id + "-import" : id;
+        if (!db_.find_model(id, holder) || (update && holder.source == "catalog")) return id;
+        for (int n = 1; n < 100; ++n)
+        {
+            const std::string candidate = id + "-import" + (n > 1 ? "-" + std::to_string(n) : std::string());
+            if (!db_.find_model(candidate, holder)) return candidate;
+        }
+        return id + "-import-" + random_hex(8);
     }
 
     struct model_manager::import_item
@@ -1916,12 +1997,24 @@ namespace albireo
         return result;
     }
 
+    bool model_manager::replacing(const std::string& id, const std::function<bool()>& work)
+    {
+        installed_model m;
+        if (id.empty() || !replace_cb_ || !db_.find_model(id, m)) return work();
+        return replace_cb_(id, work);
+    }
+
     bool model_manager::put_file(link_free_file& source, const std::string& path, const std::string& base,
-        const std::string& sha, bool move, const std::string& target, placement& how, std::string& error)
+        const std::string& sha, bool move, const std::string& target, placement& how, std::string& error,
+        const std::string& id)
     {
         how = placement();
         // A file of the models folder at its own name, recorded again where it lies (a database started anew).
         how.in_place = !source.identity().empty() && file_identity(target) == source.identity();
+        // The renaming that gives the file its name, over the file of an installed model through replacing().
+        auto rename_to_target = [&](const std::string& from) {
+            return replacing(id, [&]() { return place(from, target); });
+        };
         /*
             Moved when asked and when the models folder is on the same volume, as the file
             checked above; copied otherwise from the file opened above, through a new
@@ -1931,7 +2024,7 @@ namespace albireo
         {
             const std::string identity = source.identity();
             source.close();
-            how.moved = file_identity(path) == identity && place(path, target);
+            how.moved = file_identity(path) == identity && rename_to_target(path);
             std::string why;
             if (!how.moved && !source.open(path, base, why))
             {
@@ -1943,7 +2036,7 @@ namespace albireo
         if (how.copied)
         {
             const std::string tmp = join_path(dir_, ".import-" + random_hex(16) + ".partial");
-            if (copy_open_file(source, tmp, sha, &stopped_).empty() || !place(tmp, target))
+            if (copy_open_file(source, tmp, sha, &stopped_).empty() || !rename_to_target(tmp))
             {
                 remove_file(tmp);
                 source.close();
@@ -2077,8 +2170,11 @@ namespace albireo
                         entry[kv.first] = kv.second;
             }
         }
-        // Another file never takes the identifier of a model that comes with Albireo.
-        id = free_identifier(id);
+        /*
+            A file never takes the identifier of another installed model, a model that comes with
+            Albireo included; a newer version from the catalog of a model of the catalog replaces it.
+        */
+        id = free_identifier(id, known);
         entry["id"] = id;
         if (!safe_id(id))
         {
@@ -2093,7 +2189,7 @@ namespace albireo
         }
         const std::string target = join_path(dir_, id + ".gguf");
         placement dh;
-        if (!put_file(*d.file, d.path, d.base, d.sha256, move, target, dh, error)) return false;
+        if (!put_file(*d.file, d.path, d.base, d.sha256, move, target, dh, error, id)) return false;
         // The projector takes the name of the model: from the files, or from the pending projectors.
         std::string projector, projector_sha;
         placement ph;
@@ -2101,7 +2197,7 @@ namespace albireo
         {
             projector = join_path(dir_, id + projector_suffix);
             projector_sha = p->sha256;
-            if (!put_file(*p->file, p->path, p->base, p->sha256, move, projector, ph, error))
+            if (!put_file(*p->file, p->path, p->base, p->sha256, move, projector, ph, error, id))
             {
                 undo_put(d.path, target, dh);
                 return false;
@@ -2144,7 +2240,8 @@ namespace albireo
         }
         const std::string target = join_path(dir_, m.id + projector_suffix);
         placement how;
-        if (!put_file(*p.file, p.path, p.base, p.sha256, move, target, how, error)) return false;
+        // The model lacks a projector: no program holds a file at that name, and the model stays in the engine.
+        if (!put_file(*p.file, p.path, p.base, p.sha256, move, target, how, error, std::string())) return false;
         installed_model updated = m;
         updated.projector = target;
         updated.projector_size = file_size(target);
@@ -2187,7 +2284,7 @@ namespace albireo
         }
         const std::string target = join_path(dir_, ".pending-" + p.sha256.substr(0, 16) + projector_suffix);
         placement how;
-        if (!put_file(*p.file, p.path, p.base, p.sha256, move, target, how, error)) return false;
+        if (!put_file(*p.file, p.path, p.base, p.sha256, move, target, how, error, std::string())) return false;
         pending_projector pp;
         pp.sha256 = p.sha256;
         pp.file = target;
@@ -2442,16 +2539,18 @@ namespace albireo
                 const bool current = catalog_entry(listed, found) && static_cast<const json&>(found)["sha256"]
                     .as_string() == sha;
                 json entry = current ? found : e;
-                const std::string id = free_identifier(listed);
+                // A newer version of a model of the catalog takes its place; another model keeps its own.
+                const std::string id = free_identifier(listed, true);
                 entry["id"] = id;
                 const std::string target = join_path(dir_, id + ".gguf");
                 const std::string projector = join_path(dir_, id + projector_suffix);
                 placement dh, ph;
                 pending_projector pending;
                 const bool with_pending = !with_projector && pending_for(d, pending);
-                bool ok = direct_path(dir_) && put_file(*d.file, d.path, std::string(), sha, false, target, dh, error);
+                bool ok = direct_path(dir_)
+                    && put_file(*d.file, d.path, std::string(), sha, false, target, dh, error, id);
                 if (ok && with_projector
-                    && !put_file(*p.file, p.path, std::string(), projector_sha, false, projector, ph, error))
+                    && !put_file(*p.file, p.path, std::string(), projector_sha, false, projector, ph, error, id))
                 {
                     undo_put(d.path, target, dh);
                     ok = false;

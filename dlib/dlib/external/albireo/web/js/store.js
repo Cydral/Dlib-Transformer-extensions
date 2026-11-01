@@ -23,8 +23,15 @@ function request(r) {
 // The opening in progress, which the calls made meanwhile share.
 let opening = null;
 
+/*
+    The error of an opening that a tab of an earlier version blocked.  The browser queues every later opening behind
+    the blocked one, so that the calls of this visit fail at once with this error instead of waiting.
+*/
+let blocked = null;
+
 export function open() {
   if (db) return Promise.resolve(db);
+  if (blocked) return Promise.reject(blocked);
   if (!opening) {
     opening = connect().then((d) => {
       /*
@@ -67,7 +74,24 @@ async function connect() {
       i.createIndex('owner', 'owner');
     }
   };
-  return request(r);
+  /*
+      A tab of an earlier version that keeps the database open blocks its upgrade: the opening then fails with a
+      BlockedError, and so do the next calls of this visit (open).  The connection the browser opens once that tab
+      closed, with the database upgraded, is closed at once: the next visit reads the database.
+  */
+  return new Promise((resolve, reject) => {
+    r.onsuccess = () => {
+      if (blocked) r.result.close();
+      else resolve(r.result);
+    };
+    r.onerror = () => reject(r.error);
+    r.onblocked = () => {
+      const e = new Error('another tab keeps the database open in an earlier version');
+      e.name = 'BlockedError';
+      blocked = e;
+      reject(e);
+    };
+  });
 }
 
 function store(name, mode) {
@@ -124,11 +148,18 @@ export async function updateConversations(fn, id) {
   await completed(tx);
 }
 
+/*
+    Deletes a discussion: its record first, in a transaction of its own, then its passages and its images.  The
+    passages and the images that a tab closed meanwhile leaves are pruned at the next start (app.js, pruneIndex and
+    pruneImages).
+*/
 export async function deleteConversation(id) {
   await open();
+  const tx = db.transaction('conversations', 'readwrite');
+  tx.objectStore('conversations').delete(id);
+  await completed(tx);
   await deleteChunks('owner', id);
   await deleteImages(id);
-  return request(store('conversations', 'readwrite').delete(id));
 }
 
 export async function allProjects() {
@@ -169,23 +200,60 @@ export async function deleteProject(id) {
   await deleteImages(id);
 }
 
-// The passages of the document search.
-export async function putChunks(records) {
+/*
+    Replaces the passages of the document docId with records, in one transaction: a tab closed meanwhile leaves
+    either the former passages or the new ones.
+*/
+export async function replaceChunks(docId, records) {
   await open();
-  if (!records.length) return;
   const tx = db.transaction('chunks', 'readwrite');
   const s = tx.objectStore('chunks');
-  for (const r of records) s.put(r);
-  await new Promise((resolve, reject) => {
-    tx.oncomplete = resolve;
-    tx.onerror = () => reject(tx.error);
-    tx.onabort = () => reject(tx.error);
-  });
+  const cursor = s.index('doc').openKeyCursor(IDBKeyRange.only(docId));
+  cursor.onsuccess = () => {
+    const c = cursor.result;
+    if (c) {
+      s.delete(c.primaryKey);
+      c.continue();
+      return;
+    }
+    // The former passages deleted, the new ones are written by the same transaction.
+    for (const r of records) s.put(r);
+  };
+  await completed(tx);
 }
 
 export async function chunksOf(owner) {
   await open();
   return request(store('chunks', 'readonly').index('owner').getAll(owner));
+}
+
+// The passages of one document.
+export async function chunksOfDocument(docId) {
+  await open();
+  return request(store('chunks', 'readonly').index('doc').getAll(docId));
+}
+
+/*
+    The state of the documents of an owner, read passage by passage without keeping the passages: Map doc ->
+    {passages, vectors, model}, vectors counting the passages that hold a vector of model.
+*/
+export async function chunkStatus(owner, model) {
+  await open();
+  const tx = db.transaction('chunks', 'readonly');
+  const out = new Map();
+  const r = tx.objectStore('chunks').index('owner').openCursor(IDBKeyRange.only(owner));
+  r.onsuccess = () => {
+    const c = r.result;
+    if (!c) return;
+    const v = c.value;
+    const s = out.get(v.doc) || { passages: 0, vectors: 0, model: v.model };
+    s.passages += 1;
+    if (v.vector && model && v.model === model) s.vectors += 1;
+    out.set(v.doc, s);
+    c.continue();
+  };
+  await completed(tx);
+  return out;
 }
 
 // The documents that have passages: one {owner, doc} per document, read from one passage of each.
@@ -208,18 +276,15 @@ export async function chunkDocuments() {
 export async function deleteChunks(index, key) {
   await open();
   const tx = db.transaction('chunks', 'readwrite');
-  const range = IDBKeyRange.only(key);
-  await new Promise((resolve, reject) => {
-    const cursor = tx.objectStore('chunks').index(index).openKeyCursor(range);
-    cursor.onsuccess = () => {
-      const c = cursor.result;
-      if (!c) return;
-      tx.objectStore('chunks').delete(c.primaryKey);
-      c.continue();
-    };
-    tx.oncomplete = resolve;
-    tx.onerror = () => reject(tx.error);
-  });
+  const s = tx.objectStore('chunks');
+  const cursor = s.index(index).openKeyCursor(IDBKeyRange.only(key));
+  cursor.onsuccess = () => {
+    const c = cursor.result;
+    if (!c) return;
+    s.delete(c.primaryKey);
+    c.continue();
+  };
+  await completed(tx);
 }
 
 // The images.
@@ -361,39 +426,114 @@ export async function releaseLease(key, owner) {
   await completed(tx);
 }
 
-// Everything stored, the images as data URLs.
+/*
+    Everything stored, as a JSON file in a Blob built record by record, the images as data URLs, so that no single
+    string holds the whole export.
+*/
 export async function exportAll() {
   await open();
+  const parts = ['{"format":"albireo-export","version":1,"exported":' + Date.now() + ',"conversations":['];
+  (await allConversations()).forEach((c, i) => parts.push((i ? ',' : '') + JSON.stringify(c)));
+  parts.push('],"projects":[');
+  (await allProjects()).forEach((p, i) => parts.push((i ? ',' : '') + JSON.stringify(p)));
+  parts.push('],"settings":' + JSON.stringify(await getSettings()) + ',"images":[');
   const records = await request(store('images', 'readonly').getAll());
-  const pictures = [];
+  let first = true;
   for (const r of records) {
     if (!(r.blob instanceof Blob)) continue;
     const { blob, thumb, ...rest } = r;
-    pictures.push(Object.assign(rest, {
+    const picture = Object.assign(rest, {
       data: await dataUrlOf(blob), thumbnail: thumb instanceof Blob ? await dataUrlOf(thumb) : null
-    }));
+    });
+    parts.push((first ? '' : ',') + JSON.stringify(picture));
+    first = false;
   }
-  return {
-    format: 'albireo-export', version: 1, exported: Date.now(),
-    conversations: await allConversations(), projects: await allProjects(), settings: await getSettings(),
-    images: pictures
-  };
+  parts.push(']}');
+  return new Blob(parts, { type: 'application/json' });
 }
 
+// The identifiers the application gives its records, which its addresses (#/c/..., #/p/...) take.
+const recordId = /^[0-9a-f]{1,64}$/;
+
+// The objects of a list, none for another value.
+function objects(list) {
+  return Array.isArray(list) ? list.filter((x) => x !== null && typeof x === 'object' && !Array.isArray(x)) : [];
+}
+
+function text(value) {
+  return typeof value === 'string' ? value : '';
+}
+
+/*
+    A discussion of an export as the application reads it: null without a valid identifier or messages; the
+    messages other than questions and answers are left out, and the lists and the texts the pages read take their
+    types.
+*/
+function cleanConversation(c) {
+  if (!c || typeof c !== 'object' || typeof c.id !== 'string' || !recordId.test(c.id) || !Array.isArray(c.messages)) {
+    return null;
+  }
+  const messages = [];
+  for (const m of objects(c.messages)) {
+    if (m.role === 'user') {
+      messages.push(Object.assign({}, m, {
+        content: text(m.content),
+        attachments: objects(m.attachments).filter((a) => typeof a.id === 'string' && typeof a.name === 'string')
+          .map((a) => Object.assign({}, a, { text: text(a.text) })),
+        images: objects(m.images).filter((x) => typeof x.id === 'string' && typeof x.name === 'string')
+      }));
+    } else if (m.role === 'assistant') {
+      messages.push(Object.assign({}, m, {
+        steps: objects(m.steps).map((s) => Object.assign({}, s, {
+          content: text(s.content), reasoning: text(s.reasoning), toolCalls: objects(s.toolCalls)
+        }))
+      }));
+    }
+  }
+  const now = Date.now();
+  const index = (v) => Math.min(Math.max(0, Number.isInteger(v) ? v : 0), messages.length);
+  return Object.assign({}, c, {
+    title: text(c.title), projectId: typeof c.projectId === 'string' ? c.projectId : null, messages,
+    created: Number.isFinite(c.created) ? c.created : now, updated: Number.isFinite(c.updated) ? c.updated : now,
+    contextStart: index(c.contextStart), memoryMark: index(c.memoryMark),
+    summary: c.summary && typeof c.summary.text === 'string' ? c.summary : null, incognito: false
+  });
+}
+
+// A project of an export as the application reads it, null without a valid identifier or name.
+function cleanProject(p) {
+  if (!p || typeof p !== 'object' || typeof p.id !== 'string' || !recordId.test(p.id) || typeof p.name !== 'string') {
+    return null;
+  }
+  return Object.assign({}, p, {
+    description: text(p.description), instructions: text(p.instructions),
+    color: typeof p.color === 'string' ? p.color : '#5b8cff',
+    files: objects(p.files).filter((f) => typeof f.id === 'string' && typeof f.name === 'string')
+      .map((f) => Object.assign({}, f, { text: text(f.text) })),
+    images: objects(p.images).filter((x) => typeof x.id === 'string' && typeof x.name === 'string')
+  });
+}
+
+/*
+    Imports an export: {conversations, projects, images, ids}, the counts of the records kept and the identifiers
+    of the discussions imported.  The records the pages could not read are left out.
+*/
 export async function importAll(data) {
   if (!data || data.format !== 'albireo-export' || !Array.isArray(data.conversations)) throw new Error('format');
   let n = 0, p = 0;
-  for (const c of data.conversations) {
-    if (c && typeof c.id === 'string' && Array.isArray(c.messages)) {
-      await putConversation(c);
-      ++n;
-    }
+  const ids = [];
+  for (const raw of data.conversations) {
+    const c = cleanConversation(raw);
+    if (!c) continue;
+    await putConversation(c);
+    ids.push(c.id);
+    ++n;
   }
-  for (const pr of data.projects || []) {
-    if (pr && typeof pr.id === 'string' && typeof pr.name === 'string') {
-      await putProject(pr);
-      ++p;
-    }
+  for (const raw of Array.isArray(data.projects) ? data.projects : []) {
+    const pr = cleanProject(raw);
+    if (!pr) continue;
+    await putProject(pr);
+    ++p;
   }
   // The images, each with the owner it belongs to; an export without images (an earlier version) has none.
   const pictures = [];
@@ -407,13 +547,14 @@ export async function importAll(data) {
     pictures.push(record);
   }
   await putImages(pictures);
-  return { conversations: n, projects: p, images: pictures.length };
+  return { conversations: n, projects: p, images: pictures.length, ids };
 }
 
+// Deletes every discussion, project, passage and image, in one transaction; the settings stay.
 export async function clearAll() {
   await open();
-  await request(store('conversations', 'readwrite').clear());
-  await request(store('projects', 'readwrite').clear());
-  await request(store('chunks', 'readwrite').clear());
-  await request(store('images', 'readwrite').clear());
+  const names = ['conversations', 'projects', 'chunks', 'images'];
+  const tx = db.transaction(names, 'readwrite');
+  for (const name of names) tx.objectStore(name).clear();
+  await completed(tx);
 }

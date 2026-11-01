@@ -159,13 +159,16 @@
 // thread may then evict a batch in the middle of being filled, and each side finds the
 // flags exactly as the other left them.
 //
-// idle_release_ms is the single exception, and it is allowed because the condition that
-// triggers it is the condition that makes it safe. Nothing has been accessed for the
-// configured interval, so no kernel is in flight and the hot window has not moved; the
-// blocks a stalled thread could still hold a pointer to are exactly the ones the window
-// covers, and those are kept. What the sweep can reclaim is bounded by the window, and it
-// finishes by trimming the pool, since a buffer sitting in the pool is still charged to the
-// process as far as anything outside it can tell.
+// idle_release_ms is the single exception. Nothing has been accessed for the configured
+// interval, so no kernel is in flight and the hot window has not moved; the blocks a
+// stalled thread could still hold a pointer to are exactly the ones the window covers, and
+// those are kept. What the sweep can reclaim is bounded by the window, and it finishes by
+// trimming the pool, since a buffer sitting in the pool is still charged to the process as
+// far as anything outside it can tell. The sweep stops at the first access traced after it
+// started, but an access traced between that check and the eviction of the block it names
+// takes the device pointer of a block the sweep is releasing, since the fast path takes no
+// lock. Until the sweep runs on a compute thread, a program whose computation can resume at
+// any time leaves idle_release_ms at zero.
 //
 // The subsystem manages one device, the one current when it was enabled. Blocks allocated
 // on any other device are left alone and behave as they do in stock dlib.
@@ -309,7 +312,7 @@ namespace dlib
     /*
         A location for the store that does not have to be written into the program: the
         DLIB_XMEM_STORE environment variable when it is set, and the platform's temporary
-        directory otherwise. Available whether or not this build uses CUDA.
+        directory otherwise, in UTF-8. Available whether or not this build uses CUDA.
     */
     std::string default_extended_memory_store_path ();
 

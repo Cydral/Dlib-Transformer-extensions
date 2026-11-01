@@ -8,7 +8,9 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <list>
+#include <new>
 #include <stdexcept>
 
 #include "../common/engine_api.h"
@@ -136,8 +138,9 @@ namespace albireo
             The images of a request, in the order of their parts: the content of a message
             holds, at the place of each image, a mark made of two private-use characters around
             the index of the image, which the prompt builder turns into the tokens of the image.
-            The text of the messages loses these two characters beforehand, so that no text can
-            pose as an image.
+            Every string of the request that a chat format can render (contents, reasoning,
+            names, identifiers and arguments of the tool calls, tool definitions) loses these
+            two characters beforehand, so that no text can pose as an image.
         */
         struct image_part
         {
@@ -164,6 +167,27 @@ namespace albireo
                 out += text[i];
             }
             return out;
+        }
+
+        // The strings of a JSON value, the keys of its objects included, without the marks of images.
+        void strip_marks(json& v)
+        {
+            if (v.is_string())
+            {
+                if (v.as_string().find("\xEE\x80") != std::string::npos) v = json(without_marks(v.as_string()));
+            }
+            else if (v.is_array())
+            {
+                for (auto& e : v.elements()) strip_marks(e);
+            }
+            else if (v.is_object())
+            {
+                for (auto& kv : v.items())
+                {
+                    kv.first = without_marks(kv.first);
+                    strip_marks(kv.second);
+                }
+            }
         }
 
         /*
@@ -204,6 +228,8 @@ namespace albireo
         std::vector<chat_message> parse_messages(const json& list, std::vector<image_part>* images = nullptr)
         {
             if (!list.is_array() || list.empty()) throw std::invalid_argument("messages must be a non-empty array");
+            // The strings a format renders as text, without the marks of images for a model that reads them.
+            auto text = [&](const std::string& s) { return images ? without_marks(s) : s; };
             std::vector<chat_message> out;
             for (const auto& m : list.elements())
             {
@@ -213,19 +239,19 @@ namespace albireo
                 if (c.role != "system" && c.role != "user" && c.role != "assistant" && c.role != "tool")
                     throw std::invalid_argument("unknown message role '" + c.role + "'");
                 c.content = content_text(m["content"], images);
-                c.reasoning = m.contains("reasoning_content") ? m["reasoning_content"].as_string()
-                    : m["reasoning"].as_string();
-                c.tool_call_id = m["tool_call_id"].as_string();
-                c.name = m["name"].as_string();
+                c.reasoning = text(m.contains("reasoning_content") ? m["reasoning_content"].as_string()
+                    : m["reasoning"].as_string());
+                c.tool_call_id = text(m["tool_call_id"].as_string());
+                c.name = text(m["name"].as_string());
                 for (const auto& t : m["tool_calls"].elements())
                 {
                     tool_call_data d;
-                    d.id = t["id"].as_string();
+                    d.id = text(t["id"].as_string());
                     const json& f = t["function"];
-                    d.name = f["name"].as_string();
+                    d.name = text(f["name"].as_string());
                     // An object is written as the templates write it, with a space after each separator.
-                    d.arguments = f["arguments"].is_string() ? f["arguments"].as_string()
-                        : f["arguments"].is_null() ? std::string("{}") : f["arguments"].dump_formatted();
+                    d.arguments = text(f["arguments"].is_string() ? f["arguments"].as_string()
+                        : f["arguments"].is_null() ? std::string("{}") : f["arguments"].dump_formatted());
                     c.tool_calls.push_back(d);
                 }
                 out.push_back(c);
@@ -281,6 +307,8 @@ namespace albireo
         // to the system since (engine::trim_idle).
         clock_type::time_point last_step;
         bool trimmed = true;
+        // The steps run so far, which give the prompt being read that takes the budget of a pass first.
+        size_t prefill_turn = 0;
         forward_batch batch;
         std::vector<float> logits;
         uint64_t parameters = 0;
@@ -292,6 +320,9 @@ namespace albireo
         int vision_start = -1, image_pad = -1, vision_end = -1;
         std::list<image_encoding> encodings;            // most recently used first
         size_t encoding_bytes = 0;
+        // The decoded pixels the images of the active and waiting requests hold, freed as each
+        // image is encoded or its request ends; submit refuses a request that would exceed the budget.
+        std::atomic<size_t> queued_pixels{0};
         std::unique_ptr<vision_encoder::job> vision_job;
         uint64_t vision_owner = 0;                      // the request whose image is being encoded
         size_t vision_image = 0;
@@ -341,6 +372,8 @@ namespace albireo
         std::unique_ptr<sampler> smp;
         std::unique_ptr<output_parser> parser;
         long max_tokens = 0;
+        // Work in the background (titles, memory, summaries): its answers never slow the prompts of the users.
+        bool background = false;
         std::vector<std::string> stops;
         std::string pending_bytes;
         std::string held;
@@ -369,6 +402,77 @@ namespace albireo
         const size_t max_request_images = 16;
         // The memory the encodings of the images a model keeps for the following requests may take.
         const size_t encoding_budget = size_t(256) << 20;
+        // The tokens of prompts a pass reads at most while answers are being written, in any model.
+        const long prefill_while_answering = 64;
+        // The decoded image pixels the requests of one model may hold at once, waiting to be encoded.
+        const size_t queued_pixels_budget = size_t(1) << 30;
+
+        // Frees the decoded pixels of an image and takes them off the budget of its model.
+        void drop_pixels(loaded_model& m, request_image& im)
+        {
+            const size_t bytes = im.pixels.pixels.size();
+            if (bytes == 0) return;
+            m.queued_pixels.fetch_sub(bytes, std::memory_order_relaxed);
+            im.pixels.clear();
+        }
+
+        // Frees the pixels an ending request still holds, so that its budget returns to the model.
+        void drop_request_pixels(loaded_model& m, request_state& r)
+        {
+            for (request_image& im : r.images) drop_pixels(m, im);
+        }
+
+        uint64_t mix64(uint64_t z)
+        {
+            z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+            z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+            return z ^ (z >> 31);
+        }
+
+        /*
+            The key of token j of an image in the cache of the prompts, a negative value apart
+            from the identifiers of the vocabulary.  The first nine tokens of an image carry the
+            256 bits of the digest of its pixels, 31 at a time, so that two images whose keys
+            agree on them hold the same pixels; the following tokens carry a hash of the whole
+            digest and of their index.
+        */
+        int image_key(const std::array<uint8_t, 32>& d, long j)
+        {
+            uint32_t x = 0;
+            if (j < 9)
+            {
+                const long end = std::min<long>(31 * j + 31, 256);
+                for (long bit = 31 * j; bit < end; ++bit)
+                    x = (x << 1) | ((d[static_cast<size_t>(bit / 8)] >> (7 - bit % 8)) & 1u);
+            }
+            else
+            {
+                uint64_t h = static_cast<uint64_t>(j) * 0x9e3779b97f4a7c15ull;
+                for (size_t w = 0; w < 4; ++w)
+                {
+                    uint64_t v = 0;
+                    for (size_t b = 0; b < 8; ++b) v = (v << 8) | d[8 * w + b];
+                    h = mix64(h ^ v);
+                }
+                x = static_cast<uint32_t>(h >> 33);
+            }
+            return -1 - static_cast<int>(x & 0x7fffffffu);
+        }
+
+        // The code and the message that end a request whose image could not be encoded.
+        void encoding_error(const std::exception& e, std::string& code, std::string& message)
+        {
+            if (dynamic_cast<const std::bad_alloc*>(&e))
+            {
+                code = "out_of_memory";
+                message = "the system has no memory left to encode an image of this request";
+            }
+            else
+            {
+                code = "internal";
+                message = std::string("the encoding of an image of this request failed: ") + e.what();
+            }
+        }
 
         /*
             Reads the images of parts for the encoder of m: their bytes, their size, how the
@@ -441,11 +545,30 @@ namespace albireo
         }
 
         /*
+            The chat templates of the Mistral models sort the two parts of a message of one text
+            and one image by their type, which puts the image first; the other messages keep the
+            order of their parts.
+        */
+        void mistral_images(std::vector<chat_message>& messages)
+        {
+            for (auto& msg : messages)
+            {
+                const size_t open = msg.content.find(mark_open);
+                if (open == std::string::npos || open == 0) continue;
+                const size_t close = msg.content.find(mark_close, open + 3);
+                if (close == std::string::npos || close + 3 != msg.content.size()) continue;
+                if (msg.content.find(mark_open, close + 3) != std::string::npos) continue;
+                msg.content = msg.content.substr(open) + msg.content.substr(0, open);
+            }
+        }
+
+        /*
             The tokens of a rendered prompt.  A mark of image in the text of a message becomes
-            the markup <|vision_start|><|image_pad|><|vision_end|> (Qwen3-VL) or <image>
-            (LLaVA-NeXT), so that the text around it is encoded apart, as the reference
-            tokenizer splits on these tokens; the image token is then repeated for each token
-            of the image, and images[i].start receives the index of its first token.
+            the markup <|vision_start|><|image_pad|><|vision_end|> (Qwen3-VL), <image>
+            (LLaVA-NeXT) or [IMG][IMG_END] (Pixtral), so that the text around it is encoded
+            apart, as the reference tokenizer splits on these tokens; the image token is then
+            repeated for each token of the image, and images[i].start receives the index of its
+            first token.
         */
         std::vector<int> prompt_tokens(const loaded_model& m, const std::vector<prompt_piece>& pieces,
             std::vector<request_image>& images)
@@ -453,6 +576,8 @@ namespace albireo
             if (images.empty()) return chat_format::tokenize(m.tok, pieces);
             std::vector<prompt_piece> parts;
             std::vector<size_t> order;
+            // Each image takes one place: a second mark of an image is refused.
+            std::vector<bool> placed(images.size(), false);
             for (const auto& p : pieces)
             {
                 if (p.markup || p.text.find(mark_open) == std::string::npos)
@@ -475,15 +600,21 @@ namespace albireo
                     text.text = p.text.substr(at, open - at);
                     if (!text.text.empty()) parts.push_back(text);
                     const std::string index = p.text.substr(open + 3, close - open - 3);
-                    if (index.empty() || index.size() > 3 || index.find_first_not_of("0123456789") != std::string::npos
-                        || std::stoul(index) >= images.size())
-                        throw std::runtime_error("a mark of image names no image of the request");
+                    if (index.empty() || index.size() > 3 || index.find_first_not_of("0123456789") != std::string::npos)
+                        throw std::invalid_argument("a mark of image names no image of the request");
+                    const size_t i = std::stoul(index);
+                    if (i >= images.size() || placed[i])
+                        throw std::invalid_argument("a mark of image names no image of the request, or one already "
+                            "placed");
+                    placed[i] = true;
                     prompt_piece mark;
-                    mark.text = m.vision->kind() == vision_encoder::family::llava_next ? "<image>"
+                    const vision_encoder::family kind = m.vision->kind();
+                    mark.text = kind == vision_encoder::family::llava_next ? "<image>"
+                        : kind == vision_encoder::family::pixtral ? "[IMG][IMG_END]"
                         : "<|vision_start|><|image_pad|><|vision_end|>";
                     mark.markup = true;
                     parts.push_back(mark);
-                    order.push_back(std::stoul(index));
+                    order.push_back(i);
                     at = close + 3;
                 }
             }
@@ -500,12 +631,12 @@ namespace albireo
                     out.push_back(id);
                     continue;
                 }
-                if (k >= order.size()) throw std::runtime_error("the prompt holds more image tokens than images");
+                if (k >= order.size()) throw std::invalid_argument("the prompt holds more image tokens than images");
                 request_image& im = images[order[k++]];
                 im.start = static_cast<long>(out.size());
                 out.insert(out.end(), static_cast<size_t>(im.tokens), m.image_pad);
             }
-            if (k != order.size()) throw std::runtime_error("an image of the prompt lost its tokens");
+            if (k != order.size()) throw std::invalid_argument("an image of the prompt lost its tokens");
             return out;
         }
 
@@ -519,18 +650,18 @@ namespace albireo
         void finish_prompt(const loaded_model& m, request_state& r)
         {
             r.keys = r.prompt;
+            const long n = static_cast<long>(r.prompt.size());
             for (const request_image& im : r.images)
             {
-                uint32_t h = 0;
-                for (int b = 0; b < 4; ++b) h = (h << 8) | im.digest[static_cast<size_t>(b)];
-                h ^= static_cast<uint32_t>(im.tokens) * 0x9e3779b9u;
+                // The tokens of each image lie in the prompt, and the grid of its positions within them.
+                if (im.start < 0 || im.tokens <= 0 || im.tokens > n - im.start || im.grid_w < 0 || im.grid_h < 0
+                    || im.grid_w * im.grid_h > im.tokens)
+                    throw std::invalid_argument("an image of the request lies outside its prompt");
                 for (long j = 0; j < im.tokens; ++j)
-                    r.keys[static_cast<size_t>(im.start + j)] =
-                        -1 - static_cast<int>((h + static_cast<uint32_t>(j) * 2654435761u) & 0x7fffffffu);
+                    r.keys[static_cast<size_t>(im.start + j)] = image_key(im.digest, j);
             }
             r.positions.clear();
             if (!m.cfg.multimodal_rope()) return;
-            const long n = static_cast<long>(r.prompt.size());
             r.positions.assign(static_cast<size_t>(3 * n), 0);
             std::vector<const request_image*> by_start;
             for (const request_image& im : r.images) by_start.push_back(&im);
@@ -769,9 +900,11 @@ namespace albireo
         {
             m->vision.reset(new vision_encoder(m->projector, *pool_));
             // Qwen3-VL places the tokens of an image by multimodal rotary positions, a LLaVA-NeXT
-            // decoder by their order.
-            const bool llava = m->vision->kind() == vision_encoder::family::llava_next;
-            if (llava == m->cfg.multimodal_rope())
+            // or a Pixtral decoder by their order.
+            const vision_encoder::family kind = m->vision->kind();
+            const bool llava = kind == vision_encoder::family::llava_next;
+            const bool pixtral = kind == vision_encoder::family::pixtral;
+            if ((kind == vision_encoder::family::qwen3vl) != m->cfg.multimodal_rope())
                 throw std::invalid_argument(m->cfg.multimodal_rope() || m->cfg.n_deepstack > 0
                     ? "the projector is not the image encoder of this model"
                     : "this model reads text only and takes no projector");
@@ -784,6 +917,14 @@ namespace albireo
                 m->image_pad = m->tok.token_id("<image>");
                 if (m->image_pad < 0)
                     throw std::invalid_argument("the vocabulary of the model lacks the token <image>");
+            }
+            else if (pixtral)
+            {
+                // [IMG] stands for each token of the image, [IMG_END] follows them.
+                m->image_pad = m->tok.token_id("[IMG]");
+                m->vision_end = m->tok.token_id("[IMG_END]");
+                if (m->image_pad < 0 || m->vision_end < 0)
+                    throw std::invalid_argument("the vocabulary of the model lacks the tokens [IMG] and [IMG_END]");
             }
             else
             {
@@ -1002,6 +1143,7 @@ namespace albireo
         {
             if (!m->format->supports_tools()) throw std::invalid_argument("this model does not support tools");
             opt.tools = req["tools"];
+            if (m->vision) strip_marks(opt.tools);
         }
 
         if (req.contains("messages"))
@@ -1009,6 +1151,7 @@ namespace albireo
             std::vector<image_part> parts;
             std::vector<chat_message> messages = parse_messages(req["messages"], m->vision ? &parts : nullptr);
             if (!parts.empty() && m->vision->kind() == vision_encoder::family::llava_next) images_first(messages);
+            if (!parts.empty() && m->vision->kind() == vision_encoder::family::pixtral) mistral_images(messages);
             std::vector<prompt_piece> pieces;
             m->format->render(messages, opt, pieces);
             if (!parts.empty()) prepare_images(*m, parts, true, r->images);
@@ -1084,6 +1227,7 @@ namespace albireo
         // Compared before any narrowing: long has 32 bits on Windows.
         const long long asked = req["max_completion_tokens"].as_int(req["max_tokens"].as_int(0));
         r->max_tokens = asked <= 0 || asked > room ? room : static_cast<long>(asked);
+        r->background = req["priority"].as_string() == "background";
 
         if (req["stop"].is_string() && !req["stop"].as_string().empty()) r->stops.push_back(req["stop"].as_string());
         for (const auto& s : req["stop"].elements())
@@ -1093,11 +1237,24 @@ namespace albireo
         for (const auto& s : r->stops)
             if (s.size() > 1024) throw std::invalid_argument("a stop sequence holds 1024 bytes at most");
 
+        // The decoded pixels this request holds, counted against the budget of its model below.
+        size_t pixels = 0;
+        for (const request_image& im : r->images) pixels += im.pixels.pixels.size();
+
         std::lock_guard<std::mutex> lock(mutex_);
         if (stop_) throw std::runtime_error("the engine is stopping");
         // The model may have been unloaded while the prompt was prepared: its queue is no
         // longer read.
         if (m->unloading) throw std::invalid_argument("the model '" + model_id + "' is not loaded");
+        /*
+            The images of the queued requests hold their pixels until they are encoded.  A
+            request that would carry the model beyond its budget is refused, so that a burst
+            of large images cannot exhaust the memory of the host.
+        */
+        if (pixels > 0 && m->queued_pixels.load(std::memory_order_relaxed) + pixels > queued_pixels_budget)
+            throw engine_busy("the images already queued for the model '" + model_id
+                + "' hold the memory kept for them; submit this request again shortly");
+        m->queued_pixels.fetch_add(pixels, std::memory_order_relaxed);
         r->id = next_id_++;
         requests_[r->id] = r;
         m->waiting.push_back(r);
@@ -1247,6 +1404,23 @@ namespace albireo
         jobs_.erase(job.id);
     }
 
+    void engine::cancel_job(embedding_job& job)
+    {
+        // The parts of the request that remain see the cancellation and stop without an event.
+        job.cancelled = true;
+        if (job.ended) return;
+        job.ended = true;
+        json done = json::object();
+        done["finish_reason"] = "cancelled";
+        json usage = json::object();
+        usage["prompt_tokens"] = job.tokens;
+        usage["total_tokens"] = job.tokens;
+        done["usage"] = usage;
+        if (job.sink) job.sink(ALBIREO_EVENT_DONE, done.dump());
+        std::lock_guard<std::mutex> lock(mutex_);
+        jobs_.erase(job.id);
+    }
+
     void engine::cancel(uint64_t id)
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -1298,6 +1472,15 @@ namespace albireo
                 trim_idle(models);
                 continue;
             }
+            /*
+                Whether an answer to a user is being written in any model: the passes then read
+                few tokens of prompts.  The answers of the work in the background leave the
+                prompts their whole budget.
+            */
+            bool decoding = false;
+            for (const auto& m : models)
+                for (const auto& r : m->active)
+                    if (r->ph == request_state::phase::decode && !r->background) decoding = true;
             // The device keeps the copies of the models with requests, and may give the
             // room of the others to them (tensor_backend.h).
             for (size_t i = 0; i < models.size(); ++i) models[i]->runtime->set_busy(busy[i]);
@@ -1331,7 +1514,7 @@ namespace albireo
                 try
                 {
                     const bool short_pass = m->cfg.is_embedding() && answering;
-                    step(m, short_pass ? std::min<long>(m->batch_tokens, 16) : m->batch_tokens);
+                    step(m, short_pass ? std::min<long>(m->batch_tokens, 16) : m->batch_tokens, decoding);
                     // An embedding model keeps nothing between its requests: once idle, the
                     // memory of the inputs it read goes back to the system.
                     if (m->cfg.is_embedding() && m->active.empty())
@@ -1370,6 +1553,8 @@ namespace albireo
                     abandon(*m, "internal", "unknown error");
                 }
             }
+            // The models without requests for a while give back their free blocks, whatever the others compute.
+            trim_idle(models);
         }
     }
 
@@ -1627,29 +1812,62 @@ namespace albireo
             m.vision->release_work();
             return;
         }
-        // A short slice while answers are being written, so that their tokens keep coming.
-        if (!m.vision->advance(*m.vision_job, answering ? 0.1 : 0.5)) return;
-        const std::shared_ptr<std::vector<float>> out = std::make_shared<std::vector<float>>();
-        out->swap(m.vision_job->output());
-        const std::shared_ptr<const std::vector<float>> features = out;
         const request_image& image = owner->images[m.vision_image];
         const std::array<uint8_t, 32> digest = image.digest;
-        log(ALBIREO_LOG_DEBUG, "model '" + m.id + "': image of " + std::to_string(image.grid_w) + "x"
-            + std::to_string(image.grid_h) + " tokens encoded in "
-            + std::to_string(static_cast<long>(1000 * m.vision_job->seconds())) + " ms");
-        keep_encoding(m, digest, features);
-        for (const auto& rp : m.active)
-            for (request_image& im : rp->images)
-                if (!im.features && im.digest == digest)
-                {
-                    im.features = features;
-                    im.pixels.clear();
-                }
+        try
+        {
+            // A short slice while answers are being written, so that their tokens keep coming.
+            if (!m.vision->advance(*m.vision_job, answering ? 0.1 : 0.5)) return;
+            const std::shared_ptr<std::vector<float>> out = std::make_shared<std::vector<float>>();
+            out->swap(m.vision_job->output());
+            const std::shared_ptr<const std::vector<float>> features = out;
+            log(ALBIREO_LOG_DEBUG, "model '" + m.id + "': image of " + std::to_string(image.grid_w) + "x"
+                + std::to_string(image.grid_h) + " tokens encoded in "
+                + std::to_string(static_cast<long>(1000 * m.vision_job->seconds())) + " ms");
+            keep_encoding(m, digest, features);
+            for (const auto& rp : m.active)
+                for (request_image& im : rp->images)
+                    if (!im.features && im.digest == digest)
+                    {
+                        im.features = features;
+                        drop_pixels(m, im);
+                    }
+        }
+        catch (const std::exception& e)
+        {
+            /*
+                The requests that wait for this image end with the error of its encoding, before
+                this pass is built; the other requests of the model go on.
+            */
+            std::string code, message;
+            encoding_error(e, code, message);
+            m.vision_job.reset();
+            m.vision->release_work();
+            try
+            {
+                log(ALBIREO_LOG_WARNING, "model '" + m.id + "': " + message);
+            }
+            catch (...)
+            {
+            }
+            for (const auto& rp : m.active)
+            {
+                if (rp->ph == request_state::phase::done) continue;
+                for (const request_image& im : rp->images)
+                    if (!im.features && im.digest == digest)
+                    {
+                        fail(*rp, code, message);
+                        break;
+                    }
+            }
+            if (code == "out_of_memory") trim_after_failure(m);
+            return;
+        }
         m.vision_job.reset();
         m.vision->release_work();
     }
 
-    bool engine::step(const std::shared_ptr<loaded_model>& mp, long budget_tokens)
+    bool engine::step(const std::shared_ptr<loaded_model>& mp, long budget_tokens, bool answering)
     {
         loaded_model& m = *mp;
         for (auto& r : m.active)
@@ -1703,12 +1921,15 @@ namespace albireo
             --budget;
         }
         requeue_preempted(m);
-        for (auto& rp : m.active)
-        {
-            request_state& r = *rp;
-            if (r.ph != request_state::phase::prefill || budget <= 0) continue;
+        // While answers to users are being written, in this model or another, a pass reads few tokens of prompts.
+        bool users = answering;
+        for (const row& w : rows) users = users || !w.r->background;
+        if (users) budget = std::min(budget, prefill_while_answering);
+
+        // The tokens of the prompt of r the pass can read, up to most: none while it waits for an image.
+        auto slice = [&](request_state& r, long most) -> long {
             const long done = static_cast<long>(r.kv_tokens.size());
-            long n = std::min<long>(static_cast<long>(r.prompt.size()) - done, budget);
+            long n = std::min<long>(static_cast<long>(r.prompt.size()) - done, most);
             // The slice stops before the first image it reads that is not encoded yet.
             for (size_t i = 0; i < r.images.size(); ++i)
             {
@@ -1717,35 +1938,35 @@ namespace albireo
                 im.features = kept_encoding(m, im.digest);
                 if (im.features)
                 {
-                    im.pixels.clear();
+                    drop_pixels(m, im);
                     continue;
                 }
                 if (!m.vision_job)
                 {
-                    m.vision_job = m.vision->start(im.pixels, im.plan);
+                    try
+                    {
+                        m.vision_job = m.vision->start(im.pixels, im.plan);
+                    }
+                    catch (const std::exception& e)
+                    {
+                        // This request ends with the error of its image; the others go on.
+                        std::string code, message;
+                        encoding_error(e, code, message);
+                        m.vision->release_work();
+                        fail(r, code, message);
+                        if (code == "out_of_memory") trim_after_failure(m);
+                        return 0L;
+                    }
                     m.vision_owner = r.id;
                     m.vision_image = i;
                 }
                 n = std::min<long>(n, std::max<long>(0, im.start - done));
             }
-            if (n <= 0) continue;
-            if (!reserve(m, r.seq, done + n))
-            {
-                /*
-                    The other requests hold the memory.  While one of them computes in this
-                    pass, this prompt waits for room; otherwise the prompts admitted after
-                    this one give theirs, so that two prompts never wait for each other.
-                */
-                bool reserved = false;
-                if (rows.empty())
-                    while (!reserved && preempt(m, &r)) reserved = reserve(m, r.seq, done + n);
-                if (!reserved)
-                {
-                    if (rows.empty())
-                        fail(r, "out_of_memory", "the keys and values of this prompt do not fit in memory");
-                    continue;
-                }
-            }
+            return n;
+        };
+        // Adds n tokens of the prompt of r to the pass.
+        auto read = [&](request_state& r, long n) {
+            const long done = static_cast<long>(r.kv_tokens.size());
             const bool last = done + n == static_cast<long>(r.prompt.size());
             const long row0 = static_cast<long>(b.tokens.size());
             b.segments.push_back({ r.seq, row0, n });
@@ -1769,6 +1990,50 @@ namespace albireo
             }
             rows.push_back({ &r, n, last });
             budget -= n;
+        };
+
+        /*
+            The prompts being read take the budget in turn, the first one changing at each step,
+            so that a short prompt does not wait for the whole of a long one.  A prompt without
+            room waits while another request computes in the pass.  When none does, the prompt
+            admitted first among those without room takes the memory of the prompts admitted
+            after it, or ends when that is not enough, so that two prompts never wait for each
+            other.
+        */
+        std::vector<request_state*> reading;    // in the order of admission
+        for (auto& rp : m.active)
+            if (rp->ph == request_state::phase::prefill) reading.push_back(rp.get());
+        const size_t first = reading.empty() ? 0 : m.prefill_turn++ % reading.size();
+        request_state* blocked = nullptr;
+        size_t blocked_at = 0;
+        long blocked_n = 0;
+        for (size_t k = 0; k < reading.size() && budget > 0; ++k)
+        {
+            const size_t at = (first + k) % reading.size();
+            request_state& r = *reading[at];
+            if (r.ph != request_state::phase::prefill) continue;
+            const long n = slice(r, budget);
+            if (n <= 0) continue;
+            if (!reserve(m, r.seq, static_cast<long>(r.kv_tokens.size()) + n))
+            {
+                if (!blocked || at < blocked_at)
+                {
+                    blocked = &r;
+                    blocked_at = at;
+                    blocked_n = n;
+                }
+                continue;
+            }
+            read(r, n);
+        }
+        if (rows.empty() && blocked)
+        {
+            request_state& r = *blocked;
+            const long end = static_cast<long>(r.kv_tokens.size()) + blocked_n;
+            bool reserved = false;
+            while (!reserved && preempt(m, &r)) reserved = reserve(m, r.seq, end);
+            if (reserved) read(r, blocked_n);
+            else fail(r, "out_of_memory", "the keys and values of this prompt do not fit in memory");
         }
         requeue_preempted(m);
         if (rows.empty())
@@ -1957,12 +2222,14 @@ namespace albireo
     void engine::finish(loaded_model& m, request_state& r, const std::string& reason, bool keep_cache)
     {
         if (r.ph == request_state::phase::done) return;
+        drop_request_pixels(m, r);
         if (r.job)
         {
             r.ph = request_state::phase::done;
             if (r.seq >= 0) m.runtime->release_sequence(r.seq);
             r.seq = -1;
-            end_job(*r.job, reason, "the request was " + reason);
+            if (reason == "cancelled") cancel_job(*r.job);
+            else end_job(*r.job, reason, "the request was " + reason);
             return;
         }
         std::vector<output_event> events;
@@ -2040,14 +2307,16 @@ namespace albireo
         e["message"] = message;
         if (r.job) end_job(*r.job, code, message);
         else if (r.sink) r.sink(ALBIREO_EVENT_ERROR, e.dump());
+        std::shared_ptr<loaded_model> m;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            auto it = models_.find(r.model_id);
+            if (it != models_.end()) m = it->second;
+        }
+        // The decoded pixels the request still holds return to the budget of its model.
+        if (m) drop_request_pixels(*m, r);
         if (r.seq >= 0)
         {
-            std::shared_ptr<loaded_model> m;
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                auto it = models_.find(r.model_id);
-                if (it != models_.end()) m = it->second;
-            }
             if (m) m->runtime->release_sequence(r.seq);
             r.seq = -1;
         }
@@ -2167,9 +2436,11 @@ namespace albireo
             current_dates(opt);
             opt.reasoning = req["reasoning"].as_bool(m->format->supports_reasoning());
             if (req["tools"].is_array()) opt.tools = req["tools"];
+            if (m->vision) strip_marks(opt.tools);
             std::vector<image_part> parts;
             std::vector<chat_message> messages = parse_messages(req["messages"], m->vision ? &parts : nullptr);
             if (!parts.empty() && m->vision->kind() == vision_encoder::family::llava_next) images_first(messages);
+            if (!parts.empty() && m->vision->kind() == vision_encoder::family::pixtral) mistral_images(messages);
             std::vector<prompt_piece> pieces;
             m->format->render(messages, opt, pieces);
             // The images count by their size, read from their headers, without being decoded.

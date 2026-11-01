@@ -52,9 +52,26 @@ namespace albireo
                 each row followed by the newline embedding of the file, as the reference
                 implementation packs them.
 
-                The blocks of both families normalize before the attention and before the
-                feed-forward layer, with a mean and a bias; the attention reads every patch
-                of the view; the feed-forward layer activates with the tanh form of GELU.
+                Pixtral (clip.projector_type "pixtral", Ministral 3, Devstral Small 2 and the
+                other Mistral models that read images): the image, resized within the longest
+                edge of the file (image_size()), its aspect ratio kept, to multiples of
+                factor() pixels, is cut into patches of patch_size() pixels.  Each head of
+                the attention rotates its pairs of consecutive dimensions, the first half of
+                them by the row of the patch and the second half by its column, at the even
+                and the odd frequencies of the head.  The blocks normalize by their root mean
+                square and their feed-forward layer is a SiLU gate.  The projector normalizes
+                each patch, merges the squares of merge_size() x merge_size() patches through
+                a linear layer, then applies two linear layers around an exact GELU.  The
+                tokens of the image are its merged tokens row by row, each row but the last
+                followed by the [IMG_BREAK] embedding of the file, which a Pixtral encoder
+                must hold; the decoder reads the token [IMG_END] after them.
+
+                The blocks of Qwen3-VL and LLaVA-NeXT normalize before the attention and
+                before the feed-forward layer, with a mean and a bias; the attention reads
+                every patch of the view; the feed-forward layer activates with the tanh form
+                of GELU.  Matrices stored in bfloat16 are converted to half precision when
+                the encoder loads, which keeps their values: the half format holds more
+                mantissa bits.
 
                 The products go through the quantized kernels of qkernels.h on the threads of
                 the engine (Q8_0, F16 and F32 weights, and the other types the kernels read),
@@ -66,9 +83,13 @@ namespace albireo
 
             THREAD SAFETY
                 One thread drives an encoder: its work buffers serve the job it advances.
+                The constructor runs on the loading thread alone and opens no section of
+                the pool, whose threads may be computing the passes of other models.
+                plan(), most_tokens() and the other const functions may be called from any
+                thread.
         !*/
     public:
-        enum class family { qwen3vl, llava_next };
+        enum class family { qwen3vl, llava_next, pixtral };
 
         vision_encoder(std::shared_ptr<model_file> file, thread_pool& pool);
 
@@ -78,9 +99,10 @@ namespace albireo
         family kind() const { return kind_; }
         long patch_size() const { return patch_; }
         long merge_size() const { return merge_; }
-        // Pixels per side of a merged token, the factor the sides of an image are multiples of (Qwen3-VL).
+        // Pixels per side of a merged token, the factor the sides of an image are multiples of
+        // (Qwen3-VL, Pixtral).
         long factor() const { return patch_ * merge_; }
-        // Pixels per side of a view (LLaVA-NeXT).
+        // Pixels per side of a view (LLaVA-NeXT), the longest edge of an image (Pixtral).
         long image_size() const { return image_size_; }
         long output_dim() const { return out_dim_; }
         long deepstack_count() const { return static_cast<long>(deepstack_.size()); }
@@ -108,7 +130,9 @@ namespace albireo
                 - Returns how an image of width x height pixels is read with the detail
                   "low", "auto" (also "") or "high": for Qwen3-VL, the size resized to
                   multiples of factor() within 64 and 256, 576 or 1024 merged tokens; for
-                  LLaVA-NeXT, the pinpoints of 1, 2 or 4 tiles at most.
+                  LLaVA-NeXT, the pinpoints of 1, 2 or 4 tiles at most; for Pixtral, the
+                  size within the longest edge, rounded up to multiples of factor(), then
+                  reduced, when it holds more, to 256, 576 or 1024 merged tokens.
                 - Throws std::invalid_argument for another detail or an unusable size.
         !*/
         image_plan plan(long width, long height, const std::string& detail) const;
@@ -154,9 +178,9 @@ namespace albireo
 
         /*!
             requires
-                - For Qwen3-VL, image.width and image.height are positive multiples of
-                  factor(); for LLaVA-NeXT, image is the image plan() was given the size of,
-                  decoded at plan.width x plan.height.
+                - For Qwen3-VL and Pixtral, image.width and image.height are positive
+                  multiples of factor(); for LLaVA-NeXT, image is the image plan() was given
+                  the size of, decoded at plan.width x plan.height.
             ensures
                 - Returns an encoding of the image with its first patch embedding computed.
         !*/
@@ -180,9 +204,11 @@ namespace albireo
     private:
         struct block
         {
+            // The biases are empty when the file has none (Pixtral).
             std::vector<float> ln1_w, ln1_b, ln2_w, ln2_b, qkv_b, out_b, up_b, down_b;
-            weight_matrix qkv, q, k, v, out, up, down;
+            weight_matrix qkv, q, k, v, out, gate, up, down;
             bool fused = true;          // queries, keys and values in one matrix
+            bool gated = false;         // a SiLU gate in the feed-forward layer (Pixtral)
         };
 
         struct merger
@@ -204,6 +230,7 @@ namespace albireo
         tile_layout best_layout(long width, long height, long max_tiles) const;
 
         void embed_patches(job& j, const rgb_image& image);
+        // A layer norm with the mean and the bias of b, or a root mean square norm when b is empty.
         void layer_norm_rows(const float* x, const std::vector<float>& w, const std::vector<float>& b, float* y,
             long rows, long width);
         void add_bias_rows(float* y, long stride, const std::vector<float>& bias, long rows);
@@ -211,8 +238,11 @@ namespace albireo
         void run_merger(job& j, const merger& m, bool merged_norm, long column);
         void project_view(job& j);
         void pack_views(job& j);
+        void project_pixtral(job& j);
         void product(const weight_matrix& w, const float* x, long n, long x_stride, float* y, long y_stride,
             bool accumulate = false);
+        // A matrix of the file, converted to half precision when it is stored in bfloat16.
+        weight_matrix readable(const weight_matrix& m);
 
         std::shared_ptr<model_file> file_;
         thread_pool& pool_;
@@ -235,9 +265,16 @@ namespace albireo
         // LLaVA-NeXT: the pinpoints (width, height) and the newline embedding.
         std::vector<std::pair<long, long>> pinpoints_;
         std::vector<float> newline_;
+        // Pixtral: the norm after the patch embedding and before the projector, the merger of
+        // the squares of patches (its columns in the order of the patches of a square), the two
+        // layers of the projector and the [IMG_BREAK] embedding.
+        std::vector<float> pre_ln_w_, proj_norm_w_, proj1_b_, proj2_b_, img_break_;
+        weight_matrix patch_merger_, proj1_, proj2_;
+        // The matrices converted when the encoder loads.
+        std::vector<std::vector<uint16_t>> owned_;
 
         // Work buffers.
-        aligned_floats xn_, qkv_, q_, kt_, v_, ctx_, h_, m_;
+        aligned_floats xn_, qkv_, q_, kt_, v_, ctx_, h_, u_, m_;
         std::vector<aligned_floats> attention_work_;
         qk_scratch scratch_;
     };

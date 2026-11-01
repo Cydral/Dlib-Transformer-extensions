@@ -19,7 +19,9 @@ the notes otherwise read "Albireo <version>".
 The feed is then signed with albireo-sign (sign <private key> feed.json), and both files
 are published in dist/albireo of the repository.  The services that read it download the
 installer in the background, check its size and its SHA-256, and install it at their next
-start.  publish_release.py runs these steps after attaching the installer to its release.
+start.  publish_release.py runs these steps after attaching the installer to its release, or,
+with --public-link, names the installer by its file in the folder dist of the public link of the
+published files, which the services read first (host/public_link.h).
 """
 
 import hashlib
@@ -135,14 +137,27 @@ def read_notes(notes_path, output, version):
     return notes or {"en": "Albireo " + version}
 
 
-def make_feed(version, installer, url, notes, size=None, sha256=None):
-    """The feed announcing version, whose installer is the file installer published at url.
-    size and sha256 spare reading the file again when the caller has them."""
+def make_feed(version, installer, url, notes, size=None, sha256=None, file=None):
+    """The feed announcing version, whose installer is the file installer published at url, in the
+    folder dist of the public link under the name file (public_link.py), or both; the services read
+    the copy of the link first.  size and sha256 spare reading the file again when the caller has
+    them."""
     if not re.fullmatch(r"\d+\.\d+\.\d+", version):
         raise ValueError("the version must have the form 1.2.3")
-    if not url.startswith("https://"):
+    if not url and not file:
+        raise ValueError("the installer needs an address or a name in the public link")
+    if url and not url.startswith("https://"):
         raise ValueError("the address of the installer must be an https address")
+    if file and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*\.exe", file):
+        raise ValueError("%s is not the name of an installer" % file)
     check_installer(installer, version)
+    described = {}
+    if file:
+        described["file"] = file
+    if url:
+        described["url"] = url
+    described["size"] = size if size is not None else os.path.getsize(installer)
+    described["sha256"] = sha256 or sha256_of(installer)
     return {
         "product": "Albireo",
         "channels": {
@@ -150,11 +165,7 @@ def make_feed(version, installer, url, notes, size=None, sha256=None):
                 "version": version,
                 "date": date.today().isoformat(),
                 "notes": notes,
-                "installer": {
-                    "url": url,
-                    "size": size if size is not None else os.path.getsize(installer),
-                    "sha256": sha256 or sha256_of(installer),
-                },
+                "installer": described,
             }
         },
     }

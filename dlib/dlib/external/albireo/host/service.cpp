@@ -27,6 +27,7 @@
 #include "certificates.h"
 #include "crypto.h"
 #include "http_fetch.h"
+#include "public_link.h"
 
 namespace albireo
 {
@@ -198,6 +199,24 @@ namespace albireo
             return true;
         }
 
+        // Whether an error of SQLite tells a damaged database, which never opens again by itself.
+        bool damaged_database(const std::string& what)
+        {
+            return what.find("not a database") != std::string::npos || what.find("malformed") != std::string::npos;
+        }
+
+        // Keeps a damaged database aside under a name of its own, with its journal; false when it cannot be renamed.
+        bool set_aside_database(const std::string& db_path, const std::string& what)
+        {
+            const std::string aside = db_path + ".corrupt-" + std::to_string(now_unix());
+            log_error("service: the database " + db_path + " is damaged (" + what + "): it is kept as " + aside
+                + ", and a new database records again the models of the models folder");
+            if (!rename_file(db_path, aside)) return false;
+            for (const char* part : { "-wal", "-shm" })
+                if (file_exists(db_path + part)) rename_file(db_path + part, aside + part);
+            return true;
+        }
+
         // The options of the socket the server listens on.
         void set_listen_options(httplib::Server& server)
         {
@@ -360,6 +379,20 @@ namespace albireo
         if (restarter_.joinable()) restarter_.join();
     }
 
+    std::string service::speech_dir() const
+    {
+        return join_path(program_dir_, "speech");
+    }
+
+    std::string service::speech_program() const
+    {
+#if defined(_WIN32)
+        return join_path(program_dir_, "albireo-speech.exe");
+#else
+        return join_path(program_dir_, "albireo-speech");
+#endif
+    }
+
     std::string service::engines_dir() const
     {
         const std::string d = join_path(program_dir_, "engines");
@@ -416,6 +449,13 @@ namespace albireo
         if (first_run) settings_->set(st);
         port_ = st.port;
         apply_network_settings(st);
+        if (st.public_link.empty()) log_info("public link: none, the files come from their official addresses");
+        else if (!valid_public_link(st.public_link))
+            log_warning("public link: " + st.public_link + " is not a public link of pCloud, the files come from their "
+                "official addresses");
+        else
+            log_info("public link: " + st.public_link + (public_link_has_password() ? ", with the password built into "
+                "the service" : ", without password"));
 
         const std::string db_path = join_path(data_dir_, "albireo.db");
         try
@@ -432,21 +472,16 @@ namespace albireo
                 the start fails, and the next attempt tries again.
             */
             const std::string what = e.what();
-            if (what.find("not a database") == std::string::npos && what.find("malformed") == std::string::npos)
+            if (!damaged_database(what))
             {
                 error = "the database cannot be opened: " + what;
                 return false;
             }
-            const std::string aside = db_path + ".corrupt-" + std::to_string(now_unix());
-            log_error("service: the database " + db_path + " is damaged (" + what + "): it is kept as " + aside
-                + ", and a new database records again the models of the models folder");
-            if (!rename_file(db_path, aside))
+            if (!set_aside_database(db_path, what))
             {
                 error = "the database " + db_path + " is damaged and cannot be set aside";
                 return false;
             }
-            for (const char* part : { "-wal", "-shm" })
-                if (file_exists(db_path + part)) rename_file(db_path + part, aside + part);
             try
             {
                 db_.reset(new store(db_path));
@@ -497,15 +532,58 @@ namespace albireo
             if (!e.text.empty()) log_warning("updates: " + e.text);
         }
 
+        /*
+            The models and the models that come with Albireo read and write the database: a
+            database found damaged only now is set aside as at its opening, and the step runs
+            again once on a new database.  Any other failure fails the start, tried again.
+        */
+        for (int attempt = 0;; ++attempt)
         {
-            std::unique_ptr<model_manager> m(new model_manager(*db_, st.effective_models_dir(), st.catalog_url));
-            m->on_installed([this](const installed_model& im) { on_installed(im); });
-            std::lock_guard<std::mutex> lock(server_m_);
-            if (stopping_) m->stop();
-            models_ = std::move(m);
+            try
+            {
+                std::unique_ptr<model_manager> m(new model_manager(*db_, st.effective_models_dir(), st.catalog_url));
+                m->on_installed([this](const installed_model& im) { on_installed(im); });
+                m->on_replace([this](const std::string& id, const std::function<bool()>& place) {
+                    return replace_model_files(id, place);
+                });
+                {
+                    std::lock_guard<std::mutex> lock(server_m_);
+                    if (stopping_) m->stop();
+                    models_ = std::move(m);
+                }
+                register_builtin_models();
+                break;
+            }
+            catch (const std::exception& e)
+            {
+                const std::string what = e.what();
+                {
+                    std::lock_guard<std::mutex> lock(server_m_);
+                    models_.reset();
+                }
+                if (attempt > 0 || !damaged_database(what))
+                {
+                    error = "the database cannot be read: " + what;
+                    return false;
+                }
+                db_.reset();
+                if (!set_aside_database(db_path, what))
+                {
+                    error = "the database " + db_path + " is damaged and cannot be set aside";
+                    return false;
+                }
+                try
+                {
+                    db_.reset(new store(db_path));
+                    database_restarted_ = true;
+                }
+                catch (const std::exception& again)
+                {
+                    error = std::string("the database cannot be opened: ") + again.what();
+                    return false;
+                }
+            }
         }
-
-        register_builtin_models();
 
         // The engines start in the background (start_engines()), once the server answers.
         // The key of the server reaches the TLS server from memory, decrypted here only.
@@ -543,10 +621,12 @@ namespace albireo
             engine.  Eight threads serve the connections, up to 64 while they are busy, since a
             streamed answer holds its thread; 128 connections at most wait for one, and the next
             ones are closed at once, so that a flood of connections holds a bounded number of
-            sockets.
+            sockets.  A connection kept between two requests holds its thread too: it is closed
+            after 5 seconds without a request, so that the idle connections of the browsers of
+            several users leave the threads to the requests.
         */
         server_->set_payload_max_length(0);
-        server_->set_keep_alive_timeout(30);
+        server_->set_keep_alive_timeout(5);
         server_->set_read_timeout(30);
         server_->set_write_timeout(30);
         server_->new_task_queue = []() { return new httplib::ThreadPool(8, 64, 128); };
@@ -672,6 +752,7 @@ namespace albireo
     void service::apply_network_settings(const host_settings& s)
     {
         set_http_proxy(s.proxy);
+        set_public_link(s.public_link);
         {
             std::lock_guard<std::mutex> lock(server_m_);
             if (stopping_) return;
@@ -705,7 +786,8 @@ namespace albireo
         } ready{ engines_ready_ };
         // The engine of this machine; a processor engine when the chosen one fails.
         const host_settings st = settings_->get();
-        candidates_ = engine_.discover(engines_dir(), executable_path());
+        // The descriptions end at once when the service stops.
+        candidates_ = engine_.discover(engines_dir(), executable_path(), &stopping_);
         choice_ = choose_engine(candidates_, st);
         if (stopping_) return;
         if (choice_.candidate)
@@ -1241,6 +1323,11 @@ namespace albireo
             log_info("models: " + m.id + " loads again with its files once its requests are served");
             retire(m.id, true);
         }
+        else
+        {
+            // A model whose files were replaced while it was out of the engine (replace_model_files()) loads again.
+            reload_model(m.id);
+        }
         if (is_embedding(m))
         {
             // The first embedding model serves the document search.
@@ -1499,6 +1586,15 @@ namespace albireo
         // Serialized with the activations, which load the models too.
         std::lock_guard<std::mutex> serial(models_m_);
         if (stopping_ || !engine_.running()) return;
+        {
+            // A model still leaving the engine loads again once it left (retire()).
+            std::lock_guard<std::mutex> l(retire_m_);
+            if (retiring_.count(id) != 0)
+            {
+                reloading_.insert(id);
+                return;
+            }
+        }
         const host_settings st = settings_->get();
         bool used = id == background_model_;
         for (const auto& kv : st.active) used = used || kv.second == id;
@@ -1509,6 +1605,46 @@ namespace albireo
             return;
         std::string error;
         load_model(m, error);
+    }
+
+    bool service::replace_model_files(const std::string& id, const std::function<bool()>& place)
+    {
+        // The model of the work in the background stays loaded, and comes with Albireo: no file replaces its own.
+        if (!background_model_.empty() && id == background_model_) return false;
+        bool retired = false;
+        for (int attempt = 0; attempt < 3 && !stopping_; ++attempt)
+        {
+            bool placed = false, ok = false;
+            {
+                // No activation and no load takes the model between the check and the renames.
+                std::lock_guard<std::mutex> serial(models_m_);
+                bool leaving = false;
+                {
+                    std::lock_guard<std::mutex> l(retire_m_);
+                    // A model being deleted keeps no new file: its deletion takes the files it names.
+                    if (removing_.count(id) != 0) return false;
+                    leaving = retiring_.count(id) != 0;
+                }
+                const std::vector<std::string> loaded = engine_.loaded_models();
+                if (!leaving && std::find(loaded.begin(), loaded.end(), id) == loaded.end())
+                {
+                    ok = place();
+                    placed = true;
+                }
+            }
+            if (placed)
+            {
+                // A replacement that failed leaves the model with its files: it comes back as it was.
+                if (!ok && retired) reload_model(id);
+                return ok;
+            }
+            log_info("models: " + id + " leaves the engine once its requests are served, its files being replaced");
+            retire(id);
+            wait_retired(id);
+            retired = true;
+        }
+        if (retired) reload_model(id);
+        return false;
     }
 
     json service::leaving_models()
@@ -1911,6 +2047,15 @@ namespace albireo
 
     json service::benchmark_engines()
     {
+        // One measure at a time: the engines of a second one would run beside those of the first and skew both.
+        std::unique_lock<std::mutex> running(benchmark_m_, std::try_to_lock);
+        if (!running.owns_lock())
+        {
+            json busy = json::object();
+            busy["error"] = "a measure of the engines is in progress";
+            busy["code"] = "benchmark_running";
+            return busy;
+        }
         // The model of the measure: the general model, else the smallest one installed.
         const host_settings st = settings_->get();
         installed_model model;

@@ -108,6 +108,15 @@ else
   skip "embedding model" "no $EMBEDDING"
 fi
 
+# The program of the speech synthesis alone: a sentence read aloud in the folder of the voices.
+SPEAKER=$BUILD/bin/albireo-speech
+if [ -x "$SPEAKER" ] && [ -d "$BUILD/bin/speech" ]; then
+  step "speech program" "RIFF" sh -c "cd '$BUILD/bin/speech' && printf '%s' 'Guten Tag, Albireo liest vor.' \
+    | '$SPEAKER' de-DE 1 > '$WORK/program.wav' && head -c 4 '$WORK/program.wav' && echo && wc -c < '$WORK/program.wav'"
+else
+  skip "speech program" "no $SPEAKER or no $BUILD/bin/speech"
+fi
+
 # The service, offline, in a data folder of its own.
 SERVICE=$BUILD/bin/albireo-service
 if [ -x "$SERVICE" ] && [ -f "$MODEL" ]; then
@@ -144,15 +153,33 @@ if [ -x "$SERVICE" ] && [ -f "$MODEL" ]; then
     BODY="$BODY \"messages\": [{\"role\": \"user\", \"content\": \"$QUESTION\"}]}"
     step "service chat" "Paris" curl -sk --max-time 300 https://localhost:$PORT/v1/chat/completions \
       -H "Content-Type: application/json" -d "$BODY"
+    # The voices of the speech synthesis, then a sentence read aloud by the program the service starts.
+    step "service speech voices" '"id":"fr-FR"' curl -sk --max-time 5 \
+      https://localhost:$PORT/albireo/v1/speech/voices
+    SPEECH="{\"input\": \"Bonjour, Albireo lit ses réponses à voix haute.\", \"voice\": \"fr-FR\"}"
+    step "service speech" "RIFF" sh -c "curl -sk --max-time 60 -o '$WORK/speech.wav' \
+      -H 'Content-Type: application/json' -d '$SPEECH' https://localhost:$PORT/v1/audio/speech \
+      && head -c 4 '$WORK/speech.wav' && echo && wc -c < '$WORK/speech.wav'"
   else
     record "service start" FAIL "no answer, log in $WORK/service.log" 0.0
   fi
+  # The service has 30 seconds to stop, then it is killed by its process number.
   START=$(now)
   kill -INT $PID 2> /dev/null
-  wait $PID
-  RC=$?
-  if [ $RC -eq 0 ]; then record "service stop" PASS "exit 0" "$(elapsed "$START")"
-  else record "service stop" FAIL "exit $RC, log in $WORK/service.log" "$(elapsed "$START")"
+  for i in $(seq 1 300); do
+    kill -0 $PID 2> /dev/null || break
+    sleep 0.1
+  done
+  if kill -0 $PID 2> /dev/null; then
+    kill -KILL $PID 2> /dev/null
+    wait $PID 2> /dev/null
+    record "service stop" FAIL "killed after 30 s, log in $WORK/service.log" "$(elapsed "$START")"
+  else
+    wait $PID
+    RC=$?
+    if [ $RC -eq 0 ]; then record "service stop" PASS "exit 0" "$(elapsed "$START")"
+    else record "service stop" FAIL "exit $RC, log in $WORK/service.log" "$(elapsed "$START")"
+    fi
   fi
 else
   skip "service" "no $SERVICE or no $MODEL"

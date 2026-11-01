@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <ctime>
+#include <stdexcept>
 
 #include <dlib/sqlite.h>
 
@@ -14,10 +15,46 @@
 namespace albireo
 {
 
+    namespace
+    {
+        // The columns of a model, in the order model_of() reads them.
+        const char* const model_columns = "id, name, file, size, sha256, source, installed_at, verified_at, "
+            "descriptor, projector, projector_size, projector_sha256";
+
+        installed_model model_of(dlib::statement& st)
+        {
+            installed_model m;
+            m.id = st.get_column_as_text(0);
+            m.name = st.get_column_as_text(1);
+            m.file = st.get_column_as_text(2);
+            m.size = static_cast<uint64_t>(st.get_column_as_int64(3));
+            m.sha256 = st.get_column_as_text(4);
+            m.source = st.get_column_as_text(5);
+            m.installed_at = st.get_column_as_int64(6);
+            m.verified_at = st.get_column_as_int64(7);
+            m.descriptor = json::parse_or_null(st.get_column_as_text(8));
+            m.projector = st.get_column_as_text(9);
+            m.projector_size = static_cast<uint64_t>(st.get_column_as_int64(10));
+            m.projector_sha256 = st.get_column_as_text(11);
+            return m;
+        }
+    }
+
     store::store(const std::string& path) : path_(path)
     {
         make_dirs(parent_path(path));
         connect();
+        /*
+            Every page of the database is checked once at the start: a database damaged beyond
+            its header fails here, with "malformed" in its error, where the service sets it
+            aside and starts a new one, rather than in the queries that follow.
+        */
+        {
+            dlib::statement st(*db_, "PRAGMA quick_check");
+            st.exec();
+            const std::string result = st.move_next() ? st.get_column_as_text(0) : std::string("no answer");
+            if (result != "ok") throw std::runtime_error("database disk image is malformed (" + result + ")");
+        }
         db_->exec(
             "CREATE TABLE IF NOT EXISTS models ("
             " id TEXT PRIMARY KEY, name TEXT NOT NULL, file TEXT NOT NULL, size INTEGER NOT NULL,"
@@ -90,38 +127,22 @@ namespace albireo
     {
         std::lock_guard<std::mutex> lock(m_);
         std::vector<installed_model> out;
-        dlib::statement st(*db_, "SELECT id, name, file, size, sha256, source, installed_at, verified_at, descriptor, "
-            "projector, projector_size, projector_sha256 FROM models ORDER BY name");
+        dlib::statement st(*db_, std::string("SELECT ") + model_columns + " FROM models ORDER BY name");
         st.exec();
-        while (st.move_next())
-        {
-            installed_model m;
-            m.id = st.get_column_as_text(0);
-            m.name = st.get_column_as_text(1);
-            m.file = st.get_column_as_text(2);
-            m.size = static_cast<uint64_t>(st.get_column_as_int64(3));
-            m.sha256 = st.get_column_as_text(4);
-            m.source = st.get_column_as_text(5);
-            m.installed_at = st.get_column_as_int64(6);
-            m.verified_at = st.get_column_as_int64(7);
-            m.descriptor = json::parse_or_null(st.get_column_as_text(8));
-            m.projector = st.get_column_as_text(9);
-            m.projector_size = static_cast<uint64_t>(st.get_column_as_int64(10));
-            m.projector_sha256 = st.get_column_as_text(11);
-            out.push_back(m);
-        }
+        while (st.move_next()) out.push_back(model_of(st));
         return out;
     }
 
     bool store::find_model(const std::string& id, installed_model& m)
     {
-        for (const auto& x : models())
-            if (x.id == id)
-            {
-                m = x;
-                return true;
-            }
-        return false;
+        // The row of the model alone, by its key, rather than every model with its description.
+        std::lock_guard<std::mutex> lock(m_);
+        dlib::statement st(*db_, std::string("SELECT ") + model_columns + " FROM models WHERE id = ?");
+        st.bind(1, id);
+        st.exec();
+        if (!st.move_next()) return false;
+        m = model_of(st);
+        return true;
     }
 
     void store::put_model(const installed_model& m)

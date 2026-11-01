@@ -52,7 +52,8 @@ const paths = {
   calc: '<rect x="5" y="3" width="14" height="18" rx="2"/><path d="M8 7h8M8.5 12h.01M12 12h.01M15.5 12h.01M8.5 16h.01M12 16h.01' +
     'M15.5 16h.01"/>',
   clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/>',
-  history: '<path d="M4 12a8 8 0 1 0 2.3-5.6M4 4v4.5h4.5M12 8v4l3 2"/>'
+  history: '<path d="M4 12a8 8 0 1 0 2.3-5.6M4 4v4.5h4.5M12 8v4l3 2"/>',
+  speaker: '<path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z"/><path d="M15.5 9a4 4 0 0 1 0 6M18.2 6.5a7.6 7.6 0 0 1 0 11"/>'
 };
 
 export function icon(name, cls) {

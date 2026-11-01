@@ -11,6 +11,7 @@
 #include <cstring>
 #include <ctime>
 #include <fstream>
+#include <mutex>
 #include <random>
 #include <sstream>
 #include <thread>
@@ -35,11 +36,15 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
 #endif
 
 namespace albireo
@@ -87,8 +92,34 @@ namespace albireo
         return parent_path(executable_path());
     }
 
+    namespace
+    {
+        // The folder set_data_dir() gives, empty when none.
+        std::mutex& data_dir_mutex()
+        {
+            static std::mutex m;
+            return m;
+        }
+
+        std::string& data_dir_override()
+        {
+            static std::string folder;
+            return folder;
+        }
+    }
+
+    void set_data_dir(const std::string& p)
+    {
+        std::lock_guard<std::mutex> lock(data_dir_mutex());
+        data_dir_override() = p;
+    }
+
     std::string data_dir()
     {
+        {
+            std::lock_guard<std::mutex> lock(data_dir_mutex());
+            if (!data_dir_override().empty()) return data_dir_override();
+        }
 #if defined(_WIN32)
         // The folder the installer recorded, which only the administrators change.
         std::wstring raw(32767, L'\0');
@@ -1226,27 +1257,50 @@ namespace albireo
     bool write_file_atomic(const std::string& p, const std::string& data)
     {
         const std::string tmp = p + ".tmp-" + random_hex(8);
-        {
+        // The data is written to the disk, not only to the cache of the system, before the rename.
+        bool ok = true;
+        size_t done = 0;
 #if defined(_WIN32)
-            std::ofstream out(widen(tmp).c_str(), std::ios::binary | std::ios::trunc);
-#else
-            std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-#endif
-            if (!out) return false;
-            out.write(data.data(), static_cast<std::streamsize>(data.size()));
-            out.flush();
-            if (!out)
-            {
-                out.close();
-                remove_file(tmp);
-                return false;
-            }
+        const HANDLE h = CreateFileW(widen(tmp).c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL,
+            nullptr);
+        if (h == INVALID_HANDLE_VALUE) return false;
+        while (ok && done < data.size())
+        {
+            DWORD w = 0;
+            const DWORD chunk = static_cast<DWORD>(std::min<size_t>(data.size() - done, 1u << 30));
+            ok = WriteFile(h, data.data() + done, chunk, &w, nullptr) && w > 0;
+            done += w;
         }
-        if (!rename_file(tmp, p))
+        ok = ok && FlushFileBuffers(h);
+        CloseHandle(h);
+#else
+        const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+        if (fd < 0) return false;
+        while (ok && done < data.size())
+        {
+            const ssize_t w = ::write(fd, data.data() + done, data.size() - done);
+            if (w < 0 && errno == EINTR) continue;
+            ok = w > 0;
+            if (ok) done += static_cast<size_t>(w);
+        }
+        ok = ok && fsync(fd) == 0;
+        ok = ::close(fd) == 0 && ok;
+#endif
+        if (!ok || !rename_file(tmp, p))
         {
             remove_file(tmp);
             return false;
         }
+#if !defined(_WIN32)
+        // The new name reaches the disk with its folder.
+        const std::string folder = parent_path(p);
+        const int dir = ::open(folder.empty() ? "." : folder.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (dir >= 0)
+        {
+            fsync(dir);
+            ::close(dir);
+        }
+#endif
         return true;
     }
 
@@ -1367,9 +1421,51 @@ namespace albireo
         return out;
     }
 
-    int run_process(const std::string& program, const std::vector<std::string>& args, std::string* output,
-        unsigned timeout_ms, const std::atomic<bool>* stop)
+#if defined(_WIN32)
+    namespace
     {
+        /*
+            A copy of the token of this process without its privileges and of low integrity:
+            the program it runs reads what the users may read and writes nowhere but in the
+            handles it inherits.  Null when Windows refuses one of the steps.
+        */
+        HANDLE restricted_token()
+        {
+            HANDLE self = nullptr, restricted = nullptr;
+            if (!OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY
+                | TOKEN_ADJUST_DEFAULT, &self))
+                return nullptr;
+            const BOOL made = CreateRestrictedToken(self, DISABLE_MAX_PRIVILEGE, 0, nullptr, 0, nullptr, 0, nullptr,
+                &restricted);
+            CloseHandle(self);
+            if (!made) return nullptr;
+            SID_IDENTIFIER_AUTHORITY authority = SECURITY_MANDATORY_LABEL_AUTHORITY;
+            PSID low = nullptr;
+            bool ok = AllocateAndInitializeSid(&authority, 1, SECURITY_MANDATORY_LOW_RID, 0, 0, 0, 0, 0, 0, 0,
+                &low) != 0;
+            if (ok)
+            {
+                TOKEN_MANDATORY_LABEL label = {};
+                label.Label.Attributes = SE_GROUP_INTEGRITY;
+                label.Label.Sid = low;
+                ok = SetTokenInformation(restricted, TokenIntegrityLevel, &label,
+                    static_cast<DWORD>(sizeof(label) + GetLengthSid(low))) != 0;
+                FreeSid(low);
+            }
+            if (!ok)
+            {
+                CloseHandle(restricted);
+                return nullptr;
+            }
+            return restricted;
+        }
+    }
+#endif
+
+    int run_process(const std::string& program, const std::vector<std::string>& args, std::string* output,
+        unsigned timeout_ms, const std::atomic<bool>* stop, const process_options* options)
+    {
+        const std::string* input = options ? options->input : nullptr;
         // The waits last a tenth of a second at most, so that stop ends the program at once.
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
         auto remaining_ms = [&]() {
@@ -1400,54 +1496,145 @@ namespace albireo
         std::string cmd = quote(program);
         for (const auto& a : args) cmd += " " + quote(a);
         SECURITY_ATTRIBUTES sa = { sizeof(sa), nullptr, TRUE };
-        HANDLE read_end = nullptr, write_end = nullptr;
+        HANDLE read_end = nullptr, write_end = nullptr, in_read = nullptr, in_write = nullptr;
+        auto close_pipes = [&]() {
+            for (HANDLE* h : { &read_end, &write_end, &in_read, &in_write })
+                if (*h)
+                {
+                    CloseHandle(*h);
+                    *h = nullptr;
+                }
+        };
         if (output && !CreatePipe(&read_end, &write_end, &sa, 0)) return -1;
         if (read_end) SetHandleInformation(read_end, HANDLE_FLAG_INHERIT, 0);
+        if (input && !CreatePipe(&in_read, &in_write, &sa, 0))
+        {
+            close_pipes();
+            return -1;
+        }
+        if (in_write) SetHandleInformation(in_write, HANDLE_FLAG_INHERIT, 0);
 
-        // The child inherits the end of its pipe and nothing else of this process.
+        // A restricted child runs with a token of low integrity and without privileges, in a job.
+        HANDLE token = nullptr, job = nullptr;
+        if (options && options->restricted)
+        {
+            token = restricted_token();
+            job = CreateJobObjectW(nullptr, nullptr);
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = {};
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+                | JOB_OBJECT_LIMIT_ACTIVE_PROCESS | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
+            limits.BasicLimitInformation.ActiveProcessLimit = 1;
+            if (options->memory_limit)
+            {
+                limits.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+                limits.ProcessMemoryLimit = static_cast<SIZE_T>(options->memory_limit);
+            }
+            if (!token || !job || !SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits,
+                sizeof(limits)))
+            {
+                if (token) CloseHandle(token);
+                if (job) CloseHandle(job);
+                close_pipes();
+                return -1;
+            }
+        }
+
+        // The child inherits the ends of its pipes and nothing else of this process.
         STARTUPINFOEXW si = {};
         si.StartupInfo.cb = sizeof(si);
         std::vector<char> attributes;
-        DWORD flags = CREATE_NO_WINDOW;
-        if (output)
+        std::vector<HANDLE> inherited;
+        if (write_end) inherited.push_back(write_end);
+        if (in_read) inherited.push_back(in_read);
+        // A restricted child has no console at all: a console would need the desktop of the service.
+        DWORD flags = (job ? DETACHED_PROCESS | CREATE_SUSPENDED : CREATE_NO_WINDOW);
+        if (!inherited.empty())
         {
             SIZE_T size = 0;
             InitializeProcThreadAttributeList(nullptr, 1, 0, &size);
             attributes.resize(size);
             si.lpAttributeList = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attributes.data());
             if (!InitializeProcThreadAttributeList(si.lpAttributeList, 1, 0, &size) ||
-                !UpdateProcThreadAttribute(si.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, &write_end,
-                    sizeof(write_end), nullptr, nullptr))
+                !UpdateProcThreadAttribute(si.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherited.data(),
+                    sizeof(HANDLE) * inherited.size(), nullptr, nullptr))
             {
-                CloseHandle(read_end);
-                CloseHandle(write_end);
+                if (token) CloseHandle(token);
+                if (job) CloseHandle(job);
+                close_pipes();
                 return -1;
             }
             si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
             si.StartupInfo.hStdOutput = write_end;
             si.StartupInfo.hStdError = write_end;
-            si.StartupInfo.hStdInput = nullptr;
+            si.StartupInfo.hStdInput = in_read;
             flags |= EXTENDED_STARTUPINFO_PRESENT;
         }
         PROCESS_INFORMATION pi = {};
         std::wstring wcmd = widen(cmd);
-        const BOOL ok = CreateProcessW(widen(program).c_str(), &wcmd[0], nullptr, nullptr, output ? TRUE : FALSE,
-            flags, nullptr, nullptr, &si.StartupInfo, &pi);
+        const std::wstring wprogram = widen(program);
+        const std::wstring wdir = options && !options->directory.empty() ? widen(options->directory) : std::wstring();
+        const wchar_t* folder = wdir.empty() ? nullptr : wdir.c_str();
+        const BOOL inherit = inherited.empty() ? FALSE : TRUE;
+        const BOOL ok = token
+            ? CreateProcessAsUserW(token, wprogram.c_str(), &wcmd[0], nullptr, nullptr, inherit, flags, nullptr,
+                folder, &si.StartupInfo, &pi)
+            : CreateProcessW(wprogram.c_str(), &wcmd[0], nullptr, nullptr, inherit, flags, nullptr, folder,
+                &si.StartupInfo, &pi);
         if (si.lpAttributeList) DeleteProcThreadAttributeList(si.lpAttributeList);
-        if (write_end) CloseHandle(write_end);
+        if (token) CloseHandle(token);
+        if (write_end)
+        {
+            CloseHandle(write_end);
+            write_end = nullptr;
+        }
+        if (in_read)
+        {
+            CloseHandle(in_read);
+            in_read = nullptr;
+        }
         if (!ok)
         {
-            if (read_end) CloseHandle(read_end);
+            if (job) CloseHandle(job);
+            close_pipes();
             return -1;
         }
-        // The output is read while the process runs, so that the time limit holds.
-        std::thread reader;
+        if (job)
+        {
+            if (!AssignProcessToJobObject(job, pi.hProcess))
+            {
+                TerminateProcess(pi.hProcess, 1);
+                CloseHandle(pi.hThread);
+                CloseHandle(pi.hProcess);
+                CloseHandle(job);
+                close_pipes();
+                return -1;
+            }
+            ResumeThread(pi.hThread);
+        }
+        // The output is read and the input written while the process runs, so that the time limit holds.
+        std::thread reader, writer;
         if (output)
         {
             reader = std::thread([read_end, output]() {
                 char buf[4096];
                 DWORD n = 0;
                 while (ReadFile(read_end, buf, sizeof(buf), &n, nullptr) && n > 0) output->append(buf, n);
+            });
+        }
+        if (in_write)
+        {
+            HANDLE w = in_write;
+            in_write = nullptr;
+            writer = std::thread([w, input]() {
+                size_t at = 0;
+                while (at < input->size())
+                {
+                    DWORD n = 0;
+                    const DWORD chunk = static_cast<DWORD>(std::min<size_t>(input->size() - at, 1 << 16));
+                    if (!WriteFile(w, input->data() + at, chunk, &n, nullptr) || n == 0) break;
+                    at += n;
+                }
+                CloseHandle(w);
             });
         }
         int code = -1;
@@ -1465,22 +1652,44 @@ namespace albireo
             TerminateProcess(pi.hProcess, 1);
             WaitForSingleObject(pi.hProcess, 5000);
         }
+        if (writer.joinable()) writer.join();
         if (reader.joinable()) reader.join();
-        if (read_end) CloseHandle(read_end);
+        if (job) CloseHandle(job);
+        close_pipes();
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
         return code;
 #else
-        int fds[2] = { -1, -1 };
+        int fds[2] = { -1, -1 }, ins[2] = { -1, -1 };
         if (output && pipe(fds) != 0) return -1;
-        const pid_t pid = fork();
-        if (pid < 0)
+        if (input && pipe(ins) != 0)
         {
             if (output)
             {
                 close(fds[0]);
                 close(fds[1]);
             }
+            return -1;
+        }
+        /*
+            What the child needs is made before the fork: between the fork and the start of
+            the program, the child of a process with threads may only make system calls, a
+            lock of the allocator possibly held by a thread that does not exist in it.
+        */
+        std::vector<char*> argv;
+        argv.push_back(const_cast<char*>(program.c_str()));
+        for (const auto& a : args) argv.push_back(const_cast<char*>(a.c_str()));
+        argv.push_back(nullptr);
+        long max_fd = sysconf(_SC_OPEN_MAX);
+        if (max_fd < 0 || max_fd > 65536) max_fd = 65536;
+        const char* folder = options && !options->directory.empty() ? options->directory.c_str() : nullptr;
+        const bool restricted = options && options->restricted;
+        const size_t memory_limit = options ? options->memory_limit : 0;
+        const pid_t pid = fork();
+        if (pid < 0)
+        {
+            for (int fd : { fds[0], fds[1], ins[0], ins[1] })
+                if (fd >= 0) close(fd);
             return -1;
         }
         if (pid == 0)
@@ -1490,16 +1699,46 @@ namespace albireo
                 dup2(fds[1], 1);
                 dup2(fds[1], 2);
             }
+            if (input) dup2(ins[0], 0);
+            if (folder && chdir(folder) != 0) _exit(127);
+            // A restricted child is bounded in memory, writes no file and leaves no core file.
+            if (restricted)
+            {
+                rlimit limit;
+                if (memory_limit)
+                {
+                    limit.rlim_cur = limit.rlim_max = static_cast<rlim_t>(memory_limit);
+                    setrlimit(RLIMIT_AS, &limit);
+                }
+                limit.rlim_cur = limit.rlim_max = 0;
+                setrlimit(RLIMIT_FSIZE, &limit);
+                setrlimit(RLIMIT_CORE, &limit);
+#if defined(__linux__)
+                prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+#endif
+            }
             // The child keeps its standard streams only.
-            long max_fd = sysconf(_SC_OPEN_MAX);
-            if (max_fd < 0 || max_fd > 65536) max_fd = 65536;
             for (long fd = 3; fd < max_fd; ++fd) close(static_cast<int>(fd));
-            std::vector<char*> argv;
-            argv.push_back(const_cast<char*>(program.c_str()));
-            for (const auto& a : args) argv.push_back(const_cast<char*>(a.c_str()));
-            argv.push_back(nullptr);
             execv(program.c_str(), argv.data());
             _exit(127);
+        }
+        // The input goes to the child from a thread, so that its output is read meanwhile.
+        std::thread writer;
+        if (input)
+        {
+            close(ins[0]);
+            const int w = ins[1];
+            writer = std::thread([w, input]() {
+                size_t at = 0;
+                while (at < input->size())
+                {
+                    const ssize_t n = write(w, input->data() + at, input->size() - at);
+                    if (n < 0 && errno == EINTR) continue;
+                    if (n <= 0) break;
+                    at += static_cast<size_t>(n);
+                }
+                close(w);
+            });
         }
         bool ended = false;
         if (output)
@@ -1535,10 +1774,12 @@ namespace albireo
             {
                 kill(pid, SIGKILL);
                 waitpid(pid, &status, 0);
+                if (writer.joinable()) writer.join();
                 return -1;
             }
             usleep(10000);
         }
+        if (writer.joinable()) writer.join();
         return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 #endif
     }

@@ -97,16 +97,18 @@ namespace dlib
             throw std::runtime_error("detect_vision: '" + s.arch_name
                 + "' is not a vision projector container");
 
-        s.image_size = static_cast<long>(g.get_int("clip.vision.image_size"));
-        s.patch_size = static_cast<long>(g.get_int("clip.vision.patch_size"));
-        s.d_model = static_cast<long>(g.get_int("clip.vision.embedding_length"));
-        s.n_layers = static_cast<long>(g.get_int("clip.vision.block_count"));
-        s.n_heads = static_cast<long>(g.get_int("clip.vision.attention.head_count"));
-        s.d_ffn = static_cast<long>(g.get_int("clip.vision.feed_forward_length"));
-        s.layer_norm_eps = g.get_double("clip.vision.attention.layer_norm_epsilon", 1e-6);
+        // The geometry within the bounds of the published encoders, generously.
+        s.image_size = static_cast<long>(gguf_bounded_int(g, "clip.vision.image_size", 0, 0, 16384));
+        s.patch_size = static_cast<long>(gguf_bounded_int(g, "clip.vision.patch_size", 0, 0, 1024));
+        s.d_model = static_cast<long>(gguf_bounded_int(g, "clip.vision.embedding_length", 0, 0, int64_t(1) << 16));
+        s.n_layers = static_cast<long>(gguf_bounded_int(g, "clip.vision.block_count", 0, 0, 1024));
+        s.n_heads = static_cast<long>(gguf_bounded_int(g, "clip.vision.attention.head_count", 0, 0, 1024));
+        s.d_ffn = static_cast<long>(gguf_bounded_int(g, "clip.vision.feed_forward_length", 0, 0, int64_t(1) << 20));
+        s.layer_norm_eps = gguf_bounded_double(g, "clip.vision.attention.layer_norm_epsilon", 1e-6, 0.0, 1.0);
         s.use_gelu = g.get_int("clip.use_gelu", 1) != 0;
-        s.projection_dim = static_cast<long>(g.get_int("clip.vision.projection_dim"));
-        s.scale_factor = static_cast<long>(g.get_int("clip.vision.projector.scale_factor", 1));
+        s.projection_dim = static_cast<long>(gguf_bounded_int(g, "clip.vision.projection_dim", 0, 0,
+            int64_t(1) << 17));
+        s.scale_factor = static_cast<long>(gguf_bounded_int(g, "clip.vision.projector.scale_factor", 1, 0, 64));
         if (s.scale_factor <= 0) s.scale_factor = 1;
 
         const std::string kind = g.get_str("clip.projector_type");
@@ -119,10 +121,19 @@ namespace dlib
            would hide a container that declares different ones. */
         if (g.has("clip.vision.image_mean"))
             for (double v : g.at("clip.vision.image_mean").arr_float)
+            {
+                if (!(std::abs(v) <= 1e6))
+                    throw std::runtime_error("detect_vision: the mean of the pixels is not a finite number");
                 s.image_mean.push_back(static_cast<float>(v));
+            }
+        // The pixels are divided by these values.
         if (g.has("clip.vision.image_std"))
             for (double v : g.at("clip.vision.image_std").arr_float)
+            {
+                if (!(v > 1e-6 && v <= 1e6))
+                    throw std::runtime_error("detect_vision: the deviation of the pixels is not a positive number");
                 s.image_std.push_back(static_cast<float>(v));
+            }
 
         return s;
     }

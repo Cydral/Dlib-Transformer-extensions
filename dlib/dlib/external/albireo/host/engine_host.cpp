@@ -77,7 +77,8 @@ namespace albireo
         stop();
     }
 
-    std::vector<engine_candidate> engine_host::discover(const std::string& dir, const std::string& probe_program)
+    std::vector<engine_candidate> engine_host::discover(const std::string& dir, const std::string& probe_program,
+        const std::atomic<bool>* stop)
     {
         std::vector<engine_candidate> out;
         for (const char* v : variant_order)
@@ -118,11 +119,11 @@ namespace albireo
         {
             if (c.description.is_object()) continue;
             engine_candidate* p = &c;
-            probes.emplace_back([p, &probe_program]() {
+            probes.emplace_back([p, &probe_program, stop]() {
                 const unsigned limit_ms = 60000;
                 std::string output;
                 const auto started = std::chrono::steady_clock::now();
-                const int code = run_process(probe_program, { "--probe-engine", p->path }, &output, limit_ms);
+                const int code = run_process(probe_program, { "--probe-engine", p->path }, &output, limit_ms, stop);
                 const long long elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - started).count();
                 // The description is the last line the probe prints.
@@ -169,34 +170,6 @@ namespace albireo
             log_info(line);
         }
         return out;
-    }
-
-    const engine_candidate* engine_host::choose(const std::vector<engine_candidate>& candidates,
-        const std::string& wanted, const json& benchmarks)
-    {
-        if (wanted != "auto" && wanted != "best")
-        {
-            for (const auto& c : candidates)
-                if (c.variant == wanted && c.usable) return &c;
-            log_warning("engines: the requested engine '" + wanted + "' is not usable, automatic selection");
-        }
-        // The fastest measured on this machine.
-        const engine_candidate* best = nullptr;
-        double best_rate = 0;
-        for (const auto& c : candidates)
-        {
-            const double rate = benchmarks[c.variant]["tokens_per_second"].as_double(0);
-            if (c.usable && rate > best_rate)
-            {
-                best = &c;
-                best_rate = rate;
-            }
-        }
-        if (best) return best;
-        for (const char* v : variant_order)
-            for (const auto& c : candidates)
-                if (c.variant == v && c.usable) return &c;
-        return nullptr;
     }
 
     bool engine_host::start(const engine_candidate& c, const json& config, std::string& error)
@@ -381,8 +354,9 @@ namespace albireo
         else log_debug(m);
     }
 
-    bool engine_host::submit(const json& request, request_sink sink, uint64_t& id, std::string& error)
+    bool engine_host::submit(const json& request, request_sink sink, uint64_t& id, std::string& error, int* code)
     {
+        if (code) *code = ALBIREO_E_NOT_FOUND;
         std::shared_lock<std::shared_timed_mutex> life(life_);
         if (!engine_)
         {
@@ -403,6 +377,7 @@ namespace albireo
         sink_holder* h = new sink_holder{ std::move(sink), this, model };
         char err[2048] = { 0 };
         const int rc = lib_->submit(engine_, request.dump().c_str(), &engine_host::on_event, h, &id, err, sizeof(err));
+        if (code) *code = rc;
         if (rc != ALBIREO_OK)
         {
             delete h;

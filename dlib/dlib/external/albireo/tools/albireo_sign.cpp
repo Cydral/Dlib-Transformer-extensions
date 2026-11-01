@@ -4,8 +4,10 @@
     albireo-sign: the signatures of the documents the service downloads.
 
         albireo-sign keygen <private key> <public key>
-            Creates a key pair (ECDSA P-256) in PEM files.  The public key goes into
-            host/crypto.cpp (feed_public_key_pem); the private key stays with the publisher.
+            Creates a key pair (ECDSA P-256) in two new PEM files: a file in place is never
+            replaced.  Only the account that runs the program may read the private key.  The
+            public key goes into host/crypto.cpp (feed_public_key_pem); the private key stays
+            with the publisher.
 
         albireo-sign sign <private key> <file> [<file>...]
             Writes <file>.sig, the signature of each file in base64, as the service expects
@@ -30,6 +32,15 @@
 #include <mbedtls/pk.h>
 #include <psa/crypto.h>
 
+#if defined(_WIN32)
+#include <windows.h>
+#include <sddl.h>
+#else
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
 #include "../common/platform.h"
 #include "../host/crypto.h"
 
@@ -49,8 +60,102 @@ namespace
         return 2;
     }
 
+#if defined(_WIN32)
+    // The security identifier of the account that runs this program, as text (S-1-5-21-...).
+    std::wstring current_user_sid()
+    {
+        HANDLE token = nullptr;
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return std::wstring();
+        DWORD size = 0;
+        GetTokenInformation(token, TokenUser, nullptr, 0, &size);
+        std::vector<unsigned char> buffer(size);
+        std::wstring sid;
+        LPWSTR text = nullptr;
+        if (size > 0 && GetTokenInformation(token, TokenUser, buffer.data(), size, &size)
+            && ConvertSidToStringSidW(reinterpret_cast<TOKEN_USER*>(buffer.data())->User.Sid, &text))
+        {
+            sid = text;
+            LocalFree(text);
+        }
+        CloseHandle(token);
+        return sid;
+    }
+#endif
+
+    /*
+        Creates the file path, which must not exist, with data.  With owner_only, the account
+        that runs this program alone reads and writes it: the access list names that account
+        only on Windows, and the mode is 0600 elsewhere.  A file the write leaves incomplete
+        is removed.
+    */
+    bool create_new_file(const std::string& path, const std::string& data, bool owner_only, std::string& error)
+    {
+        const std::string exists = path + " exists already: a key in place is never replaced";
+#if defined(_WIN32)
+        SECURITY_ATTRIBUTES sa = { sizeof(sa), nullptr, FALSE };
+        PSECURITY_DESCRIPTOR sd = nullptr;
+        if (owner_only)
+        {
+            const std::wstring sid = current_user_sid();
+            const std::wstring sddl = L"D:P(A;;FA;;;" + sid + L")";
+            if (sid.empty()
+                || !ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(), SDDL_REVISION_1, &sd, nullptr))
+            {
+                error = "cannot make the access list of " + path + " for the account of this program";
+                return false;
+            }
+            sa.lpSecurityDescriptor = sd;
+        }
+        const std::wstring w = albireo::widen(path);
+        HANDLE h = CreateFileW(w.c_str(), GENERIC_WRITE, 0, &sa, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+        const DWORD create_error = GetLastError();
+        if (sd) LocalFree(sd);
+        if (h == INVALID_HANDLE_VALUE)
+        {
+            error = create_error == ERROR_FILE_EXISTS || create_error == ERROR_ALREADY_EXISTS ? exists
+                : "cannot create " + path;
+            return false;
+        }
+        DWORD written = 0;
+        const bool ok = WriteFile(h, data.data(), static_cast<DWORD>(data.size()), &written, nullptr)
+            && written == data.size() && FlushFileBuffers(h);
+        CloseHandle(h);
+        if (!ok) DeleteFileW(w.c_str());
+#else
+        // O_EXCL refuses any entry of that name, a link included.
+        const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, owner_only ? 0600 : 0644);
+        if (fd < 0)
+        {
+            error = errno == EEXIST ? exists : "cannot create " + path;
+            return false;
+        }
+        size_t done = 0;
+        while (done < data.size())
+        {
+            const ssize_t w = ::write(fd, data.data() + done, data.size() - done);
+            if (w < 0 && errno == EINTR) continue;
+            if (w <= 0) break;
+            done += static_cast<size_t>(w);
+        }
+        const bool ok = done == data.size() && fsync(fd) == 0;
+        ::close(fd);
+        if (!ok) ::unlink(path.c_str());
+#endif
+        if (!ok) error = "cannot write " + path;
+        return ok;
+    }
+
     int keygen(const std::string& private_path, const std::string& public_path)
     {
+        // The services hold the public half of the key of the feed: a key in place is never replaced.
+        for (const std::string& p : { private_path, public_path })
+        {
+            if (albireo::file_exists(p) || albireo::dir_exists(p) || albireo::is_link(p))
+            {
+                std::cerr << p << " exists already: a key in place is never replaced\n";
+                return 1;
+            }
+        }
         psa_crypto_init();
         mbedtls_entropy_context entropy;
         mbedtls_ctr_drbg_context drbg;
@@ -67,11 +172,17 @@ namespace
             && mbedtls_pk_write_key_pem(&key, private_pem, sizeof(private_pem)) == 0
             && mbedtls_pk_write_pubkey_pem(&key, public_pem, sizeof(public_pem)) == 0)
         {
-            // The private key is readable by its owner only.
-            if (!albireo::write_file_restricted(private_path, reinterpret_cast<const char*>(private_pem), false))
-                std::cerr << "cannot write " << private_path << "\n";
-            else if (!albireo::write_file_atomic(public_path, reinterpret_cast<const char*>(public_pem)))
-                std::cerr << "cannot write " << public_path << "\n";
+            std::string error;
+            if (!create_new_file(private_path, reinterpret_cast<const char*>(private_pem), true, error))
+            {
+                std::cerr << error << "\n";
+            }
+            else if (!create_new_file(public_path, reinterpret_cast<const char*>(public_pem), false, error))
+            {
+                std::cerr << error << "\n";
+                // The private key goes with the pair that could not be written whole.
+                albireo::remove_file(private_path);
+            }
             else
             {
                 std::cout << reinterpret_cast<const char*>(public_pem);

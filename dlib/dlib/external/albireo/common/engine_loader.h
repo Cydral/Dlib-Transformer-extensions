@@ -4,6 +4,7 @@
 #define ALBIREO_COMMON_ENGINE_LOADER_H_
 
 #include <string>
+#include <vector>
 
 #include "engine_api.h"
 #include "json.h"
@@ -26,7 +27,13 @@ namespace albireo
         engine_library(const engine_library&) = delete;
         engine_library& operator=(const engine_library&) = delete;
 
-        // Loads the library at path (UTF-8); false with the reason in error otherwise.
+        /*
+            Loads the library at path (UTF-8); false with the reason in error otherwise.  On
+            Windows its dependencies are searched in its folder first.  When it imports the
+            shim of cuDNN (cudnn64_*.dll), the parts of cuDNN beside it (cudnn_*64_*.dll), which
+            the shim loads by their names, are loaded at once by their full paths: those names
+            then lead to these files, whatever copies the system or the PATH hold.
+        */
         bool load(const std::string& path, std::string& error);
         void unload();
 
@@ -62,6 +69,8 @@ namespace albireo
 
     private:
         void* handle_ = nullptr;
+        // The parts of cuDNN loaded with the library, released with it.
+        std::vector<void*> preloaded_;
         std::string path_;
         bool keep_ = false;
     };

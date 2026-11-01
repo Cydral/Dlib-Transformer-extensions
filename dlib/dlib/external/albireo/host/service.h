@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -113,6 +114,9 @@ namespace albireo
         settings_store& settings() { return *settings_; }
         store& db() { return *db_; }
         model_manager& models() { return *models_; }
+        // The folder of the voices of the speech synthesis and its program, beside the service.
+        std::string speech_dir() const;
+        std::string speech_program() const;
         updater& updates() { return *updater_; }
         engine_host& engine() { return engine_; }
 
@@ -230,8 +234,12 @@ namespace albireo
         // Counts the usage of a finished request.
         void record_usage(long prompt_tokens, long generated_tokens);
 
-        // Measures every usable engine on this machine with the active general model
-        // (or the smallest installed one) and records the measures in the settings.
+        /*
+            Measures every usable engine on this machine with the active general model (or
+            the smallest installed one) and records the measures in the settings.  One
+            measure runs at a time: a call during another one returns at once with the code
+            "benchmark_running".
+        */
         json benchmark_engines();
 
         // Entry points of the child processes started by the service itself.
@@ -287,6 +295,17 @@ namespace albireo
         void reload_model(const std::string& id);
         // Waits for the model id to finish unloading, when it is.
         void wait_retired(const std::string& id);
+        /*!
+            ensures
+                - Runs place, which renames new files over those of the installed model id,
+                  while the engine holds no file of id, which Windows would refuse to replace:
+                  a model in the engine leaves it first, once its requests are served, and loads
+                  again from its new files once they are recorded (on_installed()), or from its
+                  files as they were when place fails.
+                - Returns what place returns; false without running it when the model is being
+                  deleted, serves the work in the background, or when the service stops.
+        !*/
+        bool replace_model_files(const std::string& id, const std::function<bool()>& place);
         json engine_config(const host_settings& s, const std::string& device) const;
         std::string engines_dir() const;
 
@@ -325,6 +344,7 @@ namespace albireo
         std::thread restarter_;
         std::mutex models_m_;   // serializes the activations and the loads
         std::mutex import_m_;   // serializes the imports of folders
+        std::mutex benchmark_m_;   // one measure of the engines at a time
         // model -> "loading", "ready", "unloading", "removing" or the error
         std::map<std::string, std::string> load_state_;
         // The models leaving the engine, each on a thread of retirers_, and those whose

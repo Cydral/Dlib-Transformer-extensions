@@ -62,6 +62,7 @@ add_executable(${target_name} main.cpp tester.cpp
    find_max_factor_graph_nmplp.cpp
    find_max_factor_graph_viterbi.cpp
    geometry.cpp
+   gguf.cpp
    graph.cpp
    graph_cuts.cpp
    graph_labeler.cpp

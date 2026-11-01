@@ -10,18 +10,20 @@ from a disk or a memory card.
                                    [--dist <folder>] [--sign <albireo-sign> | --no-verify]
 
 The bundle holds the signed catalog and the signed update feed of dist/albireo, the installer
-the feed announces, and in its models folder the models chosen: by default the default
-language model and the default embedding model of the catalog, which the search in the
-documents needs.  The installer is taken from --installer when given, else downloaded from
-the address of the feed.  --complete adds the complete installer of the version, which
-carries the models that come with Albireo: the default models are then left out, unless
---models or --all name models; each model is taken from the folders of --from when one of their
-files has its size and its SHA-256, else downloaded from the addresses of the catalog.
-Every file is checked against the hashes of the signed files before it enters the bundle,
-and the complete installer must carry the version of the feed.  The signatures are checked
-with albireo-sign (--sign, else build-albireo/bin of the repository, else the PATH); the
-program stops when it is not found, unless --no-verify leaves that check to the service.
-A download stops when the server sends more than the feed or the catalog announces.
+the feed announces, and in its models folder the models chosen, each model that reads images
+with its projector: by default the default language model and the default embedding model of
+the catalog, which the search in the documents needs.  The installer is taken from --installer
+when given, else downloaded from the folder dist of the public link when the feed names it there
+(public_link.py), else from the address of the feed.  --complete adds the complete
+installer of the version, which carries the models that come with Albireo: the default models
+are then left out, unless --models or --all name models; each model is taken from the folders
+of --from when one of their files has its size and its SHA-256, else downloaded from the
+addresses of the catalog.  Every file is checked against the hashes of the signed files before
+it enters the bundle, and the complete installer must carry the version of the feed.  The
+signatures are checked with albireo-sign (--sign, else build-albireo/bin of the repository,
+else the PATH); the program stops when it is not found, unless --no-verify leaves that check to
+the service.  A download stops when the server sends more than the feed or the catalog
+announces.
 
 The bundle is used in one of three ways:
 - albireo-setup-<version>.exe started from the bundle installs Albireo, and the service
@@ -48,6 +50,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import make_feed  # noqa: E402
+import public_link  # noqa: E402
 import publish_release  # noqa: E402
 
 README = """Albireo {version}, offline bundle of {date}
@@ -160,41 +163,63 @@ def local_files(folders):
     return by_size
 
 
-def bundle_model(entry, models_dir, by_size):
-    files = entry["files"]
-    name = os.path.basename(files[0]["url"]) if len(files) == 1 else entry["id"] + ".gguf"
+def bundle_file(label, parts, size, sha256, name, models_dir, by_size, placed):
+    """Places in models_dir, under name, the file of the catalog that parts make up, of that size
+    and SHA-256: kept when it is there already, else copied from a file of the folders of --from,
+    else downloaded part by part.  placed maps the names given so far to their SHA-256: two
+    files of one name stop the program."""
+    if placed.setdefault(name, sha256) != sha256:
+        raise RuntimeError("%s: another file of the bundle is named %s already" % (label, name))
     target = os.path.join(models_dir, name)
-    if os.path.isfile(target) and os.path.getsize(target) == entry["size"] \
-            and make_feed.sha256_of(target) == entry["sha256"]:
-        print("%s: already in the bundle" % entry["id"])
+    if os.path.isfile(target) and os.path.getsize(target) == size and make_feed.sha256_of(target) == sha256:
+        print("%s: already in the bundle" % label)
         return target
     partial = target + ".partial"
     try:
-        for path in by_size.get(entry["size"], []):
-            if make_feed.sha256_of(path) == entry["sha256"]:
+        for path in by_size.get(size, []):
+            if make_feed.sha256_of(path) == sha256:
                 shutil.copyfile(path, partial)
                 os.replace(partial, target)
-                print("%s: copied from %s" % (entry["id"], path))
+                print("%s: copied from %s" % (label, path))
                 return target
         whole = hashlib.sha256()
         with open(partial, "wb") as out:
-            for i, part in enumerate(files):
+            for i, part in enumerate(parts):
                 gzip_part = part.get("compression") == "gzip"
                 if gzip_part and not part.get("compressed_size"):
                     raise RuntimeError("%s: the catalog gives no compressed size for the part %s"
-                                       % (entry["id"], part["url"]))
-                label = "%s %d/%d" % (entry["id"], i + 1, len(files))
-                sha, size = download(part["url"], out, part["size"], gzip_part, label, whole,
-                                     part.get("compressed_size"))
-                if sha != part["sha256"] or size != part["size"]:
-                    raise RuntimeError("%s: the part %s does not match the catalog" % (entry["id"], part["url"]))
-        if whole.hexdigest() != entry["sha256"]:
-            raise RuntimeError("%s: the model does not match the catalog" % entry["id"])
+                                       % (label, part["url"]))
+                progress = "%s %d/%d" % (label, i + 1, len(parts))
+                sha, written = download(part["url"], out, part["size"], gzip_part, progress, whole,
+                                        part.get("compressed_size"))
+                if sha != part["sha256"] or written != part["size"]:
+                    raise RuntimeError("%s: the part %s does not match the catalog" % (label, part["url"]))
+        if whole.hexdigest() != sha256:
+            raise RuntimeError("%s: the file does not match the catalog" % label)
         os.replace(partial, target)
     finally:
         remove_partial(partial)
-    print("%s: downloaded" % entry["id"])
+    print("%s: downloaded" % label)
     return target
+
+
+def bundle_model(entry, models_dir, by_size, placed):
+    """Places the model of a catalog entry in models_dir, with the projector of a model that reads
+    images, under the names the service looks for (host/models.cpp, bundle_file()): the name of
+    the published file when it comes in one part, else <id>.gguf and <id>.mmproj.gguf.  Returns
+    the size of the files of the model."""
+    files = entry["files"]
+    name = os.path.basename(files[0]["url"]) if len(files) == 1 else entry["id"] + ".gguf"
+    bundle_file(entry["id"], files, entry["size"], entry["sha256"], name, models_dir, by_size, placed)
+    total = entry["size"]
+    projector = entry.get("projector")
+    if projector:
+        parts = projector["files"]
+        name = os.path.basename(parts[0]["url"]) if len(parts) == 1 else entry["id"] + ".mmproj.gguf"
+        bundle_file("the projector of %s" % entry["id"], parts, projector["size"], projector["sha256"], name,
+                    models_dir, by_size, placed)
+        total += projector["size"]
+    return total
 
 
 def main():
@@ -236,8 +261,9 @@ def main():
             stable = json.load(f)["channels"]["stable"]
 
         installer = stable["installer"]
-        installer_name = os.path.basename(installer["url"])
-        if not installer.get("size"):
+        # The name of the installer in the folder dist of the public link, else the one of its address.
+        installer_name = installer.get("file") or os.path.basename(installer.get("url", ""))
+        if not installer.get("size") or not installer_name:
             raise RuntimeError("the feed of %s announces no installer yet: publish the version first "
                                "(publish_release.py)" % a.dist)
         if a.complete:
@@ -251,8 +277,17 @@ def main():
         elif not (os.path.isfile(target) and make_feed.sha256_of(target) == installer["sha256"]):
             partial = target + ".partial"
             try:
+                # The copy of the public link, else the address of the feed.
+                address = installer.get("url")
+                if installer.get("file"):
+                    try:
+                        address = public_link.Link().address("dist/" + installer["file"])
+                    except RuntimeError as e:
+                        if not address:
+                            raise
+                        print("%s; the installer comes from %s" % (e, address))
                 with open(partial, "wb") as out:
-                    sha, size = download(installer["url"], out, installer["size"], label=installer_name)
+                    sha, size = download(address, out, installer["size"], label=installer_name)
                 if sha != installer["sha256"] or size != installer["size"]:
                     raise RuntimeError("the installer downloaded does not match the feed")
                 os.replace(partial, target)
@@ -280,9 +315,9 @@ def main():
             chosen = [e for e in entries if e.get("default")]
         by_size = local_files(a.sources)
         total = 0
+        placed = {}
         for e in chosen:
-            bundle_model(e, os.path.join(a.output, "models"), by_size)
-            total += e["size"]
+            total += bundle_model(e, os.path.join(a.output, "models"), by_size, placed)
 
         with open(os.path.join(a.output, "README.txt"), "w", encoding="utf-8", newline="\r\n") as f:
             complete_en = ("\n- %s: the complete installer, with the models that come with Albireo."

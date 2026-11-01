@@ -149,44 +149,48 @@ namespace dlib
         s.model_name = clean_model_name(g.get_str("general.name", s.arch_name));
         s.family = arch_family_from_name(s.arch_name);
 
-        const std::string p = s.arch_name;   // metadata keys are prefixed by the architecture
-        s.n_layers   = static_cast<long>(g.get_int(p + ".block_count"));
-        s.n_heads    = static_cast<long>(g.get_int(p + ".attention.head_count"));
-        s.n_kv_heads = static_cast<long>(g.get_int(p + ".attention.head_count_kv", s.n_heads));
-        s.d_model    = static_cast<long>(g.get_int(p + ".embedding_length"));
-        s.d_ffn      = static_cast<long>(g.get_int(p + ".feed_forward_length"));
+        /* Metadata keys are prefixed by the architecture.  Every number is read within the
+           bounds of the published models, generously: 1,024 layers and heads, a width of
+           2^17, a feed-forward width of 2^20, heads of 4,096 values, 4,096 experts. */
+        const std::string p = s.arch_name;
+        s.n_layers   = static_cast<long>(gguf_bounded_int(g, p + ".block_count", 0, 0, 1024));
+        s.n_heads    = static_cast<long>(gguf_bounded_int(g, p + ".attention.head_count", 0, 0, 1024));
+        s.n_kv_heads = static_cast<long>(gguf_bounded_int(g, p + ".attention.head_count_kv", s.n_heads, 0, 1024));
+        s.d_model    = static_cast<long>(gguf_bounded_int(g, p + ".embedding_length", 0, 0, int64_t(1) << 17));
+        s.d_ffn      = static_cast<long>(gguf_bounded_int(g, p + ".feed_forward_length", 0, 0, int64_t(1) << 20));
         /* Qwen3 (and some others) decouple head_dim from d_model / n_heads; prefer the explicit
            attention.key_length metadata when present, else fall back to the derived value. */
         {
-            const long kl = static_cast<long>(g.get_int(p + ".attention.key_length", 0));
+            const long kl = static_cast<long>(gguf_bounded_int(g, p + ".attention.key_length", 0, 0, 4096));
             s.head_dim = kl > 0 ? kl : (s.n_heads > 0 ? s.d_model / s.n_heads : 0);
         }
-        s.rms_eps    = g.get_double(p + ".attention.layer_norm_rms_epsilon", 1e-5);
-        s.rope_freq_base = g.get_double(p + ".rope.freq_base", 10000.0);
+        s.rms_eps    = gguf_bounded_double(g, p + ".attention.layer_norm_rms_epsilon", 1e-5, 0.0, 1.0);
+        s.rope_freq_base = gguf_bounded_double(g, p + ".rope.freq_base", 10000.0, 1e-3, 1e12);
         /* RoPE position scaling. Modern GGUFs declare it under rope.scaling.*; older
            files carry the legacy rope.scale_linear factor. Reference implementations apply a linear
            factor to every position, so ignoring a declared scaling silently diverges
            from the reference; the compatibility check below turns it into a blocker
            until the corresponding support lands in the rotary layer. */
         s.rope_scaling_type = g.get_str(p + ".rope.scaling.type", "");
-        s.rope_scaling_factor = g.get_double(p + ".rope.scaling.factor", 0.0);
-        s.rope_orig_ctx = static_cast<long>(g.get_int(p + ".rope.scaling.original_context_length", 0));
+        s.rope_scaling_factor = gguf_bounded_double(g, p + ".rope.scaling.factor", 0.0, 0.0, 1e6);
+        s.rope_orig_ctx = static_cast<long>(gguf_bounded_int(g, p + ".rope.scaling.original_context_length", 0, 0,
+            int64_t(1) << 26));
         if (s.rope_scaling_type.empty() && g.has(p + ".rope.scale_linear"))
         {
             s.rope_scaling_type = "linear";
-            s.rope_scaling_factor = g.get_double(p + ".rope.scale_linear", 0.0);
+            s.rope_scaling_factor = gguf_bounded_double(g, p + ".rope.scale_linear", 0.0, 0.0, 1e6);
         }
-        s.n_experts  = static_cast<long>(g.get_int(p + ".expert_count", 0));
-        s.n_experts_used = static_cast<long>(g.get_int(p + ".expert_used_count", 0));
-        s.embedding_scale = g.get_double(p + ".embedding_scale", 1.0);
-        s.residual_scale  = g.get_double(p + ".residual_scale", 1.0);
-        s.attention_scale = g.get_double(p + ".attention.scale", 0.0);
-        s.logit_scale     = g.get_double(p + ".logit_scale", 0.0);
+        s.n_experts  = static_cast<long>(gguf_bounded_int(g, p + ".expert_count", 0, 0, 4096));
+        s.n_experts_used = static_cast<long>(gguf_bounded_int(g, p + ".expert_used_count", 0, 0, s.n_experts));
+        s.embedding_scale = gguf_bounded_double(g, p + ".embedding_scale", 1.0, -1e6, 1e6);
+        s.residual_scale  = gguf_bounded_double(g, p + ".residual_scale", 1.0, -1e6, 1e6);
+        s.attention_scale = gguf_bounded_double(g, p + ".attention.scale", 0.0, -1e6, 1e6);
+        s.logit_scale     = gguf_bounded_double(g, p + ".logit_scale", 0.0, -1e6, 1e6);
 
         if (g.has("tokenizer.ggml.tokens"))
             s.vocab_size = static_cast<long>(g.at("tokenizer.ggml.tokens").arr_str.size());
         else
-            s.vocab_size = static_cast<long>(g.get_int(p + ".vocab_size", 0));
+            s.vocab_size = static_cast<long>(gguf_bounded_int(g, p + ".vocab_size", 0, 0, int64_t(1) << 24));
 
         if (s.d_model > 0 && s.d_ffn > 0)
         {
@@ -196,7 +200,7 @@ namespace dlib
         }
 
         s.tied_embeddings = (g.find_tensor("output.weight") == nullptr);
-        s.pooling_type = static_cast<long>(g.get_int(p + ".pooling_type", -1));
+        s.pooling_type = static_cast<long>(gguf_bounded_int(g, p + ".pooling_type", -1, -1, 16));
         s.embedding_model = s.tied_embeddings && s.pooling_type >= 0;
         s.qk_norm = (g.find_tensor("blk.0.attn_q_norm.weight") != nullptr);
         for (const auto& t : g.tensors()) if (t.is_quantized()) { s.quantized = true; break; }

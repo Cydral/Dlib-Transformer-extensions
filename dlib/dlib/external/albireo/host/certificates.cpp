@@ -230,6 +230,15 @@ namespace albireo
                     if (mbedtls_x509write_crt_set_extension(&crt, oid_name_constraints,
                             MBEDTLS_OID_SIZE(MBEDTLS_OID_NAME_CONSTRAINTS), 0, nc.data(), nc.size()) != 0)
                         break;
+                    /* The certificates it signs serve TLS servers alone: Windows, which applies the
+                       extended key usage of an authority to the certificates below it, refuses one
+                       of them for code or mail, whatever it declares. */
+                    mbedtls_asn1_sequence eku;
+                    std::memset(&eku, 0, sizeof(eku));
+                    eku.buf.tag = MBEDTLS_ASN1_OID;
+                    eku.buf.p = reinterpret_cast<unsigned char*>(const_cast<char*>(MBEDTLS_OID_SERVER_AUTH));
+                    eku.buf.len = MBEDTLS_OID_SIZE(MBEDTLS_OID_SERVER_AUTH);
+                    if (mbedtls_x509write_crt_set_ext_key_usage(&crt, &eku) != 0) break;
                 }
                 else
                 {
@@ -322,22 +331,25 @@ namespace albireo
         /*
             The files of the versions before 1.0.8: the key of their authority, which is
             never kept now, and on Windows the key of the server in clear, which moves into
-            its encrypted file.
+            its encrypted file.  Returns true when the key of the authority was found: a copy
+            of it may have left the computer, and the authority is replaced at once.
         */
-        void migrate(const certificate_files& f)
+        bool migrate(const certificate_files& f)
         {
-            if (file_exists(f.ca_key))
+            const bool exposed = file_exists(f.ca_key);
+            if (exposed)
             {
                 if (remove_file(f.ca_key)) log_info("certificates: the key of the earlier local authority is deleted");
                 else log_warning("certificates: the key of the earlier local authority cannot be deleted");
             }
-            if (f.plain_key == f.server_key || !file_exists(f.plain_key)) return;
+            if (f.plain_key == f.server_key || !file_exists(f.plain_key)) return exposed;
             std::string pem;
             if (!file_exists(f.server_key) && read_file(f.plain_key, pem, 64 * 1024)
                 && pem.compare(0, 11, "-----BEGIN ") == 0 && write_key(f.server_key, pem))
                 log_info("certificates: the key of the server is now encrypted for the account of the service");
             wipe_secret(pem);
             remove_file(f.plain_key);
+            return exposed;
         }
     }
 
@@ -386,11 +398,12 @@ namespace albireo
             error = "no entropy source";
             return false;
         }
-        migrate(f);
+        const bool exposed = migrate(f);
+        if (exposed) log_warning("certificates: the local authority kept its key on disk, a new authority replaces it");
 
         // The certificates in place serve while they have time left and the key opens and matches.
-        if (file_exists(f.ca_cert) && file_exists(f.server_cert) && seconds_left(f.ca_cert) > renewal_seconds
-            && seconds_left(f.server_cert) > renewal_seconds)
+        if (!exposed && file_exists(f.ca_cert) && file_exists(f.server_cert)
+            && seconds_left(f.ca_cert) > renewal_seconds && seconds_left(f.server_cert) > renewal_seconds)
         {
             std::string pem;
             const bool ok = read_server_key(dir, pem) && key_matches(pem, f.server_cert, rng);

@@ -11,17 +11,25 @@ function serviceError(message, code) {
   return e;
 }
 
+/*
+    The error of an answer of the service, with retryAfter, the seconds its Retry-After header asks to wait before the
+    request is sent again (busy, engine_busy, starting, model_loading), when it gives them.
+*/
 async function errorOf(r) {
+  let e = null;
   try {
     const j = await r.json();
     if (j && j.error) {
-      if (typeof j.error === 'string') return serviceError(j.error, j.code);
-      return serviceError(j.error.message || r.statusText, j.error.code);
+      e = typeof j.error === 'string' ? serviceError(j.error, j.code) : serviceError(j.error.message || r.statusText,
+        j.error.code);
     }
-  } catch (e) {
+  } catch (x) {
     // The body was not JSON.
   }
-  return serviceError(r.status + ' ' + r.statusText);
+  if (!e) e = serviceError(r.status + ' ' + r.statusText);
+  const wait = Number(r.headers.get('Retry-After'));
+  if (wait > 0) e.retryAfter = wait;
+  return e;
 }
 
 export async function getJSON(url, signal) {
@@ -33,6 +41,39 @@ export async function getJSON(url, signal) {
 // A signal that ends a request after ms milliseconds, where the browser offers one.
 function timeout(ms) {
   return typeof AbortSignal.timeout === 'function' ? AbortSignal.timeout(ms) : undefined;
+}
+
+/*
+    A signal that ends a request after ms milliseconds (a TimeoutError), or as soon as signal ends it (its
+    reason): {signal, done}, done forgetting the timer and the listener once the request ended.
+*/
+export function limitedSignal(signal, ms) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => {
+    controller.abort(new DOMException('The request did not end within ' + Math.round(ms / 1000) + ' seconds.',
+      'TimeoutError'));
+  }, ms);
+  const stop = () => controller.abort(signal.reason);
+  if (signal) {
+    if (signal.aborted) stop();
+    else signal.addEventListener('abort', stop, { once: true });
+  }
+  return {
+    signal: controller.signal,
+    done() {
+      clearTimeout(timer);
+      if (signal) signal.removeEventListener('abort', stop);
+    }
+  };
+}
+
+// A sound of the service (the speech synthesis), as a Blob.
+export async function postAudio(url, body, signal) {
+  const r = await fetch(url, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal
+  });
+  if (!r.ok) throw await errorOf(r);
+  return r.blob();
 }
 
 export async function postJSON(url, body, signal) {

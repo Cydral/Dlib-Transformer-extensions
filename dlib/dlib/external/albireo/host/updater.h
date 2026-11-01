@@ -19,14 +19,18 @@ namespace albireo
     {
         /*!
             WHAT THIS OBJECT REPRESENTS
-                The updates of the programs.  The feed is a JSON document published on
-                GitHub with a detached signature (ECDSA P-256 over its exact bytes); a feed
-                whose signature does not verify against the key built into the programs is
-                ignored.  When it announces a newer version, its installer is downloaded in
-                the background into the updates folder and checked against the hash the
-                feed gives.  The update is applied when the service restarts: the service
-                then starts the installer in its update mode, which replaces the programs
-                and starts the service again.
+                The updates of the programs.  The feed is a JSON document published in the
+                folder dist of the public link (public_link.h) and on GitHub, each with a
+                detached signature (ECDSA P-256 over its exact bytes); the feed of the link
+                is read first, the one of feed_url when the link does not answer, holds no
+                feed or holds one whose signature does not verify against the key built into
+                the programs, which is ignored.  When it announces a newer version, its
+                installer is downloaded in the background into the updates folder, from the
+                folder dist of the link when the feed names it there ("file"), else or then
+                from its address ("url"), and checked against the hash the feed gives.  The
+                update is applied when the service restarts: the service then starts the
+                installer in its update mode, which replaces the programs and starts the
+                service again.
 
                 A check made from the menu of the tray downloads the update in the same
                 way and leaves it for the next restart; "apply" restarts at once.
@@ -70,8 +74,9 @@ namespace albireo
         /*!
             ensures
                 - Stages the update found in folder: feed.json, feed.json.sig and the
-                  installer the feed names, by its file name, each read through no link
-                  from base (an empty base: the root of the drive of folder).
+                  installer the feed names, by its file name ("file", else the name of its
+                  "url"), each read through no link from base (an empty base: the root of
+                  the drive of folder).
                 - Returns {"state": "ready", "version", "installer"} when the update is
                   staged, {"state": "up_to_date", "version"} when the folder holds this
                   version or an older one, {"error", "code", "args"} otherwise; "installer"

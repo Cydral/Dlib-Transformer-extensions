@@ -2123,6 +2123,8 @@ namespace albireo
 #else
         const long packed_min_tokens = 256;
 #endif
+        // The floats of the packed tokens a thread keeps from one product to the next (16 MB).
+        const size_t packed_tokens_kept = size_t(1) << 22;
 
         // n floats of v, 64-byte aligned.
         float* aligned_floats(std::vector<float>& v, size_t n)
@@ -2279,6 +2281,8 @@ namespace albireo
                     }
                 }
             });
+            // A larger buffer goes back to the system: the thread would otherwise keep the largest one it needed.
+            if (token_buffer.size() > packed_tokens_kept) std::vector<float>().swap(token_buffer);
         }
 #endif
 
@@ -3134,6 +3138,7 @@ namespace albireo
                         continue;
                     }
 #endif
+#if ALBIREO_QK_AVX2
                     switch (R)
                     {
 #if ALBIREO_QK_AVX512
@@ -3142,11 +3147,14 @@ namespace albireo
                     case 4: encoder_values_group<4>(p, lds, V + i, ldv, n, w, o, ldo); break;
                     case 3: encoder_values_group<3>(p, lds, V + i, ldv, n, w, o, ldo); break;
 #endif
-#if ALBIREO_QK_AVX2
                     case 2: encoder_values_group<2>(p, lds, V + i, ldv, n, w, o, ldo); break;
-#endif
                     default: encoder_values_group<1>(p, lds, V + i, ldv, n, w, o, ldo); break;
                     }
+#else
+                    // The portable build has no vector form for several rows: one row at a time.
+                    (void)R;
+                    encoder_values_group<1>(p, lds, V + i, ldv, n, w, o, ldo);
+#endif
                 }
             }
         }

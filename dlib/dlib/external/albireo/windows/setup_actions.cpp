@@ -28,6 +28,7 @@
 #include <sddl.h>
 #include <tlhelp32.h>
 #include <wincrypt.h>
+#include <iphlpapi.h>
 
 #include <algorithm>
 #include <cctype>
@@ -62,6 +63,10 @@ namespace setup
     {
         const wchar_t uninstall_key[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Albireo";
         const wchar_t run_key[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+
+        // Why the service cannot be registered while it waits for its deletion.
+        const char* const service_marked_text = "the service Albireo waits for its deletion: close the Services "
+            "console and the programs that use the service, or restart Windows, then run the installer again";
 
         std::string known_folder(REFKNOWNFOLDERID id, const char* fallback)
         {
@@ -310,7 +315,7 @@ namespace setup
         return join_path(data_dir(), "models");
     }
 
-    std::string folder_problem(const std::string& dir, bool program)
+    std::string folder_problem(const std::string& dir, bool program, const std::string& program_dir)
     {
         if (dir.size() < 3 || !std::isalpha(static_cast<unsigned char>(dir[0])) || dir[1] != ':'
             || (dir[2] != '\\' && dir[2] != '/'))
@@ -330,6 +335,12 @@ namespace setup
             if (!f.empty() && same_or_inside(widen(f), full)) return "folder_system";
         // The programs of the service stay out of the folder of Windows and of the folders of the users.
         if (program && inside_windows_or_users(full)) return "folder_system";
+        // The models stay apart from the programs, whose folders an update replaces.
+        if (!program && !program_dir.empty())
+        {
+            const std::wstring programs = full_folder(program_dir);
+            if (same_or_inside(full, programs) || same_or_inside(programs, full)) return "folder_overlap";
+        }
         // The links on its path, as secure_folder() accepts them.
         for (size_t at = 3; at <= full.size(); ++at)
         {
@@ -564,6 +575,31 @@ namespace setup
             && s.dwCurrentState != SERVICE_STOPPED;
     }
 
+    bool service_marked_for_deletion(std::string& error)
+    {
+        service_handles h;
+        if (!open_service(h, SERVICE_CHANGE_CONFIG)) return false;
+        // A change that changes nothing fails for a service that waits for its deletion.
+        if (ChangeServiceConfigW(h.svc, SERVICE_NO_CHANGE, SERVICE_NO_CHANGE, SERVICE_NO_CHANGE, nullptr, nullptr,
+                nullptr, nullptr, nullptr, nullptr, nullptr)
+            || GetLastError() != ERROR_SERVICE_MARKED_FOR_DELETE)
+            return false;
+        error = service_marked_text;
+        return true;
+    }
+
+    bool service_disabled()
+    {
+        service_handles h;
+        if (!open_service(h, SERVICE_QUERY_CONFIG)) return false;
+        DWORD size = 0;
+        QueryServiceConfigW(h.svc, nullptr, 0, &size);
+        if (size == 0) return false;
+        std::vector<unsigned char> buf(size);
+        QUERY_SERVICE_CONFIGW* config = reinterpret_cast<QUERY_SERVICE_CONFIGW*>(buf.data());
+        return QueryServiceConfigW(h.svc, config, size, &size) && config->dwStartType == SERVICE_DISABLED;
+    }
+
     void suspend_recovery()
     {
         service_handles h;
@@ -636,7 +672,7 @@ namespace setup
         return true;
     }
 
-    bool register_service(const std::string& program_dir, std::string& error)
+    bool register_service(const std::string& program_dir, bool keep_start_type, std::string& error)
     {
         SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_ALL_ACCESS);
         if (!scm)
@@ -647,10 +683,20 @@ namespace setup
         const std::wstring name = widen(service_name);
         const std::wstring path = L"\"" + widen(join_path(program_dir, "albireo-service.exe")) + L"\"";
         SC_HANDLE svc = OpenServiceW(scm, name.c_str(), SERVICE_ALL_ACCESS);
+        // The start of a service in place stays as an administrator set it, on an update.
+        const bool keep = svc && keep_start_type;
         if (svc)
         {
-            ChangeServiceConfigW(svc, SERVICE_WIN32_OWN_PROCESS, SERVICE_AUTO_START, SERVICE_ERROR_NORMAL, path.c_str(),
-                nullptr, nullptr, nullptr, nullptr, nullptr, L"Albireo");
+            const DWORD start = keep ? SERVICE_NO_CHANGE : SERVICE_AUTO_START;
+            if (!ChangeServiceConfigW(svc, SERVICE_WIN32_OWN_PROCESS, start, SERVICE_ERROR_NORMAL, path.c_str(),
+                    nullptr, nullptr, nullptr, nullptr, nullptr, L"Albireo"))
+            {
+                error = GetLastError() == ERROR_SERVICE_MARKED_FOR_DELETE ? std::string(service_marked_text)
+                    : last_error("cannot configure the service");
+                CloseServiceHandle(svc);
+                CloseServiceHandle(scm);
+                return false;
+            }
         }
         else
         {
@@ -666,8 +712,11 @@ namespace setup
         std::wstring text = L"Runs the language models of Albireo and serves its local interface.";
         SERVICE_DESCRIPTIONW desc = { &text[0] };
         ChangeServiceConfig2W(svc, SERVICE_CONFIG_DESCRIPTION, &desc);
-        SERVICE_DELAYED_AUTO_START_INFO delayed = { TRUE };
-        ChangeServiceConfig2W(svc, SERVICE_CONFIG_DELAYED_AUTO_START_INFO, &delayed);
+        if (!keep)
+        {
+            SERVICE_DELAYED_AUTO_START_INFO delayed = { TRUE };
+            ChangeServiceConfig2W(svc, SERVICE_CONFIG_DELAYED_AUTO_START_INFO, &delayed);
+        }
         set_failure_actions(svc, true);
         SERVICE_PRESHUTDOWN_INFO pre = { 20000 };
         ChangeServiceConfig2W(svc, SERVICE_CONFIG_PRESHUTDOWN_INFO, &pre);
@@ -811,14 +860,16 @@ namespace setup
     {
         /*
             Renames a file, trying again for five seconds: a file that a scanner or an
-            indexer reads is released soon.  A running program may be renamed.
+            indexer reads is released soon.  A running program may be renamed.  With
+            replace, a file of the name to stands in the way of nothing.
         */
-        bool move_file(const std::string& from, const std::string& to)
+        bool move_file(const std::string& from, const std::string& to, bool replace = false)
         {
+            const DWORD flags = MOVEFILE_WRITE_THROUGH | (replace ? MOVEFILE_REPLACE_EXISTING : 0);
             DWORD e = ERROR_SUCCESS;
             for (int attempt = 0; attempt < 20; ++attempt)
             {
-                if (MoveFileExW(widen(from).c_str(), widen(to).c_str(), MOVEFILE_WRITE_THROUGH)) return true;
+                if (MoveFileExW(widen(from).c_str(), widen(to).c_str(), flags)) return true;
                 e = GetLastError();
                 if (e != ERROR_SHARING_VIOLATION && e != ERROR_ACCESS_DENIED && e != ERROR_LOCK_VIOLATION) return false;
                 std::this_thread::sleep_for(std::chrono::milliseconds(250));
@@ -877,7 +928,7 @@ namespace setup
             error = last_error(("cannot create " + fresh).c_str());
             return false;
         }
-        const bool ok = body([h](const void* data, size_t n) {
+        bool ok = body([h](const void* data, size_t n) {
             const char* p = static_cast<const char*>(data);
             while (n > 0)
             {
@@ -889,6 +940,12 @@ namespace setup
             }
             return true;
         });
+        // On the disk before the renames of commit(): a file renamed into place is never left empty.
+        if (ok && !FlushFileBuffers(h))
+        {
+            ok = false;
+            error = last_error(("cannot write " + fresh).c_str());
+        }
         CloseHandle(h);
         if (!ok && error.empty()) error = "cannot write " + fresh + " (disk full?)";
         return ok;
@@ -912,8 +969,14 @@ namespace setup
                 const std::string aside = e.target + ".old-" + random_hex(8);
                 if (!move_file(e.target, aside))
                 {
+                    // A file the change removes stays where it is, for finish().
+                    if (e.removal)
+                    {
+                        e.kept = true;
+                        continue;
+                    }
                     error = last_error(("cannot replace " + e.target).c_str());
-                    restore(i);
+                    if (!restore(i, unrestored_)) error += "; not put back: " + unrestored_;
                     return false;
                 }
                 e.aside = aside;
@@ -923,7 +986,7 @@ namespace setup
                 if (!move_file(e.fresh, e.target))
                 {
                     error = last_error(("cannot install " + e.target).c_str());
-                    restore(i + 1);
+                    if (!restore(i + 1, unrestored_)) error += "; not put back: " + unrestored_;
                     return false;
                 }
                 e.placed = true;
@@ -933,25 +996,40 @@ namespace setup
         return true;
     }
 
-    void staged_files::restore(size_t count)
+    bool staged_files::restore(size_t count, std::string& failed)
     {
+        bool ok = true;
         for (size_t i = count; i-- > 0;)
         {
             entry& e = entries_[i];
             // The new file goes back to its own name, which the destructor deletes.
-            const DWORD replace = MOVEFILE_REPLACE_EXISTING;
-            if (e.placed) MoveFileExW(widen(e.target).c_str(), widen(e.fresh).c_str(), replace);
-            if (!e.aside.empty()) MoveFileExW(widen(e.aside).c_str(), widen(e.target).c_str(), replace);
+            if (e.placed) move_file(e.target, e.fresh, true);
+            // The previous file takes its place again, over the new one when that could not move.
+            if (!e.aside.empty() && !move_file(e.aside, e.target, true))
+            {
+                ok = false;
+                failed += (failed.empty() ? "" : ", ") + e.target + " (kept as " + e.aside + ")";
+                log("cannot put back " + e.target + ": it stays as " + e.aside);
+            }
             e.placed = false;
             e.aside.clear();
+            e.kept = false;
         }
+        return ok;
     }
 
-    void staged_files::rollback()
+    bool staged_files::rollback(std::string& error)
     {
-        if (!committed_) return;
-        restore(entries_.size());
+        if (!committed_)
+        {
+            error = unrestored_;
+            return unrestored_.empty();
+        }
         committed_ = false;
+        std::string failed;
+        const bool ok = restore(entries_.size(), failed);
+        if (!ok) error = failed;
+        return ok;
     }
 
     void staged_files::finish()
@@ -960,8 +1038,11 @@ namespace setup
         for (auto& e : entries_)
         {
             if (!e.aside.empty()) delete_file(e.aside);
+            // A file to remove that could not be set aside goes now, or at the next restart of Windows.
+            if (e.kept) delete_file(e.target);
             e.aside.clear();
             e.placed = false;
+            e.kept = false;
         }
     }
 
@@ -1428,8 +1509,14 @@ namespace setup
                 "its models are not installed";
             return false;
         }
+        // The files of the models, and the projector of each model that reads images.
         std::set<std::string> hashes;
-        for (const auto& m : catalog["models"].elements()) hashes.insert(m["sha256"].as_string());
+        for (const auto& m : catalog["models"].elements())
+        {
+            hashes.insert(m["sha256"].as_string());
+            if (m["projector"].is_object()) hashes.insert(m["projector"]["sha256"].as_string());
+        }
+        hashes.erase(std::string());
         const std::string inbox = join_path(data_dir(), "import");
         if (!write_file_atomic(join_path(inbox, "catalog.json.sig"), sig)
             || !write_file_atomic(join_path(inbox, "catalog.json"), body))
@@ -1445,7 +1532,11 @@ namespace setup
         // A variable holds the manifest while the loop walks its array.
         const json manifest = read_file(join_path(source, builtin_manifest_name), text, 16u << 20)
             ? json::parse_or_null(text) : json();
-        for (const auto& m : manifest["models"].elements()) builtin.insert(m["file"].as_string());
+        for (const auto& m : manifest["models"].elements())
+        {
+            builtin.insert(m["file"].as_string());
+            if (m["projector"].is_object()) builtin.insert(m["projector"]["file"].as_string());
+        }
         std::vector<std::string> names;
         uint64_t total = 0;
         for (const auto& name : list_dir(source))
@@ -1572,6 +1663,50 @@ namespace setup
         RegDeleteKeyExW(HKEY_LOCAL_MACHINE, uninstall_key, KEY_WOW64_64KEY, 0);
     }
 
+    uninstall_entry save_uninstall_entry()
+    {
+        uninstall_entry entry;
+        HKEY k = nullptr;
+        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, uninstall_key, 0, KEY_READ | KEY_WOW64_64KEY, &k) != ERROR_SUCCESS)
+            return entry;
+        entry.present = true;
+        for (DWORD i = 0;; ++i)
+        {
+            wchar_t name[16384];
+            DWORD name_size = 16384, type = 0, data_size = 0;
+            if (RegEnumValueW(k, i, name, &name_size, nullptr, &type, nullptr, &data_size) != ERROR_SUCCESS) break;
+            uninstall_entry::value v;
+            v.name.assign(name, name_size);
+            v.type = type;
+            v.data.resize(data_size);
+            name_size = 16384;
+            if (RegEnumValueW(k, i, name, &name_size, nullptr, &type, v.data.empty() ? nullptr : &v.data[0],
+                    &data_size) != ERROR_SUCCESS)
+                break;
+            v.data.resize(data_size);
+            entry.values.push_back(v);
+        }
+        RegCloseKey(k);
+        return entry;
+    }
+
+    void restore_uninstall_entry(const uninstall_entry& entry)
+    {
+        remove_uninstall();
+        if (!entry.present) return;
+        HKEY k = nullptr;
+        if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, uninstall_key, 0, nullptr, 0, KEY_WRITE | KEY_WOW64_64KEY, nullptr, &k,
+                nullptr) != ERROR_SUCCESS)
+        {
+            log(last_error("cannot write back the entry of the installed programs"));
+            return;
+        }
+        for (const auto& v : entry.values)
+            RegSetValueExW(k, v.name.c_str(), 0, v.type, v.data.empty() ? nullptr : v.data.data(),
+                static_cast<DWORD>(v.data.size()));
+        RegCloseKey(k);
+    }
+
     void set_autostart(const std::string& program_dir, bool on)
     {
         HKEY k = nullptr;
@@ -1682,28 +1817,151 @@ namespace setup
         return ok;
     }
 
-    bool wait_for_server(int port, unsigned timeout_ms)
+    namespace
     {
-        WSADATA wsa;
-        if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return false;
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-        bool ok = false;
-        while (!ok && std::chrono::steady_clock::now() < deadline)
+        // Whether a server accepts a connection on the port of the loopback address; WSAStartup() was called.
+        bool port_accepts(int port)
         {
             SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-            if (s != INVALID_SOCKET)
+            if (s == INVALID_SOCKET) return false;
+            sockaddr_in a = {};
+            a.sin_family = AF_INET;
+            a.sin_port = htons(static_cast<u_short>(port));
+            a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            const bool ok = connect(s, reinterpret_cast<sockaddr*>(&a), sizeof(a)) == 0;
+            closesocket(s);
+            return ok;
+        }
+
+        // The port of settings.json, which the service rewrites when it falls back on its last port.
+        int settings_port()
+        {
+            std::string text;
+            if (!read_file(join_path(data_dir(), "settings.json"), text, 1u << 20)) return 8443;
+            const long long port = json::parse_or_null(text)["port"].as_int(8443);
+            return port >= 1024 && port <= 65535 ? static_cast<int>(port) : 8443;
+        }
+
+        typedef DWORD(WINAPI* tcp_table_function)(PVOID, PDWORD, BOOL, ULONG, TCP_TABLE_CLASS, ULONG);
+
+        /*
+            Whether the process pid listens on the TCP port of the IPv4 addresses: 1 when it
+            does, 0 when no process does or another one, -1 when the table of the listening
+            sockets cannot be read or does not name the process of a socket on that port.
+            iphlpapi.dll comes from System32 only, at the first call.
+        */
+        int listened_by(DWORD pid, int port)
+        {
+            static const tcp_table_function table_of = []() {
+                HMODULE m = LoadLibraryExW(L"iphlpapi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+                return m ? reinterpret_cast<tcp_table_function>(
+                    reinterpret_cast<void*>(GetProcAddress(m, "GetExtendedTcpTable"))) : nullptr;
+            }();
+            if (!table_of) return -1;
+            std::vector<unsigned char> buffer;
+            ULONG size = 16384;
+            DWORD r = ERROR_INSUFFICIENT_BUFFER;
+            // The table grows between the two calls when sockets open meanwhile.
+            for (int attempt = 0; attempt < 4 && r == ERROR_INSUFFICIENT_BUFFER; ++attempt)
             {
-                sockaddr_in a = {};
-                a.sin_family = AF_INET;
-                a.sin_port = htons(static_cast<u_short>(port));
-                a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-                ok = connect(s, reinterpret_cast<sockaddr*>(&a), sizeof(a)) == 0;
-                closesocket(s);
+                buffer.resize(size + 4096);
+                size = static_cast<ULONG>(buffer.size());
+                r = table_of(buffer.data(), &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_LISTENER, 0);
             }
-            if (!ok) std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            if (r != NO_ERROR) return -1;
+            const MIB_TCPTABLE_OWNER_PID* table = reinterpret_cast<const MIB_TCPTABLE_OWNER_PID*>(buffer.data());
+            int found = 0;
+            for (DWORD i = 0; i < table->dwNumEntries; ++i)
+            {
+                const MIB_TCPROW_OWNER_PID& row = table->table[i];
+                if (ntohs(static_cast<u_short>(row.dwLocalPort)) != port) continue;
+                if (row.dwOwningPid == pid) return 1;
+                if (row.dwOwningPid == 0) found = -1;
+            }
+            return found;
+        }
+    }
+
+    bool wait_for_service(unsigned timeout_ms, std::string& error)
+    {
+        service_handles h;
+        if (!open_service(h, SERVICE_QUERY_STATUS))
+        {
+            error = last_error("cannot open the service");
+            return false;
+        }
+        WSADATA wsa;
+        if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
+        {
+            error = "cannot use the network interface of Windows";
+            return false;
+        }
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+        bool ok = false;
+        for (;;)
+        {
+            SERVICE_STATUS_PROCESS sp = {};
+            DWORD needed = 0;
+            if (!QueryServiceStatusEx(h.svc, SC_STATUS_PROCESS_INFO, reinterpret_cast<LPBYTE>(&sp), sizeof(sp),
+                    &needed))
+            {
+                error = last_error("cannot query the service");
+                break;
+            }
+            if (sp.dwCurrentState == SERVICE_STOPPED)
+            {
+                const DWORD code = sp.dwWin32ExitCode == ERROR_SERVICE_SPECIFIC_ERROR ? sp.dwServiceSpecificExitCode
+                    : sp.dwWin32ExitCode;
+                // A stop without an error is the one of the service itself: for an update it started, or when asked.
+                if (code == NO_ERROR)
+                {
+                    log("the service stopped by itself after its start, without an error");
+                    ok = true;
+                    break;
+                }
+                error = "the service stopped at its start (exit code " + std::to_string(code) + ")";
+                break;
+            }
+            if (sp.dwCurrentState == SERVICE_RUNNING)
+            {
+                /*
+                    The server of the service listens on the port, not another program that
+                    took it meanwhile; a connection to the port tells it only when the table
+                    of the sockets does not name their processes.
+                */
+                const int port = settings_port();
+                const int listener = listened_by(sp.dwProcessId, port);
+                if (listener == 1 || (listener < 0 && port_accepts(port)))
+                {
+                    ok = true;
+                    break;
+                }
+            }
+            if (std::chrono::steady_clock::now() > deadline)
+            {
+                error = "the service did not open its port " + std::to_string(settings_port()) + " within "
+                    + std::to_string(timeout_ms / 1000) + " seconds";
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
         }
         WSACleanup();
         return ok;
+    }
+
+    void log_service_tail()
+    {
+        std::string text;
+        if (!read_file(join_path(join_path(data_dir(), "logs"), "service.log"), text, 64u << 20) || text.empty())
+            return;
+        // The last lines, those of the start that failed.
+        const size_t keep = 4096;
+        if (text.size() > keep)
+        {
+            const size_t from = text.find('\n', text.size() - keep);
+            text = text.substr(from == std::string::npos ? text.size() - keep : from + 1);
+        }
+        log("the end of the log of the service:\n" + text);
     }
 
     namespace
@@ -1748,15 +2006,18 @@ namespace setup
             }
         }
 
-        // The folders and the files of Albireo at the top of a folder of programs.
-        const char* const albireo_folders[] = { "engines", "web", "licenses", "models" };
+        // The folders and the programs of Albireo at the top of a folder of programs.
+        const char* const albireo_folders[] = { "engines", "web", "licenses", "models", "speech" };
+        const char* const albireo_programs[] = { "albireo-service.exe", "albireo-tray.exe", "albireo-speech.exe",
+            "albireo-setup.exe" };
 
         bool albireo_entry(const std::string& name)
         {
-            for (const char* f : { "engines", "web", "licenses", "models", "albireo-service.exe", "albireo-tray.exe",
-                     "albireo-setup.exe", file_list_name })
+            for (const char* f : albireo_folders)
                 if (_stricmp(name.c_str(), f) == 0) return true;
-            return false;
+            for (const char* f : albireo_programs)
+                if (_stricmp(name.c_str(), f) == 0) return true;
+            return _stricmp(name.c_str(), file_list_name) == 0;
         }
 
         /*
@@ -1780,11 +2041,11 @@ namespace setup
         }
 
         // The files of Albireo in a folder of programs, known by their places: its programs, and
-        // the files of its engines, web application, licenses and models.
+        // the files of its engines, web application, licenses, models and voices.
         std::vector<std::string> albireo_files(const std::string& program_dir)
         {
             std::vector<std::string> files;
-            for (const char* name : { "albireo-service.exe", "albireo-tray.exe", "albireo-setup.exe" })
+            for (const char* name : albireo_programs)
                 if (file_exists(join_path(program_dir, name))) files.push_back(name);
             for (const char* folder : albireo_folders)
                 if (!is_link(join_path(program_dir, folder))) collect_files(program_dir, folder, files);
@@ -1947,11 +2208,19 @@ namespace setup
             log("cannot write the list of the files of " + program_dir);
     }
 
-    void remove_stale_files(const std::string& program_dir, const std::vector<std::string>& installed)
+    void stage_stale_files(const std::string& program_dir, staged_files& files)
     {
         std::vector<std::wstring> placed;
-        for (const auto& f : installed) placed.push_back(windows_path(f));
-        for (const char* folder : { "engines", "web", "licenses" })
+        for (const auto& f : files.targets()) placed.push_back(windows_path(f));
+        // The folders of the user that an earlier version accepted inside these folders keep their files.
+        std::vector<std::wstring> kept = { full_folder(data_dir()) };
+        std::string text;
+        if (read_file(join_path(data_dir(), "settings.json"), text, 1u << 20))
+        {
+            const std::string models = json::parse_or_null(text)["models_dir"].as_string();
+            if (!models.empty()) kept.push_back(full_folder(models));
+        }
+        for (const char* folder : { "engines", "web", "licenses", "speech" })
         {
             const std::string top = join_path(program_dir, folder);
             if (is_link(top) || !dir_exists(top)) continue;
@@ -1965,10 +2234,21 @@ namespace setup
                 const std::wstring w = windows_path(p);
                 if (std::any_of(placed.begin(), placed.end(), [&](const std::wstring& t) { return same_text(t, w); }))
                     continue;
-                delete_file(p);
-                log("removed, no longer part of Albireo: " + rel);
+                const std::wstring full = full_folder(p);
+                const auto inside = [&](const std::wstring& k) { return same_or_inside(full, k); };
+                if (std::any_of(kept.begin(), kept.end(), inside)) continue;
+                files.remove(p);
+                log("no longer part of Albireo, set aside with the change: " + rel);
             }
-            remove_empty_folders(top);
+        }
+    }
+
+    void remove_empty_program_folders(const std::string& program_dir)
+    {
+        for (const char* folder : { "engines", "web", "licenses", "speech" })
+        {
+            const std::string top = join_path(program_dir, folder);
+            if (!is_link(top) && dir_exists(top)) remove_empty_folders(top);
         }
     }
 
@@ -2183,6 +2463,16 @@ namespace setup
             std::ios::app | std::ios::binary);
         out << log_waiting;
         log_waiting.clear();
+    }
+
+    void detach_log()
+    {
+        std::lock_guard<std::mutex> lock(log_m);
+        if (!log_ready) return;
+        std::string text;
+        read_file(join_path(join_path(data_dir(), "logs"), "setup.log"), text, 16u << 20);
+        log_waiting = text + log_waiting;
+        log_ready = false;
     }
 
 }

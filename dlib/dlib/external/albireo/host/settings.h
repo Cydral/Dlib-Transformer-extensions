@@ -59,6 +59,12 @@ namespace albireo
             "https://raw.githubusercontent.com/Cydral/Dlib-Transformer-extensions/main/dist/albireo/feed.json";
         std::string catalog_url =
             "https://raw.githubusercontent.com/Cydral/Dlib-Transformer-extensions/main/dist/albireo/catalog.json";
+        /*
+            The public link of the published files (host/public_link.h): the feed, the catalog and
+            the installers in its folder dist, the model files in its folder models, read before
+            update_feed, catalog_url and the addresses of the catalog; "" reads these alone.
+        */
+        std::string public_link = "https://u.pcloud.link/publink/show?code=kZeNhSJZpcMygkcCvGXmq1MTvkCfBuSsx2GV";
         json engine_benchmarks = json::object();     // variant -> measured tokens per second
         /*
             The choice of the installation for the local authority in the trusted roots of
@@ -78,7 +84,10 @@ namespace albireo
     {
         /*!
             WHAT THIS OBJECT REPRESENTS
-                The settings file, read at start and written atomically at each change.
+                The settings file, read at start and written atomically at each change,
+                with a copy, settings.json.bak, written with it and at each start that reads a
+                valid settings.json.  The copy is read in its place when settings.json is no
+                longer valid JSON (a disk that failed, an edit by hand), then written again.
 
                 settings.json is readable by the users of the machine, and gives the
                 password of the proxy as proxy_password_mask.  The proxy with its password

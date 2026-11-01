@@ -4,20 +4,26 @@ This folder is read by every installed copy of Albireo:
 
 | File                | Read by                                   | Content                                             |
 |---------------------|-------------------------------------------|-----------------------------------------------------|
-| `feed.json`         | the service, at each start and every 6 h  | the latest version and the address of its installer |
+| `feed.json`         | the service, at each start and every 6 h  | the latest version and its installer, named in the public link |
 | `feed.json.sig`     | the service                               | signature of `feed.json`                            |
 | `catalog.json`      | the service and the Models window         | the models offered, their files and their hashes    |
 | `catalog.json.sig`  | the service                               | signature of `catalog.json`                         |
 
-The services fetch these files from
-`https://raw.githubusercontent.com/Cydral/Dlib-Transformer-extensions/main/dist/albireo/`, check
-each signature (ECDSA P-256 over the exact bytes of the file) with the public key built into the
-programs, and ignore a file whose signature fails. A change of one byte of a JSON file therefore
-needs a new signature.
+The services fetch these files from the folder `dist` of the public link of Albireo first, a
+public folder of pCloud read only, protected by a password built into the service
+(`dlib/dlib/external/albireo/host/public_link.h`), then from
+`https://raw.githubusercontent.com/Cydral/Dlib-Transformer-extensions/main/dist/albireo/` when the
+link does not answer or holds no file whose signature verifies. They check each signature (ECDSA
+P-256 over the exact bytes of the file) with the public key built into the programs, and ignore a
+file whose signature fails. A change of one byte of a JSON file therefore needs a new signature.
 
-The installers are attached to the GitHub releases of the repository, named `albireo-v<version>`,
-and the models published outside the Hugging Face hub to the release `albireo-models`; a release
-accepts files of less than 2 GiB, and the repository itself keeps only these small files.
+The installers lie in the folder `dist` of the public link, as `albireo-setup-online-<version>.exe`,
+the installer of the updates, and `albireo-setup-complete-<version>.exe`, with the models that come
+with Albireo; the files of the models lie in its folder `models`, each at
+`<identifier>/<file name of its official address>`, and the services read them there before their
+official addresses, the hashes of the catalog checking both. The models published outside the
+Hugging Face hub are attached to the GitHub release `albireo-models`, and the repository itself
+keeps only the small files of this folder.
 
 ## Publishing a version
 
@@ -27,16 +33,35 @@ accepts files of less than 2 GiB, and the repository itself keeps only these sma
    the models that come with Albireo.
 3. Write the release notes as `notes.json`, `{"en": "...", "fr": "...", "de": "...", "it": "...", "es": "..."}`;
    without this file, the notes the feed already holds for the same version are kept.
-4. Publish the installers and sign the feed, then push the feed:
+4. Sign the feed that names the installers in the public link, then push the feed:
 
 ```
-python3 dlib/dlib/external/albireo/tools/publish_release.py build-albireo/bin/albireo-setup-online.exe --complete build-albireo/bin/albireo-setup.exe --key <private key> --notes notes.json
+python3 dlib/dlib/external/albireo/tools/publish_release.py build-albireo/bin/albireo-setup-online.exe --public-link --complete build-albireo/bin/albireo-setup.exe --key <private key> --notes notes.json
 git add dist/albireo/feed.json dist/albireo/feed.json.sig
 git commit -m "Albireo <version>"
 git push
 ```
 
-`publish_release.py` checks that the installer carries the version of `version.h`, creates the
+5. Fill the local copy of the public link, the folder the storage service synchronizes, then check
+   the link once it is synchronized; the password of the link comes from
+   `keys/albireo-public-link.txt` of the folder of the user, or from `ALBIREO_PUBLIC_LINK_PASSWORD`:
+
+```
+python dlib/dlib/external/albireo/tools/fill_public_link.py dist <copy of the link>/dist --online build-albireo/bin/albireo-setup-online.exe --complete build-albireo/bin/albireo-setup.exe
+python dlib/dlib/external/albireo/tools/fill_public_link.py models <copy of the link>/models --from <folder of models>
+python dlib/dlib/external/albireo/tools/fill_public_link.py check
+```
+
+`publish_release.py --public-link` checks that the installer carries the version of `version.h`,
+writes the feed with the name of the installer in the link, its size and its SHA-256, signs it,
+checks the signature and puts the feed and its signature in place together; nothing goes to GitHub.
+`fill_public_link.py dist` copies the signed files of this folder, checked, and both installers under
+their names, the feed last, so that the link never announces an installer it does not hold yet;
+`models` copies each file of the catalog from the folders of `--from` when a file has its size and
+SHA-256, else downloads it from its official address, and checks it before it takes its name;
+`check` lists what the link lacks.
+
+Without `--public-link`, `publish_release.py` publishes on GitHub: it creates the
 release `albireo-v<version>` when it does not exist, attaches the installer as
 `albireo-setup-<version>.exe` (replacing a file of that name whose content differs), and the
 complete installer as `albireo-setup-complete-<version>.exe` when it fits 2 GiB, reads the whole

@@ -41,6 +41,7 @@ import { extractText, maxFileBytes, extension, searchPassages, documentAccept, f
 import * as rag from './rag.js';
 import * as tools from './tools.js';
 import * as images from './images.js';
+import * as speech from './speech.js';
 
 const roles = ['general', 'code', 'security'];
 const roleIcons = { general: 'compass', code: 'code', security: 'shield' };
@@ -286,6 +287,8 @@ function receive(message) {
     everythingDeleted();
   } else if (message.type === 'lists') {
     syncLists();
+  } else if (message.type === 'projects') {
+    syncProjects();
   } else if (message.type === 'busy' && typeof message.id === 'string' && typeof message.tab === 'string') {
     busyElsewhere(message.id, message.tab, !!message.busy);
   }
@@ -346,7 +349,7 @@ function threadKey(c) {
 }
 
 // The fields of a discussion another tab may change while this one answers in it.
-const sharedFields = ['title', 'titleSource', 'pinned', 'projectId'];
+const sharedFields = ['title', 'titleSource', 'titleQuestion', 'pinned', 'projectId'];
 
 // The discussions to read again from the database, each once after a burst of messages.
 const syncTimers = new Map();
@@ -390,10 +393,14 @@ async function applyStored(id) {
   refreshViews();
 }
 
-// Forgets a discussion deleted in another tab, stops its answer in progress here, and never saves it again.
+/*
+    Forgets a discussion deleted in another tab, stops its answer in progress and the compression of its exchanges
+    here, and never saves it again.
+*/
 function conversationDeleted(id) {
   deleted.add(id);
   othersBusy.delete(id);
+  cancelCompaction(id);
   state.conversations = state.conversations.filter((x) => x.id !== id);
   if (state.current && state.current.id === id) {
     if (state.busy) stopGeneration();
@@ -409,14 +416,36 @@ function everythingDeleted() {
   if (state.current && state.current.messages.length && !state.current.incognito) deleted.add(state.current.id);
   if (state.busy) stopGeneration();
   cancelIndex();
+  cancelBackground();
   rag.removeAll();
   images.removeAll();
   syncLists().then(() => go('#/'));
 }
 
 /*
-    The lists read again from the database, after an import or a change of the projects in another
-    tab, once for a burst of messages.  The discussion shown stays the copy of this tab.
+    The projects read again from the database after another tab changed one of them, once for a burst of
+    messages: the discussions stay as they are.
+*/
+let projectsSync = null;
+
+function syncProjects() {
+  if (!projectsSync) {
+    projectsSync = new Promise((resolve) => setTimeout(resolve, 50)).then(async () => {
+      projectsSync = null;
+      try {
+        state.projects = await store.allProjects();
+      } catch (e) {
+        storageFailed(e);
+      }
+      refreshViews();
+    });
+  }
+  return projectsSync;
+}
+
+/*
+    The lists read again from the database, after an import, the deletion of a project or everything
+    deleted in another tab, once for a burst of messages.  The discussion shown stays the copy of this tab.
 */
 let listsSync = null;
 
@@ -571,7 +600,13 @@ function backgroundText(system, user, maxTokens, signal) {
   return backgroundChat([{ role: 'system', content: system }, { role: 'user', content: user }], maxTokens, signal);
 }
 
-// The text the background model writes after a list of messages.
+/*
+    The time a request of the background model may take: beyond it the request ends with a TimeoutError, which
+    frees the work waiting behind it (the descriptions of the images, the next question after a compression).
+*/
+const backgroundTimeout = 10 * 60 * 1000;
+
+// The text the background model writes after a list of messages; signal, when given, stops it too.
 async function backgroundChat(messages, maxTokens, signal, temperature) {
   const body = {
     model: backgroundModel, reasoning: false, temperature: temperature == null ? 0.2 : temperature,
@@ -579,11 +614,16 @@ async function backgroundChat(messages, maxTokens, signal, temperature) {
   };
   let text = '';
   let finish = null;
-  for await (const ev of api.streamChat(body, signal)) {
-    const choice = ev.type === 'chunk' && ev.data.choices && ev.data.choices[0];
-    if (!choice) continue;
-    if (choice.delta && choice.delta.content) text += choice.delta.content;
-    if (choice.finish_reason) finish = choice.finish_reason;
+  const limit = api.limitedSignal(signal, backgroundTimeout);
+  try {
+    for await (const ev of api.streamChat(body, limit.signal)) {
+      const choice = ev.type === 'chunk' && ev.data.choices && ev.data.choices[0];
+      if (!choice) continue;
+      if (choice.delta && choice.delta.content) text += choice.delta.content;
+      if (choice.finish_reason) finish = choice.finish_reason;
+    }
+  } finally {
+    limit.done();
   }
   return { text: text.trim(), finish };
 }
@@ -596,14 +636,20 @@ function refreshStatus() {
   return statusPoll;
 }
 
+// Whether the service was ready at the previous reading of its status (serviceReady).
+let serviceWasReady = false;
+
 /*
     Reads the status of the service, with the models of the functions, which the window of the
     notification area may change, and whether the service answers.  A change draws the displays
-    that show it again at once, and the return of the service resumes the titles left waiting.
+    that show it again at once.  When the service becomes ready, at the opening while it starts,
+    or after it did not answer, the work an earlier visit or a closed tab left resumes: the titles
+    left waiting, the memory, and the descriptions of the images.
 */
 async function pollStatus() {
   let changed = false;
   let back = false;
+  let voices = false;
   try {
     const s = await api.status();
     const key = (x) => JSON.stringify([x.active, x.loaded_models, x.state, x.background]);
@@ -620,6 +666,12 @@ async function pollStatus() {
     // The embedding model of the document search; the documents not yet given vectors are
     // indexed once it is there.
     const embedder = (s.loaded_models || []).find((m) => m.embedding && s.active && m.id === s.active.embedding);
+    // The voices of the speech synthesis, asked again while the service gave none.
+    if (!speechVoices.length) {
+      await askSpeechVoices();
+      voices = speechVoices.length > 0;
+      changed = changed || voices;
+    }
     const previous = rag.embeddingModel();
     rag.setEmbeddingModel(embedder ? { id: embedder.id, dimensions: embedder.dimensions } : null);
     if (embedder && (!previous || previous.id !== embedder.id)) indexProjects();
@@ -633,8 +685,19 @@ async function pollStatus() {
   } else {
     renderStatusLine();
   }
-  if (back) namePending();
-  if (back || changed) describePending();
+  // The answers drawn before the voices came receive their buttons, unless a question is being edited.
+  if (voices && state.view === 'chat' && ui.thread && ui.thread.isConnected && !ui.thread.querySelector('textarea')
+    && !editingIn(ui.content)) {
+    renderMain();
+  }
+  const ready = serviceReady();
+  const became = ready && !serviceWasReady;
+  serviceWasReady = ready;
+  if (became) {
+    namePending();
+    rememberLater();
+  }
+  if (back || changed || became) describePending();
 }
 
 function renderStatusLine() {
@@ -1235,6 +1298,7 @@ async function renameConversation(c) {
   live.title = name.trim();
   // A title of the user stays: the model no longer names the discussion.
   live.titleSource = 'user';
+  delete live.titleQuestion;
   await persist(live);
   refreshViews();
 }
@@ -1256,11 +1320,12 @@ async function removeConversation(c) {
   const ok = await confirmDialog(t('deleteDiscussion'), t('deleteDiscussionText', { title: c.title || t('untitled') }));
   if (!ok) return;
   deleted.add(c.id);
-  // The answer in progress stops, and the passages of the documents leave the memory of the
-  // search with those of the database.
+  // The answer in progress and the compression of the exchanges stop.  The record of the discussion leaves the
+  // database first, then the passages of its documents, from the memory of the search and from the database.
   if (state.busy && state.busyId === c.id) stopGeneration();
-  await forgetOwner(c.id).catch(() => {});
+  cancelCompaction(c.id);
   await store.deleteConversation(c.id).catch(storageFailed);
+  await forgetOwner(c.id).catch(() => {});
   await images.removeOwner(c.id).catch(() => {});
   broadcast({ type: 'deleted', id: c.id });
   state.conversations = state.conversations.filter((x) => x.id !== c.id);
@@ -1280,7 +1345,7 @@ function markdownOf(title, messages) {
   const lines = ['# ' + title, ''];
   for (const m of messages) {
     if (m.role === 'user') {
-      lines.push('## ' + (state.settings.userName || 'User'), '', m.content || '');
+      lines.push('## ' + (state.settings.userName || t('exportUser')), '', m.content || '');
       for (const a of m.attachments || []) lines.push('', '> ' + a.name + ' (' + formatSize(a.size || 0) + ')');
       for (const img of m.images || []) {
         lines.push('', '> ' + img.name + ' (' + img.width + ' × ' + img.height + ', ' + formatSize(img.size || 0) + ')');
@@ -1332,11 +1397,12 @@ async function deleteQuestion(c, index) {
   index = c.messages.findIndex((x) => x.id === id);
   if (index < 0 || threadLocked()) return;
   // A compression in progress moves the start of the discussion: it ends first.
-  if (compactions.has(c.id)) await compactions.get(c.id).catch(() => {});
+  if (compactions.has(c.id)) await compactions.get(c.id).done;
   const m = c.messages[index];
   let end = index + 1;
   while (end < c.messages.length && c.messages[end].role !== 'user') ++end;
   const removed = end - index;
+  stopReadingOf(c, c.messages.slice(index, end), index);
   // The documents and the images of the question leave, unless another question, a replay, shares them.
   const others = attachmentIds(c.messages.slice(0, index).concat(c.messages.slice(end)));
   for (const a of (m && m.attachments) || []) if (a.mode === 'search' && !others.has(a.id)) forgetDocument(c.id, a.id);
@@ -1365,6 +1431,10 @@ function attachmentIds(messages) {
   return ids;
 }
 
+/*
+    Writes again the summary of the exchanges before the start of the context, after a deletion among them.  The job
+    takes its place in compactions, marked always, so that a question sent meanwhile waits for the new summary.
+*/
 async function rewriteSummary(c) {
   const start = c.contextStart || 0;
   c.summary = null;
@@ -1372,7 +1442,16 @@ async function rewriteSummary(c) {
   const context = roleCapabilities(c.role).context || 8192;
   const room = context - Math.min(state.settings.maxTokens || 2048, Math.floor(context / 2));
   toast(t('compacting'));
-  await compact(c, 0, start, room, 1 / 3.6, null).then((r) => applyCompaction(c, r)).catch(() => { c.summary = null; });
+  const abort = new AbortController();
+  const done = compact(c, 0, start, room, 1 / 3.6, abort.signal).then((r) => applyCompaction(c, r))
+    .catch(() => { c.summary = null; });
+  const job = { done, abort, always: true };
+  compactions.set(c.id, job);
+  try {
+    await done;
+  } finally {
+    if (compactions.get(c.id) === job) compactions.delete(c.id);
+  }
 }
 
 // The document search: the documents being indexed, one at a time in the background.
@@ -1498,6 +1577,21 @@ async function indexProjects() {
   }
 }
 
+/*
+    Indexes the searched documents of the questions of a discussion that have no passages, such as those of a
+    discussion imported, since an export carries no passages, or those a tab closed while they were written.
+*/
+async function indexAttachments(c) {
+  if (!c || !Array.isArray(c.messages)) return;
+  const docs = new Map();
+  for (const m of c.messages) {
+    if (m && m.role === 'user') for (const a of m.attachments || []) if (a.mode === 'search') docs.set(a.id, a);
+  }
+  if (!docs.size) return;
+  const st = await rag.status(c.id);
+  for (const a of docs.values()) if (!st.has(a.id)) queueIndex(c.id, a, !c.incognito);
+}
+
 // How a project gives its documents to the model: whole, searched, or not at all.
 function knowledgeMode(p, contextTokens) {
   const files = (p && p.files) || [];
@@ -1508,10 +1602,24 @@ function knowledgeMode(p, contextTokens) {
 
 /*
     The descriptions of the images of the projects, which the background model writes one at a
-    time (describeImage): image -> project, for the images waiting or being described by this tab.
+    time (describeImage): image -> project, for the images waiting or being described by this tab,
+    and image -> the AbortController of the description being written.
 */
 const describing = new Map();
+const describeJobs = new Map();
 let describeQueue = Promise.resolve();
+
+// Stops the description of an image being written, when its image or its project leaves.
+function cancelDescription(imageId) {
+  const job = describeJobs.get(imageId);
+  if (job) job.abort();
+}
+
+// Stops the work of the background model in progress in this tab: the compressions and the descriptions.
+function cancelBackground() {
+  for (const id of Array.from(compactions.keys())) cancelCompaction(id);
+  for (const id of Array.from(describeJobs.keys())) cancelDescription(id);
+}
 
 // The text of an image of a project for the search: its description, else its name.
 function imageDocument(img) {
@@ -1587,7 +1695,7 @@ async function updateProjectImage(projectId, imageId, change) {
   } catch (e) {
     storageFailed(e);
   }
-  broadcast({ type: 'lists' });
+  broadcast({ type: 'projects' });
   showProjectImage(projectId, imageId);
   return img;
 }
@@ -1598,7 +1706,8 @@ async function updateProjectImage(projectId, imageId, change) {
     kept with the image and takes its place in the search of the project.  Without a background
     model that reads images, or after an error, the name of the image stands for its description,
     and the description is asked again later (describePending) or with the button of the image.
-    One tab describes an image at a time.
+    One tab describes an image at a time.  The request ends when the image or its project leaves,
+    and after backgroundTimeout, so that the descriptions waiting behind it and its lock are freed.
 */
 async function describeImage(projectId, imageId) {
   await exclusive('albireo-describe-' + imageId, async () => {
@@ -1613,17 +1722,26 @@ async function describeImage(projectId, imageId) {
       return;
     }
     let text = '';
-    if (serviceReady() && backgroundReadsImages()) {
-      const url = await images.dataUrl(imageId).catch(() => null);
-      if (url) {
-        try {
-          text = cleanDescription((await backgroundChat(describeMessages(url, img.name), 1024, null, 0.2)).text);
-        } catch (e) {
-          console.warn('Albireo: the description of an image failed', e);
-          text = '';
+    const job = new AbortController();
+    describeJobs.set(imageId, job);
+    try {
+      if (serviceReady() && backgroundReadsImages()) {
+        const url = await images.dataUrl(imageId).catch(() => null);
+        if (url) {
+          try {
+            const r = await backgroundChat(describeMessages(url, img.name), 1024, job.signal, 0.2);
+            text = cleanDescription(r.text);
+          } catch (e) {
+            console.warn('Albireo: the description of an image failed', e);
+            text = '';
+          }
         }
       }
+    } finally {
+      describeJobs.delete(imageId);
     }
+    // An image or a project removed meanwhile keeps no state.
+    if (job.signal.aborted) return;
     // The earlier passages of the image leave the search before its new state is saved, so that a tab closed
     // meanwhile leaves the image to index again (indexProjects).
     await forgetDocument(projectId, imageId).catch(() => {});
@@ -1690,7 +1808,7 @@ async function newProject(silent) {
     return null;
   }
   state.projects = state.projects.concat([p]).sort((a, b) => a.name.localeCompare(b.name));
-  broadcast({ type: 'lists' });
+  broadcast({ type: 'projects' });
   refreshViews();
   if (!silent) go('#/p/' + p.id);
   return p;
@@ -1705,12 +1823,25 @@ function renderProject(p) {
   instructions.value = p.instructions || '';
   const heading = h('h2', null, h('span', { class: 'dot', style: { background: p.color } }), h('span', null, p.name));
   const sub = h('p', { class: 'sub' }, p.description || '');
-  // The name, the description and the color show at once in the page, the top bar, the side
-  // panel and the other tabs.
-  const save = async () => {
-    p.name = name.value.trim() || p.name;
-    p.description = description.value;
-    p.instructions = instructions.value;
+  /*
+      Saves an edit of the project, edit(project) changing the fields it concerns.  The edit applies to the
+      project as stored, read again, so that what another tab or the descriptions of the images wrote meanwhile
+      stays; a project deleted meanwhile is not written again.  The name, the description and the color show at
+      once in the page, the top bar, the side panel and the other tabs.
+  */
+  const save = async (edit) => {
+    let stored = p;
+    try {
+      stored = await store.getProject(p.id);
+    } catch (e) {
+      // The database is out of reach: the copy of this tab takes the edit.
+    }
+    if (!stored) return;
+    if (stored !== p) {
+      for (const k of Object.keys(p)) if (!(k in stored)) delete p[k];
+      Object.assign(p, stored);
+    }
+    edit(p);
     p.updated = Date.now();
     try {
       await store.putProject(p);
@@ -1723,16 +1854,21 @@ function renderProject(p) {
     heading.lastChild.textContent = p.name;
     heading.firstChild.style.background = p.color;
     sub.textContent = p.description || '';
-    broadcast({ type: 'lists' });
+    broadcast({ type: 'projects' });
     renderSidebar();
     renderTopbar();
   };
-  for (const el of [name, description, instructions]) el.addEventListener('change', save);
+  name.addEventListener('change', () => save((x) => { x.name = name.value.trim() || x.name; }));
+  description.addEventListener('change', () => save((x) => { x.description = description.value; }));
+  instructions.addEventListener('change', () => save((x) => { x.instructions = instructions.value; }));
   const colors = h('div', { class: 'colors' });
   for (const col of projectColors) {
     colors.append(h('button', {
       type: 'button', class: p.color === col ? 'on' : '', style: { background: col }, 'aria-label': col,
-      onclick: async () => { p.color = col; await save(); renderProject(p); }
+      onclick: async () => {
+        await save((x) => { x.color = col; });
+        renderProject(p);
+      }
     }));
   }
   // The documents and the images, maxProjectImages of them at most: the documents are indexed, the images described.
@@ -1747,9 +1883,10 @@ function renderProject(p) {
     const docs = added.filter((a) => a.kind !== 'image');
     const pictures = added.filter((a) => a.kind === 'image')
       .map((a) => Object.assign(imageRecord(a), { state: 'pending', description: '' }));
-    p.files = (p.files || []).concat(docs);
-    if (pictures.length) p.images = (p.images || []).concat(pictures);
-    await save();
+    await save((x) => {
+      x.files = (x.files || []).concat(docs);
+      if (pictures.length) x.images = (x.images || []).concat(pictures);
+    });
     // The images are stored once the project that holds them is (pruneImages).
     try {
       await images.keep(p.id, pictures, true);
@@ -1768,8 +1905,7 @@ function renderProject(p) {
       indexState,
       iconButton('trash', t('delete'), async () => {
         const removed = forgetDocument(p.id, f.id);
-        p.files = p.files.filter((x) => x.id !== f.id);
-        await save();
+        await save((x) => { x.files = (x.files || []).filter((y) => y.id !== f.id); });
         await removed;
         renderProject(p);
       })));
@@ -1779,9 +1915,9 @@ function renderProject(p) {
   ui.projectPage = {
     id: p.id,
     removeImage: async (img) => {
+      cancelDescription(img.id);
       const removed = forgetDocument(p.id, img.id);
-      p.images = (p.images || []).filter((x) => x.id !== img.id);
-      await save();
+      await save((x) => { x.images = (x.images || []).filter((y) => y.id !== img.id); });
       await removed;
       await images.remove([img.id]);
       renderProject(p);
@@ -1832,8 +1968,9 @@ function renderProject(p) {
         class: 'button danger', type: 'button', html: icon('trash') + '<span>' + escapeHtml(t('deleteProject')) + '</span>',
         onclick: async () => {
           if (!await confirmDialog(t('deleteProject'), t('deleteProjectText', { name: p.name }))) return;
-          // The documents leave the search, in memory and in the database, and the discussion
-          // shown leaves the project as the stored ones do.
+          // The descriptions of its images stop, the documents leave the search, in memory and in the
+          // database, and the discussion shown leaves the project as the stored ones do.
+          for (const img of p.images || []) cancelDescription(img.id);
           await forgetOwner(p.id).catch(() => {});
           await store.deleteProject(p.id).catch(storageFailed);
           await images.removeOwner(p.id).catch(() => {});
@@ -1902,7 +2039,7 @@ async function readFiles(files, role, room) {
       else if (e.message === 'pdf-password') toast(t('pdfPassword', { name: f.name }), true, 9000);
       else if (e.message === 'pdf-invalid') toast(t('pdfInvalid', { name: f.name }), true);
       else if (e.message === 'pdf-reader') toast(t('pdfReader', { name: f.name }), true, 12000);
-      else toast(t('readFailed', { name: f.name, error: e.message }), true);
+      else toast(t('readFailed', { name: f.name, error: errorText(e) }), true);
     }
   }
   if (refused.length) toast(imageLimitText(refused, left, !role), true, 10000);
@@ -1949,7 +2086,7 @@ async function scanPages(scan, left) {
     }
     return out;
   } catch (e) {
-    toast(t('readFailed', { name, error: e.message }), true);
+    toast(t('readFailed', { name, error: errorText(e) }), true);
     return [];
   }
 }
@@ -2071,6 +2208,8 @@ function openViewer(list, index, opener) {
       + (list.length > 1 ? ' · ' + (at + 1) + ' / ' + list.length : '');
     box.setAttribute('aria-label', img.name);
     pic.alt = img.name;
+    // The image the viewer shows keeps its object URL (releaseHiddenImages).
+    pic.dataset.image = img.id;
     const url = await images.fullUrl(img.id);
     if (mine !== sequence) return;
     pic.classList.toggle('hidden', !url);
@@ -2148,10 +2287,15 @@ function clearPending() {
   state.pending = [];
 }
 
-// The discussion shown gives way to another one: an incognito discussion, which no list keeps, takes its images out of memory.
+/*
+    The discussion shown gives way to another one: an incognito discussion, which no list keeps, takes its images and
+    the passages of its documents out of memory.
+*/
 function forgetIncognito() {
   const c = state.current;
-  if (c && c.incognito && c.messages.length) images.removeOwner(c.id).catch(() => {});
+  if (!c || !c.incognito || !c.messages.length) return;
+  images.removeOwner(c.id).catch(() => {});
+  forgetOwner(c.id).catch(() => {});
 }
 
 // Keeps the images of a question of c, in the database of the browser, or in memory for an incognito discussion.
@@ -2174,6 +2318,8 @@ function newConversation(projectId) {
 }
 
 function newChat(projectId) {
+  // The reading aloud ends with the discussion it belongs to, as route() ends it.
+  speech.stopReading();
   if (state.busy) stopGeneration();
   forgetIncognito();
   clearPending();
@@ -2196,6 +2342,8 @@ function go(hash) {
 let routeSequence = 0;
 
 async function route() {
+  // A reading aloud ends with the page it belongs to.
+  speech.stopReading();
   closeMenu();
   const sequence = ++routeSequence;
   const hash = location.hash || '#/';
@@ -2210,6 +2358,8 @@ async function route() {
       clearPending();
       state.current = c;
       state.incognito = false;
+      // The searched documents without passages, those of an imported discussion for instance, are indexed.
+      indexAttachments(c).catch(() => {});
     }
     state.view = 'chat';
   } else if ((m = /^#\/p\/([0-9a-f]+)$/.exec(hash))) {
@@ -2256,17 +2406,22 @@ function renderTopbar() {
   const title = h('div', { class: 'title', contenteditable: c && c.messages.length ? 'true' : 'false', spellcheck: 'false' },
     c && c.title ? c.title : t('untitled'));
   title.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); title.blur(); } });
+  // The text the title shows when the user starts to edit it: leaving it unchanged renames nothing, and shows the
+  // title the model may have written meanwhile.
+  let shownText = '';
+  title.addEventListener('focus', () => { shownText = title.textContent.trim(); });
   title.addEventListener('blur', async () => {
     if (!c || !c.messages.length) return;
     const live = liveCopy(c);
     const v = title.textContent.trim();
-    if (v && v !== live.title) {
+    if (v && v !== shownText && v !== live.title) {
       live.title = v;
       // A title of the user stays: the model no longer names the discussion.
       live.titleSource = 'user';
+      delete live.titleQuestion;
       await persist(live);
       refreshViews();
-    } else if (!v) {
+    } else {
       title.textContent = live.title || t('untitled');
     }
   });
@@ -2321,7 +2476,30 @@ function toggleSidebar() {
   saveSetting('sidebar', open);
 }
 
+/*
+    Draws the main area for the view.  Afterwards, the reading aloud of an answer the page no longer shows ends, and
+    the images it no longer shows give back their object URLs.
+*/
 function renderMain() {
+  drawMain();
+  keepReadingShown();
+  releaseHiddenImages();
+}
+
+// Ends the reading aloud of an answer that the thread shown no longer holds, such as one deleted or regenerated.
+function keepReadingShown() {
+  const key = speech.readingKey();
+  if (!key) return;
+  const buttons = ui.thread && ui.thread.isConnected ? Array.from(ui.thread.querySelectorAll('[data-speech]')) : [];
+  if (!buttons.some((b) => b.dataset.speech === key)) speech.stopReading();
+}
+
+// Revokes the object URLs of the images that no element of the page shows (data-image), the viewer included.
+function releaseHiddenImages() {
+  images.releaseExcept(new Set(Array.from(document.querySelectorAll('[data-image]'), (el) => el.dataset.image)));
+}
+
+function drawMain() {
   stopClock();
   if (state.view === 'project') {
     const p = projectById(state.projectId);
@@ -2626,7 +2804,8 @@ function editMessage(c, m, index, el) {
         if (threadLocked()) return;
         const text = area.value.trim();
         if (!text && !attachments.length) return;
-        if (compactions.has(c.id)) await compactions.get(c.id).catch(() => {});
+        // A compression in progress moves the start of the discussion: it ends first.
+        if (compactions.has(c.id)) await compactions.get(c.id).done;
         // A question sent meanwhile is being answered: the messages stay as they are.
         if (threadLocked() || state.current !== c) return;
         // The images keep to the places of the context, which another tab may have taken meanwhile.
@@ -2652,6 +2831,8 @@ function editMessage(c, m, index, el) {
           for (const img of x.images || []) if (!keptImages.has(img.id)) gone.push(img.id);
         }
         images.remove(gone).catch(() => {});
+        // The reading aloud of an answer that leaves with the edited question ends.
+        stopReadingOf(c, c.messages.slice(index), index);
         c.messages = c.messages.slice(0, index);
         if ((c.memoryMark || 0) > index) c.memoryMark = index;
         if ((c.contextStart || 0) > index) {
@@ -2677,6 +2858,54 @@ function answerText(m) {
   return (m.steps || []).map((s) => s.content || '').join('\n\n').trim();
 }
 
+// The languages the speech synthesis of the service reads, empty while it gives none.
+let speechVoices = [];
+
+async function askSpeechVoices() {
+  if (!speechVoices.length) speechVoices = await speech.speechLanguages();
+}
+
+/*
+    The key of the reading aloud of the message m of c, at index: the identifier of the message, which deletions,
+    edits and regenerations leave to it, else its position for a message saved without one.
+*/
+function speechKey(c, m, index) {
+  return c.id + ':' + (m.id || 'at' + index);
+}
+
+// Ends the reading aloud of one of the messages of c that leave the discussion, the first of them at from.
+function stopReadingOf(c, messages, from) {
+  const key = speech.readingKey();
+  if (key && messages.some((m, k) => speechKey(c, m, from + k) === key)) speech.stopReading();
+}
+
+// The buttons of the answer key show whether it is being read.
+function markReading(key, on) {
+  for (const b of document.querySelectorAll('[data-speech]')) {
+    if (b.dataset.speech !== key) continue;
+    b.innerHTML = icon(on ? 'stop' : 'speaker');
+    b.title = t(on ? 'stopReading' : 'readAloud');
+    b.setAttribute('aria-label', b.title);
+    b.setAttribute('aria-pressed', on ? 'true' : 'false');
+  }
+}
+
+// Reads an answer aloud in the language of its words, or stops the reading of this answer.
+function toggleReading(m, key) {
+  if (speech.readingKey() === key) {
+    speech.stopReading();
+    return;
+  }
+  const text = speech.spokenText(answerText(m));
+  const fallback = speechVoices.includes(language()) ? language() : speechVoices[0];
+  const lang = speech.textLanguage(text, fallback);
+  speech.readAloud(text, speechVoices.includes(lang) ? lang : fallback, key, {
+    start: (k) => markReading(k, true),
+    end: (k) => markReading(k, false),
+    error: (k, e) => toast(t('readAloudFailed', { reason: errorText(e) }), true)
+  });
+}
+
 function assistantElement(c, m, index, last) {
   const live = m === liveTurn;
   const el = h('div', { class: 'message assistant' + (last ? ' last' : '') + (live ? ' live' : '') });
@@ -2686,6 +2915,16 @@ function assistantElement(c, m, index, last) {
   // The buttons of an answer wait until it is written; regenerate also waits for the discussion.
   const meta = h('div', { class: 'meta' });
   meta.append(lockable(iconButton('copy', t('copy'), () => copyText(answerText(m))), 'turn', live));
+  if (speechVoices.length) {
+    // The answer read aloud, once it is written.
+    const key = speechKey(c, m, index);
+    const on = speech.readingKey() === key;
+    const reader = lockable(iconButton(on ? 'stop' : 'speaker', t(on ? 'stopReading' : 'readAloud'),
+      () => toggleReading(m, key)), 'turn', live);
+    reader.dataset.speech = key;
+    reader.setAttribute('aria-pressed', on ? 'true' : 'false');
+    meta.append(reader);
+  }
   if (last) meta.append(lockable(iconButton('refresh', t('regenerate'), () => regenerate(liveCopy(c))), 'busy'));
   const exporter = lockable(iconButton('download', t('exportAnswer'), () => showMenu(exporter, [
     { label: t('exportMarkdown'), icon: 'download', action: () => exportAnswer(liveCopy(c), index, 'md') },
@@ -2705,7 +2944,9 @@ function assistantElement(c, m, index, last) {
 function statsText(m) {
   const parts = [];
   if (m.model) parts.push(modelName(m.model));
-  if (m.usage && m.usage.completion_tokens) parts.push(formatNumber(m.usage.completion_tokens) + ' tokens');
+  if (m.usage && m.usage.completion_tokens) {
+    parts.push(t('tokensCount', { n: formatNumber(m.usage.completion_tokens) }));
+  }
   if (m.timings && m.timings.generation_per_second) parts.push(t('tokensPerSecond', { n: m.timings.generation_per_second.toFixed(1) }));
   return parts.join(' · ');
 }
@@ -3046,11 +3287,14 @@ async function sendMessage(text, attachments) {
   attachmentModes(c, m);
   /*
       The beginning of the first question stands for the title until the model writes one, and
-      the title of a discussion whose first question is edited stays.
+      the text of that question stays with it, the only text the model names the discussion from
+      (nameConversation).  The title of a discussion whose first question is edited or deleted
+      stays.
   */
   if (c.messages.length === 1 && !c.title) {
     c.title = provisionalTitle(m);
     c.titleSource = 'question';
+    c.titleQuestion = titleQuestionOf(m);
   }
   c.updated = Date.now();
   // The answer shows at once, its buttons disabled, while its context is prepared.
@@ -3075,7 +3319,10 @@ async function sendMessage(text, attachments) {
 
 async function regenerate(c) {
   if (state.busy || answeredElsewhere(c)) return;
-  while (c.messages.length && c.messages[c.messages.length - 1].role === 'assistant') c.messages.pop();
+  const removed = [];
+  while (c.messages.length && c.messages[c.messages.length - 1].role === 'assistant') removed.unshift(c.messages.pop());
+  // The reading aloud of an answer that leaves ends with it: the new answer is drawn in the place of the old one.
+  stopReadingOf(c, removed, c.messages.length);
   if (!c.messages.length) return;
   const abort = beginTurn(c);
   await runTurn(c, abort, newTurn(c));
@@ -3545,7 +3792,35 @@ async function currentVersion(c) {
   return (await store.getConversation(c.id)) || null;
 }
 
-const compactions = new Map();   // discussion -> its compression in the background
+/*
+    The compressions of the exchanges in progress: discussion -> {done, abort, always}, done a promise that never
+    rejects, abort the AbortController of its requests, always true for a summary written again after a deletion
+    (rewriteSummary), which every question waits for.
+*/
+const compactions = new Map();
+
+// Stops the compression of the exchanges of a discussion in progress, when the discussion leaves.
+function cancelCompaction(id) {
+  const job = compactions.get(id);
+  if (job) job.abort.abort();
+}
+
+// Waits for promise, which never rejects, or throws an AbortError as soon as signal stops the answer.
+function untilDone(promise, signal) {
+  if (!signal) return promise;
+  return new Promise((resolve, reject) => {
+    const stop = () => reject(new DOMException('The answer was stopped.', 'AbortError'));
+    if (signal.aborted) {
+      stop();
+      return;
+    }
+    signal.addEventListener('abort', stop, { once: true });
+    promise.then((v) => {
+      signal.removeEventListener('abort', stop);
+      resolve(v);
+    });
+  });
+}
 
 /*
     The start of a discussion that leaves to the exchanges after it keptShare of the room of
@@ -3588,14 +3863,22 @@ function nextStart(c, build, estimate, room) {
     the questions.  The system message and the last question always stay.  onCompact tells
     when a compression starts, and model names the model the tokens are counted for.  Returns
     {messages, trimmed, compacted, context, tokens}.
+
+    A compression the background started after an earlier answer (compactLater) is waited for
+    only when the conversation does not fit without it; a summary being written again after a
+    deletion (rewriteSummary) is waited for in every case.  signal ends these waits too.
 */
 async function fitContext(c, build, toolDefs, reserve, signal, onCompact, model) {
   let trimmed = false;
   let compacted = false;
-  if (compactions.has(c.id)) {
+  const waited = new Set();
+  const wait = async (job) => {
+    waited.add(job);
     if (onCompact) onCompact();
-    await compactions.get(c.id).catch(() => {});
-  }
+    await untilDone(job.done, signal);
+  };
+  const first = compactions.get(c.id);
+  if (first && first.always) await wait(first);
   const cuts = { summary: null, texts: new Map() };
   const counted = model || 'albireo-' + c.role;
   for (let attempt = 0; attempt < 12; ++attempt) {
@@ -3611,6 +3894,12 @@ async function fitContext(c, build, toolDefs, reserve, signal, onCompact, model)
     if (!r || typeof r.tokens !== 'number' || !r.context) return { messages: list, trimmed, compacted, context: 0 };
     const room = r.context - Math.min(reserve, Math.floor(r.context / 2));
     if (r.tokens <= room) return { messages: list, trimmed, compacted, context: r.context, tokens: r.tokens };
+    // The conversation does not fit: the compression in progress moves its start, and it is measured again.
+    const job = compactions.get(c.id);
+    if (job && !waited.has(job)) {
+      await wait(job);
+      continue;
+    }
     // The tokens of a list of messages: its images by their tokens, its texts from their characters scaled to the
     // measure.
     const estimate = tokenEstimate(list, r.tokens, counted);
@@ -4277,11 +4566,20 @@ async function updateMemory(force) {
   }
 }
 
-// An error of the service in the language of the interface, by its code when it has one.
+/*
+    An error in the language of the interface: an error of the service by its code, an error of the reading of a
+    document (documents.js) by its message, else its message as it is.
+*/
 function errorText(e) {
   const known = { model_not_found: 'errModelNotFound', context_length_exceeded: 'errContextLength', unloaded: 'errUnloaded',
-    starting: 'errStarting', model_loading: 'modelLoading' };
+    starting: 'errStarting', model_loading: 'modelLoading', speech_unavailable: 'errSpeechUnavailable',
+    speech_failed: 'errSpeechFailed', too_many_images: 'errTooManyImages', invalid_image_format: 'errImageFormat',
+    engine_busy: 'errEngineBusy', busy: 'errBusy' };
   if (e && known[e.code]) return t(known[e.code]);
+  const reading = {
+    'zip-invalid': 'errZipInvalid', 'zip-compression': 'errZipCompression', 'xml-invalid': 'errXmlInvalid'
+  };
+  if (e && Object.prototype.hasOwnProperty.call(reading, e.message)) return t(reading[e.message]);
   // fetch rejects with a TypeError when the service does not answer.
   if (e instanceof TypeError) return t('errService');
   return (e && e.message) || String(e);
@@ -4302,6 +4600,12 @@ function cleanTitle(text) {
   if (!/\s/.test(title) && /[a-z][A-Z]/.test(title)) title = title.replace(/([a-z0-9])([A-Z])/g, '$1 $2');
   if (title) title = title.charAt(0).toLocaleUpperCase() + title.slice(1);
   return title.length > 70 ? keepStart(title, 70).replace(/\s*\u2026$/, '') : title;
+}
+
+// The text the model names a discussion from: its first question, with the names of its documents and images.
+function titleQuestionOf(m) {
+  const names = (m.attachments || []).concat(m.images || []).map((a) => a.name);
+  return keepStart((m.content || '') + (names.length ? '\n(' + names.join(', ') + ')' : ''), 1500);
 }
 
 // True when a discussion still bears the beginning of its first question as its title.
@@ -4380,11 +4684,13 @@ async function askTitle(question) {
 
 /*
     The errors after which the request of a title is sent again, while the service starts, while
-    its model loads or is missing, or while the service does not answer.
+    its model loads, is missing or is busy with images, while the bodies it reads at once hold too
+    many values, or while the service does not answer.  The next attempt waits at least the
+    seconds the Retry-After header of the answer gives (e.retryAfter, api.js).
 */
 function retryable(e) {
   if (e instanceof TypeError) return true;
-  return ['starting', 'model_loading', 'unloaded', 'model_not_found'].includes(e && e.code)
+  return ['starting', 'model_loading', 'unloaded', 'model_not_found', 'engine_busy', 'busy'].includes(e && e.code)
     || /^5\d\d\b/.test(String(e && e.message));
 }
 
@@ -4416,34 +4722,41 @@ const naming = new Set();
     the language of the question, which replaces the beginning of the question that stood for it
     until then, unless the user renames the discussion meanwhile.  The request waits for the
     service and its model, and is sent again after an error that passes, a bounded number of
-    times; it does not depend on the discussion shown, nor on the questions that follow.  The
-    title shows at once in the side panel, the top bar and the other tabs.
+    times; it does not depend on the discussion shown, nor on the questions that follow: the text
+    of the first question is the one kept with the provisional title (titleQuestion), which an
+    edition or a deletion of the question leaves as it was, else the first question of a
+    discussion saved before it was kept.  The title shows at once in the side panel, the top bar
+    and the other tabs.
 */
 async function nameConversation(c) {
   if (naming.has(c.id)) return;
   naming.add(c.id);
   try {
     await exclusive('albireo-title-' + c.id, async () => {
+      // The seconds the last refusal of the service asked to wait (Retry-After), which the next pause lasts at least.
+      let asked = 0;
       for (let attempt = 0; attempt <= titleRetries.length; ++attempt) {
-        if (attempt) await new Promise((r) => setTimeout(r, titleRetries[attempt - 1] * 1000));
+        if (attempt) await new Promise((r) => setTimeout(r, Math.max(titleRetries[attempt - 1], asked) * 1000));
+        asked = 0;
         const now = await currentVersion(c).catch(() => null);
         if (!needsTitle(now)) return;
         if (!serviceReady()) continue;
-        const first = now.messages.find((m) => m.role === 'user');
-        const names = (first.attachments || []).concat(first.images || []).map((a) => a.name);
-        const question = keepStart((first.content || '') + (names.length ? '\n(' + names.join(', ') + ')' : ''), 1500);
+        const question = typeof now.titleQuestion === 'string' && now.titleQuestion.trim() ? now.titleQuestion
+          : titleQuestionOf(now.messages.find((m) => m.role === 'user'));
         let title = '';
         try {
           title = await askTitle(question);
         } catch (e) {
-          if (retryable(e)) continue;
-          return;
+          if (!retryable(e)) return;
+          asked = e.retryAfter || 0;
+          continue;
         }
         // Without a title, the beginning of the question stays, and a later answer tries again.
         const latest = await currentVersion(c).catch(() => null);
         if (!title || !needsTitle(latest)) return;
         latest.title = title;
         latest.titleSource = 'model';
+        delete latest.titleQuestion;
         await persist(latest);
         refreshViews();
         return;
@@ -4456,7 +4769,8 @@ async function nameConversation(c) {
 
 /*
     Names the stored discussions that a closed tab, a reload or a service out of reach left with
-    the beginning of their question as title, the most recent first, one after the other.
+    the beginning of their question as title, the most recent first, one after the other.  A
+    discussion whose first answer did not end is named too: the title follows the question only.
 */
 let namingPending = false;
 
@@ -4464,7 +4778,7 @@ async function namePending() {
   if (namingPending || state.incognito) return;
   namingPending = true;
   try {
-    const waiting = state.conversations.filter((c) => needsTitle(c) && c.messages.some((m) => m.role === 'assistant'));
+    const waiting = state.conversations.filter((c) => needsTitle(c));
     for (const c of waiting.slice(0, 5)) {
       if (!serviceReady()) break;
       await nameConversation(c);
@@ -4477,7 +4791,9 @@ async function namePending() {
 /*
     Compresses the oldest exchanges of a discussion in the background when its last answer
     filled compactShare of the room of the context: the next question then starts from the
-    summary, without waiting for it, unless it comes before the summary is written.
+    summary.  A question that comes before the summary is written waits for it only when it
+    does not fit without it (fitContext).  The job has its own AbortController, which the
+    deletion of the discussion uses (cancelCompaction).
 */
 function compactLater(c, turn) {
   const context = turn.contextTokens;
@@ -4495,7 +4811,8 @@ function compactLater(c, turn) {
   const next = nextStart(c, build, estimate.of, room);
   c.messages = saved;
   if (next <= (c.contextStart || 0)) return;
-  const job = compact(c, c.contextStart || 0, next, room, estimate.scale, null)
+  const abort = new AbortController();
+  const done = compact(c, c.contextStart || 0, next, room, estimate.scale, abort.signal)
     .then(async (r) => {
       // The summary goes to the discussion as it is now, when its compressed messages are
       // still the same.
@@ -4512,7 +4829,10 @@ function compactLater(c, turn) {
       }
     })
     .catch(() => {})
-    .finally(() => compactions.delete(c.id));
+    .finally(() => {
+      if (compactions.get(c.id) === job) compactions.delete(c.id);
+    });
+  const job = { done, abort, always: false };
   compactions.set(c.id, job);
 }
 
@@ -4733,12 +5053,19 @@ function dataTab(body, close) {
       const data = JSON.parse(await input.files[0].text());
       const r = await store.importAll(data);
       // A discussion deleted earlier comes back with the import, and is saved again.
-      for (const c of data.conversations) if (c && typeof c.id === 'string') deleted.delete(c.id);
+      for (const id of r.ids) deleted.delete(id);
       broadcast({ type: 'lists' });
       await syncLists();
       toast(t('imported', { n: r.conversations, p: r.projects }));
+      // The documents of the projects and the searched documents of the discussions are indexed, since an export
+      // carries no passages; the images of the projects are described, and the discussions left waiting are named.
       indexProjects();
+      for (const id of r.ids) {
+        const c = state.conversations.find((x) => x.id === id);
+        if (c) indexAttachments(c).catch(() => {});
+      }
       describePending();
+      namePending();
     } catch (e) {
       toast(t('importFailed'), true);
     }
@@ -4760,10 +5087,11 @@ function dataTab(body, close) {
         class: 'button', type: 'button', html: icon('download') + '<span>' + escapeHtml(t('exportAll')) + '</span>',
         onclick: async () => {
           try {
-            const data = JSON.stringify(await store.exportAll());
-            download('albireo-' + new Date().toISOString().slice(0, 10) + '.json', data, 'application/json');
+            download('albireo-' + new Date().toISOString().slice(0, 10) + '.json', await store.exportAll(),
+              'application/json');
           } catch (e) {
-            storageFailed(e);
+            // The export reads the database of the browser only: the error is that of the browser, as it is.
+            toast(t('exportFailed', { reason: (e && e.message) || String(e) }), true);
           }
         }
       }),
@@ -4773,12 +5101,14 @@ function dataTab(body, close) {
         class: 'button danger', type: 'button', html: icon('trash') + '<span>' + escapeHtml(t('clearAll')) + '</span>',
         onclick: async () => {
           if (!await confirmDialog(t('clearAll'), t('clearAllText'))) return;
-          // The answer in progress stops, the stored discussions are not saved again, and the
-          // indexing in progress writes no passage.  A new discussion, not yet stored, stays.
+          // The answer in progress and the work of the background model stop, the stored discussions
+          // are not saved again, and the indexing in progress writes no passage.  A new discussion,
+          // not yet stored, stays.
           for (const c of state.conversations) deleted.add(c.id);
           if (state.current && state.current.messages.length) deleted.add(state.current.id);
           if (state.busy) stopGeneration();
           cancelIndex();
+          cancelBackground();
           rag.removeAll();
           images.removeAll();
           await store.clearAll().catch(storageFailed);
@@ -4843,10 +5173,10 @@ function memoryBar(stats) {
   const pct = (x) => Math.min(100, 100 * x / total) + '%';
   return h('div', null, h('div', { class: 'mem-bar' },
     h('div', { style: { width: pct(v.device_bytes || 0), background: 'var(--blue)' }, title: t('vramResident') }),
-    h('div', { style: { width: pct(v.scratch_bytes || 0), background: 'var(--gold)' } })),
+    h('div', { style: { width: pct(v.scratch_bytes || 0), background: 'var(--gold)' }, title: t('vramWorkspace') })),
   h('div', { class: 'legend' },
     h('span', { style: { '--c': 'var(--blue)' } }, t('vramResident') + ' ' + formatSize(v.device_bytes || 0)),
-    h('span', { style: { '--c': 'var(--gold)' } }, 'workspace ' + formatSize(v.scratch_bytes || 0)),
+    h('span', { style: { '--c': 'var(--gold)' } }, t('vramWorkspace') + ' ' + formatSize(v.scratch_bytes || 0)),
     h('span', { style: { '--c': 'var(--text-faint)' } }, t('vramHost') + ' ' + formatSize(v.pinned_bytes || 0)),
     h('span', { style: { '--c': 'var(--incognito)' } }, t('vramStore') + ' ' + formatSize(v.store_bytes || 0))));
 }
@@ -4914,6 +5244,7 @@ const programTexts = {
   'mbedtls.txt': ['mbedtls', 'Apache License 2.0 or GPL 2.0 or later'], 'cpp-httplib.txt': ['httplib', 'MIT License'],
   'zlib.txt': ['zlib', 'zlib License'], 'sqlite.txt': ['sqlite', null],
   'libpng.txt': ['libpng', 'PNG Reference Library License 2'], 'libjpeg.txt': ['libjpeg', 'IJG License'],
+  'svox-pico.txt': ['pico', 'Apache License 2.0'],
   'openvino-license.txt': ['openvino', 'Apache License 2.0'], 'cuda-eula.txt': ['cuda', 'NVIDIA CUDA EULA'],
   'cudnn-license.txt': ['cudnn', 'NVIDIA cuDNN License Agreement']
 };
@@ -5053,6 +5384,8 @@ function buildLayout() {
     class: 'incognito-toggle' + (state.incognito ? ' on' : ''), type: 'button', title: t('incognitoStart'), html: icon('incognito'),
     onclick: () => {
       state.incognito = !state.incognito;
+      // The reading aloud ends with the discussion it belongs to, as route() ends it.
+      speech.stopReading();
       if (state.busy) stopGeneration();
       forgetIncognito();
       state.current = newConversation(null);
@@ -5160,15 +5493,17 @@ async function init() {
       storageFailed(r);
     }
   });
+  let blocked = false;
   try {
     await store.open();
     state.settings = Object.assign({}, defaults, await store.getSettings());
     // The browser is asked to keep the database, without waiting for its answer.
     requestPersistence();
   } catch (e) {
-    // Without IndexedDB (a private window of some browsers) the application keeps its
-    // data in memory, as in an incognito discussion.
+    // Without IndexedDB (a private window of some browsers), or while a tab of an earlier version
+    // keeps it open, the application keeps its data in memory, as in an incognito discussion.
     console.warn('Albireo: the database of the browser is unavailable', e);
+    blocked = !!e && e.name === 'BlockedError';
     state.incognito = true;
   }
   // The language of Albireo, when this interface follows it, before the first texts.
@@ -5185,19 +5520,23 @@ async function init() {
     pruneImages(pictures).catch(() => {});
   }
   buildLayout();
+  if (blocked) toast(t('dbBlocked'), true, 30000);
   window.addEventListener('hashchange', route);
+  await askSpeechVoices();
   await route();
+  /*
+      The first reading of the status, once the service is ready now or later (pollStatus), plans the
+      questions an earlier visit left to the memory, the titles it left to write and the descriptions
+      of the images.
+  */
   await refreshStatus();
   setInterval(refreshStatus, 4000);
-  /*
-      The questions an earlier visit left to the memory, once the service answers, and the titles
-      it left to write.
-  */
-  rememberLater();
-  namePending();
-  describePending();
+  // The documents of the projects without passages are indexed, by their words without an embedding
+  // model; with one, the status has already started their indexing.
+  if (!rag.embeddingModel()) indexProjects();
   // A tab that closes gives back the lease of the memory and tells that it no longer answers.
   window.addEventListener('pagehide', () => {
+    speech.stopReading();
     if (memoryRunning) releaseMemoryLease().catch(() => {});
     if (state.busyId) broadcast({ type: 'busy', id: state.busyId, tab: tabId, busy: false });
   });

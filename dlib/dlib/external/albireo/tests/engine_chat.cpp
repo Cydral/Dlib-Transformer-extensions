@@ -8,7 +8,8 @@
 
     The second form prints the description of the library and returns 0, and 3 when the
     engine cannot run on this computer.  The first one refuses such an engine the same way,
-    before it runs any of its kernels.
+    before it runs any of its kernels.  The engine of a device, whose runtime the description
+    starts, stays loaded: the program then ends without unloading it, as the service does.
 
     Options:
         --reasoning on|off   reasoning of the models that can reason
@@ -55,12 +56,11 @@
 #include <vector>
 
 #include "../common/engine_loader.h"
+#include "../common/platform.h"
 
 #if defined(_WIN32)
 #include <windows.h>
 #include <shellapi.h>
-
-#include "../common/platform.h"
 #endif
 
 using namespace albireo;
@@ -174,6 +174,7 @@ namespace
         std::vector<std::unique_ptr<pending>> waits;
         const auto t0 = std::chrono::steady_clock::now();
         const size_t requests = parallel ? texts.size() : 1;
+        int failures = 0;
         for (size_t q = 0; q < requests; ++q)
         {
             json req = json::object();
@@ -188,12 +189,13 @@ namespace
             char err[1024] = { 0 };
             if (lib.submit(e, req.dump().c_str(), on_event, p.get(), &id, err, sizeof(err)) != ALBIREO_OK)
             {
+                // The requests already submitted report to their objects until they end: waited for below.
                 std::printf("submit: %s\n", err);
-                return 1;
+                ++failures;
+                break;
             }
             waits.push_back(std::move(p));
         }
-        int failures = 0;
         for (size_t q = 0; q < waits.size(); ++q)
         {
             pending& p = *waits[q];
@@ -211,6 +213,7 @@ namespace
                     decode_floats(d["embedding"].as_string());
             std::printf("usage %s, timings %s\n", done["usage"].dump().c_str(), done["timings"].dump().c_str());
         }
+        if (waits.size() < requests) return 1;
         const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         std::printf("%zu vectors in %.2f s\n", texts.size(), s);
         for (size_t i = 0; i < vectors.size(); ++i)
@@ -366,14 +369,50 @@ int main(int argc, char** argv)
     }
     bool render_mode = false;
     for (int i = 3; i < argc; ++i) render_mode = render_mode || std::string(argv[i]) == "--render";
+    /*
+        The runtime of a device starts with the description, and its threads would be torn down
+        with the library: the library stays loaded, and once the description says the engine is
+        pinned, the program ends without unloading it, as the service does (host/main.cpp).
+    */
+    lib.keep_loaded();
     const json description = lib.description();
+    const bool pinned = description["pinned"].as_bool(false);
+    const auto finish = [pinned](int code) {
+        if (pinned) end_process(code);
+        return code;
+    };
     if (!render_mode) std::printf("%s\n", description.dump_formatted().c_str());
     if (!description["usable"].as_bool(false))
     {
         std::printf("the engine cannot run on this computer: %s\n", description["reason"].as_string().c_str());
-        return 3;
+        return finish(3);
     }
-    if (describe_only) return 0;
+    if (describe_only) return finish(0);
+
+    // The images given before each question, as data URLs.
+    json image_parts = json::array();
+    for (const auto& path : images)
+    {
+        std::FILE* f = std::fopen(path.c_str(), "rb");
+        if (!f)
+        {
+            std::printf("cannot read %s\n", path.c_str());
+            return finish(1);
+        }
+        std::string bytes;
+        char buf[65536];
+        size_t n = 0;
+        while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) bytes.append(buf, n);
+        std::fclose(f);
+        const bool png = bytes.size() > 4 && bytes.compare(1, 3, "PNG") == 0;
+        json part = json::object();
+        part["type"] = "image_url";
+        json url = json::object();
+        url["url"] = std::string(png ? "data:image/png;base64," : "data:image/jpeg;base64,") + base64(bytes);
+        if (!detail.empty()) url["detail"] = detail;
+        part["image_url"] = url;
+        image_parts.push_back(part);
+    }
 
     json config = json::object();
     config["threads"] = threads;
@@ -386,7 +425,7 @@ int main(int argc, char** argv)
     if (!e)
     {
         std::printf("create: %s\n", err);
-        return 1;
+        return finish(1);
     }
     json options = json::object();
     options["context"] = context;
@@ -395,7 +434,7 @@ int main(int argc, char** argv)
     {
         std::printf("load: %s\n", err);
         lib.destroy(e);
-        return 1;
+        return finish(1);
     }
     json models;
     lib.run_query(e, json::parse_or_null("{\"op\":\"models\"}"), models);
@@ -408,7 +447,7 @@ int main(int argc, char** argv)
         lib.run_query(e, json::parse_or_null("{\"op\":\"stats\"}"), stats);
         std::printf("\n%s\n", stats.dump_formatted().c_str());
         lib.destroy(e);
-        return rc;
+        return finish(rc);
     }
 
     for (int i = 3; i + 1 < argc; ++i)
@@ -427,7 +466,7 @@ int main(int argc, char** argv)
         const int rc = lib.run_query(e, req, answer);
         std::printf("%s", rc == ALBIREO_OK ? answer["prompt"].as_string().c_str() : answer.dump().c_str());
         lib.destroy(e);
-        return rc == ALBIREO_OK ? 0 : 1;
+        return finish(rc == ALBIREO_OK ? 0 : 1);
     }
 
     json tool_list = json::parse_or_null(R"([{"type":"function","function":{"name":"get_weather",
@@ -452,30 +491,8 @@ int main(int argc, char** argv)
         msg["content"] = questions[q];
         if (!images.empty())
         {
-            // The images first, then the question, as data URLs.
-            json parts = json::array();
-            for (const auto& path : images)
-            {
-                std::FILE* f = std::fopen(path.c_str(), "rb");
-                if (!f)
-                {
-                    std::printf("cannot read %s\n", path.c_str());
-                    return 1;
-                }
-                std::string bytes;
-                char buf[65536];
-                size_t n = 0;
-                while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) bytes.append(buf, n);
-                std::fclose(f);
-                const bool png = bytes.size() > 4 && bytes.compare(1, 3, "PNG") == 0;
-                json part = json::object();
-                part["type"] = "image_url";
-                json url = json::object();
-                url["url"] = std::string(png ? "data:image/png;base64," : "data:image/jpeg;base64,") + base64(bytes);
-                if (!detail.empty()) url["detail"] = detail;
-                part["image_url"] = url;
-                parts.push_back(part);
-            }
+            // The images first, then the question.
+            json parts = image_parts;
             json text = json::object();
             text["type"] = "text";
             text["text"] = questions[q];
@@ -545,5 +562,5 @@ int main(int argc, char** argv)
     lib.run_query(e, json::parse_or_null("{\"op\":\"stats\"}"), stats);
     std::printf("\n%s\n", stats.dump_formatted().c_str());
     lib.destroy(e);
-    return failures ? 1 : 0;
+    return finish(failures ? 1 : 0);
 }

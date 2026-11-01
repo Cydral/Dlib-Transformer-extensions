@@ -37,7 +37,7 @@ add_custom_command(OUTPUT ${ALBIREO_PAYLOAD}
    COMMAND ${CMAKE_COMMAND} -DBIN_DIR=${CMAKE_BINARY_DIR}/bin -DSTAGE=${CMAKE_BINARY_DIR}/payload/stage
       -DOUTPUT=${ALBIREO_PAYLOAD} -DSOURCE_DIR=${ALBIREO_SOURCE_DIR} -DDLIB_DIR=${ALBIREO_DLIB_DIR}
       "-DEXTRA_ENGINE_DIRS=${ALBIREO_EXTRA_ENGINE_DIRS}" -P ${ALBIREO_SOURCE_DIR}/cmake/payload.cmake
-   DEPENDS albireo-service albireo-tray ${processor_engines} ${web_files}
+   DEPENDS albireo-service albireo-tray albireo-speech ${processor_engines} ${web_files}
       ${ALBIREO_SOURCE_DIR}/cmake/payload.cmake ${ALBIREO_SOURCE_DIR}/resources/license.txt
    COMMENT "Packing the programs into the payload of the installer")
 add_custom_target(albireo-payload DEPENDS ${ALBIREO_PAYLOAD})

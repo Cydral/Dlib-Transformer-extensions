@@ -65,6 +65,9 @@ namespace dlib
             Use default_extended_memory_store_path() rather than a literal, so that where the
             store lives stays a deployment decision rather than a build-time one.
 
+            On Windows the path is UTF-8; a string that is not valid UTF-8 is read in the
+            ANSI code page.
+
             The file is created with a unique name, unlinked immediately on POSIX and opened
             with FILE_FLAG_DELETE_ON_CLOSE on Windows, so it does not survive the process
             even after a crash.
@@ -74,12 +77,16 @@ namespace dlib
         /*!
             Size of the store mapping. The file is sparse, so this reserves address space and
             a file length rather than disk blocks: only the pages actually written take room.
-            Pick it generously. When set to 0 it defaults to eight times the device budget.
+            Pick it generously. When set to 0 it defaults to 64 times the device budget.
 
             The request is capped at ninety percent of the free space on the volume, with a
             line on stderr saying so. Without that cap the mapping would be created happily
             and then fail on a write, as a bus error rather than an exception, once the
             volume filled.
+
+            A volume that cannot keep the file sparse, such as FAT or exFAT, gives the file
+            its whole size as soon as it is sized. The store is then limited to the device
+            budget and to half of the free space, with a line on stderr saying so.
 
             A block that asks for a slot after the store is full falls back on a pinned
             mirror, which still works but reintroduces the host memory limit for that block.
@@ -145,9 +152,15 @@ namespace dlib
             model asks for room, which is to say on the critical path of an incoming request.
             Doing it during the pause moves it off that path.
 
-            Blocks in the hot window are kept, which bounds what a release can reclaim and is
-            what makes it safe: during inactivity the window has not moved, so it still covers
-            anything a stalled thread might hold a pointer to.
+            Blocks in the hot window are kept, which bounds what a release can reclaim: during
+            inactivity the window has not moved, so it still covers anything a stalled thread
+            might hold a pointer to.
+
+            The release runs on the observation thread, while a compute thread takes the
+            device pointer of a resident block without the lock. A compute thread that
+            resumes during a release can therefore receive the pointer of a block the release
+            is evicting. Leave this at zero in a program whose computation can resume at any
+            time, such as a server, until the release runs on a compute thread.
         !*/
 
         double idle_release_keep;
@@ -254,6 +267,8 @@ namespace dlib
               rebuilding.
             - otherwise returns the platform's temporary directory: TMPDIR or /tmp on POSIX,
               TEMP or TMP on Windows.
+            - On Windows the variables are read in UTF-16 and the path is returned in UTF-8,
+              the encoding store_path takes.
             - This function is available whether or not this build uses CUDA.
     !*/
 
@@ -276,10 +291,12 @@ namespace dlib
             - #extended_memory_enabled() == true
         throws
             - dlib::error if the subsystem is already running, if any tensor has already been
-              sized, or if the directory named by store_path has no usable room. Both restrictions exist because a block settles where its host copy
-              lives when it is sized, so a network built before this call would keep pinned
-              mirrors for the rest of the run. The call belongs in the first statements of
-              main().
+              sized, or if the directory named by store_path has no usable room, including a
+              volume that cannot keep the file sparse where the limits of store_bytes leave
+              less than 256 MiB. The first two restrictions exist because a block settles
+              where its host copy lives when it is sized, so a network built before this call
+              would keep pinned mirrors for the rest of the run. The call belongs in the first
+              statements of main().
             - cuda_error if the device cannot be queried or the store cannot be mapped.
 
             There is deliberately no way to switch the subsystem off again. Doing so would

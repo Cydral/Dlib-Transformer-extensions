@@ -14,6 +14,16 @@
 #include <sstream>
 #include <string>
 
+#ifdef _WIN32
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <windows.h>
+#endif
+
 namespace dlib
 {
 
@@ -25,33 +35,46 @@ namespace dlib
            comes first so that the same binary can be pointed at a fast local disk on one
            machine and at whatever is available on another, and only then do we fall back on
            the platform's temporary directory. */
-        // The value of a variable, empty when it is not set. MSVC deprecates getenv().
-        const auto env = [](const char* name)
-        {
-            std::string value;
-#ifdef _MSC_VER
-            char* buf = nullptr;
-            std::size_t len = 0;
-            if (_dupenv_s(&buf, &len, name) == 0 && buf != nullptr)
-            {
-                value = buf;
-                std::free(buf);
-            }
-#else
-            if (const char* v = std::getenv(name))
-                value = v;
-#endif
-            return value;
-        };
-        std::string v = env("DLIB_XMEM_STORE");
-        if (!v.empty()) return v;
 #ifdef _WIN32
-        v = env("TEMP");
+        /* The value of a variable in UTF-8, empty when it is not set. The variables are read
+           in UTF-16, so that a folder whose name the ANSI code page cannot spell, such as the
+           temporary folder of a user named in another script, keeps its name. */
+        const auto env = [](const wchar_t* name)
+        {
+            std::wstring value;
+            const DWORD size = GetEnvironmentVariableW(name, nullptr, 0);
+            if (size > 1)
+            {
+                value.resize(size);
+                const DWORD length = GetEnvironmentVariableW(name, &value[0], size);
+                value.resize(length < size ? length : 0);
+            }
+            std::string utf8;
+            const int n = value.empty() ? 0 : WideCharToMultiByte(CP_UTF8, 0, value.data(), (int)value.size(),
+                                                                   nullptr, 0, nullptr, nullptr);
+            if (n > 0)
+            {
+                utf8.resize((std::size_t)n);
+                WideCharToMultiByte(CP_UTF8, 0, value.data(), (int)value.size(), &utf8[0], n, nullptr, nullptr);
+            }
+            return utf8;
+        };
+        std::string v = env(L"DLIB_XMEM_STORE");
         if (!v.empty()) return v;
-        v = env("TMP");
+        v = env(L"TEMP");
+        if (!v.empty()) return v;
+        v = env(L"TMP");
         if (!v.empty()) return v;
         return std::string("C:\\Windows\\Temp");
 #else
+        // The value of a variable, empty when it is not set.
+        const auto env = [](const char* name)
+        {
+            const char* v = std::getenv(name);
+            return std::string(v ? v : "");
+        };
+        std::string v = env("DLIB_XMEM_STORE");
+        if (!v.empty()) return v;
         v = env("TMPDIR");
         if (!v.empty()) return v;
         return std::string("/tmp");
@@ -165,6 +188,32 @@ namespace xmem
 // after the first pass.
 // ----------------------------------------------------------------------------------------
 
+#ifdef _WIN32
+    /*
+        The store path in UTF-16, for the W functions of Windows. The path is UTF-8; a string
+        that is not valid UTF-8 is read in the ANSI code page, as the A functions read it.
+    */
+    static std::wstring wide_path (const std::string& path)
+    {
+        if (path.empty())
+            return std::wstring();
+        UINT page = CP_UTF8;
+        DWORD flags = MB_ERR_INVALID_CHARS;
+        int n = MultiByteToWideChar(page, flags, path.data(), (int)path.size(), nullptr, 0);
+        if (n <= 0)
+        {
+            page = CP_ACP;
+            flags = 0;
+            n = MultiByteToWideChar(page, flags, path.data(), (int)path.size(), nullptr, 0);
+        }
+        if (n <= 0)
+            return std::wstring();
+        std::wstring out((std::size_t)n, L'\0');
+        MultiByteToWideChar(page, flags, path.data(), (int)path.size(), &out[0], n);
+        return out;
+    }
+#endif
+
     /*
         Free space on the volume holding the store. Zero when it cannot be determined, which
         is treated as "do not second guess the caller" rather than as an error.
@@ -174,7 +223,7 @@ namespace xmem
 #ifdef _WIN32
         ULARGE_INTEGER avail;
         avail.QuadPart = 0;
-        if (!GetDiskFreeSpaceExA(dir.c_str(), &avail, nullptr, nullptr))
+        if (!GetDiskFreeSpaceExW(wide_path(dir).c_str(), &avail, nullptr, nullptr))
             return 0;
         return (std::size_t)avail.QuadPart;
 #else
@@ -193,7 +242,7 @@ namespace xmem
     static void check_directory (const std::string& dir)
     {
 #ifdef _WIN32
-        const DWORD attr = GetFileAttributesA(dir.c_str());
+        const DWORD attr = GetFileAttributesW(wide_path(dir).c_str());
         const bool exists    = (attr != INVALID_FILE_ATTRIBUTES);
         const bool directory = exists && (attr & FILE_ATTRIBUTE_DIRECTORY) != 0;
 #else
@@ -212,7 +261,11 @@ namespace xmem
     {
     public:
 
-        memory_arena (const std::string& dir, std::size_t bytes, bool verbose) : cap(bytes)
+        /*
+            dense_bytes is the most the store may take on a volume that cannot keep its file
+            sparse, where the file takes its whole size on the volume as soon as it is sized.
+        */
+        memory_arena (const std::string& dir, std::size_t bytes, std::size_t dense_bytes, bool verbose) : cap(bytes)
         {
             check_directory(dir);
 
@@ -228,7 +281,7 @@ namespace xmem
                           << ", capping it at " << (capped >> 20) << " MiB\n";
                 cap = capped;
             }
-            if (cap < (256ul << 20))
+            if (cap < min_capacity)
                 throw dlib::error("extended memory: no usable room for the store in " + dir +
                                   ". Point store_path at a volume with space, or leave it empty "
                                   "to keep evicted blocks in pinned host memory.");
@@ -242,7 +295,7 @@ namespace xmem
             name << "dlib_xmem_" << (unsigned long)GetCurrentProcessId() << ".store";
             const std::string path = name.str();
 
-            file = CreateFileA(path.c_str(),
+            file = CreateFileW(wide_path(path).c_str(),
                                GENERIC_READ | GENERIC_WRITE,
                                0,
                                nullptr,
@@ -255,10 +308,17 @@ namespace xmem
                 throw dlib::error("extended memory: cannot create the store file " + path);
             }
 
-            // Best effort. Without it the mapping still works, it just reserves the whole
-            // capacity on disk instead of only the pages that are written.
+            /* FAT and exFAT volumes refuse the sparse attribute. The mapping then takes its
+               whole capacity on the volume when it is created, so the capacity is limited
+               before the mapping exists. */
             DWORD returned = 0;
-            DeviceIoControl((HANDLE)file, FSCTL_SET_SPARSE, nullptr, 0, nullptr, 0, &returned, nullptr);
+            sparse = DeviceIoControl((HANDLE)file, FSCTL_SET_SPARSE, nullptr, 0, nullptr, 0, &returned, nullptr) != 0;
+            if (!sparse && !limit_dense(dir, avail, dense_bytes))
+            {
+                CloseHandle((HANDLE)file);
+                file = nullptr;
+                throw dlib::error(dense_error(dir));
+            }
 
             section = CreateFileMappingA((HANDLE)file, nullptr, PAGE_READWRITE,
                                          (DWORD)((std::uint64_t)cap >> 32),
@@ -295,6 +355,14 @@ namespace xmem
             // The file has no name from here on, so it cannot outlive the process even if
             // the process dies without unwinding.
             ::unlink(path.c_str());
+
+            sparse = stays_sparse(fd);
+            if (!sparse && !limit_dense(dir, avail, dense_bytes))
+            {
+                ::close(fd);
+                fd = -1;
+                throw dlib::error(dense_error(dir));
+            }
 
             if (::ftruncate(fd, (off_t)cap) != 0)
             {
@@ -403,6 +471,53 @@ namespace xmem
 
     private:
 
+        static const std::size_t min_capacity = std::size_t(256) << 20;
+
+        /*
+            Limits the capacity to dense_bytes and to half of the free space, for a file the
+            volume cannot keep sparse. Returns false when that leaves less than min_capacity.
+        */
+        bool limit_dense (const std::string& dir, std::size_t avail, std::size_t dense_bytes)
+        {
+            std::size_t dense = std::min(cap, dense_bytes);
+            if (avail > 0)
+                dense = std::min(dense, avail / 2);
+            if (dense < cap)
+            {
+                std::cerr << "extended memory: the volume of " << dir << " cannot keep the store "
+                             "file sparse, so the file takes its whole size on the volume; the "
+                             "store is limited to " << (dense >> 20) << " MiB\n";
+                cap = dense;
+            }
+            return cap >= min_capacity;
+        }
+
+        static std::string dense_error (const std::string& dir)
+        {
+            return "extended memory: the volume of " + dir + " cannot keep the store file sparse, "
+                   "and the device budget or half of its free space leaves no usable room for "
+                   "the store. Point store_path at a volume that holds sparse files (NTFS, ReFS, "
+                   "ext4, XFS, Btrfs), or leave it empty to keep evicted blocks in pinned host "
+                   "memory.";
+        }
+
+#ifndef _WIN32
+        /*
+            Whether the file system leaves the unwritten pages of the file without blocks.
+            FAT and exFAT allocate, and may write, every block of a file they extend, which
+            for a store sized at many times the budget would fill the volume. The test sizes
+            the file to a few megabytes and counts the blocks it received.
+        */
+        static bool stays_sparse (int fd)
+        {
+            const off_t trial = off_t(16) << 20;
+            struct stat st;
+            if (::ftruncate(fd, trial) != 0 || ::fstat(fd, &st) != 0)
+                return true;
+            return (std::uint64_t)st.st_blocks * 512 < (std::uint64_t)trial / 2;
+        }
+#endif
+
         /*
             Where the store ended up is the single decision that most affects how the
             subsystem behaves, and it is the one a program cannot check for itself. Two
@@ -446,7 +561,9 @@ namespace xmem
             if (cap < 2*n || !mapping)
                 return;
 
-            char* probe = mapping + (cap - n);
+            /* A file that is not sparse is probed at its start: a write at its end would first
+               make the file system write zeros over everything before it. */
+            char* probe = mapping + (sparse ? cap - n : 0);
             const auto t0 = std::chrono::steady_clock::now();
             std::memset(probe, 0xa5, n);
 #ifdef _WIN32
@@ -481,6 +598,7 @@ namespace xmem
 
         mutable long measured_mib_per_s = 0;
         mutable bool on_memory_fs = false;
+        bool         sparse  = true;
         std::size_t  cap     = 0;
         std::int64_t next    = 0;
         std::size_t  used    = 0;
@@ -948,7 +1066,7 @@ namespace xmem
             CHECK_CUDA(cudaStreamCreateWithFlags(&xstream, cudaStreamNonBlocking));
             engine.reset(new transfer_engine(opt.staging_bytes, xstream));
             if (!opt.store_path.empty())
-                arena.reset(new memory_arena(opt.store_path, opt.store_bytes, opt.verbose));
+                arena.reset(new memory_arena(opt.store_path, opt.store_bytes, vram_budget, opt.verbose));
         }
 
         ~manager ()
@@ -2823,7 +2941,8 @@ namespace xmem
                filling up mid run and falling back to pinned mirrors. Training holds
                gradients and optimizer states on top of the weights, several times what a
                budget sized for inference would suggest, so the default is generous and the
-               cap below is what actually bounds it. */
+               cap below is what actually bounds it. On a volume that cannot keep the file
+               sparse, the arena limits it to the budget. */
             o.store_bytes = o.vram_budget * 64;
         }
 

@@ -27,10 +27,11 @@
     Over an installation, the programs are replaced in their folder and everything else
     stays: the settings, the models, the certificates and their trust, the token of the
     tray, the shortcuts and the start of the icon.  The new files are written beside the
-    files in place, then take their places together; when a step fails, the previous
-    files come back and the service starts again.  Once the new files stay, those of the
-    engines, the web application and the licenses that this version no longer carries
-    are deleted.  A newer version in place is left as it is.  An offline bundle
+    files in place, then take their places together, while the files of the engines, the
+    web application, the licenses and the speech programs that this version no longer
+    carries are set aside.  The previous files go once the new service answers on its
+    port; when a step fails, the start of the new service included, they come back and
+    the service starts again.  A newer version in place is left as it is.  An offline bundle
     (tools/make_offline_bundle.py) puts the installer next to a signed catalog and a
     "models" folder, on a memory card for instance: the models the catalog lists are
     imported at the first start of the service, for the computers without network.
@@ -188,17 +189,19 @@ namespace albireo
                 error = folder_text(problem, o.program_dir);
                 return false;
             }
-            if (!setup::secure_parents(o.program_dir, error) || !secure_folder(o.program_dir, error)) return false;
-            if (o.models_dir.empty() || o.models_dir == setup::default_models_dir())
-            {
-                setup::record_models_dir(std::string(), false);
-                return true;
-            }
-            const std::string models_problem = setup::folder_problem(o.models_dir, false);
+            const bool default_models = o.models_dir.empty() || o.models_dir == setup::default_models_dir();
+            const std::string models_problem = default_models ? std::string()
+                : setup::folder_problem(o.models_dir, false, o.program_dir);
             if (!models_problem.empty())
             {
                 error = folder_text(models_problem, o.models_dir);
                 return false;
+            }
+            if (!setup::secure_parents(o.program_dir, error) || !secure_folder(o.program_dir, error)) return false;
+            if (default_models)
+            {
+                setup::record_models_dir(std::string(), false);
+                return true;
             }
             // A models folder new or empty when chosen goes whole with Albireo.
             const bool owned = !dir_exists(o.models_dir) || list_dir(o.models_dir).empty();
@@ -242,7 +245,10 @@ namespace albireo
                 };
                 if (!setup::stage_builtin_models(program_dir, files, placing, error)) return false;
             }
-            return setup::stage_uninstaller(program_dir, files, error);
+            if (!setup::stage_uninstaller(program_dir, files, error)) return false;
+            // What an earlier version placed and this one no longer carries leaves with the change.
+            setup::stage_stale_files(program_dir, files);
+            return true;
         }
 
         // The steps after the copy: settings, offline bundle, certificates, service, entry of the programs.
@@ -265,7 +271,7 @@ namespace albireo
             if (!setup::prepare_certificates(!update, error)) return false;
             if (!update && !o.trust_certificate) setup::untrust_authority();
             progress(900, tr("step_service"), false);
-            if (!setup::register_service(o.program_dir, error)) return false;
+            if (!setup::register_service(o.program_dir, update, error)) return false;
             // The size of the installation, with the models that came with it, now or before.
             uint64_t total = payload_size();
             const std::string models_dir = join_path(o.program_dir, "models");
@@ -286,7 +292,7 @@ namespace albireo
         */
         bool programs_match(const std::string& dir, std::string& error)
         {
-            for (const char* name : { "albireo-service.exe", "albireo-tray.exe" })
+            for (const char* name : { "albireo-service.exe", "albireo-tray.exe", "albireo-speech.exe" })
             {
                 const std::string version = setup::program_version(join_path(dir, name));
                 if (version.empty() || version == ALBIREO_VERSION) continue;
@@ -297,14 +303,43 @@ namespace albireo
             return true;
         }
 
+        // The time the new service takes to run and to open its port before the change is undone.
+        const unsigned service_start_ms = 120000;
+
+        /*
+            Starts the service of the programs just placed in program_dir and waits until it
+            answers on its port.  A service that an administrator disabled stays stopped, and
+            counts as started.
+        */
+        bool start_new_service(const std::string& program_dir, std::string& error)
+        {
+            if (setup::service_disabled())
+            {
+                setup::log("the service is disabled: it is not started");
+                return true;
+            }
+            // A service started meanwhile runs the previous programs: it stops first.
+            std::string e;
+            setup::stop_service(60000, e);
+            if (setup::start_service(error) && setup::wait_for_service(service_start_ms, error)) return true;
+            setup::log("the new service does not start: " + error);
+            setup::log_service_tail();
+            // The service that failed stops, with its children, before its files go back.
+            setup::stop_service(60000, e);
+            setup::end_processes(program_dir, 5000, "albireo-service.exe");
+            return false;
+        }
+
         /*
             Installs the programs, or updates them when update is true: the settings, the
             certificates and their trust, the shortcuts and the start of the icon then stay
             as they are.  close_icons closes the icons of the users first; the update started
             by the service leaves them open, and each one starts again from the new program
             when it sees the new version of the service.  The free space is checked before
-            anything stops; when a later step fails, the previous programs come back and the
-            service starts again if it was running.
+            anything stops.  The previous files stay aside until the new service answers on
+            its port: when a step fails, the new service included, the previous programs come
+            back with the entry of the installed programs, and the service starts again if it
+            was running.
         */
         bool install_programs(const setup::install_options& o, bool update, bool close_icons,
             const progress_fn& progress, install_report& report)
@@ -327,10 +362,13 @@ namespace albireo
                     + " MB needed, " + std::to_string(available >> 20) + " MB available";
                 return false;
             }
+            // A service that waits for its deletion would refuse its new configuration once the files are copied.
+            if (setup::service_marked_for_deletion(error)) return false;
 
             progress(0, tr("step_stop"), false);
             const bool was_running = setup::service_running();
             const bool had_service = setup::service_exists();
+            const setup::uninstall_entry entry = setup::save_uninstall_entry();
             setup::suspend_recovery();
             setup::stop_service(60000, error);
             error.clear();
@@ -340,43 +378,136 @@ namespace albireo
             setup::staged_files files;
             const bool copied = stage_programs(o.program_dir, overlay.present(), files, progress, error)
                 && files.commit(error) && programs_match(o.program_dir, error);
-            if (!copied || !configure(o, update, progress, report))
+            const bool configured = copied && configure(o, update, progress, report);
+            if (configured) progress(950, tr("step_start"), false);
+            if (!configured || !start_new_service(o.program_dir, error))
             {
-                // The previous programs come back, and the service as it was.
+                // The previous programs come back, with the entry of the installed programs and the service.
                 setup::log("the previous programs are put back: " + error);
-                files.rollback();
-                report.rolled_back = true;
+                std::string missing;
+                report.rolled_back = files.rollback(missing);
+                if (!report.rolled_back)
+                {
+                    error += "; the previous files could not all be put back: " + missing;
+                    setup::log("the previous files could not all be put back: " + missing);
+                }
                 std::string e;
                 if (!had_service) setup::remove_service(e);
+                setup::restore_uninstall_entry(entry);
+                if (!update)
+                {
+                    setup::set_autostart(o.program_dir, false);
+                    setup::remove_shortcuts();
+                }
                 setup::restore_recovery();
                 if (was_running) setup::start_service(e);
                 return false;
             }
             files.finish();
-            // What an earlier version placed and this one no longer carries goes once the change stays.
-            setup::remove_stale_files(o.program_dir, files.targets());
+            setup::remove_empty_program_folders(o.program_dir);
             setup::write_file_list(o.program_dir, files.targets());
-            progress(950, tr("step_start"), false);
-            // A service started meanwhile runs the previous programs: it stops first.
-            setup::stop_service(60000, error);
-            error.clear();
-            if (!setup::start_service(error)) return false;
-            setup::wait_for_server(o.port, 30000);
             progress(1000, tr("step_done"), false);
             setup::log("done");
             return true;
         }
 
         /*
+            The folders that a new installation finds missing or empty: when it fails, those it
+            made go with what they hold, the parents it made with them when nothing else came
+            into them, and those it found empty are emptied again.
+        */
+        class new_folders
+        {
+        public:
+            // Notes dir before the installation, as it is then.
+            void note(const std::string& dir)
+            {
+                std::string d = dir;
+                while (d.size() > 3 && (d.back() == '\\' || d.back() == '/')) d.pop_back();
+                if (d.size() <= 3) return;
+                if (dir_exists(d))
+                {
+                    if (!is_link(d) && list_dir(d).empty()) emptied_.push_back(d);
+                    return;
+                }
+                // The folder, then the parents missing up to the first folder that exists.
+                bool whole = true;
+                for (std::string p = d; p.size() > 3 && !dir_exists(p); p = parent_path(p))
+                {
+                    made_.push_back({ p, whole });
+                    whole = false;
+                }
+            }
+
+            // Whether path lies in a folder that undo() removes or empties.
+            bool covers(const std::string& path) const
+            {
+                for (const auto& m : made_)
+                    if (path_inside(path, m.path)) return true;
+                for (const auto& e : emptied_)
+                    if (path_inside(path, e)) return true;
+                return false;
+            }
+
+            // Removes the folders made and empties those found empty.
+            void undo() const
+            {
+                for (const auto& e : emptied_)
+                {
+                    if (is_link(e) || !dir_exists(e)) continue;
+                    setup::log("the folder " + e + " is emptied");
+                    for (const auto& name : list_dir(e))
+                    {
+                        const std::string p = join_path(e, name);
+                        if (dir_exists(p)) setup::remove_folder(p);
+                        else remove_file(p);
+                    }
+                }
+                // The deepest folders first: each folder noted comes before its parents.
+                for (const auto& m : made_)
+                {
+                    if (!dir_exists(m.path)) continue;
+                    if (m.whole)
+                    {
+                        setup::log("the folder " + m.path + " is removed");
+                        setup::remove_folder(m.path);
+                    }
+                    else
+                    {
+                        RemoveDirectoryW(widen(m.path).c_str());
+                    }
+                }
+            }
+
+        private:
+            struct made_folder
+            {
+                std::string path;
+                bool whole;   // the folder noted, which goes with what it holds; otherwise a parent that goes empty
+            };
+            std::vector<made_folder> made_;
+            std::vector<std::string> emptied_;
+        };
+
+        /*
             install_programs(), and the record of its result in the log and for the tray
             (setup::write_result()), which tells the user of an update made out of sight that
-            failed.
+            failed.  A new installation that fails removes the folders it made and empties
+            those it found empty, its log included, which then goes to the temporary folder.
         */
         bool perform_install(const setup::install_options& o, bool update, bool close_icons,
             const progress_fn& progress, install_report& report)
         {
             const std::string previous = setup::installed_version();
             const std::string recorded = setup::recorded_data_dir();
+            const bool fresh = !update && previous.empty();
+            new_folders folders;
+            if (fresh)
+            {
+                folders.note(o.program_dir);
+                folders.note(o.data_dir.empty() ? setup::default_data_dir() : o.data_dir);
+                if (!o.models_dir.empty()) folders.note(o.models_dir);
+            }
             const bool ok = install_programs(o, update, close_icons, progress, report);
             const std::string what = update ? "update" : "installation";
             if (!ok)
@@ -387,12 +518,15 @@ namespace albireo
             }
             setup::write_result(what, previous, ok, report.rolled_back, report.error);
             /*
-                A new installation that failed leaves the record of the folders as it found it,
-                unless its programs stay registered, as when only the start of the service
-                failed: they keep the folders they use, which their uninstaller removes.
+                A new installation that failed leaves the folders and their record as it found
+                them, unless its programs stay registered: they keep the folders they use, which
+                their uninstaller removes.
             */
-            if (!ok && !update && previous.empty() && setup::installed_version().empty())
+            if (!ok && fresh && setup::installed_version().empty())
             {
+                // The log leaves the data folder before it goes.
+                if (folders.covers(join_path(data_dir(), "logs"))) setup::detach_log();
+                folders.undo();
                 std::string e;
                 if (recorded.empty()) setup::forget_folders();
                 else setup::record_data_dir(recorded, e);
@@ -463,7 +597,6 @@ namespace albireo
             setup::remove_shortcuts();
             setup::untrust_authority();
             remove_certificates();
-            setup::remove_uninstall();
             std::vector<std::string> keep;
             if (keep_data) keep = { data, models };
             else if (!path_inside(models, data)) remove_models_folder(models);
@@ -486,6 +619,8 @@ namespace albireo
                 setup::log("the data folder " + data + " is a folder of the system: it stays");
                 setup::forget_folders();
             }
+            // The entry of the installed programs goes last: an uninstallation cut short can run again.
+            setup::remove_uninstall();
             progress(1000, tr("step_done"), false);
             return true;
         }
@@ -570,7 +705,7 @@ namespace albireo
             if (problem.empty() && !models.empty() && models != join_path(data, "models"))
             {
                 dir = models;
-                problem = setup::folder_problem(models, false);
+                problem = setup::folder_problem(models, false, programs);
             }
             if (problem.empty()) return true;
             ui::message(wz.hwnd, tr(problem.c_str(), { { "d", dir } }), MB_OK | MB_ICONWARNING);
@@ -1227,7 +1362,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
         }
         else if (custom)
         {
-            const std::string problem = setup::folder_problem(dir, false);
+            const std::string problem = setup::folder_problem(dir, false, setup::installed_dir());
             if (!problem.empty()) reason = folder_text(problem, dir);
             else if (!secure_folder(dir, error)) reason = error;
         }
@@ -1252,6 +1387,18 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
     if (has_arg(args, L"/update"))
     {
         // Started by the service, which stops for it; everything else is kept.
+        std::string version, installed, e;
+        const bool in_place = installed_in_place(version, installed);
+        if (in_place) setup::prepare_data_dir(e);
+        // Only an installation in place is updated, and never by an older version.
+        if (!in_place || compare_versions(version, ALBIREO_VERSION) > 0)
+        {
+            setup::log(in_place ? "update: Albireo " + version + " is installed, newer than " + ALBIREO_VERSION
+                + ": nothing done" : std::string("update: Albireo is not installed in place: nothing done"));
+            // The service that stopped for the update starts again on its programs.
+            if (in_place) setup::start_service(e);
+            return 1;
+        }
         const setup::install_options o = setup::installed_options();
         install_report report;
         const bool ok = perform_install(o, true, false, [](int, const std::wstring&, bool) {}, report);
@@ -1377,7 +1524,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
         if (problem.empty() && !m.empty() && o.models_dir != join_path(o.data_dir, "models"))
         {
             folder = o.models_dir;
-            problem = setup::folder_problem(folder, false);
+            problem = setup::folder_problem(folder, false, o.program_dir);
         }
         if (!problem.empty())
         {

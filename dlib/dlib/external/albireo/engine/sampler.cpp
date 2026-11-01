@@ -156,8 +156,8 @@ namespace albireo
             while (m < keep && candidates_[m].first >= floor) ++m;
             keep = m;
         }
-        // top-p: the smallest prefix reaching the probability mass.
-        if (p_.top_p > 0.0f && p_.top_p < 1.0f)
+        // top-p: the smallest prefix reaching the probability mass, the most likely candidate alone for 0.
+        if (p_.top_p < 1.0f)
         {
             double mass = 0;
             size_t m = 0;

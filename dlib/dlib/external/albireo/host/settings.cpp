@@ -45,6 +45,22 @@ namespace albireo
         {
             return join_path(parent_path(settings_path), "proxy.secret");
         }
+
+        // The copy of the last settings written, read when settings.json is no longer valid.
+        std::string backup_path(const std::string& settings_path)
+        {
+            return settings_path + ".bak";
+        }
+
+        bool read_settings(const std::string& path, std::string& text, json& j, std::string& error)
+        {
+            if (!read_file(path, text))
+            {
+                error = "unreadable";
+                return false;
+            }
+            return json::parse(text, j, &error) && j.is_object();
+        }
     }
 
     std::string masked_proxy(const std::string& proxy)
@@ -84,6 +100,7 @@ namespace albireo
         j["proxy"] = masked_proxy(proxy);
         j["update_feed"] = update_feed;
         j["catalog_url"] = catalog_url;
+        j["public_link"] = public_link;
         j["engine_benchmarks"] = engine_benchmarks;
         if (trust_authority >= 0) j["trust_authority"] = trust_authority > 0;
         return j;
@@ -120,6 +137,7 @@ namespace albireo
         proxy = j["proxy"].str(d.proxy);
         update_feed = j["update_feed"].str(d.update_feed);
         catalog_url = j["catalog_url"].str(d.catalog_url);
+        public_link = j["public_link"].str(d.public_link);
         engine_benchmarks = j["engine_benchmarks"].is_object() ? j["engine_benchmarks"] : json::object();
         trust_authority = j["trust_authority"].is_bool() ? (j["trust_authority"].as_bool() ? 1 : 0) : d.trust_authority;
     }
@@ -131,13 +149,34 @@ namespace albireo
 
     settings_store::settings_store(const std::string& path) : path_(path)
     {
-        std::string text;
-        if (read_file(path_, text))
+        bool restored = false;
+        if (file_exists(path_))
         {
             json j;
-            std::string error;
-            if (json::parse(text, j, &error)) s_.from_json(j);
-            else log_warning("settings: " + path_ + " is not valid JSON (" + error + "), defaults used");
+            std::string text, error;
+            if (read_settings(path_, text, j, error))
+            {
+                s_.from_json(j);
+                // The copy follows a valid file, the one the installer or a hand wrote included.
+                const std::string backup = backup_path(path_);
+                std::string copy;
+                if ((!read_file(backup, copy) || copy != text) && !write_file_atomic(backup, text))
+                    log_warning("settings: the copy of " + path_ + " cannot be written");
+            }
+            else
+            {
+                /*
+                    A file damaged on its disk, or by a hand: the copy of the last valid settings
+                    serves, so that the offline mode, the port, the functions of the models and
+                    the folders stay as they were, and settings.json is written again from it.
+                */
+                json saved;
+                std::string saved_text, unused;
+                restored = read_settings(backup_path(path_), saved_text, saved, unused);
+                if (restored) s_.from_json(saved);
+                log_warning("settings: " + path_ + " is not valid JSON (" + error + "), "
+                    + (restored ? "its last copy is used" : "defaults used"));
+            }
         }
         std::lock_guard<std::mutex> lock(m_);
         if (proxy_password_masked(s_.proxy))
@@ -161,6 +200,8 @@ namespace albireo
         {
             log_warning("settings: the password of the proxy cannot move from " + path_ + " to proxy.secret");
         }
+        // Written again from its copy once the password of the proxy is back in the settings.
+        if (restored && !write()) log_warning("settings: " + path_ + " cannot be written again");
     }
 
     bool settings_store::write()
@@ -170,7 +211,10 @@ namespace albireo
         const std::string secret = secret_path(path_);
         const bool password = masked_proxy(s_.proxy) != s_.proxy;
         if (password && !write_file_restricted(secret, s_.proxy)) return false;
-        if (!write_file_atomic(path_, s_.to_json().dump_formatted(2) + "\n")) return false;
+        const std::string text = s_.to_json().dump_formatted(2) + "\n";
+        if (!write_file_atomic(path_, text)) return false;
+        // The copy read when settings.json is damaged, written once settings.json is in place.
+        if (!write_file_atomic(backup_path(path_), text)) log_warning("settings: its copy cannot be written");
         if (!password && file_exists(secret)) remove_file(secret);
         return true;
     }

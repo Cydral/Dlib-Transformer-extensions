@@ -48,6 +48,7 @@
 #include "crypto.h"
 #include "http_fetch.h"
 #include "service.h"
+#include "speech.h"
 
 namespace albireo
 {
@@ -62,13 +63,25 @@ namespace albireo
         /*
             The bodies above large_body are read for max_large_bodies requests at once: a body
             of 64 MB, held and parsed by each of the 64 threads of the server, would take more
-            memory than the computer has.  The count is taken before the body is read and given
-            back once the answer is written, by the same thread (holding_large_body).
+            memory than the computer has.  The count is taken before the body is read, by the
+            thread that reads it (holding_large_body), and given back once the answer is written
+            or given up, a streamed answer included: the request keeps its text in memory until
+            then (give_back_after_answer()).
         */
         const uint64_t large_body = 8u << 20;
         const int max_large_bodies = 4;
         std::atomic<int> large_bodies{0};
         thread_local bool holding_large_body = false;
+        /*
+            The values of the documents being built and held at once, each taking about a hundred
+            bytes whatever its length in the text: a body of one megabyte of small values builds
+            some 60 MB, which the threads of the server together would multiply.  A body reserves
+            the values its text may hold before it is parsed (parse_body()), and gives them back
+            once its document is released, by the same thread (holding_values).
+        */
+        const size_t max_held_values = 4 * (max_body_values + 1);
+        std::atomic<size_t> held_values{0};
+        thread_local size_t holding_values = 0;
         // The events of a streamed answer waiting for a client that reads far slower than the engine writes.
         const size_t max_backlog = 16384;
 
@@ -135,6 +148,85 @@ namespace albireo
             return o;
         }
 
+        // At most the values a JSON text holds: one, and one per comma, bracket and brace outside its strings.
+        size_t value_bound(const std::string& text)
+        {
+            size_t n = 1;
+            bool in_string = false, escaped = false;
+            for (const char c : text)
+            {
+                if (in_string)
+                {
+                    if (escaped) escaped = false;
+                    else if (c == '\\') escaped = true;
+                    else if (c == '"') in_string = false;
+                }
+                else if (c == '"')
+                {
+                    in_string = true;
+                }
+                else if (c == ',' || c == '[' || c == '{')
+                {
+                    ++n;
+                }
+            }
+            return n;
+        }
+
+        /*
+            Gives back the count of the large body of req once httplib has written its answer, which
+            follows the post-routing handler, or has given it up: the release of the content of
+            the answer, when res goes, gives it back.  The bytes of an answer that is not a content
+            become one; a streamed answer gives it back after its own release.  An answer to a
+            request of ranges of bytes gives it back at once.
+        */
+        void give_back_after_answer(const httplib::Request& req, httplib::Response& res)
+        {
+            if (!req.ranges.empty())
+            {
+                --large_bodies;
+                return;
+            }
+            if (res.content_provider_)
+            {
+                auto release = std::move(res.content_provider_resource_releaser_);
+                res.content_provider_resource_releaser_ = [release](bool success) {
+                    if (release) release(success);
+                    --large_bodies;
+                };
+                return;
+            }
+            auto text = std::make_shared<std::string>(std::move(res.body));
+            const std::string type = res.get_header_value("Content-Type");
+            res.set_content_provider(text->size(), type,
+                [text](size_t offset, size_t length, httplib::DataSink& sink) {
+                    return sink.write(text->data() + offset, length);
+                },
+                [](bool) { --large_bodies; });
+            if (type.empty()) res.headers.erase("Content-Type");
+        }
+
+        // Gives back the values the body of the request of this thread reserved.
+        void release_values()
+        {
+            if (holding_values == 0) return;
+            held_values -= holding_values;
+            holding_values = 0;
+        }
+
+        // Reserves n values for the body of the request of this thread; false when the budget holds no room for them.
+        bool reserve_values(size_t n)
+        {
+            release_values();
+            size_t current = held_values.load();
+            do
+            {
+                if (current + n > max_held_values) return false;
+            } while (!held_values.compare_exchange_weak(current, current + n));
+            holding_values = n;
+            return true;
+        }
+
         bool parse_body(const httplib::Request& req, httplib::Response& res, json& body)
         {
             std::string error;
@@ -142,6 +234,14 @@ namespace albireo
             {
                 body = json::object();
                 return true;
+            }
+            // The parser stops after max_body_values values: no document holds more.
+            if (!reserve_values(std::min(value_bound(req.body), max_body_values + 1)))
+            {
+                res.set_header("Retry-After", "2");
+                send_error(res, 503, "server_error", "too many large documents are being read at once: try again",
+                    "busy");
+                return false;
             }
             if (!json::parse(req.body, body, &error, 64, max_body_values) || !body.is_object())
             {
@@ -256,9 +356,15 @@ namespace albireo
             return false;
         }
 
-        // The engine request of a completion of the OpenAI interface.
-        bool engine_request(service& svc, const json& body, json& out, std::string& error, std::string& model_name)
+        /*
+            The engine request of a completion of the OpenAI interface.  The members it takes are
+            moved out of source, the body of the request, so that the images and the conversations
+            of a large request stay in memory once; source keeps the members it does not take.
+        */
+        bool engine_request(service& svc, json& source, json& out, std::string& error, std::string& model_name)
         {
+            // Read through a const reference, which adds no member to the body.
+            const json& body = source;
             const std::string requested = body["model"].as_string();
             const std::string model = svc.resolve_model(requested);
             if (model.empty())
@@ -284,13 +390,20 @@ namespace albireo
             }
             out = json::object();
             out["model"] = model;
-            static const char* const copied[] = { "messages", "prompt", "tools", "tool_choice", "max_tokens",
+            static const char* const taken[] = { "messages", "prompt", "tools", "tool_choice", "max_tokens",
                 "max_completion_tokens", "temperature", "top_p", "top_k", "min_p", "stop", "seed", "presence_penalty",
                 "frequency_penalty", "repeat_penalty", "repetition_penalty", "repeat_last_n", "logit_bias",
                 "reasoning_effort", "reasoning", "chat_template_kwargs" };
-            for (const char* k : copied)
-                if (body.contains(k)) out[k] = body[k];
+            for (const char* k : taken)
+                for (auto& member : source.items())
+                    if (member.first == k)
+                    {
+                        out[k] = std::move(member.second);
+                        break;
+                    }
             if (body["think"].is_bool()) out["reasoning"] = body["think"];
+            // The work in the background of the web application, whose answers leave the prompts their whole pass.
+            if (requested == "albireo-background") out["priority"] = "background";
             return true;
         }
 
@@ -463,12 +576,24 @@ namespace albireo
             auto ch = std::make_shared<event_channel>();
             uint64_t id = 0;
             auto sink = [ch](int kind, const std::string& data) { ch->push(kind, data); };
-            if (!svc.engine().submit(request, sink, id, error))
+            int code = ALBIREO_OK;
+            if (!svc.engine().submit(request, sink, id, error, &code))
             {
+                if (code == ALBIREO_E_BUSY)
+                {
+                    // Refused for a while, the images queued for the model holding the memory kept for them.
+                    send_error(res, 503, "server_error", error, "engine_busy");
+                    res.set_header("Retry-After", "5");
+                    return;
+                }
                 const bool overflow = error.find("context") != std::string::npos;
                 send_error(res, 400, "invalid_request_error", error, overflow ? "context_length_exceeded" : "");
                 return;
             }
+            // The engine holds its own copy of the request: the documents built here go, with their values.
+            body = json();
+            request = json();
+            release_values();
             const std::string cid = std::string(chat ? "chatcmpl-" : "cmpl-") + random_hex(24);
             const long long created = static_cast<long long>(now_unix());
 
@@ -721,6 +846,75 @@ namespace albireo
         }
 
         /*
+            The text read aloud by the speech synthesis that comes with Albireo, as the speech
+            route of the OpenAI interface: input (at most 8192 bytes of UTF-8), voice (a voice
+            of Albireo or its language, else the language of the request or English), speed
+            (0.25 to 4 accepted, read from 0.5 to 2) and response_format (wav, or pcm for the
+            samples alone).  model is not checked: one synthesizer serves every model name.
+        */
+        void handle_speech(service& svc, const httplib::Request& req, httplib::Response& res)
+        {
+            json body;
+            if (!parse_body(req, res, body)) return;
+            if (!body["input"].is_string() || body["input"].as_string().empty())
+            {
+                send_error(res, 400, "invalid_request_error", "input must be a non-empty string", "", "input");
+                return;
+            }
+            const std::string input = body["input"].as_string();
+            if (input.size() > speech_max_bytes)
+            {
+                send_error(res, 400, "invalid_request_error", "input holds more than 8192 bytes",
+                    "string_above_max_length", "input");
+                return;
+            }
+            const std::string format = body["response_format"].str("wav");
+            if (format != "wav" && format != "pcm")
+            {
+                send_error(res, 400, "invalid_request_error", "response_format must be wav or pcm", "",
+                    "response_format");
+                return;
+            }
+            double speed = 1.0;
+            if (body.contains("speed"))
+            {
+                speed = body["speed"].as_double(-1.0);
+                if (!body["speed"].is_number() || !(speed >= 0.25 && speed <= 4.0))
+                {
+                    send_error(res, 400, "invalid_request_error", "speed must be a number from 0.25 to 4", "", "speed");
+                    return;
+                }
+            }
+            // A voice of Albireo by its name or its language; the voices of other services read
+            // with the voice of the language the request gives.
+            const speech_voice* voice = find_voice(body["voice"].as_string());
+            if (!voice) voice = find_voice(body["language"].str("en"));
+            if (!voice)
+            {
+                send_error(res, 400, "invalid_request_error", "language must be en, fr, de, it or es", "", "language");
+                return;
+            }
+            const std::string dir = svc.speech_dir();
+            if (!file_exists(svc.speech_program()) || installed_voices(dir).empty())
+            {
+                send_error(res, 503, "server_error", "the speech synthesis or its voices are not installed",
+                    "speech_unavailable");
+                return;
+            }
+            std::string wav, error;
+            if (!speak(svc.speech_program(), dir, *voice, speed, input, wav, error))
+            {
+                log_warning("speech: " + error);
+                send_error(res, 500, "server_error", error, "speech_failed");
+                return;
+            }
+            res.status = 200;
+            if (format == "pcm") res.set_content(wav.substr(44), "audio/pcm");
+            else res.set_content(wav, "audio/wav");
+            res.set_header("Cache-Control", "no-store");
+        }
+
+        /*
             The vectors of texts, as the OpenAI interface computes them: "input" a text or a
             list of texts (or of token lists), "encoding_format" float or base64, and
             "dimensions" for the models that keep their meaning when shortened.  The
@@ -750,7 +944,8 @@ namespace albireo
             }
             json request = json::object();
             request["model"] = model;
-            request["input"] = body["input"];
+            // Moved, not copied: the texts of a large request stay in memory once.
+            request["input"] = std::move(body["input"]);
             if (body.contains("dimensions")) request["dimensions"] = body["dimensions"];
             auto ch = std::make_shared<event_channel>();
             uint64_t id = 0;
@@ -761,6 +956,10 @@ namespace albireo
                 send_error(res, 400, "invalid_request_error", error);
                 return;
             }
+            // The engine holds its own copy of the request: the documents built here go, with their values.
+            body = json();
+            request = json();
+            release_values();
             std::pair<int, std::string> e;
             auto next_look = std::chrono::steady_clock::now();
             for (;;)
@@ -946,6 +1145,7 @@ namespace albireo
                     holding_large_body = false;
                     --large_bodies;
                 }
+                release_values();
                 if (content_length(req) > large_body)
                 {
                     if (large_bodies.fetch_add(1) >= max_large_bodies)
@@ -960,11 +1160,12 @@ namespace albireo
             return httplib::Server::HandlerResponse::Unhandled;
         });
         srv.set_post_routing_handler([](const httplib::Request& req, httplib::Response& res) {
-            // The body of the request is read and handled: its count goes back.
+            // The body of the request is handled: the values of its document go back, its count after the answer.
+            release_values();
             if (holding_large_body)
             {
                 holding_large_body = false;
-                --large_bodies;
+                give_back_after_answer(req, res);
             }
             res.set_header("X-Content-Type-Options", "nosniff");
             res.set_header("Referrer-Policy", "no-referrer");
@@ -993,8 +1194,9 @@ namespace albireo
                     "style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'");
             else
                 res.set_header("Content-Security-Policy", "default-src 'self'; img-src 'self' data: blob:; "
-                    "style-src 'self' 'unsafe-inline'; script-src 'self'; font-src 'self' data:; connect-src 'self'; "
-                    "worker-src 'self' blob:; frame-ancestors 'none'; base-uri 'none'; form-action 'none'");
+                    "media-src 'self' blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; font-src 'self' "
+                    "data:; connect-src 'self'; worker-src 'self' blob:; frame-ancestors 'none'; base-uri 'none'; "
+                    "form-action 'none'");
             if (req.path.compare(0, 4, "/v1/") == 0 || req.path.compare(0, 11, "/albireo/v1") == 0)
                 res.set_header("Cache-Control", "no-store");
         });
@@ -1101,6 +1303,27 @@ namespace albireo
         });
         srv.Post("/v1/embeddings", [s](const httplib::Request& req, httplib::Response& res) {
             handle_embeddings(*s, req, res);
+        });
+        srv.Post("/v1/audio/speech", [s](const httplib::Request& req, httplib::Response& res) {
+            handle_speech(*s, req, res);
+        });
+        // The voices of the speech synthesis whose files are installed, none without its program.
+        srv.Get("/albireo/v1/speech/voices", [s](const httplib::Request&, httplib::Response& res) {
+            json list = json::array();
+            const std::vector<speech_voice> voices = file_exists(s->speech_program())
+                ? installed_voices(s->speech_dir()) : std::vector<speech_voice>();
+            for (const auto& v : voices)
+            {
+                json o = json::object();
+                o["id"] = v.id;
+                o["language"] = v.language;
+                list.push_back(o);
+            }
+            json out = json::object();
+            out["voices"] = list;
+            out["format"] = "wav";
+            out["sample_rate"] = 16000;
+            send_json(res, 200, out);
         });
 
         // Interface of the web application and of the tray.
@@ -1393,7 +1616,9 @@ namespace albireo
         });
         srv.Post("/albireo/v1/engines/benchmark", [s, admin](const httplib::Request& req, httplib::Response& res) {
             if (!admin(req, res)) return;
-            send_json(res, 200, s->benchmark_engines());
+            // A measure already running refuses the second one with 409.
+            const json r = s->benchmark_engines();
+            send_json(res, r["code"].as_string() == "benchmark_running" ? 409 : 200, r);
         });
         srv.Get("/albireo/v1/logs", [admin](const httplib::Request& req, httplib::Response& res) {
             if (!admin(req, res)) return;

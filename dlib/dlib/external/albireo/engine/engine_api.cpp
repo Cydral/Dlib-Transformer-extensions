@@ -63,6 +63,7 @@ namespace
 
     int code_of(const std::exception& e)
     {
+        if (dynamic_cast<const albireo::engine_busy*>(&e)) return ALBIREO_E_BUSY;
         if (dynamic_cast<const std::invalid_argument*>(&e)) return ALBIREO_E_INVALID_ARGUMENT;
         if (dynamic_cast<const std::bad_alloc*>(&e)) return ALBIREO_E_OUT_OF_MEMORY;
         return ALBIREO_E_INTERNAL;

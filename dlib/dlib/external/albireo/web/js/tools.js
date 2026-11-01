@@ -360,6 +360,26 @@ function documentByName(documents, name) {
   return documents.find((d) => d.name.toLowerCase() === n) || documents.find((d) => d.name.toLowerCase().includes(n));
 }
 
+// The extensions of the files that Windows runs when they are opened, which a file of the agent never keeps.
+const runnableExtensions = new Set(('bat cmd com exe scr pif cpl msi msp msc ps1 psm1 psd1 ps1xml vbs vbe js jse ' +
+  'wsf wsh hta jar lnk url reg inf scf appref-ms application gadget').split(' '));
+
+/*
+    The name of a file the agent creates: without the characters a file name cannot hold, at most 120 of them, and
+    ending with ".txt" when its extension is one Windows runs, so that opening it shows its text.  The dots and the
+    spaces that end a name, which Windows drops, are dropped first, so that the extension checked is the one the file
+    keeps.
+*/
+export function fileNameOf(name) {
+  let fileName = String(name || '').replace(/[\\/:*?"<>|\u0000-\u001f\u007f]+/g, '_').slice(0, 120)
+    .replace(/[. ]+$/, '');
+  if (!fileName) fileName = 'file.txt';
+  const dot = fileName.lastIndexOf('.');
+  const ext = dot < 0 ? '' : fileName.slice(dot + 1).trim().toLowerCase();
+  if (runnableExtensions.has(ext)) fileName += '.txt';
+  return fileName;
+}
+
 /*
     Runs a tool call.  context = { documents: [{name, text}], searchDocuments(query, limit),
     searchDiscussions(query), createFile(name, content), signal }, signal stopping the run of
@@ -432,7 +452,7 @@ export async function run(name, argumentsText, context) {
         };
       }
       case 'create_file': {
-        const fileName = String(args.name || 'file.txt').replace(/[\\/:*?"<>|]+/g, '_').slice(0, 120);
+        const fileName = fileNameOf(args.name);
         const content = String(args.content || '');
         const file = context.createFile(fileName, content);
         return { ok: true, text: 'The file ' + fileName + ' (' + content.length + ' characters) is offered to the user.', file };

@@ -646,3 +646,6 @@ mark { background: var(--mark); color: inherit; border-radius: 3px; padding: 0 1
   display: flex; flex-direction: column; align-items: center; gap: 10px; color: rgba(232, 235, 247, 0.8);
 }
 .viewer-missing svg { width: 48px; height: 48px; }
+
+/* The button of an answer read aloud, while it reads: it shows without the pointer over the answer. */
+.message .meta .icon-button[aria-pressed="true"] { color: var(--blue-strong); opacity: 1; }

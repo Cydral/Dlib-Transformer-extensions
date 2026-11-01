@@ -147,6 +147,11 @@ add_library(albireo_image STATIC
    ${jpeg_dir}/jutils.c)
 target_include_directories(albireo_image PRIVATE ${png_dir} ${jpeg_dir})
 target_link_libraries(albireo_image PUBLIC albireo_zlib)
+if (MSVC)
+   # The simplified interface of libpng takes the magnitude of a negative row stride by
+   # negating its unsigned value, on purpose (C4146).
+   target_compile_options(albireo_image PRIVATE /wd4146)
+endif()
 # Compiled into the shared engines, whose own symbols alone are visible.
 set_target_properties(albireo_zlib albireo_image PROPERTIES POSITION_INDEPENDENT_CODE ON
    C_VISIBILITY_PRESET hidden)
@@ -289,13 +294,31 @@ if (WIN32)
 else()
    option(ALBIREO_COPY_RUNTIME "Copy next to the device engines the libraries they load" OFF)
 endif()
-# The runtime of the compiler, which the libraries of the devices built with it load.
+# The runtime of the compiler, which the libraries of the devices built with it load.  Its
+# folder is found again at each configuration, since an update of Visual Studio replaces it,
+# and the configuration stops when a library of it is missing.
 set(ALBIREO_COMPILER_RUNTIME)
 if (MSVC AND (ALBIREO_ENGINE_CUDA OR ALBIREO_ENGINE_OPENVINO))
    set(CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS_SKIP TRUE)
    set(CMAKE_INSTALL_UCRT_LIBRARIES FALSE)
+   unset(MSVC_REDIST_DIR CACHE)
    include(InstallRequiredSystemLibraries)
    set(ALBIREO_COMPILER_RUNTIME ${CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS})
+   foreach (required msvcp140.dll vcruntime140.dll vcruntime140_1.dll)
+      set(found FALSE)
+      foreach (library ${ALBIREO_COMPILER_RUNTIME})
+         get_filename_component(name "${library}" NAME)
+         string(TOLOWER "${name}" name)
+         if (name STREQUAL required AND EXISTS "${library}")
+            set(found TRUE)
+         endif()
+      endforeach()
+      if (NOT found)
+         message(FATAL_ERROR "${required}, of the runtime of the compiler that the device engines load, was not "
+            "found in the redistributable files of Visual Studio (MSVC_REDIST_DIR: ${MSVC_REDIST_DIR}): repair the "
+            "C++ workload of Visual Studio, or of its Build Tools")
+      endif()
+   endforeach()
 endif()
 # The licenses of the runtime libraries, copied into the licenses folder beside the engines,
 # which the installer moves to the licenses folder of the installation: the first existing
@@ -442,9 +465,12 @@ if (ALBIREO_ENGINE_CUDA)
       math(EXPR cc_minor "${ALBIREO_CUDA_MIN_CC} % 10")
       message(STATUS "CUDA engine: cards of compute capability ${cc_major}.${cc_minor} and later")
    endif()
-   if (ALBIREO_CUDA_MIN_CC GREATER_EQUAL 75)
-      message(STATUS "CUDA engine: the GeForce GTX 900 and 10 series need CUDA 12.8 or 12.9 with cuDNN 9.11 "
-         "or earlier")
+   # The oldest cards of the build, which tools/build_windows.ps1 reports at its end.
+   set(ALBIREO_CUDA_MIN_CC_BUILT ${ALBIREO_CUDA_MIN_CC} CACHE INTERNAL "Oldest compute capability of the CUDA engine")
+   if (ALBIREO_CUDA_MIN_CC GREATER 61)
+      message(WARNING "The CUDA engine of this build leaves out the GeForce GTX 900 and 10 series (Maxwell, "
+         "Pascal), which need the architectures 50 and 61 with CUDA 12.8 or 12.9 and cuDNN 9.11 or earlier "
+         "(architectures ${CMAKE_CUDA_ARCHITECTURES}, cuDNN ${cudnn_version}).")
    endif()
    # nvcc warns that it will stop compiling for the cards before Turing.
    target_compile_options(dlib PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Wno-deprecated-gpu-targets>)
@@ -482,8 +508,23 @@ if (ALBIREO_ENGINE_OPENVINO)
          endif()
       endforeach()
    endif()
+   if (NOT openvino_dir AND ALBIREO_COPY_RUNTIME)
+      message(FATAL_ERROR "The folder of the OpenVINO runtime was not found (find_package(OpenVINO) with "
+         "OpenVINO_DIR \"${OpenVINO_DIR}\"): its libraries cannot join the engines. Set OpenVINO_DIR to the "
+         "cmake folder of the runtime, or -DALBIREO_COPY_RUNTIME=OFF for engines that use the runtime in place.")
+   endif()
    if (openvino_dir)
       set(ALBIREO_RUNTIME_DIRS "${openvino_dir}")
+      # TBB lies beside the libraries of OpenVINO in its Python package, and in the 3rdparty
+      # folder of its archive (runtime/3rdparty/tbb/bin next to runtime/bin/intel64/Release).
+      get_filename_component(tbb_dir "${openvino_dir}/../../../3rdparty/tbb/bin" ABSOLUTE)
+      set(tbbbind_libraries)
+      if (IS_DIRECTORY "${tbb_dir}")
+         list(APPEND ALBIREO_RUNTIME_DIRS "${tbb_dir}")
+         # The library with which TBB reads the cores of a hybrid processor, without its debug build.
+         file(GLOB tbbbind_libraries "${tbb_dir}/${CMAKE_SHARED_LIBRARY_PREFIX}tbbbind*${CMAKE_SHARED_LIBRARY_SUFFIX}")
+         list(FILTER tbbbind_libraries EXCLUDE REGEX "_debug${CMAKE_SHARED_LIBRARY_SUFFIX}$")
+      endif()
       foreach (device npu gpu)
          set(plugin "${CMAKE_SHARED_LIBRARY_PREFIX}openvino_intel_${device}_plugin${CMAKE_SHARED_LIBRARY_SUFFIX}")
          list(APPEND ALBIREO_RUNTIME_EXTRA "${openvino_dir}/${plugin}")
@@ -496,7 +537,7 @@ if (ALBIREO_ENGINE_OPENVINO)
             "${openvino_dir}/${CMAKE_SHARED_LIBRARY_PREFIX}openvino_intel_${part}${CMAKE_SHARED_LIBRARY_SUFFIX}")
       endforeach()
       list(APPEND ALBIREO_RUNTIME_EXTRA "${openvino_dir}/${CMAKE_SHARED_LIBRARY_PREFIX}tbbbind*"
-         "${openvino_dir}/cache.json")
+         ${tbbbind_libraries} "${openvino_dir}/cache.json")
       foreach (engine ${openvino_engines})
          albireo_device_runtime(${engine})
       endforeach()
@@ -537,9 +578,83 @@ if (ALBIREO_PROGRAMS)
       target_link_libraries(albireo_common PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
    endif()
 
+   # The speech synthesis that reads the answers aloud: SVOX Pico in its own program,
+   # albireo-speech, which the service starts for each reading, and its voices of six languages.
+   set(pico_dir ${ALBIREO_DLIB_DIR}/external/svox_pico)
+   file(GLOB pico_sources ${pico_dir}/lib/*.c)
+   add_library(albireo_pico STATIC ${pico_sources})
+   target_include_directories(albireo_pico PUBLIC ${pico_dir}/lib)
+   # Third-party code of 2009, compiled as it is published: its warnings are not ours to fix.
+   # With Visual Studio, /W0 replaces the level of the directory instead of following it, which
+   # would print the notice that an option overrides another for each of its files.
+   if (MSVC)
+      get_target_property(pico_options albireo_pico COMPILE_OPTIONS)
+      list(FILTER pico_options EXCLUDE REGEX "/W[0-4]")
+      set_target_properties(albireo_pico PROPERTIES COMPILE_OPTIONS "${pico_options};/W0")
+   else()
+      target_compile_options(albireo_pico PRIVATE -w)
+   endif()
+
+   # The program of the speech synthesis: the synthesizer and the runtime of the compiler, no
+   # other library, so that it starts with a token of low integrity from the service (host/speech.h).
+   add_executable(albireo-speech host/speech_worker.cpp host/speech_text.cpp)
+   target_link_libraries(albireo-speech PRIVATE albireo_pico)
+   target_include_directories(albireo-speech PRIVATE ${ALBIREO_INCLUDE_DIR})
+   target_compile_options(albireo-speech PRIVATE ${ALBIREO_WARNINGS})
+   if (WIN32)
+      target_sources(albireo-speech PRIVATE resources/speech.rc)
+   endif()
+
+   # The password of the public link of the published files (host/public_link.h), read from a
+   # file outside the repository at each configuration and built into the service, masked: the
+   # header generated lies in the build tree alone.  Without the file, the service reaches the
+   # link without password.
+   if (WIN32 AND DEFINED ENV{USERPROFILE})
+      file(TO_CMAKE_PATH "$ENV{USERPROFILE}/keys/albireo-public-link.txt" public_link_default)
+   else()
+      set(public_link_default "$ENV{HOME}/keys/albireo-public-link.txt")
+   endif()
+   set(ALBIREO_PUBLIC_LINK_PASSWORD_FILE "${public_link_default}" CACHE FILEPATH
+      "File holding the password of the public link of the published files")
+   set(public_link_bytes "0")
+   set(public_link_size 0)
+   if (EXISTS "${ALBIREO_PUBLIC_LINK_PASSWORD_FILE}")
+      set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${ALBIREO_PUBLIC_LINK_PASSWORD_FILE}")
+      file(READ "${ALBIREO_PUBLIC_LINK_PASSWORD_FILE}" public_link_hex HEX)
+      # A byte order mark before the password and the ends of line after it are not part of it.
+      string(REGEX REPLACE "^efbbbf" "" public_link_hex "${public_link_hex}")
+      string(REGEX REPLACE "(0d|0a)+$" "" public_link_hex "${public_link_hex}")
+      string(LENGTH "${public_link_hex}" public_link_digits)
+      math(EXPR public_link_size "${public_link_digits} / 2")
+      if (public_link_size GREATER 0)
+         # Each byte masked by the generator that host/public_link.cpp runs again to unmask it.
+         set(public_link_seed 20261101)
+         set(public_link_list "")
+         math(EXPR public_link_last "${public_link_size} - 1")
+         foreach (i RANGE 0 ${public_link_last})
+            math(EXPR public_link_at "${i} * 2")
+            string(SUBSTRING "${public_link_hex}" ${public_link_at} 2 public_link_byte)
+            math(EXPR public_link_seed "(${public_link_seed} * 1103515245 + 12345) % 2147483648")
+            math(EXPR public_link_byte "0x${public_link_byte} ^ ((${public_link_seed} >> 16) & 255)")
+            list(APPEND public_link_list ${public_link_byte})
+         endforeach()
+         string(REPLACE ";" ", " public_link_bytes "${public_link_list}")
+      endif()
+      message(STATUS "Public link: password read from ${ALBIREO_PUBLIC_LINK_PASSWORD_FILE}")
+   elseif (WIN32 AND NOT CMAKE_CROSSCOMPILING)
+      # The installed services would read the protected link in vain and take the official addresses.
+      message(WARNING "Public link: no password, ${ALBIREO_PUBLIC_LINK_PASSWORD_FILE} does not exist; the "
+         "service built reaches the public link without password")
+   else()
+      message(STATUS "Public link: no password, ${ALBIREO_PUBLIC_LINK_PASSWORD_FILE} does not exist")
+   endif()
+   configure_file(cmake/public_link_secret.h.in ${CMAKE_BINARY_DIR}/generated/public_link_secret.h @ONLY)
+
    # The service.
    add_executable(albireo-service host/main.cpp host/service.cpp host/server.cpp host/settings.cpp host/store.cpp
-      host/models.cpp host/updater.cpp host/engine_host.cpp host/http_fetch.cpp host/crypto.cpp host/certificates.cpp)
+      host/models.cpp host/updater.cpp host/engine_host.cpp host/http_fetch.cpp host/public_link.cpp host/crypto.cpp
+      host/certificates.cpp host/speech.cpp host/speech_text.cpp)
+   target_include_directories(albireo-service PRIVATE ${CMAKE_BINARY_DIR}/generated)
    target_link_libraries(albireo-service PRIVATE albireo_common albireo_sqlite albireo_zlib dlib::httplib)
    target_compile_options(albireo-service PRIVATE ${ALBIREO_WARNINGS})
    if (WIN32)
@@ -617,6 +732,11 @@ if (ALBIREO_PROGRAMS)
       COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_CURRENT_SOURCE_DIR}/web ${CMAKE_BINARY_DIR}/bin/web
       COMMENT "Copying the web application")
    add_dependencies(albireo-service albireo-web)
+   # The program and the voices of the speech synthesis, next to the service.
+   add_custom_target(albireo-speech-voices ALL
+      COMMAND ${CMAKE_COMMAND} -E copy_directory ${pico_dir}/lang ${CMAKE_BINARY_DIR}/bin/speech
+      COMMENT "Copying the voices of the speech synthesis")
+   add_dependencies(albireo-service albireo-speech albireo-speech-voices)
 
    if (WIN32)
       add_subdirectory(windows)
@@ -648,7 +768,9 @@ endif()
 
 if (ALBIREO_TESTS AND ALBIREO_PROGRAMS)
    # The files the service writes in its models folder and reads in its imports, with a local server.
-   add_executable(test_host tests/test_host.cpp host/models.cpp host/store.cpp host/http_fetch.cpp host/crypto.cpp)
+   add_executable(test_host tests/test_host.cpp host/models.cpp host/store.cpp host/http_fetch.cpp
+      host/public_link.cpp host/crypto.cpp)
+   target_include_directories(test_host PRIVATE ${CMAKE_BINARY_DIR}/generated)
    target_link_libraries(test_host PRIVATE albireo_common albireo_sqlite albireo_zlib dlib::httplib)
    target_compile_options(test_host PRIVATE ${ALBIREO_WARNINGS})
    albireo_output_dir(test_host ${CMAKE_BINARY_DIR}/tests)

@@ -28,9 +28,23 @@ def reply(description, schema=None):
 error_replies = {
     "400": reply("Invalid request", ref("Error")),
     "404": reply("Unknown or inactive model", ref("Error")),
-    "503": reply("The service starts (code starting) or the model loads (code model_loading); the Retry-After "
+    "503": reply("The service starts (code starting), the model loads (code model_loading), or the values of the "
+                 "JSON bodies being read at once reach their budget (code busy, Retry-After: 2); the Retry-After "
                  "header gives the seconds to wait", ref("Error")),
 }
+# The routes whose request the engine computes, which may fail once it started; a stream ends with StreamError then.
+engine_replies = dict(error_replies, **{
+    "500": reply("The engine failed the request, which was not streamed: type server_error, and code the reason "
+                 "the engine gives, such as out_of_memory", ref("Error")),
+})
+# The routes that generate text, which the engine also refuses for a while when the images already queued for the
+# model hold the memory kept for them.
+generation_replies = dict(engine_replies, **{
+    "503": reply("The service starts (code starting), the model loads (code model_loading), the values of the JSON "
+                 "bodies being read at once reach their budget (code busy, Retry-After: 2), or the engine refuses the "
+                 "request for a while because the images already queued for the model hold the memory kept for them "
+                 "(code engine_busy, Retry-After: 5); the Retry-After header gives the seconds to wait", ref("Error")),
+})
 admin = [{"adminToken": []}]
 offline_reply = {"409": reply("Refused in offline mode", {"type": "object", "properties": {
     "ok": {"type": "boolean"}, "error": {"type": "string"}}})}
@@ -66,19 +80,26 @@ schemas = {
             "tool_call_id": {"type": "string", "description": "For a tool message: the call it answers."},
             "name": {"type": "string"}}},
     "ContentPart": {"type": "object", "required": ["type"], "properties": {
-        "type": {"type": "string", "enum": ["text", "image_url"]},
+        "type": {"type": "string", "enum": ["text", "image_url", "input_audio"]},
         "text": {"type": "string"},
-        "image_url": {"type": "object", "required": ["url"], "properties": {
-            "url": {"type": "string", "description": "A PNG or JPEG file as a data URL, data:image/png;base64,... or "
-                    "data:image/jpeg;base64,...; the service fetches no address (code invalid_image_url), reads no "
-                    "other format (invalid_image_format), and refuses more than 20 MB, 8192 pixels on a side or "
-                    "40 megapixels."},
-            "detail": {"type": "string", "enum": ["low", "auto", "high"], "default": "auto",
-                       "description": "The tokens an image takes at most: for Qwen3-VL 256, 576 or 1024 tokens of "
-                                      "32 pixels square; for a LLaVA-NeXT model (EuroVLM) the whole image and 1, 2 or "
-                                      "4 tiles of 384 pixels."}}}},
+        "image_url": {"description": "The image: an object with its url, or its url alone as a string.", "oneOf": [
+            {"type": "string", "description": "The data URL of the image, as url in the object form."},
+            {"type": "object", "required": ["url"], "properties": {
+                "url": {"type": "string", "description": "A PNG or JPEG file as a data URL, data:image/png;base64,... "
+                        "or data:image/jpeg;base64,...; the service fetches no address (code invalid_image_url), "
+                        "reads no other format (invalid_image_format), and refuses more than 20 MB, 8192 pixels on "
+                        "a side or 40 megapixels."},
+                "detail": {"type": "string", "enum": ["low", "auto", "high"], "default": "auto",
+                           "description": "The tokens an image takes at most: for Qwen3-VL 256, 576 or 1024 tokens "
+                                          "of 32 pixels square; for a LLaVA-NeXT model (EuroVLM) the whole image and "
+                                          "1, 2 or 4 tiles of 384 pixels."}}}]},
+        "input_audio": {"type": "object", "description": "A sound, for a model whose inputs list audio; a model "
+                        "that reads no sound refuses the request (code audio_input_not_supported).",
+                        "properties": {"data": {"type": "string", "description": "The sound in base64."},
+                                       "format": {"type": "string", "example": "wav"}}}},
         "description": "A part of the content of a message. A model that reads text only refuses the images (code "
-                       "image_input_not_supported), and a request carries 16 images at most (too_many_images)."},
+                       "image_input_not_supported), a model that reads no sound refuses the sounds (code "
+                       "audio_input_not_supported), and a request carries 16 images at most (too_many_images)."},
     "ToolCall": {"type": "object", "properties": {
         "index": {"type": "integer", "description": "Position of the call, in the chunks of a stream."},
         "id": {"type": "string"}, "type": {"type": "string", "enum": ["function"]},
@@ -102,7 +123,10 @@ schemas = {
                                  "(400). Without effect at temperature 0, which takes the most likely token."},
         "min_p": {"type": "number"},
         "presence_penalty": {"type": "number"}, "frequency_penalty": {"type": "number"},
-        "repeat_penalty": {"type": "number"}, "repeat_last_n": {"type": "integer"},
+        "repeat_penalty": {"type": "number"},
+        "repetition_penalty": {"type": "number", "description": "The same setting as repeat_penalty, under the "
+                               "name other clients give it."},
+        "repeat_last_n": {"type": "integer"},
         "seed": {"type": "integer"},
         "stop": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}, "maxItems": 16}]},
         "logit_bias": {"type": "object", "additionalProperties": {"type": "number"},
@@ -126,6 +150,8 @@ schemas = {
                             "oneOf": [{"type": "string"}, {"type": "object"}]},
             "reasoning": {"type": "boolean", "description": "Enables or disables the reasoning of the models that "
                           "support both modes. The reasoning streams in reasoning_content."},
+            "think": {"type": "boolean", "description": "The same setting as reasoning, under the name other "
+                      "clients give it; when both are given, think applies."},
             "reasoning_effort": {"type": "string", "enum": ["none", "low", "medium", "high"]},
             "chat_template_kwargs": {"type": "object", "properties": {"enable_thinking": {"type": "boolean"}}},
             "n": {"type": "integer", "enum": [1]}}}],
@@ -146,15 +172,27 @@ schemas = {
             "finish_reason": {"type": "string", "enum": ["stop", "length", "tool_calls", "cancelled"]}}}},
         "usage": ref("Usage"), "timings": ref("Timings"), "system_fingerprint": {"type": "string"}}},
     "ChatCompletionChunk": {"type": "object", "description": "One event of a stream (text/event-stream), as "
-                            "'data: <chunk>' lines ended by 'data: [DONE]'.", "properties": {
+                            "'data: <chunk>' lines ended by 'data: [DONE]'. With stream_options.include_usage, a "
+                            "last chunk before [DONE] carries usage and timings and no choice. An error once the "
+                            "stream has started ends it with a last event 'data: {\"error\": {\"message\": ..., "
+                            "\"type\": \"server_error\", \"code\": ...}}' (StreamError), without [DONE]. Comment "
+                            "lines (': keep-alive', ': progress {...}') may come between the events.",
+                            "properties": {
         "id": {"type": "string"}, "object": {"type": "string", "enum": ["chat.completion.chunk"]},
+        "created": {"type": "integer"}, "model": {"type": "string"},
         "choices": {"type": "array", "items": {"type": "object", "properties": {
             "index": {"type": "integer"},
             "delta": {"type": "object", "properties": {"role": {"type": "string"}, "content": {"type": "string"},
                                                        "reasoning_content": {"type": "string"},
                                                        "tool_calls": {"type": "array", "items": ref("ToolCall")}}},
+            "logprobs": {"nullable": True, "description": "Always null."},
             "finish_reason": {"type": "string", "nullable": True}}}},
-        "usage": ref("Usage")}},
+        "usage": ref("Usage"), "timings": ref("Timings")}},
+    "StreamError": {"type": "object", "description": "The last event of a stream that an error ended, without "
+                    "'data: [DONE]' after it.", "properties": {"error": {"type": "object", "properties": {
+                        "message": {"type": "string"}, "type": {"type": "string", "enum": ["server_error"]},
+                        "code": {"type": "string", "nullable": True,
+                                 "description": "The code of the engine, such as out_of_memory."}}}}},
     "CompletionRequest": {"allOf": [ref("Sampling"), {"type": "object", "required": ["prompt"], "properties": {
         "model": {"type": "string", "example": "albireo-general"}, "prompt": {"type": "string"},
         "stream": {"type": "boolean"}}}]},
@@ -163,6 +201,23 @@ schemas = {
         "choices": {"type": "array", "items": {"type": "object", "properties": {
             "index": {"type": "integer"}, "text": {"type": "string"}, "finish_reason": {"type": "string"}}}},
         "usage": ref("Usage")}},
+    "SpeechRequest": {"type": "object", "required": ["input"], "properties": {
+        "model": {"type": "string", "description": "Not checked: one synthesizer serves every model name."},
+        "input": {"type": "string",
+                  "description": "The text read aloud, at most 8192 bytes of UTF-8, counted in bytes and not in "
+                                 "characters: a longer text is refused (code string_above_max_length). The letters "
+                                 "of the Latin scripts, the digits and the usual punctuation are read; any other "
+                                 "character is a pause."},
+        "voice": {"type": "string",
+                  "description": "A voice of Albireo, en-US, en-GB, fr-FR, de-DE, it-IT or es-ES, or its "
+                                 "language, en, fr, de, it or es; another name (the voices of other services) "
+                                 "takes the voice of language."},
+        "language": {"type": "string", "enum": ["en", "fr", "de", "it", "es"], "default": "en",
+                     "description": "Albireo: the language of the voice when voice names none of Albireo."},
+        "speed": {"type": "number", "minimum": 0.25, "maximum": 4, "default": 1,
+                  "description": "The speed of the reading, applied from 0.5 to 2."},
+        "response_format": {"type": "string", "enum": ["wav", "pcm"], "default": "wav",
+                            "description": "A WAVE file, or its 16-bit mono samples at 16 kHz alone."}}},
     "EmbeddingRequest": {"type": "object", "required": ["input"], "properties": {
         "model": {"type": "string", "description": "albireo-embedding, auto, or the identifier of an active embedding "
                                                    "model.", "example": "albireo-embedding"},
@@ -272,15 +327,20 @@ paths = {
     "/v1/chat/completions": {"post": {
         "tags": ["OpenAI"], "summary": "Chat completion, streamed or not",
         "description": "Compatible with the OpenAI interface. Requests from several clients are computed together. "
-                       "A stream also carries ': progress {...}' comment lines while a long prompt is read.",
+                       "A stream also carries ': progress {...}' comment lines while a long prompt is read, and "
+                       "': keep-alive' lines while no token comes. An error once the stream has started ends it "
+                       "with a last event 'data: {\"error\": {...}}' (StreamError) instead of 'data: [DONE]'.",
         "requestBody": json_body(ref("ChatCompletionRequest")),
         "responses": dict({"200": {"description": "The completion, or a stream of chunks", "content": {
             "application/json": {"schema": ref("ChatCompletion")},
-            "text/event-stream": {"schema": ref("ChatCompletionChunk")}}}}, **error_replies)}},
+            "text/event-stream": {"schema": {"oneOf": [ref("ChatCompletionChunk"), ref("StreamError")]}}}}},
+            **generation_replies)}},
     "/v1/completions": {"post": {
         "tags": ["OpenAI"], "summary": "Text completion of a raw prompt",
+        "description": "A stream gives text_completion events ended by 'data: [DONE]', or by a StreamError event "
+                       "after an error.",
         "requestBody": json_body(ref("CompletionRequest")),
-        "responses": dict({"200": reply("The completion", ref("Completion"))}, **error_replies)}},
+        "responses": dict({"200": reply("The completion", ref("Completion"))}, **generation_replies)}},
     "/v1/embeddings": {"post": {
         "tags": ["OpenAI"], "summary": "Vectors of texts, for search and comparison",
         "description": "Computed by the embedding model of the service, which the search in the documents of the "
@@ -288,14 +348,73 @@ paths = {
                        "the embedding model stay short while a conversation is being answered.",
         "requestBody": json_body(ref("EmbeddingRequest")),
         "responses": dict({"200": reply("One vector per input, in the order of the inputs", ref("EmbeddingList"))},
-                          **error_replies)}},
+                          **engine_replies)}},
+    "/v1/audio/speech": {"post": {
+        "tags": ["OpenAI"], "summary": "A text read aloud",
+        "description": "The speech synthesis that comes with Albireo, which needs no network and no voice of the "
+                       "system, in six voices of five languages. The program albireo-speech reads the text, "
+                       "started by the service with the rights of a process of low integrity; two read at a time "
+                       "and the others wait up to 30 seconds.",
+        "requestBody": json_body(ref("SpeechRequest")),
+        "responses": {
+            "200": {"description": "The sound, 16-bit mono samples at 16 kHz",
+                    "content": {"audio/wav": {"schema": {"type": "string", "format": "binary"}},
+                                "audio/pcm": {"schema": {"type": "string", "format": "binary"}}}},
+            "400": reply("Invalid request: input, voice, language, speed or response_format", ref("Error")),
+            "500": reply("The synthesis failed (code speech_failed)", ref("Error")),
+            "503": reply("The speech program or its voices are not installed (code speech_unavailable)",
+                         ref("Error"))}}},
+    "/albireo/v1/speech/voices": {"get": {
+        "tags": ["Service"], "summary": "Voices of the speech synthesis",
+        "description": "The voices whose files the installation holds, which /v1/audio/speech reads with; none "
+                       "when the speech program is missing.",
+        "responses": {"200": reply("The voices", {"type": "object", "properties": {
+            "voices": {"type": "array", "items": {"type": "object", "properties": {
+                "id": {"type": "string", "description": "en-US, en-GB, fr-FR, de-DE, it-IT or es-ES."},
+                "language": {"type": "string", "enum": ["en", "fr", "de", "it", "es"]}}}},
+            "format": {"type": "string", "enum": ["wav"]},
+            "sample_rate": {"type": "integer", "enum": [16000]}}})}}},
     "/albireo/v1/status": {"get": {
         "tags": ["Service"], "summary": "State of the service, of the engine and of the models",
         "description": "The server answers while the service starts: state is \"starting\" and starting names the "
                        "step in progress, \"engines\" then \"models\", until the service is \"ready\".",
         "responses": {"200": reply("The state", {"type": "object", "properties": {
+            "product": {"type": "string", "example": "Albireo"},
             "edition": {"type": "string", "description": "The edition, Community Edition."},
             "version": {"type": "string"},
+            "author": {"type": "string"}, "email": {"type": "string"}, "copyright": {"type": "string"},
+            "project": {"type": "string", "description": "The address of the source code of Albireo."},
+            "settings": {"type": "object", "description": "The settings of the service that the web application "
+                         "follows, such as the language of the interface.", "properties": {
+                             "language": {"type": "string", "enum": ["auto", "en", "fr", "de", "it", "es"]},
+                             "engine": {"type": "string"}, "accelerator": {"type": "string"},
+                             "v2ram": {"type": "boolean"}, "v2ram_max_mb": {"type": "integer"},
+                             "device_mb": {"type": "integer"}, "check_updates": {"type": "boolean"},
+                             "offline": {"type": "boolean"}}},
+            "engine": {"type": "object", "description": "The engine running.", "properties": {
+                "running": {"type": "boolean"}, "variant": {"type": "string", "example": "cpu-avx2"},
+                "key": {"type": "string"}, "device": {"type": "string"}, "error": {"type": "string"},
+                "description": {"type": "string"},
+                "stats": {"type": "object", "nullable": True, "description": "Null while no engine runs.",
+                          "properties": {
+                              "active": {"type": "integer", "description": "Requests being computed."},
+                              "waiting": {"type": "integer"},
+                              "generation_tokens_per_second": {"type": "number",
+                                                               "description": "Over the last five seconds."},
+                              "prompt_tokens_per_second": {"type": "number"},
+                              "memory": {"type": "object", "description": "The memory of the graphics engines: "
+                                         "vram_budget, device_bytes, scratch_bytes, pinned_bytes, store_bytes.",
+                                         "additionalProperties": {"type": "integer"}}}}}},
+            "host": {"type": "object", "description": "The computer.", "properties": {
+                "name": {"type": "string"}, "os": {"type": "string"},
+                "cpu": {"type": "object", "properties": {
+                    "name": {"type": "string"}, "cores": {"type": "integer"}, "threads": {"type": "integer"},
+                    "features": {"type": "array", "items": {"type": "string"}}}},
+                "memory": {"type": "object", "properties": {"total": {"type": "integer"},
+                                                            "available": {"type": "integer"}}}}},
+            "usage": {"type": "object", "description": "The requests and the tokens since the service started.",
+                      "properties": {"requests": {"type": "integer"}, "prompt_tokens": {"type": "integer"},
+                                     "completion_tokens": {"type": "integer"}}},
             "state": {"type": "string", "enum": ["starting", "ready"]},
             "starting": {"type": "string", "enum": ["engines", "models"]},
             "active": {"type": "object", "additionalProperties": {"type": "string"},
@@ -316,9 +435,12 @@ paths = {
         "description": "The language models: those that come with Albireo first (builtin), then the catalog and "
                        "the imports. The embedding models serve the document search and are given apart.",
         "parameters": [{"name": "lang", "in": "query",
-                        "schema": {"type": "string", "enum": ["en", "fr", "de", "it", "es"]},
-                        "description": "Language of the descriptions."}],
+                        "schema": {"type": "string", "enum": ["auto", "en", "fr", "de", "it", "es"]},
+                        "description": "Language of the descriptions; auto, or no value, gives English."}],
         "responses": {"200": reply("The models", {"type": "object", "properties": {
+            "free": {"type": "integer", "description": "The free bytes of the disk of the models folder."},
+            "offline": {"type": "boolean", "description": "True when the service is set offline: the models come "
+                        "from imports."},
             "models": {"type": "array", "items": {"type": "object", "properties": {
                 "id": {"type": "string"}, "name": {"type": "string"},
                 "roles": {"type": "array", "items": {"type": "string"}},
@@ -360,7 +482,14 @@ paths = {
                                                                                             "removing"]},
                         "description": "Models waiting for their requests before they leave the engine."}}})}}},
     "/albireo/v1/usage": {"get": {"tags": ["Service"], "summary": "Usage per day over 30 days",
-                                  "responses": {"200": reply("The figures", {"type": "object"})}}},
+                                  "responses": {"200": reply("The figures", {"type": "object", "properties": {
+                                      "days": {"type": "array", "description": "The days with a use, 30 at most, the "
+                                               "most recent first.", "items": {"type": "object", "properties": {
+                                                   "day": {"type": "string", "format": "date",
+                                                           "example": "2026-11-01"},
+                                                   "prompt_tokens": {"type": "integer"},
+                                                   "generated_tokens": {"type": "integer"},
+                                                   "requests": {"type": "integer"}}}}}})}}},
     "/albireo/v1/engines": {"get": {"tags": ["Service"], "summary": "Engines found, their devices and measures",
                                     "responses": {"200": reply("The engines", ref("Engines"))}}},
     "/albireo/v1/updates": {"get": {"tags": ["Service"], "summary": "State of the updates",
@@ -394,7 +523,10 @@ paths = {
             "model": {"type": "string"}, "messages": {"type": "array", "items": ref("Message")},
             "tools": {"type": "array", "items": ref("Tool")}, "text": {"type": "string"}}}),
         "responses": {"200": reply("The count and the context of the model", {"type": "object", "properties": {
-            "tokens": {"type": "integer"}, "context": {"type": "integer"}}})}}},
+            "tokens": {"type": "integer"}, "context": {"type": "integer"}}}),
+                      "400": reply("The engine refused the count, such as for a model that is not loaded: error "
+                                   "gives the reason, as a text", {"type": "object", "properties": {
+                                       "error": {"type": "string"}}})}}},
     "/albireo/v1/models/refresh": {"post": {"tags": ["Administration"], "security": admin,
                                             "summary": "Fetches the catalog again, in the background",
                                             "responses": dict({"202": reply("Started", {"type": "object"})},
@@ -460,10 +592,18 @@ paths = {
                       "400": reply("Refused", import_refusal)}}},
     "/albireo/v1/models/upload": {"post": {
         "tags": ["Administration"], "security": admin, "summary": "Installs a GGUF file sent in the body",
+        "description": "The body is the file, of the length its Content-Length header gives: a body without length, "
+                       "or sent in chunks (Transfer-Encoding), is refused (400). The size limit of the JSON bodies "
+                       "does not apply.",
         "parameters": [{"name": "name", "in": "query", "required": True, "schema": {"type": "string"}}],
         "requestBody": {"required": True, "content": {
             "application/octet-stream": {"schema": {"type": "string", "format": "binary"}}}},
-        "responses": {"200": reply("Imported", {"type": "object"}), "400": reply("Refused", {"type": "object"})}}},
+        "responses": {"200": reply("Imported", {"type": "object"}),
+                      "400": reply("Refused: no name or no length, a transfer that did not complete, or a file that "
+                                   "is not a model", {"type": "object"}),
+                      "500": reply("The file cannot be created in the models folder", ref("Error")),
+                      "507": reply("The disk of the models folder lacks the size of the file and 256 MB",
+                                   ref("Error"))}}},
     "/albireo/v1/settings": {
         "get": {"tags": ["Administration"], "security": admin, "summary": "Settings of the service",
                 "responses": {"200": reply("The settings, the password of the proxy given as ********",
@@ -492,10 +632,25 @@ paths = {
                                      "responses": {"202": reply("Restarting", ok)}}},
     "/albireo/v1/engines/benchmark": {"post": {"tags": ["Administration"], "security": admin,
                                                "summary": "Measures every usable engine on this machine",
-                                               "responses": {"200": reply("The measures", {"type": "object"})}}},
+                                               "description": "One measure runs at a time.",
+                                               "responses": {
+                                                   "200": reply("The measures", {"type": "object"}),
+                                                   "409": reply("A measure is already running (code "
+                                                                "benchmark_running)", {"type": "object", "properties": {
+                                                                    "error": {"type": "string"},
+                                                                    "code": {"type": "string",
+                                                                             "enum": ["benchmark_running"]}}})}}},
     "/albireo/v1/logs": {"get": {"tags": ["Administration"], "security": admin, "summary": "Last lines of the log",
                                  "responses": {"200": reply("The lines", {"type": "object"})}}},
 }
+
+# Every administration route answers 401 without the administration token.
+unauthorized = reply("Without the administration token, or with another value (code authentication_error)",
+                     ref("Error"))
+for operations in paths.values():
+    for operation in operations.values():
+        if operation.get("security") == admin:
+            operation["responses"].setdefault("401", unauthorized)
 
 here = os.path.dirname(os.path.abspath(__file__))
 with open(os.path.join(here, "..", "common", "version.h"), encoding="utf-8") as f:
@@ -517,8 +672,15 @@ doc = {
                        "(admin.token) in the X-Albireo-Admin header.\n\n"
                        "Requests carry JSON bodies of 64 MB and 524,288 values at most, with their length: a body "
                        "without length is refused with 411, a longer one with 413, another type with 415. GET, HEAD, "
-                       "DELETE and OPTIONS take no body (400). An answer being written whose model has no memory left "
-                       "for its keys and values ends with the error code out_of_memory.",
+                       "DELETE and OPTIONS take no body (400). While the JSON bodies being read at once hold the "
+                       "values of their budget, a route that reads one answers 503 with the code busy and a "
+                       "Retry-After of 2 seconds. An answer being written whose model has no memory left "
+                       "for its keys and values ends with the error code out_of_memory.\n\n"
+                       "Before any route, the server refuses, as plain text: a request whose Host header names "
+                       "another server than this computer (421), a request whose Origin header names another "
+                       "origin than the local server (403), so that no web site drives the service through a "
+                       "browser, and a body of more than 8 MB while four such bodies are being read (503, with a "
+                       "Retry-After header).",
         "license": {"name": "Boost Software License 1.0", "url": "https://www.boost.org/LICENSE_1_0.txt"},
         "contact": {"name": "Aldric Pierrain", "email": "cydraltechnology@gmail.com",
                     "url": "https://github.com/Cydral/Dlib-Transformer-extensions"}},

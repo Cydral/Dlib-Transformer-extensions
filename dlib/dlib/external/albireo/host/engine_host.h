@@ -3,6 +3,7 @@
 #ifndef ALBIREO_HOST_ENGINE_HOST_H_
 #define ALBIREO_HOST_ENGINE_HOST_H_
 
+#include <atomic>
 #include <condition_variable>
 #include <functional>
 #include <map>
@@ -41,11 +42,8 @@ namespace albireo
                 selected for this machine, and the models it holds.
 
             SELECTION
-                "auto" takes the fastest variant measured on this machine when a
-                measure exists, otherwise the first usable one of: cuda, openvino,
-                cpu-avx512, cpu-avxvnni, cpu-avx2, cpu.  "best" is "auto" with a measure
-                made when none exists.  Any other value names a variant, used when it is
-                usable.
+                The service chooses the engine to start among the candidates discover()
+                describes (choose_engine() in service.h).
 
             CONCURRENCY
                 A model being loaded or unloaded never delays the other operations: the
@@ -63,13 +61,14 @@ namespace albireo
         engine_host();
         ~engine_host();
 
-        // Lists and describes the engine libraries of a folder, through probe_program,
-        // probing them all at once.  A library whose kernels need instructions the processor
-        // lacks is described without being loaded.
-        std::vector<engine_candidate> discover(const std::string& dir, const std::string& probe_program);
-
-        static const engine_candidate* choose(const std::vector<engine_candidate>& candidates,
-            const std::string& wanted, const json& benchmarks);
+        /*
+            Lists and describes the engine libraries of a folder, through probe_program,
+            probing them all at once.  A library whose kernels need instructions the processor
+            lacks is described without being loaded.  The probes end as soon as stop, when
+            given, becomes true.
+        */
+        std::vector<engine_candidate> discover(const std::string& dir, const std::string& probe_program,
+            const std::atomic<bool>* stop = nullptr);
 
         bool start(const engine_candidate& c, const json& config, std::string& error);
         void stop();
@@ -113,8 +112,13 @@ namespace albireo
         bool keep_model(const std::string& id);
         std::vector<std::string> loaded_models() const;
 
-        // Submits a request; the sink receives its events until the final one.
-        bool submit(const json& request, request_sink sink, uint64_t& id, std::string& error);
+        /*
+            Submits a request; the sink receives its events until the final one.  code, when
+            given, receives the result of albireo_engine_submit(): ALBIREO_OK, or the code of
+            its refusal, ALBIREO_E_BUSY for a request to submit again shortly; it receives
+            ALBIREO_E_NOT_FOUND when no engine runs or when the model is leaving the engine.
+        */
+        bool submit(const json& request, request_sink sink, uint64_t& id, std::string& error, int* code = nullptr);
         void cancel(uint64_t id);
         json query(const json& request);
 

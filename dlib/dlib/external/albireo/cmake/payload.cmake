@@ -2,14 +2,20 @@
 # License: Boost Software License   See LICENSE.txt for the full license.
 #
 # Packs the programs of a build into the payload of the installer (cmake -P, run in the
-# folder of the payload): the service, the tray, the engines, the web application and the
-# licenses, as a ZIP archive whose paths are those of the installation.
+# folder of the payload): the service, the tray, the speech synthesis and its voices, the
+# engines, the web application and the licenses, as a ZIP archive whose paths are those of
+# the installation.
 
 file(REMOVE_RECURSE ${STAGE})
 file(MAKE_DIRECTORY ${STAGE}/licenses)
-file(COPY ${BIN_DIR}/albireo-service.exe ${BIN_DIR}/albireo-tray.exe DESTINATION ${STAGE})
+file(COPY ${BIN_DIR}/albireo-service.exe ${BIN_DIR}/albireo-tray.exe ${BIN_DIR}/albireo-speech.exe
+   DESTINATION ${STAGE})
 file(COPY ${BIN_DIR}/engines DESTINATION ${STAGE} FOLLOW_SYMLINK_CHAIN)
 file(COPY ${SOURCE_DIR}/web DESTINATION ${STAGE})
+# The voices of the speech synthesis.
+file(MAKE_DIRECTORY ${STAGE}/speech)
+file(GLOB voices ${DLIB_DIR}/external/svox_pico/lang/*.bin)
+file(COPY ${voices} DESTINATION ${STAGE}/speech)
 # The engines of the other build trees; the licenses of their runtimes, in their licenses
 # folder, join those of the installation.
 foreach (dir ${EXTRA_ENGINE_DIRS})
@@ -33,6 +39,8 @@ configure_file(${DLIB_DIR}/external/sqlite/README.txt ${STAGE}/licenses/sqlite.t
 # The image decoders the engines hold; the notice of the Independent JPEG Group goes with the programs.
 configure_file(${DLIB_DIR}/external/libpng/LICENSE ${STAGE}/licenses/libpng.txt COPYONLY)
 configure_file(${DLIB_DIR}/external/libjpeg/README ${STAGE}/licenses/libjpeg.txt COPYONLY)
+# The speech synthesis of albireo-speech, and its voices.
+configure_file(${DLIB_DIR}/external/svox_pico/NOTICE ${STAGE}/licenses/svox-pico.txt COPYONLY)
 
 file(GLOB entries RELATIVE ${STAGE} ${STAGE}/*)
 file(REMOVE ${OUTPUT})
