@@ -195,7 +195,7 @@ This closes a loop a generative model cannot close alone — answering from docu
 
 ### Prediction as compression
 
-A trained network is a probability model of what comes next, and an arithmetic coder turns such a model into a lossless code whose length is the model's cross-entropy on the data. One example builds the whole chain: a BPE tokenizer and a decoder trained in Dlib, weights quantized and compiled into the program as data, an inference engine whose arithmetic is fixed operation by operation, matrix products summed exactly in integers, so that a decoder on another machine reproduces every probability, output biases that the network learns while it codes, and context models mixed with the network decision by decision. The tokenizer can also cut its segments where letters, digits and punctuation meet, and the program can fold capitals into marker bytes so that a word and its capitalized form share their tokens; the saved network records the tokenizer it was trained with, and training refuses to continue on another. Two macros reduce the same source to what coding needs, compression and decompression or decompression alone, without the network definition and the training.
+A trained network is a probability model of what comes next, and an arithmetic coder turns such a model into a lossless code whose length is the model's cross-entropy on the data. One example builds the whole chain: a BPE tokenizer and a decoder declared and trained in Dlib, whose input reads its table from the head, weights quantized and compiled into the program as data, an inference engine whose arithmetic is fixed operation by operation, matrix products summed exactly in integers, so that a decoder on another machine reproduces every probability, output biases that the network learns while it codes, and 107 context models mixed with the network decision by decision as corrections of its prediction. The pages of a wiki dump are coded grouped by category, and the decoder restores their order by sorting them by number. The tokenizer can also cut its segments where letters, digits and punctuation meet, and the program can fold capitals into marker bytes so that a word and its capitalized form share their tokens; the saved network records the tokenizer it was trained with, and training refuses to continue on another. Two macros reduce the same source to what coding needs, compression and decompression or decompression alone, without the network definition and the training.
 
 ### Python utilities, used as witnesses
 
@@ -240,18 +240,6 @@ The mechanism, what it costs, and what it does not do are treated at length in [
 4. On Windows, CMake looks for a BLAS in the default folder of the Intel oneMKL. Without one, the host computes the products and the convolutions far slower, and automatic routing compares the devices with that host; a build folder configured before oneMKL was installed needs `-DDLIB_USE_BLAS=ON -DDLIB_USE_LAPACK=ON` to look again. The notes of [`slm_npu_offload_ex.cpp`](examples/Readme.md#slm_npu_offload_excpp) describe how the threads of oneMKL weigh on the devices.
 5. In `DLIB_NPU_DEVICE`, a name may end with `:f16` or `:f32`, `GPU:f32` setting the GPU to single precision, and `CPU` runs the device paths on the OpenVINO CPU plugin, which validates them on a machine without these devices. WSL2 exposes no NPU; it exposes the Intel GPU once the Intel compute runtime is installed in the distribution. `DLIB_NPU_RESIDENT_MB` bounds the memory of the operand copies (2048 by default, 0 converts every operand at every call), and `DLIB_NPU_VERBOSE=1` prints at exit, operation by operation, the calls each device and the host computed; [`npu_dlib.h`](dlib/dlib/cuda/npu_dlib.h) lists the other settings. [`slm_npu_offload_ex.cpp`](examples/slm_npu_offload_ex.cpp) reports the devices, times the primitives of a transformer on the host and on each device, and compares training runs with and without routing.
 
-### A local inference service for Windows: Albireo
-
-**The library as an installed program.** [`dlib/dlib/external/albireo`](dlib/dlib/external/albireo) builds Albireo, a Windows 11 program that runs language models on the machine where it is installed, with the conversations, the documents and the models staying on that machine: an inference engine for quantized GGUF models, a Windows service that serves it on a local HTTPS address with an interface compatible with the OpenAI one, a web application served by that service, an icon in the notification area to manage it, and an installer.
-
-**One interface, an engine per kind of processor.** The engines are libraries with a C interface, built from the same sources for every x86-64 processor, for AVX2, for the NPU and the integrated GPU of Intel processors through OpenVINO, and for NVIDIA graphics processors through CUDA. The service describes them in child processes, measures them on the machine and runs the fastest. The engines of the devices keep quantized processor kernels for the products they lose to the processor and send the others to the device through the tensors of this library: the routing of the NPU module decides with OpenVINO, measurements of the engine decide with CUDA, where the extended device memory lets the weights in single precision exceed the memory of the card.
-
-**What it serves.** The requests of every client are computed together in each forward pass, and the keys and values of a finished request stay cached for the next turn of its conversation. Three functions, general, code and security, each get a model from a signed catalog, downloaded in parallel parts and checked against its hashes, or imported from a disk for a machine without network. The web application keeps its discussions and projects in the browser, works without network, shows the reasoning of the models that reason, and lets a model call tools in agent mode. Updates come from a signed feed and install when the service restarts.
-
-![A discussion in the web application of Albireo](dlib/dlib/external/albireo/docs/images/chat.png)
-
-The [README of Albireo](dlib/dlib/external/albireo/README.md) describes its architecture, its build, its tests and its publication, with screenshots of the web application, of the windows of the icon and of the installer.
-
 ---
 
 ### Current project emphasis
@@ -269,7 +257,6 @@ Today, the project is especially strong as a platform for:
 - training and running models whose working set exceeds the device, on a laptop-class card
 - routing the tensor operations of training and inference to the NPU and the integrated GPU of the processor when present, operation by operation
 - coding text losslessly with a trained network compiled into the program, reproducible on any processor
-- serving quantized models on Windows from an installed service, with engines for the processor, the NPU and the graphics processors, and a web application that works without network
 
 ---
 
@@ -290,9 +277,6 @@ This directory acts as the checkpoint and artifact layer.
 
 ### 4. Written material: [`docs/`](docs)
 Longer-form articles, one subject at a time: what a design costs, where it breaks, and how to reproduce a result. The examples guide says what each program does; these say why. The directory also holds the research report on buffer-level residency, which is a paper rather than an article and is kept as a PDF for that reason.
-
-### 5. Distribution: [`dist/`](dist)
-The files the installed programs read from the repository: the signed update feed and model catalog of Albireo, in [`dist/albireo`](dist/albireo), whose README gives the steps of a publication.
 
 The examples appear twice on purpose. [`examples/`](examples) is what a visitor reads: this project's files and the guide that explains them, with none of the upstream library's own examples in the way. `dlib/examples/` is what CMake builds: upstream's tree with this project's files added to it. Nothing connects the two, so `sync_examples.sh` at the repository root reports any drift between them and copies one over the other on request — the divergence being silent by construction, since both copies compile and both look complete.
 
