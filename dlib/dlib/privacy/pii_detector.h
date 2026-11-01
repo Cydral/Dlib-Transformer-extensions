@@ -827,11 +827,14 @@ namespace dlib
             return false;
         }
 
-        /* A first name read as a person and the family name after it read apart, as a person, an
-           organisation, an address or a place, as a recognizer may read a name with a particle and
-           an apostrophe: "Yann" and "Le Floc'h". The two make one person when the second opens
-           with a capitalized particle, then holds one or two capitalized words, none of them a
-           word of a firm or of a street, and is no organisation known by its own name. */
+        /* A first name and its family name read apart, as a recognizer may read a name with a
+           particle and an apostrophe. A first name read as a person and the family name after it
+           read as a person, an organisation, an address or a place ("Yann" and "Le Floc'h") make
+           one person when the second opens with a capitalized particle, then holds one or two
+           capitalized words. A family name written in capitals and read as an organisation, an
+           address or a place before a first name read as a person ("LE FLOC'H" and "Anne", the
+           order of forms and lists) makes one person with it. In both cases the family name holds
+           no word of a firm or of a street and is no organisation known by its own name. */
         static void join_given_and_family_names(const std::string& text, const utf8_text& t,
                                                 std::map<std::size_t, std::size_t>& taken,
                                                 std::vector<candidate>& accepted)
@@ -842,46 +845,82 @@ namespace dlib
             std::sort(order.begin(), order.end(),
                       [&](std::size_t a, std::size_t b) { return accepted[a].b < accepted[b].b; });
             std::vector<bool> removed(accepted.size(), false);
+            // The words of a span, separated by single spaces: false if anything else separates them.
+            auto words_of = [&](std::size_t b, std::size_t e, std::vector<std::pair<std::size_t, std::size_t>>& parts) {
+                parts.clear();
+                for (std::size_t q = b; q < e;)
+                {
+                    std::size_t r = q;
+                    while (r < e && (is_letter(t.cps[r]) ||
+                                     ((is_apostrophe(t.cps[r]) || is_hyphen(t.cps[r])) && r > q &&
+                                      r + 1 < t.size() && is_letter(t.cps[r + 1]))))
+                        ++r;
+                    if (r == q) return false;
+                    parts.push_back(std::make_pair(q, r));
+                    if (r < e && !(t.cps[r] == ' ' && r + 1 < e)) return false;
+                    q = r + 1;
+                }
+                return !parts.empty();
+            };
+            auto family_name = [&](const candidate& c) {
+                return !known_organizations().count(fold_key(cp_substr(t, text, c.b, c.e))) &&
+                       !firm_or_street_words(text, t, c.b, c.e);
+            };
             for (std::size_t i = 0; i + 1 < order.size(); ++i)
             {
                 candidate& x = accepted[order[i]];
                 candidate& y = accepted[order[i + 1]];
-                if (removed[order[i]] || x.type != pii_type::person ||
+                if (removed[order[i]] || y.b != x.e + 1 || !(t.cps[x.e] == ' ' || t.cps[x.e] == 0xA0))
+                    continue;
+                // "LE FLOC'H" and "Anne": a family name in capitals before a first name.
+                if ((x.type == pii_type::organization || x.type == pii_type::address ||
+                     x.type == pii_type::location) && y.type == pii_type::person)
+                {
+                    std::vector<std::pair<std::size_t, std::size_t>> name, given;
+                    bool capitals = words_of(x.b, x.e, name) && name.size() <= 3 && words_of(y.b, y.e, given) &&
+                                    family_name(x);
+                    for (std::size_t q = x.b; q < x.e && capitals; ++q)
+                        if (is_letter(t.cps[q]) && !is_upper(t.cps[q])) capitals = false;
+                    if (capitals && is_upper(t.cps[given[0].first]) &&
+                        given[0].second > given[0].first + 1 && is_lower(t.cps[given[0].first + 1]))
+                    {
+                        std::size_t g = given[0].first;
+                        while (g < given[0].second && is_letter(t.cps[g])) ++g;
+                        if (first_names().count(fold_key(cp_substr(t, text, given[0].first, g))))
+                        {
+                            taken.erase(y.b);
+                            taken[x.b] = y.e;
+                            x.e = y.e;
+                            x.type = pii_type::person;
+                            x.confidence = std::min(x.confidence, y.confidence);
+                            removed[order[i + 1]] = true;
+                            ++i;
+                            continue;
+                        }
+                    }
+                }
+                if (x.type != pii_type::person ||
                     !(y.type == pii_type::organization || y.type == pii_type::address ||
-                      y.type == pii_type::location || y.type == pii_type::person) ||
-                    y.b != x.e + 1 || !(t.cps[x.e] == ' ' || t.cps[x.e] == 0xA0))
+                      y.type == pii_type::location || y.type == pii_type::person))
                     continue;
                 std::size_t w = x.e;
                 while (w > x.b && is_letter(t.cps[w - 1])) --w;
                 if (w == x.e || !first_names().count(fold_key(cp_substr(t, text, w, x.e))))
                     continue;
-                // The words of the second span, separated by single spaces.
+                // The family name: a capitalized particle, then one or two capitalized words.
                 std::vector<std::pair<std::size_t, std::size_t>> parts;
-                bool ok = true;
-                for (std::size_t q = y.b; q < y.e && ok;)
-                {
-                    std::size_t r = q;
-                    while (r < y.e && (is_letter(t.cps[r]) ||
-                                       ((is_apostrophe(t.cps[r]) || is_hyphen(t.cps[r])) && r > q &&
-                                        r + 1 < t.size() && is_letter(t.cps[r + 1]))))
-                        ++r;
-                    if (r == q) ok = false;
-                    parts.push_back(std::make_pair(q, r));
-                    if (r < y.e && !(t.cps[r] == ' ' && r + 1 < y.e)) ok = false;
-                    q = r + 1;
-                }
-                if (!ok || parts.size() < 2 || parts.size() > 3)
+                if (!words_of(y.b, y.e, parts) || parts.size() < 2 || parts.size() > 3 || !family_name(y))
                     continue;
                 const std::string particle = fold_key(cp_substr(t, text, parts[0].first, parts[0].second));
-                if (!person_particles().count(particle) || !is_upper(t.cps[parts[0].first]) ||
-                    known_organizations().count(fold_key(cp_substr(t, text, y.b, y.e))))
+                if (!person_particles().count(particle) || !is_upper(t.cps[parts[0].first]))
                     continue;
+                bool ok = true;
                 for (std::size_t p = 1; p < parts.size() && ok; ++p)
                 {
                     const std::string key = fold_key(cp_substr(t, text, parts[p].first, parts[p].second));
                     ok = is_upper(t.cps[parts[p].first]) && !common_words().count(key) && !function_words().count(key);
                 }
-                if (!ok || firm_or_street_words(text, t, y.b, y.e))
+                if (!ok)
                     continue;
                 taken.erase(y.b);
                 taken[x.b] = y.e;

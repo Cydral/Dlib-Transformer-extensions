@@ -1446,6 +1446,12 @@ namespace
                         {"Anne", "GIVEN_NAME", 0.99}, {"Le", "FAMILY_NAME", 0.6}});
         DLIB_TEST(found(e, text, pii_type::person, "Yann Le Floc'h"));
         DLIB_TEST(found(e, text, pii_type::person, "Anne Le Bec'h"));
+        // A family name in capitals before a first name, as forms and lists write them; a firm stays one.
+        text = "LE FLOC'H Anne, 12 rue de Penmarc'h\nGARAGE KERLANN Anne";
+        e = read(text, {{"LE FLOC'H", "ORGANIZATION", 0.77}, {"Anne", "GIVEN_NAME", 0.59},
+                        {"GARAGE KERLANN", "ORGANIZATION", 0.9}, {"Anne", "GIVEN_NAME", 0.9}});
+        DLIB_TEST(found(e, text, pii_type::person, "LE FLOC'H Anne"));
+        DLIB_TEST(found(e, text, pii_type::organization, "GARAGE KERLANN"));
         // A civility or a name label keeps a person that a recognizer reads as an organisation.
         text = "Nom : LE FLOC'H\nSignature de Mme Le Floc'h\nNom : Garage Le Floc'h";
         e = read(text, {{"LE FLOC'H", "ORGANIZATION", 0.83}, {"Le Floc'h", "ORGANIZATION", 0.92},

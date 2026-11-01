@@ -246,9 +246,10 @@ namespace dlib
                    span that goes beyond it keeps its own boundaries. A person that a
                    civility or a name label announces stays a person when they read it as
                    an organisation, a place or an address with no word of a firm or of a
-                   street ("Nom : LE FLOC'H"), and a first name joins the family name that
+                   street ("Nom : LE FLOC'H"), a first name joins the family name that
                    follows it with a capitalized particle, whatever type they give it
-                   ("Yann" and "Le Floc'h").
+                   ("Yann" and "Le Floc'h"), and a family name written in capitals joins the
+                   first name that follows it ("LE FLOC'H Anne").
 
                 The detector is a recall-oriented filter. Its output is meant to be
                 pseudonymized, and a residual-risk audit of the protected document is
