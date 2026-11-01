@@ -352,7 +352,8 @@ namespace albireo
             if (!prepare_folders(o, update, error)) return false;
             // The new files stay beside those they replace until the end of the copy.
             const setup::builtin_overlay overlay = setup::read_builtin_overlay(executable_path());
-            const uint64_t program = overlay.present() ? overlay.start : file_size(executable_path());
+            const uint64_t program = overlay.present() && !overlay.beside ? overlay.start
+                : file_size(executable_path());
             const uint64_t needed = payload_size() + setup::builtin_bytes_to_copy(o.program_dir) + program
                 + (64ull << 20);
             const uint64_t available = free_disk_space(o.program_dir);

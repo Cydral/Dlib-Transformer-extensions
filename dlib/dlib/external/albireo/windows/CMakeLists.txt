@@ -57,8 +57,10 @@ target_compile_options(albireo-setup-online PRIVATE ${ALBIREO_WARNINGS})
 
 # The installer without models, which the updates take, and the complete installer: the
 # same program followed by the models that come with Albireo (common/builtin_models.h), or
-# its copy when the build prepares no models.  No target bears the name of the complete
-# installer, which CMake would otherwise take for the file of that target.
+# its copy when the build prepares no models.  When the program and its models would reach
+# the 4 GiB Windows runs, the models lie beside it in albireo-setup.models, which albireo-builtin
+# removes otherwise, as the copy does.  No target bears the name of the complete installer,
+# which CMake would otherwise take for the file of that target.
 set(complete_setup ${CMAKE_BINARY_DIR}/bin/albireo-setup.exe)
 if (ALBIREO_BUILTIN_MODELS)
    add_custom_command(OUTPUT ${complete_setup}
@@ -70,6 +72,7 @@ if (ALBIREO_BUILTIN_MODELS)
 else()
    add_custom_command(OUTPUT ${complete_setup}
       COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:albireo-setup-online> ${complete_setup}
+      COMMAND ${CMAKE_COMMAND} -E remove -f ${CMAKE_BINARY_DIR}/bin/albireo-setup.models
       DEPENDS albireo-setup-online
       VERBATIM)
 endif()

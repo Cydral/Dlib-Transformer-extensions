@@ -256,17 +256,28 @@ namespace setup
 
     /*
         The models that come with Albireo, which the complete installer carries after its
-        program (common/builtin_models.h): the manifest, with the position of each file in
-        the installer, and the size of their files.  The installer without models has none.
+        program, or beside it when both would reach the size Windows runs
+        (common/builtin_models.h): the manifest, with the position of each file in the file
+        that holds them, and the size of their files.  The installer without models has none.
     */
     struct builtin_overlay
     {
-        uint64_t start = 0;     // position of the overlay, the size of the program before it
+        std::string file;       // the installer, or the file of its models beside it
+        bool beside = false;    // the models lie in a file of their own beside the installer
+        uint64_t start = 0;     // position of the overlay in file: in the installer, the size of its program
         uint64_t total = 0;     // bytes of the files of the models
         json manifest;
         bool present() const { return manifest["models"].size() > 0; }
     };
+    /*!
+        ensures
+            - Returns the models the installer carries, else those of the file beside it
+              (builtin_overlay_beside()) when its manifest names the version of this program,
+              else none.
+    !*/
     builtin_overlay read_builtin_overlay(const std::string& installer);
+    // The file of the models beside an installer: its name with the extension .models.
+    std::string builtin_overlay_beside(const std::string& installer);
 
     /*
         Writes the models that come with this installer into the set, for the "models"

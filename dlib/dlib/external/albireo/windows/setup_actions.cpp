@@ -1233,45 +1233,69 @@ namespace setup
         }
     }
 
-    builtin_overlay read_builtin_overlay(const std::string& installer)
+    namespace
     {
-        builtin_overlay o;
-        file_ptr f = open_file(installer, L"rb");
-        if (!f) return o;
-        const uint64_t size = file_size(installer);
-        uint64_t sections_end = 0, security_entry = 0, certificates = 0;
-        if (!pe_layout(f.get(), size, sections_end, security_entry, certificates)) return o;
-        // The overlay ends before the certificate table, which a signing tool may precede
-        // with up to 7 bytes of zeros.
-        const uint64_t end = certificates ? certificates : size;
-        for (uint64_t pad = 0; pad < 8; ++pad)
+        // The overlay of the file f that ends at end, from lower on: its manifest checked against its size.
+        bool overlay_of(std::FILE* f, uint64_t lower, uint64_t end, builtin_overlay& o)
         {
-            if (end < sections_end + sizeof(builtin_trailer) + pad) break;
-            const uint64_t tail = end - pad;
+            uint64_t start = 0;
             builtin_trailer t;
-            if (!read_at(f.get(), tail - sizeof(t), &t, sizeof(t)) || !t.valid()) continue;
-            if (t.overlay_size > tail - sections_end || t.manifest_size > (16u << 20)
-                || t.manifest_offset + t.manifest_size > t.overlay_size)
-                break;
-            const uint64_t start = tail - t.overlay_size;
-            std::string text(static_cast<size_t>(t.manifest_size), '\0');
-            if (!read_at(f.get(), start + t.manifest_offset, &text[0], text.size())) break;
+            std::string text;
+            auto read = [&](uint64_t pos, void* data, size_t n) { return read_at(f, pos, data, n); };
+            if (!find_builtin_overlay(read, lower, end, start, t, text)) return false;
             const json manifest = json::parse_or_null(text);
             uint64_t total = 0;
             bool valid = manifest["models"].is_array();
+            // The files lie before the manifest.
             for (const builtin_file& b : builtin_files(manifest))
             {
                 valid = valid && b.offset >= 0 && b.size > 0
                     && static_cast<uint64_t>(b.offset) + b.size <= t.manifest_offset;
                 total += b.size;
             }
-            if (!valid) break;
+            if (!valid) return false;
             o.start = start;
             o.total = total;
             o.manifest = manifest;
-            break;
+            return true;
         }
-        return o;
+    }
+
+    std::string builtin_overlay_beside(const std::string& installer)
+    {
+        const size_t dot = installer.find_last_of(".\\/");
+        const bool exe = dot != std::string::npos && installer[dot] == '.'
+            && _wcsicmp(widen(installer.substr(dot)).c_str(), L".exe") == 0;
+        return (exe ? installer.substr(0, dot) : installer) + builtin_overlay_extension;
+    }
+
+    builtin_overlay read_builtin_overlay(const std::string& installer)
+    {
+        builtin_overlay o;
+        {
+            file_ptr f = open_file(installer, L"rb");
+            if (!f) return o;
+            const uint64_t size = file_size(installer);
+            uint64_t sections_end = 0, security_entry = 0, certificates = 0;
+            if (!pe_layout(f.get(), size, sections_end, security_entry, certificates)) return o;
+            // The overlay ends before the certificate table, which a signing tool may precede
+            // with up to 7 bytes of zeros.
+            if (overlay_of(f.get(), sections_end, certificates ? certificates : size, o))
+            {
+                o.file = installer;
+                return o;
+            }
+        }
+        // The models of an installer beyond the size Windows runs lie beside it, for this version alone.
+        const std::string beside = builtin_overlay_beside(installer);
+        file_ptr f = open_file(beside, L"rb");
+        if (!f) return builtin_overlay();
+        builtin_overlay b;
+        if (!overlay_of(f.get(), 0, file_size(beside), b) || b.manifest["version"].as_string() != ALBIREO_VERSION)
+            return builtin_overlay();
+        b.file = beside;
+        b.beside = true;
+        return b;
     }
 
     namespace
@@ -1312,9 +1336,10 @@ namespace setup
         const std::function<void(uint64_t done, uint64_t total, const std::string& file)>& progress,
         std::string& error)
     {
-        const std::string installer = executable_path();
-        const builtin_overlay o = read_builtin_overlay(installer);
+        const builtin_overlay o = read_builtin_overlay(executable_path());
         if (!o.present()) return true;
+        // The installer, or the file of its models beside it.
+        const std::string installer = o.file;
         const std::string dir = join_path(program_dir, builtin_models_folder);
         const std::map<std::string, std::string> had = installed_builtin_models(dir);
         file_ptr in = open_file(installer, L"rb");
@@ -1397,7 +1422,7 @@ namespace setup
         const std::wstring tmp = widen(files.add(target));
         // The program alone: the models that follow it stay in the installer.
         const builtin_overlay overlay = read_builtin_overlay(self);
-        if (overlay.present() ? !copy_program(self, tmp, overlay.start, error)
+        if (overlay.present() && !overlay.beside ? !copy_program(self, tmp, overlay.start, error)
                 : !CopyFileW(widen(self).c_str(), tmp.c_str(), FALSE))
         {
             if (error.empty()) error = last_error("cannot copy the uninstaller");

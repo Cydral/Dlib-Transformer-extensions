@@ -299,6 +299,14 @@ def main():
             complete_name = "albireo-setup-complete-%s.exe" % stable["version"]
             shutil.copyfile(a.complete, os.path.join(a.output, complete_name))
             print("%s: the complete installer, with the models that come with Albireo" % complete_name)
+            # The models of a complete installer that would reach the 4 GiB Windows runs lie beside it.
+            models = os.path.splitext(a.complete)[0] + ".models"
+            beside = os.path.splitext(complete_name)[0] + ".models"
+            if os.path.isfile(models):
+                shutil.copyfile(models, os.path.join(a.output, beside))
+                print("%s: the models of the complete installer, beside it" % beside)
+            elif os.path.isfile(os.path.join(a.output, beside)):
+                os.remove(os.path.join(a.output, beside))
 
         entries = catalog["models"]
         if a.all:
@@ -324,6 +332,10 @@ def main():
                            % complete_name) if complete_name else ""
             complete_fr = ("\n- %s : l'installateur complet, avec les modèles livrés avec Albireo."
                            % complete_name) if complete_name else ""
+            beside = os.path.splitext(complete_name)[0] + ".models" if complete_name else ""
+            if beside and os.path.isfile(os.path.join(a.output, beside)):
+                complete_en += "\n- %s: its models, which stay beside it." % beside
+                complete_fr += "\n- %s : ses modèles, qui restent à côté de lui." % beside
             f.write(README.format(version=stable["version"], date=catalog["updated"][:10], installer=installer_name,
                                   models=", ".join(e["id"] for e in chosen) or "-",
                                   first=complete_name or installer_name, complete_en=complete_en,

@@ -378,8 +378,10 @@ if ($extra.Count -gt 0 -and (Test-Path -LiteralPath $payload)) {
 Invoke-Step "building the programs, the models and the installers" (@("--build", $main, "--config", "Release") +
     $parallel)
 
-foreach ($name in @("albireo-setup.exe", "albireo-setup-online.exe")) {
+# The models of a complete installer that would reach the 4 GiB Windows runs lie beside it, in albireo-setup.models.
+foreach ($name in @("albireo-setup.exe", "albireo-setup.models", "albireo-setup-online.exe")) {
     $setup = Join-Path $main "bin\$name"
+    if (-not (Test-Path -LiteralPath $setup)) { continue }
     $hash = (Get-FileHash -Algorithm SHA256 $setup).Hash.ToLower()
     $size = (Get-Item $setup).Length
     Write-Host "== $setup"

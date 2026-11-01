@@ -35,7 +35,11 @@
     "models" folder of the programs of a build tree), <id>.gguf and the projector
     <id>.mmproj.gguf, by hard links when the folder is on the volume of the cache; --setup
     appends them to a copy of the installer without models, as the overlay of
-    common/builtin_models.h, the complete installer.
+    common/builtin_models.h, the complete installer.  When the installer and its models would
+    reach the 4 GiB Windows runs (--installer-limit gives a smaller size, for the tests), the
+    complete installer is the installer without models and its models lie beside it, in a file
+    of the same name with the extension .models.  The overlay written is read back with the
+    reader of the installer before it takes its name.
 
     QUANTIZATION
         The Q4_K_M mix of the GGUF format: the matrices in Q4_K (blocks of 256 weights in 8
@@ -1098,68 +1102,147 @@ namespace
         return true;
     }
 
-    // Appends the models to a copy of the installer, as its overlay.
-    void pack_setup(const std::string& setup, const std::string& output, const std::vector<model_entry>& models,
-        json manifest)
+    // The file of the models beside the complete installer output: its name with the extension .models.
+    std::string beside_installer(const std::string& output)
     {
-        const std::string tmp = output + ".partial";
-        std::FILE* out = open_file(tmp, "wb");
-        if (!out) throw std::runtime_error("cannot create " + tmp);
-        std::unique_ptr<std::FILE, int (*)(std::FILE*)> closer(out, std::fclose);
-        std::FILE* in = open_file(setup, "rb");
-        if (!in) throw std::runtime_error("cannot read " + setup);
-        const uint64_t program = file_size(setup);
-        const bool copied = copy_range(in, program, out);
-        std::fclose(in);
-        if (!copied) throw std::runtime_error("cannot copy " + setup);
-        uint64_t at = 0;
-        // Appends file to the overlay and returns its position in it.
-        auto append = [&](const std::string& file) {
-            std::FILE* m = open_file(file, "rb");
-            if (!m) throw std::runtime_error("cannot read " + file);
-            const uint64_t size = file_size(file);
-            const bool ok = copy_range(m, size, out);
-            std::fclose(m);
-            if (!ok) throw std::runtime_error("cannot append " + file);
-            const uint64_t where = at;
-            at += size;
-            return where;
+        const std::string name = file_name(output);
+        const size_t dot = name.rfind('.');
+        const std::string extension = dot == std::string::npos ? std::string() : name.substr(dot);
+        const bool exe = dot != std::string::npos && dot > 0 && (extension == ".exe" || extension == ".EXE");
+        return (exe ? output.substr(0, output.size() - extension.size()) : output) + builtin_overlay_extension;
+    }
+
+    /*
+        Reads back the overlay that ends file and checks that it names the files of models,
+        with their sizes, where they were written: the reader of the installer
+        (find_builtin_overlay()) finds them the same way.
+    */
+    void check_overlay(const std::string& file, uint64_t lower, const std::vector<model_entry>& models)
+    {
+        std::FILE* f = open_file(file, "rb");
+        if (!f) throw std::runtime_error("cannot read " + file);
+        std::unique_ptr<std::FILE, int (*)(std::FILE*)> closer(f, std::fclose);
+        auto read = [&](uint64_t pos, void* data, size_t n) {
+#if defined(_WIN32)
+            if (_fseeki64(f, static_cast<__int64>(pos), SEEK_SET) != 0) return false;
+#else
+            if (fseeko(f, static_cast<off_t>(pos), SEEK_SET) != 0) return false;
+#endif
+            return std::fread(data, 1, n, f) == n;
         };
+        uint64_t start = 0;
+        builtin_trailer trailer;
+        std::string text;
+        const json manifest = find_builtin_overlay(read, lower, file_size(file), start, trailer, text)
+            ? json::parse_or_null(text) : json();
+        bool valid = manifest["models"].size() == models.size() && manifest["version"].as_string() == ALBIREO_VERSION;
+        for (size_t i = 0; valid && i < models.size(); ++i)
+        {
+            const json& e = manifest["models"].elements()[i];
+            valid = e["offset"].as_int(-1) >= 0 && static_cast<uint64_t>(e["offset"].as_int(0))
+                + file_size(models[i].converted) <= trailer.manifest_offset;
+            if (valid && !models[i].projector.empty())
+                valid = e["projector"]["offset"].as_int(-1) >= 0 && static_cast<uint64_t>(e["projector"]["offset"]
+                    .as_int(0)) + file_size(models[i].projector) <= trailer.manifest_offset;
+        }
+        if (!valid) throw std::runtime_error("the models written in " + file + " cannot be read back");
+    }
+
+    /*
+        The complete installer: the installer without models setup, followed by the overlay of
+        the models (common/builtin_models.h).  When both would exceed limit, the size Windows
+        runs, output is the installer without models and the overlay lies in a file of its own
+        beside it (beside_installer()), from its first byte; a file of models left beside output
+        by an earlier build goes otherwise.
+    */
+    void pack_setup(const std::string& setup, const std::string& output, const std::vector<model_entry>& models,
+        json manifest, uint64_t limit)
+    {
+        // The positions of the files in the overlay, then the manifest that gives them.
+        uint64_t at = 0;
         for (size_t i = 0; i < models.size(); ++i)
         {
             json& entry = manifest["models"].elements()[i];
-            entry["offset"] = static_cast<unsigned long long>(append(models[i].converted));
+            entry["offset"] = static_cast<unsigned long long>(at);
+            at += file_size(models[i].converted);
             if (!models[i].projector.empty())
-                entry["projector"]["offset"] = static_cast<unsigned long long>(append(models[i].projector));
+            {
+                entry["projector"]["offset"] = static_cast<unsigned long long>(at);
+                at += file_size(models[i].projector);
+            }
         }
         const std::string text = manifest.dump();
+        const uint64_t program = file_size(setup);
+        const uint64_t whole = program + at + text.size() + sizeof(builtin_trailer) + 7;
+        const bool beside = whole > limit;
+        const std::string overlay_file = beside ? beside_installer(output) : output;
+
+        const std::string tmp = overlay_file + ".partial";
+        std::FILE* out = open_file(tmp, "wb");
+        if (!out) throw std::runtime_error("cannot create " + tmp);
+        std::unique_ptr<std::FILE, int (*)(std::FILE*)> closer(out, std::fclose);
+        // Copies length bytes of file to out.
+        auto append = [&](const std::string& file, uint64_t length) {
+            std::FILE* m = open_file(file, "rb");
+            if (!m) throw std::runtime_error("cannot read " + file);
+            const bool ok = copy_range(m, length, out);
+            std::fclose(m);
+            if (!ok) throw std::runtime_error("cannot append " + file);
+        };
+        if (!beside) append(setup, program);
+        for (const auto& m : models)
+        {
+            append(m.converted, file_size(m.converted));
+            if (!m.projector.empty()) append(m.projector, file_size(m.projector));
+        }
         builtin_trailer trailer;
         trailer.manifest_offset = at;
         trailer.manifest_size = text.size();
-        at += text.size();
-        const uint64_t end = program + at + sizeof(trailer);
+        const uint64_t end = (beside ? 0 : program) + at + text.size() + sizeof(trailer);
         const uint64_t pad = (8 - end % 8) % 8;
-        trailer.overlay_size = at + pad + sizeof(trailer);
+        trailer.overlay_size = at + text.size() + pad + sizeof(trailer);
         std::vector<char> zeros(static_cast<size_t>(pad), 0);
         if (std::fwrite(text.data(), 1, text.size(), out) != text.size()
             || (pad && std::fwrite(zeros.data(), 1, zeros.size(), out) != zeros.size())
             || std::fwrite(&trailer, 1, sizeof(trailer), out) != sizeof(trailer) || std::fflush(out) != 0)
             throw std::runtime_error("cannot write " + tmp);
         closer.reset();
+        check_overlay(tmp, beside ? 0 : program, models);
+        remove_file(overlay_file);
+        if (!rename_file(tmp, overlay_file)) throw std::runtime_error("cannot rename " + tmp);
+
+        if (beside)
+        {
+            // The installer is the one without models, under the name of the complete one.
+            const std::string copy = output + ".partial";
+            std::FILE* o = open_file(copy, "wb");
+            if (!o) throw std::runtime_error("cannot create " + copy);
+            std::unique_ptr<std::FILE, int (*)(std::FILE*)> copy_closer(o, std::fclose);
+            std::FILE* in = open_file(setup, "rb");
+            if (!in) throw std::runtime_error("cannot read " + setup);
+            const bool copied = copy_range(in, program, o) && std::fflush(o) == 0;
+            std::fclose(in);
+            if (!copied) throw std::runtime_error("cannot copy " + setup);
+            copy_closer.reset();
+            remove_file(output);
+            if (!rename_file(copy, output)) throw std::runtime_error("cannot rename " + copy);
+            std::cout << "the program and its models would exceed " << limit << " bytes: the models lie in "
+                      << overlay_file << ", which travels with " << file_name(output) << "\n";
+        }
+        else
+            remove_file(beside_installer(output));
 #if !defined(_WIN32)
         // The rights of the program it extends.
         struct stat st;
-        if (::stat(setup.c_str(), &st) == 0) ::chmod(tmp.c_str(), st.st_mode & 07777);
+        if (::stat(setup.c_str(), &st) == 0) ::chmod(output.c_str(), st.st_mode & 07777);
 #endif
-        remove_file(output);
-        if (!rename_file(tmp, output)) throw std::runtime_error("cannot rename " + tmp);
     }
 
     int usage()
     {
         std::cerr << "usage: albireo-builtin --manifest <builtin_models.json> --cache <folder>\n"
                      "           [--models-out <folder>] [--setup <setup.exe> --setup-out <setup.exe>]\n"
-                     "           [--threads <n>]\n";
+                     "           [--installer-limit <bytes>] [--threads <n>]\n";
         return 2;
     }
 
@@ -1297,7 +1380,10 @@ namespace
         }
         if (args.count("setup"))
         {
-            pack_setup(args["setup"], args["setup-out"], models, out);
+            // The size of the largest complete installer, less than the 4 GiB Windows runs, or another for the tests.
+            const uint64_t limit = args.count("installer-limit")
+                ? std::strtoull(args["installer-limit"].c_str(), nullptr, 10) : max_installer_size;
+            pack_setup(args["setup"], args["setup-out"], models, out, std::min(limit, max_installer_size));
             std::cout << args["setup-out"] << ", " << file_size(args["setup-out"]) << " bytes\n";
         }
         return 0;

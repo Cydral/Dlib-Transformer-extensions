@@ -772,6 +772,10 @@ if (ALBIREO_TESTS AND ALBIREO_PROGRAMS)
       host/public_link.cpp host/crypto.cpp)
    target_include_directories(test_host PRIVATE ${CMAKE_BINARY_DIR}/generated)
    target_link_libraries(test_host PRIVATE albireo_common albireo_sqlite albireo_zlib dlib::httplib)
+   if (WIN32)
+      # The proxy of WinHTTP, which the downloads read as the service does (host/http_fetch.cpp).
+      target_link_libraries(test_host PRIVATE winhttp)
+   endif()
    target_compile_options(test_host PRIVATE ${ALBIREO_WARNINGS})
    albireo_output_dir(test_host ${CMAKE_BINARY_DIR}/tests)
    # test_model_file: damaged model files; test_engine_api: the C interface of an engine library.

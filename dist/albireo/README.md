@@ -19,7 +19,8 @@ file whose signature fails. A change of one byte of a JSON file therefore needs 
 
 The installers lie in the folder `dist` of the public link, as `albireo-setup-online-<version>.exe`,
 the installer of the updates, and `albireo-setup-complete-<version>.exe`, with the models that come
-with Albireo; the files of the models lie in its folder `models`, each at
+with Albireo, which lie beside it in `albireo-setup-complete-<version>.models` when both would reach
+the 4 GiB Windows runs; the files of the models lie in its folder `models`, each at
 `<identifier>/<file name of its official address>`, and the services read them there before their
 official addresses, the hashes of the catalog checking both. The models published outside the
 Hugging Face hub are attached to the GitHub release `albireo-models`, and the repository itself
@@ -56,7 +57,9 @@ python dlib/dlib/external/albireo/tools/fill_public_link.py check
 writes the feed with the name of the installer in the link, its size and its SHA-256, signs it,
 checks the signature and puts the feed and its signature in place together; nothing goes to GitHub.
 `fill_public_link.py dist` copies the signed files of this folder, checked, and both installers under
-their names, the feed last, so that the link never announces an installer it does not hold yet;
+their names, with `albireo-setup-complete-<version>.models` when the models of the complete installer
+lie beside it (Windows runs no program of 4 GiB or more), the feed last, so that the link never
+announces an installer it does not hold yet;
 `models` copies each file of the catalog from the folders of `--from` when a file has its size and
 SHA-256, else downloads it from its official address, and checks it before it takes its name;
 `check` lists what the link lacks.

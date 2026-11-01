@@ -16,8 +16,9 @@ dist copies the signed feed and the signed catalog of dist/albireo with their si
 with albireo-sign (--sign, else build-albireo/bin of the repository, else the PATH), the installer
 of the updates under the name the feed gives it in the link, checked against the size and the
 SHA-256 the feed gives, and the complete installer as albireo-setup-complete-<version>.exe, checked
-against the version of the feed.  The feed must name its installer in the link: a version
-published with publish_release.py --public-link.
+against the version of the feed, with the file of its models when they lie beside it
+(albireo-setup.models of a build, as albireo-setup-complete-<version>.models).  The feed must name
+its installer in the link: a version published with publish_release.py --public-link.
 
 models places each file of the catalog, decoders and projectors, each part of a file published in
 parts as it is published, at <identifier>/<file name of its official address>: kept when it is
@@ -211,8 +212,15 @@ def fill_dist(a):
     os.makedirs(a.output, exist_ok=True)
     copies = [(os.path.join(a.dist, n + s), n + s) for n in ("feed.json", "catalog.json") for s in ("", ".sig")]
     copies.append((a.online, installer["file"]))
+    beside = "albireo-setup-complete-%s.models" % version
     if a.complete:
         copies.append((a.complete, "albireo-setup-complete-%s.exe" % version))
+        # The models of a complete installer that would reach the 4 GiB Windows runs lie beside it.
+        models = os.path.splitext(a.complete)[0] + ".models"
+        if os.path.isfile(models):
+            copies.append((models, beside))
+        elif os.path.isfile(os.path.join(a.output, beside)):
+            os.remove(os.path.join(a.output, beside))
     # The installers first and the feed last: the link never announces a file it does not hold yet.
     copies.sort(key=lambda c: c[1].startswith("feed.json"))
     for source, name in copies:

@@ -661,7 +661,11 @@ to stop, then kills it. Their exit code is the number of failed steps.
 A build gives two installers. `albireo-setup.exe` is complete: it carries the models that come
 with Albireo and installs a computer that answers at once, without network. `albireo-setup-online.exe`
 is the same program without them: the updates take it, and on a new computer the service
-downloads the default models of the catalog.
+downloads the default models of the catalog. Windows runs no program of 4 GiB or more: when the
+program and its models would reach that size, as the installer of 1.0.8 does with the libraries of
+CUDA and of OpenVINO, its models lie beside it in `albireo-setup.models`, which the installer reads
+when it carries none; the two files travel together and are renamed together
+(`albireo-setup-complete-<version>.exe` and `albireo-setup-complete-<version>.models`).
 
 The wizard asks for the language, the license, the folders of the programs, of the data and of
 the models, the options (start with Windows, desktop shortcut, trust of the local certificate,
@@ -986,10 +990,12 @@ of the engine:
 4. the converted file is read and checked again, then kept in the cache under the name of its
    conversion, so that the next builds reuse it; it reaches `bin/models` of the build tree by a
    hard link, with its manifest `builtin.json`, and the complete installer as the overlay that
-   follows its program ([`common/builtin_models.h`](common/builtin_models.h)).
+   follows its program ([`common/builtin_models.h`](common/builtin_models.h)), or in
+   `albireo-setup.models` beside it when both would reach the 4 GiB Windows runs; the overlay is
+   read back before it takes its name.
 
 The conversion takes a few minutes and the cache holds about 6.8 GB, the downloaded files and the
-converted ones; the complete installer weighs about 3.6 GB. `-DALBIREO_BUILTIN_MODELS=OFF`, or
+converted ones; the models of the complete installer weigh about 3.6 GB. `-DALBIREO_BUILTIN_MODELS=OFF`, or
 `-NoBuiltinModels` of `build_windows.ps1`, builds without them; a cross build gives
 `ALBIREO_BUILTIN_TOOL`, the `albireo-builtin` of the build machine.
 
@@ -1076,7 +1082,8 @@ its size and its SHA-256, signs it, checks the signature, puts the feed and its 
 and prints the commands that push them. [`tools/fill_public_link.py`](tools/fill_public_link.py)
 then fills the local copy of the link, the folder the storage service synchronizes: `dist` copies the
 signed feed and catalog with their signatures, checked with `albireo-sign`, and both installers
-under their names, checked against the feed, the feed last; `models` places the files of the
+under their names, checked against the feed, with the file of models of the complete installer
+when it has one, the feed last; `models` places the files of the
 catalog, kept when they are in place, copied from the folders of `--from` when a file has their size
 and SHA-256, else downloaded from their official addresses, resumed after a cut and checked; `check`
 reads the listing of the link and reports the files it lacks or holds at another size:
