@@ -47,9 +47,12 @@
     the two scales bring the result back to floating point. An integer sum does not depend
     on its order, so the kernels for AVX-512 VNNI, AVX-VNNI and AVX2 give the values of the
     portable code. The attention products have kernels for AVX2 and FMA that apply the same
-    fused operations in the same order as the scalar code. Every kernel is compiled whatever
-    the options of the build and chosen at run time, so that every processor computes the
-    same values.
+    fused operations in the same order as the scalar code, and the normalisations, the
+    softmax and the gates have AVX2 kernels that apply the scalar code's operations, element
+    by element, with nothing fused. Every kernel is compiled whatever the options of the
+    build and chosen at run time from the extensions dlib::get_cpu_features() finds, so that
+    every processor computes the same values; DLIB_DISABLE_CPU_FEATURES runs a build through
+    the paths of a processor with fewer extensions.
 
     HOW THE TEXT IS CUT FOR THE NETWORK
 
@@ -137,11 +140,6 @@
 #if defined(__x86_64__) || defined(_M_X64)
 #define SLM_CODEC_X86 1
 #include <immintrin.h>
-#if defined(_MSC_VER)
-#include <intrin.h>
-#else
-#include <cpuid.h>
-#endif
 #if defined(__GNUC__) || defined(__clang__)
 #define SLM_AVX2_FMA __attribute__((target("avx2,fma")))
 #define SLM_AVX2 __attribute__((target("avx2")))
@@ -167,6 +165,7 @@
 
 #include <dlib/cmd_line_parser.h>
 #include <dlib/crc32.h>
+#include <dlib/simd/cpu_features.h>
 #include <dlib/tokenizer.h>
 
 #if SLM_TRAINING
@@ -1137,66 +1136,43 @@ namespace tok_codec
     // ----------------------------------------------------------------------------------------
     // Processor features
 
-    // The vector instructions the processor offers, detected once; the kernels that use them are chosen at run time.
+    /*
+        The kernels the processor runs, chosen once from the extensions Dlib detects: the
+        integer products in AVX-512 VNNI, in AVX-VNNI or in AVX2, the floating-point kernels
+        in AVX2 with FMA, and the portable code otherwise. Every path writes the same
+        archives, so that DLIB_DISABLE_CPU_FEATURES can send a run through any of them.
+    */
     struct processor_features
     {
         bool avx2_fma = false, avx512_vnni = false, avx_vnni = false;
     };
 
-#if SLM_CODEC_X86
-    inline void cpuid (int leaf, int sub, unsigned r[4])
-    {
-#if defined(_MSC_VER)
-        int v[4];
-        __cpuidex(v, leaf, sub);
-        for (int i = 0; i < 4; ++i) r[i] = static_cast<unsigned>(v[i]);
-#else
-        __cpuid_count(leaf, sub, r[0], r[1], r[2], r[3]);
-#endif
-    }
-
-#if defined(_MSC_VER) && defined(__clang__)
-    __attribute__((target("xsave")))
-#endif
-    inline uint64_t xcr0 ()
-    {
-#if defined(_MSC_VER)
-        return _xgetbv(0);
-#else
-        unsigned lo, hi;
-        __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
-        return (static_cast<uint64_t>(hi) << 32) | lo;
-#endif
-    }
-
     inline processor_features detect_processor ()
     {
         processor_features f;
-        unsigned r[4];
-        cpuid(0, 0, r);
-        if (r[0] < 7) return f;
-        cpuid(1, 0, r);
-        const unsigned fma_osxsave_avx = (1u << 12) | (1u << 27) | (1u << 28);
-        if ((r[2] & fma_osxsave_avx) != fma_osxsave_avx) return f;
-        const uint64_t saved = xcr0();
-        if ((saved & 6) != 6) return f;
-        cpuid(7, 0, r);
-        f.avx2_fma = (r[1] & (1u << 5)) != 0;
-        // AVX-512 with 256-bit vectors still needs the system to save the AVX-512 state.
-        f.avx512_vnni = f.avx2_fma && (r[1] & (1u << 16)) && (r[1] & (1u << 31)) && (r[2] & (1u << 11))
-            && (saved & 0xe0) == 0xe0;
-        cpuid(7, 1, r);
-        f.avx_vnni = f.avx2_fma && (r[0] & (1u << 4));
+#if SLM_CODEC_X86
+        const dlib::cpu_features& c = dlib::get_cpu_features();
+        f.avx2_fma = c.avx2 && c.fma;
+        // The dot products of AVX-512 on 256-bit vectors also need AVX-512VL.
+        f.avx512_vnni = f.avx2_fma && c.avx512_vnni && c.avx512vl;
+        f.avx_vnni = f.avx2_fma && c.avx_vnni;
+#endif
         return f;
     }
-#else
-    inline processor_features detect_processor () { return processor_features(); }
-#endif
 
     inline const processor_features& processor ()
     {
         static const processor_features f = detect_processor();
         return f;
+    }
+
+    // The instructions of the integer products, as the reports name them.
+    inline const char* product_kernels ()
+    {
+        if (SLM_VNNI_KERNELS && processor().avx512_vnni) return "AVX-512 VNNI";
+        if (SLM_VNNI_KERNELS && processor().avx_vnni) return "AVX-VNNI";
+        if (processor().avx2_fma) return "AVX2";
+        return "portable code";
     }
 
     // ----------------------------------------------------------------------------------------
@@ -2327,6 +2303,285 @@ namespace tok_codec
             for (int j = 0; i < n; ++i, ++j) lane[j] = std::fma(a[i], b[i], lane[j]);
             return ((lane[0] + lane[1]) + (lane[2] + lane[3])) + ((lane[4] + lane[5]) + (lane[6] + lane[7]));
         }
+
+        /*
+            The scores of two query heads sharing their keys, in one pass over the keys: each
+            score accumulates the same fused products in the same order as scores() gives it.
+        */
+        SLM_AVX2_FMA inline void scores2 (const float* q0, const float* q1, const float* keys, size_t stride, int hd,
+            int cnt, float* sc0, float* sc1)
+        {
+            int j = 0;
+            for (; j + 32 <= cnt; j += 32) {
+                __m256 a0 = _mm256_setzero_ps(), a1 = a0, a2 = a0, a3 = a0, b0 = a0, b1 = a0, b2 = a0, b3 = a0;
+                const float* col = keys + j;
+                for (int i = 0; i < hd; ++i, col += stride) {
+                    const __m256 k0 = _mm256_loadu_ps(col), k1 = _mm256_loadu_ps(col + 8);
+                    const __m256 k2 = _mm256_loadu_ps(col + 16), k3 = _mm256_loadu_ps(col + 24);
+                    const __m256 x = _mm256_broadcast_ss(q0 + i), y = _mm256_broadcast_ss(q1 + i);
+                    a0 = _mm256_fmadd_ps(x, k0, a0); a1 = _mm256_fmadd_ps(x, k1, a1);
+                    a2 = _mm256_fmadd_ps(x, k2, a2); a3 = _mm256_fmadd_ps(x, k3, a3);
+                    b0 = _mm256_fmadd_ps(y, k0, b0); b1 = _mm256_fmadd_ps(y, k1, b1);
+                    b2 = _mm256_fmadd_ps(y, k2, b2); b3 = _mm256_fmadd_ps(y, k3, b3);
+                }
+                _mm256_storeu_ps(sc0 + j, a0); _mm256_storeu_ps(sc0 + j + 8, a1);
+                _mm256_storeu_ps(sc0 + j + 16, a2); _mm256_storeu_ps(sc0 + j + 24, a3);
+                _mm256_storeu_ps(sc1 + j, b0); _mm256_storeu_ps(sc1 + j + 8, b1);
+                _mm256_storeu_ps(sc1 + j + 16, b2); _mm256_storeu_ps(sc1 + j + 24, b3);
+            }
+            if (j < cnt) {
+                scores(q0, keys + j, stride, hd, cnt - j, sc0 + j);
+                scores(q1, keys + j, stride, hd, cnt - j, sc1 + j);
+            }
+        }
+
+        // The weighted sums of two heads sharing their values, in one pass over the values.
+        SLM_AVX2_FMA inline void weighted_sum2 (const float* w0, const float* w1, const float* vals, size_t stride,
+            int cnt, int hd, float* out0, float* out1)
+        {
+            int i = 0;
+            for (; i + 32 <= hd; i += 32) {
+                __m256 a0 = _mm256_setzero_ps(), a1 = a0, a2 = a0, a3 = a0, b0 = a0, b1 = a0, b2 = a0, b3 = a0;
+                const float* v = vals + i;
+                for (int j = 0; j < cnt; ++j, v += stride) {
+                    const __m256 v0 = _mm256_loadu_ps(v), v1 = _mm256_loadu_ps(v + 8);
+                    const __m256 v2 = _mm256_loadu_ps(v + 16), v3 = _mm256_loadu_ps(v + 24);
+                    const __m256 x = _mm256_broadcast_ss(w0 + j), y = _mm256_broadcast_ss(w1 + j);
+                    a0 = _mm256_fmadd_ps(x, v0, a0); a1 = _mm256_fmadd_ps(x, v1, a1);
+                    a2 = _mm256_fmadd_ps(x, v2, a2); a3 = _mm256_fmadd_ps(x, v3, a3);
+                    b0 = _mm256_fmadd_ps(y, v0, b0); b1 = _mm256_fmadd_ps(y, v1, b1);
+                    b2 = _mm256_fmadd_ps(y, v2, b2); b3 = _mm256_fmadd_ps(y, v3, b3);
+                }
+                _mm256_storeu_ps(out0 + i, a0); _mm256_storeu_ps(out0 + i + 8, a1);
+                _mm256_storeu_ps(out0 + i + 16, a2); _mm256_storeu_ps(out0 + i + 24, a3);
+                _mm256_storeu_ps(out1 + i, b0); _mm256_storeu_ps(out1 + i + 8, b1);
+                _mm256_storeu_ps(out1 + i + 16, b2); _mm256_storeu_ps(out1 + i + 24, b3);
+            }
+            if (i < hd) {
+                weighted_sum(w0, vals + i, stride, cnt, hd - i, out0 + i);
+                weighted_sum(w1, vals + i, stride, cnt, hd - i, out1 + i);
+            }
+        }
+
+        /*
+            The elementwise kernels below compute what the scalar code computes, element by
+            element and in the same order; they are compiled for AVX2 without FMA, so that no
+            multiplication can fuse with an addition.
+        */
+
+        // det::expf on eight floats.
+        SLM_AVX2 inline __m256 expf8 (__m256 x)
+        {
+            __m256i bits = _mm256_min_epu32(_mm256_castps_si256(x), _mm256_set1_epi32(static_cast<int>(0xC2AE0000u)));
+            bits = _mm256_min_epi32(bits, _mm256_set1_epi32(0x42B00000));
+            x = _mm256_castsi256_ps(bits);
+            const __m256 magic = _mm256_set1_ps(12582912.0f);
+            const __m256 k = _mm256_sub_ps(_mm256_add_ps(_mm256_mul_ps(x, _mm256_set1_ps(1.44269504088896341f)), magic),
+                magic);
+            __m256 r = _mm256_sub_ps(x, _mm256_mul_ps(k, _mm256_set1_ps(0.693359375f)));
+            r = _mm256_sub_ps(r, _mm256_mul_ps(k, _mm256_set1_ps(-2.12194440e-4f)));
+            __m256 p = _mm256_set1_ps(1.9875691500e-4f);
+            p = _mm256_add_ps(_mm256_mul_ps(p, r), _mm256_set1_ps(1.3981999507e-3f));
+            p = _mm256_add_ps(_mm256_mul_ps(p, r), _mm256_set1_ps(8.3334519073e-3f));
+            p = _mm256_add_ps(_mm256_mul_ps(p, r), _mm256_set1_ps(4.1665795894e-2f));
+            p = _mm256_add_ps(_mm256_mul_ps(p, r), _mm256_set1_ps(1.6666665459e-1f));
+            p = _mm256_add_ps(_mm256_mul_ps(p, r), _mm256_set1_ps(5.0000001201e-1f));
+            p = _mm256_add_ps(_mm256_add_ps(_mm256_mul_ps(p, _mm256_mul_ps(r, r)), r), _mm256_set1_ps(1.0f));
+            const __m256i exponent = _mm256_add_epi32(_mm256_cvttps_epi32(k), _mm256_set1_epi32(127));
+            return _mm256_mul_ps(p, _mm256_castsi256_ps(_mm256_slli_epi32(exponent, 23)));
+        }
+
+        SLM_AVX2 inline float max_of (__m256 m)
+        {
+            float lane[8];
+            _mm256_storeu_ps(lane, m);
+            float mx = lane[0];
+            for (int j = 1; j < 8; ++j) mx = lane[j] > mx ? lane[j] : mx;
+            return mx;
+        }
+
+        // The sum of n floats in eight interleaved partial sums, combined in a fixed order.
+        SLM_AVX2 inline float sum (const float* a, int n)
+        {
+            __m256 acc = _mm256_setzero_ps();
+            int i = 0;
+            for (; i + 8 <= n; i += 8) acc = _mm256_add_ps(acc, _mm256_loadu_ps(a + i));
+            float lane[8];
+            _mm256_storeu_ps(lane, acc);
+            for (int j = 0; i < n; ++i, ++j) lane[j] += a[i];
+            return ((lane[0] + lane[1]) + (lane[2] + lane[3])) + ((lane[4] + lane[5]) + (lane[6] + lane[7]));
+        }
+
+        // e[i] = exp(a[i] - mx), then e divided by its sum.
+        SLM_AVX2 inline void exp_normalize (const float* a, float mx, int n, float* e)
+        {
+            const __m256 m = _mm256_set1_ps(mx);
+            int i = 0;
+            for (; i + 8 <= n; i += 8) _mm256_storeu_ps(e + i, expf8(_mm256_sub_ps(_mm256_loadu_ps(a + i), m)));
+            for (; i < n; ++i) e[i] = det::expf(a[i] - mx);
+            const float inv = 1.0f / sum(e, n);
+            const __m256 s = _mm256_set1_ps(inv);
+            for (i = 0; i + 8 <= n; i += 8) _mm256_storeu_ps(e + i, _mm256_mul_ps(_mm256_loadu_ps(e + i), s));
+            for (; i < n; ++i) e[i] *= inv;
+        }
+
+        // The attention weights of n scores: each multiplied by scale, then their softmax, in place.
+        SLM_AVX2 inline void attention_weights (float* sc, int n, float scale)
+        {
+            const __m256 s = _mm256_set1_ps(scale);
+            __m256 m = _mm256_set1_ps(-3.0e38f);
+            int i = 0;
+            for (; i + 8 <= n; i += 8) {
+                const __m256 v = _mm256_mul_ps(_mm256_loadu_ps(sc + i), s);
+                _mm256_storeu_ps(sc + i, v);
+                m = _mm256_max_ps(m, v);
+            }
+            float mx = max_of(m);
+            for (; i < n; ++i) { sc[i] *= scale; mx = sc[i] > mx ? sc[i] : mx; }
+            exp_normalize(sc, mx, n, sc);
+        }
+
+        // The distribution over the vocabulary: logits plus the two biases, then their softmax into p.
+        SLM_AVX2 inline void distribution (float* lg, const float* b1, const float* b2, int n, float* p)
+        {
+            __m256 m = _mm256_set1_ps(-3.0e38f);
+            int i = 0;
+            for (; i + 8 <= n; i += 8) {
+                const __m256 v = _mm256_add_ps(_mm256_loadu_ps(lg + i),
+                    _mm256_add_ps(_mm256_loadu_ps(b1 + i), _mm256_loadu_ps(b2 + i)));
+                _mm256_storeu_ps(lg + i, v);
+                m = _mm256_max_ps(m, v);
+            }
+            float mx = max_of(m);
+            for (; i < n; ++i) { lg[i] += b1[i] + b2[i]; mx = lg[i] > mx ? lg[i] : mx; }
+            exp_normalize(lg, mx, n, p);
+        }
+
+        // a[i] = (b[i] + bb[i]) * silu(a[i] + ba[i]), the gate of SwiGLU.
+        SLM_AVX2 inline void swiglu (float* a, const float* b, const float* ba, const float* bb, int n)
+        {
+            const __m256 one = _mm256_set1_ps(1.0f), sign = _mm256_set1_ps(-0.0f);
+            int i = 0;
+            for (; i + 8 <= n; i += 8) {
+                const __m256 za = _mm256_add_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(ba + i));
+                const __m256 g = _mm256_div_ps(za, _mm256_add_ps(one, expf8(_mm256_xor_ps(za, sign))));
+                const __m256 h = _mm256_add_ps(_mm256_loadu_ps(b + i), _mm256_loadu_ps(bb + i));
+                _mm256_storeu_ps(a + i, _mm256_mul_ps(h, g));
+            }
+            for (; i < n; ++i) {
+                const float za = a[i] + ba[i];
+                a[i] = (b[i] + bb[i]) * (za / (1.0f + det::expf(-za)));
+            }
+        }
+
+        // dst[i] = row[i] * inv * gain[i].
+        SLM_AVX2 inline void scale_by_gain (const float* row, float inv, const float* gain, int n, float* dst)
+        {
+            const __m256 s = _mm256_set1_ps(inv);
+            int i = 0;
+            for (; i + 8 <= n; i += 8)
+                _mm256_storeu_ps(dst + i, _mm256_mul_ps(_mm256_mul_ps(_mm256_loadu_ps(row + i), s),
+                    _mm256_loadu_ps(gain + i)));
+            for (; i < n; ++i) dst[i] = row[i] * inv * gain[i];
+        }
+
+        // x[i] += o[i], or x[i] += o[i] + b[i] when b is given.
+        SLM_AVX2 inline void accumulate (float* x, const float* o, const float* b, int n)
+        {
+            int i = 0;
+            if (b) {
+                for (; i + 8 <= n; i += 8)
+                    _mm256_storeu_ps(x + i, _mm256_add_ps(_mm256_loadu_ps(x + i),
+                        _mm256_add_ps(_mm256_loadu_ps(o + i), _mm256_loadu_ps(b + i))));
+                for (; i < n; ++i) x[i] += o[i] + b[i];
+            }
+            else {
+                for (; i + 8 <= n; i += 8)
+                    _mm256_storeu_ps(x + i, _mm256_add_ps(_mm256_loadu_ps(x + i), _mm256_loadu_ps(o + i)));
+                for (; i < n; ++i) x[i] += o[i];
+            }
+        }
+
+        // o[c] = a[c] * (sx * scale[c]): the integer sums of a row brought back to floating point.
+        SLM_AVX2 inline void rescale (const int32_t* a, float sx, const float* scale, int n, float* o)
+        {
+            const __m256 s = _mm256_set1_ps(sx);
+            int c = 0;
+            for (; c + 8 <= n; c += 8)
+                _mm256_storeu_ps(o + c, _mm256_mul_ps(
+                    _mm256_cvtepi32_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(a + c))),
+                    _mm256_mul_ps(s, _mm256_loadu_ps(scale + c))));
+            for (; c < n; ++c) o[c] = static_cast<float>(a[c]) * (sx * scale[c]);
+        }
+
+        // b[i] -= rate * p[i].
+        SLM_AVX2 inline void descend (float* b, const float* p, float rate, int n)
+        {
+            const __m256 r = _mm256_set1_ps(rate);
+            int i = 0;
+            for (; i + 8 <= n; i += 8)
+                _mm256_storeu_ps(b + i,
+                    _mm256_sub_ps(_mm256_loadu_ps(b + i), _mm256_mul_ps(r, _mm256_loadu_ps(p + i))));
+            for (; i < n; ++i) b[i] -= rate * p[i];
+        }
+
+        // The index of the first largest of n floats.
+        SLM_AVX2 inline int first_max (const float* p, int n)
+        {
+            __m256 m = _mm256_loadu_ps(p);
+            int i = 8;
+            for (; i + 8 <= n; i += 8) m = _mm256_max_ps(m, _mm256_loadu_ps(p + i));
+            float mx = max_of(m);
+            for (; i < n; ++i) mx = p[i] > mx ? p[i] : mx;
+            int r = 0;
+            while (p[r] != mx) ++r;
+            return r;
+        }
+
+        // The largest magnitude of n floats.
+        SLM_AVX2 inline float max_abs (const float* a, int n)
+        {
+            const __m256 sign = _mm256_set1_ps(-0.0f);
+            __m256 m = _mm256_setzero_ps();
+            int i = 0;
+            for (; i + 8 <= n; i += 8) m = _mm256_max_ps(m, _mm256_andnot_ps(sign, _mm256_loadu_ps(a + i)));
+            float mx = max_of(m);
+            for (; i < n; ++i) mx = std::max(mx, std::fabs(a[i]));
+            return mx;
+        }
+
+        // q[i] = round(a[i] * inv), ties to even, as signed bytes.
+        SLM_AVX2 inline void round_to_bytes (const float* a, float inv, int n, int8_t* q)
+        {
+            const __m256 s = _mm256_set1_ps(inv), magic = _mm256_set1_ps(12582912.0f);
+            const __m256i order = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+            int i = 0;
+            for (; i + 32 <= n; i += 32) {
+                __m256i v[4];
+                for (int j = 0; j < 4; ++j) {
+                    const __m256 scaled = _mm256_mul_ps(_mm256_loadu_ps(a + i + 8 * j), s);
+                    v[j] = _mm256_cvttps_epi32(_mm256_sub_ps(_mm256_add_ps(scaled, magic), magic));
+                }
+                const __m256i words0 = _mm256_packs_epi32(v[0], v[1]), words1 = _mm256_packs_epi32(v[2], v[3]);
+                const __m256i bytes = _mm256_packs_epi16(words0, words1);
+                _mm256_storeu_si256(reinterpret_cast<__m256i*>(q + i), _mm256_permutevar8x32_epi32(bytes, order));
+            }
+            for (; i < n; ++i) {
+                const float magic_s = 12582912.0f;
+                q[i] = static_cast<int8_t>((a[i] * inv + magic_s) - magic_s);
+            }
+        }
+
+        // u[i] = q[i] + 128, as unsigned bytes.
+        SLM_AVX2 inline void to_unsigned (const int8_t* q, size_t n, uint8_t* u)
+        {
+            const __m256i flip = _mm256_set1_epi8(static_cast<char>(0x80));
+            size_t i = 0;
+            for (; i + 32 <= n; i += 32)
+                _mm256_storeu_si256(reinterpret_cast<__m256i*>(u + i), _mm256_xor_si256(flip,
+                    _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q + i))));
+            for (; i < n; ++i) u[i] = static_cast<uint8_t>(q[i] + 128);
+        }
     }
 #endif
 
@@ -2375,18 +2630,173 @@ namespace tok_codec
             for (int j = 0; i < n; ++i, ++j) acc[j] = std::fma(a[i], b[i], acc[j]);
             return ((acc[0] + acc[1]) + (acc[2] + acc[3])) + ((acc[4] + acc[5]) + (acc[6] + acc[7]));
         }
+
+        // scores() for two query heads sharing their keys.
+        inline void scores2 (const float* q0, const float* q1, const float* keys, size_t stride, int hd, int cnt,
+            float* sc0, float* sc1)
+        {
+#if SLM_CODEC_X86
+            if (vector_paths()) { kernels_avx2::scores2(q0, q1, keys, stride, hd, cnt, sc0, sc1); return; }
+#endif
+            scores(q0, keys, stride, hd, cnt, sc0);
+            scores(q1, keys, stride, hd, cnt, sc1);
+        }
+
+        // weighted_sum() for two heads sharing their values.
+        inline void weighted_sum2 (const float* w0, const float* w1, const float* vals, size_t stride, int cnt,
+            int hd, float* out0, float* out1)
+        {
+#if SLM_CODEC_X86
+            if (vector_paths()) { kernels_avx2::weighted_sum2(w0, w1, vals, stride, cnt, hd, out0, out1); return; }
+#endif
+            weighted_sum(w0, vals, stride, cnt, hd, out0);
+            weighted_sum(w1, vals, stride, cnt, hd, out1);
+        }
+
+        // The sum of n floats in eight interleaved partial sums, combined in a fixed order.
+        inline float sum (const float* a, int n)
+        {
+#if SLM_CODEC_X86
+            if (vector_paths()) return kernels_avx2::sum(a, n);
+#endif
+            float acc[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+            int i = 0;
+            for (; i + 8 <= n; i += 8)
+                for (int j = 0; j < 8; ++j) acc[j] += a[i + j];
+            for (int j = 0; i < n; ++i, ++j) acc[j] += a[i];
+            return ((acc[0] + acc[1]) + (acc[2] + acc[3])) + ((acc[4] + acc[5]) + (acc[6] + acc[7]));
+        }
+
+        // The attention weights of n scores: each multiplied by scale, then their softmax, in place.
+        inline void attention_weights (float* sc, int n, float scale)
+        {
+#if SLM_CODEC_X86
+            if (vector_paths()) { kernels_avx2::attention_weights(sc, n, scale); return; }
+#endif
+            float mx = -3.0e38f;
+            for (int j = 0; j < n; ++j) { sc[j] *= scale; mx = sc[j] > mx ? sc[j] : mx; }
+            for (int j = 0; j < n; ++j) sc[j] = det::expf(sc[j] - mx);
+            const float inv = 1.0f / sum(sc, n);
+            for (int j = 0; j < n; ++j) sc[j] *= inv;
+        }
+
+        // The distribution over the vocabulary: logits plus the two biases, then their softmax into p.
+        inline void distribution (float* lg, const float* b1, const float* b2, int n, float* p)
+        {
+#if SLM_CODEC_X86
+            if (vector_paths()) { kernels_avx2::distribution(lg, b1, b2, n, p); return; }
+#endif
+            float mx = -3.0e38f;
+            for (int i = 0; i < n; ++i) { lg[i] += b1[i] + b2[i]; mx = lg[i] > mx ? lg[i] : mx; }
+            for (int i = 0; i < n; ++i) p[i] = det::expf(lg[i] - mx);
+            const float inv = 1.0f / sum(p, n);
+            for (int i = 0; i < n; ++i) p[i] *= inv;
+        }
+
+        // a[i] = (b[i] + bb[i]) * silu(a[i] + ba[i]), the gate of SwiGLU.
+        inline void swiglu (float* a, const float* b, const float* ba, const float* bb, int n)
+        {
+#if SLM_CODEC_X86
+            if (vector_paths()) { kernels_avx2::swiglu(a, b, ba, bb, n); return; }
+#endif
+            for (int i = 0; i < n; ++i) {
+                const float za = a[i] + ba[i];
+                a[i] = (b[i] + bb[i]) * (za / (1.0f + det::expf(-za)));
+            }
+        }
+
+        // dst[i] = row[i] * inv * gain[i].
+        inline void scale_by_gain (const float* row, float inv, const float* gain, int n, float* dst)
+        {
+#if SLM_CODEC_X86
+            if (vector_paths()) { kernels_avx2::scale_by_gain(row, inv, gain, n, dst); return; }
+#endif
+            for (int i = 0; i < n; ++i) dst[i] = row[i] * inv * gain[i];
+        }
+
+        // x[i] += o[i], or x[i] += o[i] + b[i] when b is given.
+        inline void accumulate (float* x, const float* o, const float* b, int n)
+        {
+#if SLM_CODEC_X86
+            if (vector_paths()) { kernels_avx2::accumulate(x, o, b, n); return; }
+#endif
+            if (b) for (int i = 0; i < n; ++i) x[i] += o[i] + b[i];
+            else for (int i = 0; i < n; ++i) x[i] += o[i];
+        }
+
+        // o[c] = a[c] * (sx * scale[c]).
+        inline void rescale (const int32_t* a, float sx, const float* scale, int n, float* o)
+        {
+#if SLM_CODEC_X86
+            if (vector_paths()) { kernels_avx2::rescale(a, sx, scale, n, o); return; }
+#endif
+            for (int c = 0; c < n; ++c) o[c] = static_cast<float>(a[c]) * (sx * scale[c]);
+        }
+
+        // b[i] -= rate * p[i].
+        inline void descend (float* b, const float* p, float rate, int n)
+        {
+#if SLM_CODEC_X86
+            if (vector_paths()) { kernels_avx2::descend(b, p, rate, n); return; }
+#endif
+            for (int i = 0; i < n; ++i) b[i] -= rate * p[i];
+        }
+
+        // The index of the first largest of n floats.
+        inline int first_max (const float* p, int n)
+        {
+#if SLM_CODEC_X86
+            if (vector_paths() && n >= 8) return kernels_avx2::first_max(p, n);
+#endif
+            float top = p[0];
+            int top_id = 0;
+            for (int r = 1; r < n; ++r) if (p[r] > top) { top = p[r]; top_id = r; }
+            return top_id;
+        }
+
+        // The largest magnitude of n floats.
+        inline float max_abs (const float* a, int n)
+        {
+#if SLM_CODEC_X86
+            if (vector_paths()) return kernels_avx2::max_abs(a, n);
+#endif
+            float mx = 0.0f;
+            for (int i = 0; i < n; ++i) mx = std::max(mx, std::fabs(a[i]));
+            return mx;
+        }
+
+        // q[i] = round(a[i] * inv), ties to even, as signed bytes.
+        inline void round_to_bytes (const float* a, float inv, int n, int8_t* q)
+        {
+#if SLM_CODEC_X86
+            if (vector_paths()) { kernels_avx2::round_to_bytes(a, inv, n, q); return; }
+#endif
+            const float magic = 12582912.0f;    // 1.5 * 2^23: rounds to the nearest integer, ties to even
+            for (int i = 0; i < n; ++i) q[i] = static_cast<int8_t>((a[i] * inv + magic) - magic);
+        }
+
+        // u[i] = q[i] + 128, as unsigned bytes.
+        inline void to_unsigned (const int8_t* q, size_t n, uint8_t* u)
+        {
+#if SLM_CODEC_X86
+            if (vector_paths()) { kernels_avx2::to_unsigned(q, n, u); return; }
+#endif
+            for (size_t i = 0; i < n; ++i) u[i] = static_cast<uint8_t>(q[i] + 128);
+        }
     }
 
     /*
         A weight matrix for integer products: signed bytes with one scale per column, in
         strips of sixteen columns. Within a strip, the rows go by groups of four, each group
         holding the four bytes of every column side by side, the order the VNNI instructions
-        read; processors with AVX2 alone read pairs of 16-bit integers instead. The rows are
-        padded to a multiple of four and the columns to a multiple of sixteen with zeros.
+        read and the AVX2 byte products too when the weights fit in 7 bits; processors with
+        AVX2 alone read pairs of 16-bit integers for weights of 8 bits. The rows are padded to
+        a multiple of four and the columns to a multiple of sixteen with zeros.
     */
     struct int_matrix
     {
         int rows = 0, cols = 0, kpad = 0, strips = 0;
+        bool small = false;            // no weight exceeds 63 in magnitude, as the AVX2 byte products need
         std::vector<float> scale;      // per column
         std::vector<int8_t> q4;        // per strip, per group of four rows: sixteen columns of four bytes
         std::vector<int16_t> q2;       // per strip, per pair of rows: sixteen columns of two, for AVX2
@@ -2406,7 +2816,10 @@ namespace tok_codec
         w.scale = std::move(scale);
         w.q4.assign(static_cast<size_t>(w.strips) * w.kpad * 16, 0);
         w.colsum.assign(static_cast<size_t>(w.strips) * 16, 0);
-        const bool pairs = !vnni_paths() && processor().avx2_fma;
+        int largest = 0;
+        for (const int8_t v : m) largest = std::max(largest, std::abs(static_cast<int>(v)));
+        w.small = largest <= 63;
+        const bool pairs = !vnni_paths() && processor().avx2_fma && !w.small;
         if (pairs) w.q2.assign(w.q4.size(), 0);
         for (int st = 0; st < w.strips; ++st)
             for (int r = 0; r < rows; ++r)
@@ -2422,8 +2835,11 @@ namespace tok_codec
 
     /*
         out[r][c] = sum over k of x[r][k] * w[k][c], exactly, for n rows of signed bytes padded
-        to w.kpad. The VNNI paths take the inputs as unsigned bytes, x + 128, and subtract 128
-        times the column sums; the AVX2 path takes them as 16-bit integers.
+        to w.kpad. The byte paths take the inputs as unsigned bytes, x + 128, and subtract 128
+        times the column sums: the VNNI instructions, and in AVX2 the products of bytes summed
+        by pairs into 16 bits, which stay exact for weights of at most 63 in magnitude, since a
+        pair then stays below 2^15. For larger weights the AVX2 path takes the inputs as 16-bit
+        integers.
     */
     namespace kernels_int
     {
@@ -2506,7 +2922,6 @@ namespace tok_codec
             }
         }
 
-#if SLM_VNNI_KERNELS
         // 128 times the column sums from c on: what the inputs, taken as unsigned bytes, add.
         SLM_AVX2 inline __m256i offset_sums (const int32_t* c)
         {
@@ -2520,7 +2935,13 @@ namespace tok_codec
             _mm256_storeu_si256(reinterpret_cast<__m256i*>(row + 8), _mm256_sub_epi32(hi, s1));
         }
 
-#define SLM_VNNI_GEMM(NAME, TARGET, STEP)                                                                   \
+        // The four products of each 32-bit lane in AVX2: pairs summed into 16 bits, then into 32.
+        SLM_AVX2 inline __m256i bytes_avx2 (__m256i acc, __m256i x, __m256i w)
+        {
+            return _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_maddubs_epi16(x, w), _mm256_set1_epi16(1)));
+        }
+
+#define SLM_BYTE_GEMM(NAME, TARGET, STEP)                                                                   \
         TARGET inline __m256i NAME##_step (__m256i acc, __m256i x, __m256i w) { return STEP(acc, x, w); }   \
         TARGET inline __m256i NAME##_load (const uint8_t* p)                                                \
         {                                                                                                   \
@@ -2550,10 +2971,12 @@ namespace tok_codec
             }                                                                                               \
         }
 
-        SLM_VNNI_GEMM(vnni512, SLM_AVX512_VNNI, _mm256_dpbusd_epi32)
-        SLM_VNNI_GEMM(vnni256, SLM_AVX_VNNI, _mm256_dpbusd_avx_epi32)
-#undef SLM_VNNI_GEMM
+        SLM_BYTE_GEMM(avx2_bytes, SLM_AVX2, bytes_avx2)
+#if SLM_VNNI_KERNELS
+        SLM_BYTE_GEMM(vnni512, SLM_AVX512_VNNI, _mm256_dpbusd_epi32)
+        SLM_BYTE_GEMM(vnni256, SLM_AVX_VNNI, _mm256_dpbusd_avx_epi32)
 #endif
+#undef SLM_BYTE_GEMM
 #undef SLM_INT_TILE
 #endif
     }
@@ -2636,6 +3059,10 @@ namespace tok_codec
             else wout = read_int_matrix(in, s.dim, s.vocab);
             bout = read_vector(in, s.vocab);
             shape_ = s;
+            wide = !wout.small;
+            for (const auto& b : blocks)
+                for (const int_matrix* m : { &b.wq, &b.wk, &b.wv, &b.wo, &b.wa, &b.wb, &b.wd })
+                    wide = wide || !m->small;
 
             // Rotations of the relative positions 0 .. 2 * window - 1. The training layer forms
             // each angle in single precision, and so does this table.
@@ -2674,7 +3101,7 @@ namespace tok_codec
         {
             const int V = shape_.vocab;
             float* b = &adapted[static_cast<size_t>(sid) * V];
-            for (int i = 0; i < V; ++i) b[i] -= ADAPT_RATE * p[i];
+            kernels::descend(b, p, ADAPT_RATE, V);
             b[t] += ADAPT_RATE;
         }
 
@@ -2726,59 +3153,61 @@ namespace tok_codec
                     for (int g = 0; g < s.kv_heads; ++g) rotate(kn + g * HD, rel, half, rotated + g * HD);
                     for (int i = 0; i < KVD; ++i) kt[static_cast<size_t>(i) * W + slot] = rotated[i];
 
+                    // Scores of all the cached keys, accumulated over the head dimension, then the
+                    // weighted values; the query heads of a key-value head read its keys and
+                    // values together when there are two of them.
                     float* ctx_row = &ctx[static_cast<size_t>(r) * QD];
-                    for (int hh = 0; hh < s.heads; ++hh) {
-                        const int g = hh / R;
-                        float qr[256];
-                        rotate(&q[static_cast<size_t>(r) * QD + hh * HD], rel, half, qr);
-                        // Scores of all the cached keys, accumulated over the head dimension.
-                        float* sc = att.data();
-                        kernels::scores(qr, kt + static_cast<size_t>(g * HD) * W, W, HD, cnt, sc);
-                        float mx = -3.0e38f;
-                        for (int j = 0; j < cnt; ++j) { sc[j] *= scale; mx = sc[j] > mx ? sc[j] : mx; }
-                        for (int j = 0; j < cnt; ++j) sc[j] = det::expf(sc[j] - mx);
-                        const float inv = 1.0f / sum(sc, cnt);
-                        for (int j = 0; j < cnt; ++j) sc[j] *= inv;
-                        kernels::weighted_sum(sc, vr + g * HD, KVD, cnt, HD, ctx_row + hh * HD);
+                    for (int g = 0; g < s.kv_heads; ++g) {
+                        const float* keys = kt + static_cast<size_t>(g * HD) * W;
+                        const float* values = vr + g * HD;
+                        int hh = g * R;
+                        if (R == 2) {
+                            float q0[256], q1[256];
+                            rotate(&q[static_cast<size_t>(r) * QD + hh * HD], rel, half, q0);
+                            rotate(&q[static_cast<size_t>(r) * QD + (hh + 1) * HD], rel, half, q1);
+                            float* sc0 = att.data();
+                            float* sc1 = att.data() + W;
+                            kernels::scores2(q0, q1, keys, W, HD, cnt, sc0, sc1);
+                            kernels::attention_weights(sc0, cnt, scale);
+                            kernels::attention_weights(sc1, cnt, scale);
+                            kernels::weighted_sum2(sc0, sc1, values, KVD, cnt, HD, ctx_row + hh * HD,
+                                ctx_row + (hh + 1) * HD);
+                            continue;
+                        }
+                        for (; hh < (g + 1) * R; ++hh) {
+                            float qr[256];
+                            rotate(&q[static_cast<size_t>(r) * QD + hh * HD], rel, half, qr);
+                            float* sc = att.data();
+                            kernels::scores(qr, keys, W, HD, cnt, sc);
+                            kernels::attention_weights(sc, cnt, scale);
+                            kernels::weighted_sum(sc, values, KVD, cnt, HD, ctx_row + hh * HD);
+                        }
                     }
                 }
 
                 quantize(ctx.data(), n, QD);
                 gemm(n, b.wo, o.data());
-                for (size_t i = 0; i < static_cast<size_t>(n) * D; ++i) x[i] += o[i];
+                kernels::accumulate(x.data(), o.data(), nullptr, n * D);
 
                 rms_norm(x.data(), b.g2.data(), n, D, h.data());
                 quantize(h.data(), n, D);
                 gemm(n, b.wa, fa.data());
                 gemm(n, b.wb, fb.data());
-                for (int r = 0; r < n; ++r) {
-                    float* pa = &fa[static_cast<size_t>(r) * F];
-                    const float* pb = &fb[static_cast<size_t>(r) * F];
-                    for (int i = 0; i < F; ++i) {
-                        const float za = pa[i] + b.ba[i];
-                        pa[i] = (pb[i] + b.bb[i]) * (za / (1.0f + det::expf(-za)));
-                    }
-                }
+                for (int r = 0; r < n; ++r)
+                    kernels::swiglu(&fa[static_cast<size_t>(r) * F], &fb[static_cast<size_t>(r) * F], b.ba.data(),
+                        b.bb.data(), F);
                 quantize(fa.data(), n, F);
                 gemm(n, b.wd, o.data());
                 for (int r = 0; r < n; ++r)
-                    for (int i = 0; i < D; ++i)
-                        x[static_cast<size_t>(r) * D + i] += o[static_cast<size_t>(r) * D + i] + b.bd[i];
+                    kernels::accumulate(&x[static_cast<size_t>(r) * D], &o[static_cast<size_t>(r) * D], b.bd.data(), D);
             }
 
             rms_norm(x.data(), gf.data(), n, D, h.data());
             quantize(h.data(), n, D);
             gemm(n, wout, logits.data());
-            for (int r = 0; r < n; ++r) {
-                float* lg = &logits[static_cast<size_t>(r) * V];
-                float* pr = probs + static_cast<size_t>(r) * V;
-                const float* ab = &adapted[static_cast<size_t>(ids[r]) * V];
-                float mx = -3.0e38f;
-                for (int i = 0; i < V; ++i) { lg[i] += bout[i] + ab[i]; mx = lg[i] > mx ? lg[i] : mx; }
-                for (int i = 0; i < V; ++i) pr[i] = det::expf(lg[i] - mx);
-                const float inv = 1.0f / sum(pr, V);
-                for (int i = 0; i < V; ++i) pr[i] *= inv;
-            }
+            for (int r = 0; r < n; ++r)
+                kernels::distribution(&logits[static_cast<size_t>(r) * V], bout.data(),
+                    &adapted[static_cast<size_t>(ids[r]) * V], V, probs + static_cast<size_t>(r) * V);
             for (int r = 0; r < n; ++r) ++position[ids[r]];
         }
 
@@ -2828,7 +3257,7 @@ namespace tok_codec
             k.resize(rows * s.kv_dim()); v.resize(rows * s.kv_dim());
             fa.resize(rows * s.ffn); fb.resize(rows * s.ffn);
             logits.resize(rows * s.vocab);
-            att.resize(s.window);
+            att.resize(2 * static_cast<size_t>(s.window));
         }
 
         // Rotates every cached key of a stream to its position relative to the new base.
@@ -2850,24 +3279,12 @@ namespace tok_codec
             }
         }
 
-        // Sums with eight interleaved partial sums, combined in a fixed order.
-        static float sum (const float* a, int n)
-        {
-            float acc[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
-            int i = 0;
-            for (; i + 8 <= n; i += 8)
-                for (int j = 0; j < 8; ++j) acc[j] += a[i + j];
-            for (int j = 0; i < n; ++i, ++j) acc[j] += a[i];
-            return ((acc[0] + acc[1]) + (acc[2] + acc[3])) + ((acc[4] + acc[5]) + (acc[6] + acc[7]));
-        }
-
         void rms_norm (const float* in, const float* gain, int n, int d, float* out) const
         {
             for (int r = 0; r < n; ++r) {
                 const float* row = in + static_cast<size_t>(r) * d;
-                float* dst = out + static_cast<size_t>(r) * d;
                 const float inv = 1.0f / std::sqrt(kernels::dot(row, row, d) / static_cast<float>(d) + eps);
-                for (int i = 0; i < d; ++i) dst[i] = row[i] * inv * gain[i];
+                kernels::scale_by_gain(row, inv, gain, d, out + static_cast<size_t>(r) * d);
             }
         }
 
@@ -2894,22 +3311,17 @@ namespace tok_codec
             xs.resize(n);
             for (int r = 0; r < n; ++r) {
                 const float* row = in + static_cast<size_t>(r) * kdim;
-                float mx = 0.0f;
-                for (int i = 0; i < kdim; ++i) mx = std::max(mx, std::fabs(row[i]));
+                const float mx = kernels::max_abs(row, kdim);
                 xs[r] = mx / 127.0f;
                 if (!(mx > 0.0f)) continue;
-                const float inv = 127.0f / mx;
-                int8_t* q8 = &xq[static_cast<size_t>(r) * kpad];
-                for (int i = 0; i < kdim; ++i) {
-                    const float magic = 12582912.0f;    // 1.5 * 2^23: rounds to the nearest integer, ties to even
-                    q8[i] = static_cast<int8_t>((row[i] * inv + magic) - magic);
-                }
+                kernels::round_to_bytes(row, 127.0f / mx, kdim, &xq[static_cast<size_t>(r) * kpad]);
             }
-            if (vnni_paths()) {
+            // The byte products read the inputs as unsigned bytes, the AVX2 ones of 8-bit weights as 16-bit integers.
+            if (vnni_paths() || kernels::vector_paths()) {
                 xu.resize(xq.size());
-                for (size_t i = 0; i < xq.size(); ++i) xu[i] = static_cast<uint8_t>(xq[i] + 128);
+                kernels::to_unsigned(xq.data(), xq.size(), xu.data());
             }
-            else if (kernels::vector_paths()) {
+            if (!vnni_paths() && kernels::vector_paths() && wide) {
                 x16.resize(xq.size());
                 for (size_t i = 0; i < xq.size(); ++i) x16[i] = xq[i];
             }
@@ -2929,17 +3341,17 @@ namespace tok_codec
             else if (processor().avx_vnni) kernels_int::vnni256(xu.data(), n, w, acc.data());
             else
 #endif
-            if (kernels::vector_paths()) kernels_int::avx2(x16.data(), n, w, acc.data());
+            if (kernels::vector_paths()) {
+                if (w.small) kernels_int::avx2_bytes(xu.data(), n, w, acc.data());
+                else kernels_int::avx2(x16.data(), n, w, acc.data());
+            }
             else kernels_int::portable(xq.data(), n, w, acc.data());
 #else
             kernels_int::portable(xq.data(), n, w, acc.data());
 #endif
-            for (int r = 0; r < n; ++r) {
-                const float sx = xs[r];
-                const int32_t* a = &acc[static_cast<size_t>(r) * w.cols];
-                float* o = out + static_cast<size_t>(r) * w.cols;
-                for (int c = 0; c < w.cols; ++c) o[c] = static_cast<float>(a[c]) * (sx * w.scale[c]);
-            }
+            for (int r = 0; r < n; ++r)
+                kernels::rescale(&acc[static_cast<size_t>(r) * w.cols], xs[r], w.scale.data(), w.cols,
+                    out + static_cast<size_t>(r) * w.cols);
         }
 
         engine_shape shape_;
@@ -2960,6 +3372,7 @@ namespace tok_codec
         std::vector<int16_t> x16;
         std::vector<float> xs;
         std::vector<int32_t> acc;
+        bool wide = false;             // some weights exceed 63 in magnitude: the AVX2 path also needs x16
     };
 
     // ----------------------------------------------------------------------------------------
@@ -3236,11 +3649,9 @@ namespace tok_codec
                 cum[0] = 0.0;
                 for (int r = 0; r < n_voc; ++r) cum[r + 1] = cum[r] + p[data.vocab.token_at(r)];
                 // The network's most likely token and what it would cost, which the context models use.
-                float top = p[0];
-                int top_id = 0;
-                for (int r = 1; r < V; ++r) if (p[r] > top) { top = p[r]; top_id = r; }
+                const int top_id = kernels::first_max(p, V);
                 const double top_bits =
-                    -det::log(std::max(1e-30, static_cast<double>(top) / cum[n_voc])) / 0.69314718055994530942;
+                    -det::log(std::max(1e-30, static_cast<double>(p[top_id]) / cum[n_voc])) / 0.69314718055994530942;
                 model.network_top(s, top_id, static_cast<int>(std::min(31.0, det::round_even(4.0 * top_bits))));
                 const int want = encoding ? tokens[s][done[s]] : -1;
                 const int t = code_token(side, model, data.vocab, s, cum.data(), want);
@@ -3610,7 +4021,9 @@ static int compress_command (const std::string& input, const std::string& output
         << (data.folds() ? ", folded capitals" : "")
         << "\n  streams : " << plan.streams() << "\n  tables  : 2^" << plan.table_bits << " four-byte units per model";
     if (pages > 0) std::cout << "\n  pages   : " << pages << ", coded grouped by category";
-    std::cout << std::endl;
+    const std::string& brand = dlib::get_cpu_features().brand;
+    std::cout << "\n  kernels : " << (brand.empty() ? std::string("this processor") : brand) << ", products in "
+        << tok_codec::product_kernels() << std::endl;
 
     progress_start = std::chrono::steady_clock::now();
     tok_codec::coding_stats stats;

@@ -43,6 +43,7 @@ add_executable(${target_name} main.cpp tester.cpp
    config_reader.cpp
    constexpr_if.cpp
    correlation_tracker.cpp
+   cpu_features.cpp
    crc32.cpp
    create_iris_datafile.cpp
    data_io.cpp
