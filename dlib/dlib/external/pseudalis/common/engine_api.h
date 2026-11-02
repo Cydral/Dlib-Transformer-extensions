@@ -19,7 +19,6 @@
         "operation"     "anonymize", "restore", "anonymize_text", "restore_text" or "detect"
         "name"          the name of the file, whose extension tells its kind when its
                         content does not
-        "pdf_layout"    false to rebuild the PDF files as text only (true by default)
     result receives a JSON object: "name" (the name of the output: "photo.png.txt" for a
     picture), "kind" ("txt", "csv", "xml", "docx", "xlsx", "pptx", "pdf", "image", "zip",
     "tar", "tar.gz" or "text"), "report" ({"values": {type: count}, "removed": [...],

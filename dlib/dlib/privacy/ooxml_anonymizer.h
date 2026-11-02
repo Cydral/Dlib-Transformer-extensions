@@ -310,11 +310,14 @@ namespace dlib
 
         void set_image_describer(const document_image_describer& describer) { describer_ = describer; }
 
+        void set_package_limits(const zip_limits& limits) { limits_ = limits; }
+        const zip_limits& package_limits() const { return limits_; }
+
         std::string anonymize(const std::string& package_bytes)
         {
             if (!detector_)
                 throw error("ooxml_anonymizer::anonymize(): a detector is required");
-            ooxml_package pkg(package_bytes);
+            ooxml_package pkg(package_bytes, limits_);
             restoring_ = false;
             run(pkg);
             return pkg.save();
@@ -322,7 +325,7 @@ namespace dlib
 
         std::string restore(const std::string& package_bytes)
         {
-            ooxml_package pkg(package_bytes);
+            ooxml_package pkg(package_bytes, limits_);
             restoring_ = true;
             run(pkg);
             return pkg.save();
@@ -2243,6 +2246,7 @@ namespace dlib
         bool restoring_ = false;
         bool shift_dates_ = false;
         document_image_describer describer_;
+        zip_limits limits_;
         const ooxml_package* pkg_ = nullptr;
         std::map<std::string, std::string> described_;     // image part -> text of the describer
         bool dates_marked_ = false;

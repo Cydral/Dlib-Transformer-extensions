@@ -93,7 +93,9 @@ namespace dlib
                 byte takes the prediction of the window in which it is most central.
 
             THREAD SAFETY
-                find() may be called from several threads; calls are serialized.
+                find() may be called from several threads at once: each call runs a copy of
+                the network of its own, kept for the calls that follow (16 at most).  The
+                other members are serialized.
         !*/
     public:
         static constexpr long num_classes = 15;  // pii_bio_class_count()

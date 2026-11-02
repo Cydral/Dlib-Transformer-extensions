@@ -152,11 +152,51 @@ namespace pseudalis
             return out.empty() ? L"error " + std::to_wstring(e) : out;
         }
 
+        // What tells that a file changed: its identity, its size and the time of its last write.
+        struct file_stamp
+        {
+            DWORD volume = 0, index_high = 0, index_low = 0, size_high = 0, size_low = 0;
+            FILETIME written = {};
+
+            bool operator==(const file_stamp& o) const
+            {
+                return volume == o.volume && index_high == o.index_high && index_low == o.index_low &&
+                    size_high == o.size_high && size_low == o.size_low &&
+                    written.dwLowDateTime == o.written.dwLowDateTime &&
+                    written.dwHighDateTime == o.written.dwHighDateTime;
+            }
+        };
+
+        bool stamp_of(HANDLE h, file_stamp& s)
+        {
+            BY_HANDLE_FILE_INFORMATION i;
+            if (!GetFileInformationByHandle(h, &i)) return false;
+            s.volume = i.dwVolumeSerialNumber;
+            s.index_high = i.nFileIndexHigh;
+            s.index_low = i.nFileIndexLow;
+            s.size_high = i.nFileSizeHigh;
+            s.size_low = i.nFileSizeLow;
+            s.written = i.ftLastWriteTime;
+            return true;
+        }
+
+        // Whether path is still the file read, as it was read.
+        bool unchanged(const std::wstring& path, const file_stamp& read)
+        {
+            HANDLE h = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
+            if (h == INVALID_HANDLE_VALUE) return false;
+            file_stamp now;
+            const bool same = stamp_of(h, now) && now == read;
+            CloseHandle(h);
+            return same;
+        }
+
         /*
-            Reads a whole file, which no other program may write meanwhile; error receives the
-            code of Windows.
+            Reads a whole file, which no other program may write meanwhile, and its stamp, which
+            tells later whether it changed since; error receives the code of Windows.
         */
-        bool read_whole(const std::wstring& path, std::string& data, DWORD& error)
+        bool read_whole(const std::wstring& path, std::string& data, file_stamp& stamp, DWORD& error)
         {
             HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
                 FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
@@ -166,7 +206,7 @@ namespace pseudalis
                 return false;
             }
             LARGE_INTEGER size = {};
-            bool ok = GetFileSizeEx(h, &size) != 0;
+            bool ok = GetFileSizeEx(h, &size) != 0 && stamp_of(h, stamp);
             if (ok && static_cast<uint64_t>(size.QuadPart) > max_file_bytes)
             {
                 error = ERROR_FILE_TOO_LARGE;
@@ -190,9 +230,10 @@ namespace pseudalis
         }
 
         // Writes a new file, which must not exist, flushed to the disk.
-        bool write_new(const std::wstring& path, const std::string& data, DWORD& error)
+        bool write_new(const std::wstring& path, const std::string& data, DWORD& error,
+                       DWORD attributes = FILE_ATTRIBUTE_NORMAL)
         {
-            HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+            HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, attributes, nullptr);
             if (h == INVALID_HANDLE_VALUE)
             {
                 error = GetLastError();
@@ -214,27 +255,60 @@ namespace pseudalis
             return ok;
         }
 
+        // Deletes a file, a few times when another program holds it a moment (an antivirus).
+        bool delete_soon(const std::wstring& path)
+        {
+            for (int attempt = 0; attempt < 10; ++attempt)
+            {
+                if (DeleteFileW(path.c_str()) || GetLastError() == ERROR_FILE_NOT_FOUND) return true;
+                Sleep(200);
+            }
+            return false;
+        }
+
         /*
-            Puts data in the place of the file path: written beside it, then exchanged with it
-            by ReplaceFile, which keeps its attributes, its permissions and its object
-            identifier.
+            Puts data in the place of the file path: written beside it, hidden, then exchanged
+            with it by ReplaceFile, which keeps its attributes, its permissions and its object
+            identifier.  The previous content goes through a backup file, deleted at once,
+            which also keeps it when ReplaceFile fails halfway: the file then comes back in its
+            place, so that no failure ever loses it.
         */
         bool replace_content(const std::wstring& path, const std::string& data, DWORD& error)
         {
             const size_t slash = path.find_last_of(L'\\');
             const std::wstring dir = slash == std::wstring::npos ? L"." : path.substr(0, slash);
-            const std::wstring temp = dir + L"\\~pseudalis-" + widen(random_hex(8)) + L".tmp";
-            if (!write_new(temp, data, error)) return false;
+            const std::wstring stem = dir + L"\\~pseudalis-" + widen(random_hex(8));
+            const std::wstring temp = stem + L".tmp", backup = stem + L".bak";
+            if (!write_new(temp, data, error, FILE_ATTRIBUTE_HIDDEN)) return false;
             for (int attempt = 0; attempt < 10; ++attempt)
             {
-                if (ReplaceFileW(path.c_str(), temp.c_str(), nullptr, REPLACEFILE_IGNORE_MERGE_ERRORS, nullptr,
+                if (ReplaceFileW(path.c_str(), temp.c_str(), backup.c_str(), REPLACEFILE_IGNORE_MERGE_ERRORS, nullptr,
                         nullptr))
+                {
+                    delete_soon(backup);
                     return true;
+                }
                 error = GetLastError();
+                /*
+                    1177: the file lies under the name of the backup, the new content under its
+                    own name: the new content takes the place, else the file comes back.
+                */
+                if (error == ERROR_UNABLE_TO_MOVE_REPLACEMENT_2)
+                {
+                    if (MoveFileExW(temp.c_str(), path.c_str(), MOVEFILE_WRITE_THROUGH))
+                    {
+                        delete_soon(backup);
+                        return true;
+                    }
+                    error = GetLastError();
+                    MoveFileExW(backup.c_str(), path.c_str(), MOVEFILE_WRITE_THROUGH);
+                    break;
+                }
+                // 1175 and 1176 with a backup named: both files keep their names.
                 if (!sharing_error(error) && error != ERROR_ACCESS_DENIED) break;
                 Sleep(200);
             }
-            DeleteFileW(temp.c_str());
+            delete_soon(temp);
             return false;
         }
 
@@ -359,7 +433,7 @@ namespace pseudalis
                 if (!supported_name(name)) return failure(name, tr("shell_unsupported", { { "f", name } }));
                 std::string data;
                 DWORD e = 0;
-                if (!read_whole(path, data, e))
+                if (!read_whole(path, data, stamp_, e))
                 {
                     if (sharing_error(e)) return failure(name, tr("shell_in_use", { { "f", name } }));
                     return failure(name, tr("shell_cannot_read", { { "f", name },
@@ -399,6 +473,8 @@ namespace pseudalis
                 {
                     const std::string wanted = copy_ ? copy_name(name, made, tr_utf8("suffix_anonymized")) : made;
                     target = widen(join_path(dir, free_name(dir, wanted)));
+                    if (!copy_ && !unchanged(path, stamp_))
+                        return failure(name, tr("shell_changed", { { "f", name } }));
                     if (!write_new(target, a.body, e))
                         return failure(name, tr("shell_cannot_write", { { "f", narrow(file_of(target)) },
                             { "e", narrow(system_message(e)) } }));
@@ -406,6 +482,11 @@ namespace pseudalis
                     if (!copy_ && !DeleteFileW(path.c_str()))
                         return failure(name, tr("shell_cannot_write", { { "f", name },
                             { "e", narrow(system_message(GetLastError())) } }));
+                }
+                else if (!unchanged(path, stamp_))
+                {
+                    // Saved meanwhile: its new content is not the one protected, and stays.
+                    return failure(name, tr("shell_changed", { { "f", name } }));
                 }
                 else if (!replace_content(path, a.body, e))
                 {
@@ -467,12 +548,18 @@ namespace pseudalis
                 {
                     const std::string wanted = copy_ ? copy_name(base, base, tr_utf8("suffix_restored")) : base;
                     target = widen(join_path(dir, free_name(dir, wanted)));
+                    if (!copy_ && !unchanged(path, stamp_))
+                        return failure(name, tr("shell_changed", { { "f", name } }));
                     if (!write_new(target, a.body, e))
                         return failure(name, tr("shell_cannot_write", { { "f", narrow(file_of(target)) },
                             { "e", narrow(system_message(e)) } }));
                     if (!copy_ && !DeleteFileW(path.c_str()))
                         return failure(name, tr("shell_cannot_write", { { "f", name },
                             { "e", narrow(system_message(GetLastError())) } }));
+                }
+                else if (!unchanged(path, stamp_))
+                {
+                    return failure(name, tr("shell_changed", { { "f", name } }));
                 }
                 else if (!replace_content(path, a.body, e))
                 {
@@ -493,6 +580,7 @@ namespace pseudalis
             }
 
             bool copy_;
+            file_stamp stamp_;      // of the file being processed, as it was read
             service_client client_;
             bool online_ = false;
             std::string offline_error_;

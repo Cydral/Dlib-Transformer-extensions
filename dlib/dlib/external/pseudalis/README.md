@@ -7,11 +7,11 @@ comes back on demand from any copy of its anonymized file. It is built on
 [`dlib/privacy`](../../privacy.h) and on the recognizers trained for the example
 [`slm_document_anonymizer_ex`](../../../examples/slm_document_anonymizer_ex.cpp), which its engines carry.
 
-Pseudalis is written by Aldric Pierrain, Copyright (C) 2026 Cydral Technology, and distributed under the
-Boost Software License 1.0 ([`resources/license.txt`](resources/license.txt)). Its drive relies on
-WinFsp - Windows File System Proxy, Copyright (C) Bill Zissimopoulos,
-[github.com/winfsp/winfsp](https://github.com/winfsp/winfsp), which its installer carries unchanged and
-installs when it is missing.
+Pseudalis Community, the edition published here, is written by Aldric Pierrain, Copyright (C) 2026
+Cydral Technology, and distributed under the Boost Software License 1.0
+([`resources/license.txt`](resources/license.txt)). Its drive relies on WinFsp - Windows File System
+Proxy, Copyright (C) Bill Zissimopoulos, [github.com/winfsp/winfsp](https://github.com/winfsp/winfsp),
+which its installer carries unchanged and installs when it is missing (see Editions and licenses).
 
 ## What it does
 
@@ -59,8 +59,12 @@ Pseudalis with four commands, which `pseudalis.exe` carries out through the serv
 
 The suffixes follow the language of the installation. The original of an anonymized file is found by
 the SHA-256 of its content, and by the NTFS object identifier of the file, which the command records
-with its place; a file edited since its anonymization gets its values back from its tags. A file of the
-drive is anonymized already: Restore asks where to save its original, outside the drive. The same
+with its place; a file edited since its anonymization gets its values back from its tags. A file whose
+original was forgotten, from the web application or at the end of its time once its file left the
+drive, is no longer restored at all, from its tags either: Restore says so, with the date (HTTP 410,
+codes `original_forgotten` and `original_expired`). A file saved by another program while a command
+processes it stays as it is, and the command says so. A file of the drive is anonymized already:
+Restore asks where to save its original, outside the drive. The same
 program runs from a prompt, `pseudalis protect [--copy] <file>...` and
 `pseudalis restore [--copy] <file>...`, its results printed there (`start /wait pseudalis ...` waits
 for them).
@@ -81,9 +85,9 @@ icon receive in the fragment of their address and use by themselves.
 | `POST /v1/anonymize?name=&record=&format=` | anonymizes the file of the body; the answer is the file, or JSON with `format=json` |
 | `POST /v1/restore?name=&object_id=&format=` | restores the file of the body: its original, its picture or its tags |
 | `GET /v1/lookup?sha256=&object_id=` | whether a file is an anonymized file of this computer |
-| `POST /v1/records/{id}/location` | records where an anonymized file was written |
+| `POST /v1/records/{id}/location` | records where an anonymized file was written (token) |
 | `POST /v1/text/anonymize`, `/restore`, `/detect` | the same protection on a text, `{"text": ...}` |
-| `GET /v1/drive`, `GET /v1/events?since=` | the drive, the files it protected or refused |
+| `GET /v1/drive`, `GET /v1/events?since=` | the drive, the files it protected or refused (token for the events) |
 | `GET /v1/albireo` | whether Albireo describes the pictures |
 | `GET /v1/records`, `GET /v1/records/{id}/original`, `DELETE /v1/records/{id}` | the originals kept (token) |
 | `GET /v1/settings`, `PUT /v1/settings`, `POST /v1/restart` | the settings and the restart (token) |
@@ -113,8 +117,13 @@ restoring the text file gives the picture back. The setting `albireo` turns the 
 ### Languages
 
 The installer, the icon, the commands of the Explorer and the web application speak English, French,
-German, Italian and Spanish, English by default; the installer takes the language of Windows, and the
-setting `language` changes it afterwards.
+German, Italian and Spanish, and English for any other language. They follow the language of the
+system: the icon and the commands of each user take the language of that user's Windows, the web
+application the first language of the browser that it speaks (its menu chooses another one, kept by the
+browser), and the installer the language of Windows, which its first page changes. The setting
+`language`, `auto` by default, sets one language for every user instead; a language chosen in the
+installer other than the one of Windows becomes that setting. The errors of the service reach the web
+application and the windows as codes, written in their language.
 
 ## Programs and data
 
@@ -148,11 +157,31 @@ The data lie in `%ProgramData%\Pseudalis`, or in the folder chosen at the instal
   addresses, whose key is never written and whose server key is encrypted with DPAPI. Requests whose
   `Host` is not local, and requests of another origin, are refused, so that no web page reads or changes
   anything through the browser.
-- The model of Pseudalis is the workstation of one user. Every program of the users of the computer
-  reaches the interface, and the token of administration lies in the data folder, readable by them: a
-  user of the computer can restore any anonymized file. On a computer shared by several people, each one
-  needs an installation of their own, on a computer of their own.
+- The service serves several sessions and users at once: each request and each file of the drive is
+  processed on a thread of its own, the engine runs its recognizers for several files at once, and the
+  locks of the service are taken in one order, without wait on the network or on a client while held.
+  The files and texts of the interface processed at once are bounded by the processors and the memory
+  (half the processors, 2 to 8): a request that finds no free slot within a minute gets 503 and
+  `Retry-After`. A body larger than its route takes is refused before it is read (413).
+- An archive or an Office document may decompress 64 times its size at most, from 16 MB to 2 GB, all
+  levels together, and each part of an Office document 32 times the document at most, from 32 MB: a
+  small file that would hold gigabytes of text is refused. A text is analyzed in pieces of 64 KB, so
+  that its memory stays bounded whatever its length.
+- The trust model is the computer: every user of the computer shares its key, its originals and its
+  administration. Every program of the users reaches the interface, and the token of administration
+  lies in the data folder, readable by the interactive users: a user of the computer can restore any
+  anonymized file, read the records and export the key. People who must not see each other's documents
+  need an installation each, on computers of their own.
 - The drive gives its files to the interactive users, SYSTEM and the administrators.
+- The icon and the commands reach the service on 127.0.0.1 alone, and open its pages at
+  `https://127.0.0.1:8444`: `localhost` may resolve to `::1` first, where another account could
+  listen.
+- Albireo describes the pictures only when its data folder is the one its installer recorded in
+  `HKLM\Software\Albireo`, and when that folder, its certificates, its authority and its settings
+  belong to SYSTEM or the administrators: any user can create a folder in `%ProgramData%`, which would
+  otherwise receive the pictures of every user.
+- The messages, the answers and the logs of the updates never name the places of the publication; the
+  settings name them only when they differ from those of the build.
 
 ## Choices made from the specification
 
@@ -163,7 +192,8 @@ The data lie in `%ProgramData%\Pseudalis`, or in the folder chosen at the instal
   of a file that leaves the drive stays in the vault for `removed_days` days, which the records of the
   web application show, then goes, or at once when it is forgotten there: gone with its file, it would
   leave the copy restorable from its tags alone, without its pictures and the parts the protection
-  removed.
+  removed. Once an original is forgotten, its protected file is refused by Restore: the database keeps
+  its SHA-256 and its object identifier, never its content.
 - A file of a kind Pseudalis does not process is refused on the drive at its creation, rather than
   kept unprotected; the temporary files of Office are among them, so that documents are edited outside
   the drive and copied onto it.
@@ -173,7 +203,14 @@ The data lie in `%ProgramData%\Pseudalis`, or in the folder chosen at the instal
   only takes the commands of packaged applications.
 - The service listens on port 8444, beside Albireo on 8443, with the same stack: dlib, cpp-httplib and
   Mbed TLS.
-- WinFsp stays installed when Pseudalis is uninstalled, since other programs may use it.
+- The WinFsp that Pseudalis installs belongs to it: hidden from the installed programs of Windows, it
+  leaves when Pseudalis is uninstalled, unless another program registered a file system with the
+  launcher of WinFsp since; it then stays and shows again among the installed programs. A WinFsp found
+  in place stays the user's: Pseudalis updates it when it is older, and never removes it. Without
+  WinFsp, removed by other means, Pseudalis works without its drive, and the icon and the web
+  application say to run the installer again, which installs it.
+- A PDF always keeps its pages: the text is drawn again in place, the option of a PDF rebuilt as text
+  alone is gone.
 
 ## Installing
 
@@ -185,13 +222,16 @@ the letter of the drive and the options. Without window:
 
 ```
 pseudalis-setup /silent [/dir <folder>] [/data-dir <folder>] [/drive <letter>|none] [/port <port>] [/no-context-menu]
-pseudalis-setup /uninstall [/silent] [/keep-data]
+pseudalis-setup /uninstall [/silent] [/purge]
 pseudalis-setup /service start|stop|restart
 ```
 
-The uninstallation removes the programs and, unless the key and the originals are kept for a later
-installation (`/keep-data`, or the option of the wizard), the data: the documents anonymized with that
-key can then no longer be restored.
+The uninstallation removes the programs and keeps the key, the originals and the settings for a later
+installation, unless the option of the wizard is unticked or `/purge` is given: the documents
+anonymized with that key can then no longer be restored. A tool of deployment that uninstalls before it
+installs again (`QuietUninstallString`) therefore never takes them. The uninstaller left in the folder
+of the programs is a copy of the very program that installed them, held from its start so that no
+other account replaces it meanwhile.
 
 ## Building
 
@@ -258,11 +298,34 @@ services read the feed of the link first, then the one of GitHub, check its sign
 installer in the background, check its size and its SHA-256, and install it at the next start of the
 service, or at once from the menu of the icon.
 
+## Editions and licenses
+
+- Pseudalis Community is free and open source software under the Boost Software License 1.0, as dlib
+  and Dlib-Transformer-extensions are; its components keep their licenses: Mbed TLS (Apache 2.0),
+  cpp-httplib (MIT), SQLite (public domain), zlib (zlib License), Swagger UI (Apache 2.0).
+- WinFsp is distributed under the GPLv3 with a FLOSS exception of its author: software under a license
+  that meets the Free Software Definition or the Open Source Definition may link the library of WinFsp
+  and distribute its unmodified installer, provided it shows "WinFsp - Windows File System Proxy,
+  Copyright (C) Bill Zissimopoulos" and a link to its repository in its user interface and its user
+  documentation, and is neither linked nor distributed with proprietary software. Pseudalis Community
+  meets them: its license; the notice in the About window, the web application, the license page of the
+  installer, `licenses\winfsp.txt` and this file; the installer of WinFsp 2.1 (build 2.1.25156) as its
+  project released it, checked against its SHA-256 by the build; no proprietary component.
+  `licenses\winfsp-source.txt` says where the source of that version lies (GPLv3, section 6).
+- WinFsp itself is not modified: its kernel driver loads on Windows with the signature of its project
+  alone, and the exception covers its installer unmodified. The code of Pseudalis that drives it,
+  `host/drive_winfsp.cpp`, is checked against the headers and the rules of WinFsp 2.1.
+- An edition under a proprietary license, an edition for companies sold under its own terms for
+  instance, would no longer meet the exception for its drive: it would take a commercial license of
+  WinFsp from its author, or another file system. The other components allow it as they are.
+
 ## Limitations
 
 - The recognizers read French and English first; a document in another language keeps more values in
   clear. A protected document should be read again before it is shared.
 - A scanned page without text layer is kept as a gray box: no OCR is performed.
 - The drive takes files of 256 MB at most by default (`max_file_mb`).
+- The analysis reads some tens of kilobytes per second on each processor when nearly every word is
+  personal data: a text file of tens of megabytes takes minutes.
 - The protection is a pseudonymization in the sense of the GDPR: the key restores the data, which stay
   personal data for its holder.

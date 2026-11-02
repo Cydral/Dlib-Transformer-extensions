@@ -613,7 +613,12 @@ namespace dlib
                 const std::string t = attribute_tag(type, value);
                 if (decodes_to(t, value)) return t;
             }
-            const std::string cache_key = std::string(pii_type_keyword(type)) + '\x1F' + value;
+            /* The tags of the short values are kept, at most max_cache_bytes of them: a long
+               value is rare, and would hold memory and its clear text there. */
+            const bool cached = value.size() <= max_cached_value;
+            const std::string cache_key = cached ? std::string(pii_type_keyword(type)) + '\x1F' + value
+                                                 : std::string();
+            if (cached)
             {
                 std::lock_guard<std::mutex> lock(cache_mutex_);
                 const auto it = cache_.find(cache_key);
@@ -679,8 +684,9 @@ namespace dlib
                 if (!decodes_to(result, value))
                     throw crypto_error("pseudonymizer::tag(): the value cannot be encoded");
             }
+            if (!cached) return result;
             std::lock_guard<std::mutex> lock(cache_mutex_);
-            if (cache_.size() >= max_cache_entries) 
+            if (cache_.size() >= max_cache_entries || cache_bytes_ >= max_cache_bytes)
             {
                 for (auto& kv : cache_)
                 {
@@ -688,8 +694,9 @@ namespace dlib
                     if (!k.empty()) secure_wipe(&k[0], k.size());
                 }
                 cache_.clear();
+                cache_bytes_ = 0;
             }
-            cache_[cache_key] = result;
+            if (cache_.emplace(cache_key, result).second) cache_bytes_ += cache_key.size() + result.size();
             return result;
         }
 
@@ -840,6 +847,7 @@ namespace dlib
         bool decode_letters(const std::string& lower_letters, const std::string& tweak, std::string& plain) const
         {
             const std::size_t m = lower_letters.size();
+            if (m > max_decoded_letters) return false;
             std::size_t n = 0;
             if (m <= letter_lengths_.back())
             {
@@ -1051,6 +1059,7 @@ namespace dlib
         bool decode_opaque(const std::string& letters, const std::string& keyword, std::string& value) const
         {
             const std::size_t m = letters.size();
+            if (m > max_decoded_letters) return false;
             std::size_t n = 0;
             for (std::size_t k = 3; k < letter_lengths_.size() && n == 0; ++k)
                 if (letter_lengths_[k] == m) n = k;
@@ -1800,8 +1809,14 @@ namespace dlib
         long shift_years_ = 0;
         std::vector<std::size_t> letter_lengths_;
         static const std::size_t max_cache_entries = 1 << 16;
+        static const std::size_t max_cache_bytes = 16u << 20;
+        static const std::size_t max_cached_value = 256;
+        /* The longest code of letters decoded: FF1 costs the square of its length, and a tag
+           written by hand could be as long as a document. */
+        static const std::size_t max_decoded_letters = 16384;
         mutable std::mutex cache_mutex_;
         mutable std::unordered_map<std::string, std::string> cache_;
+        mutable std::size_t cache_bytes_ = 0;
     };
 
 // ----------------------------------------------------------------------------------------

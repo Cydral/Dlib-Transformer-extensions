@@ -1029,17 +1029,118 @@ namespace setup
         return left;
     }
 
+    namespace
+    {
+        HANDLE own_program = INVALID_HANDLE_VALUE;
+        std::string own_program_problem = "the file of the installer was not opened";
+
+        bool same_file(HANDLE a, HANDLE b)
+        {
+            BY_HANDLE_FILE_INFORMATION x, y;
+            return GetFileInformationByHandle(a, &x) && GetFileInformationByHandle(b, &y) &&
+                x.dwVolumeSerialNumber == y.dwVolumeSerialNumber && x.nFileIndexHigh == y.nFileIndexHigh &&
+                x.nFileIndexLow == y.nFileIndexLow;
+        }
+
+        // Copies the whole content of an open file into a new file.
+        bool copy_from_handle(HANDLE from, const std::wstring& to, std::string& error)
+        {
+            LARGE_INTEGER zero = {};
+            if (!SetFilePointerEx(from, zero, nullptr, FILE_BEGIN))
+            {
+                error = last_error("cannot read the file of the installer");
+                return false;
+            }
+            HANDLE out = CreateFileW(to.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+                nullptr);
+            if (out == INVALID_HANDLE_VALUE)
+            {
+                error = last_error("cannot write the uninstaller");
+                return false;
+            }
+            std::vector<char> buffer(1u << 20);
+            bool ok = true;
+            for (;;)
+            {
+                DWORD got = 0, put = 0;
+                if (!ReadFile(from, buffer.data(), static_cast<DWORD>(buffer.size()), &got, nullptr))
+                {
+                    ok = false;
+                    error = last_error("cannot read the file of the installer");
+                    break;
+                }
+                if (got == 0) break;
+                if (!WriteFile(out, buffer.data(), got, &put, nullptr) || put != got)
+                {
+                    ok = false;
+                    error = last_error("cannot write the uninstaller");
+                    break;
+                }
+            }
+            ok = ok && FlushFileBuffers(out);
+            CloseHandle(out);
+            if (!ok) DeleteFileW(to.c_str());
+            return ok;
+        }
+    }
+
+    void hold_own_program()
+    {
+        if (own_program != INVALID_HANDLE_VALUE) return;
+        // Read only, and shared for reading only: no rename, no deletion, no write until the end.
+        HANDLE h = CreateFileW(widen(executable_path()).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+            OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+        if (h == INVALID_HANDLE_VALUE)
+        {
+            own_program_problem = last_error("cannot open the file of the installer");
+            return;
+        }
+        /*
+            The file of the image of this process, by its device path, which follows the
+            renames: the file opened above must be that one, not a file put in its place
+            between the start of the process and its opening.
+        */
+        typedef DWORD (WINAPI* mapped_name)(HANDLE, LPVOID, LPWSTR, DWORD);
+        const mapped_name name_of = reinterpret_cast<mapped_name>(reinterpret_cast<void*>(
+            GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "K32GetMappedFileNameW")));
+        wchar_t device_path[2048];
+        const DWORD n = name_of ? name_of(GetCurrentProcess(), reinterpret_cast<LPVOID>(GetModuleHandleW(nullptr)),
+            device_path, 2048) : 0;
+        const std::wstring image_path = L"\\\\?\\GLOBALROOT" + std::wstring(device_path, n < 2048 ? n : 0);
+        HANDLE image = n > 0 && n < 2048 ? CreateFileW(image_path.c_str(), FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr)
+            : INVALID_HANDLE_VALUE;
+        if (image == INVALID_HANDLE_VALUE)
+        {
+            // A system that cannot name the file of the image (Wine, for one): the file held is the reference.
+            log("the file of the installer is held, its image could not be compared with it");
+            own_program = h;
+            return;
+        }
+        const bool same = same_file(h, image);
+        CloseHandle(image);
+        if (!same)
+        {
+            CloseHandle(h);
+            own_program_problem = "the file of the installer is no longer the program that runs";
+            log(own_program_problem);
+            return;
+        }
+        own_program = h;
+    }
+
     bool stage_uninstaller(const std::string& program_dir, staged_files& files, std::string& error)
     {
         const std::string self = executable_path();
         const std::string target = join_path(program_dir, "pseudalis-setup.exe");
         if (_wcsicmp(widen(self).c_str(), widen(target).c_str()) == 0) return true;
-        const std::wstring tmp = widen(files.add(target));
-        if (!CopyFileW(widen(self).c_str(), tmp.c_str(), FALSE))
+        if (own_program == INVALID_HANDLE_VALUE)
         {
-            if (error.empty()) error = last_error("cannot copy the uninstaller");
+            if (error.empty()) error = own_program_problem;
             return false;
         }
+        const std::wstring tmp = widen(files.add(target));
+        if (!copy_from_handle(own_program, tmp, error)) return false;
         // The copy keeps everything but the payload; when the payload cannot be removed,
         // the uninstaller is simply larger.
         HANDLE u = BeginUpdateResourceW(tmp.c_str(), FALSE);
@@ -1174,7 +1275,7 @@ namespace setup
         };
         const std::wstring dir = widen(program_dir);
         const std::wstring setup = L"\"" + widen(join_path(program_dir, "pseudalis-setup.exe")) + L"\"";
-        str(L"DisplayName", widen(PSEUDALIS_PRODUCT_NAME));
+        str(L"DisplayName", widen(PSEUDALIS_FULL_NAME));
         str(L"DisplayVersion", widen(PSEUDALIS_VERSION));
         str(L"Publisher", widen(PSEUDALIS_PUBLISHER));
         str(L"DisplayIcon", widen(join_path(program_dir, "pseudalis-tray.exe")) + L",0");
@@ -2040,6 +2141,111 @@ namespace setup
             const std::string dir = winfsp_dir();
             return dir.empty() ? std::string() : join_path(join_path(dir, "bin"), "winfsp-x64.dll");
         }
+
+        // The upgrade code that the installers of WinFsp keep from one version to the next.
+        const wchar_t* const winfsp_upgrade_code = L"{5466A3D8-3AA1-4240-B6A0-3A051940A3EC}";
+
+        /*
+            The product code of the WinFsp its installer installed, empty without one.  msi.dll
+            comes from the folder of the system alone, loaded when it serves: the installer
+            runs with the rights of an administrator from any folder, a download folder
+            included, where another msi.dll could lie.
+        */
+        std::wstring installed_winfsp_product()
+        {
+            typedef UINT (WINAPI* enum_related)(LPCWSTR, DWORD, DWORD, LPWSTR);
+            const HMODULE msi = LoadLibraryExW(L"msi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+            if (!msi) return std::wstring();
+            const enum_related related =
+                reinterpret_cast<enum_related>(reinterpret_cast<void*>(GetProcAddress(msi, "MsiEnumRelatedProductsW")));
+            wchar_t code[39] = {};
+            const bool found = related && related(winfsp_upgrade_code, 0, 0, code) == ERROR_SUCCESS;
+            FreeLibrary(msi);
+            return found ? std::wstring(code) : std::wstring();
+        }
+
+        // The WinFsp that Pseudalis installed: its product code, beside the record of the data folder.
+        std::wstring owned_winfsp_product()
+        {
+            return registry_string(HKEY_LOCAL_MACHINE, pseudalis_key, L"WinFspProduct");
+        }
+
+        void forget_owned_winfsp()
+        {
+            HKEY k = nullptr;
+            if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, pseudalis_key, 0, KEY_SET_VALUE | KEY_WOW64_64KEY, &k)
+                    != ERROR_SUCCESS)
+                return;
+            RegDeleteValueW(k, L"WinFspProduct");
+            RegCloseKey(k);
+        }
+
+        /*
+            The file systems that other programs registered with the launcher of WinFsp, in the
+            32-bit view of the registry; memfs, the sample its installer registers, does not count.
+        */
+        std::vector<std::string> other_winfsp_file_systems()
+        {
+            std::vector<std::string> found;
+            HKEY k = nullptr;
+            if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"Software\\WinFsp\\Services", 0, KEY_READ | KEY_WOW64_32KEY, &k)
+                    != ERROR_SUCCESS)
+                return found;
+            for (DWORD i = 0;; ++i)
+            {
+                wchar_t name[256];
+                DWORD size = 256;
+                if (RegEnumKeyExW(k, i, name, &size, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS) break;
+                const std::wstring n(name, size);
+                if (n == L"memfs-a64" || n == L"memfs64" || n == L"memfs32" || n == L"memfs-dotnet") continue;
+                found.push_back(narrow(n));
+            }
+            RegCloseKey(k);
+            return found;
+        }
+
+        // Shows again among the installed programs a WinFsp that Pseudalis hid there.
+        void show_winfsp(const std::wstring& product)
+        {
+            const std::wstring key = L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\" + product;
+            const REGSAM views[] = { KEY_WOW64_32KEY, KEY_WOW64_64KEY };
+            for (REGSAM view : views)
+            {
+                HKEY k = nullptr;
+                if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, key.c_str(), 0, KEY_SET_VALUE | view, &k) != ERROR_SUCCESS)
+                    continue;
+                RegDeleteValueW(k, L"SystemComponent");
+                RegCloseKey(k);
+            }
+        }
+
+        std::string msiexec_program(std::string& error)
+        {
+            wchar_t system[MAX_PATH];
+            const UINT n = GetSystemDirectoryW(system, MAX_PATH);
+            if (n == 0 || n >= MAX_PATH)
+            {
+                error = "the folder of Windows is not found";
+                return std::string();
+            }
+            return join_path(narrow(system), "msiexec.exe");
+        }
+
+        /*
+            Runs msiexec with args.  Another installation running answers 1618: msiexec runs
+            again after a pause, attempts times at most.
+        */
+        int run_msiexec(const std::string& msiexec, const std::vector<std::string>& args, int attempts, int pause_s)
+        {
+            int code = -1;
+            for (int attempt = 0; attempt < attempts; ++attempt)
+            {
+                code = run_process(msiexec, args, nullptr, 10 * 60 * 1000);
+                if (code != 1618) break;
+                std::this_thread::sleep_for(std::chrono::seconds(pause_s));
+            }
+            return code;
+        }
     }
 
     std::string installed_winfsp_version()
@@ -2061,32 +2267,28 @@ namespace setup
             error = "the installer of WinFsp is missing: " + msi;
             return false;
         }
-        wchar_t system[MAX_PATH];
-        const UINT n = GetSystemDirectoryW(system, MAX_PATH);
-        if (n == 0 || n >= MAX_PATH)
-        {
-            error = "the folder of Windows is not found";
-            return false;
-        }
-        const std::string msiexec = join_path(narrow(system), "msiexec.exe");
+        const std::string msiexec = msiexec_program(error);
+        if (msiexec.empty()) return false;
         const std::string logs = join_path(data_dir(), "logs");
         make_dirs(logs);
-        log(before.empty() ? "installation of WinFsp " + std::string(winfsp_version)
-            : "update of WinFsp " + before + " to " + winfsp_version);
         /*
-            Another installation running answers 1618: the installer waits for it, a few
-            minutes at most.  3010 asks for a restart of Windows, which the drive then waits
-            for; the service starts it without the drive meanwhile.
+            A WinFsp that Pseudalis installs, or updates after installing it, belongs to it:
+            hidden from the installed programs, it leaves with Pseudalis (remove_owned_winfsp()).
+            A WinFsp found in place stays the one of its user, updated in sight.
         */
-        int code = -1;
-        for (int attempt = 0; attempt < 10; ++attempt)
-        {
-            code = run_process(msiexec,
-                { "/i", msi, "/qn", "/norestart", "/l*v", join_path(logs, "winfsp-install.log") }, nullptr,
-                10 * 60 * 1000);
-            if (code != 1618) break;
-            std::this_thread::sleep_for(std::chrono::seconds(30));
-        }
+        const std::wstring owned = owned_winfsp_product();
+        const bool ours = before.empty() || (!owned.empty() && owned == installed_winfsp_product());
+        log((before.empty() ? "installation of WinFsp " + std::string(winfsp_version)
+            : "update of WinFsp " + before + " to " + winfsp_version) + (ours ? ", with Pseudalis" : ""));
+        std::vector<std::string> args = { "/i", msi, "/qn", "/norestart", "/l*v",
+            join_path(logs, "winfsp-install.log") };
+        if (ours) args.push_back("ARPSYSTEMCOMPONENT=1");
+        /*
+            Another installation running: the installer waits for it, a few minutes at most.
+            3010 asks for a restart of Windows, which the drive then waits for; the service
+            starts it without the drive meanwhile.
+        */
+        const int code = run_msiexec(msiexec, args, 10, 30);
         if (code != 0 && code != 3010)
         {
             error = "the installer of WinFsp ended with code " + std::to_string(code) + " (logs\\winfsp-install.log)";
@@ -2099,7 +2301,63 @@ namespace setup
             return false;
         }
         log("WinFsp " + after + " is installed" + (code == 3010 ? ", Windows must restart for it" : ""));
+        if (ours)
+        {
+            const std::wstring product = installed_winfsp_product();
+            if (product.empty() || !write_registry_string(L"WinFspProduct", product))
+                log("WinFsp cannot be recorded as installed with Pseudalis: it stays at the uninstallation");
+        }
+        else if (!owned.empty())
+        {
+            forget_owned_winfsp();
+        }
         return true;
+    }
+
+    bool remove_owned_winfsp(std::string& error)
+    {
+        const std::wstring owned = owned_winfsp_product();
+        if (owned.empty()) return true;
+        forget_owned_winfsp();
+        if (owned != installed_winfsp_product())
+        {
+            log("WinFsp was replaced since Pseudalis installed it: it stays");
+            return true;
+        }
+        const std::vector<std::string> others = other_winfsp_file_systems();
+        if (!others.empty())
+        {
+            std::string names;
+            for (const std::string& n : others) names += (names.empty() ? "" : ", ") + n;
+            log("WinFsp stays for the file systems of other programs (" + names + "), among the installed programs");
+            show_winfsp(owned);
+            return true;
+        }
+        const std::string msiexec = msiexec_program(error);
+        if (msiexec.empty())
+        {
+            show_winfsp(owned);
+            return false;
+        }
+        // The log of msiexec lies in the temporary folder: the data folder may go.
+        wchar_t temp[MAX_PATH + 1];
+        const DWORD n = GetTempPathW(MAX_PATH + 1, temp);
+        const std::string uninstall_log = n == 0 || n > MAX_PATH ? std::string()
+            : join_path(narrow(std::wstring(temp, n)), "pseudalis-winfsp-uninstall.log");
+        std::vector<std::string> args = { "/x", narrow(owned), "/qn", "/norestart" };
+        if (!uninstall_log.empty()) args.insert(args.end(), { "/l*v", uninstall_log });
+        log("uninstallation of WinFsp " + installed_winfsp_version() + ", installed with Pseudalis");
+        const int code = run_msiexec(msiexec, args, 4, 15);
+        // 1605: the product is no longer installed.
+        if (code == 0 || code == 3010 || code == 1605)
+        {
+            log(std::string("WinFsp is uninstalled") + (code == 3010 ? ", Windows must restart to finish" : ""));
+            return true;
+        }
+        show_winfsp(owned);
+        error = "msiexec ended with code " + std::to_string(code);
+        log("WinFsp cannot be uninstalled (" + error + "): it stays, among the installed programs");
+        return false;
     }
 
     bool allow_service_control(std::string& error)
@@ -2165,13 +2423,18 @@ namespace setup
         return true;
     }
 
-    bool register_context_menu(const std::string& program_dir, const std::map<std::string, std::wstring>& labels)
+    bool register_context_menu(const std::string& program_dir, const std::map<std::string, std::wstring>& labels,
+                               bool each_user)
     {
-        auto label = [&](const char* key, const wchar_t* fallback) {
+        const std::wstring program = widen(join_path(program_dir, "pseudalis.exe"));
+        // The text of a command: an indirect string, which the Explorer loads in the language of
+        // its user from the resources of pseudalis.exe, or the text in the language of the
+        // installation.
+        auto label = [&](const char* key, const wchar_t* fallback, int resource) {
+            if (each_user && resource > 0) return L"@" + program + L",-" + std::to_wstring(resource);
             const auto it = labels.find(key);
             return it == labels.end() || it->second.empty() ? std::wstring(fallback) : it->second;
         };
-        const std::wstring program = widen(join_path(program_dir, "pseudalis.exe"));
         const std::wstring icon = program + L",0";
         struct verb
         {
@@ -2182,10 +2445,12 @@ namespace setup
         };
         // ECF_SEPARATORBEFORE (0x40) sets the restorations apart from the protections.
         const verb verbs[] = {
-            { L"1protect", label("protect", L"Anonymize"), L"protect", 0 },
-            { L"2protectcopy", label("protect_copy", L"Anonymize as a copy"), L"protect --copy", 0 },
-            { L"3restore", label("restore", L"Restore the original"), L"restore", 0x40 },
-            { L"4restorecopy", label("restore_copy", L"Restore as a copy"), L"restore --copy", 0 },
+            { L"1protect", label("protect", L"Anonymize", IDS_VERB_PROTECT), L"protect", 0 },
+            { L"2protectcopy", label("protect_copy", L"Anonymize as a copy", IDS_VERB_PROTECT_COPY), L"protect --copy",
+              0 },
+            { L"3restore", label("restore", L"Restore the original", IDS_VERB_RESTORE), L"restore", 0x40 },
+            { L"4restorecopy", label("restore_copy", L"Restore as a copy", IDS_VERB_RESTORE_COPY), L"restore --copy",
+              0 },
         };
         bool ok = true;
         for (const std::wstring& extension : menu_extensions())
@@ -2200,7 +2465,7 @@ namespace setup
                 continue;
             }
             // A cascade whose commands are the subkeys of its own shell key.
-            set_string(k, L"MUIVerb", label("menu", L"Pseudalis"));
+            set_string(k, L"MUIVerb", label("menu", L"Pseudalis", 0));
             set_string(k, L"Icon", icon);
             set_string(k, L"SubCommands", L"");
             RegCloseKey(k);

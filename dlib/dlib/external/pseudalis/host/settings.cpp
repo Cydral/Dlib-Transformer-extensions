@@ -36,14 +36,14 @@ namespace pseudalis
         j["language"] = language;
         j["drive_letter"] = drive_letter;
         j["date_order"] = date_order;
-        j["pdf_layout"] = pdf_layout;
         j["albireo"] = albireo;
         j["max_file_mb"] = max_file_mb;
         j["removed_days"] = removed_days;
         j["check_updates"] = check_updates;
         j["trust_authority"] = trust_authority;
-        j["public_link"] = public_link;
-        j["feed_url"] = feed_url;
+        // The places of the publication appear only when they differ from those of the build.
+        if (public_link != default_public_link) j["public_link"] = public_link;
+        if (feed_url != default_feed_url) j["feed_url"] = feed_url;
         j["proxy"] = proxy;
         return j;
     }
@@ -60,12 +60,11 @@ namespace pseudalis
             s.drive_letter = std::string(1, static_cast<char>(
                 std::toupper(static_cast<unsigned char>(s.drive_letter[0]))));
         s.date_order = j["date_order"].str(d.date_order) == "mdy" ? "mdy" : "dmy";
-        s.pdf_layout = j["pdf_layout"].as_bool(d.pdf_layout);
         s.albireo = j["albireo"].str(d.albireo) == "off" ? "off" : "auto";
         const long long mb = j["max_file_mb"].as_int(d.max_file_mb);
         s.max_file_mb = mb >= 1 && mb <= 2048 ? static_cast<int>(mb) : d.max_file_mb;
         const long long days = j["removed_days"].as_int(d.removed_days);
-        s.removed_days = days >= 1 && days <= 3650 ? static_cast<int>(days) : d.removed_days;
+        s.removed_days = days >= 1 && days <= max_removed_days ? static_cast<int>(days) : d.removed_days;
         s.check_updates = j["check_updates"].as_bool(d.check_updates);
         s.trust_authority = j["trust_authority"].as_bool(d.trust_authority);
         s.public_link = j.contains("public_link") ? j["public_link"].str() : d.public_link;
@@ -85,10 +84,24 @@ namespace pseudalis
                 s_ = host_settings::from_json(j);
                 return;
             }
-            log_warning("settings: " + path_ + " is not valid JSON, the defaults replace it");
+            /*
+                The defaults replace a damaged file, kept aside, except for the days the originals
+                of the files removed from the drive stay: the longest, so that none goes before an
+                administrator sets them again.
+            */
+            log_error("settings: " + path_ + " is not valid JSON, kept as settings.json.invalid; the defaults "
+                      "replace it, the originals of the files removed from the drive kept meanwhile");
             rename_file(path_, path_ + ".invalid");
+            s_.removed_days = host_settings::max_removed_days;
         }
-        write();
+        else if (file_exists(path_))
+        {
+            // A file that cannot be read stays as it is: the defaults serve meanwhile, no original goes.
+            log_error("settings: " + path_ + " cannot be read, the defaults serve meanwhile");
+            s_.removed_days = host_settings::max_removed_days;
+            return;
+        }
+        write(s_);
     }
 
     host_settings settings_store::get() const
@@ -99,21 +112,30 @@ namespace pseudalis
 
     bool settings_store::set(const host_settings& s)
     {
-        std::lock_guard<std::mutex> lock(m_);
-        s_ = s;
-        return write();
+        // The file is written outside the lock that get() takes, in the order of the changes.
+        std::lock_guard<std::mutex> order(write_m_);
+        {
+            std::lock_guard<std::mutex> lock(m_);
+            s_ = s;
+        }
+        return write(s);
     }
 
-    host_settings settings_store::update(const std::function<void(host_settings&)>& change)
+    bool settings_store::update(const std::function<void(host_settings&)>& change, host_settings& result)
     {
-        std::lock_guard<std::mutex> lock(m_);
-        change(s_);
-        if (!write()) log_error("settings: cannot write " + path_);
-        return s_;
+        std::lock_guard<std::mutex> order(write_m_);
+        {
+            std::lock_guard<std::mutex> lock(m_);
+            change(s_);
+            result = s_;
+        }
+        if (write(result)) return true;
+        log_error("settings: cannot write " + path_);
+        return false;
     }
 
-    bool settings_store::write()
+    bool settings_store::write(const host_settings& s)
     {
-        return write_file_atomic(path_, s_.to_json().dump_formatted(2) + "\n");
+        return write_file_atomic(path_, s.to_json().dump_formatted(2) + "\n");
     }
 }

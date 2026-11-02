@@ -795,11 +795,15 @@ namespace dlib
                 const long w = number_of("Width"), h = number_of("Height");
                 if (w <= 0 || h <= 0 || static_cast<double>(w) * h > 25e6 || number_of("BitsPerComponent") != 8)
                     return img;
-                // The components of the color space, and the palette of an indexed one.
+                /*
+                    The components of the color space, and the palette of an indexed one.  The base of
+                    an indexed space is a plain space: depth bounds the spaces that name themselves.
+                */
                 int n = 0;
                 std::string palette;
                 int palette_n = 0;
-                std::function<int(const object&)> components = [&](const object& cs) -> int {
+                std::function<int(const object&, int)> components = [&](const object& cs, int depth) -> int {
+                    if (depth > 2) return 0;
                     const object& c = doc_.resolve(cs);
                     if (c.is(object::name_k))
                     {
@@ -821,7 +825,8 @@ namespace dlib
                     }
                     if ((family.str == "Indexed" || family.str == "I") && c.arr.size() > 3 && palette.empty())
                     {
-                        palette_n = components(c.arr[1]);
+                        palette_n = components(c.arr[1], depth + 1);
+                        if (palette_n < 0) palette_n = 0;
                         const object& table = doc_.resolve(c.arr[3]);
                         palette = table.is(object::stream_k) ? doc_.stream_data(table) :
                                   table.is(object::str_k) ? table.str : std::string();
@@ -829,7 +834,7 @@ namespace dlib
                     }
                     return 0;
                 };
-                if (const object* cs = doc_.resolve_key(o, "ColorSpace")) n = components(*cs);
+                if (const object* cs = doc_.resolve_key(o, "ColorSpace")) n = components(*cs, 0);
                 if (n == 0 || n == 2 || n > 4) return img;
                 const std::string data = doc_.stream_data(o);
                 const std::size_t count = static_cast<std::size_t>(w) * static_cast<std::size_t>(h);

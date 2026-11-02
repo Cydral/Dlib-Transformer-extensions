@@ -105,11 +105,8 @@ namespace pseudalis
 
     engine_library::~engine_library()
     {
-#if defined(_WIN32)
-        if (handle_) FreeLibrary(static_cast<HMODULE>(handle_));
-#else
-        if (handle_) dlclose(handle_);
-#endif
+        // The library is never unloaded (see engine_loader.h): a restart of the service
+        // within its process loads it again, which only counts one more reference.
     }
 
     bool engine_library::load(const std::string& folder, const std::string& force, std::string& error)

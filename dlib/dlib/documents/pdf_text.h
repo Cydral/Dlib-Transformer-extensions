@@ -84,6 +84,9 @@ namespace dlib
         const std::size_t max_objects = std::size_t(1) << 23;
         const std::size_t max_operations = std::size_t(1) << 27;
         const std::size_t max_shown_string = std::size_t(1) << 20;
+        /* Forms run for the whole document: forms that call one another a few times on each
+           level multiply their work with each level, far below the bound of the operators. */
+        const std::size_t max_form_calls = std::size_t(1) << 17;
 
         /* Conversions of numbers read from the file. Out of range values are clamped,
            since a direct cast of such a double is undefined. */
@@ -718,6 +721,13 @@ namespace dlib
                     throw pdf_error("PDF: the content streams exceed the work limit");
             }
 
+            // Counts one form run against max_form_calls.
+            void count_form()
+            {
+                if (++forms_ > max_form_calls)
+                    throw pdf_error("PDF: the forms of the document call one another beyond the work limit");
+            }
+
             // Streams decoded up to an error, for the reading notes.
             std::size_t damaged_streams() const { return damaged_; }
 
@@ -1216,6 +1226,7 @@ namespace dlib
             std::size_t decoded_ = 0;
             std::size_t objects_ = 0;
             std::size_t operations_ = 0;
+            std::size_t forms_ = 0;
             std::size_t damaged_ = 0;
             object null_;
         };
@@ -2500,6 +2511,7 @@ namespace dlib
                 }
                 if (!subtype || subtype->str != "Form") return;
                 if (active_forms_.count(&x) || active_forms_.size() > 64) return;
+                doc_.count_form();
                 active_forms_.insert(&x);
                 run_form(x, resources, ctm, depth, entry->is(object::ref_k) ? entry->ref : 0);
                 active_forms_.erase(&x);

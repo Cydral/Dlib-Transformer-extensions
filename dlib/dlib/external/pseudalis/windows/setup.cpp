@@ -12,10 +12,11 @@
                                             installation, an update that keeps everything but
                                             the options given
         pseudalis-setup /update /silent     update started by the service (keeps everything)
-        pseudalis-setup /uninstall [/silent] [/keep-data]
-                                            removal of the programs and of the data, the key,
-                                            the originals and the settings staying with
-                                            /keep-data (/purge, accepted, is the default)
+        pseudalis-setup /uninstall [/silent] [/purge]
+                                            removal of the programs; the key, the originals
+                                            and the settings stay for a later installation,
+                                            unless /purge removes them too (/keep-data,
+                                            accepted, is the default)
         pseudalis-setup /service start|stop|restart
         pseudalis-setup /lang <code>        language of the wizard: en, fr, de, it, es
 
@@ -32,8 +33,9 @@
     icon.  The new files are written beside the files in place, then take their places
     together; the previous files go once the new service answers on its port, and when a
     step fails, the start of the new service included, they come back and the service
-    starts again.  A newer version in place is left as it is.  WinFsp stays installed at the
-    uninstallation: other programs may use it.
+    starts again.  A newer version in place is left as it is.  The WinFsp that Pseudalis
+    installed leaves at its uninstallation, unless another program registered a file system
+    with it since (setup_actions.h).
 */
 
 #include "ui.h"
@@ -265,7 +267,7 @@ namespace pseudalis
                 setup::register_context_menu(o.program_dir, {
                     { "menu", tr("verb_menu") }, { "protect", tr("verb_protect") },
                     { "protect_copy", tr("verb_protect_copy") }, { "restore", tr("verb_restore") },
-                    { "restore_copy", tr("verb_restore_copy") } });
+                    { "restore_copy", tr("verb_restore_copy") } }, o.language == "auto");
             else if (update)
                 setup::remove_context_menu();
             if (!update)
@@ -513,6 +515,9 @@ namespace pseudalis
             */
             if (!ok && fresh && setup::installed_version().empty())
             {
+                // The WinFsp that this installation installed goes with it.
+                std::string w;
+                setup::remove_owned_winfsp(w);
                 // The log leaves the data folder before it goes.
                 if (folders.covers(join_path(data_dir(), "logs"))) setup::detach_log();
                 folders.undo();
@@ -536,7 +541,8 @@ namespace pseudalis
             The folder of the programs and the data folder go whole; with keep_data, the data
             (the key, the originals, the database and the settings) stays for a later
             installation on this computer, without the certificates, the token of the tray and
-            the updates.  WinFsp stays.
+            the updates.  The WinFsp that Pseudalis installed goes, unless another program
+            uses it (setup::remove_owned_winfsp()).
         */
         bool perform_uninstall(bool keep_data, const progress_fn& progress, install_report& report)
         {
@@ -564,9 +570,16 @@ namespace pseudalis
             setup::remove_context_menu();
             setup::untrust_authority();
             remove_certificates();
+            // The drive left with the service: WinFsp may go.
+            std::string w;
+            if (!setup::remove_owned_winfsp(w)) report.notice = narrow(tr("winfsp_kept", { { "e", w } }));
             std::vector<std::string> keep;
             if (keep_data) keep = { data };
-            if (!setup::remove_installation(dir, keep)) report.notice = narrow(tr("uninstall_kept", { { "d", dir } }));
+            if (!setup::remove_installation(dir, keep))
+            {
+                const std::string kept = narrow(tr("uninstall_kept", { { "d", dir } }));
+                report.notice = report.notice.empty() ? kept : kept + "\n\n" + report.notice;
+            }
             progress(800, tr("uninstall_progress"), false);
             if (keep_data)
             {
@@ -576,7 +589,12 @@ namespace pseudalis
             }
             else if (setup::removable_folder(data))
             {
+                /*
+                    The log leaves the data folder before it goes: written there afterwards, it
+                    would follow whatever another account placed at that path meanwhile.
+                */
                 setup::log("removal of the data folder " + data);
+                setup::detach_log();
                 setup::remove_folder(data);
                 setup::forget_folders();
             }
@@ -925,7 +943,9 @@ namespace pseudalis
             add(IDC_PROGRESS, ui::progress(wz.hwnd, IDC_PROGRESS));
             add(IDC_DETAIL, ui::label(wz.hwnd, L"", IDC_DETAIL, SS_PATHELLIPSIS), ui::font_kind::note);
             add(IDC_LAUNCH, ui::checkbox(wz.hwnd, L"", IDC_LAUNCH, true));
-            add(IDC_KEEP_DATA, ui::checkbox(wz.hwnd, L"", IDC_KEEP_DATA, false));
+            // The key and the originals stay unless the user unticks the box: without them,
+            // no document anonymized here can be restored.
+            add(IDC_KEEP_DATA, ui::checkbox(wz.hwnd, L"", IDC_KEEP_DATA, true));
             add(IDC_BACK, ui::button(wz.hwnd, L"", IDC_BACK));
             add(IDC_NEXT, ui::button(wz.hwnd, L"", IDC_NEXT, BS_DEFPUSHBUTTON));
             add(IDC_CANCEL, ui::button(wz.hwnd, L"", IDC_CANCEL));
@@ -966,7 +986,9 @@ namespace pseudalis
                 const LRESULT d = SendMessageW(ctl(IDC_DRIVE), CB_GETCURSEL, 0, 0);
                 const size_t chosen = d > 0 ? static_cast<size_t>(d) : 0;
                 o.drive_letter = chosen > 0 && chosen < wz.letters.size() ? wz.letters[chosen] : std::string();
-                o.language = current_language();
+                // The language of the system, the one of the wizard when nothing else was chosen,
+                // follows each user; a language chosen in its place is kept for every user.
+                o.language = current_language() == system_language() ? "auto" : current_language();
                 o.context_menu = ui::checked(ctl(IDC_CONTEXT_MENU));
                 o.autostart = ui::checked(ctl(IDC_AUTOSTART));
                 o.desktop_shortcut = ui::checked(ctl(IDC_DESKTOP));
@@ -1273,6 +1295,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
 
     // The copy of the uninstaller that finishes the removal of the folder of the programs.
     if (has_arg(args, L"/finish-removal")) return setup::complete_removal();
+    // The file of an installer, held from now on: the uninstaller is copied from it.
+    if (payload().data) setup::hold_own_program();
 
     const std::wstring lang = arg_after(args, L"/lang");
     set_language(lang.empty() ? "auto" : narrow(lang));
@@ -1350,9 +1374,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
         int code = 0;
         if (silent)
         {
-            // The data goes with the programs, unless /keep-data keeps it; /purge says the same.
+            /*
+                The data stays, unless /purge is given: the silent removal also serves to replace an
+                installation (a deployment tool), which must not take the key and the originals.
+            */
             install_report report;
-            if (!perform_uninstall(has_arg(args, L"/keep-data"), [](int, const std::wstring&, bool) {}, report))
+            if (!perform_uninstall(!has_arg(args, L"/purge"), [](int, const std::wstring&, bool) {}, report))
             {
                 setup::log("uninstallation: " + report.error);
                 code = 1;

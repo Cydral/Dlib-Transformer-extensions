@@ -47,6 +47,21 @@ namespace dlib
               exceed max_output_size.
     !*/
 
+    std::string inflate_raw(
+        const char* data,
+        std::size_t size,
+        std::size_t max_output_size,
+        std::size_t* consumed = nullptr
+    );
+    /*!
+        requires
+            - data points to size readable bytes (it may be null when size == 0)
+        ensures
+            - Same as inflate_raw(std::string(data, size), max_output_size, consumed), without
+              the copy: a stream that starts within a larger buffer, such as a member of a gzip
+              file, is decoded in place.
+    !*/
+
     std::string inflate_raw_prefix(
         const std::string& data,
         std::size_t max_output_size,

@@ -788,15 +788,18 @@ namespace dlib
         /* Decodes data into out. When deflate_error is thrown, out holds what was decoded
            before the error. */
         inline void inflate_into(
-            const std::string& data,
+            const char* data,
+            std::size_t size,
             std::size_t max_output_size,
             std::size_t* consumed,
             std::string& out
         )
         {
-            inflate_bit_reader in(reinterpret_cast<const unsigned char*>(data.data()), data.size());
+            inflate_bit_reader in(reinterpret_cast<const unsigned char*>(data), size);
             out.clear();
-            out.reserve(std::min<std::size_t>(max_output_size, data.size() * 4 + 64));
+            // A first guess of the size, bounded: the output grows as it needs beyond it.
+            out.reserve(std::min<std::size_t>(std::min<std::size_t>(max_output_size, std::size_t(16) << 20),
+                                              size * 4 + 64));
             inflate_table lit, dist;
             const std::uint16_t* lbase = deflate_length_base();
             const std::uint8_t* lext = deflate_length_extra();
@@ -943,7 +946,19 @@ namespace dlib
     )
     {
         std::string out;
-        impl::inflate_into(data, max_output_size, consumed, out);
+        impl::inflate_into(data.data(), data.size(), max_output_size, consumed, out);
+        return out;
+    }
+
+    inline std::string inflate_raw(
+        const char* data,
+        std::size_t size,
+        std::size_t max_output_size,
+        std::size_t* consumed = nullptr
+    )
+    {
+        std::string out;
+        impl::inflate_into(data, size, max_output_size, consumed, out);
         return out;
     }
 
@@ -957,7 +972,7 @@ namespace dlib
         complete = false;
         try
         {
-            impl::inflate_into(data, max_output_size, nullptr, out);
+            impl::inflate_into(data.data(), data.size(), max_output_size, nullptr, out);
             complete = true;
         }
         catch (deflate_error&)

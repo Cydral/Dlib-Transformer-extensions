@@ -4,9 +4,11 @@
 #define PSEUDALIS_HOST_SERVICE_H_
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 
@@ -42,6 +44,44 @@ namespace pseudalis
         std::string how;        // "original": the bytes kept; "picture": a picture from its marker; "tags"
         json report;
         long long record = 0;
+    };
+
+    class work_slots
+    {
+        /*!
+            WHAT THIS OBJECT REPRESENTS
+                The files and texts of the interface processed at once.  Each one stands in
+                memory several times while it is read, processed and answered, so their
+                number is bounded by the processors and the memory of the computer; a request
+                waits for a slot before its body is read.  The drive keeps its own bound.
+        !*/
+    public:
+        void init(int slots);
+        // Waits for a slot, until wait; false when none came free in time.
+        bool acquire(std::chrono::milliseconds wait);
+        void release();
+        int size() const { return size_; }
+
+    private:
+        std::mutex m_;
+        std::condition_variable cv_;
+        int free_ = 0;
+        int size_ = 0;
+    };
+
+    // A slot of work_slots held by its scope, after a wait of one minute at most.
+    class work_slot
+    {
+    public:
+        explicit work_slot(work_slots& slots) : slots_(slots), held_(slots.acquire(std::chrono::seconds(60))) {}
+        ~work_slot() { if (held_) slots_.release(); }
+        work_slot(const work_slot&) = delete;
+        work_slot& operator=(const work_slot&) = delete;
+        bool held() const { return held_; }
+
+    private:
+        work_slots& slots_;
+        bool held_;
     };
 
     class service
@@ -88,6 +128,7 @@ namespace pseudalis
         vault& blobs() { return *vault_; }
         updater& updates() { return *updater_; }
         albireo_client& albireo() { return albireo_; }
+        work_slots& work() { return work_; }
 
         json status();
         // The language of the descriptions and of the messages: the setting, else the one of the system.
@@ -99,8 +140,12 @@ namespace pseudalis
             restore_result& out, user_error& error);
         // operation: "anonymize_text", "restore_text" or "detect".
         bool text(const std::string& operation, const std::string& text, json& out, user_error& error);
-        // Deletes a record, its original and the pictures no other record shows.
-        bool forget(long long record);
+        /*!
+            Deletes a record, its original and the pictures no other record shows.  With a
+            reason, "forgotten" when a user asked for it or "expired" when its time is over, the
+            protected file of the record is remembered, and its restoration refused from then on.
+        !*/
+        bool forget(long long record, const std::string& reason = std::string());
         // Marks a record whose file left the drive, deleted or replaced.  A move out of the drive
         // is a copy followed by a deletion: the original stays restorable from the copies of the
         // file for removed_days days (settings), then purge_removed() forgets it.
@@ -138,6 +183,19 @@ namespace pseudalis
         std::mutex key_m_;
         std::string master_;
         int64_t started_ = 0;
+        work_slots work_;
+        /*
+            The protections hold work_m_ shared; the import of a key holds it alone from its
+            check to the save of the key, after which no protection starts until the restart
+            (key_replaced_): a protection made meanwhile would use the key that goes.
+        */
+        std::shared_timed_mutex work_m_;
+        std::atomic<bool> key_replaced_{false};
+        // The counts of status(), which every icon asks every few seconds, kept two seconds.
+        std::mutex counts_m_;
+        std::chrono::steady_clock::time_point counts_at_;
+        long long records_count_ = 0;
+        json drive_status_ = json::object();
 
         friend class drive_host;
     };

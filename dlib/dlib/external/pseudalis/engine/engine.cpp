@@ -123,17 +123,35 @@ namespace pseudalis
                     whole[key].push_back(entry.empty() ? v.str() : entry + ": " + v.str());
         }
 
-        // The name of an entry not taken yet among names: "a.png.txt", then "a.png (2).txt"...
-        std::string free_name(const std::string& name, std::set<std::string>& names)
+        /*
+            The name of an entry not taken yet among names: "a.png.txt", then "a.png (2).txt"...
+            next remembers, for each name, the number to try first, so that an archive that
+            repeats a name thousands of times is not walked again for each of them.
+        */
+        std::string free_name(const std::string& name, std::set<std::string>& names, std::map<std::string, int>& next)
         {
             std::string candidate = name;
             const size_t dot = name.rfind('.');
-            for (int k = 2; names.count(lower(candidate)); ++k)
+            int& k = next[lower(name)];
+            if (k < 2) k = 2;
+            for (; names.count(lower(candidate)); ++k)
                 candidate = dot == std::string::npos
                     ? name + " (" + std::to_string(k) + ")"
                     : name.substr(0, dot) + " (" + std::to_string(k) + ")" + name.substr(dot);
             names.insert(lower(candidate));
             return candidate;
+        }
+
+        /*
+            The bytes that the archives and the Office documents of one file may decompress, all
+            levels together: 64 times the file, from 16 MB to 2 GB.  The memory and the time of
+            the processing grow with them: a small file that holds hundreds of megabytes of text
+            is refused rather than read for hours.
+        */
+        uint64_t decompression_budget(size_t file_size)
+        {
+            const uint64_t wanted = static_cast<uint64_t>(file_size) * 64;
+            return std::min<uint64_t>(2048ull << 20, std::max<uint64_t>(16ull << 20, wanted));
         }
     }
 
@@ -191,13 +209,22 @@ namespace pseudalis
         }
 
         engine_result document(const std::string& bytes, const std::string& name, document_format f,
-                               const picture_handler& handler, bool layout, bool restoring) const
+                               const picture_handler& handler, bool restoring, uint64_t& budget) const
         {
             engine_result out;
             pii_detector d(dopt);
             if (!restoring) attach(d);
+            // A PDF keeps its pages: its text is replaced in place (the default of the anonymizer).
             document_anonymizer a(*p, d);
-            a.set_pdf_layout(layout);
+            /*
+                A part of an Office document takes about 26 bytes of memory for each of its bytes
+                while it is read: each part stays within 32 times the document, from 32 MB.
+            */
+            zip_limits limits;
+            limits.max_total_size = std::min<uint64_t>(limits.max_total_size, budget);
+            limits.max_entry_size = std::min<uint64_t>(std::min<uint64_t>(limits.max_entry_size, budget),
+                std::max<uint64_t>(32ull << 20, static_cast<uint64_t>(bytes.size()) * 32));
+            a.set_package_limits(limits);
             std::vector<std::string> ids;
             if (handler && !restoring)
                 a.set_image_describer([&](const document_image& img) {
@@ -228,7 +255,7 @@ namespace pseudalis
         }
 
         engine_result any(const std::string& bytes, const std::string& name, const picture_handler& handler,
-                          bool layout, bool restoring, int depth) const
+                          bool restoring, int depth, uint64_t& budget) const
         {
             const file_kind k = engine::kind_of(bytes, name);
             if (k == file_kind::picture)
@@ -241,25 +268,34 @@ namespace pseudalis
                 out.report = report_json(document_report());
                 return out;
             }
-            if (k == file_kind::archive) return archive(bytes, name, handler, layout, restoring, depth);
+            if (k == file_kind::archive) return archive(bytes, name, handler, restoring, depth, budget);
             if (k == file_kind::document)
-                return document(bytes, name, detect_document_format(bytes, base_name(name)), handler, layout,
-                    restoring);
+                return document(bytes, name, detect_document_format(bytes, base_name(name)), handler, restoring,
+                                budget);
             throw std::runtime_error(base_name(name) + ": this kind of file is not supported");
         }
 
         engine_result archive(const std::string& bytes, const std::string& name, const picture_handler& handler,
-                              bool layout, bool restoring, int depth) const
+                              bool restoring, int depth, uint64_t& budget) const
         {
             if (depth > 3) throw std::runtime_error(base_name(name) + ": archives nested too deep");
             archive_kind ak = archive_kind_of(bytes);
             if (ak == archive_kind::none) ak = archive_kind_of_name(name);
-            std::vector<archive_entry> entries = read_archive(ak, bytes);
+            // The entries come out of what is left of the budget of the file.
+            archive_limits limits;
+            limits.max_total_size = std::min<uint64_t>(limits.max_total_size, budget);
+            limits.max_entry_size = std::min<uint64_t>(limits.max_entry_size, budget);
+            std::vector<archive_entry> entries = read_archive(ak, bytes, limits);
+            uint64_t read = 0;
+            for (const archive_entry& e : entries) read += e.data.size();
+            budget -= std::min(budget, read);
             engine_result out;
             out.name = name;
             out.kind = archive_kind_name(ak);
             out.report = report_json(document_report());
             std::set<std::string> names;
+            std::map<std::string, int> next_number;
+            std::set<std::string> pictures;
             for (const archive_entry& e : entries) names.insert(lower(e.name));
             std::vector<archive_entry> kept;
             for (archive_entry& e : entries)
@@ -269,30 +305,25 @@ namespace pseudalis
                     kept.push_back(std::move(e));
                     continue;
                 }
-                if (!e.regular)
+                // An entry left out gives its memory back at once.
+                if (!e.regular || engine::kind_of(e.data, e.name) == file_kind::unsupported)
                 {
                     out.report["dropped"].push_back(e.name);
-                    continue;
-                }
-                const file_kind k = engine::kind_of(e.data, e.name);
-                if (k == file_kind::unsupported)
-                {
-                    out.report["dropped"].push_back(e.name);
+                    std::string().swap(e.data);
                     continue;
                 }
                 try
                 {
-                    engine_result r = any(e.data, e.name, handler, layout, restoring, depth + 1);
+                    engine_result r = any(e.data, e.name, handler, restoring, depth + 1, budget);
                     if (r.name != e.name)
                     {
                         names.erase(lower(e.name));
-                        e.name = free_name(r.name, names);
+                        e.name = free_name(r.name, names, next_number);
                     }
                     e.data = std::move(r.bytes);
                     merge_report(out.report, r.report, e.name);
                     for (const std::string& id : r.pictures)
-                        if (std::find(out.pictures.begin(), out.pictures.end(), id) == out.pictures.end())
-                            out.pictures.push_back(id);
+                        if (pictures.insert(id).second) out.pictures.push_back(id);
                     kept.push_back(std::move(e));
                 }
                 catch (std::exception& x)
@@ -305,6 +336,7 @@ namespace pseudalis
                     }
                     out.report["dropped"].push_back(e.name);
                     out.report["notes"].push_back(e.name + ": " + x.what());
+                    std::string().swap(e.data);
                 }
             }
             out.bytes = write_archive(ak, kept);
@@ -363,15 +395,17 @@ namespace pseudalis
         return description.empty() ? "[Image@" + id + "]" : "[Image@" + id + " : " + description + "]";
     }
 
-    engine_result engine::anonymize(const std::string& bytes, const std::string& name, const picture_handler& pictures,
-                                    bool pdf_layout) const
+    engine_result engine::anonymize(const std::string& bytes, const std::string& name,
+                                    const picture_handler& pictures) const
     {
-        return p_->any(bytes, name, pictures, pdf_layout, false, 0);
+        uint64_t budget = decompression_budget(bytes.size());
+        return p_->any(bytes, name, pictures, false, 0, budget);
     }
 
     engine_result engine::restore(const std::string& bytes, const std::string& name) const
     {
-        return p_->any(bytes, name, picture_handler(), true, true, 0);
+        uint64_t budget = decompression_budget(bytes.size());
+        return p_->any(bytes, name, picture_handler(), true, 0, budget);
     }
 
     std::string engine::anonymize_text(const std::string& text, json& report) const

@@ -4,6 +4,7 @@
 #define PSEUDALIS_HOST_VAULT_H_
 
 #include <string>
+#include <vector>
 
 namespace pseudalis
 {
@@ -33,6 +34,11 @@ namespace pseudalis
         bool remove(const std::string& id);
         bool exists(const std::string& id) const;
         static bool valid_id(const std::string& id);
+        /*!
+            Returns the identifiers of the blobs the vault holds, and removes the files of the
+            writes cut short.  For the start of the service, before any write.
+        !*/
+        std::vector<std::string> list_and_clean();
 
     private:
         std::string path_of(const std::string& id) const;

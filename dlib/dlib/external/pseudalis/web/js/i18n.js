@@ -31,13 +31,14 @@ window.PSEUDALIS_TEXTS = {
     s_engine: 'Engine',
     s_drive: 'Drive',
     s_drive_off: 'no drive',
+    s_drive_winfsp: 'WinFsp missing: run the installer of Pseudalis again',
     s_albireo: 'Picture descriptions',
     s_albireo_off: 'Albireo not found',
     s_records: 'Originals kept',
     s_offline: 'The service does not answer.',
     records_title: 'Originals kept',
     records_hint: 'The originals of the files protected on this computer, encrypted in its vault. A forgotten ' +
-      'original is deleted: its protected file then gets its values back from its tags only.',
+      'original is deleted: its protected file can no longer be restored.',
     records_none: 'No original kept.',
     records_removed: 'left the drive, kept until {d}',
     records_more: 'Show more',
@@ -51,7 +52,8 @@ window.PSEUDALIS_TEXTS = {
     source_api: 'interface',
     btn_original: 'Original',
     btn_forget: 'Forget',
-    confirm_forget: 'Forget the original of {f}? It is deleted from the vault.',
+    confirm_forget: 'Forget the original of {f}? It is deleted from the vault, and its protected file can no ' +
+      'longer be restored.',
     key_title: 'Key of this computer',
     key_hint: 'This key restores every file protected here. Export it, protected by a passphrase of 12 characters ' +
       'or more, and keep the export away from this computer: without it, a new installation restores nothing.',
@@ -70,12 +72,37 @@ window.PSEUDALIS_TEXTS = {
     set_drive: 'Letter of the drive (empty: no drive)',
     set_albireo: 'Describe the pictures with Albireo when it is installed',
     set_updates: 'Check for updates every day',
-    set_pdf: 'Keep the pages of the PDF files',
     set_max: 'Largest file (MB)',
     set_removed: 'Kept after leaving the drive (days)',
     btn_save: 'Save',
     saved: 'Saved.',
-    saved_restart: 'Saved: the service restarts.'
+    saved_restart: 'Saved: the service restarts.',
+    err_http: 'The service answered with the error {status}.',
+    err_busy: 'The service is busy with other files: try again in a moment.',
+    err_settings_publication: 'The public link, the feed or the proxy is not in a form the service reads.',
+    err_engine: 'The engine of Pseudalis is not ready.',
+    err_file_too_large: 'The file is larger than {mb} MB, the limit of the settings.',
+    err_protect_failed: 'The file cannot be anonymized: {error}',
+    err_restore_failed: 'The file cannot be restored: {error}',
+    err_not_protected: 'This file holds no value that Pseudalis protected with the key of this computer.',
+    err_original_missing: 'The original of this file can no longer be read in the vault.',
+    err_original_forgotten: 'The original of this file was forgotten on {date}: it can no longer be restored.',
+    err_original_expired: 'The original of this file was kept until {date} after the file left the drive: it ' +
+      'can no longer be restored.',
+    err_vault: 'The original cannot be kept in the vault.',
+    err_database: 'The database of Pseudalis cannot be written: {e}',
+    err_authentication: 'The administration token is missing or wrong: open Pseudalis again from its icon.',
+    err_bad_request: 'The request is not valid.',
+    err_not_found: 'This original is no longer kept.',
+    err_server_error: 'The service could not process the request.',
+    err_text_failed: 'The text cannot be processed: {e}',
+    err_stopping: 'The service is stopping.',
+    err_passphrase_short: 'The passphrase must have 12 characters at least.',
+    err_import_failed: 'The key cannot be imported: {e}',
+    err_import_not_empty: 'A key can only be imported while this installation keeps no original and no file ' +
+      'on its drive.',
+    err_settings: 'The settings cannot be written.',
+    err_settings_drive: 'The letter of the drive must be A, B or D to Z.'
   },
   fr: {
     tagline: 'Protection des données personnelles de vos documents',
@@ -105,13 +132,14 @@ window.PSEUDALIS_TEXTS = {
     s_engine: 'Moteur',
     s_drive: 'Lecteur',
     s_drive_off: 'pas de lecteur',
+    s_drive_winfsp: "WinFsp manquant : relancez l'installation de Pseudalis",
     s_albireo: 'Description des images',
     s_albireo_off: 'Albireo absent',
     s_records: 'Originaux conservés',
     s_offline: 'Le service ne répond pas.',
     records_title: 'Originaux conservés',
     records_hint: 'Les originaux des fichiers protégés sur cet ordinateur, chiffrés dans son coffre. Un original ' +
-      'oublié est supprimé : son fichier protégé ne retrouve alors ses valeurs que par ses balises.',
+      'oublié est supprimé : son fichier protégé ne peut plus être restauré.',
     records_none: 'Aucun original conservé.',
     records_removed: 'retiré du lecteur, conservé jusqu’au {d}',
     records_more: 'Afficher plus',
@@ -125,7 +153,8 @@ window.PSEUDALIS_TEXTS = {
     source_api: 'interface',
     btn_original: 'Original',
     btn_forget: 'Oublier',
-    confirm_forget: "Oublier l'original de {f} ? Il est supprimé du coffre.",
+    confirm_forget: "Oublier l'original de {f} ? Il est supprimé du coffre, et son fichier protégé ne pourra " +
+      'plus être restauré.',
     key_title: 'Clé de cet ordinateur',
     key_hint: 'Cette clé restaure tous les fichiers protégés ici. Exportez-la, protégée par une phrase secrète de ' +
       "12 caractères ou plus, et conservez l'export hors de cet ordinateur : sans lui, une nouvelle installation " +
@@ -145,12 +174,37 @@ window.PSEUDALIS_TEXTS = {
     set_drive: 'Lettre du lecteur (vide : pas de lecteur)',
     set_albireo: "Décrire les images avec Albireo lorsqu'il est installé",
     set_updates: 'Rechercher les mises à jour chaque jour',
-    set_pdf: 'Conserver les pages des fichiers PDF',
     set_max: 'Fichier le plus grand (Mo)',
     set_removed: 'Conservation après retrait du lecteur (jours)',
     btn_save: 'Enregistrer',
     saved: 'Enregistré.',
-    saved_restart: 'Enregistré : le service redémarre.'
+    saved_restart: 'Enregistré : le service redémarre.',
+    err_http: "Le service a répondu par l'erreur {status}.",
+    err_busy: "Le service traite d'autres fichiers : réessayez dans un instant.",
+    err_settings_publication: "Le lien public, le flux ou le proxy n'a pas une forme que le service lit.",
+    err_engine: "Le moteur de Pseudalis n'est pas prêt.",
+    err_file_too_large: 'Le fichier dépasse {mb} Mo, la limite des réglages.',
+    err_protect_failed: 'Le fichier ne peut pas être anonymisé : {error}',
+    err_restore_failed: 'Le fichier ne peut pas être restauré : {error}',
+    err_not_protected: 'Ce fichier ne contient aucune valeur protégée par Pseudalis avec la clé de cet ordinateur.',
+    err_original_missing: "L'original de ce fichier ne peut plus être lu dans le coffre.",
+    err_original_forgotten: "L'original de ce fichier a été oublié le {date} : il ne peut plus être restauré.",
+    err_original_expired: "L'original de ce fichier a été conservé jusqu'au {date} après la sortie du fichier " +
+      'du lecteur : il ne peut plus être restauré.',
+    err_vault: "L'original ne peut pas être conservé dans le coffre.",
+    err_database: 'La base de données de Pseudalis ne peut pas être écrite : {e}',
+    err_authentication: "Le jeton d'administration manque ou est incorrect : rouvrez Pseudalis depuis son icône.",
+    err_bad_request: "La requête n'est pas valide.",
+    err_not_found: "Cet original n'est plus conservé.",
+    err_server_error: "Le service n'a pas pu traiter la requête.",
+    err_text_failed: 'Le texte ne peut pas être traité : {e}',
+    err_stopping: "Le service s'arrête.",
+    err_passphrase_short: 'La phrase de passe doit compter au moins 12 caractères.',
+    err_import_failed: 'La clé ne peut pas être importée : {e}',
+    err_import_not_empty: "Une clé ne s'importe que tant que cette installation ne conserve aucun original " +
+      'ni aucun fichier sur son lecteur.',
+    err_settings: 'Les réglages ne peuvent pas être écrits.',
+    err_settings_drive: 'La lettre du lecteur doit être A, B ou de D à Z.'
   },
   de: {
     tagline: 'Schutz personenbezogener Daten in Ihren Dokumenten',
@@ -180,14 +234,14 @@ window.PSEUDALIS_TEXTS = {
     s_engine: 'Engine',
     s_drive: 'Laufwerk',
     s_drive_off: 'kein Laufwerk',
+    s_drive_winfsp: 'WinFsp fehlt: Starten Sie die Installation von Pseudalis erneut',
     s_albireo: 'Bildbeschreibungen',
     s_albireo_off: 'Albireo nicht gefunden',
     s_records: 'Aufbewahrte Originale',
     s_offline: 'Der Dienst antwortet nicht.',
     records_title: 'Aufbewahrte Originale',
     records_hint: 'Die Originale der auf diesem Computer geschützten Dateien, verschlüsselt in seinem Tresor. Ein ' +
-      'vergessenes Original wird gelöscht: Seine geschützte Datei erhält ihre Werte dann nur noch über ihre ' +
-      'Markierungen zurück.',
+      'vergessenes Original wird gelöscht: Seine geschützte Datei kann nicht mehr wiederhergestellt werden.',
     records_none: 'Kein Original aufbewahrt.',
     records_removed: 'vom Laufwerk entfernt, aufbewahrt bis {d}',
     records_more: 'Mehr anzeigen',
@@ -201,7 +255,8 @@ window.PSEUDALIS_TEXTS = {
     source_api: 'Schnittstelle',
     btn_original: 'Original',
     btn_forget: 'Vergessen',
-    confirm_forget: 'Das Original von {f} vergessen? Es wird aus dem Tresor gelöscht.',
+    confirm_forget: 'Das Original von {f} vergessen? Es wird aus dem Tresor gelöscht, und seine geschützte Datei ' +
+      'kann nicht mehr wiederhergestellt werden.',
     key_title: 'Schlüssel dieses Computers',
     key_hint: 'Dieser Schlüssel stellt alle hier geschützten Dateien wieder her. Exportieren Sie ihn, geschützt ' +
       'durch eine Passphrase von mindestens 12 Zeichen, und bewahren Sie den Export außerhalb dieses Computers ' +
@@ -221,12 +276,41 @@ window.PSEUDALIS_TEXTS = {
     set_drive: 'Laufwerksbuchstabe (leer: kein Laufwerk)',
     set_albireo: 'Bilder mit Albireo beschreiben, wenn es installiert ist',
     set_updates: 'Täglich nach Updates suchen',
-    set_pdf: 'Die Seiten der PDF-Dateien beibehalten',
     set_max: 'Größte Datei (MB)',
     set_removed: 'Aufbewahrung nach Entfernen vom Laufwerk (Tage)',
     btn_save: 'Speichern',
     saved: 'Gespeichert.',
-    saved_restart: 'Gespeichert: Der Dienst startet neu.'
+    saved_restart: 'Gespeichert: Der Dienst startet neu.',
+    err_http: 'Der Dienst hat mit dem Fehler {status} geantwortet.',
+    err_busy: 'Der Dienst verarbeitet andere Dateien: Versuchen Sie es gleich noch einmal.',
+    err_settings_publication: 'Der öffentliche Link, der Feed oder der Proxy hat keine Form, die der Dienst ' +
+      'liest.',
+    err_engine: 'Die Engine von Pseudalis ist nicht bereit.',
+    err_file_too_large: 'Die Datei ist größer als {mb} MB, die Grenze der Einstellungen.',
+    err_protect_failed: 'Die Datei kann nicht anonymisiert werden: {error}',
+    err_restore_failed: 'Die Datei kann nicht wiederhergestellt werden: {error}',
+    err_not_protected: 'Diese Datei enthält keinen Wert, den Pseudalis mit dem Schlüssel dieses Computers ' +
+      'geschützt hat.',
+    err_original_missing: 'Das Original dieser Datei kann im Tresor nicht mehr gelesen werden.',
+    err_original_forgotten: 'Das Original dieser Datei wurde am {date} vergessen: Es kann nicht mehr ' +
+      'wiederhergestellt werden.',
+    err_original_expired: 'Das Original dieser Datei wurde bis zum {date} aufbewahrt, nachdem die Datei das ' +
+      'Laufwerk verlassen hatte: Es kann nicht mehr wiederhergestellt werden.',
+    err_vault: 'Das Original kann nicht im Tresor aufbewahrt werden.',
+    err_database: 'Die Datenbank von Pseudalis kann nicht geschrieben werden: {e}',
+    err_authentication: 'Das Verwaltungstoken fehlt oder ist falsch: Öffnen Sie Pseudalis erneut über sein ' +
+      'Symbol.',
+    err_bad_request: 'Die Anfrage ist ungültig.',
+    err_not_found: 'Dieses Original wird nicht mehr aufbewahrt.',
+    err_server_error: 'Der Dienst konnte die Anfrage nicht verarbeiten.',
+    err_text_failed: 'Der Text kann nicht verarbeitet werden: {e}',
+    err_stopping: 'Der Dienst wird beendet.',
+    err_passphrase_short: 'Die Passphrase muss mindestens 12 Zeichen haben.',
+    err_import_failed: 'Der Schlüssel kann nicht importiert werden: {e}',
+    err_import_not_empty: 'Ein Schlüssel kann nur importiert werden, solange diese Installation kein Original ' +
+      'und keine Datei auf ihrem Laufwerk aufbewahrt.',
+    err_settings: 'Die Einstellungen können nicht geschrieben werden.',
+    err_settings_drive: 'Der Buchstabe des Laufwerks muss A, B oder D bis Z sein.'
   },
   it: {
     tagline: 'Protezione dei dati personali dei tuoi documenti',
@@ -256,13 +340,14 @@ window.PSEUDALIS_TEXTS = {
     s_engine: 'Motore',
     s_drive: 'Unità',
     s_drive_off: 'nessuna unità',
+    s_drive_winfsp: "WinFsp mancante: avviate di nuovo l'installazione di Pseudalis",
     s_albireo: 'Descrizione delle immagini',
     s_albireo_off: 'Albireo assente',
     s_records: 'Originali conservati',
     s_offline: 'Il servizio non risponde.',
     records_title: 'Originali conservati',
     records_hint: 'Gli originali dei file protetti su questo computer, cifrati nella sua cassaforte. Un originale ' +
-      'dimenticato viene eliminato: il suo file protetto ritrova allora i suoi valori solo dai suoi tag.',
+      'dimenticato viene eliminato: il suo file protetto non può più essere ripristinato.',
     records_none: 'Nessun originale conservato.',
     records_removed: 'rimosso dall’unità, conservato fino al {d}',
     records_more: 'Mostra altri',
@@ -276,7 +361,8 @@ window.PSEUDALIS_TEXTS = {
     source_api: 'interfaccia',
     btn_original: 'Originale',
     btn_forget: 'Dimentica',
-    confirm_forget: "Dimenticare l'originale di {f}? Viene eliminato dalla cassaforte.",
+    confirm_forget: "Dimenticare l'originale di {f}? Viene eliminato dalla cassaforte, e il suo file protetto " +
+      'non potrà più essere ripristinato.',
     key_title: 'Chiave di questo computer',
     key_hint: 'Questa chiave ripristina tutti i file protetti qui. Esportatela, protetta da una passphrase di ' +
       "almeno 12 caratteri, e conservate l'esportazione lontano da questo computer: senza di essa, una nuova " +
@@ -297,12 +383,39 @@ window.PSEUDALIS_TEXTS = {
     set_drive: "Lettera dell'unità (vuota: nessuna unità)",
     set_albireo: 'Descrivere le immagini con Albireo quando è installato',
     set_updates: 'Cercare gli aggiornamenti ogni giorno',
-    set_pdf: 'Conservare le pagine dei file PDF',
     set_max: 'File più grande (MB)',
     set_removed: 'Conservazione dopo la rimozione dall’unità (giorni)',
     btn_save: 'Salva',
     saved: 'Salvato.',
-    saved_restart: 'Salvato: il servizio riparte.'
+    saved_restart: 'Salvato: il servizio riparte.',
+    err_http: "Il servizio ha risposto con l'errore {status}.",
+    err_busy: 'Il servizio sta elaborando altri file: riprovate tra un momento.',
+    err_settings_publication: 'Il link pubblico, il feed o il proxy non ha una forma che il servizio legge.',
+    err_engine: 'Il motore di Pseudalis non è pronto.',
+    err_file_too_large: 'Il file supera {mb} MB, il limite delle impostazioni.',
+    err_protect_failed: 'Il file non può essere anonimizzato: {error}',
+    err_restore_failed: 'Il file non può essere ripristinato: {error}',
+    err_not_protected: 'Questo file non contiene alcun valore protetto da Pseudalis con la chiave di questo ' +
+      'computer.',
+    err_original_missing: "L'originale di questo file non può più essere letto nella cassaforte.",
+    err_original_forgotten: "L'originale di questo file è stato dimenticato il {date}: non può più essere " +
+      'ripristinato.',
+    err_original_expired: "L'originale di questo file è stato conservato fino al {date} dopo l'uscita del " +
+      "file dall'unità: non può più essere ripristinato.",
+    err_vault: "L'originale non può essere conservato nella cassaforte.",
+    err_database: 'Il database di Pseudalis non può essere scritto: {e}',
+    err_authentication: 'Il token di amministrazione manca o è errato: riaprite Pseudalis dalla sua icona.',
+    err_bad_request: 'La richiesta non è valida.',
+    err_not_found: 'Questo originale non è più conservato.',
+    err_server_error: 'Il servizio non ha potuto elaborare la richiesta.',
+    err_text_failed: 'Il testo non può essere elaborato: {e}',
+    err_stopping: 'Il servizio si sta arrestando.',
+    err_passphrase_short: 'La passphrase deve avere almeno 12 caratteri.',
+    err_import_failed: 'La chiave non può essere importata: {e}',
+    err_import_not_empty: 'Una chiave può essere importata solo finché questa installazione non conserva ' +
+      "alcun originale né alcun file sulla sua unità.",
+    err_settings: 'Le impostazioni non possono essere scritte.',
+    err_settings_drive: "La lettera dell'unità deve essere A, B o da D a Z."
   },
   es: {
     tagline: 'Protección de los datos personales de sus documentos',
@@ -332,14 +445,14 @@ window.PSEUDALIS_TEXTS = {
     s_engine: 'Motor',
     s_drive: 'Unidad',
     s_drive_off: 'sin unidad',
+    s_drive_winfsp: 'Falta WinFsp: vuelva a ejecutar la instalación de Pseudalis',
     s_albireo: 'Descripción de imágenes',
     s_albireo_off: 'Albireo no encontrado',
     s_records: 'Originales conservados',
     s_offline: 'El servicio no responde.',
     records_title: 'Originales guardados',
     records_hint: 'Los originales de los archivos protegidos en este equipo, cifrados en su caja fuerte. Un ' +
-      'original olvidado se elimina: su archivo protegido solo recupera entonces sus valores a partir de sus ' +
-      'etiquetas.',
+      'original olvidado se elimina: su archivo protegido ya no se puede restaurar.',
     records_none: 'Ningún original guardado.',
     records_removed: 'retirado de la unidad, guardado hasta el {d}',
     records_more: 'Mostrar más',
@@ -353,7 +466,8 @@ window.PSEUDALIS_TEXTS = {
     source_api: 'interfaz',
     btn_original: 'Original',
     btn_forget: 'Olvidar',
-    confirm_forget: '¿Olvidar el original de {f}? Se elimina de la caja fuerte.',
+    confirm_forget: '¿Olvidar el original de {f}? Se elimina de la caja fuerte, y su archivo protegido ya no se ' +
+      'podrá restaurar.',
     key_title: 'Clave de este equipo',
     key_hint: 'Esta clave restaura todos los archivos protegidos aquí. Expórtela, protegida por una frase de ' +
       'contraseña de 12 caracteres o más, y guarde la exportación fuera de este equipo: sin ella, una nueva ' +
@@ -373,11 +487,38 @@ window.PSEUDALIS_TEXTS = {
     set_drive: 'Letra de la unidad (vacía: sin unidad)',
     set_albireo: 'Describir las imágenes con Albireo cuando está instalado',
     set_updates: 'Buscar actualizaciones cada día',
-    set_pdf: 'Conservar las páginas de los archivos PDF',
     set_max: 'Archivo más grande (MB)',
     set_removed: 'Conservación tras salir de la unidad (días)',
     btn_save: 'Guardar',
     saved: 'Guardado.',
-    saved_restart: 'Guardado: el servicio se reinicia.'
+    saved_restart: 'Guardado: el servicio se reinicia.',
+    err_http: 'El servicio respondió con el error {status}.',
+    err_busy: 'El servicio está procesando otros archivos: vuelva a intentarlo en un momento.',
+    err_settings_publication: 'El enlace público, el feed o el proxy no tiene una forma que el servicio lea.',
+    err_engine: 'El motor de Pseudalis no está listo.',
+    err_file_too_large: 'El archivo supera {mb} MB, el límite de la configuración.',
+    err_protect_failed: 'El archivo no se puede anonimizar: {error}',
+    err_restore_failed: 'El archivo no se puede restaurar: {error}',
+    err_not_protected: 'Este archivo no contiene ningún valor protegido por Pseudalis con la clave de este ' +
+      'equipo.',
+    err_original_missing: 'El original de este archivo ya no se puede leer en la caja fuerte.',
+    err_original_forgotten: 'El original de este archivo se olvidó el {date}: ya no se puede restaurar.',
+    err_original_expired: 'El original de este archivo se conservó hasta el {date} después de que el archivo ' +
+      'saliera de la unidad: ya no se puede restaurar.',
+    err_vault: 'El original no se puede guardar en la caja fuerte.',
+    err_database: 'La base de datos de Pseudalis no se puede escribir: {e}',
+    err_authentication: 'El token de administración falta o es incorrecto: vuelva a abrir Pseudalis desde su ' +
+      'icono.',
+    err_bad_request: 'La solicitud no es válida.',
+    err_not_found: 'Este original ya no se conserva.',
+    err_server_error: 'El servicio no pudo procesar la solicitud.',
+    err_text_failed: 'El texto no se puede procesar: {e}',
+    err_stopping: 'El servicio se está deteniendo.',
+    err_passphrase_short: 'La frase de contraseña debe tener al menos 12 caracteres.',
+    err_import_failed: 'La clave no se puede importar: {e}',
+    err_import_not_empty: 'Una clave solo se puede importar mientras esta instalación no conserve ningún ' +
+      'original ni ningún archivo en su unidad.',
+    err_settings: 'La configuración no se puede escribir.',
+    err_settings_drive: 'La letra de la unidad debe ser A, B o de D a Z.'
   }
 };

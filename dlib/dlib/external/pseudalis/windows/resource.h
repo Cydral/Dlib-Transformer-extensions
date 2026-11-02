@@ -17,4 +17,10 @@
 #define IDR_LICENSE 301
 #define IDR_PAYLOAD 401
 
+// The texts of the commands of the Explorer, in each language of pseudalis.exe.
+#define IDS_VERB_PROTECT 501
+#define IDS_VERB_PROTECT_COPY 502
+#define IDS_VERB_RESTORE 503
+#define IDS_VERB_RESTORE_COPY 504
+
 #endif // PSEUDALIS_WINDOWS_RESOURCE_H_

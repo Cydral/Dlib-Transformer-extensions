@@ -11,6 +11,15 @@
 #define PSEUDALIS_VERSION "1.0.0"
 
 #define PSEUDALIS_PRODUCT_NAME "Pseudalis"
+/*
+    The edition: Community, free and open source under the Boost Software License, which
+    the FLOSS exception of WinFsp covers (README.md, Editions).  The installed programs, the
+    About window, the web application and the files of the programs name it.
+*/
+#ifndef PSEUDALIS_EDITION
+#define PSEUDALIS_EDITION "Community"
+#endif
+#define PSEUDALIS_FULL_NAME PSEUDALIS_PRODUCT_NAME " " PSEUDALIS_EDITION
 #define PSEUDALIS_PUBLISHER "Cydral Technology"
 #define PSEUDALIS_AUTHOR_NAME "Aldric Pierrain"
 #define PSEUDALIS_AUTHOR_EMAIL "cydraltechnology@gmail.com"

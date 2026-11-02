@@ -386,14 +386,14 @@ namespace pseudalis
                     if (WaitForSingleObject(l->overlapped.hEvent, 2000) != WAIT_OBJECT_0) l.release();
                     else free_lookup(l);
                     error = w == WAIT_OBJECT_0 + 1 ? cancelled_error()
-                        : "the name " + host + " was not resolved within " + std::to_string(connect_seconds) + " s";
+                        : "the name of the server was not resolved within " + std::to_string(connect_seconds) + " s";
                     return nullptr;
                 }
                 rc = overlapped_result(&l->overlapped);
             }
             if (rc != NO_ERROR)
             {
-                error = "the name " + host + " cannot be resolved (error " + std::to_string(rc) + ")";
+                error = "the name of the server cannot be resolved (error " + std::to_string(rc) + ")";
                 free_lookup(l);
                 return nullptr;
             }
@@ -417,7 +417,7 @@ namespace pseudalis
             // Without the functions of a bounded resolution, the client resolves the name.
             if (!l) return error.empty();
             const bool ok = probe(l->result, port, error);
-            if (!ok) error = host + ":" + std::to_string(port) + ": " + error;
+            if (!ok) error = "the server does not answer: " + error;
             free_lookup(l);
             return ok;
 #else
@@ -449,7 +449,7 @@ namespace pseudalis
             const int rc = getaddrinfo(host.c_str(), nullptr, &hints, &list);
             if (rc != 0)
             {
-                error = "the name " + host + " cannot be resolved (error " + std::to_string(rc) + ")";
+                error = "the name of the server cannot be resolved (error " + std::to_string(rc) + ")";
                 return false;
             }
             for (const addrinfo* a = list; a; a = a->ai_next)
@@ -499,7 +499,7 @@ namespace pseudalis
             }
             if (from.compare(0, 8, "https://") == 0 && to.compare(0, 8, "https://") != 0)
             {
-                error = from + " redirects to an address without https";
+                error = "the server redirects to an address without https";
                 return false;
             }
             return true;
@@ -609,7 +609,7 @@ namespace pseudalis
         }
         if (addresses.empty())
         {
-            error = "the name " + host + " has no address";
+            error = "the name of the server has no address";
             return false;
         }
         return true;
@@ -623,7 +623,7 @@ namespace pseudalis
             url_parts u;
             if (!parse_url(current, u))
             {
-                error = "invalid address " + current;
+                error = "the address of the download is not valid";
                 return false;
             }
             if (cancelled)
@@ -634,7 +634,7 @@ namespace pseudalis
             const std::shared_ptr<httplib::Client> c = open(u, timeout_seconds, error);
             if (!c)
             {
-                error = url + ": " + error;
+                error = "the download failed: " + error;
                 return false;
             }
             http_registration reg(c);
@@ -683,22 +683,22 @@ namespace pseudalis
             }
             if (too_big)
             {
-                error = url + " is larger than expected";
+                error = "the download is larger than expected";
                 return false;
             }
             if (status != 0 && status != 200)
             {
-                error = url + ": status " + std::to_string(status);
+                error = "the server answered with the status " + std::to_string(status);
                 return false;
             }
             if (!r)
             {
-                error = url + ": " + httplib::to_string(r.error());
+                error = "the download failed: " + httplib::to_string(r.error());
                 return false;
             }
             return true;
         }
-        error = url + ": too many redirections";
+        error = "the download meets too many redirections";
         return false;
     }
 
@@ -721,7 +721,7 @@ namespace pseudalis
             url_parts u;
             if (!parse_url(current, u))
             {
-                error = "invalid address " + current;
+                error = "the address of the download is not valid";
                 return false;
             }
             if (cancelled)
@@ -732,7 +732,7 @@ namespace pseudalis
             const std::shared_ptr<httplib::Client> c = open(u, 30, error);
             if (!c)
             {
-                error = url + ": " + error;
+                error = "the download failed: " + error;
                 return false;
             }
             http_registration reg(c);
@@ -822,22 +822,23 @@ namespace pseudalis
             }
             if (refused_range)
             {
-                error = url + ": the server does not resume downloads";
+                error = "the server does not resume downloads";
                 return false;
             }
             if (other_range)
             {
-                error = url + ": the server answered with another range than the one asked";
+                error = "the server answered with another range than the one asked";
                 return false;
             }
             if (!r)
             {
-                error = url + ": " + (status ? "status " + std::to_string(status) : httplib::to_string(r.error()));
+                error = status ? "the server answered with the status " + std::to_string(status)
+                               : "the download failed: " + httplib::to_string(r.error());
                 return false;
             }
             return true;
         }
-        error = url + ": too many redirections";
+        error = "the download meets too many redirections";
         return false;
     }
 

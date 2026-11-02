@@ -32,7 +32,7 @@ BEGIN
             VALUE "InternalName", "pseudalis"
             VALUE "LegalCopyright", PSEUDALIS_COPYRIGHT
             VALUE "OriginalFilename", "pseudalis.exe"
-            VALUE "ProductName", PSEUDALIS_PRODUCT_NAME
+            VALUE "ProductName", PSEUDALIS_FULL_NAME
             VALUE "ProductVersion", PSEUDALIS_VERSION
         END
     END
@@ -40,4 +40,54 @@ BEGIN
     BEGIN
         VALUE "Translation", 0x409, 1200
     END
+END
+
+/*
+    The texts of the commands of the Explorer, which the Explorer loads in the language of
+    each user (the indirect strings of MUIVerb), and in English, the neutral language, for a
+    language that Pseudalis does not speak.  0x0c French, 0x07 German, 0x10 Italian, 0x0a
+    Spanish, each with its neutral sublanguage (0).
+*/
+STRINGTABLE
+BEGIN
+    IDS_VERB_PROTECT "Anonymize"
+    IDS_VERB_PROTECT_COPY "Anonymize as a copy"
+    IDS_VERB_RESTORE "Restore the original"
+    IDS_VERB_RESTORE_COPY "Restore as a copy"
+END
+
+LANGUAGE 0x0c, 0
+STRINGTABLE
+BEGIN
+    IDS_VERB_PROTECT "Anonymiser"
+    IDS_VERB_PROTECT_COPY "Anonymiser dans une copie"
+    IDS_VERB_RESTORE "Restaurer l'original"
+    IDS_VERB_RESTORE_COPY "Restaurer dans une copie"
+END
+
+LANGUAGE 0x07, 0
+STRINGTABLE
+BEGIN
+    IDS_VERB_PROTECT "Anonymisieren"
+    IDS_VERB_PROTECT_COPY "Als Kopie anonymisieren"
+    IDS_VERB_RESTORE "Original wiederherstellen"
+    IDS_VERB_RESTORE_COPY "Als Kopie wiederherstellen"
+END
+
+LANGUAGE 0x10, 0
+STRINGTABLE
+BEGIN
+    IDS_VERB_PROTECT "Anonimizza"
+    IDS_VERB_PROTECT_COPY "Anonimizza in una copia"
+    IDS_VERB_RESTORE "Ripristina l'originale"
+    IDS_VERB_RESTORE_COPY "Ripristina in una copia"
+END
+
+LANGUAGE 0x0a, 0
+STRINGTABLE
+BEGIN
+    IDS_VERB_PROTECT "Anonimizar"
+    IDS_VERB_PROTECT_COPY "Anonimizar en una copia"
+    IDS_VERB_RESTORE "Restaurar el original"
+    IDS_VERB_RESTORE_COPY "Restaurar en una copia"
 END

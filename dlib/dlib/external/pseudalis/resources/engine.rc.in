@@ -24,7 +24,7 @@ BEGIN
             VALUE "InternalName", "@PSEUDALIS_RC_FILE@"
             VALUE "LegalCopyright", PSEUDALIS_COPYRIGHT
             VALUE "OriginalFilename", "@PSEUDALIS_RC_FILE@"
-            VALUE "ProductName", PSEUDALIS_PRODUCT_NAME
+            VALUE "ProductName", PSEUDALIS_FULL_NAME
             VALUE "ProductVersion", PSEUDALIS_VERSION
         END
     END

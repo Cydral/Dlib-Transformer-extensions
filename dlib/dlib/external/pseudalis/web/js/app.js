@@ -8,11 +8,20 @@
   const texts = window.PSEUDALIS_TEXTS;
   let language = 'en';
 
+  /* The language of the page: the one chosen in its menu, else the first language of the
+     browser, which follows the system unless its user chose otherwise, that the application
+     knows, else English. */
   function pick() {
     let saved = null;
     try { saved = localStorage.getItem('pseudalis.language'); } catch (e) { /* storage unavailable */ }
-    const wanted = (saved || navigator.language || 'en').slice(0, 2).toLowerCase();
-    return texts[wanted] ? wanted : 'en';
+    if (saved && texts[saved]) return saved;
+    const wanted = navigator.languages && navigator.languages.length ? navigator.languages
+      : [navigator.language || 'en'];
+    for (let i = 0; i < wanted.length; ++i) {
+      const code = String(wanted[i] || '').slice(0, 2).toLowerCase();
+      if (texts[code]) return code;
+    }
+    return 'en';
   }
 
   function t(key, values) {
@@ -71,11 +80,12 @@
       const r = await fetch('v1/info', { cache: 'no-store' });
       const info = await r.json();
       box.textContent = '';
-      document.getElementById('version').textContent = info.version || '';
+      document.getElementById('version').textContent = [info.edition, info.version].filter(Boolean).join(' ');
       box.appendChild(pill(t('s_version'), info.version));
       box.appendChild(pill(t('s_engine'), (info.engine && info.engine.variant) || '?'));
       const d = info.drive || {};
-      box.appendChild(pill(t('s_drive'), d.mounted ? d.letter + ':' : t('s_drive_off'), !!d.mounted));
+      const off = d.error_code === 'winfsp_missing' ? t('s_drive_winfsp') : t('s_drive_off');
+      box.appendChild(pill(t('s_drive'), d.mounted ? d.letter + ':' : off, !!d.mounted));
       const a = info.albireo || {};
       box.appendChild(pill(t('s_albireo'), a.found ? a.model : t('s_albireo_off'), !!a.found));
       box.appendChild(pill(t('s_records'), String(info.records || 0)));
@@ -95,9 +105,24 @@
     return b;
   }
 
+  /* The failure of a request in the language of the page: the text of its code, with its values
+     (a date written in the manner of the language, sizes in megabytes), else the English text
+     of the service. */
   function errorText(body, status) {
+    if (body && body.code && texts.en['err_' + body.code]) {
+      const values = { e: body.error || '' };
+      const args = body.args || {};
+      Object.keys(args).forEach(function (k) { values[k] = String(args[k]); });
+      if (/^\d{4}-\d{2}-\d{2}$/.test(values.date || '')) {
+        const d = new Date(values.date + 'T12:00:00');
+        if (!isNaN(d.getTime())) values.date = d.toLocaleDateString(language);
+      }
+      const sizes = body.sizes || {};
+      Object.keys(sizes).forEach(function (k) { values[k] = String(Math.ceil((Number(sizes[k]) || 0) / 1048576)); });
+      return t('err_' + body.code, values);
+    }
     if (body && body.error) return body.error;
-    return 'HTTP ' + status;
+    return t('err_http', { status: status });
   }
 
   async function send(file, route, list, describe) {
@@ -132,9 +157,10 @@
       a.download = body.name;
       li.appendChild(a);
     } catch (e) {
+      // The request did not reach the service, or its answer was cut.
       busy.remove();
       detail.className = 'error';
-      detail.textContent = String(e);
+      detail.textContent = t('s_offline');
     }
   }
 
@@ -185,11 +211,18 @@
 
   async function textRoute(route) {
     const out = document.getElementById('text-result');
-    const r = await fetch(route, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: document.getElementById('text').value })
-    });
+    let r;
+    try {
+      r = await fetch(route, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: document.getElementById('text').value })
+      });
+    } catch (e) {
+      out.hidden = false;
+      out.textContent = t('s_offline');
+      return;
+    }
     const body = await r.json().catch(function () { return null; });
     out.hidden = false;
     if (!r.ok || !body) {
@@ -341,7 +374,6 @@
     document.getElementById('set-removed').value = s.removed_days;
     document.getElementById('set-albireo').checked = s.albireo !== 'off';
     document.getElementById('set-updates').checked = !!s.check_updates;
-    document.getElementById('set-pdf').checked = s.pdf_layout !== false;
   }
 
   async function saveSettings() {
@@ -351,8 +383,7 @@
       max_file_mb: parseInt(document.getElementById('set-max').value, 10) || 256,
       removed_days: parseInt(document.getElementById('set-removed').value, 10) || 30,
       albireo: document.getElementById('set-albireo').checked ? 'auto' : 'off',
-      check_updates: document.getElementById('set-updates').checked,
-      pdf_layout: document.getElementById('set-pdf').checked
+      check_updates: document.getElementById('set-updates').checked
     });
     if (!r.ok) return message('settings-message', errorText(r.body, r.status), true);
     message('settings-message', t(r.body.restart ? 'saved_restart' : 'saved'));

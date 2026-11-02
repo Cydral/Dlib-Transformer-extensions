@@ -14,6 +14,7 @@
 #include <memory>
 #include <new>
 #include <string>
+#include <utility>
 
 #include "engine.h"
 
@@ -164,11 +165,11 @@ PSD_API int PSD_CALL psd_process(psd_engine* engine, const char* request, const 
         std::string out;
         if (op == "anonymize" || op == "restore")
         {
-            const pseudalis::engine_result r = op == "anonymize"
-                ? engine->e->anonymize(bytes, name, handler, req["pdf_layout"].as_bool(true))
+            pseudalis::engine_result r = op == "anonymize"
+                ? engine->e->anonymize(bytes, name, handler)
                 : engine->e->restore(bytes, name);
             res = result_of(r);
-            out = r.bytes;
+            out = std::move(r.bytes);
         }
         else if (op == "anonymize_text" || op == "restore_text")
         {
@@ -217,7 +218,15 @@ PSD_API int PSD_CALL psd_key_fingerprint(psd_engine* engine, psd_buffer* fingerp
 {
     clear(fingerprint);
     if (!engine || !engine->e) return 0;
-    return put(fingerprint, engine->e->key_fingerprint()) ? 1 : 0;
+    // No exception crosses the interface of the library.
+    try
+    {
+        return put(fingerprint, engine->e->key_fingerprint()) ? 1 : 0;
+    }
+    catch (...)
+    {
+        return 0;
+    }
 }
 
 PSD_API char* PSD_CALL psd_alloc(size_t size)

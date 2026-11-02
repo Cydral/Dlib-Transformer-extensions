@@ -26,13 +26,14 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
-#include <thread>
 
 #include "../common/log.h"
 #include "../common/platform.h"
 #include "../common/version.h"
 #include "crypto.h"
 #include "drive.h"
+#include "http_fetch.h"
+#include "public_link.h"
 #include "service.h"
 
 namespace pseudalis
@@ -209,6 +210,15 @@ namespace pseudalis
                 });
         }
 
+        // false, with 503, when no slot of work was free in time.
+        bool busy_refused(const work_slot& slot, httplib::Response& res)
+        {
+            if (slot.held()) return true;
+            res.set_header("Retry-After", "15");
+            send_error(res, 503, "the service is busy with other files: try again in a moment", "busy");
+            return false;
+        }
+
         bool parse_body(const httplib::Request& req, httplib::Response& res, json& body)
         {
             if (!json::parse(req.body, body) || !body.is_object())
@@ -225,7 +235,7 @@ namespace pseudalis
         const int port = svc.port();
         service* s = &svc;
 
-        srv.set_pre_routing_handler([port](const httplib::Request& req, httplib::Response& res) {
+        srv.set_pre_routing_handler([port, s](const httplib::Request& req, httplib::Response& res) {
             auto refuse = [&](int status, const char* message) {
                 res.status = status;
                 res.set_header("Connection", "close");
@@ -236,6 +246,24 @@ namespace pseudalis
             const std::string origin = req.get_header_value("Origin");
             if (!origin.empty() && !is_local_origin(origin, port))
                 return refuse(403, "cross-origin requests are refused");
+            /*
+                A body larger than its route takes is refused before it is read: the files up to
+                the size of the settings, a JSON body up to 16 MB.
+            */
+            const unsigned long long length =
+                std::strtoull(req.get_header_value("Content-Length").c_str(), nullptr, 10);
+            const bool file_route = req.path == "/v1/anonymize" || req.path == "/v1/restore";
+            const unsigned long long limit = file_route
+                ? (static_cast<unsigned long long>(s->settings().get().max_file_mb) + 1) << 20 : 16ull << 20;
+            if (length > limit)
+            {
+                user_error e;
+                e.set("the request is larger than the service takes", "file_too_large")
+                    .arg("mb", std::to_string(limit >> 20));
+                res.set_header("Connection", "close");
+                send_error(res, 413, e);
+                return httplib::Server::HandlerResponse::Handled;
+            }
             return httplib::Server::HandlerResponse::Unhandled;
         });
         srv.set_post_routing_handler([](const httplib::Request& req, httplib::Response& res) {
@@ -266,8 +294,9 @@ namespace pseudalis
             catch (...)
             {
             }
+            // The detail goes to the log alone.
             log_error("http: " + req.method + " " + req.path + ": " + what);
-            send_error(res, 500, what, "server_error");
+            send_error(res, 500, "the service could not process the request", "server_error");
         });
 
         auto admin = [s](const httplib::Request& req, httplib::Response& res) {
@@ -293,6 +322,8 @@ namespace pseudalis
         // Files.
         srv.Post("/v1/anonymize", [s](const httplib::Request& req, httplib::Response& res,
                                       const httplib::ContentReader& reader) {
+            work_slot slot(s->work());
+            if (!busy_refused(slot, res)) return;
             std::string body, filename;
             if (!read_file_body(req, reader, body, filename))
             {
@@ -318,6 +349,8 @@ namespace pseudalis
         });
         srv.Post("/v1/restore", [s](const httplib::Request& req, httplib::Response& res,
                                     const httplib::ContentReader& reader) {
+            work_slot slot(s->work());
+            if (!busy_refused(slot, res)) return;
             std::string body, filename;
             if (!read_file_body(req, reader, body, filename))
             {
@@ -328,9 +361,11 @@ namespace pseudalis
             const std::string name = clean_name(given.empty() ? filename : given, "document");
             restore_result r;
             user_error e;
-            if (!s->restore(body, name, req.get_param_value("object_id"), r, e))
+            if (!s->restore(body, name, lower(req.get_param_value("object_id")), r, e))
             {
-                send_error(res, e.code == "not_protected" ? 404 : 422, e);
+                // A file whose original was forgotten is gone for good: 410, not 404.
+                const bool gone = e.code == "original_forgotten" || e.code == "original_expired";
+                send_error(res, e.code == "not_protected" ? 404 : gone ? 410 : 422, e);
                 return;
             }
             json meta = json::object();
@@ -351,9 +386,24 @@ namespace pseudalis
                 j["output_name"] = r.output_name;
                 j["exact"] = r.output_sha256 == lower(req.get_param_value("sha256"));
             }
+            else
+            {
+                // A protected file whose original was forgotten: its restoration is refused.
+                int64_t when = 0;
+                std::string reason;
+                if (s->db().find_forgotten(lower(req.get_param_value("sha256")),
+                                           lower(req.get_param_value("object_id")), when, reason))
+                {
+                    json f = json::object();
+                    f["time"] = iso_time(when);
+                    f["reason"] = reason;
+                    j["forgotten"] = f;
+                }
+            }
             send_json(res, 200, j);
         });
-        srv.Post(R"(/v1/records/(\d+)/location)", [s](const httplib::Request& req, httplib::Response& res) {
+        srv.Post(R"(/v1/records/(\d+)/location)", [s, admin](const httplib::Request& req, httplib::Response& res) {
+            if (!admin(req, res)) return;
             json body;
             if (!parse_body(req, res, body)) return;
             const long long id = std::atoll(req.matches[1].str().c_str());
@@ -373,6 +423,8 @@ namespace pseudalis
         // Texts.
         auto text_route = [s](const char* operation) {
             return [s, operation](const httplib::Request& req, httplib::Response& res) {
+                work_slot slot(s->work());
+                if (!busy_refused(slot, res)) return;
                 json body, out;
                 if (!parse_body(req, res, body)) return;
                 user_error e;
@@ -392,7 +444,8 @@ namespace pseudalis
         srv.Get("/v1/drive", [s](const httplib::Request&, httplib::Response& res) {
             send_json(res, 200, s->status()["drive"]);
         });
-        srv.Get("/v1/events", [s](const httplib::Request& req, httplib::Response& res) {
+        srv.Get("/v1/events", [s, admin](const httplib::Request& req, httplib::Response& res) {
+            if (!admin(req, res)) return;
             json j = json::object();
             j["events"] = s->db().events(std::atoll(req.get_param_value("since").c_str()));
             send_json(res, 200, j);
@@ -432,7 +485,7 @@ namespace pseudalis
         });
         srv.Delete(R"(/v1/records/(\d+))", [s, admin](const httplib::Request& req, httplib::Response& res) {
             if (!admin(req, res)) return;
-            if (!s->forget(std::atoll(req.matches[1].str().c_str())))
+            if (!s->forget(std::atoll(req.matches[1].str().c_str()), "forgotten"))
             {
                 send_error(res, 404, "no such record", "not_found");
                 return;
@@ -453,11 +506,25 @@ namespace pseudalis
                 send_error(res, 400, "the letter of the drive must be A, B or D to Z", "settings_drive");
                 return;
             }
-            const host_settings before = s->settings().get();
-            json merged = before.to_json();
-            for (const auto& kv : body.items()) merged[kv.first] = kv.second;
-            const host_settings after = host_settings::from_json(merged);
-            if (!s->settings().set(after))
+            // The places of the publication and the proxy, in the forms the service reads only.
+            const std::string link = body["public_link"].str(), feed = body["feed_url"].str();
+            if ((body.contains("public_link") && !link.empty() &&
+                 (link.compare(0, 8, "https://") != 0 || !valid_public_link(link))) ||
+                (body.contains("feed_url") && (feed.compare(0, 8, "https://") != 0 || feed.size() > 1024 ||
+                 feed.find_first_of(" \t\r\n\"<>") != std::string::npos)) ||
+                (body.contains("proxy") && !valid_proxy_setting(body["proxy"].str())))
+            {
+                send_error(res, 400, "the public link, the feed or the proxy is not in a form the service reads",
+                           "settings_publication");
+                return;
+            }
+            host_settings before, after;
+            if (!s->settings().update([&](host_settings& st) {
+                    before = st;
+                    json merged = st.to_json();
+                    for (const auto& kv : body.items()) merged[kv.first] = kv.second;
+                    st = host_settings::from_json(merged);
+                }, after))
             {
                 send_error(res, 500, "the settings cannot be written", "settings");
                 return;
@@ -471,14 +538,15 @@ namespace pseudalis
             send_json(res, 200, j);
             if (restart)
             {
+                // The listener closes now; the answer leaves before the service stops.
                 log_info("settings: changed, the service restarts");
-                std::thread([s]() { s->request_restart(); }).detach();
+                s->request_restart();
             }
         });
         srv.Post("/v1/restart", [s, admin](const httplib::Request& req, httplib::Response& res) {
             if (!admin(req, res)) return;
             send_json(res, 200, json::object());
-            std::thread([s]() { s->request_restart(); }).detach();
+            s->request_restart();
         });
         srv.Get("/v1/updates", [s](const httplib::Request&, httplib::Response& res) {
             send_json(res, 200, s->updates().status());
@@ -497,7 +565,7 @@ namespace pseudalis
                 return;
             }
             send_json(res, 202, json::object());
-            std::thread([s]() { s->request_restart(); }).detach();
+            s->request_restart();
         });
         srv.Post("/v1/key/export", [s, admin](const httplib::Request& req, httplib::Response& res) {
             if (!admin(req, res)) return;

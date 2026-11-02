@@ -7,9 +7,11 @@
 
 #include "service.h"
 
+#include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <cstdlib>
+#include <set>
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -83,6 +85,29 @@ namespace pseudalis
         stop();
     }
 
+    void work_slots::init(int slots)
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        size_ = free_ = std::max(1, slots);
+    }
+
+    bool work_slots::acquire(std::chrono::milliseconds wait)
+    {
+        std::unique_lock<std::mutex> lock(m_);
+        if (!cv_.wait_for(lock, wait, [this]() { return free_ > 0; })) return false;
+        --free_;
+        return true;
+    }
+
+    void work_slots::release()
+    {
+        {
+            std::lock_guard<std::mutex> lock(m_);
+            ++free_;
+        }
+        cv_.notify_one();
+    }
+
     std::string service::language() const
     {
         const std::string l = settings_ ? settings_->get().language : std::string("auto");
@@ -123,6 +148,8 @@ namespace pseudalis
     bool service::run(std::string& error)
     {
         started_ = now_unix();
+        // A previous run of this process cancelled the downloads as it stopped.
+        http_restore();
         program_dir_ = executable_dir();
         data_dir_ = pseudalis::data_dir();
         std::string e;
@@ -133,7 +160,7 @@ namespace pseudalis
         }
         make_dirs(join_path(data_dir_, "logs"));
         log_file::instance().open(join_path(join_path(data_dir_, "logs"), "service.log"));
-        log_info("service: " + std::string(PSEUDALIS_PRODUCT_NAME) + " " + PSEUDALIS_VERSION + " starts, data in " +
+        log_info("service: " + std::string(PSEUDALIS_FULL_NAME) + " " + PSEUDALIS_VERSION + " starts, data in " +
                  data_dir_);
         settings_.reset(new settings_store(join_path(data_dir_, "settings.json")));
         const host_settings st = settings_->get();
@@ -164,6 +191,15 @@ namespace pseudalis
         try
         {
             db_.reset(new store(join_path(join_path(data_dir_, "db"), "pseudalis.db")));
+            /*
+                The blobs that nothing names any more go before anything is written: a deletion
+                that failed or was cut short, a picture kept twice by two files at once.
+            */
+            const std::set<std::string> named = db_->referenced_blobs();
+            size_t orphans = 0;
+            for (const std::string& id : vault_->list_and_clean())
+                if (!named.count(id) && vault_->remove(id)) ++orphans;
+            if (orphans) log_info("vault: " + std::to_string(orphans) + " blob(s) that no record names removed");
         }
         catch (const std::exception& x)
         {
@@ -171,6 +207,22 @@ namespace pseudalis
             return false;
         }
         if (!start_engine(error)) return false;
+        /*
+            The files of the interface processed at once: half the processors, from 2 to 8, and
+            no more than the memory holds, each file standing about six times in memory.
+        */
+        {
+            const unsigned cores = std::max(2u, std::thread::hardware_concurrency());
+            unsigned long long by_memory = 8;
+#if defined(_WIN32)
+            const unsigned long long file_bytes = static_cast<unsigned long long>(st.max_file_mb) << 20;
+            MEMORYSTATUSEX memory;
+            memory.dwLength = sizeof(memory);
+            if (GlobalMemoryStatusEx(&memory)) by_memory = memory.ullTotalPhys / (6 * std::max(file_bytes, 1ull));
+#endif
+            const int slots = static_cast<int>(std::min<unsigned long long>(by_memory, std::min(8u, cores / 2)));
+            work_.init(std::max(2, slots));
+        }
 
         // The certificates of the local server, and the trust of a new authority.
         const std::string cert_dir = join_path(data_dir_, "certificates");
@@ -244,19 +296,36 @@ namespace pseudalis
             error = "the TLS configuration of the server failed";
             return false;
         }
-        server_->set_payload_max_length(static_cast<size_t>(st.max_file_mb + 1) << 20);
-        server_->set_keep_alive_timeout(5);
-        server_->set_read_timeout(60);
+        // The bound of the files of the settings at most (the routes check the current one); a
+        // connection left idle a second goes, so that the polls of the icons hold no worker.
+        server_->set_payload_max_length(static_cast<size_t>(2048 + 1) << 20);
+        server_->set_keep_alive_timeout(1);
+        server_->set_keep_alive_max_count(20);
+        server_->set_read_timeout(30);
         server_->set_write_timeout(60);
         server_->new_task_queue = []() { return new httplib::ThreadPool(8, 32, 64); };
+        /*
+            On Windows the socket keeps its default options: a port bound to 127.0.0.1 that way
+            cannot be taken by a program of another account, and a restart binds it again at
+            once, where SO_EXCLUSIVEADDRUSE would refuse it while the connections of the previous
+            run end.  Elsewhere SO_REUSEADDR gives the same restart.
+        */
         server_->set_socket_options([](socket_t sock) {
 #if defined(_WIN32)
-            httplib::set_socket_opt(sock, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, 1);
+            (void)sock;
 #else
             httplib::set_socket_opt(sock, SOL_SOCKET, SO_REUSEADDR, 1);
 #endif
         });
-        if (!server_->bind_to_port("127.0.0.1", port_))
+        // The previous run, or the previous process, may still release the port: tried again
+        // for ten seconds.
+        bool bound = false;
+        for (int attempt = 0; attempt < 40 && !bound && !stopping_; ++attempt)
+        {
+            if (attempt > 0) std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            bound = server_->bind_to_port("127.0.0.1", port_);
+        }
+        if (!bound)
         {
             error = "the port " + std::to_string(port_) + " is in use or cannot be opened";
             if (drive_) drive_->stop();
@@ -319,6 +388,7 @@ namespace pseudalis
     {
         json j = json::object();
         j["product"] = PSEUDALIS_PRODUCT_NAME;
+        j["edition"] = PSEUDALIS_EDITION;
         j["version"] = PSEUDALIS_VERSION;
         j["copyright"] = PSEUDALIS_COPYRIGHT;
         j["author"] = PSEUDALIS_AUTHOR_NAME;
@@ -332,8 +402,18 @@ namespace pseudalis
         engine["avx2"] = cpu_has_avx2();
         j["engine"] = engine;
         j["key_fingerprint"] = key_fingerprint_;
-        j["records"] = db_ ? db_->count_files() : 0;
-        j["drive"] = drive_ ? drive_->status() : json::object();
+        {
+            std::lock_guard<std::mutex> lock(counts_m_);
+            const auto now = std::chrono::steady_clock::now();
+            if (counts_at_.time_since_epoch().count() == 0 || now - counts_at_ > std::chrono::seconds(2))
+            {
+                records_count_ = db_ ? db_->count_files() : 0;
+                drive_status_ = drive_ ? drive_->status() : json::object();
+                counts_at_ = now;
+            }
+            j["records"] = records_count_;
+            j["drive"] = drive_status_;
+        }
         j["albireo"] = albireo_.status();
         j["updates"] = updater_ ? updater_->status() : json::object();
         return j;
@@ -342,6 +422,12 @@ namespace pseudalis
     bool service::protect(const std::string& bytes, const std::string& name, const std::string& source, bool record,
                           protect_result& out, user_error& error)
     {
+        std::shared_lock<std::shared_timed_mutex> work(work_m_);
+        if (key_replaced_)
+        {
+            error.set("the service restarts with the key imported", "stopping");
+            return false;
+        }
         if (!engine_)
         {
             error.set("the engine is not ready", "engine");
@@ -355,12 +441,17 @@ namespace pseudalis
             return false;
         }
         const std::string lang = language();
-        // Each picture: kept, described once.
+        /*
+            Each picture: kept, described once.  The descriptions of a file take three minutes
+            at most, and none starts once the service stops: the pictures that follow keep
+            their marker alone.
+        */
+        const auto describe_until = std::chrono::steady_clock::now() + std::chrono::minutes(3);
         auto pictures = [&](const picture_request& p) -> std::string {
             picture_record rec;
             if (db_->find_picture(p.sha256, rec)) return rec.description;
             std::string description, why;
-            if (st.albireo != "off")
+            if (st.albireo != "off" && !stopping_ && std::chrono::steady_clock::now() < describe_until)
             {
                 description = albireo_.describe(p.bytes, p.media_type, lang, why);
                 if (description.empty()) log_info("pictures: " + p.id + " without description: " + why);
@@ -379,7 +470,6 @@ namespace pseudalis
         json request = json::object();
         request["operation"] = "anonymize";
         request["name"] = name;
-        request["pdf_layout"] = st.pdf_layout;
         json result;
         std::string e;
         if (!engine_->process(request, bytes, result, out.bytes, pictures, e))
@@ -457,6 +547,23 @@ namespace pseudalis
             }
             return true;
         }
+        /* The original was forgotten: the file is not restored, from its tags either.  Its object
+           identifier tells it only while no live record holds it since. */
+        int64_t when = 0;
+        std::string reason;
+        const bool tracked = db_->find_by_object(object_id, r);
+        if (db_->find_forgotten(sha256_hex(bytes), tracked ? std::string() : object_id, when, reason))
+        {
+            const std::string day = iso_time(when).substr(0, 10);
+            if (reason == "expired")
+                error.set("the original of this file was kept until " + day +
+                          " after its file left the drive, and can no longer be restored", "original_expired");
+            else
+                error.set("the original of this file was forgotten on " + day + " and can no longer be restored",
+                          "original_forgotten");
+            error.arg("date", day);
+            return false;
+        }
         const std::string id = marker_id(bytes);
         picture_record pic;
         if (!id.empty() && db_->get_picture(id, pic))
@@ -528,19 +635,22 @@ namespace pseudalis
         return true;
     }
 
-    bool service::forget(long long record)
+    bool service::forget(long long record, const std::string& reason)
     {
         std::vector<std::string> blobs;
         try
         {
-            if (!db_->remove_file(record, blobs)) return false;
+            if (!db_->remove_file(record, blobs, reason)) return false;
         }
         catch (const std::exception& x)
         {
             log_error("records: " + std::string(x.what()));
             return false;
         }
-        for (const std::string& b : blobs) vault_->remove(b);
+        // A blob that cannot be deleted now goes at the next start, nothing naming it any more.
+        for (const std::string& b : blobs)
+            if (!vault_->remove(b) && vault_->exists(b)) log_warning("vault: a blob of record " +
+                std::to_string(record) + " cannot be deleted now, it goes at the next start");
         return true;
     }
 
@@ -571,7 +681,7 @@ namespace pseudalis
         }
         size_t forgotten = 0;
         for (long long r : records)
-            if (forget(r)) ++forgotten;
+            if (forget(r, "expired")) ++forgotten;
         if (forgotten)
             log_info("records: " + std::to_string(forgotten) + " original(s) of files removed from the drive " +
                      std::to_string(days) + " days ago or more forgotten");
@@ -579,6 +689,11 @@ namespace pseudalis
 
     bool service::export_key(const std::string& passphrase, std::string& exported, user_error& error)
     {
+        if (key_replaced_)
+        {
+            error.set("the service restarts with the key imported", "stopping");
+            return false;
+        }
         if (passphrase.size() < 12)
         {
             error.set("the passphrase must have 12 characters at least", "passphrase_short");
@@ -592,6 +707,13 @@ namespace pseudalis
 
     bool service::import_key(const std::string& exported, const std::string& passphrase, user_error& error)
     {
+        // No protection runs from the check below to the restart (work_m_, key_replaced_).
+        std::unique_lock<std::shared_timed_mutex> work(work_m_);
+        if (key_replaced_)
+        {
+            error.set("the service restarts with the key imported", "stopping");
+            return false;
+        }
         long long files = 0, bytes = 0;
         db_->drive_usage(files, bytes);
         if (db_->count_files() > 0 || files > 0)
@@ -616,6 +738,7 @@ namespace pseudalis
             }
         }
         wipe(key);
+        key_replaced_ = true;
         log_info("keys: a master key was imported, the service restarts");
         request_restart();
         return true;

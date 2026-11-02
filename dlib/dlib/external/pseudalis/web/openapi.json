@@ -66,7 +66,7 @@
      "Service"
     ],
     "summary": "The state of the service",
-    "description": "Version, engine (variant, models), fingerprint of the key, drive, Albireo and the number of originals kept.",
+    "description": "Product, edition (\"Community\"), version, engine (variant, models), fingerprint of the key, drive (with error_code \"winfsp_missing\" when WinFsp is not installed), Albireo and the number of originals kept.",
     "responses": {
      "200": {
       "description": "The state",
@@ -87,7 +87,7 @@
      "Files"
     ],
     "summary": "Protect a file",
-    "description": "Protects a document (Word, Excel, PowerPoint, PDF, text, CSV, markup), a picture or an archive (ZIP, TAR, TAR.GZ) sent as the body. Each personal value becomes a tag [[TYPE:body#CCC]] encrypted under the key of this installation. A picture becomes the text file <name>.txt holding \"[Image@<id> : <description>]\", the description written by Albireo when it is installed; the pictures of Word documents, slides and PDF pages are replaced in place the same way. The entries of an archive of another kind are left out. With record (the default), the original is kept, encrypted, so that /v1/restore gives it back from any copy of the protected file.",
+    "description": "Protects a document (Word, Excel, PowerPoint, PDF, text, CSV, markup), a picture or an archive (ZIP, TAR, TAR.GZ) sent as the body. Each personal value becomes a tag [[TYPE:body#CCC]] encrypted under the key of this installation. A picture becomes the text file <name>.txt holding \"[Image@<id> : <description>]\", the description written by Albireo when it is installed; the pictures of Word documents, slides and PDF pages are replaced in place the same way. The entries of an archive of another kind are left out. With record (the default), the original is kept, encrypted, so that /v1/restore gives it back from any copy of the protected file. A body larger than the route takes is refused before it is read (413): the files up to max_file_mb of the settings, the JSON bodies up to 16 MB. When every slot of work stays taken for a minute, the answer is 503 with Retry-After (code busy).",
     "parameters": [
      {
       "name": "name",
@@ -186,6 +186,9 @@
      },
      "422": {
       "$ref": "#/components/responses/Error"
+     },
+     "503": {
+      "$ref": "#/components/responses/Error"
      }
     }
    }
@@ -196,7 +199,7 @@
      "Files"
     ],
     "summary": "Restore a file",
-    "description": "Gives back the original of a protected file: the original kept when the body is a protected file this installation recorded (X-Pseudalis-restored: original), the picture of a text file holding a picture marker (picture), else the file with the values of its tags put back (tags). 404 when the file holds no value this key protected.",
+    "description": "Gives back the original of a protected file: the original kept when the body is a protected file this installation recorded (X-Pseudalis-restored: original), the picture of a text file holding a picture marker (picture), else the file with the values of its tags put back (tags). 404 when the file holds no value this key protected; 410 when the original of the file was forgotten (code original_forgotten) or kept for its time after the file left the drive (code original_expired), its date in args.date: such a file is not restored from its tags either. A body larger than the route takes is refused before it is read (413): the files up to max_file_mb of the settings, the JSON bodies up to 16 MB. When every slot of work stays taken for a minute, the answer is 503 with Retry-After (code busy).",
     "parameters": [
      {
       "name": "name",
@@ -277,7 +280,16 @@
      "404": {
       "$ref": "#/components/responses/Error"
      },
+     "410": {
+      "$ref": "#/components/responses/Error"
+     },
+     "413": {
+      "$ref": "#/components/responses/Error"
+     },
      "422": {
+      "$ref": "#/components/responses/Error"
+     },
+     "503": {
       "$ref": "#/components/responses/Error"
      }
     }
@@ -311,7 +323,7 @@
     ],
     "responses": {
      "200": {
-      "description": "{\"known\", \"record\", \"output_name\", \"exact\"}",
+      "description": "{\"known\", \"record\", \"output_name\", \"exact\"}; for a file not known whose original was forgotten, \"forgotten\": {\"time\", \"reason\"}, the reason \"forgotten\" or \"expired\"",
       "content": {
        "application/json": {
         "schema": {
@@ -329,6 +341,11 @@
      "Files"
     ],
     "summary": "Record where a protected file was written",
+    "security": [
+     {
+      "admin": []
+     }
+    ],
     "parameters": [
      {
       "name": "id",
@@ -367,6 +384,9 @@
         }
        }
       }
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
      },
      "404": {
       "$ref": "#/components/responses/Error"
@@ -412,10 +432,17 @@
        }
       }
      },
+     "413": {
+      "$ref": "#/components/responses/Error"
+     },
      "422": {
       "$ref": "#/components/responses/Error"
+     },
+     "503": {
+      "$ref": "#/components/responses/Error"
      }
-    }
+    },
+    "description": "A body larger than the route takes is refused before it is read (413): the files up to max_file_mb of the settings, the JSON bodies up to 16 MB. When every slot of work stays taken for a minute, the answer is 503 with Retry-After (code busy)."
    }
   },
   "/v1/text/restore": {
@@ -453,10 +480,17 @@
        }
       }
      },
+     "413": {
+      "$ref": "#/components/responses/Error"
+     },
      "422": {
       "$ref": "#/components/responses/Error"
+     },
+     "503": {
+      "$ref": "#/components/responses/Error"
      }
-    }
+    },
+    "description": "A body larger than the route takes is refused before it is read (413): the files up to max_file_mb of the settings, the JSON bodies up to 16 MB. When every slot of work stays taken for a minute, the answer is 503 with Retry-After (code busy)."
    }
   },
   "/v1/text/detect": {
@@ -497,10 +531,17 @@
        }
       }
      },
+     "413": {
+      "$ref": "#/components/responses/Error"
+     },
      "422": {
       "$ref": "#/components/responses/Error"
+     },
+     "503": {
+      "$ref": "#/components/responses/Error"
      }
-    }
+    },
+    "description": "A body larger than the route takes is refused before it is read (413): the files up to max_file_mb of the settings, the JSON bodies up to 16 MB. When every slot of work stays taken for a minute, the answer is 503 with Retry-After (code busy)."
    }
   },
   "/v1/drive": {
@@ -529,6 +570,11 @@
      "Drive"
     ],
     "summary": "The events of the drive: files protected or refused",
+    "security": [
+     {
+      "admin": []
+     }
+    ],
     "parameters": [
      {
       "name": "since",
@@ -551,6 +597,9 @@
         }
        }
       }
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
      }
     }
    }
@@ -768,14 +817,15 @@
      "401": {
       "$ref": "#/components/responses/Error"
      }
-    }
+    },
+    "description": "The public link and the feed appear only when they differ from those of the build."
    },
    "put": {
     "tags": [
      "Administration"
     ],
     "summary": "Change settings",
-    "description": "The members given replace those of settings.json; the service restarts when the port, the drive, the date order, the proxy or the publication addresses change (\"restart\": true).",
+    "description": "The members given replace those of settings.json; the service restarts when the port, the drive, the date order, the proxy or the publication addresses change (\"restart\": true). The public link must be a public link of pCloud over https, the feed an https address, the proxy empty, \"none\" or http://host:port (400, code settings_publication otherwise). The changes apply in one step against concurrent ones.",
     "security": [
      {
       "admin": []
@@ -801,6 +851,9 @@
         }
        }
       }
+     },
+     "400": {
+      "$ref": "#/components/responses/Error"
      },
      "401": {
       "$ref": "#/components/responses/Error"
@@ -1142,9 +1195,6 @@
        "dmy",
        "mdy"
       ]
-     },
-     "pdf_layout": {
-      "type": "boolean"
      },
      "albireo": {
       "type": "string",

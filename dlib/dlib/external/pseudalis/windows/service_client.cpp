@@ -46,7 +46,14 @@ namespace pseudalis
 
         std::unique_ptr<httplib::SSLClient> make_client(int port, const std::string& ca, int timeout_seconds)
         {
+            /*
+                localhost, checked against the certificate, reached on 127.0.0.1 alone, where the
+                service listens: ::1, which the name gives first, could be the port of another
+                account.
+            */
             std::unique_ptr<httplib::SSLClient> c(new httplib::SSLClient("localhost", port));
+            c->set_hostname_addr_map({ { "localhost", "127.0.0.1" } });
+            c->set_address_family(AF_INET);
             c->set_ca_cert_path(ca.c_str());
             c->enable_server_certificate_verification(true);
             c->set_connection_timeout(3);
@@ -137,9 +144,11 @@ namespace pseudalis
         }
     }
 
+    // The address of the pages the icon opens: 127.0.0.1, which the certificate names, rather
+    // than localhost, which the browser may reach on ::1 first.
     std::string service_client::base_url() const
     {
-        return "https://localhost:" + std::to_string(port_) + "/";
+        return "https://127.0.0.1:" + std::to_string(port_) + "/";
     }
 
     bool service_client::get(const std::string& path, json& out, std::string& error, int timeout_seconds) const

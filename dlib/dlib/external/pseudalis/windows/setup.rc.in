@@ -36,7 +36,7 @@ BEGIN
             VALUE "InternalName", "pseudalis-setup"
             VALUE "LegalCopyright", PSEUDALIS_COPYRIGHT
             VALUE "OriginalFilename", "pseudalis-setup.exe"
-            VALUE "ProductName", PSEUDALIS_PRODUCT_NAME
+            VALUE "ProductName", PSEUDALIS_FULL_NAME
             VALUE "ProductVersion", PSEUDALIS_VERSION
         END
     END

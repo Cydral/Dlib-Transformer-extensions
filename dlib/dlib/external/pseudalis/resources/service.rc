@@ -24,7 +24,7 @@ BEGIN
             VALUE "InternalName", "pseudalis-service"
             VALUE "LegalCopyright", PSEUDALIS_COPYRIGHT
             VALUE "OriginalFilename", "pseudalis-service.exe"
-            VALUE "ProductName", PSEUDALIS_PRODUCT_NAME
+            VALUE "ProductName", PSEUDALIS_FULL_NAME
             VALUE "ProductVersion", PSEUDALIS_VERSION
         END
     END

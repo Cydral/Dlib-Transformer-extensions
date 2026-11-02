@@ -121,6 +121,21 @@ namespace dlib
                 - restore() never uses it.
         !*/
 
+        void set_package_limits(
+            const zip_limits& limits
+        );
+        /*!
+            ensures
+                - #package_limits() == limits: the bounds within which the parts of a package
+                  are decompressed (zip_archive_reader), the defaults of zip_limits until
+                  then.  A caller that knows the size of the files it takes keeps them in
+                  proportion, since the memory of the processing grows with the size of the
+                  parts decompressed.
+        !*/
+
+        const zip_limits& package_limits(
+        ) const;
+
         std::string anonymize(const std::string& package_bytes);
         /*!
             ensures

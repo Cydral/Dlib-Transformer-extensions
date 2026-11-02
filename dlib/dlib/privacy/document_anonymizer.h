@@ -416,6 +416,9 @@ namespace dlib
 
         void set_image_describer(const document_image_describer& describer) { describer_ = describer; }
 
+        void set_package_limits(const zip_limits& limits) { package_limits_ = limits; }
+        const zip_limits& package_limits() const { return package_limits_; }
+
     private:
         struct edit
         {
@@ -437,6 +440,7 @@ namespace dlib
                 {
                     ooxml_anonymizer a(p_, &detector_, report);
                     a.set_image_describer(describer_);
+                    a.set_package_limits(package_limits_);
                     return restoring ? a.restore(bytes) : a.anonymize(bytes);
                 }
                 case document_format::pdf:
@@ -1205,6 +1209,7 @@ namespace dlib
         std::string name_hint_;
         bool pdf_layout_ = true;
         document_image_describer describer_;
+        zip_limits package_limits_;
     };
 
 // ----------------------------------------------------------------------------------------

@@ -273,6 +273,7 @@ namespace pseudalis
         FSP_FILE_SYSTEM_INTERFACE iface = {};
         std::string letter;
         std::string error;
+        std::string error_code;     // "winfsp_missing" when WinFsp is not installed
         bool mounted = false;
         PSECURITY_DESCRIPTOR sd = nullptr;
         DWORD sd_size = 0;
@@ -1270,6 +1271,7 @@ namespace pseudalis
         if (!load_winfsp(p.api, error))
         {
             p.error = error;
+            p.error_code = "winfsp_missing";
             return false;
         }
         if (!p.sd)
@@ -1387,6 +1389,7 @@ namespace pseudalis
         }
         p.mounted = true;
         p.error.clear();
+        p.error_code.clear();
         return true;
     }
 
@@ -1423,6 +1426,7 @@ namespace pseudalis
         j["files"] = files;
         j["bytes"] = bytes;
         j["error"] = p_->error;
+        if (!p_->error_code.empty()) j["error_code"] = p_->error_code;
         return j;
     }
 }

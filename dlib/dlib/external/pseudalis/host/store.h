@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -87,6 +88,8 @@ namespace pseudalis
         std::vector<file_record> list_files(long long limit, long long offset,
             const std::string& source = std::string());
         long long count_files();
+        // The blobs the records, the pictures and the files of the drive name.
+        std::set<std::string> referenced_blobs();
         void set_file_location(long long id, const std::string& object_id, const std::string& path);
         // Records the time the file of a record left the drive, deleted or replaced.
         void set_file_removed(long long id, int64_t when);
@@ -97,8 +100,13 @@ namespace pseudalis
                 - Removes the record and its links to its pictures; blobs receives the blobs
                   nothing refers to any more: its original, and the pictures no other file
                   shows.
+                - With a reason ("forgotten", "expired"), the protected file of the record is
+                  remembered as forgotten (find_forgotten()), in the same transaction.
         !*/
-        bool remove_file(long long id, std::vector<std::string>& blobs);
+        bool remove_file(long long id, std::vector<std::string>& blobs, const std::string& reason = std::string());
+        // The last original forgotten of a protected file, by its SHA-256 or its object identifier.
+        bool find_forgotten(const std::string& sha256, const std::string& object_id, int64_t& time,
+            std::string& reason);
 
         bool get_picture(const std::string& id, picture_record& r);
         bool find_picture(const std::string& sha256, picture_record& r);

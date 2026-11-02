@@ -24,7 +24,10 @@ namespace pseudalis
                 pseudalis-engine-avx2.dll beside the program when the processor runs AVX2,
                 else pseudalis-engine.dll; elsewhere the engine compiled into the program
                 (PSEUDALIS_ENGINE_STATIC) or libpseudalis-engine.so beside it.  The library
-                stays loaded until the object is destroyed, after the engines made with it.
+                stays loaded until the process ends, whatever becomes of the object: the pool
+                of threads its networks run on, the one of dlib, would be joined by its
+                unloading, which Windows runs under its loader lock that the ending threads
+                need, so that the unloading would wait forever and the service with it.
         !*/
     public:
         engine_library() {}

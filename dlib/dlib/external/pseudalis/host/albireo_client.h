@@ -17,12 +17,15 @@ namespace pseudalis
             WHAT THIS OBJECT REPRESENTS
                 The descriptions of the pictures by Albireo, the local inference service,
                 when it is installed on the same computer and one of its models reads
-                images.  Albireo is found through its interface: its data folder
-                (DataDir of HKLM\Software\Albireo, else %ProgramData%\Albireo), the port of
-                its settings.json (8443 by default) and its local authority
+                images.  Albireo is found through its interface: its data folder (DataDir
+                of HKLM\Software\Albireo, which its installer records), the port of its
+                settings.json (8443 by default) and its local authority
                 (certificates\albireo-authority.crt), which checks its certificate; then
-                GET /v1/models, whose "inputs" name the models that read images.  The
-                result is kept for a minute.
+                GET /v1/models, whose "inputs" name the models that read images.  On
+                Windows, the folder, its certificates folder, the authority and the
+                settings must be those of SYSTEM or the administrators.  The result is
+                kept for a minute, checked again by one caller at a time, outside the lock
+                of the state.
 
                 describe() sends the picture to POST /v1/chat/completions, one request at a
                 time, and asks for one or two factual sentences that name no person and
@@ -46,9 +49,12 @@ namespace pseudalis
 
     private:
         bool refresh(std::string& reason);
+        // Finds Albireo and the model that reads images, without the lock of the state.
+        static bool probe(int& port, std::string& ca, std::string& model, std::string& reason);
         std::mutex m_;              // the state
         std::mutex request_m_;      // one description at a time
         bool enabled_ = true;
+        bool checking_ = false;
         int64_t checked_ = 0;
         bool found_ = false;
         int port_ = 8443;

@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <random>
 #include <string>
@@ -362,6 +363,8 @@ namespace dlib
             DLIB_CASSERT(!data.empty());
 
             std::lock_guard<std::mutex> lock(mutex_);
+            spares_.clear();
+            ++generation_;
             const bool resume = options.continue_training && trained_;
             trained_ = false;
             // find() reads long texts through windows of the longest length trained on.
@@ -392,9 +395,35 @@ namespace dlib
             const std::string& text
         ) const
         {
+            /*
+                The layers of a network keep the results of its last pass, so that one network
+                serves one caller at a time: each caller runs a copy of its own, taken from the
+                copies the earlier callers left, and the texts of several callers go through
+                the network at once.
+            */
+            std::unique_ptr<net_type> net;
+            long window = 0;
+            unsigned long generation = 0;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                DLIB_CASSERT(trained_, "pii_span_model::find(): the model is not trained");
+                window = window_;
+                generation = generation_;
+                if (!spares_.empty())
+                {
+                    net = std::move(spares_.back());
+                    spares_.pop_back();
+                }
+                else
+                {
+                    net.reset(new net_type(net_));
+                }
+            }
+            std::vector<pii_span> spans = find_with(*net, window, text);
             std::lock_guard<std::mutex> lock(mutex_);
-            DLIB_CASSERT(trained_, "pii_span_model::find(): the model is not trained");
-            return find_unlocked(text);
+            // A copy of a network trained or loaded since is not kept.
+            if (generation == generation_ && spares_.size() < max_spares) spares_.push_back(std::move(net));
+            return spans;
         }
 
         static constexpr long max_window = 4096;
@@ -514,7 +543,13 @@ namespace dlib
             trainer.get_net();
         }
 
+        // mutex_ is held: the network itself, while it trains.
         std::vector<pii_span> find_unlocked(const std::string& original) const
+        {
+            return find_with(net_, window_, original);
+        }
+
+        std::vector<pii_span> find_with(net_type& net, long window, const std::string& original) const
         {
             /* What is reported as personal data must not depend on the hardware present, so
                the network runs here with the arithmetic of the host. */
@@ -523,15 +558,15 @@ namespace dlib
             const std::string text = privacy_impl::visible_bytes(original, origin);
             const long n = static_cast<long>(text.size());
             if (n == 0) return std::vector<pii_span>();
-            const long w = std::min<long>(window_, n);
+            const long w = std::min<long>(window, n);
             std::vector<long> starts;
-            if (n <= window_)
+            if (n <= window)
             {
                 starts.push_back(0);
             }
             else
             {
-                const long stride = std::max<long>(1, window_ * 3 / 4);
+                const long stride = std::max<long>(1, window * 3 / 4);
                 for (long s = 0; s + w < n; s += stride) starts.push_back(s);
                 if (starts.empty() || starts.back() != n - w) starts.push_back(n - w);
             }
@@ -561,9 +596,9 @@ namespace dlib
                         batch[k - first](q) = static_cast<unsigned char>(text[static_cast<std::size_t>(starts[k] + q)]);
                 }
                 resizable_tensor x;
-                net_.to_tensor(batch.begin(), batch.end(), x);
-                net_.subnet().forward(x);
-                const tensor& out = net_.subnet().get_output();
+                net.to_tensor(batch.begin(), batch.end(), x);
+                net.subnet().forward(x);
+                const tensor& out = net.subnet().get_output();
                 const float* p = out.host();
                 for (std::size_t k = first; k < last; ++k)
                     for (long q = 0; q < w; ++q)
@@ -607,10 +642,15 @@ namespace dlib
             return spans;
         }
 
+        static constexpr std::size_t max_spares = 16;
+
         bool trained_ = false;
         long window_ = 256;
         mutable net_type net_;
         mutable std::mutex mutex_;
+        // The copies of net_ the callers of find() left, of the generation of net_ they copied.
+        mutable std::vector<std::unique_ptr<net_type>> spares_;
+        unsigned long generation_ = 0;
     };
 
     template <long D, long L, long H>
@@ -654,11 +694,14 @@ namespace dlib
         item.net_ = std::move(net);
         item.window_ = window;
         item.trained_ = trained;
+        item.spares_.clear();
+        ++item.generation_;
     }
 
     template <long D, long L, long H> constexpr long pii_span_model<D, L, H>::num_classes;
     template <long D, long L, long H> constexpr long pii_span_model<D, L, H>::vocabulary;
     template <long D, long L, long H> constexpr long pii_span_model<D, L, H>::max_window;
+    template <long D, long L, long H> constexpr std::size_t pii_span_model<D, L, H>::max_spares;
 
     typedef pii_span_model<64, 2, 2> pii_span_model_tiny;
     typedef pii_span_model<128, 4, 4> pii_span_model_small;

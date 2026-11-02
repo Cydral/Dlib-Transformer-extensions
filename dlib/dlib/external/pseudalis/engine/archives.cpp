@@ -75,16 +75,22 @@ namespace pseudalis
             return b.substr(at, len);
         }
 
-        // The records "<length> <key>=<value>\n" of a PAX header.
+        /*
+            The records "<length> <key>=<value>\n" of a PAX header.  The length, decimal digits
+            alone, counts the whole record: a record that does not end where it says, or that
+            would not move forward, ends the reading.
+        */
         void pax_records(const std::string& data, std::string& path, uint64_t& size, bool& has_size)
         {
             size_t p = 0;
             while (p < data.size())
             {
-                size_t sp = data.find(' ', p);
-                if (sp == std::string::npos) break;
+                const size_t sp = data.find(' ', p);
+                if (sp == std::string::npos || sp == p || sp - p > 19) break;
+                if (data.find_first_not_of("0123456789", p) != sp) break;
                 const uint64_t len = std::strtoull(data.substr(p, sp - p).c_str(), nullptr, 10);
-                if (len == 0 || p + len > data.size()) break;
+                if (len <= sp - p + 1 || len > data.size() - p || data[p + static_cast<size_t>(len) - 1] != '\n')
+                    break;
                 const std::string record = data.substr(sp + 1, static_cast<size_t>(p + len - sp - 2));
                 const size_t eq = record.find('=');
                 if (eq != std::string::npos)
@@ -99,6 +105,28 @@ namespace pseudalis
                 }
                 p += static_cast<size_t>(len);
             }
+        }
+
+        /*
+            Whether the name of an entry stays inside the folder where the archive opens: no
+            absolute path, no drive, no backslash and no ".." among its components.  The
+            entries named otherwise are left out of the archive written.
+        */
+        bool safe_entry_name(const std::string& name)
+        {
+            if (name.empty() || name[0] == '/' || name.find('\\') != std::string::npos ||
+                name.find(':') != std::string::npos || name.find('\0') != std::string::npos)
+                return false;
+            size_t at = 0;
+            while (at <= name.size())
+            {
+                const size_t slash = name.find('/', at);
+                const size_t end = slash == std::string::npos ? name.size() : slash;
+                if (name.compare(at, end - at, "..") == 0 && end - at == 2) return false;
+                if (slash == std::string::npos) break;
+                at = slash + 1;
+            }
+            return true;
         }
 
         std::vector<archive_entry> read_tar(const std::string& b, const archive_limits& limits)
@@ -122,16 +150,14 @@ namespace pseudalis
                 if (pax_has_size && type != 'x' && type != 'g') size = pax_size;
                 const size_t data_at = at + 512;
                 if (size > b.size() - data_at) throw archive_error("TAR: an entry goes past the end of the archive");
-                const std::string data = b.substr(data_at, static_cast<size_t>(size));
                 at = data_at + static_cast<size_t>((size + 511) / 512 * 512);
-                if (type == 'L')
+                if (type == 'L' || type == 'x')
                 {
-                    long_name = tar_string(data, 0, data.size());
-                    continue;
-                }
-                if (type == 'x')
-                {
-                    pax_records(data, pax_path, pax_size, pax_has_size);
+                    // The headers of names are read here; a name of 64 KB is long enough.
+                    if (size > (64u << 10)) throw archive_error("TAR: a header of names is too long");
+                    const std::string data = b.substr(data_at, static_cast<size_t>(size));
+                    if (type == 'L') long_name = tar_string(data, 0, data.size());
+                    else pax_records(data, pax_path, pax_size, pax_has_size);
                     continue;
                 }
                 if (type == 'g' || type == 'K') continue;
@@ -146,11 +172,12 @@ namespace pseudalis
                 pax_path.clear();
                 pax_has_size = false;
                 e.name = name;
-                e.mode = static_cast<uint32_t>(tar_number(b, hdr + 100, 8));
+                // The permissions alone: no set-user or set-group identifier, no sticky bit.
+                e.mode = static_cast<uint32_t>(tar_number(b, hdr + 100, 8)) & 0777u;
                 e.mtime = static_cast<int64_t>(tar_number(b, hdr + 136, 12));
                 e.directory = type == '5' || (!name.empty() && name.back() == '/');
-                e.regular = type == '0' || type == '\0' || type == '7' || e.directory;
-                if (e.regular && !e.directory) e.data = data;
+                e.regular = (type == '0' || type == '\0' || type == '7' || e.directory) && safe_entry_name(name);
+                if (e.regular && !e.directory) e.data.assign(b, data_at, static_cast<size_t>(size));
                 total += e.data.size();
                 if (e.data.size() > limits.max_entry_size || total > limits.max_total_size)
                     throw archive_error("TAR: the archive exceeds the size limits");
@@ -177,7 +204,7 @@ namespace pseudalis
         {
             std::string h(512, '\0');
             h.replace(0, std::min<size_t>(name.size(), 100), name.substr(0, 100));
-            put_octal(h, 100, 8, mode & 07777);
+            put_octal(h, 100, 8, mode & 0777);
             put_octal(h, 108, 8, 0);
             put_octal(h, 116, 8, 0);
             put_octal(h, 124, 12, size);
@@ -292,8 +319,11 @@ namespace pseudalis
     {
         std::string out;
         size_t at = 0;
+        // Members follow one another; each is read where it lies, and their number is bounded.
+        size_t members = 0;
         while (at + 18 <= data.size())
         {
+            if (++members > 4096) throw archive_error("gzip: too many members");
             if (static_cast<unsigned char>(data[at]) != 0x1F || static_cast<unsigned char>(data[at + 1]) != 0x8B ||
                 data[at + 2] != 8)
             {
@@ -320,7 +350,7 @@ namespace pseudalis
             std::string member;
             try
             {
-                member = dlib::inflate_raw(data.substr(p),
+                member = dlib::inflate_raw(data.data() + p, data.size() - p,
                                            static_cast<size_t>(max_size - std::min<uint64_t>(max_size, out.size())),
                                            &consumed);
             }
@@ -363,7 +393,8 @@ namespace pseudalis
                 archive_entry e;
                 e.name = info.name;
                 e.directory = !info.name.empty() && info.name.back() == '/';
-                if (!e.directory) e.data = z.read(i);
+                e.regular = safe_entry_name(info.name);
+                if (e.regular && !e.directory) e.data = z.read(i);
                 out.push_back(std::move(e));
             }
         }

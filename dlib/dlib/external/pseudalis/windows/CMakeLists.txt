@@ -32,6 +32,14 @@ if (NOT EXISTS "${PSEUDALIS_WINFSP_MSI}")
    message(FATAL_ERROR "No installer of WinFsp at ${PSEUDALIS_WINFSP_MSI}: run tools/build_windows.ps1, or set "
       "PSEUDALIS_WINFSP_MSI")
 endif()
+# The installer of WinFsp 2.1 (build 2.1.25156) as its project released it, which the installer
+# of Pseudalis runs with the rights of an administrator: any other file stops the build.
+set(PSEUDALIS_WINFSP_MSI_SHA256 073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a)
+file(SHA256 "${PSEUDALIS_WINFSP_MSI}" winfsp_msi_sha256)
+if (NOT winfsp_msi_sha256 STREQUAL PSEUDALIS_WINFSP_MSI_SHA256)
+   message(FATAL_ERROR "${PSEUDALIS_WINFSP_MSI} is not the installer of WinFsp 2.1.25156 released by its project "
+      "(SHA-256 ${winfsp_msi_sha256})")
+endif()
 get_filename_component(winfsp_dir "${PSEUDALIS_WINFSP_MSI}" DIRECTORY)
 set(PSEUDALIS_WINFSP_LICENSE "${winfsp_dir}/License.txt" CACHE FILEPATH "The license of WinFsp")
 # The build checks the list again, so that a file added to or removed from web needs no new configuration.
@@ -41,7 +49,8 @@ add_custom_command(OUTPUT ${PSEUDALIS_PAYLOAD}
    COMMAND ${CMAKE_COMMAND} -DBIN_DIR=${CMAKE_BINARY_DIR}/bin -DSTAGE=${CMAKE_BINARY_DIR}/payload/stage
       -DOUTPUT=${PSEUDALIS_PAYLOAD} -DSOURCE_DIR=${PSEUDALIS_SOURCE_DIR} -DDLIB_DIR=${PSEUDALIS_DLIB_DIR}
       -DSWAGGER_DIR=${PSEUDALIS_ALBIREO_DIR}/web/docs -DWINFSP_MSI=${PSEUDALIS_WINFSP_MSI}
-      -DWINFSP_LICENSE=${PSEUDALIS_WINFSP_LICENSE} -P ${PSEUDALIS_SOURCE_DIR}/cmake/payload.cmake
+      -DWINFSP_MSI_SHA256=${PSEUDALIS_WINFSP_MSI_SHA256} -DWINFSP_LICENSE=${PSEUDALIS_WINFSP_LICENSE}
+      -P ${PSEUDALIS_SOURCE_DIR}/cmake/payload.cmake
    DEPENDS pseudalis-service pseudalis-tray pseudalis-shell pseudalis-engine pseudalis-engine-avx2 ${web_files}
       ${PSEUDALIS_SOURCE_DIR}/cmake/payload.cmake ${PSEUDALIS_SOURCE_DIR}/resources/license.txt
       ${PSEUDALIS_WINFSP_MSI}

@@ -65,20 +65,26 @@ namespace pseudalis
         s.clear();
     }
 
-    std::string aes256_ctr(const std::string& key, const std::string& iv, const std::string& data)
+    void aes256_ctr_into(const std::string& key, const char* iv, const char* in, char* out, size_t size)
     {
         const dlib::aes_block_cipher aes(key.data(), key.size());
         unsigned char counter[16], stream[16];
-        for (int k = 0; k < 16; ++k) counter[k] = static_cast<unsigned char>(iv[static_cast<size_t>(k)]);
-        std::string out(data.size(), '\0');
-        for (size_t at = 0; at < data.size(); at += 16)
+        for (int k = 0; k < 16; ++k) counter[k] = static_cast<unsigned char>(iv[k]);
+        for (size_t at = 0; at < size; at += 16)
         {
             aes.encrypt_block(counter, stream);
-            const size_t n = std::min<size_t>(16, data.size() - at);
+            const size_t n = std::min<size_t>(16, size - at);
             for (size_t k = 0; k < n; ++k)
-                out[at + k] = static_cast<char>(static_cast<unsigned char>(data[at + k]) ^ stream[k]);
+                out[at + k] = static_cast<char>(static_cast<unsigned char>(in[at + k]) ^ stream[k]);
             for (int k = 15; k >= 0 && ++counter[k] == 0; --k) {}
         }
+        dlib::secure_wipe(stream, sizeof(stream));
+    }
+
+    std::string aes256_ctr(const std::string& key, const std::string& iv, const std::string& data)
+    {
+        std::string out(data.size(), '\0');
+        if (!data.empty()) aes256_ctr_into(key, iv.data(), data.data(), &out[0], data.size());
         return out;
     }
 
@@ -86,6 +92,13 @@ namespace pseudalis
     {
         const std::array<unsigned char, 32> d = dlib::hmac_sha256_digest(key, data);
         return std::string(reinterpret_cast<const char*>(d.data()), d.size());
+    }
+
+    key_set::~key_set()
+    {
+        wipe(pseudonymization);
+        wipe(vault_encryption);
+        wipe(vault_authentication);
     }
 
     key_set derive_keys(const std::string& master)
@@ -100,9 +113,28 @@ namespace pseudalis
     bool private_folder(const std::string& path, std::string& error)
     {
 #if defined(_WIN32)
+        const wchar_t* const wanted = L"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
+        /*
+            A folder that has these permissions already keeps them as they are: setting them
+            again would write them on each file it holds, the blobs of the vault included.
+        */
+        if (dir_exists(path))
+        {
+            PSECURITY_DESCRIPTOR current = nullptr;
+            std::wstring w = widen(path);
+            if (GetNamedSecurityInfoW(&w[0], SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr, nullptr,
+                    nullptr, &current) == ERROR_SUCCESS)
+            {
+                LPWSTR text = nullptr;
+                const bool same = ConvertSecurityDescriptorToStringSecurityDescriptorW(current, SDDL_REVISION_1,
+                    DACL_SECURITY_INFORMATION, &text, nullptr) && text && std::wstring(text) == wanted;
+                if (text) LocalFree(text);
+                LocalFree(current);
+                if (same) return true;
+            }
+        }
         PSECURITY_DESCRIPTOR sd = nullptr;
-        if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)",
-                                                                  SDDL_REVISION_1, &sd, nullptr))
+        if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(wanted, SDDL_REVISION_1, &sd, nullptr))
         {
             error = "cannot build the permissions of " + path;
             return false;

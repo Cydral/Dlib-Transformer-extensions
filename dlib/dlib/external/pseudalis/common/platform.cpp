@@ -1240,10 +1240,33 @@ namespace pseudalis
     bool read_file(const std::string& p, std::string& data, uint64_t max_bytes)
     {
 #if defined(_WIN32)
-        std::ifstream in(widen(p).c_str(), std::ios::binary);
+        /*
+            Read with every sharing, deletion included: a file being read can still be deleted
+            or replaced, its content staying readable here until the handle closes (a blob of
+            the vault forgotten while a restoration reads it).
+        */
+        const HANDLE h = CreateFileW(widen(p).c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE |
+            FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return false;
+        LARGE_INTEGER size;
+        bool ok = GetFileSizeEx(h, &size) && size.QuadPart >= 0 && static_cast<uint64_t>(size.QuadPart) <= max_bytes;
+        if (ok)
+        {
+            data.resize(static_cast<size_t>(size.QuadPart));
+            size_t done = 0;
+            while (ok && done < data.size())
+            {
+                DWORD got = 0;
+                const DWORD chunk = static_cast<DWORD>(std::min<size_t>(data.size() - done, 1u << 30));
+                ok = ReadFile(h, &data[done], chunk, &got, nullptr) && got > 0;
+                done += got;
+            }
+        }
+        CloseHandle(h);
+        if (!ok) data.clear();
+        return ok;
 #else
         std::ifstream in(p, std::ios::binary);
-#endif
         if (!in) return false;
         in.seekg(0, std::ios::end);
         const std::streamoff size = in.tellg();
@@ -1252,6 +1275,7 @@ namespace pseudalis
         data.resize(static_cast<size_t>(size));
         if (size > 0) in.read(&data[0], size);
         return static_cast<bool>(in);
+#endif
     }
 
     bool write_file_atomic(const std::string& p, const std::string& data)

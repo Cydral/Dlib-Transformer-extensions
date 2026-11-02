@@ -75,10 +75,11 @@ namespace pseudalis
                 if (dir_exists(dir)) return dir;
             }
         }
-        wchar_t program_data[MAX_PATH];
-        const DWORD n = GetEnvironmentVariableW(L"ProgramData", program_data, MAX_PATH);
-        const std::string dir = n > 0 && n < MAX_PATH ? join_path(narrow(program_data), "Albireo") : std::string();
-        return dir_exists(dir) ? dir : std::string();
+        /*
+            Only the folder that the installer of Albireo recorded, which only an administrator
+            can record: any user can create a folder Albireo in %ProgramData%.
+        */
+        return std::string();
 #else
         const char* home = std::getenv("ALBIREO_HOME");
         if (home && *home) return dir_exists(home) ? std::string(home) : std::string();
@@ -95,45 +96,48 @@ namespace pseudalis
         checked_ = 0;
     }
 
-    bool albireo_client::refresh(std::string& reason)
+    bool albireo_client::probe(int& port, std::string& ca, std::string& model, std::string& reason)
     {
-        // m_ is held.
-        if (!enabled_)
-        {
-            reason = "turned off in the settings";
-            return false;
-        }
-        if (checked_ && now_unix() - checked_ < 60)
-        {
-            reason = reason_;
-            return found_;
-        }
-        checked_ = now_unix();
-        found_ = false;
-        model_.clear();
+        port = 8443;
+        ca.clear();
+        model.clear();
         const std::string dir = albireo_data_dir();
         if (dir.empty())
         {
-            reason_ = reason = "Albireo is not installed";
+            reason = "Albireo is not installed";
+            return false;
+        }
+        const std::string settings_path = join_path(dir, "settings.json");
+        ca = join_path(join_path(dir, "certificates"), "albireo-authority.crt");
+        if (!file_exists(ca))
+        {
+            reason = "the local authority of Albireo is missing";
+            return false;
+        }
+        /*
+            A folder, an authority or settings that another account than SYSTEM or the
+            administrators could have written are not those of Albireo: the pictures would
+            reach whoever placed them.
+        */
+        if (!folder_admin_only(dir) || !folder_admin_only(join_path(dir, "certificates")) || !owned_by_system(ca)
+            || (file_exists(settings_path) && !owned_by_system(settings_path)))
+        {
+            reason = "the data folder of Albireo is not protected: its pictures are not described";
             return false;
         }
         std::string text;
         json settings;
-        port_ = 8443;
-        if (read_file(join_path(dir, "settings.json"), text, 1u << 20) && json::parse(text, settings))
-            port_ = static_cast<int>(settings["port"].as_int(8443));
-        ca_ = join_path(join_path(dir, "certificates"), "albireo-authority.crt");
-        if (!file_exists(ca_))
+        if (read_file(settings_path, text, 1u << 20) && json::parse(text, settings))
         {
-            reason_ = reason = "the local authority of Albireo is missing";
-            return false;
+            const long long p = settings["port"].as_int(8443);
+            port = p >= 1 && p <= 65535 ? static_cast<int>(p) : 8443;
         }
-        auto c = client(port_, ca_, 10);
+        auto c = client(port, ca, 10);
         auto r = c->Get("/v1/models");
         json models;
         if (!r || r->status != 200 || !json::parse(r->body, models))
         {
-            reason_ = reason = "Albireo does not answer on port " + std::to_string(port_);
+            reason = "Albireo does not answer on port " + std::to_string(port);
             return false;
         }
         std::string any;
@@ -142,26 +146,68 @@ namespace pseudalis
             bool image = false;
             for (const json& i : m["inputs"].elements()) image = image || i.str() == "image";
             if (!image) continue;
-            if (m["id"].str() == "albireo-general") model_ = m["id"].str();
+            if (m["id"].str() == "albireo-general") model = m["id"].str();
             if (any.empty()) any = m["id"].str();
         }
-        if (model_.empty()) model_ = any;
-        if (model_.empty())
+        if (model.empty()) model = any;
+        if (model.empty())
         {
-            reason_ = reason = "no model of Albireo reads images";
+            reason = "no model of Albireo reads images";
             return false;
         }
-        found_ = true;
-        reason_.clear();
         reason.clear();
         return true;
     }
 
+    bool albireo_client::refresh(std::string& reason)
+    {
+        /*
+            The state is checked again once a minute, by one caller at a time and outside the
+            lock, so that a slow Albireo never holds the callers of status(): the others get
+            the state in place meanwhile.
+        */
+        {
+            std::lock_guard<std::mutex> lock(m_);
+            if (!enabled_)
+            {
+                reason = "turned off in the settings";
+                return false;
+            }
+            if (checking_ || (checked_ && now_unix() - checked_ < 60))
+            {
+                reason = checked_ ? reason_ : std::string("Albireo is being looked for");
+                return found_;
+            }
+            checking_ = true;
+        }
+        int port = 8443;
+        std::string ca, model, why;
+        bool found = false;
+        try
+        {
+            found = probe(port, ca, model, why);
+        }
+        catch (const std::exception& x)
+        {
+            why = x.what();
+        }
+        std::lock_guard<std::mutex> lock(m_);
+        checking_ = false;
+        checked_ = now_unix();
+        found_ = found;
+        port_ = port;
+        ca_ = ca;
+        model_ = model;
+        reason_ = why;
+        reason = why;
+        return found;
+    }
+
     json albireo_client::status()
     {
-        std::lock_guard<std::mutex> lock(m_);
         std::string reason;
         const bool ok = refresh(reason);
+        std::lock_guard<std::mutex> lock(m_);
         json j = json::object();
         j["enabled"] = enabled_;
         j["found"] = ok;
@@ -186,9 +232,14 @@ namespace pseudalis
         }
         int port = 0;
         std::string ca, model;
+        if (!refresh(error)) return std::string();
         {
             std::lock_guard<std::mutex> lock(m_);
-            if (!refresh(error)) return std::string();
+            if (!found_)
+            {
+                error = reason_;
+                return std::string();
+            }
             port = port_;
             ca = ca_;
             model = model_;

@@ -448,6 +448,11 @@ namespace pseudalis
             { "shell_cannot_write", { "{f} cannot be written: {e}", "{f} ne peut pas être écrit : {e}",
                 "{f} kann nicht geschrieben werden: {e}", "{f} non può essere scritto: {e}",
                 "{f} no se puede escribir: {e}" } },
+            { "shell_changed", { "{f} changed while it was processed: it stays as it is. Try again.",
+                "{f} a changé pendant son traitement : il reste tel quel. Réessayez.",
+                "{f} wurde während der Verarbeitung geändert: Die Datei bleibt unverändert. Versuchen Sie es erneut.",
+                "{f} è cambiato durante l'elaborazione: resta com'è. Riprovate.",
+                "{f} cambió durante su procesamiento: se queda como está. Vuelva a intentarlo." } },
             { "shell_in_use", { "{f} is open in another program: close it, then try again.",
                 "{f} est ouvert dans un autre programme : fermez-le, puis réessayez.",
                 "{f} ist in einem anderen Programm geöffnet: Schließen Sie es und versuchen Sie es erneut.",
@@ -481,6 +486,27 @@ namespace pseudalis
                 "Das Original dieser Datei kann im Tresor nicht mehr gelesen werden.",
                 "L'originale di questo file non può più essere letto nella cassaforte.",
                 "El original de este archivo ya no se puede leer en la caja fuerte." } },
+            { "err_busy", { "The service is busy with other files: try again in a moment.",
+                "Le service traite d'autres fichiers : réessayez dans un instant.",
+                "Der Dienst verarbeitet andere Dateien: Versuchen Sie es gleich noch einmal.",
+                "Il servizio sta elaborando altri file: riprovate tra un momento.",
+                "El servicio está procesando otros archivos: vuelva a intentarlo en un momento." } },
+            { "err_original_forgotten", { "The original of this file was forgotten on {date}: it can no longer be "
+                "restored.",
+                "L'original de ce fichier a été oublié le {date} : il ne peut plus être restauré.",
+                "Das Original dieser Datei wurde am {date} vergessen: Es kann nicht mehr wiederhergestellt werden.",
+                "L'originale di questo file è stato dimenticato il {date}: non può più essere ripristinato.",
+                "El original de este archivo se olvidó el {date}: ya no se puede restaurar." } },
+            { "err_original_expired", { "The original of this file was kept until {date} after the file left the "
+                "drive: it can no longer be restored.",
+                "L'original de ce fichier a été conservé jusqu'au {date} après la sortie du fichier du lecteur : il "
+                "ne peut plus être restauré.",
+                "Das Original dieser Datei wurde bis zum {date} aufbewahrt, nachdem die Datei das Laufwerk verlassen "
+                "hatte: Es kann nicht mehr wiederhergestellt werden.",
+                "L'originale di questo file è stato conservato fino al {date} dopo l'uscita del file dall'unità: non "
+                "può più essere ripristinato.",
+                "El original de este archivo se conservó hasta el {date} después de que el archivo saliera de la "
+                "unidad: ya no se puede restaurar." } },
             { "err_vault", { "The original cannot be kept in the vault.",
                 "L'original ne peut pas être conservé dans le coffre.",
                 "Das Original kann nicht im Tresor aufbewahrt werden.",
@@ -498,7 +524,8 @@ namespace pseudalis
                 "El token de administración de Pseudalis falta o es incorrecto: reinicie el icono." } },
             { "about_title", { "About Pseudalis", "À propos de Pseudalis", "Über Pseudalis",
                 "Informazioni su Pseudalis", "Acerca de Pseudalis" } },
-            { "about_version", { "Version {v}", "Version {v}", "Version {v}", "Versione {v}", "Versión {v}" } },
+            { "about_version", { "{p}, version {v}", "{p}, version {v}", "{p}, Version {v}", "{p}, versione {v}",
+                "{p}, versión {v}" } },
             { "about_purpose", { "Anonymization of the personal data of documents, on this computer: nothing leaves "
                 "it.", "Anonymisation des données personnelles des documents, sur cet ordinateur : rien n'en sort.",
                 "Anonymisierung der personenbezogenen Daten von Dokumenten auf diesem Computer: Nichts verlässt ihn.",
@@ -506,30 +533,35 @@ namespace pseudalis
                 "Anonimización de los datos personales de los documentos, en este equipo: nada sale de él." } },
             { "about_written", { "Written by {a}", "Écrit par {a}", "Geschrieben von {a}", "Scritto da {a}",
                 "Escrito por {a}" } },
-            { "about_license", { "Distributed under the Boost Software License 1.0.",
-                "Distribué sous la licence Boost Software License 1.0.",
-                "Vertrieben unter der Boost Software License 1.0.",
-                "Distribuito con la licenza Boost Software License 1.0.",
-                "Distribuido bajo la licencia Boost Software License 1.0." } },
+            { "about_license", { "The Community edition is free and open source software, distributed under the "
+                "Boost Software License 1.0.",
+                "L'édition Community est un logiciel libre et open source, distribué sous la licence Boost Software "
+                "License 1.0.",
+                "Die Community-Edition ist freie Open-Source-Software, vertrieben unter der Boost Software License "
+                "1.0.",
+                "L'edizione Community è software libero e open source, distribuito con la licenza Boost Software "
+                "License 1.0.",
+                "La edición Community es software libre y de código abierto, distribuido bajo la licencia Boost "
+                "Software License 1.0." } },
             { "about_winfsp", { "The drive relies on {w}, under its own license ({u}).",
                 "Le lecteur repose sur {w}, sous sa propre licence ({u}).",
                 "Das Laufwerk beruht auf {w}, unter dessen eigener Lizenz ({u}).",
                 "L'unità si basa su {w}, con la sua licenza ({u}).",
                 "La unidad se basa en {w}, con su propia licencia ({u})." } },
             { "btn_winfsp", { "WinFsp", "WinFsp", "WinFsp", "WinFsp", "WinFsp" } },
-            { "welcome_text", { "This assistant installs Pseudalis {v}: the service that anonymizes the personal "
-                "data of documents on this computer, its drive, its commands in the Explorer, its icon in the "
-                "notification area and its web application. Nothing leaves this computer.",
-                "Cet assistant installe Pseudalis {v} : le service qui anonymise les données personnelles des "
-                "documents sur cet ordinateur, son lecteur, ses commandes dans l'Explorateur, son icône dans "
+            { "welcome_text", { "This assistant installs Pseudalis Community {v}: the service that anonymizes the "
+                "personal data of documents on this computer, its drive, its commands in the Explorer, its icon in "
+                "the notification area and its web application. Nothing leaves this computer.",
+                "Cet assistant installe Pseudalis Community {v} : le service qui anonymise les données personnelles "
+                "des documents sur cet ordinateur, son lecteur, ses commandes dans l'Explorateur, son icône dans "
                 "la zone de notification et son application web. Rien ne quitte cet ordinateur.",
-                "Dieser Assistent installiert Pseudalis {v}: den Dienst, der die personenbezogenen Daten von "
+                "Dieser Assistent installiert Pseudalis Community {v}: den Dienst, der die personenbezogenen Daten von "
                 "Dokumenten auf diesem Computer anonymisiert, sein Laufwerk, seine Befehle im Explorer, sein "
                 "Symbol im Infobereich und seine Webanwendung. Nichts verlässt diesen Computer.",
-                "Questo assistente installa Pseudalis {v}: il servizio che anonimizza i dati personali dei "
+                "Questo assistente installa Pseudalis Community {v}: il servizio che anonimizza i dati personali dei "
                 "documenti su questo computer, la sua unità, i suoi comandi in Esplora file, la sua icona "
                 "nell'area di notifica e la sua applicazione web. Nulla lascia questo computer.",
-                "Este asistente instala Pseudalis {v}: el servicio que anonimiza los datos personales de los "
+                "Este asistente instala Pseudalis Community {v}: el servicio que anonimiza los datos personales de los "
                 "documentos en este equipo, su unidad, sus comandos en el Explorador, su icono en el área de "
                 "notificación y su aplicación web. Nada sale de este equipo." } },
             { "update_text", { "Pseudalis {o} is installed in {d}. This assistant updates it to version {v} and "
@@ -579,38 +611,46 @@ namespace pseudalis
                 "su icono en el área de notificación abre la aplicación web." } },
             { "uninstall_text", { "Pseudalis, its service, its drive, its commands in the Explorer, its "
                 "notification icon, its key, the originals it keeps, its settings and its logs will be removed "
-                "from this computer: the documents it anonymized can then no longer be restored. WinFsp stays "
-                "installed.",
+                "from this computer: the documents it anonymized can then no longer be restored. WinFsp goes too when "
+                "Pseudalis installed it, unless another program uses it.",
                 "Pseudalis, son service, son lecteur, ses commandes dans l'Explorateur, son icône de notification, "
                 "sa clé, les originaux qu'il garde, ses réglages et ses journaux seront retirés de cet "
-                "ordinateur : les documents qu'il a anonymisés ne pourront plus être restaurés. WinFsp reste "
-                "installé.",
+                "ordinateur : les documents qu'il a anonymisés ne pourront plus être restaurés. WinFsp est retiré "
+                "aussi s'il a été installé par Pseudalis, sauf si un autre programme l'utilise.",
                 "Pseudalis, sein Dienst, sein Laufwerk, seine Befehle im Explorer, sein Benachrichtigungssymbol, "
                 "sein Schlüssel, die aufbewahrten Originale, seine Einstellungen und Protokolle werden von "
                 "diesem Computer entfernt: Die damit anonymisierten Dokumente können dann nicht mehr "
-                "wiederhergestellt werden. WinFsp bleibt installiert.",
+                "wiederhergestellt werden. WinFsp wird ebenfalls entfernt, wenn Pseudalis es installiert hat, außer "
+                "wenn ein anderes Programm es verwendet.",
                 "Pseudalis, il suo servizio, la sua unità, i suoi comandi in Esplora file, la sua icona di "
                 "notifica, la sua chiave, gli originali che custodisce, le impostazioni e i registri saranno "
                 "rimossi da questo computer: i documenti che ha anonimizzato non potranno più essere "
-                "ripristinati. WinFsp resta installato.",
+                "ripristinati. WinFsp viene rimosso anch'esso se è stato installato da Pseudalis, a meno che un altro "
+                "programma non lo usi.",
                 "Pseudalis, su servicio, su unidad, sus comandos en el Explorador, su icono de notificación, su "
                 "clave, los originales que guarda, sus ajustes y sus registros se eliminarán de este equipo: "
-                "los documentos que anonimizó ya no podrán restaurarse. WinFsp permanece instalado." } },
+                "los documentos que anonimizó ya no podrán restaurarse. WinFsp también se elimina si lo instaló "
+                "Pseudalis, salvo que otro programa lo utilice." } },
             { "uninstall_text_keep", { "Pseudalis, its service, its drive, its commands in the Explorer and its "
                 "notification icon will be removed from this computer. Its key, the originals it keeps and its "
-                "settings stay for a later installation. WinFsp stays installed.",
+                "settings stay for a later installation. WinFsp goes too when Pseudalis installed it, unless "
+                "another program uses it.",
                 "Pseudalis, son service, son lecteur, ses commandes dans l'Explorateur et son icône de notification "
                 "seront retirés de cet ordinateur. Sa clé, les originaux qu'il garde et ses réglages restent "
-                "pour une installation ultérieure. WinFsp reste installé.",
+                "pour une installation ultérieure. WinFsp est retiré aussi s'il a été installé par Pseudalis, sauf si "
+                "un autre programme l'utilise.",
                 "Pseudalis, sein Dienst, sein Laufwerk, seine Befehle im Explorer und sein Benachrichtigungssymbol "
                 "werden von diesem Computer entfernt. Sein Schlüssel, die aufbewahrten Originale und seine "
-                "Einstellungen bleiben für eine spätere Installation erhalten. WinFsp bleibt installiert.",
+                "Einstellungen bleiben für eine spätere Installation erhalten. WinFsp wird ebenfalls entfernt, wenn "
+                "Pseudalis es installiert hat, außer wenn ein anderes Programm es verwendet.",
                 "Pseudalis, il suo servizio, la sua unità, i suoi comandi in Esplora file e la sua icona di "
                 "notifica saranno rimossi da questo computer. La sua chiave, gli originali che custodisce e le "
-                "impostazioni restano per un'installazione successiva. WinFsp resta installato.",
+                "impostazioni restano per un'installazione successiva. WinFsp viene rimosso anch'esso se è stato "
+                "installato da Pseudalis, a meno che un altro programma non lo usi.",
                 "Pseudalis, su servicio, su unidad, sus comandos en el Explorador y su icono de notificación se "
                 "eliminarán de este equipo. Su clave, los originales que guarda y sus ajustes se conservan "
-                "para una instalación posterior. WinFsp permanece instalado." } },
+                "para una instalación posterior. WinFsp también se elimina si lo instaló Pseudalis, salvo que "
+                "otro programa lo utilice." } },
             { "uninstall_keep_data", { "Keep the key, the originals and the settings for a later installation",
                 "Conserver la clé, les originaux et les réglages pour une installation ultérieure",
                 "Schlüssel, Originale und Einstellungen für eine spätere Installation behalten",
@@ -640,6 +680,16 @@ namespace pseudalis
                 "Anonymisieren und Wiederherstellen zum Menü der Dateien im Explorer hinzufügen",
                 "Aggiungi Anonimizza e Ripristina al menu dei file in Esplora file",
                 "Añadir Anonimizar y Restaurar al menú de los archivos en el Explorador" } },
+            { "winfsp_kept", { "WinFsp could not be uninstalled ({e}): it stays among the installed programs, "
+                "from where it can be uninstalled.",
+                "WinFsp n'a pas pu être désinstallé ({e}) : il reste parmi les programmes installés, d'où il peut "
+                "être désinstallé.",
+                "WinFsp konnte nicht deinstalliert werden ({e}): Es bleibt unter den installierten Programmen, von "
+                "wo es deinstalliert werden kann.",
+                "WinFsp non ha potuto essere disinstallato ({e}): resta tra i programmi installati, da cui può "
+                "essere disinstallato.",
+                "WinFsp no pudo desinstalarse ({e}): permanece entre los programas instalados, desde donde puede "
+                "desinstalarse." } },
             { "step_winfsp", { "Installing WinFsp, for the drive", "Installation de WinFsp, pour le lecteur",
                 "WinFsp wird für das Laufwerk installiert", "Installazione di WinFsp, per l'unità",
                 "Instalación de WinFsp, para la unidad" } },

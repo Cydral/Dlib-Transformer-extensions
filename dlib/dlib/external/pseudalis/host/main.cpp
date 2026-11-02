@@ -57,8 +57,19 @@ namespace
     // Returned by serve() when the restart needs a new process.
     const int restart_process = 75;
 
+    /*
+        The end of the program, once the service closed what it opened and the log holds its
+        last line.  On Windows the process ends at once: the engine library stays loaded
+        (engine_loader.h), and its static destructors, run at the end of the process, would
+        join the threads of the pool of dlib that Windows ended first, and wait forever.
+    */
     int finish(int code)
     {
+#if defined(_WIN32)
+        std::cout.flush();
+        std::cerr.flush();
+        TerminateProcess(GetCurrentProcess(), static_cast<UINT>(code));
+#endif
         return code;
     }
 
@@ -344,7 +355,7 @@ int main(int argc, char** argv)
 
     if (args.size() >= 2 && args[1] == "--version")
     {
-        std::cout << PSEUDALIS_PRODUCT_NAME << " " << PSEUDALIS_VERSION << std::endl;
+        std::cout << PSEUDALIS_FULL_NAME << " " << PSEUDALIS_VERSION << std::endl;
         return 0;
     }
     const bool console = args.size() >= 2 && args[1] == "--console";

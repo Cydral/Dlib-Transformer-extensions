@@ -206,6 +206,19 @@ namespace dlib
                   as text only.
         !*/
 
+        void set_package_limits(
+            const zip_limits& limits
+        );
+        /*!
+            ensures
+                - #package_limits() == limits: the bounds within which the parts of Word,
+                  Excel and PowerPoint documents are decompressed
+                  (ooxml_anonymizer::set_package_limits()).
+        !*/
+
+        const zip_limits& package_limits(
+        ) const;
+
         void set_image_describer(
             const document_image_describer& describer
         );

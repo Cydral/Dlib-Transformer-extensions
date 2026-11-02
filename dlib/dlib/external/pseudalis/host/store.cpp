@@ -14,6 +14,8 @@ namespace pseudalis
     {
         const char* const schema =
             "PRAGMA journal_mode=WAL;"
+            // Each commit reaches the disk, as the blobs of the vault it names do before it.
+            "PRAGMA synchronous=FULL;"
             "PRAGMA foreign_keys=ON;"
             // AUTOINCREMENT: the identifier of a record or of a node deleted is never given again,
             // since the drive and the copies of the files may still name it.
@@ -35,6 +37,11 @@ namespace pseudalis
             " created INTEGER NOT NULL DEFAULT 0, accessed INTEGER NOT NULL DEFAULT 0,"
             " written INTEGER NOT NULL DEFAULT 0, changed INTEGER NOT NULL DEFAULT 0);"
             "CREATE UNIQUE INDEX IF NOT EXISTS nodes_name ON nodes(parent, name COLLATE NOCASE);"
+            // The originals forgotten, by the protected files that showed them: their restoration is refused.
+            "CREATE TABLE IF NOT EXISTS forgotten(id INTEGER PRIMARY KEY AUTOINCREMENT, time INTEGER NOT NULL,"
+            " reason TEXT NOT NULL, output_sha256 TEXT NOT NULL, object_id TEXT NOT NULL DEFAULT '');"
+            "CREATE INDEX IF NOT EXISTS forgotten_output ON forgotten(output_sha256);"
+            "CREATE INDEX IF NOT EXISTS forgotten_object ON forgotten(object_id);"
             "CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY, time INTEGER NOT NULL, kind TEXT NOT NULL,"
             " path TEXT NOT NULL, message TEXT NOT NULL);"
             "CREATE TABLE IF NOT EXISTS kv(key TEXT PRIMARY KEY, value TEXT NOT NULL);";
@@ -228,6 +235,16 @@ namespace pseudalis
         return s.step() ? s.integer(0) : 0;
     }
 
+    std::set<std::string> store::referenced_blobs()
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        std::set<std::string> found;
+        statement s(db_, "SELECT original_blob FROM files UNION SELECT blob FROM pictures"
+                         " UNION SELECT blob FROM nodes WHERE blob != ''");
+        while (s.step()) found.insert(s.text(0));
+        return found;
+    }
+
     void store::set_file_location(long long id, const std::string& object_id, const std::string& path)
     {
         std::lock_guard<std::mutex> lock(m_);
@@ -254,7 +271,7 @@ namespace pseudalis
         return out;
     }
 
-    bool store::remove_file(long long id, std::vector<std::string>& blobs)
+    bool store::remove_file(long long id, std::vector<std::string>& blobs, const std::string& reason)
     {
         std::lock_guard<std::mutex> lock(m_);
         std::string original;
@@ -273,6 +290,13 @@ namespace pseudalis
         exec("BEGIN IMMEDIATE");
         try
         {
+            if (!reason.empty())
+            {
+                statement f(db_, "INSERT INTO forgotten(time, reason, output_sha256, object_id)"
+                                 " SELECT ?2, ?3, output_sha256, object_id FROM files WHERE id = ?1");
+                f.bind(1, id).bind(2, static_cast<long long>(now_unix())).bind(3, reason);
+                f.step();
+            }
             statement d(db_, "DELETE FROM files WHERE id = ?1");
             d.bind(1, id);
             d.step();
@@ -299,6 +323,19 @@ namespace pseudalis
             throw;
         }
         if (!original.empty()) blobs.push_back(original);
+        return true;
+    }
+
+    bool store::find_forgotten(const std::string& sha256, const std::string& object_id, int64_t& time,
+                               std::string& reason)
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        statement s(db_, "SELECT time, reason FROM forgotten WHERE output_sha256 = ?1 OR (?2 != '' AND object_id = ?2)"
+                         " ORDER BY id DESC LIMIT 1");
+        s.bind(1, sha256).bind(2, object_id);
+        if (!s.step()) return false;
+        time = s.integer(0);
+        reason = s.text(1);
         return true;
     }
 

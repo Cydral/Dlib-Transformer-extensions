@@ -372,6 +372,50 @@ namespace dlib
 
         void learn(const std::string& text, const detection_context& context = detection_context())
         {
+            // A long text is learned in the pieces detect() reads.
+            if (text.size() > piece_size + piece_overlap && context.forced == pii_type::none)
+            {
+                for_each_piece(text, [&](std::size_t start, std::size_t end, std::size_t, std::size_t) {
+                    learn_piece(text.substr(start, end - start), context);
+                });
+                return;
+            }
+            learn_piece(text, context);
+        }
+
+    private:
+        static const std::size_t piece_size = 64 * 1024;
+        static const std::size_t piece_overlap = 2048;
+
+        /*
+            Calls f(start, end, own_begin, own_end) for each piece of a long text: pieces of
+            piece_size bytes overlapping by piece_overlap, cut after a space when there is one
+            and never inside a character; a value belongs to the piece where it begins between
+            own_begin and own_end, away from the edges the next pieces read again.
+        */
+        template <typename F>
+        static void for_each_piece(const std::string& text, F f)
+        {
+            std::size_t start = 0;
+            for (;;)
+            {
+                std::size_t end = std::min(text.size(), start + piece_size + piece_overlap);
+                if (end < text.size())
+                {
+                    const std::size_t space = text.find_last_of(" \t\r\n", end - 1);
+                    if (space != std::string::npos && space >= start + piece_size) end = space + 1;
+                    while (end < text.size() && (static_cast<unsigned char>(text[end]) & 0xC0) == 0x80) ++end;
+                }
+                f(start, end, start == 0 ? 0 : start + piece_overlap / 2,
+                  end == text.size() ? end : end - piece_overlap / 2);
+                if (end == text.size()) break;
+                start = end - piece_overlap;
+                while (start < end && (static_cast<unsigned char>(text[start]) & 0xC0) == 0x80) ++start;
+            }
+        }
+
+        void learn_piece(const std::string& text, const detection_context& context)
+        {
             std::vector<privacy_impl::pii_candidate> found;
             const privacy_impl::utf8_text t(text, true);
             analyze(text, t, context, found);
@@ -422,9 +466,49 @@ namespace dlib
             }
         }
 
+    public:
         std::vector<pii_entity> detect(
             const std::string& text,
             const detection_context& context = detection_context()
+        ) const
+        {
+            /*
+                The memory of the analysis grows with the length of the text, about 200 bytes
+                for each byte: a long text is read in pieces (for_each_piece()), and each value
+                comes from the piece where it begins away from the edges.  A value of a column
+                keeps its cell whole.
+            */
+            if (text.size() <= piece_size + piece_overlap || context.forced != pii_type::none)
+                return detect_piece(text, context);
+            std::vector<pii_entity> out;
+            for_each_piece(text, [&](std::size_t start, std::size_t end, std::size_t own_b, std::size_t own_e) {
+                std::vector<pii_entity> found = detect_piece(text.substr(start, end - start), context);
+                std::sort(found.begin(), found.end(),
+                          [](const pii_entity& a, const pii_entity& b) { return a.begin < b.begin; });
+                for (pii_entity e : found)
+                {
+                    e.begin += start;
+                    e.end += start;
+                    // A value that begins in the part of this piece, and overlaps none kept.
+                    if (e.begin < own_b || e.begin >= own_e) continue;
+                    if (!out.empty() && e.begin < out.back().end) continue;
+                    out.push_back(e);
+                }
+            });
+            return out;
+        }
+
+        pii_type label_type(const std::string& text) const
+        {
+            return privacy_impl::lookup_label(privacy_impl::normalize_label(text));
+        }
+
+        std::size_t learned_name_count() const { return doc_names_full_.size(); }
+
+    private:
+        std::vector<pii_entity> detect_piece(
+            const std::string& text,
+            const detection_context& context
         ) const
         {
             std::vector<privacy_impl::pii_candidate> found;
@@ -443,14 +527,6 @@ namespace dlib
             return out;
         }
 
-        pii_type label_type(const std::string& text) const
-        {
-            return privacy_impl::lookup_label(privacy_impl::normalize_label(text));
-        }
-
-        std::size_t learned_name_count() const { return doc_names_full_.size(); }
-
-    private:
         typedef privacy_impl::pii_candidate candidate;
         typedef privacy_impl::word_token word_token;
         typedef privacy_impl::utf8_text utf8_text;

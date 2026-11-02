@@ -516,18 +516,22 @@ namespace pseudalis
             // Tooltip: version, drive, originals kept.
             const json& d = s["drive"];
             const std::string letter = d["letter"].as_string();
-            std::wstring tip = L"Pseudalis " + widen(s["version"].as_string()) + L"\n";
+            std::wstring tip = widen(PSEUDALIS_FULL_NAME) + L" " + widen(s["version"].as_string()) + L"\n";
             if (letter.empty()) tip += tr("tip_no_drive");
             else if (d["mounted"].as_bool(false)) tip += tr("tip_drive", { { "l", letter } });
             else tip += tr("tip_drive_error", { { "l", letter } });
             tip += L" \xB7 " + tr("tip_records", { { "n", std::to_string(s["records"].as_int(0)) } });
             set_tooltip(tip);
 
-            // A drive that cannot be mounted is notified once for each of its errors.
+            /* A drive that cannot be mounted is notified once for each of its errors; without
+               WinFsp, the notification says how to install it again. */
             const std::string drive_error = letter.empty() || d["mounted"].as_bool(false) ? std::string()
                 : d["error"].as_string();
             if (!drive_error.empty() && drive_error != tray.drive_error)
-                notify(L"Pseudalis", tr("notify_drive_error", { { "l", letter }, { "e", drive_error } }), true);
+            {
+                if (d["error_code"].as_string() == "winfsp_missing") notify(L"Pseudalis", tr("notify_no_winfsp"), true);
+                else notify(L"Pseudalis", tr("notify_drive_error", { { "l", letter }, { "e", drive_error } }), true);
+            }
             tray.drive_error = drive_error;
 
             notify_events((*result)["events"]);
@@ -650,7 +654,8 @@ namespace pseudalis
             case WM_CREATE:
             {
                 about.title = ui::label(w, L"Pseudalis", IDC_A_TITLE, 0, ui::font_kind::title);
-                const std::wstring body = tr("about_version", { { "v", PSEUDALIS_VERSION } }) + L"\n"
+                const std::wstring body = tr("about_version", { { "p", PSEUDALIS_FULL_NAME },
+                    { "v", PSEUDALIS_VERSION } }) + L"\n"
                     + tr("about_purpose") + L"\n\n"
                     + tr("about_written", { { "a", PSEUDALIS_AUTHOR_NAME " (" PSEUDALIS_AUTHOR_EMAIL ")" } }) + L"\n"
                     + tr("about_built") + L"\n\n"

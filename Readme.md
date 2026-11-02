@@ -193,7 +193,7 @@ This closes a loop a generative model cannot close alone — answering from docu
 
 **Trained on synthetic data only.** The recognizers learn from annotated texts that a generator writes from templates and lexicons: about forty document genres, places and organisations of about fifty countries written the way each country writes them, OCR and casing noise, and held-out values that score what training never showed. The trained models are compiled into [`slm_document_anonymizer_ex.cpp`](examples/slm_document_anonymizer_ex.cpp), which runs with no file beside it; built with its protection commands alone, it makes a single executable for the people who protect and restore documents, on Windows as on Linux.
 
-**A Windows application carries it to the desk.** [Pseudalis](dlib/dlib/external/pseudalis) runs the same protection as a service of the computer: a drive on which a copied document is anonymized as it is written, Anonymize and Restore commands in the Explorer, a web application with its documented local interface, the originals kept encrypted under a key that Windows protects, and an installer that carries everything it needs, WinFsp included.
+**A Windows application carries it to the desk.** [Pseudalis Community](dlib/dlib/external/pseudalis), free and open source under the Boost license, runs the same protection as a service of the computer, for every session at once: a drive on which a copied document is anonymized as it is written, Anonymize and Restore commands in the Explorer, a web application with its documented local interface, the originals kept encrypted under a key that Windows protects, and an installer that carries everything it needs, WinFsp included, in the language of each user.
 
 ### Prediction as compression
 

@@ -302,7 +302,8 @@ namespace pseudalis
                 settle("idle", user_error());
                 return;
             }
-            if (!from_link) log_warning("updates: " + about_public_link(e) + "; the feed is read from " + feed_url_);
+            if (!from_link)
+                log_warning("updates: " + about_public_link(e) + "; the feed is read from its second place");
             else log_info("updates: feed read from the public link");
         }
         if (!from_link)
@@ -316,7 +317,7 @@ namespace pseudalis
             if (!verify_signature(body, sig, feed_public_key_pem))
             {
                 fail(user_error().set("the signature of the update feed is not valid", "update_signature")
-                    .arg("file", feed_url_));
+                    .arg("file", "pseudalis-feed.json"));
                 log_error("updates: the signature of the feed is not valid, feed ignored");
                 return;
             }
@@ -435,12 +436,13 @@ namespace pseudalis
                     if (!done && why.code == "update_record") break;
                 }
                 if (!done && !ended() && !url.empty() && why.code != "update_record")
-                    log_warning("updates: " + about_public_link(why.text) + "; the installer comes from " + url);
+                    log_warning("updates: " + about_public_link(why.text) +
+                                "; the installer comes from its second place");
             }
             if (!done && !ended() && !url.empty() && why.code != "update_record")
             {
                 done = download(url, "", why);
-                if (done) origin = " from " + url;
+                if (done) origin = " from the second place of the publication";
             }
             if (!done)
             {

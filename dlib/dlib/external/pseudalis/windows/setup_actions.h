@@ -240,6 +240,15 @@ namespace setup
     // Removes the folders of the web application, the licenses and WinFsp that hold nothing.
     void remove_empty_program_folders(const std::string& program_dir);
 
+    /*
+        Opens the file of this program at its start and holds it, so that no account renames,
+        replaces or changes it while the installer runs, after checking that it is the very
+        file Windows runs (the file of the image of the process, which follows its renames).
+        stage_uninstaller() copies that file, never the path the program was started from,
+        which another account may have replaced since.
+    */
+    void hold_own_program();
+
     // Writes this program into the set, without its payload, as the uninstaller.
     bool stage_uninstaller(const std::string& program_dir, staged_files& files, std::string& error);
 
@@ -299,10 +308,17 @@ namespace setup
     /*
         WinFsp, which the drive needs: installed from the installer msi, silently, when it is
         missing or older than the version the installer carries.  installed_winfsp_version()
-        is empty without WinFsp.  WinFsp stays at the uninstallation of Pseudalis.
+        is empty without WinFsp.  The WinFsp that Pseudalis installs, or updates after
+        installing it, belongs to it: hidden from the installed programs, recorded in the
+        registry, it leaves with Pseudalis, remove_owned_winfsp() uninstalling it.  It stays
+        when another program registered a file system with it since, or replaced it, shown
+        again among the installed programs.  A WinFsp found in place is never hidden nor
+        uninstalled.  remove_owned_winfsp() returns false, with the reason in error, when
+        msiexec could not uninstall it.
     */
     std::string installed_winfsp_version();
     bool ensure_winfsp(const std::string& msi, std::string& error);
+    bool remove_owned_winfsp(std::string& error);
 
     // Lets the interactive users start and stop the service, from the icon.
     bool allow_service_control(std::string& error);
@@ -312,10 +328,13 @@ namespace setup
         Windows 11): a cascade "Pseudalis" with Anonymize, Anonymize as a copy, Restore the
         original and Restore as a copy, which run pseudalis.exe of program_dir.  labels gives
         their texts in the language of the installation: "menu", "protect", "protect_copy",
-        "restore" and "restore_copy".
+        "restore" and "restore_copy".  With each_user, the language of the installation
+        follows the system, and the commands take the texts of pseudalis.exe in the language
+        of each user instead.
     */
     bool context_menu_registered();
-    bool register_context_menu(const std::string& program_dir, const std::map<std::string, std::wstring>& labels);
+    bool register_context_menu(const std::string& program_dir, const std::map<std::string, std::wstring>& labels,
+                               bool each_user);
     void remove_context_menu();
 
     /*

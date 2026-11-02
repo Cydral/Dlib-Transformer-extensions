@@ -76,8 +76,8 @@ namespace pseudalis
         static std::string picture_marker(const std::string& id, const std::string& description);
 
         // Throws std::runtime_error for a file of no supported kind, or that cannot be read.
-        engine_result anonymize(const std::string& bytes, const std::string& name, const picture_handler& pictures,
-            bool pdf_layout = true) const;
+        engine_result anonymize(const std::string& bytes, const std::string& name,
+            const picture_handler& pictures) const;
         // Puts back the values of the tags; a picture marker stays (the service keeps the pictures).
         engine_result restore(const std::string& bytes, const std::string& name) const;
 

@@ -63,6 +63,23 @@ int main()
     const std::string id2 = v.put("second");
     CHECK(!other.get(id2, back) && v.get(id2, back) && back == "second");
     CHECK(v.remove(id2) && !v.exists(id2));
+    const std::string empty_id = v.put(std::string());
+    CHECK(v.get(empty_id, back) && back.empty());
+    // The listing of the vault, which removes the writes cut short.
+    const std::string leftover =
+        join_path(join_path(join_path(dir, "vault"), id.substr(0, 2)), id + ".bin.tmp-0a1b2c3d");
+    CHECK(write_file_atomic(leftover, "cut short"));
+    {
+        const std::vector<std::string> ids = v.list_and_clean();
+        bool has_id = false, has_empty = false;
+        for (const std::string& x : ids)
+        {
+            has_id = has_id || x == id;
+            has_empty = has_empty || x == empty_id;
+        }
+        CHECK(has_id && has_empty && ids.size() == 2 && !file_exists(leftover));
+    }
+    CHECK(v.remove(empty_id));
 
     // The settings: a value out of its range takes its default.
     {
@@ -77,6 +94,22 @@ int main()
         s = host_settings::from_json(j);
         CHECK(s.removed_days == 90 && s.drive_letter == "P");
         CHECK(host_settings::from_json(s.to_json()).removed_days == 90);
+        // The places of the publication of the build stay out of the file and of the answers.
+        CHECK(!s.to_json().contains("public_link") && !s.to_json().contains("feed_url"));
+        CHECK(host_settings::from_json(s.to_json()).public_link == default_public_link);
+        s.public_link.clear();
+        CHECK(s.to_json().contains("public_link") && host_settings::from_json(s.to_json()).public_link.empty());
+    }
+    // A damaged settings.json keeps the originals of the files removed from the drive the longest.
+    {
+        const std::string path = join_path(dir, "settings.json");
+        CHECK(write_file_atomic(path, "{ not json"));
+        settings_store damaged(path);
+        CHECK(damaged.get().removed_days == host_settings::max_removed_days && file_exists(path + ".invalid"));
+        host_settings changed;
+        CHECK(damaged.update([](host_settings& s) { s.removed_days = 45; }, changed) && changed.removed_days == 45);
+        settings_store again(path);
+        CHECK(again.get().removed_days == 45);
     }
 
     // The database: records, pictures and the tree of the drive.
@@ -113,11 +146,20 @@ int main()
         CHECK(db.get_file(rec, found) && found.removed > 0);
         CHECK(db.files_removed_before(now_unix() - 30 * 86400).size() == 1);
         CHECK(db.files_removed_before(now_unix() - 32 * 86400).empty());
+        CHECK(db.referenced_blobs().count(r.original_blob) == 1 && db.referenced_blobs().count(p.blob) == 1);
         std::vector<std::string> blobs;
-        CHECK(db.remove_file(rec, blobs) && blobs.size() == 2 && db.count_files() == 0);
+        int64_t when = 0;
+        std::string reason;
+        CHECK(!db.find_forgotten(std::string(64, 'b'), std::string(32, 'c'), when, reason));
+        // An original forgotten: its protected file is remembered, by its hash and its object identifier.
+        CHECK(db.remove_file(rec, blobs, "forgotten") && blobs.size() == 2 && db.count_files() == 0);
+        CHECK(db.find_forgotten(std::string(64, 'b'), std::string(), when, reason) && reason == "forgotten");
+        CHECK(db.find_forgotten(std::string(64, 'f'), std::string(32, 'c'), when, reason) && when > 0);
+        CHECK(!db.find_forgotten(std::string(64, 'f'), std::string(), when, reason));
         CHECK(!db.get_picture(p.id, q));
         // The identifier of a record deleted is never given again.
         const long long next = db.add_file(r);
+        // A record that leaves without reason (the drive replaces its file) leaves no trace.
         CHECK(next > rec && db.remove_file(next, blobs) && db.count_files() == 0);
 
         drive_node n;

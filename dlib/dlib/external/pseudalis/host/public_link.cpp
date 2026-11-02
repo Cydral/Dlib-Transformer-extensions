@@ -186,7 +186,8 @@ namespace pseudalis
             const long long result = a["result"].as_int(-1);
             if (result != 0)
             {
-                error = "the public link answers \"" + a["error"].as_string() + "\" (" + std::to_string(result) + ")";
+                // The text of the answer may name the link: its code alone is kept.
+                error = "the public link refuses the request (code " + std::to_string(result) + ")";
                 return false;
             }
             return true;

@@ -25,6 +25,12 @@ namespace pseudalis
         std::string pseudonymization;       // 32 bytes
         std::string vault_encryption;       // 32 bytes
         std::string vault_authentication;   // 32 bytes
+
+        key_set() = default;
+        key_set(const key_set&) = default;
+        key_set& operator=(const key_set&) = default;
+        // The keys leave no copy in memory once they are no longer needed.
+        ~key_set();
     };
 
     key_set derive_keys(const std::string& master);
@@ -56,6 +62,8 @@ namespace pseudalis
 
     // AES-256-CTR with a counter block iv of 16 bytes, encryption and decryption alike.
     std::string aes256_ctr(const std::string& key, const std::string& iv, const std::string& data);
+    // AES-256-CTR from in to out, size bytes, iv 16 bytes; in and out may be the same.
+    void aes256_ctr_into(const std::string& key, const char* iv, const char* in, char* out, size_t size);
     std::string hmac_sha256(const std::string& key, const std::string& data);
 }
 
