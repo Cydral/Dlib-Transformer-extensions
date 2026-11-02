@@ -9,17 +9,22 @@
 #include "settings.h"
 
 /*
-    The web access of the agent mode.  The Web button of the composer of the web application
-    gives the model two tools, web_search and fetch_page, which reach the web through two
-    routes of the service:
+    The web access.  The Web button of the composer of the web application gives the model
+    two tools, web_search and fetch_page, which reach the web through two routes of the
+    service:
 
         POST /albireo/v1/web/search   {"query", "count", "language"}
         POST /albireo/v1/web/fetch    {"url", "language"}
 
-    The search goes through the provider of the settings (web_search): the search of
-    Wikipedia through its REST interface by default, the Brave Search API with the key of the
-    administrator, or a SearXNG instance through its JSON format.  Their addresses are fixed or
-    chosen by the administrator, and the rule of the public addresses does not apply to them.
+    The search goes through the provider of the settings (web_search): by default ("auto") the
+    Brave Search API with the key built into the service when the build has one (the file of
+    ALBIREO_WEB_SEARCH_KEY_FILE, cmake/web_search_key.cmake), else the search of Wikipedia
+    through its REST interface; "brave" takes the key of the administrator (web_search_key), else
+    the one built in; "searxng" a SearXNG instance through its JSON format.  Every installation
+    of a build shares the monthly credit of the key built in.  The addresses of the providers
+    are fixed or chosen by the administrator, and the rule of the public addresses does not
+    apply to them.  The key built in never reaches a message, the log, a route or a document of
+    the settings.
 
     A page is read at a public address only.  The name of its host is refused when it names
     this computer or a local network (localhost, *.localhost, *.local, *.internal, *.home.arpa,
@@ -71,10 +76,16 @@ namespace albireo
     !*/
     bool public_address(const std::string& numeric);
 
+    // Whether the build carries a key of the Brave Search API (cmake/web_search_key.cmake).
+    bool web_search_key_builtin();
+
     /*!
         ensures
-            - Returns the provider of the search of s: "wikipedia"; "brave" with a key;
-              "searxng" with the address of an instance; "none" otherwise.
+            - Returns the provider of the search of s: for "auto", "brave" when the build
+              carries a key, else "wikipedia"; "wikipedia"; "brave" with the key of the
+              administrator, or without one with the key built in; "searxng" with the address
+              of an instance; "none" otherwise.  A search of the Brave Search API sends the
+              key of the administrator when there is one, else the key built in.
     !*/
     std::string web_search_provider(const host_settings& s);
 
@@ -141,6 +152,8 @@ namespace albireo
     // Sends the requests of Wikipedia and of the Brave Search API to origin, "http://127.0.0.1:<port>";
     // an empty origin gives them back their own addresses.
     void web_provider_origin_for_tests(const std::string& origin);
+    // Takes key in place of the key built into the service, "" for a build without one.
+    void web_builtin_key_for_tests(const std::string& key);
 
 }
 

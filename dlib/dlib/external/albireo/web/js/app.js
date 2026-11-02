@@ -47,7 +47,8 @@ import * as speech from './speech.js';
 const roles = ['general', 'code', 'security'];
 const roleIcons = { general: 'compass', code: 'code', security: 'shield' };
 const projectColors = ['#5b8cff', '#f2b544', '#3fb68b', '#e5534b', '#a371f7', '#2fb9d4', '#e08a3c', '#8a90aa'];
-const maxAgentSteps = 8;
+// The steps of an answer with tools at most: each step is a request of the model, then the calls it asks for.
+const maxAgentSteps = 100;
 
 // Shares of the context of the model: the documents of a project read whole, an attached
 // document read whole, and the excerpts given with a question.  Beyond the first two, the
@@ -368,8 +369,13 @@ function threadKey(c) {
   return messages.map((m) => m.id).join(',') + '|' + steps.join(',') + '|' + ended + '|' + (c.contextStart || 0);
 }
 
-// The fields of a discussion another tab may change while this one answers in it.
-const sharedFields = ['title', 'titleSource', 'titleQuestion', 'pinned', 'projectId'];
+/*
+    The fields of a discussion another tab may change while this one answers in it or edits one of its questions: the
+    title, the pin, the project, the function and the buttons of the composer, which the next question takes.  The
+    answer being written keeps the function and the tools of its start.
+*/
+const sharedFields = ['title', 'titleSource', 'titleQuestion', 'pinned', 'projectId', 'role', 'reasoning', 'agent',
+  'web'];
 
 // The discussions to read again from the database, each once after a burst of messages.
 const syncTimers = new Map();
@@ -416,7 +422,7 @@ async function applyStored(id) {
 
 /*
     Forgets a discussion deleted in another tab, stops its answer in progress and the compression of its exchanges
-    here, and never saves it again.
+    here, forgets its draft, and never saves it again.
 */
 function conversationDeleted(id) {
   deleted.add(id);
@@ -426,12 +432,13 @@ function conversationDeleted(id) {
   cancelCompaction(id);
   cancelWarmup(id);
   web.forgetPages(id);
+  forgetDraft(id);
   state.conversations = state.conversations.filter((x) => x.id !== id);
   if (state.current && state.current.id === id) go('#/');
   else refreshViews();
 }
 
-// Every discussion and every project deleted in another tab.
+// Every discussion and every project deleted in another tab; the draft of "New chat" stays.
 function everythingDeleted() {
   for (const c of state.conversations) deleted.add(c.id);
   if (state.current && state.current.messages.length && !state.current.incognito) deleted.add(state.current.id);
@@ -441,7 +448,8 @@ function everythingDeleted() {
   cancelIndex();
   cancelBackground();
   rag.removeAll();
-  images.removeAll();
+  images.removeAll(waitingImages());
+  forgetStoredDrafts();
   for (const id of deleted) web.forgetPages(id);
   syncLists().then(() => go('#/'));
 }
@@ -634,6 +642,21 @@ function webUnavailable(caps) {
   if (!s || !s.web || typeof s.web !== 'object') return t('webUnavailable');
   if (s.web.available) return '';
   return s.offline ? t('webOffline') : t('webOff');
+}
+
+// The texts of the providers of the web search that the status names (web.search).
+const searchProviders = { wikipedia: 'provider_wikipedia', brave: 'provider_brave', searxng: 'provider_searxng' };
+
+/*
+    The provider of the web search of the service in the language of the interface, '' while the web access is
+    unavailable or gives no search.  The help of the agent mode and the About window name it, as Brave asks of the
+    projects that use the credit of its API.
+*/
+function searchProvider() {
+  const w = state.status && state.status.web;
+  if (!w || typeof w !== 'object' || !w.available) return '';
+  const key = searchProviders[w.search];
+  return key ? t(key) : '';
 }
 
 /*
@@ -1284,17 +1307,22 @@ function closeMenu() {
   document.removeEventListener('keydown', escapeMenu);
 }
 
-// What the agent mode and the web access do, and the tools each of them gives the model, with what it is for.
+/*
+    What the agent mode and the web access do, and the tools each of them gives the model, with what it is for; the
+    provider of the web search last, while the service offers one.
+*/
 function agentHelp(anchor) {
   const row = (name) => h('div', { class: 'popover-tool' },
     h('span', { html: icon(toolIcons[name] || 'tool') }),
     h('span', null, h('b', null, toolLabel(name)), h('span', { class: 'desc' }, t('toolHint_' + name))));
+  const provider = searchProvider();
   showPopover(anchor, [
     h('div', { class: 'head' }, t('agentHelpTitle')),
     h('p', null, t('agentHelp')),
     h('div', { class: 'popover-tools' }, tools.definitions.map((d) => row(d.function.name))),
     h('p', null, t('webHelp')),
-    h('div', { class: 'popover-tools' }, web.definitions(true).map((d) => row(d.function.name)))
+    h('div', { class: 'popover-tools' }, web.definitions(true).map((d) => row(d.function.name))),
+    provider ? h('p', { class: 'search-provider' }, t('webSearchBy', { provider })) : null
   ]);
 }
 
@@ -1411,13 +1439,14 @@ async function removeConversation(c) {
   if (!ok) return;
   deleted.add(c.id);
   unread.delete(c.id);
-  // The answer in progress, shown or written in the background, and the compression of the exchanges stop.  The
-  // record of the discussion leaves the database first, then the passages of its documents, from the memory of the
-  // search and from the database.
+  // The answer in progress, shown or written in the background, and the compression of the exchanges stop, and the
+  // draft leaves.  The record of the discussion leaves the database first, then the passages of its documents, from
+  // the memory of the search and from the database.
   stopGeneration(c.id);
   cancelCompaction(c.id);
   cancelWarmup(c.id);
   web.forgetPages(c.id);
+  forgetDraft(c.id);
   await store.deleteConversation(c.id).catch(storageFailed);
   await forgetOwner(c.id).catch(() => {});
   await images.removeOwner(c.id).catch(() => {});
@@ -2386,10 +2415,133 @@ function pastedFiles(e) {
   });
 }
 
-// Empties the composer, the images prepared for it forgotten.
-function clearPending() {
-  images.drop(state.pending.filter((a) => a.kind === 'image').map((a) => a.id));
-  state.pending = [];
+/*
+    The drafts of the composer, one per discussion: the text typed and the documents and images waiting to be sent.
+    The composer holds the draft of the discussion shown (ui.input, state.pending), drafts those of the other
+    discussions of this tab, by their key (draftKey).  The discussion that "New chat" opens keeps its draft under
+    newDraft until its first question creates the discussion.  The texts stay across a reload of the page in
+    localStorage, one key per discussion, removed once its question is sent or the discussion deleted; the files stay
+    in the memory of the tab.  An incognito discussion keeps no draft.
+*/
+const drafts = new Map();
+const newDraft = 'new';
+const draftPrefix = 'albireo-draft-';
+// The text typed is kept this many milliseconds after the last key.
+const draftDelay = 400;
+let draftTimer = 0;
+
+// The key of the draft of c: its id, newDraft while it is not stored, '' for an incognito or deleted discussion.
+function draftKey(c) {
+  if (!c || c.incognito || deleted.has(c.id)) return '';
+  return c.messages.length || state.conversations.some((x) => x.id === c.id) ? c.id : newDraft;
+}
+
+// The text of the draft key that localStorage keeps, '' without one.
+function storedDraft(key) {
+  if (!key) return '';
+  try {
+    return localStorage.getItem(draftPrefix + key) || '';
+  } catch (e) {
+    return '';
+  }
+}
+
+// Keeps the text of the draft key in localStorage, or removes it when the text holds nothing to send.
+function storeDraft(key, text) {
+  if (!key) return;
+  try {
+    if (String(text || '').trim()) localStorage.setItem(draftPrefix + key, text);
+    else localStorage.removeItem(draftPrefix + key);
+  } catch (e) {
+    // Without localStorage, or beyond its room, the text stays in the memory of the tab.
+  }
+}
+
+// Keeps the text of the composer for the discussion shown once the user stops typing, at once with now.
+function saveDraft(now) {
+  clearTimeout(draftTimer);
+  draftTimer = 0;
+  if (!now) {
+    draftTimer = setTimeout(() => saveDraft(true), draftDelay);
+    return;
+  }
+  if (ui.input) storeDraft(draftKey(state.current), ui.input.value);
+}
+
+// The ids of the images of a list of attachments.
+function imageIdsOf(list) {
+  return list.filter((a) => a.kind === 'image').map((a) => a.id);
+}
+
+// The images waiting in the drafts that stay once everything is deleted: those of the composer and of "New chat".
+function waitingImages() {
+  const d = drafts.get(newDraft);
+  return new Set(imageIdsOf(state.pending.concat(d ? d.files : [])));
+}
+
+// Forgets the draft key, once its question is sent or its discussion deleted, here or in another tab.
+function forgetDraft(key) {
+  if (!key) return;
+  const d = drafts.get(key);
+  if (d) images.drop(imageIdsOf(d.files));
+  drafts.delete(key);
+  storeDraft(key, '');
+}
+
+// Forgets the drafts of the stored discussions, once everything was deleted; the one of "New chat" stays.
+function forgetStoredDrafts() {
+  for (const key of Array.from(drafts.keys())) if (key !== newDraft) forgetDraft(key);
+  try {
+    for (let i = localStorage.length - 1; i >= 0; --i) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith(draftPrefix) && k !== draftPrefix + newDraft) localStorage.removeItem(k);
+    }
+  } catch (e) {
+    // Without localStorage, no text was kept.
+  }
+}
+
+// Removes the texts kept for discussions that no longer exist, such as those deleted while no tab was open.
+function pruneDrafts() {
+  const ids = new Set(state.conversations.map((c) => c.id));
+  try {
+    for (let i = localStorage.length - 1; i >= 0; --i) {
+      const k = localStorage.key(i);
+      if (!k || !k.startsWith(draftPrefix)) continue;
+      const id = k.slice(draftPrefix.length);
+      if (id !== newDraft && !ids.has(id)) localStorage.removeItem(k);
+    }
+  } catch (e) {
+    // Without localStorage, no text was kept.
+  }
+}
+
+/*
+    Shows the discussion c in place of the one shown, each with its own draft.  The draft of the one shown leaves the
+    composer for drafts and localStorage, or leaves the memory for an incognito or deleted discussion; the draft of c
+    takes its place: the one this tab keeps, else the text of localStorage, else nothing.
+*/
+function showDiscussion(c) {
+  clearTimeout(draftTimer);
+  draftTimer = 0;
+  const key = draftKey(state.current);
+  const text = ui.input ? ui.input.value : '';
+  if (key) {
+    if (text.trim() || state.pending.length) drafts.set(key, { text, files: state.pending });
+    else drafts.delete(key);
+    storeDraft(key, text);
+  } else {
+    images.drop(imageIdsOf(state.pending));
+  }
+  state.current = c;
+  const next = draftKey(c);
+  const d = next ? drafts.get(next) : null;
+  if (d) drafts.delete(next);
+  state.pending = d ? d.files : [];
+  if (ui.input) {
+    ui.input.value = d ? d.text : storedDraft(next);
+    autoGrow();
+  }
 }
 
 /*
@@ -2435,12 +2587,12 @@ function leaveCurrent() {
   forgetIncognito();
 }
 
+// A new discussion, which the draft of "New chat" fills.
 function newChat(projectId) {
   // The reading aloud ends with the discussion it belongs to, as route() ends it.
   speech.stopReading();
   leaveCurrent();
-  clearPending();
-  state.current = newConversation(projectId);
+  showDiscussion(newConversation(projectId));
   state.view = 'chat';
   if (location.hash !== '#/') history.pushState(null, '', '#/');
   renderAll();
@@ -2473,8 +2625,7 @@ async function route() {
       if (sequence !== routeSequence) return;
       if (!c) { go('#/'); return; }
       leaveCurrent();
-      clearPending();
-      state.current = c;
+      showDiscussion(c);
       state.incognito = false;
       // The searched documents without passages, those of an imported discussion for instance, are indexed.
       indexAttachments(c).catch(() => {});
@@ -2494,7 +2645,7 @@ async function route() {
     state.view = 'chat';
     if (!state.current || state.current.messages.length || (state.current.incognito !== state.incognito)) {
       leaveCurrent();
-      state.current = newConversation(null);
+      showDiscussion(newConversation(null));
     }
   }
   renderAll();
@@ -2640,7 +2791,10 @@ function drawMain() {
     renderLicenses();
     return;
   }
+  // The composer shown again takes the height of its text, which it could not measure while hidden.
+  const hidden = ui.composerWrap.classList.contains('hidden');
   ui.composerWrap.classList.remove('hidden');
+  if (hidden) autoGrow();
   const c = state.current;
   if (!c.messages.length) {
     renderWelcome();
@@ -2663,7 +2817,7 @@ function renderWelcome() {
   for (let i = 1; i <= 4; ++i) {
     const [title, prompt] = t('suggest_' + c.role + '_' + i).split('|');
     suggestions.append(h('div', {
-      class: 'suggestion', onclick: () => { ui.input.value = prompt; autoGrow(); ui.input.focus(); }
+      class: 'suggestion', onclick: () => { ui.input.value = prompt; autoGrow(); saveDraft(true); ui.input.focus(); }
     }, h('b', null, title), h('span', null, prompt)));
   }
   const p = c.projectId ? projectById(c.projectId) : null;
@@ -3311,7 +3465,9 @@ function settledEnd(text, from) {
     Fills the body of an answer: per step, its reasoning, its text and its tool calls, then the
     notes on its state.  While the answer is written, the steps already drawn that did not change
     stay as they are, the step being written is drawn in place (liveStep), and the notes change
-    only when what they say changes.
+    only when what they say changes.  A step that ended no longer changes while the answer is
+    written: once drawn whole, it is left as it is, so that a drawing costs the same whatever the
+    number of steps.
 */
 function fillAssistant(bubble, m, live) {
   const steps = m.steps || [];
@@ -3332,6 +3488,7 @@ function fillAssistant(bubble, m, live) {
       }
       return;
     }
+    if (live && old && !old.live && old.dataset.key) return;
     const key = stepKey(s, false);
     if (old && !old.live && old.dataset.key === key) return;
     const el = stepElement(s, false, first);
@@ -3523,8 +3680,6 @@ function renderComposerState() {
   ui.webButton.setAttribute('aria-pressed', String(webOn));
   ui.webButton.disabled = !!reason;
   ui.webButton.title = reason || t('webHint');
-  // The tools the next question gives the model show under the prompt.
-  renderToolChips(c ? toolSet(c, caps).definitions : null, agent);
   // The attachments the model of the function reads, the images while the context has places for them.
   const role = c ? c.role : 'general';
   const room = imageRoom(c);
@@ -3556,25 +3711,6 @@ function renderComposerState() {
   ui.pendingBox.classList.toggle('hidden', !state.pending.length);
 }
 
-/*
-    The tools the next question gives the model, as chips under the prompt, under the label of the agent while it is
-    on and under the one of the web otherwise, hidden without tools.  The chips are drawn again only when their list
-    changes, so that a chip keeps the focus.
-*/
-function renderToolChips(definitions, agent) {
-  const names = (definitions || []).map((d) => d.function.name);
-  ui.agentTools.classList.toggle('hidden', !names.length);
-  const key = (agent ? 'agent:' : 'web:') + names.join(',');
-  if (ui.agentTools.dataset.tools === key) return;
-  ui.agentTools.dataset.tools = key;
-  const label = t(agent ? 'agentTools' : 'webTools');
-  ui.agentTools.setAttribute('aria-label', label);
-  fill(ui.agentTools, h('span', { class: 'label' }, label), names.map((name) => h('span', {
-    class: 'tool-chip', role: 'listitem', tabindex: '0', title: t('toolHint_' + name),
-    html: icon(toolIcons[name] || 'tool') + '<span>' + escapeHtml(toolLabel(name)) + '</span>'
-  })));
-}
-
 // Takes an attachment out of the composer; the places of an image go back to the context.
 function removePending(a) {
   state.pending = state.pending.filter((x) => x !== a);
@@ -3596,29 +3732,40 @@ function sendDisabled() {
 
 function autoGrow() {
   ui.input.style.height = 'auto';
-  ui.input.style.height = Math.min(ui.input.scrollHeight, 260) + 'px';
+  // A composer hidden, behind the page of a project, has no height to measure: it takes it once shown (drawMain).
+  if (ui.input.scrollHeight) ui.input.style.height = Math.min(ui.input.scrollHeight, 260) + 'px';
   ui.sendButton.disabled = sendDisabled();
 }
 
 /*
     Adds files to the composer of the discussion shown, the images within the places its context
-    has left.  The files read while another discussion took its place are forgotten.
+    has left.  The files read while another discussion took its place join the draft of their own
+    discussion, and leave the memory with an incognito or deleted one.
 */
 async function addPending(files) {
   const c = state.current;
   let added = await readFiles(files, c ? c.role : 'general', imageRoom(c));
-  if (state.current !== c) {
-    images.drop(added.filter((a) => a.kind === 'image').map((a) => a.id));
+  const key = draftKey(c);
+  const shown = state.current === c || (key !== '' && draftKey(state.current) === key);
+  const draft = shown || !key ? null : drafts.get(key) || { text: storedDraft(key), files: [] };
+  if (!shown && !draft) {
+    images.drop(imageIdsOf(added));
     return;
   }
   // Two additions read together keep to the places as well.
-  const room = imageRoom(c);
+  const waiting = shown ? state.pending : draft.files;
+  const room = Math.max(0, maxContextImages - contextImages(shown ? state.current : c) - imageIdsOf(waiting).length);
   const pictures = added.filter((a) => a.kind === 'image');
   if (pictures.length > room) {
     const extra = pictures.slice(room);
     images.drop(extra.map((a) => a.id));
     added = added.filter((a) => !extra.includes(a));
     toast(imageLimitText(extra.map((a) => a.name), 0), true, 10000);
+  }
+  if (!shown) {
+    draft.files = draft.files.concat(added);
+    drafts.set(key, draft);
+    return;
   }
   state.pending = state.pending.concat(added);
   renderComposerState();
@@ -3677,6 +3824,9 @@ async function onSend() {
   state.pending = [];
   ui.input.value = '';
   autoGrow();
+  // The draft leaves with its question: the discussion, created by it or not, goes on with an empty composer.
+  clearTimeout(draftTimer);
+  forgetDraft(draftKey(state.current));
   await sendMessage(text, attachments);
 }
 
@@ -3995,7 +4145,10 @@ function sentImages(messages) {
     url(id), the data URL of an image, null when this browser does not hold it.  The images of a
     question go before its text, the newest maxContextImages of the discussion, and the images of
     the project found for the last question come with it; a model that reads text only, a request
-    without media, and the images missing receive their names ("[Image: name]").
+    without media, and the images missing receive their names ("[Image: name]").  cuts (fitContext)
+    shortens the oldest texts, a result of a tool keeping its beginning, leaves out the reasoning of
+    the steps it gives a length of 0, and leaves out the cuts.steps oldest steps of the answer being
+    written, the last message, which a line then names.
 */
 function apiMessages(c, system, cuts, media) {
   const out = [];
@@ -4033,16 +4186,32 @@ function apiMessages(c, system, cuts, media) {
       out.push({ role: 'user', content: parts.length ? parts.concat(content ? [{ type: 'text', text: content }] : []) : content });
       continue;
     }
-    for (const s of m.steps || []) {
+    const kept = (key) => (cuts ? cuts.texts.get(key) : null);
+    let steps = m.steps || [];
+    let left = '';
+    if (cuts && cuts.steps && m === messages[messages.length - 1]) {
+      left = '[The first ' + cuts.steps + ' steps of this answer, their tool calls and their results, left the '
+        + 'context.]';
+      steps = steps.slice(cuts.steps);
+    }
+    for (const s of steps) {
       const msg = { role: 'assistant', content: s.content || '' };
-      if (s.reasoning) msg.reasoning_content = s.reasoning;
+      if (left) {
+        msg.content = left + (msg.content ? '\n\n' + msg.content : '');
+        left = '';
+      }
+      if (s.reasoning && kept(s) !== 0) msg.reasoning_content = s.reasoning;
       const calls = (s.toolCalls || []).filter((tc) => tc.result != null);
       if (calls.length) {
         msg.tool_calls = calls.map((tc) => ({ id: tc.id, type: 'function', function: { name: tc.name, arguments: tc.arguments || '{}' } }));
       }
       if (!msg.content && !msg.tool_calls) continue;
       out.push(msg);
-      for (const tc of calls) out.push({ role: 'tool', tool_call_id: tc.id, name: tc.name, content: tc.result });
+      for (const tc of calls) {
+        const n = kept(tc);
+        const content = n == null ? tc.result : keepStart(tc.result, n);
+        out.push({ role: 'tool', tool_call_id: tc.id, name: tc.name, content });
+      }
     }
   }
   return out;
@@ -4358,17 +4527,22 @@ function keptTokens(fixed, room) {
     into the summary of the discussion, which the model receives with the first question
     that stays (compact); the exchanges leave without it when the model cannot write it.
     When the last question alone does not fit, the oldest texts lose their beginnings,
-    at the end of a sentence: the summary first, then the documents of the questions, then
-    the questions.  The system message and the last question always stay.  onCompact tells
+    at the end of a sentence, and then the oldest steps of the answer being written leave
+    (shortenOldest).  The system message and the last question always stay.  onCompact tells
     when a compression starts, and model names the model the tokens are counted for.  Returns
     {messages, trimmed, compacted, context, tokens}.
+
+    The answer of the agent fits its context before each of its steps, with the cuts of its
+    earlier steps (kept, which a compression empties), so that the beginning of the prompt stays
+    from one step to the next; once its steps are cut, a quarter of the room of the exchanges is
+    freed beyond what is needed, so that the next steps fit without another cut.
 
     A compression the background started after an earlier answer (compactLater) is waited for
     only when the conversation does not fit without it, and one that ended while the answer was
     written (generations) applies then; a summary being written again after a deletion
     (rewriteSummary) is waited for in every case.  signal ends these waits too.
 */
-async function fitContext(c, build, toolDefs, reserve, signal, onCompact, model) {
+async function fitContext(c, build, toolDefs, reserve, signal, onCompact, model, kept) {
   let trimmed = false;
   let compacted = false;
   const waited = new Set();
@@ -4379,7 +4553,16 @@ async function fitContext(c, build, toolDefs, reserve, signal, onCompact, model)
   };
   const first = compactions.get(c.id);
   if (first && first.always) await wait(first);
-  const cuts = { summary: null, texts: new Map() };
+  const cuts = kept || { summary: null, texts: new Map(), steps: 0 };
+  // A compression moves the start of the conversation, and the texts are measured again whole.
+  const restart = () => {
+    cuts.summary = null;
+    cuts.texts.clear();
+    cuts.steps = 0;
+  };
+  // The steps of the answer being written that the request holds, the last message of c holding the one asked for.
+  const answer = c.messages[c.messages.length - 1];
+  let spare = answer && answer.role === 'assistant' && (answer.steps || []).length > 1 ? 0.25 : 0;
   const counted = model || 'albireo-' + c.role;
   for (let attempt = 0; attempt < 12; ++attempt) {
     const list = build(cuts);
@@ -4402,6 +4585,7 @@ async function fitContext(c, build, toolDefs, reserve, signal, onCompact, model)
       g.compaction = null;
       if (settleCompaction(c, done)) {
         compacted = true;
+        restart();
         continue;
       }
     }
@@ -4429,10 +4613,12 @@ async function fitContext(c, build, toolDefs, reserve, signal, onCompact, model)
         c.contextStart = next;
         trimmed = true;
       }
+      restart();
       continue;
     }
-    // Nothing more can leave whole: the oldest texts lose their beginnings.
-    const excess = Math.ceil((r.tokens - room) / scale) + 200;
+    // Nothing more can leave whole: the oldest texts lose their beginnings, with the spare room once.
+    const excess = Math.ceil((r.tokens - room + spare * Math.max(0, room - fixed)) / scale) + 200;
+    spare = 0;
     if (!shortenOldest(c, cuts, excess)) {
       return { messages: list, trimmed, compacted, context: r.context, tokens: r.tokens, overflow: true };
     }
@@ -4442,30 +4628,78 @@ async function fitContext(c, build, toolDefs, reserve, signal, onCompact, model)
 }
 
 /*
-    Takes excess characters from the beginnings of the oldest texts the model receives, the
-    summary first, then the documents and the texts of the questions in their order: cuts
-    holds the characters each of them keeps.  Returns false when nothing is left to take.
+    Takes excess characters from the texts the model receives, the oldest first: the summary,
+    the documents and the texts of the earlier questions with the results of the tools of their
+    answers, then the reasoning and the results of the tools of the steps of the answer being
+    written, the last message of c, but those of its last step, then the documents and the text
+    of the question it answers, and the results of the last step of the answer last.  cuts holds
+    the characters each of them keeps: a text keeps its end and a result its beginning, 200
+    characters at least, and the reasoning of a step leaves whole.  When the texts before the
+    question have nothing more to give, the oldest steps of the answer leave whole, the last step
+    of the request staying (cuts.steps).  Returns false when nothing is left to take.
 */
 function shortenOldest(c, cuts, excess) {
-  const texts = [];
-  if (c.summary && c.summary.text && (c.contextStart || 0) > 0) texts.push({ key: 'summary', text: c.summary.text });
-  for (const m of c.messages.slice(c.contextStart || 0)) {
-    if (m.role !== 'user') continue;
-    for (const a of m.attachments || []) if (a.mode !== 'search') texts.push({ key: a.id, text: a.text || '' });
-    texts.push({ key: m.id, text: m.content || '' });
+  const messages = c.messages.slice(c.contextStart || 0);
+  const lastUser = messages.map((m) => m.role).lastIndexOf('user');
+  const end = messages[messages.length - 1];
+  const answer = end && end.role === 'assistant' && messages.length - 1 > lastUser ? end : null;
+  // The request holds the steps of the answer before its last one, which is being asked for.
+  const latest = answer && answer.steps.length > 1 ? answer.steps[answer.steps.length - 2] : null;
+  const early = [];
+  const reasoning = [];
+  const results = [];
+  const question = [];
+  const last = [];
+  if (c.summary && c.summary.text && (c.contextStart || 0) > 0) early.push({ key: 'summary', text: c.summary.text });
+  messages.forEach((m, i) => {
+    if (m.role === 'user') {
+      const list = i === lastUser ? question : early;
+      for (const a of m.attachments || []) if (a.mode !== 'search') list.push({ key: a.id, text: a.text || '' });
+      list.push({ key: m.id, text: m.content || '' });
+      return;
+    }
+    for (const s of m.steps || []) {
+      if (m === answer && s.reasoning) reasoning.push({ key: s, text: s.reasoning, whole: true });
+      for (const tc of s.toolCalls || []) {
+        if (tc.result == null) continue;
+        const list = m !== answer ? early : s === latest ? last : results;
+        list.push({ key: tc, text: tc.result });
+      }
+    }
+  });
+  const keptOf = (key, text) => {
+    const kept = key === 'summary' ? cuts.summary : cuts.texts.get(key);
+    return kept == null ? text.length : kept;
+  };
+  const take = (list) => {
+    for (const x of list) {
+      if (excess <= 0) return;
+      const length = keptOf(x.key, x.text);
+      // A text keeps 200 characters at least: the last sentences of a question, the beginning of a result.
+      const n = x.whole ? length : Math.min(excess, length - Math.min(length, 200));
+      if (n <= 0) continue;
+      if (x.key === 'summary') cuts.summary = length - n;
+      else cuts.texts.set(x.key, length - n);
+      excess -= n;
+    }
+  };
+  take(early);
+  take(reasoning);
+  take(results);
+  if (excess > 0 && answer) {
+    const steps = answer.steps.length - 1;
+    while (excess > 0 && cuts.steps < steps - 1) {
+      const s = answer.steps[cuts.steps];
+      let n = 60 + (s.content || '').length + (s.reasoning ? keptOf(s, s.reasoning) : 0);
+      for (const tc of s.toolCalls || []) {
+        if (tc.result != null) n += 80 + (tc.arguments || '').length + keptOf(tc, tc.result);
+      }
+      excess -= n;
+      cuts.steps += 1;
+    }
   }
-  for (const x of texts) {
-    if (excess <= 0) break;
-    const kept = x.key === 'summary' ? cuts.summary : cuts.texts.get(x.key);
-    const length = kept == null ? x.text.length : kept;
-    // A text keeps a short end: what remains of the question, its last sentences.
-    const floor = Math.min(length, 200);
-    const take = Math.min(excess, length - floor);
-    if (take <= 0) continue;
-    if (x.key === 'summary') cuts.summary = length - take;
-    else cuts.texts.set(x.key, length - take);
-    excess -= take;
-  }
+  take(question);
+  take(last);
   return excess <= 0;
 }
 
@@ -4569,18 +4803,20 @@ async function runTurn(c, abort, turn) {
       turn.imagesNamed = true;
       toast(t('imagesNamed', { model: modelName(model) }), false, 9000);
     }
+    // The cuts of the texts that the steps of the answer share (fitContext).
+    const cuts = { summary: null, texts: new Map(), steps: 0 };
     for (let step = 0; step < maxAgentSteps; ++step) {
       const s = { reasoning: '', content: '', toolCalls: [] };
       turn.steps.push(s);
       const system = systemPrompt(c, caps.context || 8192, set);
       // The conversation, with the steps of this answer already done (the agent's).
-      const build = (cuts) => apiMessages(Object.assign({}, c, {
+      const build = (x) => apiMessages(Object.assign({}, c, {
         messages: c.messages.slice(0, -1).concat([Object.assign({}, turn, { steps: turn.steps.slice(0, -1) })])
-      }), system, cuts, media);
+      }), system, x, media);
       const fitted = await fitContext(c, build, toolDefs, state.settings.maxTokens || 2048, signal, () => {
         turn.compacting = true;
         scheduleRender(c);
-      }, 'albireo-' + role);
+      }, 'albireo-' + role, cuts);
       turn.compacting = false;
       if (fitted.trimmed) turn.trimmed = true;
       if (fitted.compacted) turn.compacted = true;
@@ -5811,7 +6047,7 @@ function dataTab(body, close) {
           if (!await confirmDialog(t('clearAll'), t('clearAllText'))) return;
           // The answers in progress, shown or written in the background, and the work of the background
           // model stop, the stored discussions are not saved again, and the indexing in progress writes
-          // no passage.  A new discussion, not yet stored, stays.
+          // no passage.  A new discussion, not yet stored, stays with its draft.
           for (const c of state.conversations) deleted.add(c.id);
           if (state.current && state.current.messages.length) deleted.add(state.current.id);
           for (const g of generations.values()) deleted.add(g.c.id);
@@ -5820,7 +6056,8 @@ function dataTab(body, close) {
           cancelIndex();
           cancelBackground();
           rag.removeAll();
-          images.removeAll();
+          images.removeAll(waitingImages());
+          forgetStoredDrafts();
           for (const id of deleted) web.forgetPages(id);
           await store.clearAll().catch(storageFailed);
           broadcast({ type: 'cleared' });
@@ -5911,6 +6148,10 @@ async function aboutTab(body, close) {
   }
   const models = Array.from(byModel, ([id, names]) => names.join(', ') + ': ' + modelName(id)).join(' · ');
   row(t('models'), models || '-');
+  // The provider of the web search, while the service offers one: Brave asks the projects that use its credit to
+  // name its API there.
+  const provider = searchProvider();
+  if (provider) row(t('tool_web_search'), provider);
   if (s.usage) row(t('requests'), formatNumber(s.usage.requests) + ' · ' + t('tokensIn') + ' ' + formatNumber(s.usage.prompt_tokens) +
     ' · ' + t('tokensOut') + ' ' + formatNumber(s.usage.completion_tokens));
   body.append(art, h('p', null, t('aboutText')), kv);
@@ -6113,7 +6354,7 @@ function buildLayout() {
       // The reading aloud ends with the discussion it belongs to, as route() ends it.
       speech.stopReading();
       leaveCurrent();
-      state.current = newConversation(null);
+      showDiscussion(newConversation(null));
       state.view = 'chat';
       if (location.hash !== '#/') history.pushState(null, '', '#/');
       renderAll();
@@ -6139,7 +6380,10 @@ function buildLayout() {
   ui.content = h('div', { class: 'scroller' });
   ui.input = h('textarea', { rows: 1, 'aria-label': t('placeholder') });
   ui.input.value = draft;
-  ui.input.addEventListener('input', autoGrow);
+  ui.input.addEventListener('input', () => {
+    autoGrow();
+    saveDraft();
+  });
   ui.input.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && state.settings.sendOnEnter) {
       e.preventDefault();
@@ -6190,16 +6434,15 @@ function buildLayout() {
       refreshViews();
     }
   });
-  // What the agent mode and the web access do, from a button beside them, and the tools they give, under the prompt.
+  // What the agent mode and the web access do, and the tools they give, from a button beside them.
   ui.agentHelp = h('button', {
     class: 'help-button', type: 'button', title: t('agentHelpTitle'), 'aria-label': t('agentHelpTitle'),
     html: icon('info'), onclick: (e) => agentHelp(e.currentTarget)
   });
-  ui.agentTools = h('div', { class: 'agent-tools hidden', role: 'list', 'aria-label': t('agentTools') });
   ui.sendButton = h('button', { class: 'send', type: 'button', onclick: onSend });
   ui.pendingBox = h('div', { class: 'composer-attachments hidden' });
   ui.attachButton = iconButton('clip', t('attach'), () => fileInput.click());
-  const composer = h('div', { class: 'composer' }, ui.pendingBox, ui.input, ui.agentTools, h('div', { class: 'row' },
+  const composer = h('div', { class: 'composer' }, ui.pendingBox, ui.input, h('div', { class: 'row' },
     ui.attachButton, fileInput, ui.reasonButton, ui.agentButton, ui.webButton, ui.agentHelp,
     h('span', { class: 'grow' }), ui.sendButton));
   for (const ev of ['dragenter', 'dragover']) composer.addEventListener(ev, (e) => { e.preventDefault(); composer.classList.add('drag'); });
@@ -6273,10 +6516,16 @@ async function init() {
   if (await reloadLists().then(() => true, () => false)) {
     pruneIndex(indexed).catch(() => {});
     pruneImages(pictures).catch(() => {});
+    if (!state.incognito) pruneDrafts();
   }
   buildLayout();
   if (blocked) toast(t('dbBlocked'), true, 30000);
   window.addEventListener('hashchange', route);
+  // The text being typed stays when the page is left, reloaded or hidden.
+  window.addEventListener('pagehide', () => saveDraft(true));
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') saveDraft(true);
+  });
   await askSpeechVoices();
   await route();
   /*

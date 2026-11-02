@@ -3,25 +3,24 @@
 """
 Writes the update feed of Albireo for a new version.
 
-    python3 make_feed.py <output feed.json> <version> <installer> <address of the installer> [<notes.json>]
+    python3 make_feed.py <output feed.json> <version> <installer> <file in the link> [<notes.json>]
 
-The installer is the albireo-setup.exe of the version, which must carry that version in its
-version resource, the address the one it is published at, a release asset of the repository
-for instance:
-
-    https://github.com/<owner>/<repository>/releases/download/albireo-v<version>/albireo-setup-<version>.exe
+The installer is the albireo-setup-online.exe of the version, which must carry that version in
+its version resource, and the file in the link the name it takes in the folder dist of the
+public link of the published files, albireo-setup-online-<version>.exe, from which the services
+download it: the public link is the only source of their downloads (host/public_link.h), and the
+feed names no other address.
 
 notes.json holds the release notes by language, {"en": "...", "fr": "...", ...}; the
 service shows the notes of the language of the user, else the English ones.  Without it,
 the notes of the output feed are kept when that feed already describes the version, and
 the notes otherwise read "Albireo <version>".
 
-The feed is then signed with albireo-sign (sign <private key> feed.json), and both files
-are published in dist/albireo of the repository.  The services that read it download the
-installer in the background, check its size and its SHA-256, and install it at their next
-start.  publish_release.py runs these steps after attaching the installer to its release, or,
-with --public-link, names the installer by its file in the folder dist of the public link of the
-published files, which the services read first (host/public_link.h).
+The feed is then signed with albireo-sign (sign <private key> feed.json), and both files go
+to dist/albireo of the repository and to the folder dist of the link with the installer
+(fill_public_link.py dist).  The services that read it download the installer in the
+background, check its size and its SHA-256, and install it at their next start.
+publish_release.py runs these steps.
 """
 
 import hashlib
@@ -137,25 +136,16 @@ def read_notes(notes_path, output, version):
     return notes or {"en": "Albireo " + version}
 
 
-def make_feed(version, installer, url, notes, size=None, sha256=None, file=None):
-    """The feed announcing version, whose installer is the file installer published at url, in the
-    folder dist of the public link under the name file (public_link.py), or both; the services read
-    the copy of the link first.  size and sha256 spare reading the file again when the caller has
-    them."""
+def make_feed(version, installer, file, notes, size=None, sha256=None):
+    """The feed announcing version, whose installer is the file installer, published in the folder
+    dist of the public link under the name file (public_link.py).  size and sha256 spare reading
+    the file again when the caller has them."""
     if not re.fullmatch(r"\d+\.\d+\.\d+", version):
         raise ValueError("the version must have the form 1.2.3")
-    if not url and not file:
-        raise ValueError("the installer needs an address or a name in the public link")
-    if url and not url.startswith("https://"):
-        raise ValueError("the address of the installer must be an https address")
-    if file and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*\.exe", file):
-        raise ValueError("%s is not the name of an installer" % file)
+    if not file or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*\.exe", file):
+        raise ValueError("%s is not the name of an installer in the public link" % file)
     check_installer(installer, version)
-    described = {}
-    if file:
-        described["file"] = file
-    if url:
-        described["url"] = url
+    described = {"file": file}
     described["size"] = size if size is not None else os.path.getsize(installer)
     described["sha256"] = sha256 or sha256_of(installer)
     return {
@@ -181,10 +171,10 @@ def main():
     if len(sys.argv) not in (5, 6):
         print(__doc__)
         return 2
-    output, version, installer, url = sys.argv[1:5]
+    output, version, installer, file = sys.argv[1:5]
     try:
         notes = read_notes(sys.argv[5] if len(sys.argv) == 6 else None, output, version)
-        feed = make_feed(version, installer, url, notes)
+        feed = make_feed(version, installer, file, notes)
     except (OSError, ValueError) as e:
         print(e)
         return 2

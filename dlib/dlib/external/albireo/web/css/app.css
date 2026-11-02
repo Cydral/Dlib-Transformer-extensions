@@ -504,16 +504,7 @@ mark { background: var(--mark); color: inherit; border-radius: 3px; padding: 0 1
 }
 .tool-call[open] > summary .chev { transform: rotate(180deg); }
 
-/* The tools of the agent under the prompt, and the explanation of the agent mode. */
-.agent-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; padding: 2px 4px 8px; }
-.agent-tools .label { font-size: 11.5px; color: var(--text-faint); margin-right: 2px; }
-.tool-chip {
-  display: inline-flex; align-items: center; gap: 4px; height: 22px; padding: 0 8px; border-radius: 999px;
-  border: 1px solid var(--border); background: var(--bg-hover); color: var(--text-soft); font-size: 11.5px;
-  cursor: help;
-}
-.tool-chip svg { width: 12px; height: 12px; color: var(--blue); }
-.tool-chip:focus-visible { outline: 2px solid var(--blue); outline-offset: 1px; }
+/* The explanation of the agent mode and of the web access, with their tools, from the button beside them. */
 .help-button {
   width: 28px; height: 28px; border-radius: 50%; border: none; background: transparent; color: var(--text-faint);
   display: inline-flex; align-items: center; justify-content: center;

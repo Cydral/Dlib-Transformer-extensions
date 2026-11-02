@@ -116,8 +116,6 @@ namespace albireo
         j["web_search"] = web_search;
         j["web_search_url"] = web_search_url;
         j["web_search_key_set"] = !web_search_key.empty();
-        j["update_feed"] = update_feed;
-        j["catalog_url"] = catalog_url;
         j["public_link"] = public_link;
         j["engine_benchmarks"] = engine_benchmarks;
         if (trust_authority >= 0) j["trust_authority"] = trust_authority > 0;
@@ -158,8 +156,6 @@ namespace albireo
         web_search_url = j["web_search_url"].str(d.web_search_url);
         // The key comes from the administration route or from web_search.secret: a document without it keeps it.
         if (j["web_search_key"].is_string()) web_search_key = j["web_search_key"].as_string();
-        update_feed = j["update_feed"].str(d.update_feed);
-        catalog_url = j["catalog_url"].str(d.catalog_url);
         public_link = j["public_link"].str(d.public_link);
         engine_benchmarks = j["engine_benchmarks"].is_object() ? j["engine_benchmarks"] : json::object();
         trust_authority = j["trust_authority"].is_bool() ? (j["trust_authority"].as_bool() ? 1 : 0) : d.trust_authority;

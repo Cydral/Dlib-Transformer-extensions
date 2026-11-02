@@ -30,7 +30,7 @@
   },
   {
    "name": "Web access",
-   "description": "The search and the pages of the web for the agent mode"
+   "description": "The search and the pages of the web for the Web button"
   },
   {
    "name": "Administration",
@@ -644,7 +644,7 @@
           },
           "web": {
            "type": "object",
-           "description": "The web access of the agent mode, which the web application reads at its start: available while the administrator leaves it on (web_access) and the service is not offline, and the provider of /albireo/v1/web/search, none when the search is unavailable while /albireo/v1/web/fetch stays available.",
+           "description": "The web access of the Web button, which the web application reads at its start: available while the administrator leaves it on (web_access) and the service is not offline, and the provider of /albireo/v1/web/search in use, the setting auto resolved, none when the search is unavailable while /albireo/v1/web/fetch stays available.",
            "properties": {
             "available": {
              "type": "boolean"
@@ -1150,7 +1150,7 @@
      "Web access"
     ],
     "summary": "Searches the web through the provider of the settings",
-    "description": "The tool web_search of the agent mode. The provider is the setting web_search: the REST interface of Wikipedia (GET https://<language>.wikipedia.org/w/rest.php/v1/search/page, with a User-Agent that gives a contact, as the policy of Wikimedia asks), the Brave Search API with the key of the administrator, or a SearXNG instance through its JSON format. The log names the provider and the number of results, never the query.",
+    "description": "The tool web_search of the Web button. The provider is the setting web_search: by default the Brave Search API with the key built into the service when the build carries one, else the REST interface of Wikipedia (GET https://<language>.wikipedia.org/w/rest.php/v1/search/page, with a User-Agent that gives a contact, as the policy of Wikimedia asks); the Brave Search API with the key of the administrator, else the key built in; or a SearXNG instance through its JSON format. The log names the provider and the number of results, never the query or a key.",
     "requestBody": {
      "required": true,
      "content": {
@@ -1183,7 +1183,7 @@
       }
      },
      "403": {
-      "description": "The service works offline (code offline), the administrator turned the web access off (web_access_off), or no provider is set (no_search_provider): web_search none, brave without key or searxng without address",
+      "description": "The service works offline (code offline), the administrator turned the web access off (web_access_off), or no provider is set (no_search_provider): web_search none, brave without a key of the administrator in a build without key, or searxng without address",
       "content": {
        "application/json": {
         "schema": {
@@ -1193,7 +1193,7 @@
       }
      },
      "429": {
-      "description": "The provider limits the rate of the requests (code rate_limited): Wikipedia for the anonymous requests, the rate or the monthly credit of the key of Brave, the limiter of SearXNG; Retry-After gives the delay the provider asks for",
+      "description": "The provider limits the rate of the requests (code rate_limited): Wikipedia for the anonymous requests, the rate or the monthly credit of the key of Brave, the credit of the key built in being shared by every installation, the limiter of SearXNG; Retry-After gives the delay the provider asks for",
       "content": {
        "application/json": {
         "schema": {
@@ -1241,7 +1241,7 @@
      "Web access"
     ],
     "summary": "Reads a page of the web at a public address",
-    "description": "The tool fetch_page of the agent mode. The address is http or https, without user information; its host is refused when it names this computer or a local network (localhost, *.localhost, *.local, *.internal, *.home.arpa, a name of a single label) or when one of its addresses is not public (loopback, private, link-local, shared, documentation, multicast and reserved ranges, and the IPv4 addresses that IPv6 embeds), the decimal, hexadecimal and shortened forms of IPv4 included. The connection goes to the address checked, the name keeping the server name of TLS and the check of the certificate. The service follows five redirections at most, each address checked again. A text (text/<subtype>, XML, JSON) is read up to 2 MB and cut beyond (truncated), a PDF file up to 20 MB. A request takes 10 s to connect, 15 s for each wait for data and 30 s in all, and keeps no cookie. Behind a proxy, the check applies to the addresses this computer resolves and the proxy resolves the name again. The log names the host, the status and the size, never the path or the query.",
+    "description": "The tool fetch_page of the Web button. The address is http or https, without user information; its host is refused when it names this computer or a local network (localhost, *.localhost, *.local, *.internal, *.home.arpa, a name of a single label) or when one of its addresses is not public (loopback, private, link-local, shared, documentation, multicast and reserved ranges, and the IPv4 addresses that IPv6 embeds), the decimal, hexadecimal and shortened forms of IPv4 included. The connection goes to the address checked, the name keeping the server name of TLS and the check of the certificate. The service follows five redirections at most, each address checked again. A text (text/<subtype>, XML, JSON) is read up to 2 MB and cut beyond (truncated), a PDF file up to 20 MB. A request takes 10 s to connect, 15 s for each wait for data and 30 s in all, and keeps no cookie. Behind a proxy, the check applies to the addresses this computer resolves and the proxy resolves the name again. The log names the host, the status and the size, never the path or the query.",
     "requestBody": {
      "required": true,
      "content": {
@@ -3380,18 +3380,19 @@
      "web_access": {
       "type": "boolean",
       "default": true,
-      "description": "The web access of the agent mode, /albireo/v1/web/search and /albireo/v1/web/fetch; false turns it off."
+      "description": "The web access of the Web button, /albireo/v1/web/search and /albireo/v1/web/fetch; false turns it off."
      },
      "web_search": {
       "type": "string",
       "enum": [
+       "auto",
        "wikipedia",
        "brave",
        "searxng",
        "none"
       ],
-      "default": "wikipedia",
-      "description": "The provider of /albireo/v1/web/search: the REST interface of Wikipedia, the Brave Search API with web_search_key, the SearXNG instance at web_search_url, or none."
+      "default": "auto",
+      "description": "The provider of /albireo/v1/web/search: auto, the Brave Search API with the key built into the service when the build carries one, else the REST interface of Wikipedia; wikipedia; brave, the Brave Search API with web_search_key, else with the key built in; searxng, the instance at web_search_url; or none. Every installation of a build shares the monthly credit of its key, which no route gives."
      },
      "web_search_url": {
       "type": "string",
@@ -3722,13 +3723,14 @@
        "update_installer_mismatch",
        "update_feed_invalid",
        "update_download",
+       "update_not_published",
        "update_not_ready",
        "update_invalid",
        "update_start",
        "update_package_manager",
        "stopping"
       ],
-      "description": "update_check {e}, update_record {version}, update_feed_missing {version}, update_feed_missing_folder {folder}, update_signature {file}, update_feed_mismatch {file, version}, update_outside {file}, update_installer_mismatch {version}, update_feed_invalid, update_download {e}, update_not_ready, update_invalid {version}, update_start {code}, update_package_manager, stopping."
+      "description": "update_check {e}, update_record {version}, update_feed_missing {version}, update_feed_missing_folder {folder}, update_signature {file}, update_feed_mismatch {file, version}, update_outside {file}, update_installer_mismatch {version}, update_feed_invalid, update_download {e}, update_not_published {file}, update_not_ready, update_invalid {version}, update_start {code}, update_package_manager, stopping."
      },
      "args": {
       "type": "object",

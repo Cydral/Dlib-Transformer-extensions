@@ -649,6 +649,8 @@ if (ALBIREO_PROGRAMS)
       message(STATUS "Public link: no password, ${ALBIREO_PUBLIC_LINK_PASSWORD_FILE} does not exist")
    endif()
    configure_file(cmake/public_link_secret.h.in ${CMAKE_BINARY_DIR}/generated/public_link_secret.h @ONLY)
+   # The key of the Brave Search API built into the service, from a file outside the repository.
+   include(cmake/web_search_key.cmake)
 
    # The service.
    add_executable(albireo-service host/main.cpp host/service.cpp host/server.cpp host/settings.cpp host/store.cpp
@@ -767,10 +769,10 @@ if (ALBIREO_TESTS AND (ALBIREO_ENGINE_CUDA OR ALBIREO_ENGINE_OPENVINO OR ALBIREO
 endif()
 
 if (ALBIREO_TESTS AND ALBIREO_PROGRAMS)
-   # The files the service writes in its models folder and reads in its imports, the settings and the
-   # web access, with a local server.
+   # The files the service writes in its models folder and reads in its imports, the downloads and the
+   # updates from the public link, the settings and the web access, with a local server.
    add_executable(test_host tests/test_host.cpp host/models.cpp host/store.cpp host/http_fetch.cpp
-      host/public_link.cpp host/crypto.cpp host/settings.cpp host/web_access.cpp)
+      host/public_link.cpp host/crypto.cpp host/settings.cpp host/web_access.cpp host/updater.cpp)
    target_include_directories(test_host PRIVATE ${CMAKE_BINARY_DIR}/generated)
    target_link_libraries(test_host PRIVATE albireo_common albireo_sqlite albireo_zlib dlib::httplib)
    if (WIN32)

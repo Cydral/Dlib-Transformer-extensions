@@ -56,24 +56,22 @@ namespace albireo
         bool offline = false;
         std::string proxy;                      // "": the proxy of the system, "none", or http://host:port
         /*
-            The web access of the agent mode (web_access.h): the routes through which the web
+            The web access of the Web button (web_access.h): the routes through which the web
             application searches the web and reads its pages, turned off by web_access = false.
-            web_search names the provider of the search: "wikipedia", "brave" (the Brave Search
-            API, with its key web_search_key), "searxng" (the instance at web_search_url) or
-            "none".  The key is kept apart, as the password of the proxy.
+            web_search names the provider of the search: "auto" (the Brave Search API with the key
+            built into the service when the build has one, else Wikipedia), "wikipedia", "brave"
+            (the Brave Search API, with the key web_search_key, else the key built into the
+            service), "searxng" (the instance at web_search_url) or "none".  The key is kept apart,
+            as the password of the proxy.
         */
         bool web_access = true;
-        std::string web_search = "wikipedia";
+        std::string web_search = "auto";
         std::string web_search_url;
         std::string web_search_key;
-        std::string update_feed =
-            "https://raw.githubusercontent.com/Cydral/Dlib-Transformer-extensions/main/dist/albireo/feed.json";
-        std::string catalog_url =
-            "https://raw.githubusercontent.com/Cydral/Dlib-Transformer-extensions/main/dist/albireo/catalog.json";
         /*
-            The public link of the published files (host/public_link.h): the feed, the catalog and
-            the installers in its folder dist, the model files in its folder models, read before
-            update_feed, catalog_url and the addresses of the catalog; "" reads these alone.
+            The public link of the published files (host/public_link.h), the only source of the
+            downloads: the feed, the catalog and the installers in its folder dist, the model files
+            in its folder models.  "" turns the downloads off.
         */
         std::string public_link = "https://u.pcloud.link/publink/show?code=kZeNhSJZpcMygkcCvGXmq1MTvkCfBuSsx2GV";
         json engine_benchmarks = json::object();     // variant -> measured tokens per second

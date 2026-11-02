@@ -494,7 +494,7 @@ namespace albireo
     {
         struct chunk
         {
-            std::string url;
+            std::string url;          // the official address of the resource, which names its copy in the link
             std::string link_path;    // the copy of the resource in the public link (public_link.h)
             uint64_t resource = 0;    // bytes of the resource
             uint64_t from = 0;        // byte range in the resource
@@ -523,8 +523,6 @@ namespace albireo
         std::vector<std::unique_ptr<chunk>> chunks;
         std::atomic<uint64_t> received{0};
         std::atomic<bool> cancel{false};
-        // Where the segments came from: the copies of the public link, the official addresses.
-        std::atomic<bool> from_link{false}, from_official{false};
         // Cancelled by the user, set under m_: the progress and the partial file are dropped,
         // where a stop of the service keeps them for the next start.
         std::atomic<bool> abandoned{false};
@@ -535,8 +533,8 @@ namespace albireo
         std::thread worker;
     };
 
-    model_manager::model_manager(store& db, const std::string& models_dir, const std::string& catalog_url)
-        : db_(db), dir_(models_dir), catalog_url_(catalog_url)
+    model_manager::model_manager(store& db, const std::string& models_dir)
+        : db_(db), dir_(models_dir)
     {
         /*
             The service writes, renames and deletes the model files with its rights: only
@@ -628,36 +626,15 @@ namespace albireo
 
     bool model_manager::refresh_catalog(std::string& error)
     {
+        // The catalog and its signature come from the folder dist of the public link alone.
         std::string body, sig;
-        // The catalog of the public link first, then the one of its official address.
-        if (public_link_enabled())
-        {
-            std::string e;
-            json result = json::object();
-            if (public_link_get("dist/catalog.json", body, e, 16u << 20)
-                && public_link_get("dist/catalog.json.sig", sig, e, 4096)
-                && install_catalog(body, sig, true, result, e))
-            {
-                log_info("models: catalog read from the public link");
-                return true;
-            }
-            if (http_cancelled())
-            {
-                error = e;
-                return false;
-            }
-            log_warning("models: " + about_public_link(e) + "; the catalog is read from " + catalog_url_);
-            body.clear();
-            sig.clear();
-        }
-        if (!http_get(catalog_url_, body, error)) return false;
-        if (!http_get(catalog_url_ + ".sig", sig, error, 4096))
-        {
-            error = "the catalog has no signature: " + error;
+        if (!public_link_get("dist/catalog.json", body, error, 16u << 20)
+            || !public_link_get("dist/catalog.json.sig", sig, error, 4096))
             return false;
-        }
         json result = json::object();
-        return install_catalog(body, sig, true, result, error);
+        if (!install_catalog(body, sig, true, result, error)) return false;
+        log_info("models: catalog read from the public link");
+        return true;
     }
 
     void model_manager::refresh_catalog_async()
@@ -971,7 +948,9 @@ namespace albireo
                 const std::string url = f["url"].as_string();
                 const uint64_t size = static_cast<uint64_t>(f["size"].as_int(0));
                 const bool gz = f["compression"].as_string() == "gzip";
-                if (url.empty() || size == 0)
+                // The part is downloaded from its copy in the public link, named after its official address.
+                const std::string link_path = public_link_model_path(id, url);
+                if (url.empty() || size == 0 || link_path.empty())
                 {
                     error.set("the catalog entry of '" + id + "' lists an invalid file", "catalog_entry")
                         .arg("m", name);
@@ -981,7 +960,7 @@ namespace albireo
                 {
                     std::unique_ptr<job::chunk> c(new job::chunk());
                     c->url = url;
-                    c->link_path = public_link_model_path(id, url);
+                    c->link_path = link_path;
                     c->from = 0;
                     c->length = static_cast<uint64_t>(f["compressed_size"].as_int(0));
                     c->resource = c->length;
@@ -1004,7 +983,7 @@ namespace albireo
                     {
                         std::unique_ptr<job::chunk> c(new job::chunk());
                         c->url = url;
-                        c->link_path = public_link_model_path(id, url);
+                        c->link_path = link_path;
                         c->resource = size;
                         c->from = s;
                         c->length = std::min(segment, size - s);
@@ -1237,6 +1216,8 @@ namespace albireo
             size_t next = 0;
             std::atomic<bool> failed{false};
             std::string failure;
+            // The file of the link the failure names when the link does not hold it.
+            std::string unpublished;
 
             auto worker = [&]() {
                 for (;;)
@@ -1252,6 +1233,7 @@ namespace albireo
                     random_access_file& file = *outputs[c.file];
                     std::string error;
                     bool ok = false;
+                    bool absent = false;
                     for (int attempt = 0; attempt < 4 && !ok && !j->cancel; ++attempt)
                     {
                         // A pause before each new attempt, which a cancellation ends.
@@ -1259,22 +1241,30 @@ namespace albireo
                             std::this_thread::sleep_for(std::chrono::milliseconds(100));
                         if (j->cancel) break;
                         /*
-                            The copy of the public link for the first two attempts, the second with
-                            a new address, when the link holds the resource at its size; the
-                            official address then, or at once: the hashes of the catalog check
-                            the bytes of either.
+                            The copy of the resource in the public link, its address asked again
+                            after a failure; the hashes of the catalog check its bytes.  The
+                            official address of the catalog is never read: no link, or a link
+                            that does not hold the resource at its size, ends the attempts.
                         */
-                        std::string address = c.url, label;
-                        if (attempt < 2 && !c.link_path.empty() && public_link_enabled())
+                        std::string address;
+                        uint64_t listed = 0;
+                        link_status status = link_status::ok;
+                        absent = false;
+                        if (!public_link_file(c.link_path, address, listed, error, attempt > 0, &status))
                         {
-                            std::string direct, e;
-                            uint64_t listed = 0;
-                            if (public_link_file(c.link_path, direct, listed, e, attempt > 0) && listed == c.resource)
-                            {
-                                address = direct;
-                                label = "the copy of " + c.link_path + " in the public link";
-                            }
+                            absent = status == link_status::missing;
+                            // A file the link lacks is looked for once more in a new listing.
+                            if (status == link_status::unset || (absent && attempt > 0) || http_cancelled()) break;
+                            continue;
                         }
+                        if (listed != c.resource)
+                        {
+                            error = "the copy of " + c.link_path + " in the public link does not have the size "
+                                "the catalog gives";
+                            if (attempt > 0) break;
+                            continue;
+                        }
+                        const std::string label = "the copy of " + c.link_path + " in the public link";
                         if (c.gzip)
                         {
                             // Inflated as it arrives, written at the offsets of the part.
@@ -1332,9 +1322,8 @@ namespace albireo
                                 }, error);
                             ok = ok && c.done == c.length;
                         }
-                        if (ok) (label.empty() ? j->from_official : j->from_link) = true;
                         // The address of a content server of the link stays out of the messages.
-                        const size_t at = label.empty() ? std::string::npos : error.find(address);
+                        const size_t at = error.find(address);
                         if (at != std::string::npos) error.replace(at, address.size(), label);
                         // The downloads ended for the whole service (it stops, or goes
                         // offline) are not attempted again; they resume later.
@@ -1343,8 +1332,12 @@ namespace albireo
                     if (!ok && !j->cancel)
                     {
                         std::lock_guard<std::mutex> lock(chunk_m);
+                        if (!failed)
+                        {
+                            failure = error.empty() ? "download failed" : error;
+                            if (absent) unpublished = c.link_path;
+                        }
                         failed = true;
-                        failure = error.empty() ? "download failed" : error;
                         return;
                     }
                 }
@@ -1391,7 +1384,11 @@ namespace albireo
             save();
             if (failed)
             {
-                set_state("error", user_error().set(failure, "download_failed").arg("e", failure));
+                // A file the publication space does not hold yet has its own code, which names it.
+                if (!unpublished.empty())
+                    set_state("error", user_error().set(failure, "download_not_published").arg("file", unpublished));
+                else
+                    set_state("error", user_error().set(failure, "download_failed").arg("e", failure));
                 log_error("models: download of " + j->id + " failed: " + failure);
                 // A cancellation that came while the download failed drops its partial files all the same.
                 if (j->abandoned) drop_partials();
@@ -1486,10 +1483,8 @@ namespace albireo
                 db_.remove_download_state(j->id);
                 if (with_projector) drop_pending_copy(shas[1]);
                 set_state("done");
-                const std::string origin = j->from_link && j->from_official ? "the public link and the official "
-                    "addresses" : j->from_link ? "the public link" : "the official addresses";
-                log_info("models: " + j->id + " installed" + (with_projector ? ", with its projector" : "") + ", from "
-                    + origin);
+                log_info("models: " + j->id + " installed" + (with_projector ? ", with its projector" : "")
+                    + ", from the public link");
                 return;
             }
             if (!any) break;

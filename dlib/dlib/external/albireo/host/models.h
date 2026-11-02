@@ -27,12 +27,11 @@ namespace albireo
         /*!
             WHAT THIS OBJECT REPRESENTS
                 The models of the machine and of the catalog: the catalog published in the
-                folder dist of the public link (public_link.h) and on GitHub (a signed JSON
-                document listing the models, their descriptions in each language, their
-                files and their hashes, the official source of each model among them), the
-                installed models, the downloads in progress and the imports from removable
-                media.  The catalog of the link is read first, the one of catalog_url when
-                the link does not answer or holds none that verifies.
+                folder dist of the public link (public_link.h), a signed JSON document
+                listing the models, their descriptions in each language, their files and
+                their hashes, the official source of each model among them, read from the
+                link alone; the installed models, the downloads in progress and the imports
+                from removable media.
 
             MODELS THAT READ IMAGES
                 Such a model comes as two GGUF files: its decoder, and a projector
@@ -57,12 +56,15 @@ namespace albireo
                 a hash that still fails or a model the database cannot record leaves
                 neither file under its final name.
 
-                Each segment comes from the copy of its part in the public link,
-                models/<identifier>/<file name of the address of the part>, when the link
-                holds it at its size: the first attempt with the address of the cache, the
-                second with a new one.  The later attempts, and every attempt when the link
-                holds no such copy, read the address of the catalog.  The hashes check the
-                bytes of both sources the same way.
+                Each segment comes from the copy of its part in the public link alone,
+                models/<identifier>/<file name of the official address of the part>: the
+                first attempt with the address of the cache, the next ones with a new one.
+                The official address the catalog gives is never read.  A link that is not
+                set, or that does not hold the part at its size in a new listing, ends the
+                download in error; a part the link does not hold has the code
+                download_not_published, which names it ("file"), since the files of the
+                models reach the link while they are published.  The hashes of the catalog
+                check the bytes.
 
             OFFLINE INSTALLATION
                 import_path() installs the GGUF files of the import folder of the data
@@ -114,11 +116,11 @@ namespace albireo
                 it.
         !*/
     public:
-        model_manager(store& db, const std::string& models_dir, const std::string& catalog_url);
+        model_manager(store& db, const std::string& models_dir);
         ~model_manager();
 
-        // Fetches the catalog and checks its signature; keeps the last valid one, and the
-        // one in use when the fetched one was published before it.
+        // Fetches the catalog from the public link and checks its signature; keeps the last
+        // valid one, and the one in use when the fetched one was published before it.
         bool refresh_catalog(std::string& error);
         // The same on a thread of its own, one refresh at a time; the caller never waits.
         void refresh_catalog_async();
@@ -359,7 +361,6 @@ namespace albireo
 
         store& db_;
         std::string dir_;
-        std::string catalog_url_;
         mutable std::mutex m_;
         json catalog_;
         std::string catalog_state_ = "idle";

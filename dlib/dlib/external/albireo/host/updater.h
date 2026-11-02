@@ -20,17 +20,17 @@ namespace albireo
         /*!
             WHAT THIS OBJECT REPRESENTS
                 The updates of the programs.  The feed is a JSON document published in the
-                folder dist of the public link (public_link.h) and on GitHub, each with a
-                detached signature (ECDSA P-256 over its exact bytes); the feed of the link
-                is read first, the one of feed_url when the link does not answer, holds no
-                feed or holds one whose signature does not verify against the key built into
-                the programs, which is ignored.  When it announces a newer version, its
-                installer is downloaded in the background into the updates folder, from the
-                folder dist of the link when the feed names it there ("file"), else or then
-                from its address ("url"), and checked against the hash the feed gives.  The
-                update is applied when the service restarts: the service then starts the
-                installer in its update mode, which replaces the programs and starts the
-                service again.
+                folder dist of the public link (public_link.h), with a detached signature
+                (ECDSA P-256 over its exact bytes), both read from the link alone; a feed
+                whose signature does not verify against the key built into the programs is
+                ignored.  When it announces a newer version, its installer is downloaded in
+                the background into the updates folder from the folder dist of the link, by
+                the name the feed gives it there ("file"), and checked against the size and
+                the hash the feed gives; the address a feed may also give ("url") is never
+                read.  A file the link does not hold yet fails the check with the code
+                update_not_published, which names it.  The update is applied when the
+                service restarts: the service then starts the installer in its update mode,
+                which replaces the programs and starts the service again.
 
                 A check made from the menu of the tray downloads the update in the same
                 way and leaves it for the next restart; "apply" restarts at once.
@@ -58,11 +58,12 @@ namespace albireo
                 {version}, update_feed_missing {version}, update_feed_missing_folder
                 {folder}, update_signature {file}, update_feed_mismatch {file, version},
                 update_outside {file}, update_installer_mismatch {version},
-                update_feed_invalid, update_download {e}, update_not_ready, update_invalid
-                {version}, update_start {code}, update_package_manager and stopping.
+                update_feed_invalid, update_download {e}, update_not_published {file},
+                update_not_ready, update_invalid {version}, update_start {code},
+                update_package_manager and stopping.
         !*/
     public:
-        updater(const std::string& feed_url, const std::string& updates_dir);
+        explicit updater(const std::string& updates_dir);
         ~updater();
 
         // Checks the feed and downloads the update on a thread of its own.
@@ -124,7 +125,6 @@ namespace albireo
         // Forgets the staged update, whose files no longer match: the next check stages it again.
         void drop_staged(const user_error& error);
 
-        std::string feed_url_;
         std::string dir_;
         mutable std::mutex m_;
         json status_;

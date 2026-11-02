@@ -55,8 +55,8 @@ ok = {"type": "object", "properties": {"ok": {"type": "boolean"}, "error": {"typ
 # (service::import_folder() in host/service.h).
 update_codes = ["update_check", "update_record", "update_feed_missing", "update_feed_missing_folder",
                 "update_signature", "update_feed_mismatch", "update_outside", "update_installer_mismatch",
-                "update_feed_invalid", "update_download", "update_not_ready", "update_invalid", "update_start",
-                "update_package_manager", "stopping"]
+                "update_feed_invalid", "update_download", "update_not_published", "update_not_ready",
+                "update_invalid", "update_start", "update_package_manager", "stopping"]
 import_codes = ["import_path_relative", "import_path_network", "import_path_device", "import_path_invalid",
                 "import_use_upload", "import_not_bundle", "import_not_found", "import_path_link",
                 "import_folder_insecure"]
@@ -275,12 +275,16 @@ schemas = {
                                  "as ********; that value sent back keeps the stored password when the user, the "
                                  "host and the port stay the same, and is refused (code proxy_password) otherwise."},
         "web_access": {"type": "boolean", "default": True,
-                       "description": "The web access of the agent mode, /albireo/v1/web/search and "
+                       "description": "The web access of the Web button, /albireo/v1/web/search and "
                                       "/albireo/v1/web/fetch; false turns it off."},
-        "web_search": {"type": "string", "enum": ["wikipedia", "brave", "searxng", "none"], "default": "wikipedia",
-                       "description": "The provider of /albireo/v1/web/search: the REST interface of Wikipedia, the "
-                                      "Brave Search API with web_search_key, the SearXNG instance at web_search_url, "
-                                      "or none."},
+        "web_search": {"type": "string", "enum": ["auto", "wikipedia", "brave", "searxng", "none"],
+                       "default": "auto",
+                       "description": "The provider of /albireo/v1/web/search: auto, the Brave Search API with the "
+                                      "key built into the service when the build carries one, else the REST "
+                                      "interface of Wikipedia; wikipedia; brave, the Brave Search API with "
+                                      "web_search_key, else with the key built in; searxng, the instance at "
+                                      "web_search_url; or none. Every installation of a build shares the monthly "
+                                      "credit of its key, which no route gives."},
         "web_search_url": {"type": "string", "maxLength": 512,
                            "description": "The address of the SearXNG instance, http or https, any host, without "
                                           "user, query or fragment; the instance must allow the JSON format "
@@ -365,8 +369,9 @@ schemas = {
                  "description": "update_check {e}, update_record {version}, update_feed_missing {version}, "
                                 "update_feed_missing_folder {folder}, update_signature {file}, update_feed_mismatch "
                                 "{file, version}, update_outside {file}, update_installer_mismatch {version}, "
-                                "update_feed_invalid, update_download {e}, update_not_ready, update_invalid "
-                                "{version}, update_start {code}, update_package_manager, stopping."},
+                                "update_feed_invalid, update_download {e}, update_not_published {file}, "
+                                "update_not_ready, update_invalid {version}, update_start {code}, "
+                                "update_package_manager, stopping."},
         "args": {"type": "object", "additionalProperties": {"type": "string"}}}},
     "Refusal": {"type": "object", "description": "A refused operation, with the code of its reason and its values.",
                 "properties": {"ok": {"type": "boolean", "enum": [False]}, "error": {"type": "string"},
@@ -483,10 +488,11 @@ paths = {
                               "description": "The models of the engine, with their context and capabilities."},
             "models_state": {"type": "object", "additionalProperties": {"type": "string"},
                              "description": "loading, ready, unloading, removing, or the error of a load."},
-            "web": {"type": "object", "description": "The web access of the agent mode, which the web application "
+            "web": {"type": "object", "description": "The web access of the Web button, which the web application "
                     "reads at its start: available while the administrator leaves it on (web_access) and the "
-                    "service is not offline, and the provider of /albireo/v1/web/search, none when the search is "
-                    "unavailable while /albireo/v1/web/fetch stays available.", "properties": {
+                    "service is not offline, and the provider of /albireo/v1/web/search in use, the setting auto "
+                    "resolved, none when the search is unavailable while /albireo/v1/web/fetch stays available.",
+                    "properties": {
                         "available": {"type": "boolean"},
                         "search": {"type": "string", "enum": ["wikipedia", "brave", "searxng", "none"]}}}}})}}},
     "/albireo/v1/models": {"get": {
@@ -588,11 +594,13 @@ paths = {
                                        "error": {"type": "string"}}})}}},
     "/albireo/v1/web/search": {"post": {
         "tags": ["Web access"], "summary": "Searches the web through the provider of the settings",
-        "description": "The tool web_search of the agent mode. The provider is the setting web_search: the REST "
-                       "interface of Wikipedia (GET https://<language>.wikipedia.org/w/rest.php/v1/search/page, with "
-                       "a User-Agent that gives a contact, as the policy of Wikimedia asks), the Brave Search API "
-                       "with the key of the administrator, or a SearXNG instance through its JSON format. The log "
-                       "names the provider and the number of results, never the query.",
+        "description": "The tool web_search of the Web button. The provider is the setting web_search: by default "
+                       "the Brave Search API with the key built into the service when the build carries one, else the "
+                       "REST interface of Wikipedia (GET https://<language>.wikipedia.org/w/rest.php/v1/search/page, "
+                       "with a User-Agent that gives a contact, as the policy of Wikimedia asks); the Brave Search API "
+                       "with the key of the administrator, else the key built in; or a SearXNG instance through its "
+                       "JSON format. The log names the provider and the number of results, never the query or a "
+                       "key.",
         "requestBody": json_body(ref("WebSearchRequest")),
         "responses": {
             "200": reply("The results", ref("WebSearchResults")),
@@ -600,10 +608,12 @@ paths = {
                          "invalid_language)", ref("Error")),
             "403": reply("The service works offline (code offline), the administrator turned the web access off "
                          "(web_access_off), or no provider is set (no_search_provider): web_search none, brave "
-                         "without key or searxng without address", ref("Error")),
+                         "without a key of the administrator in a build without key, or searxng without address",
+                         ref("Error")),
             "429": reply("The provider limits the rate of the requests (code rate_limited): Wikipedia for the "
-                         "anonymous requests, the rate or the monthly credit of the key of Brave, the limiter of "
-                         "SearXNG; Retry-After gives the delay the provider asks for", ref("Error")),
+                         "anonymous requests, the rate or the monthly credit of the key of Brave, the credit of the "
+                         "key built in being shared by every installation, the limiter of SearXNG; Retry-After gives "
+                         "the delay the provider asks for", ref("Error")),
             "502": reply("The Brave Search API refuses the key (code search_key_refused), the SearXNG instance "
                          "refuses the JSON format (search_format_refused), the provider gives another answer "
                          "(search_failed), or cannot be reached (unreachable, tls_failed, proxy_failed)",
@@ -613,7 +623,7 @@ paths = {
             "504": reply("The provider did not answer in time (code timeout)", ref("Error"))}}},
     "/albireo/v1/web/fetch": {"post": {
         "tags": ["Web access"], "summary": "Reads a page of the web at a public address",
-        "description": "The tool fetch_page of the agent mode. The address is http or https, without user "
+        "description": "The tool fetch_page of the Web button. The address is http or https, without user "
                        "information; its host is refused when it names this computer or a local network "
                        "(localhost, *.localhost, *.local, *.internal, *.home.arpa, a name of a single label) or "
                        "when one of its addresses is not public (loopback, private, link-local, shared, "
@@ -805,7 +815,7 @@ doc = {
     "servers": [{"url": "/"}],
     "tags": [{"name": "OpenAI", "description": "Compatible with the OpenAI interface"},
              {"name": "Service", "description": "State of the service"},
-             {"name": "Web access", "description": "The search and the pages of the web for the agent mode"},
+             {"name": "Web access", "description": "The search and the pages of the web for the Web button"},
              {"name": "Administration", "description": "Routes of the tray, protected by the administration token"}],
     "paths": paths,
     "components": {"schemas": schemas, "securitySchemes": {

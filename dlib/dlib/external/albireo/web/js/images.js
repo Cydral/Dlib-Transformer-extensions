@@ -260,10 +260,11 @@ export async function removeOwner(owner) {
   await store.deleteImages(owner).catch(() => {});
 }
 
-// Forgets every image, after the database was emptied.
-export function removeAll() {
-  for (const id of Array.from(urls.keys())) release(id);
-  held.clear();
+// Forgets every image, after the database was emptied, but the images prepared and not kept whose ids keep holds.
+export function removeAll(keep) {
+  const stays = (id) => !!keep && keep.has(id) && held.has(id);
+  for (const id of Array.from(urls.keys())) if (!stays(id)) release(id);
+  for (const id of Array.from(held.keys())) if (!stays(id)) held.delete(id);
   memory.clear();
 }
 

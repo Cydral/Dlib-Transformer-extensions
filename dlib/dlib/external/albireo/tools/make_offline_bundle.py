@@ -13,8 +13,8 @@ The bundle holds the signed catalog and the signed update feed of dist/albireo, 
 the feed announces, and in its models folder the models chosen, each model that reads images
 with its projector: by default the default language model and the default embedding model of
 the catalog, which the search in the documents needs.  The installer is taken from --installer
-when given, else downloaded from the folder dist of the public link when the feed names it there
-(public_link.py), else from the address of the feed.  --complete adds the complete
+when given, else downloaded from the folder dist of the public link, under the name the feed gives
+it there (public_link.py), the only source of the installers.  --complete adds the complete
 installer of the version, which carries the models that come with Albireo: the default models
 are then left out, unless --models or --all name models; each model is taken from the folders
 of --from when one of their files has its size and its SHA-256, else downloaded from the
@@ -261,11 +261,11 @@ def main():
             stable = json.load(f)["channels"]["stable"]
 
         installer = stable["installer"]
-        # The name of the installer in the folder dist of the public link, else the one of its address.
-        installer_name = installer.get("file") or os.path.basename(installer.get("url", ""))
+        # The name of the installer in the folder dist of the public link.
+        installer_name = installer.get("file")
         if not installer.get("size") or not installer_name:
-            raise RuntimeError("the feed of %s announces no installer yet: publish the version first "
-                               "(publish_release.py)" % a.dist)
+            raise RuntimeError("the feed of %s announces no installer in the public link yet: publish the version "
+                               "first (publish_release.py)" % a.dist)
         if a.complete:
             make_feed.check_installer(a.complete, stable["version"])
         target = os.path.join(a.output, installer_name)
@@ -277,15 +277,8 @@ def main():
         elif not (os.path.isfile(target) and make_feed.sha256_of(target) == installer["sha256"]):
             partial = target + ".partial"
             try:
-                # The copy of the public link, else the address of the feed.
-                address = installer.get("url")
-                if installer.get("file"):
-                    try:
-                        address = public_link.Link().address("dist/" + installer["file"])
-                    except RuntimeError as e:
-                        if not address:
-                            raise
-                        print("%s; the installer comes from %s" % (e, address))
+                # The copy of the public link alone.
+                address = public_link.Link().address("dist/" + installer_name)
                 with open(partial, "wb") as out:
                     sha, size = download(address, out, installer["size"], label=installer_name)
                 if sha != installer["sha256"] or size != installer["size"]:

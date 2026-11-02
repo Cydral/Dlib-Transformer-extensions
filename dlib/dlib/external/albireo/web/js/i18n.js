@@ -37,12 +37,12 @@ const texts = {
     toolHint_search_discussions: 'Finds your earlier discussions that contain some words.',
     toolHint_current_datetime: 'Gives the date, the time and the time zone of this computer.',
     toolHint_create_file: 'Creates a text file, such as code, CSV or Markdown, that you can download.',
-    agentTools: 'Tools of the agent', agentHelpTitle: 'How the agent mode works',
+    agentHelpTitle: 'How the agent mode works',
     agentHelp: 'With the agent on, the model can call tools while it answers. It computes, runs code, reads your ' +
       'documents and creates files, then answers with their results. Each call shows in the answer with its input, ' +
       'its result and its duration.',
     web: 'Web', webAccess: 'Web access', webHint: 'The model may search the web and read web pages',
-    webTools: 'Web tools', webNoTools: 'The model of this function cannot call tools, which the web access needs',
+    webNoTools: 'The model of this function cannot call tools, which the web access needs',
     webOffline: 'Albireo works offline: the web access is unavailable',
     webOff: 'The web access is turned off in the settings of the Albireo service',
     webUnavailable: 'The Albireo service gives no web access',
@@ -50,9 +50,11 @@ const texts = {
       'service. It reads only the addresses you write in your questions, those of the results of its searches and ' +
       'the links of the pages it already read. Web starts off in every new discussion.',
     tool_web_search: 'Web search', tool_fetch_page: 'Page reading',
-    toolHint_web_search: 'Searches the web through the search provider of the Albireo service (Wikipedia by ' +
-      'default) and lists the results with their addresses.',
+    toolHint_web_search: 'Searches the web through the search provider of the Albireo service and lists the ' +
+      'results with their addresses.',
     toolHint_fetch_page: 'Reads, part by part, a web page or a PDF file whose address the discussion holds.',
+    webSearchBy: 'Web search: {provider}', provider_wikipedia: 'Wikipedia', provider_brave: 'Brave Search API',
+    provider_searxng: 'SearXNG',
     afterAnswer: 'Available once the answer is written', answering: 'Answering…',
     unreadAnswer: 'New answer, not read yet', scrollStart: 'Go to the start of the discussion',
     scrollEnd: 'Go to the end of the discussion',
@@ -297,12 +299,11 @@ const texts = {
     toolHint_current_datetime: 'Donne la date, l\'heure et le fuseau horaire de cet ordinateur.',
     toolHint_create_file: 'Crée un fichier texte, par exemple du code, un CSV ou du Markdown, que vous pouvez ' +
       'télécharger.',
-    agentTools: 'Outils de l\'agent', agentHelpTitle: 'Fonctionnement du mode agent',
+    agentHelpTitle: 'Fonctionnement du mode agent',
     agentHelp: 'Avec l\'agent activé, le modèle peut appeler des outils pendant sa réponse. Il calcule, exécute du ' +
       'code, lit vos documents et crée des fichiers, puis répond à partir de leurs résultats. Chaque appel apparaît ' +
       'dans la réponse avec son entrée, son résultat et sa durée.',
     web: 'Web', webAccess: 'Accès au Web', webHint: 'Le modèle peut chercher sur le Web et lire des pages Web',
-    webTools: 'Outils du Web',
     webNoTools: 'Le modèle de cette fonction ne peut pas appeler d\'outils, ce que demande l\'accès au Web',
     webOffline: 'Albireo fonctionne hors ligne : l\'accès au Web est indisponible',
     webOff: 'L\'accès au Web est désactivé dans les paramètres du service Albireo',
@@ -312,10 +313,12 @@ const texts = {
       'ses recherches et les liens des pages qu\'il a déjà lues. Le Web est désactivé au début de chaque ' +
       'nouvelle discussion.',
     tool_web_search: 'Recherche Web', tool_fetch_page: 'Lecture d\'une page',
-    toolHint_web_search: 'Cherche sur le Web par le fournisseur de recherche du service Albireo (Wikipédia par ' +
-      'défaut) et liste les résultats avec leurs adresses.',
+    toolHint_web_search: 'Cherche sur le Web par le fournisseur de recherche du service Albireo et liste les ' +
+      'résultats avec leurs adresses.',
     toolHint_fetch_page: 'Lit, partie par partie, une page Web ou un fichier PDF dont la discussion contient ' +
       'l\'adresse.',
+    webSearchBy: 'Recherche Web : {provider}', provider_wikipedia: 'Wikipédia', provider_brave: 'API Brave Search',
+    provider_searxng: 'SearXNG',
     afterAnswer: 'Disponible une fois la réponse écrite', answering: 'Réponse en cours…',
     unreadAnswer: 'Nouvelle réponse, pas encore lue', scrollStart: 'Aller au début de la discussion',
     scrollEnd: 'Aller à la fin de la discussion',
@@ -566,12 +569,11 @@ const texts = {
     toolHint_search_discussions: 'Findet Ihre früheren Unterhaltungen, die bestimmte Wörter enthalten.',
     toolHint_current_datetime: 'Gibt Datum, Uhrzeit und Zeitzone dieses Computers an.',
     toolHint_create_file: 'Erstellt eine Textdatei, etwa Code, CSV oder Markdown, die Sie herunterladen können.',
-    agentTools: 'Werkzeuge des Agenten', agentHelpTitle: 'So funktioniert der Agentenmodus',
+    agentHelpTitle: 'So funktioniert der Agentenmodus',
     agentHelp: 'Mit eingeschaltetem Agenten kann das Modell beim Antworten Werkzeuge aufrufen. Es rechnet, führt ' +
       'Code aus, liest Ihre Dokumente und erstellt Dateien und antwortet dann anhand der Ergebnisse. Jeder Aufruf ' +
       'erscheint in der Antwort mit Eingabe, Ergebnis und Dauer.',
     web: 'Web', webAccess: 'Zugriff auf das Web', webHint: 'Das Modell darf im Web suchen und Webseiten lesen',
-    webTools: 'Web-Werkzeuge',
     webNoTools: 'Das Modell dieser Funktion kann keine Werkzeuge aufrufen, die der Webzugriff braucht',
     webOffline: 'Albireo arbeitet offline: Der Webzugriff ist nicht verfügbar',
     webOff: 'Der Webzugriff ist in den Einstellungen des Albireo-Dienstes ausgeschaltet',
@@ -581,10 +583,12 @@ const texts = {
       'seiner Suchen und die Links der Seiten, die es bereits gelesen hat. Web ist zu Beginn jeder neuen ' +
       'Unterhaltung ausgeschaltet.',
     tool_web_search: 'Websuche', tool_fetch_page: 'Seite lesen',
-    toolHint_web_search: 'Sucht im Web über den Suchanbieter des Albireo-Dienstes (standardmäßig Wikipedia) und ' +
-      'listet die Ergebnisse mit ihren Adressen auf.',
+    toolHint_web_search: 'Sucht im Web über den Suchanbieter des Albireo-Dienstes und listet die Ergebnisse mit ' +
+      'ihren Adressen auf.',
     toolHint_fetch_page: 'Liest Teil für Teil eine Webseite oder eine PDF-Datei, deren Adresse die Unterhaltung ' +
       'enthält.',
+    webSearchBy: 'Websuche: {provider}', provider_wikipedia: 'Wikipedia', provider_brave: 'Brave Search API',
+    provider_searxng: 'SearXNG',
     afterAnswer: 'Verfügbar, sobald die Antwort geschrieben ist', answering: 'Antwort läuft…',
     unreadAnswer: 'Neue Antwort, noch nicht gelesen', scrollStart: 'Zum Anfang der Unterhaltung',
     scrollEnd: 'Zum Ende der Unterhaltung',
@@ -830,12 +834,11 @@ const texts = {
     toolHint_search_discussions: 'Ritrova le tue conversazioni precedenti che contengono certe parole.',
     toolHint_current_datetime: 'Indica la data, l\'ora e il fuso orario di questo computer.',
     toolHint_create_file: 'Crea un file di testo, ad esempio codice, CSV o Markdown, che puoi scaricare.',
-    agentTools: 'Strumenti dell\'agente', agentHelpTitle: 'Come funziona la modalità agente',
+    agentHelpTitle: 'Come funziona la modalità agente',
     agentHelp: 'Con l\'agente attivo, il modello può chiamare strumenti mentre risponde. Calcola, esegue codice, ' +
       'legge i tuoi documenti e crea file, poi risponde con i loro risultati. Ogni chiamata compare nella risposta ' +
       'con il suo ingresso, il suo risultato e la sua durata.',
     web: 'Web', webAccess: 'Accesso al Web', webHint: 'Il modello può cercare sul Web e leggere pagine Web',
-    webTools: 'Strumenti del Web',
     webNoTools: 'Il modello di questa funzione non può chiamare strumenti, che l\'accesso al Web richiede',
     webOffline: 'Albireo funziona offline: l\'accesso al Web non è disponibile',
     webOff: 'L\'accesso al Web è disattivato nelle impostazioni del servizio Albireo',
@@ -844,10 +847,12 @@ const texts = {
       'Albireo. Legge solo gli indirizzi che scrivi nelle tue domande, quelli dei risultati delle sue ricerche e i ' +
       'link delle pagine che ha già letto. Il Web è disattivato all\'inizio di ogni nuova conversazione.',
     tool_web_search: 'Ricerca sul Web', tool_fetch_page: 'Lettura di una pagina',
-    toolHint_web_search: 'Cerca sul Web tramite il motore di ricerca del servizio Albireo (Wikipedia per ' +
-      'impostazione predefinita) ed elenca i risultati con i loro indirizzi.',
+    toolHint_web_search: 'Cerca sul Web tramite il motore di ricerca del servizio Albireo ed elenca i risultati con ' +
+      'i loro indirizzi.',
     toolHint_fetch_page: 'Legge, parte per parte, una pagina Web o un file PDF il cui indirizzo è nella ' +
       'conversazione.',
+    webSearchBy: 'Ricerca sul Web: {provider}', provider_wikipedia: 'Wikipedia', provider_brave: 'API Brave Search',
+    provider_searxng: 'SearXNG',
     afterAnswer: 'Disponibile una volta scritta la risposta', answering: 'Risposta in corso…',
     unreadAnswer: 'Nuova risposta, non ancora letta', scrollStart: 'Vai all\'inizio della conversazione',
     scrollEnd: 'Vai alla fine della conversazione',
@@ -1094,12 +1099,11 @@ const texts = {
     toolHint_search_discussions: 'Encuentra sus conversaciones anteriores que contienen ciertas palabras.',
     toolHint_current_datetime: 'Indica la fecha, la hora y la zona horaria de este ordenador.',
     toolHint_create_file: 'Crea un archivo de texto, por ejemplo código, CSV o Markdown, que puede descargar.',
-    agentTools: 'Herramientas del agente', agentHelpTitle: 'Cómo funciona el modo agente',
+    agentHelpTitle: 'Cómo funciona el modo agente',
     agentHelp: 'Con el agente activado, el modelo puede llamar a herramientas mientras responde. Calcula, ejecuta ' +
       'código, lee sus documentos y crea archivos, y luego responde con sus resultados. Cada llamada aparece en la ' +
       'respuesta con su entrada, su resultado y su duración.',
     web: 'Web', webAccess: 'Acceso a la Web', webHint: 'El modelo puede buscar en la Web y leer páginas web',
-    webTools: 'Herramientas web',
     webNoTools: 'El modelo de esta función no puede llamar a herramientas, que el acceso a la Web necesita',
     webOffline: 'Albireo funciona sin conexión: el acceso a la Web no está disponible',
     webOff: 'El acceso a la Web está desactivado en la configuración del servicio Albireo',
@@ -1109,10 +1113,12 @@ const texts = {
       'búsqueda web y los enlaces de las páginas ya leídas. La Web está desactivada al comienzo de cada nueva ' +
       'conversación.',
     tool_web_search: 'Búsqueda web', tool_fetch_page: 'Lectura de una página',
-    toolHint_web_search: 'Busca en la Web mediante el proveedor de búsqueda del servicio Albireo (Wikipedia por ' +
-      'defecto) y enumera los resultados con sus direcciones.',
+    toolHint_web_search: 'Busca en la Web mediante el proveedor de búsqueda del servicio Albireo y enumera los ' +
+      'resultados con sus direcciones.',
     toolHint_fetch_page: 'Lee, parte por parte, una página web o un archivo PDF cuya dirección figura en la ' +
       'conversación.',
+    webSearchBy: 'Búsqueda web: {provider}', provider_wikipedia: 'Wikipedia', provider_brave: 'API de Brave Search',
+    provider_searxng: 'SearXNG',
     afterAnswer: 'Disponible cuando la respuesta esté escrita', answering: 'Respondiendo…',
     unreadAnswer: 'Nueva respuesta, aún sin leer', scrollStart: 'Ir al principio de la conversación',
     scrollEnd: 'Ir al final de la conversación',

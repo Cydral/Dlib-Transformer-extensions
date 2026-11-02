@@ -28,6 +28,7 @@
 #include "crypto.h"
 #include "http_fetch.h"
 #include "public_link.h"
+#include "web_access.h"
 
 namespace albireo
 {
@@ -449,13 +450,18 @@ namespace albireo
         if (first_run) settings_->set(st);
         port_ = st.port;
         apply_network_settings(st);
-        if (st.public_link.empty()) log_info("public link: none, the files come from their official addresses");
+        // The public link is the only source of the downloads: without one, nothing is downloaded.
+        if (st.public_link.empty())
+            log_warning("public link: none, the catalog, the models and the updates are not downloaded");
         else if (!valid_public_link(st.public_link))
-            log_warning("public link: " + st.public_link + " is not a public link of pCloud, the files come from their "
-                "official addresses");
+            log_warning("public link: " + st.public_link + " is not a public link of pCloud, the catalog, the models "
+                "and the updates are not downloaded");
         else
             log_info("public link: " + st.public_link + (public_link_has_password() ? ", with the password built into "
                 "the service" : ", without password"));
+        // The provider of the search, and whether the build carries a key of the Brave Search API, never the key.
+        log_info("web search: " + web_search_provider(st) + (web_search_key_builtin() ? ", the build carries a key of "
+            "the Brave Search API" : ", the build carries no key of the Brave Search API"));
 
         const std::string db_path = join_path(data_dir_, "albireo.db");
         try
@@ -514,7 +520,7 @@ namespace albireo
 
         // An update downloaded earlier is applied before anything else starts.
         {
-            std::unique_ptr<updater> u(new updater(st.update_feed, join_path(data_dir_, "updates")));
+            std::unique_ptr<updater> u(new updater(join_path(data_dir_, "updates")));
             std::lock_guard<std::mutex> lock(server_m_);
             if (stopping_) u->cancel();
             updater_ = std::move(u);
@@ -541,7 +547,7 @@ namespace albireo
         {
             try
             {
-                std::unique_ptr<model_manager> m(new model_manager(*db_, st.effective_models_dir(), st.catalog_url));
+                std::unique_ptr<model_manager> m(new model_manager(*db_, st.effective_models_dir()));
                 m->on_installed([this](const installed_model& im) { on_installed(im); });
                 m->on_replace([this](const std::string& id, const std::function<bool()>& place) {
                     return replace_model_files(id, place);

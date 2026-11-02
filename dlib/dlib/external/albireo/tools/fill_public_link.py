@@ -17,8 +17,8 @@ with albireo-sign (--sign, else build-albireo/bin of the repository, else the PA
 of the updates under the name the feed gives it in the link, checked against the size and the
 SHA-256 the feed gives, and the complete installer as albireo-setup-complete-<version>.exe, checked
 against the version of the feed, with the file of its models when they lie beside it
-(albireo-setup.models of a build, as albireo-setup-complete-<version>.models).  The feed must name
-its installer in the link: a version published with publish_release.py --public-link.
+(albireo-setup.models of a build, as albireo-setup-complete-<version>.models).  The feed names
+its installer in the link: a version published with publish_release.py.
 
 models places each file of the catalog, decoders and projectors, each part of a file published in
 parts as it is published, at <identifier>/<file name of its official address>: kept when it is
@@ -216,7 +216,7 @@ def fill_dist(a):
     version = stable["version"]
     if not installer.get("file"):
         raise RuntimeError("the feed of %s names no installer in the public link: publish the version with "
-                           "publish_release.py --public-link" % a.dist)
+                           "publish_release.py" % a.dist)
     if os.path.getsize(a.online) != installer["size"] or make_feed.sha256_of(a.online) != installer["sha256"]:
         raise RuntimeError("%s is not the installer the feed announces" % a.online)
     if a.complete:

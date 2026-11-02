@@ -81,8 +81,8 @@ application, the description of the interface and the list of the programs of Wi
   checked by the build (see [Models that come with Albireo](#models-that-come-with-albireo)).
 - **Agent mode**: the model calls tools that run in the page (calculator, JavaScript in a
   sandboxed frame, outline, reading and search of the documents, search of the other
-  discussions, date, files to download), up to eight steps per answer. While the mode is on, the
-  tools are listed under the prompt, with a help next to its button; each step of an answer shows
+  discussions, date, files to download), up to 100 steps per answer, the context fitted before
+  each step. The help next to its button describes the tools; each step of an answer shows
   its tool, its arguments, its result, its state and its duration. The calculator reads the
   percentages ("17,5 % de 2 340"), the decimal commas and the thousands written with spaces.
 - **Web access**: the Web button of the composer, off in each new discussion, gives the model a
@@ -103,9 +103,9 @@ application, the description of the interface and the list of the programs of Wi
   service measures them on the machine and runs the fastest, and the Accelerator menu of the
   icon chooses the automatic choice, the processor alone, or a device by its name.
 - **Models from a signed catalog**, downloaded in parallel parts from the public link of the
-  published files of Albireo, else from their official source, checked against their hashes, or
+  published files of Albireo, the only source of the downloads, checked against their hashes, or
   imported from a disk or a memory card.
-- **Updates** announced by a signed feed, their installers published in the public link,
+- **Updates** announced by a signed feed of the public link, their installers published there,
   downloaded in the background and installed when the service restarts.
 - **An offline mode** for the computers without network: the service opens no connection, and
   the catalog, the models and the updates come from an offline bundle brought on a disk.
@@ -198,6 +198,13 @@ the next tokens of the pass in parallel. When the pages run out, a prompt being 
 pages back to the answers being written and is read again once there is room; the context of a
 model never exceeds the positions its pages can hold, so a prompt the engine accepts can always
 be read to its end.
+
+The processor engines take no BLAS: their products start from the quantized weights of the mapped
+file, and the packed kernel of the prompt passes reaches 66 to 77 % of the peak of the AVX2 units
+of two cores. Measured there, oneMKL 2026.2 bounded to AVX2 and called per tile of expanded rows
+read a prompt of 2,182 tokens 1 to 6 % faster with Qwen3 0.6B and 7 to 11 % faster with
+Qwen3-VL 4B, for 283 MB of libraries in the installation. The engines of CUDA multiply on the card
+with cuBLAS, whose libraries the installers carry.
 
 The engines of the devices add a `matmul_offload` ([`engine/offload.h`](engine/offload.h)) that
 receives each product with the way to compute it on the processor
@@ -374,10 +381,15 @@ update show at once. The application runs without any network: it loads nothing 
 origin, its fonts, styles, scripts, the character maps of pdf.js and the page of the interface
 (`/docs/`) included, and an image that the markdown of an answer would take from another site is
 shown as a link. The answer being written is drawn ten times a second at most, block by block: the
-blocks already written stay as they are, a code block is highlighted once its fence closes, the
-reasoning receives its new text in place, and the animations of the page change only the opacity
-and the position of their elements, which the compositor of the browser draws without painting the
-page again. The thread keeps its last lines above the composer whatever the height of the composer.
+blocks and the steps of the agent already written stay as they are, a code block is highlighted
+once its fence closes, the reasoning receives its new text in place, and the animations of the page
+change only the opacity and the position of their elements, which the compositor of the browser
+draws without painting the page again. The thread keeps its last lines above the composer whatever
+the height of the composer. Each discussion keeps its own draft in the composer, its text and the
+documents and images waiting to be sent, while another discussion is shown, and "New chat" keeps
+its own until its first question creates the discussion: the texts stay across a reload of the page
+in the storage of the browser (`localStorage`, one key per discussion, removed once its question is
+sent or the discussion deleted), the files for the tab, and an incognito discussion keeps none.
 
 ### Documents and context
 
@@ -457,9 +469,15 @@ comes before the summary waits for it only when it does not fit without it, and 
 while an answer is being written in the discussion applies once that answer ends; a summary that
 cannot be written lets the exchanges leave without it. One tab compresses a discussion at a time.
 When the last question alone does not fit, the oldest texts lose their beginnings, at the end of a
-sentence: the summary first, then the documents and the texts of the questions. A question deleted
-from a discussion leaves with its answer and the documents attached to it; when it was already
-compressed, the summary is written again without it.
+sentence: the summary first, then the documents and the texts of the earlier questions with the
+results of the tools of their answers, then the reasoning and the results of the tools of the steps
+of the answer being written, then these steps whole, the oldest first and the last one staying,
+and the documents and the text of the question last. An answer of the agent fits its context
+before each of its steps, and a compression of the oldest exchanges happens there when it is
+needed; the cuts stay from one step to the next, and a quarter of the room is freed beyond what is
+needed once its steps are cut, so that the next steps keep the beginning of their prompt. A
+question deleted from a discussion leaves with its answer and the documents attached to it; when
+it was already compressed, the summary is written again without it.
 
 A summary changes the beginning of the prompt, which the engine has not read yet. Once it applies
 and no answer is being written in the discussion, the tab that wrote it asks the background model
@@ -513,7 +531,12 @@ The lists of the side panel show the 20 most recent projects and discussions; th
 of each finds the others, the words in any case and accents, complete or not, in the titles first,
 then in the content (questions, answers, descriptions, instructions and documents of the projects),
 and shows where it found them. The About window shows the tokens read and generated each day over
-30 days, each bar giving its date and its figures in the language of the interface. Each answer
+30 days, each bar giving its date and its figures in the language of the interface, and, while
+the web access offers a search, a line that names its provider ("Web search" and "Brave Search
+API", in French "Recherche Web" and "API Brave Search", or Wikipedia or SearXNG), as Brave asks of
+the projects that use the credit of its API; the help next to the buttons of the composer names
+that provider too ("Web search: Brave Search API"), and nothing names one while the web access is
+unavailable. Each answer
 exports to Markdown or JSON with its question, as the
 whole discussion does. The interface takes the language of Albireo, set in the window of the
 computer, unless its own settings choose another. The Generation tab of the settings gives the
@@ -643,6 +666,7 @@ reported as unusable, with its compute capability, and the other engines serve t
 | `ALBIREO_BUILTIN_MANIFEST`| `resources/builtin_models.json` | the models that come with Albireo           |
 | `ALBIREO_BUILTIN_TOOL`    |         | `albireo-builtin` of the build machine, for a cross build         |
 | `ALBIREO_PUBLIC_LINK_PASSWORD_FILE` | `keys/albireo-public-link.txt` of the user's folder | password of the public link, built into the service (see [Publishing a version](#publishing-a-version)) |
+| `ALBIREO_WEB_SEARCH_KEY_FILE` | `keys/albireo-brave-search-key.txt` of the user's folder | key of the Brave Search API, built into the service when the file exists (see [Web access](#web-access)) |
 | `ALBIREO_RUNTIME_LICENSES`|         | more license files for the `licenses` folder                      |
 
 The programs link their C and C++ runtime statically and depend on system libraries only; the
@@ -678,7 +702,7 @@ cmake --build build-albireo-win -j
 | `test_model_file` | a small Qwen3 model built in memory and 144 damaged forms of it (names given twice and tensors off the alignment among them), which the loader must all refuse without allocating more than 256 MB, then a sparse file of more than 2 GiB whose last tensor lies beyond 2 GiB, read mapped and streamed, each value of that tensor checked and the logits compared with those of the same model in a small file |
 | `test_engine_api` | the refusals of the C interface, three threads of requests with cancellations under the pressure of the keys and values, the unloading and the destruction during requests, one final event per request, and the history of an answer read ahead of the next question |
 | `test_chat_format` | the prompts of the agent mode and of each chat format against those of its template rendered by Jinja, the marker tokens and the parsing of the tool calls, whole or cut in pieces, the calls of Mistral with and without their identifier, the Llama 3 answers that are no call and an earlier answer holding `</think>` |
-| `test_host`      | in a data folder of its own: the files of the downloads and of the imports through no link, the refusals of the import route, the copies of models already installed, the identifiers of the imports, the replacement of a model file, the ranges of the downloads, a damaged database, the public link through a local API of pCloud (its listing, the copies it holds and lacks, a refused password), the web access through a local server (the public addresses on both sides of each range, the addresses refused before any connection, a page, a text cut at 2 MB, a type refused, the PDF files above 20 MB, a redirection to a private address, the three providers of the search, the refusals offline and with the web access turned off) and the key of the search, absent from the documents of the settings and from the log |
+| `test_host`      | in a data folder of its own: the files of the downloads and of the imports through no link, the refusals of the import route, the copies of models already installed, the identifiers of the imports, the replacement of a model file, the ranges of the downloads, a damaged database, the downloads from the public link alone through a local API of pCloud (its listing, the copies it holds, a copy of another size and a file it lacks that fail with the name of the file in the link, no request to an official address, the catalog and the feed of the updates from the link, a refused password), the web access through a local server (the public addresses on both sides of each range, the addresses refused before any connection, a page, a text cut at 2 MB, a type refused, the PDF files above 20 MB, a redirection to a private address, the three providers of the search, the refusals offline and with the web access turned off) and the key of the search, absent from the documents of the settings and from the log, with the key of the Brave Search API built into the service (the provider by default, after the key of the administrator, its refusal and its spent credit) |
 | `engine_chat`    | drives an engine library through its C interface: chat, images with their projector (`--image`, `--detail`), tools, reasoning, parallel requests, turns with pauses (`--turns --pause`), embeddings compared with a reference; it ends without unloading the engine of a device, as the service does |
 | `bench_runtime`  | tokens per second of the prompt and of the generation, also as `bench_runtime_avxvnni` and `bench_runtime_avx512` |
 
@@ -800,8 +824,8 @@ Two ways to update an installed computer:
 - by hand: start the new `albireo-setup.exe`, or `albireo-setup-online.exe`, and follow the
   update wizard;
 - automatically: once a version is published (see [Publishing a version](#publishing-a-version)),
-  the service reads the signed feed at its start and every six hours, in the public link first,
-  downloads the installer without models in the background, from the link first as well, checks
+  the service reads the signed feed at its start and every six hours in the public link,
+  downloads the installer without models in the background from the link as well, checks
   its size, its SHA-256 and the signature of the feed,
   and the menu of the icon offers "Install version <version> and restart"; otherwise the update is
   installed at the next start of the service. "Check for updates" asks the feed at once.
@@ -831,12 +855,11 @@ opened once before it is saved, and the service restarts when a change requires 
 | `offline`       | false   | no connection: catalog, models and updates come from imports              |
 | `proxy`         | `""`    | `""` for the proxy of the system (`HTTPS_PROXY`, then WinHTTP), `none`, or `http://[user:password@]host:port`; the settings give the password as `********`, kept in `proxy.secret` |
 | `web_access`    | true    | the web access of the Web button, `false` turns it off (see [Web access](#web-access)) |
-| `web_search`    | `wikipedia` | provider of the search: `wikipedia`, `brave`, `searxng` or `none`     |
+| `web_search`    | `auto`  | provider of the search: `auto` (the Brave Search API with the key built into the service when the build carries one, else Wikipedia), `wikipedia`, `brave` (with `web_search_key`, else with the key built in), `searxng` or `none` |
 | `web_search_url` | `""`   | address of the SearXNG instance, http or https, any host                  |
 | `web_search_key` | `""`   | key of the Brave Search API, kept in `web_search.secret`; the settings give `web_search_key_set` instead |
 | `active`        |         | the model of each function: `general`, `code`, `security`, `embedding`     |
-| `update_feed`, `catalog_url` | | addresses of the signed feed and catalog, read when the public link does not answer or holds none |
-| `public_link`   | the link of Albireo | public link of pCloud of the published files (`dist`, `models`), read first; `""` turns it off |
+| `public_link`   | the link of Albireo | public link of pCloud of the published files (`dist`, `models`), the only source of the downloads; `""` turns the downloads off |
 
 ## Interfaces
 
@@ -929,7 +952,9 @@ service works offline (`offline`) or once the administrator turned the web acces
 
 The setting `web_search` names the provider of the search:
 
-- `wikipedia`, by default: the search of the REST interface of Wikipedia in the language of the
+- `auto`, by default: the Brave Search API with the key built into the service when the build
+  carries one, else Wikipedia;
+- `wikipedia`: the search of the REST interface of Wikipedia in the language of the
   request, English without one (`GET https://<language>.wikipedia.org/w/rest.php/v1/search/page`),
   each result an article of that Wikipedia with its excerpt, its markup removed, or else its
   description. The requests carry the User-Agent that the policy of Wikimedia asks for, with a
@@ -939,8 +964,9 @@ The setting `web_search` names the provider of the search:
   known by its address alone, limits introduced in 2026 that may change, and the computers behind
   one public address share them. The route reports the limit with 429 (`rate_limited`) and the
   delay Wikimedia gives (`Retry-After`);
-- `brave`: the Brave Search API, with the key of the administrator (`web_search_key`) in the
-  `X-Subscription-Token` header. Brave grants each account a credit of $5 a month, about 1,000
+- `brave`: the Brave Search API, with the key of the administrator (`web_search_key`), else the
+  key built into the service, in the `X-Subscription-Token` header. Brave grants each account a
+  credit of $5 a month, about 1,000
   searches at $5 per 1,000 requests, and asks the projects that use this credit to name the Brave
   Search API on their website or on their About pages; a rate or a credit exhausted gives 429, and
   a key refused 502 (`search_key_refused`);
@@ -949,6 +975,23 @@ The setting `web_search` names the provider of the search:
   under `search`); an instance that refuses the format answers 403, reported with 502
   (`search_format_refused`);
 - `none`: no search, `fetch_page` staying available.
+
+The key built into the service comes from the file that the CMake option
+`ALBIREO_WEB_SEARCH_KEY_FILE` names, by default `keys/albireo-brave-search-key.txt` in the folder
+of the user (`%USERPROFILE%` on a native Windows build, `~` elsewhere), outside the repository:
+the configuration reads it without its byte order mark and its ends of line and writes it masked,
+with a seed of its own, into a header of the build tree
+([`cmake/web_search_key.cmake`](cmake/web_search_key.cmake)), as it does for the password of the
+public link. Without the file, the build carries no key, the configuration says so, and the search
+goes to Wikipedia by default. The owner of the build chooses whether to give that file: every
+installation of a build that carries the key shares its credit, $5 a month, about 1,000 searches;
+once the credit is spent, the Brave Search API answers 429 until the next month unless credits are
+bought, which the route reports as the credit the installations share, and a key of the
+administrator in `web_search_key` takes the place of the shared key on its installation. The key
+never enters the repository, a log, a route or a document of the settings, and the programs carry
+it masked, inside the service alone: `/albireo/v1/status` names the provider in use
+(`"search": "brave"`), and the log of the start says whether the build carries a key. The masking
+keeps the key from a reading of the program as text, not from someone who studies the program.
 
 The service reads no page of results meant for people and sends no User-Agent of a browser; a
 limit of rate or a check of bots of a provider comes back as the error of the route. The addresses
@@ -1007,15 +1050,16 @@ read; an empty key removes it, and the log never shows it.
 
 In the web application, the Web button stands beside Agent. It is off in every new discussion,
 whatever the earlier ones chose: its state belongs to its discussion, which keeps it with its
-messages, while the last choice of Agent and of the reasoning becomes the default of the next
-discussions. The button is disabled, with the reason as its title, while the model of the function
+messages, after an answer, a regeneration, an edit and a reload and in the other tabs, until the
+user turns it off, while the last choice of Agent and of the reasoning becomes the default of the
+next discussions. The button is disabled, with the reason as its title, while the model of the function
 calls no tools, while the service works offline and once the administrator turned the web access
 off. With Web on, each question carries `web_search`, when the service names a provider other than
 `none`, and `fetch_page`, after the tools of the agent while Agent is on, and the answer runs the
 calls of the tools even with Agent off. The tools and the system message stay the same from one
 question to the next while the buttons and the provider do not change, so that the beginning of
-the prompt stays in the cache of the engine. The list under the prompt shows the tools of the next
-question, and the help next to the buttons describes the web tools with those of the agent.
+the prompt stays in the cache of the engine. The help next to the buttons describes the web tools
+with those of the agent.
 
 `fetch_page` reads only an address of the discussion: one that a question of the user holds
 (`http://`, `https://`, or `www.` for both schemes), an address of a result of `web_search`, or a
@@ -1060,10 +1104,13 @@ consortium that made them, what they read, their descriptions in the five langua
 license, and the address, size and SHA-256 of each file, the projector of a model that reads
 images included. [`tools/make_catalog.py`](tools/make_catalog.py) writes it from the Hugging Face
 hub, the addresses pinned to a commit so that a file never changes under its hash. The service
-downloads each file from its copy in the public link of the published files,
-`models/<identifier>/<file name of its address>`, and from the address of the catalog when the link
-does not answer or does not hold the file at its size; the hashes check both, and the catalog keeps
-the official source of each model. The sizes below count the decoder and its projector.
+downloads each file from its copy in the public link of the published files alone,
+`models/<identifier>/<file name of its address>`, and never contacts the address of the catalog,
+the official source of the model, which the catalog keeps. A file that the link does not hold at
+the size of the catalog fails the download with the name of its copy in the link, "the publication
+space of Albireo does not hold models/<identifier>/<file name> yet" for a file not published yet
+(the files of the models reach the link while they are copied there), and the hashes check the
+bytes. The sizes below count the decoder and its projector.
 
 | Model                          | Publisher          | Functions               | Inputs        | Size     | License |
 |--------------------------------|--------------------|-------------------------|---------------|----------|---------|
@@ -1227,7 +1274,8 @@ python3 dlib/dlib/external/albireo/tools/make_offline_bundle.py <folder> [--mode
 ```
 
 The bundle holds the signed catalog and the signed update feed of `dist/albireo`, the installer the
-feed announces, a `models` folder with the models chosen, each model that reads images with its
+feed announces, taken from `--installer` or else from the folder `dist` of the public link alone, a
+`models` folder with the models chosen, each model that reads images with its
 projector (the two default models when `--models` is absent) and a `README.txt`. `--complete build-albireo/bin/albireo-setup.exe` adds the complete
 installer, which carries the models that come with Albireo: the bundle then needs no models. Each
 file is checked against the hashes of the signed files when it enters the bundle, and again by the
@@ -1268,9 +1316,11 @@ the service carries. Its folder `dist` holds `feed.json`, `catalog.json`, their 
 installer of the updates, `albireo-setup-online-<version>.exe`, and the complete installer,
 `albireo-setup-complete-<version>.exe`; its folder `models` holds each file of the catalog at
 `<identifier>/<file name of its official address>`. The service reads the feed, the catalog, the
-installer and the model files there first, through the API of pCloud, and from their official
-addresses (`dist/albireo` on GitHub, the hub of each model) when the link does not answer or does not
-hold the file; the signatures and the hashes check the files of both sources the same way.
+installer and the model files there alone, through the API of pCloud, and never their official
+addresses: a link that is not set, that does not answer or that does not hold a file makes the
+operation fail with a message that names the file in the link, and the signatures and the hashes
+check every file. [`dist/albireo`](../../../../dist/albireo) of the repository keeps the signed feed
+and catalog that the publisher places in the link.
 
 The password is read at the configuration from `ALBIREO_PUBLIC_LINK_PASSWORD_FILE`, by default
 `keys\albireo-public-link.txt` in the folder of the user (`~/keys` on Linux), outside the
@@ -1278,8 +1328,8 @@ repository, and built into the service masked; a service built without that file
 without password, which the link refuses while it is protected. The tools of the publisher read the
 same file, or the variable `ALBIREO_PUBLIC_LINK_PASSWORD`.
 
-[`tools/publish_release.py`](tools/publish_release.py) `--public-link` writes the feed of a version
-from its installer without models: it checks that the installer carries the version of
+[`tools/publish_release.py`](tools/publish_release.py) writes the feed of a version from its
+installer without models: it checks that the installer carries the version of
 [`common/version.h`](common/version.h), writes the feed with the name of the installer in the link,
 its size and its SHA-256, signs it, checks the signature, puts the feed and its signature in place
 and prints the commands that push them. [`tools/fill_public_link.py`](tools/fill_public_link.py)
@@ -1292,21 +1342,19 @@ and SHA-256, else downloaded from their official addresses, resumed after a cut 
 reads the listing of the link and reports the files it lacks or holds at another size:
 
 ```
-python3 dlib/dlib/external/albireo/tools/publish_release.py build-albireo/bin/albireo-setup-online.exe --public-link --complete build-albireo/bin/albireo-setup.exe --key ~/keys/albireo-feed-signing.key --notes notes.json
+python3 dlib/dlib/external/albireo/tools/publish_release.py build-albireo/bin/albireo-setup-online.exe --complete build-albireo/bin/albireo-setup.exe --key ~/keys/albireo-feed-signing.key --notes notes.json
 python dlib\dlib\external\albireo\tools\fill_public_link.py dist <copy of the link>\dist --online build-albireo\bin\albireo-setup-online.exe --complete build-albireo\bin\albireo-setup.exe
 python dlib\dlib\external\albireo\tools\fill_public_link.py models <copy of the link>\models --from C:\ProgramData\Albireo\models
 python dlib\dlib\external\albireo\tools\fill_public_link.py check
 ```
 
-Without `--public-link`, the script publishes on GitHub: it creates the release `albireo-v<version>`,
-attaches the installer, reads it back whole from its public address, stops without touching the feed
-when that address serves another file, and writes the feed with the address; `--complete` attaches
-the complete installer when it fits the 2 GiB of a release file, which the complete installer of
-1.0.8, with Qwen3-VL-4B-Thinking-albireo (3.6 GB), exceeds. The token of GitHub comes from
-`GITHUB_TOKEN`, `GH_TOKEN` or `gh auth token`. A model published outside the hub, a model converted
-for the engine for instance, is cut into parts of less than 2 GiB and attached to the release
-`albireo-models` by [`tools/publish_model.py`](tools/publish_model.py), whose output is the entry of
-the catalog, with the architecture, the parameters and the context read from the file:
+The feed names the installer by its file in the link alone, with no address of another site. A
+model published outside the hub, a model converted for the engine for instance, is cut into parts
+of less than 2 GiB and attached to the release `albireo-models` of GitHub by
+[`tools/publish_model.py`](tools/publish_model.py), whose output is the entry of the catalog, with
+the architecture, the parameters and the context read from the file; these release files are the
+official addresses of its parts, from which `fill_public_link.py models` copies them to the link,
+and the token of GitHub comes from `GITHUB_TOKEN`, `GH_TOKEN` or `gh auth token`:
 
 ```
 python3 dlib/dlib/external/albireo/tools/publish_model.py model.gguf my-model parts --release albireo-models --gzip
@@ -1364,8 +1412,9 @@ size and its SHA-256, and run it in update mode at their next start.
   the signed offline bundles (see [Models](#models)). Every error of the updates carries a code
   with its values (`update_signature`, `update_installer_mismatch`, `update_package_manager`...),
   which the tray explains in the language of the user.
-- The public link brings nothing the signed feed and catalog do not name, at the size and with the
-  SHA-256 they give: a file of the link that differs gives way to its official address. Its
+- The public link, the only source of the downloads, brings nothing the signed feed and catalog
+  do not name, at the size and with the SHA-256 they give: a file of the link that differs is
+  refused, and no other source takes its place. Its
   password never lies in the repository: the configuration reads it from a file of the publisher
   and builds it into the service masked, and the messages and the logs leave out the query of every
   request to the API of pCloud. It keeps the link from being read outside Albireo, not from someone

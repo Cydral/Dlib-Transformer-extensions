@@ -2,9 +2,10 @@
 # License: Boost Software License   See LICENSE.txt for the full license.
 """
 The public link of the published files of Albireo, a public folder of pCloud read through its
-API, as the service reads it (host/public_link.h): its folder dist holds the update feed, the
-catalog, their signatures and the installers, its folder models the files of the models of the
-catalog, each at models/<identifier>/<file name of its official address>.
+API, as the service reads it (host/public_link.h), the only source of its downloads: its folder
+dist holds the update feed, the catalog, their signatures and the installers, its folder models
+the files of the models of the catalog, each at models/<identifier>/<file name of its official
+address>.
 
 The password of the link comes from the variable ALBIREO_PUBLIC_LINK_PASSWORD, else from the
 file keys/albireo-public-link.txt of the home folder (%USERPROFILE% on Windows), the file the
@@ -132,7 +133,7 @@ class Link:
         """The address of the file path of the link on a content server, valid for a few hours."""
         entry = self.files().get(path)
         if not entry:
-            raise RuntimeError("the public link holds no %s" % path)
+            raise RuntimeError("the publication space of Albireo does not hold %s yet" % path)
         answer = self._call("getpublinkdownload", fileid=entry[0], forcedownload=1)
         hosts = answer.get("hosts") or []
         where = answer.get("path", "")

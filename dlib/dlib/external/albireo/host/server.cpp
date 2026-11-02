@@ -843,7 +843,7 @@ namespace albireo
                 error = "invalid value for web_search_key: 256 printable characters at most, without space, or empty";
                 return false;
             }
-            return one_of("web_search", { "wikipedia", "brave", "searxng", "none" }) && boolean("web_access")
+            return one_of("web_search", { "auto", "wikipedia", "brave", "searxng", "none" }) && boolean("web_access")
                 && one_of("language", { "auto", "en", "fr", "de", "it", "es" })
                 && one_of("engine", { "auto", "best", "cpu", "cpu-avx2", "cpu-avxvnni", "cpu-avx512", "openvino",
                     "cuda" })

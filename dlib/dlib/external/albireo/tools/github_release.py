@@ -2,8 +2,9 @@
 # License: Boost Software License   See LICENSE.txt for the full license.
 """
 Creates the releases of a GitHub repository and attaches files to them, through the REST
-interface of GitHub, for publish_release.py (the installers of Albireo) and publish_model.py
-(the models published outside the Hugging Face hub).
+interface of GitHub, for publish_model.py (the models published outside the Hugging Face hub,
+whose files there are their official addresses, which fill_public_link.py copies to the public
+link).
 
 The token is read from GITHUB_TOKEN, else GH_TOKEN, else from the GitHub command line
 (gh auth token); it needs the right to write the contents of the repository.  GITHUB_API_URL

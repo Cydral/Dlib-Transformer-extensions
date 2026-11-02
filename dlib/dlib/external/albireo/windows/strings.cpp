@@ -297,6 +297,13 @@ namespace albireo
                 "Die heruntergeladene Datei entspricht nicht dem Fingerabdruck des Katalogs; sie wurde gelöscht.",
                 "Il file scaricato non corrisponde all'impronta del catalogo; è stato eliminato.",
                 "El archivo descargado no coincide con la huella del catálogo; se ha eliminado." } },
+            { "err_download_not_published", { "The publication space of Albireo does not hold {file} yet: the "
+                "model can be downloaded once it is published there.", "L'espace de publication d'Albireo ne "
+                "contient pas encore {file} : le modèle pourra être téléchargé une fois publié.", "Der "
+                "Veröffentlichungsbereich von Albireo enthält {file} noch nicht: Das Modell kann heruntergeladen "
+                "werden, sobald es dort veröffentlicht ist.", "Lo spazio di pubblicazione di Albireo non contiene "
+                "ancora {file}: il modello potrà essere scaricato una volta pubblicato.", "El espacio de publicación "
+                "de Albireo aún no contiene {file}: el modelo se podrá descargar una vez publicado." } },
             { "err_download_install", { "The downloaded model could not be installed: {e}",
                 "Le modèle téléchargé n'a pas pu être installé : {e}",
                 "Das heruntergeladene Modell konnte nicht installiert werden: {e}",
@@ -408,6 +415,13 @@ namespace albireo
                 "Le téléchargement de la mise à jour a échoué : {e}",
                 "Der Download der Aktualisierung ist fehlgeschlagen: {e}",
                 "Il download dell'aggiornamento non è riuscito: {e}", "La descarga de la actualización falló: {e}" } },
+            { "err_update_not_published", { "The publication space of Albireo does not hold {file} yet: the "
+                "update comes once it is published there.", "L'espace de publication d'Albireo ne contient pas "
+                "encore {file} : la mise à jour viendra une fois ce fichier publié.", "Der "
+                "Veröffentlichungsbereich von Albireo enthält {file} noch nicht: Die Aktualisierung folgt, sobald die "
+                "Datei dort veröffentlicht ist.", "Lo spazio di pubblicazione di Albireo non contiene ancora {file}: "
+                "l'aggiornamento arriverà una volta pubblicato il file.", "El espacio de publicación de Albireo aún "
+                "no contiene {file}: la actualización llegará una vez publicado el archivo." } },
             { "err_update_not_ready", { "No update is ready.", "Aucune mise à jour n'est prête.",
                 "Keine Aktualisierung ist bereit.", "Nessun aggiornamento è pronto.",
                 "No hay ninguna actualización lista." } },
