@@ -1,0 +1,47 @@
+// Copyright (C) 2026 Cydral Technology (cydraltechnology@gmail.com)
+// License: Boost Software License   See LICENSE.txt for the full license.
+// Resources of pseudalis-setup.exe (generated from windows/setup.rc.in): the payload is the
+// archive of the programs made by the build.
+
+#include <winver.h>
+#include <winuser.h>
+#include "@PSEUDALIS_WINDOWS_DIR@/resource.h"
+#include "@PSEUDALIS_SOURCE_DIR@/common/version.h"
+
+LANGUAGE 0, 0
+
+1 24 "@PSEUDALIS_WINDOWS_DIR@/setup.manifest"
+
+IDI_APP ICON "@PSEUDALIS_SOURCE_DIR@/resources/pseudalis.ico"
+IDB_SIDE RCDATA "@PSEUDALIS_SOURCE_DIR@/resources/setup-side.png"
+IDR_LICENSE RCDATA "@PSEUDALIS_SOURCE_DIR@/resources/license.txt"
+IDR_PAYLOAD RCDATA "@PSEUDALIS_PAYLOAD@"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION PSEUDALIS_VERSION_MAJOR, PSEUDALIS_VERSION_MINOR, PSEUDALIS_VERSION_PATCH, 0
+PRODUCTVERSION PSEUDALIS_VERSION_MAJOR, PSEUDALIS_VERSION_MINOR, PSEUDALIS_VERSION_PATCH, 0
+FILEFLAGSMASK 0x3fL
+FILEFLAGS 0x0L
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName", PSEUDALIS_PUBLISHER
+            VALUE "FileDescription", "Pseudalis setup"
+            VALUE "FileVersion", PSEUDALIS_VERSION
+            VALUE "InternalName", "pseudalis-setup"
+            VALUE "LegalCopyright", PSEUDALIS_COPYRIGHT
+            VALUE "OriginalFilename", "pseudalis-setup.exe"
+            VALUE "ProductName", PSEUDALIS_PRODUCT_NAME
+            VALUE "ProductVersion", PSEUDALIS_VERSION
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

@@ -22,6 +22,7 @@
 
         #include <dlib/privacy/pii_sequence_tagger.h>   // structural SVM sequence labeler
         #include <dlib/privacy/pii_span_model.h>        // byte level transformer
+        #include <dlib/privacy/pii_recognizers.h>       // both read and attached to a detector
 */
 
 #endif // DLIB_PRIVACY_

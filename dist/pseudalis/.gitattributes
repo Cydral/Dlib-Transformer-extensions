@@ -1,0 +1,4 @@
+# The signed files stay byte for byte as they were signed: a conversion of their ends of line at
+# the checkout (core.autocrlf on Windows) would change the bytes their signatures cover.
+*.json -text
+*.sig -text

@@ -644,7 +644,7 @@ namespace dlib
             scan_year_references(t, c);
             scan_logins(t, words, c);
             scan_patterns(text, t, c);
-            scan_recognizers(text, t, c);
+            scan_recognizers(text, t, context, c);
 
             // Resolution: higher priority first, then longer, then earlier.
             std::sort(c.begin(), c.end(), [](const candidate& a, const candidate& b) {
@@ -872,6 +872,33 @@ namespace dlib
                 candidate& y = accepted[order[i + 1]];
                 if (removed[order[i]] || y.b != x.e + 1 || !(t.cps[x.e] == ' ' || t.cps[x.e] == 0xA0))
                     continue;
+                /* "Nolwenn" and "Le Floc'h": a first name alone, read as an organisation or a place, before
+                   a name; not "Tan Law", whose first name is a common word too, nor "Milan CEDEX". */
+                if ((x.type == pii_type::organization || x.type == pii_type::location) && y.type == pii_type::person)
+                {
+                    std::vector<std::pair<std::size_t, std::size_t>> given, family;
+                    const std::string key = fold_key(cp_substr(t, text, x.b, x.e));
+                    bool name = words_of(x.b, x.e, given) && given.size() == 1 && words_of(y.b, y.e, family) &&
+                                is_upper(t.cps[x.b]) && x.e > x.b + 1 && is_lower(t.cps[x.b + 1]) &&
+                                is_upper(t.cps[family[0].first]) && first_names().count(key) &&
+                                !ambiguous_first_names().count(key) && !known_organizations().count(key);
+                    for (std::size_t q = 0; q < family.size() && name; ++q)
+                    {
+                        const std::string w = fold_key(cp_substr(t, text, family[q].first, family[q].second));
+                        name = !street_types().count(w) && (!address_kept_words().count(w) || person_particles().count(w));
+                    }
+                    if (name)
+                    {
+                        taken.erase(y.b);
+                        taken[x.b] = y.e;
+                        x.e = y.e;
+                        x.type = pii_type::person;
+                        x.confidence = std::min(x.confidence, y.confidence);
+                        removed[order[i + 1]] = true;
+                        ++i;
+                        continue;
+                    }
+                }
                 // "LE FLOC'H" and "Anne": a family name in capitals before a first name.
                 if ((x.type == pii_type::organization || x.type == pii_type::address ||
                      x.type == pii_type::location) && y.type == pii_type::person)
@@ -3738,9 +3765,12 @@ namespace dlib
             }
         }
 
-        void scan_recognizers(const std::string& text, const utf8_text& t, std::vector<candidate>& out) const
+        void scan_recognizers(const std::string& text, const utf8_text& t, const detection_context& context,
+                              std::vector<candidate>& out) const
         {
             if (recognizers_.empty() || t.size() == 0) return;
+            // A column or a field of names: its label announces the person of the whole text.
+            const bool person_label = context.label == pii_type::person || context.forced == pii_type::person;
             // The cache is keyed by the recognizer and the SHA-256 digest of the text.
             const std::array<unsigned char,32> digest = sha256_digest(text);
             for (const recognizer_entry& r : recognizers_)
@@ -3762,7 +3792,7 @@ namespace dlib
                         cache_->spans.emplace(key, spans);
                     }
                 }
-                add_recognized(text, t, spans, r.min_confidence, out);
+                add_recognized(text, t, spans, r.min_confidence, person_label, out);
             }
         }
 
@@ -3808,6 +3838,64 @@ namespace dlib
                 i = j;
             }
             return words;
+        }
+
+        /* Whether position b opens its text, its line, a cell or a sentence: before it on its line,
+           only spaces, quotes and list marks ("•", "-", "1."), after the end of a sentence or a
+           semicolon. The period of a civility or of an initial ends no sentence ("M. Page", "J.
+           Page"), and the value of a label does not open one ("Approved by: North"). */
+        static bool opens_sentence(const utf8_text& t, std::size_t b)
+        {
+            using namespace privacy_impl;
+            auto mark = [](char32_t c) {
+                return c == 0x2022 || c == 0x25AA || c == 0x25BA || c == 0x2013 || c == 0x2014 || c == '-' ||
+                       c == '*' || c == 0xB7 || c == '>';
+            };
+            std::size_t q = b;
+            for (;;)
+            {
+                while (q > 0 && (t.cps[q - 1] == ' ' || t.cps[q - 1] == 0xA0 || t.cps[q - 1] == '"' ||
+                                 t.cps[q - 1] == 0xAB || t.cps[q - 1] == 0x201C || t.cps[q - 1] == '('))
+                    --q;
+                // A list mark before a space: "• Recette", "- Recette".
+                if (q > 0 && mark(t.cps[q - 1]) && q < b && (q == 1 || !is_letter(t.cps[q - 2]))) { --q; continue; }
+                break;
+            }
+            if (q == 0) return true;
+            const char32_t c = t.cps[q - 1];
+            if (is_line_break(c) || c == '\t' || c == '|' || c == '!' || c == '?' || c == ';')
+                return true;
+            if (c != '.' && c != ')') return false;
+            // The word before the period or the parenthesis: a number ("1.", "2)") marks a list.
+            std::size_t r = q - 1;
+            while (r > 0 && is_word_char(t.cps[r - 1])) --r;
+            if (r == q - 1) return c == '.';
+            bool digits = true;
+            for (std::size_t k = r; k < q - 1 && digits; ++k) digits = is_ascii_digit(t.cps[k]);
+            if (digits) return true;
+            if (c == ')') return false;
+            std::string word;
+            for (std::size_t k = r; k < q - 1; ++k)
+                word += static_cast<char>(t.cps[k] < 0x80 ? std::tolower(static_cast<int>(t.cps[k])) : '_');
+            return q - 1 - r > 2 && !person_titles().count(word) && !civility_words().count(word);
+        }
+
+        /* A common word, or a compound of common words joined by hyphens ("médecin-conseil"); key
+           is folded with privacy_impl::fold_key(). */
+        static bool common_word_or_compound(const std::string& key)
+        {
+            using namespace privacy_impl;
+            if (common_words().count(key)) return true;
+            if (key.find('-') == std::string::npos) return false;
+            std::size_t from = 0;
+            while (from <= key.size())
+            {
+                const std::size_t to = std::min(key.find('-', from), key.size());
+                const std::string part = key.substr(from, to - from);
+                if (part.empty() || (!common_words().count(part) && !function_words().count(part))) return false;
+                from = to + 1;
+            }
+            return true;
         }
 
         // A capital letter alone, or a letter followed by a period, is an initial: "A. Ferguson".
@@ -3936,14 +4024,50 @@ namespace dlib
                 return lower_letters && (common_words().count(key) || function_words().count(key) ||
                                          field_labels().count(key) || greeting_words().count(key));
             }
-            // A number alone read as an address, which no street name follows: "60" in "60 – 100".
             if (type == pii_type::address)
             {
-                for (std::size_t q = b; q < e; ++q)
-                    if (!is_ascii_digit(t.cps[q]) && t.cps[q] != ' ') return false;
-                std::size_t q = e;
-                while (q < n && (t.cps[q] == ' ' || t.cps[q] == 0xA0)) ++q;
-                return !(q < n && is_letter(t.cps[q]));
+                bool digits = true;
+                for (std::size_t q = b; q < e && digits; ++q)
+                    digits = is_ascii_digit(t.cps[q]) || t.cps[q] == ' ';
+                if (digits)
+                {
+                    /* A number alone read as an address, which no street name follows: "60" in "60 –
+                       100", "14" in "à 14 h". */
+                    static const std::unordered_set<std::string> units = make_word_set(
+                        "h heure heures min mn minute minutes s sec seconde secondes j jour jours semaine semaines "
+                        "mois an ans annee annees km m cm mm kg g mg l ml hour hours minute day days week weeks "
+                        "month months year years pct pts points");
+                    std::size_t q = e;
+                    while (q < n && (t.cps[q] == ' ' || t.cps[q] == 0xA0)) ++q;
+                    if (!(q < n && is_letter(t.cps[q]))) return true;
+                    std::size_t r = q;
+                    while (r < n && is_letter(t.cps[r])) ++r;
+                    return units.count(fold_key(cp_substr(t, text, q, r))) != 0 && !(r < n && is_word_char(t.cps[r]));
+                }
+                /* A field label or a common word alone names no street: "Rédacteur" alone in a
+                   cell. */
+                const std::vector<std::pair<std::size_t, std::size_t>> alone = span_words(t, b, e);
+                if (alone.size() == 1 && alone[0].first == b && alone[0].second == e)
+                {
+                    const std::string key = fold_key(cp_substr(t, text, b, e));
+                    if (field_labels().count(key) || common_word_or_compound(key)) return true;
+                }
+                /* A number before common words in lower case, none of them a word of an address,
+                   names no street: "212 doublons", while "9e étage" and "220 broadway" stay. */
+                if (!is_ascii_digit(t.cps[b])) return false;
+                bool words_after = false;
+                for (const auto& w : span_words(t, b, e))
+                {
+                    bool number = true;
+                    for (std::size_t q = w.first; q < w.second && number; ++q) number = is_ascii_digit(t.cps[q]);
+                    if (number) continue;
+                    const std::string key = fold_key(cp_substr(t, text, w.first, w.second));
+                    if (!is_lower(t.cps[w.first]) || street_types().count(key) || english_street_types().count(key) ||
+                        address_kept_words().count(key) || !common_words().count(key))
+                        return false;
+                    words_after = true;
+                }
+                return words_after;
             }
             if (type != pii_type::person && type != pii_type::location && type != pii_type::organization)
                 return false;
@@ -3974,6 +4098,22 @@ namespace dlib
             }
             if (all_function) return true;
             if (technical_words(text, t, words)) return true;
+            /* A common word that opens a line, a cell or a sentence, capitalized by its place, names
+               nothing, alone or before words in lower case: "Recette", "Bascule confirmée",
+               "Doublon possible", "Médecin-conseil". The towns among the common words stay places:
+               "Paris, le 3 mars". */
+            static const std::unordered_set<std::string> towns = make_word_set(
+                "bordeaux brest lille lyon marseille nantes nice paris rennes toulouse");
+            if (opens_sentence(t, b) && is_upper(t.cps[words[0].first]) && words[0].second > words[0].first + 1 &&
+                is_lower(t.cps[words[0].first + 1]) && common_word_or_compound(keys[0]) &&
+                !first_names().count(keys[0]) && !ambiguous_first_names().count(keys[0]) &&
+                !known_organizations().count(keys[0]) && !(type == pii_type::location && towns.count(keys[0])))
+            {
+                bool lower_after = true;
+                for (std::size_t k = 1; k < words.size() && lower_after; ++k)
+                    lower_after = is_lower(t.cps[words[k].first]);
+                if (lower_after) return true;
+            }
             // A country alone names no organisation: "Pologne" on the line after a town.
             if (type == pii_type::organization && country_names().count(fold_key(cp_substr(t, text, b, e))))
                 return true;
@@ -4037,7 +4177,7 @@ namespace dlib
                 static const std::unordered_set<std::string> networks = make_word_set(
                     "sparkasse volksbank raiffeisenbank");
                 if (words.size() == 1 && !known_organizations().count(keys[0]) && !networks.count(keys[0]) &&
-                    (common_words().count(keys[0]) || organization_edge_words().count(keys[0]) ||
+                    (common_word_or_compound(keys[0]) || organization_edge_words().count(keys[0]) ||
                      person_titles().count(keys[0])))
                     return true;
                 // "Bruit (quais de": a word in lower case alone, on a line that writes names with capitals.
@@ -4797,7 +4937,7 @@ namespace dlib
         }
 
         void add_recognized(const std::string& text, const utf8_text& t, const std::vector<pii_span>& spans,
-                            double min_confidence, std::vector<candidate>& out) const
+                            double min_confidence, bool person_label, std::vector<candidate>& out) const
         {
             using namespace privacy_impl;
             typedef learned_piece piece;
@@ -4945,13 +5085,15 @@ namespace dlib
                     if (r.exact && r.type == pii_type::organization && merged[p].type == pii_type::organization &&
                         !(merged[p].b <= r.b && r.e <= merged[p].e) && !(r.b <= merged[p].b && merged[p].e <= r.e))
                         inside_exact[p] = true;
-                    /* A person that a civility or a name label announces stays a person when a piece
-                       read inside it is an organisation, a place or an address with no word of a firm
-                       or of a street: "Nom : LE FLOC'H", "Mme Le Floc'h". */
+                    /* A person that a civility, a name label or the label of its column announces
+                       stays a person when a piece read inside it is an organisation, a place or an
+                       address with no word of a firm or of a street: "Nom : LE FLOC'H", "Mme Le
+                       Floc'h", "LE FLOC'H" in a column headed "Nom". */
                     if (r.strong && r.type == pii_type::person && within(r, merged[p]) &&
                         (merged[p].type == pii_type::organization || merged[p].type == pii_type::location ||
                          merged[p].type == pii_type::address) &&
-                        announced_person(text, t, r.b) && !firm_or_street_words(text, t, merged[p].b, merged[p].e))
+                        (person_label || announced_person(text, t, r.b)) &&
+                        !firm_or_street_words(text, t, merged[p].b, merged[p].e))
                         merged[p].type = pii_type::person;
                     if (merged[p].type != r.type) continue;
                     strong[p] = strong[p] || r.strong;

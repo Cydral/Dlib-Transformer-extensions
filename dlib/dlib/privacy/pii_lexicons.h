@@ -862,7 +862,19 @@ namespace dlib
                     "embassy consulate consulat ambassade administratif administrative sociale paramedic paralegal "
                     "notice booking inbound outbound high crown gate full ok commission convocation coordonnees "
                     "police rdv deux trois sept dix treize ans two four five seven eight nine ten eleven thousand "
-                    "first second third up down out cour commissariat haute ");
+                    "first second third up down out cour commissariat haute "
+                    // The words of projects, files and accounts that open a slide, a cell or a comment.
+                    "cadrage gel bascule doublon doublons dedoublonnage jalon jalons livrable livrables pilotage "
+                    "anomalie anomalies archivage cotisation cotisations prelevement prelevements relance relances "
+                    "resiliation resiliations reclamation reclamations virement virements remboursements echeancier "
+                    "avenant avenants facturation encaissement impaye impayes recouvrement contentieux litige litiges "
+                    "sinistre sinistres indemnisation garanties souscription perimetre recommandation prerequis "
+                    "hypotheses dependances priorites avancement retards alertes indicateur indicateurs participant "
+                    "absents redacteur validation recettage deploiement preproduction specification specifications "
+                    "copil codir entretiens constats ecarts preconisation preconisations phases iteration livraisons "
+                    "fiches fusions adherent adherents adherente mensuel mensuelle trimestriel trimestrielle cheffe "
+                    "consultante deleguee milestone milestones deliverable deliverables kickoff rollout cutover "
+                    "backlog steering stakeholders assumptions dependencies attendees approvals signoff steps ");
                 // Frequent words of French and English that are neither given names nor family names
                 const char* const frequent[] = {
                     "one like time get also only after see make think back want because most very need really work being "

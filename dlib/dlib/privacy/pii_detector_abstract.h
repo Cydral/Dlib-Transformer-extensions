@@ -244,12 +244,17 @@ namespace dlib
                    words ("Vueling" read as a place) and an organisation that holds a part
                    of it only ("Courrier de Le Parlement" across "Parlement européen"); a
                    span that goes beyond it keeps its own boundaries. A person that a
-                   civility or a name label announces stays a person when they read it as
-                   an organisation, a place or an address with no word of a firm or of a
-                   street ("Nom : LE FLOC'H"), a first name joins the family name that
-                   follows it with a capitalized particle, whatever type they give it
-                   ("Yann" and "Le Floc'h"), and a family name written in capitals joins the
-                   first name that follows it ("LE FLOC'H Anne").
+                   civility, a name label or the label of its column (context.label)
+                   announces stays a person when they read it as an organisation, a place
+                   or an address with no word of a firm or of a street ("Nom : LE
+                   FLOC'H"), a first name joins the family name that follows it with a
+                   capitalized particle, whatever type they give it ("Yann" and "Le
+                   Floc'h"), a first name alone that they read as an organisation or a
+                   place joins the family name that follows it ("Nolwenn" and "Le
+                   Floc'h", unless the first name is also a common word, as "Tan" in "Tan
+                   Law", or the name a word of an address, as "Milan CEDEX"), and a family
+                   name written in capitals joins the first name that follows it ("LE
+                   FLOC'H Anne").
 
                 The detector is a recall-oriented filter. Its output is meant to be
                 pseudonymized, and a residual-risk audit of the protected document is
@@ -335,9 +340,18 @@ namespace dlib
                   ignored: a piece of a word that no other piece completes ("Rem" in
                   "Remplacez"), a login inside a longer token, a file name
                   ("rapport_final.docx"), a single character or a common word in lower case
-                  ("month") and, for persons, places and organisations, function words alone
+                  ("month"), for addresses, a field label or a common word alone
+                  ("Rédacteur"), a number alone before a unit ("14" in "à 14 h") and a
+                  number before common words in lower case, none of them a word of an
+                  address ("212 doublons", while "9e étage" and "220 broadway" stay) and,
+                  for persons, places and organisations, function words alone
                   ("Votre"), a greeting, a closing or a field label alone ("Bonsoir",
-                  "Cordialement", "Nom"), a common word in lower case ("commande"), an
+                  "Cordialement", "Nom"), a common word in lower case ("commande"), a
+                  common word, or a compound of common words, that opens its text, its
+                  line, a cell or a sentence, alone or before words in lower case, unless
+                  it is a first name, a known organisation or one of the towns among the
+                  common words ("Recette", "Doublon possible", "Médecin-conseil",
+                  while "Paris, le 3 mars" and "Approved by: North" stay), an
                   organisation opened by an article and a word in lower case ("Le logiciel
                   Excel"), a person or a place that joins capitalized words to words in
                   lower case other than particles ("Le projet", while "Jean de La Fontaine"

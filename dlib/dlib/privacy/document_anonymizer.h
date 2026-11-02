@@ -411,6 +411,11 @@ namespace dlib
             return plain_text(utf8_text, report, false);
         }
 
+        void set_pdf_layout(bool keep) { pdf_layout_ = keep; }
+        bool pdf_layout() const { return pdf_layout_; }
+
+        void set_image_describer(const document_image_describer& describer) { describer_ = describer; }
+
     private:
         struct edit
         {
@@ -431,11 +436,13 @@ namespace dlib
                 case document_format::pptx:
                 {
                     ooxml_anonymizer a(p_, &detector_, report);
+                    a.set_image_describer(describer_);
                     return restoring ? a.restore(bytes) : a.anonymize(bytes);
                 }
                 case document_format::pdf:
                 {
-                    pdf_anonymizer a(p_, &detector_, report);
+                    pdf_anonymizer a(p_, &detector_, report, pdf_layout_);
+                    a.set_image_describer(describer_);
                     return restoring ? a.restore(bytes) : a.anonymize(bytes);
                 }
                 case document_format::text:
@@ -1196,6 +1203,8 @@ namespace dlib
         const pseudonymizer& p_;
         pii_detector& detector_;
         std::string name_hint_;
+        bool pdf_layout_ = true;
+        document_image_describer describer_;
     };
 
 // ----------------------------------------------------------------------------------------

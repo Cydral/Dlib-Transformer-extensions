@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- Pseudalis, Copyright (C) 2026 Cydral Technology: a shield holding the brackets of a
+       pseudonymization tag [[ ]] around a keyhole. -->
+  <defs>
+    <linearGradient id="shield" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1b4f7f"/>
+      <stop offset="1" stop-color="#0c2238"/>
+    </linearGradient>
+    <linearGradient id="gold" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffd166"/>
+      <stop offset="1" stop-color="#e09a1a"/>
+    </linearGradient>
+  </defs>
+  <path d="M128 10 C168 28 204 32 232 34 V118 C232 186 186 226 128 248 C70 226 24 186 24 118 V34 C52 32 88 28 128 10 Z"
+        fill="url(#shield)" stroke="url(#gold)" stroke-width="8" stroke-linejoin="round"/>
+  <g fill="#2fd3c0">
+    <path d="M76 70 H52 V186 H76 V174 H64 V82 H76 Z"/>
+    <path d="M98 70 H74 V186 H98 V174 H86 V82 H98 Z"/>
+    <path d="M180 70 H204 V186 H180 V174 H192 V82 H180 Z"/>
+    <path d="M158 70 H182 V186 H158 V174 H170 V82 H158 Z"/>
+  </g>
+  <g fill="url(#gold)">
+    <circle cx="128" cy="112" r="21"/>
+    <path d="M117 124 H139 L147 168 H109 Z"/>
+  </g>
+</svg>

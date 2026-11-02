@@ -1,0 +1,236 @@
+// Copyright (C) 2026 Cydral Technology (cydraltechnology@gmail.com)
+// License: Boost Software License   See LICENSE.txt for the full license.
+
+// The C interface of the engine libraries (common/engine_api.h).
+
+#ifndef PSEUDALIS_ENGINE_BUILD
+#define PSEUDALIS_ENGINE_BUILD
+#endif
+#include "../common/engine_api.h"
+
+#include <cstdlib>
+#include <cstring>
+#include <exception>
+#include <memory>
+#include <new>
+#include <string>
+
+#include "engine.h"
+
+struct psd_engine
+{
+    std::unique_ptr<pseudalis::engine> e;
+};
+
+namespace
+{
+    bool put(psd_buffer* b, const std::string& s)
+    {
+        if (!b) return true;
+        b->data = nullptr;
+        b->size = 0;
+        b->data = static_cast<char*>(std::malloc(s.size() + 1));
+        if (!b->data) return false;
+        std::memcpy(b->data, s.data(), s.size());
+        b->data[s.size()] = '\0';
+        b->size = s.size();
+        return true;
+    }
+
+    void clear(psd_buffer* b)
+    {
+        if (b)
+        {
+            b->data = nullptr;
+            b->size = 0;
+        }
+    }
+
+    pseudalis::json result_of(const pseudalis::engine_result& r)
+    {
+        pseudalis::json j = pseudalis::json::object();
+        j["name"] = r.name;
+        j["kind"] = r.kind;
+        j["report"] = r.report;
+        pseudalis::json ids = pseudalis::json::array();
+        for (const std::string& id : r.pictures) ids.push_back(id);
+        j["pictures"] = ids;
+        return j;
+    }
+}
+
+extern "C" {
+
+PSD_API int PSD_CALL psd_api_version(void)
+{
+    return PSEUDALIS_ENGINE_API_VERSION;
+}
+
+PSD_API const char* PSD_CALL psd_variant(void)
+{
+#if defined(__AVX2__)
+    return "avx2";
+#else
+    return "baseline";
+#endif
+}
+
+PSD_API int PSD_CALL psd_models(psd_buffer* description)
+{
+    clear(description);
+    try
+    {
+        return put(description, pseudalis::engine::models().dump()) ? 1 : 0;
+    }
+    catch (...)
+    {
+        return 0;
+    }
+}
+
+PSD_API psd_engine* PSD_CALL psd_create(const char* key, size_t key_size, const char* options, psd_buffer* error)
+{
+    clear(error);
+    try
+    {
+        pseudalis::engine_options o;
+        pseudalis::json j;
+        if (options && *options && !pseudalis::json::parse(options, j))
+        {
+            put(error, "the options of the engine are not JSON");
+            return nullptr;
+        }
+        o.date_order = j["date_order"].str("dmy");
+        o.context = j["context"].str("default");
+        std::unique_ptr<psd_engine> e(new psd_engine);
+        e->e.reset(new pseudalis::engine(std::string(key ? key : "", key ? key_size : 0), o));
+        return e.release();
+    }
+    catch (const std::exception& x)
+    {
+        put(error, x.what());
+    }
+    catch (...)
+    {
+        put(error, "unexpected error");
+    }
+    return nullptr;
+}
+
+PSD_API void PSD_CALL psd_destroy(psd_engine* engine)
+{
+    delete engine;
+}
+
+PSD_API int PSD_CALL psd_process(psd_engine* engine, const char* request, const char* data, size_t size,
+    psd_picture_fn picture, void* context, psd_buffer* result, psd_buffer* output, psd_buffer* error)
+{
+    clear(result);
+    clear(output);
+    clear(error);
+    if (!engine || !engine->e)
+    {
+        put(error, "no engine");
+        return 0;
+    }
+    try
+    {
+        pseudalis::json req;
+        if (!request || !pseudalis::json::parse(request, req) || !req.is_object())
+        {
+            put(error, "the request is not a JSON object");
+            return 0;
+        }
+        const std::string op = req["operation"].str();
+        const std::string name = req["name"].str("document");
+        const std::string bytes(data ? data : "", data ? size : 0);
+        pseudalis::picture_handler handler;
+        if (picture)
+            handler = [picture, context](const pseudalis::picture_found& f) {
+                psd_picture p;
+                p.bytes = f.bytes->data();
+                p.size = f.bytes->size();
+                p.id = f.id.c_str();
+                p.sha256 = f.sha256.c_str();
+                p.media_type = f.media_type.c_str();
+                p.location = f.location.c_str();
+                psd_buffer d = { nullptr, 0 };
+                std::string text;
+                if (picture(context, &p, &d) == 1 && d.data) text.assign(d.data, d.size);
+                psd_free(&d);
+                return text;
+            };
+        pseudalis::json res = pseudalis::json::object();
+        std::string out;
+        if (op == "anonymize" || op == "restore")
+        {
+            const pseudalis::engine_result r = op == "anonymize"
+                ? engine->e->anonymize(bytes, name, handler, req["pdf_layout"].as_bool(true))
+                : engine->e->restore(bytes, name);
+            res = result_of(r);
+            out = r.bytes;
+        }
+        else if (op == "anonymize_text" || op == "restore_text")
+        {
+            pseudalis::json report;
+            out = op == "anonymize_text" ? engine->e->anonymize_text(bytes, report)
+                                         : engine->e->restore_text(bytes, report);
+            res["name"] = name;
+            res["kind"] = "text";
+            res["report"] = report;
+            res["pictures"] = pseudalis::json::array();
+        }
+        else if (op == "detect")
+        {
+            res["spans"] = engine->e->detect(bytes);
+        }
+        else
+        {
+            put(error, "unknown operation: " + op);
+            return 0;
+        }
+        if (!put(result, res.dump()) || !put(output, out))
+        {
+            psd_free(result);
+            psd_free(output);
+            put(error, "out of memory");
+            return 0;
+        }
+        return 1;
+    }
+    catch (const std::bad_alloc&)
+    {
+        put(error, "out of memory");
+    }
+    catch (const std::exception& x)
+    {
+        put(error, x.what());
+    }
+    catch (...)
+    {
+        put(error, "unexpected error");
+    }
+    return 0;
+}
+
+PSD_API int PSD_CALL psd_key_fingerprint(psd_engine* engine, psd_buffer* fingerprint)
+{
+    clear(fingerprint);
+    if (!engine || !engine->e) return 0;
+    return put(fingerprint, engine->e->key_fingerprint()) ? 1 : 0;
+}
+
+PSD_API char* PSD_CALL psd_alloc(size_t size)
+{
+    return static_cast<char*>(std::malloc(size + 1));
+}
+
+PSD_API void PSD_CALL psd_free(psd_buffer* buffer)
+{
+    if (!buffer) return;
+    std::free(buffer->data);
+    buffer->data = nullptr;
+    buffer->size = 0;
+}
+
+}

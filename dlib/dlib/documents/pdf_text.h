@@ -56,6 +56,7 @@ namespace dlib
         std::vector<pdf_page_text> pages;
         std::size_t undecodable_glyphs = 0;
         bool produced_by_dlib = false;
+        bool rewritten_by_dlib = false;
         std::vector<std::string> notes;
         std::vector<std::string> features;
     };
@@ -1545,6 +1546,149 @@ namespace dlib
             return 556;
         }
 
+        inline int unicode_to_winansi(std::uint32_t cp)
+        {
+            if ((cp >= 0x20 && cp < 0x7F) || (cp >= 0xA0 && cp <= 0xFF)) return static_cast<int>(cp);
+            static const std::uint16_t high[32] = { 0x20AC, 0,      0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021,
+                                                    0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0,      0x017D, 0,
+                                                    0,      0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
+                                                    0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0,      0x017E, 0x0178 };
+            for (int i = 0; i < 32; ++i)
+                if (high[i] != 0 && high[i] == cp) return 0x80 + i;
+            return -1;
+        }
+
+        /* The twelve standard fonts by style: k = 4 * family + bold + 2 * italic, families sans
+           serif, serif and fixed pitch. */
+        inline const char* standard_font_name(int k)
+        {
+            static const char* const names[12] = {
+                "Helvetica", "Helvetica-Bold", "Helvetica-Oblique", "Helvetica-BoldOblique",
+                "Times-Roman", "Times-Bold", "Times-Italic", "Times-BoldItalic",
+                "Courier", "Courier-Bold", "Courier-Oblique", "Courier-BoldOblique" };
+            return names[k >= 0 && k < 12 ? k : 0];
+        }
+
+        inline int standard_font_of(int style)
+        {
+            int family = (style >> 2) & 3;
+            if (family > 2) family = 0;
+            return 4 * family + (style & 1) + ((style & 2) ? 2 : 0);
+        }
+
+        // Width of a WinAnsi code in standard font k, in thousandths of an em.
+        inline double standard_width(int k, unsigned char code)
+        {
+            if (code < 32) return 0;
+            if (k >= 8) return 600;
+            static const short table[6][224] = {
+                // Helvetica
+                {
+                    278, 278, 355, 556, 556, 889, 667, 191, 333, 333, 389, 584, 278, 333, 278, 278,
+                    556, 556, 556, 556, 556, 556, 556, 556, 556, 556, 278, 278, 584, 584, 584, 556,
+                    1015, 667, 667, 722, 722, 667, 611, 778, 722, 278, 500, 667, 556, 833, 722, 778,
+                    667, 778, 722, 667, 611, 722, 667, 944, 667, 667, 611, 278, 278, 278, 469, 556,
+                    333, 556, 556, 500, 556, 556, 278, 556, 556, 222, 222, 500, 222, 833, 556, 556,
+                    556, 556, 333, 500, 278, 556, 500, 722, 500, 500, 500, 334, 260, 334, 584, 350,
+                    556, 350, 222, 556, 333, 1000, 556, 556, 333, 1000, 667, 333, 1000, 350, 611, 350,
+                    350, 222, 222, 333, 333, 350, 556, 1000, 333, 1000, 500, 333, 944, 350, 500, 667,
+                    278, 333, 556, 556, 556, 556, 260, 556, 333, 737, 370, 556, 584, 333, 737, 333,
+                    400, 584, 333, 333, 333, 556, 537, 278, 333, 333, 365, 556, 834, 834, 834, 611,
+                    667, 667, 667, 667, 667, 667, 1000, 722, 667, 667, 667, 667, 278, 278, 278, 278,
+                    722, 722, 778, 778, 778, 778, 778, 584, 778, 722, 722, 722, 722, 667, 667, 611,
+                    556, 556, 556, 556, 556, 556, 889, 500, 556, 556, 556, 556, 278, 278, 278, 278,
+                    556, 556, 556, 556, 556, 556, 556, 584, 611, 556, 556, 556, 556, 500, 556, 500
+                },
+                // Helvetica-Bold
+                {
+                    278, 333, 474, 556, 556, 889, 722, 238, 333, 333, 389, 584, 278, 333, 278, 278,
+                    556, 556, 556, 556, 556, 556, 556, 556, 556, 556, 333, 333, 584, 584, 584, 611,
+                    975, 722, 722, 722, 722, 667, 611, 778, 722, 278, 556, 722, 611, 833, 722, 778,
+                    667, 778, 722, 667, 611, 722, 667, 944, 667, 667, 611, 333, 278, 333, 584, 556,
+                    333, 556, 611, 556, 611, 556, 333, 611, 611, 278, 278, 556, 278, 889, 611, 611,
+                    611, 611, 389, 556, 333, 611, 556, 778, 556, 556, 500, 389, 280, 389, 584, 350,
+                    556, 350, 278, 556, 500, 1000, 556, 556, 333, 1000, 667, 333, 1000, 350, 611, 350,
+                    350, 278, 278, 500, 500, 350, 556, 1000, 333, 1000, 556, 333, 944, 350, 500, 667,
+                    278, 333, 556, 556, 556, 556, 280, 556, 333, 737, 370, 556, 584, 333, 737, 333,
+                    400, 584, 333, 333, 333, 611, 556, 278, 333, 333, 365, 556, 834, 834, 834, 611,
+                    722, 722, 722, 722, 722, 722, 1000, 722, 667, 667, 667, 667, 278, 278, 278, 278,
+                    722, 722, 778, 778, 778, 778, 778, 584, 778, 722, 722, 722, 722, 667, 667, 611,
+                    556, 556, 556, 556, 556, 556, 889, 556, 556, 556, 556, 556, 278, 278, 278, 278,
+                    611, 611, 611, 611, 611, 611, 611, 584, 611, 611, 611, 611, 611, 556, 611, 556
+                },
+                // Times-Roman
+                {
+                    250, 333, 408, 500, 500, 833, 778, 180, 333, 333, 500, 564, 250, 333, 250, 278,
+                    500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 278, 278, 564, 564, 564, 444,
+                    921, 722, 667, 667, 722, 611, 556, 722, 722, 333, 389, 722, 611, 889, 722, 722,
+                    556, 722, 667, 556, 611, 722, 722, 944, 722, 722, 611, 333, 278, 333, 469, 500,
+                    333, 444, 500, 444, 500, 444, 333, 500, 500, 278, 278, 500, 278, 778, 500, 500,
+                    500, 500, 333, 389, 278, 500, 500, 722, 500, 500, 444, 480, 200, 480, 541, 350,
+                    500, 350, 333, 500, 444, 1000, 500, 500, 333, 1000, 556, 333, 889, 350, 611, 350,
+                    350, 333, 333, 444, 444, 350, 500, 1000, 333, 980, 389, 333, 722, 350, 444, 722,
+                    250, 333, 500, 500, 500, 500, 200, 500, 333, 760, 276, 500, 564, 333, 760, 333,
+                    400, 564, 300, 300, 333, 500, 453, 250, 333, 300, 310, 500, 750, 750, 750, 444,
+                    722, 722, 722, 722, 722, 722, 889, 667, 611, 611, 611, 611, 333, 333, 333, 333,
+                    722, 722, 722, 722, 722, 722, 722, 564, 722, 722, 722, 722, 722, 722, 556, 500,
+                    444, 444, 444, 444, 444, 444, 667, 444, 444, 444, 444, 444, 278, 278, 278, 278,
+                    500, 500, 500, 500, 500, 500, 500, 564, 500, 500, 500, 500, 500, 500, 500, 500
+                },
+                // Times-Bold
+                {
+                    250, 333, 555, 500, 500, 1000, 833, 278, 333, 333, 500, 570, 250, 333, 250, 278,
+                    500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 333, 333, 570, 570, 570, 500,
+                    930, 722, 667, 722, 722, 667, 611, 778, 778, 389, 500, 778, 667, 944, 722, 778,
+                    611, 778, 722, 556, 667, 722, 722, 1000, 722, 722, 667, 333, 278, 333, 581, 500,
+                    333, 500, 556, 444, 556, 444, 333, 500, 556, 278, 333, 556, 278, 833, 556, 500,
+                    556, 556, 444, 389, 333, 556, 500, 722, 500, 500, 444, 394, 220, 394, 520, 350,
+                    500, 350, 333, 500, 500, 1000, 500, 500, 333, 1000, 556, 333, 1000, 350, 667, 350,
+                    350, 333, 333, 500, 500, 350, 500, 1000, 333, 1000, 389, 333, 722, 350, 444, 722,
+                    250, 333, 500, 500, 500, 500, 220, 500, 333, 747, 300, 500, 570, 333, 747, 333,
+                    400, 570, 300, 300, 333, 556, 540, 250, 333, 300, 330, 500, 750, 750, 750, 500,
+                    722, 722, 722, 722, 722, 722, 1000, 722, 667, 667, 667, 667, 389, 389, 389, 389,
+                    722, 722, 778, 778, 778, 778, 778, 570, 778, 722, 722, 722, 722, 722, 611, 556,
+                    500, 500, 500, 500, 500, 500, 722, 444, 444, 444, 444, 444, 278, 278, 278, 278,
+                    500, 556, 500, 500, 500, 500, 500, 570, 500, 556, 556, 556, 556, 500, 556, 500
+                },
+                // Times-Italic
+                {
+                    250, 333, 420, 500, 500, 833, 778, 214, 333, 333, 500, 675, 250, 333, 250, 278,
+                    500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 333, 333, 675, 675, 675, 500,
+                    920, 611, 611, 667, 722, 611, 611, 722, 722, 333, 444, 667, 556, 833, 667, 722,
+                    611, 722, 611, 500, 556, 722, 611, 833, 611, 556, 556, 389, 278, 389, 422, 500,
+                    333, 500, 500, 444, 500, 444, 278, 500, 500, 278, 278, 444, 278, 722, 500, 500,
+                    500, 500, 389, 389, 278, 500, 444, 667, 444, 444, 389, 400, 275, 400, 541, 350,
+                    500, 350, 333, 500, 556, 889, 500, 500, 333, 1000, 500, 333, 944, 350, 556, 350,
+                    350, 333, 333, 556, 556, 350, 500, 889, 333, 980, 389, 333, 667, 350, 389, 556,
+                    250, 389, 500, 500, 500, 500, 275, 500, 333, 760, 276, 500, 675, 333, 760, 333,
+                    400, 675, 300, 300, 333, 500, 523, 250, 333, 300, 310, 500, 750, 750, 750, 500,
+                    611, 611, 611, 611, 611, 611, 889, 667, 611, 611, 611, 611, 333, 333, 333, 333,
+                    722, 667, 722, 722, 722, 722, 722, 675, 722, 722, 722, 722, 722, 556, 611, 500,
+                    500, 500, 500, 500, 500, 500, 667, 444, 444, 444, 444, 444, 278, 278, 278, 278,
+                    500, 500, 500, 500, 500, 500, 500, 675, 500, 500, 500, 500, 500, 444, 500, 444
+                },
+                // Times-BoldItalic
+                {
+                    250, 389, 555, 500, 500, 833, 778, 278, 333, 333, 500, 570, 250, 333, 250, 278,
+                    500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 333, 333, 570, 570, 570, 500,
+                    832, 667, 667, 667, 722, 667, 667, 722, 778, 389, 500, 667, 611, 889, 722, 722,
+                    611, 722, 667, 556, 611, 722, 667, 889, 667, 611, 611, 333, 278, 333, 570, 500,
+                    333, 500, 500, 444, 500, 444, 333, 500, 556, 278, 278, 500, 278, 778, 556, 500,
+                    500, 500, 389, 389, 278, 556, 444, 667, 500, 444, 389, 348, 220, 348, 570, 350,
+                    500, 350, 333, 500, 500, 1000, 500, 500, 333, 1000, 556, 333, 944, 350, 611, 350,
+                    350, 333, 333, 500, 500, 350, 500, 1000, 333, 1000, 389, 333, 722, 350, 389, 611,
+                    250, 389, 500, 500, 500, 500, 220, 500, 333, 747, 266, 500, 606, 333, 747, 333,
+                    400, 570, 300, 300, 333, 576, 500, 250, 333, 300, 300, 500, 750, 750, 750, 500,
+                    667, 667, 667, 667, 667, 667, 944, 667, 667, 667, 667, 667, 389, 389, 389, 389,
+                    722, 722, 722, 722, 722, 722, 722, 570, 722, 722, 722, 722, 722, 611, 611, 500,
+                    500, 500, 500, 500, 500, 500, 722, 444, 444, 444, 444, 444, 278, 278, 278, 278,
+                    500, 556, 500, 500, 500, 500, 500, 570, 500, 556, 556, 556, 556, 444, 500, 444
+                }
+            };
+            const int t = k < 4 ? (k & 1) : k - 2;
+            return table[t][code - 32];
+        }
+
     // ------------------------------------------------------------------------------------
     // Fonts.
 
@@ -1589,6 +1733,8 @@ namespace dlib
             bool fixed_pitch = false;
             double default_width = 1000;
             double scale = 0.001;
+            int style = 0;                  // bit 0 bold, bit 1 italic; bits 2 and 3: 0 sans serif, 1 serif, 2 fixed
+            int standard = -1;              // a standard font without widths: its index for standard_width()
 
             // Unicode text of a code from the ToUnicode map; false if it has none.
             bool unicode_of(std::uint32_t code, std::string& text) const
@@ -1740,9 +1886,54 @@ namespace dlib
             catch (pdf_error&) {}
         }
 
+        /* The style of a font, from its name and its descriptor: bold, italic, and a family with
+           serifs or of fixed pitch, so that a rewrite draws its text with the standard font that
+           looks the most like it. */
+        inline int font_style(document& doc, const object& fd)
+        {
+            std::string base;
+            if (const object* bf = doc.resolve_key(fd, "BaseFont")) if (bf->is(object::name_k)) base = bf->str;
+            const object* desc = doc.resolve_key(fd, "FontDescriptor");
+            if (!desc)
+                if (const object* df = doc.resolve_key(fd, "DescendantFonts"))
+                    if (df->is(object::array_k) && !df->arr.empty())
+                    {
+                        const object& d = doc.resolve(df->arr[0]);
+                        if (d.is(object::dict_k)) desc = doc.resolve_key(d, "FontDescriptor");
+                    }
+            int flags = 0;
+            double weight = 0, italic_angle = 0;
+            if (desc && desc->is(object::dict_k))
+            {
+                if (const object* f = doc.resolve_key(*desc, "Flags")) if (f->is(object::num_k)) flags = to_int(f->num);
+                if (const object* w = doc.resolve_key(*desc, "FontWeight")) if (w->is(object::num_k)) weight = w->num;
+                if (const object* a = doc.resolve_key(*desc, "ItalicAngle"))
+                    if (a->is(object::num_k)) italic_angle = a->num;
+                if (base.empty())
+                    if (const object* fn = doc.resolve_key(*desc, "FontName")) if (fn->is(object::name_k)) base = fn->str;
+            }
+            // "ABCDEF+Calibri-Bold": the prefix of a subset is not part of the name.
+            if (base.size() > 7 && base[6] == '+') base = base.substr(7);
+            std::string n;
+            for (char c : base) n.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+            auto has = [&](const char* w) { return n.find(w) != std::string::npos; };
+            const bool bold = has("bold") || has("black") || has("heavy") || has("demi") || has("semibold") ||
+                              weight >= 600 || (flags & (1 << 18)) != 0;
+            const bool italic = has("italic") || has("oblique") || (flags & 64) != 0 || std::abs(italic_angle) > 1;
+            int family = 0;
+            if ((flags & 1) || has("courier") || has("mono") || has("consolas") || has("menlo") || has("fixed"))
+                family = 2;
+            else if (!has("sans") && ((flags & 2) || has("times") || has("serif") || has("georgia") ||
+                                     has("garamond") || has("cambria") || has("book") || has("minion") ||
+                                     has("palatino") || has("century") || has("roman")))
+                family = 1;
+            return (bold ? 1 : 0) | (italic ? 2 : 0) | (family << 2);
+        }
+
         inline font build_font(document& doc, const object& fd)
         {
             font f;
+            f.style = font_style(doc, fd);
             const object* subtype = doc.resolve_key(fd, "Subtype");
             const std::string st = subtype && subtype->is(object::name_k) ? subtype->str : "";
             if (const object* tu = doc.resolve_key(fd, "ToUnicode"))
@@ -1821,6 +2012,12 @@ namespace dlib
             std::string base;
             if (const object* bf = doc.resolve_key(fd, "BaseFont")) if (bf->is(object::name_k)) base = bf->str;
             f.fixed_pitch = base.find("Courier") != std::string::npos;
+            for (int k = 0; k < 12; ++k)
+                if (base == standard_font_name(k)) f.standard = k;
+            if (base == "Arial" || base == "ArialMT") f.standard = 0;
+            else if (base == "Arial,Bold" || base == "Arial-BoldMT") f.standard = 1;
+            else if (base == "TimesNewRoman" || base == "TimesNewRomanPSMT") f.standard = 4;
+            else if (base == "TimesNewRoman,Bold" || base == "TimesNewRomanPS-BoldMT") f.standard = 5;
             const object* widths = doc.resolve_key(fd, "Widths");
             if (widths && widths->is(object::array_k))
             {
@@ -1945,6 +2142,8 @@ namespace dlib
                 if (f.has_width[c]) w = f.widths[c];
                 else if (f.missing > 0) w = f.missing;
                 else if (f.fixed_pitch) w = 600;
+                else if (f.standard >= 0 && unicode_to_winansi(cp ? cp : c) >= 0)
+                    w = standard_width(f.standard, static_cast<unsigned char>(unicode_to_winansi(cp ? cp : c)));
                 else w = helvetica_width(cp ? cp : c);
                 g.width = w * f.scale;
                 out.push_back(g);
@@ -1973,6 +2172,55 @@ namespace dlib
         // Fonts built once per document, by the address of their dictionary in the object cache.
         typedef std::map<const object*, font> font_cache;
 
+        /* What a rewrite of the document needs to know of the text drawn by its content
+           streams: each text showing operator, where it is, and the runs of glyphs it draws,
+           in the space of its stream. */
+        struct glyph_run
+        {
+            std::size_t span = 0;               // index in the spans of the page
+            pdf_matrix tm;                      // text matrix before the first glyph
+            double size = 0, th = 1, ts = 0;    // font size, horizontal scaling (a fraction), rise
+            double em = 1;                      // size of the em of the font for a size of 1 (Type 3 fonts)
+            int render = 0;                     // text rendering mode
+            int style = 0;                      // font::style
+            std::vector<std::size_t> offsets;   // where each glyph starts in the span text, then the end
+            std::vector<double> advances;       // advance before each glyph, then the total, in text space
+        };
+
+        struct text_operation
+        {
+            long long stream = 0;               // -(page + 1) for the contents of a page, else its object
+            std::size_t begin = 0, end = 0;     // the operator and its operands in the decoded stream
+            std::size_t page = 0;
+            std::vector<glyph_run> runs;
+        };
+
+        // The appearance of an annotation, drawn with the page by a rewrite.
+        struct drawn_annotation
+        {
+            std::size_t page = 0;
+            int object = 0;                     // the appearance stream
+            pdf_matrix to_rect;                 // the matrix that places it on the page
+        };
+
+        // A picture object drawn by a stream: where its Do operator stands, and the matrix that places it.
+        struct image_draw
+        {
+            long long stream = 0;               // as in text_operation
+            std::size_t at = 0;                 // the Do operator and its operand in the decoded stream
+            std::size_t page = 0;
+            pdf_matrix ctm;                     // the unit square of the picture in default user space
+            int object = 0;                     // the image XObject
+        };
+
+        struct text_recording
+        {
+            std::size_t page = 0;
+            std::vector<text_operation> operations;
+            std::vector<drawn_annotation> annotations;
+            std::vector<image_draw> images;
+        };
+
         class interpreter
         {
         public:
@@ -1985,6 +2233,14 @@ namespace dlib
             std::size_t missing_font_runs() const { return missing_font_runs_; }
             std::size_t truncated_strings() const { return truncated_strings_; }
 
+            // Records the text operators of the streams run from now on; stream names the next one.
+            void record(text_recording* rec, long long stream)
+            {
+                rec_ = rec;
+                stream_ = stream;
+            }
+            text_recording* recording() const { return rec_; }
+
             void run(const std::string& content, const object* resources, const pdf_matrix& ctm, int depth)
             {
                 if (depth > 12) return;
@@ -1995,6 +2251,7 @@ namespace dlib
                 pdf_matrix tm, tlm;
                 lexer lx(content);
                 std::size_t guard = 0;
+                std::size_t op_begin = 0;
                 while (!lx.at_end() && ++guard < 50000000)
                 {
                     object o;
@@ -2008,6 +2265,18 @@ namespace dlib
                     }
                     doc_.count_operation();
                     const std::string& op = o.str;
+                    current_op_ = std::string::npos;
+                    if (rec_ && stream_ != 0 &&
+                        (op == "Tj" || op == "TJ" || op == "'" || op == "\""))
+                    {
+                        text_operation t;
+                        t.stream = stream_;
+                        t.begin = op_begin;
+                        t.end = lx.pos();
+                        t.page = rec_->page;
+                        current_op_ = rec_->operations.size();
+                        rec_->operations.push_back(t);
+                    }
                     auto num = [&](std::size_t k) {
                         return (k < operands.size() && operands[k].is(object::num_k)) ? operands[k].num : 0.0;
                     };
@@ -2024,6 +2293,7 @@ namespace dlib
                     }
                     else if (op == "Tc") s.tc = num(0);
                     else if (op == "Tw") s.tw = num(0);
+                    else if (op == "Tr") s.tr = to_int(num(0));
                     else if (op == "Tz") s.th = num(0) / 100.0;
                     else if (op == "TL") s.tl = num(0);
                     else if (op == "Ts") s.ts = num(0);
@@ -2070,17 +2340,34 @@ namespace dlib
                         }
                     }
                     else if (op == "Do" && !operands.empty() && operands[0].is(object::name_k))
-                        do_xobject(resources, operands[0].str, s.ctm, depth);
+                        do_xobject(resources, operands[0].str, s.ctm, depth, op_begin);
                     else if (op == "BI")
                         skip_inline_image(lx, content);
                     operands.clear();
+                    op_begin = lx.pos();
                 }
             }
 
-            void run_form(const object& form, const object* fallback_resources, const pdf_matrix& ctm, int depth)
+            // stream is the object number of the form, 0 when it is not known.
+            void run_form(const object& form, const object* fallback_resources, const pdf_matrix& ctm, int depth,
+                          long long stream = 0)
             {
                 const object* res = doc_.resolve_key(form, "Resources");
-                run(doc_.stream_data(form), res ? res : fallback_resources, form_matrix(form) * ctm, depth + 1);
+                const long long saved = stream_;
+                const std::size_t saved_op = current_op_;
+                stream_ = stream;
+                try
+                {
+                    run(doc_.stream_data(form), res ? res : fallback_resources, form_matrix(form) * ctm, depth + 1);
+                }
+                catch (...)
+                {
+                    stream_ = saved;
+                    current_op_ = saved_op;
+                    throw;
+                }
+                stream_ = saved;
+                current_op_ = saved_op;
             }
 
             pdf_matrix form_matrix(const object& form)
@@ -2100,6 +2387,7 @@ namespace dlib
                 pdf_matrix ctm;
                 const font* current_font = nullptr;
                 double size = 0, tc = 0, tw = 0, th = 1, tl = 0, ts = 0;
+                int tr = 0;
             };
 
             const font* lookup_font(const object* resources, const std::string& name)
@@ -2144,6 +2432,20 @@ namespace dlib
                 }
                 const pdf_matrix trm = pdf_matrix(s.size * s.th, 0, 0, s.size, 0, s.ts) * tm * s.ctm;
                 const pdf_matrix tc = tm * s.ctm;
+                const bool recording = rec_ && current_op_ < rec_->operations.size();
+                glyph_run run;
+                if (recording)
+                {
+                    run.tm = tm;
+                    run.size = s.size;
+                    run.th = s.th;
+                    run.ts = s.ts;
+                    run.render = s.tr;
+                    run.style = s.current_font ? s.current_font->style : 0;
+                    run.em = s.current_font ? std::abs(s.current_font->scale) * 1000 : 1;
+                    run.offsets.reserve(glyphs.size() + 1);
+                    run.advances.reserve(glyphs.size() + 1);
+                }
                 pdf_text_span span;
                 span.x = trm.e;
                 span.y = trm.f;
@@ -2153,6 +2455,11 @@ namespace dlib
                 double advance = 0;
                 for (const glyph& g : glyphs)
                 {
+                    if (recording)
+                    {
+                        run.offsets.push_back(span.text.size());
+                        run.advances.push_back(advance);
+                    }
                     span.text += g.known ? g.text : std::string("\xEF\xBF\xBD");
                     const double tx = (g.width * s.size + s.tc + ((g.bytes == 1 && g.code == 32) ? s.tw : 0)) * s.th;
                     advance += tx;
@@ -2161,10 +2468,20 @@ namespace dlib
                 span.width = advance * std::sqrt(tc.a * tc.a + tc.b * tc.b);
                 if (!span.text.empty() && std::isfinite(span.x) && std::isfinite(span.y) &&
                     page_.spans.size() < 5000000)
+                {
                     page_.spans.push_back(span);
+                    if (recording)
+                    {
+                        run.offsets.push_back(span.text.size());
+                        run.advances.push_back(advance);
+                        run.span = page_.spans.size() - 1;
+                        rec_->operations[current_op_].runs.push_back(std::move(run));
+                    }
+                }
             }
 
-            void do_xobject(const object* resources, const std::string& name, const pdf_matrix& ctm, int depth)
+            void do_xobject(const object* resources, const std::string& name, const pdf_matrix& ctm, int depth,
+                            std::size_t at)
             {
                 if (!resources) return;
                 const object* xobjects = doc_.resolve_key(*resources, "XObject");
@@ -2174,11 +2491,17 @@ namespace dlib
                 const object& x = doc_.resolve(*entry);
                 if (!x.is(object::stream_k)) return;
                 const object* subtype = x.get("Subtype");
-                if (subtype && subtype->str == "Image") { ++page_.images; return; }
+                if (subtype && subtype->str == "Image")
+                {
+                    ++page_.images;
+                    if (rec_ && entry->is(object::ref_k))
+                        rec_->images.push_back(image_draw{ stream_, at, rec_->page, ctm, entry->ref });
+                    return;
+                }
                 if (!subtype || subtype->str != "Form") return;
                 if (active_forms_.count(&x) || active_forms_.size() > 64) return;
                 active_forms_.insert(&x);
-                run_form(x, resources, ctm, depth);
+                run_form(x, resources, ctm, depth, entry->is(object::ref_k) ? entry->ref : 0);
                 active_forms_.erase(&x);
             }
 
@@ -2214,6 +2537,9 @@ namespace dlib
             std::set<const object*> active_forms_;
             std::size_t missing_font_runs_ = 0;
             std::size_t truncated_strings_ = 0;
+            text_recording* rec_ = nullptr;
+            long long stream_ = 0;
+            std::size_t current_op_ = std::string::npos;
         };
 
         /* Annotation appearances drawn as page text: the form XObject's bounding box,
@@ -2247,9 +2573,13 @@ namespace dlib
 
                 const object* ap = doc.resolve_key(ad, "AP");
                 const object* n = ap ? doc.resolve_key(*ap, "N") : nullptr;
+                int appearance = 0;
+                if (ap && ap->get("N") && ap->get("N")->is(object::ref_k)) appearance = ap->get("N")->ref;
                 if (n && n->is(object::dict_k))
                 {
                     const object* as = doc.resolve_key(ad, "AS");
+                    const object* state = (as && as->is(object::name_k)) ? n->get(as->str) : nullptr;
+                    appearance = state && state->is(object::ref_k) ? state->ref : 0;
                     n = (as && as->is(object::name_k)) ? doc.resolve_key(*n, as->str) : nullptr;
                 }
                 if (n && n->is(object::stream_k))
@@ -2271,7 +2601,10 @@ namespace dlib
                     const double sx = bx1 - bx0 > 1e-6 ? (r[2] - r[0]) / (bx1 - bx0) : 1;
                     const double sy = by1 - by0 > 1e-6 ? (r[3] - r[1]) / (by1 - by0) : 1;
                     const pdf_matrix to_rect(sx, 0, 0, sy, r[0] - sx * bx0, r[1] - sy * by0);
-                    it.run_form(*n, default_resources, to_rect, 0);
+                    it.run_form(*n, default_resources, to_rect, 0, appearance);
+                    if (text_recording* rec = it.recording())
+                        if (appearance > 0)
+                            rec->annotations.push_back(drawn_annotation{ rec->page, appearance, to_rect });
                     continue;
                 }
                 // A text field without appearance: its value, on one line inside the rectangle.
@@ -2358,128 +2691,169 @@ namespace dlib
 
 // ----------------------------------------------------------------------------------------
 
+    namespace pdf_impl
+    {
+        // A page of the page tree, with the attributes it inherits.
+        struct page_leaf
+        {
+            const object* dict = nullptr;
+            const object* resources = nullptr;
+            const object* mediabox = nullptr;
+            const object* cropbox = nullptr;
+            int rotate = 0;
+        };
+
+        inline std::vector<page_leaf> collect_pages(document& doc, const object& pages)
+        {
+            std::set<const object*> visited;
+            std::vector<std::pair<const object*, page_leaf>> stack;
+            stack.push_back(std::make_pair(&pages, page_leaf()));
+            std::vector<page_leaf> leaves;
+            while (!stack.empty())
+            {
+                const auto node = stack.back();
+                stack.pop_back();
+                page_leaf inh = node.second;
+                const object& n = *node.first;
+                if (const object* r = doc.resolve_key(n, "Resources")) if (r->is(object::dict_k)) inh.resources = r;
+                if (const object* m = doc.resolve_key(n, "MediaBox")) if (m->is(object::array_k)) inh.mediabox = m;
+                if (const object* c = doc.resolve_key(n, "CropBox")) if (c->is(object::array_k)) inh.cropbox = c;
+                if (const object* rot = doc.resolve_key(n, "Rotate"))
+                    if (rot->is(object::num_k)) inh.rotate = to_int(rot->num);
+                const object* kids = doc.resolve_key(n, "Kids");
+                const object* type = doc.resolve_key(n, "Type");
+                if (kids && kids->is(object::array_k) && !(type && type->is(object::name_k) && type->str == "Page"))
+                {
+                    for (std::size_t k = kids->arr.size(); k-- > 0;)
+                    {
+                        const object& kr = doc.resolve(kids->arr[k]);
+                        if (!kr.is(object::dict_k) || visited.count(&kr) || visited.size() > 200000) continue;
+                        visited.insert(&kr);
+                        stack.push_back(std::make_pair(&kr, inh));
+                    }
+                }
+                else
+                {
+                    inh.dict = &n;
+                    leaves.push_back(inh);
+                }
+            }
+            return leaves;
+        }
+
+        // The contents of a page, its streams joined by line feeds.
+        inline std::string page_content(document& doc, const object& page)
+        {
+            std::string content;
+            if (const object* c = doc.resolve_key(page, "Contents"))
+            {
+                if (c->is(object::stream_k)) content = doc.stream_data(*c);
+                else if (c->is(object::array_k))
+                    for (const object& part : c->arr)
+                    {
+                        content += doc.stream_data(doc.resolve(part));
+                        content += "\n";
+                    }
+            }
+            return content;
+        }
+
+        /* The text of every page; rec, when not null, records the text operators of the
+           streams, and leaves the pages read. */
+        inline pdf_text_document read_document(document& doc, text_recording* rec, std::vector<page_leaf>* leaves_out)
+        {
+            pdf_text_document out;
+            const object* root = doc.resolve_key(doc.trailer, "Root");
+            if (!root || !root->is(object::dict_k))
+                throw pdf_error("PDF: missing document catalog");
+            if (const object* mark = root->get("DlibPrivacy"))
+                out.produced_by_dlib = mark->is(object::bool_k) && mark->b;
+            if (const object* mark = root->get("DlibPrivacyLayout"))
+                out.rewritten_by_dlib = mark->is(object::bool_k) && mark->b;
+            list_features(doc, *root, out);
+            const object* pages = doc.resolve_key(*root, "Pages");
+            if (!pages || !pages->is(object::dict_k)) throw pdf_error("PDF: missing page tree");
+            const object* default_resources = nullptr;
+            if (const object* af = doc.resolve_key(*root, "AcroForm"))
+                if (af->is(object::dict_k)) default_resources = doc.resolve_key(*af, "DR");
+
+            const std::vector<page_leaf> leaves = collect_pages(doc, *pages);
+            font_cache fonts;
+            std::size_t damaged = doc.damaged_streams();
+            if (damaged > 0)
+                out.notes.push_back(std::to_string(damaged) + " damaged stream(s) read up to the damage");
+            for (const page_leaf& leaf : leaves)
+            {
+                pdf_page_text page;
+                if (leaf.mediabox && leaf.mediabox->arr.size() >= 4)
+                {
+                    double v[4];
+                    for (int k = 0; k < 4; ++k) v[k] = doc.resolve(leaf.mediabox->arr[static_cast<std::size_t>(k)]).num;
+                    page.x0 = std::min(v[0], v[2]);
+                    page.y0 = std::min(v[1], v[3]);
+                    page.x1 = std::max(v[0], v[2]);
+                    page.y1 = std::max(v[1], v[3]);
+                    if (page.x1 - page.x0 < 1 || page.y1 - page.y0 < 1)
+                    {
+                        page.x0 = 0;
+                        page.y0 = 0;
+                        page.x1 = 612;
+                        page.y1 = 792;
+                    }
+                }
+                page.rotate = ((leaf.rotate % 360) + 360) % 360;
+                page.rotate -= page.rotate % 90;
+                const std::size_t number = out.pages.size() + 1;
+                try
+                {
+                    const std::string content = page_content(doc, *leaf.dict);
+                    interpreter it(doc, fonts, page, out.undecodable_glyphs);
+                    if (rec)
+                    {
+                        rec->page = number - 1;
+                        it.record(rec, -static_cast<long long>(number));
+                    }
+                    it.run(content, leaf.resources, pdf_matrix(), 0);
+                    read_annotations(doc, it, *leaf.dict, page, default_resources);
+                    if (it.missing_font_runs() > 0)
+                        out.notes.push_back("page " + std::to_string(number) + ": " +
+                                            std::to_string(it.missing_font_runs()) +
+                                            " text run(s) use a font missing from the resources");
+                    if (it.truncated_strings() > 0)
+                        out.notes.push_back("page " + std::to_string(number) + ": " +
+                                            std::to_string(it.truncated_strings()) +
+                                            " shown string(s) longer than 1 MiB read in part");
+                }
+                catch (pdf_error& e)
+                {
+                    // A file whose streams decode to more than the budget is refused as a whole.
+                    if (doc.over_budget()) throw;
+                    out.notes.push_back("page " + std::to_string(number) + ": " + e.info);
+                }
+                catch (std::exception& e)
+                {
+                    out.notes.push_back("page " + std::to_string(number) + ": " + e.what());
+                }
+                if (doc.damaged_streams() > damaged)
+                {
+                    out.notes.push_back("page " + std::to_string(number) + ": " +
+                                        std::to_string(doc.damaged_streams() - damaged) +
+                                        " damaged stream(s) read up to the damage");
+                    damaged = doc.damaged_streams();
+                }
+                if (doc.resolve_key(*leaf.dict, "Thumb"))
+                    out.features.push_back("page " + std::to_string(number) + " thumbnail");
+                out.pages.push_back(page);
+            }
+            if (leaves_out) *leaves_out = leaves;
+            return out;
+        }
+    }
+
     inline pdf_text_document read_pdf_text(const std::string& bytes)
     {
-        using namespace pdf_impl;
-        document doc(bytes);
-        pdf_text_document out;
-        const object* root = doc.resolve_key(doc.trailer, "Root");
-        if (!root || !root->is(object::dict_k))
-            throw pdf_error("PDF: missing document catalog");
-        if (const object* mark = root->get("DlibPrivacy"))
-            out.produced_by_dlib = mark->is(object::bool_k) && mark->b;
-        list_features(doc, *root, out);
-        const object* pages = doc.resolve_key(*root, "Pages");
-        if (!pages || !pages->is(object::dict_k)) throw pdf_error("PDF: missing page tree");
-        const object* default_resources = nullptr;
-        if (const object* af = doc.resolve_key(*root, "AcroForm"))
-            if (af->is(object::dict_k)) default_resources = doc.resolve_key(*af, "DR");
-
-        struct inherited { const object* resources = nullptr; const object* mediabox = nullptr; int rotate = 0; };
-        std::set<const object*> visited;
-        std::vector<std::pair<const object*, inherited>> stack;
-        stack.push_back(std::make_pair(pages, inherited()));
-        std::vector<std::pair<const object*, inherited>> leaves;
-        while (!stack.empty())
-        {
-            const auto node = stack.back();
-            stack.pop_back();
-            inherited inh = node.second;
-            const object& n = *node.first;
-            if (const object* r = doc.resolve_key(n, "Resources")) if (r->is(object::dict_k)) inh.resources = r;
-            if (const object* m = doc.resolve_key(n, "MediaBox")) if (m->is(object::array_k)) inh.mediabox = m;
-            if (const object* rot = doc.resolve_key(n, "Rotate"))
-                if (rot->is(object::num_k)) inh.rotate = to_int(rot->num);
-            const object* kids = doc.resolve_key(n, "Kids");
-            const object* type = doc.resolve_key(n, "Type");
-            if (kids && kids->is(object::array_k) && !(type && type->is(object::name_k) && type->str == "Page"))
-            {
-                for (std::size_t k = kids->arr.size(); k-- > 0;)
-                {
-                    const object& kr = doc.resolve(kids->arr[k]);
-                    if (!kr.is(object::dict_k) || visited.count(&kr) || visited.size() > 200000) continue;
-                    visited.insert(&kr);
-                    stack.push_back(std::make_pair(&kr, inh));
-                }
-            }
-            else
-            {
-                leaves.push_back(std::make_pair(&n, inh));
-            }
-        }
-
-        font_cache fonts;
-        std::size_t damaged = doc.damaged_streams();
-        if (damaged > 0)
-            out.notes.push_back(std::to_string(damaged) + " damaged stream(s) read up to the damage");
-        for (const auto& leaf : leaves)
-        {
-            pdf_page_text page;
-            const inherited& inh = leaf.second;
-            if (inh.mediabox && inh.mediabox->arr.size() >= 4)
-            {
-                double v[4];
-                for (int k = 0; k < 4; ++k) v[k] = doc.resolve(inh.mediabox->arr[static_cast<std::size_t>(k)]).num;
-                page.x0 = std::min(v[0], v[2]);
-                page.y0 = std::min(v[1], v[3]);
-                page.x1 = std::max(v[0], v[2]);
-                page.y1 = std::max(v[1], v[3]);
-                if (page.x1 - page.x0 < 1 || page.y1 - page.y0 < 1)
-                {
-                    page.x0 = 0;
-                    page.y0 = 0;
-                    page.x1 = 612;
-                    page.y1 = 792;
-                }
-            }
-            page.rotate = ((inh.rotate % 360) + 360) % 360;
-            page.rotate -= page.rotate % 90;
-            const std::size_t number = out.pages.size() + 1;
-            try
-            {
-                std::string content;
-                if (const object* c = doc.resolve_key(*leaf.first, "Contents"))
-                {
-                    if (c->is(object::stream_k)) content = doc.stream_data(*c);
-                    else if (c->is(object::array_k))
-                        for (const object& part : c->arr)
-                        {
-                            content += doc.stream_data(doc.resolve(part));
-                            content += "\n";
-                        }
-                }
-                interpreter it(doc, fonts, page, out.undecodable_glyphs);
-                it.run(content, inh.resources, pdf_matrix(), 0);
-                read_annotations(doc, it, *leaf.first, page, default_resources);
-                if (it.missing_font_runs() > 0)
-                    out.notes.push_back("page " + std::to_string(number) + ": " + std::to_string(it.missing_font_runs()) +
-                                        " text run(s) use a font missing from the resources");
-                if (it.truncated_strings() > 0)
-                    out.notes.push_back("page " + std::to_string(number) + ": " + std::to_string(it.truncated_strings()) +
-                                        " shown string(s) longer than 1 MiB read in part");
-            }
-            catch (pdf_error& e)
-            {
-                // A file whose streams decode to more than the budget is refused as a whole.
-                if (doc.over_budget()) throw;
-                out.notes.push_back("page " + std::to_string(number) + ": " + e.info);
-            }
-            catch (std::exception& e)
-            {
-                out.notes.push_back("page " + std::to_string(number) + ": " + e.what());
-            }
-            if (doc.damaged_streams() > damaged)
-            {
-                out.notes.push_back("page " + std::to_string(number) + ": " +
-                                    std::to_string(doc.damaged_streams() - damaged) +
-                                    " damaged stream(s) read up to the damage");
-                damaged = doc.damaged_streams();
-            }
-            if (doc.resolve_key(*leaf.first, "Thumb"))
-                out.features.push_back("page " + std::to_string(number) + " thumbnail");
-            out.pages.push_back(page);
-        }
-        return out;
+        pdf_impl::document doc(bytes);
+        return pdf_impl::read_document(doc, nullptr, nullptr);
     }
 
 // ----------------------------------------------------------------------------------------
@@ -2492,8 +2866,18 @@ namespace dlib
             double u, v;
         };
 
+        /* Where the text of the segments of a page comes from: for each segment, its spans with
+           the offset of their text in the segment text, and the spans drawn again over another
+           one (fake bold, shadows), which the segments leave out. */
+        struct page_layout_source
+        {
+            std::vector<std::vector<std::pair<std::size_t, std::size_t>>> segments;
+            std::vector<std::pair<std::size_t, std::size_t>> duplicates;    // (span left out, span kept)
+        };
+
         // Joins the spans of one baseline into segments, splitting at wide gaps.
-        inline void join_line(std::vector<layout_item>& line, std::size_t line_id, std::vector<pdf_text_segment>& segs)
+        inline void join_line(std::vector<layout_item>& line, std::size_t line_id, std::vector<pdf_text_segment>& segs,
+                              const pdf_text_span* first_span = nullptr, page_layout_source* source = nullptr)
         {
             std::stable_sort(line.begin(), line.end(),
                              [](const layout_item& a, const layout_item& b) { return a.u < b.u; });
@@ -2509,13 +2893,21 @@ namespace dlib
                 const double dup_tol = std::min(0.3 * fs, 0.3 * std::max(s.width, 0.1));
                 if (last && last->s->text == s.text && std::abs(last->u - it.u) < dup_tol &&
                     std::abs(last->v - it.v) < dup_tol)
+                {
+                    if (source)
+                        source->duplicates.push_back(std::make_pair(static_cast<std::size_t>(it.s - first_span),
+                                                                    static_cast<std::size_t>(last->s - first_span)));
                     continue;
+                }
                 last = &it;
                 const double gap = it.u - end_u;
                 if (open && gap < 2.0 * fs && gap > -0.6 * fs)
                 {
                     const bool spaced = (!cur.text.empty() && cur.text.back() == ' ') || s.text[0] == ' ';
                     if (gap > 0.1 * fs && !spaced) cur.text += ' ';
+                    if (source)
+                        source->segments.back().push_back(
+                            std::make_pair(static_cast<std::size_t>(it.s - first_span), cur.text.size()));
                     cur.text += s.text;
                     end_u = std::max(end_u, it.u + s.width);
                     cur.width = end_u - u0;
@@ -2523,6 +2915,9 @@ namespace dlib
                     continue;
                 }
                 if (open) segs.push_back(cur);
+                if (source)
+                    source->segments.push_back(std::vector<std::pair<std::size_t, std::size_t>>(
+                        1, std::make_pair(static_cast<std::size_t>(it.s - first_span), std::size_t(0))));
                 cur = pdf_text_segment();
                 cur.text = s.text;
                 cur.x = s.x;
@@ -2539,123 +2934,129 @@ namespace dlib
         }
     }
 
-    inline std::vector<std::vector<pdf_text_segment>> layout_pdf_text(const pdf_text_document& doc)
+    namespace pdf_impl
     {
-        using namespace pdf_impl;
-        std::vector<std::vector<pdf_text_segment>> pages;
-        for (const pdf_page_text& page : doc.pages)
+        // layout_pdf_text(), with where the text of each segment comes from when sources is not null.
+        inline std::vector<std::vector<pdf_text_segment>> layout_pages(const pdf_text_document& doc,
+                                                                      std::vector<page_layout_source>* sources)
         {
-            std::vector<pdf_text_segment> segs;
-            if (doc.produced_by_dlib)
+            std::vector<std::vector<pdf_text_segment>> pages;
+            if (sources) sources->assign(doc.pages.size(), page_layout_source());
+            for (const pdf_page_text& page : doc.pages)
             {
-                // The runs written for one segment follow each other on the same baseline.
+                std::vector<pdf_text_segment> segs;
+                page_layout_source* source = sources ? &(*sources)[pages.size()] : nullptr;
+                const pdf_text_span* first_span = page.spans.empty() ? nullptr : &page.spans[0];
+                if (doc.produced_by_dlib)
+                {
+                    // The runs written for one segment follow each other on the same baseline.
+                    for (const pdf_text_span& s : page.spans)
+                    {
+                        if (!segs.empty())
+                        {
+                            pdf_text_segment& g = segs.back();
+                            const double rad = g.angle * pi / 180.0;
+                            const double ex = g.x + g.width * std::cos(rad), ey = g.y + g.width * std::sin(rad);
+                            const double tol = 0.05 + 0.01 * g.font_size;
+                            if (std::abs(s.angle - g.angle) < 0.01 && std::abs(s.font_size - g.font_size) < 0.01 &&
+                                std::abs(s.x - ex) < tol && std::abs(s.y - ey) < tol)
+                            {
+                                if (source)
+                                    source->segments.back().push_back(
+                                        std::make_pair(static_cast<std::size_t>(&s - first_span), g.text.size()));
+                                g.text += s.text;
+                                g.width += s.width;
+                                continue;
+                            }
+                        }
+                        if (source)
+                            source->segments.push_back(std::vector<std::pair<std::size_t, std::size_t>>(
+                                1, std::make_pair(static_cast<std::size_t>(&s - first_span), std::size_t(0))));
+                        pdf_text_segment g;
+                        g.text = s.text;
+                        g.x = s.x;
+                        g.y = s.y;
+                        g.width = s.width;
+                        g.font_size = s.font_size;
+                        g.angle = s.angle;
+                        segs.push_back(g);
+                    }
+                    // Segments written for one line share its baseline.
+                    std::size_t line = 0;
+                    for (std::size_t i = 0; i < segs.size(); ++i)
+                    {
+                        if (i > 0)
+                        {
+                            const pdf_text_segment& p = segs[i - 1];
+                            const double rad = p.angle * pi / 180.0;
+                            const double dv = -(segs[i].x - p.x) * std::sin(rad) + (segs[i].y - p.y) * std::cos(rad);
+                            const double du = (segs[i].x - p.x) * std::cos(rad) + (segs[i].y - p.y) * std::sin(rad);
+                            if (!(std::abs(segs[i].angle - p.angle) < 0.01 &&
+                                  std::abs(dv) <= 0.35 * std::max(1.0, p.font_size) && du > 0))
+                                ++line;
+                        }
+                        segs[i].line = line;
+                    }
+                    pages.push_back(segs);
+                    continue;
+                }
+
+                // Spans grouped by baseline direction, to the degree; upright text first.
+                std::map<int, std::vector<const pdf_text_span*>> groups;
                 for (const pdf_text_span& s : page.spans)
                 {
-                    if (!segs.empty())
+                    if (s.text.empty()) continue;
+                    int key = static_cast<int>(std::lround(s.angle));
+                    key = ((key % 360) + 540) % 360 - 180;
+                    groups[key].push_back(&s);
+                }
+                std::vector<int> keys;
+                if (groups.count(0)) keys.push_back(0);
+                for (const auto& g : groups) if (g.first != 0) keys.push_back(g.first);
+
+                std::size_t line_id = 0;
+                for (int key : keys)
+                {
+                    const double rad = key * pi / 180.0;
+                    const double c = std::cos(rad), sn = std::sin(rad);
+                    std::vector<layout_item> items;
+                    for (const pdf_text_span* s : groups[key])
+                        items.push_back(layout_item{ s, s->x * c + s->y * sn, -s->x * sn + s->y * c });
+                    std::stable_sort(items.begin(), items.end(),
+                                     [](const layout_item& a, const layout_item& b) { return a.v > b.v; });
+                    std::vector<layout_item> line;
+                    double line_v = 0, line_fs = 0;
+                    for (const layout_item& it : items)
                     {
-                        pdf_text_segment& g = segs.back();
-                        const double rad = g.angle * pi / 180.0;
-                        const double ex = g.x + g.width * std::cos(rad), ey = g.y + g.width * std::sin(rad);
-                        const double tol = 0.05 + 0.01 * g.font_size;
-                        if (std::abs(s.angle - g.angle) < 0.01 && std::abs(s.font_size - g.font_size) < 0.01 &&
-                            std::abs(s.x - ex) < tol && std::abs(s.y - ey) < tol)
+                        const double fs = std::max(it.s->font_size, 1.0);
+                        if (!line.empty() && std::abs(line_v - it.v) <= std::max(1.0, 0.5 * std::max(fs, line_fs)))
                         {
-                            g.text += s.text;
-                            g.width += s.width;
+                            line.push_back(it);
+                            line_fs = std::max(line_fs, fs);
                             continue;
                         }
+                        if (!line.empty()) join_line(line, line_id++, segs, first_span, source);
+                        line.assign(1, it);
+                        line_v = it.v;
+                        line_fs = fs;
                     }
-                    pdf_text_segment g;
-                    g.text = s.text;
-                    g.x = s.x;
-                    g.y = s.y;
-                    g.width = s.width;
-                    g.font_size = s.font_size;
-                    g.angle = s.angle;
-                    segs.push_back(g);
-                }
-                // Segments written for one line share its baseline.
-                std::size_t line = 0;
-                for (std::size_t i = 0; i < segs.size(); ++i)
-                {
-                    if (i > 0)
-                    {
-                        const pdf_text_segment& p = segs[i - 1];
-                        const double rad = p.angle * pi / 180.0;
-                        const double dv = -(segs[i].x - p.x) * std::sin(rad) + (segs[i].y - p.y) * std::cos(rad);
-                        const double du = (segs[i].x - p.x) * std::cos(rad) + (segs[i].y - p.y) * std::sin(rad);
-                        if (!(std::abs(segs[i].angle - p.angle) < 0.01 &&
-                              std::abs(dv) <= 0.35 * std::max(1.0, p.font_size) && du > 0))
-                            ++line;
-                    }
-                    segs[i].line = line;
+                    if (!line.empty()) join_line(line, line_id++, segs, first_span, source);
                 }
                 pages.push_back(segs);
-                continue;
             }
-
-            // Spans grouped by baseline direction, to the degree; upright text first.
-            std::map<int, std::vector<const pdf_text_span*>> groups;
-            for (const pdf_text_span& s : page.spans)
-            {
-                if (s.text.empty()) continue;
-                int key = static_cast<int>(std::lround(s.angle));
-                key = ((key % 360) + 540) % 360 - 180;
-                groups[key].push_back(&s);
-            }
-            std::vector<int> keys;
-            if (groups.count(0)) keys.push_back(0);
-            for (const auto& g : groups) if (g.first != 0) keys.push_back(g.first);
-
-            std::size_t line_id = 0;
-            for (int key : keys)
-            {
-                const double rad = key * pi / 180.0;
-                const double c = std::cos(rad), sn = std::sin(rad);
-                std::vector<layout_item> items;
-                for (const pdf_text_span* s : groups[key])
-                    items.push_back(layout_item{ s, s->x * c + s->y * sn, -s->x * sn + s->y * c });
-                std::stable_sort(items.begin(), items.end(),
-                                 [](const layout_item& a, const layout_item& b) { return a.v > b.v; });
-                std::vector<layout_item> line;
-                double line_v = 0, line_fs = 0;
-                for (const layout_item& it : items)
-                {
-                    const double fs = std::max(it.s->font_size, 1.0);
-                    if (!line.empty() && std::abs(line_v - it.v) <= std::max(1.0, 0.5 * std::max(fs, line_fs)))
-                    {
-                        line.push_back(it);
-                        line_fs = std::max(line_fs, fs);
-                        continue;
-                    }
-                    if (!line.empty()) join_line(line, line_id++, segs);
-                    line.assign(1, it);
-                    line_v = it.v;
-                    line_fs = fs;
-                }
-                if (!line.empty()) join_line(line, line_id++, segs);
-            }
-            pages.push_back(segs);
+            return pages;
         }
-        return pages;
+    }
+
+    inline std::vector<std::vector<pdf_text_segment>> layout_pdf_text(const pdf_text_document& doc)
+    {
+        return pdf_impl::layout_pages(doc, nullptr);
     }
 
 // ----------------------------------------------------------------------------------------
 
     namespace pdf_impl
     {
-        inline int unicode_to_winansi(std::uint32_t cp)
-        {
-            if ((cp >= 0x20 && cp < 0x7F) || (cp >= 0xA0 && cp <= 0xFF)) return static_cast<int>(cp);
-            static const std::uint16_t high[32] = { 0x20AC, 0,      0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021,
-                                                    0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0,      0x017D, 0,
-                                                    0,      0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
-                                                    0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0,      0x017E, 0x0178 };
-            for (int i = 0; i < 32; ++i)
-                if (high[i] != 0 && high[i] == cp) return 0x80 + i;
-            return -1;
-        }
-
         /* ASCII stand-ins for frequent characters outside the fonts' repertoire. An empty
            string drops the character (zero width marks). */
         inline const char* writer_substitute(std::uint32_t cp)

@@ -4,6 +4,7 @@
 #ifdef DLIB_OOXML_ANONYMIZER_ABSTRACT_H_
 
 #include <string>
+#include "../documents/document_image_abstract.h"
 #include "pii_detector_abstract.h"
 #include "pseudonymizer_abstract.h"
 #include "document_report_abstract.h"
@@ -60,7 +61,10 @@ namespace dlib
                                 company, manager, title, subject, keywords and description,
                                 the values of custom properties, hyperlink lists of the
                                 extended properties, external hyperlink targets
-                                (percent-encoded tags) and local file paths.
+                                (percent-encoded tags) and local file paths. The lists of
+                                parts of the extended properties (titles of slides, names
+                                of sheets, fonts and themes, which Office writes again
+                                when it saves) are removed.
                     Dates     - dates held in typed fields (date-typed spreadsheet cells,
                                 document and revision timestamps), which cannot carry a
                                 tag, are shifted in place unless dates are kept; a custom
@@ -74,6 +78,11 @@ namespace dlib
                                 no fill; a picture still referenced from a place that
                                 cannot lose it is replaced by a blank 1x1 image of the same
                                 format.
+
+            REPORT
+                The report counts the values replaced in the parts written: those of a
+                part removed with what referred to it, such as the data of a chart, are
+                not counted.
 
             RESTORATION
                 restore() replaces the verified tags found in the same places, gives
@@ -94,6 +103,22 @@ namespace dlib
                 - p, report and, when it is not null, *detector outlive this object.
             ensures
                 - restore() does not use the detector, which may be null for it.
+        !*/
+
+        void set_image_describer(
+            const document_image_describer& describer
+        );
+        /*!
+            ensures
+                - anonymize() then gives describer each image part shown by a picture of
+                  a Word document (w:drawing, w:pict, or their mc:AlternateContent, in a
+                  run) or of a slide (p:pic, or its mc:AlternateContent), once, and puts
+                  the text it returns in the place of the picture: a run text in a Word
+                  document, a gray text box at the position of the picture on a slide.
+                  The text is written as it is returned. A picture for which describer
+                  returns an empty string, and the pictures of workbooks, are removed as
+                  before. An empty function, the default, removes every picture.
+                - restore() never uses it.
         !*/
 
         std::string anonymize(const std::string& package_bytes);

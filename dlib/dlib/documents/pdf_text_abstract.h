@@ -51,7 +51,8 @@ namespace dlib
     {
         std::vector<pdf_page_text> pages;
         std::size_t undecodable_glyphs = 0;
-        bool produced_by_dlib = false;
+        bool produced_by_dlib = false;      // written by write_pdf_text()
+        bool rewritten_by_dlib = false;     // written by rewrite_pdf_text()
         std::vector<std::string> notes;     // reading problems met, by page
         std::vector<std::string> features;  // non-text content present in the file
         /*!

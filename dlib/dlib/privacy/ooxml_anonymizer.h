@@ -6,7 +6,9 @@
 #include "ooxml_anonymizer_abstract.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <map>
 #include <set>
 #include <string>
@@ -15,6 +17,7 @@
 #include "../zip/deflate.h"
 #include "../documents/xml_scanner.h"
 #include "../documents/ooxml_package.h"
+#include "../documents/document_image.h"
 #include "pii_detector.h"
 #include "pseudonymizer.h"
 #include "document_report.h"
@@ -305,6 +308,8 @@ namespace dlib
             document_report& report
         ) : p_(p), detector_(detector), report_(report) {}
 
+        void set_image_describer(const document_image_describer& describer) { describer_ = describer; }
+
         std::string anonymize(const std::string& package_bytes)
         {
             if (!detector_)
@@ -385,12 +390,15 @@ namespace dlib
             std::map<int, pii_type> column_types;
             int header_row = -1;
             std::set<std::string> removed_ids;  // shape identifiers of removed slide elements
+            std::map<std::string, std::size_t> counted;  // values replaced in the part, by type keyword
         };
 
     // ------------------------------------------------------------------------------------
 
         void run(ooxml_package& pkg)
         {
+            pkg_ = &pkg;
+            described_.clear();
             report_.format = pkg.kind() == ooxml_kind::wordprocessing ? "docx" :
                              pkg.kind() == ooxml_kind::spreadsheet ? "xlsx" :
                              pkg.kind() == ooxml_kind::presentation ? "pptx" : "ooxml";
@@ -441,6 +449,7 @@ namespace dlib
 
             for (part_state& st : parts)
             {
+                const std::map<std::string, std::size_t> before = report_.entities;
                 for (unit& u : st.units)
                     transform_unit(st, u);
                 transform_special_nodes(st);
@@ -448,13 +457,31 @@ namespace dlib
                 if (st.role == "sheet")
                     transform_cells(st);
                 pkg.set_part(st.name, st.edits.apply(st.xml));
+                for (const auto& e : report_.entities)
+                {
+                    const auto b = before.find(e.first);
+                    const std::size_t n = b == before.end() ? e.second : e.second - b->second;
+                    if (n) st.counted[e.first] = n;
+                }
             }
 
             process_relationships(pkg);
             if (!restoring_)
             {
+                // The values of a part that nothing references any more go with it: a chart, its data.
                 for (const std::string& r : pkg.collect_garbage())
+                {
                     report_.removed.push_back(r);
+                    for (const part_state& st : parts)
+                        if (st.name == r)
+                            for (const auto& c : st.counted)
+                            {
+                                const auto it = report_.entities.find(c.first);
+                                if (it == report_.entities.end()) continue;
+                                it->second -= std::min(it->second, c.second);
+                                if (it->second == 0) report_.entities.erase(it);
+                            }
+                }
                 for (const std::string& name : pkg.part_names())
                 {
                     if (privacy_impl::is_media_part(name))
@@ -513,6 +540,131 @@ namespace dlib
                         if (xml_local_name(a.name) == "id" && xml_prefix(a.name) == "r") return true;
             }
             return false;
+        }
+
+        // The image part shown by the element between tokens from and to: the target of its first
+        // a:blip (r:embed) or v:imagedata (r:id), when the package holds it.
+        std::string picture_part(const part_state& st, std::size_t from, std::size_t to) const
+        {
+            if (!pkg_) return std::string();
+            for (std::size_t k = from; k <= to && k < st.tokens.size(); ++k)
+            {
+                const xml_token& t = st.tokens[k];
+                if (t.kind != xml_token::start_tag && t.kind != xml_token::empty_tag) continue;
+                const std::string l = xml_local_name(t.name);
+                if (l != "blip" && l != "imagedata") continue;
+                for (const xml_attribute& a : t.attributes)
+                {
+                    const std::string an = xml_local_name(a.name);
+                    if (!(l == "blip" && an == "embed") && !(l == "imagedata" && an == "id" && xml_prefix(a.name) == "r"))
+                        continue;
+                    const std::string id = st.xml.substr(a.value_begin, a.value_end - a.value_begin);
+                    std::vector<ooxml_relationship> rels;
+                    try { rels = pkg_->relationships(st.name); }
+                    catch (xml_error&) { return std::string(); }
+                    for (const ooxml_relationship& r : rels)
+                    {
+                        if (r.id != id || r.external) continue;
+                        const std::string target = pkg_->target_part(st.name, r.target);
+                        if (pkg_->has_part(target)) return target;
+                    }
+                }
+            }
+            return std::string();
+        }
+
+        // The text of the describer for the picture of an element, asked once per image part.
+        std::string described_picture(const part_state& st, std::size_t from, std::size_t to)
+        {
+            const std::string part = picture_part(st, from, to);
+            if (part.empty()) return std::string();
+            const auto it = described_.find(part);
+            if (it != described_.end()) return it->second;
+            document_image img;
+            img.bytes = pkg_->part(part);
+            img.media_type = image_media_type(img.bytes);
+            if (img.media_type.empty()) img.media_type = pkg_->content_type(part);
+            img.location = part;
+            const std::string text = img.media_type.compare(0, 6, "image/") == 0 ? describer_(img) : std::string();
+            return described_[part] = text;
+        }
+
+        // A run text holding text, in the run that holds the element at token i; empty outside a run.
+        static std::string wml_text_run(const part_state& st, std::size_t i, const std::string& text)
+        {
+            for (std::size_t k = i; k-- > 0;)
+            {
+                const xml_token& t = st.tokens[k];
+                const std::string l = xml_local_name(t.name);
+                if (t.kind == xml_token::start_tag && l == "r")
+                {
+                    const std::string q = xml_prefix(t.name).empty() ? std::string() : xml_prefix(t.name) + ":";
+                    return "<" + q + "t xml:space=\"preserve\">" + xml_escape_text(text) + "</" + q + "t>";
+                }
+                if ((t.kind == xml_token::end_tag && l == "r") || (t.kind == xml_token::start_tag && l == "p"))
+                    return std::string();
+            }
+            return std::string();
+        }
+
+        /* A text box holding text in the place of a picture of a slide, between tokens from and to:
+           at the position of the picture, gray, its text centered at the largest size from 14 points
+           down to 6 at which it fits. */
+        static std::string pml_text_box(const part_state& st, std::size_t from, std::size_t to,
+                                        const std::vector<std::size_t>& match, const std::string& text)
+        {
+            std::string p, a, id, name, xfrm;
+            double cx = 0, cy = 0;
+            for (std::size_t k = from; k <= to && k < st.tokens.size(); ++k)
+            {
+                const xml_token& t = st.tokens[k];
+                if (t.kind != xml_token::start_tag && t.kind != xml_token::empty_tag) continue;
+                const std::string l = xml_local_name(t.name);
+                auto attribute = [&](const char* n) {
+                    for (const xml_attribute& at : t.attributes)
+                        if (at.name == n) return st.xml.substr(at.value_begin, at.value_end - at.value_begin);
+                    return std::string();
+                };
+                if (l == "pic" && p.empty()) p = xml_prefix(t.name);
+                else if (l == "cNvPr" && id.empty())
+                {
+                    id = attribute("id");
+                    name = attribute("name");
+                }
+                else if (l == "xfrm" && xfrm.empty() && match[k] != std::string::npos)
+                {
+                    a = xml_prefix(t.name);
+                    xfrm = st.xml.substr(t.begin, st.tokens[match[k]].end - t.begin);
+                }
+                else if (l == "ext" && cx == 0 && !xfrm.empty())
+                {
+                    cx = std::atof(attribute("cx").c_str());
+                    cy = std::atof(attribute("cy").c_str());
+                }
+            }
+            if (xfrm.empty() || id.empty()) return std::string();
+            const std::string pp = p.empty() ? std::string() : p + ":";
+            const std::string ap = a.empty() ? std::string() : a + ":";
+            // The size: lines of characters half as wide as high, 1.2 times their height apart.
+            const double w = cx / 12700 - 7.2, h = cy / 12700 - 7.2;
+            std::size_t chars = 0;
+            for (unsigned char c : text) if ((c & 0xC0) != 0x80) ++chars;
+            int size = 14;
+            for (; size > 6; --size)
+            {
+                const double per_line = std::max(1.0, w / (size * 0.5));
+                const double lines = std::ceil(static_cast<double>(chars) / per_line);
+                if (lines * size * 1.2 <= h) break;
+            }
+            return "<" + pp + "sp><" + pp + "nvSpPr><" + pp + "cNvPr id=\"" + id + "\" name=\"" + name + "\"/><" + pp +
+                   "cNvSpPr txBox=\"1\"/><" + pp + "nvPr/></" + pp + "nvSpPr><" + pp + "spPr>" + xfrm + "<" + ap +
+                   "prstGeom prst=\"rect\"><" + ap + "avLst/></" + ap + "prstGeom><" + ap + "solidFill><" + ap +
+                   "srgbClr val=\"E6E6E6\"/></" + ap + "solidFill></" + pp + "spPr><" + pp + "txBody><" + ap +
+                   "bodyPr wrap=\"square\" lIns=\"45720\" tIns=\"45720\" rIns=\"45720\" bIns=\"45720\" anchor=\"ctr\"/><" +
+                   ap + "lstStyle/><" + ap + "p><" + ap + "pPr algn=\"ctr\"/><" + ap + "r><" + ap + "rPr lang=\"en-US\" sz=\"" +
+                   std::to_string(size * 100) + "\" dirty=\"0\"><" + ap + "solidFill><" + ap + "srgbClr val=\"404040\"/></" +
+                   ap + "solidFill></" + ap + "rPr><" + ap + "t>" + xml_escape_text(text) + "</" + ap + "t></" + ap + "r></" +
+                   ap + "p></" + pp + "txBody></" + pp + "sp>";
         }
 
         void analyze_part(part_state& st)
@@ -721,6 +873,10 @@ namespace dlib
             // A chart sheet keeps the drawing that holds its chart, which is read as text.
             if (st.role == "chartsheet")
                 return ns::s(e_ns) && (local == "picture" || local == "legacyDrawingHF" || local == "drawingHF");
+            /* The lists of parts of the extended properties: fonts, themes, titles of slides and names
+               of sheets copied from the document, which Office writes again when it saves it. */
+            if (st.role == "app")
+                return ns::extended(e_ns) && (local == "HeadingPairs" || local == "TitlesOfParts");
             return false;
         }
 
@@ -798,6 +954,25 @@ namespace dlib
                         if (end_tok != std::string::npos && st.role != "sheet" && (local == "AlternateContent" ||
                             local == "graphicFrame" || local == "pict" || local == "drawing"))
                             remove = has_image_marker(st, i, end_tok);
+                        // A picture the describer gives a text for: the text takes its place.
+                        std::string in_place;
+                        if (remove && end_tok != std::string::npos && describer_ &&
+                            (local == "drawing" || local == "pict" || local == "pic" || local == "AlternateContent"))
+                        {
+                            const std::string text = described_picture(st, i, end_tok);
+                            if (!text.empty())
+                                in_place = st.role == "wml" ? wml_text_run(st, i, text) :
+                                           st.role == "pml" ? pml_text_box(st, i, end_tok, match, text) : std::string();
+                        }
+                        if (remove && end_tok != std::string::npos && !in_place.empty())
+                        {
+                            st.edits.replace(t.begin, st.tokens[end_tok].end, in_place);
+                            st.removed.push_back(std::make_pair(t.begin, st.tokens[end_tok].end));
+                            report_.removed.push_back(st.name + ": " + local + " (replaced by the text of the image describer)");
+                            nst.leave();
+                            i = end_tok;
+                            continue;
+                        }
                         if (remove && end_tok != std::string::npos)
                         {
                             // Shape identifiers, so that animations aimed at them go too.
@@ -2067,6 +2242,9 @@ namespace dlib
         document_report& report_;
         bool restoring_ = false;
         bool shift_dates_ = false;
+        document_image_describer describer_;
+        const ooxml_package* pkg_ = nullptr;
+        std::map<std::string, std::string> described_;     // image part -> text of the describer
         bool dates_marked_ = false;
         long shift_ = 0;
         std::map<std::string, std::string> markers_;

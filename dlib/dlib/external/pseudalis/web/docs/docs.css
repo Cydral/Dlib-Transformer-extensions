@@ -1,0 +1,9 @@
+/* Copyright (C) 2026 Cydral Technology (cydraltechnology@gmail.com)
+   License: Boost Software License   See LICENSE.txt for the full license. */
+body { margin: 0; background: #fff; }
+.pseudalis-head { display: flex; align-items: center; gap: 10px; padding: 10px 20px; background: #0f2a44; color: #fff;
+  font: 600 18px/1.2 "Segoe UI", system-ui, sans-serif; }
+.pseudalis-head img { width: 28px; height: 28px; }
+.pseudalis-head a { margin-left: auto; color: #9fe3dc; font-weight: 400; font-size: 14px; text-decoration: none; }
+.pseudalis-head a:hover { text-decoration: underline; }
+.swagger-ui .topbar { display: none; }

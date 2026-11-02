@@ -1,0 +1,1182 @@
+{
+ "openapi": "3.0.3",
+ "info": {
+  "title": "Pseudalis interface",
+  "version": "1.0.0",
+  "description": "The local interface of Pseudalis, on this computer only (https://localhost:8444 by default). The files travel as they are, in the body of the requests. No account is needed; the operations of administration take the token of the data folder (%ProgramData%\\Pseudalis\\admin.token) in the X-Pseudalis-Admin header, which this page fills in by itself when the icon of Pseudalis opens it (Interface documentation), and which Authorize sets otherwise.",
+  "contact": {
+   "name": "Cydral Technology",
+   "email": "cydraltechnology@gmail.com",
+   "url": "https://github.com/Cydral/Dlib-Transformer-extensions"
+  },
+  "license": {
+   "name": "Boost Software License 1.0",
+   "url": "https://www.boost.org/LICENSE_1_0.txt"
+  }
+ },
+ "servers": [
+  {
+   "url": "/"
+  }
+ ],
+ "tags": [
+  {
+   "name": "Files"
+  },
+  {
+   "name": "Texts"
+  },
+  {
+   "name": "Drive"
+  },
+  {
+   "name": "Service"
+  },
+  {
+   "name": "Updates"
+  },
+  {
+   "name": "Administration"
+  }
+ ],
+ "paths": {
+  "/v1/health": {
+   "get": {
+    "tags": [
+     "Service"
+    ],
+    "summary": "Whether the service answers",
+    "responses": {
+     "200": {
+      "description": "{\"status\": \"ok\", \"version\"}",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/v1/info": {
+   "get": {
+    "tags": [
+     "Service"
+    ],
+    "summary": "The state of the service",
+    "description": "Version, engine (variant, models), fingerprint of the key, drive, Albireo and the number of originals kept.",
+    "responses": {
+     "200": {
+      "description": "The state",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/v1/anonymize": {
+   "post": {
+    "tags": [
+     "Files"
+    ],
+    "summary": "Protect a file",
+    "description": "Protects a document (Word, Excel, PowerPoint, PDF, text, CSV, markup), a picture or an archive (ZIP, TAR, TAR.GZ) sent as the body. Each personal value becomes a tag [[TYPE:body#CCC]] encrypted under the key of this installation. A picture becomes the text file <name>.txt holding \"[Image@<id> : <description>]\", the description written by Albireo when it is installed; the pictures of Word documents, slides and PDF pages are replaced in place the same way. The entries of an archive of another kind are left out. With record (the default), the original is kept, encrypted, so that /v1/restore gives it back from any copy of the protected file.",
+    "parameters": [
+     {
+      "name": "name",
+      "in": "query",
+      "required": false,
+      "description": "The name of the file, whose extension tells its kind when its content does not",
+      "schema": {
+       "type": "string"
+      }
+     },
+     {
+      "name": "record",
+      "in": "query",
+      "required": false,
+      "description": "Keep the original to restore it exactly",
+      "schema": {
+       "type": "boolean",
+       "default": true
+      }
+     },
+     {
+      "name": "source",
+      "in": "query",
+      "required": false,
+      "description": "Who asks: \"web\", \"shell\" or \"api\"",
+      "schema": {
+       "type": "string",
+       "enum": [
+        "api",
+        "web",
+        "shell"
+       ],
+       "default": "api"
+      }
+     },
+     {
+      "name": "format",
+      "in": "query",
+      "required": false,
+      "description": "\"json\" for a JSON answer holding the file in base64",
+      "schema": {
+       "type": "string",
+       "enum": [
+        "binary",
+        "json"
+       ],
+       "default": "binary"
+      }
+     }
+    ],
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/octet-stream": {
+       "schema": {
+        "type": "string",
+        "format": "binary"
+       }
+      },
+      "multipart/form-data": {
+       "schema": {
+        "type": "object",
+        "properties": {
+         "file": {
+          "type": "string",
+          "format": "binary"
+         }
+        },
+        "required": [
+         "file"
+        ]
+       }
+      }
+     },
+     "description": "The file, as the body of the request, or as the first file of a multipart form, whose file name serves when the parameter name is absent."
+    },
+    "responses": {
+     "200": {
+      "description": "The file written, its name in Content-Disposition and X-Pseudalis-Name, its report in X-Pseudalis-Report; with format=json, a JSON object whose \"data\" holds it in base64.",
+      "content": {
+       "application/octet-stream": {
+        "schema": {
+         "type": "string",
+         "format": "binary"
+        }
+       },
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/FileResult"
+        }
+       }
+      }
+     },
+     "413": {
+      "$ref": "#/components/responses/Error"
+     },
+     "422": {
+      "$ref": "#/components/responses/Error"
+     }
+    }
+   }
+  },
+  "/v1/restore": {
+   "post": {
+    "tags": [
+     "Files"
+    ],
+    "summary": "Restore a file",
+    "description": "Gives back the original of a protected file: the original kept when the body is a protected file this installation recorded (X-Pseudalis-restored: original), the picture of a text file holding a picture marker (picture), else the file with the values of its tags put back (tags). 404 when the file holds no value this key protected.",
+    "parameters": [
+     {
+      "name": "name",
+      "in": "query",
+      "required": false,
+      "description": "The name of the file",
+      "schema": {
+       "type": "string"
+      }
+     },
+     {
+      "name": "object_id",
+      "in": "query",
+      "required": false,
+      "description": "The NTFS object identifier of the file, when known (32 hexadecimal digits)",
+      "schema": {
+       "type": "string"
+      }
+     },
+     {
+      "name": "format",
+      "in": "query",
+      "required": false,
+      "description": "\"json\" for a JSON answer holding the file in base64",
+      "schema": {
+       "type": "string",
+       "enum": [
+        "binary",
+        "json"
+       ],
+       "default": "binary"
+      }
+     }
+    ],
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/octet-stream": {
+       "schema": {
+        "type": "string",
+        "format": "binary"
+       }
+      },
+      "multipart/form-data": {
+       "schema": {
+        "type": "object",
+        "properties": {
+         "file": {
+          "type": "string",
+          "format": "binary"
+         }
+        },
+        "required": [
+         "file"
+        ]
+       }
+      }
+     },
+     "description": "The file, as the body of the request, or as the first file of a multipart form, whose file name serves when the parameter name is absent."
+    },
+    "responses": {
+     "200": {
+      "description": "The file written, its name in Content-Disposition and X-Pseudalis-Name, its report in X-Pseudalis-Report; with format=json, a JSON object whose \"data\" holds it in base64.",
+      "content": {
+       "application/octet-stream": {
+        "schema": {
+         "type": "string",
+         "format": "binary"
+        }
+       },
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/FileResult"
+        }
+       }
+      }
+     },
+     "404": {
+      "$ref": "#/components/responses/Error"
+     },
+     "422": {
+      "$ref": "#/components/responses/Error"
+     }
+    }
+   }
+  },
+  "/v1/lookup": {
+   "get": {
+    "tags": [
+     "Files"
+    ],
+    "summary": "Whether a file is a protected file this installation recorded",
+    "parameters": [
+     {
+      "name": "sha256",
+      "in": "query",
+      "required": false,
+      "description": "The SHA-256 of the file, in hexadecimal",
+      "schema": {
+       "type": "string"
+      }
+     },
+     {
+      "name": "object_id",
+      "in": "query",
+      "required": false,
+      "description": "Its NTFS object identifier",
+      "schema": {
+       "type": "string"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "{\"known\", \"record\", \"output_name\", \"exact\"}",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/v1/records/{id}/location": {
+   "post": {
+    "tags": [
+     "Files"
+    ],
+    "summary": "Record where a protected file was written",
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "integer"
+      }
+     }
+    ],
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "properties": {
+         "object_id": {
+          "type": "string"
+         },
+         "path": {
+          "type": "string"
+         }
+        }
+       }
+      }
+     }
+    },
+    "responses": {
+     "200": {
+      "description": "Recorded",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object"
+        }
+       }
+      }
+     },
+     "404": {
+      "$ref": "#/components/responses/Error"
+     }
+    }
+   }
+  },
+  "/v1/text/anonymize": {
+   "post": {
+    "tags": [
+     "Texts"
+    ],
+    "summary": "Protect a text",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "properties": {
+         "text": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "text"
+        ]
+       },
+       "example": {
+        "text": "Jean Dupont habite 12 rue des Lilas à Rennes."
+       }
+      }
+     }
+    },
+    "responses": {
+     "200": {
+      "description": "{\"text\", \"report\"}",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object"
+        }
+       }
+      }
+     },
+     "422": {
+      "$ref": "#/components/responses/Error"
+     }
+    }
+   }
+  },
+  "/v1/text/restore": {
+   "post": {
+    "tags": [
+     "Texts"
+    ],
+    "summary": "Restore the tags of a text",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "properties": {
+         "text": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "text"
+        ]
+       }
+      }
+     }
+    },
+    "responses": {
+     "200": {
+      "description": "{\"text\", \"report\"}",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object"
+        }
+       }
+      }
+     },
+     "422": {
+      "$ref": "#/components/responses/Error"
+     }
+    }
+   }
+  },
+  "/v1/text/detect": {
+   "post": {
+    "tags": [
+     "Texts"
+    ],
+    "summary": "The personal values of a text",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "properties": {
+         "text": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "text"
+        ]
+       },
+       "example": {
+        "text": "Contact: marie.curie@example.org, 06 12 34 56 78"
+       }
+      }
+     }
+    },
+    "responses": {
+     "200": {
+      "description": "{\"spans\": [{\"begin\", \"end\", \"type\", \"confidence\", \"text\"}]}",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object"
+        }
+       }
+      }
+     },
+     "422": {
+      "$ref": "#/components/responses/Error"
+     }
+    }
+   }
+  },
+  "/v1/drive": {
+   "get": {
+    "tags": [
+     "Drive"
+    ],
+    "summary": "The state of the drive",
+    "responses": {
+     "200": {
+      "description": "{\"letter\", \"mounted\", \"files\", \"bytes\", \"error\"}",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/v1/events": {
+   "get": {
+    "tags": [
+     "Drive"
+    ],
+    "summary": "The events of the drive: files protected or refused",
+    "parameters": [
+     {
+      "name": "since",
+      "in": "query",
+      "required": false,
+      "description": "The identifier of the last event read",
+      "schema": {
+       "type": "integer",
+       "default": 0
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "{\"events\": [{\"id\", \"time\", \"kind\", \"path\", \"message\"}]}",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/v1/albireo": {
+   "get": {
+    "tags": [
+     "Service"
+    ],
+    "summary": "Whether Albireo describes the pictures",
+    "responses": {
+     "200": {
+      "description": "{\"enabled\", \"found\", \"port\", \"model\", \"reason\"}",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/v1/records": {
+   "get": {
+    "tags": [
+     "Administration"
+    ],
+    "summary": "The originals kept",
+    "security": [
+     {
+      "admin": []
+     }
+    ],
+    "parameters": [
+     {
+      "name": "limit",
+      "in": "query",
+      "required": false,
+      "description": "At most",
+      "schema": {
+       "type": "integer",
+       "default": 100
+      }
+     },
+     {
+      "name": "offset",
+      "in": "query",
+      "required": false,
+      "description": "From",
+      "schema": {
+       "type": "integer",
+       "default": 0
+      }
+     },
+     {
+      "name": "source",
+      "in": "query",
+      "required": false,
+      "description": "Only those of a source",
+      "schema": {
+       "type": "string",
+       "enum": [
+        "drive",
+        "shell",
+        "web",
+        "api"
+       ]
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "{\"records\", \"total\"}",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object"
+        }
+       }
+      }
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     }
+    },
+    "description": "Each record gives its file (original_name, output_name, sizes, kind, output_sha256, object_id, path) and, when its file left the drive, the time it left (removed) and the time its original is forgotten (forgotten), removed_days later."
+   }
+  },
+  "/v1/records/{id}/original": {
+   "get": {
+    "tags": [
+     "Administration"
+    ],
+    "summary": "An original kept",
+    "security": [
+     {
+      "admin": []
+     }
+    ],
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "integer"
+      }
+     },
+     {
+      "name": "format",
+      "in": "query",
+      "required": false,
+      "description": "",
+      "schema": {
+       "type": "string",
+       "enum": [
+        "binary",
+        "json"
+       ],
+       "default": "binary"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "The file written, its name in Content-Disposition and X-Pseudalis-Name, its report in X-Pseudalis-Report; with format=json, a JSON object whose \"data\" holds it in base64.",
+      "content": {
+       "application/octet-stream": {
+        "schema": {
+         "type": "string",
+         "format": "binary"
+        }
+       },
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/FileResult"
+        }
+       }
+      }
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     },
+     "404": {
+      "$ref": "#/components/responses/Error"
+     }
+    }
+   }
+  },
+  "/v1/records/{id}": {
+   "delete": {
+    "tags": [
+     "Administration"
+    ],
+    "summary": "Forget an original, and the pictures no other file shows",
+    "security": [
+     {
+      "admin": []
+     }
+    ],
+    "parameters": [
+     {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "integer"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "Forgotten",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object"
+        }
+       }
+      }
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     },
+     "404": {
+      "$ref": "#/components/responses/Error"
+     }
+    }
+   }
+  },
+  "/v1/settings": {
+   "get": {
+    "tags": [
+     "Administration"
+    ],
+    "summary": "The settings",
+    "security": [
+     {
+      "admin": []
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "The settings",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Settings"
+        }
+       }
+      }
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     }
+    }
+   },
+   "put": {
+    "tags": [
+     "Administration"
+    ],
+    "summary": "Change settings",
+    "description": "The members given replace those of settings.json; the service restarts when the port, the drive, the date order, the proxy or the publication addresses change (\"restart\": true).",
+    "security": [
+     {
+      "admin": []
+     }
+    ],
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/Settings"
+       }
+      }
+     }
+    },
+    "responses": {
+     "200": {
+      "description": "The settings written",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object"
+        }
+       }
+      }
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     }
+    }
+   }
+  },
+  "/v1/restart": {
+   "post": {
+    "tags": [
+     "Administration"
+    ],
+    "summary": "Restart the service",
+    "security": [
+     {
+      "admin": []
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "Restarting",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object"
+        }
+       }
+      }
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     }
+    }
+   }
+  },
+  "/v1/updates": {
+   "get": {
+    "tags": [
+     "Updates"
+    ],
+    "summary": "The state of the updates",
+    "responses": {
+     "200": {
+      "description": "{\"state\", \"current\", \"latest\", \"notes\"...}",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/v1/updates/check": {
+   "post": {
+    "tags": [
+     "Updates"
+    ],
+    "summary": "Check the signed feed and download a newer version",
+    "security": [
+     {
+      "admin": []
+     }
+    ],
+    "responses": {
+     "202": {
+      "description": "Checking",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object"
+        }
+       }
+      }
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     }
+    }
+   }
+  },
+  "/v1/updates/apply": {
+   "post": {
+    "tags": [
+     "Updates"
+    ],
+    "summary": "Install the downloaded update (the service restarts)",
+    "security": [
+     {
+      "admin": []
+     }
+    ],
+    "responses": {
+     "202": {
+      "description": "Installing",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object"
+        }
+       }
+      }
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     },
+     "409": {
+      "$ref": "#/components/responses/Error"
+     }
+    }
+   }
+  },
+  "/v1/key/export": {
+   "post": {
+    "tags": [
+     "Administration"
+    ],
+    "summary": "Export the master key, protected by a passphrase",
+    "description": "Keep the export apart: with its passphrase, it restores every file this installation protected, on another computer too.",
+    "security": [
+     {
+      "admin": []
+     }
+    ],
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "properties": {
+         "passphrase": {
+          "type": "string",
+          "minLength": 12
+         }
+        },
+        "required": [
+         "passphrase"
+        ]
+       }
+      }
+     }
+    },
+    "responses": {
+     "200": {
+      "description": "{\"key\": exported document}",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object"
+        }
+       }
+      }
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     },
+     "422": {
+      "$ref": "#/components/responses/Error"
+     }
+    }
+   }
+  },
+  "/v1/key/import": {
+   "post": {
+    "tags": [
+     "Administration"
+    ],
+    "summary": "Import the master key of an earlier installation",
+    "description": "Accepted while no file is recorded; the service restarts with the key.",
+    "security": [
+     {
+      "admin": []
+     }
+    ],
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "properties": {
+         "key": {
+          "type": "string"
+         },
+         "passphrase": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "key",
+         "passphrase"
+        ]
+       }
+      }
+     }
+    },
+    "responses": {
+     "200": {
+      "description": "Imported",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object"
+        }
+       }
+      }
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     },
+     "422": {
+      "$ref": "#/components/responses/Error"
+     }
+    }
+   }
+  },
+  "/v1/logs": {
+   "get": {
+    "tags": [
+     "Administration"
+    ],
+    "summary": "The last lines of the log",
+    "security": [
+     {
+      "admin": []
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "{\"lines\"}",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object"
+        }
+       }
+      }
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     }
+    }
+   }
+  }
+ },
+ "components": {
+  "securitySchemes": {
+   "admin": {
+    "type": "apiKey",
+    "in": "header",
+    "name": "X-Pseudalis-Admin",
+    "description": "The administration token of the data folder, which the users of this computer read."
+   }
+  },
+  "responses": {
+   "Error": {
+    "description": "The error: its English text, its code and its values",
+    "content": {
+     "application/json": {
+      "schema": {
+       "$ref": "#/components/schemas/Error"
+      }
+     }
+    }
+   }
+  },
+  "schemas": {
+   "Error": {
+    "type": "object",
+    "properties": {
+     "error": {
+      "type": "string"
+     },
+     "code": {
+      "type": "string"
+     },
+     "args": {
+      "type": "object"
+     }
+    }
+   },
+   "FileResult": {
+    "type": "object",
+    "properties": {
+     "name": {
+      "type": "string"
+     },
+     "kind": {
+      "type": "string"
+     },
+     "record": {
+      "type": "integer"
+     },
+     "restored": {
+      "type": "string",
+      "enum": [
+       "original",
+       "picture",
+       "tags"
+      ]
+     },
+     "report": {
+      "type": "object"
+     },
+     "data": {
+      "type": "string",
+      "format": "byte"
+     }
+    }
+   },
+   "Settings": {
+    "type": "object",
+    "properties": {
+     "port": {
+      "type": "integer",
+      "default": 8444
+     },
+     "language": {
+      "type": "string",
+      "enum": [
+       "auto",
+       "en",
+       "fr",
+       "de",
+       "it",
+       "es"
+      ]
+     },
+     "drive_letter": {
+      "type": "string",
+      "example": "A"
+     },
+     "date_order": {
+      "type": "string",
+      "enum": [
+       "dmy",
+       "mdy"
+      ]
+     },
+     "pdf_layout": {
+      "type": "boolean"
+     },
+     "albireo": {
+      "type": "string",
+      "enum": [
+       "auto",
+       "off"
+      ]
+     },
+     "max_file_mb": {
+      "type": "integer"
+     },
+     "removed_days": {
+      "type": "integer",
+      "description": "The days the original of a file removed from the drive stays kept, 1 to 3650"
+     },
+     "check_updates": {
+      "type": "boolean"
+     },
+     "trust_authority": {
+      "type": "boolean"
+     },
+     "public_link": {
+      "type": "string"
+     },
+     "feed_url": {
+      "type": "string"
+     },
+     "proxy": {
+      "type": "string"
+     }
+    }
+   }
+  }
+ }
+}

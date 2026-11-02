@@ -1,0 +1,498 @@
+// Copyright (C) 2026 Cydral Technology (cydraltechnology@gmail.com)
+// License: Boost Software License   See LICENSE.txt for the full license.
+#include "store.h"
+
+#include <sqlite3.h>
+
+#include <stdexcept>
+
+#include "../common/platform.h"
+
+namespace pseudalis
+{
+    namespace
+    {
+        const char* const schema =
+            "PRAGMA journal_mode=WAL;"
+            "PRAGMA foreign_keys=ON;"
+            // AUTOINCREMENT: the identifier of a record or of a node deleted is never given again,
+            // since the drive and the copies of the files may still name it.
+            "CREATE TABLE IF NOT EXISTS files(id INTEGER PRIMARY KEY AUTOINCREMENT, created INTEGER NOT NULL,"
+            " source TEXT NOT NULL, original_name TEXT NOT NULL, output_name TEXT NOT NULL,"
+            " original_sha256 TEXT NOT NULL, output_sha256 TEXT NOT NULL, original_blob TEXT NOT NULL,"
+            " original_size INTEGER NOT NULL, output_size INTEGER NOT NULL, kind TEXT NOT NULL,"
+            " object_id TEXT NOT NULL DEFAULT '', path TEXT NOT NULL DEFAULT '', removed INTEGER NOT NULL DEFAULT 0);"
+            "CREATE INDEX IF NOT EXISTS files_output ON files(output_sha256);"
+            "CREATE INDEX IF NOT EXISTS files_object ON files(object_id);"
+            "CREATE TABLE IF NOT EXISTS pictures(id TEXT PRIMARY KEY, sha256 TEXT NOT NULL, media_type TEXT NOT NULL,"
+            " blob TEXT NOT NULL, description TEXT NOT NULL, created INTEGER NOT NULL);"
+            "CREATE INDEX IF NOT EXISTS pictures_sha ON pictures(sha256);"
+            "CREATE TABLE IF NOT EXISTS file_pictures(file INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,"
+            " picture TEXT NOT NULL, PRIMARY KEY(file, picture));"
+            "CREATE TABLE IF NOT EXISTS nodes(id INTEGER PRIMARY KEY AUTOINCREMENT, parent INTEGER NOT NULL,"
+            " name TEXT NOT NULL, directory INTEGER NOT NULL, file INTEGER NOT NULL DEFAULT 0,"
+            " blob TEXT NOT NULL DEFAULT '', size INTEGER NOT NULL DEFAULT 0, attributes INTEGER NOT NULL DEFAULT 0,"
+            " created INTEGER NOT NULL DEFAULT 0, accessed INTEGER NOT NULL DEFAULT 0,"
+            " written INTEGER NOT NULL DEFAULT 0, changed INTEGER NOT NULL DEFAULT 0);"
+            "CREATE UNIQUE INDEX IF NOT EXISTS nodes_name ON nodes(parent, name COLLATE NOCASE);"
+            "CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY, time INTEGER NOT NULL, kind TEXT NOT NULL,"
+            " path TEXT NOT NULL, message TEXT NOT NULL);"
+            "CREATE TABLE IF NOT EXISTS kv(key TEXT PRIMARY KEY, value TEXT NOT NULL);";
+
+        // A prepared statement, finalized at the end of its scope.
+        class statement
+        {
+        public:
+            statement(sqlite3* db, const char* sql) : db_(db)
+            {
+                if (sqlite3_prepare_v2(db, sql, -1, &s_, nullptr) != SQLITE_OK)
+                    throw std::runtime_error(std::string("database: ") + sqlite3_errmsg(db));
+            }
+            ~statement() { sqlite3_finalize(s_); }
+            statement& bind(int i, const std::string& v)
+            {
+                sqlite3_bind_text(s_, i, v.data(), static_cast<int>(v.size()), SQLITE_TRANSIENT);
+                return *this;
+            }
+            statement& bind(int i, long long v)
+            {
+                sqlite3_bind_int64(s_, i, v);
+                return *this;
+            }
+            // True with a row, false at the end.
+            bool step()
+            {
+                const int rc = sqlite3_step(s_);
+                if (rc == SQLITE_ROW) return true;
+                if (rc == SQLITE_DONE) return false;
+                throw std::runtime_error(std::string("database: ") + sqlite3_errmsg(db_));
+            }
+            std::string text(int i)
+            {
+                const unsigned char* t = sqlite3_column_text(s_, i);
+                return t ? std::string(reinterpret_cast<const char*>(t),
+                                       static_cast<size_t>(sqlite3_column_bytes(s_, i)))
+                         : std::string();
+            }
+            long long integer(int i) { return sqlite3_column_int64(s_, i); }
+
+        private:
+            sqlite3* db_;
+            sqlite3_stmt* s_ = nullptr;
+        };
+
+        const char* const file_columns = "id, created, source, original_name, output_name, original_sha256,"
+                                         " output_sha256, original_blob, original_size, output_size, kind,"
+                                         " object_id, path, removed";
+
+        file_record read_file_row(statement& s)
+        {
+            file_record r;
+            r.id = s.integer(0);
+            r.created = s.integer(1);
+            r.source = s.text(2);
+            r.original_name = s.text(3);
+            r.output_name = s.text(4);
+            r.original_sha256 = s.text(5);
+            r.output_sha256 = s.text(6);
+            r.original_blob = s.text(7);
+            r.original_size = s.integer(8);
+            r.output_size = s.integer(9);
+            r.kind = s.text(10);
+            r.object_id = s.text(11);
+            r.path = s.text(12);
+            r.removed = s.integer(13);
+            return r;
+        }
+
+        const char* const node_columns = "id, parent, name, directory, file, blob, size, attributes, created, accessed,"
+                                         " written, changed";
+
+        drive_node read_node_row(statement& s)
+        {
+            drive_node n;
+            n.id = s.integer(0);
+            n.parent = s.integer(1);
+            n.name = s.text(2);
+            n.directory = s.integer(3) != 0;
+            n.file = s.integer(4);
+            n.blob = s.text(5);
+            n.size = s.integer(6);
+            n.attributes = static_cast<uint32_t>(s.integer(7));
+            n.created = s.integer(8);
+            n.accessed = s.integer(9);
+            n.written = s.integer(10);
+            n.changed = s.integer(11);
+            return n;
+        }
+    }
+
+    store::store(const std::string& path)
+    {
+        if (sqlite3_open_v2(path.c_str(), &db_, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
+                            nullptr) != SQLITE_OK)
+        {
+            const std::string e = db_ ? sqlite3_errmsg(db_) : "out of memory";
+            sqlite3_close(db_);
+            db_ = nullptr;
+            throw std::runtime_error("database " + path + ": " + e);
+        }
+        sqlite3_busy_timeout(db_, 5000);
+        exec(schema);
+        // The version of the schema, from which the migrations of later versions start.
+        exec("PRAGMA user_version = 1");
+        // The root of the drive.
+        drive_node root;
+        if (!node(1, root))
+            exec("INSERT INTO nodes(id, parent, name, directory, attributes) VALUES(1, 0, '', 1, 16)");
+    }
+
+    store::~store()
+    {
+        sqlite3_close(db_);
+    }
+
+    void store::exec(const char* sql)
+    {
+        char* error = nullptr;
+        if (sqlite3_exec(db_, sql, nullptr, nullptr, &error) != SQLITE_OK)
+        {
+            const std::string e = error ? error : "error";
+            sqlite3_free(error);
+            throw std::runtime_error("database: " + e);
+        }
+    }
+
+    long long store::add_file(const file_record& r)
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        statement s(db_,
+            "INSERT INTO files(created, source, original_name, output_name, original_sha256, output_sha256,"
+                         " original_blob, original_size, output_size, kind, object_id, path)"
+                         " VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)");
+        s.bind(1, static_cast<long long>(r.created ? r.created : now_unix())).bind(2, r.source).bind(3, r.original_name)
+            .bind(4, r.output_name).bind(5, r.original_sha256).bind(6, r.output_sha256).bind(7, r.original_blob)
+            .bind(8, r.original_size).bind(9, r.output_size).bind(10, r.kind).bind(11, r.object_id).bind(12, r.path);
+        s.step();
+        return sqlite3_last_insert_rowid(db_);
+    }
+
+    bool store::get_file(long long id, file_record& r)
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        statement s(db_, (std::string("SELECT ") + file_columns + " FROM files WHERE id = ?1").c_str());
+        s.bind(1, id);
+        if (!s.step()) return false;
+        r = read_file_row(s);
+        return true;
+    }
+
+    bool store::find_by_output(const std::string& sha256, file_record& r)
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        statement s(db_, (std::string("SELECT ") + file_columns +
+                          " FROM files WHERE output_sha256 = ?1 ORDER BY id DESC LIMIT 1").c_str());
+        s.bind(1, sha256);
+        if (!s.step()) return false;
+        r = read_file_row(s);
+        return true;
+    }
+
+    bool store::find_by_object(const std::string& object_id, file_record& r)
+    {
+        if (object_id.empty()) return false;
+        std::lock_guard<std::mutex> lock(m_);
+        statement s(db_, (std::string("SELECT ") + file_columns +
+                          " FROM files WHERE object_id = ?1 ORDER BY id DESC LIMIT 1").c_str());
+        s.bind(1, object_id);
+        if (!s.step()) return false;
+        r = read_file_row(s);
+        return true;
+    }
+
+    std::vector<file_record> store::list_files(long long limit, long long offset, const std::string& source)
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        statement s(db_, (std::string("SELECT ") + file_columns +
+                          " FROM files WHERE ?3 = '' OR source = ?3 ORDER BY id DESC LIMIT ?1 OFFSET ?2").c_str());
+        s.bind(1, limit).bind(2, offset).bind(3, source);
+        std::vector<file_record> out;
+        while (s.step()) out.push_back(read_file_row(s));
+        return out;
+    }
+
+    long long store::count_files()
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        statement s(db_, "SELECT COUNT(*) FROM files");
+        return s.step() ? s.integer(0) : 0;
+    }
+
+    void store::set_file_location(long long id, const std::string& object_id, const std::string& path)
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        statement s(db_, "UPDATE files SET object_id = ?2, path = ?3 WHERE id = ?1");
+        s.bind(1, id).bind(2, object_id).bind(3, path);
+        s.step();
+    }
+
+    void store::set_file_removed(long long id, int64_t when)
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        statement s(db_, "UPDATE files SET removed = ?2 WHERE id = ?1");
+        s.bind(1, id).bind(2, static_cast<long long>(when));
+        s.step();
+    }
+
+    std::vector<long long> store::files_removed_before(int64_t when)
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        statement s(db_, "SELECT id FROM files WHERE removed > 0 AND removed <= ?1 ORDER BY id");
+        s.bind(1, static_cast<long long>(when));
+        std::vector<long long> out;
+        while (s.step()) out.push_back(s.integer(0));
+        return out;
+    }
+
+    bool store::remove_file(long long id, std::vector<std::string>& blobs)
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        std::string original;
+        {
+            statement s(db_, "SELECT original_blob FROM files WHERE id = ?1");
+            s.bind(1, id);
+            if (!s.step()) return false;
+            original = s.text(0);
+        }
+        std::vector<std::string> pictures;
+        {
+            statement s(db_, "SELECT picture FROM file_pictures WHERE file = ?1");
+            s.bind(1, id);
+            while (s.step()) pictures.push_back(s.text(0));
+        }
+        exec("BEGIN IMMEDIATE");
+        try
+        {
+            statement d(db_, "DELETE FROM files WHERE id = ?1");
+            d.bind(1, id);
+            d.step();
+            statement l(db_, "DELETE FROM file_pictures WHERE file = ?1");
+            l.bind(1, id);
+            l.step();
+            for (const std::string& p : pictures)
+            {
+                statement used(db_, "SELECT COUNT(*) FROM file_pictures WHERE picture = ?1");
+                used.bind(1, p);
+                if (used.step() && used.integer(0) > 0) continue;
+                statement b(db_, "SELECT blob FROM pictures WHERE id = ?1");
+                b.bind(1, p);
+                if (b.step()) blobs.push_back(b.text(0));
+                statement dp(db_, "DELETE FROM pictures WHERE id = ?1");
+                dp.bind(1, p);
+                dp.step();
+            }
+            exec("COMMIT");
+        }
+        catch (...)
+        {
+            sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+            throw;
+        }
+        if (!original.empty()) blobs.push_back(original);
+        return true;
+    }
+
+    bool store::get_picture(const std::string& id, picture_record& r)
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        statement s(db_, "SELECT id, sha256, media_type, blob, description, created FROM pictures WHERE id = ?1");
+        s.bind(1, id);
+        if (!s.step()) return false;
+        r.id = s.text(0);
+        r.sha256 = s.text(1);
+        r.media_type = s.text(2);
+        r.blob = s.text(3);
+        r.description = s.text(4);
+        r.created = s.integer(5);
+        return true;
+    }
+
+    bool store::find_picture(const std::string& sha256, picture_record& r)
+    {
+        return get_picture(sha256.substr(0, 16), r) && r.sha256 == sha256;
+    }
+
+    void store::add_picture(const picture_record& r)
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        statement s(db_, "INSERT OR IGNORE INTO pictures(id, sha256, media_type, blob, description, created)"
+                         " VALUES(?1, ?2, ?3, ?4, ?5, ?6)");
+        s.bind(1, r.id).bind(2, r.sha256).bind(3, r.media_type).bind(4, r.blob).bind(5, r.description)
+            .bind(6, static_cast<long long>(r.created ? r.created : now_unix()));
+        s.step();
+    }
+
+    void store::link_picture(long long file, const std::string& picture)
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        statement s(db_, "INSERT OR IGNORE INTO file_pictures(file, picture) VALUES(?1, ?2)");
+        s.bind(1, file).bind(2, picture);
+        s.step();
+    }
+
+    std::vector<std::string> store::pictures_of(long long file)
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        statement s(db_, "SELECT picture FROM file_pictures WHERE file = ?1");
+        s.bind(1, file);
+        std::vector<std::string> out;
+        while (s.step()) out.push_back(s.text(0));
+        return out;
+    }
+
+    bool store::node(long long id, drive_node& n)
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        statement s(db_, (std::string("SELECT ") + node_columns + " FROM nodes WHERE id = ?1").c_str());
+        s.bind(1, id);
+        if (!s.step()) return false;
+        n = read_node_row(s);
+        return true;
+    }
+
+    bool store::child(long long parent, const std::string& name, drive_node& n)
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        statement s(db_, (std::string("SELECT ") + node_columns +
+                          " FROM nodes WHERE parent = ?1 AND name = ?2 COLLATE NOCASE").c_str());
+        s.bind(1, parent).bind(2, name);
+        if (!s.step()) return false;
+        n = read_node_row(s);
+        return true;
+    }
+
+    std::vector<drive_node> store::children(long long parent)
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        statement s(db_, (std::string("SELECT ") + node_columns +
+                          " FROM nodes WHERE parent = ?1 AND id != 1 ORDER BY name COLLATE NOCASE").c_str());
+        s.bind(1, parent);
+        std::vector<drive_node> out;
+        while (s.step()) out.push_back(read_node_row(s));
+        return out;
+    }
+
+    long long store::add_node(const drive_node& n)
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        statement s(db_, "INSERT INTO nodes(parent, name, directory, file, blob, size, attributes, created, accessed,"
+                         " written, changed) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)");
+        s.bind(1, n.parent).bind(2, n.name).bind(3, static_cast<long long>(n.directory ? 1 : 0)).bind(4, n.file)
+            .bind(5, n.blob).bind(6, n.size).bind(7, static_cast<long long>(n.attributes)).bind(8, n.created)
+            .bind(9, n.accessed).bind(10, n.written).bind(11, n.changed);
+        s.step();
+        return sqlite3_last_insert_rowid(db_);
+    }
+
+    void store::write_node(const drive_node& n)
+    {
+        statement s(db_, "UPDATE nodes SET parent = ?2, name = ?3, directory = ?4, file = ?5, blob = ?6, size = ?7,"
+                         " attributes = ?8, created = ?9, accessed = ?10, written = ?11, changed = ?12 WHERE id = ?1");
+        s.bind(1, n.id).bind(2, n.parent).bind(3, n.name).bind(4, static_cast<long long>(n.directory ? 1 : 0))
+            .bind(5, n.file).bind(6, n.blob).bind(7, n.size).bind(8, static_cast<long long>(n.attributes))
+            .bind(9, n.created).bind(10, n.accessed).bind(11, n.written).bind(12, n.changed);
+        s.step();
+    }
+
+    void store::update_node(const drive_node& n)
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        write_node(n);
+    }
+
+    void store::replace_node(const drive_node& n, long long replaced)
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        exec("BEGIN IMMEDIATE");
+        try
+        {
+            {
+                statement d(db_, "DELETE FROM nodes WHERE id = ?1 AND id != 1");
+                d.bind(1, replaced);
+                d.step();
+            }
+            write_node(n);
+            exec("COMMIT");
+        }
+        catch (...)
+        {
+            sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+            throw;
+        }
+    }
+
+    void store::remove_node(long long id)
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        statement s(db_, "DELETE FROM nodes WHERE id = ?1 AND id != 1");
+        s.bind(1, id);
+        s.step();
+    }
+
+    void store::drive_usage(long long& files, long long& bytes)
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        statement s(db_, "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM nodes WHERE directory = 0");
+        files = bytes = 0;
+        if (s.step())
+        {
+            files = s.integer(0);
+            bytes = s.integer(1);
+        }
+    }
+
+    void store::add_event(const std::string& kind, const std::string& path, const std::string& message)
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        statement s(db_, "INSERT INTO events(time, kind, path, message) VALUES(?1, ?2, ?3, ?4)");
+        s.bind(1, static_cast<long long>(now_unix())).bind(2, kind).bind(3, path).bind(4, message);
+        s.step();
+        // The last thousand events are kept.
+        exec("DELETE FROM events WHERE id <= (SELECT MAX(id) - 1000 FROM events)");
+    }
+
+    json store::events(long long since, int limit)
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        statement s(db_, "SELECT id, time, kind, path, message FROM events WHERE id > ?1 ORDER BY id LIMIT ?2");
+        s.bind(1, since).bind(2, static_cast<long long>(limit));
+        json out = json::array();
+        while (s.step())
+        {
+            json e = json::object();
+            e["id"] = s.integer(0);
+            e["time"] = iso_time(s.integer(1));
+            e["kind"] = s.text(2);
+            e["path"] = s.text(3);
+            e["message"] = s.text(4);
+            out.push_back(e);
+        }
+        return out;
+    }
+
+    std::string store::value(const std::string& key)
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        statement s(db_, "SELECT value FROM kv WHERE key = ?1");
+        s.bind(1, key);
+        return s.step() ? s.text(0) : std::string();
+    }
+
+    void store::set_value(const std::string& key, const std::string& value)
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        statement s(db_, "INSERT INTO kv(key, value) VALUES(?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2");
+        s.bind(1, key).bind(2, value);
+        s.step();
+    }
+}

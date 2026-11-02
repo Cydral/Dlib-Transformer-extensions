@@ -548,6 +548,10 @@ namespace
               "ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml\"/>"
               "<Override PartName=\"/docProps/core.xml\" "
               "ContentType=\"application/vnd.openxmlformats-package.core-properties+xml\"/>"
+              "<Override PartName=\"/docProps/app.xml\" "
+              "ContentType=\"application/vnd.openxmlformats-officedocument.extended-properties+xml\"/>"
+              "<Override PartName=\"/word/charts/chart1.xml\" "
+              "ContentType=\"application/vnd.openxmlformats-officedocument.drawingml.chart+xml\"/>"
               "</Types>");
         w.add("_rels/.rels",
               "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
@@ -557,13 +561,19 @@ namespace
               "Target=\"word/document.xml\"/>"
               "<Relationship Id=\"rId2\" "
               "Type=\"http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties\" "
-              "Target=\"docProps/core.xml\"/></Relationships>");
+              "Target=\"docProps/core.xml\"/>"
+              "<Relationship Id=\"rId3\" "
+              "Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties\" "
+              "Target=\"docProps/app.xml\"/></Relationships>");
         w.add("word/_rels/document.xml.rels",
               "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
               "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
               "<Relationship Id=\"rId5\" "
               "Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/image\" "
-              "Target=\"media/image1.png\"/></Relationships>");
+              "Target=\"media/image1.png\"/>"
+              "<Relationship Id=\"rId6\" "
+              "Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart\" "
+              "Target=\"charts/chart1.xml\"/></Relationships>");
         w.add("word/document.xml",
             "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
             "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" "
@@ -575,8 +585,26 @@ namespace
             "<w:r><w:t xml:space=\"preserve\">, joignable au 06 12 34 56 78.</w:t></w:r></w:p>"
             "<w:p><w:r><w:drawing><wp:inline><a:graphic><a:graphicData><a:blip r:embed=\"rId5\"/>"
             "</a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>"
+            "<w:p><w:r><w:drawing><wp:inline><a:graphic><a:graphicData "
+            "uri=\"http://schemas.openxmlformats.org/drawingml/2006/chart\"><c:chart "
+            "xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\" r:id=\"rId6\"/>"
+            "</a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>"
             "<w:p><w:r><w:t>Dupont a signé.</w:t></w:r></w:p><w:sectPr/></w:body></w:document>");
         w.add("word/media/image1.png", string("\x89PNG\r\n\x1a\n", 8) + string(64, 'x'));
+        w.add("word/charts/chart1.xml",
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+            "<c:chartSpace xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\" "
+            "xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\"><c:chart><c:title><c:tx><c:rich>"
+            "<a:p><a:r><a:t>Ventes de Marie Curie le 12/03/2024</a:t></a:r></a:p></c:rich></c:tx></c:title>"
+            "</c:chart></c:chartSpace>");
+        w.add("docProps/app.xml",
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+            "<Properties xmlns=\"http://schemas.openxmlformats.org/officeDocument/2006/extended-properties\" "
+            "xmlns:vt=\"http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes\">"
+            "<HeadingPairs><vt:vector size=\"2\" baseType=\"variant\"><vt:variant><vt:lpstr>Titre</vt:lpstr>"
+            "</vt:variant><vt:variant><vt:i4>1</vt:i4></vt:variant></vt:vector></HeadingPairs>"
+            "<TitlesOfParts><vt:vector size=\"1\" baseType=\"lpstr\"><vt:lpstr>Attestation de Jean Dupont</vt:lpstr>"
+            "</vt:vector></TitlesOfParts><Company>Dupont Conseil SARL</Company></Properties>");
         w.add("docProps/core.xml",
             "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
             "<cp:coreProperties xmlns:cp=\"http://schemas.openxmlformats.org/package/2006/metadata/core-properties\" "
@@ -595,6 +623,18 @@ namespace
             DLIB_TEST_MSG(z.read(i).find("Dupont") == string::npos, z.entries()[i].name);
         DLIB_TEST(z.read("word/document.xml").find("[[PERSON:") != string::npos);
         DLIB_TEST(z.read("word/document.xml").find("blip") == string::npos);
+        // The chart goes with its drawing, the lists of parts of the properties too.
+        DLIB_TEST(!z.contains("word/charts/chart1.xml"));
+        DLIB_TEST(z.read("docProps/app.xml").find("TitlesOfParts") == string::npos);
+        DLIB_TEST(z.read("docProps/app.xml").find("<Company>[[ORG:") != string::npos);
+        // The report counts the values of the document as written, without those of removed parts.
+        size_t tags = 0;
+        for (size_t i = 0; i < z.entries().size(); ++i)
+        {
+            const string part = z.read(i);
+            for (size_t k = part.find("[[");  k != string::npos; k = part.find("[[", k + 2)) ++tags;
+        }
+        DLIB_TEST_MSG(tags == report.total_entities(), tags << " " << report.total_entities());
 
         document_report back;
         const zip_archive_reader r(a.restore(out, document_format::docx, back));
@@ -665,7 +705,377 @@ namespace
         DLIB_TEST(encrypted_refused);
     }
 
+
+    // A PDF written by hand, its objects numbered from 1, with a cross-reference table.
+    string pdf_file(const std::vector<string>& objects)
+    {
+        string out = "%PDF-1.7\n";
+        std::vector<size_t> offsets;
+        for (size_t i = 0; i < objects.size(); ++i)
+        {
+            offsets.push_back(out.size());
+            out += std::to_string(i + 1) + " 0 obj\n" + objects[i] + "\nendobj\n";
+        }
+        const size_t xref = out.size();
+        out += "xref\n0 " + std::to_string(objects.size() + 1) + "\n0000000000 65535 f \n";
+        for (size_t off : offsets)
+        {
+            char buf[32];
+            std::snprintf(buf, sizeof(buf), "%010lu 00000 n \n", static_cast<unsigned long>(off));
+            out += buf;
+        }
+        return out + "trailer\n<< /Size " + std::to_string(objects.size() + 1) + " /Root 1 0 R /Info 9 0 R >>\n"
+               "startxref\n" + std::to_string(xref) + "\n%%EOF\n";
+    }
+
+    string pdf_stream(const string& dict, const string& data)
+    {
+        return "<< " + dict + " /Length " + std::to_string(data.size()) + " >>\nstream\n" + data + "\nendstream";
+    }
+
+    // Every byte of a PDF, its Flate streams inflated.
+    string pdf_bytes_inflated(const string& pdf)
+    {
+        string all = pdf;
+        for (size_t p = pdf.find("stream\n"); p != string::npos; p = pdf.find("stream\n", p + 7))
+        {
+            const size_t e = pdf.find("\nendstream", p);
+            if (e == string::npos) break;
+            try { all += zlib_decompress(pdf.substr(p + 7, e - p - 7)); }
+            catch (std::exception&) {}
+        }
+        return all;
+    }
+
+    void test_pdf_layout()
+    {
+        /* A page with graphics, a name cut by the kerning of a TJ operator, text drawn twice
+           (fake bold), a letterhead form drawn twice, a picture, an inline picture, an
+           alternate text, a comment of the content stream, a filled form field and a text
+           annotation. */
+        const string content =
+            "% Jean Dupont\n"
+            "0.9 0.1 0.1 rg 50 750 500 40 re f\n"
+            "q 1 0 0 1 0 0 cm /Head Do Q q 1 0 0 1 0 -100 cm /Head Do Q\n"
+            "/Span << /ActualText (Jean Dupont) >> BDC\n"
+            "BT /F1 11 Tf 72 600 Td [(Rapport de M. Jean Du) -15 (pont, joignable au 06 12 34 56 78.)] TJ ET\n"
+            "EMC\n"
+            "BT /F2 11 Tf 72 580 Td (Sign\\351 : Mme H\\351l\\350ne LE GOFF) Tj ET\n"
+            "BT /F2 11 Tf 72.3 580 Td (Sign\\351 : Mme H\\351l\\350ne LE GOFF) Tj ET\n"
+            "q 100 0 0 50 72 400 cm /Im1 Do Q\n"
+            "q 10 0 0 10 300 400 cm BI /W 1 /H 1 /BPC 8 /CS /G ID \x80 EI Q\n";
+        const string head = "BT /F1 9 Tf 72 760 Td (Clinique des Glycines, Dr Paul Martin, Quimper) Tj ET";
+        const string widget = "/Tx BMC BT /F1 10 Tf 2 4 Td (Anne Morel) Tj ET EMC";
+        const string pdf = pdf_file({
+            "<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [11 0 R] >> /StructTreeRoot << >> >>",
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Contents 4 0 R /Annots [11 0 R 12 0 R] "
+            "/Resources << /Font << /F1 5 0 R /F2 6 0 R >> /XObject << /Head 7 0 R /Im1 8 0 R >> >> >>",
+            pdf_stream("", content),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Times-Bold /Encoding /WinAnsiEncoding >>",
+            pdf_stream("/Type /XObject /Subtype /Form /BBox [0 0 595 842] /Resources << /Font << /F1 5 0 R >> >>",
+                       head),
+            pdf_stream("/Type /XObject /Subtype /Image /Width 2 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8",
+                       string("\xFF\x00\x00\x00\xFF\x00", 6)),
+            "<< /Author (Jean Dupont) /Title (Rapport) >>",
+            pdf_stream("/Type /XObject /Subtype /Form /BBox [0 0 100 20] /Resources << /Font << /F1 5 0 R >> >>",
+                       widget),
+            "<< /Type /Annot /Subtype /Widget /FT /Tx /T (nom) /V (Anne Morel) /Rect [72 300 172 320] "
+            "/AP << /N 10 0 R >> >>",
+            "<< /Type /Annot /Subtype /Text /Rect [400 700 420 720] /Contents (Note de Jean Dupont) >>" });
+        DLIB_TEST(detect_document_format(pdf) == document_format::pdf);
+        string text;
+        for (const auto& page : layout_pdf_text(read_pdf_text(pdf)))
+            for (const pdf_text_segment& s : page) text += s.text + "\n";
+        DLIB_TEST_MSG(text.find("Jean Dupont") != string::npos && text.find("Anne Morel") != string::npos, text);
+
+        const pseudonymizer p(pseudonymization_key::from_bytes(string(32, '\x37')));
+        pii_detector detector;
+        document_anonymizer a(p, detector);
+        DLIB_TEST(a.pdf_layout());
+        document_report report;
+        const string out = a.anonymize(pdf, document_format::pdf, report);
+        const pdf_text_document reread = read_pdf_text(out);
+        DLIB_TEST(reread.rewritten_by_dlib && !reread.produced_by_dlib && reread.pages.size() == 1);
+        // No value left anywhere in the file, streams included; the graphics and the pictures' places stay.
+        const string bytes = pdf_bytes_inflated(out);
+        for (const char* v : { "Dupont", "LE GOFF", "06 12 34 56 78", "Morel", "Martin", "Note de", "ActualText" })
+            DLIB_TEST_MSG(bytes.find(v) == string::npos, v);
+        DLIB_TEST(bytes.find("500 40 re") != string::npos);
+        DLIB_TEST(bytes.find("/Width 1 /Height 1") != string::npos && bytes.find("BI /W 1 /H 1") != string::npos);
+        DLIB_TEST(bytes.find("/Annots") == string::npos && bytes.find("/StructTreeRoot") == string::npos &&
+                  bytes.find("/Author") == string::npos);
+        DLIB_TEST(bytes.find("/BaseFont /Times-Bold") != string::npos);
+        string anon;
+        for (const auto& page : layout_pdf_text(reread))
+            for (const pdf_text_segment& s : page) anon += s.text + "\n";
+        DLIB_TEST_MSG(anon.find("[[PERSON:") != string::npos && anon.find("[[PHONE:") != string::npos, anon);
+        // The letterhead drawn twice and the field drawn into the page, both protected.
+        size_t heads = 0;
+        for (size_t k = anon.find("Clinique des Glycines"); k != string::npos; k = anon.find("Clinique des Glycines", k + 1))
+            ++heads;
+        DLIB_TEST_MSG(heads == 0 || anon.find("Dr [[PERSON:") != string::npos, anon);
+
+        document_report back;
+        const string restored_pdf = a.restore(out, document_format::pdf, back);
+        DLIB_TEST_MSG(back.tags_restored == report.total_entities(),
+                      back.tags_restored << " " << report.total_entities() << "\n" << anon);
+        string restored;
+        for (const auto& page : layout_pdf_text(read_pdf_text(restored_pdf)))
+            for (const pdf_text_segment& s : page) restored += s.text + "\n";
+        for (const char* v : { "Rapport de M. Jean Dupont, joignable au 06 12 34 56 78.", "Mme Hélène LE GOFF",
+                               "Dr Paul Martin", "Anne Morel" })
+            DLIB_TEST_MSG(restored.find(v) != string::npos, v << "\n" << restored);
+        // A PDF without tag that was not protected here comes back unchanged.
+        document_report none;
+        DLIB_TEST(a.restore(pdf, document_format::pdf, none) == pdf);
+        // The text-only reconstruction stays available.
+        a.set_pdf_layout(false);
+        document_report flat;
+        DLIB_TEST(read_pdf_text(a.anonymize(pdf, document_format::pdf, flat)).produced_by_dlib);
+    }
+
 // ----------------------------------------------------------------------------------------
+
+    void test_pdf_wrapped_cell()
+    {
+        // An e-mail address cut by its hyphen in a narrow cell of a table is found whole.
+        const string content =
+            "BT /F1 8.5 Tf 72 197.6 Td (Assistante de direction) Tj ET\n"
+            "BT /F1 8.5 Tf 300 197.6 Td (fatou.ndiaye@arvelis-) Tj ET\n"
+            "BT /F1 8.5 Tf 300 187.2 Td (services.fr) Tj ET\n"
+            "BT /F1 8.5 Tf 450 197.6 Td (Lien malveillant recu) Tj ET\n";
+        const string pdf = pdf_file({
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Contents 4 0 R "
+            "/Resources << /Font << /F1 5 0 R >> >> >>",
+            pdf_stream("", content),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>" });
+        const pseudonymizer p(pseudonymization_key::from_bytes(string(32, '\x43')));
+        pii_detector detector;
+        document_anonymizer a(p, detector);
+        document_report report;
+        const string out = a.anonymize(pdf, document_format::pdf, report);
+        string text;
+        for (const auto& page : layout_pdf_text(read_pdf_text(out)))
+            for (const pdf_text_segment& s : page) text += s.text + "\n";
+        DLIB_TEST_MSG(text.find("arvelis") == string::npos && text.find("[[EMAIL:") != string::npos, text);
+        document_report back;
+        string restored;
+        for (const auto& page : layout_pdf_text(read_pdf_text(a.restore(out, document_format::pdf, back))))
+            for (const pdf_text_segment& s : page) restored += s.text;
+        DLIB_TEST_MSG(restored.find("fatou.ndiaye@arvelis-services.fr") != string::npos ||
+                      restored.find("fatou.ndiaye@arvelis-") != string::npos, restored);
+
+        /* The end of the address drawn with the text of the cell on its left, in one segment,
+           alone on its line or with another cell. */
+        for (int other = 0; other < 2; ++other)
+        {
+            const string merged = string(
+                "BT /F1 8.5 Tf 72 115.7 Td (Client, Transports) Tj ET\n"
+                "BT /F1 8.5 Tf 185 115.7 Td (b.lefeuvre@ouessant-) Tj ET\n"
+                "BT /F1 8.5 Tf 330 115.7 Td (02 97 64 33 81) Tj ET\n"
+                "BT /F1 8.5 Tf 72 105.3 Td (Ouessant Logistique SARL) Tj ET\n"
+                "BT /F1 8.5 Tf 185 105.3 Td (logistique.fr) Tj ET\n") +
+                (other ? "BT /F1 8.5 Tf 400 105.3 Td (recue) Tj ET\n" : "");
+            const string mpdf = pdf_file({
+                "<< /Type /Catalog /Pages 2 0 R >>",
+                "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Contents 4 0 R "
+                "/Resources << /Font << /F1 5 0 R >> >> >>",
+                pdf_stream("", merged),
+                "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>" });
+            string before;
+            for (const auto& page : layout_pdf_text(read_pdf_text(mpdf)))
+                for (const pdf_text_segment& s : page) before += s.text + "\n";
+            DLIB_TEST_MSG(before.find("Ouessant Logistique SARL logistique.fr") != string::npos, before);
+            document_report mreport;
+            const string mout = a.anonymize(mpdf, document_format::pdf, mreport);
+            string mtext;
+            for (const auto& page : layout_pdf_text(read_pdf_text(mout)))
+                for (const pdf_text_segment& s : page) mtext += s.text + "\n";
+            DLIB_TEST_MSG(mtext.find("lefeuvre") == string::npos && mtext.find("logistique.fr") == string::npos &&
+                          mtext.find("[[EMAIL:") != string::npos, mtext);
+            DLIB_TEST_MSG(mtext.find("97 64") == string::npos && (!other || mtext.find("recue") != string::npos), mtext);
+            document_report mback;
+            string mrestored;
+            for (const auto& page : layout_pdf_text(read_pdf_text(a.restore(mout, document_format::pdf, mback))))
+                for (const pdf_text_segment& s : page) mrestored += s.text + "\n";
+            DLIB_TEST_MSG(mrestored.find("b.lefeuvre@ouessant-") != string::npos &&
+                          mrestored.find("logistique.fr") != string::npos &&
+                          mrestored.find("Ouessant Logistique SARL") != string::npos, mrestored);
+        }
+    }
+
+    void test_image_describer()
+    {
+        // The pictures given to a describer, whose text takes their place in each format.
+        std::vector<document_image> seen;
+        const document_image_describer describer = [&seen](const document_image& img) {
+            seen.push_back(img);
+            return img.media_type == "image/png" ? string("[Image@42 : a red & green square]") : string();
+        };
+        const string png = encode_png(string("\xFF\x00\x00\x00\xFF\x00", 6), 2, 1, 3);
+        DLIB_TEST(image_media_type(png) == "image/png" && png.size() > 40);
+        DLIB_TEST(image_media_type("\xFF\xD8\xFF\xE0") == "image/jpeg" && image_media_type("abc").empty());
+        const pseudonymizer p(pseudonymization_key::from_bytes(string(32, '\x41')));
+
+        // Word: the drawing of a run becomes a run text.
+        {
+            zip_archive_writer w;
+            w.add("[Content_Types].xml",
+                  "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Types "
+                  "xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">"
+                  "<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>"
+                  "<Default Extension=\"xml\" ContentType=\"application/xml\"/>"
+                  "<Default Extension=\"png\" ContentType=\"image/png\"/>"
+                  "<Override PartName=\"/word/document.xml\" "
+                  "ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml\"/>"
+                  "</Types>");
+            w.add("_rels/.rels",
+                  "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Relationships "
+                  "xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" "
+                  "Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" "
+                  "Target=\"word/document.xml\"/></Relationships>");
+            w.add("word/_rels/document.xml.rels",
+                  "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Relationships "
+                  "xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId5\" "
+                  "Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/image\" "
+                  "Target=\"media/image1.png\"/></Relationships>");
+            w.add("word/document.xml",
+                  "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+                  "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" "
+                  "xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" "
+                  "xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\" "
+                  "xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\"><w:body>"
+                  "<w:p><w:r><w:t>Photo de Jean Dupont :</w:t></w:r></w:p>"
+                  "<w:p><w:r><w:drawing><wp:inline><a:graphic><a:graphicData><a:blip r:embed=\"rId5\"/>"
+                  "</a:graphicData></a:graphic></wp:inline></w:drawing></w:r>"
+                  "<w:r><w:drawing><wp:inline><a:graphic><a:graphicData><a:blip r:embed=\"rId5\"/>"
+                  "</a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p><w:sectPr/></w:body></w:document>");
+            w.add("word/media/image1.png", png);
+            pii_detector detector;
+            document_anonymizer a(p, detector);
+            a.set_image_describer(describer);
+            document_report report;
+            const zip_archive_reader z(a.anonymize(w.finish(), document_format::docx, report));
+            const string doc = z.read("word/document.xml");
+            DLIB_TEST(seen.size() == 1 && seen[0].location == "word/media/image1.png" && seen[0].bytes == png);
+            DLIB_TEST_MSG(doc.find("<w:t xml:space=\"preserve\">[Image@42 : a red &amp; green square]</w:t>") !=
+                          string::npos, doc);
+            DLIB_TEST(doc.find("blip") == string::npos && doc.find("Dupont") == string::npos);
+            DLIB_TEST(!z.contains("word/media/image1.png"));
+        }
+
+        // PowerPoint: the picture becomes a text box at its position.
+        seen.clear();
+        {
+            zip_archive_writer w;
+            w.add("[Content_Types].xml",
+                  "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Types "
+                  "xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">"
+                  "<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>"
+                  "<Default Extension=\"xml\" ContentType=\"application/xml\"/>"
+                  "<Default Extension=\"png\" ContentType=\"image/png\"/>"
+                  "<Override PartName=\"/ppt/presentation.xml\" "
+                  "ContentType=\"application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml\"/>"
+                  "<Override PartName=\"/ppt/slides/slide1.xml\" "
+                  "ContentType=\"application/vnd.openxmlformats-officedocument.presentationml.slide+xml\"/>"
+                  "</Types>");
+            w.add("_rels/.rels",
+                  "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Relationships "
+                  "xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" "
+                  "Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" "
+                  "Target=\"ppt/presentation.xml\"/></Relationships>");
+            w.add("ppt/presentation.xml",
+                  "<?xml version=\"1.0\" encoding=\"UTF-8\"?><p:presentation "
+                  "xmlns:p=\"http://schemas.openxmlformats.org/presentationml/2006/main\" "
+                  "xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"><p:sldIdLst>"
+                  "<p:sldId id=\"256\" r:id=\"rId2\"/></p:sldIdLst></p:presentation>");
+            w.add("ppt/_rels/presentation.xml.rels",
+                  "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Relationships "
+                  "xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId2\" "
+                  "Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide\" "
+                  "Target=\"slides/slide1.xml\"/></Relationships>");
+            w.add("ppt/slides/_rels/slide1.xml.rels",
+                  "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Relationships "
+                  "xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId3\" "
+                  "Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/image\" "
+                  "Target=\"../media/image1.png\"/></Relationships>");
+            w.add("ppt/slides/slide1.xml",
+                  "<?xml version=\"1.0\" encoding=\"UTF-8\"?><p:sld "
+                  "xmlns:p=\"http://schemas.openxmlformats.org/presentationml/2006/main\" "
+                  "xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" "
+                  "xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"><p:cSld><p:spTree>"
+                  "<p:sp><p:nvSpPr><p:cNvPr id=\"2\" name=\"Titre\"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr/>"
+                  "<p:txBody><a:bodyPr/><a:p><a:r><a:t>Equipe de Jean Dupont</a:t></a:r></a:p></p:txBody></p:sp>"
+                  "<p:pic><p:nvPicPr><p:cNvPr id=\"4\" name=\"Picture 3\"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr>"
+                  "<p:blipFill><a:blip r:embed=\"rId3\"/><a:stretch><a:fillRect/></a:stretch></p:blipFill>"
+                  "<p:spPr><a:xfrm><a:off x=\"914400\" y=\"914400\"/><a:ext cx=\"3048000\" cy=\"1524000\"/></a:xfrm>"
+                  "<a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom></p:spPr></p:pic>"
+                  "</p:spTree></p:cSld></p:sld>");
+            w.add("ppt/media/image1.png", png);
+            pii_detector detector;
+            document_anonymizer a(p, detector);
+            a.set_image_describer(describer);
+            document_report report;
+            const zip_archive_reader z(a.anonymize(w.finish(), document_format::pptx, report));
+            const string slide = z.read("ppt/slides/slide1.xml");
+            DLIB_TEST(seen.size() == 1 && seen[0].location == "ppt/media/image1.png");
+            DLIB_TEST_MSG(slide.find("<p:sp><p:nvSpPr><p:cNvPr id=\"4\" name=\"Picture 3\"/><p:cNvSpPr txBox=\"1\"/>") !=
+                          string::npos, slide);
+            DLIB_TEST(slide.find("<a:xfrm><a:off x=\"914400\" y=\"914400\"/><a:ext cx=\"3048000\" cy=\"1524000\"/>"
+                                 "</a:xfrm>") != string::npos);
+            DLIB_TEST(slide.find("<a:t>[Image@42 : a red &amp; green square]</a:t>") != string::npos);
+            DLIB_TEST(slide.find("blip") == string::npos && slide.find("Dupont") == string::npos);
+            DLIB_TEST(!z.contains("ppt/media/image1.png"));
+        }
+
+        // PDF: the text is written over the gray box of the picture, drawn twice, described once.
+        seen.clear();
+        {
+            const string content =
+                "BT /F1 11 Tf 72 700 Td (Photo de Jean Dupont :) Tj ET\n"
+                "q 200 0 0 100 72 500 cm /Im1 Do Q\n"
+                "q 200 0 0 -100 72 400 cm /Im1 Do Q\n";
+            const string pdf = pdf_file({
+                "<< /Type /Catalog /Pages 2 0 R >>",
+                "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Contents 4 0 R "
+                "/Resources << /Font << /F1 5 0 R >> /XObject << /Im1 6 0 R >> >> >>",
+                pdf_stream("", content),
+                "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+                pdf_stream("/Type /XObject /Subtype /Image /Width 2 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8",
+                           string("\xFF\x00\x00\x00\xFF\x00", 6)) });
+            pii_detector detector;
+            document_anonymizer a(p, detector);
+            a.set_image_describer(describer);
+            document_report report;
+            const string out = a.anonymize(pdf, document_format::pdf, report);
+            DLIB_TEST(seen.size() == 1 && seen[0].bytes == png && seen[0].location == "page 1");
+            string text;
+            for (const auto& page : layout_pdf_text(read_pdf_text(out)))
+                for (const pdf_text_segment& s : page) text += s.text + "\n";
+            size_t captions = 0;
+            for (size_t k = text.find("red & green"); k != string::npos; k = text.find("red & green", k + 1)) ++captions;
+            DLIB_TEST_MSG(captions == 2 && text.find("Dupont") == string::npos, text);
+            // Upright in both boxes: the caption of the flipped picture reads inside its box.
+            const pdf_text_document reread = read_pdf_text(out);
+            for (const pdf_text_span& s : reread.pages[0].spans)
+                if (s.text.find("Image@42") != string::npos)
+                    DLIB_TEST_MSG(std::abs(s.angle) < 1 && s.x >= 72 && s.x < 272 &&
+                                  ((s.y > 500 && s.y < 600) || (s.y > 300 && s.y < 400)), s.x << " " << s.y);
+            // Without a describer the boxes stay empty.
+            document_anonymizer plain(p, detector);
+            document_report r2;
+            string none;
+            for (const auto& page : layout_pdf_text(read_pdf_text(plain.anonymize(pdf, document_format::pdf, r2))))
+                for (const pdf_text_segment& s : page) none += s.text + "\n";
+            DLIB_TEST(none.find("Image@") == string::npos);
+        }
+    }
 
     void test_more_identifiers()
     {
@@ -1470,6 +1880,87 @@ namespace
         DLIB_TEST(found(e, text, pii_type::organization, "La Poste"));
     }
 
+    void test_short_texts()
+    {
+        /* Cells, titles of slides and comments: a common word capitalized by its place names
+           nothing, a number before a unit or a common noun is no address, the label of a column
+           keeps its person, and a first name read as a place or an organisation joins the family
+           name after it. */
+        struct value { string text; string label; double confidence; };
+        auto spans = std::make_shared<std::vector<value>>();
+        pii_detector detector;
+        detector.add_recognizer([spans](const string& t) {
+            std::vector<pii_span> out;
+            size_t from = 0;
+            for (const auto& v : *spans)
+            {
+                const size_t p = t.find(v.text, from);
+                if (p == string::npos) continue;
+                pii_span s;
+                s.begin = p; s.end = p + v.text.size(); s.label = v.label; s.confidence = v.confidence;
+                out.push_back(s);
+                from = s.end;
+            }
+            return out;
+        });
+        auto read = [&](const string& text, const std::vector<value>& values, pii_type label) {
+            *spans = values;
+            detector.begin_document();
+            detection_context ctx;
+            ctx.label = label;
+            return detector.detect(text, ctx);
+        };
+        auto count = [](const std::vector<pii_entity>& e, const string& text, const string& value) {
+            size_t n = 0;
+            for (const pii_entity& x : e)
+                if (text.substr(x.begin, x.end - x.begin) == value) ++n;
+            return n;
+        };
+        string text = "Recette\nBascule confirmée le 30 avril 2026\n• Doublon possible avec ADH-2021-11502\n"
+                      "Prélèvement rejeté en janvier 2026.\nMédecin-conseil\nCotisation mensuelle";
+        std::vector<pii_entity> e = read(text, {{"Recette", "FAMILY_NAME", 0.65}, {"Bascule", "CITY", 0.61},
+                                                {"Doublon", "CITY", 0.69}, {"Prélèvement", "GIVEN_NAME", 0.54},
+                                                {"Médecin-conseil", "ORGANIZATION", 0.9},
+                                                {"Cotisation mensuelle", "ORGANIZATION", 0.78}}, pii_type::none);
+        for (const char* w : { "Recette", "Bascule", "Doublon", "Prélèvement", "Médecin-conseil", "Cotisation" })
+            DLIB_TEST_MSG(!covered(e, text, w), w);
+        DLIB_TEST(found(e, text, pii_type::date, "30 avril 2026"));
+        // A name after a civility or inside a sentence, a name that is no common word, a town.
+        text = "Signé par M. Page. Le rapport de Page est prêt.\nLe Floc'h arrive.\nParis, le 3 mars 2026";
+        e = read(text, {{"Page", "FAMILY_NAME", 0.9}, {"Page", "FAMILY_NAME", 0.9}, {"Le Floc'h", "FAMILY_NAME", 0.9},
+                        {"Paris", "CITY", 0.9}}, pii_type::none);
+        DLIB_TEST(count(e, text, "Page") == 2);
+        DLIB_TEST(found(e, text, pii_type::person, "Le Floc'h"));
+        DLIB_TEST(found(e, text, pii_type::location, "Paris"));
+        // A number before a unit or before words in lower case, without a street type.
+        text = "Comité à 14 h, dont 212 doublons, au 12 rue des Goélands.";
+        e = read(text, {{"14", "STREET_ADDRESS", 0.63}, {"212 doublons", "STREET_ADDRESS", 0.94},
+                        {"12 rue des Goélands", "STREET_ADDRESS", 0.99}}, pii_type::none);
+        DLIB_TEST(!covered(e, text, "14"));
+        DLIB_TEST(!covered(e, text, "212"));
+        DLIB_TEST(found(e, text, pii_type::address, "12 rue des Goélands"));
+        // A floor, a street without its type in a text in lower case, the value of a label, a firm.
+        text = "Logement : 12 rue de Brest, 9e étage.\nre: 220 broadway, lowell\nApproved by: North\n"
+               "estate agent, Tan Law, Bath.";
+        e = read(text, {{"9e étage", "STREET_ADDRESS", 0.9}, {"220 broadway", "STREET_ADDRESS", 0.9},
+                        {"North", "FAMILY_NAME", 0.8}, {"Tan", "ORGANIZATION", 0.98}, {"Law", "FAMILY_NAME", 0.71}},
+                 pii_type::none);
+        DLIB_TEST(found(e, text, pii_type::address, "9e étage"));
+        DLIB_TEST(found(e, text, pii_type::address, "220 broadway"));
+        DLIB_TEST(found(e, text, pii_type::person, "North"));
+        DLIB_TEST(!found(e, text, pii_type::person, "Tan Law"));
+        // The label of a column of names keeps the person a recognizer reads as an organisation.
+        text = "LE FLOC'H";
+        e = read(text, {{"FLOC'H", "ORGANIZATION", 0.85}}, pii_type::person);
+        DLIB_TEST(found(e, text, pii_type::person, "LE FLOC'H"));
+        // A first name read as an organisation or a place, before the family name.
+        text = "Signalé par sa sœur, Nolwenn Le Floc'h, et par Malo Cozic.";
+        e = read(text, {{"Nolwenn", "ORGANIZATION", 0.91}, {"Le Floc'h", "FAMILY_NAME", 0.83},
+                        {"Malo", "CITY", 0.92}, {"Cozic", "FAMILY_NAME", 0.87}}, pii_type::none);
+        DLIB_TEST(found(e, text, pii_type::person, "Nolwenn Le Floc'h"));
+        DLIB_TEST(found(e, text, pii_type::person, "Malo Cozic"));
+    }
+
     void test_partial_dates()
     {
         // A month and its year, a year that dates something: dates, which move with the others.
@@ -2217,6 +2708,9 @@ namespace
             test_office_document();
             print_spinner();
             test_pdf_document();
+            test_pdf_layout();
+            test_image_describer();
+            test_pdf_wrapped_cell();
             print_spinner();
             test_more_identifiers();
             print_spinner();
@@ -2234,6 +2728,7 @@ namespace
             print_spinner();
             test_learned_terms();
             test_name_edges();
+            test_short_texts();
             print_spinner();
             test_attribute_coverage();
             print_spinner();

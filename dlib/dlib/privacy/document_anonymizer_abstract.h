@@ -4,6 +4,7 @@
 #ifdef DLIB_DOCUMENT_ANONYMIZER_ABSTRACT_H_
 
 #include <string>
+#include "../documents/document_image_abstract.h"
 #include "pii_detector_abstract.h"
 #include "pseudonymizer_abstract.h"
 #include "document_report_abstract.h"
@@ -185,6 +186,46 @@ namespace dlib
                 - Protects a UTF-8 string as plain text, such as a prompt about to be sent
                   to a language model. The answer can be restored with
                   pseudonymizer::restore().
+        !*/
+
+        void set_pdf_layout(
+            bool keep
+        );
+        /*!
+            ensures
+                - #pdf_layout() == keep
+        !*/
+
+        bool pdf_layout(
+        ) const;
+        /*!
+            ensures
+                - Returns true, the default, when a PDF keeps its pages: they are written
+                  again with their graphics, the text drawn with standard fonts and the
+                  pictures replaced (pdf_anonymizer). Returns false when a PDF is rebuilt
+                  as text only.
+        !*/
+
+        void set_image_describer(
+            const document_image_describer& describer
+        );
+        /*!
+            ensures
+                - anonymize() then gives describer the pictures of the documents and
+                  writes the text it returns in their place, as it is returned (a
+                  describer whose text may hold personal data protects it first, with
+                  anonymize_text() of another document_anonymizer and its own detector):
+                    - Word documents: a picture of a run (w:drawing, w:pict, or their
+                      mc:AlternateContent) becomes a run text;
+                    - PowerPoint presentations: a picture (p:pic, or its
+                      mc:AlternateContent) becomes a gray text box at its position;
+                    - PDF documents that keep their pages: the text is written over the
+                      gray box of the picture (pdf_anonymizer::set_image_describer()).
+                  Each image part, or image object of a PDF, is given once. The pictures
+                  of Excel workbooks, the pictures for which describer returns an empty
+                  string and those of the other formats are removed as before.
+                - An empty function, the default, removes the pictures without text.
+                  restore() never uses it.
         !*/
     };
 

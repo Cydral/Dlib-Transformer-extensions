@@ -12,6 +12,7 @@
 #include <vector>
 #include "../numeric_constants.h"
 #include "../documents/pdf_text.h"
+#include "../documents/pdf_rewrite.h"
 #include "pii_detector.h"
 #include "pseudonymizer.h"
 #include "document_report.h"
@@ -27,8 +28,11 @@ namespace dlib
         pdf_anonymizer(
             const pseudonymizer& p,
             pii_detector* detector,
-            document_report& report
-        ) : p_(p), detector_(detector), report_(report) {}
+            document_report& report,
+            bool keep_layout = true
+        ) : p_(p), detector_(detector), report_(report), keep_layout_(keep_layout) {}
+
+        void set_image_describer(const document_image_describer& describer) { describer_ = describer; }
 
         std::string anonymize(const std::string& pdf_bytes)
         {
@@ -47,6 +51,7 @@ namespace dlib
         {
             std::size_t seg;                    // index in the page layout
             std::size_t ub, ue;                 // range in the unit text
+            std::size_t sb;                     // where the range starts in the text of the segment
         };
 
         struct unit
@@ -116,6 +121,10 @@ namespace dlib
             restoring_ = restoring;
             report_.format = "pdf";
             pdf_text_document doc = read_pdf_text(bytes);
+            /* A text-only reconstruction stays one; any other document keeps its pages when asked,
+               and is restored keeping them. */
+            layout_mode_ = !doc.produced_by_dlib && (restoring || keep_layout_ || doc.rewritten_by_dlib);
+            replacements_.clear();
             std::vector<std::vector<pdf_text_segment>> layout = layout_pdf_text(doc);
 
             for (const std::string& n : doc.notes)
@@ -135,8 +144,66 @@ namespace dlib
                 for (const unit& u : units)
                     if (!u.text.empty()) detector_->learn(u.text, u.ctx);
             }
-            for (unit& u : units)
-                transform_unit(u, layout[u.page]);
+            for (const unit& u : units)
+                transform_unit(u);
+
+            if (!layout_mode_)
+            {
+                // The edits of a segment are applied from its end, so that their offsets hold.
+                std::vector<pdf_text_replacement> edits = replacements_;
+                std::stable_sort(edits.begin(), edits.end(),
+                                 [](const pdf_text_replacement& a, const pdf_text_replacement& b) {
+                                     if (a.page != b.page) return a.page < b.page;
+                                     if (a.segment != b.segment) return a.segment < b.segment;
+                                     return a.begin > b.begin;
+                                 });
+                for (const pdf_text_replacement& r : edits)
+                {
+                    std::string& t = layout[r.page][r.segment].text;
+                    if (r.begin <= r.end && r.end <= t.size()) t.replace(r.begin, r.end - r.begin, r.text);
+                }
+            }
+
+            if (layout_mode_)
+            {
+                // A document that holds no tag and was not protected here is given back as it is.
+                if (restoring_ && !doc.rewritten_by_dlib && replacements_.empty())
+                {
+                    report_.note("no tag found: the document is returned unchanged");
+                    return bytes;
+                }
+                pdf_rewrite_report rr;
+                const std::string out = rewrite_pdf_text(bytes, replacements_, &rr,
+                                                         restoring_ ? document_image_describer() : describer_);
+                if (!restoring_)
+                {
+                    if (rr.images > 0)
+                        report_.removed.push_back("images (" + std::to_string(rr.images) + ", replaced by gray boxes)");
+                    if (rr.described_images > 0)
+                        report_.note(std::to_string(rr.described_images) +
+                                     " gray box(es) received the text of the image describer");
+                    if (rr.annotations > 0)
+                        report_.removed.push_back("annotations (" + std::to_string(rr.annotations) + ")");
+                    for (const std::string& f : doc.features)
+                        report_.removed.push_back(f);
+                    report_.removed.push_back("embedded fonts (text drawn with standard fonts of the same style)");
+                    if (rr.drawn_annotations > 0)
+                        report_.note(std::to_string(rr.drawn_annotations) +
+                                     " form field, free text or stamp appearance(s) drawn into their page");
+                    for (std::size_t p = 0; p < doc.pages.size(); ++p)
+                        if (doc.pages[p].spans.empty() && doc.pages[p].images > 0)
+                            report_.note("page " + std::to_string(p + 1) +
+                                         " has no text layer (scanned page?): its pictures became gray boxes, no "
+                                         "OCR is performed");
+                    if (rr.scanned_pages > 0)
+                        report_.note(std::to_string(rr.scanned_pages) +
+                                     " scanned page(s): their recognized text is drawn visible over gray boxes");
+                }
+                if (rr.unencodable > 0)
+                    report_.note(std::to_string(rr.unencodable) +
+                                 " characters outside the Latin repertoire of the standard PDF fonts were written as '?'");
+                return out;
+            }
 
             if (!restoring_)
             {
@@ -182,15 +249,105 @@ namespace dlib
             std::vector<column> header;
             double last_row_v = 0, last_row_fs = 0;
 
+            /* The end of a word cut by its hyphen in a cell of a table, which the next line
+               holds under the cell: "fatou.ndiaye@arvelis-" then "services.fr".  The writer of
+               the file may have drawn it with the text of the cell on its left, in one segment:
+               "Ouessant Logistique SARL logistique.fr".  The part of a segment taken by such a
+               cell is [taken_b, taken_e). */
+            const std::size_t npos = std::string::npos;
+            std::vector<std::size_t> taken_b(segs.size(), npos), taken_e(segs.size(), 0);
+            struct taken_part { std::size_t seg, b, e; };
+            auto continuation = [&](std::size_t k, std::size_t si) -> taken_part {
+                const taken_part none = { npos, 0, 0 };
+                const pdf_text_segment& s = segs[si];
+                if (k + 1 >= lines.size() || !ends_with_hyphen(s.text)) return none;
+                const double a = s.angle, fs = std::max(1.0, s.font_size);
+                const double x = along(s, a);
+                for (std::size_t c : lines[k + 1])
+                {
+                    const pdf_text_segment& n = segs[c];
+                    if (taken_b[c] != npos || std::abs(n.angle - a) > 0.5 || n.text.empty()) continue;
+                    const double dv = across(s, a) - across(n, a);
+                    if (dv < 0.5 * fs || dv > 2.5 * fs) continue;
+                    const double nx = along(n, a);
+                    std::size_t b = npos;
+                    if (std::abs(x - nx) <= std::max(1.5, 0.6 * fs))
+                    {
+                        b = 0;
+                    }
+                    else if (nx < x - fs && nx + n.width > x + fs)
+                    {
+                        /* The word starting the closest to the cell, its place estimated from
+                           the number of characters before it.  The segment joins texts closer
+                           than two sizes of the font, which bounds the error of the estimate. */
+                        const double per = n.width / static_cast<double>(std::max<std::size_t>(1, code_points(n.text)));
+                        double best = 2.0 * fs;
+                        std::size_t cps = 0;
+                        for (std::size_t i = 0; i < n.text.size(); ++i)
+                        {
+                            const unsigned char ch = static_cast<unsigned char>(n.text[i]);
+                            if (i > 0 && n.text[i - 1] == ' ' && ch != ' ')
+                            {
+                                const double d = std::abs(nx + per * static_cast<double>(cps) - x);
+                                if (d < best)
+                                {
+                                    best = d;
+                                    b = i;
+                                }
+                            }
+                            if ((ch & 0xC0) != 0x80) ++cps;
+                        }
+                    }
+                    if (b == npos) continue;
+                    const unsigned char c0 = static_cast<unsigned char>(n.text[b]);
+                    if (!std::islower(c0) && !std::isdigit(c0)) continue;
+                    std::size_t e = n.text.size();
+                    if (b > 0)
+                    {
+                        e = n.text.find(' ', b);
+                        if (e == npos) e = n.text.size();
+                    }
+                    return taken_part{ c, b, e };
+                }
+                return none;
+            };
+
+            // Appends to a unit the parts of a segment that no cell above took.
+            auto add_own = [&](unit& u, std::size_t si) {
+                const std::string& t = segs[si].text;
+                const std::size_t b = taken_b[si] == npos ? t.size() : taken_b[si];
+                const std::size_t e = taken_b[si] == npos ? t.size() : taken_e[si];
+                if (b > 0)
+                {
+                    u.pieces.push_back(piece{ si, u.text.size(), u.text.size() + b, 0 });
+                    u.text.append(t, 0, b);
+                }
+                if (e < t.size())
+                {
+                    if (!u.text.empty()) u.text += "\n";
+                    u.pieces.push_back(piece{ si, u.text.size(), u.text.size() + (t.size() - e), e });
+                    u.text.append(t, e, npos);
+                }
+            };
+
             std::size_t k = 0;
             while (k < lines.size())
             {
                 const std::vector<std::size_t>& line = lines[k];
+                if (line.size() == 1 && taken_b[line[0]] != npos)
+                {
+                    unit u;
+                    u.page = page;
+                    add_own(u, line[0]);
+                    if (!u.pieces.empty()) units.push_back(u);
+                    ++k;
+                    continue;
+                }
                 if (line.size() == 1)
                 {
                     // A chain of single segment lines: paragraph, address block, list item.
                     std::vector<std::size_t> chain(1, line[0]);
-                    while (k + 1 < lines.size() && lines[k + 1].size() == 1 &&
+                    while (k + 1 < lines.size() && lines[k + 1].size() == 1 && taken_b[lines[k + 1][0]] == npos &&
                            continues(segs[chain.back()], segs[lines[k + 1][0]], chain.size() == 1))
                     {
                         chain.push_back(lines[k + 1][0]);
@@ -232,8 +389,20 @@ namespace dlib
                 {
                     unit u;
                     u.page = page;
-                    u.text = segs[line[j]].text;
-                    u.pieces.push_back(piece{ line[j], 0, u.text.size() });
+                    add_own(u, line[j]);
+                    if (u.pieces.empty()) continue;
+                    if (!restoring_ && taken_b[line[j]] == npos)
+                    {
+                        const taken_part t = continuation(k, line[j]);
+                        if (t.seg != npos)
+                        {
+                            const std::size_t b = u.text.size();
+                            u.text.append(segs[t.seg].text, t.b, t.e - t.b);
+                            u.pieces.push_back(piece{ t.seg, b, u.text.size(), t.b });
+                            taken_b[t.seg] = t.b;
+                            taken_e[t.seg] = t.e;
+                        }
+                    }
                     if (!restoring_ && !is_header)
                     {
                         if (j > 0 && label[j - 1] != pii_type::none)
@@ -322,20 +491,25 @@ namespace dlib
                             s.width * static_cast<double>(code_points(s.text, 0, word_end)) / total;
                         const double prev_end = along(prev, a) + prev.width;
                         const bool full = prev.width >= 10 * fs && prev_end + 0.28 * fs + first_word > max_end - 0.5;
-                        if (full) u.text += (hyphen || spaced(prev, s)) ? "" : " ";
+                        /* A word cut by its hyphen at the end of a line of a narrow cell goes on
+                           in the next one: "jean.dupont@exemple-" then "conseil.fr". */
+                        const unsigned char next0 = s.text.empty() ? 0 : static_cast<unsigned char>(s.text[0]);
+                        const bool continued = hyphen && prev.text.find(' ') == std::string::npos &&
+                                               (std::islower(next0) || std::isdigit(next0));
+                        if (full || continued) u.text += (hyphen || spaced(prev, s)) ? "" : " ";
                         else u.text += "\n";
                     }
                 }
                 const std::size_t b = u.text.size();
                 u.text += s.text;
-                u.pieces.push_back(piece{ chain[c], b, u.text.size() });
+                u.pieces.push_back(piece{ chain[c], b, u.text.size(), 0 });
             }
             return u;
         }
 
     // ------------------------------------------------------------------------------------
 
-        void transform_unit(unit& u, std::vector<pdf_text_segment>& segs)
+        void transform_unit(const unit& u)
         {
             if (u.text.empty()) return;
             struct span { std::size_t b, e; std::string rep; };
@@ -376,53 +550,37 @@ namespace dlib
                     }
                 }
             }
-            if (edits.empty()) return;
 
-            /* Each segment keeps its characters outside the edits; the replacement of an
-               edit goes to the segment holding its first character, or to the next one
-               when the edit starts on a line separator. */
-            std::vector<std::string> out(u.pieces.size());
-            std::vector<bool> touched(u.pieces.size(), false);
-            std::vector<bool> placed(edits.size(), false);
-            std::size_t ei = 0;
-            for (std::size_t k = 0; k < u.pieces.size(); ++k)
+            /* Each edit replaces the characters of the segments it covers: its text goes to
+               the first one (drawn over its extent when the pages are kept), the others lose
+               theirs. */
+            for (const span& ed : edits)
             {
-                const piece& pc = u.pieces[k];
-                while (ei < edits.size() && edits[ei].e <= pc.ub)
+                bool first = true;
+                for (const piece& pc : u.pieces)
                 {
-                    if (!placed[ei]) { out[k] += edits[ei].rep; touched[k] = true; placed[ei] = true; }
-                    ++ei;
-                }
-                std::size_t pos = pc.ub;
-                while (pos < pc.ue)
-                {
-                    while (ei < edits.size() && edits[ei].e <= pos) ++ei;
-                    if (ei < edits.size() && edits[ei].b <= pos)
-                    {
-                        if (!placed[ei]) { out[k] += edits[ei].rep; placed[ei] = true; }
-                        touched[k] = true;
-                        pos = std::min(edits[ei].e, pc.ue);
-                        continue;
-                    }
-                    const std::size_t stop = (ei < edits.size()) ? std::min(edits[ei].b, pc.ue) : pc.ue;
-                    out[k] += u.text.substr(pos, stop - pos);
-                    pos = stop;
+                    const std::size_t b = std::max(ed.b, pc.ub), e = std::min(ed.e, pc.ue);
+                    if (b >= e) continue;
+                    pdf_text_replacement r;
+                    r.page = u.page;
+                    r.segment = pc.seg;
+                    r.begin = pc.sb + (b - pc.ub);
+                    r.end = pc.sb + (e - pc.ub);
+                    if (first) r.text = ed.rep;
+                    first = false;
+                    replacements_.push_back(r);
                 }
             }
-            for (std::size_t i = 0; i < edits.size(); ++i)
-            {
-                if (placed[i] || u.pieces.empty()) continue;
-                out.back() += edits[i].rep;
-                touched.back() = true;
-            }
-            for (std::size_t k = 0; k < u.pieces.size(); ++k)
-                if (touched[k]) segs[u.pieces[k].seg].text = out[k];
         }
 
         const pseudonymizer& p_;
         pii_detector* detector_;
         document_report& report_;
+        bool keep_layout_ = true;
+        document_image_describer describer_;
         bool restoring_ = false;
+        bool layout_mode_ = false;
+        std::vector<pdf_text_replacement> replacements_;
     };
 
 // ----------------------------------------------------------------------------------------

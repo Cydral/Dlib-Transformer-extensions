@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <!-- The mark of Pseudalis: the shield and its keyhole. -->
+  <path d="M32 3 C42 8 51 9 59 9.5 V30 C59 47 47 57 32 62 C17 57 5 47 5 30 V9.5 C13 9 22 8 32 3 Z"
+        fill="#16446e" stroke="#f2b632" stroke-width="3.5" stroke-linejoin="round"/>
+  <circle cx="32" cy="27" r="7.5" fill="#2fd3c0"/>
+  <path d="M28 31 H36 L39 46 H25 Z" fill="#2fd3c0"/>
+</svg>

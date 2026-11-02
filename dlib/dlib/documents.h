@@ -6,5 +6,7 @@
 #include "documents/xml_scanner.h"
 #include "documents/ooxml_package.h"
 #include "documents/pdf_text.h"
+#include "documents/pdf_rewrite.h"
+#include "documents/document_image.h"
 
 #endif // DLIB_DOCUMENTS_

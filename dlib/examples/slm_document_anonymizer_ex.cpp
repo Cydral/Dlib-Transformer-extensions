@@ -31,9 +31,11 @@
     in any text derived from it, such as a summary written by a language model. The
     source document is never modified: outputs are new files.
 
-    Pictures, charts, embedded objects and macros are removed from Office documents, and
-    PDF files are rebuilt as text only, since none of those can be checked for personal
-    data here.
+    Pictures, charts, embedded objects and macros are removed from Office documents, since
+    none of those can be checked for personal data here. A PDF file keeps its pages: its
+    graphics, colors and tables stay, its text is drawn again in place with the standard
+    font of its style and its pictures become gray boxes (--pdf-text-only rebuilds it as
+    text only).
 
     FINDING THE PERSONAL DATA
 
@@ -61,7 +63,8 @@
     where the span model kept nothing, the confident spans of the tagger and the name
     parts that complete a name already found; where the span model reads an organisation
     with little confidence and the tagger reads its words as the parts of a name, the
-    name is kept.
+    name is kept, and so is a given name that the span model reads as a town or an
+    organisation when the tagger reads the family name after it.
 
     The recognizers can be compiled into the program, so that the executable travels
     alone. The embed command writes them, compressed and encoded as file_to_code_ex does,
@@ -169,6 +172,7 @@
 #include <dlib/privacy.h>
 #include <dlib/privacy/pii_sequence_tagger.h>
 #include <dlib/privacy/pii_span_model.h>
+#include <dlib/privacy/pii_recognizers.h>
 #include <dlib/base64.h>
 #include <dlib/cmd_line_parser.h>
 #include <dlib/dir_nav.h>
@@ -583,62 +587,23 @@ namespace
 // ----------------------------------------------------------------------------------------
 // The learned recognizers
 
-    /* The span model sizes this program can load; the size is read from the model file.
-       pii_span_model_base is added the same way. */
-    struct span_model
-    {
-        string size;
-        std::shared_ptr<pii_span_model_tiny> tiny_net;
-        std::shared_ptr<pii_span_model_small> small_net;
-
-        std::vector<pii_span> find(const string& text) const
-        {
-            return tiny_net ? tiny_net->find(text) : small_net->find(text);
-        }
-    };
+    /* The span model sizes this program can load, tiny and small (pii_span_recognizer); the
+       size is read from the model file. */
+    typedef pii_span_recognizer span_model;
 
     /* The size of the span model serialized at the start of in: "tiny" or "small". The
        stream is left where it was. */
     string span_model_size_in(std::istream& in, const string& source)
     {
-        const std::streampos at = in.tellg();
-        string name;
-        long d = 0, l = 0, h = 0;
-        try
-        {
-            deserialize(name, in);
-            if (name == "pii_span_model")
-            {
-                deserialize(d, in);
-                deserialize(l, in);
-                deserialize(h, in);
-            }
-        }
-        catch (serialization_error&) {}
-        in.clear();
-        in.seekg(at);
-        if (name != "pii_span_model") throw error(source + " is not a pii_span_model");
-        if (d == 64 && l == 2 && h == 2) return "tiny";
-        if (d == 128 && l == 4 && h == 4) return "small";
-        throw error(source + ": unsupported model size (" + to_string(d) + ", " + to_string(l) + ", " +
-                    to_string(h) + ")");
+        const string size = pii_span_recognizer::serialized_size(in);
+        if (size.empty()) throw error(source + " is not a tiny or small pii_span_model");
+        return size;
     }
 
     span_model read_span_model(std::istream& in, const string& source)
     {
-        span_model m;
-        m.size = span_model_size_in(in, source);
-        if (m.size == "tiny")
-        {
-            m.tiny_net = std::make_shared<pii_span_model_tiny>();
-            deserialize(*m.tiny_net, in);
-        }
-        else
-        {
-            m.small_net = std::make_shared<pii_span_model_small>();
-            deserialize(*m.small_net, in);
-        }
-        return m;
+        span_model_size_in(in, source);
+        return span_model(in);
     }
 
 #if !ANONYMIZER_ESSENTIALS_ONLY
@@ -784,7 +749,7 @@ namespace
         {
             const string bytes = read_file(parser.option("model").argument());
             istringstream in(bytes);
-            model_size = read_span_model(in, parser.option("model").argument()).size;
+            model_size = read_span_model(in, parser.option("model").argument()).size();
             model_text = encode_model(bytes);
             model_source = file_name_of(parser.option("model").argument());
         }
@@ -861,107 +826,15 @@ namespace
         return r;
     }
 
-    bool name_part(const pii_span& s)
-    {
-        return s.label == "GIVEN_NAME" || s.label == "FAMILY_NAME";
-    }
-
-    // True when s is a name part separated from a name part of spans by spaces or a hyphen only.
-    bool next_to_name(const string& text, const pii_span& s, const std::vector<pii_span>& spans)
-    {
-        for (const pii_span& o : spans)
-        {
-            if (!name_part(o) || (o.begin < s.end && s.begin < o.end)) continue;
-            const size_t from = o.end <= s.begin ? o.end : s.end, to = o.end <= s.begin ? s.begin : o.begin;
-            if (to - from > 2) continue;
-            bool gap = true;
-            for (size_t k = from; k < to; ++k)
-                if (text[k] != ' ' && text[k] != '-') gap = false;
-            if (gap) return true;
-        }
-        return false;
-    }
-
-    /* The spans of the model, where a span read as an organisation with a confidence below
-       doubt is replaced by the name parts the tagger reads over its words with more confidence,
-       when they cover all of it: "Lucie Rey" alone on its line. */
-    std::vector<pii_span> prefer_names(const string& text, const std::vector<pii_span>& model_spans,
-                                       const std::vector<pii_span>& tagger_spans, double doubt)
-    {
-        std::vector<pii_span> out;
-        for (const pii_span& m : model_spans)
-        {
-            std::vector<pii_span> parts;
-            if (m.label == "ORGANIZATION" && m.confidence < doubt)
-                for (const pii_span& s : tagger_spans)
-                    if (name_part(s) && s.begin < m.end && m.begin < s.end && s.confidence > m.confidence)
-                        parts.push_back(s);
-            bool covered = !parts.empty();
-            for (const pii_span& s : parts)
-                if (s.begin < m.begin || s.end > m.end) covered = false;
-            for (size_t k = m.begin; k < m.end && covered; ++k)
-            {
-                if (text[k] == ' ' || text[k] == '-') continue;
-                bool inside = false;
-                for (const pii_span& s : parts)
-                    if (s.begin <= k && k < s.end) inside = true;
-                covered = inside;
-            }
-            if (covered) out.insert(out.end(), parts.begin(), parts.end());
-            else out.push_back(m);
-        }
-        return out;
-    }
-
     /* Alone, either recognizer joins the detector with min_confidence. With both, the span
-       model leads: the tagger, whose word features also fire on capitalized words that are not
-       personal data, only fills its gaps, with spans of at least tagger_min_confidence where the
-       span model kept nothing, and with the less confident name parts that complete a name
-       already found, so that the parts of a name are replaced together. A doubtful
-       organisation of the span model gives way to the name the tagger reads there. */
+       model leads and the tagger fills its gaps (attach_pii_recognizers() of
+       dlib/privacy/pii_recognizers.h): its confident spans where the span model kept nothing,
+       the less confident name parts that complete a name already found, and the name it reads
+       where the span model reads an organisation with little confidence, or a single word as a
+       town or an organisation before a family name the tagger reads. */
     void attach(const recognizers& r, pii_detector& detector, double min_confidence, double tagger_min_confidence)
     {
-        const std::shared_ptr<pii_sequence_tagger> tagger = r.tagger;
-        const std::shared_ptr<span_model> model = r.model;
-        if (model && tagger)
-        {
-            detector.add_recognizer([model, tagger, min_confidence, tagger_min_confidence](const string& t) {
-                std::vector<pii_span> kept, spans, pending;
-                for (const pii_span& s : model->find(t))
-                    if (s.confidence >= min_confidence) kept.push_back(s);
-                const std::vector<pii_span> tagged = tagger->find(t);
-                kept = prefer_names(t, kept, tagged, 0.9);
-                spans = kept;
-                for (const pii_span& s : tagged)
-                {
-                    bool free = true;
-                    for (const pii_span& m : kept)
-                        if (s.begin < m.end && m.begin < s.end) free = false;
-                    if (!free) continue;
-                    if (s.confidence >= tagger_min_confidence) spans.push_back(s);
-                    else if (s.confidence >= min_confidence && name_part(s)) pending.push_back(s);
-                }
-                for (bool grown = true; grown;)
-                {
-                    grown = false;
-                    for (size_t k = 0; k < pending.size(); ++k)
-                    {
-                        if (!next_to_name(t, pending[k], spans)) continue;
-                        spans.push_back(pending[k]);
-                        pending.erase(pending.begin() + static_cast<long>(k));
-                        grown = true;
-                        break;
-                    }
-                }
-                std::sort(spans.begin(), spans.end(),
-                          [](const pii_span& a, const pii_span& b) { return a.begin < b.begin; });
-                return spans;
-            }, 0);
-        }
-        else if (model)
-            detector.add_recognizer([model](const string& t) { return model->find(t); }, min_confidence);
-        else if (tagger)
-            detector.add_recognizer([tagger](const string& t) { return tagger->find(t); }, min_confidence);
+        attach_pii_recognizers(detector, r.tagger, r.model, min_confidence, tagger_min_confidence);
     }
 
 #if !ANONYMIZER_ESSENTIALS_ONLY
@@ -1248,7 +1121,7 @@ namespace
         };
         if (r.tagger) score_recognizer("Sequence tagger", [&](const string& t) { return r.tagger->find(t); });
         if (r.model)
-            score_recognizer("Span model (" + r.model->size + ")", [&](const string& t) { return r.model->find(t); });
+            score_recognizer("Span model (" + r.model->size() + ")", [&](const string& t) { return r.model->find(t); });
 
         if (r.tagger || r.model)
         {
@@ -1355,6 +1228,9 @@ int main(int argc, char** argv)
         parser.add_option("report", "Write a JSON report next to each output: counts by type, removed content, notes. "
                           "Reports never contain personal values.");
         parser.add_option("force", "Overwrite existing outputs.");
+        parser.add_option("pdf-text-only", "Rebuild PDF files as text only, without their graphics; by default "
+                          "they keep their pages, their text drawn again with standard fonts and their pictures "
+                          "replaced by gray boxes.");
         parser.add_option("restore", "With the text command: restore standard input.");
 #if !ANONYMIZER_ESSENTIALS_ONLY
         parser.set_group_name("Training options");
@@ -1574,6 +1450,7 @@ int main(int argc, char** argv)
         popt.date_order = order;
         const pseudonymizer p(key, popt);
         document_anonymizer anonymizer(p, detector);
+        anonymizer.set_pdf_layout(!parser.option("pdf-text-only"));
 
         // Standard input to standard output.
         if (cmd == command::text)

@@ -1,0 +1,130 @@
+<!doctype html>
+<!-- Copyright (C) 2026 Cydral Technology (cydraltechnology@gmail.com)
+     License: Boost Software License   See LICENSE.txt for the full license. -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Pseudalis</title>
+  <link rel="icon" href="img/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+  <header class="top">
+    <img src="img/pseudalis-mark.svg" alt="" class="mark">
+    <span class="brand">Pseudalis</span>
+    <span class="tagline" data-t="tagline"></span>
+    <nav>
+      <a href="docs/" data-t="api"></a>
+      <select id="language" aria-label="Language">
+        <option value="en">English</option>
+        <option value="fr">Français</option>
+        <option value="de">Deutsch</option>
+        <option value="it">Italiano</option>
+        <option value="es">Español</option>
+      </select>
+    </nav>
+  </header>
+
+  <main>
+    <section class="status" id="status" aria-live="polite"></section>
+
+    <section class="card">
+      <h2 data-t="protect_title"></h2>
+      <p class="hint" data-t="protect_hint"></p>
+      <label class="drop" id="protect-drop">
+        <input type="file" id="protect-input" multiple>
+        <span data-t="drop"></span>
+      </label>
+      <label class="option"><input type="checkbox" id="keep" checked> <span data-t="keep"></span></label>
+      <ul class="results" id="protect-results"></ul>
+    </section>
+
+    <section class="card">
+      <h2 data-t="restore_title"></h2>
+      <p class="hint" data-t="restore_hint"></p>
+      <label class="drop" id="restore-drop">
+        <input type="file" id="restore-input" multiple>
+        <span data-t="drop"></span>
+      </label>
+      <ul class="results" id="restore-results"></ul>
+    </section>
+
+    <section class="card">
+      <h2 data-t="text_title"></h2>
+      <textarea id="text" rows="7" spellcheck="false"></textarea>
+      <div class="buttons">
+        <button id="text-protect" data-t="text_protect"></button>
+        <button id="text-restore" class="secondary" data-t="text_restore"></button>
+        <button id="text-detect" class="secondary" data-t="text_detect"></button>
+      </div>
+      <pre id="text-result" class="output" hidden></pre>
+    </section>
+
+    <!-- The administration, shown when the icon opens the application with its token. -->
+    <section class="card" id="records-card" hidden>
+      <h2 data-t="records_title"></h2>
+      <p class="hint" data-t="records_hint"></p>
+      <table class="records">
+        <thead>
+          <tr><th data-t="col_name"></th><th data-t="col_date"></th><th data-t="col_source"></th>
+            <th data-t="col_size"></th><th></th></tr>
+        </thead>
+        <tbody id="records"></tbody>
+      </table>
+      <p class="hint" id="records-none" data-t="records_none" hidden></p>
+      <div class="buttons"><button class="secondary" id="records-more" data-t="records_more" hidden></button></div>
+    </section>
+
+    <section class="card" id="key-card" hidden>
+      <h2 data-t="key_title"></h2>
+      <p class="hint" data-t="key_hint"></p>
+      <p class="fingerprint"><span data-t="key_fingerprint"></span> <code id="fingerprint"></code></p>
+      <div class="fields">
+        <label><span data-t="passphrase"></span><input type="password" id="pass1" autocomplete="new-password"></label>
+        <label><span data-t="passphrase_again"></span>
+          <input type="password" id="pass2" autocomplete="new-password"></label>
+      </div>
+      <div class="buttons">
+        <button id="key-export" data-t="btn_export"></button>
+        <label class="button secondary file"><input type="file" id="key-import" accept=".json,application/json">
+          <span data-t="btn_import"></span></label>
+      </div>
+      <p class="hint" data-t="import_hint"></p>
+      <p class="message" id="key-message" hidden></p>
+    </section>
+
+    <section class="card" id="settings-card" hidden>
+      <h2 data-t="settings_title"></h2>
+      <div class="fields">
+        <label><span data-t="set_language"></span>
+          <select id="set-language">
+            <option value="auto" data-t="set_language_auto"></option>
+            <option value="en">English</option>
+            <option value="fr">Français</option>
+            <option value="de">Deutsch</option>
+            <option value="it">Italiano</option>
+            <option value="es">Español</option>
+          </select></label>
+        <label><span data-t="set_drive"></span><input type="text" id="set-drive" maxlength="1" class="letter"></label>
+        <label><span data-t="set_max"></span><input type="number" id="set-max" min="1" max="2048"></label>
+        <label><span data-t="set_removed"></span><input type="number" id="set-removed" min="1" max="3650"></label>
+      </div>
+      <label class="option"><input type="checkbox" id="set-albireo"> <span data-t="set_albireo"></span></label>
+      <label class="option"><input type="checkbox" id="set-updates"> <span data-t="set_updates"></span></label>
+      <label class="option"><input type="checkbox" id="set-pdf"> <span data-t="set_pdf"></span></label>
+      <div class="buttons"><button id="settings-save" data-t="btn_save"></button></div>
+      <p class="message" id="settings-message" hidden></p>
+    </section>
+  </main>
+
+  <footer>
+    <span>Pseudalis <span id="version"></span>. Copyright (C) 2026 Cydral Technology. <span data-t="written_by"></span>
+      Aldric Pierrain.</span>
+    <span>WinFsp - Windows File System Proxy, Copyright (C) Bill Zissimopoulos,
+      <a href="https://github.com/winfsp/winfsp" rel="noreferrer" target="_blank">github.com/winfsp/winfsp</a>.</span>
+  </footer>
+  <script src="js/i18n.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
