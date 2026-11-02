@@ -19,40 +19,50 @@
     replacement it refuses leaves the model as it was, the next one completing from the
     files received.  The ranges of the downloads bring the bytes asked for and no more, a
     damaged database fails its opening as malformed, and the files written atomically leave
-    no temporary file.  The downloads come from the public link alone, which answers through a
-    local API of pCloud: its listing and addresses are kept, every model comes from its copy in
-    the link while no official address of the catalog receives a request, and a copy of another
-    size, a file the link lacks and a link that is not set fail with a message that names the
-    file in the link; the catalog and the feed of the updates come from the link alone too, and
-    its errors never show the query of a request.  The test works in a data folder of its own
-    (set_data_dir()), never in the one of an installed service.
+    no temporary file.  The downloads come from the publication space alone, whose link of the
+    tests answers through a local interface of pCloud: its listing and addresses are kept, every
+    model comes from its copy in the space while no official address of the catalog receives a
+    request, and a copy of another size, a file the space lacks and a space that is not set fail
+    with a message that names the file in the space; the catalog and the feed of the updates come
+    from the space alone too.  Each failure of the space fails its operation with its message,
+    lets no exception out, leaves the local server answering, and names neither pCloud, nor the
+    link, nor its code, nor an address: a web page with 200 and with 403 and a proxy asking for
+    its authentication, from each method of the interface and from a content server, a
+    connection reset or refused, a JSON cut short or of other types, sizes of another type,
+    negative, beyond the integers or above the file read, and a server that stalls or sends its
+    answer byte by byte beyond the bounds the tests shorten.  The log passes its lines, and its
+    files of an earlier version, through the last guard (common/log.h), as the errors of the
+    routes.  The settings of an earlier version (public_link, the providers and the key of the
+    search) are read without error and leave settings.json at the start.  The test works in a
+    data folder of its own (set_data_dir()), never in the one of an installed service.
 
     The web access reads public addresses only: the addresses on both sides of each range that
     is not public, the addresses refused before any connection (user information, schemes, names
     of a single label, the names and the numeric forms of the loopback), then, the loopback
     allowed for the tests, the pages of the local server: a page, a text cut at 2 MB, a type
     refused, the PDF files above 20 MB refused, a redirection to a private address refused.  The
-    providers of the search answer from the same server with the documents of Wikipedia, of the
-    Brave Search API and of SearXNG.  Both routes refuse to work offline or with the web access
-    turned off, and the key of the search never reaches a document of the settings or the log.
-    A key of the Brave Search API built into the service, given by the function reserved for the
-    tests, makes the Brave Search API the provider by default and takes the place of the key of
-    the administrator when there is none, its refusals and its spent credit named as such.
+    search of Wikipedia answers from the same server with its documents.  Both routes refuse to
+    work offline or with the web access turned off, and a search without provider is refused.
 */
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <fstream>
 #include <functional>
 #include <map>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
 
 #if !defined(_WIN32)
+#include <netinet/in.h>
+#include <sys/select.h>
+#include <sys/socket.h>
 #include <unistd.h>
 #endif
 
@@ -159,6 +169,81 @@ namespace
     {
         return db.find_model(id, m);
     }
+
+    /*
+        A server that accepts each connection, reads its request, and resets it (SO_LINGER at
+        0), as a filter of the network that cuts the connections to a site.
+    */
+    class reset_server
+    {
+    public:
+        ~reset_server() { stop(); }
+
+        bool start(int port)
+        {
+            listener_ = ::socket(AF_INET, SOCK_STREAM, 0);
+            if (listener_ == INVALID_SOCKET) return false;
+            int yes = 1;
+            setsockopt(listener_, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&yes), sizeof(yes));
+            sockaddr_in a = {};
+            a.sin_family = AF_INET;
+            a.sin_port = htons(static_cast<unsigned short>(port));
+            a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            if (::bind(listener_, reinterpret_cast<const sockaddr*>(&a), sizeof(a)) != 0 || ::listen(listener_, 8) != 0)
+            {
+                httplib::detail::close_socket(listener_);
+                listener_ = INVALID_SOCKET;
+                return false;
+            }
+            thread_ = std::thread([this]() {
+                while (!stopped_)
+                {
+                    if (!readable(listener_)) continue;
+                    const socket_t c = ::accept(listener_, nullptr, nullptr);
+                    if (c == INVALID_SOCKET) continue;
+                    char request[4096];
+                    if (readable(c)) ::recv(c, request, sizeof(request), 0);
+                    linger reset;
+                    reset.l_onoff = 1;
+                    reset.l_linger = 0;
+                    setsockopt(c, SOL_SOCKET, SO_LINGER, reinterpret_cast<const char*>(&reset), sizeof(reset));
+                    httplib::detail::close_socket(c);
+                }
+            });
+            return true;
+        }
+
+        void stop()
+        {
+            stopped_ = true;
+            if (thread_.joinable()) thread_.join();
+            if (listener_ != INVALID_SOCKET) httplib::detail::close_socket(listener_);
+            listener_ = INVALID_SOCKET;
+        }
+
+    private:
+        // Whether a socket has data or a connection to give within a tenth of a second.
+        static bool readable(socket_t sock)
+        {
+            fd_set set;
+            FD_ZERO(&set);
+            FD_SET(sock, &set);
+            timeval wait = { 0, 100000 };
+            return select(static_cast<int>(sock + 1), &set, nullptr, nullptr, &wait) > 0;
+        }
+
+        socket_t listener_ = INVALID_SOCKET;
+        std::atomic<bool> stopped_{false};
+        std::thread thread_;
+    };
+
+    // Whether text holds word, its ASCII letters compared whatever their case (word in lowercase).
+    bool holds_folded(const std::string& text, const std::string& word)
+    {
+        std::string folded = text;
+        for (auto& c : folded) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        return folded.find(word) != std::string::npos;
+    }
 }
 
 int main(int argc, char** argv)
@@ -201,13 +286,15 @@ int main(int argc, char** argv)
         });
     });
     /*
-        The public link of the tests: the API of pCloud on the local server (showpublink,
-        getpublinkdownload) and the files of its folder, each served at /content/<identifier>:
-        dist/feed.json without its signature, the copies of the models the downloads take,
-        models/linked/gone.bin, and models/short/other.bin of another size than the file of the
-        catalog.  The official addresses of the catalogs lie under /official/, which counts the
-        requests it receives and answers 404: the downloads never send one.  protected_link makes
-        the API answer as a link whose password is refused.
+        The publication space of the tests: the interface of pCloud on the local server
+        (showpublink, getpublinkdownload) and the files of its folder, each served at
+        /content/<identifier>: dist/feed.json without its signature, the copies of the models the
+        downloads take, models/linked/gone.bin, and models/short/other.bin of another size than
+        the file of the catalog.  The official addresses of the catalogs lie under /official/,
+        which counts the requests it receives and answers 404: the downloads never send one.
+        protected_link makes the interface answer as a link whose password is refused, and the
+        faults make a method or the content server answer as a proxy, a filter of the network or
+        a damaged server would; reset_port is the server that resets its connections.
     */
     const std::string feed_copy = "{\"feed\": 1}";
     const std::string linked = blob(250000, 'l');
@@ -218,6 +305,55 @@ int main(int argc, char** argv)
     };
     std::atomic<int> listings{0}, addresses{0}, password_mismatch{0}, official_requests{0};
     std::atomic<bool> protected_link{false};
+    enum fault
+    {
+        no_fault, html_200, html_403, proxy_407, truncated_json, stall, trickle, metadata_array, result_string,
+        size_string, size_negative, size_beyond, size_huge, hosts_object, reset
+    };
+    std::atomic<int> listing_fault{no_fault}, address_fault{no_fault}, content_fault{no_fault};
+    std::atomic<int> reset_port{0};
+    // The answer of a fault that any method gives; false for the faults of the documents.
+    auto fault_answer = [](int f, httplib::Response& res) {
+        const std::string blocked = "<html><body><h1>Access denied</h1><p>The filter of this network blocks the "
+            "site.</p></body></html>";
+        switch (f)
+        {
+        case html_200:
+            res.set_content(blocked, "text/html; charset=utf-8");
+            return true;
+        case html_403:
+            res.status = 403;
+            res.set_content(blocked, "text/html");
+            return true;
+        case proxy_407:
+            res.status = 407;
+            res.set_header("Proxy-Authenticate", "Basic realm=\"filter\"");
+            res.set_content(blocked, "text/html");
+            return true;
+        case truncated_json:
+            res.set_content("{\"result\": 0, \"metadata\": {\"name\": \"Albireo\", \"contents\": [{\"na",
+                "application/json");
+            return true;
+        case stall:
+            std::this_thread::sleep_for(std::chrono::seconds(3));
+            res.set_content("{}", "application/json");
+            return true;
+        case trickle:
+            // A byte every 0.3 s, below the bound of each wait and beyond the bound of the whole request.
+            res.set_chunked_content_provider("application/json", [](size_t offset, httplib::DataSink& sink) {
+                if (offset >= 20)
+                {
+                    sink.done();
+                    return true;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(300));
+                return sink.write(" ", 1);
+            });
+            return true;
+        default:
+            return false;
+        }
+    };
     auto api_refusal = [&](const httplib::Request& req, httplib::Response& res) {
         if (req.has_param("linkpassword") != albireo::public_link_has_password()) ++password_mismatch;
         if (req.get_param_value("code") != "TESTLINK1")
@@ -232,15 +368,18 @@ int main(int argc, char** argv)
         }
         return false;
     };
+    server.Get("/alive", [](const httplib::Request&, httplib::Response& res) {
+        res.set_content("alive", "text/plain");
+    });
     server.Get("/showpublink", [&](const httplib::Request& req, httplib::Response& res) {
-        if (api_refusal(req, res)) return;
+        if (api_refusal(req, res) || fault_answer(listing_fault, res)) return;
         ++listings;
-        auto file = [](const std::string& name, long long id, size_t size) {
+        auto file = [](const std::string& name, long long id, const json& size) {
             json f = json::object();
             f["name"] = name;
             f["isfolder"] = false;
             f["fileid"] = id;
-            f["size"] = static_cast<unsigned long long>(size);
+            f["size"] = size;
             return f;
         };
         auto folder = [](const std::string& name, const json& contents) {
@@ -252,12 +391,17 @@ int main(int argc, char** argv)
         };
         json dist = json::array(), models = json::array(), in_linked = json::array(), in_short = json::array();
         json in_tiny = json::array(), in_small = json::array();
-        dist.push_back(file("feed.json", 11, feed_copy.size()));
-        in_linked.push_back(file("gone.bin", 21, linked.size()));
-        in_short.push_back(file("other.bin", 31, short_copy.size()));
-        in_tiny.push_back(file("model.bin", 41, served.size()));
-        in_tiny.push_back(file("model-2.bin", 43, newer_tiny.size()));
-        in_small.push_back(file("other.bin", 42, other.size()));
+        // The size of dist/feed.json: of another type, negative, beyond the integers, or above any file read.
+        const int f = listing_fault;
+        const json feed_size = f == size_string ? json("11") : f == size_negative ? json(-11)
+            : f == size_beyond ? json(1e30) : f == size_huge ? json(9000000000000000000ll)
+            : json(static_cast<unsigned long long>(feed_copy.size()));
+        dist.push_back(file("feed.json", 11, feed_size));
+        in_linked.push_back(file("gone.bin", 21, json(static_cast<unsigned long long>(linked.size()))));
+        in_short.push_back(file("other.bin", 31, json(static_cast<unsigned long long>(short_copy.size()))));
+        in_tiny.push_back(file("model.bin", 41, json(static_cast<unsigned long long>(served.size()))));
+        in_tiny.push_back(file("model-2.bin", 43, json(static_cast<unsigned long long>(newer_tiny.size()))));
+        in_small.push_back(file("other.bin", 42, json(static_cast<unsigned long long>(other.size()))));
         models.push_back(folder("linked", in_linked));
         models.push_back(folder("short", in_short));
         models.push_back(folder("tiny", in_tiny));
@@ -266,12 +410,12 @@ int main(int argc, char** argv)
         root_contents.push_back(folder("dist", dist));
         root_contents.push_back(folder("models", models));
         json answer = json::object();
-        answer["result"] = 0;
-        answer["metadata"] = folder("Albireo", root_contents);
+        answer["result"] = f == result_string ? json("0") : json(0);
+        answer["metadata"] = f == metadata_array ? json::array() : folder("Albireo", root_contents);
         res.set_content(answer.dump(), "application/json");
     });
     server.Get("/getpublinkdownload", [&](const httplib::Request& req, httplib::Response& res) {
-        if (api_refusal(req, res)) return;
+        if (api_refusal(req, res) || fault_answer(address_fault, res)) return;
         ++addresses;
         const std::string id = req.get_param_value("fileid");
         const std::string path = link_content.count(id) ? "/content/" + id : std::string();
@@ -283,15 +427,17 @@ int main(int argc, char** argv)
         }
         else
         {
+            // The content server, or the server that resets its connections.
             json hosts = json::array();
-            hosts.push_back("127.0.0.1:" + std::to_string(port));
+            hosts.push_back("127.0.0.1:" + std::to_string(content_fault == reset ? reset_port.load() : port));
             answer["result"] = 0;
-            answer["hosts"] = hosts;
+            answer["hosts"] = address_fault == hosts_object ? json::object() : hosts;
             answer["path"] = path;
         }
         res.set_content(answer.dump(), "application/json");
     });
     server.Get(R"(/content/(\d+))", [&](const httplib::Request& req, httplib::Response& res) {
+        if (fault_answer(content_fault, res)) return;
         const auto it = link_content.find(req.matches[1].str());
         if (it == link_content.end()) res.status = 404;
         else res.set_content(*it->second, "application/octet-stream");
@@ -304,9 +450,8 @@ int main(int argc, char** argv)
         The pages of the web access: a page, a text of 3 MB, an image, a small PDF file, two PDF
         files of 21 MB (one announced by its length, one sent in chunks), a page that answers
         404, redirections to a private address, to a relative address and to themselves, and a
-        page that sends back the headers it received.  The providers of the search answer as
-        the interfaces of Wikipedia, of the Brave Search API and of SearXNG, and keep what they
-        received, which the checks read under seen_m.
+        page that sends back the headers it received.  The search answers as the interface of
+        Wikipedia, and keeps what it received, which the checks read under seen_m.
     */
     const std::string page = "<html><body><p>Albireo &amp; the web</p></body></html>";
     const std::string large_text = blob(3u << 20, 't');
@@ -358,18 +503,14 @@ int main(int argc, char** argv)
             + req.get_header_value("Cookie"), "text/plain; charset=\"utf-8\"");
     });
     std::mutex seen_m;
-    std::string seen_agent, seen_query, seen_count, seen_key, seen_format, seen_language;
-    auto keep_seen = [&](const httplib::Request& req, const char* count_name) {
-        std::lock_guard<std::mutex> lock(seen_m);
-        seen_agent = req.get_header_value("User-Agent");
-        seen_query = req.get_param_value("q");
-        seen_count = req.get_param_value(count_name);
-        seen_key = req.get_header_value("X-Subscription-Token");
-        seen_format = req.get_param_value("format");
-        seen_language = req.get_param_value("language");
-    };
+    std::string seen_agent, seen_query, seen_count;
     server.Get("/w/rest.php/v1/search/page", [&](const httplib::Request& req, httplib::Response& res) {
-        keep_seen(req, "limit");
+        {
+            std::lock_guard<std::mutex> lock(seen_m);
+            seen_agent = req.get_header_value("User-Agent");
+            seen_query = req.get_param_value("q");
+            seen_count = req.get_param_value("limit");
+        }
         if (req.get_param_value("q") == "too many")
         {
             res.status = 429;
@@ -383,52 +524,6 @@ int main(int argc, char** argv)
             "\"Einstein_(crater)\", \"title\": \"Einstein (crater)\", \"excerpt\": \"\", \"description\": "
             "\"Lunar crater\"}]}", "application/json");
     });
-    server.Get("/res/v1/web/search", [&](const httplib::Request& req, httplib::Response& res) {
-        keep_seen(req, "count");
-        const std::string key = req.get_header_value("X-Subscription-Token");
-        if (key == "revoked-key")
-        {
-            res.status = 401;
-            res.set_content("{\"type\": \"ErrorResponse\"}", "application/json");
-            return;
-        }
-        if (key == "spent-key")
-        {
-            res.status = 429;
-            res.set_content("{\"type\": \"ErrorResponse\", \"error\": {\"status\": 429, \"code\": \"RATE_LIMITED\"}}",
-                "application/json");
-            return;
-        }
-        if (key != "test-key" && key != "builtin-key")
-        {
-            res.status = 422;
-            res.set_content("{\"type\": \"ErrorResponse\", \"error\": {\"status\": 422, \"code\": "
-                "\"SUBSCRIPTION_TOKEN_INVALID\", \"detail\": \"The provided subscription token is invalid.\"}}",
-                "application/json");
-            return;
-        }
-        res.set_content("{\"type\": \"search\", \"web\": {\"type\": \"search\", \"results\": [{\"title\": "
-            "\"Brave &amp; Albireo\", \"url\": \"https://example.org/a\", \"description\": \"A <strong>local</strong> "
-            "model\"}, {\"title\": \"Files\", \"url\": \"ftp://example.org/b\", \"description\": \"left out\"}, "
-            "{\"title\": \"Second\", \"url\": \"http://example.org/c\", \"description\": \"plain\"}]}}",
-            "application/json");
-    });
-    server.Get("/searxng/search", [&](const httplib::Request& req, httplib::Response& res) {
-        keep_seen(req, "pageno");
-        if (req.get_param_value("format") != "json")
-        {
-            res.status = 403;
-            return;
-        }
-        res.set_content("{\"query\": \"x\", \"number_of_results\": 0, \"results\": [{\"url\": "
-            "\"https://searx.example/1\", \"title\": \"One\", \"content\": \"first   result\", "
-            "\"engine\": \"wikipedia\"}, {\"url\": \"javascript:alert(1)\", \"title\": \"Script\", "
-            "\"content\": \"left out\"}]}", "application/json");
-    });
-    server.Get("/closed/search", [&](const httplib::Request&, httplib::Response& res) {
-        res.status = 403;
-        res.set_content("Forbidden", "text/html");
-    });
     if (!server.bind_to_port("127.0.0.1", port))
     {
         std::printf("the port %d cannot be opened\n", port);
@@ -436,8 +531,9 @@ int main(int argc, char** argv)
     }
     std::thread listener([&]() { server.listen_after_bind(); });
     const std::string base_url = "http://127.0.0.1:" + std::to_string(port);
-    // The downloads come from the public link of the tests alone.
-    albireo::set_public_link(base_url + "/publink/show?code=TESTLINK1");
+    // The link of the build sets the publication space; the downloads of the tests come from their own link alone.
+    check(albireo::public_link_enabled(), "the link of the build sets the publication space");
+    albireo::public_link_for_tests(base_url + "/publink/show?code=TESTLINK1");
 
     {
         albireo::store db(albireo::join_path(work, "albireo.db"));
@@ -727,41 +823,41 @@ int main(int argc, char** argv)
     }
 
     {
-        // The public link: the links it accepts, its listing and addresses kept, the files it lacks.
-        check(albireo::valid_public_link("https://u.pcloud.link/publink/show?code=kZeNhSJZpcMygkcCvGXmq1MTvkCfBuSsx2GV")
-            && albireo::valid_public_link("https://e.pcloud.link/publink/show?code=XZabcdef12")
-            && !albireo::valid_public_link("https://example.org/publink/show?code=kZeNhSJZpcMygkcC")
-            && !albireo::valid_public_link("http://u.pcloud.link/publink/show?code=kZeNhSJZpcMygkcC")
-            && !albireo::valid_public_link("https://u.pcloud.link/publink/show?code=kZeN%2FhSJZpcM"),
-            "the public links of pCloud are told from the other addresses");
-        albireo::set_public_link("");
-        check(!albireo::public_link_enabled(), "an empty link turns the reads of the link off");
+        // The publication space: the links the tests may give, its listing and addresses kept, the files it lacks.
+        const std::string link = base_url + "/publink/show?code=TESTLINK1";
+        albireo::public_link_for_tests("https://example.org/publink/show?code=kZeNhSJZpcMygkcC");
+        const bool other_site = albireo::public_link_enabled();
+        albireo::public_link_for_tests("http://u.pcloud.link/publink/show?code=kZeNhSJZpcMygkcC");
+        const bool without_tls = albireo::public_link_enabled();
+        albireo::public_link_for_tests("");
+        check(!other_site && !without_tls && !albireo::public_link_enabled(),
+            "a link of another site, without TLS or empty sets no publication space");
         std::string body, error, url;
         uint64_t size = 0;
         albireo::link_status status = albireo::link_status::ok;
-        check(!albireo::public_link_file("dist/feed.json", url, size, error, false, &status)
-            && status == albireo::link_status::unset && error.find("dist/feed.json") != std::string::npos,
-            "without a link, a file of the link is refused with its name (" + error + ")");
-        albireo::set_public_link(base_url + "/publink/show?code=TESTLINK1");
+        bool ok = albireo::public_link_file("dist/feed.json", url, size, error, false, &status);
+        check(!ok && status == albireo::link_status::unset && error == "dist/feed.json cannot be downloaded: no "
+            "publication space is set", "without a space, a file is refused with its name (" + error + ")");
+        albireo::public_link_for_tests(link);
         check(albireo::public_link_enabled(), "a local link is used");
         const int listed_before = listings, addressed_before = addresses;
-        check(albireo::public_link_get("dist/feed.json", body, error, 1u << 20) && body == feed_copy,
-            "a file of the link is read (" + error + ")");
+        error.clear();
+        ok = albireo::public_link_get("dist/feed.json", body, error, 1u << 20);
+        check(ok && body == feed_copy, "a file of the space is read (" + error + ")");
         check(albireo::public_link_get("dist/feed.json", body, error, 1u << 20) && listings - listed_before == 1
             && addresses - addressed_before == 1,
-            "the listing and the address of the link are kept for the next reads");
-        check(!albireo::public_link_file("dist/catalog.json", url, size, error, false, &status)
-            && status == albireo::link_status::missing
+            "the listing and the address of the space are kept for the next reads");
+        ok = albireo::public_link_file("dist/catalog.json", url, size, error, false, &status);
+        check(!ok && status == albireo::link_status::missing
             && error == "the publication space of Albireo does not hold dist/catalog.json yet",
-            "a file the link lacks is reported as not published yet (" + error + ")");
+            "a file the space lacks is reported as not published yet (" + error + ")");
         check(password_mismatch == 0, "the password goes with each request when the program carries one");
         check(albireo::public_link_model_path("tiny", "https://hub.example/a/resolve/abc/Tiny-Q4.gguf?download=1")
             == "models/tiny/Tiny-Q4.gguf", "the copy of a file of a model lies in the folder of its identifier");
-        check(albireo::without_queries("https://api.pcloud.com/showpublink?code=X&linkpassword=Y: status 500")
-            == "https://api.pcloud.com/showpublink: status 500",
-            "the queries of the addresses stay out of the messages");
+        check(albireo::without_queries("https://example.org/search?q=X&key=Y: status 500")
+            == "https://example.org/search: status 500", "the queries of the addresses stay out of the messages");
 
-        // The downloads: the copy of the link alone, a copy of another size or a file the link lacks failing.
+        // The downloads: the copy of the space alone, a copy of another size or a file the space lacks failing.
         albireo::store db(albireo::join_path(work, "albireo-3.db"));
         json catalog = json::object();
         catalog["updated"] = "2026-11-01T00:00:00Z";
@@ -774,37 +870,37 @@ int main(int argc, char** argv)
         albireo::model_manager m(db, albireo::join_path(work, "models-3"));
         albireo::user_error started;
         albireo::installed_model im;
-        check(m.start_download("linked", started), "the download of a model the link holds starts");
+        check(m.start_download("linked", started), "the download of a model the space holds starts");
         json d = wait_download(m, "linked");
         check(d["state"].as_string() == "done" && installed(db, "linked", im) && read_text(im.file) == linked,
-            "a model comes from its copy in the link (" + d.dump() + ")");
+            "a model comes from its copy in the space (" + d.dump() + ")");
         check(m.start_download("short", started), "the download of a model whose copy has another size starts");
         d = wait_download(m, "short");
         check(d["state"].as_string() == "error" && d["code"].as_string() == "download_failed"
-            && d["error"].as_string() == "the copy of models/short/other.bin in the public link does not have the "
-            "size the catalog gives" && !installed(db, "short", im),
-            "a copy of another size than the catalog fails, naming the file in the link (" + d.dump() + ")");
-        check(m.start_download("absent", started), "the download of a model the link lacks starts");
+            && d["error"].as_string() == "the copy of models/short/other.bin in the publication space of Albireo does "
+            "not have the size the catalog gives" && !installed(db, "short", im),
+            "a copy of another size than the catalog fails, naming the file in the space (" + d.dump() + ")");
+        check(m.start_download("absent", started), "the download of a model the space lacks starts");
         d = wait_download(m, "absent");
         check(d["state"].as_string() == "error" && d["code"].as_string() == "download_not_published"
             && d["args"]["file"].as_string() == "models/absent/absent.bin"
             && d["error"].as_string() == "the publication space of Albireo does not hold models/absent/absent.bin yet",
-            "a model the link lacks fails as not published yet, naming its file (" + d.dump() + ")");
+            "a model the space lacks fails as not published yet, naming its file (" + d.dump() + ")");
         std::string refreshed;
         check(!m.refresh_catalog(refreshed)
             && refreshed == "the publication space of Albireo does not hold dist/catalog.json yet",
-            "a catalog the link lacks fails as not published yet (" + refreshed + ")");
-        // Without a link, a download fails at once, naming its file.
-        albireo::set_public_link("");
-        check(m.start_download("absent", started), "a download starts without a link");
+            "a catalog the space lacks fails as not published yet (" + refreshed + ")");
+        // Without a space, a download fails at once, naming its file.
+        albireo::public_link_for_tests("");
+        check(m.start_download("absent", started), "a download starts without a space");
         d = wait_download(m, "absent");
         check(d["state"].as_string() == "error" && d["code"].as_string() == "download_failed"
-            && d["error"].as_string() == "models/absent/absent.bin cannot be downloaded: no public link is set (the "
-            "setting public_link)", "without a link, a download fails, naming its file (" + d.dump() + ")");
+            && d["error"].as_string() == "models/absent/absent.bin cannot be downloaded: no publication space is set",
+            "without a space, a download fails, naming its file (" + d.dump() + ")");
         m.stop();
 
-        // The updates: the feed and its signature come from the link alone; the link holds no signature.
-        albireo::set_public_link(base_url + "/publink/show?code=TESTLINK1");
+        // The updates: the feed and its signature come from the space alone; the space holds no signature.
+        albireo::public_link_for_tests(link);
         {
             albireo::updater u(albireo::join_path(work, "updates"));
             u.check_async();
@@ -819,19 +915,324 @@ int main(int argc, char** argv)
             check(update["state"].as_string() == "error" && update["code"].as_string() == "update_not_published"
                 && update["args"]["file"].as_string() == "dist/feed.json.sig"
                 && update["error"].as_string() == "the publication space of Albireo does not hold dist/feed.json.sig "
-                "yet", "a feed whose signature the link lacks fails as not published yet (" + update.dump() + ")");
+                "yet", "a feed whose signature the space lacks fails as not published yet (" + update.dump() + ")");
         }
         check(official_requests == 0, "no official address of the catalog receives a request ("
             + std::to_string(official_requests) + ")");
 
         // A link that refuses the password: the message names the answer, never the query.
         protected_link = true;
-        albireo::set_public_link(base_url + "/publink/show?code=TESTLINK1");
-        check(!albireo::public_link_get("dist/feed.json", body, error, 1u << 20)
-            && error.find("1125") != std::string::npos && error.find("linkpassword=") == std::string::npos
-            && error.find("code=") == std::string::npos, "a refused password is reported without the query (" + error
-            + ")");
-        albireo::set_public_link("");
+        albireo::public_link_for_tests(link);
+        ok = albireo::public_link_get("dist/feed.json", body, error, 1u << 20);
+        check(!ok && error == "the publication space of Albireo answers \"Invalid 'linkpassword' provided.\" (1125) "
+            "for dist/feed.json", "a refused password is reported without the query (" + error + ")");
+        protected_link = false;
+        albireo::public_link_for_tests("");
+    }
+
+    {
+        /*
+            The failures of the publication space, each with the bounds of the waits shortened to 1 s
+            and of a whole request to 2 s: the operation fails with its message, no exception leaves it,
+            the local server still answers, and the message names neither pCloud, nor the link, nor its
+            code, nor an address.
+        */
+        reset_server resetting;
+        check(resetting.start(port + 1), "a server that resets its connections listens on the port "
+            + std::to_string(port + 1));
+        reset_port = port + 1;
+        const std::string link = base_url + "/publink/show?code=TESTLINK1";
+        albireo::http_bounds_for_tests(1, 2);
+        auto clean = [&](const std::string& text) {
+            return !holds_folded(text, "pcloud") && !holds_folded(text, "publink") && text.find("TESTLINK1")
+                == std::string::npos && text.find("://") == std::string::npos && text.find("127.0.0.1")
+                == std::string::npos;
+        };
+        auto answers = [&]() {
+            std::string alive, e;
+            return albireo::http_get(base_url + "/alive", alive, e, 64) && alive == "alive";
+        };
+        const std::string unreachable = "the publication space of Albireo cannot be reached for dist/feed.json: ";
+        const std::string undownloadable = "the copy of dist/feed.json in the publication space of Albireo cannot be "
+            "downloaded: ";
+        const std::string page_text = "a web page comes in place of the answer, as a proxy or a filter of the network "
+            "sends one";
+        const std::string other_answer = "the publication space of Albireo gives an answer that is not the one of its "
+            "interface for dist/feed.json";
+        const std::string invalid_entry = "the publication space of Albireo lists dist/feed.json without a valid "
+            "identifier or size";
+        struct failure_case
+        {
+            const char* what;
+            std::atomic<int>* where;
+            int f;
+            std::string expected;    // the message, or its beginning when prefix is true
+            bool prefix;
+        };
+        const failure_case cases[] = {
+            {"a listing answered by a web page with 200", &listing_fault, html_200, unreachable + page_text, false},
+            {"a listing answered by a web page with 403", &listing_fault, html_403,
+                unreachable + "the request is answered with the status 403", false},
+            {"a listing answered by a proxy that asks for its authentication", &listing_fault, proxy_407,
+                unreachable + "the proxy asks for an authentication (status 407)", false},
+            {"a listing cut short", &listing_fault, truncated_json, other_answer, false},
+            {"a listing whose folder is an array", &listing_fault, metadata_array, "the publication space of "
+                "Albireo gives a listing that is not the one of its interface for dist/feed.json", false},
+            {"a listing whose result is a string", &listing_fault, result_string, other_answer, false},
+            {"a listing whose size is a string", &listing_fault, size_string, invalid_entry, false},
+            {"a listing whose size is negative", &listing_fault, size_negative, invalid_entry, false},
+            {"a listing whose size is beyond the integers", &listing_fault, size_beyond, invalid_entry, false},
+            {"a listing whose size is above the file read", &listing_fault, size_huge, "the copy of dist/feed.json in "
+                "the publication space of Albireo is larger than expected", false},
+            {"a listing that stalls", &listing_fault, stall, unreachable + "no data arrives within 1 s", false},
+            {"a listing sent byte by byte", &listing_fault, trickle,
+                unreachable + "no complete answer arrives within 2 s", false},
+            {"an address answered by a web page with 200", &address_fault, html_200, unreachable + page_text, false},
+            {"an address answered by a web page with 403", &address_fault, html_403,
+                unreachable + "the request is answered with the status 403", false},
+            {"an address answered by a proxy that asks for its authentication", &address_fault, proxy_407,
+                unreachable + "the proxy asks for an authentication (status 407)", false},
+            {"an address cut short", &address_fault, truncated_json, other_answer, false},
+            {"an address whose servers are an object", &address_fault, hosts_object, "the publication space of "
+                "Albireo gives no address for dist/feed.json", false},
+            {"an address that stalls", &address_fault, stall, unreachable + "no data arrives within 1 s", false},
+            {"a content server that answers a web page with 200", &content_fault, html_200, undownloadable + page_text,
+                false},
+            {"a content server that answers a web page with 403", &content_fault, html_403,
+                undownloadable + "the request is answered with the status 403", false},
+            {"a content server that stalls", &content_fault, stall, undownloadable + "no data arrives within 1 s",
+                false},
+            {"a content server that sends the file byte by byte", &content_fault, trickle,
+                undownloadable + "no complete answer arrives within 2 s", false},
+            {"a content server that resets the connection", &content_fault, reset, undownloadable, true}
+        };
+        for (const auto& c : cases)
+        {
+            albireo::public_link_for_tests(link);
+            *c.where = c.f;
+            std::string body, error;
+            bool ok = true, escaped = false;
+            const auto begun = std::chrono::steady_clock::now();
+            try
+            {
+                ok = albireo::public_link_get("dist/feed.json", body, error, 1u << 20);
+            }
+            catch (...)
+            {
+                escaped = true;
+            }
+            const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - begun).count();
+            *c.where = no_fault;
+            const bool told = c.prefix ? error.compare(0, c.expected.size(), c.expected) == 0
+                && error.size() > c.expected.size() : error == c.expected;
+            check(!ok && !escaped && told && clean(error) && seconds < 10 && answers(), std::string(c.what)
+                + " fails with its message, in " + std::to_string(static_cast<int>(seconds)) + " s (" + error + ")");
+        }
+        // A space whose interface resets its connections, or does not listen.
+        for (int to : { port + 1, port + 2 })
+        {
+            albireo::public_link_for_tests("http://127.0.0.1:" + std::to_string(to) + "/publink/show?code=TESTLINK1");
+            std::string body, error;
+            bool ok = true, escaped = false;
+            try
+            {
+                ok = albireo::public_link_get("dist/feed.json", body, error, 1u << 20);
+            }
+            catch (...)
+            {
+                escaped = true;
+            }
+            check(!ok && !escaped && error.compare(0, unreachable.size(), unreachable) == 0 && clean(error)
+                && answers(), std::string(to == port + 1 ? "an interface that resets its connections"
+                : "an interface that does not listen") + " fails with its message (" + error + ")");
+        }
+        albireo::public_link_for_tests(link);
+
+        // The ranges of the downloads: a web page, a stall and a reset fail before any byte reaches the file.
+        std::string written, error;
+        auto keep = [&](const char* data, size_t n) {
+            written.append(data, n);
+            return true;
+        };
+        bool escaped = false;
+        content_fault = html_200;
+        const bool from_page = albireo::http_get_range(base_url + "/content/41", 0, 999, keep, error);
+        const std::string page_error = error;
+        content_fault = stall;
+        const bool from_stall = albireo::http_get_range(base_url + "/content/41", 0, 999, keep, error);
+        const std::string stall_error = error;
+        content_fault = no_fault;
+        const bool from_reset = albireo::http_get_range("http://127.0.0.1:" + std::to_string(port + 1) + "/content/41",
+            1000, 1999, keep, error);
+        // A receiver that throws: the exception becomes the error of the download.
+        try
+        {
+            albireo::http_get_range(base_url + "/content/41", 0, 999, [](const char*, size_t) -> bool {
+                throw std::runtime_error("the disk is full");
+            }, error);
+        }
+        catch (...)
+        {
+            escaped = true;
+        }
+        check(!from_page && !from_stall && !from_reset && written.empty() && page_error == page_text
+            && stall_error == "no data arrives within 1 s" && !escaped
+            && error == "the transfer fails: the disk is full", "a range answered by a web page, a stall or a reset "
+            "writes nothing, and an exception of its receiver becomes its error (" + page_error + "; " + stall_error
+            + "; " + error + ")");
+
+        // A model whose copy is a web page, an update whose feed is refused, a catalog from a stalled listing.
+        albireo::store db(albireo::join_path(work, "albireo-4.db"));
+        json catalog = json::object();
+        catalog["updated"] = "2026-11-01T00:00:00Z";
+        json list = json::array();
+        list.push_back(catalog_entry("tiny", served, base_url + "/official/model.bin"));
+        catalog["models"] = list;
+        db.set_value("catalog", catalog.dump());
+        {
+            albireo::model_manager m(db, albireo::join_path(work, "models-4"));
+            albireo::user_error started;
+            content_fault = html_200;
+            check(m.start_download("tiny", started), "the download of a model whose copy is a web page starts");
+            const json d = wait_download(m, "tiny");
+            content_fault = no_fault;
+            const std::string partial = albireo::join_path(m.models_dir(), "tiny.gguf.partial");
+            check(d["state"].as_string() == "error" && d["code"].as_string() == "download_failed"
+                && d["error"].as_string() == "the copy of models/tiny/model.bin in the publication space of Albireo "
+                "cannot be downloaded: " + page_text && clean(d.dump())
+                && read_text(partial).find("Access denied") == std::string::npos && answers(),
+                "a model whose copy is a web page fails, its partial file free of the page (" + d.dump() + ")");
+            listing_fault = stall;
+            std::string refreshed;
+            const bool refreshed_ok = m.refresh_catalog(refreshed);
+            check(!refreshed_ok && refreshed == "the publication space of Albireo cannot be reached for "
+                "dist/catalog.json: no data arrives within 1 s" && clean(refreshed) && answers(),
+                "a catalog from a listing that stalls fails with its message (" + refreshed + ")");
+            listing_fault = no_fault;
+            m.stop();
+        }
+        {
+            albireo::public_link_for_tests(link);
+            listing_fault = html_403;
+            albireo::updater u(albireo::join_path(work, "updates-4"));
+            u.check_async();
+            json update;
+            for (int i = 0; i < 600; ++i)
+            {
+                update = u.status();
+                const std::string state = update["state"].as_string();
+                if (state != "idle" && state != "checking") break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            listing_fault = no_fault;
+            check(update["state"].as_string() == "error" && update["code"].as_string() == "update_download"
+                && update["args"]["e"].as_string() == "the publication space of Albireo cannot be reached for "
+                "dist/feed.json: the request is answered with the status 403" && clean(update.dump()) && answers(),
+                "a feed refused by a filter of the network fails with its message (" + update.dump() + ")");
+        }
+        albireo::http_bounds_for_tests(0, 0);
+        resetting.stop();
+
+        // The log of these failures names neither pCloud, nor the link, nor its code.
+        bool named = false;
+        for (const auto& line : albireo::log_file::instance().recent())
+            named = named || holds_folded(line, "pcloud") || holds_folded(line, "publink")
+                || line.find("TESTLINK1") != std::string::npos;
+        check(!named, "the log of the failures names neither pCloud, nor the link, nor its code");
+        albireo::public_link_for_tests("");
+    }
+
+    {
+        /*
+            The last guard: the words that name the publication space, whatever their case, and the
+            code given to hide_in_messages(), in a text, in the errors of a document, in the log and
+            in its files of an earlier version.
+        */
+        const std::string space = "the publication space of Albireo";
+        albireo::hide_in_messages("TESTLINK1");
+        albireo::hide_in_messages("abc");
+        check(albireo::without_publication_space("public link: https://u.pcloud.link/publink/show?code=kZeNhSJZpcMyg"
+            "kcCvGXmq1MTvkCfBuSsx2GV, with the password") == "public link: " + space + ", with the password"
+            && albireo::without_publication_space("api.pcloud.com:443: no answer") == space + ": no answer"
+            && albireo::without_publication_space("(c123.PCLOUD.com) and \"eapi.pcloud.com\".") == "(" + space
+                + ") and \"" + space + "\"."
+            && albireo::without_publication_space("the code TESTLINK1 is refused") == "the code " + space
+                + " is refused"
+            && albireo::without_publication_space("abc and abcdef stay") == "abc and abcdef stay"
+            && albireo::without_publication_space("no address here: dist/feed.json") == "no address here: "
+                "dist/feed.json", "the guard replaces the words that name the publication space");
+        json document = json::object();
+        document["error"] = "see https://api.pcloud.com/showpublink";
+        json args = json::object();
+        args["e"] = "content server c4.pcloud.com";
+        document["args"] = args;
+        document["text"] = "pcloud";
+        json errors = json::array();
+        errors.push_back("eapi.pcloud.com");
+        document["errors"] = errors;
+        const bool named = albireo::errors_name_publication_space(document);
+        albireo::hide_publication_space_in_errors(document);
+        const json& hidden = document;
+        check(named && hidden["error"].as_string() == "see " + space && hidden["args"]["e"].as_string()
+            == "content server " + space && hidden["errors"][0].as_string() == space
+            && hidden["text"].as_string() == "pcloud" && !albireo::errors_name_publication_space(hidden),
+            "the errors of a document leave the publication space unnamed, its other members unchanged");
+        const std::string old_log = albireo::join_path(work, "logs/service.log");
+        albireo::make_dirs(albireo::join_path(work, "logs"));
+        write_text(old_log, "2026-10-30 10:00:00.000 [info] public link: https://u.pcloud.link/publink/show?code="
+            "kZeNhSJZpcMygkcCvGXmq1MTvkCfBuSsx2GV, with the password\n2026-10-30 10:00:01.000 [info] kept\n");
+        write_text(old_log + ".1", "2026-10-29 09:00:00.000 [warning] updates: https://api.pcloud.com/showpublink: "
+            "status 403\n");
+        albireo::log_file::instance().open(old_log);
+        albireo::log_warning("models: c12.pcloud.com does not answer");
+        const std::string now = read_text(old_log), before = read_text(old_log + ".1");
+        check(!holds_folded(now, "pcloud") && !holds_folded(before, "pcloud")
+            && now.find("[info] kept") != std::string::npos
+            && now.find("public link: " + space + ", with the password") != std::string::npos
+            && now.find("models: " + space + " does not answer") != std::string::npos,
+            "the log and its files of an earlier version leave the publication space unnamed");
+    }
+
+    {
+        // The settings of an earlier version: read without error, written again without what this version lacks.
+        const std::string folder = albireo::join_path(work, "settings");
+        albireo::make_dirs(folder);
+        const std::string settings_file = albireo::join_path(folder, "settings.json");
+        const std::string key_file = albireo::join_path(folder, "web_search.secret");
+        write_text(settings_file, "{\"port\": 9123, \"web_search\": \"brave\", \"web_search_url\": "
+            "\"https://searx.example.org\", \"web_search_key_set\": true, \"web_search_key\": \"BSA-by-hand-42\", "
+            "\"public_link\": \"https://u.pcloud.link/publink/show?code=kZeNhSJZpcMygkcCvGXmq1MTvkCfBuSsx2GV\"}");
+        write_text(key_file, "BSA-secret-0123456789");
+        {
+            albireo::settings_store store(settings_file);
+            const std::string text = read_text(settings_file), copy = read_text(settings_file + ".bak");
+            check(store.get().port == 9123 && store.get().web_search == "wikipedia" && !holds_folded(text, "pcloud")
+                && !holds_folded(copy, "pcloud") && text.find("web_search_url") == std::string::npos
+                && text.find("web_search_key") == std::string::npos && text.find("public_link") == std::string::npos
+                && text.find("BSA-") == std::string::npos && !albireo::file_exists(key_file),
+                "the settings of an earlier version are read, and written again without what this version lacks");
+        }
+        albireo::host_settings s;
+        const char* const providers[] = { "auto", "brave", "searxng", "wikipedia" };
+        bool wikipedia = s.web_search == "wikipedia";
+        for (const char* p : providers)
+        {
+            json j = json::object();
+            j["web_search"] = p;
+            s.from_json(j);
+            wikipedia = wikipedia && s.web_search == "wikipedia";
+        }
+        json none = json::object();
+        none["web_search"] = "none";
+        s.from_json(none);
+        const bool off = s.web_search == "none";
+        json number = json::object();
+        number["web_search"] = 3;
+        s.from_json(number);
+        const json document = s.to_json();
+        check(wikipedia && off && s.web_search == "wikipedia" && !document.contains("public_link")
+            && !document.contains("web_search_url") && !document.contains("web_search_key_set"),
+            "the search of the settings is wikipedia or none, and the documents give no link and no key");
     }
 
     {
@@ -911,8 +1312,6 @@ int main(int argc, char** argv)
 
         // The addresses refused before any connection: 400 for an invalid one, 403 for a local or private one.
         albireo::host_settings web;
-        // The checks of the providers hold whatever key of the Brave Search API the build carries.
-        albireo::web_builtin_key_for_tests("");
         auto fetch = [&](const std::string& url, const albireo::host_settings& s, const std::string& language) {
             json request = json::object();
             request["url"] = url;
@@ -948,12 +1347,10 @@ int main(int argc, char** argv)
             "a refusal names the host (" + local.message + ")");
 
         // The service offline and the web access turned off refuse both routes; the capability follows.
-        albireo::host_settings offline = web, off = web, none = web, brave = web, searxng = web;
+        albireo::host_settings offline = web, off = web, none = web;
         offline.offline = true;
         off.web_access = false;
         none.web_search = "none";
-        brave.web_search = "brave";
-        searxng.web_search = "searxng";
         json search_request = json::object();
         search_request["query"] = "Einstein relativit\xc3\xa9";
         albireo::web_reply reply = fetch("https://example.org/", offline, "");
@@ -968,65 +1365,12 @@ int main(int argc, char** argv)
         reply = albireo::web_search(search_request, none);
         check(reply.status == 403 && reply.code == "no_search_provider" && reply.message == "no search provider is set",
             "a search without provider is refused");
-        reply = albireo::web_search(search_request, brave);
-        check(reply.status == 403 && reply.code == "no_search_provider",
-            "the Brave Search API without key is no provider");
         check(albireo::web_capability(web).dump() == "{\"available\":true,\"search\":\"wikipedia\"}"
             && albireo::web_capability(offline).dump() == "{\"available\":false,\"search\":\"none\"}"
             && albireo::web_capability(off).dump() == "{\"available\":false,\"search\":\"none\"}"
-            && albireo::web_capability(brave).dump() == "{\"available\":true,\"search\":\"none\"}"
-            && albireo::web_capability(searxng).dump() == "{\"available\":true,\"search\":\"none\"}",
-            "the capability gives the web access and its provider of search");
-        check(albireo::valid_web_search_url("") && albireo::valid_web_search_url("http://localhost:8888")
-            && albireo::valid_web_search_url("https://searx.example.org/searxng/")
-            && !albireo::valid_web_search_url("ftp://searx.example.org")
-            && !albireo::valid_web_search_url("https://user:pw@searx.example.org")
-            && !albireo::valid_web_search_url("https://searx.example.org/?q=x")
-            && albireo::valid_web_search_key("") && albireo::valid_web_search_key("BSA0123456789abcdef")
-            && !albireo::valid_web_search_key("two words") && !albireo::valid_web_search_key("line\r\nX-Other: 1"),
-            "the settings of the search are checked");
-
-        // The key of the search: given as web_search_key_set, kept in web_search.secret, never in settings.json.
-        const std::string key = "BSA-secret-0123456789";
-        albireo::host_settings keyed = brave;
-        keyed.web_search_key = key;
-        const json document = keyed.to_json();
-        check(document.dump().find(key) == std::string::npos && !document.contains("web_search_key")
-            && document["web_search_key_set"].as_bool() && albireo::web_capability(keyed).dump().find(key)
-            == std::string::npos && albireo::web_capability(keyed)["search"].as_string() == "brave",
-            "a document of the settings gives web_search_key_set and never the key");
-        const std::string folder = albireo::join_path(work, "settings");
-        albireo::make_dirs(folder);
-        const std::string settings_file = albireo::join_path(folder, "settings.json");
-        const std::string key_file = albireo::join_path(folder, "web_search.secret");
-        {
-            albireo::settings_store store(settings_file);
-            store.update([&](albireo::host_settings& s) {
-                s.web_search = "brave";
-                s.web_search_key = key;
-            });
-        }
-        check(read_text(settings_file).find(key) == std::string::npos
-            && read_text(settings_file + ".bak").find(key) == std::string::npos && read_text(key_file) == key,
-            "the key is kept in web_search.secret, outside settings.json and its copy");
-        {
-            albireo::settings_store store(settings_file);
-            albireo::host_settings changed = store.get();
-            json merged = changed.to_json();
-            merged["web_access"] = false;
-            changed.from_json(merged);
-            check(store.get().web_search_key == key && changed.web_search_key == key && !changed.web_access,
-                "the key is read back, and a change of another setting keeps it");
-            store.update([](albireo::host_settings& s) { s.web_search_key.clear(); });
-        }
-        check(!albireo::file_exists(key_file), "a key cleared removes web_search.secret");
-        write_text(settings_file, "{\"web_search\": \"brave\", \"web_search_key\": \"BSA-by-hand-42\"}");
-        {
-            albireo::settings_store store(settings_file);
-            check(store.get().web_search_key == "BSA-by-hand-42" && read_text(key_file) == "BSA-by-hand-42"
-                && read_text(settings_file).find("BSA-by-hand") == std::string::npos,
-                "a key written in settings.json by hand moves to web_search.secret");
-        }
+            && albireo::web_capability(none).dump() == "{\"available\":true,\"search\":\"none\"}"
+            && albireo::web_search_provider(web) == "wikipedia" && albireo::web_search_provider(none) == "none",
+            "the capability gives the web access and its provider of search, wikipedia or none");
 
         // The pages of the local server, the loopback allowed for the tests.
         albireo::web_allow_loopback_for_tests(true);
@@ -1077,7 +1421,7 @@ int main(int argc, char** argv)
         check(reply.status == 503 && reply.code == "cancelled", "a service that stops ends the reading of pages");
         albireo::http_restore();
 
-        // The providers of the search, answered by the local server.
+        // The search of Wikipedia, answered by the local server.
         albireo::web_provider_origin_for_tests(base_url);
         search_request["count"] = 5;
         search_request["language"] = "fr";
@@ -1102,45 +1446,6 @@ int main(int argc, char** argv)
         check(reply.status == 429 && reply.code == "rate_limited" && reply.retry_after == 30
             && reply.message.find("Wikipedia limits the rate") != std::string::npos,
             "a limit of the rate of Wikipedia is reported with its delay (" + reply.message + ")");
-        brave.web_search_key = "test-key";
-        search_request["query"] = "albireo";
-        search_request["count"] = 3;
-        reply = albireo::web_search(search_request, brave);
-        const json found = reply.body["results"];
-        check(reply.status == 200 && reply.body["provider"].as_string() == "brave" && found.size() == 2
-            && found[0]["title"].as_string() == "Brave & Albireo"
-            && found[0]["url"].as_string() == "https://example.org/a"
-            && found[0]["snippet"].as_string() == "A local model"
-            && found[1]["url"].as_string() == "http://example.org/c",
-            "the Brave Search API gives its results of http and https (" + reply.message + ")");
-        {
-            std::lock_guard<std::mutex> lock(seen_m);
-            check(seen_key == "test-key" && seen_count == "3" && seen_query == "albireo",
-                "the Brave Search API receives the key, the query and the count");
-        }
-        brave.web_search_key = "revoked-key";
-        reply = albireo::web_search(search_request, brave);
-        check(reply.status == 502 && reply.code == "search_key_refused", "a key refused with 401 is reported");
-        brave.web_search_key = "wrong-key";
-        reply = albireo::web_search(search_request, brave);
-        check(reply.status == 502 && reply.code == "search_key_refused", "a key refused as invalid (422) is reported");
-        searxng.web_search_url = base_url + "/searxng/";
-        search_request["language"] = "fr-FR";
-        reply = albireo::web_search(search_request, searxng);
-        const json listed = reply.body["results"];
-        check(reply.status == 200 && reply.body["provider"].as_string() == "searxng" && listed.size() == 1
-            && listed[0]["url"].as_string() == "https://searx.example/1" && listed[0]["snippet"].as_string()
-            == "first result", "SearXNG gives its results of http and https (" + reply.message + ")");
-        {
-            std::lock_guard<std::mutex> lock(seen_m);
-            check(seen_format == "json" && seen_language == "fr-FR",
-                "SearXNG receives the JSON format and the language");
-        }
-        searxng.web_search_url = base_url + "/closed";
-        reply = albireo::web_search(search_request, searxng);
-        check(reply.status == 502 && reply.code == "search_format_refused"
-            && reply.message.find("search.formats") != std::string::npos,
-            "an instance of SearXNG without the JSON format names its setting");
         json invalid = json::object();
         invalid["query"] = "   ";
         const bool empty_refused = albireo::web_search(invalid, web).code == "invalid_query";
@@ -1159,81 +1464,20 @@ int main(int argc, char** argv)
         check(empty_refused && long_refused && characters_counted && count_refused && language_refused,
             "a query of 1 to 400 characters, a count of 1 to 10 and a code of language are required");
 
-        /*
-            A key of the Brave Search API built into the service: the provider by default ("auto"), and the
-            key of "brave" when the administrator gives none, whose own key otherwise goes first.  No answer
-            and no document of the settings gives it, and its refusal and its spent credit are named so.
-        */
-        albireo::web_builtin_key_for_tests("builtin-key");
-        albireo::host_settings automatic;
-        search_request["query"] = "albireo";
-        search_request["count"] = 3;
-        search_request["language"] = "fr";
-        reply = albireo::web_search(search_request, automatic);
-        std::string sent;
-        {
-            std::lock_guard<std::mutex> lock(seen_m);
-            sent = seen_key;
-        }
-        check(automatic.web_search == "auto" && albireo::web_search_key_builtin() && reply.status == 200
-            && reply.body["provider"].as_string() == "brave" && sent == "builtin-key"
-            && albireo::web_capability(automatic)["search"].as_string() == "brave",
-            "by default the search goes to the Brave Search API with the key built in (" + reply.message + ")");
-        albireo::host_settings chosen;
-        chosen.web_search = "brave";
-        chosen.web_search_key = "test-key";
-        reply = albireo::web_search(search_request, chosen);
-        {
-            std::lock_guard<std::mutex> lock(seen_m);
-            sent = seen_key;
-        }
-        check(reply.status == 200 && sent == "test-key", "the key of the administrator goes before the key built in");
-        chosen.web_search_key.clear();
-        reply = albireo::web_search(search_request, chosen);
-        {
-            std::lock_guard<std::mutex> lock(seen_m);
-            sent = seen_key;
-        }
-        check(reply.status == 200 && reply.body["provider"].as_string() == "brave" && sent == "builtin-key",
-            "the Brave Search API without a key of the administrator takes the key built in");
-        const std::string documents = automatic.to_json().dump() + chosen.to_json().dump()
-            + albireo::web_capability(automatic).dump() + reply.body.dump();
-        check(documents.find("builtin-key") == std::string::npos
-            && !automatic.to_json()["web_search_key_set"].as_bool(),
-            "no document of the settings and no answer gives the key built in");
-        albireo::web_builtin_key_for_tests("revoked-key");
-        reply = albireo::web_search(search_request, automatic);
-        check(reply.status == 502 && reply.code == "search_key_refused"
-            && reply.message == "the Brave Search API refuses the key built into Albireo",
-            "a key built in that the Brave Search API refuses is named so (" + reply.message + ")");
-        albireo::web_builtin_key_for_tests("spent-key");
-        reply = albireo::web_search(search_request, automatic);
-        check(reply.status == 429 && reply.code == "rate_limited"
-            && reply.message.find("which its installations share") != std::string::npos
-            && reply.message.find("spent-key") == std::string::npos,
-            "a spent credit of the key built in is reported as the credit of every installation (" + reply.message
-            + ")");
-        albireo::web_builtin_key_for_tests("");
-        reply = albireo::web_search(search_request, chosen);
-        check(albireo::web_search_provider(automatic) == "wikipedia" && albireo::web_search_provider(chosen) == "none"
-            && reply.code == "no_search_provider" && !albireo::web_search_key_builtin(),
-            "without a key built in, the search goes to Wikipedia by default and brave needs a key");
         albireo::web_provider_origin_for_tests("");
         albireo::web_allow_loopback_for_tests(false);
 
-        // The log names the hosts read and the providers, never a path, a query or a key.
+        // The log names the hosts read and the provider, never a path or a query.
         bool leaked = false, read_line = false, search_line = false;
         for (const auto& line : albireo::log_file::instance().recent())
         {
-            leaked = leaked || line.find("relativit") != std::string::npos || line.find("test-key") != std::string::npos
-                || line.find("BSA-") != std::string::npos || line.find("/web/") != std::string::npos
-                || line.find("q=") != std::string::npos || line.find("builtin-key") != std::string::npos
-                || line.find("spent-key") != std::string::npos;
+            leaked = leaked || line.find("relativit") != std::string::npos || line.find("/web/") != std::string::npos
+                || line.find("q=") != std::string::npos;
             read_line = read_line || line.find("web: 127.0.0.1 read (200, ") != std::string::npos;
             search_line = search_line || line.find("web: search through wikipedia (2 results)") != std::string::npos;
         }
-        check(!leaked && read_line && search_line, "the log names the hosts and the providers, never a path, a query "
-            "or a key");
+        check(!leaked && read_line && search_line, "the log names the hosts and the provider, never a path or a "
+            "query");
     }
 
     server.stop();

@@ -644,32 +644,27 @@ function webUnavailable(caps) {
   return s.offline ? t('webOffline') : t('webOff');
 }
 
-// The texts of the providers of the web search that the status names (web.search).
-const searchProviders = { wikipedia: 'provider_wikipedia', brave: 'provider_brave', searxng: 'provider_searxng' };
-
 /*
-    The provider of the web search of the service in the language of the interface, '' while the web access is
-    unavailable or gives no search.  The help of the agent mode and the About window name it, as Brave asks of the
-    projects that use the credit of its API.
+    The provider of the web search of the service, Wikipedia, in the language of the interface; '' while the web
+    access is unavailable or gives no search (web.search "none").  The help of the agent mode and the About window
+    name it.
 */
 function searchProvider() {
   const w = state.status && state.status.web;
-  if (!w || typeof w !== 'object' || !w.available) return '';
-  const key = searchProviders[w.search];
-  return key ? t(key) : '';
+  if (!w || typeof w !== 'object' || !w.available || w.search !== 'wikipedia') return '';
+  return t('provider_wikipedia');
 }
 
 /*
     The tools of the requests of c and the parts of its system message that come with them: those of the agent while
-    it is on, then those of the web while Web is on and the service offers it, web_search when the service names a
-    provider of search.  The list and its order stay the same while the toggles and the provider do not change, so
+    it is on, then those of the web while Web is on and the service offers it, web_search when the service offers the
+    search of Wikipedia.  The list and its order stay the same while the toggles and the provider do not change, so
     that the beginning of the prompt stays the same from one question to the next.
 */
 function toolSet(c, caps) {
   const agent = !!(c.agent && caps.tools);
   const webOn = !!(c.web && !webUnavailable(caps));
-  const provider = webOn ? state.status.web.search : '';
-  const search = typeof provider === 'string' && provider !== '' && provider !== 'none';
+  const search = webOn && state.status.web.search === 'wikipedia';
   const definitions = (agent ? tools.definitions : []).concat(webOn ? web.definitions(search) : []);
   return { agent, web: webOn, search, definitions: definitions.length ? definitions : null };
 }
@@ -6148,8 +6143,7 @@ async function aboutTab(body, close) {
   }
   const models = Array.from(byModel, ([id, names]) => names.join(', ') + ': ' + modelName(id)).join(' · ');
   row(t('models'), models || '-');
-  // The provider of the web search, while the service offers one: Brave asks the projects that use its credit to
-  // name its API there.
+  // The provider of the web search, Wikipedia, while the service offers it.
   const provider = searchProvider();
   if (provider) row(t('tool_web_search'), provider);
   if (s.usage) row(t('requests'), formatNumber(s.usage.requests) + ' · ' + t('tokensIn') + ' ' + formatNumber(s.usage.prompt_tokens) +

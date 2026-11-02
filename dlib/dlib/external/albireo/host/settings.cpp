@@ -46,10 +46,19 @@ namespace albireo
             return join_path(parent_path(settings_path), "proxy.secret");
         }
 
-        // The file of the key of the search (web_search_key), beside settings.json.
-        std::string key_path(const std::string& settings_path)
+        // The file of the key of a search provider that the earlier versions kept beside settings.json.
+        std::string obsolete_key_path(const std::string& settings_path)
         {
             return join_path(parent_path(settings_path), "web_search.secret");
+        }
+
+        // Whether a document of the settings holds a setting this version lacks, or another provider of the search.
+        bool obsolete_settings(const json& j)
+        {
+            for (const char* key : { "public_link", "web_search_url", "web_search_key", "web_search_key_set" })
+                if (j.contains(key)) return true;
+            const std::string search = j["web_search"].as_string();
+            return j.contains("web_search") && search != "wikipedia" && search != "none";
         }
 
         // The text of a secret file without the ends of line and the spaces that follow it.
@@ -114,9 +123,6 @@ namespace albireo
         j["proxy"] = masked_proxy(proxy);
         j["web_access"] = web_access;
         j["web_search"] = web_search;
-        j["web_search_url"] = web_search_url;
-        j["web_search_key_set"] = !web_search_key.empty();
-        j["public_link"] = public_link;
         j["engine_benchmarks"] = engine_benchmarks;
         if (trust_authority >= 0) j["trust_authority"] = trust_authority > 0;
         return j;
@@ -152,11 +158,8 @@ namespace albireo
         offline = j["offline"].as_bool(d.offline);
         proxy = j["proxy"].str(d.proxy);
         web_access = j["web_access"].as_bool(d.web_access);
-        web_search = j["web_search"].str(d.web_search);
-        web_search_url = j["web_search_url"].str(d.web_search_url);
-        // The key comes from the administration route or from web_search.secret: a document without it keeps it.
-        if (j["web_search_key"].is_string()) web_search_key = j["web_search_key"].as_string();
-        public_link = j["public_link"].str(d.public_link);
+        // The providers of the earlier versions, "auto", "brave" and "searxng", give way to Wikipedia.
+        web_search = j["web_search"].as_string() == "none" ? "none" : d.web_search;
         engine_benchmarks = j["engine_benchmarks"].is_object() ? j["engine_benchmarks"] : json::object();
         trust_authority = j["trust_authority"].is_bool() ? (j["trust_authority"].as_bool() ? 1 : 0) : d.trust_authority;
     }
@@ -169,8 +172,8 @@ namespace albireo
     settings_store::settings_store(const std::string& path) : path_(path)
     {
         bool restored = false;
-        // A key of the search written in the settings by hand, which moves to web_search.secret.
-        bool key_in_document = false;
+        // A document of an earlier version, written again without what this version lacks.
+        bool obsolete = false;
         if (file_exists(path_))
         {
             json j;
@@ -178,7 +181,7 @@ namespace albireo
             if (read_settings(path_, text, j, error))
             {
                 s_.from_json(j);
-                key_in_document = j["web_search_key"].is_string();
+                obsolete = obsolete_settings(j);
                 // The copy follows a valid file, the one the installer or a hand wrote included.
                 const std::string backup = backup_path(path_);
                 std::string copy;
@@ -196,15 +199,11 @@ namespace albireo
                 std::string saved_text, unused;
                 restored = read_settings(backup_path(path_), saved_text, saved, unused);
                 if (restored) s_.from_json(saved);
-                key_in_document = restored && saved["web_search_key"].is_string();
                 log_warning("settings: " + path_ + " is not valid JSON (" + error + "), "
                     + (restored ? "its last copy is used" : "defaults used"));
             }
         }
         std::lock_guard<std::mutex> lock(m_);
-        // The key of the search is read before any write, which keeps web_search.secret for a key only.
-        std::string key;
-        if (!key_in_document && read_file(key_path(path_), key, 4096)) s_.web_search_key = trimmed(key);
         if (proxy_password_masked(s_.proxy))
         {
             // The password stored for this address and this user.
@@ -224,11 +223,10 @@ namespace albireo
         {
             log_warning("settings: the password of the proxy cannot move from " + path_ + " to proxy.secret");
         }
-        // A key written in the document moves to web_search.secret once the password of the proxy is back.
-        if (key_in_document && !write())
-            log_warning("settings: the key of the search cannot move from " + path_ + " to web_search.secret");
-        // Written again from its copy once the password of the proxy is back in the settings.
-        if (restored && !write()) log_warning("settings: " + path_ + " cannot be written again");
+        // Written again once the password of the proxy is back in the settings: from its copy, or without the
+        // settings of an earlier version and the key of its search provider.
+        if ((restored || obsolete || file_exists(obsolete_key_path(path_))) && !write())
+            log_warning("settings: " + path_ + " cannot be written again");
     }
 
     bool settings_store::write()
@@ -238,16 +236,12 @@ namespace albireo
         const std::string secret = secret_path(path_);
         const bool password = masked_proxy(s_.proxy) != s_.proxy;
         if (password && !write_file_restricted(secret, s_.proxy)) return false;
-        // The key of the search, which settings.json gives as web_search_key_set.
-        const std::string key_file = key_path(path_);
-        const bool key = !s_.web_search_key.empty();
-        if (key && !write_file_restricted(key_file, s_.web_search_key)) return false;
         const std::string text = s_.to_json().dump_formatted(2) + "\n";
         if (!write_file_atomic(path_, text)) return false;
         // The copy read when settings.json is damaged, written once settings.json is in place.
         if (!write_file_atomic(backup_path(path_), text)) log_warning("settings: its copy cannot be written");
         if (!password && file_exists(secret)) remove_file(secret);
-        if (!key && file_exists(key_file)) remove_file(key_file);
+        if (file_exists(obsolete_key_path(path_))) remove_file(obsolete_key_path(path_));
         return true;
     }
 

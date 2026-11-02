@@ -642,15 +642,13 @@ if (ALBIREO_PROGRAMS)
       endif()
       message(STATUS "Public link: password read from ${ALBIREO_PUBLIC_LINK_PASSWORD_FILE}")
    elseif (WIN32 AND NOT CMAKE_CROSSCOMPILING)
-      # The installed services would read the protected link in vain and take the official addresses.
+      # The installed services would read the protected link in vain.
       message(WARNING "Public link: no password, ${ALBIREO_PUBLIC_LINK_PASSWORD_FILE} does not exist; the "
          "service built reaches the public link without password")
    else()
       message(STATUS "Public link: no password, ${ALBIREO_PUBLIC_LINK_PASSWORD_FILE} does not exist")
    endif()
    configure_file(cmake/public_link_secret.h.in ${CMAKE_BINARY_DIR}/generated/public_link_secret.h @ONLY)
-   # The key of the Brave Search API built into the service, from a file outside the repository.
-   include(cmake/web_search_key.cmake)
 
    # The service.
    add_executable(albireo-service host/main.cpp host/service.cpp host/server.cpp host/settings.cpp host/store.cpp

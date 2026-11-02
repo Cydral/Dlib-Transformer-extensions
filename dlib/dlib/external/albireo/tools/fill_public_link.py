@@ -288,7 +288,8 @@ def main():
     try:
         return {"dist": fill_dist, "models": fill_models, "check": check}[a.command](a)
     except (OSError, ValueError, KeyError, RuntimeError, subprocess.CalledProcessError) as e:
-        print("error: %s" % e, file=sys.stderr)
+        # The errors of the requests to the public link name none of its addresses.
+        print("error: %s" % public_link.hidden(e), file=sys.stderr)
         return 1
 
 

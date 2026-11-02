@@ -14,6 +14,7 @@
 #include <memory>
 #include <mutex>
 
+#include "../common/log.h"
 #include "../common/platform.h"
 
 namespace albireo
@@ -63,6 +64,8 @@ namespace albireo
                 return false;
             }
             out = json::parse_or_null(r->body);
+            // The windows show no address of the publication space, which a service before this version gave.
+            if (errors_name_publication_space(out)) hide_publication_space_in_errors(out);
             if (r->status >= 400)
             {
                 const json& e = out["error"];

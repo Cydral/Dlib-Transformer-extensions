@@ -86,9 +86,9 @@ application, the description of the interface and the list of the programs of Wi
   its tool, its arguments, its result, its state and its duration. The calculator reads the
   percentages ("17,5 % de 2 340"), the decimal commas and the thousands written with spaces.
 - **Web access**: the Web button of the composer, off in each new discussion, gives the model a
-  search of the web, through Wikipedia, the Brave Search API or a SearXNG instance, and the reading
-  of the pages and PDF files of public addresses, which the service fetches; the model reads only
-  the addresses that the discussion holds (see [Web access](#web-access)).
+  search of Wikipedia and the reading of the pages and PDF files of public addresses, which the
+  service fetches; the model reads only the addresses that the discussion holds (see
+  [Web access](#web-access)).
 - **Several conversations at once**: the requests of every client are computed together, one
   forward pass serving the next token of each, and the keys and values of a finished request stay
   cached so that the next turn of a conversation starts where the previous one ended; once an
@@ -102,11 +102,11 @@ application, the description of the interface and the list of the programs of Wi
   integrated GPU through OpenVINO, NVIDIA GPU through CUDA, behind a single C interface. The
   service measures them on the machine and runs the fastest, and the Accelerator menu of the
   icon chooses the automatic choice, the processor alone, or a device by its name.
-- **Models from a signed catalog**, downloaded in parallel parts from the public link of the
-  published files of Albireo, the only source of the downloads, checked against their hashes, or
-  imported from a disk or a memory card.
-- **Updates** announced by a signed feed of the public link, their installers published there,
-  downloaded in the background and installed when the service restarts.
+- **Models from a signed catalog**, downloaded in parallel parts from the publication space of
+  Albireo, the only source of the downloads, checked against their hashes, or imported from a disk
+  or a memory card.
+- **Updates** announced by a signed feed of the publication space, their installers published
+  there, downloaded in the background and installed when the service restarts.
 - **An offline mode** for the computers without network: the service opens no connection, and
   the catalog, the models and the updates come from an offline bundle brought on a disk.
 - **Five languages** in every window: English, French, German, Italian and Spanish, the language
@@ -532,11 +532,9 @@ of each finds the others, the words in any case and accents, complete or not, in
 then in the content (questions, answers, descriptions, instructions and documents of the projects),
 and shows where it found them. The About window shows the tokens read and generated each day over
 30 days, each bar giving its date and its figures in the language of the interface, and, while
-the web access offers a search, a line that names its provider ("Web search" and "Brave Search
-API", in French "Recherche Web" and "API Brave Search", or Wikipedia or SearXNG), as Brave asks of
-the projects that use the credit of its API; the help next to the buttons of the composer names
-that provider too ("Web search: Brave Search API"), and nothing names one while the web access is
-unavailable. Each answer
+the web access offers the search, a line that names Wikipedia ("Web search" and "Wikipedia", in
+French "Recherche Web" and "Wikipédia"); the help next to the buttons of the composer names it too
+("Web search: Wikipedia"), and nothing names it while the web access is unavailable. Each answer
 exports to Markdown or JSON with its question, as the
 whole discussion does. The interface takes the language of Albireo, set in the window of the
 computer, unless its own settings choose another. The Generation tab of the settings gives the
@@ -566,19 +564,59 @@ installed models, each with its version, its role and its license, whose text op
 
 ## Building on Windows
 
-Requirements: Visual Studio 2022, or the Build Tools for Visual Studio 2022, with the C++ workload,
-and CMake 3.21 or later (the C++ CMake tools of the workload serve, the script finds them outside
-the PATH), and about 6 GB of free space for the models that come with Albireo, their cache and the
-complete installer. The OpenVINO engines need the runtime of OpenVINO (`python -m pip install openvino`, or
-the archive with `INTEL_OPENVINO_DIR` set); the CUDA engine needs the CUDA toolkit 12.8 or later,
-its integration with Visual Studio and cuDNN 9. Without Visual Studio, the installer of the CUDA
-toolkit adds its integration to the Build Tools.
+Requirements: Windows 10 or 11 on x64, an access to the Internet, directly or through a proxy, and
+the free space given below. The script [`tools/build_windows.ps1`](tools/build_windows.ps1) begins
+with a stage, "checking the prerequisites", which checks what the build needs, installs what is
+missing and prints a table of what it found and installed:
 
-The build machine needs no NVIDIA card. The CUDA toolkit installs and compiles without one: a
-custom installation without the driver, which keeps the CUDA components and the Visual Studio
-Integration, then cuDNN 9 from its installer or its archive. nvcc compiles the engine for every
-architecture of the table below, and only its tests on a card are skipped. A build machine with
-the toolkit thus produces an installer that carries every engine, whatever its own hardware.
+- Visual Studio 2022 or its Build Tools with the C++ workload (the x64 tools, a Windows SDK, the
+  redistributable files of the C++ runtime), found through vswhere. Without an installation, the
+  script downloads the Build Tools from `https://aka.ms/vs/17/release/vs_BuildTools.exe`, checks
+  the signature of Microsoft and installs them; an installation that lacks a component receives it
+  from its installer (`setup.exe modify`). Both need the rights of an administrator, which Windows
+  asks for once the script has said so, and after a new installation the script stops, to be run
+  again from a new Developer PowerShell for VS 2022.
+- CMake 3.21 or later: the one of the PATH, else the C++ CMake tools of Visual Studio, installed
+  with it.
+- Python 3.10 or later, an interpreter that runs, the alias of the Microsoft Store passed over:
+  `winget install --id Python.Python.3.12 --scope user`, else the installer of python.org 3.12.10,
+  whose SHA-256 is checked, both for the user alone.
+- The runtime of OpenVINO, unless `-NoOpenVINO`: the package of that interpreter, installed with
+  `pip install --user "openvino>=2025.0,<2027"`, or the archive of OpenVINO with
+  `INTEL_OPENVINO_DIR` set.
+- CUDA and cuDNN, unless `-NoCuda`: an installed CUDA toolkit 12.8 or later with its integration
+  with Visual Studio and cuDNN 9, else the redistributable archives of NVIDIA, laid out in a cache
+  (below). Without Visual Studio, the installer of the CUDA toolkit adds its integration to the
+  Build Tools.
+- The free space of each volume that receives the build trees and the caches, estimated at 7 GB
+  for the tree of the programs and of the installers, 1 GB for the one of OpenVINO, 2 GB for the
+  one of CUDA, 6.8 GB for the models that come with Albireo in their cache and 4.2 GB for the
+  archives of NVIDIA, less what these folders hold already; the script stops when a volume is short.
+
+An installation that fails stops the build with the place of its log. `-NoInstall` installs
+nothing; the table then gives the command that installs each missing item, for a computer where an
+administrator installs them, and the build stops when one is missing. Visual Studio alone needs the
+rights of an administrator; Python, OpenVINO and the archives of NVIDIA install for the user. The
+downloads take the proxy of `HTTPS_PROXY`, else the one of the system, which the script gives to
+CMake and pip through `HTTPS_PROXY`, and Windows checks the servers with its certificate store, so
+that a proxy of the company that inspects TLS is accepted.
+
+The CUDA engine needs no NVIDIA card, no CUDA toolkit and no rights of an administrator. When
+the toolkit, its integration with Visual Studio or cuDNN is missing, the script takes the
+redistributable archives that NVIDIA publishes for Windows: CUDA 12.9.1 (the compiler, the
+runtime, the headers of CCCL, cuBLAS, cuRAND, cuSOLVER and the integration with Visual Studio) and
+cuDNN 9.11.0, the versions that keep the GeForce GTX 900 and 10 series.
+[`cmake/cuda_redist.cmake`](cmake/cuda_redist.cmake) downloads them once, 1.6 GB, into
+`%LOCALAPPDATA%\Albireo\build-cache\cuda` (`-CudaCache <folder>` puts this cache elsewhere),
+checks each against the SHA-256 of the manifests of NVIDIA, downloads again an archive that does
+not match, and lays them out there as a toolkit and a cuDNN folder, 4.2 GB with the archives; a
+stamp in each folder makes the next builds download and extract nothing. The CUDA tree is then
+configured with this toolkit as a standalone one, through the toolset `cuda=<folder>` of Visual
+Studio. An installed toolkit with its
+integration and cuDNN is taken first; it installs without a card too, as a custom installation
+without the driver. nvcc compiles the engine for every architecture of the table below, and only
+its tests on a card are skipped. A build machine thus produces an installer that carries every
+engine, whatever its own hardware.
 
 dlib is configured for one device per build tree, so the engines of the devices are built in their
 own trees and join the installer through `ALBIREO_EXTRA_ENGINE_DIRS`. The script
@@ -590,20 +628,22 @@ powershell -ExecutionPolicy Bypass -File dlib\dlib\external\albireo\tools\build_
 ```
 
 The OpenVINO engines are built by default, so that every installation reaches the NPU and the
-graphics processor of an Intel machine; the script stops with a message when the runtime of
-OpenVINO is missing, and `-NoOpenVINO` builds without these engines (`-OpenVINO`, which earlier
-versions required, is still accepted). The CUDA engine is built as soon as the toolkit, its
-integration with Visual Studio and cuDNN are found; without them, the script says which one is
-missing and goes on without the engine. `-Cuda` makes their absence an error and `-NoCuda` leaves
+graphics processor of an Intel machine; the check of the prerequisites installs the runtime of
+OpenVINO, and `-NoOpenVINO` builds without these engines (`-OpenVINO`, which earlier
+versions required, is still accepted). The CUDA engine is built with the installed toolkit, else
+with the archives of NVIDIA; when a download, a hash or an extraction fails, the script says why
+and goes on without the engine. `-Cuda` makes that an error and `-NoCuda` leaves
 the engine out. On a machine with a supported NVIDIA card, the service prefers the CUDA engine in
 its automatic choice, since the card takes every product. The engines of CUDA, with cuBLAS and
 cuDNN, add several hundred megabytes to the installers. A build tree
 configured by a Visual Studio installation removed since, such as Visual Studio Community
-replaced by the Build Tools, is deleted and configured again. `-NoBuiltinModels` builds without
+replaced by the Build Tools, is deleted and configured again, as is the CUDA tree configured for
+another CUDA integration (an installed toolkit, then the archives). `-NoBuiltinModels` builds without
 the models that come with Albireo and `-ModelCache <folder>` puts their cache on another drive.
 `-Tests` adds the test programs, `-Jobs <n>` bounds the compilations run at once on a machine with
-little memory, `-CudaVersion 12.9` picks one of several installed CUDA toolkits, `-Cudnn <folder>`
-one cuDNN installation (`C:\Program Files\NVIDIA\CUDNN\v9.11` for instance), and
+little memory, `-CudaVersion 12.9` picks one of several installed CUDA toolkits (the archives serve
+without it, or with 12.9), `-Cudnn <folder>` one cuDNN installation for an installed toolkit
+(`C:\Program Files\NVIDIA\CUDNN\v9.11` for instance), and
 `-CudaArchitectures` replaces the list of architectures of the CUDA engine. Of several cuDNN
 versions in `C:\Program Files\NVIDIA\CUDNN`, the script takes the latest before 9.12 that serves
 the toolkit, else the latest; each configuration sets the architectures, the list given or the
@@ -620,6 +660,11 @@ cmake --build build-albireo-cuda --config Release
 cmake -S dlib/dlib/external/albireo -B build-albireo -G "Visual Studio 17 2022" -A x64 "-DALBIREO_EXTRA_ENGINE_DIRS=build-albireo-ov/bin/engines;build-albireo-cuda/bin/engines"
 cmake --build build-albireo --config Release
 ```
+
+With the archives of NVIDIA, `cmake -DCACHE=<cache> -P dlib/dlib/external/albireo/cmake/cuda_redist.cmake`
+lays them out first, and the CUDA tree is configured with `-T cuda=<cache>\cuda-12.9.1`,
+`-DCUDAToolkit_ROOT=<cache>/cuda-12.9.1`, `-DCUDNN_INCLUDE_PATH=<cache>/cudnn-9.11.0-cuda12/include`
+and `-DCUDNN_LIBRARY_PATH=<cache>/cudnn-9.11.0-cuda12/lib/x64/cudnn.lib`.
 
 The installers are `build-albireo\bin\albireo-setup.exe`, complete with the models that come with
 Albireo, and `build-albireo\bin\albireo-setup-online.exe`, the one of the updates; the script
@@ -648,7 +693,8 @@ the cards that follow:
 
 cuDNN 9.12 and later run on Turing and later cards only (GTX 16 and RTX series). A build for the
 GTX 900 and 10 series therefore takes CUDA 12.8 or 12.9 with cuDNN 9.11 or earlier, the version
-copied beside the engine. The configuration prints the toolkit, the cuDNN version and the oldest
+copied beside the engine, which the archives of NVIDIA provide (CUDA 12.9.1, cuDNN 9.11.0). The
+configuration prints the toolkit, the cuDNN version and the oldest
 compute capability of the result, which the engine also checks at its start: a card below it is
 reported as unusable, with its compute capability, and the other engines serve the models.
 
@@ -666,7 +712,6 @@ reported as unusable, with its compute capability, and the other engines serve t
 | `ALBIREO_BUILTIN_MANIFEST`| `resources/builtin_models.json` | the models that come with Albireo           |
 | `ALBIREO_BUILTIN_TOOL`    |         | `albireo-builtin` of the build machine, for a cross build         |
 | `ALBIREO_PUBLIC_LINK_PASSWORD_FILE` | `keys/albireo-public-link.txt` of the user's folder | password of the public link, built into the service (see [Publishing a version](#publishing-a-version)) |
-| `ALBIREO_WEB_SEARCH_KEY_FILE` | `keys/albireo-brave-search-key.txt` of the user's folder | key of the Brave Search API, built into the service when the file exists (see [Web access](#web-access)) |
 | `ALBIREO_RUNTIME_LICENSES`|         | more license files for the `licenses` folder                      |
 
 The programs link their C and C++ runtime statically and depend on system libraries only; the
@@ -675,9 +720,16 @@ OpenVINO engine uses the shared runtime of OpenVINO's own libraries, installed b
 ## Building on Linux
 
 The service, the processor engines and the tests build on Linux, which serves for development
-(`--console` runs the service in the terminal, `ALBIREO_HOME` names its data folder):
+(`--console` runs the service in the terminal, `ALBIREO_HOME` names its data folder).
+[`tools/prerequisites_linux.sh`](tools/prerequisites_linux.sh) checks the tools of the build first,
+CMake 3.21 or later, a C++14 compiler, make or ninja, Python 3.8 or later, git and curl, and
+installs those that are missing with apt-get (Debian, Ubuntu) or dnf (Fedora), through sudo, after
+naming the packages; `--dry-run` prints the command without running it, and
+`tools/test_linux.sh` runs the script as its first step. The same check serves before the build of
+the publication under WSL:
 
 ```
+bash dlib/dlib/external/albireo/tools/prerequisites_linux.sh
 cmake -S dlib/dlib/external/albireo -B build-albireo
 cmake --build build-albireo -j
 ALBIREO_HOME=$HOME/albireo-data build-albireo/bin/albireo-service --console
@@ -702,7 +754,7 @@ cmake --build build-albireo-win -j
 | `test_model_file` | a small Qwen3 model built in memory and 144 damaged forms of it (names given twice and tensors off the alignment among them), which the loader must all refuse without allocating more than 256 MB, then a sparse file of more than 2 GiB whose last tensor lies beyond 2 GiB, read mapped and streamed, each value of that tensor checked and the logits compared with those of the same model in a small file |
 | `test_engine_api` | the refusals of the C interface, three threads of requests with cancellations under the pressure of the keys and values, the unloading and the destruction during requests, one final event per request, and the history of an answer read ahead of the next question |
 | `test_chat_format` | the prompts of the agent mode and of each chat format against those of its template rendered by Jinja, the marker tokens and the parsing of the tool calls, whole or cut in pieces, the calls of Mistral with and without their identifier, the Llama 3 answers that are no call and an earlier answer holding `</think>` |
-| `test_host`      | in a data folder of its own: the files of the downloads and of the imports through no link, the refusals of the import route, the copies of models already installed, the identifiers of the imports, the replacement of a model file, the ranges of the downloads, a damaged database, the downloads from the public link alone through a local API of pCloud (its listing, the copies it holds, a copy of another size and a file it lacks that fail with the name of the file in the link, no request to an official address, the catalog and the feed of the updates from the link, a refused password), the web access through a local server (the public addresses on both sides of each range, the addresses refused before any connection, a page, a text cut at 2 MB, a type refused, the PDF files above 20 MB, a redirection to a private address, the three providers of the search, the refusals offline and with the web access turned off) and the key of the search, absent from the documents of the settings and from the log, with the key of the Brave Search API built into the service (the provider by default, after the key of the administrator, its refusal and its spent credit) |
+| `test_host`      | in a data folder of its own: the files of the downloads and of the imports through no link, the refusals of the import route, the copies of models already installed, the identifiers of the imports, the replacement of a model file, the ranges of the downloads, a damaged database, the downloads from the publication space alone through a local interface of pCloud (its listing, the copies it holds, a copy of another size and a file it lacks that fail with the name of the file in the space, no request to an official address, the catalog and the feed of the updates from the space, a refused password), each failure of the space with the bounds of the tests shortened (web pages with 200 and 403 and a proxy that asks for its authentication from each method of the interface and from a content server, connections reset or refused, a JSON cut short or of other types, sizes of another type, negative or beyond the integers, a server that stalls or answers byte by byte) failing with its message, without exception, the local server still answering, and no message or line of the log naming pCloud, the link or its code, the last guard of the messages and of the log files of an earlier version, the settings of an earlier version written again without the link and the search providers, and the web access through a local server (the public addresses on both sides of each range, the addresses refused before any connection, a page, a text cut at 2 MB, a type refused, the PDF files above 20 MB, a redirection to a private address, the search of Wikipedia, the refusals offline, with the web access turned off and without provider) |
 | `engine_chat`    | drives an engine library through its C interface: chat, images with their projector (`--image`, `--detail`), tools, reasoning, parallel requests, turns with pauses (`--turns --pause`), embeddings compared with a reference; it ends without unloading the engine of a device, as the service does |
 | `bench_runtime`  | tokens per second of the prompt and of the generation, also as `bench_runtime_avxvnni` and `bench_runtime_avx512` |
 
@@ -832,9 +884,12 @@ Two ways to update an installed computer:
 
 ## Settings
 
-`settings.json`, in the data folder, holds the settings, the password of the proxy and the key of
-the search apart; the tray changes them through the administration interface, a new port being
-opened once before it is saved, and the service restarts when a change requires it.
+`settings.json`, in the data folder, holds the settings, the password of the proxy apart; the tray
+changes them through the administration interface, a new port being opened once before it is saved,
+and the service restarts when a change requires it. A `settings.json` of an earlier version is read
+without error: the settings this version lacks (`public_link`, `web_search_url`, `web_search_key`)
+and another provider of the search, read as `wikipedia`, leave it at the next start, and
+`web_search.secret` is deleted.
 
 | Key             | Default | Meaning                                                                   |
 |-----------------|---------|---------------------------------------------------------------------------|
@@ -855,11 +910,8 @@ opened once before it is saved, and the service restarts when a change requires 
 | `offline`       | false   | no connection: catalog, models and updates come from imports              |
 | `proxy`         | `""`    | `""` for the proxy of the system (`HTTPS_PROXY`, then WinHTTP), `none`, or `http://[user:password@]host:port`; the settings give the password as `********`, kept in `proxy.secret` |
 | `web_access`    | true    | the web access of the Web button, `false` turns it off (see [Web access](#web-access)) |
-| `web_search`    | `auto`  | provider of the search: `auto` (the Brave Search API with the key built into the service when the build carries one, else Wikipedia), `wikipedia`, `brave` (with `web_search_key`, else with the key built in), `searxng` or `none` |
-| `web_search_url` | `""`   | address of the SearXNG instance, http or https, any host                  |
-| `web_search_key` | `""`   | key of the Brave Search API, kept in `web_search.secret`; the settings give `web_search_key_set` instead |
+| `web_search`    | `wikipedia` | provider of the search: `wikipedia`, or `none` to turn the search off |
 | `active`        |         | the model of each function: `general`, `code`, `security`, `embedding`     |
-| `public_link`   | the link of Albireo | public link of pCloud of the published files (`dist`, `models`), the only source of the downloads; `""` turns the downloads off |
 
 ## Interfaces
 
@@ -881,7 +933,7 @@ of `/v1/embeddings` takes `albireo-embedding`.
 | `GET /albireo/v1/models?lang=fr`         | catalog and installed models                              |
 | `GET /albireo/v1/engines`                | engine libraries, options and measures                    |
 | `POST /albireo/v1/count`                 | tokens of a conversation for a model                      |
-| `POST /albireo/v1/web/search`            | a search of the web through the provider of the settings (see [Web access](#web-access)) |
+| `POST /albireo/v1/web/search`            | a search of Wikipedia (see [Web access](#web-access))     |
 | `POST /albireo/v1/web/fetch`             | a page of the web at a public address, its bytes in base64 |
 | `GET /albireo/v1/licenses`               | license texts of the `licenses` folder of the installation, with the versions the service knows |
 | `GET /albireo/v1/licenses/<file>`        | one of these texts, 1 MB at most, a file of that folder only |
@@ -929,12 +981,11 @@ which the windows explain in the language of the user.
 ## Web access
 
 The Web button of the composer gives the model two tools that reach the web through the service
-([`host/web_access.h`](host/web_access.h)): `web_search`, which searches the web through the
-provider the administrator set, and `fetch_page`, which reads a page at an address, one of the
-results or one the user gave. The service makes the requests, so that the application still loads
-nothing from another origin, and gives back the bytes it read, which the application decodes
-([`web/js/web.js`](web/js/web.js)): a text with `TextDecoder` and its charset, HTML with
-`DOMParser`, PDF with its reader.
+([`host/web_access.h`](host/web_access.h)): `web_search`, which searches Wikipedia, and
+`fetch_page`, which reads a page at an address, one of the results or one the user gave. The
+service makes the requests, so that the application still loads nothing from another origin, and
+gives back the bytes it read, which the application decodes ([`web/js/web.js`](web/js/web.js)): a
+text with `TextDecoder` and its charset, HTML with `DOMParser`, PDF with its reader.
 
 | Route | Body | Answer |
 |-------|------|--------|
@@ -945,16 +996,14 @@ These routes take no administration token: they belong to the interface of the w
 of the same origin as its other routes, which the server refuses to any other site (see
 [Security](#security)). `/albireo/v1/status`, which the application reads at its start, gives
 `"web": {"available": true, "search": "wikipedia"}`: `available` while the administrator leaves
-the web access on and the service is not offline, and the provider of the search, `none` when no
-provider can search, the reading of pages staying available. Both routes answer 403 while the
+the web access on and the service is not offline, and the provider of the search, `none` when the
+search is turned off, the reading of pages staying available. Both routes answer 403 while the
 service works offline (`offline`) or once the administrator turned the web access off
 (`web_access_off`).
 
 The setting `web_search` names the provider of the search:
 
-- `auto`, by default: the Brave Search API with the key built into the service when the build
-  carries one, else Wikipedia;
-- `wikipedia`: the search of the REST interface of Wikipedia in the language of the
+- `wikipedia`, by default: the search of the REST interface of Wikipedia in the language of the
   request, English without one (`GET https://<language>.wikipedia.org/w/rest.php/v1/search/page`),
   each result an article of that Wikipedia with its excerpt, its markup removed, or else its
   description. The requests carry the User-Agent that the policy of Wikimedia asks for, with a
@@ -964,39 +1013,12 @@ The setting `web_search` names the provider of the search:
   known by its address alone, limits introduced in 2026 that may change, and the computers behind
   one public address share them. The route reports the limit with 429 (`rate_limited`) and the
   delay Wikimedia gives (`Retry-After`);
-- `brave`: the Brave Search API, with the key of the administrator (`web_search_key`), else the
-  key built into the service, in the `X-Subscription-Token` header. Brave grants each account a
-  credit of $5 a month, about 1,000
-  searches at $5 per 1,000 requests, and asks the projects that use this credit to name the Brave
-  Search API on their website or on their About pages; a rate or a credit exhausted gives 429, and
-  a key refused 502 (`search_key_refused`);
-- `searxng`: the SearXNG instance at `web_search_url`, http or https on any host the administrator
-  chooses, through its JSON format, which its `settings.yml` must list (`formats: [html, json]`
-  under `search`); an instance that refuses the format answers 403, reported with 502
-  (`search_format_refused`);
 - `none`: no search, `fetch_page` staying available.
 
-The key built into the service comes from the file that the CMake option
-`ALBIREO_WEB_SEARCH_KEY_FILE` names, by default `keys/albireo-brave-search-key.txt` in the folder
-of the user (`%USERPROFILE%` on a native Windows build, `~` elsewhere), outside the repository:
-the configuration reads it without its byte order mark and its ends of line and writes it masked,
-with a seed of its own, into a header of the build tree
-([`cmake/web_search_key.cmake`](cmake/web_search_key.cmake)), as it does for the password of the
-public link. Without the file, the build carries no key, the configuration says so, and the search
-goes to Wikipedia by default. The owner of the build chooses whether to give that file: every
-installation of a build that carries the key shares its credit, $5 a month, about 1,000 searches;
-once the credit is spent, the Brave Search API answers 429 until the next month unless credits are
-bought, which the route reports as the credit the installations share, and a key of the
-administrator in `web_search_key` takes the place of the shared key on its installation. The key
-never enters the repository, a log, a route or a document of the settings, and the programs carry
-it masked, inside the service alone: `/albireo/v1/status` names the provider in use
-(`"search": "brave"`), and the log of the start says whether the build carries a key. The masking
-keeps the key from a reading of the program as text, not from someone who studies the program.
-
 The service reads no page of results meant for people and sends no User-Agent of a browser; a
-limit of rate or a check of bots of a provider comes back as the error of the route. The addresses
-of the providers are fixed or chosen by the administrator, and the rule of the public addresses
-that follows applies to the pages alone.
+limit of rate or a check of bots of Wikipedia comes back as the error of the route. The address
+of Wikipedia is fixed, and the rule of the public addresses that follows applies to the pages
+alone.
 
 A page is read at a public address only. The service refuses with 403 (`address_refused`) the
 names of this computer and of the local networks, `localhost`, `*.localhost`, `*.local`,
@@ -1031,7 +1053,7 @@ Behind a proxy, the one of the setting `proxy` or of the system, the requests go
 proxy, which resolves the name again on its own: the check applies to the addresses this computer
 resolves, and the proxy may reach other addresses for the same name. A name this computer cannot
 resolve is refused, which leaves the reading of pages out on the networks where the proxy alone
-resolves the names of the Internet; the search, whose providers are not checked, goes through the
+resolves the names of the Internet; the search, whose address is not checked, goes through the
 proxy there.
 
 The administrator sets the web access through the settings route of the administration interface
@@ -1039,14 +1061,9 @@ The administrator sets the web access through the settings route of the administ
 
 ```
 {"web_access": false}
-{"web_search": "brave", "web_search_key": "<key of the Brave Search API>"}
-{"web_search": "searxng", "web_search_url": "https://searx.example.org"}
 {"web_search": "none"}
+{"web_search": "wikipedia"}
 ```
-
-That route alone writes the key: the settings give `web_search_key_set`, true or false, and the key
-lies in `web_search.secret` beside `settings.json`, which the service and the administrators alone
-read; an empty key removes it, and the log never shows it.
 
 In the web application, the Web button stands beside Agent. It is off in every new discussion,
 whatever the earlier ones chose: its state belongs to its discussion, which keeps it with its
@@ -1054,8 +1071,8 @@ messages, after an answer, a regeneration, an edit and a reload and in the other
 user turns it off, while the last choice of Agent and of the reasoning becomes the default of the
 next discussions. The button is disabled, with the reason as its title, while the model of the function
 calls no tools, while the service works offline and once the administrator turned the web access
-off. With Web on, each question carries `web_search`, when the service names a provider other than
-`none`, and `fetch_page`, after the tools of the agent while Agent is on, and the answer runs the
+off. With Web on, each question carries `web_search`, when the service offers the search of
+Wikipedia, and `fetch_page`, after the tools of the agent while Agent is on, and the answer runs the
 calls of the tools even with Agent off. The tools and the system message stay the same from one
 question to the next while the buttons and the provider do not change, so that the beginning of
 the prompt stays in the cache of the engine. The help next to the buttons describes the web tools
@@ -1310,17 +1327,24 @@ gives the private key to the account that runs it alone. The programs travel in 
 carries the service, the tray, every engine with the runtime libraries of its device, and the web
 application.
 
-The published files lie in the public link of Albireo, a public folder of pCloud read only (the
-setting `public_link`, [`host/public_link.h`](host/public_link.h)), protected by a password that
-the service carries. Its folder `dist` holds `feed.json`, `catalog.json`, their signatures, the
-installer of the updates, `albireo-setup-online-<version>.exe`, and the complete installer,
+The published files lie in the publication space of Albireo, the public link of a public folder of
+pCloud read only, a constant of the build that no setting, route or document gives
+([`host/public_link.h`](host/public_link.h)), protected by a password that the service carries. Its
+folder `dist` holds `feed.json`, `catalog.json`, their signatures, the installer of the updates,
+`albireo-setup-online-<version>.exe`, and the complete installer,
 `albireo-setup-complete-<version>.exe`; its folder `models` holds each file of the catalog at
 `<identifier>/<file name of its official address>`. The service reads the feed, the catalog, the
 installer and the model files there alone, through the API of pCloud, and never their official
-addresses: a link that is not set, that does not answer or that does not hold a file makes the
-operation fail with a message that names the file in the link, and the signatures and the hashes
-check every file. [`dist/albireo`](../../../../dist/albireo) of the repository keeps the signed feed
-and catalog that the publisher places in the link.
+addresses: a space that does not answer or that does not hold a file makes the operation fail with
+a message that names the file in the space and the kind of failure ("the publication space of
+Albireo cannot be reached for dist/feed.json: the request is answered with the status 403"), and
+the signatures and the hashes check every file. No message, window or log of the service, the tray
+or the installer names the link, its code, an address of the API or of a content server, or a host
+of pCloud: the messages name the files of the space, and the log, the errors of the routes, the
+windows of the tray and the log of the installer pass their texts through a last guard that
+replaces any such word with "the publication space of Albireo" ([`common/log.h`](common/log.h)),
+the log files of an earlier version included. [`dist/albireo`](../../../../dist/albireo) of the
+repository keeps the signed feed and catalog that the publisher places in the link.
 
 The password is read at the configuration from `ALBIREO_PUBLIC_LINK_PASSWORD_FILE`, by default
 `keys\albireo-public-link.txt` in the folder of the user (`~/keys` on Linux), outside the
@@ -1412,21 +1436,23 @@ size and its SHA-256, and run it in update mode at their next start.
   the signed offline bundles (see [Models](#models)). Every error of the updates carries a code
   with its values (`update_signature`, `update_installer_mismatch`, `update_package_manager`...),
   which the tray explains in the language of the user.
-- The public link, the only source of the downloads, brings nothing the signed feed and catalog
-  do not name, at the size and with the SHA-256 they give: a file of the link that differs is
-  refused, and no other source takes its place. Its
-  password never lies in the repository: the configuration reads it from a file of the publisher
-  and builds it into the service masked, and the messages and the logs leave out the query of every
-  request to the API of pCloud. It keeps the link from being read outside Albireo, not from someone
-  who studies the program.
+- The publication space, the only source of the downloads, brings nothing the signed feed and
+  catalog do not name, at the size and with the SHA-256 they give: a file of the space that differs
+  is refused, and no other source takes its place. A web page that a proxy or a filter of the
+  network sends in its place, a body cut short, a JSON of other types, a stalled server and a
+  connection reset fail the operation with its message, bounded in time, and no exception leaves
+  the threads of the downloads and of the checks. The password of its link never lies in the
+  repository: the configuration reads it from a file of the publisher and builds it into the
+  service masked, and the messages and the logs never name the link, its code or the addresses of
+  pCloud. It keeps the link from being read outside Albireo, not from someone who studies the
+  program.
 - The JavaScript the agent mode runs executes in a sandboxed frame of opaque origin, in a worker
   stopped after 15 s; the page builds its own copy of each answer of the frame, with checked and
   shortened fields, and gives up on a frame silent for 20 s.
 - The web access reads the pages of public addresses only, the names and the addresses of this
   computer and of the local networks refused, its connection going to the address checked; it
-  follows the redirections itself, each address checked again, reads 2 MB of text and 20 MB of PDF
-  at most, and keeps the key of the Brave Search API as the password of the proxy, in
-  `web_search.secret`. The application reads only the addresses of the discussion, reads the pages
+  follows the redirections itself, each address checked again, and reads 2 MB of text and 20 MB of
+  PDF at most. The application reads only the addresses of the discussion, reads the pages
   in an inert document, and gives their text to the model as untrusted data (see
   [Web access](#web-access)).
 - The text read aloud reaches the synthesizer through `albireo-speech.exe` alone, started for each
@@ -1459,7 +1485,6 @@ size and its SHA-256, and run it in update mode at their next start.
 | `C:\Program Files\Albireo\speech`      | the voices of the speech synthesis                           |
 | `C:\ProgramData\Albireo\settings.json` | settings, and their last copy `settings.json.bak`            |
 | `C:\ProgramData\Albireo\proxy.secret`  | password of the proxy, readable by the administrators and the service |
-| `C:\ProgramData\Albireo\web_search.secret` | key of the Brave Search API, readable by the administrators and the service |
 | `C:\ProgramData\Albireo\albireo.db`    | installed models, downloads, usage, catalog                   |
 | `C:\ProgramData\Albireo\models`        | models (or the folder chosen at installation)                |
 | `C:\ProgramData\Albireo\import`        | offline bundles and models, installed within a minute        |

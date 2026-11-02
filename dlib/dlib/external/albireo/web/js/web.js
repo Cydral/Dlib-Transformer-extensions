@@ -3,7 +3,7 @@
 
 /*
     The web tools of the agent mode, which the Web button of the composer gives the model: web_search, which searches
-    the web through the provider the service names (POST /albireo/v1/web/search), and fetch_page, which reads a page
+    Wikipedia through the service (POST /albireo/v1/web/search), and fetch_page, which reads a page
     through the service (POST /albireo/v1/web/fetch) and turns its bytes into text: HTML through an inert document of
     DOMParser, which runs no script, loads no image and never enters the page; PDF through the reader of the
     documents; JSON, XML and plain text as they are.  The model receives a page by parts of sliceChars characters, and
@@ -35,8 +35,8 @@ const searchDefinition = {
   type: 'function',
   function: {
     name: 'web_search',
-    description: 'Searches the web and returns a numbered list of results, each with its title, its address and a ' +
-      'snippet. Use it for recent or factual information that the discussion does not hold.',
+    description: 'Searches the articles of Wikipedia and returns a numbered list of results, each with its title, ' +
+      'its address and a snippet. Use it for factual information that the discussion does not hold.',
     parameters: {
       type: 'object',
       properties: {
@@ -67,7 +67,7 @@ const fetchDefinition = {
   }
 };
 
-// The tools of the web, in their order: web_search when the service names a provider of search, then fetch_page.
+// The tools of the web, in their order: web_search when the service offers the search of Wikipedia, then fetch_page.
 export function definitions(search) {
   return search ? [searchDefinition, fetchDefinition] : [fetchDefinition];
 }
@@ -82,7 +82,7 @@ export function isTool(name) {
     addresses and of the searches.  It depends on search alone, so that it stays the same from one question to the next.
 */
 export function instructions(search) {
-  return (search ? 'You can search the web with web_search and read web pages and PDF files with fetch_page. '
+  return (search ? 'You can search Wikipedia with web_search and read web pages and PDF files with fetch_page. '
     : 'You can read web pages and PDF files with fetch_page. ')
     + 'fetch_page reads only the addresses that the user gave in this discussion, '
     + (search ? 'the addresses of the results of web_search ' : '')
@@ -430,8 +430,6 @@ function failure(e, what) {
   return { ok: false, text: resultHeader + '\n' + what + ' failed: ' + (e && e.message ? e.message : String(e)) };
 }
 
-const providers = { wikipedia: 'Wikipedia', brave: 'the Brave Search API', searxng: 'SearXNG' };
-
 async function webSearch(args, context) {
   const query = typeof args.query === 'string' ? args.query.trim() : '';
   if (!query) return { ok: false, text: resultHeader + '\nweb_search needs a query.' };
@@ -443,8 +441,7 @@ async function webSearch(args, context) {
     return failure(e, 'The search');
   }
   const results = (Array.isArray(r.results) ? r.results : []).filter((x) => x && addressKey(x.url));
-  const lines = [resultHeader, 'Results of ' + (providers[r.provider] || String(r.provider || 'the search')) + ' for "'
-    + query + '":'];
+  const lines = [resultHeader, 'Results of Wikipedia for "' + query + '":'];
   results.forEach((x, i) => {
     lines.push('', (i + 1) + '. ' + collapse(x.title), '   ' + x.url);
     if (x.snippet) lines.push('   ' + collapse(x.snippet));

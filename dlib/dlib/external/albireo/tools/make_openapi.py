@@ -277,41 +277,28 @@ schemas = {
         "web_access": {"type": "boolean", "default": True,
                        "description": "The web access of the Web button, /albireo/v1/web/search and "
                                       "/albireo/v1/web/fetch; false turns it off."},
-        "web_search": {"type": "string", "enum": ["auto", "wikipedia", "brave", "searxng", "none"],
-                       "default": "auto",
-                       "description": "The provider of /albireo/v1/web/search: auto, the Brave Search API with the "
-                                      "key built into the service when the build carries one, else the REST "
-                                      "interface of Wikipedia; wikipedia; brave, the Brave Search API with "
-                                      "web_search_key, else with the key built in; searxng, the instance at "
-                                      "web_search_url; or none. Every installation of a build shares the monthly "
-                                      "credit of its key, which no route gives."},
-        "web_search_url": {"type": "string", "maxLength": 512,
-                           "description": "The address of the SearXNG instance, http or https, any host, without "
-                                          "user, query or fragment; the instance must allow the JSON format "
-                                          "(search.formats in its settings.yml)."},
-        "web_search_key": {"type": "string", "maxLength": 256, "writeOnly": True,
-                           "description": "The key of the Brave Search API, printable characters without space. "
-                                          "This route writes it and no route gives it back: the settings give "
-                                          "web_search_key_set, and the key lies in web_search.secret, which the "
-                                          "service and the administrators alone read. An empty value removes it."}}},
+        "web_search": {"type": "string", "enum": ["wikipedia", "none"], "default": "wikipedia",
+                       "description": "The provider of /albireo/v1/web/search: wikipedia, the REST interface of "
+                                      "Wikipedia; or none, which turns the search off while /albireo/v1/web/fetch "
+                                      "stays available. A settings.json of an earlier version that names another "
+                                      "provider is read as wikipedia."}}},
     "WebSearchRequest": {"type": "object", "required": ["query"], "properties": {
         "query": {"type": "string", "minLength": 1, "maxLength": 400,
                   "description": "The text searched, 1 to 400 characters once the spaces at its ends are removed."},
         "count": {"type": "integer", "minimum": 1, "maximum": 10, "default": 5, "description": "Results at most."},
         "language": {"type": "string", "pattern": "^[a-z]{2,3}(-([A-Z]{2}|[0-9]{3}))?$", "example": "fr",
                      "description": "The language of the results: the site of Wikipedia of that language (en "
-                                    "without one), and the language parameter of SearXNG."}},
+                                    "without one)."}},
         "example": {"query": "Albireo double star", "count": 5, "language": "en"}},
     "WebSearchResults": {"type": "object", "properties": {
-        "provider": {"type": "string", "enum": ["wikipedia", "brave", "searxng"]},
+        "provider": {"type": "string", "enum": ["wikipedia"]},
         "results": {"type": "array", "description": "The results whose address is http or https, count at most.",
                     "items": {"type": "object", "properties": {
                         "title": {"type": "string"},
                         "url": {"type": "string", "description": "An http or https address; for Wikipedia, "
                                 "https://<language>.wikipedia.org/wiki/<key of the page>."},
                         "snippet": {"type": "string", "description": "The excerpt of Wikipedia without its tags "
-                                    "and entities, else the description of the page; the description of Brave "
-                                    "without its tags; the content of SearXNG."}}}}}},
+                                    "and entities, else the description of the page."}}}}}},
     "WebFetchRequest": {"type": "object", "required": ["url"], "properties": {
         "url": {"type": "string", "description": "An http or https address of a public host, without user "
                 "information.", "example": "https://en.wikipedia.org/wiki/Albireo"},
@@ -490,11 +477,11 @@ paths = {
                              "description": "loading, ready, unloading, removing, or the error of a load."},
             "web": {"type": "object", "description": "The web access of the Web button, which the web application "
                     "reads at its start: available while the administrator leaves it on (web_access) and the "
-                    "service is not offline, and the provider of /albireo/v1/web/search in use, the setting auto "
-                    "resolved, none when the search is unavailable while /albireo/v1/web/fetch stays available.",
+                    "service is not offline, and the provider of /albireo/v1/web/search, wikipedia, or none when "
+                    "the search is unavailable while /albireo/v1/web/fetch stays available.",
                     "properties": {
                         "available": {"type": "boolean"},
-                        "search": {"type": "string", "enum": ["wikipedia", "brave", "searxng", "none"]}}}}})}}},
+                        "search": {"type": "string", "enum": ["wikipedia", "none"]}}}}})}}},
     "/albireo/v1/models": {"get": {
         "tags": ["Service"], "summary": "Catalog, installed models, downloads and active models",
         "description": "The language models: those that come with Albireo first (builtin), then the catalog and "
@@ -593,29 +580,21 @@ paths = {
                                    "gives the reason, as a text", {"type": "object", "properties": {
                                        "error": {"type": "string"}}})}}},
     "/albireo/v1/web/search": {"post": {
-        "tags": ["Web access"], "summary": "Searches the web through the provider of the settings",
-        "description": "The tool web_search of the Web button. The provider is the setting web_search: by default "
-                       "the Brave Search API with the key built into the service when the build carries one, else the "
-                       "REST interface of Wikipedia (GET https://<language>.wikipedia.org/w/rest.php/v1/search/page, "
-                       "with a User-Agent that gives a contact, as the policy of Wikimedia asks); the Brave Search API "
-                       "with the key of the administrator, else the key built in; or a SearXNG instance through its "
-                       "JSON format. The log names the provider and the number of results, never the query or a "
-                       "key.",
+        "tags": ["Web access"], "summary": "Searches Wikipedia",
+        "description": "The tool web_search of the Web button, through the REST interface of Wikipedia (GET "
+                       "https://<language>.wikipedia.org/w/rest.php/v1/search/page, with a User-Agent that gives a "
+                       "contact, as the policy of Wikimedia asks), unless the setting web_search is none. The log "
+                       "names the provider and the number of results, never the query.",
         "requestBody": json_body(ref("WebSearchRequest")),
         "responses": {
             "200": reply("The results", ref("WebSearchResults")),
             "400": reply("An invalid query, count or language (codes invalid_query, invalid_count, "
                          "invalid_language)", ref("Error")),
             "403": reply("The service works offline (code offline), the administrator turned the web access off "
-                         "(web_access_off), or no provider is set (no_search_provider): web_search none, brave "
-                         "without a key of the administrator in a build without key, or searxng without address",
-                         ref("Error")),
-            "429": reply("The provider limits the rate of the requests (code rate_limited): Wikipedia for the "
-                         "anonymous requests, the rate or the monthly credit of the key of Brave, the credit of the "
-                         "key built in being shared by every installation, the limiter of SearXNG; Retry-After gives "
-                         "the delay the provider asks for", ref("Error")),
-            "502": reply("The Brave Search API refuses the key (code search_key_refused), the SearXNG instance "
-                         "refuses the JSON format (search_format_refused), the provider gives another answer "
+                         "(web_access_off), or the setting web_search is none (no_search_provider)", ref("Error")),
+            "429": reply("Wikipedia limits the rate of the anonymous requests (code rate_limited); Retry-After "
+                         "gives the delay it asks for", ref("Error")),
+            "502": reply("Wikipedia answers with another status or another answer than its interface "
                          "(search_failed), or cannot be reached (unreachable, tls_failed, proxy_failed)",
                          ref("Error")),
             "503": reply("Three requests of the web access run already (code busy, Retry-After: 2), or the service "
@@ -733,8 +712,7 @@ paths = {
                                    ref("Error"))}}},
     "/albireo/v1/settings": {
         "get": {"tags": ["Administration"], "security": admin, "summary": "Settings of the service",
-                "responses": {"200": reply("The settings, the password of the proxy given as ******** and the key "
-                                           "of the search as web_search_key_set, true or false",
+                "responses": {"200": reply("The settings, the password of the proxy given as ********",
                                            {"type": "object"})}},
         "put": {"tags": ["Administration"], "security": admin, "summary": "Changes settings",
                 "description": "A new port is opened once before it is saved.",

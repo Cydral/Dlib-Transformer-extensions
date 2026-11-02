@@ -85,13 +85,15 @@ la minute. La mise à jour s'installe au prochain démarrage du service.
 """
 
 
-def download(url, out, expected_size, gzip_part=False, label="", whole=None, compressed_size=None):
+def download(url, out, expected_size, gzip_part=False, label="", whole=None, compressed_size=None, shown=None):
     """Writes the content of url to the open file out, inflated when gzip_part, and returns
     the SHA-256 and the size of what was written; whole also receives the content.  The
     transfer stops with an error when the server sends more bytes than announced, the
     compressed_size of a compressed part or else expected_size, when a compressed part
     inflates beyond expected_size, and when the connection ends before the size the server
-    announced."""
+    announced.  shown names the content in the messages in place of url: an address of the
+    public link, which no message gives."""
+    name = shown or url
     h = hashlib.sha256()
     written = 0
     received = 0
@@ -108,12 +110,12 @@ def download(url, out, expected_size, gzip_part=False, label="", whole=None, com
                     break
                 received += len(block)
                 if received > announced:
-                    raise RuntimeError("%s sends more than the %d bytes announced" % (url, announced))
+                    raise RuntimeError("%s sends more than the %d bytes announced" % (name, announced))
                 if inflate:
                     # One byte beyond the rest of the part tells a part that inflates too far.
                     block = inflate.decompress(block, expected_size - written + 1)
                     if written + len(block) > expected_size:
-                        raise RuntimeError("%s inflates beyond the %d bytes announced" % (url, expected_size))
+                        raise RuntimeError("%s inflates beyond the %d bytes announced" % (name, expected_size))
                 out.write(block)
                 h.update(block)
                 if whole is not None:
@@ -126,20 +128,20 @@ def download(url, out, expected_size, gzip_part=False, label="", whole=None, com
             # The reading of a content of announced length stops without an error when the
             # connection closes before its end.
             if length.isdigit() and received < int(length):
-                raise RuntimeError("the transfer of %s was cut off after %d bytes" % (url, received))
+                raise RuntimeError("the transfer of %s was cut off after %d bytes" % (name, received))
             if inflate:
                 tail = inflate.flush()
                 if written + len(tail) > expected_size:
-                    raise RuntimeError("%s inflates beyond the %d bytes announced" % (url, expected_size))
+                    raise RuntimeError("%s inflates beyond the %d bytes announced" % (name, expected_size))
                 out.write(tail)
                 h.update(tail)
                 if whole is not None:
                     whole.update(tail)
                 written += len(tail)
     except http.client.IncompleteRead:
-        raise RuntimeError("the transfer of %s was cut off after %d bytes" % (url, received))
+        raise RuntimeError("the transfer of %s was cut off after %d bytes" % (name, received))
     except zlib.error as e:
-        raise RuntimeError("%s is not a valid gzip part (%s)" % (url, e))
+        raise RuntimeError("%s is not a valid gzip part (%s)" % (name, e))
     print("\r  %s: %d of %d MB" % (label, written >> 20, expected_size >> 20), file=sys.stderr)
     return h.hexdigest(), written
 
@@ -280,7 +282,8 @@ def main():
                 # The copy of the public link alone.
                 address = public_link.Link().address("dist/" + installer_name)
                 with open(partial, "wb") as out:
-                    sha, size = download(address, out, installer["size"], label=installer_name)
+                    sha, size = download(address, out, installer["size"], label=installer_name,
+                                         shown="the copy of dist/%s in the public link" % installer_name)
                 if sha != installer["sha256"] or size != installer["size"]:
                     raise RuntimeError("the installer downloaded does not match the feed")
                 os.replace(partial, target)
@@ -335,7 +338,8 @@ def main():
                                   complete_fr=complete_fr))
     except (OSError, ValueError, KeyError, RuntimeError, subprocess.CalledProcessError,
             http.client.HTTPException) as e:
-        print("error: %s" % e, file=sys.stderr)
+        # The errors of the requests to the public link name none of its addresses.
+        print("error: %s" % public_link.hidden(e), file=sys.stderr)
         return 1
     print("bundle %s: installer %s, %d models, %.2f GB of models"
           % (a.output, stable["version"], len(chosen), total / 1e9))

@@ -11,11 +11,10 @@ namespace albireo
 
     /*!
         ensures
-            - Returns the secret that the configuration built into the program masked (CMakeLists.txt
-              and cmake/web_search_key.cmake): each of its size bytes xored with the bits 16 to 23 of
+            - Returns the secret that the configuration built into the program masked (CMakeLists.txt),
+              the password of the public link: each of its size bytes xored with the bits 16 to 23 of
               the next value of the generator x = (x * 1103515245 + 12345) mod 2^31 started at seed,
-              which the configuration runs the same way.  The password of the public link and the key
-              of the search have seeds of their own.
+              which the configuration runs the same way.
     !*/
     inline std::string unmask_secret(const unsigned char* bytes, size_t size, unsigned long long seed)
     {

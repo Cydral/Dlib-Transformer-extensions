@@ -20,15 +20,17 @@ namespace albireo
         /*!
             WHAT THIS OBJECT REPRESENTS
                 The updates of the programs.  The feed is a JSON document published in the
-                folder dist of the public link (public_link.h), with a detached signature
-                (ECDSA P-256 over its exact bytes), both read from the link alone; a feed
-                whose signature does not verify against the key built into the programs is
-                ignored.  When it announces a newer version, its installer is downloaded in
-                the background into the updates folder from the folder dist of the link, by
-                the name the feed gives it there ("file"), and checked against the size and
-                the hash the feed gives; the address a feed may also give ("url") is never
-                read.  A file the link does not hold yet fails the check with the code
-                update_not_published, which names it.  The update is applied when the
+                folder dist of the publication space (public_link.h), with a detached
+                signature (ECDSA P-256 over its exact bytes), both read from the space alone;
+                a feed whose signature does not verify against the key built into the
+                programs is ignored.  When it announces a newer version, its installer is
+                downloaded in the background into the updates folder from the folder dist of
+                the space, by the name the feed gives it there ("file"), and checked against
+                the size and the hash the feed gives; the address a feed may also give
+                ("url") is never read.  A file the space does not hold yet fails the check
+                with the code update_not_published, which names it; the other failures name
+                the file and the kind of failure, never an address, and no exception leaves
+                the thread of a check.  The update is applied when the
                 service restarts: the service then starts the installer in its update mode,
                 which replaces the programs and starts the service again.
 

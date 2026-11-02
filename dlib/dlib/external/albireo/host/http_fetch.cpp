@@ -56,6 +56,65 @@ namespace albireo
         std::string cancel_reason = "stopped";
         std::set<std::shared_ptr<httplib::Client>> active;
 
+        // The bounds the tests shorten (http_bounds_for_tests()), 0 for those of the callers.
+        std::atomic<int> test_read_seconds{0};
+        std::atomic<int> test_total_seconds{0};
+
+        // The bound of a wait for data, or of a whole request: the one of the caller, or the shorter one of the tests.
+        int bounded(int seconds, const std::atomic<int>& test_seconds)
+        {
+            const int t = test_seconds;
+            return t > 0 && t < seconds ? t : seconds;
+        }
+
+        const char* const web_page_text = "a web page comes in place of the answer, as a proxy or a filter of the "
+            "network sends one";
+
+        // Whether a Content-Type names a web page, which a server of files never sends for the files of Albireo.
+        bool web_page(const std::string& content_type)
+        {
+            std::string type = content_type.substr(0, content_type.find(';'));
+            for (auto& c : type) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            while (!type.empty() && type.back() == ' ') type.pop_back();
+            return type == "text/html" || type == "application/xhtml+xml";
+        }
+
+        // The failure of an answer whose status is not the one expected; neither the address nor its host.
+        std::string status_text(int status)
+        {
+            if (status == 407) return "the proxy asks for an authentication (status 407)";
+            return "the request is answered with the status " + std::to_string(status);
+        }
+
+        // The failure of a transfer that httplib reports, through a proxy or not; neither the address nor its host.
+        std::string transfer_text(httplib::Error e, int read_seconds, bool via_proxy)
+        {
+            const std::string peer = via_proxy ? "the proxy" : "the server";
+            switch (e)
+            {
+            case httplib::Error::Connection: return "the connection to " + peer + " fails";
+            case httplib::Error::ConnectionTimeout:
+                return peer + " does not answer within " + std::to_string(connect_seconds) + " s";
+            case httplib::Error::Timeout: return "no data arrives within " + std::to_string(read_seconds) + " s";
+            case httplib::Error::ConnectionClosed: return "the server closes the connection";
+            case httplib::Error::Read: return "the connection breaks while the answer arrives";
+            case httplib::Error::Write: return "the connection breaks while the request leaves";
+            case httplib::Error::SSLConnection: return "the secure connection (TLS) fails";
+            case httplib::Error::SSLLoadingCerts: return "the certificates of the system cannot be loaded";
+            case httplib::Error::SSLServerVerification:
+                return "the certificate of the server is not trusted, as when a filter of the network inspects "
+                    "the secure connections";
+            case httplib::Error::SSLServerHostnameVerification: return "the certificate names another server";
+            case httplib::Error::ProxyConnection: return "the proxy refuses the connection";
+            default:
+            {
+                std::string text = httplib::to_string(e);
+                if (!text.empty()) text[0] = static_cast<char>(std::tolower(static_cast<unsigned char>(text[0])));
+                return text;
+            }
+            }
+        }
+
         std::string cancelled_error()
         {
             std::lock_guard<std::mutex> lock(active_m);
@@ -298,6 +357,8 @@ namespace albireo
             // One bound for every address of the name, so that a network that drops the
             // packets costs connect_seconds whatever the number of its addresses.
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(connect_seconds);
+            // Whether an address refused the connection, which its error tells from a network that drops the packets.
+            bool refused = false;
             for (const ADDRINFOEXW* a = list; a && std::chrono::steady_clock::now() < deadline; a = a->ai_next)
             {
                 if ((a->ai_family != AF_INET && a->ai_family != AF_INET6) || !a->ai_addr) continue;
@@ -325,8 +386,13 @@ namespace albireo
                         const int r = select(0, nullptr, &writable, &failed, &slice);
                         if (r == 0) continue;
                         open = r > 0 && FD_ISSET(sock, &writable) && !FD_ISSET(sock, &failed);
+                        refused = refused || !open;
                         break;
                     }
+                }
+                else if (!open)
+                {
+                    refused = true;
                 }
                 closesocket(sock);
                 if (open) return true;
@@ -336,7 +402,8 @@ namespace albireo
                     return false;
                 }
             }
-            error = "no answer within " + std::to_string(connect_seconds) + " s";
+            error = refused ? std::string("the connection is refused")
+                : "no answer within " + std::to_string(connect_seconds) + " s";
             return false;
         }
 
@@ -386,14 +453,14 @@ namespace albireo
                     if (WaitForSingleObject(l->overlapped.hEvent, 2000) != WAIT_OBJECT_0) l.release();
                     else free_lookup(l);
                     error = w == WAIT_OBJECT_0 + 1 ? cancelled_error()
-                        : "the name " + host + " was not resolved within " + std::to_string(connect_seconds) + " s";
+                        : "the name is not resolved within " + std::to_string(connect_seconds) + " s";
                     return nullptr;
                 }
                 rc = overlapped_result(&l->overlapped);
             }
             if (rc != NO_ERROR)
             {
-                error = "the name " + host + " cannot be resolved (error " + std::to_string(rc) + ")";
+                error = "the name cannot be resolved (error " + std::to_string(rc) + ")";
                 free_lookup(l);
                 return nullptr;
             }
@@ -417,7 +484,6 @@ namespace albireo
             // Without the functions of a bounded resolution, the client resolves the name.
             if (!l) return error.empty();
             const bool ok = probe(l->result, port, error);
-            if (!ok) error = host + ":" + std::to_string(port) + ": " + error;
             free_lookup(l);
             return ok;
 #else
@@ -449,7 +515,7 @@ namespace albireo
             const int rc = getaddrinfo(host.c_str(), nullptr, &hints, &list);
             if (rc != 0)
             {
-                error = "the name " + host + " cannot be resolved (error " + std::to_string(rc) + ")";
+                error = "the name cannot be resolved (error " + std::to_string(rc) + ")";
                 return false;
             }
             for (const addrinfo* a = list; a; a = a->ai_next)
@@ -461,26 +527,34 @@ namespace albireo
             return true;
         }
 
-        // The port of an origin, "https://host:port".
+        // The port of an origin, "https://host:port": five digits at most, else the port of the scheme.
         int port_of(const std::string& origin)
         {
             const bool https = origin.compare(0, 8, "https://") == 0;
             const std::string h = origin.substr(origin.find("://") + 3);
             const size_t bracket = h.find(']');
             const size_t colon = h.find(':', bracket == std::string::npos ? 0 : bracket);
-            const int port = colon == std::string::npos ? 0 : std::atoi(h.substr(colon + 1).c_str());
+            const std::string digits = colon == std::string::npos ? std::string() : h.substr(colon + 1);
+            const bool number = !digits.empty() && digits.size() <= 5
+                && digits.find_first_not_of("0123456789") == std::string::npos;
+            const int port = number ? std::atoi(digits.c_str()) : 0;
             return port > 0 && port < 65536 ? port : https ? 443 : 80;
         }
 
-        // The client for one address, the server or the proxy reached first.
-        std::shared_ptr<httplib::Client> open(const url_parts& u, int timeout_seconds, std::string& error)
+        // The client for one address, the server or the proxy reached first; via_proxy tells which.
+        std::shared_ptr<httplib::Client> open(const url_parts& u, int timeout_seconds, std::string& error,
+            bool& via_proxy)
         {
             const std::string proxy = proxy_for(u.origin);
             proxy_address p;
-            const bool via_proxy = !proxy.empty() && parse_proxy(proxy, p);
+            via_proxy = !proxy.empty() && parse_proxy(proxy, p);
             if (via_proxy ? !reach_bounded(lower(p.host), p.port, error)
                           : !reach_bounded(host_of(u.origin), port_of(u.origin), error))
+            {
+                if (!cancelled) error = (via_proxy ? "the proxy cannot be reached: " : "the server cannot be reached: ")
+                    + error;
                 return nullptr;
+            }
             return make_client(u.origin, proxy, timeout_seconds);
         }
 
@@ -499,7 +573,7 @@ namespace albireo
             }
             if (from.compare(0, 8, "https://") == 0 && to.compare(0, 8, "https://") != 0)
             {
-                error = from + " redirects to an address without https";
+                error = "a redirection leads to an address without https";
                 return false;
             }
             return true;
@@ -609,236 +683,317 @@ namespace albireo
         }
         if (addresses.empty())
         {
-            error = "the name " + host + " has no address";
+            error = "the name has no address";
             return false;
         }
         return true;
     }
 
-    bool http_get(const std::string& url, std::string& body, std::string& error, size_t max_bytes, int timeout_seconds)
+    namespace
     {
-        std::string current = url;
-        for (int hop = 0; hop <= max_redirections; ++hop)
+        using clock_type = std::chrono::steady_clock;
+
+        /*
+            The failure of a transfer, told by its time as well: httplib reports a wait beyond the
+            bound of a read, or of the whole request, as a read that fails.  last_data is the time
+            the request left or the last data arrived.
+        */
+        std::string failure_of(httplib::Error e, clock_type::time_point last_data, clock_type::time_point deadline,
+            int read_seconds, int total_seconds, bool via_proxy)
         {
-            url_parts u;
-            if (!parse_url(current, u))
-            {
-                error = "invalid address " + current;
-                return false;
-            }
-            if (cancelled)
-            {
-                error = cancelled_error();
-                return false;
-            }
-            const std::shared_ptr<httplib::Client> c = open(u, timeout_seconds, error);
-            if (!c)
-            {
-                error = url + ": " + error;
-                return false;
-            }
-            http_registration reg(c);
-            // A cancellation between the resolution and the registration.
-            if (cancelled)
-            {
-                error = cancelled_error();
-                return false;
-            }
-            body.clear();
-            bool too_big = false;
-            int status = 0;
-            std::string location;
-            httplib::Result r;
-            try
-            {
-                r = c->Get(u.target,
-                    [&](const httplib::Response& res) {
-                        status = res.status;
-                        if (res.status >= 300 && res.status < 400) location = res.get_header_value("Location");
-                        return res.status == 200 && !cancelled;
-                    },
-                    [&](const char* data, size_t n) {
-                        if (cancelled) return false;
-                        if (body.size() + n > max_bytes)
-                        {
-                            too_big = true;
-                            return false;
-                        }
-                        body.append(data, n);
-                        return true;
-                    });
-            }
-            catch (const connection_cancelled&)
-            {
-            }
-            if (cancelled)
-            {
-                error = cancelled_error();
-                return false;
-            }
-            if (!location.empty())
-            {
-                if (!redirection(current, location, current, error)) return false;
-                continue;
-            }
-            if (too_big)
-            {
-                error = url + " is larger than expected";
-                return false;
-            }
-            if (status != 0 && status != 200)
-            {
-                error = url + ": status " + std::to_string(status);
-                return false;
-            }
-            if (!r)
-            {
-                error = url + ": " + httplib::to_string(r.error());
-                return false;
-            }
-            return true;
+            const auto now = clock_type::now();
+            const auto margin = std::chrono::milliseconds(100);
+            const bool waited = e == httplib::Error::Read || e == httplib::Error::Timeout;
+            if (waited && now + margin >= deadline)
+                return "no complete answer arrives within " + std::to_string(total_seconds) + " s";
+            if (waited && now - last_data + margin >= std::chrono::seconds(read_seconds))
+                return "no data arrives within " + std::to_string(read_seconds) + " s";
+            return transfer_text(e, read_seconds, via_proxy);
         }
-        error = url + ": too many redirections";
+
+        // The address of the first request, or of a redirection, as a client reads it; false with the error otherwise.
+        bool parse_hop(const std::string& current, int hop, url_parts& u, std::string& error)
+        {
+            if (parse_url(current, u)) return true;
+            error = hop == 0 ? "the address is invalid" : "a redirection leads to an invalid address";
+            return false;
+        }
+
+        // http_get(), which may throw.
+        bool get_whole(const std::string& url, std::string& body, std::string& error, size_t max_bytes,
+            int read_seconds, int total_seconds)
+        {
+            const auto deadline = clock_type::now() + std::chrono::seconds(total_seconds);
+            std::string current = url;
+            for (int hop = 0; hop <= max_redirections; ++hop)
+            {
+                url_parts u;
+                if (!parse_hop(current, hop, u, error)) return false;
+                if (cancelled)
+                {
+                    error = cancelled_error();
+                    return false;
+                }
+                bool via_proxy = false;
+                const std::shared_ptr<httplib::Client> c = open(u, read_seconds, error, via_proxy);
+                if (!c) return false;
+                http_registration reg(c);
+                // A cancellation between the resolution and the registration.
+                if (cancelled)
+                {
+                    error = cancelled_error();
+                    return false;
+                }
+                const long long left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    deadline - clock_type::now()).count();
+                if (left <= 0)
+                {
+                    error = "no complete answer arrives within " + std::to_string(total_seconds) + " s";
+                    return false;
+                }
+                c->set_max_timeout(static_cast<time_t>(left));
+                body.clear();
+                bool too_big = false, page = false;
+                int status = 0;
+                std::string location;
+                httplib::Result r;
+                auto last_data = clock_type::now();
+                try
+                {
+                    r = c->Get(u.target,
+                        [&](const httplib::Response& res) {
+                            last_data = clock_type::now();
+                            status = res.status;
+                            if (res.status >= 300 && res.status < 400) location = res.get_header_value("Location");
+                            page = res.status == 200 && web_page(res.get_header_value("Content-Type"));
+                            return res.status == 200 && !page && !cancelled;
+                        },
+                        [&](const char* data, size_t n) {
+                            if (cancelled) return false;
+                            if (body.size() + n > max_bytes)
+                            {
+                                too_big = true;
+                                return false;
+                            }
+                            body.append(data, n);
+                            last_data = clock_type::now();
+                            return true;
+                        });
+                }
+                catch (const connection_cancelled&)
+                {
+                }
+                if (cancelled)
+                {
+                    error = cancelled_error();
+                    return false;
+                }
+                if (!location.empty())
+                {
+                    if (!redirection(current, location, current, error)) return false;
+                    continue;
+                }
+                // The status of the answer, or of the proxy that refused to open the tunnel (407).
+                const int answered = status != 0 ? status : r ? r->status : 0;
+                if (too_big) error = "the answer is larger than expected";
+                else if (page) error = web_page_text;
+                else if (answered != 0 && answered != 200) error = status_text(answered);
+                else if (!r || r.error() != httplib::Error::Success)
+                    error = failure_of(r.error(), last_data, deadline, read_seconds, total_seconds, via_proxy);
+                else
+                    return true;
+                return false;
+            }
+            error = "the redirections go on beyond " + std::to_string(max_redirections);
+            return false;
+        }
+
+        // http_get_range(), which may throw.
+        bool get_range(const std::string& url, uint64_t from, int64_t to,
+            const std::function<bool(const char*, size_t)>& receiver, std::string& error, uint64_t* total)
+        {
+            const int read_seconds = bounded(30, test_read_seconds);
+            httplib::Headers headers;
+            const bool ranged = from > 0 || to >= 0;
+            if (ranged)
+            {
+                const std::string last = to >= 0 ? std::to_string(to) : std::string();
+                headers.emplace("Range", "bytes=" + std::to_string(from) + "-" + last);
+            }
+            // The bytes asked for, when the range has an end: the receiver gets no more than them.
+            const bool limited = to >= 0 && static_cast<uint64_t>(to) >= from;
+            const uint64_t wanted = limited ? static_cast<uint64_t>(to) - from + 1 : 0;
+            std::string current = url;
+            for (int hop = 0; hop <= max_redirections; ++hop)
+            {
+                url_parts u;
+                if (!parse_hop(current, hop, u, error)) return false;
+                if (cancelled)
+                {
+                    error = cancelled_error();
+                    return false;
+                }
+                bool via_proxy = false;
+                const std::shared_ptr<httplib::Client> c = open(u, read_seconds, error, via_proxy);
+                if (!c) return false;
+                http_registration reg(c);
+                if (cancelled)
+                {
+                    error = cancelled_error();
+                    return false;
+                }
+                bool refused_range = false;
+                bool other_range = false;
+                bool page = false;
+                bool stopped = false;
+                bool complete = false;
+                uint64_t delivered = 0;
+                int status = 0;
+                std::string location;
+                httplib::Result r;
+                auto last_data = clock_type::now();
+                try
+                {
+                    r = c->Get(u.target, headers,
+                        [&](const httplib::Response& res) {
+                            last_data = clock_type::now();
+                            status = res.status;
+                            if (res.status >= 300 && res.status < 400)
+                            {
+                                location = res.get_header_value("Location");
+                                return false;
+                            }
+                            const std::string cr = res.get_header_value("Content-Range");
+                            if (total)
+                            {
+                                *total = 0;
+                                const size_t slash = cr.find('/');
+                                if (slash != std::string::npos && cr.substr(slash + 1) != "*")
+                                    *total = std::strtoull(cr.substr(slash + 1).c_str(), nullptr, 10);
+                                else if (res.status == 200 && res.has_header("Content-Length"))
+                                    *total = std::strtoull(res.get_header_value("Content-Length").c_str(), nullptr, 10);
+                            }
+                            // A web page in place of the file, which writing it would corrupt.
+                            const bool answers = res.status == 200 || res.status == 206;
+                            if (answers && web_page(res.get_header_value("Content-Type")))
+                            {
+                                page = true;
+                                return false;
+                            }
+                            if (from > 0 && res.status == 200)
+                            {
+                                refused_range = true;
+                                return false;
+                            }
+                            // A part of the resource starts where it was asked: "bytes <first>-<last>/<size>".
+                            if (ranged && res.status == 206)
+                            {
+                                const size_t unit = cr.find("bytes ");
+                                const std::string first = unit == std::string::npos ? std::string()
+                                    : cr.substr(unit + 6);
+                                const bool digits = !first.empty() && first[0] >= '0' && first[0] <= '9';
+                                if (!digits || std::strtoull(first.c_str(), nullptr, 10) != from)
+                                {
+                                    other_range = true;
+                                    return false;
+                                }
+                            }
+                            return (res.status == 200 || res.status == 206) && !cancelled;
+                        },
+                        [&](const char* data, size_t n) {
+                            const size_t take = limited
+                                ? static_cast<size_t>(std::min<uint64_t>(n, wanted - delivered)) : n;
+                            if (cancelled || (take > 0 && !receiver(data, take)))
+                            {
+                                stopped = true;
+                                return false;
+                            }
+                            delivered += take;
+                            last_data = clock_type::now();
+                            // The bytes asked for have come: what an answer sends beyond them is not read.
+                            if (limited && delivered >= wanted)
+                            {
+                                complete = true;
+                                return false;
+                            }
+                            return true;
+                        });
+                }
+                catch (const connection_cancelled&)
+                {
+                }
+                if (cancelled || stopped)
+                {
+                    error = cancelled ? cancelled_error() : std::string("the transfer is stopped");
+                    return false;
+                }
+                if (complete) return true;
+                if (!location.empty())
+                {
+                    if (!redirection(current, location, current, error)) return false;
+                    continue;
+                }
+                // The status of the answer, or of the proxy that refused to open the tunnel (407).
+                const int answered = status != 0 ? status : r ? r->status : 0;
+                if (page) error = web_page_text;
+                else if (refused_range) error = "the server does not resume downloads";
+                else if (other_range) error = "the server answers with another range than the one asked";
+                else if (answered != 0 && answered != 200 && answered != 206) error = status_text(answered);
+                else if (!r || r.error() != httplib::Error::Success)
+                    error = failure_of(r.error(), last_data, clock_type::time_point::max(), read_seconds, 0, via_proxy);
+                else if (limited && delivered < wanted) error = "the answer ends before the bytes asked for";
+                else
+                    return true;
+                return false;
+            }
+            error = "the redirections go on beyond " + std::to_string(max_redirections);
+            return false;
+        }
+    }
+
+    bool http_get(const std::string& url, std::string& body, std::string& error, size_t max_bytes, int timeout_seconds,
+        int total_seconds)
+    {
+        // An exception of httplib becomes the error of the request, which never leaves this function.
+        try
+        {
+            return get_whole(url, body, error, max_bytes, bounded(timeout_seconds, test_read_seconds),
+                bounded(total_seconds, test_total_seconds));
+        }
+        catch (const std::exception& e)
+        {
+            error = std::string("the transfer fails: ") + e.what();
+        }
+        catch (...)
+        {
+            error = "the transfer fails";
+        }
         return false;
     }
 
     bool http_get_range(const std::string& url, uint64_t from, int64_t to,
         const std::function<bool(const char*, size_t)>& receiver, std::string& error, uint64_t* total)
     {
-        httplib::Headers headers;
-        const bool ranged = from > 0 || to >= 0;
-        if (ranged)
+        // An exception of httplib or of the receiver becomes the error of the request, which never leaves here.
+        try
         {
-            const std::string last = to >= 0 ? std::to_string(to) : std::string();
-            headers.emplace("Range", "bytes=" + std::to_string(from) + "-" + last);
+            return get_range(url, from, to, receiver, error, total);
         }
-        // The bytes asked for, when the range has an end: the receiver gets no more than them.
-        const bool limited = to >= 0 && static_cast<uint64_t>(to) >= from;
-        const uint64_t wanted = limited ? static_cast<uint64_t>(to) - from + 1 : 0;
-        std::string current = url;
-        for (int hop = 0; hop <= max_redirections; ++hop)
+        catch (const std::exception& e)
         {
-            url_parts u;
-            if (!parse_url(current, u))
-            {
-                error = "invalid address " + current;
-                return false;
-            }
-            if (cancelled)
-            {
-                error = cancelled_error();
-                return false;
-            }
-            const std::shared_ptr<httplib::Client> c = open(u, 30, error);
-            if (!c)
-            {
-                error = url + ": " + error;
-                return false;
-            }
-            http_registration reg(c);
-            if (cancelled)
-            {
-                error = cancelled_error();
-                return false;
-            }
-            bool refused_range = false;
-            bool other_range = false;
-            bool stopped = false;
-            bool complete = false;
-            uint64_t delivered = 0;
-            int status = 0;
-            std::string location;
-            httplib::Result r;
-            try
-            {
-                r = c->Get(u.target, headers,
-                    [&](const httplib::Response& res) {
-                        status = res.status;
-                        if (res.status >= 300 && res.status < 400)
-                        {
-                            location = res.get_header_value("Location");
-                            return false;
-                        }
-                        const std::string cr = res.get_header_value("Content-Range");
-                        if (total)
-                        {
-                            *total = 0;
-                            const size_t slash = cr.find('/');
-                            if (slash != std::string::npos && cr.substr(slash + 1) != "*")
-                                *total = std::strtoull(cr.substr(slash + 1).c_str(), nullptr, 10);
-                            else if (res.status == 200 && res.has_header("Content-Length"))
-                                *total = std::strtoull(res.get_header_value("Content-Length").c_str(), nullptr, 10);
-                        }
-                        if (from > 0 && res.status == 200)
-                        {
-                            refused_range = true;
-                            return false;
-                        }
-                        // A part of the resource starts where it was asked: "bytes <first>-<last>/<size>".
-                        if (ranged && res.status == 206)
-                        {
-                            const size_t unit = cr.find("bytes ");
-                            const std::string first = unit == std::string::npos ? std::string() : cr.substr(unit + 6);
-                            const bool digits = !first.empty() && first[0] >= '0' && first[0] <= '9';
-                            if (!digits || std::strtoull(first.c_str(), nullptr, 10) != from)
-                            {
-                                other_range = true;
-                                return false;
-                            }
-                        }
-                        return (res.status == 200 || res.status == 206) && !cancelled;
-                    },
-                    [&](const char* data, size_t n) {
-                        const size_t take = limited ? static_cast<size_t>(std::min<uint64_t>(n, wanted - delivered))
-                            : n;
-                        if (cancelled || (take > 0 && !receiver(data, take)))
-                        {
-                            stopped = true;
-                            return false;
-                        }
-                        delivered += take;
-                        // The bytes asked for have come: what an answer sends beyond them is not read.
-                        if (limited && delivered >= wanted)
-                        {
-                            complete = true;
-                            return false;
-                        }
-                        return true;
-                    });
-            }
-            catch (const connection_cancelled&)
-            {
-            }
-            if (cancelled || stopped)
-            {
-                error = cancelled ? cancelled_error() : std::string("stopped");
-                return false;
-            }
-            if (complete) return true;
-            if (!location.empty())
-            {
-                if (!redirection(current, location, current, error)) return false;
-                continue;
-            }
-            if (refused_range)
-            {
-                error = url + ": the server does not resume downloads";
-                return false;
-            }
-            if (other_range)
-            {
-                error = url + ": the server answered with another range than the one asked";
-                return false;
-            }
-            if (!r)
-            {
-                error = url + ": " + (status ? "status " + std::to_string(status) : httplib::to_string(r.error()));
-                return false;
-            }
-            return true;
+            error = std::string("the transfer fails: ") + e.what();
         }
-        error = url + ": too many redirections";
+        catch (...)
+        {
+            error = "the transfer fails";
+        }
         return false;
+    }
+
+    void http_bounds_for_tests(int read_seconds, int total_seconds)
+    {
+        test_read_seconds = read_seconds;
+        test_total_seconds = total_seconds;
     }
 
 }

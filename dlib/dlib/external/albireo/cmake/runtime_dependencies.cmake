@@ -48,9 +48,13 @@ endforeach()
 # The data files among them, such as the table of the kernels of the GPU plugin of OpenVINO,
 # are copied without a search of their dependencies, which only the libraries have.
 set(extra_libraries)
+set(extra_names)
 foreach (f IN LISTS extra_files)
    if (f MATCHES "\\.(dll|so|dylib)(\\.[0-9]+)*$")
       list(APPEND extra_libraries "${f}")
+      get_filename_component(extra_name "${f}" NAME)
+      string(TOLOWER "${extra_name}" extra_name)
+      list(APPEND extra_names "${extra_name}")
    endif()
 endforeach()
 
@@ -91,6 +95,13 @@ set(missing)
 foreach (u IN LISTS unresolved)
    string(TOLOWER "${u}" name)
    if (name MATCHES "^(nvcuda|nvml|opencl|ze_loader|ze_intel_.*|libcuda|libopencl)")
+      continue()
+   endif()
+   # A library of the list EXTRA is copied beside the engine whatever the search found: the
+   # runtime of the compiler on a computer that has no Visual C++ Redistributable in its
+   # system folder, for instance, where the search of the system finds no copy of it.
+   list(FIND extra_names "${name}" extra_index)
+   if (NOT extra_index EQUAL -1)
       continue()
    endif()
    if (name MATCHES "^(lib)?(openvino|tbb|cudnn|cublas|cudart|msvcp|vcruntime|concrt)")

@@ -27,9 +27,7 @@
 #include "../common/version.h"
 #include "crypto.h"
 #include "http_fetch.h"
-#include "masked_secret.h"
 #include "public_link.h"
-#include "web_search_secret.h"
 
 namespace albireo
 {
@@ -54,35 +52,10 @@ namespace albireo
         const int max_requests = 3;
         std::atomic<int> running_requests{0};
 
-        // What the functions reserved for the tests set: the loopback addresses read, the origin of the providers.
+        // What the functions reserved for the tests set: the loopback addresses read, the origin of the provider.
         std::atomic<bool> loopback_allowed{false};
         std::mutex provider_m;
         std::string provider_origin;
-        bool builtin_key_replaced = false;
-        std::string builtin_key_for_tests;
-
-        /*
-            The key of the Brave Search API built into the service from the file of the configuration
-            (ALBIREO_WEB_SEARCH_KEY_FILE, cmake/web_search_key.cmake), masked with a seed of its own;
-            empty when the build has none.  No message, log, route or document of the settings gives it.
-        */
-        const unsigned char masked_key[] = ALBIREO_WEB_SEARCH_SECRET;
-        const size_t masked_key_size = ALBIREO_WEB_SEARCH_SECRET_SIZE;
-
-        std::string builtin_key()
-        {
-            {
-                std::lock_guard<std::mutex> lock(provider_m);
-                if (builtin_key_replaced) return builtin_key_for_tests;
-            }
-            return unmask_secret(masked_key, masked_key_size, 20261102);
-        }
-
-        // The key of the Brave Search API a search uses: the one of the administrator, else the one built in.
-        std::string brave_key(const host_settings& s)
-        {
-            return s.web_search_key.empty() ? builtin_key() : s.web_search_key;
-        }
 
         // Thrown from the socket of a client about to connect once the requests of the service are cancelled.
         struct connection_cancelled
@@ -1241,41 +1214,21 @@ namespace albireo
             return false;
         }
 
-        /*
-            The reply to an answer of a provider whose status is not 200; shared tells a search of the
-            Brave Search API made with the key built into the service, whose credit every installation
-            shares.
-        */
-        web_reply provider_refusal(const std::string& provider, const std::string& name, const received& got,
-            bool shared)
+        // The reply to an answer of Wikipedia whose status is not 200.
+        web_reply provider_refusal(const received& got)
         {
             if (got.status == 429)
             {
-                web_reply r = failure(429, "rate_limited", provider == "wikipedia"
-                    ? "Wikipedia limits the rate of the anonymous requests: wait before searching again"
-                    : provider == "brave" && shared
-                    ? "the credit of the key of the Brave Search API built into Albireo, which its installations "
-                        "share, is spent for this month, or its rate is reached: the search works again next month, "
-                        "or with a key of the administrator (web_search_key)"
-                    : provider == "brave"
-                    ? "the rate or the monthly credit of the key of the Brave Search API is exhausted"
-                    : "the SearXNG instance limits the rate of the requests: wait before searching again");
+                web_reply r = failure(429, "rate_limited",
+                    "Wikipedia limits the rate of the anonymous requests: wait before searching again");
                 r.retry_after = got.retry_after;
                 return r;
             }
-            if (provider == "brave" && (got.status == 401 || got.status == 403
-                || (got.status == 422 && got.body.find("SUBSCRIPTION_TOKEN_INVALID") != std::string::npos)))
-                return failure(502, "search_key_refused", shared ? "the Brave Search API refuses the key built "
-                    "into Albireo" : "the Brave Search API refuses the key of the settings (web_search_key)");
-            if (provider == "searxng" && got.status == 403)
-                return failure(502, "search_format_refused", "the SearXNG instance refuses the JSON format: json "
-                    "must be listed in search.formats of its settings.yml");
-            return failure(502, "search_failed", name + " answers with the status " + std::to_string(got.status));
+            return failure(502, "search_failed", "Wikipedia answers with the status " + std::to_string(got.status));
         }
 
-        // Searches query through provider for web_search().
-        web_reply search(const host_settings& s, const std::string& provider, const std::string& query, int count,
-            const std::string& language)
+        // Searches query through the search of Wikipedia for web_search().
+        web_reply search(const std::string& query, int count, const std::string& language)
         {
             request_place place;
             if (!place.held()) return busy_reply();
@@ -1287,42 +1240,19 @@ namespace albireo
             httplib::Headers headers;
             headers.emplace("Accept", "application/json");
             headers.emplace("Accept-Encoding", "identity");
-            std::string url, name;
-            const bool shared = provider == "brave" && s.web_search_key.empty();
+            headers.emplace("User-Agent", wikimedia_user_agent());
             // The language of Wikipedia, which names its site: the language of the request without its region.
             const std::string wiki = language.empty() ? std::string("en") : language.substr(0, language.find('-'));
-            if (provider == "wikipedia")
-            {
-                url = (origin.empty() ? "https://" + wiki + ".wikipedia.org" : origin) + "/w/rest.php/v1/search/page?q="
-                    + query_component(query) + "&limit=" + std::to_string(count);
-                headers.emplace("User-Agent", wikimedia_user_agent());
-                name = "Wikipedia";
-            }
-            else if (provider == "brave")
-            {
-                url = (origin.empty() ? std::string("https://api.search.brave.com") : origin) + "/res/v1/web/search?q="
-                    + query_component(query) + "&count=" + std::to_string(count);
-                headers.emplace("User-Agent", user_agent());
-                headers.emplace("X-Subscription-Token", brave_key(s));
-                name = "the Brave Search API";
-            }
-            else
-            {
-                std::string base = s.web_search_url;
-                while (!base.empty() && base.back() == '/') base.pop_back();
-                url = base + "/search?q=" + query_component(query) + "&format=json"
-                    + (language.empty() ? std::string() : "&language=" + language);
-                headers.emplace("User-Agent", user_agent());
-                name = "the SearXNG instance";
-            }
+            const std::string url = (origin.empty() ? "https://" + wiki + ".wikipedia.org" : origin)
+                + "/w/rest.php/v1/search/page?q=" + query_component(query) + "&limit=" + std::to_string(count);
             web_address a;
             std::string why;
             if (!parse_address(url, a, why))
-                return failure(502, "search_failed", "the address of " + name + " is invalid");
-            const answer_check accept = [&name](const received&, body_limit& limit, web_reply&) {
+                return failure(502, "search_failed", "the address of Wikipedia is invalid");
+            const answer_check accept = [](const received&, body_limit& limit, web_reply&) {
                 limit.bytes = max_answer_bytes;
                 limit.refuse_beyond = true;
-                limit.beyond = failure(502, "search_failed", "the answer of " + name + " is larger than "
+                limit.beyond = failure(502, "search_failed", "the answer of Wikipedia is larger than "
                     + std::to_string(max_answer_bytes >> 20) + " MB");
                 return true;
             };
@@ -1330,7 +1260,7 @@ namespace albireo
             web_reply fail;
             const auto deadline = clock_type::now() + std::chrono::seconds(total_seconds);
             if (!exchange(a, headers, false, deadline, accept, got, fail)) return fail;
-            if (got.status != 200) return provider_refusal(provider, name, got, shared);
+            if (got.status != 200) return provider_refusal(got);
             json document;
             json results = json::array();
             auto add = [&results, count](const std::string& title, const std::string& address,
@@ -1345,40 +1275,23 @@ namespace albireo
                 r["snippet"] = text;
                 results.push_back(r);
             };
-            bool valid = json::parse(got.body, document);
             const json& d = document;
-            if (valid && provider == "wikipedia")
-            {
-                valid = d["pages"].is_array();
-                for (const auto& page : d["pages"].elements())
-                {
-                    const std::string key = page["key"].as_string();
-                    if (key.empty()) continue;
-                    std::string snippet = plain_text(page["excerpt"].as_string());
-                    if (snippet.empty()) snippet = tidy(page["description"].as_string());
-                    add(tidy(page["title"].as_string()), "https://" + wiki + ".wikipedia.org/wiki/" + article_path(key),
-                        snippet);
-                }
-            }
-            else if (valid && provider == "brave")
-            {
-                valid = d.is_object();
-                for (const auto& item : d["web"]["results"].elements())
-                    add(plain_text(item["title"].as_string()), item["url"].as_string(),
-                        plain_text(item["description"].as_string()));
-            }
-            else if (valid)
-            {
-                valid = d["results"].is_array();
-                for (const auto& item : d["results"].elements())
-                    add(tidy(item["title"].as_string()), item["url"].as_string(), tidy(item["content"].as_string()));
-            }
+            const bool valid = json::parse(got.body, document) && d["pages"].is_array();
             if (!valid)
-                return failure(502, "search_failed", "the answer of " + name + " is not the JSON of its interface");
+                return failure(502, "search_failed", "the answer of Wikipedia is not the JSON of its interface");
+            for (const auto& page : d["pages"].elements())
+            {
+                const std::string key = page["key"].as_string();
+                if (key.empty()) continue;
+                std::string snippet = plain_text(page["excerpt"].as_string());
+                if (snippet.empty()) snippet = tidy(page["description"].as_string());
+                add(tidy(page["title"].as_string()), "https://" + wiki + ".wikipedia.org/wiki/" + article_path(key),
+                    snippet);
+            }
             json body = json::object();
-            body["provider"] = provider;
+            body["provider"] = "wikipedia";
             body["results"] = results;
-            log_info("web: search through " + provider + " (" + std::to_string(results.size()) + " results)");
+            log_info("web: search through wikipedia (" + std::to_string(results.size()) + " results)");
             web_reply reply;
             reply.body = std::move(body);
             return reply;
@@ -1392,21 +1305,9 @@ namespace albireo
         return ip.family == 4 ? public_ipv4(ipv4_at(ip.bytes)) : public_ipv6(ip.bytes);
     }
 
-    bool web_search_key_builtin()
-    {
-        return !builtin_key().empty();
-    }
-
     std::string web_search_provider(const host_settings& s)
     {
-        const bool builtin = web_search_key_builtin();
-        if (s.web_search == "auto") return builtin ? "brave" : "wikipedia";
-        if (s.web_search == "wikipedia") return "wikipedia";
-        const bool own = !s.web_search_key.empty() && valid_web_search_key(s.web_search_key);
-        if (s.web_search == "brave" && (own || (s.web_search_key.empty() && builtin))) return "brave";
-        if (s.web_search == "searxng" && !s.web_search_url.empty() && valid_web_search_url(s.web_search_url))
-            return "searxng";
-        return "none";
+        return s.web_search == "none" ? "none" : "wikipedia";
     }
 
     json web_capability(const host_settings& s)
@@ -1416,22 +1317,6 @@ namespace albireo
         web["available"] = available;
         web["search"] = available ? web_search_provider(s) : std::string("none");
         return web;
-    }
-
-    bool valid_web_search_url(const std::string& url)
-    {
-        web_address a;
-        std::string why;
-        return url.empty() || (url.size() <= 512 && url.find_first_of("?# ") == std::string::npos
-            && parse_address(url, a, why));
-    }
-
-    bool valid_web_search_key(const std::string& key)
-    {
-        if (key.size() > 256) return false;
-        for (const char c : key)
-            if (static_cast<unsigned char>(c) < 0x21 || static_cast<unsigned char>(c) > 0x7e) return false;
-        return true;
     }
 
     web_reply web_fetch(const json& request, const host_settings& s)
@@ -1463,16 +1348,8 @@ namespace albireo
         if (available(s, reply) && read_query(request, query, reply) && read_count(request, count, reply)
             && read_language(request, language, reply))
         {
-            const std::string provider = web_search_provider(s);
-            if (provider != "none") reply = search(s, provider, query, count, language);
-            else if (s.web_search == "brave")
-                reply = failure(403, "no_search_provider", "no search provider is set: the Brave Search API needs its "
-                    "key (web_search_key), and this build of Albireo carries none");
-            else if (s.web_search == "searxng")
-                reply = failure(403, "no_search_provider", "no search provider is set: the SearXNG instance needs its "
-                    "address (web_search_url)");
-            else
-                reply = failure(403, "no_search_provider", "no search provider is set");
+            if (web_search_provider(s) == "wikipedia") reply = search(query, count, language);
+            else reply = failure(403, "no_search_provider", "no search provider is set");
         }
         if (reply.status != 200) log_warning("web: " + without_queries(reply.message));
         return reply;
@@ -1487,13 +1364,6 @@ namespace albireo
     {
         std::lock_guard<std::mutex> lock(provider_m);
         provider_origin = origin;
-    }
-
-    void web_builtin_key_for_tests(const std::string& key)
-    {
-        std::lock_guard<std::mutex> lock(provider_m);
-        builtin_key_replaced = true;
-        builtin_key_for_tests = key;
     }
 
 }

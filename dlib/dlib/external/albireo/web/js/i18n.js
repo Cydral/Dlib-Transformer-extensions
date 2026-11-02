@@ -46,15 +46,14 @@ const texts = {
     webOffline: 'Albireo works offline: the web access is unavailable',
     webOff: 'The web access is turned off in the settings of the Albireo service',
     webUnavailable: 'The Albireo service gives no web access',
-    webHelp: 'With Web on, the model can search the web and read web pages and PDF files through the Albireo ' +
+    webHelp: 'With Web on, the model can search Wikipedia and read web pages and PDF files through the Albireo ' +
       'service. It reads only the addresses you write in your questions, those of the results of its searches and ' +
       'the links of the pages it already read. Web starts off in every new discussion.',
     tool_web_search: 'Web search', tool_fetch_page: 'Page reading',
-    toolHint_web_search: 'Searches the web through the search provider of the Albireo service and lists the ' +
-      'results with their addresses.',
+    toolHint_web_search: 'Searches the articles of Wikipedia through the Albireo service and lists the results ' +
+      'with their addresses.',
     toolHint_fetch_page: 'Reads, part by part, a web page or a PDF file whose address the discussion holds.',
-    webSearchBy: 'Web search: {provider}', provider_wikipedia: 'Wikipedia', provider_brave: 'Brave Search API',
-    provider_searxng: 'SearXNG',
+    webSearchBy: 'Web search: {provider}', provider_wikipedia: 'Wikipedia',
     afterAnswer: 'Available once the answer is written', answering: 'Answering…',
     unreadAnswer: 'New answer, not read yet', scrollStart: 'Go to the start of the discussion',
     scrollEnd: 'Go to the end of the discussion',
@@ -308,17 +307,16 @@ const texts = {
     webOffline: 'Albireo fonctionne hors ligne : l\'accès au Web est indisponible',
     webOff: 'L\'accès au Web est désactivé dans les paramètres du service Albireo',
     webUnavailable: 'Le service Albireo ne donne pas d\'accès au Web',
-    webHelp: 'Avec le Web activé, le modèle peut chercher sur le Web et lire des pages Web et des fichiers PDF par ' +
-      'le service Albireo. Il ne lit que les adresses que vous écrivez dans vos questions, celles des résultats de ' +
-      'ses recherches et les liens des pages qu\'il a déjà lues. Le Web est désactivé au début de chaque ' +
-      'nouvelle discussion.',
+    webHelp: 'Avec le Web activé, le modèle peut chercher dans Wikipédia et lire des pages Web et des fichiers PDF ' +
+      'par le service Albireo. Il ne lit que les adresses que vous écrivez dans vos questions, celles des ' +
+      'résultats de ses recherches et les liens des pages qu\'il a déjà lues. Le Web est désactivé au début de ' +
+      'chaque nouvelle discussion.',
     tool_web_search: 'Recherche Web', tool_fetch_page: 'Lecture d\'une page',
-    toolHint_web_search: 'Cherche sur le Web par le fournisseur de recherche du service Albireo et liste les ' +
-      'résultats avec leurs adresses.',
+    toolHint_web_search: 'Cherche dans les articles de Wikipédia par le service Albireo et liste les résultats ' +
+      'avec leurs adresses.',
     toolHint_fetch_page: 'Lit, partie par partie, une page Web ou un fichier PDF dont la discussion contient ' +
       'l\'adresse.',
-    webSearchBy: 'Recherche Web : {provider}', provider_wikipedia: 'Wikipédia', provider_brave: 'API Brave Search',
-    provider_searxng: 'SearXNG',
+    webSearchBy: 'Recherche Web : {provider}', provider_wikipedia: 'Wikipédia',
     afterAnswer: 'Disponible une fois la réponse écrite', answering: 'Réponse en cours…',
     unreadAnswer: 'Nouvelle réponse, pas encore lue', scrollStart: 'Aller au début de la discussion',
     scrollEnd: 'Aller à la fin de la discussion',
@@ -578,17 +576,16 @@ const texts = {
     webOffline: 'Albireo arbeitet offline: Der Webzugriff ist nicht verfügbar',
     webOff: 'Der Webzugriff ist in den Einstellungen des Albireo-Dienstes ausgeschaltet',
     webUnavailable: 'Der Albireo-Dienst bietet keinen Webzugriff',
-    webHelp: 'Mit eingeschaltetem Web kann das Modell über den Albireo-Dienst im Web suchen und Webseiten und ' +
-      'PDF-Dateien lesen. Es liest nur die Adressen, die Sie in Ihren Fragen schreiben, die Adressen der Ergebnisse ' +
-      'seiner Suchen und die Links der Seiten, die es bereits gelesen hat. Web ist zu Beginn jeder neuen ' +
-      'Unterhaltung ausgeschaltet.',
+    webHelp: 'Mit eingeschaltetem Web kann das Modell über den Albireo-Dienst in Wikipedia suchen und Webseiten ' +
+      'und PDF-Dateien lesen. Es liest nur die Adressen, die Sie in Ihren Fragen schreiben, die Adressen der ' +
+      'Ergebnisse seiner Suchen und die Links der Seiten, die es bereits gelesen hat. Web ist zu Beginn jeder ' +
+      'neuen Unterhaltung ausgeschaltet.',
     tool_web_search: 'Websuche', tool_fetch_page: 'Seite lesen',
-    toolHint_web_search: 'Sucht im Web über den Suchanbieter des Albireo-Dienstes und listet die Ergebnisse mit ' +
-      'ihren Adressen auf.',
+    toolHint_web_search: 'Sucht in den Artikeln von Wikipedia über den Albireo-Dienst und listet die Ergebnisse ' +
+      'mit ihren Adressen auf.',
     toolHint_fetch_page: 'Liest Teil für Teil eine Webseite oder eine PDF-Datei, deren Adresse die Unterhaltung ' +
       'enthält.',
-    webSearchBy: 'Websuche: {provider}', provider_wikipedia: 'Wikipedia', provider_brave: 'Brave Search API',
-    provider_searxng: 'SearXNG',
+    webSearchBy: 'Websuche: {provider}', provider_wikipedia: 'Wikipedia',
     afterAnswer: 'Verfügbar, sobald die Antwort geschrieben ist', answering: 'Antwort läuft…',
     unreadAnswer: 'Neue Antwort, noch nicht gelesen', scrollStart: 'Zum Anfang der Unterhaltung',
     scrollEnd: 'Zum Ende der Unterhaltung',
@@ -843,16 +840,16 @@ const texts = {
     webOffline: 'Albireo funziona offline: l\'accesso al Web non è disponibile',
     webOff: 'L\'accesso al Web è disattivato nelle impostazioni del servizio Albireo',
     webUnavailable: 'Il servizio Albireo non offre l\'accesso al Web',
-    webHelp: 'Con il Web attivo, il modello può cercare sul Web e leggere pagine Web e file PDF tramite il servizio ' +
-      'Albireo. Legge solo gli indirizzi che scrivi nelle tue domande, quelli dei risultati delle sue ricerche e i ' +
-      'link delle pagine che ha già letto. Il Web è disattivato all\'inizio di ogni nuova conversazione.',
+    webHelp: 'Con il Web attivo, il modello può cercare su Wikipedia e leggere pagine Web e file PDF tramite il ' +
+      'servizio Albireo. Legge solo gli indirizzi che scrivi nelle tue domande, quelli dei risultati delle sue ' +
+      'ricerche e i link delle pagine che ha già letto. Il Web è disattivato all\'inizio di ogni nuova ' +
+      'conversazione.',
     tool_web_search: 'Ricerca sul Web', tool_fetch_page: 'Lettura di una pagina',
-    toolHint_web_search: 'Cerca sul Web tramite il motore di ricerca del servizio Albireo ed elenca i risultati con ' +
+    toolHint_web_search: 'Cerca negli articoli di Wikipedia tramite il servizio Albireo ed elenca i risultati con ' +
       'i loro indirizzi.',
     toolHint_fetch_page: 'Legge, parte per parte, una pagina Web o un file PDF il cui indirizzo è nella ' +
       'conversazione.',
-    webSearchBy: 'Ricerca sul Web: {provider}', provider_wikipedia: 'Wikipedia', provider_brave: 'API Brave Search',
-    provider_searxng: 'SearXNG',
+    webSearchBy: 'Ricerca sul Web: {provider}', provider_wikipedia: 'Wikipedia',
     afterAnswer: 'Disponibile una volta scritta la risposta', answering: 'Risposta in corso…',
     unreadAnswer: 'Nuova risposta, non ancora letta', scrollStart: 'Vai all\'inizio della conversazione',
     scrollEnd: 'Vai alla fine della conversazione',
@@ -1108,17 +1105,16 @@ const texts = {
     webOffline: 'Albireo funciona sin conexión: el acceso a la Web no está disponible',
     webOff: 'El acceso a la Web está desactivado en la configuración del servicio Albireo',
     webUnavailable: 'El servicio Albireo no ofrece acceso a la Web',
-    webHelp: 'Con la Web activada, el modelo puede buscar en la Web y leer páginas web y archivos PDF a través del ' +
-      'servicio Albireo. Solo lee las direcciones que usted escribe en sus preguntas, las de los resultados de la ' +
-      'búsqueda web y los enlaces de las páginas ya leídas. La Web está desactivada al comienzo de cada nueva ' +
+    webHelp: 'Con la Web activada, el modelo puede buscar en Wikipedia y leer páginas web y archivos PDF a través ' +
+      'del servicio Albireo. Solo lee las direcciones que usted escribe en sus preguntas, las de los resultados ' +
+      'de la búsqueda y los enlaces de las páginas ya leídas. La Web está desactivada al comienzo de cada nueva ' +
       'conversación.',
     tool_web_search: 'Búsqueda web', tool_fetch_page: 'Lectura de una página',
-    toolHint_web_search: 'Busca en la Web mediante el proveedor de búsqueda del servicio Albireo y enumera los ' +
+    toolHint_web_search: 'Busca en los artículos de Wikipedia a través del servicio Albireo y enumera los ' +
       'resultados con sus direcciones.',
     toolHint_fetch_page: 'Lee, parte por parte, una página web o un archivo PDF cuya dirección figura en la ' +
       'conversación.',
-    webSearchBy: 'Búsqueda web: {provider}', provider_wikipedia: 'Wikipedia', provider_brave: 'API de Brave Search',
-    provider_searxng: 'SearXNG',
+    webSearchBy: 'Búsqueda web: {provider}', provider_wikipedia: 'Wikipedia',
     afterAnswer: 'Disponible cuando la respuesta esté escrita', answering: 'Respondiendo…',
     unreadAnswer: 'Nueva respuesta, aún sin leer', scrollStart: 'Ir al principio de la conversación',
     scrollEnd: 'Ir al final de la conversación',

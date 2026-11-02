@@ -11,7 +11,8 @@
 # The service runs offline in a data folder of its own, on port 18443 (ALBIREO_TEST_PORT, and
 # the next port for the local server of test_host), receives the model as the tray sends it,
 # refuses it by its path, answers a question through the OpenAI interface and stops.  The
-# exit code is the number of failed steps.
+# first step checks the tools of the build with tools/prerequisites_linux.sh, which installs those
+# that are missing.  The exit code is the number of failed steps.
 
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -52,6 +53,14 @@ step() { # name pattern command...
 }
 
 skip() { record "$1" SKIP "$2" 0.0; }
+
+# The tools of the build and of these tests, installed when missing; the run shows the prompt of sudo.
+START=$(now)
+if bash "$HERE/prerequisites_linux.sh"; then
+  record "prerequisites" PASS "every tool is there" "$(elapsed "$START")"
+else
+  record "prerequisites" FAIL "see the messages of tools/prerequisites_linux.sh above" "$(elapsed "$START")"
+fi
 
 ENGINES=$BUILD/bin/engines
 CHAT=$BUILD/tests/engine_chat

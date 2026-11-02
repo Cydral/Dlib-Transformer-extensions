@@ -74,10 +74,16 @@ namespace albireo
         ensures
             - Downloads url into body, following up to five redirections, verifying the
               certificates of https servers against those of the system.  Fails beyond
-              max_bytes, or when no data arrives during timeout_seconds.
+              max_bytes, when no data arrives during timeout_seconds, when the whole request
+              takes more than total_seconds, and when a web page (text/html) answers in place
+              of the file, as a proxy or a filter of the network sends one.
+            - The errors tell the kind of failure ("the request is answered with the status
+              403") and never name the address or its host, which the callers name as they
+              need: the downloads of the publication space name its files alone.
+            - Never throws: an exception of the transfer becomes its error.
     !*/
     bool http_get(const std::string& url, std::string& body, std::string& error, size_t max_bytes = 16u << 20,
-        int timeout_seconds = 20);
+        int timeout_seconds = 20, int total_seconds = 120);
 
     /*!
         ensures
@@ -87,13 +93,26 @@ namespace albireo
             - total, when given, receives the size of the whole resource when the server
               tells it (Content-Range or Content-Length), 0 otherwise.
             - Fails when the server ignores the range of a request that does not start at
-              0, or answers with a range that starts elsewhere, since writing its answer
-              would corrupt the file.
+              0, answers with a range that starts elsewhere, or answers with a web page
+              (text/html), since writing its answer would corrupt the file; fails when no
+              data arrives during 30 s.
             - With to >= 0, the receiver gets the bytes [from, to] at most: the reading ends
-              once they have come, the answer of a server that ignores the range included.
+              once they have come, the answer of a server that ignores the range included,
+              and an answer that ends before them fails.
+            - The errors are those of http_get(), and the function never throws either: an
+              exception of the transfer or of receiver becomes its error.
     !*/
     bool http_get_range(const std::string& url, uint64_t from, int64_t to,
         const std::function<bool(const char*, size_t)>& receiver, std::string& error, uint64_t* total = nullptr);
+
+    /*!
+        Reserved for the tests (tests/test_host.cpp).  No setting and no route reaches it.
+        ensures
+            - Bounds each wait for data of http_get() and http_get_range() by read_seconds,
+              and each whole request of http_get() by total_seconds, when they are above 0
+              and below the bounds of the callers; 0 gives the callers their bounds back.
+    !*/
+    void http_bounds_for_tests(int read_seconds, int total_seconds);
 
     /*!
         ensures

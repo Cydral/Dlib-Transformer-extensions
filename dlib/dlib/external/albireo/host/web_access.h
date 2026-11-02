@@ -16,15 +16,10 @@
         POST /albireo/v1/web/search   {"query", "count", "language"}
         POST /albireo/v1/web/fetch    {"url", "language"}
 
-    The search goes through the provider of the settings (web_search): by default ("auto") the
-    Brave Search API with the key built into the service when the build has one (the file of
-    ALBIREO_WEB_SEARCH_KEY_FILE, cmake/web_search_key.cmake), else the search of Wikipedia
-    through its REST interface; "brave" takes the key of the administrator (web_search_key), else
-    the one built in; "searxng" a SearXNG instance through its JSON format.  Every installation
-    of a build shares the monthly credit of the key built in.  The addresses of the providers
-    are fixed or chosen by the administrator, and the rule of the public addresses does not
-    apply to them.  The key built in never reaches a message, the log, a route or a document of
-    the settings.
+    The search goes through the search of Wikipedia, its REST interface, in the language of the
+    request (the setting web_search "wikipedia", the default); web_search "none" turns it off.
+    The address of Wikipedia is fixed, and the rule of the public addresses does not apply to
+    it.
 
     A page is read at a public address only.  The name of its host is refused when it names
     this computer or a local network (localhost, *.localhost, *.local, *.internal, *.home.arpa,
@@ -76,17 +71,7 @@ namespace albireo
     !*/
     bool public_address(const std::string& numeric);
 
-    // Whether the build carries a key of the Brave Search API (cmake/web_search_key.cmake).
-    bool web_search_key_builtin();
-
-    /*!
-        ensures
-            - Returns the provider of the search of s: for "auto", "brave" when the build
-              carries a key, else "wikipedia"; "wikipedia"; "brave" with the key of the
-              administrator, or without one with the key built in; "searxng" with the address
-              of an instance; "none" otherwise.  A search of the Brave Search API sends the
-              key of the administrator when there is one, else the key built in.
-    !*/
+    // The provider of the search of s: "none" when web_search is "none", "wikipedia" otherwise.
     std::string web_search_provider(const host_settings& s);
 
     /*!
@@ -97,14 +82,6 @@ namespace albireo
               reading is available with the web access, whatever the provider of the search.
     !*/
     json web_capability(const host_settings& s);
-
-    // Whether url can be the setting web_search_url: empty, or an http or https address of
-    // 512 characters at most, with a host and without user information, query or fragment.
-    bool valid_web_search_url(const std::string& url);
-
-    // Whether key can be the setting web_search_key: empty, or 256 printable ASCII
-    // characters at most, without space.
-    bool valid_web_search_key(const std::string& key);
 
     /*!
         ensures
@@ -137,9 +114,9 @@ namespace albireo
             - Refuses with 400 an invalid request; 403 an offline service, a web access turned
               off and a search without provider (code no_search_provider); 429 a provider that
               limits the rate of the requests, with retry_after when it gives one; 502 a
-              provider that refuses the key or the format, gives another answer than its
-              interface, or cannot be reached; 503 as web_fetch(); 504 a provider that does not
-              answer in time.
+              provider that answers with another status or another answer than its interface,
+              or cannot be reached; 503 as web_fetch(); 504 a provider that does not answer in
+              time.
     !*/
     web_reply web_search(const json& request, const host_settings& s);
 
@@ -149,11 +126,9 @@ namespace albireo
     */
     // Lets web_fetch() read the loopback addresses, 127.0.0.0/8 and ::1.
     void web_allow_loopback_for_tests(bool allow);
-    // Sends the requests of Wikipedia and of the Brave Search API to origin, "http://127.0.0.1:<port>";
-    // an empty origin gives them back their own addresses.
+    // Sends the requests of Wikipedia to origin, "http://127.0.0.1:<port>"; an empty origin gives
+    // them back their own address.
     void web_provider_origin_for_tests(const std::string& origin);
-    // Takes key in place of the key built into the service, "" for a build without one.
-    void web_builtin_key_for_tests(const std::string& key);
 
 }
 

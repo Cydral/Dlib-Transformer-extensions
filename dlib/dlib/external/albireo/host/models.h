@@ -27,10 +27,10 @@ namespace albireo
         /*!
             WHAT THIS OBJECT REPRESENTS
                 The models of the machine and of the catalog: the catalog published in the
-                folder dist of the public link (public_link.h), a signed JSON document
+                folder dist of the publication space (public_link.h), a signed JSON document
                 listing the models, their descriptions in each language, their files and
                 their hashes, the official source of each model among them, read from the
-                link alone; the installed models, the downloads in progress and the imports
+                space alone; the installed models, the downloads in progress and the imports
                 from removable media.
 
             MODELS THAT READ IMAGES
@@ -56,15 +56,17 @@ namespace albireo
                 a hash that still fails or a model the database cannot record leaves
                 neither file under its final name.
 
-                Each segment comes from the copy of its part in the public link alone,
-                models/<identifier>/<file name of the official address of the part>: the
-                first attempt with the address of the cache, the next ones with a new one.
-                The official address the catalog gives is never read.  A link that is not
-                set, or that does not hold the part at its size in a new listing, ends the
-                download in error; a part the link does not hold has the code
+                Each segment comes from the copy of its part in the publication space
+                alone, models/<identifier>/<file name of the official address of the part>:
+                the first attempt with the address of the cache, the next ones with a new
+                one.  The official address the catalog gives is never read.  A space that
+                does not answer, or that does not hold the part at its size in a new
+                listing, ends the download in error, named by the file in the space and
+                never by an address; a part the space does not hold has the code
                 download_not_published, which names it ("file"), since the files of the
-                models reach the link while they are published.  The hashes of the catalog
-                check the bytes.
+                models reach the space while they are published.  The hashes of the
+                catalog check the bytes.  An exception of a transfer fails the download
+                and never leaves its thread.
 
             OFFLINE INSTALLATION
                 import_path() installs the GGUF files of the import folder of the data
@@ -119,7 +121,7 @@ namespace albireo
         model_manager(store& db, const std::string& models_dir);
         ~model_manager();
 
-        // Fetches the catalog from the public link and checks its signature; keeps the last
+        // Fetches the catalog from the publication space and checks its signature; keeps the last
         // valid one, and the one in use when the fetched one was published before it.
         bool refresh_catalog(std::string& error);
         // The same on a thread of its own, one refresh at a time; the caller never waits.

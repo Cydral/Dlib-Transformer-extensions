@@ -47,6 +47,7 @@
 
 #include "../common/builtin_models.h"
 #include "../common/json.h"
+#include "../common/log.h"
 #include "../common/platform.h"
 #include "../common/version.h"
 #include "../host/certificates.h"
@@ -1489,6 +1490,8 @@ namespace setup
         if (!secure_parents(dir, error) || !secure_folder(dir, error, !content_checked)) return false;
         for (const char* sub : { "logs", "import", "certificates" }) make_dirs(join_path(dir, sub));
         std::lock_guard<std::mutex> lock(log_m);
+        // The lines an installer before this one copied from the log of the service.
+        hide_publication_space_in_file(join_path(join_path(dir, "logs"), "setup.log"));
         log_ready = true;
         append_log(std::string());
         return true;
@@ -2473,8 +2476,10 @@ namespace setup
 
     void log(const std::string& line)
     {
+        // The lines of the log of the service it copies included, which a version before this one wrote.
+        const std::string hidden = without_publication_space(line);
         std::lock_guard<std::mutex> lock(log_m);
-        append_log(iso_time(now_unix()) + " " + line + "\n");
+        append_log(iso_time(now_unix()) + " " + hidden + "\n");
     }
 
     void flush_log()

@@ -58,22 +58,10 @@ namespace albireo
         /*
             The web access of the Web button (web_access.h): the routes through which the web
             application searches the web and reads its pages, turned off by web_access = false.
-            web_search names the provider of the search: "auto" (the Brave Search API with the key
-            built into the service when the build has one, else Wikipedia), "wikipedia", "brave"
-            (the Brave Search API, with the key web_search_key, else the key built into the
-            service), "searxng" (the instance at web_search_url) or "none".  The key is kept apart,
-            as the password of the proxy.
+            web_search names the provider of the search: "wikipedia" or "none".
         */
         bool web_access = true;
-        std::string web_search = "auto";
-        std::string web_search_url;
-        std::string web_search_key;
-        /*
-            The public link of the published files (host/public_link.h), the only source of the
-            downloads: the feed, the catalog and the installers in its folder dist, the model files
-            in its folder models.  "" turns the downloads off.
-        */
-        std::string public_link = "https://u.pcloud.link/publink/show?code=kZeNhSJZpcMygkcCvGXmq1MTvkCfBuSsx2GV";
+        std::string web_search = "wikipedia";
         json engine_benchmarks = json::object();     // variant -> measured tokens per second
         /*
             The choice of the installation for the local authority in the trusted roots of
@@ -83,10 +71,11 @@ namespace albireo
         int trust_authority = -1;
 
         /*
-            The settings as settings.json and the administration interface give them: the
-            password of the proxy masked, and web_search_key_set, true or false, in place of
-            the key of the search, which no document gives.  from_json() takes web_search_key
-            when j holds it and keeps the key in place otherwise.
+            The settings as settings.json and the administration interface give them, the
+            password of the proxy masked.  from_json() reads the documents of the earlier
+            versions without error: web_search "auto", "brave" or "searxng" becomes
+            "wikipedia", and the settings they had that this version lacks (public_link,
+            web_search_url, web_search_key, web_search_key_set) are left aside.
         */
         json to_json() const;
         void from_json(const json& j);
@@ -106,9 +95,12 @@ namespace albireo
                 password of the proxy as proxy_password_mask.  The proxy with its password
                 is kept in proxy.secret beside it, which only the service and the
                 administrators read.  A password found in settings.json, written by an
-                earlier version or by hand, moves to proxy.secret at once.  The key of the
-                search (web_search_key) is kept the same way in web_search.secret, and a key
-                written by hand in settings.json moves there at once.
+                earlier version or by hand, moves to proxy.secret at once.
+
+                A settings.json of an earlier version that holds settings this version
+                lacks, or another provider of the search, is written again at the start
+                without them, and web_search.secret, the key of a search provider of those
+                versions, is deleted.
         !*/
     public:
         explicit settings_store(const std::string& path);

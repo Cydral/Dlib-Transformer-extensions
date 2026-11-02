@@ -91,6 +91,14 @@ namespace albireo
         void send_json(httplib::Response& res, int status, const json& j)
         {
             res.status = status;
+            // The last guard: the errors a route returns name the files of the publication space, never its addresses.
+            if (errors_name_publication_space(j))
+            {
+                json hidden = j;
+                hide_publication_space_in_errors(hidden);
+                res.set_content(hidden.dump(), "application/json; charset=utf-8");
+                return;
+            }
             res.set_content(j.dump(), "application/json; charset=utf-8");
         }
 
@@ -793,7 +801,7 @@ namespace albireo
         {
             static const char* const keys[] = { "port", "language", "engine", "accelerator", "v2ram", "v2ram_max_mb",
                 "device_mb", "threads", "context", "max_sequences", "kv_mb", "check_updates", "offline", "proxy",
-                "web_access", "web_search", "web_search_url", "web_search_key" };
+                "web_access", "web_search" };
             for (const auto& kv : body.items())
             {
                 if (std::find_if(std::begin(keys), std::end(keys), [&](const char* k) { return kv.first == k; })
@@ -827,23 +835,7 @@ namespace albireo
                 error = "invalid value for proxy: http://host:port, \"none\" or empty";
                 return false;
             }
-            // The provider of the search of the web access, the address of its SearXNG instance and its key.
-            const json& search_url = body["web_search_url"];
-            if (body.contains("web_search_url")
-                && !(search_url.is_string() && valid_web_search_url(search_url.as_string())))
-            {
-                error = "invalid value for web_search_url: an http or https address without user, query or fragment, "
-                    "or empty";
-                return false;
-            }
-            const json& search_key = body["web_search_key"];
-            if (body.contains("web_search_key")
-                && !(search_key.is_string() && valid_web_search_key(search_key.as_string())))
-            {
-                error = "invalid value for web_search_key: 256 printable characters at most, without space, or empty";
-                return false;
-            }
-            return one_of("web_search", { "auto", "wikipedia", "brave", "searxng", "none" }) && boolean("web_access")
+            return one_of("web_search", { "wikipedia", "none" }) && boolean("web_access")
                 && one_of("language", { "auto", "en", "fr", "de", "it", "es" })
                 && one_of("engine", { "auto", "best", "cpu", "cpu-avx2", "cpu-avxvnni", "cpu-avx512", "openvino",
                     "cuda" })
@@ -1574,8 +1566,7 @@ namespace albireo
             send_json(res, r["imported"].empty() && r["already"].empty() && r["pending"].empty() ? 400 : 200, r);
         });
 
-        // The password of the proxy is given as proxy_password_mask and the key of the search as
-        // web_search_key_set (host_settings::to_json()).
+        // The password of the proxy is given as proxy_password_mask (host_settings::to_json()).
         srv.Get("/albireo/v1/settings", [s, admin](const httplib::Request& req, httplib::Response& res) {
             if (!admin(req, res)) return;
             send_json(res, 200, s->settings().get().to_json());

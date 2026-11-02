@@ -10,6 +10,10 @@ address>.
 The password of the link comes from the variable ALBIREO_PUBLIC_LINK_PASSWORD, else from the
 file keys/albireo-public-link.txt of the home folder (%USERPROFILE% on Windows), the file the
 configuration of the service reads (ALBIREO_PUBLIC_LINK_PASSWORD_FILE).
+
+No message names the link, its code, its password, an address of its API or of a content
+server, or a host of pCloud: hidden() replaces them in the messages of the tools, as the service
+does in its own (common/log.h).
 """
 
 import json
@@ -20,6 +24,7 @@ import urllib.parse
 import urllib.request
 
 DEFAULT_LINK = "https://u.pcloud.link/publink/show?code=kZeNhSJZpcMygkcCvGXmq1MTvkCfBuSsx2GV"
+SPACE = "the publication space of Albireo"
 
 APIS = {
     "u.pcloud.link": "https://api.pcloud.com",
@@ -55,14 +60,35 @@ def api_of(link):
     m = re.fullmatch(r"(https://[A-Za-z.]+|http://127\.0\.0\.1:\d{1,5})/publink/show\?code=([A-Za-z0-9]{8,64})(&.*)?",
                      link)
     if not m:
-        raise ValueError("%s is not a public link of pCloud" % link)
+        raise ValueError("the link given is not a public link")
     origin = m.group(1)
     host = origin.split("://", 1)[1].lower()
     if origin.startswith("https://"):
         if host not in APIS:
-            raise ValueError("%s is not a public link of pCloud" % link)
+            raise ValueError("the link given is not a public link")
         return APIS[host], m.group(2)
     return origin, m.group(2)
+
+
+# The codes and the passwords of the links read, the code of the default link first, which hidden() replaces as well.
+_secrets = {api_of(DEFAULT_LINK)[1]}
+
+
+def hidden(message):
+    """The message with each word that names the publication space replaced by SPACE: an address or a
+    host of pCloud (a word holding "pcloud" or "publink", whatever their case), or a code or a password
+    of a link read.  A word ends at a space, a quote, a bracket, a comma or a semicolon, and the
+    punctuation that ends a sentence after it stays."""
+    def replace(m):
+        word = m.group(0)
+        tail = ""
+        while word and word[-1] in ".:!?":
+            word, tail = word[:-1], word[-1] + tail
+        folded = word.lower()
+        if word and ("pcloud" in folded or "publink" in folded or any(x in word for x in _secrets)):
+            return SPACE + tail
+        return m.group(0)
+    return re.sub(r"[^\s\"'`<>()\[\]{},;|\\]+", replace, str(message))
 
 
 def without_query(message):
@@ -91,6 +117,9 @@ class Link:
         self.api, self.code = api_of(link)
         self.password = read_password() if password is None else password
         self._files = None
+        _secrets.add(self.code)
+        if len(self.password) >= 6:
+            _secrets.add(self.password)
 
     def _call(self, method, **params):
         params["code"] = self.code
@@ -102,11 +131,12 @@ class Link:
             with urllib.request.urlopen(request, timeout=30) as r:
                 answer = json.load(r)
         except (OSError, ValueError) as e:
-            raise RuntimeError("the public link cannot be reached: %s" % without_query(str(e)))
+            raise RuntimeError("the public link cannot be reached: %s" % hidden(without_query(str(e))))
         if not isinstance(answer, dict):
             raise RuntimeError("the public link gives an answer that is not JSON")
         if answer.get("result") != 0:
-            raise RuntimeError('the public link answers "%s" (%s)' % (answer.get("error", ""), answer.get("result")))
+            raise RuntimeError('the public link answers "%s" (%s)' % (hidden(answer.get("error", ""))[:80],
+                                                                      hidden(answer.get("result"))))
         return answer
 
     def files(self):
@@ -125,7 +155,10 @@ class Link:
                     elif c.get("fileid"):
                         found[prefix + name] = (c["fileid"], c.get("size", 0))
 
-            walk(self._call("showpublink").get("metadata", {}), "", 0)
+            metadata = self._call("showpublink").get("metadata")
+            if not isinstance(metadata, dict):
+                raise RuntimeError("the public link gives a listing that is not the one of its API")
+            walk(metadata, "", 0)
             self._files = found
         return self._files
 

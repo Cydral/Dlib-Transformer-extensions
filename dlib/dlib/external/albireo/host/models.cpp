@@ -495,7 +495,7 @@ namespace albireo
         struct chunk
         {
             std::string url;          // the official address of the resource, which names its copy in the link
-            std::string link_path;    // the copy of the resource in the public link (public_link.h)
+            std::string link_path;    // the copy of the resource in the publication space (public_link.h)
             uint64_t resource = 0;    // bytes of the resource
             uint64_t from = 0;        // byte range in the resource
             uint64_t length = 0;      // bytes of the resource (compressed size for gzip)
@@ -626,14 +626,14 @@ namespace albireo
 
     bool model_manager::refresh_catalog(std::string& error)
     {
-        // The catalog and its signature come from the folder dist of the public link alone.
+        // The catalog and its signature come from the folder dist of the publication space alone.
         std::string body, sig;
         if (!public_link_get("dist/catalog.json", body, error, 16u << 20)
             || !public_link_get("dist/catalog.json.sig", sig, error, 4096))
             return false;
         json result = json::object();
         if (!install_catalog(body, sig, true, result, error)) return false;
-        log_info("models: catalog read from the public link");
+        log_info("models: catalog read from the publication space of Albireo");
         return true;
     }
 
@@ -659,6 +659,10 @@ namespace albireo
             {
                 // A database that cannot be written, for instance a full disk.
                 error = e.what();
+            }
+            catch (...)
+            {
+                error = "the catalog cannot be refreshed";
             }
             // A refresh ended by the service, which stops or goes offline, is no error.
             const bool ended = stopped_ || http_cancelled();
@@ -946,9 +950,11 @@ namespace albireo
             for (const auto& f : static_cast<const json&>(out.parts).elements())
             {
                 const std::string url = f["url"].as_string();
-                const uint64_t size = static_cast<uint64_t>(f["size"].as_int(0));
+                // A size of a part above 1 TiB, or negative, would make billions of segments: the entry is invalid.
+                const long long given = f["size"].as_int(0);
+                const uint64_t size = given > 0 && given <= (1ll << 40) ? static_cast<uint64_t>(given) : 0;
                 const bool gz = f["compression"].as_string() == "gzip";
-                // The part is downloaded from its copy in the public link, named after its official address.
+                // The part is downloaded from its copy in the publication space, named after its official address.
                 const std::string link_path = public_link_model_path(id, url);
                 if (url.empty() || size == 0 || link_path.empty())
                 {
@@ -962,7 +968,7 @@ namespace albireo
                     c->url = url;
                     c->link_path = link_path;
                     c->from = 0;
-                    c->length = static_cast<uint64_t>(f["compressed_size"].as_int(0));
+                    c->length = static_cast<uint64_t>(std::max<long long>(0, f["compressed_size"].as_int(0)));
                     c->resource = c->length;
                     c->offset = offset;
                     c->gzip = true;
@@ -1054,23 +1060,43 @@ namespace albireo
         }
         jobs_[id] = j;
         j->started = now_unix();
-        j->worker = std::thread([this, j, before = std::move(previous)]() mutable {
-            if (before.joinable()) before.join();
-            try
+        auto failed = [this, j](const std::string& why) {
             {
-                run_job(j);
+                std::lock_guard<std::mutex> lock(m_);
+                j->state = "error";
+                j->error.set(why, "download_failed").arg("e", why);
             }
-            catch (const std::exception& e)
-            {
-                // A database or a disk that fails under the download.
+            log_error("models: download of " + j->id + ": " + why);
+        };
+        // The earlier worker, kept by the job when no thread can take it, so that it is joined later all the same.
+        const auto before = std::make_shared<std::thread>(std::move(previous));
+        try
+        {
+            j->worker = std::thread([this, j, failed, before]() {
+                if (before->joinable()) before->join();
+                // No exception leaves the thread: a database or a disk that fails under the download ends it in error.
+                try
                 {
-                    std::lock_guard<std::mutex> lock(m_);
-                    j->state = "error";
-                    j->error.set(e.what(), "download_failed").arg("e", e.what());
+                    run_job(j);
                 }
-                log_error("models: download of " + j->id + ": " + e.what());
-            }
-        });
+                catch (const std::exception& e)
+                {
+                    failed(e.what());
+                }
+                catch (...)
+                {
+                    failed("the download fails");
+                }
+            });
+        }
+        catch (const std::exception& e)
+        {
+            // A thread the system refuses leaves the download in error, never queued.
+            j->worker = std::move(*before);
+            const std::string why = std::string("the download cannot start: ") + e.what();
+            j->state = "error";
+            j->error.set(why, "download_failed").arg("e", why);
+        }
         return true;
     }
 
@@ -1216,10 +1242,15 @@ namespace albireo
             size_t next = 0;
             std::atomic<bool> failed{false};
             std::string failure;
-            // The file of the link the failure names when the link does not hold it.
+            // The file of the publication space the failure names when the space does not hold it.
             std::string unpublished;
+            // The first failure of the download; chunk_m is held.
+            auto fail_with = [&](const std::string& why) {
+                if (!failed) failure = why;
+                failed = true;
+            };
 
-            auto worker = [&]() {
+            auto transfer = [&]() {
                 for (;;)
                 {
                     job::chunk* cp = nullptr;
@@ -1241,10 +1272,11 @@ namespace albireo
                             std::this_thread::sleep_for(std::chrono::milliseconds(100));
                         if (j->cancel) break;
                         /*
-                            The copy of the resource in the public link, its address asked again
-                            after a failure; the hashes of the catalog check its bytes.  The
-                            official address of the catalog is never read: no link, or a link
-                            that does not hold the resource at its size, ends the attempts.
+                            The copy of the resource in the publication space, its address asked
+                            again after a failure; the hashes of the catalog check its bytes.  The
+                            official address of the catalog is never read: a space that does not
+                            hold the resource at its size ends the attempts.  The messages name the
+                            file in the space, never its address.
                         */
                         std::string address;
                         uint64_t listed = 0;
@@ -1253,18 +1285,19 @@ namespace albireo
                         if (!public_link_file(c.link_path, address, listed, error, attempt > 0, &status))
                         {
                             absent = status == link_status::missing;
-                            // A file the link lacks is looked for once more in a new listing.
+                            // A file the space lacks is looked for once more in a new listing.
                             if (status == link_status::unset || (absent && attempt > 0) || http_cancelled()) break;
                             continue;
                         }
                         if (listed != c.resource)
                         {
-                            error = "the copy of " + c.link_path + " in the public link does not have the size "
-                                "the catalog gives";
+                            error = "the copy of " + c.link_path + " in the publication space of Albireo does not "
+                                "have the size the catalog gives";
                             if (attempt > 0) break;
                             continue;
                         }
-                        const std::string label = "the copy of " + c.link_path + " in the public link";
+                        std::string reason;
+                        bool unwritten = false, corrupt = false;
                         if (c.gzip)
                         {
                             // Inflated as it arrives, written at the offsets of the part.
@@ -1273,8 +1306,6 @@ namespace albireo
                             if (inflateInit2(&zs, 15 + 32) != Z_OK) break;
                             uint64_t produced = 0;
                             std::vector<char> out(1 << 20);
-                            bool bad = false;
-                            uint64_t got_in = 0;
                             ok = http_get_range(address, 0, -1, [&](const char* data, size_t n) {
                                 if (j->cancel) return false;
                                 zs.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(data));
@@ -1284,27 +1315,26 @@ namespace albireo
                                     zs.next_out = reinterpret_cast<Bytef*>(out.data());
                                     zs.avail_out = static_cast<uInt>(out.size());
                                     const int r = inflate(&zs, Z_NO_FLUSH);
-                                    if (r != Z_OK && r != Z_STREAM_END) { bad = true; return false; }
                                     const size_t got = out.size() - zs.avail_out;
-                                    const bool fits = produced + got <= c.output;
-                                    if (!fits || !file.write_at(c.offset + produced, out.data(), got))
+                                    if ((r != Z_OK && r != Z_STREAM_END) || produced + got > c.output)
                                     {
-                                        bad = true;
+                                        corrupt = true;
+                                        return false;
+                                    }
+                                    if (!file.write_at(c.offset + produced, out.data(), got))
+                                    {
+                                        unwritten = true;
                                         return false;
                                     }
                                     produced += got;
                                     j->received += got;
                                     if (r == Z_STREAM_END) break;
                                 }
-                                got_in += n;
                                 return true;
-                            }, error);
+                            }, reason);
                             inflateEnd(&zs);
-                            if (ok && (bad || produced != c.output))
-                            {
-                                ok = false;
-                                error = "the compressed part " + std::to_string(c.part) + " is corrupt";
-                            }
+                            corrupt = corrupt || (ok && produced != c.output);
+                            ok = ok && !corrupt;
                             if (ok) c.done = c.length;
                             else j->received -= produced;
                         }
@@ -1315,16 +1345,22 @@ namespace albireo
                                     if (j->cancel) return false;
                                     const uint64_t done = c.done;
                                     const size_t take = static_cast<size_t>(std::min<uint64_t>(n, c.length - done));
-                                    if (!file.write_at(c.offset + done, data, take)) return false;
+                                    if (!file.write_at(c.offset + done, data, take))
+                                    {
+                                        unwritten = true;
+                                        return false;
+                                    }
                                     c.done = done + take;
                                     j->received += take;
                                     return true;
-                                }, error);
+                                }, reason);
                             ok = ok && c.done == c.length;
                         }
-                        // The address of a content server of the link stays out of the messages.
-                        const size_t at = error.find(address);
-                        if (at != std::string::npos) error.replace(at, address.size(), label);
+                        if (unwritten) error = "cannot write " + j->files[c.file].partial;
+                        else if (corrupt) error = "the compressed part " + std::to_string(c.part) + " is corrupt";
+                        else if (!ok)
+                            error = "the copy of " + c.link_path + " in the publication space of Albireo cannot be "
+                                "downloaded: " + (reason.empty() ? std::string("the answer ends too soon") : reason);
                         // The downloads ended for the whole service (it stops, or goes
                         // offline) are not attempted again; they resume later.
                         if (!ok && http_cancelled()) break;
@@ -1332,19 +1368,41 @@ namespace albireo
                     if (!ok && !j->cancel)
                     {
                         std::lock_guard<std::mutex> lock(chunk_m);
-                        if (!failed)
-                        {
-                            failure = error.empty() ? "download failed" : error;
-                            if (absent) unpublished = c.link_path;
-                        }
-                        failed = true;
+                        if (!failed && absent) unpublished = c.link_path;
+                        fail_with(error.empty() ? "download failed" : error);
                         return;
                     }
                 }
             };
+            // An exception of a transfer, memory exhausted say, fails the download and never leaves its thread.
+            auto worker = [&]() {
+                try
+                {
+                    transfer();
+                }
+                catch (const std::exception& e)
+                {
+                    std::lock_guard<std::mutex> lock(chunk_m);
+                    fail_with(std::string("the download fails: ") + e.what());
+                }
+                catch (...)
+                {
+                    std::lock_guard<std::mutex> lock(chunk_m);
+                    fail_with("the download fails");
+                }
+            };
 
             std::vector<std::thread> threads;
-            for (int t = 0; t < 4; ++t) threads.emplace_back(worker);
+            try
+            {
+                for (int t = 0; t < 4; ++t) threads.emplace_back(worker);
+            }
+            catch (const std::exception& e)
+            {
+                // A thread the system refuses: those started end with their chunk, joined below.
+                std::lock_guard<std::mutex> lock(chunk_m);
+                fail_with(std::string("the download cannot start its transfers: ") + e.what());
+            }
             auto last_save = std::chrono::steady_clock::now();
             auto speed_t = std::chrono::steady_clock::now();
             uint64_t speed_bytes = j->received;
@@ -1484,7 +1542,7 @@ namespace albireo
                 if (with_projector) drop_pending_copy(shas[1]);
                 set_state("done");
                 log_info("models: " + j->id + " installed" + (with_projector ? ", with its projector" : "")
-                    + ", from the public link");
+                    + ", from the publication space of Albireo");
                 return;
             }
             if (!any) break;

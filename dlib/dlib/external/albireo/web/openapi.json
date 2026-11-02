@@ -644,7 +644,7 @@
           },
           "web": {
            "type": "object",
-           "description": "The web access of the Web button, which the web application reads at its start: available while the administrator leaves it on (web_access) and the service is not offline, and the provider of /albireo/v1/web/search in use, the setting auto resolved, none when the search is unavailable while /albireo/v1/web/fetch stays available.",
+           "description": "The web access of the Web button, which the web application reads at its start: available while the administrator leaves it on (web_access) and the service is not offline, and the provider of /albireo/v1/web/search, wikipedia, or none when the search is unavailable while /albireo/v1/web/fetch stays available.",
            "properties": {
             "available": {
              "type": "boolean"
@@ -653,8 +653,6 @@
              "type": "string",
              "enum": [
               "wikipedia",
-              "brave",
-              "searxng",
               "none"
              ]
             }
@@ -1149,8 +1147,8 @@
     "tags": [
      "Web access"
     ],
-    "summary": "Searches the web through the provider of the settings",
-    "description": "The tool web_search of the Web button. The provider is the setting web_search: by default the Brave Search API with the key built into the service when the build carries one, else the REST interface of Wikipedia (GET https://<language>.wikipedia.org/w/rest.php/v1/search/page, with a User-Agent that gives a contact, as the policy of Wikimedia asks); the Brave Search API with the key of the administrator, else the key built in; or a SearXNG instance through its JSON format. The log names the provider and the number of results, never the query or a key.",
+    "summary": "Searches Wikipedia",
+    "description": "The tool web_search of the Web button, through the REST interface of Wikipedia (GET https://<language>.wikipedia.org/w/rest.php/v1/search/page, with a User-Agent that gives a contact, as the policy of Wikimedia asks), unless the setting web_search is none. The log names the provider and the number of results, never the query.",
     "requestBody": {
      "required": true,
      "content": {
@@ -1183,7 +1181,7 @@
       }
      },
      "403": {
-      "description": "The service works offline (code offline), the administrator turned the web access off (web_access_off), or no provider is set (no_search_provider): web_search none, brave without a key of the administrator in a build without key, or searxng without address",
+      "description": "The service works offline (code offline), the administrator turned the web access off (web_access_off), or the setting web_search is none (no_search_provider)",
       "content": {
        "application/json": {
         "schema": {
@@ -1193,7 +1191,7 @@
       }
      },
      "429": {
-      "description": "The provider limits the rate of the requests (code rate_limited): Wikipedia for the anonymous requests, the rate or the monthly credit of the key of Brave, the credit of the key built in being shared by every installation, the limiter of SearXNG; Retry-After gives the delay the provider asks for",
+      "description": "Wikipedia limits the rate of the anonymous requests (code rate_limited); Retry-After gives the delay it asks for",
       "content": {
        "application/json": {
         "schema": {
@@ -1203,7 +1201,7 @@
       }
      },
      "502": {
-      "description": "The Brave Search API refuses the key (code search_key_refused), the SearXNG instance refuses the JSON format (search_format_refused), the provider gives another answer (search_failed), or cannot be reached (unreachable, tls_failed, proxy_failed)",
+      "description": "Wikipedia answers with another status or another answer than its interface (search_failed), or cannot be reached (unreachable, tls_failed, proxy_failed)",
       "content": {
        "application/json": {
         "schema": {
@@ -2124,7 +2122,7 @@
     "summary": "Settings of the service",
     "responses": {
      "200": {
-      "description": "The settings, the password of the proxy given as ******** and the key of the search as web_search_key_set, true or false",
+      "description": "The settings, the password of the proxy given as ********",
       "content": {
        "application/json": {
         "schema": {
@@ -3385,25 +3383,11 @@
      "web_search": {
       "type": "string",
       "enum": [
-       "auto",
        "wikipedia",
-       "brave",
-       "searxng",
        "none"
       ],
-      "default": "auto",
-      "description": "The provider of /albireo/v1/web/search: auto, the Brave Search API with the key built into the service when the build carries one, else the REST interface of Wikipedia; wikipedia; brave, the Brave Search API with web_search_key, else with the key built in; searxng, the instance at web_search_url; or none. Every installation of a build shares the monthly credit of its key, which no route gives."
-     },
-     "web_search_url": {
-      "type": "string",
-      "maxLength": 512,
-      "description": "The address of the SearXNG instance, http or https, any host, without user, query or fragment; the instance must allow the JSON format (search.formats in its settings.yml)."
-     },
-     "web_search_key": {
-      "type": "string",
-      "maxLength": 256,
-      "writeOnly": true,
-      "description": "The key of the Brave Search API, printable characters without space. This route writes it and no route gives it back: the settings give web_search_key_set, and the key lies in web_search.secret, which the service and the administrators alone read. An empty value removes it."
+      "default": "wikipedia",
+      "description": "The provider of /albireo/v1/web/search: wikipedia, the REST interface of Wikipedia; or none, which turns the search off while /albireo/v1/web/fetch stays available. A settings.json of an earlier version that names another provider is read as wikipedia."
      }
     }
    },
@@ -3430,7 +3414,7 @@
       "type": "string",
       "pattern": "^[a-z]{2,3}(-([A-Z]{2}|[0-9]{3}))?$",
       "example": "fr",
-      "description": "The language of the results: the site of Wikipedia of that language (en without one), and the language parameter of SearXNG."
+      "description": "The language of the results: the site of Wikipedia of that language (en without one)."
      }
     },
     "example": {
@@ -3445,9 +3429,7 @@
      "provider": {
       "type": "string",
       "enum": [
-       "wikipedia",
-       "brave",
-       "searxng"
+       "wikipedia"
       ]
      },
      "results": {
@@ -3465,7 +3447,7 @@
         },
         "snippet": {
          "type": "string",
-         "description": "The excerpt of Wikipedia without its tags and entities, else the description of the page; the description of Brave without its tags; the content of SearXNG."
+         "description": "The excerpt of Wikipedia without its tags and entities, else the description of the page."
         }
        }
       }

@@ -450,18 +450,10 @@ namespace albireo
         if (first_run) settings_->set(st);
         port_ = st.port;
         apply_network_settings(st);
-        // The public link is the only source of the downloads: without one, nothing is downloaded.
-        if (st.public_link.empty())
-            log_warning("public link: none, the catalog, the models and the updates are not downloaded");
-        else if (!valid_public_link(st.public_link))
-            log_warning("public link: " + st.public_link + " is not a public link of pCloud, the catalog, the models "
-                "and the updates are not downloaded");
-        else
-            log_info("public link: " + st.public_link + (public_link_has_password() ? ", with the password built into "
-                "the service" : ", without password"));
-        // The provider of the search, and whether the build carries a key of the Brave Search API, never the key.
-        log_info("web search: " + web_search_provider(st) + (web_search_key_builtin() ? ", the build carries a key of "
-            "the Brave Search API" : ", the build carries no key of the Brave Search API"));
+        // The publication space, the only source of the downloads, is named without its link.
+        log_info(std::string("publication space: ") + (public_link_enabled() ? "set" : "not set")
+            + (public_link_has_password() ? ", with its password" : ", without password"));
+        log_info("web search: " + web_search_provider(st));
 
         const std::string db_path = join_path(data_dir_, "albireo.db");
         try
@@ -692,6 +684,10 @@ namespace albireo
             {
                 log_error("service: the background tasks stopped: " + std::string(e.what()));
             }
+            catch (...)
+            {
+                log_error("service: the background tasks stopped");
+            }
             // A start cut short by an error ends the starting state all the same.
             engines_ready_ = true;
             models_ready_ = true;
@@ -758,7 +754,6 @@ namespace albireo
     void service::apply_network_settings(const host_settings& s)
     {
         set_http_proxy(s.proxy);
-        set_public_link(s.public_link);
         {
             std::lock_guard<std::mutex> lock(server_m_);
             if (stopping_) return;
@@ -901,6 +896,10 @@ namespace albireo
             catch (const std::exception& e)
             {
                 log_error(std::string("service: ") + task + ": " + e.what());
+            }
+            catch (...)
+            {
+                log_error(std::string("service: ") + task + " failed");
             }
         };
         attempt("network", [&]() { network(settings_->get()); });

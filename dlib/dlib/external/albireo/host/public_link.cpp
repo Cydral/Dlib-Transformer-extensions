@@ -7,6 +7,7 @@
 #include <mutex>
 
 #include "../common/json.h"
+#include "../common/log.h"
 #include "http_fetch.h"
 #include "masked_secret.h"
 #include "public_link_secret.h"
@@ -18,8 +19,15 @@ namespace albireo
     {
         using clock_type = std::chrono::steady_clock;
 
+        // The link of the build, which no setting, route, document or message gives.
+        const char* const build_link = "https://u.pcloud.link/publink/show?code=kZeNhSJZpcMygkcCvGXmq1MTvkCfBuSsx2GV";
+
         const unsigned char masked_password[] = ALBIREO_PUBLIC_LINK_SECRET;
         const size_t masked_size = ALBIREO_PUBLIC_LINK_SECRET_SIZE;
+
+        // The bounds of a request to the interface: each wait for data, and the whole request.
+        const int api_read_seconds = 20;
+        const int api_total_seconds = 60;
 
         // The password, unmasked by the generator the configuration masked it with.
         std::string link_password()
@@ -79,9 +87,9 @@ namespace albireo
         }
 
         /*
-            The origin of the API of a link, and its code.  The links of the region of Europe
-            (e.pcloud.link, e.pcloud.com) answer on eapi.pcloud.com, the others on
-            api.pcloud.com; a loopback address is its own API, for the tests.
+            The origin of the interface of a link, and its code.  The links of the region of
+            Europe (e.pcloud.link, e.pcloud.com) answer on eapi.pcloud.com, the others on
+            api.pcloud.com; a loopback address is its own interface, for the tests.
         */
         bool parse_link(const std::string& link, std::string& api, std::string& code)
         {
@@ -112,10 +120,12 @@ namespace albireo
             return true;
         }
 
+        // A file of the listing: its identifier and size, or valid false for an entry without them.
         struct listed_file
         {
             long long id = 0;
             uint64_t size = 0;
+            bool valid = false;
         };
 
         struct direct_address
@@ -128,13 +138,36 @@ namespace albireo
         const std::chrono::minutes address_life(30);
 
         std::mutex m;
-        std::string api_origin;    // empty: no link
+        bool configured = false;   // the link of the build read, until the tests replace it
+        std::string api_origin;    // empty: no space set
         std::string link_code;
         unsigned long long generation = 0;
         bool listed = false;
         clock_type::time_point listed_at;
         std::map<std::string, listed_file> listing;
         std::map<std::string, direct_address> addresses;
+
+        // Uses link, given to hide_in_messages() with the password; m is held.
+        void use_link(const std::string& link)
+        {
+            std::string api, code;
+            const bool valid = parse_link(link, api, code);
+            api_origin = valid ? api : std::string();
+            link_code = valid ? code : std::string();
+            configured = true;
+            ++generation;
+            listed = false;
+            listing.clear();
+            addresses.clear();
+            if (valid) hide_in_messages(code);
+            hide_in_messages(link_password());
+        }
+
+        // The link of the build, read at the first use; m is held.
+        void configure()
+        {
+            if (!configured) use_link(build_link);
+        }
 
         // The files of folder, under the paths that prefix begins, its subfolders walked.
         void walk(const json& folder, const std::string& prefix, std::map<std::string, listed_file>& out, int depth)
@@ -144,22 +177,43 @@ namespace albireo
             {
                 const std::string name = c["name"].as_string();
                 if (name.empty() || name == "." || name == ".." || name.find('/') != std::string::npos) continue;
-                if (c["isfolder"].as_bool(false)) walk(c, prefix + name + "/", out, depth + 1);
-                else
+                if (c["isfolder"].as_bool(false))
                 {
-                    listed_file f;
-                    f.id = c["fileid"].as_int(0);
-                    const long long size = c["size"].as_int(-1);
-                    if (f.id <= 0 || size < 0) continue;
-                    f.size = static_cast<uint64_t>(size);
-                    out[prefix + name] = f;
+                    walk(c, prefix + name + "/", out, depth + 1);
+                    continue;
                 }
+                // An identifier and a size of another type, negative, or beyond the integers, make the entry invalid.
+                listed_file f;
+                const json& id = c["fileid"];
+                const json& size = c["size"];
+                f.valid = id.is_integer() && id.as_int() > 0 && size.is_integer() && size.as_int() >= 0;
+                f.id = f.valid ? id.as_int() : 0;
+                f.size = f.valid ? static_cast<uint64_t>(size.as_int()) : 0;
+                out[prefix + name] = f;
             }
         }
 
+        // A text of an answer quoted in a message: 80 characters at most, its control characters left out.
+        std::string quoted(const std::string& text)
+        {
+            std::string out;
+            for (char c : without_publication_space(text))
+            {
+                if (static_cast<unsigned char>(c) < 0x20 || c == 0x7f) continue;
+                if (out.size() >= 80)
+                {
+                    out += "...";
+                    break;
+                }
+                out += c;
+            }
+            return out;
+        }
+
         /*
-            A method of the API with its parameters, the code of the link and its password, for the
-            file path of the link, which the messages name.
+            A method of the interface with its parameters, the code of the link and its password,
+            for the file path of the space, which the messages name.  The answer is a JSON object
+            whose result is 0, else the request fails.
         */
         bool call(const std::string& api, const std::string& code, const std::string& method, const std::string& params,
             const std::string& path, json& answer, std::string& error)
@@ -168,23 +222,24 @@ namespace albireo
             const std::string password = link_password();
             if (!password.empty()) url += "&linkpassword=" + query_value(password);
             std::string body, e;
-            if (!http_get(url, body, e, 16u << 20, 20))
+            if (!http_get(url, body, e, 16u << 20, api_read_seconds, api_total_seconds))
             {
-                error = "the public link cannot be reached for " + path + ": " + without_queries(e);
+                error = "the publication space of Albireo cannot be reached for " + path + ": " + e;
                 return false;
             }
             answer = json::parse_or_null(body);
             const json& a = answer;
-            if (!a.is_object())
+            if (!a.is_object() || !a["result"].is_integer())
             {
-                error = "the public link gives an answer that is not JSON for " + path;
+                error = "the publication space of Albireo gives an answer that is not the one of its interface for "
+                    + path;
                 return false;
             }
-            const long long result = a["result"].as_int(-1);
+            const long long result = a["result"].as_int();
             if (result != 0)
             {
-                error = "the public link answers \"" + a["error"].as_string() + "\" (" + std::to_string(result)
-                    + ") for " + path;
+                error = "the publication space of Albireo answers \"" + quoted(a["error"].as_string()) + "\" ("
+                    + std::to_string(result) + ") for " + path;
                 return false;
             }
             return true;
@@ -195,16 +250,17 @@ namespace albireo
             if (status) *status = value;
         }
 
-        // The entry of path in the listing of the link, read again when it is older than its life or fresh asks.
+        // The entry of path in the listing, read again when it is older than its life or fresh asks.
         bool find_listed(const std::string& path, bool fresh, listed_file& f, std::string& error, link_status* status)
         {
             std::string api, code;
             unsigned long long g = 0;
             {
                 std::lock_guard<std::mutex> lock(m);
+                configure();
                 if (api_origin.empty())
                 {
-                    error = path + " cannot be downloaded: no public link is set (the setting public_link)";
+                    error = path + " cannot be downloaded: no publication space is set";
                     set_status(status, link_status::unset);
                     return false;
                 }
@@ -218,6 +274,13 @@ namespace albireo
                         return false;
                     }
                     f = it->second;
+                    if (!f.valid)
+                    {
+                        error = "the publication space of Albireo lists " + path + " without a valid identifier "
+                            "or size";
+                        set_status(status, link_status::failed);
+                        return false;
+                    }
                     return true;
                 }
                 api = api_origin;
@@ -227,13 +290,20 @@ namespace albireo
             json answer;
             set_status(status, link_status::failed);
             if (!call(api, code, "showpublink", "", path, answer, error)) return false;
+            // A listing whose folder is no object with its contents is no listing: it is not kept.
+            const json& metadata = static_cast<const json&>(answer)["metadata"];
+            if (!metadata.is_object() || !metadata["contents"].is_array())
+            {
+                error = "the publication space of Albireo gives a listing that is not the one of its interface for "
+                    + path;
+                return false;
+            }
             std::map<std::string, listed_file> files;
-            const json& a = answer;
-            walk(a["metadata"], "", files, 0);
+            walk(metadata, "", files, 0);
             std::lock_guard<std::mutex> lock(m);
             if (g != generation)
             {
-                error = "the public link changed during its reading for " + path;
+                error = "the publication space of Albireo changed during its reading for " + path;
                 return false;
             }
             listing.swap(files);
@@ -246,40 +316,33 @@ namespace albireo
                 set_status(status, link_status::missing);
                 return false;
             }
-            set_status(status, link_status::ok);
             f = it->second;
+            if (!f.valid)
+            {
+                error = "the publication space of Albireo lists " + path + " without a valid identifier or size";
+                return false;
+            }
+            set_status(status, link_status::ok);
             return true;
         }
-    }
-
-    bool valid_public_link(const std::string& link)
-    {
-        std::string api, code;
-        return parse_link(link, api, code);
-    }
-
-    void set_public_link(const std::string& link)
-    {
-        std::string api, code;
-        const bool valid = parse_link(link, api, code);
-        std::lock_guard<std::mutex> lock(m);
-        api_origin = valid ? api : std::string();
-        link_code = valid ? code : std::string();
-        ++generation;
-        listed = false;
-        listing.clear();
-        addresses.clear();
     }
 
     bool public_link_enabled()
     {
         std::lock_guard<std::mutex> lock(m);
+        configure();
         return !api_origin.empty();
     }
 
     bool public_link_has_password()
     {
         return masked_size > 0;
+    }
+
+    void public_link_for_tests(const std::string& link)
+    {
+        std::lock_guard<std::mutex> lock(m);
+        use_link(link);
     }
 
     bool public_link_file(const std::string& path, std::string& url, uint64_t& size, std::string& error, bool fresh,
@@ -308,16 +371,17 @@ namespace albireo
         if (!call(api, code, "getpublinkdownload", "&fileid=" + std::to_string(f.id) + "&forcedownload=1", path,
                 answer, error))
             return false;
-        // The first content server, a name of letters, digits, dots and hyphens (a port for a local API).
+        // The first content server, a name of letters, digits, dots and hyphens (a port for a local interface).
         const json& a = answer;
-        const std::string host = a["hosts"].elements().empty() ? std::string() : a["hosts"].elements()[0].as_string();
+        const json& first = a["hosts"][0];
+        const std::string host = first.as_string();
         const std::string where = a["path"].as_string();
         bool valid_host = !host.empty() && host.size() <= 255;
         for (char c : host)
             valid_host = valid_host && (alphanumeric(c) || c == '.' || c == '-' || c == ':');
         if (!valid_host || where.empty() || where[0] != '/' || where.size() > 4096)
         {
-            error = "the public link gives no address for " + path;
+            error = "the publication space of Albireo gives no address for " + path;
             return false;
         }
         const std::string scheme = api.compare(0, 8, "https://") == 0 ? "https://" : "http://";
@@ -356,7 +420,7 @@ namespace albireo
             set_status(status, link_status::failed);
             if (size > max_bytes)
             {
-                error = "the copy of " + path + " in the public link is larger than expected";
+                error = "the copy of " + path + " in the publication space of Albireo is larger than expected";
                 return false;
             }
             std::string e;
@@ -367,13 +431,10 @@ namespace albireo
                     set_status(status, link_status::ok);
                     return true;
                 }
-                error = "the copy of " + path + " in the public link does not have its listed size";
+                error = "the copy of " + path + " in the publication space of Albireo does not have its listed size";
                 continue;
             }
-            // The address of the content server stays out of the message, as the queries of the API.
-            const size_t at = e.find(url);
-            if (at != std::string::npos) e.replace(at, url.size(), "the copy of " + path + " in the public link");
-            error = without_queries(e);
+            error = "the copy of " + path + " in the publication space of Albireo cannot be downloaded: " + e;
             if (http_cancelled()) return false;
         }
         return false;

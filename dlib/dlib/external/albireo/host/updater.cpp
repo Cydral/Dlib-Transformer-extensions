@@ -113,19 +113,36 @@ namespace albireo
         std::lock_guard<std::mutex> start(worker_m_);
         if (cancelled_ || busy_.exchange(true)) return;
         if (worker_.joinable()) worker_.join();
-        worker_ = std::thread([this]() {
-            try
-            {
-                check();
-            }
-            catch (const std::exception& e)
-            {
-                std::lock_guard<std::mutex> lock(m_);
-                status_["state"] = "error";
-                put_error(status_, user_error().set(e.what(), "update_check").arg("e", e.what()));
-            }
+        auto failed = [this](const std::string& why) {
+            std::lock_guard<std::mutex> lock(m_);
+            status_["state"] = "error";
+            put_error(status_, user_error().set(why, "update_check").arg("e", why));
+        };
+        try
+        {
+            // No exception leaves the thread of a check.
+            worker_ = std::thread([this, failed]() {
+                try
+                {
+                    check();
+                }
+                catch (const std::exception& e)
+                {
+                    failed(e.what());
+                }
+                catch (...)
+                {
+                    failed("the check of the updates fails");
+                }
+                busy_ = false;
+            });
+        }
+        catch (const std::exception& e)
+        {
+            // A thread the system refuses: the check fails, and the next one may start.
+            failed(std::string("the check of the updates cannot start: ") + e.what());
             busy_ = false;
-        });
+        }
     }
 
     void updater::cancel()
@@ -285,11 +302,11 @@ namespace albireo
         std::string body, sig, error;
         // Where the installer comes from, for the log: empty when it was downloaded before.
         std::string origin;
-        // The feed and its signature come from the folder dist of the public link alone.
+        // The feed and its signature come from the folder dist of the publication space alone.
         auto read = [&](const std::string& path, std::string& into, size_t max_bytes) {
             link_status status = link_status::ok;
             if (public_link_get(path, into, error, max_bytes, &status)) return true;
-            // A file the link does not hold yet has its own code, which names it.
+            // A file the space does not hold yet has its own code, which names it.
             if (status == link_status::missing) fail(user_error().set(error, "update_not_published").arg("file", path));
             else fail(user_error().set(error, "update_download").arg("e", error));
             if (!ended()) log_warning("updates: " + error);
@@ -300,10 +317,10 @@ namespace albireo
         {
             fail(user_error().set("the signature of the update feed is not valid", "update_signature")
                 .arg("file", "dist/feed.json"));
-            log_error("updates: the signature of the feed of the public link is not valid, feed ignored");
+            log_error("updates: the signature of the feed of the publication space is not valid, feed ignored");
             return;
         }
-        log_info("updates: feed read from the public link");
+        log_info("updates: feed read from the publication space of Albireo");
         const json feed = json::parse_or_null(body);
         const json& stable = feed["channels"]["stable"];
         const std::string latest = stable["version"].as_string();
@@ -335,14 +352,16 @@ namespace albireo
         set("latest", latest);
         set("notes", notes);
         const json& inst = stable["installer"];
-        // The installer lies in the folder dist of the public link, under the name the feed gives it ("file").
+        // The installer lies in the folder dist of the publication space, under the name the feed gives it ("file").
         const std::string in_link = inst["file"].as_string();
         const std::string sha = inst["sha256"].as_string();
-        const uint64_t size = static_cast<uint64_t>(inst["size"].as_int(0));
+        // A size the feed gives as negative, or of another type, makes it incomplete.
+        const long long given = inst["size"].as_int(0);
+        const uint64_t size = given > 0 ? static_cast<uint64_t>(given) : 0;
         if (in_link.empty() || !plain_name(in_link) || sha.size() != 64 || size == 0)
         {
-            fail(user_error().set(in_link.empty() ? "the update feed names no installer in the public link"
-                : "the update feed is incomplete", "update_feed_invalid"));
+            fail(user_error().set(in_link.empty() ? "the update feed names no installer in the publication space of "
+                "Albireo" : "the update feed is incomplete", "update_feed_invalid"));
             return;
         }
         make_dirs(dir_);
@@ -357,7 +376,7 @@ namespace albireo
             const std::string tmp = file + ".partial";
             /*
                 One download of the installer from address into the partial file, checked against
-                the feed; label, when given, takes the place of the address in the messages.
+                the feed; label names the file in the messages, which never name its address.
             */
             auto download = [&](const std::string& address, const std::string& label, user_error& why) {
                 // The partial file of an earlier attempt goes: the new one must not exist yet (new_file).
@@ -384,8 +403,7 @@ namespace albireo
                     return !cancelled_.load();
                 }, e);
                 const bool closed = out.close();
-                const size_t at = label.empty() ? std::string::npos : e.find(address);
-                if (at != std::string::npos) e.replace(at, address.size(), label);
+                e = label + " cannot be downloaded: " + e;
                 why = user_error();
                 if (!created || unwritten || (ok && !closed)) why = unrecorded;
                 else if (!ok && !too_large) why.set(e, "update_download").arg("e", e);
@@ -399,12 +417,12 @@ namespace albireo
             user_error why;
             bool done = false;
             /*
-                The copy of the installer in the public link: an address of the cache may have
-                expired, and a file the listing of the cache lacks may have been published since,
-                so that the second attempt asks the listing and the address again.
+                The copy of the installer in the publication space: an address of the cache may
+                have expired, and a file the listing of the cache lacks may have been published
+                since, so that the second attempt asks the listing and the address again.
             */
             const std::string path = "dist/" + in_link;
-            const std::string label = "the copy of " + path + " in the public link";
+            const std::string label = "the copy of " + path + " in the publication space of Albireo";
             for (int attempt = 0; attempt < 2 && !done && !ended(); ++attempt)
             {
                 std::string address, e;
@@ -434,7 +452,7 @@ namespace albireo
                 if (!ended()) log_error("updates: download of " + latest + " failed: " + why.text);
                 return;
             }
-            origin = " from the public link";
+            origin = " from the publication space of Albireo";
         }
         user_error staging;
         switch (stage(latest, sha, notes, body, sig, staging))
@@ -502,7 +520,7 @@ namespace albireo
         const json& inst = stable["installer"];
         const std::string sha = inst["sha256"].as_string();
         const uint64_t size = static_cast<uint64_t>(inst["size"].as_int(0));
-        // The name of the installer in the folder dist of the public link, else the one of its address.
+        // The name of the installer in the folder dist of the publication space, else the one of its address.
         const std::string name = inst["file"].is_string() ? inst["file"].as_string()
             : file_name(inst["url"].as_string());
         const std::string source = join_path(folder, name);
