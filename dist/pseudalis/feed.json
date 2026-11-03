@@ -1,0 +1,21 @@
+{
+  "product": "Pseudalis",
+  "channels": {
+    "stable": {
+      "version": "1.0.0",
+      "date": "2026-11-03",
+      "notes": {
+        "en": "First public version of Pseudalis Community: anonymization on this computer of Word, Excel, PowerPoint and PDF documents, texts of any extension, pictures, ZIP, TAR and TAR.GZ archives and whole folders, their names and properties included; a drive that anonymizes the files and folders written to it; Anonymize and Restore in the Explorer, on files and folders; a local web application and interface; originals kept encrypted for their restoration.",
+        "fr": "Première version publique de Pseudalis Community : anonymisation sur cet ordinateur des documents Word, Excel, PowerPoint et PDF, des textes de toute extension, des images, des archives ZIP, TAR et TAR.GZ et de dossiers entiers, noms et propriétés compris ; un lecteur qui anonymise les fichiers et dossiers qu'on y écrit ; Anonymiser et Restaurer dans l'Explorateur, sur les fichiers et les dossiers ; une application web et une interface locales ; les originaux conservés chiffrés pour leur restauration.",
+        "de": "Erste öffentliche Version von Pseudalis Community: Anonymisierung von Word-, Excel-, PowerPoint- und PDF-Dokumenten, Texten jeder Endung, Bildern, ZIP-, TAR- und TAR.GZ-Archiven und ganzen Ordnern auf diesem Computer, ihre Namen und Eigenschaften inbegriffen; ein Laufwerk, das die darauf geschriebenen Dateien und Ordner anonymisiert; Anonymisieren und Wiederherstellen im Explorer, für Dateien und Ordner; eine lokale Webanwendung und Schnittstelle; verschlüsselt aufbewahrte Originale für ihre Wiederherstellung.",
+        "it": "Prima versione pubblica di Pseudalis Community: anonimizzazione su questo computer di documenti Word, Excel, PowerPoint e PDF, testi di qualsiasi estensione, immagini, archivi ZIP, TAR e TAR.GZ e cartelle intere, nomi e proprietà compresi; un'unità che anonimizza i file e le cartelle scritti su di essa; Anonimizza e Ripristina in Esplora file, su file e cartelle; un'applicazione web e un'interfaccia locali; gli originali conservati cifrati per il loro ripristino.",
+        "es": "Primera versión pública de Pseudalis Community: anonimización en este equipo de documentos Word, Excel, PowerPoint y PDF, textos de cualquier extensión, imágenes, archivos ZIP, TAR y TAR.GZ y carpetas enteras, nombres y propiedades incluidos; una unidad que anonimiza los archivos y carpetas escritos en ella; Anonimizar y Restaurar en el Explorador, en archivos y carpetas; una aplicación web y una interfaz locales; los originales guardados cifrados para su restauración."
+      },
+      "installer": {
+        "file": "pseudalis-setup-1.0.0.exe",
+        "size": 16210944,
+        "sha256": "e3fe71e754ee81d3b6baf4e3c5bc8870307da4be9230f3c451f85149cf352f38"
+      }
+    }
+  }
+}
