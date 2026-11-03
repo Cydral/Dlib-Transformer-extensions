@@ -10,10 +10,10 @@
 # Every program lands in <build>/bin, the layout of an installation: the service, its two
 # engines (pseudalis-engine.dll for every x64 processor, pseudalis-engine-avx2.dll for the
 # processors with AVX2), the web application, the tray, the shell program and, on Windows,
-# the installer pseudalis-setup.exe, which carries all of them and WinFsp.
+# the installer pseudalis-setup.exe, which carries all of them.
 #
-# Outside Windows the service builds with its engine inside (PSEUDALIS_ENGINE_STATIC) and
-# without drive, for the tests (tools/test_linux.sh).
+# Outside Windows the service builds with its engine inside (PSEUDALIS_ENGINE_STATIC), its
+# drives working as folders without letters, for the tests (tools/test_linux.sh).
 
 cmake_minimum_required(VERSION 3.16)
 project(pseudalis VERSION 1.0.0 LANGUAGES C CXX)
@@ -220,31 +220,21 @@ else()
 endif()
 configure_file(cmake/feed_public_key.h.in ${CMAKE_BINARY_DIR}/generated/feed_public_key.h @ONLY)
 
-# The headers of WinFsp, for the drive (tools/build_windows.ps1 downloads those of the version
-# the installer carries).
-set(PSEUDALIS_WINFSP_INCLUDE "${CMAKE_BINARY_DIR}/winfsp/inc" CACHE PATH "Folder holding winfsp/winfsp.h")
-set(PSEUDALIS_WINFSP_MSI "${CMAKE_BINARY_DIR}/winfsp/winfsp.msi" CACHE FILEPATH
-   "The installer of WinFsp carried by the installer of Pseudalis")
-if (WIN32 AND NOT EXISTS "${PSEUDALIS_WINFSP_INCLUDE}/winfsp/winfsp.h")
-   message(FATAL_ERROR "No winfsp/winfsp.h in ${PSEUDALIS_WINFSP_INCLUDE}: run tools/build_windows.ps1, or set "
-      "PSEUDALIS_WINFSP_INCLUDE to the inc folder of WinFsp")
-endif()
-
 # The service.
 set(PSEUDALIS_SERVICE_SOURCES common/engine_loader.cpp host/main.cpp host/service.cpp host/server.cpp
    host/settings.cpp host/store.cpp host/vault.cpp host/keys.cpp host/albireo_client.cpp host/updater.cpp
    host/http_fetch.cpp host/public_link.cpp host/crypto.cpp host/certificates.cpp)
+# The drives: two folders of the data folder, watched by the service, with their letters on Windows.
+list(APPEND PSEUDALIS_SERVICE_SOURCES host/drive_folders.cpp)
 if (WIN32)
-   list(APPEND PSEUDALIS_SERVICE_SOURCES host/drive_winfsp.cpp resources/service.rc)
+   list(APPEND PSEUDALIS_SERVICE_SOURCES resources/service.rc)
 else()
-   list(APPEND PSEUDALIS_SERVICE_SOURCES host/drive_none.cpp ${PSEUDALIS_ENGINE_SOURCES})
+   list(APPEND PSEUDALIS_SERVICE_SOURCES ${PSEUDALIS_ENGINE_SOURCES})
 endif()
 add_executable(pseudalis-service ${PSEUDALIS_SERVICE_SOURCES})
 target_include_directories(pseudalis-service PRIVATE ${CMAKE_BINARY_DIR}/generated)
 target_link_libraries(pseudalis-service PRIVATE pseudalis_common pseudalis_sqlite dlib::httplib)
 if (WIN32)
-   # The headers of WinFsp keep the warnings of their compiler.
-   target_include_directories(pseudalis-service SYSTEM PRIVATE ${PSEUDALIS_WINFSP_INCLUDE})
    target_link_libraries(pseudalis-service PRIVATE winhttp crypt32)
 else()
    # The engine inside the program, outside Windows.

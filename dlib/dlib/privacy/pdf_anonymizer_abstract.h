@@ -52,8 +52,12 @@ namespace dlib
                 In both modes, only text that was read and checked is written: the
                 original fonts, pictures, annotations, attachments, bookmarks, scripts,
                 metadata, alternate texts and earlier revisions are left out, and text
-                that cannot be decoded is not copied. The text-only mode also leaves out
-                the vector graphics. The report lists what was removed, without values.
+                that cannot be decoded is not copied. With set_untagged_properties(),
+                the title, author, subject, keywords and creator of the document
+                information are written again, their values replaced by substitutes
+                (pseudonymizer::substitute()) listed in the report. The text-only mode
+                also leaves out the vector graphics. The report lists what was removed,
+                without values.
 
             RESTORATION
                 restore() reads a PDF produced by anonymize(), or any PDF containing
@@ -64,7 +68,9 @@ namespace dlib
                 its original place in Helvetica. Characters outside the repertoire of the
                 standard fonts (WinAnsi and Latin Extended-A), such as Greek, Cyrillic or
                 CJK text, are written as '?'. A PDF that holds no tag and was not written
-                by anonymize() is returned unchanged.
+                by anonymize() is returned unchanged. With set_untagged_properties(),
+                the substitutes of the document information that the resolver of
+                set_substitute_resolver() knows are given back too.
         !*/
     public:
         pdf_anonymizer(
@@ -92,6 +98,27 @@ namespace dlib
                   describer, and writes the text it returns over the gray box of the
                   picture (see rewrite_pdf_text()). An empty function, the default,
                   leaves the gray boxes empty. restore() never uses it.
+        !*/
+
+        void set_untagged_properties(
+            bool untagged
+        );
+        /*!
+            ensures
+                - When untagged is true, the protected PDF keeps the title, author,
+                  subject, keywords and creator of its document information, each value
+                  found replaced by its substitute and listed with its tag in
+                  report.substitutions, and restore() gives back the substitutes there.
+                  False, the default, leaves the document information out.
+        !*/
+
+        void set_substitute_resolver(
+            const pseudonymizer::substitute_resolver& resolve
+        );
+        /*!
+            ensures
+                - restore() gives resolve the candidates of the document information
+                  (pseudonymizer::find_substitutes()) when the properties are untagged.
         !*/
 
         std::string anonymize(const std::string& pdf_bytes);

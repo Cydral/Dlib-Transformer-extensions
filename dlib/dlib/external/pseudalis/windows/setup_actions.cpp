@@ -476,6 +476,10 @@ namespace setup
             const long long port = s["port"].as_int(0);
             if (port >= 1024 && port <= 65535) o.port = static_cast<int>(port);
             if (s.contains("drive_letter")) o.drive_letter = s["drive_letter"].str();
+            /* The drive of restoration came with the drives without driver: an installation of the
+               version before takes the first free letter from R on. */
+            if (s.contains("restore_letter")) o.restore_letter = s["restore_letter"].str();
+            else o.restore_letter = default_restore_letter(o.drive_letter);
             const std::string language = s["language"].str("auto");
             if (language == "en" || language == "fr" || language == "de" || language == "it" || language == "es")
                 o.language = language;
@@ -1219,6 +1223,7 @@ namespace setup
         }
         s["port"] = o.port;
         s["drive_letter"] = o.drive_letter;
+        s["restore_letter"] = o.restore_letter;
         s["language"] = o.language;
         // The service puts its authority in the trusted roots according to this choice.
         s["trust_authority"] = o.trust_certificate;
@@ -1228,6 +1233,38 @@ namespace setup
             return false;
         }
         return true;
+    }
+
+    bool add_missing_settings(const install_options& o, std::string& error)
+    {
+        const std::string path = join_path(data_dir(), "settings.json");
+        std::string text;
+        if (!read_file(path, text, 1u << 20)) return true;
+        json s = json::parse_or_null(text);
+        if (!s.is_object() || s.contains("restore_letter")) return true;
+        s["restore_letter"] = o.restore_letter;
+        if (!write_file_atomic(path, s.dump_formatted(2) + "\n"))
+        {
+            error = "cannot write " + path;
+            return false;
+        }
+        log("the drive of restoration takes " + (o.restore_letter.empty() ? std::string("no letter")
+                                                                          : o.restore_letter + ":"));
+        return true;
+    }
+
+    void remove_drive_labels(const std::string& program_dir)
+    {
+        const std::wstring base = L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\DriveIcons\\";
+        const std::wstring icon = widen(join_path(program_dir, "pseudalis-tray.exe"));
+        for (wchar_t c = L'A'; c <= L'Z'; ++c)
+        {
+            const std::wstring key = base + c;
+            const std::wstring value = registry_string(HKEY_LOCAL_MACHINE, (key + L"\\DefaultIcon").c_str(), L"");
+            // Only the names that the service of these programs gave.
+            if (value.size() >= icon.size() && _wcsnicmp(value.c_str(), icon.c_str(), icon.size()) == 0)
+                RegDeleteTreeW(HKEY_LOCAL_MACHINE, key.c_str());
+        }
     }
 
     bool prepare_certificates(bool new_installation, std::string& error)
@@ -1652,7 +1689,8 @@ namespace setup
             }
         }
 
-        // The folders and the programs of Pseudalis at the top of a folder of programs.
+        // The folders and the programs of Pseudalis at the top of a folder of programs; winfsp held the
+        // installer of WinFsp that the versions before carried.
         const char* const pseudalis_folders[] = { "web", "licenses", "winfsp" };
         const char* const pseudalis_programs[] = { "pseudalis-service.exe", "pseudalis-tray.exe", "pseudalis.exe",
             "pseudalis-setup.exe", "pseudalis-engine.dll", "pseudalis-engine-avx2.dll" };
@@ -1687,7 +1725,8 @@ namespace setup
         }
 
         // The files of Pseudalis in a folder of programs, known by their places: its programs, its
-        // engines, and the files of its web application, its licenses and the installer of WinFsp.
+        // engines, and the files of its web application, its licenses and, from the versions before,
+        // the installer of WinFsp.
         std::vector<std::string> pseudalis_files(const std::string& program_dir)
         {
             std::vector<std::string> files;
@@ -2117,31 +2156,11 @@ namespace setup
     }
 
 // ----------------------------------------------------------------------------------------
-// WinFsp, the control of the service by the users, the commands of the Explorer and the
-// letters of the drive.
+// The WinFsp of the earlier versions, the control of the service by the users, the commands of
+// the Explorer and the letters of the drives.
 
     namespace
     {
-        // The version of WinFsp the installer carries (winfsp.msi), the oldest one the drive takes.
-        const char* const winfsp_version = "2.1.25156";
-
-        // The folder of WinFsp, which its installer records in the 32-bit view of the registry.
-        std::string winfsp_dir()
-        {
-            wchar_t value[MAX_PATH] = {};
-            DWORD size = sizeof(value);
-            if (RegGetValueW(HKEY_LOCAL_MACHINE, L"Software\\WinFsp", L"InstallDir",
-                    RRF_RT_REG_SZ | RRF_SUBKEY_WOW6432KEY, nullptr, value, &size) != ERROR_SUCCESS)
-                return std::string();
-            return narrow(value);
-        }
-
-        std::string winfsp_library()
-        {
-            const std::string dir = winfsp_dir();
-            return dir.empty() ? std::string() : join_path(join_path(dir, "bin"), "winfsp-x64.dll");
-        }
-
         // The upgrade code that the installers of WinFsp keep from one version to the next.
         const wchar_t* const winfsp_upgrade_code = L"{5466A3D8-3AA1-4240-B6A0-3A051940A3EC}";
 
@@ -2248,72 +2267,6 @@ namespace setup
         }
     }
 
-    std::string installed_winfsp_version()
-    {
-        const std::string dll = winfsp_library();
-        return dll.empty() || !file_exists(dll) ? std::string() : program_version(dll);
-    }
-
-    bool ensure_winfsp(const std::string& msi, std::string& error)
-    {
-        const std::string before = installed_winfsp_version();
-        if (!before.empty() && compare_versions(before, winfsp_version) >= 0)
-        {
-            log("WinFsp " + before + " is installed");
-            return true;
-        }
-        if (!file_exists(msi))
-        {
-            error = "the installer of WinFsp is missing: " + msi;
-            return false;
-        }
-        const std::string msiexec = msiexec_program(error);
-        if (msiexec.empty()) return false;
-        const std::string logs = join_path(data_dir(), "logs");
-        make_dirs(logs);
-        /*
-            A WinFsp that Pseudalis installs, or updates after installing it, belongs to it:
-            hidden from the installed programs, it leaves with Pseudalis (remove_owned_winfsp()).
-            A WinFsp found in place stays the one of its user, updated in sight.
-        */
-        const std::wstring owned = owned_winfsp_product();
-        const bool ours = before.empty() || (!owned.empty() && owned == installed_winfsp_product());
-        log((before.empty() ? "installation of WinFsp " + std::string(winfsp_version)
-            : "update of WinFsp " + before + " to " + winfsp_version) + (ours ? ", with Pseudalis" : ""));
-        std::vector<std::string> args = { "/i", msi, "/qn", "/norestart", "/l*v",
-            join_path(logs, "winfsp-install.log") };
-        if (ours) args.push_back("ARPSYSTEMCOMPONENT=1");
-        /*
-            Another installation running: the installer waits for it, a few minutes at most.
-            3010 asks for a restart of Windows, which the drive then waits for; the service
-            starts it without the drive meanwhile.
-        */
-        const int code = run_msiexec(msiexec, args, 10, 30);
-        if (code != 0 && code != 3010)
-        {
-            error = "the installer of WinFsp ended with code " + std::to_string(code) + " (logs\\winfsp-install.log)";
-            return false;
-        }
-        const std::string after = installed_winfsp_version();
-        if (after.empty())
-        {
-            error = "WinFsp is not found after its installation (logs\\winfsp-install.log)";
-            return false;
-        }
-        log("WinFsp " + after + " is installed" + (code == 3010 ? ", Windows must restart for it" : ""));
-        if (ours)
-        {
-            const std::wstring product = installed_winfsp_product();
-            if (product.empty() || !write_registry_string(L"WinFspProduct", product))
-                log("WinFsp cannot be recorded as installed with Pseudalis: it stays at the uninstallation");
-        }
-        else if (!owned.empty())
-        {
-            forget_owned_winfsp();
-        }
-        return true;
-    }
-
     bool remove_owned_winfsp(std::string& error)
     {
         const std::wstring owned = owned_winfsp_product();
@@ -2346,7 +2299,7 @@ namespace setup
             : join_path(narrow(std::wstring(temp, n)), "pseudalis-winfsp-uninstall.log");
         std::vector<std::string> args = { "/x", narrow(owned), "/qn", "/norestart" };
         if (!uninstall_log.empty()) args.insert(args.end(), { "/l*v", uninstall_log });
-        log("uninstallation of WinFsp " + installed_winfsp_version() + ", installed with Pseudalis");
+        log("uninstallation of WinFsp, installed with an earlier version of Pseudalis");
         const int code = run_msiexec(msiexec, args, 4, 15);
         // 1605: the product is no longer installed.
         if (code == 0 || code == 3010 || code == 1605)
@@ -2541,16 +2494,18 @@ namespace setup
         }
     }
 
-    std::vector<std::string> free_drive_letters(const std::string& current)
+    std::vector<std::string> free_drive_letters(const std::string& current, const std::string& also)
     {
         const std::set<char> used = letters_in_use();
-        const char mine = letter_syntax(current)
-            ? static_cast<char>(std::toupper(static_cast<unsigned char>(current[0]))) : '\0';
+        auto upper = [](const std::string& l) {
+            return letter_syntax(l) ? static_cast<char>(std::toupper(static_cast<unsigned char>(l[0]))) : '\0';
+        };
+        const char mine = upper(current), other = upper(also);
         std::vector<std::string> out;
         for (char c = 'A'; c <= 'Z'; ++c)
         {
             if (c == 'C') continue;
-            if (c == mine || !used.count(c)) out.push_back(std::string(1, c));
+            if (c == mine || c == other || !used.count(c)) out.push_back(std::string(1, c));
         }
         return out;
     }
@@ -2558,9 +2513,23 @@ namespace setup
     bool valid_drive_choice(const std::string& letter)
     {
         if (!letter_syntax(letter)) return false;
-        const std::vector<std::string> free = free_drive_letters(installed_options().drive_letter);
+        const install_options o = installed_options();
+        const std::vector<std::string> free = free_drive_letters(o.drive_letter, o.restore_letter);
         const std::string up(1, static_cast<char>(std::toupper(static_cast<unsigned char>(letter[0]))));
         return std::find(free.begin(), free.end(), up) != free.end();
+    }
+
+    std::string default_restore_letter(const std::string& drive_letter)
+    {
+        const std::vector<std::string> free = free_drive_letters(std::string());
+        for (char c = 'R'; c <= 'Z'; ++c)
+        {
+            const std::string l(1, c);
+            if (l != drive_letter && std::find(free.begin(), free.end(), l) != free.end()) return l;
+        }
+        for (const std::string& l : free)
+            if (l != drive_letter && l != "A" && l != "B") return l;
+        return std::string();
     }
 
 }

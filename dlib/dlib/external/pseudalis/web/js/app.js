@@ -84,8 +84,9 @@
       box.appendChild(pill(t('s_version'), info.version));
       box.appendChild(pill(t('s_engine'), (info.engine && info.engine.variant) || '?'));
       const d = info.drive || {};
-      const off = d.error_code === 'winfsp_missing' ? t('s_drive_winfsp') : t('s_drive_off');
-      box.appendChild(pill(t('s_drive'), d.mounted ? d.letter + ':' : off, !!d.mounted));
+      const rd = d.restore || {};
+      box.appendChild(pill(t('s_drive'), d.mounted ? d.letter + ':' : t('s_drive_off'), !!d.mounted));
+      box.appendChild(pill(t('s_restore_drive'), rd.mounted ? rd.letter + ':' : t('s_drive_off'), !!rd.mounted));
       const a = info.albireo || {};
       box.appendChild(pill(t('s_albireo'), a.found ? a.model : t('s_albireo_off'), !!a.found));
       box.appendChild(pill(t('s_records'), String(info.records || 0)));
@@ -370,6 +371,7 @@
     const s = await r.json();
     document.getElementById('set-language').value = s.language || 'auto';
     document.getElementById('set-drive').value = s.drive_letter || '';
+    document.getElementById('set-restore-drive').value = s.restore_letter || '';
     document.getElementById('set-max').value = s.max_file_mb;
     document.getElementById('set-removed').value = s.removed_days;
     document.getElementById('set-albireo').checked = s.albireo !== 'off';
@@ -380,6 +382,7 @@
     const r = await postJson('v1/settings', {
       language: document.getElementById('set-language').value,
       drive_letter: document.getElementById('set-drive').value.trim().toUpperCase(),
+      restore_letter: document.getElementById('set-restore-drive').value.trim().toUpperCase(),
       max_file_mb: parseInt(document.getElementById('set-max').value, 10) || 256,
       removed_days: parseInt(document.getElementById('set-removed').value, 10) || 30,
       albireo: document.getElementById('set-albireo').checked ? 'auto' : 'off',

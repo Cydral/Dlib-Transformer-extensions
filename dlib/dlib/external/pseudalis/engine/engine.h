@@ -32,6 +32,19 @@ namespace pseudalis
     // Receives each picture found and returns its description in clear, or an empty string.
     typedef std::function<std::string(const picture_found&)> picture_handler;
 
+    /*
+        Returns the tags recorded for a substitute equal to candidate, the most likely first: the
+        names and the properties of the documents hold substitutes, values written without
+        their tags, which the caller records when they are made (engine_result::substitutions).
+    */
+    typedef std::function<std::vector<std::string>(const std::string& candidate)> substitute_lookup;
+
+    struct substitution
+    {
+        std::string substitute;             // as written in a name or a property
+        std::string tag;                    // the tag it stands for
+    };
+
     struct engine_options
     {
         std::string date_order = "dmy";     // or "mdy": the order of the numeric dates
@@ -41,10 +54,11 @@ namespace pseudalis
     struct engine_result
     {
         std::string bytes;                  // the file written
-        std::string name;                   // its name: "photo.png.txt" for a picture
+        std::string name;                   // its name, protected: "photo.png.txt" for a picture
         std::string kind;                   // "txt", "csv", "xml", "docx", ..., "image", "zip", "tar", "tar.gz"
         json report = json::object();
         std::vector<std::string> pictures;  // the identifiers of the pictures found, once each
+        std::vector<substitution> substitutions;   // anonymize(): the substitutes written
     };
 
     class engine
@@ -64,6 +78,18 @@ namespace pseudalis
                 keep their documents, protected, and their pictures as text files; the
                 entries of another kind are left out and listed in report["dropped"].
 
+                The names of the files, of the entries of the archives and of their
+                folders, and the properties of the documents (title, authors, subject,
+                keywords, company... of Word, Excel and PowerPoint, the document
+                information of a PDF) take substitutes rather than tags: each value is
+                written in its protected form without the brackets, the type and the
+                check of its tag, which a name cannot hold and a window of properties
+                would show as they are.  The name of a document is read with what its
+                content taught the detector.  A substitute holds no character that
+                Windows refuses in a name.  engine_result::substitutions lists each one
+                with its tag, which the caller records: restore() asks the lookup for
+                them.
+
             THREAD SAFETY
                 The methods may be called from several threads at once.
         !*/
@@ -75,11 +101,24 @@ namespace pseudalis
         static file_kind kind_of(const std::string& bytes, const std::string& name);
         static std::string picture_marker(const std::string& id, const std::string& description);
 
-        // Throws std::runtime_error for a file of no supported kind, or that cannot be read.
+        /*
+            Throws std::runtime_error for a file of no supported kind, or that cannot be read.  The
+            substitutes that lookup knows, in a name or a property protected before, are not
+            replaced again.
+        */
         engine_result anonymize(const std::string& bytes, const std::string& name,
-            const picture_handler& pictures) const;
-        // Puts back the values of the tags; a picture marker stays (the service keeps the pictures).
-        engine_result restore(const std::string& bytes, const std::string& name) const;
+            const picture_handler& pictures, const substitute_lookup& lookup = substitute_lookup()) const;
+        /*
+            Puts back the values of the tags, and those of the substitutes that lookup knows in
+            the names and the properties; a picture marker stays (the service keeps the pictures).
+        */
+        engine_result restore(const std::string& bytes, const std::string& name,
+            const substitute_lookup& lookup = substitute_lookup()) const;
+
+        // A name alone, a folder for instance: its values become substitutes, its extension stays.
+        std::string anonymize_name(const std::string& name, const substitute_lookup& lookup,
+            std::vector<substitution>& made, json& report) const;
+        std::string restore_name(const std::string& name, const substitute_lookup& lookup, json& report) const;
 
         std::string anonymize_text(const std::string& text, json& report) const;
         std::string restore_text(const std::string& text, json& report) const;

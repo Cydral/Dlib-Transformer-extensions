@@ -8,7 +8,9 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 #include "../numeric_constants.h"
 #include "../documents/pdf_text.h"
@@ -33,6 +35,9 @@ namespace dlib
         ) : p_(p), detector_(detector), report_(report), keep_layout_(keep_layout) {}
 
         void set_image_describer(const document_image_describer& describer) { describer_ = describer; }
+
+        void set_untagged_properties(bool untagged) { untagged_properties_ = untagged; }
+        void set_substitute_resolver(const pseudonymizer::substitute_resolver& resolve) { resolve_ = resolve; }
 
         std::string anonymize(const std::string& pdf_bytes)
         {
@@ -146,6 +151,8 @@ namespace dlib
             }
             for (const unit& u : units)
                 transform_unit(u);
+            bool info_changed = false;
+            const std::vector<std::pair<std::string, std::string>> info = properties(doc, info_changed);
 
             if (!layout_mode_)
             {
@@ -167,14 +174,14 @@ namespace dlib
             if (layout_mode_)
             {
                 // A document that holds no tag and was not protected here is given back as it is.
-                if (restoring_ && !doc.rewritten_by_dlib && replacements_.empty())
+                if (restoring_ && !doc.rewritten_by_dlib && replacements_.empty() && !info_changed)
                 {
                     report_.note("no tag found: the document is returned unchanged");
                     return bytes;
                 }
                 pdf_rewrite_report rr;
                 const std::string out = rewrite_pdf_text(bytes, replacements_, &rr,
-                                                         restoring_ ? document_image_describer() : describer_);
+                                                         restoring_ ? document_image_describer() : describer_, info);
                 if (!restoring_)
                 {
                     if (rr.images > 0)
@@ -184,8 +191,7 @@ namespace dlib
                                      " gray box(es) received the text of the image describer");
                     if (rr.annotations > 0)
                         report_.removed.push_back("annotations (" + std::to_string(rr.annotations) + ")");
-                    for (const std::string& f : doc.features)
-                        report_.removed.push_back(f);
+                    removed_features(doc);
                     report_.removed.push_back("embedded fonts (text drawn with standard fonts of the same style)");
                     if (rr.drawn_annotations > 0)
                         report_.note(std::to_string(rr.drawn_annotations) +
@@ -219,17 +225,105 @@ namespace dlib
                 }
                 if (images > 0) report_.removed.push_back("images (" + std::to_string(images) + ")");
                 if (annotations > 0) report_.removed.push_back("annotations (" + std::to_string(annotations) + ")");
-                for (const std::string& f : doc.features)
-                    report_.removed.push_back(f);
+                removed_features(doc);
                 report_.removed.push_back("fonts, colors and vector graphics (text-only reconstruction)");
             }
 
             std::size_t unencodable = 0;
-            const std::string out = write_pdf_text(doc, layout, &unencodable);
+            const std::string out = write_pdf_text(doc, layout, &unencodable, info);
             if (unencodable > 0)
                 report_.note(std::to_string(unencodable) +
                              " characters outside the Latin repertoire of the standard PDF fonts were written as '?'");
             return out;
+        }
+
+    // ------------------------------------------------------------------------------------
+    // Document information.
+
+        // The entries of the document information that untagged properties keep, with their substitutes.
+        static bool kept_property(const std::string& key)
+        {
+            return key == "Title" || key == "Author" || key == "Subject" || key == "Keywords" || key == "Creator";
+        }
+
+        /* The document information written with the PDF: none unless the properties are untagged;
+           then the kept entries with their values replaced by substitutes, or given back. */
+        std::vector<std::pair<std::string, std::string>> properties(const pdf_text_document& doc, bool& changed)
+        {
+            std::vector<std::pair<std::string, std::string>> out;
+            changed = false;
+            if (!untagged_properties_) return out;
+            for (const auto& kv : doc.info)
+            {
+                if (!kept_property(kv.first) || kv.second.empty()) continue;
+                ++report_.text_units;
+                std::string v = kv.second;
+                if (restoring_)
+                {
+                    pseudonymizer::restore_report rr, sr;
+                    v = p_.restore(v, &rr);
+                    report_.tags_restored += rr.restored;
+                    report_.tags_rejected += rr.rejected;
+                    v = p_.restore_substitutes(v, resolve_, &sr);
+                    report_.substitutes_restored += sr.restored;
+                }
+                else
+                {
+                    detection_context ctx;
+                    if (kv.first == "Author") ctx.forced = pii_type::person;
+                    // The substitutes written before, a document protected and then edited, stay as they are.
+                    const std::vector<pseudonymizer::substitute_occurrence> known = p_.find_substitutes(v, resolve_);
+                    std::vector<pii_entity> found;
+                    for (const pii_entity& e : detector_->detect(v, ctx))
+                    {
+                        if (p_.keeps_in_clear(e.type)) continue;
+                        bool written = false;
+                        for (const auto& o : known)
+                            if (e.begin < o.end && o.begin < e.end) written = true;
+                        if (written) continue;
+                        pii_entity f = e;
+                        while (f.begin < f.end && v[f.begin] == ' ') ++f.begin;
+                        while (f.end > f.begin && v[f.end - 1] == ' ') --f.end;
+                        if (f.end <= f.begin) continue;
+                        found.push_back(f);
+                        report_.count(e.type);
+                    }
+                    std::vector<pseudonymizer::substitution> made;
+                    v = p_.apply_substitutes(v, found, &made);
+                    for (const pseudonymizer::substitution& s : made)
+                        report_.substitutions.push_back(document_substitution{ s.substitute, s.tag });
+                }
+                if (v != kv.second) changed = true;
+                out.push_back(std::make_pair(kv.first, v));
+            }
+            return out;
+        }
+
+        // What the protected PDF leaves out; the document information it keeps is not listed.
+        void removed_features(const pdf_text_document& doc)
+        {
+            for (const std::string& f : doc.features)
+            {
+                if (!untagged_properties_ || f.compare(0, 20, "document information") != 0)
+                {
+                    report_.removed.push_back(f);
+                    continue;
+                }
+                // "document information (Author, CreationDate, Producer)": the keys not kept.
+                const std::size_t open = f.find('('), close = f.rfind(')');
+                std::string dropped;
+                if (open != std::string::npos && close != std::string::npos && close > open)
+                {
+                    std::istringstream keys(f.substr(open + 1, close - open - 1));
+                    std::string key;
+                    while (std::getline(keys, key, ','))
+                    {
+                        while (!key.empty() && key[0] == ' ') key.erase(0, 1);
+                        if (!key.empty() && !kept_property(key)) dropped += (dropped.empty() ? "" : ", ") + key;
+                    }
+                }
+                if (!dropped.empty()) report_.removed.push_back("document information (" + dropped + ")");
+            }
         }
 
     // ------------------------------------------------------------------------------------
@@ -578,6 +672,8 @@ namespace dlib
         document_report& report_;
         bool keep_layout_ = true;
         document_image_describer describer_;
+        bool untagged_properties_ = false;
+        pseudonymizer::substitute_resolver resolve_;
         bool restoring_ = false;
         bool layout_mode_ = false;
         std::vector<pdf_text_replacement> replacements_;

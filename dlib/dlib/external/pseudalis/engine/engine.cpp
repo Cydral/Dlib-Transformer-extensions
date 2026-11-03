@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstring>
 #include <map>
 #include <set>
 #include <sstream>
@@ -90,6 +91,62 @@ namespace pseudalis
             return m;
         }
 
+        /*
+            A name and its extension, ".docx" or ".tar.gz", which keeps its letters: the extension
+            of a kind Pseudalis processes, since the end of a folder or of an e-mail address
+            ("jean.dupont@example.fr") is no extension.
+        */
+        void split_extension(const std::string& base, std::string& stem, std::string& ext)
+        {
+            ext = pseudalis::kind_of_name(base) == name_kind::unsupported ? std::string() : name_extension(base);
+            if (ext.size() >= base.size()) ext.clear();
+            ext = base.substr(base.size() - ext.size());
+            stem = base.substr(0, base.size() - ext.size());
+        }
+
+        // A substitute with the characters Windows refuses in a name replaced by '_'.
+        std::string windows_safe(std::string s)
+        {
+            for (char& c : s)
+                if (static_cast<unsigned char>(c) < 0x20 || std::strchr("<>:\"/\\|?*", c) != nullptr) c = '_';
+            return s;
+        }
+
+        // The number of UTF-16 units of a UTF-8 text, which bounds a name of Windows.
+        std::size_t utf16_units(const std::string& s)
+        {
+            std::size_t n = 0;
+            for (std::size_t i = 0; i < s.size(); ++i)
+            {
+                const unsigned char c = static_cast<unsigned char>(s[i]);
+                if ((c & 0xC0) != 0x80) n += c >= 0xF0 ? 2 : 1;
+            }
+            return n;
+        }
+
+        /*
+            A protected name that Windows takes: a stem that names a device (CON, NUL, COM1...)
+            gets '_', and a name past 255 UTF-16 units loses the end of its stem, its extension
+            kept.  The original name of a file, which the caller records, gives it back whole.
+        */
+        std::string windows_name(std::string stem, const std::string& ext)
+        {
+            std::string head = lower(stem.substr(0, stem.find('.')));
+            while (!head.empty() && head.back() == ' ') head.pop_back();
+            const bool device = head == "con" || head == "prn" || head == "aux" || head == "nul" ||
+                (head.size() == 4 && (head.compare(0, 3, "com") == 0 || head.compare(0, 3, "lpt") == 0) &&
+                 head[3] >= '1' && head[3] <= '9');
+            if (device) stem.insert(stem.find('.') == std::string::npos ? stem.size() : stem.find('.'), "_");
+            while (!stem.empty() && utf16_units(stem + ext) > 255)
+            {
+                stem.pop_back();
+                while (!stem.empty() && (static_cast<unsigned char>(stem.back()) & 0xC0) == 0x80) stem.pop_back();
+                if (!stem.empty() && static_cast<unsigned char>(stem.back()) >= 0xC0) stem.pop_back();
+            }
+            while (!stem.empty() && (stem.back() == ' ' || stem.back() == '.')) stem.pop_back();
+            return stem.empty() ? "_" + ext : stem + ext;
+        }
+
         json report_json(const document_report& r)
         {
             json j = json::object();
@@ -106,6 +163,8 @@ namespace pseudalis
             j["tags_restored"] = static_cast<unsigned long long>(r.tags_restored);
             j["tags_rejected"] = static_cast<unsigned long long>(r.tags_rejected);
             j["dates_shifted"] = static_cast<unsigned long long>(r.dates_shifted);
+            j["substitutes"] = static_cast<unsigned long long>(r.substitutions.size());
+            j["substitutes_restored"] = static_cast<unsigned long long>(r.substitutes_restored);
             j["dropped"] = json::array();
             return j;
         }
@@ -116,7 +175,8 @@ namespace pseudalis
             for (const auto& kv : part["values"].items())
                 whole["values"][kv.first] =
                     static_cast<unsigned long long>(whole["values"][kv.first].as_int(0) + kv.second.as_int(0));
-            for (const char* key : { "total", "tags_restored", "tags_rejected", "dates_shifted" })
+            for (const char* key : { "total", "tags_restored", "tags_rejected", "dates_shifted", "substitutes",
+                                     "substitutes_restored" })
                 whole[key] = static_cast<unsigned long long>(whole[key].as_int(0) + part[key].as_int(0));
             for (const char* key : { "removed", "notes", "dropped" })
                 for (const json& v : part[key].elements())
@@ -208,14 +268,82 @@ namespace pseudalis
             return engine::picture_marker(f.id, protect_description(handler(f)));
         }
 
+        /*
+            The base name of a file, its values replaced by substitutes that Windows takes, its
+            extension kept: a, with the detector of the document it names, reads it.
+        */
+        std::string protect_base(document_anonymizer& a, document_report& r, const std::string& base,
+                                 std::vector<substitution>& made) const
+        {
+            std::string stem, ext;
+            split_extension(base, stem, ext);
+            const std::size_t first = r.substitutions.size();
+            std::string out = a.anonymize_name(stem, r);
+            for (std::size_t k = first; k < r.substitutions.size(); ++k)
+            {
+                document_substitution& s = r.substitutions[k];
+                const std::string safe = windows_safe(s.substitute);
+                if (safe != s.substitute)
+                {
+                    const std::size_t at = out.find(s.substitute);
+                    if (at != std::string::npos) out.replace(at, s.substitute.size(), safe);
+                    s.substitute = safe;
+                }
+                made.push_back(substitution{ s.substitute, s.tag });
+            }
+            return out == stem ? base : windows_name(out, ext);
+        }
+
+        std::string restore_base(document_anonymizer& a, document_report& r, const std::string& base) const
+        {
+            std::string stem, ext;
+            split_extension(base, stem, ext);
+            return a.restore_name(stem, r) + ext;
+        }
+
+        // The resolver of the document anonymizer, from the lookup of the caller.
+        static pseudonymizer::substitute_resolver resolver_of(const substitute_lookup& lookup)
+        {
+            if (!lookup) return pseudonymizer::substitute_resolver();
+            return [lookup](const std::string& candidate) { return lookup(candidate); };
+        }
+
+        // The protected name of a file read alone: a picture, an archive, a folder.
+        std::string protect_alone(const std::string& base, const substitute_lookup& lookup,
+                                  std::vector<substitution>& made, document_report& r) const
+        {
+            pii_detector d(dopt);
+            attach(d);
+            document_anonymizer a(*p, d);
+            a.set_substitute_resolver(resolver_of(lookup));
+            return protect_base(a, r, base, made);
+        }
+
+        std::string restore_alone(const std::string& base, const substitute_lookup& lookup, document_report& r) const
+        {
+            pii_detector d(dopt);
+            document_anonymizer a(*p, d);
+            a.set_substitute_resolver(resolver_of(lookup));
+            return restore_base(a, r, base);
+        }
+
+        static std::string folder_of(const std::string& name)
+        {
+            return name.substr(0, name.size() - base_name(name).size());
+        }
+
         engine_result document(const std::string& bytes, const std::string& name, document_format f,
-                               const picture_handler& handler, bool restoring, uint64_t& budget) const
+                               const picture_handler& handler, bool restoring, const substitute_lookup& lookup,
+                               uint64_t& budget) const
         {
             engine_result out;
             pii_detector d(dopt);
             if (!restoring) attach(d);
             // A PDF keeps its pages: its text is replaced in place (the default of the anonymizer).
             document_anonymizer a(*p, d);
+            // The properties of the document take substitutes, which a window of properties shows as they are.
+            a.set_untagged_properties(true);
+            a.set_substitute_resolver(resolver_of(lookup));
             /*
                 A part of an Office document takes about 26 bytes of memory for each of its bytes
                 while it is read: each part stays within 32 times the document, from 32 MB.
@@ -233,50 +361,125 @@ namespace pseudalis
             document_report report;
             out.bytes = restoring ? a.restore(bytes, f, report, base_name(name))
                                   : a.anonymize(bytes, f, report, base_name(name));
-            out.name = name;
+            // The name is read with what the document taught the detector.
+            std::vector<substitution> named;
+            out.name = folder_of(name) + (restoring ? restore_base(a, report, base_name(name))
+                                                    : protect_base(a, report, base_name(name), named));
             out.kind = document_format_name(f);
             out.report = report_json(report);
             out.pictures = ids;
+            // The substitutes of the properties and of the name, as written.
+            for (const document_substitution& s : report.substitutions)
+                out.substitutions.push_back(substitution{ s.substitute, s.tag });
             return out;
         }
 
-        engine_result picture(const std::string& bytes, const std::string& name, const picture_handler& handler) const
+        engine_result picture(const std::string& bytes, const std::string& name, const picture_handler& handler,
+                              const substitute_lookup& lookup) const
         {
             engine_result out;
             std::vector<std::string> ids;
             const picture_handler none = [](const picture_found&) { return std::string(); };
             out.bytes = marker_of(bytes, image_media_type(bytes), base_name(name), handler ? handler : none, ids)
                 + "\r\n";
-            out.name = name + ".txt";
+            document_report report;
+            out.name = folder_of(name) + protect_alone(base_name(name), lookup, out.substitutions, report) + ".txt";
             out.kind = "image";
-            out.report = report_json(document_report());
+            out.report = report_json(report);
             out.pictures = ids;
             return out;
         }
 
         engine_result any(const std::string& bytes, const std::string& name, const picture_handler& handler,
-                          bool restoring, int depth, uint64_t& budget) const
+                          bool restoring, const substitute_lookup& lookup, int depth, uint64_t& budget) const
         {
             const file_kind k = engine::kind_of(bytes, name);
             if (k == file_kind::picture)
             {
-                if (!restoring) return picture(bytes, name, handler);
+                if (!restoring) return picture(bytes, name, handler, lookup);
                 engine_result out;
+                document_report report;
                 out.bytes = bytes;
-                out.name = name;
+                out.name = folder_of(name) + restore_alone(base_name(name), lookup, report);
                 out.kind = "image";
-                out.report = report_json(document_report());
+                out.report = report_json(report);
                 return out;
             }
-            if (k == file_kind::archive) return archive(bytes, name, handler, restoring, depth, budget);
+            if (k == file_kind::archive) return archive(bytes, name, handler, restoring, lookup, depth, budget);
             if (k == file_kind::document)
                 return document(bytes, name, detect_document_format(bytes, base_name(name)), handler, restoring,
-                                budget);
+                                lookup, budget);
             throw std::runtime_error(base_name(name) + ": this kind of file is not supported");
         }
 
+        /*
+            The folders of the path of an entry, each one protected, or restored, once for the
+            whole archive: "Clients/Jean Dupont/" gives the same folder to all its entries.
+        */
+        std::string entry_folders(const std::string& folders, bool restoring, const substitute_lookup& lookup,
+                                  std::map<std::string, std::string>& done, engine_result& out) const
+        {
+            std::string result;
+            std::size_t start = 0;
+            while (start < folders.size())
+            {
+                std::size_t slash = folders.find('/', start);
+                if (slash == std::string::npos) slash = folders.size();
+                const std::string part = folders.substr(start, slash - start);
+                if (!part.empty() && part != "." && part != "..")
+                {
+                    auto it = done.find(part);
+                    if (it == done.end())
+                    {
+                        document_report r;
+                        std::string changed;
+                        if (restoring)
+                        {
+                            pii_detector d(dopt);
+                            document_anonymizer a(*p, d);
+                            a.set_substitute_resolver(resolver_of(lookup));
+                            changed = a.restore_name(part, r);
+                        }
+                        else
+                        {
+                            pii_detector d(dopt);
+                            attach(d);
+                            document_anonymizer a(*p, d);
+                            a.set_substitute_resolver(resolver_of(lookup));
+                            // A folder has no extension: its whole name is read.
+                            const std::size_t first = r.substitutions.size();
+                            changed = a.anonymize_name(part, r);
+                            for (std::size_t k = first; k < r.substitutions.size(); ++k)
+                            {
+                                document_substitution& s = r.substitutions[k];
+                                const std::string safe = windows_safe(s.substitute);
+                                if (safe != s.substitute)
+                                {
+                                    const std::size_t at = changed.find(s.substitute);
+                                    if (at != std::string::npos) changed.replace(at, s.substitute.size(), safe);
+                                    s.substitute = safe;
+                                }
+                                out.substitutions.push_back(substitution{ s.substitute, s.tag });
+                            }
+                            if (changed != part) changed = windows_name(changed, std::string());
+                        }
+                        merge_report(out.report, report_json(r), std::string());
+                        it = done.insert(std::make_pair(part, changed)).first;
+                    }
+                    result += it->second;
+                }
+                else
+                {
+                    result += part;
+                }
+                if (slash < folders.size()) result += '/';
+                start = slash + 1;
+            }
+            return result;
+        }
+
         engine_result archive(const std::string& bytes, const std::string& name, const picture_handler& handler,
-                              bool restoring, int depth, uint64_t& budget) const
+                              bool restoring, const substitute_lookup& lookup, int depth, uint64_t& budget) const
         {
             if (depth > 3) throw std::runtime_error(base_name(name) + ": archives nested too deep");
             archive_kind ak = archive_kind_of(bytes);
@@ -290,18 +493,31 @@ namespace pseudalis
             for (const archive_entry& e : entries) read += e.data.size();
             budget -= std::min(budget, read);
             engine_result out;
-            out.name = name;
             out.kind = archive_kind_name(ak);
             out.report = report_json(document_report());
+            {
+                document_report r;
+                out.name = folder_of(name) + (restoring ? restore_alone(base_name(name), lookup, r)
+                                                        : protect_alone(base_name(name), lookup, out.substitutions, r));
+                merge_report(out.report, report_json(r), std::string());
+            }
             std::set<std::string> names;
             std::map<std::string, int> next_number;
             std::set<std::string> pictures;
+            std::map<std::string, std::string> folders;
             for (const archive_entry& e : entries) names.insert(lower(e.name));
             std::vector<archive_entry> kept;
             for (archive_entry& e : entries)
             {
                 if (e.directory)
                 {
+                    const std::string renamed = entry_folders(e.name, restoring, lookup, folders, out);
+                    if (renamed != e.name)
+                    {
+                        names.erase(lower(e.name));
+                        e.name = renamed;
+                        names.insert(lower(e.name));
+                    }
                     kept.push_back(std::move(e));
                     continue;
                 }
@@ -314,16 +530,19 @@ namespace pseudalis
                 }
                 try
                 {
-                    engine_result r = any(e.data, e.name, handler, restoring, depth + 1, budget);
-                    if (r.name != e.name)
+                    engine_result r = any(e.data, e.name, handler, restoring, lookup, depth + 1, budget);
+                    const std::string renamed =
+                        entry_folders(folder_of(e.name), restoring, lookup, folders, out) + base_name(r.name);
+                    if (renamed != e.name)
                     {
                         names.erase(lower(e.name));
-                        e.name = free_name(r.name, names, next_number);
+                        e.name = free_name(renamed, names, next_number);
                     }
                     e.data = std::move(r.bytes);
                     merge_report(out.report, r.report, e.name);
                     for (const std::string& id : r.pictures)
                         if (pictures.insert(id).second) out.pictures.push_back(id);
+                    for (substitution& s : r.substitutions) out.substitutions.push_back(std::move(s));
                     kept.push_back(std::move(e));
                 }
                 catch (std::exception& x)
@@ -396,16 +615,34 @@ namespace pseudalis
     }
 
     engine_result engine::anonymize(const std::string& bytes, const std::string& name,
-                                    const picture_handler& pictures) const
+                                    const picture_handler& pictures, const substitute_lookup& lookup) const
     {
         uint64_t budget = decompression_budget(bytes.size());
-        return p_->any(bytes, name, pictures, false, 0, budget);
+        return p_->any(bytes, name, pictures, false, lookup, 0, budget);
     }
 
-    engine_result engine::restore(const std::string& bytes, const std::string& name) const
+    engine_result engine::restore(const std::string& bytes, const std::string& name,
+                                  const substitute_lookup& lookup) const
     {
         uint64_t budget = decompression_budget(bytes.size());
-        return p_->any(bytes, name, picture_handler(), true, 0, budget);
+        return p_->any(bytes, name, picture_handler(), true, lookup, 0, budget);
+    }
+
+    std::string engine::anonymize_name(const std::string& name, const substitute_lookup& lookup,
+                                       std::vector<substitution>& made, json& report) const
+    {
+        document_report r;
+        const std::string out = impl::folder_of(name) + p_->protect_alone(base_name(name), lookup, made, r);
+        report = report_json(r);
+        return out;
+    }
+
+    std::string engine::restore_name(const std::string& name, const substitute_lookup& lookup, json& report) const
+    {
+        document_report r;
+        const std::string out = impl::folder_of(name) + p_->restore_alone(base_name(name), lookup, r);
+        report = report_json(r);
+        return out;
     }
 
     std::string engine::anonymize_text(const std::string& text, json& report) const

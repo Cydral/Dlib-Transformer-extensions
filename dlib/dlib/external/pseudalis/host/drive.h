@@ -16,33 +16,38 @@ namespace pseudalis
     {
         /*!
             WHAT THIS OBJECT REPRESENTS
-                The drive of Pseudalis: a file system of WinFsp, served by the service and
-                mounted on the letter of the settings for every session of the computer.
-                It works as any drive (the Explorer, cmd: dir, copy, move, del, ren, md,
-                rd /s, type, edit), with one difference: a file written there is
-                protected when its last handle closes, and only the protected file is ever
-                read back.
+                The two drives of Pseudalis: two folders of the data folder, drive and
+                restore, which the service watches and shows under the letters of the
+                settings for every session of the computer, as the command subst would.
+                They work as any folder, from the Explorer and from the prompt, with one
+                difference each:
 
-                    - a document keeps its name, protected, its original kept in the vault;
-                    - a picture becomes <name>.txt, its marker "[Image@<id> : <description>]";
-                    - a ZIP, TAR or TAR.GZ archive keeps its name, its documents protected,
-                      its pictures as text files, its other entries left out;
-                    - a file of another kind is refused at its creation (access denied); a
-                      file whose content cannot be read keeps its previous version, or is
-                      removed when it had none, with an event;
-                    - while a file is written and protected, the other programs cannot open
-                      its content (sharing violation).
+                    - a file written to the drive of anonymization is anonymized once its
+                      writer closed it: its original goes to the encrypted vault with a
+                      record, the anonymized file takes its place, under its name with its
+                      values replaced (pictures: <name>.txt, holding their marker), and the
+                      file written is deleted.  A folder that comes in takes a name without
+                      personal data once the files under it rest.  A file of another kind,
+                      or that cannot be anonymized, goes to the folder of the files not
+                      processed of the user who wrote it (refused\<user> in the data
+                      folder), out of the drive, with an event;
+                    - a file written to the drive of restoration is replaced by its original,
+                      under its original name, once its writer closed it, readable by the
+                      user who wrote it alone; a file that is not an anonymized file of this
+                      computer stays as it is, with an event.
 
-                The tree of the drive lies in the database, the protected content in the
-                vault.  The originals come back through the "Restore" command of the
-                Explorer, the web application or the interface, from any copy of a
-                protected file, since a file system cannot tell a move out of the drive
-                from a copy followed by a deletion: deleting or replacing a file marks its
-                record (service::mark_removed()), whose original stays for the days of the
-                setting removed_days, then goes with the pictures no other file shows.
+                No driver: the file written lies in its folder, in clear for the drive of
+                anonymization, from its last write to its processing, a few seconds for most
+                documents, during which the service holds it alone (sharing violation).
+                Deleting a file of the drive marks its record (service::mark_removed()), whose
+                original stays for the days of the setting removed_days; a file found again
+                in the drive, renamed or moved there, keeps it.  The files already processed
+                are recorded in the database, so that a restart processes only what changed.
 
-                On a system without WinFsp, and outside Windows, start() fails and the
-                service runs without drive.
+                The tree of the drive of WinFsp of the versions before is written into the
+                folder at the first start, then forgotten by the database.
+
+                Outside Windows, the folders work without letters.
         !*/
     public:
         explicit drive_host(service& svc);
@@ -50,9 +55,15 @@ namespace pseudalis
         drive_host(const drive_host&) = delete;
         drive_host& operator=(const drive_host&) = delete;
 
-        bool start(const std::string& letter, std::string& error);
+        // letter and restore_letter: "A".."Z", or empty for a drive without letter.
+        bool start(const std::string& letter, const std::string& restore_letter, std::string& error);
         void stop();
-        // {"letter", "mounted", "files", "bytes", "error"}
+        /*!
+            ensures
+                - Returns {"letter", "mounted", "folder", "files", "bytes", "error",
+                  "restore": {"letter", "mounted", "folder", "files", "error"},
+                  "refused_folder"}.
+        !*/
         json status() const;
 
     private:

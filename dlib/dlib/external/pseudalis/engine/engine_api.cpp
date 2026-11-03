@@ -15,6 +15,7 @@
 #include <new>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "engine.h"
 
@@ -47,6 +48,19 @@ namespace
         }
     }
 
+    pseudalis::json substitutions_of(const std::vector<pseudalis::substitution>& made)
+    {
+        pseudalis::json list = pseudalis::json::array();
+        for (const pseudalis::substitution& s : made)
+        {
+            pseudalis::json one = pseudalis::json::object();
+            one["substitute"] = s.substitute;
+            one["tag"] = s.tag;
+            list.push_back(one);
+        }
+        return list;
+    }
+
     pseudalis::json result_of(const pseudalis::engine_result& r)
     {
         pseudalis::json j = pseudalis::json::object();
@@ -56,6 +70,7 @@ namespace
         pseudalis::json ids = pseudalis::json::array();
         for (const std::string& id : r.pictures) ids.push_back(id);
         j["pictures"] = ids;
+        j["substitutions"] = substitutions_of(r.substitutions);
         return j;
     }
 }
@@ -124,7 +139,8 @@ PSD_API void PSD_CALL psd_destroy(psd_engine* engine)
 }
 
 PSD_API int PSD_CALL psd_process(psd_engine* engine, const char* request, const char* data, size_t size,
-    psd_picture_fn picture, void* context, psd_buffer* result, psd_buffer* output, psd_buffer* error)
+    psd_picture_fn picture, psd_lookup_fn lookup, void* context, psd_buffer* result, psd_buffer* output,
+    psd_buffer* error)
 {
     clear(result);
     clear(output);
@@ -161,15 +177,47 @@ PSD_API int PSD_CALL psd_process(psd_engine* engine, const char* request, const 
                 psd_free(&d);
                 return text;
             };
+        pseudalis::substitute_lookup tags_of;
+        if (lookup)
+            tags_of = [lookup, context](const std::string& candidate) {
+                std::vector<std::string> tags;
+                psd_buffer b = { nullptr, 0 };
+                if (lookup(context, candidate.data(), candidate.size(), &b) == 1 && b.data)
+                {
+                    const std::string all(b.data, b.size);
+                    std::size_t start = 0;
+                    while (start < all.size())
+                    {
+                        std::size_t end = all.find('\n', start);
+                        if (end == std::string::npos) end = all.size();
+                        if (end > start) tags.push_back(all.substr(start, end - start));
+                        start = end + 1;
+                    }
+                }
+                psd_free(&b);
+                return tags;
+            };
         pseudalis::json res = pseudalis::json::object();
         std::string out;
         if (op == "anonymize" || op == "restore")
         {
             pseudalis::engine_result r = op == "anonymize"
-                ? engine->e->anonymize(bytes, name, handler)
-                : engine->e->restore(bytes, name);
+                ? engine->e->anonymize(bytes, name, handler, tags_of)
+                : engine->e->restore(bytes, name, tags_of);
             res = result_of(r);
             out = std::move(r.bytes);
+        }
+        else if (op == "anonymize_name" || op == "restore_name")
+        {
+            pseudalis::json report;
+            std::vector<pseudalis::substitution> made;
+            out = op == "anonymize_name" ? engine->e->anonymize_name(bytes, tags_of, made, report)
+                                         : engine->e->restore_name(bytes, tags_of, report);
+            res["name"] = out;
+            res["kind"] = "name";
+            res["report"] = report;
+            res["pictures"] = pseudalis::json::array();
+            res["substitutions"] = substitutions_of(made);
         }
         else if (op == "anonymize_text" || op == "restore_text")
         {

@@ -500,11 +500,14 @@ namespace pseudalis
             if (!admin(req, res)) return;
             json body;
             if (!parse_body(req, res, body)) return;
-            const std::string letter = body["drive_letter"].str();
-            if (body.contains("drive_letter") && !letter.empty() && !valid_drive_letter(letter))
+            for (const char* key : { "drive_letter", "restore_letter" })
             {
-                send_error(res, 400, "the letter of the drive must be A, B or D to Z", "settings_drive");
-                return;
+                const std::string letter = body[key].str();
+                if (body.contains(key) && !letter.empty() && !valid_drive_letter(letter))
+                {
+                    send_error(res, 400, "the letter of a drive must be A, B or D to Z", "settings_drive");
+                    return;
+                }
             }
             // The places of the publication and the proxy, in the forms the service reads only.
             const std::string link = body["public_link"].str(), feed = body["feed_url"].str();
@@ -530,6 +533,7 @@ namespace pseudalis
                 return;
             }
             const bool restart = after.port != before.port || after.drive_letter != before.drive_letter ||
+                                 after.restore_letter != before.restore_letter ||
                                  after.date_order != before.date_order || after.proxy != before.proxy ||
                                  after.public_link != before.public_link || after.feed_url != before.feed_url;
             s->albireo().set_enabled(after.albireo != "off");

@@ -6,11 +6,13 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "../common/engine_loader.h"
 #include "../common/json.h"
@@ -138,6 +140,10 @@ namespace pseudalis
             protect_result& out, user_error& error);
         bool restore(const std::string& bytes, const std::string& name, const std::string& object_id,
             restore_result& out, user_error& error);
+        // A name alone, a folder of the drive for instance: its values become substitutes, recorded.
+        bool protect_name(const std::string& name, std::string& out, user_error& error);
+        // A name with the substitutes the database knows given back, or the name as it is.
+        std::string restore_name(const std::string& name);
         // operation: "anonymize_text", "restore_text" or "detect".
         bool text(const std::string& operation, const std::string& text, json& out, user_error& error);
         /*!
@@ -160,6 +166,9 @@ namespace pseudalis
     private:
         bool start_engine(std::string& error);
         void background_loop();
+        // The lookup of the engine: the tags recorded for a substitute.
+        std::function<std::vector<std::string>(const std::string&)> substitute_lookup();
+        bool record_substitutes(const json& result, user_error& error);
 
         std::string program_dir_, data_dir_, admin_token_;
         int port_ = 8444;

@@ -93,6 +93,14 @@ int main()
         j["drive_letter"] = "p";
         s = host_settings::from_json(j);
         CHECK(s.removed_days == 90 && s.drive_letter == "P");
+        // The drive of restoration: R by default, in upper case, never on the letter of the other drive.
+        CHECK(s.restore_letter == "R");
+        j["restore_letter"] = "s";
+        CHECK(host_settings::from_json(j).restore_letter == "S");
+        j["restore_letter"] = "p";
+        CHECK(host_settings::from_json(j).restore_letter.empty());
+        j["restore_letter"] = "c";
+        CHECK(host_settings::from_json(j).restore_letter == "R");
         CHECK(host_settings::from_json(s.to_json()).removed_days == 90);
         // The places of the publication of the build stay out of the file and of the answers.
         CHECK(!s.to_json().contains("public_link") && !s.to_json().contains("feed_url"));

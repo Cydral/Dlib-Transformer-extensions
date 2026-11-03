@@ -64,7 +64,10 @@ namespace dlib
                                 (percent-encoded tags) and local file paths. The lists of
                                 parts of the extended properties (titles of slides, names
                                 of sheets, fonts and themes, which Office writes again
-                                when it saves) are removed.
+                                when it saves) are removed. With set_untagged_properties(),
+                                the core, extended and custom properties take substitutes
+                                instead of tags (pseudonymizer::substitute()), listed in
+                                the report.
                     Dates     - dates held in typed fields (date-typed spreadsheet cells,
                                 document and revision timestamps), which cannot carry a
                                 tag, are shifted in place unless dates are kept; a custom
@@ -85,12 +88,14 @@ namespace dlib
                 not counted.
 
             RESTORATION
-                restore() replaces the verified tags found in the same places, gives
-                renamed sheets their names back and shifts dates back when the marker is
-                present. Removed pictures and objects cannot be restored. Text boxes and
-                cells keep the text form of what they hold: an identifier stored as a
-                number comes back as a text cell, and a value whose runs had different
-                formatting comes back in the formatting of its first run.
+                restore() replaces the verified tags found in the same places, and the
+                substitutes of the properties that the resolver of
+                set_substitute_resolver() knows, gives renamed sheets their names back
+                and shifts dates back when the marker is present. Removed pictures and
+                objects cannot be restored. Text boxes and cells keep the text form of
+                what they hold: an identifier stored as a number comes back as a text
+                cell, and a value whose runs had different formatting comes back in the
+                formatting of its first run.
         !*/
     public:
         ooxml_anonymizer(
@@ -135,6 +140,26 @@ namespace dlib
 
         const zip_limits& package_limits(
         ) const;
+
+        void set_untagged_properties(
+            bool untagged
+        );
+        /*!
+            ensures
+                - When untagged is true, anonymize() writes the values found in the core,
+                  extended and custom properties (docProps/core.xml, app.xml, custom.xml)
+                  as substitutes, each listed with its tag in report.substitutions, and
+                  restore() looks for substitutes there. False is the default.
+        !*/
+
+        void set_substitute_resolver(
+            const pseudonymizer::substitute_resolver& resolve
+        );
+        /*!
+            ensures
+                - restore() gives resolve the candidates of the properties
+                  (pseudonymizer::find_substitutes()) when the properties are untagged.
+        !*/
 
         std::string anonymize(const std::string& package_bytes);
         /*!

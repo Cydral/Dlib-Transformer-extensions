@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -715,6 +716,133 @@ namespace dlib
                 out.append(text, pos, e.begin - pos);
                 out += tag(e.type, text.substr(e.begin, e.end - e.begin));
                 pos = e.end;
+            }
+            out.append(text, pos, std::string::npos);
+            return out;
+        }
+
+        std::string substitute(pii_type type, const std::string& value, std::string* tag_out = nullptr) const
+        {
+            const std::string t = tag(type, value);
+            if (tag_out) *tag_out = t;
+            std::string shifted;
+            if (type == pii_type::date && options_.dates == date_policy::shift && date_substitute(value, shifted))
+                return shifted;
+            // The body lies between the keyword and the check, which holds no '#'.
+            const std::size_t colon = t.find(':');
+            const std::size_t hash = t.rfind('#');
+            return t.substr(colon + 1, hash - colon - 1);
+        }
+
+        struct substitution
+        {
+            std::string substitute;
+            std::string tag;
+        };
+
+        std::string apply_substitutes(const std::string& text, const std::vector<pii_entity>& entities,
+                                      std::vector<substitution>* made = nullptr) const
+        {
+            std::vector<pii_entity> sorted(entities);
+            std::sort(sorted.begin(), sorted.end(), [](const pii_entity& a, const pii_entity& b)
+                      { return a.begin < b.begin || (a.begin == b.begin && a.end > b.end); });
+            std::string out;
+            std::size_t pos = 0;
+            for (const pii_entity& e : sorted)
+            {
+                if (e.begin < pos || e.end > text.size() || e.end <= e.begin || e.type == pii_type::none ||
+                    keeps_in_clear(e.type))
+                    continue;
+                out.append(text, pos, e.begin - pos);
+                substitution s;
+                s.substitute = substitute(e.type, text.substr(e.begin, e.end - e.begin), &s.tag);
+                out += s.substitute;
+                if (made) made->push_back(s);
+                pos = e.end;
+            }
+            out.append(text, pos, std::string::npos);
+            return out;
+        }
+
+        typedef std::function<std::vector<std::string>(const std::string& candidate)> substitute_resolver;
+
+        struct substitute_occurrence
+        {
+            std::size_t begin = 0;
+            std::size_t end = 0;
+            pii_type type = pii_type::none;
+            std::string original;
+        };
+
+        std::vector<substitute_occurrence> find_substitutes(const std::string& text, const substitute_resolver& resolve,
+                                                            restore_report* report = nullptr) const
+        {
+            std::vector<substitute_occurrence> found;
+            if (!resolve || text.empty()) return found;
+            // The words: runs of letters and digits, any byte of a multibyte character counting as a letter.
+            auto word_byte = [](unsigned char c) {
+                return c >= 0x80 || (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+            };
+            std::vector<std::pair<std::size_t, std::size_t>> words;
+            for (std::size_t i = 0; i < text.size();)
+            {
+                if (!word_byte(static_cast<unsigned char>(text[i]))) { ++i; continue; }
+                std::size_t j = i;
+                while (j < text.size() && word_byte(static_cast<unsigned char>(text[j]))) ++j;
+                words.push_back(std::make_pair(i, j));
+                i = j;
+            }
+            const std::size_t max_words = 12;
+            for (std::size_t i = 0; i < words.size();)
+            {
+                bool matched = false;
+                for (std::size_t n = std::min(max_words, words.size() - i); n > 0 && !matched; --n)
+                {
+                    const std::size_t b = words[i].first;
+                    std::size_t e = words[i + n - 1].second;
+                    // A code of irregular case and an opaque code end with '!'.
+                    const std::size_t ends[2] = { e < text.size() && text[e] == '!' ? e + 1 : e, e };
+                    for (std::size_t k = 0; k < 2 && !matched; ++k)
+                    {
+                        if (k == 1 && ends[1] == ends[0]) break;
+                        const std::string candidate = text.substr(b, ends[k] - b);
+                        for (const std::string& t : resolve(candidate))
+                        {
+                            pii_type type;
+                            std::string original;
+                            if (!decode(t, type, original))
+                            {
+                                if (report) ++report->rejected;
+                                continue;
+                            }
+                            substitute_occurrence o;
+                            o.begin = b;
+                            o.end = ends[k];
+                            o.type = type;
+                            o.original = original;
+                            found.push_back(o);
+                            if (report) ++report->restored;
+                            matched = true;
+                            i += n;
+                            break;
+                        }
+                    }
+                }
+                if (!matched) ++i;
+            }
+            return found;
+        }
+
+        std::string restore_substitutes(const std::string& text, const substitute_resolver& resolve,
+                                        restore_report* report = nullptr) const
+        {
+            std::string out;
+            std::size_t pos = 0;
+            for (const substitute_occurrence& o : find_substitutes(text, resolve, report))
+            {
+                out.append(text, pos, o.begin - pos);
+                out += o.original;
+                pos = o.end;
             }
             out.append(text, pos, std::string::npos);
             return out;
@@ -1563,6 +1691,32 @@ namespace dlib
             if (!f.is_iso())
                 body += "~" + privacy_impl::crockford_encode(f.pack(), 4);
             return true;
+        }
+
+        // The date v shifted as date_forward() shifts it, written in the form of v.
+        bool date_substitute(const std::string& v, std::string& shifted) const
+        {
+            civil_date d;
+            date_format f;
+            if (!parse_date(v, options_.date_order, d, f)) return false;
+            if (format_date(d, f) != v) return false;
+            civil_date s = d;
+            if (!f.has_month())
+            {
+                s.year = static_cast<int>(d.year + shift_years_);
+            }
+            else if (!f.has_day())
+            {
+                const long m = 12L * d.year + (d.month - 1) + shift_months_;
+                s.year = static_cast<int>(m / 12);
+                s.month = static_cast<int>(m % 12 + 1);
+            }
+            else
+            {
+                s = civil_from_days(days_from_civil(d.year, d.month, d.day) + shift_days_);
+            }
+            shifted = format_date(s, f);
+            return !shifted.empty() && shifted != v;
         }
 
         bool date_backward(const std::string& body, std::string& original) const

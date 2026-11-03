@@ -17,6 +17,14 @@ namespace dlib
 
 // ----------------------------------------------------------------------------------------
 
+    struct document_substitution
+    {
+        std::string substitute;
+        std::string tag;
+    };
+
+// ----------------------------------------------------------------------------------------
+
     struct document_report
     {
         std::string format;
@@ -29,6 +37,8 @@ namespace dlib
         std::size_t dates_shifted = 0;
         std::vector<std::string> removed;
         std::vector<std::string> notes;
+        std::vector<document_substitution> substitutions;
+        std::size_t substitutes_restored = 0;
 
         void count(pii_type t) { ++entities[pii_type_keyword(t)]; }
 
@@ -71,7 +81,8 @@ namespace dlib
             }
             o << (entities.empty() ? "" : "\n  ") << "},\n  \"entities_total\": " << total_entities()
               << ",\n  \"tags_restored\": " << tags_restored << ",\n  \"tags_rejected\": " << tags_rejected
-              << ",\n  \"dates_shifted\": " << dates_shifted << ",\n  \"removed\": [";
+              << ",\n  \"dates_shifted\": " << dates_shifted << ",\n  \"substitutes\": " << substitutions.size()
+              << ",\n  \"substitutes_restored\": " << substitutes_restored << ",\n  \"removed\": [";
             for (std::size_t i = 0; i < removed.size(); ++i)
                 o << (i ? ", " : "") << "\"" << esc(removed[i]) << "\"";
             o << "],\n  \"notes\": [";

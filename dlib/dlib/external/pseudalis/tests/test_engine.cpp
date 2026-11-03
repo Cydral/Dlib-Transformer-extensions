@@ -3,8 +3,10 @@
 
 // Tests of the engine through its C interface: documents, pictures and archives.
 
+#include <algorithm>
 #include <cstring>
 #include <iostream>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -48,6 +50,21 @@ namespace
         return 1;
     }
 
+    // The substitutes written so far, with their tags, as the service records them.
+    std::map<std::string, std::vector<std::string>> recorded;
+
+    int PSD_CALL lookup(void*, const char* candidate, size_t size, psd_buffer* tags)
+    {
+        const auto it = recorded.find(std::string(candidate, size));
+        if (it == recorded.end()) return 0;
+        std::string all;
+        for (const std::string& t : it->second) all += (all.empty() ? "" : "\n") + t;
+        tags->data = psd_alloc(all.size());
+        std::memcpy(tags->data, all.data(), all.size());
+        tags->size = all.size();
+        return 1;
+    }
+
     bool process(psd_engine* e, const std::string& op, const std::string& name, const std::string& data, json& result,
                  std::string& output, bool pictures = true)
     {
@@ -56,13 +73,18 @@ namespace
         req["name"] = name;
         psd_buffer r = { nullptr, 0 }, o = { nullptr, 0 }, err = { nullptr, 0 };
         const int ok = psd_process(e, req.dump().c_str(), data.data(), data.size(), pictures ? describe : nullptr,
-                                   nullptr, &r, &o, &err);
+                                   lookup, nullptr, &r, &o, &err);
         if (!ok) std::cerr << "psd_process: " << (err.data ? err.data : "") << std::endl;
         result = ok ? json::parse_or_null(std::string(r.data, r.size)) : json();
         output = ok ? std::string(o.data, o.size) : std::string();
         psd_free(&r);
         psd_free(&o);
         psd_free(&err);
+        for (const json& s : result["substitutions"].elements())
+        {
+            std::vector<std::string>& tags = recorded[s["substitute"].str()];
+            if (std::find(tags.begin(), tags.end(), s["tag"].str()) == tags.end()) tags.push_back(s["tag"].str());
+        }
         return ok == 1;
     }
 }
@@ -141,6 +163,50 @@ int main()
         const std::vector<pseudalis::archive_entry> t =
             pseudalis::read_archive(pseudalis::archive_kind::tar_gz, z.read("archive.tar.gz"));
         CHECK(t.size() == 1 && t[0].data == inner[0].data);
+    }
+
+    // Names: their values become substitutes, which the lookup gives back.
+    CHECK(process(e, "anonymize", "Lettre_jean.dupont@example.fr_2024-03-12.txt", letter, res, out));
+    const std::string renamed = res["name"].str();
+    CHECK(renamed.find("dupont") == std::string::npos && renamed.find("2024-03-12") == std::string::npos);
+    CHECK(renamed.compare(0, 7, "Lettre_") == 0 && renamed.size() > 4 && renamed.substr(renamed.size() - 4) == ".txt");
+    CHECK(renamed.find_first_of("<>:\"/\\|?*[]") == std::string::npos);
+    CHECK(res["substitutions"].size() >= 2 && res["report"]["substitutes"].as_int() >= 2);
+    CHECK(process(e, "restore", renamed, out, res, back));
+    CHECK(back == letter && res["name"].str() == "Lettre_jean.dupont@example.fr_2024-03-12.txt");
+    CHECK(res["report"]["substitutes_restored"].as_int() >= 2);
+    CHECK(process(e, "anonymize_name", "", "Dossier jean.dupont@example.fr", res, out));
+    CHECK(out.find("dupont") == std::string::npos && out.compare(0, 8, "Dossier ") == 0 && res["name"].str() == out);
+    std::string folder_back;
+    CHECK(process(e, "restore_name", "", out, res, folder_back));
+    CHECK(folder_back == "Dossier jean.dupont@example.fr");
+    // The common word that opens a name stays: it names the document, not the person.
+    CHECK(process(e, "anonymize_name", "", "Contrat Jean Dupont", res, out));
+    CHECK(out.find("Jean") == std::string::npos && out.compare(0, 8, "Contrat ") == 0);
+    CHECK(process(e, "restore_name", "", out, res, folder_back));
+    CHECK(folder_back == "Contrat Jean Dupont");
+    // The folders of an archive, the same in all their entries.
+    {
+        dlib::zip_archive_writer zw;
+        zw.add("jean.dupont@example.fr/", "", false);
+        zw.add("jean.dupont@example.fr/lettre.txt", letter);
+        zw.add("jean.dupont@example.fr/copie.txt", letter);
+        std::string zout, zback;
+        CHECK(process(e, "anonymize", "envoi.zip", zw.finish(), res, zout));
+        const dlib::zip_archive_reader z(zout);
+        std::string first;
+        bool same = true;
+        for (const auto& entry : z.entries())
+        {
+            CHECK(entry.name.find("dupont") == std::string::npos);
+            const std::string folder = entry.name.substr(0, entry.name.find('/'));
+            if (first.empty()) first = folder;
+            same = same && folder == first;
+        }
+        CHECK(same && z.entries().size() == 3);
+        CHECK(process(e, "restore", "envoi.zip", zout, res, zback));
+        const dlib::zip_archive_reader r(zback);
+        CHECK(r.contains("jean.dupont@example.fr/lettre.txt") && r.read("jean.dupont@example.fr/copie.txt") == letter);
     }
 
     // Unsupported content, and text.

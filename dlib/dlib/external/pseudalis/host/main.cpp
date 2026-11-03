@@ -334,9 +334,9 @@ int main(int argc, char** argv)
 {
 #if defined(_WIN32)
     /*
-        The libraries loaded by name from here on, by this program and by its engines (WinFsp
-        is loaded by its full path), are searched in the folder of the program and System32
-        only: never in the current folder or in the PATH.
+        The libraries loaded by name from here on, by this program and by its engines, are
+        searched in the folder of the program and System32 only: never in the current folder
+        or in the PATH.
     */
     SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
 #endif

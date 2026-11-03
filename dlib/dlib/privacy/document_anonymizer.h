@@ -419,12 +419,80 @@ namespace dlib
         void set_package_limits(const zip_limits& limits) { package_limits_ = limits; }
         const zip_limits& package_limits() const { return package_limits_; }
 
+        void set_untagged_properties(bool untagged) { untagged_properties_ = untagged; }
+        bool untagged_properties() const { return untagged_properties_; }
+
+        void set_substitute_resolver(const pseudonymizer::substitute_resolver& resolve) { resolve_ = resolve; }
+
+        std::string anonymize_name(const std::string& name, document_report& report)
+        {
+            if (name.empty()) return name;
+            /* Words of a file name are often joined by underscores: they read as spaces, the
+               underscores staying in the name and in the values replaced. */
+            std::string seen = name;
+            std::replace(seen.begin(), seen.end(), '_', ' ');
+            // A substitute written before, a name protected and then edited, is not replaced again.
+            const std::vector<pseudonymizer::substitute_occurrence> known = p_.find_substitutes(name, resolve_);
+            std::vector<pii_entity> found;
+            for (const pii_entity& e : detector_.detect(seen))
+            {
+                if (p_.keeps_in_clear(e.type)) continue;
+                bool written = false;
+                for (const auto& o : known)
+                    if (e.begin < o.end && o.begin < e.end) written = true;
+                if (written) continue;
+                std::size_t b = e.begin, en = e.end;
+                while (b < en && seen[b] == ' ') ++b;
+                while (en > b && seen[en - 1] == ' ') --en;
+                if (e.type == pii_type::person || e.type == pii_type::organization) b = past_opening_words(seen, b, en);
+                if (en <= b) continue;
+                pii_entity v = e;
+                v.begin = b;
+                v.end = en;
+                found.push_back(v);
+                report.count(e.type);
+            }
+            std::vector<pseudonymizer::substitution> made;
+            const std::string out = p_.apply_substitutes(name, found, &made);
+            for (const pseudonymizer::substitution& s : made)
+                report.substitutions.push_back(document_substitution{ s.substitute, s.tag });
+            return out;
+        }
+
+        std::string restore_name(const std::string& name, document_report& report) const
+        {
+            pseudonymizer::restore_report rr;
+            const std::string out = p_.restore_substitutes(name, resolve_, &rr);
+            report.substitutes_restored += rr.restored;
+            return out;
+        }
+
     private:
         struct edit
         {
             std::size_t b, e;
             std::string rep;
         };
+
+        /*
+            The start of a value found in a name, past the common words that open it: "Contrat"
+            in "Contrat Jean Dupont", which a name read without a sentence around it takes in.
+            The last word of the value stays.
+        */
+        static std::size_t past_opening_words(const std::string& s, std::size_t b, std::size_t e)
+        {
+            while (b < e)
+            {
+                std::size_t w = b;
+                while (w < e && s[w] != ' ') ++w;
+                if (w >= e) break;
+                const std::string key = privacy_impl::fold_key(s.substr(b, w - b));
+                if (!privacy_impl::common_words().count(key) || privacy_impl::first_names().count(key)) break;
+                b = w;
+                while (b < e && s[b] == ' ') ++b;
+            }
+            return b;
+        }
 
         std::string run(const std::string& bytes, document_format format, document_report& report, bool restoring)
         {
@@ -441,12 +509,16 @@ namespace dlib
                     ooxml_anonymizer a(p_, &detector_, report);
                     a.set_image_describer(describer_);
                     a.set_package_limits(package_limits_);
+                    a.set_untagged_properties(untagged_properties_);
+                    a.set_substitute_resolver(resolve_);
                     return restoring ? a.restore(bytes) : a.anonymize(bytes);
                 }
                 case document_format::pdf:
                 {
                     pdf_anonymizer a(p_, &detector_, report, pdf_layout_);
                     a.set_image_describer(describer_);
+                    a.set_untagged_properties(untagged_properties_);
+                    a.set_substitute_resolver(resolve_);
                     return restoring ? a.restore(bytes) : a.anonymize(bytes);
                 }
                 case document_format::text:
@@ -1210,6 +1282,8 @@ namespace dlib
         bool pdf_layout_ = true;
         document_image_describer describer_;
         zip_limits package_limits_;
+        bool untagged_properties_ = false;
+        pseudonymizer::substitute_resolver resolve_;
     };
 
 // ----------------------------------------------------------------------------------------

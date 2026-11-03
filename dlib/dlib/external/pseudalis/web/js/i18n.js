@@ -31,7 +31,7 @@ window.PSEUDALIS_TEXTS = {
     s_engine: 'Engine',
     s_drive: 'Drive',
     s_drive_off: 'no drive',
-    s_drive_winfsp: 'WinFsp missing: run the installer of Pseudalis again',
+    s_restore_drive: 'Restoration',
     s_albireo: 'Picture descriptions',
     s_albireo_off: 'Albireo not found',
     s_records: 'Originals kept',
@@ -69,7 +69,8 @@ window.PSEUDALIS_TEXTS = {
     settings_title: 'Settings',
     set_language: 'Language of the icon, of the commands and of the descriptions',
     set_language_auto: 'Language of Windows',
-    set_drive: 'Letter of the drive (empty: no drive)',
+    set_drive: 'Letter of the drive of anonymization (empty: no drive)',
+    set_restore_drive: 'Letter of the drive of restoration (empty: no drive)',
     set_albireo: 'Describe the pictures with Albireo when it is installed',
     set_updates: 'Check for updates every day',
     set_max: 'Largest file (MB)',
@@ -102,7 +103,7 @@ window.PSEUDALIS_TEXTS = {
     err_import_not_empty: 'A key can only be imported while this installation keeps no original and no file ' +
       'on its drive.',
     err_settings: 'The settings cannot be written.',
-    err_settings_drive: 'The letter of the drive must be A, B or D to Z.'
+    err_settings_drive: 'The letter of a drive must be A, B or D to Z.'
   },
   fr: {
     tagline: 'Protection des données personnelles de vos documents',
@@ -132,7 +133,7 @@ window.PSEUDALIS_TEXTS = {
     s_engine: 'Moteur',
     s_drive: 'Lecteur',
     s_drive_off: 'pas de lecteur',
-    s_drive_winfsp: "WinFsp manquant : relancez l'installation de Pseudalis",
+    s_restore_drive: 'Restauration',
     s_albireo: 'Description des images',
     s_albireo_off: 'Albireo absent',
     s_records: 'Originaux conservés',
@@ -171,7 +172,8 @@ window.PSEUDALIS_TEXTS = {
     settings_title: 'Réglages',
     set_language: "Langue de l'icône, des commandes et des descriptions",
     set_language_auto: 'Langue de Windows',
-    set_drive: 'Lettre du lecteur (vide : pas de lecteur)',
+    set_drive: "Lettre du lecteur d'anonymisation (vide : pas de lecteur)",
+    set_restore_drive: 'Lettre du lecteur de restauration (vide : pas de lecteur)',
     set_albireo: "Décrire les images avec Albireo lorsqu'il est installé",
     set_updates: 'Rechercher les mises à jour chaque jour',
     set_max: 'Fichier le plus grand (Mo)',
@@ -204,7 +206,7 @@ window.PSEUDALIS_TEXTS = {
     err_import_not_empty: "Une clé ne s'importe que tant que cette installation ne conserve aucun original " +
       'ni aucun fichier sur son lecteur.',
     err_settings: 'Les réglages ne peuvent pas être écrits.',
-    err_settings_drive: 'La lettre du lecteur doit être A, B ou de D à Z.'
+    err_settings_drive: "La lettre d'un lecteur doit être A, B ou de D à Z."
   },
   de: {
     tagline: 'Schutz personenbezogener Daten in Ihren Dokumenten',
@@ -234,7 +236,7 @@ window.PSEUDALIS_TEXTS = {
     s_engine: 'Engine',
     s_drive: 'Laufwerk',
     s_drive_off: 'kein Laufwerk',
-    s_drive_winfsp: 'WinFsp fehlt: Starten Sie die Installation von Pseudalis erneut',
+    s_restore_drive: 'Wiederherstellung',
     s_albireo: 'Bildbeschreibungen',
     s_albireo_off: 'Albireo nicht gefunden',
     s_records: 'Aufbewahrte Originale',
@@ -273,7 +275,8 @@ window.PSEUDALIS_TEXTS = {
     settings_title: 'Einstellungen',
     set_language: 'Sprache des Symbols, der Befehle und der Beschreibungen',
     set_language_auto: 'Sprache von Windows',
-    set_drive: 'Laufwerksbuchstabe (leer: kein Laufwerk)',
+    set_drive: 'Buchstabe des Anonymisierungslaufwerks (leer: kein Laufwerk)',
+    set_restore_drive: 'Buchstabe des Wiederherstellungslaufwerks (leer: kein Laufwerk)',
     set_albireo: 'Bilder mit Albireo beschreiben, wenn es installiert ist',
     set_updates: 'Täglich nach Updates suchen',
     set_max: 'Größte Datei (MB)',
@@ -310,7 +313,7 @@ window.PSEUDALIS_TEXTS = {
     err_import_not_empty: 'Ein Schlüssel kann nur importiert werden, solange diese Installation kein Original ' +
       'und keine Datei auf ihrem Laufwerk aufbewahrt.',
     err_settings: 'Die Einstellungen können nicht geschrieben werden.',
-    err_settings_drive: 'Der Buchstabe des Laufwerks muss A, B oder D bis Z sein.'
+    err_settings_drive: 'Der Buchstabe eines Laufwerks muss A, B oder D bis Z sein.'
   },
   it: {
     tagline: 'Protezione dei dati personali dei tuoi documenti',
@@ -340,7 +343,7 @@ window.PSEUDALIS_TEXTS = {
     s_engine: 'Motore',
     s_drive: 'Unità',
     s_drive_off: 'nessuna unità',
-    s_drive_winfsp: "WinFsp mancante: avviate di nuovo l'installazione di Pseudalis",
+    s_restore_drive: 'Ripristino',
     s_albireo: 'Descrizione delle immagini',
     s_albireo_off: 'Albireo assente',
     s_records: 'Originali conservati',
@@ -380,7 +383,8 @@ window.PSEUDALIS_TEXTS = {
     settings_title: 'Impostazioni',
     set_language: "Lingua dell'icona, dei comandi e delle descrizioni",
     set_language_auto: 'Lingua di Windows',
-    set_drive: "Lettera dell'unità (vuota: nessuna unità)",
+    set_drive: "Lettera dell'unità di anonimizzazione (vuota: nessuna unità)",
+    set_restore_drive: "Lettera dell'unità di ripristino (vuota: nessuna unità)",
     set_albireo: 'Descrivere le immagini con Albireo quando è installato',
     set_updates: 'Cercare gli aggiornamenti ogni giorno',
     set_max: 'File più grande (MB)',
@@ -415,7 +419,7 @@ window.PSEUDALIS_TEXTS = {
     err_import_not_empty: 'Una chiave può essere importata solo finché questa installazione non conserva ' +
       "alcun originale né alcun file sulla sua unità.",
     err_settings: 'Le impostazioni non possono essere scritte.',
-    err_settings_drive: "La lettera dell'unità deve essere A, B o da D a Z."
+    err_settings_drive: "La lettera di un'unità deve essere A, B o da D a Z."
   },
   es: {
     tagline: 'Protección de los datos personales de sus documentos',
@@ -445,7 +449,7 @@ window.PSEUDALIS_TEXTS = {
     s_engine: 'Motor',
     s_drive: 'Unidad',
     s_drive_off: 'sin unidad',
-    s_drive_winfsp: 'Falta WinFsp: vuelva a ejecutar la instalación de Pseudalis',
+    s_restore_drive: 'Restauración',
     s_albireo: 'Descripción de imágenes',
     s_albireo_off: 'Albireo no encontrado',
     s_records: 'Originales conservados',
@@ -484,7 +488,8 @@ window.PSEUDALIS_TEXTS = {
     settings_title: 'Ajustes',
     set_language: 'Idioma del icono, de los comandos y de las descripciones',
     set_language_auto: 'Idioma de Windows',
-    set_drive: 'Letra de la unidad (vacía: sin unidad)',
+    set_drive: 'Letra de la unidad de anonimización (vacía: sin unidad)',
+    set_restore_drive: 'Letra de la unidad de restauración (vacía: sin unidad)',
     set_albireo: 'Describir las imágenes con Albireo cuando está instalado',
     set_updates: 'Buscar actualizaciones cada día',
     set_max: 'Archivo más grande (MB)',
@@ -519,6 +524,6 @@ window.PSEUDALIS_TEXTS = {
     err_import_not_empty: 'Una clave solo se puede importar mientras esta instalación no conserve ningún ' +
       'original ni ningún archivo en su unidad.',
     err_settings: 'La configuración no se puede escribir.',
-    err_settings_drive: 'La letra de la unidad debe ser A, B o de D a Z.'
+    err_settings_drive: 'La letra de una unidad debe ser A, B o de D a Z.'
   }
 };

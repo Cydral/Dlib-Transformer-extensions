@@ -55,10 +55,13 @@ namespace dlib
         bool rewritten_by_dlib = false;     // written by rewrite_pdf_text()
         std::vector<std::string> notes;     // reading problems met, by page
         std::vector<std::string> features;  // non-text content present in the file
+        std::vector<std::pair<std::string, std::string>> info;
         /*!
             features names what the file holds besides page text, without any value:
             "document information (Author, Title)", "XMP metadata", "bookmarks",
             "embedded files", "JavaScript", "form fields", "structure tree"...
+            info holds the text entries of the document information dictionary, in
+            UTF-8, in the order of their keys: ("Author", "Jean Dupont"), ("Title", ...).
         !*/
     };
 
@@ -131,7 +134,9 @@ namespace dlib
     std::string write_pdf_text(
         const pdf_text_document& layout_source,
         const std::vector<std::vector<pdf_text_segment>>& pages,
-        std::size_t* unencodable = nullptr
+        std::size_t* unencodable = nullptr,
+        const std::vector<std::pair<std::string, std::string>>& info =
+            std::vector<std::pair<std::string, std::string>>()
     );
     /*!
         requires
@@ -150,6 +155,9 @@ namespace dlib
             - Nothing else is carried over: no images, vector graphics, annotations,
               form fields, bookmarks, attachments, scripts or metadata. The catalog
               carries /DlibPrivacy true so that layout_pdf_text() recognizes the file.
+            - The document information dictionary holds info, each value written as a
+              text string in UTF-16 (the keys keep their letters and digits), and is
+              left out when info is empty: layout_source.info is never copied.
     !*/
 
 // ----------------------------------------------------------------------------------------

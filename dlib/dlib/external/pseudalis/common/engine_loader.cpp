@@ -53,8 +53,32 @@ namespace pseudalis
         struct callback_context
         {
             const std::function<std::string(const picture_request&)>* pictures;
+            const std::function<std::vector<std::string>(const std::string&)>* lookup;
             const engine_library* lib;
         };
+
+        int PSD_CALL on_lookup(void* context, const char* candidate, size_t size, psd_buffer* tags)
+        {
+            const callback_context* c = static_cast<const callback_context*>(context);
+            tags->data = nullptr;
+            tags->size = 0;
+            try
+            {
+                std::string all;
+                for (const std::string& t : (*c->lookup)(std::string(candidate, size)))
+                    if (!t.empty() && t.find('\n') == std::string::npos) all += (all.empty() ? "" : "\n") + t;
+                if (all.empty()) return 0;
+                tags->data = c->lib->alloc(all.size());
+                if (!tags->data) return 0;
+                std::memcpy(tags->data, all.data(), all.size());
+                tags->size = all.size();
+                return 1;
+            }
+            catch (...)
+            {
+                return 0;
+            }
+        }
 
         int PSD_CALL on_picture(void* context, const psd_picture* p, psd_buffer* description)
         {
@@ -201,17 +225,18 @@ namespace pseudalis
 
     bool engine_client::process(const json& request, const std::string& data, json& result, std::string& output,
                                 const std::function<std::string(const picture_request&)>& pictures,
-                                std::string& error) const
+                                std::string& error,
+                                const std::function<std::vector<std::string>(const std::string&)>& lookup) const
     {
         if (!e_)
         {
             error = "no engine";
             return false;
         }
-        callback_context c = { &pictures, lib_.get() };
+        callback_context c = { &pictures, &lookup, lib_.get() };
         psd_buffer r = { nullptr, 0 }, o = { nullptr, 0 }, err = { nullptr, 0 };
         const int ok = lib_->process(e_, request.dump().c_str(), data.data(), data.size(),
-                                     pictures ? on_picture : nullptr, &c, &r, &o, &err);
+                                     pictures ? on_picture : nullptr, lookup ? on_lookup : nullptr, &c, &r, &o, &err);
         if (ok == 1)
         {
             result = json::parse_or_null(std::string(r.data ? r.data : "", r.size));

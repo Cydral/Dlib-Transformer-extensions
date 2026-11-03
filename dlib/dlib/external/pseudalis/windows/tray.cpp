@@ -11,10 +11,12 @@
                                         made without its window: notifies its failure
 
     The icon follows the service: its state (running, stopped, update ready), its tooltip
-    (the drive, the originals kept), the files the drive protects or refuses, the results
-    of the commands of the Explorer (pseudalis.exe sends them here, WM_COPYDATA), and the
-    updates.  Its menu opens the web application and the drive, checks for updates,
-    restarts the service, opens the documentation of the interface and the About window.
+    (the drives, the originals kept), the files the drives protect, restore or refuse, the
+    results of the commands of the Explorer (pseudalis.exe sends them here, WM_COPYDATA),
+    and the updates.  It tells the Explorer of the drives that come and go.  Its menu opens
+    the web application, the drives and the folder of the files the drive did not process,
+    checks for updates, restarts the service, opens the documentation of the interface and
+    the About window.
 
     While the service does not answer, the icon asks the service manager of Windows what
     the service does, and warns only when the service stays stopped, or stays silent while
@@ -24,12 +26,15 @@
 #include "ui.h"
 
 #include <objbase.h>
+#include <sddl.h>
 #include <shellapi.h>
+#include <shlobj.h>
 
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <cwchar>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -59,7 +64,7 @@ namespace pseudalis
         enum command_id
         {
             CMD_OPEN = 100, CMD_DRIVE, CMD_CHECK_UPDATES, CMD_INSTALL_UPDATE, CMD_RESTART, CMD_START_SERVICE, CMD_DOCS,
-            CMD_ABOUT, CMD_QUIT
+            CMD_ABOUT, CMD_QUIT, CMD_RESTORE_DRIVE, CMD_REFUSED
         };
 
         enum action_tag { ACT_CHECK = 1, ACT_APPLY_UPDATE, ACT_RESTART, ACT_SCM };
@@ -102,8 +107,9 @@ namespace pseudalis
             */
             long long last_event = -1;
             bool catching_up = true;
-            // The error of the drive notified last.
-            std::string drive_error;
+            // The errors of the drives notified last, and the letters the Explorer was told of.
+            std::string drive_error, restore_error;
+            std::set<std::string> letters_shown;
             // The results of the commands of the Explorer, notified together.
             std::vector<shell_result> results;
             // When the icon started (seconds since 1970), and the result of the installer read last.
@@ -366,10 +372,53 @@ namespace pseudalis
             ui::open_url(page_url(""));
         }
 
-        std::string drive_letter()
+        // The letter of the drive of anonymization, or of restoration, while it is given.
+        std::string drive_letter(bool restoration = false)
         {
-            const json& d = tray.info["drive"];
+            const json& d = restoration ? tray.info["drive"]["restore"] : tray.info["drive"];
             return d["mounted"].as_bool(false) ? d["letter"].as_string() : std::string();
+        }
+
+        // The folder of the files of this user that the drive did not process, out of the drive.
+        std::string refused_folder()
+        {
+            const std::string root = tray.info["drive"]["refused_folder"].as_string();
+            HANDLE token = nullptr;
+            if (root.empty() || !OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return std::string();
+            std::vector<BYTE> buffer(256);
+            DWORD size = 0;
+            std::string sid;
+            if (GetTokenInformation(token, TokenUser, buffer.data(), static_cast<DWORD>(buffer.size()), &size) ||
+                (GetLastError() == ERROR_INSUFFICIENT_BUFFER && (buffer.resize(size), true) &&
+                 GetTokenInformation(token, TokenUser, buffer.data(), static_cast<DWORD>(buffer.size()), &size)))
+            {
+                LPWSTR text = nullptr;
+                if (ConvertSidToStringSidW(reinterpret_cast<TOKEN_USER*>(buffer.data())->User.Sid, &text))
+                {
+                    sid = narrow(text);
+                    LocalFree(text);
+                }
+            }
+            CloseHandle(token);
+            const std::string folder = sid.empty() ? std::string() : join_path(root, sid);
+            return !folder.empty() && dir_exists(folder) ? folder : std::string();
+        }
+
+        // Tells the Explorer of the drives that came or went, which it shows at once.
+        void show_letters()
+        {
+            std::set<std::string> now;
+            for (bool r : { false, true })
+            {
+                const std::string l = drive_letter(r);
+                if (!l.empty()) now.insert(l);
+            }
+            for (const std::string& l : now)
+                if (!tray.letters_shown.count(l))
+                    SHChangeNotify(SHCNE_DRIVEADD, SHCNF_PATHW, widen(l + ":\\").c_str(), nullptr);
+            for (const std::string& l : tray.letters_shown)
+                if (!now.count(l)) SHChangeNotify(SHCNE_DRIVEREMOVED, SHCNF_PATHW, widen(l + ":\\").c_str(), nullptr);
+            tray.letters_shown = now;
         }
 
         // The name of a file of the drive from its path in the drive: "\folder\name" gives "name".
@@ -380,18 +429,20 @@ namespace pseudalis
             return slash == std::string::npos ? path : path.substr(slash + 1);
         }
 
-        // The files the drive protected or refused since the last poll, notified together.
+        // The files the drives processed or refused since the last poll, notified together.
         void notify_events(const json& events)
         {
             if (!events.is_array()) return;
             long long last = tray.last_event;
-            std::vector<const json*> protected_files, refused;
+            std::vector<const json*> protected_files, refused, restored, not_restored;
             for (const auto& e : events.elements())
             {
                 last = std::max(last, e["id"].as_int(0));
                 const std::string kind = e["kind"].as_string();
                 if (kind == "protected") protected_files.push_back(&e);
                 else if (kind == "refused") refused.push_back(&e);
+                else if (kind == "restored") restored.push_back(&e);
+                else if (kind == "not_restored") not_restored.push_back(&e);
             }
             tray.last_event = std::max<long long>(last, 0);
             if (tray.catching_up)
@@ -399,6 +450,21 @@ namespace pseudalis
                 tray.catching_up = events.size() >= 100;
                 return;
             }
+            // The drive of restoration: what it gave back, or could not.
+            const std::wstring restore_title =
+                tr("notify_restore_title", { { "l", tray.info["drive"]["restore"]["letter"].as_string() } });
+            if (!not_restored.empty())
+            {
+                const json& e = *not_restored.front();
+                notify(restore_title, not_restored.size() == 1
+                    ? tr("notify_not_restored", { { "f", event_name(e) }, { "e", e["message"].as_string() } })
+                    : tr("notify_not_restored_many", { { "n", std::to_string(not_restored.size()) },
+                        { "f", event_name(e) }, { "e", e["message"].as_string() } }), true);
+            }
+            else if (restored.size() == 1)
+                notify(restore_title, tr("notify_restored_one", { { "f", event_name(*restored.front()) } }));
+            else if (restored.size() > 1)
+                notify(restore_title, tr("notify_restored_many", { { "n", std::to_string(restored.size()) } }));
             const std::string letter = tray.info["drive"]["letter"].as_string();
             const std::wstring title = tr("notify_drive_title", { { "l", letter } });
             if (!refused.empty())
@@ -513,26 +579,33 @@ namespace pseudalis
                 return;
             }
 
-            // Tooltip: version, drive, originals kept.
+            // Tooltip: version, drives, originals kept.
             const json& d = s["drive"];
-            const std::string letter = d["letter"].as_string();
+            const json& rd = d["restore"];
+            const std::string letter = d["letter"].as_string(), restore_letter = rd["letter"].as_string();
             std::wstring tip = widen(PSEUDALIS_FULL_NAME) + L" " + widen(s["version"].as_string()) + L"\n";
             if (letter.empty()) tip += tr("tip_no_drive");
             else if (d["mounted"].as_bool(false)) tip += tr("tip_drive", { { "l", letter } });
             else tip += tr("tip_drive_error", { { "l", letter } });
-            tip += L" \xB7 " + tr("tip_records", { { "n", std::to_string(s["records"].as_int(0)) } });
+            if (!restore_letter.empty())
+                tip += L" \xB7 " + tr(rd["mounted"].as_bool(false) ? "tip_restore_drive" : "tip_restore_drive_error",
+                                      { { "l", restore_letter } });
+            tip += L"\n" + tr("tip_records", { { "n", std::to_string(s["records"].as_int(0)) } });
             set_tooltip(tip);
+            show_letters();
 
-            /* A drive that cannot be mounted is notified once for each of its errors; without
-               WinFsp, the notification says how to install it again. */
+            // A drive that cannot take its letter is notified once for each of its errors.
             const std::string drive_error = letter.empty() || d["mounted"].as_bool(false) ? std::string()
                 : d["error"].as_string();
             if (!drive_error.empty() && drive_error != tray.drive_error)
-            {
-                if (d["error_code"].as_string() == "winfsp_missing") notify(L"Pseudalis", tr("notify_no_winfsp"), true);
-                else notify(L"Pseudalis", tr("notify_drive_error", { { "l", letter }, { "e", drive_error } }), true);
-            }
+                notify(L"Pseudalis", tr("notify_drive_error", { { "l", letter }, { "e", drive_error } }), true);
             tray.drive_error = drive_error;
+            const std::string restore_error = restore_letter.empty() || rd["mounted"].as_bool(false) ? std::string()
+                : rd["error"].as_string();
+            if (!restore_error.empty() && restore_error != tray.restore_error)
+                notify(L"Pseudalis",
+                       tr("notify_drive_error", { { "l", restore_letter }, { "e", restore_error } }), true);
+            tray.restore_error = restore_error;
 
             notify_events((*result)["events"]);
 
@@ -610,12 +683,12 @@ namespace pseudalis
             return out;
         }
 
-        // The About window: the banner, the version, the author, the licenses, WinFsp.
-        enum { IDC_A_TITLE = 3000, IDC_A_TEXT, IDC_A_PROJECT, IDC_A_WINFSP, IDC_A_CLOSE };
+        // The About window: the banner, the version, the author, the license.
+        enum { IDC_A_TITLE = 3000, IDC_A_TEXT, IDC_A_PROJECT, IDC_A_CLOSE };
 
         struct about_state
         {
-            HWND title = nullptr, text = nullptr, project = nullptr, winfsp = nullptr, close = nullptr;
+            HWND title = nullptr, text = nullptr, project = nullptr, close = nullptr;
             HBITMAP art = nullptr;
             int art_w = 0, art_h = 0;
         } about;
@@ -643,7 +716,6 @@ namespace pseudalis
             ui::place(about.text, m, y, cw - 2 * m, ch - y - bh - 2 * m);
             const int bw = ui::px(w, 110);
             ui::place(about.close, cw - m - bw, ch - m - bh, bw, bh);
-            ui::place(about.winfsp, cw - m - 2 * bw - ui::px(w, 8), ch - m - bh, bw, bh);
             ui::place(about.project, m, ch - m - bh, ui::px(w, 150), bh);
         }
 
@@ -659,11 +731,9 @@ namespace pseudalis
                     + tr("about_purpose") + L"\n\n"
                     + tr("about_written", { { "a", PSEUDALIS_AUTHOR_NAME " (" PSEUDALIS_AUTHOR_EMAIL ")" } }) + L"\n"
                     + tr("about_built") + L"\n\n"
-                    + widen(PSEUDALIS_COPYRIGHT) + L"\n" + tr("about_license") + L"\n\n"
-                    + tr("about_winfsp", { { "w", PSEUDALIS_WINFSP_NOTICE }, { "u", PSEUDALIS_WINFSP_URL } });
+                    + widen(PSEUDALIS_COPYRIGHT) + L"\n" + tr("about_license");
                 about.text = ui::label(w, body, IDC_A_TEXT);
                 about.project = ui::button(w, tr("btn_project"), IDC_A_PROJECT);
-                about.winfsp = ui::button(w, tr("btn_winfsp"), IDC_A_WINFSP);
                 about.close = ui::button(w, tr("btn_close"), IDC_A_CLOSE, BS_DEFPUSHBUTTON);
                 about_layout(w);
                 return 0;
@@ -673,7 +743,7 @@ namespace pseudalis
                 return 0;
             case WM_DPICHANGED:
             {
-                for (HWND c : { about.text, about.project, about.winfsp, about.close })
+                for (HWND c : { about.text, about.project, about.close })
                     SendMessageW(c, WM_SETFONT, reinterpret_cast<WPARAM>(ui::font(w, ui::font_kind::normal)), TRUE);
                 SendMessageW(about.title, WM_SETFONT, reinterpret_cast<WPARAM>(ui::font(w, ui::font_kind::title)),
                     TRUE);
@@ -709,7 +779,6 @@ namespace pseudalis
                 switch (LOWORD(wp))
                 {
                 case IDC_A_PROJECT: ui::open_url(widen(PSEUDALIS_PROJECT_URL)); break;
-                case IDC_A_WINFSP: ui::open_url(widen(PSEUDALIS_WINFSP_URL)); break;
                 case IDC_A_CLOSE:
                 case IDCANCEL: DestroyWindow(w); break;
                 default: break;
@@ -775,6 +844,12 @@ namespace pseudalis
             const std::string letter = on ? drive_letter() : std::string();
             if (!letter.empty())
                 AppendMenuW(m, MF_STRING, CMD_DRIVE, menu_label(tr("tray_drive", { { "l", letter } })).c_str());
+            const std::string restore_letter = on ? drive_letter(true) : std::string();
+            if (!restore_letter.empty())
+                AppendMenuW(m, MF_STRING, CMD_RESTORE_DRIVE,
+                    menu_label(tr("tray_restore_drive", { { "l", restore_letter } })).c_str());
+            if (on && !refused_folder().empty())
+                AppendMenuW(m, MF_STRING, CMD_REFUSED, tr("tray_refused").c_str());
             AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
             AppendMenuW(m, MF_STRING | (on ? 0 : MF_GRAYED), CMD_CHECK_UPDATES, tr("tray_updates").c_str());
             const json& up = tray.updates;
@@ -812,9 +887,16 @@ namespace pseudalis
             {
             case CMD_OPEN: open_app(); break;
             case CMD_DRIVE:
+            case CMD_RESTORE_DRIVE:
             {
-                const std::string letter = drive_letter();
+                const std::string letter = drive_letter(id == CMD_RESTORE_DRIVE);
                 if (!letter.empty()) ui::open_url(widen(letter + ":\\"));
+                break;
+            }
+            case CMD_REFUSED:
+            {
+                const std::string folder = refused_folder();
+                if (!folder.empty()) ui::open_url(widen(folder));
                 break;
             }
             case CMD_CHECK_UPDATES: post_action("/v1/updates/check", ACT_CHECK, 30); break;

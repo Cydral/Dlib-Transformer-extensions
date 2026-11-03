@@ -13,12 +13,17 @@
                                              "name (restored).ext"
 
     A picture becomes the text file of its marker, "photo.jpg.txt", which its restoration
-    turns back into the picture.  The original of an anonymized file comes from the vault of
-    the service when the file is the one it made (its SHA-256, or its NTFS object identifier,
-    which the service records with the place of the file); a file edited since gets its
-    values back from its tags.  The files of the drive of Pseudalis are anonymized already:
-    their originals are saved where the user chooses, outside the drive, which would
-    anonymize them again.
+    turns back into the picture.  The name of a file is anonymized too, its values written
+    without tags, and the original comes back under its own name.  The original of an
+    anonymized file comes from the vault of the service when the file is the one it made
+    (its SHA-256, or its NTFS object identifier, which the service records with the place
+    of the file); a file edited since gets its values back from its tags, and those of its
+    name and of its properties from the substitutes the service recorded.  The files of the
+    drive of anonymization are anonymized already: their originals are saved where the user
+    chooses, outside the drive, which would anonymize them again.  The files of the drive of
+    restoration are restored already: their anonymized versions are saved where the user
+    chooses, outside the drive, which would restore them again.  A drive is known by its
+    letter and by its folder in the data folder.
 
     The results go to the icon of the session, which notifies them together; without the
     icon, a message box tells them, and from a console they are printed there.  The exit
@@ -371,14 +376,14 @@ namespace pseudalis
             return out;
         }
 
-        // A folder of the user where to save the original of a file of the drive, or "".
-        std::wstring choose_destination(const std::string& name)
+        // Where the user saves a file that cannot stay on its drive, or "": title, then the name proposed.
+        std::wstring choose_destination(const std::wstring& title, const std::string& name)
         {
             std::wstring chosen;
             IFileSaveDialog* dialog = nullptr;
             if (FAILED(CoCreateInstance(CLSID_FileSaveDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog))))
                 return chosen;
-            dialog->SetTitle(tr("shell_save_title", { { "f", name } }).c_str());
+            dialog->SetTitle(title.c_str());
             dialog->SetFileName(widen(name).c_str());
             DWORD options = 0;
             dialog->GetOptions(&options);
@@ -412,6 +417,31 @@ namespace pseudalis
             return chosen;
         }
 
+        // A drive of the service, from its state: its letter, whether Windows shows it, its folder.
+        struct drive_place
+        {
+            std::string letter;     // empty when the service runs no such drive
+            bool mounted = false;
+            std::wstring folder;
+
+            explicit drive_place(const json& d)
+                : letter(d["letter"].as_string()), mounted(d["mounted"].as_bool(false)),
+                  folder(widen(d["folder"].as_string()))
+            {
+            }
+
+            // Whether path lies on the drive: under its letter, or in its folder of the data folder.
+            bool holds(const std::wstring& path) const
+            {
+                if (letter.empty()) return false;
+                if (mounted && path.size() > 2 && path[1] == L':' &&
+                    std::towupper(path[0]) == static_cast<wchar_t>(std::toupper(static_cast<unsigned char>(letter[0]))))
+                    return true;
+                return !folder.empty() && path.size() > folder.size() && path[folder.size()] == L'\\' &&
+                    _wcsnicmp(path.c_str(), folder.c_str(), folder.size()) == 0;
+            }
+        };
+
         class commands
         {
         public:
@@ -421,8 +451,8 @@ namespace pseudalis
                 std::string error;
                 online_ = client_.get("/v1/info", info, error, 10);
                 if (!online_) offline_error_ = error;
-                const json& d = info["drive"];
-                if (d["mounted"].as_bool(false)) drive_ = d["letter"].as_string();
+                drive_ = drive_place(info["drive"]);
+                restore_drive_ = drive_place(info["drive"]["restore"]);
             }
 
             outcome run(bool protect, const std::wstring& given)
@@ -439,19 +469,19 @@ namespace pseudalis
                     return failure(name, tr("shell_cannot_read", { { "f", name },
                         { "e", narrow(system_message(e)) } }));
                 }
-                const bool on_drive = !drive_.empty() && path.size() > 2 && path[1] == L':' &&
-                    std::towupper(path[0]) == static_cast<wchar_t>(drive_[0]);
+                const bool on_drive = drive_.holds(path);
                 if (protect)
                 {
                     // Nothing to do: the drive holds anonymized files only.
-                    if (on_drive) return success(tr("shell_on_drive", { { "l", drive_ } }), name);
-                    return anonymize(path, name, data);
+                    if (on_drive) return success(tr("shell_on_drive", { { "l", drive_.letter } }), name);
+                    return anonymize(path, name, data, restore_drive_.holds(path));
                 }
                 return restore(path, name, data, on_drive);
             }
 
         private:
-            outcome anonymize(const std::wstring& path, const std::string& name, const std::string& data)
+            outcome anonymize(const std::wstring& path, const std::string& name, const std::string& data,
+                              bool on_restore_drive)
             {
                 json found;
                 std::string error;
@@ -469,7 +499,18 @@ namespace pseudalis
                 const std::string dir = narrow(path.substr(0, path.find_last_of(L'\\')));
                 std::wstring target = path;
                 DWORD e = 0;
-                if (copy_ || made != name)
+                if (on_restore_drive)
+                {
+                    // The drive of restoration would restore it again: it goes where the user says.
+                    target = choose_destination(tr("shell_save_anonymized_title", { { "f", name } }), made);
+                    // Cancelled by the user: nothing to tell.
+                    if (target.empty()) return success(std::wstring(), name);
+                    const bool exists = GetFileAttributesW(target.c_str()) != INVALID_FILE_ATTRIBUTES;
+                    if (exists ? !replace_content(target, a.body, e) : !write_new(target, a.body, e))
+                        return failure(narrow(file_of(target)), tr("shell_cannot_write",
+                            { { "f", narrow(file_of(target)) }, { "e", narrow(system_message(e)) } }));
+                }
+                else if (copy_ || made != name)
                 {
                     const std::string wanted = copy_ ? copy_name(name, made, tr_utf8("suffix_anonymized")) : made;
                     target = widen(join_path(dir, free_name(dir, wanted)));
@@ -503,8 +544,8 @@ namespace pseudalis
                     client_.send("POST", "/v1/records/" + std::to_string(record) + "/location", body, out, error);
                 }
                 const std::string shown = narrow(file_of(target));
-                return success(tr(copy_ ? "shell_protected_copy" : "shell_protected", { { "f", shown },
-                    { "n", values } }), shown);
+                return success(tr(copy_ || on_restore_drive ? "shell_protected_copy" : "shell_protected",
+                    { { "f", shown }, { "n", values } }), shown);
             }
 
             outcome restore(const std::wstring& path, const std::string& name, const std::string& data, bool on_drive)
@@ -525,7 +566,8 @@ namespace pseudalis
                 if (on_drive)
                 {
                     // The drive would anonymize the original again: it goes where the user says.
-                    target = choose_destination(original.empty() ? name : original);
+                    const std::string base = original.empty() ? name : original;
+                    target = choose_destination(tr("shell_save_title", { { "f", base } }), base);
                     // Cancelled by the user: nothing to tell.
                     if (target.empty()) return success(std::wstring(), name);
                     const std::string shown = narrow(file_of(target));
@@ -537,14 +579,12 @@ namespace pseudalis
                 }
                 const std::string dir = narrow(path.substr(0, path.find_last_of(L'\\')));
                 /*
-                    The original keeps the name of the file in its place, unless it is of another
-                    kind: the text file of a picture gives back the picture under its own name.
-                    A copy takes the name of the original.
+                    The original takes its own name back, which the service kept or found again
+                    from the substitutes of the name: the text file of a picture gives back the
+                    picture under its name too.  A copy takes the name of the original.
                 */
-                const bool same_kind = how == "tags" || original.empty() ||
-                    name_extension(original) == name_extension(name);
-                const std::string base = (copy_ || !same_kind) && !original.empty() ? original : name;
-                if (copy_ || !same_kind)
+                const std::string base = original.empty() ? name : original;
+                if (copy_ || base != name)
                 {
                     const std::string wanted = copy_ ? copy_name(base, base, tr_utf8("suffix_restored")) : base;
                     target = widen(join_path(dir, free_name(dir, wanted)));
@@ -584,7 +624,8 @@ namespace pseudalis
             service_client client_;
             bool online_ = false;
             std::string offline_error_;
-            std::string drive_;
+            drive_place drive_{ json() };
+            drive_place restore_drive_{ json() };
         };
 
         std::string language_setting()

@@ -40,18 +40,6 @@ cpp-httplib                             MIT License
 SQLite                                  Public domain
 zlib                                    zlib License
 Swagger UI (interface documentation)    Apache License 2.0
-WinFsp (the drive), installed by the    GNU General Public License 3.0, with the
-installer of Pseudalis when missing     FLOSS exception of its author
-
-WinFsp - Windows File System Proxy, Copyright (C) Bill Zissimopoulos
-https://github.com/winfsp/winfsp
-
-Pseudalis carries the installer of WinFsp 2.1 (build 2.1.25156) unchanged, as the
-WinFsp project released it, and its service loads the library WinFsp installs,
-under the FLOSS exception of WinFsp.  The source code of that version is published
-by the WinFsp project: licenses\winfsp-source.txt says where.  The WinFsp that the
-installer of Pseudalis installs leaves with Pseudalis, unless another program
-registered a file system with it since; a WinFsp found in place stays.
 
 The texts of these licenses are installed with Pseudalis, in licenses\, and the
 license of Swagger UI in web\docs.

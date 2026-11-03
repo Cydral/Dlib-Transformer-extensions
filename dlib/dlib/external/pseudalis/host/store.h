@@ -7,6 +7,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "../common/json.h"
@@ -50,6 +51,23 @@ namespace pseudalis
         int64_t created = 0;
     };
 
+    struct folder_file
+    {
+        /*!
+            WHAT THIS OBJECT REPRESENTS
+                A file of a folder of the drives (drive.h) as the service left it: processed,
+                restored or left as it is, with the size and the time of last write that tell
+                whether it changed since.
+        !*/
+        std::string folder;             // "drive" or "restore"
+        std::string path;               // within the folder, '/' between its parts
+        long long size = 0;
+        int64_t written = 0;            // the time of its last write, as the file system gives it
+        std::string sha256;
+        long long record = 0;           // the record of its original, in the drive of anonymization
+        std::string state;              // "protected", "restored" or "kept"
+    };
+
     struct drive_node
     {
         long long id = 0;               // 1 is the root
@@ -83,7 +101,8 @@ namespace pseudalis
 
         long long add_file(const file_record& r);
         bool get_file(long long id, file_record& r);
-        bool find_by_output(const std::string& sha256, file_record& r);
+        // The record of a protected file; among several of the same content, the one whose protected name is name.
+        bool find_by_output(const std::string& sha256, file_record& r, const std::string& name = std::string());
         bool find_by_object(const std::string& object_id, file_record& r);
         std::vector<file_record> list_files(long long limit, long long offset,
             const std::string& source = std::string());
@@ -114,6 +133,12 @@ namespace pseudalis
         void link_picture(long long file, const std::string& picture);
         std::vector<std::string> pictures_of(long long file);
 
+        // The files of a folder of the drives as the service left them.
+        std::vector<folder_file> folder_files(const std::string& folder);
+        void set_folder_file(const folder_file& f);
+        void remove_folder_file(const std::string& folder, const std::string& path);
+
+        // The tree of the drive of WinFsp of the versions before, which the drive writes in its folder.
         bool node(long long id, drive_node& n);
         bool child(long long parent, const std::string& name, drive_node& n);
         std::vector<drive_node> children(long long parent);
@@ -130,6 +155,16 @@ namespace pseudalis
 
         std::string value(const std::string& key);
         void set_value(const std::string& key, const std::string& value);
+
+        /*!
+            ensures
+                - Records the substitutes the engine wrote in the names and the properties of
+                  the files, each (substitute, tag), a tag and never a value in clear, so
+                  that their values come back at the restoration of any copy of the file.
+        !*/
+        void add_substitutes(const std::vector<std::pair<std::string, std::string>>& made);
+        // The tags recorded for a substitute, the most recent first, eight at most.
+        std::vector<std::string> tags_for(const std::string& substitute);
 
     private:
         void exec(const char* sql);

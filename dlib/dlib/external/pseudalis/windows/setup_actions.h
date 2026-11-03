@@ -27,7 +27,8 @@ namespace setup
     {
         std::string program_dir;      // C:\Program Files\Pseudalis by default
         std::string data_dir;         // C:\ProgramData\Pseudalis by default
-        std::string drive_letter = "A";   // the letter of the drive, empty without drive
+        std::string drive_letter = "A";   // the letter of the drive of anonymization, empty without drive
+        std::string restore_letter = "R"; // the letter of the drive of restoration, empty without drive
         std::string language = "auto";    // the language of the programs and of the descriptions
         bool autostart = true;        // the tray at the sign in of every user
         bool desktop_shortcut = false;
@@ -237,7 +238,7 @@ namespace setup
     */
     void stage_stale_files(const std::string& program_dir, staged_files& files);
 
-    // Removes the folders of the web application, the licenses and WinFsp that hold nothing.
+    // Removes the folders of the web application, the licenses and the WinFsp of the versions before that hold nothing.
     void remove_empty_program_folders(const std::string& program_dir);
 
     /*
@@ -264,6 +265,11 @@ namespace setup
 
     // Merges the options into settings.json, keeping the other settings.
     bool write_settings(const install_options& o, std::string& error);
+    // Adds to settings.json the settings a version before did not write: the letter of the drive of restoration.
+    bool add_missing_settings(const install_options& o, std::string& error);
+
+    // Removes the names and the icons of the drives of the programs of program_dir from the Explorer.
+    void remove_drive_labels(const std::string& program_dir);
 
 
     /*
@@ -306,18 +312,14 @@ namespace setup
     void restore_uninstall_entry(const uninstall_entry& entry);
 
     /*
-        WinFsp, which the drive needs: installed from the installer msi, silently, when it is
-        missing or older than the version the installer carries.  installed_winfsp_version()
-        is empty without WinFsp.  The WinFsp that Pseudalis installs, or updates after
-        installing it, belongs to it: hidden from the installed programs, recorded in the
-        registry, it leaves with Pseudalis, remove_owned_winfsp() uninstalling it.  It stays
-        when another program registered a file system with it since, or replaced it, shown
-        again among the installed programs.  A WinFsp found in place is never hidden nor
-        uninstalled.  remove_owned_winfsp() returns false, with the reason in error, when
-        msiexec could not uninstall it.
+        The WinFsp that an earlier version of Pseudalis installed for its drive, recorded in
+        the registry and hidden from the installed programs: the drives need no driver any
+        more, and remove_owned_winfsp() uninstalls it, at the installation of this version and
+        at the uninstallation.  It stays when another program registered a file system with
+        it since, or replaced it, shown again among the installed programs.  A WinFsp that
+        Pseudalis did not install is never touched.  Returns false, with the reason in error,
+        when msiexec could not uninstall it.
     */
-    std::string installed_winfsp_version();
-    bool ensure_winfsp(const std::string& msi, std::string& error);
     bool remove_owned_winfsp(std::string& error);
 
     // Lets the interactive users start and stop the service, from the icon.
@@ -338,12 +340,15 @@ namespace setup
     void remove_context_menu();
 
     /*
-        The letters the drive may take: A, B and D to Z that no drive of the computer nor
-        network drive of the user takes, and current, the letter of the drive in place.
-        valid_drive_choice() tells whether a letter given to the silent installation is one.
+        The letters the drives may take: A, B and D to Z that no drive of the computer nor
+        network drive of the user takes, and current and also, the letters of the drives in
+        place.  valid_drive_choice() tells whether a letter given to the silent installation
+        is one.  default_restore_letter() is the first free letter from R on that is not
+        drive_letter, else another free one, else none.
     */
-    std::vector<std::string> free_drive_letters(const std::string& current);
+    std::vector<std::string> free_drive_letters(const std::string& current, const std::string& also = std::string());
     bool valid_drive_choice(const std::string& letter);
+    std::string default_restore_letter(const std::string& drive_letter);
 
     // Shortcuts of the Start menu and of the desktop.
     void create_shortcuts(const std::string& program_dir, bool desktop);

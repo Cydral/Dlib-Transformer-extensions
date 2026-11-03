@@ -6,6 +6,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "engine_api.h"
 #include "json.h"
@@ -45,8 +46,8 @@ namespace pseudalis
         int (PSD_CALL* models)(psd_buffer*) = nullptr;
         psd_engine* (PSD_CALL* create)(const char*, size_t, const char*, psd_buffer*) = nullptr;
         void (PSD_CALL* destroy)(psd_engine*) = nullptr;
-        int (PSD_CALL* process)(psd_engine*, const char*, const char*, size_t, psd_picture_fn, void*, psd_buffer*,
-            psd_buffer*, psd_buffer*) = nullptr;
+        int (PSD_CALL* process)(psd_engine*, const char*, const char*, size_t, psd_picture_fn, psd_lookup_fn, void*,
+            psd_buffer*, psd_buffer*, psd_buffer*) = nullptr;
         int (PSD_CALL* key_fingerprint)(psd_engine*, psd_buffer*) = nullptr;
         char* (PSD_CALL* alloc)(size_t) = nullptr;
         void (PSD_CALL* free_buffer)(psd_buffer*) = nullptr;
@@ -80,11 +81,15 @@ namespace pseudalis
             ensures
                 - Runs request (engine_api.h) on data; result receives the result document
                   and output the bytes written.  pictures, when given, receives each
-                  picture and returns its description, or an empty string.
+                  picture and returns its description, or an empty string; lookup, when
+                  given, receives each candidate substitute of a restoration and returns
+                  the tags recorded for it.
                 - Returns false with the reason in error.
         !*/
         bool process(const json& request, const std::string& data, json& result, std::string& output,
-            const std::function<std::string(const picture_request&)>& pictures, std::string& error) const;
+            const std::function<std::string(const picture_request&)>& pictures, std::string& error,
+            const std::function<std::vector<std::string>(const std::string&)>& lookup =
+                std::function<std::vector<std::string>(const std::string&)>()) const;
         std::string key_fingerprint() const;
         std::string variant() const;
         json models() const;

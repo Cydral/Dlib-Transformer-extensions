@@ -47,7 +47,9 @@ namespace dlib
         const std::string& pdf_bytes,
         const std::vector<pdf_text_replacement>& replacements,
         pdf_rewrite_report* report = nullptr,
-        const document_image_describer& describer = document_image_describer()
+        const document_image_describer& describer = document_image_describer(),
+        const std::vector<std::pair<std::string, std::string>>& info =
+            std::vector<std::pair<std::string, std::string>>()
     );
     /*!
         requires
@@ -92,6 +94,9 @@ namespace dlib
               gray boxes.
             - The catalog carries /DlibPrivacyLayout true. Rewriting the output again
               keeps it as it is, apart from the replacements.
+            - The new document information dictionary holds info, each value written as
+              a text string in UTF-16 (the keys keep their letters and digits), and is
+              left out when info is empty.
             - When report is not null, *report tells what was replaced or left out.
         throws
             - pdf_error if the file cannot be read (see read_pdf_text()).

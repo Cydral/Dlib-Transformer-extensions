@@ -3,18 +3,15 @@
 <#
     Builds Pseudalis for Windows with Visual Studio 2022 or its Build Tools: the service, its
     two engines (every x64 processor, and the processors with AVX2), the icon, the commands
-    of the Explorer and the installer, which carries them with the web application, the
-    licenses and the installer of WinFsp.
+    of the Explorer and the installer, which carries them with the web application and the
+    licenses.
 
         powershell -ExecutionPolicy Bypass -File build_windows.ps1 [-Tests] [-Jobs <n>]
 
     Requirements: Visual Studio 2022, or the Build Tools for Visual Studio 2022, with the
     C++ workload, and CMake 3.21 or later (the C++ CMake tools of the workload, found
     without the PATH).  Nothing else: dlib, Mbed TLS, cpp-httplib, SQLite and zlib come with
-    the repository, and the files of WinFsp 2.1 (its installer, the two headers the drive
-    compiles with, its license) are downloaded once from its repository and its release
-    into build-pseudalis\winfsp, each checked against its SHA-256.  Behind a proxy, the
-    downloads take the one of HTTPS_PROXY.
+    the repository, and the drives need no driver.
 
     The update feed is checked with the public key of resources\feed-public-key.pem, which
     the publisher makes once with pseudalis-sign keygen and commits: without it, the build
@@ -37,19 +34,6 @@ $root = (Resolve-Path (Join-Path $source "..\..\..\..")).Path
 $tree = Join-Path $root "build-pseudalis"
 $testing = if ($Tests) { "ON" } else { "OFF" }
 $parallel = if ($Jobs -gt 0) { @("--parallel", "$Jobs") } else { @("--parallel") }
-
-# The files of WinFsp 2.1 (build 25156), with their SHA-256.
-$winfspVersion = "2.1.25156"
-$winfspFiles = @(
-    @{ Url = "https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi"; Path = "winfsp.msi";
-       Sha256 = "073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a" },
-    @{ Url = "https://raw.githubusercontent.com/winfsp/winfsp/v2.1/inc/winfsp/winfsp.h"; Path = "inc\winfsp\winfsp.h";
-       Sha256 = "163332ebe058dd6e49d038edefef273454912c2ec44e8430a18ed73112e5678c" },
-    @{ Url = "https://raw.githubusercontent.com/winfsp/winfsp/v2.1/inc/winfsp/fsctl.h"; Path = "inc\winfsp\fsctl.h";
-       Sha256 = "7a83a69cdeb155751032eedbbb6875234b1e0824be7cf2d7ba23c1ef44944651" },
-    @{ Url = "https://raw.githubusercontent.com/winfsp/winfsp/v2.1/License.txt"; Path = "License.txt";
-       Sha256 = "68ae2fa9d8e6110ebdc9a236beecf118e279f8a26530daf09c9e682c231f7879" }
-)
 
 # CMake: the one of the PATH, else the one of the C++ workload of Visual Studio or of its
 # Build Tools.
@@ -93,32 +77,6 @@ function Get-Sha256([string]$path) {
     return (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 
-# Downloads a file once: a file in place with the expected SHA-256 stays, another is replaced.
-function Get-CheckedFile([string]$url, [string]$path, [string]$sha256) {
-    if ((Test-Path -LiteralPath $path) -and (Get-Sha256 $path) -eq $sha256) { return }
-    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $path) | Out-Null
-    $partial = "$path.partial"
-    Write-Host "== downloading $url"
-    $parameters = @{ Uri = $url; OutFile = $partial; UseBasicParsing = $true }
-    if ($env:HTTPS_PROXY) { $parameters.Proxy = $env:HTTPS_PROXY }
-    Invoke-WebRequest @parameters
-    $found = Get-Sha256 $partial
-    if ($found -ne $sha256) {
-        Remove-Item -LiteralPath $partial -Force
-        throw "$url has the SHA-256 $found, not $sha256"
-    }
-    Move-Item -LiteralPath $partial -Destination $path -Force
-}
-
-# Windows PowerShell 5.1 may offer TLS 1.0 alone, which GitHub refuses.
-$protocols = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-[Net.ServicePointManager]::SecurityProtocol = $protocols
-$winfsp = Join-Path $tree "winfsp"
-foreach ($f in $winfspFiles) {
-    Get-CheckedFile $f.Url (Join-Path $winfsp $f.Path) $f.Sha256
-}
-Write-Host "== WinFsp $winfspVersion in $winfsp"
-
 $publicKey = Join-Path $source "resources\feed-public-key.pem"
 if (-not (Test-Path -LiteralPath $publicKey)) {
     Write-Warning ("no $publicKey`: the programs will install no update. The publisher makes it once with " +
@@ -126,12 +84,8 @@ if (-not (Test-Path -LiteralPath $publicKey)) {
 }
 
 Reset-StaleTree $tree
-$winfspInclude = (Join-Path $winfsp "inc").Replace('\', '/')
-$winfspMsi = (Join-Path $winfsp "winfsp.msi").Replace('\', '/')
-$winfspLicense = (Join-Path $winfsp "License.txt").Replace('\', '/')
 Invoke-Step "configuring $tree" @("-S", $source, "-B", $tree, "-G", "Visual Studio 17 2022", "-A", "x64",
-    "-DPSEUDALIS_TESTS=$testing", "-DPSEUDALIS_WINFSP_INCLUDE=$winfspInclude", "-DPSEUDALIS_WINFSP_MSI=$winfspMsi",
-    "-DPSEUDALIS_WINFSP_LICENSE=$winfspLicense")
+    "-DPSEUDALIS_TESTS=$testing")
 Invoke-Step "building Pseudalis" (@("--build", $tree, "--config", "Release") + $parallel)
 
 if ($Tests) {

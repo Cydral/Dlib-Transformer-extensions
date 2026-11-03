@@ -3,15 +3,15 @@
 Pseudalis protects the personal data of documents on a Windows computer, on that computer alone.
 A service anonymizes the files it receives through a drive, through commands of the Explorer, through a
 web application and through a local interface, and keeps their originals encrypted, so that each one
-comes back on demand from any copy of its anonymized file. It is built on
-[`dlib/privacy`](../../privacy.h) and on the recognizers trained for the example
+comes back on demand from any copy of its anonymized file, through a second drive and the same
+commands, application and interface. It is built on [`dlib/privacy`](../../privacy.h) and on the
+recognizers trained for the example
 [`slm_document_anonymizer_ex`](../../../examples/slm_document_anonymizer_ex.cpp), which its engines carry.
 
 Pseudalis Community, the edition published here, is written by Aldric Pierrain, Copyright (C) 2026
 Cydral Technology, and distributed under the Boost Software License 1.0
-([`resources/license.txt`](resources/license.txt)). Its drive relies on WinFsp - Windows File System
-Proxy, Copyright (C) Bill Zissimopoulos, [github.com/winfsp/winfsp](https://github.com/winfsp/winfsp),
-which its installer carries unchanged and installs when it is missing (see Editions and licenses).
+([`resources/license.txt`](resources/license.txt)). It installs no driver: its drives are folders of its
+data folder, which the service watches and Windows shows under their letters.
 
 ## What it does
 
@@ -22,28 +22,59 @@ check. The key of the computer alone restores the document, or any text derived 
 PowerPoint, PDF, text, CSV, Markdown, HTML, XML, JSON and YAML files keep their layout; a PDF keeps its
 pages, its text drawn again in place.
 
-### The drive
+The places that a tag would spoil take the value in its protected form without the tag, its
+substitute: `Xoydoeh Nuggwdfsorn` for `Jean Dupont`, a date shifted in the form of the original. They
+are the name of the file (`Contrat Jean Dupont.docx` becomes `Contrat Xoydoeh Nuggwdfsorn.docx`), the
+names of the entries and folders of an archive, and the properties that the windows of properties show:
+title, subject, authors, keywords, description, category, company, manager and custom properties of
+Word, Excel and PowerPoint, title, author, subject, keywords and creator of a PDF. A substitute holds no
+character that Windows refuses in a name. The database records each substitute with its tag, never with
+its value in clear; a restoration gives back the original name and the original properties, those of a
+copy edited since included, as long as the substitutes stay in place.
 
-The installer gives the drive a letter chosen among the free ones, `A:` when it is free. The drive
-works for every session of the computer as any drive does, from the Explorer and from the prompt
-(`dir`, `copy`, `xcopy`, `move`, `del`, `ren`, `md`, `rd /s`, which replaces `deltree`, `type`, and
-any editor of text files), with one difference: a file written there is anonymized when its last
-handle closes, under its name, and only its anonymized version can ever be read back.
+### The drives
 
-- A document keeps its name, anonymized; its original goes to the encrypted vault of the service.
+The installer gives the drive of anonymization a letter chosen among the free ones, `A:` when it is
+free, and the drive of restoration the first free letter from `R:` on. Both are folders of the data
+folder, `drive` and `restore`, which the service shows under their letters for every session of the
+computer, as the command `subst` would, and watches: they work as any folder, from the Explorer and from
+the prompt (`dir`, `copy`, `xcopy`, `move`, `del`, `ren`, `md`, `rd /s`, `type`, any editor), with one
+difference each.
+
+On the drive of anonymization, a file is anonymized once its writer closed it and it rested two
+seconds, its name included: the anonymized file takes its place, the original goes to the encrypted
+vault, and the file written is deleted.
+
+- A document keeps its kind and its layout, its values replaced by tags in its content and by
+  substitutes in its name and its properties.
 - A picture becomes `<name>.txt`, its marker `[Image@<id> : <description>]`, or `[Image@<id>]` when no
   description is available, and the picture goes to the vault.
-- A ZIP, TAR or TAR.GZ archive keeps its name; its documents are anonymized, its pictures become text
-  files, and its other entries are left out, which its report says.
-- A file of another kind is refused when it is created (access denied). A file whose content cannot be
-  read, a damaged document for instance, keeps its previous version, or is removed when it had none, and
-  the icon tells which one and why.
-- While a file is written, then protected, the other programs cannot open its content (sharing
-  violation), a few seconds for most documents.
-- Deleting a file, a folder or the whole tree removes them from the drive and from its database at once.
-  The original of a file deleted or replaced by a new version stays restorable from the copies of the
-  file for 30 days (the setting `removed_days`), then leaves the vault with the pictures no other file
-  shows.
+- A ZIP, TAR or TAR.GZ archive keeps its kind, the values of its name replaced; its documents are
+  anonymized, its pictures become text files, the names of its entries and folders take substitutes,
+  and its other entries are left out, which its report says.
+- A folder that comes in takes its name, its values replaced, once nothing changed under it for six
+  seconds: a copy in progress keeps its folders.
+- A file of another kind, or whose content cannot be read, a damaged document for instance, leaves the
+  drive for the folder of the files not processed of the user who wrote it (`refused\<user>` in the
+  data folder, which only that user, SYSTEM and the administrators read), and the icon says it; its
+  menu opens that folder.
+- A file that a program still holds, a document open in its editor for instance, waits until the
+  program closes it: a document edited on the drive is anonymized again when its editor closes it, and
+  its version before leaves the list of the files of the drive. While the service processes a file, no
+  other program opens it (sharing violation), a few seconds for most documents. The lock and temporary
+  files of the editors, whose names start with `~` or end with `.tmp`, are left as they are.
+- Deleting a file, a folder or the whole tree removes them from the drive. The original of a file
+  deleted or replaced by a new version stays restorable from the copies of the file for 30 days (the
+  setting `removed_days`), then leaves the vault with the pictures no other file shows. A file moved or
+  renamed within the drive keeps its original.
+
+On the drive of restoration, an anonymized file of this computer is replaced by its original once its
+writer closed it, under its original name: the original kept in the vault when the service made that
+file, else the file itself with the values of its tags and of its substitutes put back; the text file
+of a picture gives back the picture. The restored file is readable by the user who wrote it, SYSTEM and
+the administrators alone. A folder takes back its original name the same way. Any other file stays as
+it is, and the icon says why: a file that holds no value protected with this key, an original
+forgotten, a file too large.
 
 ### The commands of the Explorer
 
@@ -54,20 +85,21 @@ Pseudalis with four commands, which `pseudalis.exe` carries out through the serv
 |---|---|
 | Anonymize | the file is replaced by its anonymized version; a picture by its text file |
 | Anonymize as a copy | `name (anonymized).ext` is written beside the file, ` (2)` added when the name is taken |
-| Restore the original | the original takes the place of the anonymized file |
-| Restore as a copy | `name (restored).ext` is written beside the file |
+| Restore the original | the original takes the place of the anonymized file, under its original name |
+| Restore as a copy | `<original name> (restored).ext` is written beside the file |
 
 The suffixes follow the language of the installation. The original of an anonymized file is found by
 the SHA-256 of its content, and by the NTFS object identifier of the file, which the command records
-with its place; a file edited since its anonymization gets its values back from its tags. A file whose
-original was forgotten, from the web application or at the end of its time once its file left the
-drive, is no longer restored at all, from its tags either: Restore says so, with the date (HTTP 410,
-codes `original_forgotten` and `original_expired`). A file saved by another program while a command
-processes it stays as it is, and the command says so. A file of the drive is anonymized already:
-Restore asks where to save its original, outside the drive. The same
-program runs from a prompt, `pseudalis protect [--copy] <file>...` and
-`pseudalis restore [--copy] <file>...`, its results printed there (`start /wait pseudalis ...` waits
-for them).
+with its place; a file edited since its anonymization gets its values back from its tags, and its name
+and its properties from the substitutes the database recorded. A file whose original was forgotten,
+from the web application or at the end of its time once its file left the drive, is no longer restored
+at all, from its tags either: Restore says so, with the date (HTTP 410, codes `original_forgotten` and
+`original_expired`). A file saved by another program while a command processes it stays as it is, and
+the command says so. A file of the drive of anonymization is anonymized already: Restore asks where to
+save its original, outside the drive. A file of the drive of restoration is restored already:
+Anonymize asks where to save its anonymized version, outside the drive. The same program runs from a
+prompt, `pseudalis protect [--copy] <file>...` and `pseudalis restore [--copy] <file>...`, its results
+printed there (`start /wait pseudalis ...` waits for them).
 
 ### The web application and the interface
 
@@ -81,13 +113,13 @@ icon receive in the fragment of their address and use by themselves.
 
 | Route | Purpose |
 |---|---|
-| `GET /v1/health`, `GET /v1/info` | the state of the service, of its engine, of the drive and of Albireo |
+| `GET /v1/health`, `GET /v1/info` | the state of the service, of its engine, of the drives and of Albireo |
 | `POST /v1/anonymize?name=&record=&format=` | anonymizes the file of the body; the answer is the file, or JSON with `format=json` |
 | `POST /v1/restore?name=&object_id=&format=` | restores the file of the body: its original, its picture or its tags |
 | `GET /v1/lookup?sha256=&object_id=` | whether a file is an anonymized file of this computer |
 | `POST /v1/records/{id}/location` | records where an anonymized file was written (token) |
 | `POST /v1/text/anonymize`, `/restore`, `/detect` | the same protection on a text, `{"text": ...}` |
-| `GET /v1/drive`, `GET /v1/events?since=` | the drive, the files it protected or refused (token for the events) |
+| `GET /v1/drive`, `GET /v1/events?since=` | the drives, the files they protected, refused or restored (token for the events) |
 | `GET /v1/albireo` | whether Albireo describes the pictures |
 | `GET /v1/records`, `GET /v1/records/{id}/original`, `DELETE /v1/records/{id}` | the originals kept (token) |
 | `GET /v1/settings`, `PUT /v1/settings`, `POST /v1/restart` | the settings and the restart (token) |
@@ -97,11 +129,12 @@ icon receive in the fragment of their address and use by themselves.
 
 ### The icon
 
-The icon in the notification area follows the service: its tooltip gives the version, the drive and
-the number of originals kept, and it notifies the files the drive anonymized or refused, the results of
-the commands of the Explorer, the updates and a service that stops answering. Its menu opens Pseudalis
-(the web application) and the drive, checks for updates and installs them, restarts the service,
-opens the documentation of the interface and the About window.
+The icon in the notification area follows the service: its tooltip gives the version, the drives and
+the number of originals kept, and it notifies the files the drives anonymized, restored or did not
+process, the results of the commands of the Explorer, the updates and a service that stops answering.
+It tells the Explorer of the drives that come and go. Its menu opens Pseudalis (the web application),
+the drives and the folder of the files not processed of its user, checks for updates and installs them,
+restarts the service, opens the documentation of the interface and the About window.
 
 ### Pictures and Albireo
 
@@ -129,17 +162,18 @@ application and the windows as codes, written in their language.
 
 | File | Role |
 |---|---|
-| `pseudalis-service.exe` | the service (LocalSystem): the engine, the drive, the vault, the database, the interface on `127.0.0.1` |
+| `pseudalis-service.exe` | the service (LocalSystem): the engine, the drives, the vault, the database, the interface on `127.0.0.1` |
 | `pseudalis-engine.dll`, `pseudalis-engine-avx2.dll` | the engine, for every x64 processor and for those with AVX2, chosen at the start of the service |
 | `pseudalis-tray.exe` | the icon, started at the sign in of each user |
 | `pseudalis.exe` | the commands of the Explorer |
 | `pseudalis-setup.exe` | the installer, kept in the folder of the programs as the uninstaller |
 | `web\` | the web application and the documentation of the interface |
-| `winfsp\winfsp.msi`, `licenses\` | the installer of WinFsp and the licenses of the components |
+| `licenses\` | the licenses of the components |
 
 The data lie in `%ProgramData%\Pseudalis`, or in the folder chosen at the installation, recorded in
 `HKLM\Software\Pseudalis`: `settings.json`, `admin.token`, `keys\master.key`, `vault\`, `db\pseudalis.db`,
-`certificates\`, `logs\` and `updates\`.
+`certificates\`, `logs\`, `updates\`, and the folders of the drives, `drive\`, `restore\` and
+`refused\`.
 
 ## Security
 
@@ -157,9 +191,10 @@ The data lie in `%ProgramData%\Pseudalis`, or in the folder chosen at the instal
   addresses, whose key is never written and whose server key is encrypted with DPAPI. Requests whose
   `Host` is not local, and requests of another origin, are refused, so that no web page reads or changes
   anything through the browser.
-- The service serves several sessions and users at once: each request and each file of the drive is
-  processed on a thread of its own, the engine runs its recognizers for several files at once, and the
-  locks of the service are taken in one order, without wait on the network or on a client while held.
+- The service serves several sessions and users at once: each request is processed on a thread of its
+  own, the files of the drives on up to four threads of their own, the engine runs its recognizers for
+  several files at once, and the locks of the service are taken in one order, without wait on the
+  network or on a client while held.
   The files and texts of the interface processed at once are bounded by the processors and the memory
   (half the processors, 2 to 8): a request that finds no free slot within a minute gets 503 and
   `Retry-After`. A body larger than its route takes is refused before it is read (413).
@@ -172,7 +207,13 @@ The data lie in `%ProgramData%\Pseudalis`, or in the folder chosen at the instal
   lies in the data folder, readable by the interactive users: a user of the computer can restore any
   anonymized file, read the records and export the key. People who must not see each other's documents
   need an installation each, on computers of their own.
-- The drive gives its files to the interactive users, SYSTEM and the administrators.
+- The folders of the drives give their files to the interactive users, SYSTEM and the
+  administrators; the users read, write and delete there, and change no permission, the owners of the
+  files included. A file restored on the drive of restoration, and the folder of the files not
+  processed of a user, admit that user, SYSTEM and the administrators alone.
+- The service opens every file of the drives alone, through no link, checks where its handle lies, and
+  deletes or moves it through that handle; it neither follows nor processes a link, a junction or a
+  mount point placed in a drive, so that no user leads it elsewhere with its rights.
 - The icon and the commands reach the service on 127.0.0.1 alone, and open its pages at
   `https://127.0.0.1:8444`: `localhost` may resolve to `::1` first, where another account could
   listen.
@@ -185,53 +226,63 @@ The data lie in `%ProgramData%\Pseudalis`, or in the folder chosen at the instal
 
 ## Choices made from the specification
 
-- A file system cannot tell a move out of the drive from a copy followed by a deletion: Windows copies
-  the file, then deletes it. The drive therefore never gives back an original, which would otherwise
-  reach any program that reads it; the originals come back through Restore, from the Explorer, the web
-  application or the interface, from any copy of the anonymized file. For the same reason, the original
-  of a file that leaves the drive stays in the vault for `removed_days` days, which the records of the
-  web application show, then goes, or at once when it is forgotten there: gone with its file, it would
-  leave the copy restorable from its tags alone, without its pictures and the parts the protection
-  removed. Once an original is forgotten, its protected file is refused by Restore: the database keeps
-  its SHA-256 and its object identifier, never its content.
-- A file of a kind Pseudalis does not process is refused on the drive at its creation, rather than
-  kept unprotected; the temporary files of Office are among them, so that documents are edited outside
-  the drive and copied onto it.
+- The drives need no driver. A drive whose reads and writes reach a program needs a driver of the
+  kernel of Windows, which Windows 10 and 11 load only once Microsoft signed it (an EV certificate and
+  an attestation for each version); the versions before used the driver of WinFsp. Without driver, the
+  drives are folders that the service watches: the file a program writes lies in the folder of the
+  drive of anonymization in clear, from its last write to its processing, a few seconds for most
+  documents, under the permissions of the drive, before its original goes encrypted to the vault and the
+  file is deleted, its sectors freed but not overwritten; BitLocker, where it is on, keeps them
+  encrypted on the disk. A file of another kind cannot be refused at its creation: it leaves the drive
+  for the folder of the files not processed of its user.
+- Windows copies a file out of a drive, then deletes it: a move out of the drive cannot be told from a
+  copy followed by a deletion. The drive of anonymization therefore never gives back an original, which
+  would otherwise reach any program that reads it; the originals come back through the drive of
+  restoration, Restore, the web application or the interface, from any copy of the anonymized file. For
+  the same reason, the original of a file that leaves the drive stays in the vault for `removed_days`
+  days, which the records of the web application show, then goes, or at once when it is forgotten there:
+  gone with its file, it would leave the copy restorable from its tags alone, without its pictures and
+  the parts the protection removed. Once an original is forgotten, its protected file is refused by
+  Restore: the database keeps its SHA-256 and its object identifier, never its content.
+- The names and the properties take substitutes rather than tags, which a name cannot hold and a window
+  of properties would show as they are; the database keeps their tags. A substitute is found again in a
+  name or a property edited since as long as it keeps its form, a run of up to twelve words; one of four
+  characters or fewer, a year for instance, is too common to be read back there, and comes back only
+  with the original kept in the vault.
 - A picture becomes a text file of the same name with `.txt` added, which the Explorer and the prompt
-  show as text; its picture comes back through Restore.
+  show as text; its picture comes back through Restore and the drive of restoration.
 - On Windows 11, the commands of the Explorer lie under Show more options: the first menu of Windows 11
   only takes the commands of packaged applications.
 - The service listens on port 8444, beside Albireo on 8443, with the same stack: dlib, cpp-httplib and
   Mbed TLS.
-- The WinFsp that Pseudalis installs belongs to it: hidden from the installed programs of Windows, it
-  leaves when Pseudalis is uninstalled, unless another program registered a file system with the
-  launcher of WinFsp since; it then stays and shows again among the installed programs. A WinFsp found
-  in place stays the user's: Pseudalis updates it when it is older, and never removes it. Without
-  WinFsp, removed by other means, Pseudalis works without its drive, and the icon and the web
-  application say to run the installer again, which installs it.
+- The WinFsp that a version before installed for its drive leaves at the installation of this version
+  and at the uninstallation, unless another program registered a file system with the launcher of WinFsp
+  since; it then stays and shows again among the installed programs. A WinFsp that Pseudalis did not
+  install is never touched. The files of the drive of WinFsp, which its database held, are written into
+  the folder of the drive at the first start.
 - A PDF always keeps its pages: the text is drawn again in place, the option of a PDF rebuilt as text
   alone is gone.
 
 ## Installing
 
-`pseudalis-setup.exe` installs the programs, WinFsp when it is missing or older than the version it
-carries (2.1), the service, the icon, the commands of the Explorer, the shortcuts and the entry of the
-installed applications of Windows; started again over an installation, it updates it and keeps the
-data, the key, the drive and the options. The wizard asks for the language, the license, the folders,
-the letter of the drive and the options. Without window:
+`pseudalis-setup.exe` installs the programs, the service, the icon, the commands of the Explorer, the
+shortcuts and the entry of the installed applications of Windows; started again over an installation,
+it updates it and keeps the data, the key, the drives and the options. The wizard asks for the
+language, the license, the folders, the letters of the two drives and the options. Without window:
 
 ```
-pseudalis-setup /silent [/dir <folder>] [/data-dir <folder>] [/drive <letter>|none] [/port <port>] [/no-context-menu]
+pseudalis-setup /silent [/dir <folder>] [/data-dir <folder>] [/drive <letter>|none] [/restore-drive <letter>|none] [/port <port>] [/no-context-menu]
 pseudalis-setup /uninstall [/silent] [/purge]
 pseudalis-setup /service start|stop|restart
 ```
 
-The uninstallation removes the programs and keeps the key, the originals and the settings for a later
-installation, unless the option of the wizard is unticked or `/purge` is given: the documents
-anonymized with that key can then no longer be restored. A tool of deployment that uninstalls before it
-installs again (`QuietUninstallString`) therefore never takes them. The uninstaller left in the folder
-of the programs is a copy of the very program that installed them, held from its start so that no
-other account replaces it meanwhile.
+The uninstallation removes the programs and keeps the key, the originals, the files of the drives and
+the settings for a later installation, unless the option of the wizard is unticked or `/purge` is given:
+the files of the drives go with the data folder, and the documents anonymized with that key can then no
+longer be restored. A tool of deployment that uninstalls before it installs again
+(`QuietUninstallString`) therefore never takes them. The uninstaller left in the folder of the
+programs is a copy of the very program that installed them, held from its start so that no other
+account replaces it meanwhile.
 
 ## Building
 
@@ -244,17 +295,16 @@ repository:
 powershell -ExecutionPolicy Bypass -File dlib\dlib\external\pseudalis\tools\build_windows.ps1
 ```
 
-The script downloads once the files of WinFsp 2.1 (its installer, the two headers the drive compiles
-with, its license), each checked against its SHA-256, into `build-pseudalis\winfsp`, then builds every
-program into `build-pseudalis\bin`; the installer, `build-pseudalis\bin\pseudalis-setup.exe`, carries
-them all, with the runtime linked statically. The engines compile the models of the header
+The script builds every program into `build-pseudalis\bin`; the installer,
+`build-pseudalis\bin\pseudalis-setup.exe`, carries them all, with the runtime linked statically. The
+engines compile the models of the header
 [`examples/slm_document_anonymizer_ex.h`](../../../examples/slm_document_anonymizer_ex.h)
 (`PSEUDALIS_MODELS_HEADER`). `-Tests` also builds and runs the tests.
 
 ### Linux
 
-The service builds on Linux with its engine inside and without drive, for the tests of the engine, of
-the host and of the interface:
+The service builds on Linux with its engine inside and its drives as folders without letters, for the
+tests of the engine, of the host, of the interface and of the drives:
 
 ```
 bash dlib/dlib/external/pseudalis/tools/test_linux.sh
@@ -263,7 +313,7 @@ bash dlib/dlib/external/pseudalis/tools/test_linux.sh
 ### Cross compilation
 
 ```
-cmake -S dlib/dlib/external/pseudalis -B build-pseudalis-win -DCMAKE_TOOLCHAIN_FILE=dlib/dlib/external/pseudalis/cmake/mingw-w64.cmake -DPSEUDALIS_WINFSP_INCLUDE=<inc of WinFsp> -DPSEUDALIS_WINFSP_MSI=<winfsp.msi>
+cmake -S dlib/dlib/external/pseudalis -B build-pseudalis-win -DCMAKE_TOOLCHAIN_FILE=dlib/dlib/external/pseudalis/cmake/mingw-w64.cmake
 cmake --build build-pseudalis-win
 ```
 
@@ -303,28 +353,20 @@ service, or at once from the menu of the icon.
 - Pseudalis Community is free and open source software under the Boost Software License 1.0, as dlib
   and Dlib-Transformer-extensions are; its components keep their licenses: Mbed TLS (Apache 2.0),
   cpp-httplib (MIT), SQLite (public domain), zlib (zlib License), Swagger UI (Apache 2.0).
-- WinFsp is distributed under the GPLv3 with a FLOSS exception of its author: software under a license
-  that meets the Free Software Definition or the Open Source Definition may link the library of WinFsp
-  and distribute its unmodified installer, provided it shows "WinFsp - Windows File System Proxy,
-  Copyright (C) Bill Zissimopoulos" and a link to its repository in its user interface and its user
-  documentation, and is neither linked nor distributed with proprietary software. Pseudalis Community
-  meets them: its license; the notice in the About window, the web application, the license page of the
-  installer, `licenses\winfsp.txt` and this file; the installer of WinFsp 2.1 (build 2.1.25156) as its
-  project released it, checked against its SHA-256 by the build; no proprietary component.
-  `licenses\winfsp-source.txt` says where the source of that version lies (GPLv3, section 6).
-- WinFsp itself is not modified: its kernel driver loads on Windows with the signature of its project
-  alone, and the exception covers its installer unmodified. The code of Pseudalis that drives it,
-  `host/drive_winfsp.cpp`, is checked against the headers and the rules of WinFsp 2.1.
-- An edition under a proprietary license, an edition for companies sold under its own terms for
-  instance, would no longer meet the exception for its drive: it would take a commercial license of
-  WinFsp from its author, or another file system. The other components allow it as they are.
+- No component of Pseudalis is under a copyleft license: the drives need no driver since WinFsp left,
+  and an edition under a proprietary license, an edition for companies sold under its own terms for
+  instance, may take every component as it is.
 
 ## Limitations
 
 - The recognizers read French and English first; a document in another language keeps more values in
   clear. A protected document should be read again before it is shared.
 - A scanned page without text layer is kept as a gray box: no OCR is performed.
-- The drive takes files of 256 MB at most by default (`max_file_mb`).
+- The drives take files of 256 MB at most by default (`max_file_mb`): a larger file goes from the drive
+  of anonymization to the folder of the files not processed, and stays as it is on the drive of
+  restoration.
+- A file written to the drive of anonymization lies there in clear until its processing, a few seconds
+  for most documents (see the choices above).
 - The analysis reads some tens of kilobytes per second on each processor when nearly every word is
   personal data: a text file of tens of megabytes takes minutes.
 - The protection is a pseudonymization in the sense of the GDPR: the key restores the data, which stay

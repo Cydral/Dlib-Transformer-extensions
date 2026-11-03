@@ -44,7 +44,15 @@ namespace pseudalis
             "CREATE INDEX IF NOT EXISTS forgotten_object ON forgotten(object_id);"
             "CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY, time INTEGER NOT NULL, kind TEXT NOT NULL,"
             " path TEXT NOT NULL, message TEXT NOT NULL);"
-            "CREATE TABLE IF NOT EXISTS kv(key TEXT PRIMARY KEY, value TEXT NOT NULL);";
+            "CREATE TABLE IF NOT EXISTS kv(key TEXT PRIMARY KEY, value TEXT NOT NULL);"
+            /* The substitutes written in the names and the properties of the files, values without
+               their tags, with the tags they stand for: tags, never values in clear. */
+            "CREATE TABLE IF NOT EXISTS substitutes(substitute TEXT NOT NULL, tag TEXT NOT NULL,"
+            " created INTEGER NOT NULL, PRIMARY KEY(substitute, tag)) WITHOUT ROWID;"
+            // The files of the folders of the drives as the service left them.
+            "CREATE TABLE IF NOT EXISTS folder_files(folder TEXT NOT NULL, path TEXT NOT NULL COLLATE NOCASE,"
+            " size INTEGER NOT NULL, written INTEGER NOT NULL, sha256 TEXT NOT NULL, record INTEGER NOT NULL,"
+            " state TEXT NOT NULL, PRIMARY KEY(folder, path));";
 
         // A prepared statement, finalized at the end of its scope.
         class statement
@@ -194,12 +202,14 @@ namespace pseudalis
         return true;
     }
 
-    bool store::find_by_output(const std::string& sha256, file_record& r)
+    bool store::find_by_output(const std::string& sha256, file_record& r, const std::string& name)
     {
         std::lock_guard<std::mutex> lock(m_);
+        // Several files of the same content: the one that bears the name, else the last one.
         statement s(db_, (std::string("SELECT ") + file_columns +
-                          " FROM files WHERE output_sha256 = ?1 ORDER BY id DESC LIMIT 1").c_str());
-        s.bind(1, sha256);
+                          " FROM files WHERE output_sha256 = ?1 ORDER BY output_name = ?2 COLLATE NOCASE DESC,"
+                          " id DESC LIMIT 1").c_str());
+        s.bind(1, sha256).bind(2, name);
         if (!s.step()) return false;
         r = read_file_row(s);
         return true;
@@ -515,6 +525,81 @@ namespace pseudalis
             out.push_back(e);
         }
         return out;
+    }
+
+    std::vector<folder_file> store::folder_files(const std::string& folder)
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        statement s(db_, "SELECT path, size, written, sha256, record, state FROM folder_files WHERE folder = ?1");
+        s.bind(1, folder);
+        std::vector<folder_file> out;
+        while (s.step())
+        {
+            folder_file f;
+            f.folder = folder;
+            f.path = s.text(0);
+            f.size = s.integer(1);
+            f.written = s.integer(2);
+            f.sha256 = s.text(3);
+            f.record = s.integer(4);
+            f.state = s.text(5);
+            out.push_back(f);
+        }
+        return out;
+    }
+
+    void store::set_folder_file(const folder_file& f)
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        statement s(db_, "INSERT INTO folder_files(folder, path, size, written, sha256, record, state)"
+                         " VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT(folder, path) DO UPDATE SET"
+                         " path = ?2, size = ?3, written = ?4, sha256 = ?5, record = ?6, state = ?7");
+        s.bind(1, f.folder).bind(2, f.path).bind(3, f.size).bind(4, static_cast<long long>(f.written)).bind(5, f.sha256)
+            .bind(6, f.record).bind(7, f.state);
+        s.step();
+    }
+
+    void store::remove_folder_file(const std::string& folder, const std::string& path)
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        statement s(db_, "DELETE FROM folder_files WHERE folder = ?1 AND path = ?2");
+        s.bind(1, folder).bind(2, path);
+        s.step();
+    }
+
+    void store::add_substitutes(const std::vector<std::pair<std::string, std::string>>& made)
+    {
+        if (made.empty()) return;
+        std::lock_guard<std::mutex> lock(m_);
+        exec("BEGIN IMMEDIATE");
+        try
+        {
+            const long long now = static_cast<long long>(now_unix());
+            for (const auto& m : made)
+            {
+                if (m.first.empty() || m.second.empty()) continue;
+                statement s(db_, "INSERT INTO substitutes(substitute, tag, created) VALUES(?1, ?2, ?3)"
+                                 " ON CONFLICT(substitute, tag) DO UPDATE SET created = ?3");
+                s.bind(1, m.first).bind(2, m.second).bind(3, now);
+                s.step();
+            }
+            exec("COMMIT");
+        }
+        catch (...)
+        {
+            exec("ROLLBACK");
+            throw;
+        }
+    }
+
+    std::vector<std::string> store::tags_for(const std::string& substitute)
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        statement s(db_, "SELECT tag FROM substitutes WHERE substitute = ?1 ORDER BY created DESC LIMIT 8");
+        s.bind(1, substitute);
+        std::vector<std::string> tags;
+        while (s.step()) tags.push_back(s.text(0));
+        return tags;
     }
 
     std::string store::value(const std::string& key)

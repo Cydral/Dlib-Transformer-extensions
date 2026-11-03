@@ -241,6 +241,16 @@ namespace pseudalis
                 "{d} ist kein Ordner eines Laufwerks dieses Computers.",
                 "{d} non è una cartella di un'unità di questo computer.",
                 "{d} no es una carpeta de una unidad de este equipo." } },
+            { "folder_not_fixed", { "{d} lies on a removable or network drive: the data of Pseudalis need a "
+                "fixed drive of this computer.",
+                "{d} se trouve sur un lecteur amovible ou réseau : les données de Pseudalis demandent un lecteur "
+                "fixe de cet ordinateur.",
+                "{d} liegt auf einem Wechsel- oder Netzlaufwerk: Die Daten von Pseudalis brauchen ein festes "
+                "Laufwerk dieses Computers.",
+                "{d} si trova su un'unità rimovibile o di rete: i dati di Pseudalis richiedono un'unità fissa di "
+                "questo computer.",
+                "{d} está en una unidad extraíble o de red: los datos de Pseudalis necesitan una unidad fija de "
+                "este equipo." } },
             { "folder_system", { "{d} is the root of a drive, or a folder of Windows or of the users: choose a "
                 "folder of its own for Pseudalis.",
                 "{d} est la racine d'un lecteur, ou un dossier de Windows ou des utilisateurs : choisissez un "
@@ -364,14 +374,26 @@ namespace pseudalis
             { "lbl_language", { "Language", "Langue", "Sprache", "Lingua", "Idioma" } },
             { "tray_open", { "Open Pseudalis", "Ouvrir Pseudalis", "Pseudalis öffnen", "Apri Pseudalis",
                 "Abrir Pseudalis" } },
-            { "tray_drive", { "Open the drive {l}:", "Ouvrir le lecteur {l}:", "Laufwerk {l}: öffnen",
-                "Apri l'unità {l}:", "Abrir la unidad {l}:" } },
+            { "tray_drive", { "Open the drive of anonymization {l}:", "Ouvrir le lecteur d'anonymisation {l}:",
+                "Anonymisierungslaufwerk {l}: öffnen", "Apri l'unità di anonimizzazione {l}:",
+                "Abrir la unidad de anonimización {l}:" } },
+            { "tray_restore_drive", { "Open the drive of restoration {l}:", "Ouvrir le lecteur de restauration {l}:",
+                "Wiederherstellungslaufwerk {l}: öffnen", "Apri l'unità di ripristino {l}:",
+                "Abrir la unidad de restauración {l}:" } },
+            { "tray_refused", { "Files not processed by the drive", "Fichiers non traités par le lecteur",
+                "Vom Laufwerk nicht verarbeitete Dateien", "File non elaborati dall'unità",
+                "Archivos no procesados por la unidad" } },
             { "tray_about", { "About Pseudalis", "À propos de Pseudalis", "Über Pseudalis",
                 "Informazioni su Pseudalis", "Acerca de Pseudalis" } },
             { "tip_drive", { "Drive {l}:", "Lecteur {l}:", "Laufwerk {l}:", "Unità {l}:", "Unidad {l}:" } },
             { "tip_no_drive", { "No drive", "Pas de lecteur", "Kein Laufwerk", "Nessuna unità", "Sin unidad" } },
             { "tip_drive_error", { "Drive {l}: not available", "Lecteur {l}: indisponible",
                 "Laufwerk {l}: nicht verfügbar", "Unità {l}: non disponibile", "Unidad {l}: no disponible" } },
+            { "tip_restore_drive", { "restoration {l}:", "restauration {l}:", "Wiederherstellung {l}:",
+                "ripristino {l}:", "restauración {l}:" } },
+            { "tip_restore_drive_error", { "restoration {l}: not available", "restauration {l}: indisponible",
+                "Wiederherstellung {l}: nicht verfügbar", "ripristino {l}: non disponibile",
+                "restauración {l}: no disponible" } },
             { "tip_records", { "{n} originals kept", "{n} originaux conservés", "{n} Originale aufbewahrt",
                 "{n} originali conservati", "{n} originales guardados" } },
             { "notify_drive_title", { "Drive {l}:", "Lecteur {l}:", "Laufwerk {l}:", "Unità {l}:", "Unidad {l}:" } },
@@ -379,25 +401,30 @@ namespace pseudalis
                 "{f}: {n} Werte ersetzt", "{f}: {n} valori sostituiti", "{f}: {n} valores sustituidos" } },
             { "notify_protected_many", { "{n} files anonymized", "{n} fichiers anonymisés", "{n} Dateien anonymisiert",
                 "{n} file anonimizzati", "{n} archivos anonimizados" } },
-            { "notify_refused", { "{f} was refused: {e}", "{f} a été refusé : {e}", "{f} wurde abgelehnt: {e}",
-                "{f} è stato rifiutato: {e}", "{f} fue rechazado: {e}" } },
-            { "notify_refused_many", { "{n} files were refused, {f} among them: {e}",
-                "{n} fichiers ont été refusés, dont {f} : {e}", "{n} Dateien wurden abgelehnt, darunter {f}: {e}",
-                "{n} file sono stati rifiutati, tra cui {f}: {e}",
-                "{n} archivos fueron rechazados, entre ellos {f}: {e}" } },
+            { "notify_refused", { "{f} was not processed: {e}", "{f} n'a pas été traité : {e}",
+                "{f} wurde nicht verarbeitet: {e}", "{f} non è stato elaborato: {e}", "{f} no se procesó: {e}" } },
+            { "notify_refused_many", { "{n} files were not processed, {f} among them: {e}",
+                "{n} fichiers n'ont pas été traités, dont {f} : {e}",
+                "{n} Dateien wurden nicht verarbeitet, darunter {f}: {e}",
+                "{n} file non sono stati elaborati, tra cui {f}: {e}",
+                "{n} archivos no se procesaron, entre ellos {f}: {e}" } },
+            { "notify_restore_title", { "Drive of restoration {l}:", "Lecteur de restauration {l}:",
+                "Wiederherstellungslaufwerk {l}:", "Unità di ripristino {l}:", "Unidad de restauración {l}:" } },
+            { "notify_restored_one", { "{f}: the original is back", "{f} : l'original est restauré",
+                "{f}: das Original ist wiederhergestellt", "{f}: l'originale è ripristinato",
+                "{f}: el original está restaurado" } },
+            { "notify_restored_many", { "{n} originals restored", "{n} originaux restaurés",
+                "{n} Originale wiederhergestellt", "{n} originali ripristinati", "{n} originales restaurados" } },
+            { "notify_not_restored", { "{f} stays as it is: {e}", "{f} reste tel quel : {e}",
+                "{f} bleibt unverändert: {e}", "{f} resta così com'è: {e}", "{f} se queda como está: {e}" } },
+            { "notify_not_restored_many", { "{n} files stay as they are, {f} among them: {e}",
+                "{n} fichiers restent tels quels, dont {f} : {e}",
+                "{n} Dateien bleiben unverändert, darunter {f}: {e}",
+                "{n} file restano così come sono, tra cui {f}: {e}",
+                "{n} archivos se quedan como están, entre ellos {f}: {e}" } },
             { "notify_drive_error", { "The drive {l}: is not available: {e}",
                 "Le lecteur {l}: n'est pas disponible : {e}", "Das Laufwerk {l}: ist nicht verfügbar: {e}",
                 "L'unità {l}: non è disponibile: {e}", "La unidad {l}: no está disponible: {e}" } },
-            { "notify_no_winfsp", { "WinFsp is not installed: Pseudalis works without its drive. Run the installer "
-                "again to install it.",
-                "WinFsp n'est pas installé : Pseudalis fonctionne sans son lecteur. Relancez le programme "
-                "d'installation pour l'installer.",
-                "WinFsp ist nicht installiert: Pseudalis arbeitet ohne sein Laufwerk. Starten Sie das "
-                "Installationsprogramm erneut, um es zu installieren.",
-                "WinFsp non è installato: Pseudalis funziona senza la sua unità. Avviate di nuovo il programma di "
-                "installazione per installarlo.",
-                "WinFsp no está instalado: Pseudalis funciona sin su unidad. Vuelva a ejecutar el programa de "
-                "instalación para instalarlo." } },
             { "shell_protected", { "{f} is anonymized: {n} values replaced.",
                 "{f} est anonymisé : {n} valeurs remplacées.", "{f} ist anonymisiert: {n} Werte ersetzt.",
                 "{f} è anonimizzato: {n} valori sostituiti.", "{f} está anonimizado: {n} valores sustituidos." } },
@@ -443,6 +470,9 @@ namespace pseudalis
                 "Los archivos de la unidad {l}: ya están anonimizados." } },
             { "shell_save_title", { "Save the original of {f}", "Enregistrer l'original de {f}",
                 "Original von {f} speichern", "Salva l'originale di {f}", "Guardar el original de {f}" } },
+            { "shell_save_anonymized_title", { "Save the anonymized copy of {f}",
+                "Enregistrer la copie anonymisée de {f}", "Anonymisierte Kopie von {f} speichern",
+                "Salva la copia anonimizzata di {f}", "Guardar la copia anonimizada de {f}" } },
             { "shell_cannot_read", { "{f} cannot be read: {e}", "{f} ne peut pas être lu : {e}",
                 "{f} kann nicht gelesen werden: {e}", "{f} non può essere letto: {e}", "{f} no se puede leer: {e}" } },
             { "shell_cannot_write", { "{f} cannot be written: {e}", "{f} ne peut pas être écrit : {e}",
@@ -543,27 +573,25 @@ namespace pseudalis
                 "License 1.0.",
                 "La edición Community es software libre y de código abierto, distribuido bajo la licencia Boost "
                 "Software License 1.0." } },
-            { "about_winfsp", { "The drive relies on {w}, under its own license ({u}).",
-                "Le lecteur repose sur {w}, sous sa propre licence ({u}).",
-                "Das Laufwerk beruht auf {w}, unter dessen eigener Lizenz ({u}).",
-                "L'unità si basa su {w}, con la sua licenza ({u}).",
-                "La unidad se basa en {w}, con su propia licencia ({u})." } },
-            { "btn_winfsp", { "WinFsp", "WinFsp", "WinFsp", "WinFsp", "WinFsp" } },
             { "welcome_text", { "This assistant installs Pseudalis Community {v}: the service that anonymizes the "
-                "personal data of documents on this computer, its drive, its commands in the Explorer, its icon in "
-                "the notification area and its web application. Nothing leaves this computer.",
+                "personal data of documents on this computer, its drives of anonymization and of restoration, its "
+                "commands in the Explorer, its icon in the notification area and its web application. Nothing "
+                "leaves this computer.",
                 "Cet assistant installe Pseudalis Community {v} : le service qui anonymise les données personnelles "
-                "des documents sur cet ordinateur, son lecteur, ses commandes dans l'Explorateur, son icône dans "
-                "la zone de notification et son application web. Rien ne quitte cet ordinateur.",
+                "des documents sur cet ordinateur, ses lecteurs d'anonymisation et de restauration, ses commandes "
+                "dans l'Explorateur, son icône dans la zone de notification et son application web. Rien ne quitte "
+                "cet ordinateur.",
                 "Dieser Assistent installiert Pseudalis Community {v}: den Dienst, der die personenbezogenen Daten von "
-                "Dokumenten auf diesem Computer anonymisiert, sein Laufwerk, seine Befehle im Explorer, sein "
-                "Symbol im Infobereich und seine Webanwendung. Nichts verlässt diesen Computer.",
+                "Dokumenten auf diesem Computer anonymisiert, seine Laufwerke für Anonymisierung und "
+                "Wiederherstellung, seine Befehle im Explorer, sein Symbol im Infobereich und seine Webanwendung. "
+                "Nichts verlässt diesen Computer.",
                 "Questo assistente installa Pseudalis Community {v}: il servizio che anonimizza i dati personali dei "
-                "documenti su questo computer, la sua unità, i suoi comandi in Esplora file, la sua icona "
-                "nell'area di notifica e la sua applicazione web. Nulla lascia questo computer.",
+                "documenti su questo computer, le sue unità di anonimizzazione e di ripristino, i suoi comandi in "
+                "Esplora file, la sua icona nell'area di notifica e la sua applicazione web. Nulla lascia questo "
+                "computer.",
                 "Este asistente instala Pseudalis Community {v}: el servicio que anonimiza los datos personales de los "
-                "documentos en este equipo, su unidad, sus comandos en el Explorador, su icono en el área de "
-                "notificación y su aplicación web. Nada sale de este equipo." } },
+                "documentos en este equipo, sus unidades de anonimización y de restauración, sus comandos en el "
+                "Explorador, su icono en el área de notificación y su aplicación web. Nada sale de este equipo." } },
             { "update_text", { "Pseudalis {o} is installed in {d}. This assistant updates it to version {v} and "
                 "keeps its key, the originals it keeps, its settings, its certificates, its drive, its "
                 "commands in the Explorer, its shortcuts and the start of its icon.",
@@ -594,63 +622,64 @@ namespace pseudalis
                 "Daten: Schlüssel, Originale, Einstellungen, Protokolle und Zertifikate",
                 "Dati: chiave, originali, impostazioni, log e certificati",
                 "Datos: clave, originales, ajustes, registros y certificados" } },
-            { "finish_text", { "Pseudalis runs as a service. To anonymize a document, copy it onto its drive, or "
-                "right-click the file in the Explorer (Show more options, Pseudalis); its icon in the "
-                "notification area opens the web application.",
-                "Pseudalis fonctionne comme un service. Pour anonymiser un document, copiez-le sur son lecteur, ou "
-                "faites un clic droit sur le fichier dans l'Explorateur (Afficher d'autres options, Pseudalis) "
-                "; son icône dans la zone de notification ouvre l'application web.",
-                "Pseudalis läuft als Dienst. Um ein Dokument zu anonymisieren, kopieren Sie es auf sein Laufwerk "
-                "oder klicken Sie die Datei im Explorer mit der rechten Maustaste an (Weitere Optionen "
-                "anzeigen, Pseudalis); sein Symbol im Infobereich öffnet die Webanwendung.",
-                "Pseudalis funziona come servizio. Per anonimizzare un documento, copiatelo sulla sua unità, o fate "
-                "clic con il tasto destro sul file in Esplora file (Mostra altre opzioni, Pseudalis); la sua "
-                "icona nell'area di notifica apre l'applicazione web.",
-                "Pseudalis funciona como un servicio. Para anonimizar un documento, cópielo en su unidad o haga "
-                "clic con el botón derecho en el archivo en el Explorador (Mostrar más opciones, Pseudalis); "
-                "su icono en el área de notificación abre la aplicación web." } },
-            { "uninstall_text", { "Pseudalis, its service, its drive, its commands in the Explorer, its "
-                "notification icon, its key, the originals it keeps, its settings and its logs will be removed "
-                "from this computer: the documents it anonymized can then no longer be restored. WinFsp goes too when "
-                "Pseudalis installed it, unless another program uses it.",
-                "Pseudalis, son service, son lecteur, ses commandes dans l'Explorateur, son icône de notification, "
-                "sa clé, les originaux qu'il garde, ses réglages et ses journaux seront retirés de cet "
-                "ordinateur : les documents qu'il a anonymisés ne pourront plus être restaurés. WinFsp est retiré "
-                "aussi s'il a été installé par Pseudalis, sauf si un autre programme l'utilise.",
-                "Pseudalis, sein Dienst, sein Laufwerk, seine Befehle im Explorer, sein Benachrichtigungssymbol, "
-                "sein Schlüssel, die aufbewahrten Originale, seine Einstellungen und Protokolle werden von "
-                "diesem Computer entfernt: Die damit anonymisierten Dokumente können dann nicht mehr "
-                "wiederhergestellt werden. WinFsp wird ebenfalls entfernt, wenn Pseudalis es installiert hat, außer "
-                "wenn ein anderes Programm es verwendet.",
-                "Pseudalis, il suo servizio, la sua unità, i suoi comandi in Esplora file, la sua icona di "
-                "notifica, la sua chiave, gli originali che custodisce, le impostazioni e i registri saranno "
-                "rimossi da questo computer: i documenti che ha anonimizzato non potranno più essere "
-                "ripristinati. WinFsp viene rimosso anch'esso se è stato installato da Pseudalis, a meno che un altro "
-                "programma non lo usi.",
-                "Pseudalis, su servicio, su unidad, sus comandos en el Explorador, su icono de notificación, su "
-                "clave, los originales que guarda, sus ajustes y sus registros se eliminarán de este equipo: "
-                "los documentos que anonimizó ya no podrán restaurarse. WinFsp también se elimina si lo instaló "
-                "Pseudalis, salvo que otro programa lo utilice." } },
-            { "uninstall_text_keep", { "Pseudalis, its service, its drive, its commands in the Explorer and its "
-                "notification icon will be removed from this computer. Its key, the originals it keeps and its "
-                "settings stay for a later installation. WinFsp goes too when Pseudalis installed it, unless "
-                "another program uses it.",
-                "Pseudalis, son service, son lecteur, ses commandes dans l'Explorateur et son icône de notification "
-                "seront retirés de cet ordinateur. Sa clé, les originaux qu'il garde et ses réglages restent "
-                "pour une installation ultérieure. WinFsp est retiré aussi s'il a été installé par Pseudalis, sauf si "
-                "un autre programme l'utilise.",
-                "Pseudalis, sein Dienst, sein Laufwerk, seine Befehle im Explorer und sein Benachrichtigungssymbol "
-                "werden von diesem Computer entfernt. Sein Schlüssel, die aufbewahrten Originale und seine "
-                "Einstellungen bleiben für eine spätere Installation erhalten. WinFsp wird ebenfalls entfernt, wenn "
-                "Pseudalis es installiert hat, außer wenn ein anderes Programm es verwendet.",
-                "Pseudalis, il suo servizio, la sua unità, i suoi comandi in Esplora file e la sua icona di "
-                "notifica saranno rimossi da questo computer. La sua chiave, gli originali che custodisce e le "
-                "impostazioni restano per un'installazione successiva. WinFsp viene rimosso anch'esso se è stato "
-                "installato da Pseudalis, a meno che un altro programma non lo usi.",
-                "Pseudalis, su servicio, su unidad, sus comandos en el Explorador y su icono de notificación se "
-                "eliminarán de este equipo. Su clave, los originales que guarda y sus ajustes se conservan "
-                "para una instalación posterior. WinFsp también se elimina si lo instaló Pseudalis, salvo que "
-                "otro programa lo utilice." } },
+            { "finish_text", { "Pseudalis runs as a service. To anonymize a document, copy it onto its drive of "
+                "anonymization; to restore it, copy it onto its drive of restoration, or right-click the file in "
+                "the Explorer (Show more options, Pseudalis). Its icon in the notification area opens the web "
+                "application.",
+                "Pseudalis fonctionne comme un service. Pour anonymiser un document, copiez-le sur son lecteur "
+                "d'anonymisation ; pour le restaurer, copiez-le sur son lecteur de restauration, ou faites un clic "
+                "droit sur le fichier dans l'Explorateur (Afficher d'autres options, Pseudalis). Son icône dans la "
+                "zone de notification ouvre l'application web.",
+                "Pseudalis läuft als Dienst. Um ein Dokument zu anonymisieren, kopieren Sie es auf sein "
+                "Anonymisierungslaufwerk; um es wiederherzustellen, kopieren Sie es auf sein "
+                "Wiederherstellungslaufwerk oder klicken Sie die Datei im Explorer mit der rechten Maustaste an "
+                "(Weitere Optionen anzeigen, Pseudalis). Sein Symbol im Infobereich öffnet die Webanwendung.",
+                "Pseudalis funziona come servizio. Per anonimizzare un documento, copiatelo sulla sua unità di "
+                "anonimizzazione; per ripristinarlo, copiatelo sulla sua unità di ripristino, o fate clic con il "
+                "tasto destro sul file in Esplora file (Mostra altre opzioni, Pseudalis). La sua icona nell'area "
+                "di notifica apre l'applicazione web.",
+                "Pseudalis funciona como un servicio. Para anonimizar un documento, cópielo en su unidad de "
+                "anonimización; para restaurarlo, cópielo en su unidad de restauración o haga clic con el botón "
+                "derecho en el archivo en el Explorador (Mostrar más opciones, Pseudalis). Su icono en el área de "
+                "notificación abre la aplicación web." } },
+            { "uninstall_text", { "Pseudalis, its service, its drives and the files they hold, its commands in the "
+                "Explorer, its notification icon, its key, the originals it keeps, its settings and its logs will be "
+                "removed from this computer: the documents it anonymized can then no longer be restored.",
+                "Pseudalis, son service, ses lecteurs et les fichiers qu'ils contiennent, ses commandes dans "
+                "l'Explorateur, son icône de notification, sa clé, les originaux qu'il garde, ses réglages et ses "
+                "journaux seront retirés de cet ordinateur : les documents qu'il a anonymisés ne pourront plus "
+                "être restaurés.",
+                "Pseudalis, sein Dienst, seine Laufwerke mit den darin enthaltenen Dateien, seine Befehle im "
+                "Explorer, sein Benachrichtigungssymbol, sein Schlüssel, die aufbewahrten Originale, seine "
+                "Einstellungen und Protokolle werden von diesem Computer entfernt: Die damit anonymisierten "
+                "Dokumente können dann nicht mehr wiederhergestellt werden.",
+                "Pseudalis, il suo servizio, le sue unità e i file che contengono, i suoi comandi in Esplora file, "
+                "la sua icona di notifica, la sua chiave, gli originali che custodisce, le impostazioni e i "
+                "registri saranno rimossi da questo computer: i documenti che ha anonimizzato non potranno più "
+                "essere ripristinati.",
+                "Pseudalis, su servicio, sus unidades y los archivos que contienen, sus comandos en el Explorador, "
+                "su icono de notificación, su clave, los originales que guarda, sus ajustes y sus registros se "
+                "eliminarán de este equipo: los documentos que anonimizó ya no podrán restaurarse." } },
+            { "uninstall_text_keep", { "Pseudalis, its service, the letters of its drives, its commands in the "
+                "Explorer and its notification icon will be removed from this computer. Its key, the originals it "
+                "keeps, the files of its drives and its settings stay in its data folder for a later "
+                "installation.",
+                "Pseudalis, son service, les lettres de ses lecteurs, ses commandes dans l'Explorateur et son icône "
+                "de notification seront retirés de cet ordinateur. Sa clé, les originaux qu'il garde, les fichiers "
+                "de ses lecteurs et ses réglages restent dans son dossier de données pour une installation "
+                "ultérieure.",
+                "Pseudalis, sein Dienst, die Buchstaben seiner Laufwerke, seine Befehle im Explorer und sein "
+                "Benachrichtigungssymbol werden von diesem Computer entfernt. Sein Schlüssel, die aufbewahrten "
+                "Originale, die Dateien seiner Laufwerke und seine Einstellungen bleiben in seinem Datenordner "
+                "für eine spätere Installation erhalten.",
+                "Pseudalis, il suo servizio, le lettere delle sue unità, i suoi comandi in Esplora file e la sua "
+                "icona di notifica saranno rimossi da questo computer. La sua chiave, gli originali che custodisce, "
+                "i file delle sue unità e le impostazioni restano nella sua cartella dei dati per "
+                "un'installazione successiva.",
+                "Pseudalis, su servicio, las letras de sus unidades, sus comandos en el Explorador y su icono de "
+                "notificación se eliminarán de este equipo. Su clave, los originales que guarda, los archivos de "
+                "sus unidades y sus ajustes se conservan en su carpeta de datos para una instalación "
+                "posterior." } },
             { "uninstall_keep_data", { "Keep the key, the originals and the settings for a later installation",
                 "Conserver la clé, les originaux et les réglages pour une installation ultérieure",
                 "Schlüssel, Originale und Einstellungen für eine spätere Installation behalten",
@@ -661,48 +690,42 @@ namespace pseudalis
                 "Der Ordner {d} bleibt bestehen, mit den Daten, die Sie darin behalten.",
                 "La cartella {d} resta al suo posto, con i dati che vi conservate.",
                 "La carpeta {d} se mantiene, con los datos que conserva en ella." } },
-            { "opt_drive", { "Letter of the drive:", "Lettre du lecteur :", "Laufwerksbuchstabe:",
-                "Lettera dell'unità:", "Letra de la unidad:" } },
+            { "opt_drive", { "Drive of anonymization:", "Lecteur d'anonymisation :", "Anonymisierungslaufwerk:",
+                "Unità di anonimizzazione:", "Unidad de anonimización:" } },
+            { "opt_restore_drive", { "Drive of restoration:", "Lecteur de restauration :",
+                "Wiederherstellungslaufwerk:", "Unità di ripristino:", "Unidad de restauración:" } },
+            { "opt_drive_same", { "The two drives need two letters: {l}: is chosen for both.",
+                "Les deux lecteurs demandent deux lettres : {l}: est choisie pour les deux.",
+                "Die zwei Laufwerke brauchen zwei Buchstaben: {l}: ist für beide gewählt.",
+                "Le due unità richiedono due lettere: {l}: è scelta per entrambe.",
+                "Las dos unidades necesitan dos letras: {l}: está elegida para ambas." } },
             { "opt_drive_none", { "No drive", "Pas de lecteur", "Kein Laufwerk", "Nessuna unità", "Sin unidad" } },
-            { "opt_drive_note", { "A document copied onto this drive is anonymized as it is written, under its "
-                "name; the drive gives back anonymized files only, and the originals come back through Restore.",
-                "Un document copié sur ce lecteur est anonymisé à l'écriture, sous son nom ; le lecteur ne rend que "
-                "des fichiers anonymisés, et les originaux reviennent par Restaurer.",
-                "Ein auf dieses Laufwerk kopiertes Dokument wird beim Schreiben unter seinem Namen anonymisiert; "
-                "das Laufwerk gibt nur anonymisierte Dateien zurück, die Originale kommen über "
-                "Wiederherstellen zurück.",
-                "Un documento copiato su questa unità viene anonimizzato durante la scrittura, con il suo nome; "
-                "l'unità restituisce solo file anonimizzati, e gli originali tornano con Ripristina.",
-                "Un documento copiado en esta unidad se anonimiza al escribirse, con su nombre; la unidad solo "
-                "devuelve archivos anonimizados, y los originales vuelven con Restaurar." } },
+            { "opt_drive_note", { "A document copied onto the first drive is anonymized once written, its name "
+                "included; a file copied onto the second one gets its original back. No driver is installed.",
+                "Un document copié sur le premier lecteur est anonymisé une fois écrit, nom compris ; un fichier "
+                "copié sur le second retrouve son original. Aucun pilote n'est installé.",
+                "Ein auf das erste Laufwerk kopiertes Dokument wird nach dem Schreiben anonymisiert, sein Name "
+                "inbegriffen; eine auf das zweite kopierte Datei erhält ihr Original zurück. Kein Treiber wird "
+                "installiert.",
+                "Un documento copiato sulla prima unità viene anonimizzato una volta scritto, nome compreso; un "
+                "file copiato sulla seconda ritrova il suo originale. Nessun driver viene installato.",
+                "Un documento copiado en la primera unidad se anonimiza una vez escrito, nombre incluido; un "
+                "archivo copiado en la segunda recupera su original. No se instala ningún controlador." } },
             { "opt_context_menu", { "Add Anonymize and Restore to the menu of the files in the Explorer",
                 "Ajouter Anonymiser et Restaurer au menu des fichiers dans l'Explorateur",
                 "Anonymisieren und Wiederherstellen zum Menü der Dateien im Explorer hinzufügen",
                 "Aggiungi Anonimizza e Ripristina al menu dei file in Esplora file",
                 "Añadir Anonimizar y Restaurar al menú de los archivos en el Explorador" } },
-            { "winfsp_kept", { "WinFsp could not be uninstalled ({e}): it stays among the installed programs, "
-                "from where it can be uninstalled.",
-                "WinFsp n'a pas pu être désinstallé ({e}) : il reste parmi les programmes installés, d'où il peut "
-                "être désinstallé.",
-                "WinFsp konnte nicht deinstalliert werden ({e}): Es bleibt unter den installierten Programmen, von "
-                "wo es deinstalliert werden kann.",
-                "WinFsp non ha potuto essere disinstallato ({e}): resta tra i programmi installati, da cui può "
-                "essere disinstallato.",
-                "WinFsp no pudo desinstalarse ({e}): permanece entre los programas instalados, desde donde puede "
-                "desinstalarse." } },
-            { "step_winfsp", { "Installing WinFsp, for the drive", "Installation de WinFsp, pour le lecteur",
-                "WinFsp wird für das Laufwerk installiert", "Installazione di WinFsp, per l'unità",
-                "Instalación de WinFsp, para la unidad" } },
-            { "winfsp_failed", { "WinFsp, which the drive needs, could not be installed ({e}): Pseudalis works "
-                "without its drive. Run the installer again to try once more.",
-                "WinFsp, nécessaire au lecteur, n'a pas pu être installé ({e}) : Pseudalis fonctionne sans son "
-                "lecteur. Relancez le programme d'installation pour réessayer.",
-                "WinFsp, das das Laufwerk benötigt, konnte nicht installiert werden ({e}): Pseudalis arbeitet ohne "
-                "sein Laufwerk. Starten Sie das Installationsprogramm erneut, um es noch einmal zu versuchen.",
-                "WinFsp, necessario all'unità, non ha potuto essere installato ({e}): Pseudalis funziona senza la "
-                "sua unità. Avviate di nuovo il programma di installazione per riprovare.",
-                "WinFsp, que la unidad necesita, no pudo instalarse ({e}): Pseudalis funciona sin su unidad. "
-                "Vuelva a ejecutar el programa de instalación para intentarlo de nuevo." } },
+            { "winfsp_kept", { "WinFsp, which an earlier version installed for its drive, could not be "
+                "uninstalled ({e}): it stays among the installed programs, from where it can be uninstalled.",
+                "WinFsp, installé par une version antérieure pour son lecteur, n'a pas pu être désinstallé ({e}) : "
+                "il reste parmi les programmes installés, d'où il peut être désinstallé.",
+                "WinFsp, das eine frühere Version für ihr Laufwerk installiert hatte, konnte nicht deinstalliert "
+                "werden ({e}): Es bleibt unter den installierten Programmen, von wo es deinstalliert werden kann.",
+                "WinFsp, installato da una versione precedente per la sua unità, non ha potuto essere "
+                "disinstallato ({e}): resta tra i programmi installati, da cui può essere disinstallato.",
+                "WinFsp, instalado por una versión anterior para su unidad, no pudo desinstalarse ({e}): permanece "
+                "entre los programas instalados, desde donde puede desinstalarse." } },
             { "verb_menu", { "Pseudalis", "Pseudalis", "Pseudalis", "Pseudalis", "Pseudalis" } },
             { "verb_protect", { "Anonymize", "Anonymiser", "Anonymisieren", "Anonimizza", "Anonimizar" } },
             { "verb_protect_copy", { "Anonymize as a copy", "Anonymiser dans une copie", "Als Kopie anonymisieren",

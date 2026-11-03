@@ -23,12 +23,13 @@ namespace pseudalis
                 The settings of the service, kept in settings.json in the data folder,
                 which the users of the machine read (the tray takes the port there) and the
                 administrators change, through the administration interface or the
-                installer.  The service restarts itself when the port, the drive, the order
+                installer.  The service restarts itself when the port, the drives, the order
                 of the dates, the proxy, the public link or the address of the feed change.
         !*/
         int port = 8444;
         std::string language = "auto";          // auto, en, fr, de, it, es: the tray, the shell, the descriptions
-        std::string drive_letter = "A";         // the letter of the drive, empty without drive
+        std::string drive_letter = "A";         // the letter of the drive of anonymization, empty without drive
+        std::string restore_letter = "R";       // the letter of the drive of restoration, empty without drive
         std::string date_order = "dmy";         // dmy or mdy: the numeric dates the detector reads
         std::string albireo = "auto";           // auto: the pictures are described when Albireo answers; off
         int max_file_mb = 256;                  // the largest file processed
@@ -44,7 +45,7 @@ namespace pseudalis
         static host_settings from_json(const json& j);
     };
 
-    // Whether a drive letter is one the drive may take: D to Z, or A and B, without colon.
+    // Whether a drive letter is one the drives may take: D to Z, or A and B, without colon.
     bool valid_drive_letter(const std::string& letter);
 
     class settings_store

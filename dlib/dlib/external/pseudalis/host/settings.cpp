@@ -35,6 +35,7 @@ namespace pseudalis
         j["port"] = port;
         j["language"] = language;
         j["drive_letter"] = drive_letter;
+        j["restore_letter"] = restore_letter;
         j["date_order"] = date_order;
         j["albireo"] = albireo;
         j["max_file_mb"] = max_file_mb;
@@ -54,11 +55,16 @@ namespace pseudalis
         const long long port = j["port"].as_int(d.port);
         s.port = port >= 1024 && port <= 65535 ? static_cast<int>(port) : d.port;
         s.language = known_language(j["language"].str(d.language)) ? j["language"].str(d.language) : d.language;
-        s.drive_letter = j["drive_letter"].str(d.drive_letter);
-        if (!s.drive_letter.empty() && !valid_drive_letter(s.drive_letter)) s.drive_letter = d.drive_letter;
-        if (!s.drive_letter.empty())
-            s.drive_letter = std::string(1, static_cast<char>(
-                std::toupper(static_cast<unsigned char>(s.drive_letter[0]))));
+        // A letter of each drive, upper case; the same letter for both leaves the restoration without one.
+        auto letter_of = [&](const char* key, const std::string& fallback) {
+            std::string l = j[key].str(fallback);
+            if (!l.empty() && !valid_drive_letter(l)) l = fallback;
+            if (!l.empty()) l = std::string(1, static_cast<char>(std::toupper(static_cast<unsigned char>(l[0]))));
+            return l;
+        };
+        s.drive_letter = letter_of("drive_letter", d.drive_letter);
+        s.restore_letter = letter_of("restore_letter", d.restore_letter);
+        if (!s.restore_letter.empty() && s.restore_letter == s.drive_letter) s.restore_letter.clear();
         s.date_order = j["date_order"].str(d.date_order) == "mdy" ? "mdy" : "dmy";
         s.albireo = j["albireo"].str(d.albireo) == "off" ? "off" : "auto";
         const long long mb = j["max_file_mb"].as_int(d.max_file_mb);

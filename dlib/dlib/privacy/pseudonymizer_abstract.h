@@ -3,6 +3,7 @@
 #undef DLIB_PSEUDONYMIZER_ABSTRACT_H_
 #ifdef DLIB_PSEUDONYMIZER_ABSTRACT_H_
 
+#include <functional>
 #include <string>
 #include <vector>
 #include "pii_types_abstract.h"
@@ -274,6 +275,86 @@ namespace dlib
                   entities are resolved in favour of the first in text order, the longest
                   first at the same position. Entities of type none, outside the text,
                   empty, or of a type kept in clear (keeps_in_clear()) are skipped.
+        !*/
+
+        std::string substitute(
+            pii_type type,
+            const std::string& value,
+            std::string* tag_out = nullptr
+        ) const;
+        /*!
+            requires
+                - type != pii_type::none
+            ensures
+                - Returns the protected form of value written without its tag, for the places
+                  where a tag means nothing to the reader: a file name, the title or the
+                  author of a document. It is the body of tag(type, value), except for a date
+                  shifted under date_policy::shift, written in the form of the original
+                  ("12/03/2024" becomes "12/03/2019" with a shift of five years).
+                - A substitute carries no check: restore() does not read it back. The caller
+                  keeps the tag it stands for, *tag_out when tag_out != nullptr, and gives it
+                  to find_substitutes() to restore the value.
+        !*/
+
+        struct substitution
+        {
+            std::string substitute;     // the protected form written in the text
+            std::string tag;            // the tag it stands for, which decode() reads back
+        };
+
+        std::string apply_substitutes(
+            const std::string& text,
+            const std::vector<pii_entity>& entities,
+            std::vector<substitution>* made = nullptr
+        ) const;
+        /*!
+            ensures
+                - Returns text with every entity span replaced by its substitute(), the
+                  entities chosen as apply() chooses them.
+                - If made != nullptr, each replacement is appended to *made.
+        !*/
+
+        typedef std::function<std::vector<std::string>(const std::string& candidate)> substitute_resolver;
+        /*!
+            Returns the tags recorded for a substitute equal to candidate, the most likely
+            first, or nothing.
+        !*/
+
+        struct substitute_occurrence
+        {
+            std::size_t begin = 0;      // byte range of the substitute in the text
+            std::size_t end = 0;
+            pii_type type = pii_type::none;
+            std::string original;
+        };
+
+        std::vector<substitute_occurrence> find_substitutes(
+            const std::string& text,
+            const substitute_resolver& resolve,
+            restore_report* report = nullptr
+        ) const;
+        /*!
+            ensures
+                - Returns the substitutes of text that resolve knows, in order, with their
+                  original values. The candidates are the runs of one to twelve words of
+                  text, a word being a run of letters and digits (any byte of a multibyte
+                  character counts as a letter), with the separators between them and the
+                  '!' that may end a code; the longest run is tried first, and the first
+                  tag returned by resolve that decode() verifies wins.
+                - If report != nullptr, the substitutes restored are counted in
+                  report->restored, and the tags returned that do not verify in
+                  report->rejected.
+        !*/
+
+        std::string restore_substitutes(
+            const std::string& text,
+            const substitute_resolver& resolve,
+            restore_report* report = nullptr
+        ) const;
+        /*!
+            ensures
+                - Returns text with every substitute that find_substitutes() finds replaced
+                  by its original value.
         !*/
 
         bool keeps_in_clear(pii_type type) const;

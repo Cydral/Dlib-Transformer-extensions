@@ -313,6 +313,9 @@ namespace dlib
         void set_package_limits(const zip_limits& limits) { limits_ = limits; }
         const zip_limits& package_limits() const { return limits_; }
 
+        void set_untagged_properties(bool untagged) { untagged_properties_ = untagged; }
+        void set_substitute_resolver(const pseudonymizer::substitute_resolver& resolve) { resolve_ = resolve; }
+
         std::string anonymize(const std::string& package_bytes)
         {
             if (!detector_)
@@ -1688,6 +1691,9 @@ namespace dlib
             ++report_.text_units;
             struct span { std::size_t b, e; std::string rep; };
             std::vector<span> edits;
+            // The properties of the package, which the windows of properties show, may hold substitutes.
+            const bool property =
+                untagged_properties_ && (st.role == "core" || st.role == "app" || st.role == "custom");
             if (restoring_)
             {
                 pseudonymizer::restore_report rr;
@@ -1695,6 +1701,41 @@ namespace dlib
                     edits.push_back(span{ o.begin, o.end, o.original });
                 report_.tags_restored += rr.restored;
                 report_.tags_rejected += rr.rejected;
+                if (property)
+                {
+                    pseudonymizer::restore_report sr;
+                    for (const auto& o : p_.find_substitutes(u.text, resolve_, &sr))
+                    {
+                        bool inside_tag = false;
+                        for (const span& s : edits)
+                            if (o.begin < s.e && s.b < o.end) inside_tag = true;
+                        if (!inside_tag) edits.push_back(span{ o.begin, o.end, o.original });
+                    }
+                    report_.substitutes_restored += sr.restored;
+                    std::sort(edits.begin(), edits.end(), [](const span& a, const span& b) { return a.b < b.b; });
+                }
+            }
+            else if (property)
+            {
+                // The substitutes written before, a document protected and then edited, stay as they are.
+                const std::vector<pseudonymizer::substitute_occurrence> known = p_.find_substitutes(u.text, resolve_);
+                for (const pii_entity& e : detector_->detect(u.text, u.ctx))
+                {
+                    if (p_.keeps_in_clear(e.type)) continue;
+                    bool written = false;
+                    for (const auto& o : known)
+                        if (e.begin < o.end && o.begin < e.end) written = true;
+                    if (written) continue;
+                    std::size_t pb = e.begin, pe = e.end;
+                    while (pb < pe && u.text[pb] == ' ') ++pb;
+                    while (pe > pb && u.text[pe - 1] == ' ') --pe;
+                    if (pe <= pb) continue;
+                    report_.count(e.type);
+                    document_substitution s;
+                    s.substitute = p_.substitute(e.type, u.text.substr(pb, pe - pb), &s.tag);
+                    edits.push_back(span{ pb, pe, s.substitute });
+                    report_.substitutions.push_back(s);
+                }
             }
             else
             {
@@ -2247,6 +2288,8 @@ namespace dlib
         bool shift_dates_ = false;
         document_image_describer describer_;
         zip_limits limits_;
+        bool untagged_properties_ = false;
+        pseudonymizer::substitute_resolver resolve_;
         const ooxml_package* pkg_ = nullptr;
         std::map<std::string, std::string> described_;     // image part -> text of the describer
         bool dates_marked_ = false;

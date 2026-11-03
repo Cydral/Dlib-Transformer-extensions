@@ -259,13 +259,18 @@ namespace pseudalis
         }
         albireo_.set_enabled(st.albireo != "off");
 
-        // The drive.
+        // The drives, of anonymization and of restoration.
         drive_.reset(new drive_host(*this));
-        if (!st.drive_letter.empty())
+        if (!st.drive_letter.empty() || !st.restore_letter.empty())
         {
             std::string de;
-            if (drive_->start(st.drive_letter, de)) log_info("drive: " + st.drive_letter + ": mounted");
-            else log_warning("drive: " + de);
+            if (drive_->start(st.drive_letter, st.restore_letter, de))
+                log_info("drive: " + (st.drive_letter.empty() ? std::string("no drive") : st.drive_letter + ":") +
+                         " for the anonymization, " +
+                         (st.restore_letter.empty() ? std::string("none") : st.restore_letter + ":") +
+                         " for the restoration");
+            else
+                log_warning("drive: " + de);
         }
 
         // The server.
@@ -472,7 +477,7 @@ namespace pseudalis
         request["name"] = name;
         json result;
         std::string e;
-        if (!engine_->process(request, bytes, result, out.bytes, pictures, e))
+        if (!engine_->process(request, bytes, result, out.bytes, pictures, e, substitute_lookup()))
         {
             error.set(e, "protect_failed").arg("error", e);
             return false;
@@ -482,6 +487,8 @@ namespace pseudalis
         out.report = result["report"];
         out.sha256 = sha256_hex(out.bytes);
         out.record = 0;
+        // The substitutes of the names and the properties come back through their tags, kept here.
+        if (!record_substitutes(result, error)) return false;
         if (record)
         {
             const std::string blob = vault_->put(bytes);
@@ -519,7 +526,7 @@ namespace pseudalis
                           restore_result& out, user_error& error)
     {
         file_record r;
-        if (db_->find_by_output(sha256_hex(bytes), r))
+        if (db_->find_by_output(sha256_hex(bytes), r, name))
         {
             if (!vault_->get(r.original_blob, out.bytes))
             {
@@ -531,15 +538,21 @@ namespace pseudalis
             out.record = r.id;
             out.report = json::object();
             /* The original of a protected file edited on the drive is that file with its edits:
-               the tags it kept are restored too. */
-            if (engine_ && out.bytes.find("[[") != std::string::npos)
+               the tags it kept are restored too, with the substitutes of its properties.  The
+               parts of an Office document, of a PDF or of an archive are compressed: only a
+               text shows its tags to a search. */
+            const bool text = r.kind == "txt" || r.kind == "csv" || r.kind == "xml" || r.kind == "text";
+            if (engine_ && r.kind != "image" && (!text || out.bytes.find("[[") != std::string::npos))
             {
                 json request = json::object(), result;
                 request["operation"] = "restore";
                 request["name"] = r.original_name;
                 std::string restored, e;
-                if (engine_->process(request, out.bytes, result, restored, nullptr, e) &&
-                    result["report"]["tags_restored"].as_int(0) > 0)
+                const bool done =
+                    engine_->process(request, out.bytes, result, restored, nullptr, e, substitute_lookup());
+                const long long put_back = done ? result["report"]["tags_restored"].as_int(0) +
+                                                  result["report"]["substitutes_restored"].as_int(0) : 0;
+                if (put_back > 0)
                 {
                     out.bytes = restored;
                     out.report = result["report"];
@@ -573,7 +586,7 @@ namespace pseudalis
                 error.set("the picture can no longer be read in the vault", "original_missing");
                 return false;
             }
-            out.name = without_suffix(name, ".txt");
+            out.name = restore_name(without_suffix(name, ".txt"));
             out.how = "picture";
             out.report = json::object();
             return true;
@@ -588,21 +601,94 @@ namespace pseudalis
         request["name"] = name;
         json result;
         std::string e;
-        if (!engine_->process(request, bytes, result, out.bytes, nullptr, e))
+        if (!engine_->process(request, bytes, result, out.bytes, nullptr, e, substitute_lookup()))
         {
             error.set(e, "restore_failed").arg("error", e);
             return false;
         }
         out.report = result["report"];
-        if (out.report["tags_restored"].as_int(0) == 0)
+        if (out.report["tags_restored"].as_int(0) == 0 && out.report["substitutes_restored"].as_int(0) == 0)
         {
             error.set("this file holds no value that Pseudalis protected with this key", "not_protected");
             return false;
         }
-        out.name = name;
+        // The name with its substitutes given back.
+        out.name = result["name"].str(name);
         out.how = "tags";
         if (db_->find_by_object(object_id, r)) out.record = r.id;
         return true;
+    }
+
+    std::function<std::vector<std::string>(const std::string&)> service::substitute_lookup()
+    {
+        /* A candidate of four characters or fewer, a year for instance, is too common in a name or a
+           property edited since to be taken for a substitute. */
+        return [this](const std::string& candidate) -> std::vector<std::string> {
+            if (candidate.size() < 5 || !db_) return std::vector<std::string>();
+            try
+            {
+                return db_->tags_for(candidate);
+            }
+            catch (const std::exception& x)
+            {
+                log_error("substitutes: " + std::string(x.what()));
+                return std::vector<std::string>();
+            }
+        };
+    }
+
+    bool service::record_substitutes(const json& result, user_error& error)
+    {
+        std::vector<std::pair<std::string, std::string>> made;
+        for (const json& s : result["substitutions"].elements())
+            made.push_back(std::make_pair(s["substitute"].str(), s["tag"].str()));
+        try
+        {
+            db_->add_substitutes(made);
+            return true;
+        }
+        catch (const std::exception& x)
+        {
+            error.set(x.what(), "database");
+            return false;
+        }
+    }
+
+    bool service::protect_name(const std::string& name, std::string& out, user_error& error)
+    {
+        std::shared_lock<std::shared_timed_mutex> work(work_m_);
+        if (key_replaced_)
+        {
+            error.set("the service restarts with the key imported", "stopping");
+            return false;
+        }
+        if (!engine_)
+        {
+            error.set("the engine is not ready", "engine");
+            return false;
+        }
+        json request = json::object(), result;
+        request["operation"] = "anonymize_name";
+        request["name"] = "name";
+        std::string e;
+        if (!engine_->process(request, name, result, out, nullptr, e, substitute_lookup()))
+        {
+            error.set(e, "protect_failed").arg("error", e);
+            return false;
+        }
+        return record_substitutes(result, error);
+    }
+
+    std::string service::restore_name(const std::string& name)
+    {
+        if (!engine_) return name;
+        json request = json::object(), result;
+        request["operation"] = "restore_name";
+        request["name"] = "name";
+        std::string out, e;
+        if (!engine_->process(request, name, result, out, nullptr, e, substitute_lookup()) || out.empty())
+            return name;
+        return out;
     }
 
     bool service::text(const std::string& operation, const std::string& text, json& out, user_error& error)

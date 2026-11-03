@@ -111,8 +111,9 @@ namespace dlib
         {
         public:
             pdf_rewriter(const std::string& bytes, const std::vector<pdf_text_replacement>& replacements,
-                         pdf_rewrite_report& report, const document_image_describer& describer)
-                : doc_(bytes), report_(report)
+                         pdf_rewrite_report& report, const document_image_describer& describer,
+                         const std::vector<std::pair<std::string, std::string>>& info)
+                : doc_(bytes), report_(report), info_(info)
             {
                 text_ = read_document(doc_, &rec_, &leaves_);
                 layout_ = layout_pages(text_, &sources_);
@@ -156,7 +157,8 @@ namespace dlib
                 }
                 set(catalog, cat + " >>");
                 drain();
-                return file(catalog);
+                const std::string info = info_dictionary(info_);
+                return file(catalog, info.empty() ? 0 : add(info));
             }
 
         private:
@@ -1373,7 +1375,7 @@ namespace dlib
                 return add(d);
             }
 
-            std::string file(int catalog) const
+            std::string file(int catalog, int info) const
             {
                 std::string out = "%PDF-1.7\n%\xE2\xE3\xCF\xD3\n";
                 std::vector<std::size_t> offsets;
@@ -1392,12 +1394,14 @@ namespace dlib
                     out += buf;
                 }
                 out += "trailer\n<< /Size " + std::to_string(bodies_.size() + 1) + " /Root " + std::to_string(catalog) +
-                       " 0 R >>\nstartxref\n" + std::to_string(xref) + "\n%%EOF\n";
+                       " 0 R" + (info > 0 ? " /Info " + std::to_string(info) + " 0 R" : std::string()) +
+                       " >>\nstartxref\n" + std::to_string(xref) + "\n%%EOF\n";
                 return out;
             }
 
             document doc_;
             pdf_rewrite_report& report_;
+            std::vector<std::pair<std::string, std::string>> info_;
             text_recording rec_;
             std::vector<page_leaf> leaves_;
             pdf_text_document text_;
@@ -1427,11 +1431,13 @@ namespace dlib
         const std::string& pdf_bytes,
         const std::vector<pdf_text_replacement>& replacements,
         pdf_rewrite_report* report = nullptr,
-        const document_image_describer& describer = document_image_describer()
+        const document_image_describer& describer = document_image_describer(),
+        const std::vector<std::pair<std::string, std::string>>& info =
+            std::vector<std::pair<std::string, std::string>>()
     )
     {
         pdf_rewrite_report local;
-        pdf_impl::pdf_rewriter w(pdf_bytes, replacements, report ? *report : local, describer);
+        pdf_impl::pdf_rewriter w(pdf_bytes, replacements, report ? *report : local, describer, info);
         return w.write();
     }
 

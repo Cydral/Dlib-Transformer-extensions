@@ -59,6 +59,7 @@ namespace dlib
         bool rewritten_by_dlib = false;
         std::vector<std::string> notes;
         std::vector<std::string> features;
+        std::vector<std::pair<std::string, std::string>> info;
     };
 
     struct pdf_text_segment
@@ -277,6 +278,45 @@ namespace dlib
             std::string out;
             for (unsigned char c : s) utf8_put(out, pdfdoc_to_unicode(c));
             return out;
+        }
+
+        // A text string written as UTF-16BE with its byte order mark, in hexadecimal.
+        inline std::string hex_text_string(const std::string& utf8)
+        {
+            static const char* digits = "0123456789ABCDEF";
+            std::string out = "<FEFF";
+            auto unit = [&](std::uint32_t u) {
+                for (int shift = 12; shift >= 0; shift -= 4) out.push_back(digits[(u >> shift) & 0xF]);
+            };
+            for (std::size_t i = 0; i < utf8.size();)
+            {
+                std::uint32_t cp = utf8_get(utf8, i);
+                if (cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) cp = 0xFFFD;
+                if (cp >= 0x10000)
+                {
+                    cp -= 0x10000;
+                    unit(0xD800 + (cp >> 10));
+                    unit(0xDC00 + (cp & 0x3FF));
+                }
+                else
+                    unit(cp);
+            }
+            return out + ">";
+        }
+
+        // A document information dictionary, its keys kept to the letters and digits of a PDF name.
+        inline std::string info_dictionary(const std::vector<std::pair<std::string, std::string>>& info)
+        {
+            std::string d;
+            for (const auto& kv : info)
+            {
+                std::string key;
+                for (char c : kv.first)
+                    if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) key.push_back(c);
+                if (key.empty()) continue;
+                d += " /" + key + " " + hex_text_string(kv.second);
+            }
+            return d.empty() ? std::string() : "<<" + d + " >>";
         }
 
     // ------------------------------------------------------------------------------------
@@ -2669,7 +2709,12 @@ namespace dlib
                 {
                     std::string keys;
                     for (const auto& kv : info->dict)
+                    {
                         keys += (keys.empty() ? "" : ", ") + kv.first;
+                        const object* v = doc.resolve_key(*info, kv.first);
+                        if (v && v->is(object::str_k) && out.info.size() < 64)
+                            out.info.push_back(std::make_pair(kv.first, text_string(v->str)));
+                    }
                     out.features.push_back("document information (" + keys + ")");
                 }
             }
@@ -3152,7 +3197,9 @@ namespace dlib
     inline std::string write_pdf_text(
         const pdf_text_document& layout_source,
         const std::vector<std::vector<pdf_text_segment>>& pages,
-        std::size_t* unencodable = nullptr
+        std::size_t* unencodable = nullptr,
+        const std::vector<std::pair<std::string, std::string>>& info =
+            std::vector<std::pair<std::string, std::string>>()
     )
     {
         using namespace pdf_impl;
@@ -3307,6 +3354,11 @@ namespace dlib
         for (int id : page_ids) kids += std::to_string(id) + " 0 R ";
         objects[1] = "<< /Type /Pages /Kids [" + kids + "] /Count " + std::to_string(page_ids.size()) + " >>";
 
+        const std::string info_dict = info_dictionary(info);
+        if (!info_dict.empty()) objects.push_back(info_dict);
+        const std::string info_ref =
+            info_dict.empty() ? std::string() : " /Info " + std::to_string(objects.size()) + " 0 R";
+
         std::string out = "%PDF-1.7\n%\xE2\xE3\xCF\xD3\n";
         std::vector<std::size_t> offsets;
         for (std::size_t i = 0; i < objects.size(); ++i)
@@ -3322,8 +3374,8 @@ namespace dlib
             std::snprintf(buf, sizeof(buf), "%010lu 00000 n \n", static_cast<unsigned long>(off));
             out += buf;
         }
-        out += "trailer\n<< /Size " + std::to_string(objects.size() + 1) + " /Root 1 0 R >>\nstartxref\n" +
-               std::to_string(xref) + "\n%%EOF\n";
+        out += "trailer\n<< /Size " + std::to_string(objects.size() + 1) + " /Root 1 0 R" + info_ref +
+               " >>\nstartxref\n" + std::to_string(xref) + "\n%%EOF\n";
         if (unencodable) *unencodable = bad;
         return out;
     }

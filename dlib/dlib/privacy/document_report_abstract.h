@@ -14,6 +14,18 @@ namespace dlib
 
 // ----------------------------------------------------------------------------------------
 
+    struct document_substitution
+    {
+        /*!
+            WHAT THIS OBJECT REPRESENTS
+                A value written without its tag: its substitute and the tag it stands for.
+        !*/
+        std::string substitute;
+        std::string tag;
+    };
+
+// ----------------------------------------------------------------------------------------
+
     struct document_report
     {
         /*!
@@ -40,6 +52,11 @@ namespace dlib
                 dates_shifted   - the number of dates moved by the secret shift
                 removed         - the parts, pictures, objects and properties removed
                 notes           - the limitations met, each written once
+                substitutions   - anonymization of names and properties without tags
+                                  (document_anonymizer::set_untagged_properties()): each
+                                  substitute written (pseudonymizer::substitute()) with the
+                                  tag it stands for, which the caller keeps to restore it
+                substitutes_restored - restoration: the number of substitutes put back
         !*/
         std::string format;
         std::string operation;
@@ -51,6 +68,8 @@ namespace dlib
         std::size_t dates_shifted = 0;
         std::vector<std::string> removed;
         std::vector<std::string> notes;
+        std::vector<document_substitution> substitutions;
+        std::size_t substitutes_restored = 0;
 
         void count(pii_type t);
         /*!
@@ -74,7 +93,8 @@ namespace dlib
         /*!
             ensures
                 - Returns the report as a JSON object with the fields above and
-                  entities_total, control characters of the strings written as spaces.
+                  entities_total, control characters of the strings written as spaces; the
+                  substitutions are given by their number.
         !*/
     };
 

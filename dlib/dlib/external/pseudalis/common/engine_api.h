@@ -13,18 +13,31 @@
     An engine holds the models of the detector and the key of the pseudonymization; it
     processes several files at once, each call on the thread of its caller.
 
-        psd_process(engine, request, data, size, picture, context, &result, &output, &error)
+        psd_process(engine, request, data, size, picture, lookup, context, &result, &output, &error)
 
     request is a JSON object:
-        "operation"     "anonymize", "restore", "anonymize_text", "restore_text" or "detect"
+        "operation"     "anonymize", "restore", "anonymize_text", "restore_text", "detect",
+                        "anonymize_name" or "restore_name"
         "name"          the name of the file, whose extension tells its kind when its
                         content does not
-    result receives a JSON object: "name" (the name of the output: "photo.png.txt" for a
-    picture), "kind" ("txt", "csv", "xml", "docx", "xlsx", "pptx", "pdf", "image", "zip",
-    "tar", "tar.gz" or "text"), "report" ({"values": {type: count}, "removed": [...],
-    "notes": [...], "dropped": [entries of an archive left out], "tags_restored",
-    "tags_rejected"}) and "pictures" (the identifiers of the pictures found); "spans" for
-    "detect".  output receives the bytes of the file written.
+    result receives a JSON object: "name" (the name of the output, protected or restored:
+    "photo.png.txt" for a picture), "kind" ("txt", "csv", "xml", "docx", "xlsx", "pptx",
+    "pdf", "image", "zip", "tar", "tar.gz" or "text"), "report" ({"values": {type: count},
+    "removed": [...], "notes": [...], "dropped": [entries of an archive left out],
+    "tags_restored", "tags_rejected", "substitutes", "substitutes_restored"}), "pictures"
+    (the identifiers of the pictures found) and, for "anonymize" and "anonymize_name",
+    "substitutions" ([{"substitute", "tag"}]: the values written without their tags in the
+    names and the properties, which the caller records for "restore"); "spans" for
+    "detect".  output receives the bytes of the file written.  "anonymize_name" and
+    "restore_name" take a name alone as data, a folder for instance, and give the new name
+    as output and as "name".
+
+    lookup, when not null, receives each candidate substitute that "restore" and
+    "restore_name" meet in the names and the properties, and returns 1 with the tags
+    recorded for it in *tags, one per line, the most likely first (a buffer the engine
+    releases with psd_free(), allocated with psd_alloc()), or 0 when it knows none.
+    "anonymize" and "anonymize_name" ask it too, so that a substitute written before, in a
+    name or a property edited since, is not replaced again.
 
     picture, when not null, receives each picture found: in a document (Word, PowerPoint,
     PDF), in an archive, or the file itself, with its identifier (the first 16 hexadecimal
@@ -51,7 +64,7 @@
 #define PSD_CALL
 #endif
 
-#define PSEUDALIS_ENGINE_API_VERSION 1
+#define PSEUDALIS_ENGINE_API_VERSION 2
 
 #ifdef __cplusplus
 extern "C" {
@@ -74,6 +87,7 @@ typedef struct psd_picture
 } psd_picture;
 
 typedef int (PSD_CALL* psd_picture_fn)(void* context, const psd_picture* picture, psd_buffer* description);
+typedef int (PSD_CALL* psd_lookup_fn)(void* context, const char* candidate, size_t size, psd_buffer* tags);
 
 typedef struct psd_engine psd_engine;
 
@@ -90,7 +104,8 @@ PSD_API int PSD_CALL psd_models(psd_buffer* description);
 PSD_API psd_engine* PSD_CALL psd_create(const char* key, size_t key_size, const char* options, psd_buffer* error);
 PSD_API void PSD_CALL psd_destroy(psd_engine* engine);
 PSD_API int PSD_CALL psd_process(psd_engine* engine, const char* request, const char* data, size_t size,
-    psd_picture_fn picture, void* context, psd_buffer* result, psd_buffer* output, psd_buffer* error);
+    psd_picture_fn picture, psd_lookup_fn lookup, void* context, psd_buffer* result, psd_buffer* output,
+    psd_buffer* error);
 // The fingerprint of the key, as the reports give it.
 PSD_API int PSD_CALL psd_key_fingerprint(psd_engine* engine, psd_buffer* fingerprint);
 

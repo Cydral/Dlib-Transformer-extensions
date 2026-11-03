@@ -219,6 +219,72 @@ namespace dlib
         const zip_limits& package_limits(
         ) const;
 
+        void set_untagged_properties(
+            bool untagged
+        );
+        /*!
+            ensures
+                - #untagged_properties() == untagged
+        !*/
+
+        bool untagged_properties(
+        ) const;
+        /*!
+            ensures
+                - Returns false, the default, when the properties of the documents (title,
+                  subject, authors, keywords, description, company, manager and the other
+                  fields of the core, extended and custom properties of Word, Excel and
+                  PowerPoint, the document information of a PDF) take tags like the text.
+                - Returns true when anonymize() writes them with substitutes instead
+                  (pseudonymizer::substitute()), which the windows of properties show as
+                  plain values, and lists each one with its tag in report.substitutions;
+                  restore() then gives back the substitutes that the resolver of
+                  set_substitute_resolver() knows. A PDF otherwise loses its document
+                  information, which the protected file then carries.
+        !*/
+
+        void set_substitute_resolver(
+            const pseudonymizer::substitute_resolver& resolve
+        );
+        /*!
+            ensures
+                - restore() and restore_name() give resolve the candidates of the places
+                  that hold substitutes (pseudonymizer::find_substitutes()): the properties
+                  when untagged_properties() is true, and the names. An empty function, the
+                  default, restores no substitute.
+        !*/
+
+        std::string anonymize_name(
+            const std::string& name,
+            document_report& report
+        );
+        /*!
+            ensures
+                - Returns name, a file name without its extension or any other short text
+                  that cannot hold a tag, with each value found replaced by its substitute,
+                  the underscores of the name read as spaces. The detector keeps what it
+                  learned from the document processed before, so that a name it established
+                  there is found in the name of its file too. A person or an organization
+                  found with the common words that open it, "Contrat" in "Contrat Jean
+                  Dupont", leaves those words as they are: a name read without a sentence
+                  around it takes them in. The substitutes that the resolver of
+                  set_substitute_resolver() knows, written by an earlier call, stay as they
+                  are.
+                - Each substitute is counted in report.entities and listed with its tag in
+                  report.substitutions.
+        !*/
+
+        std::string restore_name(
+            const std::string& name,
+            document_report& report
+        ) const;
+        /*!
+            ensures
+                - Returns name with the substitutes that the resolver of
+                  set_substitute_resolver() knows replaced by their original values, counted
+                  in report.substitutes_restored.
+        !*/
+
         void set_image_describer(
             const document_image_describer& describer
         );

@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <fstream>
 #include <functional>
+#include <map>
 #include <sstream>
 #include <memory>
 #include <string>
@@ -705,6 +706,178 @@ namespace
         DLIB_TEST(encrypted_refused);
     }
 
+
+    // The substitutes a report lists, as a resolver gives them back.
+    pseudonymizer::substitute_resolver resolver_of(const std::vector<document_substitution>& made)
+    {
+        std::map<string, std::vector<string>> table;
+        for (const document_substitution& s : made) table[s.substitute].push_back(s.tag);
+        return [table](const string& candidate) {
+            const auto it = table.find(candidate);
+            return it == table.end() ? std::vector<string>() : it->second;
+        };
+    }
+
+    void test_untagged_values()
+    {
+        const pseudonymizer p(pseudonymization_key::from_bytes(string(32, '\x37')));
+
+        // A substitute is the body of the tag, a shifted date keeps its form.
+        string tag;
+        const string person = p.substitute(pii_type::person, "Jean Dupont", &tag);
+        DLIB_TEST(tag == p.tag(pii_type::person, "Jean Dupont"));
+        DLIB_TEST_MSG(tag.find(":" + person + "#") != string::npos, tag << " " << person);
+        DLIB_TEST(person.find("Jean") == string::npos && person.find(' ') != string::npos);
+        const string date = p.substitute(pii_type::date, "12/03/2024", &tag);
+        DLIB_TEST_MSG(date.size() == 10 && date[2] == '/' && date[5] == '/' && date != "12/03/2024", date);
+        pii_type type;
+        string original;
+        DLIB_TEST(p.decode(tag, type, original) && original == "12/03/2024");
+
+        // The substitutes of a text come back through the tags recorded for them.
+        std::vector<pii_entity> entities(2);
+        const string text = "Contrat de Jean Dupont, le 12/03/2024";
+        entities[0].begin = 11;
+        entities[0].end = 22;
+        entities[0].type = pii_type::person;
+        entities[1].begin = 27;
+        entities[1].end = 37;
+        entities[1].type = pii_type::date;
+        std::vector<pseudonymizer::substitution> made;
+        const string protected_text = p.apply_substitutes(text, entities, &made);
+        DLIB_TEST(made.size() == 2 && protected_text.find("[[") == string::npos);
+        DLIB_TEST(protected_text == "Contrat de " + person + ", le " + date);
+        std::vector<document_substitution> listed;
+        for (const auto& s : made) listed.push_back(document_substitution{ s.substitute, s.tag });
+        pseudonymizer::restore_report rr;
+        DLIB_TEST(p.restore_substitutes(protected_text, resolver_of(listed), &rr) == text);
+        DLIB_TEST(rr.restored == 2);
+        // Without the recorded tags, nothing is given back.
+        DLIB_TEST(p.restore_substitutes(protected_text, pseudonymizer::substitute_resolver()) == protected_text);
+
+        // A file name: the underscores read as spaces and stay.
+        pii_detector detector;
+        document_anonymizer a(p, detector);
+        document_report report;
+        const string name = a.anonymize_name("contrat_jean.dupont@acme.fr_2024-03-12", report);
+        DLIB_TEST_MSG(name.find("dupont") == string::npos && name.find("2024-03-12") == string::npos, name);
+        DLIB_TEST_MSG(name.compare(0, 8, "contrat_") == 0 && name.find("[[") == string::npos, name);
+        DLIB_TEST(report.substitutions.size() == 2);
+        a.set_substitute_resolver(resolver_of(report.substitutions));
+        document_report back;
+        const string restored_name = a.restore_name(name, back);
+        DLIB_TEST_MSG(restored_name == "contrat_jean.dupont@acme.fr_2024-03-12", restored_name);
+        DLIB_TEST(back.substitutes_restored == 2);
+        // A name found with the common word that opens it leaves the word: it names the document.
+        {
+            pii_detector wide;
+            wide.add_term(pii_type::person, "Contrat Jean Dupont");
+            document_anonymizer b(p, wide);
+            document_report r;
+            const string named = b.anonymize_name("Contrat Jean Dupont", r);
+            DLIB_TEST_MSG(named == "Contrat " + person, named);
+        }
+
+        // The properties of a Word document take substitutes, and come back.
+        zip_archive_writer w;
+        w.add("[Content_Types].xml",
+              "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+              "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">"
+              "<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>"
+              "<Default Extension=\"xml\" ContentType=\"application/xml\"/>"
+              "<Override PartName=\"/word/document.xml\" "
+              "ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml\"/>"
+              "<Override PartName=\"/docProps/core.xml\" "
+              "ContentType=\"application/vnd.openxmlformats-package.core-properties+xml\"/>"
+              "<Override PartName=\"/docProps/app.xml\" "
+              "ContentType=\"application/vnd.openxmlformats-officedocument.extended-properties+xml\"/></Types>");
+        w.add("_rels/.rels",
+              "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+              "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+              "<Relationship Id=\"rId1\" "
+              "Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" "
+              "Target=\"word/document.xml\"/>"
+              "<Relationship Id=\"rId2\" "
+              "Type=\"http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties\" "
+              "Target=\"docProps/core.xml\"/>"
+              "<Relationship Id=\"rId3\" "
+              "Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties\" "
+              "Target=\"docProps/app.xml\"/></Relationships>");
+        w.add("word/document.xml",
+              "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+              "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:body>"
+              "<w:p><w:r><w:t>Je soussigné, M. Jean Dupont, atteste.</w:t></w:r></w:p><w:sectPr/></w:body>"
+              "</w:document>");
+        w.add("docProps/app.xml",
+              "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+              "<Properties xmlns=\"http://schemas.openxmlformats.org/officeDocument/2006/extended-properties\">"
+              "<Company>Dupont Conseil SARL</Company></Properties>");
+        w.add("docProps/core.xml",
+              "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+              "<cp:coreProperties xmlns:cp=\"http://schemas.openxmlformats.org/package/2006/metadata/core-properties\" "
+              "xmlns:dc=\"http://purl.org/dc/elements/1.1/\"><dc:title>Attestation de M. Jean Dupont</dc:title>"
+              "<dc:creator>Jean Dupont</dc:creator></cp:coreProperties>");
+        const string docx = w.finish();
+        document_anonymizer office(p, detector);
+        office.set_untagged_properties(true);
+        document_report oreport;
+        const string oout = office.anonymize(docx, document_format::docx, oreport);
+        const zip_archive_reader z(oout);
+        const string core = z.read("docProps/core.xml");
+        DLIB_TEST_MSG(core.find("Dupont") == string::npos && core.find("[[") == string::npos, core);
+        DLIB_TEST_MSG(core.find("<dc:creator>" + person + "</dc:creator>") != string::npos, core);
+        DLIB_TEST(z.read("docProps/app.xml").find("[[") == string::npos);
+        DLIB_TEST(z.read("docProps/app.xml").find("Dupont") == string::npos);
+        DLIB_TEST(z.read("word/document.xml").find("[[PERSON:") != string::npos);
+        DLIB_TEST(oreport.substitutions.size() >= 3);
+        office.set_substitute_resolver(resolver_of(oreport.substitutions));
+        document_report oback;
+        const zip_archive_reader r(office.restore(oout, document_format::docx, oback));
+        DLIB_TEST_MSG(r.read("docProps/core.xml").find("<dc:creator>Jean Dupont</dc:creator>") != string::npos,
+                      r.read("docProps/core.xml"));
+        DLIB_TEST(r.read("docProps/core.xml").find("<dc:title>Attestation de M. Jean Dupont</dc:title>") !=
+                  string::npos);
+        DLIB_TEST(r.read("docProps/app.xml").find("<Company>Dupont Conseil SARL</Company>") != string::npos);
+        DLIB_TEST(oback.substitutes_restored >= 3 && oback.tags_restored >= 1);
+
+        // The document information of a PDF too.
+        pdf_text_document source;
+        source.pages.resize(1);
+        source.pages[0].x1 = 595;
+        source.pages[0].y1 = 842;
+        std::vector<std::vector<pdf_text_segment>> lines(1);
+        pdf_text_segment s;
+        s.text = "Je soussigné, M. Jean Dupont, atteste.";
+        s.x = 72;
+        s.y = 700;
+        s.font_size = 11;
+        s.width = 300;
+        lines[0].push_back(s);
+        std::vector<std::pair<string, string>> info;
+        info.push_back(std::make_pair("Title", "Attestation de M. Jean Dupont"));
+        info.push_back(std::make_pair("Author", "Jean Dupont"));
+        info.push_back(std::make_pair("Producer", "Writer 7"));
+        const string pdf = write_pdf_text(source, lines, nullptr, info);
+        DLIB_TEST(read_pdf_text(pdf).info.size() == 3);
+        document_anonymizer printer(p, detector);
+        printer.set_untagged_properties(true);
+        document_report preport;
+        const string pout = printer.anonymize(pdf, document_format::pdf, preport);
+        const pdf_text_document pdoc = read_pdf_text(pout);
+        DLIB_TEST(pdoc.info.size() == 2);
+        for (const auto& kv : pdoc.info)
+            DLIB_TEST_MSG(kv.second.find("Dupont") == string::npos && kv.second.find("[[") == string::npos, kv.second);
+        printer.set_substitute_resolver(resolver_of(preport.substitutions));
+        document_report pback;
+        const pdf_text_document restored = read_pdf_text(printer.restore(pout, document_format::pdf, pback));
+        DLIB_TEST(restored.info.size() == 2);
+        for (const auto& kv : restored.info)
+            DLIB_TEST_MSG(kv.second == (kv.first == "Title" ? "Attestation de M. Jean Dupont" : "Jean Dupont"),
+                          kv.first << ": " << kv.second);
+        // Without untagged properties, the document information stays out.
+        document_report plain;
+        DLIB_TEST(read_pdf_text(a.anonymize(pdf, document_format::pdf, plain)).info.empty());
+    }
 
     // A PDF written by hand, its objects numbered from 1, with a cross-reference table.
     string pdf_file(const std::vector<string>& objects)
@@ -2706,6 +2879,8 @@ namespace
             test_text_documents();
             print_spinner();
             test_office_document();
+            print_spinner();
+            test_untagged_values();
             print_spinner();
             test_pdf_document();
             test_pdf_layout();
