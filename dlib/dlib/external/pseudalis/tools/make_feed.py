@@ -3,22 +3,22 @@
 """
 Writes the update feed of Pseudalis for a new version.
 
-    python3 make_feed.py <output feed.json> <version> <installer> <name in the public link> [<notes.json>]
+    python3 make_feed.py <output feed.json> <version> <installer> <name beside the feed> [<notes.json>]
 
 The installer is the pseudalis-setup.exe of the version, which must carry that version in its
-version resource; the name is the one it takes in the folder dist of the public link of the
-published files, pseudalis-setup-<version>.exe (host/public_link.h).
+version resource; the name is the one it takes beside the feed, in dist/pseudalis of the
+repository: pseudalis-setup-<version>.exe.
 
 notes.json holds the release notes by language, {"en": "...", "fr": "...", ...}; the service
 shows the notes of the language of the user, else the English ones.  Without it, the notes of
 the output feed are kept when that feed already describes the version, and the notes otherwise
 read "Pseudalis <version>".
 
-The feed is then signed with pseudalis-sign (sign <private key> feed.json), and both files are
-published in dist/pseudalis of the repository and, as pseudalis-feed.json and its signature, in
-the folder dist of the public link.  The services that read it download the installer in the
-background, check its size and its SHA-256, and install it at their next start.
-publish_release.py runs these steps.
+The feed is then signed with pseudalis-sign (sign <private key> feed.json), and the feed, its
+signature and the installer are published in dist/pseudalis of the repository, which GitHub
+serves.  The services that read the feed download the installer beside it in the background,
+check its size and its SHA-256, and install it at their next start.  publish_release.py runs
+these steps.
 """
 
 import hashlib
@@ -136,13 +136,12 @@ def read_notes(notes_path, output, version):
 
 def make_feed(version, installer, url, notes, size=None, sha256=None, file=None):
     """The feed announcing version, whose installer is the file installer published at url, in the
-    folder dist of the public link under the name file (public_link.py), or both; the services read
-    the copy of the link first.  size and sha256 spare reading the file again when the caller has
-    them."""
+    folder of the feed under the name file, or both; the services take the file beside the feed when
+    the feed names one.  size and sha256 spare reading the file again when the caller has them."""
     if not re.fullmatch(r"\d+\.\d+\.\d+", version):
         raise ValueError("the version must have the form 1.2.3")
     if not url and not file:
-        raise ValueError("the installer needs an address or a name in the public link")
+        raise ValueError("the installer needs an address or a name beside the feed")
     if url and not url.startswith("https://"):
         raise ValueError("the address of the installer must be an https address")
     if file and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*\.exe", file):

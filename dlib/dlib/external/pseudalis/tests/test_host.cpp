@@ -93,20 +93,11 @@ int main()
         j["drive_letter"] = "p";
         s = host_settings::from_json(j);
         CHECK(s.removed_days == 90 && s.drive_letter == "P");
-        // The drive of restoration: R by default, in upper case, never on the letter of the other drive.
-        CHECK(s.restore_letter == "R");
-        j["restore_letter"] = "s";
-        CHECK(host_settings::from_json(j).restore_letter == "S");
-        j["restore_letter"] = "p";
-        CHECK(host_settings::from_json(j).restore_letter.empty());
-        j["restore_letter"] = "c";
-        CHECK(host_settings::from_json(j).restore_letter == "R");
         CHECK(host_settings::from_json(s.to_json()).removed_days == 90);
-        // The places of the publication of the build stay out of the file and of the answers.
-        CHECK(!s.to_json().contains("public_link") && !s.to_json().contains("feed_url"));
-        CHECK(host_settings::from_json(s.to_json()).public_link == default_public_link);
-        s.public_link.clear();
-        CHECK(s.to_json().contains("public_link") && host_settings::from_json(s.to_json()).public_link.empty());
+        // The place of the publication of the build stays out of the file and of the answers.
+        CHECK(!s.to_json().contains("feed_url") && host_settings::from_json(s.to_json()).feed_url == default_feed_url);
+        s.feed_url = "https://example.org/feed.json";
+        CHECK(host_settings::from_json(s.to_json()).feed_url == "https://example.org/feed.json");
     }
     // A damaged settings.json keeps the originals of the files removed from the drive the longest.
     {
@@ -170,34 +161,36 @@ int main()
         // A record that leaves without reason (the drive replaces its file) leaves no trace.
         CHECK(next > rec && db.remove_file(next, blobs) && db.count_files() == 0);
 
-        drive_node n;
-        n.parent = 1;
-        n.name = "Dossier";
-        n.directory = true;
-        const long long folder = db.add_node(n);
-        drive_node f;
-        f.parent = folder;
-        f.name = "Note.txt";
-        f.size = 12;
-        const long long note = db.add_node(f);
-        drive_node got;
-        CHECK(db.child(folder, "NOTE.TXT", got) && got.id == note && got.size == 12);
-        CHECK(db.children(1).size() == 1 && db.children(folder).size() == 1);
+        // The files of the folder of the drive as the service left them, and what they weigh.
+        folder_file note;
+        note.folder = "drive";
+        note.path = "Dossier/Note.txt";
+        note.size = 12;
+        note.written = 7;
+        note.sha256 = std::string(64, 'e');
+        note.state = "protected";
+        db.set_folder_file(note);
+        folder_file folder = note;
+        folder.path = "Dossier";
+        folder.size = 0;
+        folder.state = "folder";
+        db.set_folder_file(folder);
+        CHECK(db.folder_files("drive").size() == 2 && db.folder_files("other").empty());
         long long files = 0, bytes = 0;
         db.drive_usage(files, bytes);
         CHECK(files == 1 && bytes == 12);
-        db.remove_node(note);
-        CHECK(db.children(folder).empty());
-        // A file takes the name of another, which goes, in one transaction.
-        const long long first = db.add_node(f);
-        CHECK(first > note);
-        drive_node other = f;
-        other.name = "Autre.txt";
-        other.id = db.add_node(other);
-        other.name = "note.TXT";
-        db.replace_node(other, first);
-        CHECK(!db.node(first, got) && db.child(folder, "NOTE.TXT", got) && got.id == other.id);
-        CHECK(db.children(folder).size() == 1);
+        // The paths compare without case, as Windows names its files.
+        note.path = "DOSSIER/note.TXT";
+        note.size = 13;
+        db.set_folder_file(note);
+        db.drive_usage(files, bytes);
+        CHECK(db.folder_files("drive").size() == 2 && files == 1 && bytes == 13);
+        db.remove_folder_file("drive", "dossier/NOTE.txt");
+        db.drive_usage(files, bytes);
+        CHECK(files == 0 && bytes == 0 && db.folder_files("drive").size() == 1);
+        // A substitute comes back through the tags recorded for it, never through its value.
+        db.add_substitutes({ { "Xoydoeh Nuggwdfsorn", "[[PERSON:Xoydoeh Nuggwdfsorn#EKR]]" } });
+        CHECK(db.tags_for("Xoydoeh Nuggwdfsorn").size() == 1 && db.tags_for("Jean Dupont").empty());
         db.add_event("protected", "\\Dossier\\Note.txt", "3 values");
         CHECK(db.events(0).size() == 1);
         db.set_value("k", "v");

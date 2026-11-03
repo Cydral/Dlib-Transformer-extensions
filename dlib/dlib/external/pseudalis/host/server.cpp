@@ -33,7 +33,6 @@
 #include "crypto.h"
 #include "drive.h"
 #include "http_fetch.h"
-#include "public_link.h"
 #include "service.h"
 
 namespace pseudalis
@@ -440,6 +439,46 @@ namespace pseudalis
         srv.Post("/v1/text/restore", text_route("restore_text"));
         srv.Post("/v1/text/detect", text_route("detect"));
 
+        /*
+            Names: the name of a folder, or any name, its values written as substitutes that the
+            database keeps for their restoration, without tags, which a name cannot hold.
+        */
+        auto name_route = [s](bool protect) {
+            return [s, protect](const httplib::Request& req, httplib::Response& res) {
+                work_slot slot(s->work());
+                if (!busy_refused(slot, res)) return;
+                json body;
+                if (!parse_body(req, res, body)) return;
+                const std::string name = body["name"].str();
+                bool plain = !name.empty() && name.size() <= 1024 && name != "." && name != "..";
+                for (const char c : name)
+                    plain = plain && static_cast<unsigned char>(c) >= 32 && c != '/' && c != '\\';
+                if (!plain)
+                {
+                    send_error(res, 400, "the name must be a name alone, of 1024 bytes at most", "bad_request");
+                    return;
+                }
+                json j = json::object();
+                if (!protect)
+                {
+                    j["name"] = s->restore_name(name);
+                    send_json(res, 200, j);
+                    return;
+                }
+                std::string out;
+                user_error e;
+                if (!s->protect_name(name, out, e))
+                {
+                    send_error(res, 422, e);
+                    return;
+                }
+                j["name"] = out.empty() ? name : out;
+                send_json(res, 200, j);
+            };
+        };
+        srv.Post("/v1/names/anonymize", name_route(true));
+        srv.Post("/v1/names/restore", name_route(false));
+
         // The drive, its events, Albireo.
         srv.Get("/v1/drive", [s](const httplib::Request&, httplib::Response& res) {
             send_json(res, 200, s->status()["drive"]);
@@ -500,25 +539,19 @@ namespace pseudalis
             if (!admin(req, res)) return;
             json body;
             if (!parse_body(req, res, body)) return;
-            for (const char* key : { "drive_letter", "restore_letter" })
+            const std::string letter = body["drive_letter"].str();
+            if (body.contains("drive_letter") && !letter.empty() && !valid_drive_letter(letter))
             {
-                const std::string letter = body[key].str();
-                if (body.contains(key) && !letter.empty() && !valid_drive_letter(letter))
-                {
-                    send_error(res, 400, "the letter of a drive must be A, B or D to Z", "settings_drive");
-                    return;
-                }
+                send_error(res, 400, "the letter of the drive must be A, B or D to Z", "settings_drive");
+                return;
             }
-            // The places of the publication and the proxy, in the forms the service reads only.
-            const std::string link = body["public_link"].str(), feed = body["feed_url"].str();
-            if ((body.contains("public_link") && !link.empty() &&
-                 (link.compare(0, 8, "https://") != 0 || !valid_public_link(link))) ||
-                (body.contains("feed_url") && (feed.compare(0, 8, "https://") != 0 || feed.size() > 1024 ||
+            // The place of the publication and the proxy, in the forms the service reads only.
+            const std::string feed = body["feed_url"].str();
+            if ((body.contains("feed_url") && (feed.compare(0, 8, "https://") != 0 || feed.size() > 1024 ||
                  feed.find_first_of(" \t\r\n\"<>") != std::string::npos)) ||
                 (body.contains("proxy") && !valid_proxy_setting(body["proxy"].str())))
             {
-                send_error(res, 400, "the public link, the feed or the proxy is not in a form the service reads",
-                           "settings_publication");
+                send_error(res, 400, "the feed or the proxy is not in a form the service reads", "settings_publication");
                 return;
             }
             host_settings before, after;
@@ -533,9 +566,8 @@ namespace pseudalis
                 return;
             }
             const bool restart = after.port != before.port || after.drive_letter != before.drive_letter ||
-                                 after.restore_letter != before.restore_letter ||
                                  after.date_order != before.date_order || after.proxy != before.proxy ||
-                                 after.public_link != before.public_link || after.feed_url != before.feed_url;
+                                 after.feed_url != before.feed_url;
             s->albireo().set_enabled(after.albireo != "off");
             json j = after.to_json();
             j["restart"] = restart;

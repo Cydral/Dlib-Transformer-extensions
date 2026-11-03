@@ -7,7 +7,7 @@
         pseudalis-setup                     the installation wizard, or the update wizard
                                             when Pseudalis is installed
         pseudalis-setup /silent [/dir <folder>] [/data-dir <folder>] [/drive <letter>|none]
-                        [/restore-drive <letter>|none] [/port <port>] [/no-context-menu]
+                        [/port <port>] [/no-context-menu]
                                             installation without questions; over an
                                             installation, an update that keeps everything but
                                             the options given
@@ -20,10 +20,10 @@
         pseudalis-setup /service start|stop|restart
         pseudalis-setup /lang <code>        language of the wizard: en, fr, de, it, es
 
-    The programs travel inside this program as a ZIP payload (a resource).  The drives need
-    no driver: the service shows two folders of its data folder under their letters.  The
-    copy left in the installation folder, the uninstaller, has no payload: it uninstalls,
-    started with /uninstall or without options, and does nothing else.
+    The programs travel inside this program as a ZIP payload (a resource).  The drive needs
+    no driver: the service shows a folder of its data folder under its letter.  The copy left
+    in the installation folder, the uninstaller, has no payload: it uninstalls, started with
+    /uninstall or without options, and does nothing else.
 
     Over an installation, the programs are replaced in their folder and everything else
     stays: the settings, the key and the originals, the certificates and their trust, the
@@ -31,9 +31,7 @@
     icon.  The new files are written beside the files in place, then take their places
     together; the previous files go once the new service answers on its port, and when a
     step fails, the start of the new service included, they come back and the service
-    starts again.  A newer version in place is left as it is.  The WinFsp that an earlier
-    version installed for its drive leaves once this version is in place, unless another
-    program registered a file system with it since (setup_actions.h).
+    starts again.  A newer version in place is left as it is.
 */
 
 #include "ui.h"
@@ -228,8 +226,6 @@ namespace pseudalis
         {
             std::string& error = report.error;
             if (!update && !setup::write_settings(o, error)) return false;
-            // An update from a version without drive of restoration gives it a free letter.
-            if (update && !setup::add_missing_settings(o, error)) return false;
             /*
                 The service makes the certificates at its start, under its own account, and puts
                 its authority in the trusted roots as settings.json says (write_settings()); an
@@ -326,9 +322,8 @@ namespace pseudalis
             if (!record_data_folder(o, update, error) || !setup::prepare_data_dir(error)) return false;
             const std::string what = update ? "update" : "installation";
             setup::log(what + " of " + PSEUDALIS_VERSION + " in " + o.program_dir + ", data in " + data_dir() +
-                ", port " + std::to_string(o.port) + ", drives " +
-                (o.drive_letter.empty() ? std::string("none") : o.drive_letter + ":") + " and " +
-                (o.restore_letter.empty() ? std::string("none") : o.restore_letter + ":"));
+                ", port " + std::to_string(o.port) + ", drive " +
+                (o.drive_letter.empty() ? std::string("none") : o.drive_letter + ":"));
             if (!prepare_folders(o, update, error)) return false;
             // The new files stay beside those they replace until the end of the copy.
             const uint64_t needed = payload_size() + file_size(executable_path()) + (64ull << 20);
@@ -382,16 +377,6 @@ namespace pseudalis
                 return false;
             }
             files.finish();
-            /*
-                The drives need no driver: the WinFsp that an earlier version installed for its
-                drive leaves, unless another program uses it.
-            */
-            std::string w;
-            if (!setup::remove_owned_winfsp(w))
-            {
-                setup::log("WinFsp: " + w);
-                report.notice = narrow(tr("winfsp_kept", { { "e", w } }));
-            }
             setup::remove_empty_program_folders(o.program_dir);
             setup::write_file_list(o.program_dir, files.targets());
             progress(1000, tr("step_done"), false);
@@ -534,9 +519,7 @@ namespace pseudalis
             The folder of the programs and the data folder go whole; with keep_data, the data
             (the key, the originals, the database and the settings) stays for a later
             installation on this computer, without the certificates, the token of the tray and
-            the updates, and the files of the drives, which lie in the data folder, follow it.
-            The WinFsp that an earlier version installed goes, unless another program uses it
-            (setup::remove_owned_winfsp()).
+            the updates, and the files of the drive, which lie in the data folder, follow it.
         */
         bool perform_uninstall(bool keep_data, const progress_fn& progress, install_report& report)
         {
@@ -564,10 +547,8 @@ namespace pseudalis
             setup::remove_context_menu();
             setup::untrust_authority();
             remove_certificates();
-            // The letters of the drives left with the service; their names in the Explorer go too.
+            // The letter of the drive left with the service; its name in the Explorer goes too.
             setup::remove_drive_labels(dir);
-            std::string w;
-            if (!setup::remove_owned_winfsp(w)) report.notice = narrow(tr("winfsp_kept", { { "e", w } }));
             std::vector<std::string> keep;
             if (keep_data) keep = { data };
             if (!setup::remove_installation(dir, keep))
@@ -611,8 +592,7 @@ namespace pseudalis
             IDC_TITLE = 100, IDC_TEXT, IDC_LANG_LABEL, IDC_LANG, IDC_LICENSE, IDC_ACCEPT, IDC_DIR_LABEL, IDC_DIR,
             IDC_DIR_BROWSE, IDC_SPACE, IDC_AUTOSTART, IDC_DESKTOP, IDC_TRUST, IDC_CONTEXT_MENU, IDC_PORT_LABEL,
             IDC_PORT, IDC_STEP, IDC_PROGRESS, IDC_DETAIL, IDC_LAUNCH, IDC_KEEP_DATA, IDC_BACK, IDC_NEXT, IDC_CANCEL,
-            IDC_DATA_LABEL, IDC_DATA, IDC_DATA_BROWSE, IDC_DRIVE_LABEL, IDC_DRIVE, IDC_DRIVE_NOTE,
-            IDC_RESTORE_LABEL, IDC_RESTORE
+            IDC_DATA_LABEL, IDC_DATA, IDC_DATA_BROWSE, IDC_DRIVE_LABEL, IDC_DRIVE, IDC_DRIVE_NOTE
         };
 
         struct wizard
@@ -628,7 +608,8 @@ namespace pseudalis
             bool working = false;
             bool succeeded = false;
             std::string error;
-            // What failed without stopping the installation: the removal of a WinFsp of an earlier version.
+            // What the end of the work says beside its result: the folder of the programs kept by the
+            // uninstallation, for instance.
             std::string notice;
             // The icons of this session were closed for the copy.
             bool icons_closed = false;
@@ -639,9 +620,8 @@ namespace pseudalis
             bool update = false;
             bool newer_installed = false;
             std::string installed_dir;
-            // The letters the drives may take, "" first for no drive.
+            // The letters the drive may take, "" first for no drive.
             std::vector<std::string> letters;
-            std::vector<std::string> restore_letters;
         } wz;
 
         HWND ctl(int id) { return wz.c[id]; }
@@ -695,22 +675,20 @@ namespace pseudalis
             ui::set_text(ctl(IDC_DIR_BROWSE), tr("browse"));
             ui::set_text(ctl(IDC_DATA_BROWSE), tr("browse"));
             ui::set_text(ctl(IDC_DRIVE_LABEL), tr("opt_drive"));
-            ui::set_text(ctl(IDC_RESTORE_LABEL), tr("opt_restore_drive"));
             ui::set_text(ctl(IDC_DRIVE_NOTE), tr("opt_drive_note"));
             ui::set_text(ctl(IDC_AUTOSTART), tr("opt_autostart"));
             ui::set_text(ctl(IDC_DESKTOP), tr("opt_desktop"));
             ui::set_text(ctl(IDC_TRUST), tr("opt_trust"));
             ui::set_text(ctl(IDC_CONTEXT_MENU), tr("opt_context_menu"));
             ui::set_text(ctl(IDC_PORT_LABEL), tr("opt_port"));
-            // The first choice of each drive: no drive.
-            for (int id : { IDC_DRIVE, IDC_RESTORE })
+            // The first choice of the drive: no drive.
+            if (!wz.letters.empty())
             {
-                if ((id == IDC_DRIVE ? wz.letters : wz.restore_letters).empty()) continue;
-                const LRESULT sel = SendMessageW(ctl(id), CB_GETCURSEL, 0, 0);
-                SendMessageW(ctl(id), CB_DELETESTRING, 0, 0);
+                const LRESULT sel = SendMessageW(ctl(IDC_DRIVE), CB_GETCURSEL, 0, 0);
+                SendMessageW(ctl(IDC_DRIVE), CB_DELETESTRING, 0, 0);
                 const std::wstring none = tr("opt_drive_none");
-                SendMessageW(ctl(id), CB_INSERTSTRING, 0, reinterpret_cast<LPARAM>(none.c_str()));
-                SendMessageW(ctl(id), CB_SETCURSEL, static_cast<WPARAM>(sel < 0 ? 0 : sel), 0);
+                SendMessageW(ctl(IDC_DRIVE), CB_INSERTSTRING, 0, reinterpret_cast<LPARAM>(none.c_str()));
+                SendMessageW(ctl(IDC_DRIVE), CB_SETCURSEL, static_cast<WPARAM>(sel < 0 ? 0 : sel), 0);
             }
             ui::set_text(ctl(IDC_LAUNCH), tr("opt_launch"));
             ui::set_text(ctl(IDC_KEEP_DATA), tr("uninstall_keep_data"));
@@ -730,8 +708,7 @@ namespace pseudalis
             const std::vector<int> all = { IDC_TEXT, IDC_LANG_LABEL, IDC_LANG, IDC_LICENSE, IDC_ACCEPT, IDC_DIR_LABEL,
                 IDC_DIR, IDC_DIR_BROWSE, IDC_DATA_LABEL, IDC_DATA, IDC_DATA_BROWSE, IDC_SPACE, IDC_DRIVE_LABEL,
                 IDC_DRIVE, IDC_DRIVE_NOTE, IDC_AUTOSTART, IDC_DESKTOP, IDC_TRUST, IDC_CONTEXT_MENU, IDC_PORT_LABEL,
-                IDC_PORT, IDC_STEP, IDC_PROGRESS, IDC_DETAIL, IDC_LAUNCH, IDC_KEEP_DATA, IDC_RESTORE_LABEL,
-                IDC_RESTORE };
+                IDC_PORT, IDC_STEP, IDC_PROGRESS, IDC_DETAIL, IDC_LAUNCH, IDC_KEEP_DATA };
             std::vector<int> visible;
             std::wstring title, text;
             switch (p)
@@ -758,8 +735,8 @@ namespace pseudalis
                 break;
             case P_OPTIONS:
                 title = tr("options_title");
-                visible = { IDC_DRIVE_LABEL, IDC_DRIVE, IDC_RESTORE_LABEL, IDC_RESTORE, IDC_DRIVE_NOTE,
-                    IDC_CONTEXT_MENU, IDC_AUTOSTART, IDC_DESKTOP, IDC_TRUST, IDC_PORT_LABEL, IDC_PORT };
+                visible = { IDC_DRIVE_LABEL, IDC_DRIVE, IDC_DRIVE_NOTE, IDC_CONTEXT_MENU, IDC_AUTOSTART, IDC_DESKTOP,
+                    IDC_TRUST, IDC_PORT_LABEL, IDC_PORT };
                 break;
             case P_PROGRESS:
                 title = wz.uninstall ? tr("uninstall_progress") : wz.update ? tr("update_progress")
@@ -859,13 +836,11 @@ namespace pseudalis
                 ui::place(ctl(fields[3 * i + 2]), x + cw - px(100), fy + px(21), px(100), px(28));
             }
             ui::place(ctl(IDC_SPACE), x, y + px(130), cw, px(64));
-            // The drives, their note, then the options.
+            // The drive, its note, then the options.
             ui::place(ctl(IDC_DRIVE_LABEL), x, y + px(4), px(260), px(22));
             ui::place(ctl(IDC_DRIVE), x + px(266), y, px(140), px(200));
-            ui::place(ctl(IDC_RESTORE_LABEL), x, y + px(36), px(260), px(22));
-            ui::place(ctl(IDC_RESTORE), x + px(266), y + px(32), px(140), px(200));
-            ui::place(ctl(IDC_DRIVE_NOTE), x, y + px(64), cw, px(52));
-            int oy = y + px(118);
+            ui::place(ctl(IDC_DRIVE_NOTE), x, y + px(32), cw, px(52));
+            int oy = y + px(88);
             for (int id : { IDC_CONTEXT_MENU, IDC_AUTOSTART, IDC_DESKTOP, IDC_TRUST })
             {
                 ui::place(ctl(id), x, oy, cw, px(32));
@@ -921,28 +896,20 @@ namespace pseudalis
             }
             add(IDC_SPACE, ui::label(wz.hwnd, L"", IDC_SPACE));
             // The letters free on this computer, A: first when it is, and the letters of the drives in place.
+            // The letters free on this computer, A: first when it is, and the letter of the drive in place.
             add(IDC_DRIVE_LABEL, ui::label(wz.hwnd, L"", IDC_DRIVE_LABEL));
             HWND drive = add(IDC_DRIVE, ui::combo(wz.hwnd, IDC_DRIVE));
-            add(IDC_RESTORE_LABEL, ui::label(wz.hwnd, L"", IDC_RESTORE_LABEL));
-            HWND restore = add(IDC_RESTORE, ui::combo(wz.hwnd, IDC_RESTORE));
-            for (int k = 0; k < 2; ++k)
+            wz.letters = setup::free_drive_letters(current.drive_letter);
+            wz.letters.insert(wz.letters.begin(), std::string());
+            int chosen = 0;
+            for (size_t i = 0; i < wz.letters.size(); ++i)
             {
-                std::vector<std::string>& letters = k == 0 ? wz.letters : wz.restore_letters;
-                const std::string& wanted = k == 0 ? current.drive_letter : current.restore_letter;
-                HWND box = k == 0 ? drive : restore;
-                letters = setup::free_drive_letters(current.drive_letter, current.restore_letter);
-                letters.insert(letters.begin(), std::string());
-                int chosen = 0;
-                for (size_t i = 0; i < letters.size(); ++i)
-                {
-                    const std::wstring item = letters[i].empty() ? std::wstring(L"-") : widen(letters[i] + ":");
-                    SendMessageW(box, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item.c_str()));
-                    if (letters[i] == wanted && !letters[i].empty()) chosen = static_cast<int>(i);
-                }
-                // The letter of the drive of anonymization defaults to the first free one.
-                if (k == 0 && chosen == 0 && letters.size() > 1 && !wanted.empty()) chosen = 1;
-                SendMessageW(box, CB_SETCURSEL, static_cast<WPARAM>(chosen), 0);
+                const std::wstring item = wz.letters[i].empty() ? std::wstring(L"-") : widen(wz.letters[i] + ":");
+                SendMessageW(drive, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item.c_str()));
+                if (wz.letters[i] == current.drive_letter && !wz.letters[i].empty()) chosen = static_cast<int>(i);
             }
+            if (chosen == 0 && wz.letters.size() > 1 && !current.drive_letter.empty()) chosen = 1;
+            SendMessageW(drive, CB_SETCURSEL, static_cast<WPARAM>(chosen), 0);
             add(IDC_DRIVE_NOTE, ui::label(wz.hwnd, L"", IDC_DRIVE_NOTE), ui::font_kind::note);
             add(IDC_CONTEXT_MENU, ui::checkbox(wz.hwnd, L"", IDC_CONTEXT_MENU, current.context_menu));
             add(IDC_AUTOSTART, ui::checkbox(wz.hwnd, L"", IDC_AUTOSTART, current.autostart));
@@ -1003,7 +970,6 @@ namespace pseudalis
                 o.program_dir = narrow(ui::text_of(ctl(IDC_DIR)));
                 o.data_dir = narrow(ui::text_of(ctl(IDC_DATA)));
                 o.drive_letter = chosen_letter(IDC_DRIVE, wz.letters);
-                o.restore_letter = chosen_letter(IDC_RESTORE, wz.restore_letters);
                 // The language of the system, the one of the wizard when nothing else was chosen,
                 // follows each user; a language chosen in its place is kept for every user.
                 o.language = current_language() == system_language() ? "auto" : current_language();
@@ -1149,18 +1115,7 @@ namespace pseudalis
                     case P_FOLDERS:
                         if (folders_accepted()) show_page(P_OPTIONS);
                         break;
-                    case P_OPTIONS:
-                    {
-                        // Two drives, two letters.
-                        const std::string a = chosen_letter(IDC_DRIVE, wz.letters);
-                        if (!a.empty() && a == chosen_letter(IDC_RESTORE, wz.restore_letters))
-                        {
-                            ui::message(wz.hwnd, tr("opt_drive_same", { { "l", a } }), MB_OK | MB_ICONWARNING);
-                            break;
-                        }
-                        start_work();
-                        break;
-                    }
+                    case P_OPTIONS: start_work(); break;
                     case P_UNINSTALL: start_work(); break;
                     case P_FINISH:
                     case P_REMOVED: finish(); break;
@@ -1453,15 +1408,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
         const std::wstring dir = arg_after(args, L"/dir");
         // An update replaces the programs in their folder.
         if (!dir.empty() && !update) o.program_dir = narrow(dir);
-        // The letter of each drive, or none.
-        for (int k = 0; k < 2; ++k)
+        // The letter of the drive, or none.
+        const std::wstring drive = arg_after(args, L"/drive");
+        if (!drive.empty())
         {
-            const std::wstring drive = arg_after(args, k == 0 ? L"/drive" : L"/restore-drive");
-            if (drive.empty()) continue;
-            std::string& target = k == 0 ? o.drive_letter : o.restore_letter;
             const std::string letter = narrow(drive).substr(0, 1);
-            if (_wcsicmp(drive.c_str(), L"none") == 0) target.clear();
-            else if (setup::valid_drive_choice(letter)) target = std::string(1,
+            if (_wcsicmp(drive.c_str(), L"none") == 0) o.drive_letter.clear();
+            else if (setup::valid_drive_choice(letter)) o.drive_letter = std::string(1,
                 static_cast<char>(std::toupper(static_cast<unsigned char>(letter[0]))));
             else
             {
@@ -1469,11 +1422,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
                 return 1;
             }
             options = true;
-        }
-        if (!o.drive_letter.empty() && o.drive_letter == o.restore_letter)
-        {
-            setup::log("the two drives need two letters: " + o.drive_letter + ":");
-            return 1;
         }
         if (has_arg(args, L"/no-context-menu")) o.context_menu = false;
         const std::wstring port = arg_after(args, L"/port");

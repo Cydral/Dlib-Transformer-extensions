@@ -17,8 +17,8 @@ namespace pseudalis
             // Each commit reaches the disk, as the blobs of the vault it names do before it.
             "PRAGMA synchronous=FULL;"
             "PRAGMA foreign_keys=ON;"
-            // AUTOINCREMENT: the identifier of a record or of a node deleted is never given again,
-            // since the drive and the copies of the files may still name it.
+            // AUTOINCREMENT: the identifier of a record deleted is never given again, since the drive
+            // and the copies of the files may still name it.
             "CREATE TABLE IF NOT EXISTS files(id INTEGER PRIMARY KEY AUTOINCREMENT, created INTEGER NOT NULL,"
             " source TEXT NOT NULL, original_name TEXT NOT NULL, output_name TEXT NOT NULL,"
             " original_sha256 TEXT NOT NULL, output_sha256 TEXT NOT NULL, original_blob TEXT NOT NULL,"
@@ -31,12 +31,6 @@ namespace pseudalis
             "CREATE INDEX IF NOT EXISTS pictures_sha ON pictures(sha256);"
             "CREATE TABLE IF NOT EXISTS file_pictures(file INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,"
             " picture TEXT NOT NULL, PRIMARY KEY(file, picture));"
-            "CREATE TABLE IF NOT EXISTS nodes(id INTEGER PRIMARY KEY AUTOINCREMENT, parent INTEGER NOT NULL,"
-            " name TEXT NOT NULL, directory INTEGER NOT NULL, file INTEGER NOT NULL DEFAULT 0,"
-            " blob TEXT NOT NULL DEFAULT '', size INTEGER NOT NULL DEFAULT 0, attributes INTEGER NOT NULL DEFAULT 0,"
-            " created INTEGER NOT NULL DEFAULT 0, accessed INTEGER NOT NULL DEFAULT 0,"
-            " written INTEGER NOT NULL DEFAULT 0, changed INTEGER NOT NULL DEFAULT 0);"
-            "CREATE UNIQUE INDEX IF NOT EXISTS nodes_name ON nodes(parent, name COLLATE NOCASE);"
             // The originals forgotten, by the protected files that showed them: their restoration is refused.
             "CREATE TABLE IF NOT EXISTS forgotten(id INTEGER PRIMARY KEY AUTOINCREMENT, time INTEGER NOT NULL,"
             " reason TEXT NOT NULL, output_sha256 TEXT NOT NULL, object_id TEXT NOT NULL DEFAULT '');"
@@ -49,7 +43,7 @@ namespace pseudalis
                their tags, with the tags they stand for: tags, never values in clear. */
             "CREATE TABLE IF NOT EXISTS substitutes(substitute TEXT NOT NULL, tag TEXT NOT NULL,"
             " created INTEGER NOT NULL, PRIMARY KEY(substitute, tag)) WITHOUT ROWID;"
-            // The files of the folders of the drives as the service left them.
+            // The files of the folder of the drive as the service left them.
             "CREATE TABLE IF NOT EXISTS folder_files(folder TEXT NOT NULL, path TEXT NOT NULL COLLATE NOCASE,"
             " size INTEGER NOT NULL, written INTEGER NOT NULL, sha256 TEXT NOT NULL, record INTEGER NOT NULL,"
             " state TEXT NOT NULL, PRIMARY KEY(folder, path));";
@@ -119,27 +113,6 @@ namespace pseudalis
             r.removed = s.integer(13);
             return r;
         }
-
-        const char* const node_columns = "id, parent, name, directory, file, blob, size, attributes, created, accessed,"
-                                         " written, changed";
-
-        drive_node read_node_row(statement& s)
-        {
-            drive_node n;
-            n.id = s.integer(0);
-            n.parent = s.integer(1);
-            n.name = s.text(2);
-            n.directory = s.integer(3) != 0;
-            n.file = s.integer(4);
-            n.blob = s.text(5);
-            n.size = s.integer(6);
-            n.attributes = static_cast<uint32_t>(s.integer(7));
-            n.created = s.integer(8);
-            n.accessed = s.integer(9);
-            n.written = s.integer(10);
-            n.changed = s.integer(11);
-            return n;
-        }
     }
 
     store::store(const std::string& path)
@@ -156,10 +129,6 @@ namespace pseudalis
         exec(schema);
         // The version of the schema, from which the migrations of later versions start.
         exec("PRAGMA user_version = 1");
-        // The root of the drive.
-        drive_node root;
-        if (!node(1, root))
-            exec("INSERT INTO nodes(id, parent, name, directory, attributes) VALUES(1, 0, '', 1, 16)");
     }
 
     store::~store()
@@ -249,8 +218,7 @@ namespace pseudalis
     {
         std::lock_guard<std::mutex> lock(m_);
         std::set<std::string> found;
-        statement s(db_, "SELECT original_blob FROM files UNION SELECT blob FROM pictures"
-                         " UNION SELECT blob FROM nodes WHERE blob != ''");
+        statement s(db_, "SELECT original_blob FROM files UNION SELECT blob FROM pictures");
         while (s.step()) found.insert(s.text(0));
         return found;
     }
@@ -397,99 +365,11 @@ namespace pseudalis
         return out;
     }
 
-    bool store::node(long long id, drive_node& n)
-    {
-        std::lock_guard<std::mutex> lock(m_);
-        statement s(db_, (std::string("SELECT ") + node_columns + " FROM nodes WHERE id = ?1").c_str());
-        s.bind(1, id);
-        if (!s.step()) return false;
-        n = read_node_row(s);
-        return true;
-    }
-
-    bool store::child(long long parent, const std::string& name, drive_node& n)
-    {
-        std::lock_guard<std::mutex> lock(m_);
-        statement s(db_, (std::string("SELECT ") + node_columns +
-                          " FROM nodes WHERE parent = ?1 AND name = ?2 COLLATE NOCASE").c_str());
-        s.bind(1, parent).bind(2, name);
-        if (!s.step()) return false;
-        n = read_node_row(s);
-        return true;
-    }
-
-    std::vector<drive_node> store::children(long long parent)
-    {
-        std::lock_guard<std::mutex> lock(m_);
-        statement s(db_, (std::string("SELECT ") + node_columns +
-                          " FROM nodes WHERE parent = ?1 AND id != 1 ORDER BY name COLLATE NOCASE").c_str());
-        s.bind(1, parent);
-        std::vector<drive_node> out;
-        while (s.step()) out.push_back(read_node_row(s));
-        return out;
-    }
-
-    long long store::add_node(const drive_node& n)
-    {
-        std::lock_guard<std::mutex> lock(m_);
-        statement s(db_, "INSERT INTO nodes(parent, name, directory, file, blob, size, attributes, created, accessed,"
-                         " written, changed) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)");
-        s.bind(1, n.parent).bind(2, n.name).bind(3, static_cast<long long>(n.directory ? 1 : 0)).bind(4, n.file)
-            .bind(5, n.blob).bind(6, n.size).bind(7, static_cast<long long>(n.attributes)).bind(8, n.created)
-            .bind(9, n.accessed).bind(10, n.written).bind(11, n.changed);
-        s.step();
-        return sqlite3_last_insert_rowid(db_);
-    }
-
-    void store::write_node(const drive_node& n)
-    {
-        statement s(db_, "UPDATE nodes SET parent = ?2, name = ?3, directory = ?4, file = ?5, blob = ?6, size = ?7,"
-                         " attributes = ?8, created = ?9, accessed = ?10, written = ?11, changed = ?12 WHERE id = ?1");
-        s.bind(1, n.id).bind(2, n.parent).bind(3, n.name).bind(4, static_cast<long long>(n.directory ? 1 : 0))
-            .bind(5, n.file).bind(6, n.blob).bind(7, n.size).bind(8, static_cast<long long>(n.attributes))
-            .bind(9, n.created).bind(10, n.accessed).bind(11, n.written).bind(12, n.changed);
-        s.step();
-    }
-
-    void store::update_node(const drive_node& n)
-    {
-        std::lock_guard<std::mutex> lock(m_);
-        write_node(n);
-    }
-
-    void store::replace_node(const drive_node& n, long long replaced)
-    {
-        std::lock_guard<std::mutex> lock(m_);
-        exec("BEGIN IMMEDIATE");
-        try
-        {
-            {
-                statement d(db_, "DELETE FROM nodes WHERE id = ?1 AND id != 1");
-                d.bind(1, replaced);
-                d.step();
-            }
-            write_node(n);
-            exec("COMMIT");
-        }
-        catch (...)
-        {
-            sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
-            throw;
-        }
-    }
-
-    void store::remove_node(long long id)
-    {
-        std::lock_guard<std::mutex> lock(m_);
-        statement s(db_, "DELETE FROM nodes WHERE id = ?1 AND id != 1");
-        s.bind(1, id);
-        s.step();
-    }
-
     void store::drive_usage(long long& files, long long& bytes)
     {
         std::lock_guard<std::mutex> lock(m_);
-        statement s(db_, "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM nodes WHERE directory = 0");
+        statement s(db_, "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM folder_files"
+                         " WHERE folder = 'drive' AND state != 'folder'");
         files = bytes = 0;
         if (s.step())
         {

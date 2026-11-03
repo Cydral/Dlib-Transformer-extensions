@@ -213,6 +213,39 @@ namespace pseudalis
             const uint64_t wanted = static_cast<uint64_t>(file_size) * 64;
             return std::min<uint64_t>(2048ull << 20, std::max<uint64_t>(16ull << 20, wanted));
         }
+
+        // The family of a document from its content: a text, an Office document, a PDF, or none.
+        document_family family_of(document_format f)
+        {
+            switch (f)
+            {
+                case document_format::docx:
+                case document_format::xlsx:
+                case document_format::pptx: return document_family::office;
+                case document_format::pdf: return document_family::pdf;
+                case document_format::text:
+                case document_format::delimited:
+                case document_format::markup: return document_family::text;
+                default: return document_family::none;
+            }
+        }
+
+        // The kind of a content alone, for a name without extension.
+        file_kind content_kind(const std::string& bytes, const std::string& base)
+        {
+            if (!image_media_type(bytes).empty()) return file_kind::picture;
+            const document_family family = family_of(detect_document_format(bytes, base));
+            if (family == document_family::office) return file_kind::document;
+            if (archive_kind_of(bytes) != archive_kind::none) return file_kind::archive;
+            return family == document_family::none ? file_kind::unsupported : file_kind::document;
+        }
+
+        // Whether bytes read as a text, which may hold tags whatever the name of its file.
+        bool text_content(const std::string& bytes, const std::string& base)
+        {
+            return archive_kind_of(bytes) == archive_kind::none &&
+                   family_of(detect_document_format(bytes, base)) == document_family::text;
+        }
     }
 
 // ----------------------------------------------------------------------------------------
@@ -393,7 +426,10 @@ namespace pseudalis
         engine_result any(const std::string& bytes, const std::string& name, const picture_handler& handler,
                           bool restoring, const substitute_lookup& lookup, int depth, uint64_t& budget) const
         {
-            const file_kind k = engine::kind_of(bytes, name);
+            file_kind k = engine::kind_of(bytes, name);
+            // A text under another name may hold tags, which its restoration puts back.
+            if (k == file_kind::unsupported && restoring && text_content(bytes, base_name(name)))
+                k = file_kind::document;
             if (k == file_kind::picture)
             {
                 if (!restoring) return picture(bytes, name, handler, lookup);
@@ -409,6 +445,8 @@ namespace pseudalis
             if (k == file_kind::document)
                 return document(bytes, name, detect_document_format(bytes, base_name(name)), handler, restoring,
                                 lookup, budget);
+            if (supported_name(base_name(name)))
+                throw std::runtime_error(base_name(name) + ": the content of this file does not match its name");
             throw std::runtime_error(base_name(name) + ": this kind of file is not supported");
         }
 
@@ -522,7 +560,7 @@ namespace pseudalis
                     continue;
                 }
                 // An entry left out gives its memory back at once.
-                if (!e.regular || engine::kind_of(e.data, e.name) == file_kind::unsupported)
+                if (!e.regular || (!restoring && engine::kind_of(e.data, e.name) == file_kind::unsupported))
                 {
                     out.report["dropped"].push_back(e.name);
                     std::string().swap(e.data);
@@ -547,9 +585,22 @@ namespace pseudalis
                 }
                 catch (std::exception& x)
                 {
-                    // An entry that cannot be read could hold personal data: it is left out.
+                    /*
+                        A restoration keeps an entry it cannot read, which holds no tag, as it is, in
+                        its folder restored with the others and under its name restored.  A protection
+                        leaves it out: it could hold personal data.
+                    */
                     if (restoring)
                     {
+                        document_report r;
+                        const std::string renamed = entry_folders(folder_of(e.name), true, lookup, folders, out) +
+                                                    restore_alone(base_name(e.name), lookup, r);
+                        merge_report(out.report, report_json(r), std::string());
+                        if (renamed != e.name)
+                        {
+                            names.erase(lower(e.name));
+                            e.name = free_name(renamed, names, next_number);
+                        }
                         kept.push_back(std::move(e));
                         continue;
                     }
@@ -598,15 +649,21 @@ namespace pseudalis
 
     file_kind engine::kind_of(const std::string& bytes, const std::string& name)
     {
-        if (!image_media_type(bytes).empty()) return file_kind::picture;
-        const document_format f = detect_document_format(bytes, base_name(name));
-        if (f == document_format::docx || f == document_format::xlsx || f == document_format::pptx)
-            return file_kind::document;
-        if (archive_kind_of(bytes) != archive_kind::none) return file_kind::archive;
-        if (f == document_format::pdf || f == document_format::text || f == document_format::delimited ||
-            f == document_format::markup)
-            return file_kind::document;
-        return file_kind::unsupported;
+        const std::string base = base_name(name);
+        if (name_extension(base).empty()) return content_kind(bytes, base);
+        switch (pseudalis::kind_of_name(base))
+        {
+            case name_kind::picture:
+                return image_media_type(bytes).empty() ? file_kind::unsupported : file_kind::picture;
+            case name_kind::archive:
+                // An archive holds what it holds: an Office document renamed .zip is read as an archive.
+                return archive_kind_of(bytes) == archive_kind::none ? file_kind::unsupported : file_kind::archive;
+            case name_kind::document:
+                return family_of(detect_document_format(bytes, base)) == document_family_of_name(base)
+                    ? file_kind::document : file_kind::unsupported;
+            default:
+                return file_kind::unsupported;
+        }
     }
 
     std::string engine::picture_marker(const std::string& id, const std::string& description)

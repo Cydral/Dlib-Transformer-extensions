@@ -25,7 +25,6 @@
 #include "drive.h"
 #include "http_fetch.h"
 #include "keys.h"
-#include "public_link.h"
 
 namespace pseudalis
 {
@@ -47,6 +46,19 @@ namespace pseudalis
             for (char c : id)
                 if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return std::string();
             return t.size() == 24 || t.compare(23, 3, " : ") == 0 ? id : std::string();
+        }
+
+        /*
+            The code of a failure of the engine: "unsupported" for a file of a kind it does not
+            process, "kind_mismatch" for a file whose content is not the kind its name gives, which
+            the clients tell apart from a file that cannot be read.
+        */
+        std::string engine_code(const std::string& e, const char* code)
+        {
+            if (e.find(": this kind of file is not supported") != std::string::npos) return "unsupported";
+            if (e.find(": the content of this file does not match its name") != std::string::npos)
+                return "kind_mismatch";
+            return code;
         }
 
         std::string without_suffix(const std::string& name, const char* suffix)
@@ -244,7 +256,6 @@ namespace pseudalis
 
         // The updates: one downloaded earlier is applied before anything is served.
         set_http_proxy(st.proxy);
-        set_public_link(st.public_link);
         updater_.reset(new updater(st.feed_url, join_path(data_dir_, "updates")));
         if (!updater_->staged_installer().empty())
         {
@@ -259,18 +270,13 @@ namespace pseudalis
         }
         albireo_.set_enabled(st.albireo != "off");
 
-        // The drives, of anonymization and of restoration.
+        // The drive.
         drive_.reset(new drive_host(*this));
-        if (!st.drive_letter.empty() || !st.restore_letter.empty())
+        if (!st.drive_letter.empty())
         {
             std::string de;
-            if (drive_->start(st.drive_letter, st.restore_letter, de))
-                log_info("drive: " + (st.drive_letter.empty() ? std::string("no drive") : st.drive_letter + ":") +
-                         " for the anonymization, " +
-                         (st.restore_letter.empty() ? std::string("none") : st.restore_letter + ":") +
-                         " for the restoration");
-            else
-                log_warning("drive: " + de);
+            if (drive_->start(st.drive_letter, de)) log_info("drive: " + st.drive_letter + ": mounted");
+            else log_warning("drive: " + de);
         }
 
         // The server.
@@ -479,7 +485,7 @@ namespace pseudalis
         std::string e;
         if (!engine_->process(request, bytes, result, out.bytes, pictures, e, substitute_lookup()))
         {
-            error.set(e, "protect_failed").arg("error", e);
+            error.set(e, engine_code(e, "protect_failed")).arg("error", e);
             return false;
         }
         out.name = result["name"].str(name);
@@ -603,7 +609,7 @@ namespace pseudalis
         std::string e;
         if (!engine_->process(request, bytes, result, out.bytes, nullptr, e, substitute_lookup()))
         {
-            error.set(e, "restore_failed").arg("error", e);
+            error.set(e, engine_code(e, "restore_failed")).arg("error", e);
             return false;
         }
         out.report = result["report"];

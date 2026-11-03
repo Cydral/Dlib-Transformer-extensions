@@ -33,6 +33,14 @@ namespace pseudalis
     std::wstring tr(const std::string& key, const std::vector<std::pair<std::string, std::string>>& values);
     // Whether the table holds a text for key.
     bool has_text(const std::string& key);
+    // The texts of key in the five languages, UTF-8.
+    std::vector<std::string> texts_of(const char* key);
+    /*
+        A text that counts n things, its {n} replaced by n: the text key_one for one thing, and for
+        none in French, when the table holds it, else the text key.
+    */
+    std::wstring tr_count(const char* key, long long n,
+        std::initializer_list<std::pair<const char*, std::string>> values = {});
 
     /*
         The error of an answer of the service ({"error", "code", "args", "sizes"}, as

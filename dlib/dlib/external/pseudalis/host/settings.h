@@ -11,9 +11,7 @@
 
 namespace pseudalis
 {
-    // The public link of the published files of Pseudalis (host/public_link.h).
-    extern const char* const default_public_link;
-    // The update feed on GitHub, read when the public link does not answer.
+    // The update feed, in the folder dist/pseudalis of the repository on GitHub, beside the installer it names.
     extern const char* const default_feed_url;
 
     struct host_settings
@@ -23,13 +21,12 @@ namespace pseudalis
                 The settings of the service, kept in settings.json in the data folder,
                 which the users of the machine read (the tray takes the port there) and the
                 administrators change, through the administration interface or the
-                installer.  The service restarts itself when the port, the drives, the order
-                of the dates, the proxy, the public link or the address of the feed change.
+                installer.  The service restarts itself when the port, the drive, the order
+                of the dates, the proxy or the address of the feed change.
         !*/
         int port = 8444;
         std::string language = "auto";          // auto, en, fr, de, it, es: the tray, the shell, the descriptions
-        std::string drive_letter = "A";         // the letter of the drive of anonymization, empty without drive
-        std::string restore_letter = "R";       // the letter of the drive of restoration, empty without drive
+        std::string drive_letter = "A";         // the letter of the drive, empty without drive
         std::string date_order = "dmy";         // dmy or mdy: the numeric dates the detector reads
         std::string albireo = "auto";           // auto: the pictures are described when Albireo answers; off
         int max_file_mb = 256;                  // the largest file processed
@@ -37,7 +34,6 @@ namespace pseudalis
         static const int max_removed_days = 3650;
         bool check_updates = true;              // a check every day
         bool trust_authority = true;            // the local authority in the trusted roots (the installer)
-        std::string public_link = default_public_link;
         std::string feed_url = default_feed_url;
         std::string proxy;                      // "", "none" or http://host:port (http_fetch.h)
 
@@ -45,7 +41,7 @@ namespace pseudalis
         static host_settings from_json(const json& j);
     };
 
-    // Whether a drive letter is one the drives may take: D to Z, or A and B, without colon.
+    // Whether a drive letter is one the drive may take: D to Z, or A and B, without colon.
     bool valid_drive_letter(const std::string& letter);
 
     class settings_store

@@ -1,4 +1,6 @@
 # The signed files stay byte for byte as they were signed: a conversion of their ends of line at
-# the checkout (core.autocrlf on Windows) would change the bytes their signatures cover.
+# the checkout (core.autocrlf on Windows) would change the bytes their signatures cover.  The
+# installer is a binary file, which the feed describes by its size and its SHA-256.
 *.json -text
 *.sig -text
+*.exe binary

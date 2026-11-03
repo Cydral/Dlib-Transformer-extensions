@@ -27,6 +27,9 @@
    "name": "Texts"
   },
   {
+   "name": "Names"
+  },
+  {
    "name": "Drive"
   },
   {
@@ -66,7 +69,7 @@
      "Service"
     ],
     "summary": "The state of the service",
-    "description": "Product, edition (\"Community\"), version, engine (variant, models), fingerprint of the key, drives (the drive of anonymization and, in restore, the drive of restoration), Albireo and the number of originals kept.",
+    "description": "Product, edition (\"Community\"), version, engine (variant, models), fingerprint of the key, drive, Albireo and the number of originals kept.",
     "responses": {
      "200": {
       "description": "The state",
@@ -87,7 +90,7 @@
      "Files"
     ],
     "summary": "Protect a file",
-    "description": "Protects a document (Word, Excel, PowerPoint, PDF, text, CSV, markup), a picture or an archive (ZIP, TAR, TAR.GZ) sent as the body. Each personal value becomes a tag [[TYPE:body#CCC]] encrypted under the key of this installation. A picture becomes the text file <name>.txt holding \"[Image@<id> : <description>]\", the description written by Albireo when it is installed; the pictures of Word documents, slides and PDF pages are replaced in place the same way. The entries of an archive of another kind are left out. The name of the file, the names of the entries and folders of an archive and the properties of the documents (title, authors, subject, keywords, company of Office documents, the document information of a PDF) take substitutes: each value written without its tag, whose tag the service records so that a restoration gives it back. The protected name is in X-Pseudalis-Name and in Content-Disposition. With record (the default), the original is kept, encrypted, so that /v1/restore gives it back from any copy of the protected file. A body larger than the route takes is refused before it is read (413): the files up to max_file_mb of the settings, the JSON bodies up to 16 MB. When every slot of work stays taken for a minute, the answer is 503 with Retry-After (code busy).",
+    "description": "Protects a document (Word, Excel, PowerPoint, PDF, text, CSV, markup), a picture or an archive (ZIP, TAR, TAR.GZ) sent as the body, whose name gives the kind that its content must have; a name without extension takes the kind of its content. A file of another kind, or whose content is not the kind its name gives, is refused (422, code unsupported or kind_mismatch): its content would come out half protected. A folder travels as a ZIP archive of its tree, which comes back anonymized. Each personal value becomes a tag [[TYPE:body#CCC]] encrypted under the key of this installation. A picture becomes the text file <name>.txt holding \"[Image@<id> : <description>]\", the description written by Albireo when it is installed; the pictures of Word documents, slides and PDF pages are replaced in place the same way. The entries of an archive of another kind are left out, and listed in the report (dropped). The name of the file, the names of the entries and folders of an archive and the properties of the documents (title, authors, subject, keywords, company of Office documents, the document information of a PDF) take substitutes: each value written without its tag, whose tag the service records so that a restoration gives it back. The protected name is in X-Pseudalis-Name and in Content-Disposition. With record (the default), the original is kept, encrypted, so that /v1/restore gives it back from any copy of the protected file. A body larger than the route takes is refused before it is read (413): the files up to max_file_mb of the settings, the JSON bodies up to 16 MB. When every slot of work stays taken for a minute, the answer is 503 with Retry-After (code busy).",
     "parameters": [
      {
       "name": "name",
@@ -199,7 +202,7 @@
      "Files"
     ],
     "summary": "Restore a file",
-    "description": "Gives back the original of a protected file: the original kept when the body is a protected file this installation recorded (X-Pseudalis-restored: original), the picture of a text file holding a picture marker (picture), else the file with the values of its tags put back (tags), and those of the substitutes of its name and of its properties that the service recorded. The original name is in X-Pseudalis-Name. 404 when the file holds no value this key protected; 410 when the original of the file was forgotten (code original_forgotten) or kept for its time after the file left the drive (code original_expired), its date in args.date: such a file is not restored from its tags either. A body larger than the route takes is refused before it is read (413): the files up to max_file_mb of the settings, the JSON bodies up to 16 MB. When every slot of work stays taken for a minute, the answer is 503 with Retry-After (code busy).",
+    "description": "Gives back the original of a protected file: the original kept when the body is a protected file this installation recorded (X-Pseudalis-restored: original), the picture of a text file holding a picture marker (picture), else the file with the values of its tags put back (tags), and those of the substitutes of its name and of its properties that the service recorded. The original name is in X-Pseudalis-Name. A restoration reads the tags of a text under any name, and keeps the entries of an archive that it cannot read as they are, under their names restored. 404 when the file holds no value this key protected; 410 when the original of the file was forgotten (code original_forgotten) or kept for its time after the file left the drive (code original_expired), its date in args.date: such a file is not restored from its tags either. A body larger than the route takes is refused before it is read (413): the files up to max_file_mb of the settings, the JSON bodies up to 16 MB. When every slot of work stays taken for a minute, the answer is 503 with Retry-After (code busy).",
     "parameters": [
      {
       "name": "name",
@@ -544,15 +547,121 @@
     "description": "A body larger than the route takes is refused before it is read (413): the files up to max_file_mb of the settings, the JSON bodies up to 16 MB. When every slot of work stays taken for a minute, the answer is 503 with Retry-After (code busy)."
    }
   },
+  "/v1/names/anonymize": {
+   "post": {
+    "tags": [
+     "Names"
+    ],
+    "summary": "Anonymize a name",
+    "description": "The name of a folder, or any name without its folder: its values become substitutes written without tags, which Windows takes in a name, and which the service records for their restoration. A name without personal data comes back as it is.",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "properties": {
+         "name": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "name"
+        ]
+       }
+      }
+     }
+    },
+    "responses": {
+     "200": {
+      "description": "{\"name\"}: the name anonymized",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "name": {
+           "type": "string"
+          }
+         }
+        }
+       }
+      }
+     },
+     "400": {
+      "$ref": "#/components/responses/Error"
+     },
+     "422": {
+      "$ref": "#/components/responses/Error"
+     },
+     "503": {
+      "$ref": "#/components/responses/Error"
+     }
+    }
+   }
+  },
+  "/v1/names/restore": {
+   "post": {
+    "tags": [
+     "Names"
+    ],
+    "summary": "Restore a name",
+    "description": "Puts back the values of the substitutes that the service recorded in a name; a name without them comes back as it is.",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "type": "object",
+        "properties": {
+         "name": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "name"
+        ]
+       }
+      }
+     }
+    },
+    "responses": {
+     "200": {
+      "description": "{\"name\"}: the name restored",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {
+          "name": {
+           "type": "string"
+          }
+         }
+        }
+       }
+      }
+     },
+     "400": {
+      "$ref": "#/components/responses/Error"
+     },
+     "422": {
+      "$ref": "#/components/responses/Error"
+     },
+     "503": {
+      "$ref": "#/components/responses/Error"
+     }
+    }
+   }
+  },
   "/v1/drive": {
    "get": {
     "tags": [
      "Drive"
     ],
-    "summary": "The state of the drives",
+    "summary": "The state of the drive",
     "responses": {
      "200": {
-      "description": "{\"letter\", \"mounted\", \"folder\", \"files\", \"bytes\", \"error\", \"restore\": {\"letter\", \"mounted\", \"folder\", \"files\", \"bytes\", \"error\"}, \"refused_folder\"}: the drive of anonymization, the drive of restoration, and the folder that holds the files the drive did not process, one folder per user",
+      "description": "{\"letter\", \"mounted\", \"folder\", \"files\", \"bytes\", \"error\", \"refused_folder\"}: the drive, and the folder that holds the files the drive did not process, one folder per user, where each file keeps its place in the tree of the drive",
       "content": {
        "application/json": {
         "schema": {
@@ -569,7 +678,7 @@
     "tags": [
      "Drive"
     ],
-    "summary": "The events of the drives: files protected, refused, restored or left as they are",
+    "summary": "The events of the drive: files protected or refused",
     "security": [
      {
       "admin": []
@@ -589,7 +698,7 @@
     ],
     "responses": {
      "200": {
-      "description": "{\"events\": [{\"id\", \"time\", \"kind\", \"path\", \"message\"}]}: kind is \"protected\", \"refused\" (a file of another kind or that cannot be protected, moved out of the drive), \"restored\" or \"not_restored\"",
+      "description": "{\"events\": [{\"id\", \"time\", \"kind\", \"path\", \"message\"}]}: kind is \"protected\" or \"refused\" (a file of another kind or that cannot be protected, moved out of the drive)",
       "content": {
        "application/json": {
         "schema": {
@@ -818,14 +927,14 @@
       "$ref": "#/components/responses/Error"
      }
     },
-    "description": "The public link and the feed appear only when they differ from those of the build."
+    "description": "The address of the feed appears only when it differs from the one of the build."
    },
    "put": {
     "tags": [
      "Administration"
     ],
     "summary": "Change settings",
-    "description": "The members given replace those of settings.json; the service restarts when the port, the letters of the drives, the date order, the proxy or the publication addresses change (\"restart\": true). The public link must be a public link of pCloud over https, the feed an https address, the proxy empty, \"none\" or http://host:port (400, code settings_publication otherwise). The changes apply in one step against concurrent ones.",
+    "description": "The members given replace those of settings.json; the service restarts when the port, the letter of the drive, the date order, the proxy or the address of the feed change (\"restart\": true). The feed must be an https address, the proxy empty, \"none\" or http://host:port (400, code settings_publication otherwise). The changes apply in one step against concurrent ones.",
     "security": [
      {
       "admin": []
@@ -1188,12 +1297,7 @@
      "drive_letter": {
       "type": "string",
       "example": "A",
-      "description": "The letter of the drive of anonymization, A, B or D to Z; empty: no drive"
-     },
-     "restore_letter": {
-      "type": "string",
-      "example": "R",
-      "description": "The letter of the drive of restoration, A, B or D to Z, another than drive_letter; empty: no drive"
+      "description": "The letter of the drive, A, B or D to Z; empty: no drive"
      },
      "date_order": {
       "type": "string",
@@ -1221,9 +1325,6 @@
      },
      "trust_authority": {
       "type": "boolean"
-     },
-     "public_link": {
-      "type": "string"
      },
      "feed_url": {
       "type": "string"

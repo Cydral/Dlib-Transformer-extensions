@@ -2,15 +2,15 @@
 // License: Boost Software License   See LICENSE.txt for the full license.
 
 /*
-    pseudalis: the commands of the Explorer on the files Pseudalis protects, which the
-    service carries out.
+    pseudalis: the commands of the Explorer on the files and the folders Pseudalis protects,
+    which the service carries out.
 
-        pseudalis protect <file>...          anonymizes each file in its place
-        pseudalis protect --copy <file>...   writes the anonymized copy beside each file,
-                                             "name (anonymized).ext"
-        pseudalis restore <file>...          puts the original back in the place of each file
-        pseudalis restore --copy <file>...   writes the original beside each file,
-                                             "name (restored).ext"
+        pseudalis protect <file or folder>...          anonymizes each one in its place
+        pseudalis protect --copy <file or folder>...   writes the anonymized copy beside each one,
+                                                       "name (anonymized).ext"
+        pseudalis restore <file or folder>...          puts the original back in the place of each one
+        pseudalis restore --copy <file or folder>...   writes the original beside each one,
+                                                       "name (restored).ext"
 
     A picture becomes the text file of its marker, "photo.jpg.txt", which its restoration
     turns back into the picture.  The name of a file is anonymized too, its values written
@@ -19,11 +19,16 @@
     (its SHA-256, or its NTFS object identifier, which the service records with the place
     of the file); a file edited since gets its values back from its tags, and those of its
     name and of its properties from the substitutes the service recorded.  The files of the
-    drive of anonymization are anonymized already: their originals are saved where the user
-    chooses, outside the drive, which would anonymize them again.  The files of the drive of
-    restoration are restored already: their anonymized versions are saved where the user
-    chooses, outside the drive, which would restore them again.  A drive is known by its
+    drive of Pseudalis are anonymized already: their originals are saved where the user
+    chooses, outside the drive, which would anonymize them again.  The drive is known by its
     letter and by its folder in the data folder.
+
+    A folder is processed file by file, its folders included, each one taking its name
+    anonymized, or restored, once its files are done: in its place, or as a copy that
+    receives the same tree.  A file of another kind stays as it is in its place and out of an
+    anonymized copy, which holds anonymized files only; a restored copy takes it as it is.
+    The symbolic links and the junctions are passed, and the processing stops beyond
+    max_folder_files files or max_folder_depth levels.
 
     The results go to the icon of the session, which notifies them together; without the
     icon, a message box tells them, and from a console they are printed there.  The exit
@@ -59,6 +64,9 @@ namespace pseudalis
         // The mark of the results sent to the icon (WM_COPYDATA), and the largest file read.
         const ULONG_PTR results_mark = 0x50534431;
         const uint64_t max_file_bytes = 1ull << 30;
+        // The bounds of the processing of a folder: the levels of its folders and the files it meets.
+        const int max_folder_depth = 64;
+        const long long max_folder_files = 100000;
 
         struct outcome
         {
@@ -66,6 +74,9 @@ namespace pseudalis
             std::wstring text;
             std::string name;
             std::string error;
+            std::string code;           // the code of the service, for a failure it answered
+            bool already = false;       // the file is anonymized already
+            long long values = 0;       // the values replaced, or put back from the tags
         };
 
         outcome success(const std::wstring& text, const std::string& name)
@@ -77,11 +88,12 @@ namespace pseudalis
             return o;
         }
 
-        outcome failure(const std::string& name, const std::wstring& why)
+        outcome failure(const std::string& name, const std::wstring& why, const std::string& code = std::string())
         {
             outcome o;
             o.name = name;
             o.error = narrow(why);
+            o.code = code;
             o.text = tr("shell_failed", { { "f", name }, { "e", o.error } });
             return o;
         }
@@ -135,10 +147,12 @@ namespace pseudalis
             return it == a.headers.end() ? std::string() : percent_decoded(it->second);
         }
 
-        // The text of an answer of the service that failed.
-        std::wstring answer_error(const service_client::raw_answer& a)
+        // The failure an answer of the service tells, with its code.
+        outcome answer_failure(const std::string& name, const service_client::raw_answer& a)
         {
-            return error_text(failed_answer(json::parse_or_null(a.body), "status " + std::to_string(a.status)));
+            const json body = json::parse_or_null(a.body);
+            return failure(name, error_text(failed_answer(body, "status " + std::to_string(a.status))),
+                body["code"].as_string());
         }
 
         bool sharing_error(DWORD e)
@@ -349,6 +363,30 @@ namespace pseudalis
             return stem + " (" + suffix + ")" + base.substr(stem.size()) + tail;
         }
 
+        /*
+            A name without the suffix that Anonymize as a copy gave it, in any of the languages, and
+            the number that a name taken added after it: "rapport (anonymized) (2).docx" and
+            "Dossier (anonymisé)" give "rapport.docx" and "Dossier".  Its restored copy takes its
+            own suffix in its place.
+        */
+        std::string without_copy_suffix(const std::string& name)
+        {
+            const std::string ext = name_extension(name);
+            const std::string stem = name.substr(0, name.size() - ext.size());
+            size_t end = stem.size();
+            const size_t open = stem.rfind(" (");
+            if (open != std::string::npos && end > open + 3 && stem[end - 1] == ')' &&
+                stem.find_first_not_of("0123456789", open + 2) == end - 1)
+                end = open;
+            for (const std::string& s : texts_of("suffix_anonymized"))
+            {
+                const std::string tail = " (" + s + ")";
+                if (end > tail.size() && stem.compare(end - tail.size(), tail.size(), tail) == 0)
+                    return stem.substr(0, end - tail.size()) + ext;
+            }
+            return name;
+        }
+
         // A name free in dir: name itself, else "name (2).ext", "name (3).ext"...
         std::string free_name(const std::string& dir, const std::string& name)
         {
@@ -376,26 +414,33 @@ namespace pseudalis
             return out;
         }
 
-        // Where the user saves a file that cannot stay on its drive, or "": title, then the name proposed.
+        /*
+            Where the user saves a file that cannot stay on its drive, or "": title, then the name
+            proposed; with an empty name, the folder where the originals of a folder go.  The
+            dialog opens on the documents of the user.
+        */
         std::wstring choose_destination(const std::wstring& title, const std::string& name)
         {
             std::wstring chosen;
-            IFileSaveDialog* dialog = nullptr;
-            if (FAILED(CoCreateInstance(CLSID_FileSaveDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog))))
+            const bool folder = name.empty();
+            IFileDialog* dialog = nullptr;
+            if (FAILED(CoCreateInstance(folder ? CLSID_FileOpenDialog : CLSID_FileSaveDialog, nullptr,
+                    CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog))))
                 return chosen;
             dialog->SetTitle(title.c_str());
-            dialog->SetFileName(widen(name).c_str());
+            if (!folder) dialog->SetFileName(widen(name).c_str());
             DWORD options = 0;
             dialog->GetOptions(&options);
-            dialog->SetOptions(options | FOS_OVERWRITEPROMPT | FOS_FORCEFILESYSTEM | FOS_NOREADONLYRETURN);
+            dialog->SetOptions(options | FOS_FORCEFILESYSTEM | FOS_NOREADONLYRETURN |
+                (folder ? FOS_PICKFOLDERS | FOS_PATHMUSTEXIST : FOS_OVERWRITEPROMPT));
             PWSTR documents = nullptr;
             if (SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &documents) == S_OK)
             {
-                IShellItem* folder = nullptr;
-                if (SUCCEEDED(SHCreateItemFromParsingName(documents, nullptr, IID_PPV_ARGS(&folder))))
+                IShellItem* start = nullptr;
+                if (SUCCEEDED(SHCreateItemFromParsingName(documents, nullptr, IID_PPV_ARGS(&start))))
                 {
-                    dialog->SetFolder(folder);
-                    folder->Release();
+                    dialog->SetFolder(start);
+                    start->Release();
                 }
             }
             if (documents) CoTaskMemFree(documents);
@@ -416,6 +461,83 @@ namespace pseudalis
             dialog->Release();
             return chosen;
         }
+
+        // The names a folder holds for the system or for a program at work, which stay as they are.
+        bool passed_name(const std::wstring& name, DWORD attributes)
+        {
+            if ((attributes & FILE_ATTRIBUTE_SYSTEM) && (attributes & FILE_ATTRIBUTE_HIDDEN)) return true;
+            std::wstring n = name;
+            for (wchar_t& c : n) c = static_cast<wchar_t>(std::towlower(c));
+            return n == L"desktop.ini" || n == L"thumbs.db" || n == L"ehthumbs.db" || n == L".ds_store" ||
+                n.compare(0, 2, L"~$") == 0 || n.compare(0, 11, L"~pseudalis-") == 0;
+        }
+
+        struct folder_entry
+        {
+            std::wstring name;
+            bool folder = false;
+        };
+
+        /*
+            The files and the folders of dir, by name.  A symbolic link or a junction is passed: it
+            may lead out of the folder, or back into it.  A file of a cloud (OneDrive) is read like
+            the others, which brings it to the computer.
+        */
+        bool list_folder(const std::wstring& dir, std::vector<folder_entry>& out, DWORD& error)
+        {
+            out.clear();
+            WIN32_FIND_DATAW d;
+            HANDLE h = FindFirstFileExW((dir + L"\\*").c_str(), FindExInfoBasic, &d, FindExSearchNameMatch, nullptr,
+                FIND_FIRST_EX_LARGE_FETCH);
+            if (h == INVALID_HANDLE_VALUE)
+            {
+                error = GetLastError();
+                return false;
+            }
+            do
+            {
+                const std::wstring n = d.cFileName;
+                if (n == L"." || n == L"..") continue;
+                if ((d.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) &&
+                    (d.dwReserved0 == IO_REPARSE_TAG_SYMLINK || d.dwReserved0 == IO_REPARSE_TAG_MOUNT_POINT))
+                    continue;
+                if (passed_name(n, d.dwFileAttributes)) continue;
+                folder_entry e;
+                e.name = n;
+                e.folder = (d.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+                out.push_back(e);
+            } while (FindNextFileW(h, &d));
+            error = GetLastError();
+            FindClose(h);
+            if (error != ERROR_NO_MORE_FILES) return false;
+            std::sort(out.begin(), out.end(), [](const folder_entry& a, const folder_entry& b) {
+                return _wcsicmp(a.name.c_str(), b.name.c_str()) < 0;
+            });
+            return true;
+        }
+
+        // Whether path lies in the folder dir, or is dir.
+        bool within(const std::wstring& path, const std::wstring& dir)
+        {
+            return path.size() >= dir.size() && _wcsnicmp(path.c_str(), dir.c_str(), dir.size()) == 0 &&
+                (path.size() == dir.size() || path[dir.size()] == L'\\');
+        }
+
+        // What the processing of a folder did, told at its end.
+        struct folder_tally
+        {
+            long long done = 0;         // the files anonymized, or restored
+            long long values = 0;       // the values they had replaced
+            long long already = 0;      // the files anonymized already
+            long long other = 0;        // the files of another kind
+            long long failed = 0;
+            long long files = 0;        // the files met
+            std::vector<std::string> others;    // the first files of another kind
+            std::string failed_name;    // the first failure
+            std::string failed_error;
+            bool stopped = false;       // more than max_folder_files files
+            bool too_deep = false;      // folders deeper than max_folder_depth levels
+        };
 
         // A drive of the service, from its state: its letter, whether Windows shows it, its folder.
         struct drive_place
@@ -452,15 +574,25 @@ namespace pseudalis
                 online_ = client_.get("/v1/info", info, error, 10);
                 if (!online_) offline_error_ = error;
                 drive_ = drive_place(info["drive"]);
-                restore_drive_ = drive_place(info["drive"]["restore"]);
             }
 
             outcome run(bool protect, const std::wstring& given)
             {
                 const std::wstring path = full_path(given);
-                const std::string name = narrow(path.substr(path.find_last_of(L'\\') + 1));
+                const std::string name = narrow(file_of(path));
                 if (!online_) return failure(name, error_text(failed_answer(json(), offline_error_)));
-                if (!supported_name(name)) return failure(name, tr("shell_unsupported", { { "f", name } }));
+                const DWORD attributes = GetFileAttributesW(path.c_str());
+                if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY))
+                    return run_folder(protect, path, name);
+                // A name without extension: its content decides.
+                if (!possible_name(name)) return failure(name, tr("shell_unsupported", { { "f", name } }));
+                return run_file(protect, path, name, std::string());
+            }
+
+        private:
+            // into: the folder that receives the result under the name the service gives, or "".
+            outcome run_file(bool protect, const std::wstring& path, const std::string& name, const std::string& into)
+            {
                 std::string data;
                 DWORD e = 0;
                 if (!read_whole(path, data, stamp_, e))
@@ -474,53 +606,47 @@ namespace pseudalis
                 {
                     // Nothing to do: the drive holds anonymized files only.
                     if (on_drive) return success(tr("shell_on_drive", { { "l", drive_.letter } }), name);
-                    return anonymize(path, name, data, restore_drive_.holds(path));
+                    return anonymize(path, name, data, into);
                 }
-                return restore(path, name, data, on_drive);
+                return restore(path, name, data, on_drive, into);
             }
 
-        private:
             outcome anonymize(const std::wstring& path, const std::string& name, const std::string& data,
-                              bool on_restore_drive)
+                              const std::string& into)
             {
                 json found;
                 std::string error;
                 if (client_.get("/v1/lookup?sha256=" + sha256_hex(data), found, error) && found["exact"].as_bool(false))
-                    return failure(name, tr("shell_already", { { "f", name } }));
+                {
+                    outcome o = failure(name, tr("shell_already", { { "f", name } }));
+                    o.already = true;
+                    return o;
+                }
                 service_client::raw_answer a;
                 if (!client_.post_bytes("/v1/anonymize?source=shell&name=" + query_value(name), data, a, error))
                     return failure(name, error_text(failed_answer(json(), error)));
-                if (a.status != 200) return failure(name, answer_error(a));
+                if (a.status != 200) return answer_failure(name, a);
                 const std::string made = header(a, "x-pseudalis-name");
                 const long long record = std::atoll(header(a, "x-pseudalis-record").c_str());
                 const json report = json::parse_or_null(header(a, "x-pseudalis-report"));
-                const std::string values = std::to_string(report["total"].as_int(0));
+                const long long values = report["total"].as_int(0);
 
-                const std::string dir = narrow(path.substr(0, path.find_last_of(L'\\')));
+                const std::string dir = into.empty() ? narrow(path.substr(0, path.find_last_of(L'\\'))) : into;
+                // In its place, the file leaves for its anonymized form when its name changes.
+                const bool moved = into.empty() && !copy_;
                 std::wstring target = path;
                 DWORD e = 0;
-                if (on_restore_drive)
+                if (!moved || made != name)
                 {
-                    // The drive of restoration would restore it again: it goes where the user says.
-                    target = choose_destination(tr("shell_save_anonymized_title", { { "f", name } }), made);
-                    // Cancelled by the user: nothing to tell.
-                    if (target.empty()) return success(std::wstring(), name);
-                    const bool exists = GetFileAttributesW(target.c_str()) != INVALID_FILE_ATTRIBUTES;
-                    if (exists ? !replace_content(target, a.body, e) : !write_new(target, a.body, e))
-                        return failure(narrow(file_of(target)), tr("shell_cannot_write",
-                            { { "f", narrow(file_of(target)) }, { "e", narrow(system_message(e)) } }));
-                }
-                else if (copy_ || made != name)
-                {
-                    const std::string wanted = copy_ ? copy_name(name, made, tr_utf8("suffix_anonymized")) : made;
+                    const std::string wanted = into.empty() && copy_
+                        ? copy_name(name, made, tr_utf8("suffix_anonymized")) : made;
                     target = widen(join_path(dir, free_name(dir, wanted)));
-                    if (!copy_ && !unchanged(path, stamp_))
-                        return failure(name, tr("shell_changed", { { "f", name } }));
+                    if (moved && !unchanged(path, stamp_)) return failure(name, tr("shell_changed", { { "f", name } }));
                     if (!write_new(target, a.body, e))
                         return failure(name, tr("shell_cannot_write", { { "f", narrow(file_of(target)) },
                             { "e", narrow(system_message(e)) } }));
                     // In its place, a picture leaves for the text of its marker.
-                    if (!copy_ && !DeleteFileW(path.c_str()))
+                    if (moved && !DeleteFileW(path.c_str()))
                         return failure(name, tr("shell_cannot_write", { { "f", name },
                             { "e", narrow(system_message(GetLastError())) } }));
                 }
@@ -544,29 +670,35 @@ namespace pseudalis
                     client_.send("POST", "/v1/records/" + std::to_string(record) + "/location", body, out, error);
                 }
                 const std::string shown = narrow(file_of(target));
-                return success(tr(copy_ || on_restore_drive ? "shell_protected_copy" : "shell_protected",
-                    { { "f", shown }, { "n", values } }), shown);
+                outcome o = success(tr_count(moved ? "shell_protected" : "shell_protected_copy", values,
+                    { { "f", shown } }), shown);
+                o.values = values;
+                return o;
             }
 
-            outcome restore(const std::wstring& path, const std::string& name, const std::string& data, bool on_drive)
+            outcome restore(const std::wstring& path, const std::string& name, const std::string& data, bool on_drive,
+                            const std::string& into)
             {
                 service_client::raw_answer a;
                 std::string error;
                 const std::string oid = on_drive ? std::string() : object_id(path);
                 if (!client_.post_bytes("/v1/restore?name=" + query_value(name) + "&object_id=" + oid, data, a, error))
                     return failure(name, error_text(failed_answer(json(), error)));
-                if (a.status != 200) return failure(name, answer_error(a));
+                if (a.status != 200) return answer_failure(name, a);
                 const std::string how = header(a, "x-pseudalis-restored");
                 const std::string original = header(a, "x-pseudalis-name");
                 const json report = json::parse_or_null(header(a, "x-pseudalis-report"));
-                const std::string values = std::to_string(report["tags_restored"].as_int(0));
+                const long long values = report["tags_restored"].as_int(0);
+                // The name of an original kept is the one it had; a name restored from its substitutes
+                // loses the suffix of an anonymized copy.
+                const std::string base = how == "original" && !original.empty()
+                    ? original : without_copy_suffix(original.empty() ? name : original);
 
                 std::wstring target = path;
                 DWORD e = 0;
-                if (on_drive)
+                if (on_drive && into.empty())
                 {
                     // The drive would anonymize the original again: it goes where the user says.
-                    const std::string base = original.empty() ? name : original;
                     target = choose_destination(tr("shell_save_title", { { "f", base } }), base);
                     // Cancelled by the user: nothing to tell.
                     if (target.empty()) return success(std::wstring(), name);
@@ -577,23 +709,23 @@ namespace pseudalis
                             { "e", narrow(system_message(e)) } }));
                     return success(tr("shell_restored_copy", { { "f", shown } }), shown);
                 }
-                const std::string dir = narrow(path.substr(0, path.find_last_of(L'\\')));
+                const std::string dir = into.empty() ? narrow(path.substr(0, path.find_last_of(L'\\'))) : into;
+                const bool moved = into.empty() && !copy_;
                 /*
                     The original takes its own name back, which the service kept or found again
                     from the substitutes of the name: the text file of a picture gives back the
                     picture under its name too.  A copy takes the name of the original.
                 */
-                const std::string base = original.empty() ? name : original;
-                if (copy_ || base != name)
+                if (!moved || base != name)
                 {
-                    const std::string wanted = copy_ ? copy_name(base, base, tr_utf8("suffix_restored")) : base;
+                    const std::string wanted = into.empty() && copy_
+                        ? copy_name(base, base, tr_utf8("suffix_restored")) : base;
                     target = widen(join_path(dir, free_name(dir, wanted)));
-                    if (!copy_ && !unchanged(path, stamp_))
-                        return failure(name, tr("shell_changed", { { "f", name } }));
+                    if (moved && !unchanged(path, stamp_)) return failure(name, tr("shell_changed", { { "f", name } }));
                     if (!write_new(target, a.body, e))
                         return failure(name, tr("shell_cannot_write", { { "f", narrow(file_of(target)) },
                             { "e", narrow(system_message(e)) } }));
-                    if (!copy_ && !DeleteFileW(path.c_str()))
+                    if (moved && !DeleteFileW(path.c_str()))
                         return failure(name, tr("shell_cannot_write", { { "f", name },
                             { "e", narrow(system_message(GetLastError())) } }));
                 }
@@ -608,9 +740,236 @@ namespace pseudalis
                         { "e", narrow(system_message(e)) } }));
                 }
                 const std::string shown = narrow(file_of(target));
-                if (how == "tags")
-                    return success(tr("shell_restored_tags", { { "f", shown }, { "n", values } }), shown);
-                return success(tr(copy_ ? "shell_restored_copy" : "shell_restored", { { "f", shown } }), shown);
+                outcome o = how == "tags"
+                    ? success(tr_count("shell_restored_tags", values, { { "f", shown } }), shown)
+                    : success(tr(moved ? "shell_restored" : "shell_restored_copy", { { "f", shown } }), shown);
+                o.values = values;
+                return o;
+            }
+
+            // The name of a folder anonymized, or restored, by the service; why tells a failure.
+            bool name_of(bool protect, const std::string& name, std::string& out, std::string& why)
+            {
+                json body = json::object(), answer;
+                body["name"] = name;
+                std::string error;
+                out = name;
+                if (!client_.send("POST", protect ? "/v1/names/anonymize" : "/v1/names/restore", body, answer, error))
+                {
+                    why = narrow(error_text(failed_answer(answer, error)));
+                    return false;
+                }
+                const std::string made = answer["name"].as_string();
+                if (!made.empty()) out = made;
+                return true;
+            }
+
+            static void note_failure(folder_tally& t, const std::string& name, const std::string& why)
+            {
+                if (t.failed++ > 0) return;
+                t.failed_name = name;
+                t.failed_error = why;
+            }
+
+            static void copy_as_is(const std::wstring& path, const std::string& name, const std::string& into,
+                                   folder_tally& t)
+            {
+                const std::wstring target = widen(join_path(into, free_name(into, name)));
+                if (!CopyFileW(path.c_str(), target.c_str(), TRUE))
+                    note_failure(t, name, narrow(system_message(GetLastError())));
+            }
+
+            /*
+                A file of another kind: it stays as it is in its place and out of an anonymized
+                copy, which holds anonymized files only; a restored copy takes it as it is.
+            */
+            static void other_kind(bool protect, const std::wstring& path, const std::string& name,
+                                   const std::string& into, folder_tally& t)
+            {
+                if (!protect)
+                {
+                    if (!into.empty()) copy_as_is(path, name, into, t);
+                    return;
+                }
+                if (t.other++ < 3) t.others.push_back(name);
+            }
+
+            /*
+                Processes the files of the folder from, then its folders, each one taking its name
+                once its files are done: into is "" for a processing in place, else the folder of
+                the copy that receives them.
+            */
+            void walk(bool protect, const std::wstring& from, const std::string& into, int depth, folder_tally& t)
+            {
+                std::vector<folder_entry> entries;
+                DWORD e = 0;
+                if (!list_folder(from, entries, e))
+                {
+                    note_failure(t, narrow(file_of(from)), narrow(system_message(e)));
+                    return;
+                }
+                for (const folder_entry& x : entries)
+                {
+                    if (x.folder) continue;
+                    if (++t.files > max_folder_files)
+                    {
+                        t.stopped = true;
+                        return;
+                    }
+                    const std::wstring path = from + L"\\" + x.name;
+                    const std::string name = narrow(x.name);
+                    if (!possible_name(name))
+                    {
+                        other_kind(protect, path, name, into, t);
+                        continue;
+                    }
+                    const outcome o = run_file(protect, path, name, into);
+                    if (o.ok)
+                    {
+                        ++t.done;
+                        t.values += o.values;
+                    }
+                    else if (o.already)
+                    {
+                        // Anonymized already: an anonymized copy takes it as it is.
+                        ++t.already;
+                        if (!into.empty()) copy_as_is(path, name, into, t);
+                    }
+                    else if (o.code == "unsupported" || o.code == "kind_mismatch")
+                    {
+                        other_kind(protect, path, name, into, t);
+                    }
+                    else if (!protect && o.code == "not_protected")
+                    {
+                        // Nothing to restore: a restored copy takes it as it is.
+                        if (!into.empty()) copy_as_is(path, name, into, t);
+                    }
+                    else
+                    {
+                        note_failure(t, name, o.error);
+                    }
+                }
+                for (const folder_entry& x : entries)
+                {
+                    if (!x.folder) continue;
+                    if (t.stopped) return;
+                    if (depth >= max_folder_depth)
+                    {
+                        t.too_deep = true;
+                        continue;
+                    }
+                    const std::wstring path = from + L"\\" + x.name;
+                    const std::string name = narrow(x.name);
+                    std::string named, why;
+                    const bool named_ok = name_of(protect, name, named, why);
+                    if (into.empty())
+                    {
+                        walk(protect, path, std::string(), depth + 1, t);
+                        if (!named_ok) note_failure(t, name, why);
+                        else if (named != name) rename_folder(path, named, t);
+                        continue;
+                    }
+                    // An anonymized copy never takes a name the service could not anonymize.
+                    if (!named_ok && protect)
+                    {
+                        note_failure(t, name, why);
+                        continue;
+                    }
+                    const std::wstring sub = widen(join_path(into, free_name(into, named)));
+                    if (!CreateDirectoryW(sub.c_str(), nullptr))
+                    {
+                        note_failure(t, name, narrow(system_message(GetLastError())));
+                        continue;
+                    }
+                    walk(protect, path, narrow(sub), depth + 1, t);
+                }
+            }
+
+            // Gives the folder at path the name named, beside it; returns its new path, or path.
+            static std::wstring rename_folder(const std::wstring& path, const std::string& named, folder_tally& t)
+            {
+                const std::string parent = narrow(path.substr(0, path.find_last_of(L'\\')));
+                const std::wstring target = widen(join_path(parent, free_name(parent, named)));
+                if (MoveFileExW(path.c_str(), target.c_str(), 0)) return target;
+                note_failure(t, narrow(file_of(path)), narrow(tr("shell_folder_kept_name",
+                    { { "e", narrow(system_message(GetLastError())) } })));
+                return path;
+            }
+
+            outcome run_folder(bool protect, const std::wstring& path, const std::string& name)
+            {
+                if (name.empty()) return failure(narrow(path), tr("shell_unsupported", { { "f", narrow(path) } }));
+                const bool on_drive = drive_.holds(path);
+                // Nothing to do: the drive holds anonymized files only.
+                if (protect && on_drive) return success(tr("shell_on_drive", { { "l", drive_.letter } }), name);
+                std::string named, why;
+                const bool named_ok = name_of(protect, name, named, why);
+                // A restored folder loses the suffix of an anonymized copy.
+                if (!protect) named = without_copy_suffix(named);
+                folder_tally t;
+                std::wstring top = path;
+                const bool copied = copy_ || on_drive;
+                if (!copied)
+                {
+                    walk(protect, path, std::string(), 0, t);
+                    if (!named_ok) note_failure(t, name, why);
+                    else if (named != name) top = rename_folder(path, named, t);
+                    return folder_outcome(protect, false, top, t);
+                }
+                // An anonymized copy never takes a name the service could not anonymize.
+                if (!named_ok && protect) return failure(name, widen(why));
+                std::wstring into = path.substr(0, path.find_last_of(L'\\'));
+                if (on_drive)
+                {
+                    // The drive would anonymize the originals again: they go where the user says.
+                    into = choose_destination(tr("shell_save_folder_title", { { "f", name } }), std::string());
+                    if (into.empty()) return success(std::wstring(), name);
+                }
+                const std::string into8 = narrow(into);
+                const std::string wanted = copy_ ? named + " (" + tr_utf8(protect ? "suffix_anonymized"
+                                                                                  : "suffix_restored") + ")" : named;
+                top = widen(join_path(into8, free_name(into8, wanted)));
+                // A copy inside the folder it copies would copy itself.
+                if (within(top, path))
+                    return failure(name, tr("shell_cannot_write", { { "f", narrow(file_of(top)) },
+                        { "e", narrow(system_message(ERROR_BAD_PATHNAME)) } }));
+                if (!CreateDirectoryW(top.c_str(), nullptr))
+                    return failure(name, tr("shell_cannot_write", { { "f", narrow(file_of(top)) },
+                        { "e", narrow(system_message(GetLastError())) } }));
+                walk(protect, path, narrow(top), 0, t);
+                return folder_outcome(protect, true, top, t);
+            }
+
+            static outcome folder_outcome(bool protect, bool copied, const std::wstring& top, const folder_tally& t)
+            {
+                const std::string shown = narrow(file_of(top));
+                const char* key = protect ? (copied ? "shell_folder_protected_copy" : "shell_folder_protected")
+                                          : (copied ? "shell_folder_restored_copy" : "shell_folder_restored");
+                std::wstring text = tr(key, { { "f", shown },
+                    { "files", narrow(tr_count(protect ? "count_files_anonymized" : "count_files_restored", t.done)) },
+                    { "values", narrow(tr_count("count_values_replaced", t.values)) } });
+                if (t.already) text += L" " + tr_count("shell_folder_already", t.already);
+                if (t.other)
+                {
+                    std::string list;
+                    for (const std::string& n : t.others) list += (list.empty() ? "" : ", ") + n;
+                    if (t.other > static_cast<long long>(t.others.size())) list += "...";
+                    text += L" " + tr_count(copied ? "shell_folder_other_out" : "shell_folder_other_kept", t.other,
+                        { { "l", list } });
+                }
+                if (t.failed)
+                    text += L" " + tr_count("shell_folder_failed", t.failed, { { "f", t.failed_name },
+                        { "e", t.failed_error } });
+                if (t.too_deep)
+                    text += L" " + tr("shell_folder_too_deep", { { "n", std::to_string(max_folder_depth) } });
+                if (t.stopped)
+                    text += L" " + tr("shell_folder_stopped", { { "n", std::to_string(max_folder_files) } });
+                outcome o;
+                o.ok = t.failed == 0 && !t.stopped && !t.too_deep;
+                o.text = text;
+                o.name = shown;
+                o.error = t.failed_error;
+                return o;
             }
 
             static std::wstring file_of(const std::wstring& path)
@@ -625,7 +984,6 @@ namespace pseudalis
             bool online_ = false;
             std::string offline_error_;
             drive_place drive_{ json() };
-            drive_place restore_drive_{ json() };
         };
 
         std::string language_setting()
@@ -670,8 +1028,8 @@ namespace pseudalis
 
         const wchar_t usage[] =
             L"Pseudalis " PSEUDALIS_VERSION L"\r\n"
-            L"  pseudalis protect [--copy] <file>...   anonymize each file, in its place or as a copy\r\n"
-            L"  pseudalis restore [--copy] <file>...   restore the original, in its place or as a copy";
+            L"  pseudalis protect [--copy] <file or folder>...   anonymize each one, in its place or as a copy\r\n"
+            L"  pseudalis restore [--copy] <file or folder>...   restore the original, in its place or as a copy";
     }
 
 }

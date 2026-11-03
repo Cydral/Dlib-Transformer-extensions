@@ -36,6 +36,8 @@
         <input type="file" id="protect-input" multiple>
         <span data-t="drop"></span>
       </label>
+      <div class="buttons"><label class="button secondary file"><input type="file" id="protect-folder" webkitdirectory>
+        <span data-t="choose_folder"></span></label></div>
       <label class="option"><input type="checkbox" id="keep" checked> <span data-t="keep"></span></label>
       <ul class="results" id="protect-results"></ul>
     </section>
@@ -47,6 +49,8 @@
         <input type="file" id="restore-input" multiple>
         <span data-t="drop"></span>
       </label>
+      <div class="buttons"><label class="button secondary file"><input type="file" id="restore-folder" webkitdirectory>
+        <span data-t="choose_folder"></span></label></div>
       <ul class="results" id="restore-results"></ul>
     </section>
 
@@ -107,8 +111,6 @@
             <option value="es">Español</option>
           </select></label>
         <label><span data-t="set_drive"></span><input type="text" id="set-drive" maxlength="1" class="letter"></label>
-        <label><span data-t="set_restore_drive"></span><input type="text" id="set-restore-drive" maxlength="1"
-          class="letter"></label>
         <label><span data-t="set_max"></span><input type="number" id="set-max" min="1" max="2048"></label>
         <label><span data-t="set_removed"></span><input type="number" id="set-removed" min="1" max="3650"></label>
       </div>

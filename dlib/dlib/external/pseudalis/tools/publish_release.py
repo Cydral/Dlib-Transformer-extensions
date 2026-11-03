@@ -1,29 +1,33 @@
 # Copyright (C) 2026 Cydral Technology (cydraltechnology@gmail.com)
 # License: Boost Software License   See LICENSE.txt for the full license.
 """
-Publishes a version of Pseudalis: writes and signs the update feed that announces it, the
-installer lying in the folder dist of the public link of the published files.
+Publishes a version of Pseudalis on GitHub: puts its installer in dist/pseudalis of the
+repository, beside the update feed that announces it, written and signed.
 
     python3 publish_release.py <pseudalis-setup.exe> --key <private key>
                                [--notes <notes.json>] [--sign <pseudalis-sign>]
                                [--dist <folder>] [--dry-run]
 
 The version is that of common/version.h, which must also be the version the installer carries
-in its resources.  The feed names the installer by its file in the folder dist of the public
-link, pseudalis-setup-<version>.exe, with its size and its SHA-256; the program writes it beside
-<dist>/feed.json (dist/pseudalis of the repository by default), signs it with pseudalis-sign,
-checks the signature, puts the feed and its signature in place of the published ones, and prints
-the commands that publish them.  fill_public_link.py dist then puts the feed, its signature and
-the installer in the local copy of the link.
+in its resources.  The installer is copied into <dist> (dist/pseudalis of the repository by
+default) as pseudalis-setup-<version>.exe, and the installers of the other versions leave it:
+the repository holds the installer its feed names, the earlier ones staying in its history.
+GitHub refuses the files of 100 MB and more and warns from 50 MB: an installer of 95 MB or more
+is refused, one of 50 MB or more announced.  The feed names the installer by its file beside it,
+with its size and its SHA-256; the program writes it, signs it with pseudalis-sign, checks the
+signature, puts the installer, then the signature and the feed in place of the published ones,
+and prints the commands that publish them.  A failure before that leaves the published files as
+they are.
 
 notes.json holds the release notes by language,
 {"en": "...", "fr": "...", "de": "...", "it": "...", "es": "..."}.  --dry-run checks the
-installer, the version and the notes and prints what would be done, without writing the feed.
+installer, the version and the notes and prints what would be done, without writing anything.
 pseudalis-sign is searched in build-pseudalis/bin and build-pseudalis-linux/bin of the
 repository, then in the PATH.
 """
 
 import argparse
+import glob
 import json
 import os
 import re
@@ -40,6 +44,9 @@ ROOT = os.path.abspath(os.path.join(HERE, "..", "..", "..", "..", ".."))
 DIST = os.path.join(ROOT, "dist", "pseudalis")
 # The public key of the feed, which the programs embed when it is there at their configuration.
 PUBLIC_KEY = os.path.join(HERE, "..", "resources", "feed-public-key.pem")
+# The limits of GitHub for a file of a repository, with a margin under the refusal.
+REFUSED_BYTES = 95 << 20
+WARNED_BYTES = 50 << 20
 
 
 def verify_command(signer, path):
@@ -89,22 +96,6 @@ def remove_quietly(path):
         pass
 
 
-def write_signed_feed(feed_path, feed, signer, key):
-    """Writes the feed and its signature beside feed_path, checks the signature, then puts both
-    in place of the published files.  A failure before that leaves the published files as they
-    are."""
-    new = feed_path + ".new"
-    try:
-        make_feed.write_feed(new, feed)
-        subprocess.run([signer, "sign", key, new], check=True)
-        subprocess.run(verify_command(signer, new), check=True)
-        os.replace(new, feed_path)
-        os.replace(new + ".sig", feed_path + ".sig")
-    finally:
-        remove_quietly(new)
-        remove_quietly(new + ".sig")
-
-
 def check_newer(feed_path, version):
     """Raises RuntimeError when the feed at feed_path already announces a later version."""
     try:
@@ -114,6 +105,43 @@ def check_newer(feed_path, version):
         return
     if compare(version, published) < 0:
         raise RuntimeError("the feed already announces %s, later than %s" % (published, version))
+
+
+def check_size(size):
+    if size >= REFUSED_BYTES:
+        raise RuntimeError("the installer weighs %.1f MB: GitHub refuses the files of 100 MB and more" %
+                           (size / 1048576.0))
+    if size >= WARNED_BYTES:
+        print("warning: the installer weighs %.1f MB: GitHub warns from 50 MB" % (size / 1048576.0))
+
+
+def publish(installer, dist, name, sha, feed, signer, key):
+    """Puts the installer and the signed feed in dist, the installers of the other versions leaving
+    it; returns the names of those that left."""
+    feed_path = os.path.join(dist, "feed.json")
+    target = os.path.join(dist, name)
+    partial = target + ".partial"
+    new = feed_path + ".new"
+    try:
+        shutil.copyfile(installer, partial)
+        if make_feed.sha256_of(partial) != sha:
+            raise RuntimeError("the copy of the installer differs from it: %s" % partial)
+        make_feed.write_feed(new, feed)
+        subprocess.run([signer, "sign", key, new], check=True)
+        subprocess.run(verify_command(signer, new), check=True)
+        os.replace(partial, target)
+        os.replace(new + ".sig", feed_path + ".sig")
+        os.replace(new, feed_path)
+    finally:
+        remove_quietly(partial)
+        remove_quietly(new)
+        remove_quietly(new + ".sig")
+    left = []
+    for other in sorted(glob.glob(os.path.join(dist, "pseudalis-setup-*.exe"))):
+        if os.path.basename(other) != name:
+            os.remove(other)
+            left.append(os.path.basename(other))
+    return left
 
 
 def main():
@@ -131,27 +159,29 @@ def main():
         notes = make_feed.read_notes(a.notes, feed_path, version)
         name = installer_name(version)
         size = os.path.getsize(a.installer)
+        check_size(size)
         sha = make_feed.sha256_of(a.installer)
         feed = make_feed.make_feed(version, a.installer, None, notes, size, sha, file=name)
         check_newer(feed_path, version)
+        rel = os.path.relpath(a.dist, ROOT).replace(os.sep, "/")
         print("version %s, installer of %d bytes, SHA-256 %s" % (version, size, sha))
-        print("in the public link: dist/%s, dist/pseudalis-feed.json, dist/pseudalis-feed.json.sig" % name)
+        print("published in %s: %s, feed.json, feed.json.sig" % (rel, name))
         if a.dry_run:
             print("dry run: nothing written")
             return 0
         if not a.key:
             raise RuntimeError("--key names the private key that signs the feed")
         os.makedirs(a.dist, exist_ok=True)
-        write_signed_feed(feed_path, feed, find_signer(a.sign), a.key)
+        left = publish(a.installer, a.dist, name, sha, feed, find_signer(a.sign), a.key)
     except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as e:
         print("error: %s" % e, file=sys.stderr)
         return 1
-    rel = os.path.relpath(feed_path, ROOT).replace(os.sep, "/")
+    for other in left:
+        print("removed from %s: %s" % (rel, other))
     print()
-    print("git add %s %s.sig" % (rel, rel))
-    print('git commit -m "Publish version %s of Pseudalis in its update feed"' % version)
+    print("git add %s" % rel)
+    print('git commit -m "Publish version %s of Pseudalis" -- %s' % (version, rel))
     print("git push")
-    print("then fill_public_link.py dist <local copy of the link>/dist --installer <installer>")
     return 0
 
 

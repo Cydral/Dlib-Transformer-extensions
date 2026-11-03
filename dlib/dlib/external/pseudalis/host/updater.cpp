@@ -23,7 +23,6 @@
 #include "../common/version.h"
 #include "crypto.h"
 #include "http_fetch.h"
-#include "public_link.h"
 
 namespace pseudalis
 {
@@ -44,6 +43,15 @@ namespace pseudalis
         {
             return !name.empty() && name.size() <= 255 && name != "." && name != ".."
                 && name.find_first_of("/\\:*?\"<>|") == std::string::npos;
+        }
+
+        // The address of a file of the folder of the feed: the installer that the feed names beside it.
+        std::string beside(const std::string& feed_url, const std::string& name)
+        {
+            const size_t end = feed_url.find_first_of("?#");
+            const std::string path = feed_url.substr(0, end);
+            const size_t slash = path.rfind('/');
+            return slash == std::string::npos ? std::string() : path.substr(0, slash + 1) + name;
         }
 
         // An error in the state or in an answer: its English text, its code and its values.
@@ -283,44 +291,19 @@ namespace pseudalis
         set("state", "checking");
         set("checked_at", static_cast<long long>(now_unix()));
         std::string body, sig, error;
-        // Where the installer comes from, for the log: empty when it was downloaded before.
-        std::string origin;
-        // The feed of the public link first, then the one of its official address.
-        bool from_link = false;
-        if (public_link_enabled())
+        // The feed and its signature, beside the installers of the publication.
+        if (!http_get(feed_url_, body, error, 1u << 20) || !http_get(feed_url_ + ".sig", sig, error, 4096))
         {
-            std::string e;
-            from_link = public_link_get("dist/pseudalis-feed.json", body, e, 1u << 20)
-                && public_link_get("dist/pseudalis-feed.json.sig", sig, e, 4096);
-            if (from_link && !verify_signature(body, sig, feed_public_key_pem))
-            {
-                from_link = false;
-                e = "the signature of the feed of the public link is not valid";
-            }
-            if (ended())
-            {
-                settle("idle", user_error());
-                return;
-            }
-            if (!from_link)
-                log_warning("updates: " + about_public_link(e) + "; the feed is read from its second place");
-            else log_info("updates: feed read from the public link");
+            fail(user_error().set(error, "update_download").arg("e", error));
+            if (!ended()) log_warning("updates: " + error);
+            return;
         }
-        if (!from_link)
+        if (!verify_signature(body, sig, feed_public_key_pem))
         {
-            if (!http_get(feed_url_, body, error, 1u << 20) || !http_get(feed_url_ + ".sig", sig, error, 4096))
-            {
-                fail(user_error().set(error, "update_download").arg("e", error));
-                if (!ended()) log_warning("updates: " + error);
-                return;
-            }
-            if (!verify_signature(body, sig, feed_public_key_pem))
-            {
-                fail(user_error().set("the signature of the update feed is not valid", "update_signature")
-                    .arg("file", "pseudalis-feed.json"));
-                log_error("updates: the signature of the feed is not valid, feed ignored");
-                return;
-            }
+            fail(user_error().set("the signature of the update feed is not valid", "update_signature")
+                .arg("file", "feed.json"));
+            log_error("updates: the signature of the feed is not valid, feed ignored");
+            return;
         }
         const json feed = json::parse_or_null(body);
         const json& stable = feed["channels"]["stable"];
@@ -353,13 +336,13 @@ namespace pseudalis
         set("latest", latest);
         set("notes", notes);
         const json& inst = stable["installer"];
-        // The installer lies in the folder dist of the public link ("file"), on the web ("url"), or both.
-        const std::string url = inst["url"].as_string();
-        const std::string in_link = inst["file"].as_string();
+        // The installer lies beside the feed ("file"), or at an address of its own ("url").
+        const std::string named = inst["file"].as_string();
+        const std::string url = !named.empty() ? (plain_name(named) ? beside(feed_url_, named) : std::string())
+                                               : inst["url"].as_string();
         const std::string sha = inst["sha256"].as_string();
         const uint64_t size = static_cast<uint64_t>(inst["size"].as_int(0));
-        if ((url.empty() && in_link.empty()) || (!in_link.empty() && !plain_name(in_link)) || sha.size() != 64
-            || size == 0)
+        if (url.compare(0, 8, "https://") != 0 || sha.size() != 64 || size == 0)
         {
             fail(user_error().set("the update feed is incomplete", "update_feed_invalid"));
             return;
@@ -374,11 +357,8 @@ namespace pseudalis
             const user_error unrecorded = user_error().set("the update of version " + latest
                 + " cannot be recorded in " + dir_, "update_record").arg("version", latest);
             const std::string tmp = file + ".partial";
-            /*
-                One download of the installer from address into the partial file, checked against
-                the feed; label, when given, takes the place of the address in the messages.
-            */
-            auto download = [&](const std::string& address, const std::string& label, user_error& why) {
+            // One download of the installer from address into the partial file, checked against the feed.
+            auto download = [&](const std::string& address, user_error& why) {
                 // The partial file of an earlier attempt goes: the new one must not exist yet (new_file).
                 remove_file(tmp);
                 set("received", 0ull);
@@ -403,8 +383,6 @@ namespace pseudalis
                     return !cancelled_.load();
                 }, e);
                 const bool closed = out.close();
-                const size_t at = label.empty() ? std::string::npos : e.find(address);
-                if (at != std::string::npos) e.replace(at, address.size(), label);
                 why = user_error();
                 if (!created || unwritten || (ok && !closed)) why = unrecorded;
                 else if (!ok && !too_large) why.set(e, "update_download").arg("e", e);
@@ -416,34 +394,7 @@ namespace pseudalis
                 return why.code.empty();
             };
             user_error why;
-            bool done = false;
-            if (!in_link.empty() && public_link_enabled())
-            {
-                // An address of the cache may have expired: the second attempt asks for a new one.
-                const std::string path = "dist/" + in_link;
-                for (int attempt = 0; attempt < 2 && !done && !ended(); ++attempt)
-                {
-                    std::string address, e;
-                    uint64_t listed = 0;
-                    if (!public_link_file(path, address, listed, e, attempt > 0))
-                    {
-                        why.set(e, "update_download").arg("e", e);
-                        break;
-                    }
-                    done = download(address, "the copy of " + path + " in the public link", why);
-                    if (done) origin = " from the public link";
-                    // A file that cannot be written ends the attempts, from every source.
-                    if (!done && why.code == "update_record") break;
-                }
-                if (!done && !ended() && !url.empty() && why.code != "update_record")
-                    log_warning("updates: " + about_public_link(why.text) +
-                                "; the installer comes from its second place");
-            }
-            if (!done && !ended() && !url.empty() && why.code != "update_record")
-            {
-                done = download(url, "", why);
-                if (done) origin = " from the second place of the publication";
-            }
+            const bool done = !ended() && download(url, why);
             if (!done)
             {
                 if (why.code.empty()) why.set("the update feed is incomplete", "update_feed_invalid");
@@ -456,7 +407,7 @@ namespace pseudalis
         switch (stage(latest, sha, notes, body, sig, staging))
         {
         case stage_result::staged:
-            log_info("updates: version " + latest + " downloaded" + origin + ", applied at the next restart");
+            log_info("updates: version " + latest + " downloaded, applied at the next restart");
             break;
         case stage_result::older:
             // A newer version, imported from a medium meanwhile, stays the one installed.
@@ -518,7 +469,7 @@ namespace pseudalis
         const json& inst = stable["installer"];
         const std::string sha = inst["sha256"].as_string();
         const uint64_t size = static_cast<uint64_t>(inst["size"].as_int(0));
-        // The name of the installer in the folder dist of the public link, else the one of its address.
+        // The name of the installer beside the feed, else the one of its address.
         const std::string name = inst["file"].is_string() ? inst["file"].as_string()
             : file_name(inst["url"].as_string());
         const std::string source = join_path(folder, name);

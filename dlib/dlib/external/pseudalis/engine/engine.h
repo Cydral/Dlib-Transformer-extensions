@@ -76,7 +76,10 @@ namespace pseudalis
                 place in a Word document or on a slide, over its gray box in a PDF, as the
                 text file <name>.txt for a picture alone or in an archive.  The archives
                 keep their documents, protected, and their pictures as text files; the
-                entries of another kind are left out and listed in report["dropped"].
+                entries of another kind are left out and listed in report["dropped"], and a
+                restoration keeps them as they are.  A file is of the kind its name gives
+                when its content is of that kind (kind_of()); a restoration also reads a
+                text under any name, since it may hold tags.
 
                 The names of the files, of the entries of the archives and of their
                 folders, and the properties of the documents (title, authors, subject,
@@ -98,6 +101,13 @@ namespace pseudalis
         engine(const std::string& key, const engine_options& options);
 
         static file_kind kind_of_name(const std::string& name);
+        /*
+            The kind of a file: the kind of its content when its name has no extension, else the
+            kind its extension gives (common/file_kinds.h) when the content is of that kind, an
+            Office document, a PDF or a text for a document, any archive for an archive.  The
+            other files are unsupported: an OpenDocument or an e-mail, which hold their content
+            compressed or encoded, would come out half protected.
+        */
         static file_kind kind_of(const std::string& bytes, const std::string& name);
         static std::string picture_marker(const std::string& id, const std::string& description);
 

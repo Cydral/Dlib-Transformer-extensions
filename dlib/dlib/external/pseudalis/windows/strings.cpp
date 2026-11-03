@@ -374,12 +374,11 @@ namespace pseudalis
             { "lbl_language", { "Language", "Langue", "Sprache", "Lingua", "Idioma" } },
             { "tray_open", { "Open Pseudalis", "Ouvrir Pseudalis", "Pseudalis öffnen", "Apri Pseudalis",
                 "Abrir Pseudalis" } },
-            { "tray_drive", { "Open the drive of anonymization {l}:", "Ouvrir le lecteur d'anonymisation {l}:",
-                "Anonymisierungslaufwerk {l}: öffnen", "Apri l'unità di anonimizzazione {l}:",
-                "Abrir la unidad de anonimización {l}:" } },
-            { "tray_restore_drive", { "Open the drive of restoration {l}:", "Ouvrir le lecteur de restauration {l}:",
-                "Wiederherstellungslaufwerk {l}: öffnen", "Apri l'unità di ripristino {l}:",
-                "Abrir la unidad de restauración {l}:" } },
+            { "tray_drive", { "Open the drive {l}:",
+                "Ouvrir le lecteur {l}:",
+                "Laufwerk {l}: öffnen",
+                "Apri l'unità {l}:",
+                "Abrir la unidad {l}:" } },
             { "tray_refused", { "Files not processed by the drive", "Fichiers non traités par le lecteur",
                 "Vom Laufwerk nicht verarbeitete Dateien", "File non elaborati dall'unità",
                 "Archivos no procesados por la unidad" } },
@@ -389,16 +388,24 @@ namespace pseudalis
             { "tip_no_drive", { "No drive", "Pas de lecteur", "Kein Laufwerk", "Nessuna unità", "Sin unidad" } },
             { "tip_drive_error", { "Drive {l}: not available", "Lecteur {l}: indisponible",
                 "Laufwerk {l}: nicht verfügbar", "Unità {l}: non disponibile", "Unidad {l}: no disponible" } },
-            { "tip_restore_drive", { "restoration {l}:", "restauration {l}:", "Wiederherstellung {l}:",
-                "ripristino {l}:", "restauración {l}:" } },
-            { "tip_restore_drive_error", { "restoration {l}: not available", "restauration {l}: indisponible",
-                "Wiederherstellung {l}: nicht verfügbar", "ripristino {l}: non disponibile",
-                "restauración {l}: no disponible" } },
             { "tip_records", { "{n} originals kept", "{n} originaux conservés", "{n} Originale aufbewahrt",
                 "{n} originali conservati", "{n} originales guardados" } },
+            { "tip_records_one", { "{n} original kept",
+                "{n} original conservé",
+                "{n} Original aufbewahrt",
+                "{n} originale conservato",
+                "{n} original guardado" } },
             { "notify_drive_title", { "Drive {l}:", "Lecteur {l}:", "Laufwerk {l}:", "Unità {l}:", "Unidad {l}:" } },
-            { "notify_protected_one", { "{f}: {n} values replaced", "{f} : {n} valeurs remplacées",
-                "{f}: {n} Werte ersetzt", "{f}: {n} valori sostituiti", "{f}: {n} valores sustituidos" } },
+            { "notify_protected_file", { "{f}: {n} values replaced",
+                "{f} : {n} valeurs remplacées",
+                "{f}: {n} Werte ersetzt",
+                "{f}: {n} valori sostituiti",
+                "{f}: {n} valores sustituidos" } },
+            { "notify_protected_file_one", { "{f}: {n} value replaced",
+                "{f} : {n} valeur remplacée",
+                "{f}: {n} Wert ersetzt",
+                "{f}: {n} valore sostituito",
+                "{f}: {n} valor sustituido" } },
             { "notify_protected_many", { "{n} files anonymized", "{n} fichiers anonymisés", "{n} Dateien anonymisiert",
                 "{n} file anonimizzati", "{n} archivos anonimizados" } },
             { "notify_refused", { "{f} was not processed: {e}", "{f} n'a pas été traité : {e}",
@@ -408,31 +415,27 @@ namespace pseudalis
                 "{n} Dateien wurden nicht verarbeitet, darunter {f}: {e}",
                 "{n} file non sono stati elaborati, tra cui {f}: {e}",
                 "{n} archivos no se procesaron, entre ellos {f}: {e}" } },
-            { "notify_restore_title", { "Drive of restoration {l}:", "Lecteur de restauration {l}:",
-                "Wiederherstellungslaufwerk {l}:", "Unità di ripristino {l}:", "Unidad de restauración {l}:" } },
-            { "notify_restored_one", { "{f}: the original is back", "{f} : l'original est restauré",
-                "{f}: das Original ist wiederhergestellt", "{f}: l'originale è ripristinato",
-                "{f}: el original está restaurado" } },
-            { "notify_restored_many", { "{n} originals restored", "{n} originaux restaurés",
-                "{n} Originale wiederhergestellt", "{n} originali ripristinati", "{n} originales restaurados" } },
-            { "notify_not_restored", { "{f} stays as it is: {e}", "{f} reste tel quel : {e}",
-                "{f} bleibt unverändert: {e}", "{f} resta così com'è: {e}", "{f} se queda como está: {e}" } },
-            { "notify_not_restored_many", { "{n} files stay as they are, {f} among them: {e}",
-                "{n} fichiers restent tels quels, dont {f} : {e}",
-                "{n} Dateien bleiben unverändert, darunter {f}: {e}",
-                "{n} file restano così come sono, tra cui {f}: {e}",
-                "{n} archivos se quedan como están, entre ellos {f}: {e}" } },
             { "notify_drive_error", { "The drive {l}: is not available: {e}",
                 "Le lecteur {l}: n'est pas disponible : {e}", "Das Laufwerk {l}: ist nicht verfügbar: {e}",
                 "L'unità {l}: non è disponibile: {e}", "La unidad {l}: no está disponible: {e}" } },
             { "shell_protected", { "{f} is anonymized: {n} values replaced.",
                 "{f} est anonymisé : {n} valeurs remplacées.", "{f} ist anonymisiert: {n} Werte ersetzt.",
                 "{f} è anonimizzato: {n} valori sostituiti.", "{f} está anonimizado: {n} valores sustituidos." } },
+            { "shell_protected_one", { "{f} is anonymized: {n} value replaced.",
+                "{f} est anonymisé : {n} valeur remplacée.",
+                "{f} ist anonymisiert: {n} Wert ersetzt.",
+                "{f} è anonimizzato: {n} valore sostituito.",
+                "{f} está anonimizado: {n} valor sustituido." } },
             { "shell_protected_copy", { "{f} is written, anonymized: {n} values replaced.",
                 "{f} est écrit, anonymisé : {n} valeurs remplacées.",
                 "{f} ist anonymisiert geschrieben: {n} Werte ersetzt.",
                 "{f} è stato scritto, anonimizzato: {n} valori sostituiti.",
                 "{f} se ha escrito, anonimizado: {n} valores sustituidos." } },
+            { "shell_protected_copy_one", { "{f} is written, anonymized: {n} value replaced.",
+                "{f} est écrit, anonymisé : {n} valeur remplacée.",
+                "{f} ist anonymisiert geschrieben: {n} Wert ersetzt.",
+                "{f} è stato scritto, anonimizzato: {n} valore sostituito.",
+                "{f} se ha escrito, anonimizado: {n} valor sustituido." } },
             { "shell_restored", { "{f} is restored.", "{f} est restauré.", "{f} ist wiederhergestellt.",
                 "{f} è ripristinato.", "{f} está restaurado." } },
             { "shell_restored_copy", { "{f} is written, restored.", "{f} est écrit, restauré.",
@@ -448,6 +451,120 @@ namespace pseudalis
                 "anonimizzazione.",
                 "{f} se restauró a partir de sus etiquetas, {n} valores repuestos: el archivo cambió después de "
                 "su anonimización." } },
+            { "shell_restored_tags_one", { "{f} is restored from its tags, {n} value put back: the file changed after "
+                "its anonymization.",
+                "{f} est restauré à partir de ses balises, {n} valeur remise : le fichier a changé après son "
+                "anonymisation.",
+                "{f} ist aus seinen Markierungen wiederhergestellt, {n} Wert zurückgesetzt: Die Datei wurde nach "
+                "ihrer Anonymisierung geändert.",
+                "{f} è ripristinato dai suoi tag, {n} valore rimesso: il file è cambiato dopo la sua anonimizzazione.",
+                "{f} se restauró a partir de sus etiquetas, {n} valor repuesto: el archivo cambió después de su "
+                "anonimización." } },
+            { "count_files_anonymized", { "{n} files anonymized",
+                "{n} fichiers anonymisés",
+                "{n} Dateien anonymisiert",
+                "{n} file anonimizzati",
+                "{n} archivos anonimizados" } },
+            { "count_files_anonymized_one", { "{n} file anonymized",
+                "{n} fichier anonymisé",
+                "{n} Datei anonymisiert",
+                "{n} file anonimizzato",
+                "{n} archivo anonimizado" } },
+            { "count_values_replaced", { "{n} values replaced",
+                "{n} valeurs remplacées",
+                "{n} Werte ersetzt",
+                "{n} valori sostituiti",
+                "{n} valores sustituidos" } },
+            { "count_values_replaced_one", { "{n} value replaced",
+                "{n} valeur remplacée",
+                "{n} Wert ersetzt",
+                "{n} valore sostituito",
+                "{n} valor sustituido" } },
+            { "count_files_restored", { "{n} files restored",
+                "{n} fichiers restaurés",
+                "{n} Dateien wiederhergestellt",
+                "{n} file ripristinati",
+                "{n} archivos restaurados" } },
+            { "count_files_restored_one", { "{n} file restored",
+                "{n} fichier restauré",
+                "{n} Datei wiederhergestellt",
+                "{n} file ripristinato",
+                "{n} archivo restaurado" } },
+            { "shell_folder_protected", { "{f}: {files}, {values}.",
+                "{f} : {files}, {values}.",
+                "{f}: {files}, {values}.",
+                "{f}: {files}, {values}.",
+                "{f}: {files}, {values}." } },
+            { "shell_folder_protected_copy", { "{f} is written: {files}, {values}.",
+                "{f} est écrit : {files}, {values}.",
+                "{f} ist geschrieben: {files}, {values}.",
+                "{f} è stato scritto: {files}, {values}.",
+                "{f} se ha escrito: {files}, {values}." } },
+            { "shell_folder_restored", { "{f}: {files}.",
+                "{f} : {files}.",
+                "{f}: {files}.",
+                "{f}: {files}.",
+                "{f}: {files}." } },
+            { "shell_folder_restored_copy", { "{f} is written: {files}.",
+                "{f} est écrit : {files}.",
+                "{f} ist geschrieben: {files}.",
+                "{f} è stato scritto: {files}.",
+                "{f} se ha escrito: {files}." } },
+            { "shell_folder_already", { "{n} already anonymized.",
+                "{n} déjà anonymisés.",
+                "{n} bereits anonymisiert.",
+                "{n} già anonimizzati.",
+                "{n} ya anonimizados." } },
+            { "shell_folder_already_one", { "{n} already anonymized.",
+                "{n} déjà anonymisé.",
+                "{n} bereits anonymisiert.",
+                "{n} già anonimizzato.",
+                "{n} ya anonimizado." } },
+            { "shell_folder_other_kept", { "{n} of another kind left as they are: {l}.",
+                "{n} d'un autre type laissés tels quels : {l}.",
+                "{n} anderer Art unverändert gelassen: {l}.",
+                "{n} di altro tipo lasciati invariati: {l}.",
+                "{n} de otro tipo dejados como están: {l}." } },
+            { "shell_folder_other_kept_one", { "{n} of another kind left as it is: {l}.",
+                "{n} d'un autre type laissé tel quel : {l}.",
+                "{n} anderer Art unverändert gelassen: {l}.",
+                "{n} di altro tipo lasciato invariato: {l}.",
+                "{n} de otro tipo dejado como está: {l}." } },
+            { "shell_folder_other_out", { "{n} of another kind left out: {l}.",
+                "{n} d'un autre type écartés : {l}.",
+                "{n} anderer Art ausgelassen: {l}.",
+                "{n} di altro tipo esclusi: {l}.",
+                "{n} de otro tipo descartados: {l}." } },
+            { "shell_folder_other_out_one", { "{n} of another kind left out: {l}.",
+                "{n} d'un autre type écarté : {l}.",
+                "{n} anderer Art ausgelassen: {l}.",
+                "{n} di altro tipo escluso: {l}.",
+                "{n} de otro tipo descartado: {l}." } },
+            { "shell_folder_failed", { "{n} not processed, {f} among them: {e}",
+                "{n} non traités, dont {f} : {e}",
+                "{n} nicht verarbeitet, darunter {f}: {e}",
+                "{n} non elaborati, tra cui {f}: {e}",
+                "{n} no procesados, entre ellos {f}: {e}" } },
+            { "shell_folder_failed_one", { "{f} not processed: {e}",
+                "{f} non traité : {e}",
+                "{f} nicht verarbeitet: {e}",
+                "{f} non elaborato: {e}",
+                "{f} no procesado: {e}" } },
+            { "shell_folder_stopped", { "Stopped after {n} files: the folder holds more.",
+                "Arrêt après {n} fichiers : le dossier en contient davantage.",
+                "Abbruch nach {n} Dateien: Der Ordner enthält mehr.",
+                "Interrotto dopo {n} file: la cartella ne contiene di più.",
+                "Detenido tras {n} archivos: la carpeta contiene más." } },
+            { "shell_folder_too_deep", { "The folders lie more than {n} levels deep.",
+                "Les dossiers descendent à plus de {n} niveaux.",
+                "Die Ordner liegen mehr als {n} Ebenen tief.",
+                "Le cartelle scendono oltre {n} livelli.",
+                "Las carpetas bajan más de {n} niveles." } },
+            { "shell_folder_kept_name", { "it keeps its name: {e}",
+                "il garde son nom : {e}",
+                "er behält seinen Namen: {e}",
+                "mantiene il suo nome: {e}",
+                "conserva su nombre: {e}" } },
             { "shell_many_done", { "{n} files processed.", "{n} fichiers traités.", "{n} Dateien verarbeitet.",
                 "{n} file elaborati.", "{n} archivos procesados." } },
             { "shell_many_failed", { "{n} files could not be processed, {f} among them: {e}",
@@ -455,6 +572,11 @@ namespace pseudalis
                 "{n} Dateien konnten nicht verarbeitet werden, darunter {f}: {e}",
                 "{n} file non hanno potuto essere elaborati, tra cui {f}: {e}",
                 "{n} archivos no pudieron procesarse, entre ellos {f}: {e}" } },
+            { "shell_many_failed_one", { "{f} could not be processed: {e}",
+                "{f} n'a pas pu être traité : {e}",
+                "{f} konnte nicht verarbeitet werden: {e}",
+                "{f} non ha potuto essere elaborato: {e}",
+                "{f} no pudo procesarse: {e}" } },
             { "shell_failed", { "{f}: {e}", "{f} : {e}", "{f}: {e}", "{f}: {e}", "{f}: {e}" } },
             { "shell_already", { "{f} is already anonymized.", "{f} est déjà anonymisé.",
                 "{f} ist bereits anonymisiert.", "{f} è già anonimizzato.", "{f} ya está anonimizado." } },
@@ -470,9 +592,11 @@ namespace pseudalis
                 "Los archivos de la unidad {l}: ya están anonimizados." } },
             { "shell_save_title", { "Save the original of {f}", "Enregistrer l'original de {f}",
                 "Original von {f} speichern", "Salva l'originale di {f}", "Guardar el original de {f}" } },
-            { "shell_save_anonymized_title", { "Save the anonymized copy of {f}",
-                "Enregistrer la copie anonymisée de {f}", "Anonymisierte Kopie von {f} speichern",
-                "Salva la copia anonimizzata di {f}", "Guardar la copia anonimizada de {f}" } },
+            { "shell_save_folder_title", { "Choose the folder where the originals of {f} go",
+                "Choisir le dossier où vont les originaux de {f}",
+                "Ordner für die Originale von {f} wählen",
+                "Scegli la cartella in cui vanno gli originali di {f}",
+                "Elegir la carpeta a la que van los originales de {f}" } },
             { "shell_cannot_read", { "{f} cannot be read: {e}", "{f} ne peut pas être lu : {e}",
                 "{f} kann nicht gelesen werden: {e}", "{f} non può essere letto: {e}", "{f} no se puede leer: {e}" } },
             { "shell_cannot_write", { "{f} cannot be written: {e}", "{f} ne peut pas être écrit : {e}",
@@ -505,6 +629,16 @@ namespace pseudalis
                 "Le fichier ne peut pas être restauré : {error}",
                 "Die Datei kann nicht wiederhergestellt werden: {error}",
                 "Il file non può essere ripristinato: {error}", "El archivo no se puede restaurar: {error}" } },
+            { "err_unsupported", { "Pseudalis does not process the files of this kind.",
+                "Pseudalis ne traite pas les fichiers de ce type.",
+                "Pseudalis verarbeitet Dateien dieser Art nicht.",
+                "Pseudalis non elabora i file di questo tipo.",
+                "Pseudalis no procesa los archivos de este tipo." } },
+            { "err_kind_mismatch", { "The content of this file does not match its name.",
+                "Le contenu de ce fichier ne correspond pas à son nom.",
+                "Der Inhalt dieser Datei entspricht nicht ihrem Namen.",
+                "Il contenuto di questo file non corrisponde al suo nome.",
+                "El contenido de este archivo no corresponde a su nombre." } },
             { "err_not_protected", { "This file holds no value that Pseudalis protected with the key of this "
                 "computer.",
                 "Ce fichier ne contient aucune valeur protégée par Pseudalis avec la clé de cet ordinateur.",
@@ -574,24 +708,20 @@ namespace pseudalis
                 "La edición Community es software libre y de código abierto, distribuido bajo la licencia Boost "
                 "Software License 1.0." } },
             { "welcome_text", { "This assistant installs Pseudalis Community {v}: the service that anonymizes the "
-                "personal data of documents on this computer, its drives of anonymization and of restoration, its "
-                "commands in the Explorer, its icon in the notification area and its web application. Nothing "
-                "leaves this computer.",
+                "personal data of documents on this computer, its drive, its commands in the Explorer, its icon in "
+                "the notification area and its web application. Nothing leaves this computer.",
                 "Cet assistant installe Pseudalis Community {v} : le service qui anonymise les données personnelles "
-                "des documents sur cet ordinateur, ses lecteurs d'anonymisation et de restauration, ses commandes "
-                "dans l'Explorateur, son icône dans la zone de notification et son application web. Rien ne quitte "
-                "cet ordinateur.",
-                "Dieser Assistent installiert Pseudalis Community {v}: den Dienst, der die personenbezogenen Daten von "
-                "Dokumenten auf diesem Computer anonymisiert, seine Laufwerke für Anonymisierung und "
-                "Wiederherstellung, seine Befehle im Explorer, sein Symbol im Infobereich und seine Webanwendung. "
-                "Nichts verlässt diesen Computer.",
+                "des documents sur cet ordinateur, son lecteur, ses commandes dans l'Explorateur, son icône dans la "
+                "zone de notification et son application web. Rien ne quitte cet ordinateur.",
+                "Dieser Assistent installiert Pseudalis Community {v}: den Dienst, der die personenbezogenen Daten "
+                "von Dokumenten auf diesem Computer anonymisiert, sein Laufwerk, seine Befehle im Explorer, sein "
+                "Symbol im Infobereich und seine Webanwendung. Nichts verlässt diesen Computer.",
                 "Questo assistente installa Pseudalis Community {v}: il servizio che anonimizza i dati personali dei "
-                "documenti su questo computer, le sue unità di anonimizzazione e di ripristino, i suoi comandi in "
-                "Esplora file, la sua icona nell'area di notifica e la sua applicazione web. Nulla lascia questo "
-                "computer.",
-                "Este asistente instala Pseudalis Community {v}: el servicio que anonimiza los datos personales de los "
-                "documentos en este equipo, sus unidades de anonimización y de restauración, sus comandos en el "
-                "Explorador, su icono en el área de notificación y su aplicación web. Nada sale de este equipo." } },
+                "documenti su questo computer, la sua unità, i suoi comandi in Esplora file, la sua icona nell'area "
+                "di notifica e la sua applicazione web. Nulla lascia questo computer.",
+                "Este asistente instala Pseudalis Community {v}: el servicio que anonimiza los datos personales "
+                "de los documentos en este equipo, su unidad, sus comandos en el Explorador, su icono en el área "
+                "de notificación y su aplicación web. Nada sale de este equipo." } },
             { "update_text", { "Pseudalis {o} is installed in {d}. This assistant updates it to version {v} and "
                 "keeps its key, the originals it keeps, its settings, its certificates, its drive, its "
                 "commands in the Explorer, its shortcuts and the start of its icon.",
@@ -622,64 +752,57 @@ namespace pseudalis
                 "Daten: Schlüssel, Originale, Einstellungen, Protokolle und Zertifikate",
                 "Dati: chiave, originali, impostazioni, log e certificati",
                 "Datos: clave, originales, ajustes, registros y certificados" } },
-            { "finish_text", { "Pseudalis runs as a service. To anonymize a document, copy it onto its drive of "
-                "anonymization; to restore it, copy it onto its drive of restoration, or right-click the file in "
-                "the Explorer (Show more options, Pseudalis). Its icon in the notification area opens the web "
-                "application.",
-                "Pseudalis fonctionne comme un service. Pour anonymiser un document, copiez-le sur son lecteur "
-                "d'anonymisation ; pour le restaurer, copiez-le sur son lecteur de restauration, ou faites un clic "
-                "droit sur le fichier dans l'Explorateur (Afficher d'autres options, Pseudalis). Son icône dans la "
-                "zone de notification ouvre l'application web.",
-                "Pseudalis läuft als Dienst. Um ein Dokument zu anonymisieren, kopieren Sie es auf sein "
-                "Anonymisierungslaufwerk; um es wiederherzustellen, kopieren Sie es auf sein "
-                "Wiederherstellungslaufwerk oder klicken Sie die Datei im Explorer mit der rechten Maustaste an "
-                "(Weitere Optionen anzeigen, Pseudalis). Sein Symbol im Infobereich öffnet die Webanwendung.",
-                "Pseudalis funziona come servizio. Per anonimizzare un documento, copiatelo sulla sua unità di "
-                "anonimizzazione; per ripristinarlo, copiatelo sulla sua unità di ripristino, o fate clic con il "
-                "tasto destro sul file in Esplora file (Mostra altre opzioni, Pseudalis). La sua icona nell'area "
-                "di notifica apre l'applicazione web.",
-                "Pseudalis funciona como un servicio. Para anonimizar un documento, cópielo en su unidad de "
-                "anonimización; para restaurarlo, cópielo en su unidad de restauración o haga clic con el botón "
-                "derecho en el archivo en el Explorador (Mostrar más opciones, Pseudalis). Su icono en el área de "
-                "notificación abre la aplicación web." } },
-            { "uninstall_text", { "Pseudalis, its service, its drives and the files they hold, its commands in the "
+            { "finish_text", { "Pseudalis runs as a service. To anonymize a document or a folder, copy it onto its "
+                "drive, or right-click it in the Explorer (Show more options, Pseudalis), which restores it too. Its "
+                "icon in the notification area opens the web application.",
+                "Pseudalis fonctionne comme un service. Pour anonymiser un document ou un dossier, copiez-le sur son "
+                "lecteur, ou faites un clic droit dessus dans l'Explorateur (Afficher d'autres options, Pseudalis), "
+                "qui le restaure aussi. Son icône dans la zone de notification ouvre l'application web.",
+                "Pseudalis läuft als Dienst. Um ein Dokument oder einen Ordner zu anonymisieren, kopieren Sie es auf "
+                "sein Laufwerk oder klicken Sie es im Explorer mit der rechten Maustaste an (Weitere Optionen "
+                "anzeigen, Pseudalis), wo es auch wiederhergestellt wird. Sein Symbol im Infobereich öffnet die "
+                "Webanwendung.",
+                "Pseudalis funziona come servizio. Per anonimizzare un documento o una cartella, copiatelo sulla sua "
+                "unità, o fate clic con il tasto destro su di esso in Esplora file (Mostra altre opzioni, Pseudalis), "
+                "che lo ripristina anche. La sua icona nell'area di notifica apre l'applicazione web.",
+                "Pseudalis funciona como un servicio. Para anonimizar un documento o una carpeta, cópielo en su "
+                "unidad o haga clic con el botón derecho sobre él en el Explorador (Mostrar más opciones, "
+                "Pseudalis), que también lo restaura. Su icono en el área de notificación abre la aplicación web." } },
+            { "uninstall_text", { "Pseudalis, its service, its drive and the files it holds, its commands in the "
                 "Explorer, its notification icon, its key, the originals it keeps, its settings and its logs will be "
                 "removed from this computer: the documents it anonymized can then no longer be restored.",
-                "Pseudalis, son service, ses lecteurs et les fichiers qu'ils contiennent, ses commandes dans "
+                "Pseudalis, son service, son lecteur et les fichiers qu'il contient, ses commandes dans "
                 "l'Explorateur, son icône de notification, sa clé, les originaux qu'il garde, ses réglages et ses "
-                "journaux seront retirés de cet ordinateur : les documents qu'il a anonymisés ne pourront plus "
-                "être restaurés.",
-                "Pseudalis, sein Dienst, seine Laufwerke mit den darin enthaltenen Dateien, seine Befehle im "
-                "Explorer, sein Benachrichtigungssymbol, sein Schlüssel, die aufbewahrten Originale, seine "
-                "Einstellungen und Protokolle werden von diesem Computer entfernt: Die damit anonymisierten "
-                "Dokumente können dann nicht mehr wiederhergestellt werden.",
-                "Pseudalis, il suo servizio, le sue unità e i file che contengono, i suoi comandi in Esplora file, "
-                "la sua icona di notifica, la sua chiave, gli originali che custodisce, le impostazioni e i "
-                "registri saranno rimossi da questo computer: i documenti che ha anonimizzato non potranno più "
-                "essere ripristinati.",
-                "Pseudalis, su servicio, sus unidades y los archivos que contienen, sus comandos en el Explorador, "
-                "su icono de notificación, su clave, los originales que guarda, sus ajustes y sus registros se "
+                "journaux seront retirés de cet ordinateur : les documents qu'il a anonymisés ne pourront plus être "
+                "restaurés.",
+                "Pseudalis, sein Dienst, sein Laufwerk mit den darin enthaltenen Dateien, seine Befehle im Explorer, "
+                "sein Benachrichtigungssymbol, sein Schlüssel, die aufbewahrten Originale, seine Einstellungen und "
+                "Protokolle werden von diesem Computer entfernt: Die damit anonymisierten Dokumente können dann nicht "
+                "mehr wiederhergestellt werden.",
+                "Pseudalis, il suo servizio, la sua unità e i file che contiene, i suoi comandi in Esplora file, la "
+                "sua icona di notifica, la sua chiave, gli originali che custodisce, le impostazioni e i registri "
+                "saranno rimossi da questo computer: i documenti che ha anonimizzato non potranno più essere "
+                "ripristinati.",
+                "Pseudalis, su servicio, su unidad y los archivos que contiene, sus comandos en el Explorador, su "
+                "icono de notificación, su clave, los originales que guarda, sus ajustes y sus registros se "
                 "eliminarán de este equipo: los documentos que anonimizó ya no podrán restaurarse." } },
-            { "uninstall_text_keep", { "Pseudalis, its service, the letters of its drives, its commands in the "
-                "Explorer and its notification icon will be removed from this computer. Its key, the originals it "
-                "keeps, the files of its drives and its settings stay in its data folder for a later "
-                "installation.",
-                "Pseudalis, son service, les lettres de ses lecteurs, ses commandes dans l'Explorateur et son icône "
-                "de notification seront retirés de cet ordinateur. Sa clé, les originaux qu'il garde, les fichiers "
-                "de ses lecteurs et ses réglages restent dans son dossier de données pour une installation "
-                "ultérieure.",
-                "Pseudalis, sein Dienst, die Buchstaben seiner Laufwerke, seine Befehle im Explorer und sein "
+            { "uninstall_text_keep", { "Pseudalis, its service, the letter of its drive, its commands in the Explorer "
+                "and its notification icon will be removed from this computer. Its key, the originals it keeps, the "
+                "files of its drive and its settings stay in its data folder for a later installation.",
+                "Pseudalis, son service, la lettre de son lecteur, ses commandes dans l'Explorateur et son icône de "
+                "notification seront retirés de cet ordinateur. Sa clé, les originaux qu'il garde, les fichiers de "
+                "son lecteur et ses réglages restent dans son dossier de données pour une installation ultérieure.",
+                "Pseudalis, sein Dienst, der Buchstabe seines Laufwerks, seine Befehle im Explorer und sein "
                 "Benachrichtigungssymbol werden von diesem Computer entfernt. Sein Schlüssel, die aufbewahrten "
-                "Originale, die Dateien seiner Laufwerke und seine Einstellungen bleiben in seinem Datenordner "
-                "für eine spätere Installation erhalten.",
-                "Pseudalis, il suo servizio, le lettere delle sue unità, i suoi comandi in Esplora file e la sua "
-                "icona di notifica saranno rimossi da questo computer. La sua chiave, gli originali che custodisce, "
-                "i file delle sue unità e le impostazioni restano nella sua cartella dei dati per "
-                "un'installazione successiva.",
-                "Pseudalis, su servicio, las letras de sus unidades, sus comandos en el Explorador y su icono de "
+                "Originale, die Dateien seines Laufwerks und seine Einstellungen bleiben in seinem Datenordner für "
+                "eine spätere Installation erhalten.",
+                "Pseudalis, il suo servizio, la lettera della sua unità, i suoi comandi in Esplora file e la sua "
+                "icona di notifica saranno rimossi da questo computer. La sua chiave, gli originali che custodisce, i "
+                "file della sua unità e le impostazioni restano nella sua cartella dei dati per un'installazione "
+                "successiva.",
+                "Pseudalis, su servicio, la letra de su unidad, sus comandos en el Explorador y su icono de "
                 "notificación se eliminarán de este equipo. Su clave, los originales que guarda, los archivos de "
-                "sus unidades y sus ajustes se conservan en su carpeta de datos para una instalación "
-                "posterior." } },
+                "su unidad y sus ajustes se conservan en su carpeta de datos para una instalación posterior." } },
             { "uninstall_keep_data", { "Keep the key, the originals and the settings for a later installation",
                 "Conserver la clé, les originaux et les réglages pour une installation ultérieure",
                 "Schlüssel, Originale und Einstellungen für eine spätere Installation behalten",
@@ -690,42 +813,28 @@ namespace pseudalis
                 "Der Ordner {d} bleibt bestehen, mit den Daten, die Sie darin behalten.",
                 "La cartella {d} resta al suo posto, con i dati che vi conservate.",
                 "La carpeta {d} se mantiene, con los datos que conserva en ella." } },
-            { "opt_drive", { "Drive of anonymization:", "Lecteur d'anonymisation :", "Anonymisierungslaufwerk:",
-                "Unità di anonimizzazione:", "Unidad de anonimización:" } },
-            { "opt_restore_drive", { "Drive of restoration:", "Lecteur de restauration :",
-                "Wiederherstellungslaufwerk:", "Unità di ripristino:", "Unidad de restauración:" } },
-            { "opt_drive_same", { "The two drives need two letters: {l}: is chosen for both.",
-                "Les deux lecteurs demandent deux lettres : {l}: est choisie pour les deux.",
-                "Die zwei Laufwerke brauchen zwei Buchstaben: {l}: ist für beide gewählt.",
-                "Le due unità richiedono due lettere: {l}: è scelta per entrambe.",
-                "Las dos unidades necesitan dos letras: {l}: está elegida para ambas." } },
+            { "opt_drive", { "Letter of the drive:",
+                "Lettre du lecteur :",
+                "Laufwerksbuchstabe:",
+                "Lettera dell'unità:",
+                "Letra de la unidad:" } },
             { "opt_drive_none", { "No drive", "Pas de lecteur", "Kein Laufwerk", "Nessuna unità", "Sin unidad" } },
-            { "opt_drive_note", { "A document copied onto the first drive is anonymized once written, its name "
-                "included; a file copied onto the second one gets its original back. No driver is installed.",
-                "Un document copié sur le premier lecteur est anonymisé une fois écrit, nom compris ; un fichier "
-                "copié sur le second retrouve son original. Aucun pilote n'est installé.",
-                "Ein auf das erste Laufwerk kopiertes Dokument wird nach dem Schreiben anonymisiert, sein Name "
-                "inbegriffen; eine auf das zweite kopierte Datei erhält ihr Original zurück. Kein Treiber wird "
+            { "opt_drive_note", { "A document or a folder copied onto this drive is anonymized once written, its name "
+                "included; its original comes back through Restore. No driver is installed.",
+                "Un document ou un dossier copié sur ce lecteur est anonymisé une fois écrit, nom compris ; son "
+                "original revient par Restaurer. Aucun pilote n'est installé.",
+                "Ein auf dieses Laufwerk kopiertes Dokument oder ein Ordner wird nach dem Schreiben anonymisiert, "
+                "sein Name inbegriffen; das Original kommt über Wiederherstellen zurück. Kein Treiber wird "
                 "installiert.",
-                "Un documento copiato sulla prima unità viene anonimizzato una volta scritto, nome compreso; un "
-                "file copiato sulla seconda ritrova il suo originale. Nessun driver viene installato.",
-                "Un documento copiado en la primera unidad se anonimiza una vez escrito, nombre incluido; un "
-                "archivo copiado en la segunda recupera su original. No se instala ningún controlador." } },
-            { "opt_context_menu", { "Add Anonymize and Restore to the menu of the files in the Explorer",
-                "Ajouter Anonymiser et Restaurer au menu des fichiers dans l'Explorateur",
-                "Anonymisieren und Wiederherstellen zum Menü der Dateien im Explorer hinzufügen",
-                "Aggiungi Anonimizza e Ripristina al menu dei file in Esplora file",
-                "Añadir Anonimizar y Restaurar al menú de los archivos en el Explorador" } },
-            { "winfsp_kept", { "WinFsp, which an earlier version installed for its drive, could not be "
-                "uninstalled ({e}): it stays among the installed programs, from where it can be uninstalled.",
-                "WinFsp, installé par une version antérieure pour son lecteur, n'a pas pu être désinstallé ({e}) : "
-                "il reste parmi les programmes installés, d'où il peut être désinstallé.",
-                "WinFsp, das eine frühere Version für ihr Laufwerk installiert hatte, konnte nicht deinstalliert "
-                "werden ({e}): Es bleibt unter den installierten Programmen, von wo es deinstalliert werden kann.",
-                "WinFsp, installato da una versione precedente per la sua unità, non ha potuto essere "
-                "disinstallato ({e}): resta tra i programmi installati, da cui può essere disinstallato.",
-                "WinFsp, instalado por una versión anterior para su unidad, no pudo desinstalarse ({e}): permanece "
-                "entre los programas instalados, desde donde puede desinstalarse." } },
+                "Un documento o una cartella copiati su questa unità vengono anonimizzati una volta scritti, nome "
+                "compreso; l'originale torna con Ripristina. Nessun driver viene installato.",
+                "Un documento o una carpeta copiados en esta unidad se anonimizan una vez escritos, nombre "
+                "incluido; el original vuelve con Restaurar. No se instala ningún controlador." } },
+            { "opt_context_menu", { "Add Anonymize and Restore to the menu of the files and folders in the Explorer",
+                "Ajouter Anonymiser et Restaurer au menu des fichiers et des dossiers dans l'Explorateur",
+                "Anonymisieren und Wiederherstellen zum Menü der Dateien und Ordner im Explorer hinzufügen",
+                "Aggiungi Anonimizza e Ripristina al menu dei file e delle cartelle in Esplora file",
+                "Añadir Anonimizar y Restaurar al menú de los archivos y las carpetas en el Explorador" } },
             { "verb_menu", { "Pseudalis", "Pseudalis", "Pseudalis", "Pseudalis", "Pseudalis" } },
             { "verb_protect", { "Anonymize", "Anonymiser", "Anonymisieren", "Anonimizza", "Anonimizar" } },
             { "verb_protect_copy", { "Anonymize as a copy", "Anonymiser dans une copie", "Als Kopie anonymisieren",
@@ -819,6 +928,28 @@ namespace pseudalis
     bool has_text(const std::string& key)
     {
         return table().count(key) != 0;
+    }
+
+    std::vector<std::string> texts_of(const char* key)
+    {
+        std::vector<std::string> out;
+        const auto& t = table();
+        auto it = t.find(key);
+        if (it == t.end()) return out;
+        for (const char* s : it->second->text)
+            if (s && *s) out.push_back(s);
+        return out;
+    }
+
+    std::wstring tr_count(const char* key, long long n,
+        std::initializer_list<std::pair<const char*, std::string>> values)
+    {
+        // One thing takes the singular, and none too in French.
+        const bool one = n == 1 || (n == 0 && current_language() == "fr");
+        const std::string single = std::string(key) + "_one";
+        std::vector<std::pair<std::string, std::string>> all(1, std::make_pair(std::string("n"), std::to_string(n)));
+        for (const auto& v : values) all.push_back(std::make_pair(std::string(v.first), v.second));
+        return tr(one && has_text(single) ? single : std::string(key), all);
     }
 
     std::wstring error_text(const json& answer)

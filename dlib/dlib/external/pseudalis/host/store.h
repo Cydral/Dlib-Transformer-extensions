@@ -55,30 +55,18 @@ namespace pseudalis
     {
         /*!
             WHAT THIS OBJECT REPRESENTS
-                A file of a folder of the drives (drive.h) as the service left it: processed,
-                restored or left as it is, with the size and the time of last write that tell
-                whether it changed since.
+                A file of the folder of the drive (drive.h) as the service left it: processed or
+                left as it is, with the size and the time of last write that tell whether it
+                changed since.  A folder of the drive is recorded too, in the state "folder", once
+                its name is protected.
         !*/
-        std::string folder;             // "drive" or "restore"
+        std::string folder;             // "drive"
         std::string path;               // within the folder, '/' between its parts
         long long size = 0;
         int64_t written = 0;            // the time of its last write, as the file system gives it
         std::string sha256;
-        long long record = 0;           // the record of its original, in the drive of anonymization
-        std::string state;              // "protected", "restored" or "kept"
-    };
-
-    struct drive_node
-    {
-        long long id = 0;               // 1 is the root
-        long long parent = 0;
-        std::string name;
-        bool directory = false;
-        long long file = 0;             // the record of the original, 0 for a folder or a file without one
-        std::string blob;               // the protected content in the vault
-        long long size = 0;
-        uint32_t attributes = 0;
-        int64_t created = 0, accessed = 0, written = 0, changed = 0;   // FILETIME units
+        long long record = 0;           // the record of its original
+        std::string state;              // "protected", "kept" or "folder"
     };
 
     class store
@@ -87,7 +75,7 @@ namespace pseudalis
             WHAT THIS OBJECT REPRESENTS
                 The database of the service, pseudalis.db in a folder of SYSTEM and the
                 administrators: the files protected and their originals, the pictures and
-                their descriptions, the tree of the drive and the recent events.  Every
+                their descriptions, the files of the drive and the recent events.  Every
                 method takes the lock of the connection, so that the threads of the server
                 and of the drive share it.
             THROWS
@@ -107,7 +95,7 @@ namespace pseudalis
         std::vector<file_record> list_files(long long limit, long long offset,
             const std::string& source = std::string());
         long long count_files();
-        // The blobs the records, the pictures and the files of the drive name.
+        // The blobs the records and the pictures name.
         std::set<std::string> referenced_blobs();
         void set_file_location(long long id, const std::string& object_id, const std::string& path);
         // Records the time the file of a record left the drive, deleted or replaced.
@@ -133,21 +121,11 @@ namespace pseudalis
         void link_picture(long long file, const std::string& picture);
         std::vector<std::string> pictures_of(long long file);
 
-        // The files of a folder of the drives as the service left them.
+        // The files of the folder of the drive as the service left them; their paths compare without case.
         std::vector<folder_file> folder_files(const std::string& folder);
         void set_folder_file(const folder_file& f);
         void remove_folder_file(const std::string& folder, const std::string& path);
-
-        // The tree of the drive of WinFsp of the versions before, which the drive writes in its folder.
-        bool node(long long id, drive_node& n);
-        bool child(long long parent, const std::string& name, drive_node& n);
-        std::vector<drive_node> children(long long parent);
-        long long add_node(const drive_node& n);
-        void update_node(const drive_node& n);
-        // Writes n and deletes the node replaced, which n takes the place of, both or neither.
-        void replace_node(const drive_node& n, long long replaced);
-        void remove_node(long long id);
-        // The files and the bytes of the drive.
+        // The files and the bytes of the drive, its folders left out.
         void drive_usage(long long& files, long long& bytes);
 
         void add_event(const std::string& kind, const std::string& path, const std::string& message);
@@ -168,7 +146,6 @@ namespace pseudalis
 
     private:
         void exec(const char* sql);
-        void write_node(const drive_node& n);   // m_ held
         std::mutex m_;
         sqlite3* db_ = nullptr;
     };

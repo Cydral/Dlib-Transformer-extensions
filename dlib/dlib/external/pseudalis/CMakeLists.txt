@@ -159,52 +159,8 @@ if (WIN32)
    target_link_libraries(pseudalis_common PUBLIC shell32 ole32 bcrypt advapi32)
 endif()
 
-# The password of the public link of the published files (host/public_link.h), read from a
-# file outside the repository at each configuration and built into the service, masked: the
-# header generated lies in the build tree alone.  Albireo publishes its files in the same link,
-# under names of their own: without pseudalis-public-link.txt, albireo-public-link.txt serves.
-if (WIN32 AND DEFINED ENV{USERPROFILE})
-   file(TO_CMAKE_PATH "$ENV{USERPROFILE}/keys" keys_dir)
-else()
-   set(keys_dir "$ENV{HOME}/keys")
-endif()
-set(public_link_default "${keys_dir}/pseudalis-public-link.txt")
-if (NOT EXISTS "${public_link_default}" AND EXISTS "${keys_dir}/albireo-public-link.txt")
-   set(public_link_default "${keys_dir}/albireo-public-link.txt")
-endif()
-set(PSEUDALIS_PUBLIC_LINK_PASSWORD_FILE "${public_link_default}" CACHE FILEPATH
-   "File holding the password of the public link of the published files")
-set(public_link_bytes "0")
-set(public_link_size 0)
-if (EXISTS "${PSEUDALIS_PUBLIC_LINK_PASSWORD_FILE}")
-   set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${PSEUDALIS_PUBLIC_LINK_PASSWORD_FILE}")
-   file(READ "${PSEUDALIS_PUBLIC_LINK_PASSWORD_FILE}" public_link_hex HEX)
-   string(REGEX REPLACE "^efbbbf" "" public_link_hex "${public_link_hex}")
-   string(REGEX REPLACE "(0d|0a)+$" "" public_link_hex "${public_link_hex}")
-   string(LENGTH "${public_link_hex}" public_link_digits)
-   math(EXPR public_link_size "${public_link_digits} / 2")
-   if (public_link_size GREATER 0)
-      # Each byte masked by the generator that host/public_link.cpp runs again to unmask it.
-      set(public_link_seed 20261101)
-      set(public_link_list "")
-      math(EXPR public_link_last "${public_link_size} - 1")
-      foreach (i RANGE 0 ${public_link_last})
-         math(EXPR public_link_at "${i} * 2")
-         string(SUBSTRING "${public_link_hex}" ${public_link_at} 2 public_link_byte)
-         math(EXPR public_link_seed "(${public_link_seed} * 1103515245 + 12345) % 2147483648")
-         math(EXPR public_link_byte "0x${public_link_byte} ^ ((${public_link_seed} >> 16) & 255)")
-         list(APPEND public_link_list ${public_link_byte})
-      endforeach()
-      string(REPLACE ";" ", " public_link_bytes "${public_link_list}")
-   endif()
-   message(STATUS "Public link: password read from ${PSEUDALIS_PUBLIC_LINK_PASSWORD_FILE}")
-else()
-   message(STATUS "Public link: no password, ${PSEUDALIS_PUBLIC_LINK_PASSWORD_FILE} does not exist")
-endif()
-configure_file(cmake/public_link_secret.h.in ${CMAKE_BINARY_DIR}/generated/public_link_secret.h @ONLY)
-
-# The public key of the update feed, which pseudalis-sign keygen writes beside the private key
-# of the publisher (tools/build_windows.ps1 makes the pair at the first build).
+# The public key of the update feed, which pseudalis-sign keygen writes once, beside the private
+# key that the publisher keeps outside the repository (README.md, Publishing a version).
 set(PSEUDALIS_FEED_PUBLIC_KEY_FILE "${CMAKE_CURRENT_SOURCE_DIR}/resources/feed-public-key.pem" CACHE FILEPATH
    "Public key (PEM) of the update feed")
 set(PSEUDALIS_FEED_PUBLIC_KEY_TEXT "")
@@ -223,7 +179,7 @@ configure_file(cmake/feed_public_key.h.in ${CMAKE_BINARY_DIR}/generated/feed_pub
 # The service.
 set(PSEUDALIS_SERVICE_SOURCES common/engine_loader.cpp host/main.cpp host/service.cpp host/server.cpp
    host/settings.cpp host/store.cpp host/vault.cpp host/keys.cpp host/albireo_client.cpp host/updater.cpp
-   host/http_fetch.cpp host/public_link.cpp host/crypto.cpp host/certificates.cpp)
+   host/http_fetch.cpp host/crypto.cpp host/certificates.cpp)
 # The drives: two folders of the data folder, watched by the service, with their letters on Windows.
 list(APPEND PSEUDALIS_SERVICE_SOURCES host/drive_folders.cpp)
 if (WIN32)

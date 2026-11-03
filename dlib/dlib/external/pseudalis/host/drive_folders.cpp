@@ -2,9 +2,9 @@
 // License: Boost Software License   See LICENSE.txt for the full license.
 
 /*
-    The drives of Pseudalis without driver (drive.h): two folders of the data folder, drive
-    and restore, which a scan finds the changes of, every second while files rest and at each
-    change that Windows reports, and which letters show for every session of the computer.
+    The drive of Pseudalis without driver (drive.h): the folder drive of the data folder, which
+    a scan finds the changes of, every second while files rest and at each change that Windows
+    reports, and which a letter shows for every session of the computer.
 
     A file is processed once it rests, unchanged for two seconds, and once the service opens
     it alone: a program that still holds it keeps it (sharing violation), and the service
@@ -19,8 +19,10 @@
     processed again, and its record leaves the list of the removed ones.
 
     A folder that comes in takes its name once nothing changed under it for six seconds and
-    nothing under it waits: a copy in progress keeps its folders.  Its name is protected, or
-    restored, like the name of a file, then recorded so that it is not read again.
+    nothing under it waits: a copy in progress keeps its folders.  Its name is protected like
+    the name of a file, then recorded so that it is not read again.  A file of another kind
+    leaves for the folder of the files not processed of its owner, at the same place of the
+    tree, so that a folder copied whole keeps its shape there.
 */
 
 #if defined(_WIN32)
@@ -116,6 +118,15 @@ namespace pseudalis
         std::string child_of(const std::string& dir, const std::string& name)
         {
             return dir.empty() ? name : dir + "/" + name;
+        }
+
+        // A path within a folder, '/' between its parts, with the separators of the system.
+        std::string os_path(std::string path)
+        {
+#if defined(_WIN32)
+            std::replace(path.begin(), path.end(), '/', '\\');
+#endif
+            return path;
         }
 
         // The path of an event: "\folder\name", as the icon reads it.
@@ -503,7 +514,7 @@ namespace pseudalis
         }
 #endif
 
-        // The files of the drives as they rest, and what they wait for.
+        // The files of the drive as they rest, and what they wait for.
         struct pending_file
         {
             long long size = 0;
@@ -514,7 +525,7 @@ namespace pseudalis
 
         struct folder_state
         {
-            std::string kind;           // "drive" or "restore"
+            std::string kind;           // "drive", the name of the folder in the database
             std::string path;           // the folder
             std::string letter;
             bool mapped = false;
@@ -546,7 +557,7 @@ namespace pseudalis
         explicit impl(service& s) : svc(s) {}
 
         service& svc;
-        folder_state drive, restore;
+        folder_state drive;
         std::string refused_root;
         mutable std::mutex m;
         std::condition_variable wake_cv;
@@ -728,7 +739,7 @@ namespace pseudalis
                 }
                 const folder_file gone = it->second;
                 ++it;
-                if (f.kind == "drive" && gone.state == "protected" && gone.record > 0) svc.mark_removed(gone.record);
+                if (gone.state == "protected" && gone.record > 0) svc.mark_removed(gone.record);
                 forget_path(f, key_of(gone.path));
             }
             for (auto it = f.pending.begin(); it != f.pending.end();)
@@ -797,7 +808,7 @@ namespace pseudalis
             or an empty string.
         */
         std::string replace(folder_state& f, const std::string& path, file_handle& source, const std::string& data,
-                            const std::string& name, const std::string& owner_only)
+                            const std::string& name)
         {
             const std::string dir = dir_of(path);
             const std::string temp = join_path(join_path(f.path, dir), ".pseudalis-" + random_hex(8) + ".part");
@@ -805,9 +816,6 @@ namespace pseudalis
 #if defined(_WIN32)
             file_handle out = no_handle;
             if (!write_new(temp, data, out)) return std::string();
-            if (!owner_only.empty() && !apply_sddl(out, std::string(),
-                    "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;" + owner_only + ")"))
-                log_warning("drive: the permissions of a restored file cannot be set");
             // Moves out to a free name of dir, checked where it lands: a junction swapped meanwhile fails it.
             auto place = [&](std::string& target) {
                 for (int attempt = 0; attempt < 3 && target.empty(); ++attempt)
@@ -848,7 +856,6 @@ namespace pseudalis
             close_file(out);
             return target;
 #else
-            (void)owner_only;
             {
                 new_file out;
                 if (!out.create(temp) || !out.write(data.data(), data.size()) || !out.close())
@@ -872,13 +879,19 @@ namespace pseudalis
 
         /*
             Moves the file held out of the drive, to the folder of the files not processed of its
-            owner, where it admits that owner, SYSTEM and the administrators alone: it keeps the
-            permissions of the drive otherwise, which a move within a volume carries.
+            owner, at the place it had in the tree of the drive, where it admits that owner,
+            SYSTEM and the administrators alone: it keeps the permissions of the drive otherwise,
+            which a move within a volume carries.
         */
         void refuse(folder_state& f, const std::string& path, file_handle& h, const std::string& why)
         {
             const std::string owner = owner_of(h);
-            const std::string folder = refused_folder(owner);
+            std::string folder = refused_folder(owner);
+            if (!folder.empty() && !dir_of(path).empty())
+            {
+                const std::string under = join_path(folder, os_path(dir_of(path)));
+                folder = make_dirs(under) ? under : folder;
+            }
             std::string moved;
             if (!folder.empty())
             {
@@ -934,7 +947,7 @@ namespace pseudalis
                   const std::string& state, bool protect_name_of_file)
         {
             std::string at = path;
-            if (protect_name_of_file && f.kind == "drive")
+            if (protect_name_of_file)
             {
                 std::string named;
                 user_error e;
@@ -996,141 +1009,89 @@ namespace pseudalis
                 const auto it = f.known.find(key_of(path));
                 if (it != f.known.end()) before = it->second;
             }
-            if (f.kind == "drive" && static_cast<uint64_t>(size) > max_bytes)
+            if (static_cast<uint64_t>(size) > max_bytes)
             {
                 refuse(f, path, h, "the file is larger than " + std::to_string(st.max_file_mb) + " MB");
                 if (before.record > 0) svc.mark_removed(before.record);
                 return 0;
             }
             std::string data;
-            if (static_cast<uint64_t>(size) > max_bytes || !read_all(h, data, static_cast<uint64_t>(size)))
+            if (!read_all(h, data, static_cast<uint64_t>(size)))
             {
                 close_file(h);
                 keep(f, path, std::string(), 0, "kept", false);
-                // The drive of restoration leaves a file too large as it is, and says so.
-                if (static_cast<uint64_t>(size) > max_bytes)
-                    event("not_restored", path, "the file is larger than " + std::to_string(st.max_file_mb) + " MB");
                 return 0;
             }
             const std::string sha = sha256_hex(data);
 
-            if (f.kind == "drive")
+            // A protected file come in again, copied, moved or renamed: kept as it is, under a protected name.
+            file_record known_record;
+            if (svc.db().find_by_output(sha, known_record, base_of(path)))
             {
-                // A protected file come in again, copied, moved or renamed: kept as it is, under a protected name.
-                file_record known_record;
-                if (svc.db().find_by_output(sha, known_record, base_of(path)))
-                {
-                    wipe(data);
-                    close_file(h);
-                    if (known_record.removed) svc.db().set_file_removed(known_record.id, 0);
-                    keep(f, path, sha, known_record.id, "protected", true);
-                    return 0;
-                }
-                if (data.empty())
-                {
-                    close_file(h);
-                    keep(f, path, sha, 0, "kept", true);
-                    return 0;
-                }
-                if (!supported_name(base_of(path)))
-                {
-                    wipe(data);
-                    refuse(f, path, h, "this kind of file is not processed");
-                    if (before.record > 0) svc.mark_removed(before.record);
-                    return 0;
-                }
-                protect_result r;
-                user_error e;
-                bool ok = false;
-                try
-                {
-                    ok = svc.protect(data, base_of(path), "drive", true, r, e);
-                }
-                catch (const std::exception& x)
-                {
-                    e.set(x.what());
-                }
                 wipe(data);
-                if (!ok)
-                {
-                    if (transient(e)) return failure_retry_ms;
-                    refuse(f, path, h, e.text.empty() ? std::string("the file cannot be protected") : e.text);
-                    if (before.record > 0) svc.mark_removed(before.record);
-                    return 0;
-                }
-                const std::string target = replace(f, path, h, r.bytes, r.name, std::string());
-                if (target.empty())
-                {
-                    if (r.record) svc.forget(r.record);
-                    return failure_retry_ms;
-                }
-                if (before.record > 0 && before.record != r.record) svc.mark_removed(before.record);
-                {
-                    std::lock_guard<std::mutex> lock(m);
-                    if (target != path) forget_path(f, key_of(path));
-                }
-                keep(f, target, r.sha256, r.record, "protected", false);
-                event("protected", target, std::to_string(r.report["total"].as_int(0)) + " values, " +
-                                           std::to_string(r.report["dropped"].size()) + " entries left out");
+                close_file(h);
+                if (known_record.removed) svc.db().set_file_removed(known_record.id, 0);
+                keep(f, path, sha, known_record.id, "protected", true);
                 return 0;
             }
-
-            // The drive of restoration.
             if (data.empty())
             {
                 close_file(h);
-                keep(f, path, sha, 0, "kept", false);
+                keep(f, path, sha, 0, "kept", true);
                 return 0;
             }
-            restore_result r;
+            // A name of another kind is refused at once; the content decides for a name without extension.
+            if (!possible_name(base_of(path)))
+            {
+                wipe(data);
+                refuse(f, path, h, "this kind of file is not processed");
+                if (before.record > 0) svc.mark_removed(before.record);
+                return 0;
+            }
+            protect_result r;
             user_error e;
             bool ok = false;
             try
             {
-                ok = svc.restore(data, base_of(path), std::string(), r, e);
+                ok = svc.protect(data, base_of(path), "drive", true, r, e);
             }
             catch (const std::exception& x)
             {
                 e.set(x.what());
             }
+            wipe(data);
             if (!ok)
             {
                 if (transient(e)) return failure_retry_ms;
-                close_file(h);
-                keep(f, path, sha, 0, "kept", false);
-                event("not_restored", path, e.text.empty() ? std::string("the file cannot be restored") : e.text);
+                refuse(f, path, h, e.text.empty() ? std::string("the file cannot be protected") : e.text);
+                if (before.record > 0) svc.mark_removed(before.record);
                 return 0;
             }
-            const std::string owner = owner_of(h);
-            const std::string name = r.name.empty() ? base_of(path) : base_of(r.name);
-            const std::string restored_sha = sha256_hex(r.bytes);
-            const std::string target = replace(f, path, h, r.bytes, name, owner.compare(0, 2, "S-") == 0 ? owner : "");
-            wipe(r.bytes);
-            if (target.empty()) return failure_retry_ms;
+            const std::string target = replace(f, path, h, r.bytes, r.name);
+            if (target.empty())
+            {
+                if (r.record) svc.forget(r.record);
+                return failure_retry_ms;
+            }
+            if (before.record > 0 && before.record != r.record) svc.mark_removed(before.record);
             {
                 std::lock_guard<std::mutex> lock(m);
                 if (target != path) forget_path(f, key_of(path));
             }
-            keep(f, target, restored_sha, r.record, "restored", false);
-            event("restored", target, r.how);
+            keep(f, target, r.sha256, r.record, "protected", false);
+            event("protected", target, std::to_string(r.report["total"].as_int(0)) + " values, " +
+                                       std::to_string(r.report["dropped"].size()) + " entries left out");
             return 0;
         }
 
-        // A new folder: its name protected, or restored, then recorded.
+        // A new folder: its name protected, then recorded.
         int64_t process_folder(folder_state& f, const std::string& path)
         {
             const std::string base = base_of(path);
             std::string named = base;
-            if (f.kind == "drive")
-            {
-                user_error e;
-                if (!svc.protect_name(base, named, e))
-                    return transient(e) ? failure_retry_ms : 0;
-            }
-            else
-            {
-                named = svc.restore_name(base);
-            }
+            user_error e;
+            if (!svc.protect_name(base, named, e))
+                return transient(e) ? failure_retry_ms : 0;
             std::string at = path;
             if (!named.empty() && named != base)
             {
@@ -1232,7 +1193,6 @@ namespace pseudalis
                 try
                 {
                     scan(drive, ready);
-                    scan(restore, ready);
                 }
                 catch (const std::exception& x)
                 {
@@ -1242,8 +1202,7 @@ namespace pseudalis
                 {
                     std::lock_guard<std::mutex> lock(m);
                     for (const job& j : ready) queue.push_back(j);
-                    waiting = !drive.pending.empty() || !restore.pending.empty() || !drive.seen_folders.empty() ||
-                              !restore.seen_folders.empty() || !queue.empty();
+                    waiting = !drive.pending.empty() || !drive.seen_folders.empty() || !queue.empty();
                 }
                 if (!ready.empty()) queue_cv.notify_all();
                 std::unique_lock<std::mutex> lock(m);
@@ -1364,119 +1323,6 @@ namespace pseudalis
 
 #endif
 
-        // The name of the drive of restoration in the Explorer, in the language of the computer.
-        std::string restore_label() const
-        {
-            const std::string l = svc.language();
-            if (l == "fr") return "Pseudalis - Restauration";
-            if (l == "de") return "Pseudalis - Wiederherstellung";
-            if (l == "it") return "Pseudalis - Ripristino";
-            if (l == "es") return "Pseudalis - Restauración";
-            return "Pseudalis - Restore";
-        }
-
-        // ---------------------------------------------------------------------------
-        // The tree of the drive of WinFsp of the versions before.
-
-        void migrate()
-        {
-            std::vector<drive_node> top;
-            try
-            {
-                top = svc.db().children(1);
-            }
-            catch (const std::exception& e)
-            {
-                log_error("drive: " + std::string(e.what()));
-                return;
-            }
-            if (top.empty()) return;
-            log_info("drive: the files of the drive of the version before are written to " + drive.path);
-            size_t files = 0, failed = 0;
-            std::vector<std::pair<drive_node, std::string>> stack;
-            for (const drive_node& n : top) stack.push_back(std::make_pair(n, n.name));
-            std::vector<long long> done;
-            while (!stack.empty())
-            {
-                const drive_node n = stack.back().first;
-                const std::string path = stack.back().second;
-                stack.pop_back();
-                const std::string full = join_path(drive.path, path);
-                if (n.directory)
-                {
-                    make_dirs(full);
-                    for (const drive_node& c : svc.db().children(n.id))
-                        stack.push_back(std::make_pair(c, path + "/" + c.name));
-                    folder_file r;
-                    r.folder = "drive";
-                    r.path = path;
-                    r.state = "folder";
-                    std::lock_guard<std::mutex> lock(m);
-                    remember(drive, r);
-                    continue;
-                }
-                std::string bytes;
-                if (!n.blob.empty() && !svc.blobs().get(n.blob, bytes))
-                {
-                    ++failed;
-                    continue;
-                }
-                std::string target = path;
-                for (int k = 2; file_exists(join_path(drive.path, target)) && k < 10000; ++k)
-                    target = child_of(dir_of(path), numbered(base_of(path), k));
-                new_file out;
-                if (!out.create(join_path(drive.path, target)) || !out.write(bytes.data(), bytes.size()) ||
-                    !out.close())
-                {
-                    ++failed;
-                    continue;
-                }
-                long long size = 0;
-                int64_t written = 0;
-                if (current(drive, target, size, written))
-                {
-                    folder_file r;
-                    r.folder = "drive";
-                    r.path = target;
-                    r.size = size;
-                    r.written = written;
-                    r.sha256 = sha256_hex(bytes);
-                    r.record = n.file;
-                    r.state = n.file > 0 ? "protected" : "kept";
-                    std::lock_guard<std::mutex> lock(m);
-                    remember(drive, r);
-                }
-                ++files;
-                done.push_back(n.id);
-            }
-            if (failed > 0)
-            {
-                log_error("drive: " + std::to_string(failed) + " files of the drive of the version before cannot be "
-                          "written; they stay in the database for the next start");
-                return;
-            }
-            // Written: the tree and the protected copies of the vault go.
-            std::vector<std::pair<long long, int>> nodes;
-            std::vector<std::pair<drive_node, int>> walk;
-            for (const drive_node& n : top) walk.push_back(std::make_pair(n, 0));
-            while (!walk.empty())
-            {
-                const drive_node n = walk.back().first;
-                const int depth = walk.back().second;
-                walk.pop_back();
-                nodes.push_back(std::make_pair(n.id, depth));
-                if (!n.blob.empty()) svc.blobs().remove(n.blob);
-                if (n.directory)
-                    for (const drive_node& c : svc.db().children(n.id)) walk.push_back(std::make_pair(c, depth + 1));
-            }
-            std::sort(nodes.begin(), nodes.end(),
-                      [](const std::pair<long long, int>& a, const std::pair<long long, int>& b) {
-                          return a.second > b.second;
-                      });
-            for (const auto& n : nodes) svc.db().remove_node(n.first);
-            log_info("drive: " + std::to_string(files) + " files written to the folder of the drive");
-        }
-
         // ---------------------------------------------------------------------------
 
         void load(folder_state& f)
@@ -1503,8 +1349,7 @@ namespace pseudalis
             load(f);
             f.active = true;
 #if defined(_WIN32)
-            if (!letter.empty() && !map_letter(f, f.kind == "drive" ? std::string("Pseudalis") : restore_label()))
-                error = f.error;
+            if (!letter.empty() && !map_letter(f, "Pseudalis")) error = f.error;
             f.watcher = std::thread([this, &f]() { watch(f); });
 #endif
             return error.empty();
@@ -1520,13 +1365,11 @@ namespace pseudalis
         stop();
     }
 
-    bool drive_host::start(const std::string& letter, const std::string& restore_letter, std::string& error)
+    bool drive_host::start(const std::string& letter, std::string& error)
     {
         impl& p = *p_;
         p.drive.kind = "drive";
-        p.restore.kind = "restore";
         p.drive.path = join_path(p.svc.data_dir(), "drive");
-        p.restore.path = join_path(p.svc.data_dir(), "restore");
         p.refused_root = join_path(p.svc.data_dir(), "refused");
         p.stopping = false;
 #if defined(_WIN32)
@@ -1534,18 +1377,13 @@ namespace pseudalis
         p.stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 #endif
         // A drive without letter is not run.
-        std::string drive_error, restore_error;
-        if (!letter.empty())
-        {
-            p.start_folder(p.drive, letter, drive_error);
-            if (p.drive.active) p.migrate();
-        }
-        if (!restore_letter.empty()) p.start_folder(p.restore, restore_letter, restore_error);
+        error.clear();
+        if (letter.empty()) return true;
+        p.start_folder(p.drive, letter, error);
         p.scanner = std::thread([&p]() { p.scanner_loop(); });
         const unsigned cores = std::max(2u, std::thread::hardware_concurrency());
         for (unsigned i = 0; i < std::min(4u, cores / 2); ++i)
             p.workers.push_back(std::thread([&p]() { p.worker_loop(); }));
-        error = drive_error.empty() ? restore_error : drive_error;
         return error.empty();
     }
 
@@ -1567,11 +1405,8 @@ namespace pseudalis
             if (t.joinable()) t.join();
         p.workers.clear();
 #if defined(_WIN32)
-        for (folder_state* f : { &p.drive, &p.restore })
-        {
-            if (f->watcher.joinable()) f->watcher.join();
-            p.unmap_letter(*f);
-        }
+        if (p.drive.watcher.joinable()) p.drive.watcher.join();
+        p.unmap_letter(p.drive);
         if (p.stop_event)
         {
             CloseHandle(p.stop_event);
@@ -1579,37 +1414,31 @@ namespace pseudalis
         }
 #endif
         p.drive.active = false;
-        p.restore.active = false;
     }
 
     json drive_host::status() const
     {
         const impl& p = *p_;
         std::lock_guard<std::mutex> lock(p.m);
-        auto describe = [](const folder_state& f, json& j) {
-            long long files = 0, bytes = 0;
-            for (const auto& kv : f.known)
-                if (kv.second.state != "folder")
-                {
-                    ++files;
-                    bytes += kv.second.size;
-                }
-            j["letter"] = f.letter;
-#if defined(_WIN32)
-            j["mounted"] = f.active && f.mapped;
-#else
-            j["mounted"] = f.active;
-#endif
-            j["folder"] = f.path;
-            j["files"] = files;
-            j["bytes"] = bytes;
-            j["error"] = f.error;
-        };
+        const folder_state& f = p.drive;
+        long long files = 0, bytes = 0;
+        for (const auto& kv : f.known)
+            if (kv.second.state != "folder")
+            {
+                ++files;
+                bytes += kv.second.size;
+            }
         json j = json::object();
-        describe(p.drive, j);
-        json r = json::object();
-        describe(p.restore, r);
-        j["restore"] = r;
+        j["letter"] = f.letter;
+#if defined(_WIN32)
+        j["mounted"] = f.active && f.mapped;
+#else
+        j["mounted"] = f.active;
+#endif
+        j["folder"] = f.path;
+        j["files"] = files;
+        j["bytes"] = bytes;
+        j["error"] = f.error;
         j["refused_folder"] = p.refused_root;
         return j;
     }

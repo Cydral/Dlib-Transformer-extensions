@@ -27,8 +27,7 @@ namespace setup
     {
         std::string program_dir;      // C:\Program Files\Pseudalis by default
         std::string data_dir;         // C:\ProgramData\Pseudalis by default
-        std::string drive_letter = "A";   // the letter of the drive of anonymization, empty without drive
-        std::string restore_letter = "R"; // the letter of the drive of restoration, empty without drive
+        std::string drive_letter = "A";   // the letter of the drive, empty without drive
         std::string language = "auto";    // the language of the programs and of the descriptions
         bool autostart = true;        // the tray at the sign in of every user
         bool desktop_shortcut = false;
@@ -229,16 +228,16 @@ namespace setup
     size_t remove_old_files(const std::string& program_dir, bool now_only = false);
 
     /*
-        Adds to the set, as files it removes, the files of the web application, the licenses
-        and the installer of WinFsp that an earlier installation placed in program_dir and
-        that the set does not install: commit() sets them aside with the files it replaces,
+        Adds to the set, as files it removes, the files of the web application and the
+        licenses that an earlier installation placed in program_dir and that the set does
+        not install: commit() sets them aside with the files it replaces,
         rollback() puts them back and finish() deletes them.  The paths compare without case,
         as Windows names its files; the links stay, with what they lead to, and so do the
         files of the data folder.
     */
     void stage_stale_files(const std::string& program_dir, staged_files& files);
 
-    // Removes the folders of the web application, the licenses and the WinFsp of the versions before that hold nothing.
+    // Removes the folders of the web application and the licenses that hold nothing.
     void remove_empty_program_folders(const std::string& program_dir);
 
     /*
@@ -265,10 +264,8 @@ namespace setup
 
     // Merges the options into settings.json, keeping the other settings.
     bool write_settings(const install_options& o, std::string& error);
-    // Adds to settings.json the settings a version before did not write: the letter of the drive of restoration.
-    bool add_missing_settings(const install_options& o, std::string& error);
 
-    // Removes the names and the icons of the drives of the programs of program_dir from the Explorer.
+    // Removes the name and the icon of the drive of the programs of program_dir from the Explorer.
     void remove_drive_labels(const std::string& program_dir);
 
 
@@ -311,28 +308,17 @@ namespace setup
     uninstall_entry save_uninstall_entry();
     void restore_uninstall_entry(const uninstall_entry& entry);
 
-    /*
-        The WinFsp that an earlier version of Pseudalis installed for its drive, recorded in
-        the registry and hidden from the installed programs: the drives need no driver any
-        more, and remove_owned_winfsp() uninstalls it, at the installation of this version and
-        at the uninstallation.  It stays when another program registered a file system with
-        it since, or replaced it, shown again among the installed programs.  A WinFsp that
-        Pseudalis did not install is never touched.  Returns false, with the reason in error,
-        when msiexec could not uninstall it.
-    */
-    bool remove_owned_winfsp(std::string& error);
-
     // Lets the interactive users start and stop the service, from the icon.
     bool allow_service_control(std::string& error);
 
     /*
-        The commands of the Explorer on the files Pseudalis protects (Show more options on
-        Windows 11): a cascade "Pseudalis" with Anonymize, Anonymize as a copy, Restore the
-        original and Restore as a copy, which run pseudalis.exe of program_dir.  labels gives
-        their texts in the language of the installation: "menu", "protect", "protect_copy",
-        "restore" and "restore_copy".  With each_user, the language of the installation
-        follows the system, and the commands take the texts of pseudalis.exe in the language
-        of each user instead.
+        The commands of the Explorer on the files Pseudalis protects and on the folders (Show
+        more options on Windows 11): a cascade "Pseudalis" with Anonymize, Anonymize as a copy,
+        Restore the original and Restore as a copy, which run pseudalis.exe of program_dir.
+        labels gives their texts in the language of the installation: "menu", "protect",
+        "protect_copy", "restore" and "restore_copy".  With each_user, the language of the
+        installation follows the system, and the commands take the texts of pseudalis.exe in
+        the language of each user instead.
     */
     bool context_menu_registered();
     bool register_context_menu(const std::string& program_dir, const std::map<std::string, std::wstring>& labels,
@@ -340,15 +326,12 @@ namespace setup
     void remove_context_menu();
 
     /*
-        The letters the drives may take: A, B and D to Z that no drive of the computer nor
-        network drive of the user takes, and current and also, the letters of the drives in
-        place.  valid_drive_choice() tells whether a letter given to the silent installation
-        is one.  default_restore_letter() is the first free letter from R on that is not
-        drive_letter, else another free one, else none.
+        The letters the drive may take: A, B and D to Z that no drive of the computer nor
+        network drive of the user takes, and current, the letter of the drive in place.
+        valid_drive_choice() tells whether a letter given to the silent installation is one.
     */
-    std::vector<std::string> free_drive_letters(const std::string& current, const std::string& also = std::string());
+    std::vector<std::string> free_drive_letters(const std::string& current);
     bool valid_drive_choice(const std::string& letter);
-    std::string default_restore_letter(const std::string& drive_letter);
 
     // Shortcuts of the Start menu and of the desktop.
     void create_shortcuts(const std::string& program_dir, bool desktop);

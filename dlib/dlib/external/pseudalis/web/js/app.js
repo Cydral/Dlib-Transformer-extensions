@@ -30,6 +30,14 @@
     return s;
   }
 
+  /* A text that counts n things: its singular form, key_one, for one thing, and for none in French,
+     else its plural form. */
+  function tn(key, n, values) {
+    const one = n === 1 || (language === 'fr' && n === 0);
+    const k = one && texts[language] && texts[language][key + '_one'] ? key + '_one' : key;
+    return t(k, Object.assign({ n: n }, values || {}));
+  }
+
   function translate() {
     document.documentElement.lang = language;
     document.querySelectorAll('[data-t]').forEach(function (e) { e.textContent = t(e.getAttribute('data-t')); });
@@ -84,9 +92,7 @@
       box.appendChild(pill(t('s_version'), info.version));
       box.appendChild(pill(t('s_engine'), (info.engine && info.engine.variant) || '?'));
       const d = info.drive || {};
-      const rd = d.restore || {};
       box.appendChild(pill(t('s_drive'), d.mounted ? d.letter + ':' : t('s_drive_off'), !!d.mounted));
-      box.appendChild(pill(t('s_restore_drive'), rd.mounted ? rd.letter + ':' : t('s_drive_off'), !!rd.mounted));
       const a = info.albireo || {};
       box.appendChild(pill(t('s_albireo'), a.found ? a.model : t('s_albireo_off'), !!a.found));
       box.appendChild(pill(t('s_records'), String(info.records || 0)));
@@ -126,19 +132,29 @@
     return t('err_http', { status: status });
   }
 
-  async function send(file, route, list, describe) {
+  /* Sends an item, {name, read}, whose read() gives its bytes: a file, or the ZIP archive of a
+     folder, which the service processes whole and gives back as an archive. */
+  async function send(item, route, list, describe) {
     const li = el('li');
     const busy = el('span', 'busy');
     const grow = el('div', 'grow');
-    grow.appendChild(el('div', 'name', file.name));
+    grow.appendChild(el('div', 'name', item.name));
     const detail = el('div', 'detail', t('working'));
     grow.appendChild(detail);
     li.appendChild(busy);
     li.appendChild(grow);
     list.prepend(li);
+    let data;
     try {
-      const data = await file.arrayBuffer();
-      const r = await fetch(route + '&name=' + encodeURIComponent(file.name), {
+      data = await item.read();
+    } catch (e) {
+      busy.remove();
+      detail.className = 'error';
+      detail.textContent = t(e && e.message === 'folder_too_big' ? 'folder_too_big' : 'read_failed');
+      return;
+    }
+    try {
+      const r = await fetch(route + '&name=' + encodeURIComponent(item.name), {
         method: 'POST',
         headers: { 'Content-Type': 'application/octet-stream' },
         body: data
@@ -165,26 +181,173 @@
     }
   }
 
+  // ---------------------------------------------------------------------------------------
+  // Folders: their files and their folders, with their paths, in a ZIP archive.
+
+  const crcTable = (function () {
+    const table = new Uint32Array(256);
+    for (let n = 0; n < 256; ++n) {
+      let c = n;
+      for (let k = 0; k < 8; ++k) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1;
+      table[n] = c >>> 0;
+    }
+    return table;
+  })();
+
+  function crc32(bytes) {
+    let c = 0xFFFFFFFF;
+    for (let i = 0; i < bytes.length; ++i) c = crcTable[(c ^ bytes[i]) & 0xFF] ^ (c >>> 8);
+    return (c ^ 0xFFFFFFFF) >>> 0;
+  }
+
+  /* A ZIP archive of the entries {path, bytes, folder}, stored without compression, their names
+     in UTF-8: the service reads it, and writes the archive it gives back compressed. */
+  function zipOf(entries) {
+    const encoder = new TextEncoder();
+    const now = new Date();
+    const time = (now.getHours() << 11) | (now.getMinutes() << 5) | (now.getSeconds() >> 1);
+    const date = ((now.getFullYear() - 1980) << 9) | ((now.getMonth() + 1) << 5) | now.getDate();
+    const parts = [];
+    const central = [];
+    let offset = 0, size = 0;
+    entries.forEach(function (e) {
+      const name = encoder.encode(e.path);
+      const crc = crc32(e.bytes);
+      const local = new DataView(new ArrayBuffer(30));
+      local.setUint32(0, 0x04034b50, true);
+      local.setUint16(4, 20, true);
+      local.setUint16(6, 0x0800, true);
+      local.setUint16(10, time, true);
+      local.setUint16(12, date, true);
+      local.setUint32(14, crc, true);
+      local.setUint32(18, e.bytes.length, true);
+      local.setUint32(22, e.bytes.length, true);
+      local.setUint16(26, name.length, true);
+      parts.push(local.buffer, name, e.bytes);
+      const c = new DataView(new ArrayBuffer(46));
+      c.setUint32(0, 0x02014b50, true);
+      c.setUint16(4, 20, true);
+      c.setUint16(6, 20, true);
+      c.setUint16(8, 0x0800, true);
+      c.setUint16(12, time, true);
+      c.setUint16(14, date, true);
+      c.setUint32(16, crc, true);
+      c.setUint32(20, e.bytes.length, true);
+      c.setUint32(24, e.bytes.length, true);
+      c.setUint16(28, name.length, true);
+      c.setUint32(38, e.folder ? 0x10 : 0, true);
+      c.setUint32(42, offset, true);
+      central.push(c.buffer, name);
+      offset += 30 + name.length + e.bytes.length;
+      size += 46 + name.length;
+    });
+    const end = new DataView(new ArrayBuffer(22));
+    end.setUint32(0, 0x06054b50, true);
+    end.setUint16(8, entries.length, true);
+    end.setUint16(10, entries.length, true);
+    end.setUint32(12, size, true);
+    end.setUint32(16, offset, true);
+    return new Blob(parts.concat(central, [end.buffer]), { type: 'application/zip' });
+  }
+
+  // The names that a folder holds for the system or for a program at work, left out.
+  function passed(name) {
+    const n = name.toLowerCase();
+    return n === 'desktop.ini' || n === 'thumbs.db' || n === 'ehthumbs.db' || n === '.ds_store' ||
+      n.indexOf('~$') === 0;
+  }
+
+  // The archive of the items {path, file} or {path, folder: true}, as an ArrayBuffer.
+  async function archiveOf(items) {
+    // The limits of a ZIP archive without its 64-bit extensions.
+    if (items.length > 65535) throw new Error('folder_too_big');
+    const entries = [];
+    let total = 0;
+    for (let i = 0; i < items.length; ++i) {
+      const it = items[i];
+      if (it.folder) {
+        entries.push({ path: it.path, bytes: new Uint8Array(0), folder: true });
+        continue;
+      }
+      total += it.file.size + 76 + 2 * it.path.length * 3;
+      if (total > 0xFFF00000) throw new Error('folder_too_big');
+      entries.push({ path: it.path, bytes: new Uint8Array(await it.file.arrayBuffer()) });
+    }
+    return zipOf(entries).arrayBuffer();
+  }
+
+  // The files and the folders under a folder dropped, the folder itself first.
+  async function collect(entry, prefix, out) {
+    if (passed(entry.name)) return;
+    if (entry.isFile) {
+      const file = await new Promise(function (resolve, reject) { entry.file(resolve, reject); });
+      out.push({ path: prefix + entry.name, file: file });
+      return;
+    }
+    const path = prefix + entry.name + '/';
+    out.push({ path: path, folder: true });
+    const reader = entry.createReader();
+    for (;;) {
+      const batch = await new Promise(function (resolve, reject) { reader.readEntries(resolve, reject); });
+      if (!batch.length) break;
+      for (let i = 0; i < batch.length; ++i) await collect(batch[i], path, out);
+    }
+  }
+
+  function fileItem(file) {
+    return { name: file.name, read: function () { return file.arrayBuffer(); } };
+  }
+
+  function folderItem(entry) {
+    return {
+      name: entry.name + '.zip',
+      read: async function () {
+        const items = [];
+        await collect(entry, '', items);
+        return archiveOf(items);
+      }
+    };
+  }
+
+  // A folder chosen in the dialog: its files, which keep their paths under it.
+  function chosenFolderItem(files) {
+    const top = (files[0].webkitRelativePath || files[0].name).split('/')[0];
+    return {
+      name: top + '.zip',
+      read: function () {
+        return archiveOf(files.filter(function (f) { return !passed(f.name); }).map(function (f) {
+          return { path: f.webkitRelativePath || f.name, file: f };
+        }));
+      }
+    };
+  }
+
   function protectDetail(body) {
     const report = body.report || {};
-    let s = t('values', { n: report.total || 0 });
+    let s = tn('values', report.total || 0);
     const dropped = (report.dropped || []).length;
-    if (dropped) s += ', ' + t('dropped', { n: dropped });
+    if (dropped) s += ', ' + tn('dropped', dropped);
     return s;
   }
 
   function restoreDetail(body) {
     if (body.restored === 'original') return t('restored_original');
     if (body.restored === 'picture') return t('restored_picture');
-    return t('restored_tags', { n: (body.report && body.report.tags_restored) || 0 });
+    return tn('restored_tags', (body.report && body.report.tags_restored) || 0);
   }
 
-  function wire(dropId, inputId, run) {
+  function wire(dropId, inputId, folderId, run) {
     const drop = document.getElementById(dropId);
     const input = document.getElementById(inputId);
+    const folder = document.getElementById(folderId);
     input.addEventListener('change', function () {
-      Array.from(input.files).forEach(run);
+      Array.from(input.files).forEach(function (f) { run(fileItem(f)); });
       input.value = '';
+    });
+    folder.addEventListener('change', function () {
+      const files = Array.from(folder.files);
+      folder.value = '';
+      if (files.length) run(chosenFolderItem(files));
     });
     ['dragenter', 'dragover'].forEach(function (k) {
       drop.addEventListener(k, function (e) { e.preventDefault(); drop.classList.add('over'); });
@@ -194,17 +357,25 @@
     });
     drop.addEventListener('drop', function (e) {
       e.preventDefault();
-      Array.from(e.dataTransfer.files).forEach(run);
+      // The entries are taken during the event: a folder among them becomes an archive.
+      const files = Array.from(e.dataTransfer.files);
+      const entries = Array.from(e.dataTransfer.items || []).filter(function (it) { return it.kind === 'file'; })
+        .map(function (it) { return it.webkitGetAsEntry ? it.webkitGetAsEntry() : null; });
+      if (entries.length !== files.length || !entries.every(Boolean)) {
+        files.forEach(function (f) { run(fileItem(f)); });
+        return;
+      }
+      entries.forEach(function (entry, i) { run(entry.isDirectory ? folderItem(entry) : fileItem(files[i])); });
     });
   }
 
-  wire('protect-drop', 'protect-input', function (f) {
+  wire('protect-drop', 'protect-input', 'protect-folder', function (item) {
     const keep = document.getElementById('keep').checked;
-    send(f, 'v1/anonymize?format=json&source=web&record=' + (keep ? 'true' : 'false'),
+    send(item, 'v1/anonymize?format=json&source=web&record=' + (keep ? 'true' : 'false'),
       document.getElementById('protect-results'), protectDetail).then(refreshStatus);
   });
-  wire('restore-drop', 'restore-input', function (f) {
-    send(f, 'v1/restore?format=json', document.getElementById('restore-results'), restoreDetail);
+  wire('restore-drop', 'restore-input', 'restore-folder', function (item) {
+    send(item, 'v1/restore?format=json', document.getElementById('restore-results'), restoreDetail);
   });
 
   // ---------------------------------------------------------------------------------------
@@ -371,7 +542,6 @@
     const s = await r.json();
     document.getElementById('set-language').value = s.language || 'auto';
     document.getElementById('set-drive').value = s.drive_letter || '';
-    document.getElementById('set-restore-drive').value = s.restore_letter || '';
     document.getElementById('set-max').value = s.max_file_mb;
     document.getElementById('set-removed').value = s.removed_days;
     document.getElementById('set-albireo').checked = s.albireo !== 'off';
@@ -382,7 +552,6 @@
     const r = await postJson('v1/settings', {
       language: document.getElementById('set-language').value,
       drive_letter: document.getElementById('set-drive').value.trim().toUpperCase(),
-      restore_letter: document.getElementById('set-restore-drive').value.trim().toUpperCase(),
       max_file_mb: parseInt(document.getElementById('set-max').value, 10) || 256,
       removed_days: parseInt(document.getElementById('set-removed').value, 10) || 30,
       albireo: document.getElementById('set-albireo').checked ? 'auto' : 'off',

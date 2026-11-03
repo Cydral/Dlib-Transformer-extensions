@@ -2,16 +2,17 @@
 # Copyright (C) 2026 Cydral Technology (cydraltechnology@gmail.com)
 # License: Boost Software License   See LICENSE.txt for the full license.
 #
-# Builds and tests Pseudalis on Linux, where the service carries its engine and its drives work
-# as folders without letters, and prints a summary, one line per step.
+# Builds and tests Pseudalis on Linux, where the service carries its engine and its drive works
+# as a folder without letter, and prints a summary, one line per step.
 #
 #   bash dlib/dlib/external/pseudalis/tools/test_linux.sh [build folder]
 #
 # Default build folder: build-pseudalis-linux at the root of the repository.  The tests of the
 # engine and of the host run first; the service then runs in a data folder of its own, on port
-# 18444 (PSEUDALIS_TEST_PORT), anonymizes and restores a text and a CSV file through its
-# interface, then files and a folder through its drives, and stops.  The exit code is the
-# number of failed steps.
+# 18444 (PSEUDALIS_TEST_PORT), anonymizes and restores through its interface a text, a CSV file,
+# a name and the archive of a folder as the web application sends it, then files and a folder
+# through its drive, whose originals come back through the interface, and stops.  The exit code
+# is the number of failed steps.
 
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -51,8 +52,7 @@ step "host tests" "all tests passed" "$BUILD/bin/test_host"
 HOME_DIR=$WORK/home
 mkdir -p "$HOME_DIR"
 cat > "$HOME_DIR/settings.json" <<EOF
-{"port": $PORT, "drive_letter": "A", "restore_letter": "R", "check_updates": false, "albireo": "off",
- "public_link": ""}
+{"port": $PORT, "drive_letter": "A", "check_updates": false, "albireo": "off"}
 EOF
 PSEUDALIS_HOME=$HOME_DIR "$BUILD/bin/pseudalis-service" --console > "$WORK/service.log" 2>&1 &
 SERVICE=$!
@@ -87,11 +87,56 @@ if [ $ready -eq 1 ]; then
     record "name anonymized" PASS "$(grep -i '^x-pseudalis-name:' "$WORK/name.headers" | tr -d '\r')"
   else record "name anonymized" FAIL "$(grep -i '^x-pseudalis-name:' "$WORK/name.headers" | tr -d '\r')"
   fi
+  # A name alone, the one of a folder, and its restoration.
+  name_call() { # route name
+    api -X POST -H "Content-Type: application/json" --data "$(python3 -c 'import json, sys
+print(json.dumps({"name": sys.argv[1]}))' "$2")" "$URL/v1/names/$1" |
+      python3 -c 'import json, sys; print(json.load(sys.stdin).get("name", ""))'
+  }
+  NAMED=$(name_call anonymize "Dossier jean.dupont@exemple.fr")
+  if [ -n "$NAMED" ] && ! printf '%s' "$NAMED" | grep -q -i dupont &&
+     [ "$(name_call restore "$NAMED")" = "Dossier jean.dupont@exemple.fr" ]; then
+    record "folder name" PASS "$NAMED"
+  else record "folder name" FAIL "anonymized as '$NAMED'"
+  fi
 
-  # The drives: a document anonymized under a name without personal data, a file of another kind
-  # moved out, a folder renamed once its files rest; then the restoration of the file and the folder.
+  # A folder as the web application sends it, a ZIP archive stored without compression: its
+  # documents and its names protected, the file of another kind left out, the original given back.
+  python3 - "$WORK/dossier.zip" <<'PY'
+import sys, zipfile
+z = zipfile.ZipFile(sys.argv[1], "w", zipfile.ZIP_STORED)
+z.writestr("Dossier Jean Dupont/", b"")
+z.writestr("Dossier Jean Dupont/lettre.txt", "Je suis Jean Dupont, jean.dupont@exemple.fr.\n".encode())
+z.writestr("Dossier Jean Dupont/vide/", b"")
+z.writestr("Dossier Jean Dupont/outil.bin", b"MZ\x90\x00binary\x00")
+z.close()
+PY
+  api -X POST --data-binary @"$WORK/dossier.zip" -D "$WORK/zip.headers" -o "$WORK/dossier.anon.zip" \
+    "$URL/v1/anonymize?name=Dossier%20Jean%20Dupont.zip"
+  ZIP_CHECK=$(python3 - "$WORK/dossier.anon.zip" "$WORK/zip.headers" <<'PY'
+import json, sys, urllib.parse, zipfile
+names = zipfile.ZipFile(sys.argv[1]).namelist()
+headers = dict(l.split(":", 1) for l in open(sys.argv[2], encoding="latin-1").read().splitlines() if ":" in l)
+headers = {k.strip().lower(): v.strip() for k, v in headers.items()}
+report = json.loads(urllib.parse.unquote(headers.get("x-pseudalis-report", "{}")))
+name = urllib.parse.unquote(headers.get("x-pseudalis-name", ""))
+clean = all("dupont" not in n.lower() for n in names) and "dupont" not in name.lower()
+print("ok" if clean and report.get("dropped") == 1 and len(names) == 3 else "bad %s %s %s" % (name, names, report))
+PY
+)
+  if [ "$ZIP_CHECK" = ok ]; then record "folder archive" PASS "names, documents, 1 entry left out"
+  else record "folder archive" FAIL "$ZIP_CHECK"
+  fi
+  api -X POST --data-binary @"$WORK/dossier.anon.zip" -o "$WORK/dossier.back.zip" \
+    "$URL/v1/restore?name=dossier.zip"
+  if cmp -s "$WORK/dossier.zip" "$WORK/dossier.back.zip"; then record "archive restored" PASS "the original archive"
+  else record "archive restored" FAIL "the restored archive differs, in $WORK"
+  fi
+
+  # The drive: a document anonymized under a name without personal data, the files of another
+  # kind moved out at their place in the tree, a folder renamed once its files rest; then the
+  # originals of the file and of the name of the folder through the interface.
   DRIVE=$HOME_DIR/drive
-  RESTORE=$HOME_DIR/restore
   wait_for() { # seconds command...
     local n=$1
     shift
@@ -104,23 +149,28 @@ if [ $ready -eq 1 ]; then
   mkdir -p "$DRIVE/Dossier jean.dupont@exemple.fr"
   cp "$WORK/note.txt" "$DRIVE/Dossier jean.dupont@exemple.fr/note.txt"
   printf 'binary\0' > "$DRIVE/outil.bin"
+  printf 'binary\0' > "$DRIVE/Dossier jean.dupont@exemple.fr/outil2.bin"
+  cp "$WORK/lettre.txt" "$DRIVE/faux.docx"
   drive_done() {
     [ -z "$(find "$DRIVE" -iname '*dupont*')" ] && [ -f "$HOME_DIR/refused/files/outil.bin" ] &&
-      [ -n "$(find "$DRIVE" -mindepth 2 -name note.txt)" ]
+      [ -f "$HOME_DIR/refused/files/faux.docx" ] && [ -n "$(find "$DRIVE" -mindepth 2 -name note.txt)" ] &&
+      [ -n "$(find "$HOME_DIR/refused/files" -mindepth 2 -name outil2.bin)" ]
   }
-  if wait_for 60 drive_done; then record "drive anonymized" PASS "names, content, the file of another kind out"
+  if wait_for 60 drive_done; then record "drive anonymized" PASS "names, content, the files of another kind out"
   else record "drive anonymized" FAIL "$(find "$DRIVE" "$HOME_DIR/refused" | tr '\n' ' ')"
   fi
   ANON=$(find "$DRIVE" -maxdepth 1 -type f -name 'Lettre*' | head -1)
   step "drive content" '\[\[PERSON:' cat "$ANON"
-  cp "$ANON" "$RESTORE/"
-  cp -r "$DRIVE"/Dossier* "$RESTORE/"
-  restore_done() {
-    cmp -s "$WORK/lettre.txt" "$RESTORE/Lettre jean.dupont@exemple.fr.txt" &&
-      cmp -s "$WORK/note.txt" "$RESTORE/Dossier jean.dupont@exemple.fr/note.txt"
-  }
-  if wait_for 60 restore_done; then record "drive restored" PASS "the original names and contents"
-  else record "drive restored" FAIL "$(find "$RESTORE" | tr '\n' ' ')"
+  api -X POST --data-binary @"$ANON" -D "$WORK/back.headers" -o "$WORK/lettre.back.txt" \
+    "$URL/v1/restore?name=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1]))' \
+      "$(basename "$ANON")")"
+  BACK_NAME=$(grep -i '^x-pseudalis-name:' "$WORK/back.headers" | cut -d: -f2- | tr -d '\r ' |
+    python3 -c 'import sys, urllib.parse; print(urllib.parse.unquote(sys.stdin.read().strip()))')
+  FOLDER=$(find "$DRIVE" -mindepth 1 -maxdepth 1 -type d | head -1)
+  if cmp -s "$WORK/lettre.txt" "$WORK/lettre.back.txt" && [ "$BACK_NAME" = "Lettre jean.dupont@exemple.fr.txt" ] &&
+     [ "$(name_call restore "$(basename "$FOLDER")")" = "Dossier jean.dupont@exemple.fr" ]; then
+    record "drive restored" PASS "the original, its name and the name of the folder"
+  else record "drive restored" FAIL "name '$BACK_NAME', folder $(basename "$FOLDER")"
   fi
 else
   tail -20 "$WORK/service.log" > "$WORK/service_start.log"

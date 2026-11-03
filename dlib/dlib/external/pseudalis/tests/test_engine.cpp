@@ -65,8 +65,11 @@ namespace
         return 1;
     }
 
+    // The error of the last call of process(), which it prints unless the call was meant to fail.
+    std::string last_error;
+
     bool process(psd_engine* e, const std::string& op, const std::string& name, const std::string& data, json& result,
-                 std::string& output, bool pictures = true)
+                 std::string& output, bool pictures = true, bool failure_expected = false)
     {
         json req = json::object();
         req["operation"] = op;
@@ -74,7 +77,8 @@ namespace
         psd_buffer r = { nullptr, 0 }, o = { nullptr, 0 }, err = { nullptr, 0 };
         const int ok = psd_process(e, req.dump().c_str(), data.data(), data.size(), pictures ? describe : nullptr,
                                    lookup, nullptr, &r, &o, &err);
-        if (!ok) std::cerr << "psd_process: " << (err.data ? err.data : "") << std::endl;
+        last_error = !ok && err.data ? std::string(err.data, err.size) : std::string();
+        if (!ok && !failure_expected) std::cerr << "psd_process: " << last_error << std::endl;
         result = ok ? json::parse_or_null(std::string(r.data, r.size)) : json();
         output = ok ? std::string(o.data, o.size) : std::string();
         psd_free(&r);
@@ -165,6 +169,55 @@ int main()
         CHECK(t.size() == 1 && t[0].data == inner[0].data);
     }
 
+    // A restoration keeps the entries of another kind as they are, and reads a text under any name.
+    {
+        std::vector<pseudalis::archive_entry> entries = pseudalis::read_archive(pseudalis::archive_kind::zip, out);
+        std::string tagged;
+        for (const pseudalis::archive_entry& x : entries)
+            if (x.name == "dossier/lettre.txt") tagged = x.data;
+        pseudalis::archive_entry tool, script;
+        tool.name = "outil.exe";
+        tool.data = std::string("MZ\x90\0\x03\0\0\0", 8) + std::string(64, '\0');
+        script.name = "dossier/script.py";
+        script.data = "note = \"\"\"" + tagged + "\"\"\"\n";
+        entries.push_back(tool);
+        entries.push_back(script);
+        std::string zback;
+        CHECK(process(e, "restore", "envoi.zip", pseudalis::write_archive(pseudalis::archive_kind::zip, entries), res,
+                      zback));
+        const dlib::zip_archive_reader z(zback);
+        CHECK(z.contains("outil.exe") && z.read("outil.exe") == tool.data);
+        CHECK(z.read("dossier/script.py") == "note = \"\"\"" + letter + "\"\"\"\n");
+        CHECK(z.read("dossier/lettre.txt") == letter && res["report"]["dropped"].size() == 0);
+        CHECK(process(e, "restore", "script.py", script.data, res, back));
+        CHECK(back == "note = \"\"\"" + letter + "\"\"\"\n");
+    }
+
+    // The kind of a file: its content must be the kind its name gives, and decides without extension.
+    {
+        dlib::zip_archive_writer od;
+        od.add("mimetype", "application/vnd.oasis.opendocument.text", false);
+        od.add("content.xml", "<office:text>Jean Dupont</office:text>");
+        const std::string odt = od.finish();
+        CHECK(!process(e, "anonymize", "lettre.odt", odt, res, out, true, true));
+        CHECK(last_error.find("not supported") != std::string::npos);
+        CHECK(!process(e, "anonymize", "lettre.docx", letter, res, out, true, true));
+        CHECK(last_error.find("does not match") != std::string::npos);
+        CHECK(!process(e, "anonymize", "photo.png", letter, res, out, true, true));
+        CHECK(process(e, "anonymize", "clients.sql", "INSERT INTO c VALUES ('jean.dupont@example.fr');\n", res, out));
+        CHECK(res["kind"].str() == "txt" && out.find("dupont") == std::string::npos);
+        CHECK(process(e, "anonymize", "LISEZMOI", letter, res, out));
+        CHECK(out.find("Dupont") == std::string::npos);
+        CHECK(process(e, "anonymize", "Lettre à M. Dupont", letter, res, out));
+        CHECK(res["kind"].str() == "txt" && out.find("Dupont") == std::string::npos);
+        // An Office document renamed .zip is read as an archive.
+        dlib::zip_archive_writer ox;
+        ox.add("[Content_Types].xml", "<Types><Default ContentType=\"wordprocessingml\"/></Types>");
+        ox.add("word/document.xml", "<w:document><w:t>Jean Dupont</w:t></w:document>");
+        CHECK(process(e, "anonymize", "rapport.zip", ox.finish(), res, out));
+        CHECK(res["kind"].str() == "zip");
+    }
+
     // Names: their values become substitutes, which the lookup gives back.
     CHECK(process(e, "anonymize", "Lettre_jean.dupont@example.fr_2024-03-12.txt", letter, res, out));
     const std::string renamed = res["name"].str();
@@ -209,9 +262,10 @@ int main()
         CHECK(r.contains("jean.dupont@example.fr/lettre.txt") && r.read("jean.dupont@example.fr/copie.txt") == letter);
     }
 
-    // Unsupported content, and text.
+    // Unsupported content, refused with its reason, and text.
     CHECK(!process(e, "anonymize", "outil.exe", std::string("MZ\x90\0\x03\0\0\0", 8) + std::string(64, '\0'),
-                   res, out));
+                   res, out, true, true));
+    CHECK(last_error.find("not supported") != std::string::npos);
     CHECK(process(e, "anonymize_text", "prompt", "Écrire à Jean Dupont", res, out));
     CHECK(out.find("Dupont") == std::string::npos);
     CHECK(process(e, "detect", "prompt", "Écrire à Jean Dupont", res, out));
