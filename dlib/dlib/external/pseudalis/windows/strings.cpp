@@ -639,6 +639,16 @@ namespace pseudalis
                 "Der Inhalt dieser Datei entspricht nicht ihrem Namen.",
                 "Il contenuto di questo file non corrisponde al suo nome.",
                 "El contenido de este archivo no corresponde a su nombre." } },
+            { "err_encoded_content", { "This file holds encoded parts, attachments, base64 or RTF for instance, that "
+                "Pseudalis cannot read: it is not processed.",
+                "Ce fichier contient des parties encodées, pièces jointes, base64 ou RTF par exemple, que Pseudalis "
+                "ne sait pas lire : il n'est pas traité.",
+                "Diese Datei enthält kodierte Teile, etwa Anhänge, Base64 oder RTF, die Pseudalis nicht lesen kann: "
+                "Sie wird nicht verarbeitet.",
+                "Questo file contiene parti codificate, allegati, base64 o RTF per esempio, che Pseudalis non sa "
+                "leggere: non viene elaborato.",
+                "Este archivo contiene partes codificadas, adjuntos, base64 o RTF por ejemplo, que Pseudalis no "
+                "sabe leer: no se procesa." } },
             { "err_not_protected", { "This file holds no value that Pseudalis protected with the key of this "
                 "computer.",
                 "Ce fichier ne contient aucune valeur protégée par Pseudalis avec la clé de cet ordinateur.",

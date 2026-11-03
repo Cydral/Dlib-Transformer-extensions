@@ -17,6 +17,8 @@
 #include <utility>
 #include <vector>
 
+#include "build_stamp.h"
+#include "../common/version.h"
 #include "engine.h"
 
 struct psd_engine
@@ -89,6 +91,11 @@ PSD_API const char* PSD_CALL psd_variant(void)
 #else
     return "baseline";
 #endif
+}
+
+PSD_API const char* PSD_CALL psd_build(void)
+{
+    return PSEUDALIS_VERSION "+" PSEUDALIS_BUILD_STAMP;
 }
 
 PSD_API int PSD_CALL psd_models(psd_buffer* description)

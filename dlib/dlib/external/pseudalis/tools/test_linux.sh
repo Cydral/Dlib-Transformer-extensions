@@ -87,6 +87,16 @@ if [ $ready -eq 1 ]; then
     record "name anonymized" PASS "$(grep -i '^x-pseudalis-name:' "$WORK/name.headers" | tr -d '\r')"
   else record "name anonymized" FAIL "$(grep -i '^x-pseudalis-name:' "$WORK/name.headers" | tr -d '\r')"
   fi
+  # A text of no kind is protected as a text; a binary file, or a text with encoded parts, is refused.
+  printf 'Journal de Jean Dupont, jean.dupont@exemple.fr\n' > "$WORK/journal.log2"
+  step "text of no kind" '\[\[EMAIL:' api -X POST --data-binary @"$WORK/journal.log2" \
+    "$URL/v1/anonymize?name=journal.log2"
+  printf 'Jean Dupont\0\001\002' > "$WORK/donnees.bin"
+  step "binary of no kind" '"code":"unsupported"' api -X POST --data-binary @"$WORK/donnees.bin" \
+    "$URL/v1/anonymize?name=donnees.bin"
+  printf 'From: Jean Dupont\r\nContent-Transfer-Encoding: base64\r\n\r\nSmVhbiBEdXBvbnQ=\r\n' > "$WORK/message.eml"
+  step "encoded of no kind" '"code":"encoded_content"' api -X POST --data-binary @"$WORK/message.eml" \
+    "$URL/v1/anonymize?name=message.eml"
   # A name alone, the one of a folder, and its restoration.
   name_call() { # route name
     api -X POST -H "Content-Type: application/json" --data "$(python3 -c 'import json, sys
@@ -151,13 +161,46 @@ PY
   printf 'binary\0' > "$DRIVE/outil.bin"
   printf 'binary\0' > "$DRIVE/Dossier jean.dupont@exemple.fr/outil2.bin"
   cp "$WORK/lettre.txt" "$DRIVE/faux.docx"
+  cp "$WORK/lettre.txt" "$DRIVE/journal jean.dupont@exemple.fr.log2"
   drive_done() {
     [ -z "$(find "$DRIVE" -iname '*dupont*')" ] && [ -f "$HOME_DIR/refused/files/outil.bin" ] &&
       [ -f "$HOME_DIR/refused/files/faux.docx" ] && [ -n "$(find "$DRIVE" -mindepth 2 -name note.txt)" ] &&
-      [ -n "$(find "$HOME_DIR/refused/files" -mindepth 2 -name outil2.bin)" ]
+      [ -n "$(find "$HOME_DIR/refused/files" -mindepth 2 -name outil2.bin)" ] &&
+      [ -n "$(find "$DRIVE" -maxdepth 1 -name '*.log2')" ]
   }
   if wait_for 60 drive_done; then record "drive anonymized" PASS "names, content, the files of another kind out"
   else record "drive anonymized" FAIL "$(find "$DRIVE" "$HOME_DIR/refused" | tr '\n' ' ')"
+  fi
+  # An archive over 64 KB: anonymized, then renamed with an extension of no kind, it stays a protected
+  # file of the drive; without extension, it is taken by its signature.
+  python3 - "$WORK/grosse.zip" <<'PY'
+import random, sys, zipfile
+random.seed(5)
+words = ["".join(random.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(random.randint(3, 9)))
+         for _ in range(5000)]
+text = "Note de Jean Dupont, " + " ".join(random.choice(words) for _ in range(60000)) + "\n"
+z = zipfile.ZipFile(sys.argv[1], "w", zipfile.ZIP_STORED)
+z.writestr("notes.txt", text)
+z.close()
+PY
+  cp "$WORK/grosse.zip" "$DRIVE/grosse.zip"
+  cp "$WORK/grosse.zip" "$DRIVE/archive_sans_extension"
+  # The name without extension may take substitutes too: the file is found by its end.
+  bare() { find "$DRIVE" -maxdepth 1 -type f -name '*sans_extension' | head -1; }
+  archive_done() {
+    [ -f "$DRIVE/grosse.zip" ] && [ -n "$(bare)" ] && ! cmp -s "$WORK/grosse.zip" "$DRIVE/grosse.zip" &&
+      ! cmp -s "$WORK/grosse.zip" "$(bare)"
+  }
+  wait_for 90 archive_done
+  BIG=$(stat -c %s "$DRIVE/grosse.zip" 2>/dev/null || echo 0)
+  mv "$DRIVE/grosse.zip" "$DRIVE/grosse.zip.bak"
+  sleep 8
+  if [ -f "$DRIVE/grosse.zip.bak" ] && [ ! -e "$HOME_DIR/refused/files/grosse.zip.bak" ] &&
+     [ "$BIG" -gt 65536 ] && [ -n "$(bare)" ] && ! cmp -s "$WORK/grosse.zip" "$(bare)"; then
+    record "drive signatures" PASS "a protected archive renamed stays, an archive without extension is taken"
+  else
+    record "drive signatures" FAIL "size $BIG, $(find "$DRIVE" "$HOME_DIR/refused" -name '*grosse*' -o -name '*sans*' |
+      tr '\n' ' ')"
   fi
   ANON=$(find "$DRIVE" -maxdepth 1 -type f -name 'Lettre*' | head -1)
   step "drive content" '\[\[PERSON:' cat "$ANON"

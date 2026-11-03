@@ -17,6 +17,10 @@
     the publisher makes once with pseudalis-sign keygen and commits: without it, the build
     goes on and the programs install no update.
 
+    The programs link the runtime of the compiler statically: the build stops when a program, an
+    engine or the installer imports another library than those of Windows (tools\check_imports.cpp),
+    so that the installer carries every file the programs need and no library of a third party.
+
     -Tests also builds and runs the tests of the engine and of the service.  -Jobs bounds
     the number of compilations run at once, for a machine with little memory.  The build
     tree is build-pseudalis at the root of the repository; the installer is

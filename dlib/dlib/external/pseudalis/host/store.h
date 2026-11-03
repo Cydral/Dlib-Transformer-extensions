@@ -43,11 +43,11 @@ namespace pseudalis
 
     struct picture_record
     {
-        std::string id;                 // 16 hexadecimal digits, the start of sha256
+        std::string id;                 // 16 hexadecimal digits of a keyed digest (picture_found)
         std::string sha256;
         std::string media_type;
         std::string blob;               // the picture in the vault
-        std::string description;        // protected
+        std::string description;        // the description of Albireo encrypted in the vault, or empty
         int64_t created = 0;
     };
 
@@ -92,6 +92,8 @@ namespace pseudalis
         // The record of a protected file; among several of the same content, the one whose protected name is name.
         bool find_by_output(const std::string& sha256, file_record& r, const std::string& name = std::string());
         bool find_by_object(const std::string& object_id, file_record& r);
+        // Whether a protected file of this size is recorded, which a file must be to be one.
+        bool output_size_known(long long size);
         std::vector<file_record> list_files(long long limit, long long offset,
             const std::string& source = std::string());
         long long count_files();
@@ -116,8 +118,14 @@ namespace pseudalis
             std::string& reason);
 
         bool get_picture(const std::string& id, picture_record& r);
-        bool find_picture(const std::string& sha256, picture_record& r);
         void add_picture(const picture_record& r);
+        /*
+            Gives the picture id the description blob description, before receiving the blob it
+            named; false when no picture has this identifier.
+        */
+        bool set_picture_description(const std::string& id, const std::string& description, std::string& before);
+        // Removes the pictures that no file names, the blobs of which the vault then drops; their count.
+        size_t remove_unlinked_pictures();
         void link_picture(long long file, const std::string& picture);
         std::vector<std::string> pictures_of(long long file);
 

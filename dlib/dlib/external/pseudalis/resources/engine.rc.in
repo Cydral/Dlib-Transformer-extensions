@@ -1,6 +1,6 @@
 // Copyright (C) 2026 Cydral Technology (cydraltechnology@gmail.com)
 // License: Boost Software License   See LICENSE.txt for the full license.
-// Version information of an engine library (generated from resources/engine.rc.in).
+// Version information of an engine library and its build (generated from resources/engine.rc.in).
 
 #include <winver.h>
 #include "@CMAKE_CURRENT_SOURCE_DIR@/common/version.h"
@@ -32,4 +32,10 @@ BEGIN
     BEGIN
         VALUE "Translation", 0x409, 1200
     END
+END
+
+// The build of the library, which the service reads before it runs any of its code (engine_loader.cpp).
+PSEUDALIS_BUILD RCDATA
+BEGIN
+    "@PSEUDALIS_BUILD_STAMP@"
 END

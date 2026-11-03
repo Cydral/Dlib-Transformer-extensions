@@ -26,6 +26,7 @@ namespace pseudalis
             " object_id TEXT NOT NULL DEFAULT '', path TEXT NOT NULL DEFAULT '', removed INTEGER NOT NULL DEFAULT 0);"
             "CREATE INDEX IF NOT EXISTS files_output ON files(output_sha256);"
             "CREATE INDEX IF NOT EXISTS files_object ON files(object_id);"
+            "CREATE INDEX IF NOT EXISTS files_output_size ON files(output_size);"
             "CREATE TABLE IF NOT EXISTS pictures(id TEXT PRIMARY KEY, sha256 TEXT NOT NULL, media_type TEXT NOT NULL,"
             " blob TEXT NOT NULL, description TEXT NOT NULL, created INTEGER NOT NULL);"
             "CREATE INDEX IF NOT EXISTS pictures_sha ON pictures(sha256);"
@@ -126,9 +127,44 @@ namespace pseudalis
             throw std::runtime_error("database " + path + ": " + e);
         }
         sqlite3_busy_timeout(db_, 5000);
-        exec(schema);
-        // The version of the schema, from which the migrations of later versions start.
-        exec("PRAGMA user_version = 1");
+        try
+        {
+            exec(schema);
+            /*
+                The version of the schema, from which the migrations start.  2: the description of
+                a picture names a blob of the vault (32 hexadecimal digits), where version 1 kept it
+                in clear under an identifier that the SHA-256 alone gave; nothing reads those any
+                more, the pictures of this version taking keyed identifiers, and they are erased.
+            */
+            long long version = 0;
+            {
+                statement v(db_, "PRAGMA user_version");
+                if (v.step()) version = v.integer(0);
+            }
+            if (version < 2)
+            {
+                exec("BEGIN IMMEDIATE");
+                try
+                {
+                    exec("UPDATE pictures SET description = '' WHERE description <> ''"
+                         " AND (length(description) <> 32 OR description GLOB '*[^0-9a-f]*');"
+                         "PRAGMA user_version = 2;"
+                         "COMMIT;");
+                }
+                catch (...)
+                {
+                    sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+                    throw;
+                }
+            }
+        }
+        catch (...)
+        {
+            // The destructor of an object whose constructor failed never runs.
+            sqlite3_close(db_);
+            db_ = nullptr;
+            throw;
+        }
     }
 
     store::~store()
@@ -184,6 +220,14 @@ namespace pseudalis
         return true;
     }
 
+    bool store::output_size_known(long long size)
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        statement s(db_, "SELECT 1 FROM files WHERE output_size = ?1 LIMIT 1");
+        s.bind(1, size);
+        return s.step();
+    }
+
     bool store::find_by_object(const std::string& object_id, file_record& r)
     {
         if (object_id.empty()) return false;
@@ -218,7 +262,8 @@ namespace pseudalis
     {
         std::lock_guard<std::mutex> lock(m_);
         std::set<std::string> found;
-        statement s(db_, "SELECT original_blob FROM files UNION SELECT blob FROM pictures");
+        statement s(db_, "SELECT original_blob FROM files UNION SELECT blob FROM pictures"
+                         " UNION SELECT description FROM pictures WHERE description <> ''");
         while (s.step()) found.insert(s.text(0));
         return found;
     }
@@ -286,9 +331,13 @@ namespace pseudalis
                 statement used(db_, "SELECT COUNT(*) FROM file_pictures WHERE picture = ?1");
                 used.bind(1, p);
                 if (used.step() && used.integer(0) > 0) continue;
-                statement b(db_, "SELECT blob FROM pictures WHERE id = ?1");
+                statement b(db_, "SELECT blob, description FROM pictures WHERE id = ?1");
                 b.bind(1, p);
-                if (b.step()) blobs.push_back(b.text(0));
+                if (b.step())
+                {
+                    blobs.push_back(b.text(0));
+                    if (!b.text(1).empty()) blobs.push_back(b.text(1));
+                }
                 statement dp(db_, "DELETE FROM pictures WHERE id = ?1");
                 dp.bind(1, p);
                 dp.step();
@@ -332,9 +381,25 @@ namespace pseudalis
         return true;
     }
 
-    bool store::find_picture(const std::string& sha256, picture_record& r)
+    bool store::set_picture_description(const std::string& id, const std::string& description, std::string& before)
     {
-        return get_picture(sha256.substr(0, 16), r) && r.sha256 == sha256;
+        std::lock_guard<std::mutex> lock(m_);
+        statement s(db_, "SELECT description FROM pictures WHERE id = ?1");
+        s.bind(1, id);
+        if (!s.step()) return false;
+        before = s.text(0);
+        statement u(db_, "UPDATE pictures SET description = ?2 WHERE id = ?1");
+        u.bind(1, id).bind(2, description);
+        u.step();
+        return true;
+    }
+
+    size_t store::remove_unlinked_pictures()
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        statement s(db_, "DELETE FROM pictures WHERE id NOT IN (SELECT picture FROM file_pictures)");
+        s.step();
+        return static_cast<size_t>(sqlite3_changes(db_));
     }
 
     void store::add_picture(const picture_record& r)

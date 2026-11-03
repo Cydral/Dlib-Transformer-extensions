@@ -26,19 +26,43 @@ target_link_libraries(pseudalis-shell PRIVATE pseudalis_common dlib::httplib ${u
 target_compile_options(pseudalis-shell PRIVATE ${PSEUDALIS_WARNINGS})
 set_source_files_properties(shell.rc PROPERTIES OBJECT_DEPENDS ${PSEUDALIS_SOURCE_DIR}/resources/pseudalis.ico)
 
+# The libraries the programs and the engines import: those of Windows alone, the runtime of the
+# compiler linked statically, so that the installer carries no library of a third party
+# (tools/check_imports.cpp, through cmake/check_imports.cmake).  The check runs on Windows, or
+# under the emulator of a cross build (CMAKE_CROSSCOMPILING_EMULATOR, Wine for instance).
+add_executable(pseudalis-check-imports ${PSEUDALIS_SOURCE_DIR}/tools/check_imports.cpp)
+target_compile_options(pseudalis-check-imports PRIVATE ${PSEUDALIS_WARNINGS})
+set(check_imports)
+if (NOT CMAKE_CROSSCOMPILING OR CMAKE_CROSSCOMPILING_EMULATOR)
+   set(check_command ${CMAKE_COMMAND} -DCHECK=$<TARGET_FILE:pseudalis-check-imports>
+      "-DEMULATOR=${CMAKE_CROSSCOMPILING_EMULATOR}")
+   set(checked $<TARGET_FILE:pseudalis-service> $<TARGET_FILE:pseudalis-tray> $<TARGET_FILE:pseudalis-shell>
+      $<TARGET_FILE:pseudalis-engine> $<TARGET_FILE:pseudalis-engine-avx2>)
+   list(JOIN checked "|" checked)
+   set(check_imports COMMAND ${check_command} "-DFILES=${checked}" -P ${PSEUDALIS_SOURCE_DIR}/cmake/check_imports.cmake)
+else()
+   message(STATUS "Libraries of the programs: not checked, this cross build runs no program of Windows "
+      "(CMAKE_CROSSCOMPILING_EMULATOR)")
+endif()
+
 # The payload of the installer.
 set(PSEUDALIS_PAYLOAD ${CMAKE_BINARY_DIR}/payload/pseudalis-payload.zip)
 # The build checks the list again, so that a file added to or removed from web needs no new configuration.
 file(GLOB_RECURSE web_files CONFIGURE_DEPENDS ${PSEUDALIS_SOURCE_DIR}/web/*)
 add_custom_command(OUTPUT ${PSEUDALIS_PAYLOAD}
+   ${check_imports}
    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/payload/stage
    COMMAND ${CMAKE_COMMAND} -DBIN_DIR=${CMAKE_BINARY_DIR}/bin -DSTAGE=${CMAKE_BINARY_DIR}/payload/stage
       -DOUTPUT=${PSEUDALIS_PAYLOAD} -DSOURCE_DIR=${PSEUDALIS_SOURCE_DIR} -DDLIB_DIR=${PSEUDALIS_DLIB_DIR}
       -DSWAGGER_DIR=${PSEUDALIS_ALBIREO_DIR}/web/docs
       -P ${PSEUDALIS_SOURCE_DIR}/cmake/payload.cmake
-   DEPENDS pseudalis-service pseudalis-tray pseudalis-shell pseudalis-engine pseudalis-engine-avx2 ${web_files}
-      ${PSEUDALIS_SOURCE_DIR}/cmake/payload.cmake ${PSEUDALIS_SOURCE_DIR}/resources/license.txt
-   COMMENT "Packing the programs into the payload of the installer")
+   DEPENDS pseudalis-service pseudalis-tray pseudalis-shell pseudalis-engine pseudalis-engine-avx2
+      pseudalis-check-imports ${web_files}
+      ${PSEUDALIS_SOURCE_DIR}/cmake/payload.cmake ${PSEUDALIS_SOURCE_DIR}/cmake/check_imports.cmake
+      ${PSEUDALIS_SOURCE_DIR}/resources/license.txt
+   COMMENT "Packing the programs into the payload of the installer"
+   # The list of the files checked holds '|', which a shell would read without quotes.
+   VERBATIM)
 add_custom_target(pseudalis-payload DEPENDS ${PSEUDALIS_PAYLOAD})
 add_dependencies(pseudalis-payload pseudalis-web)
 
@@ -54,6 +78,14 @@ target_include_directories(pseudalis-setup PRIVATE ${CMAKE_BINARY_DIR}/generated
 target_link_libraries(pseudalis-setup PRIVATE pseudalis_common pseudalis_zlib dlib::httplib ${ui_libraries} crypt32
    ws2_32)
 target_compile_options(pseudalis-setup PRIVATE ${PSEUDALIS_WARNINGS})
+if (check_imports)
+   add_dependencies(pseudalis-setup pseudalis-check-imports)
+   add_custom_command(TARGET pseudalis-setup POST_BUILD
+      COMMAND ${check_command} -DFILES=$<TARGET_FILE:pseudalis-setup> -DREMOVE=$<TARGET_FILE:pseudalis-setup>
+         -P ${PSEUDALIS_SOURCE_DIR}/cmake/check_imports.cmake
+      COMMENT "Checking the libraries the installer imports"
+      VERBATIM)
+endif()
 
 foreach (t pseudalis-tray pseudalis-shell pseudalis-setup)
    if (MSVC)

@@ -7,6 +7,8 @@
 #include <string>
 #include <vector>
 
+#include <sqlite3.h>
+
 #include "../common/platform.h"
 #include "../host/keys.h"
 #include "../host/settings.h"
@@ -129,29 +131,45 @@ int main()
             && found.original_name == r.original_name);
         db.set_file_location(rec, std::string(32, 'c'), "C:\\docs\\cv.docx");
         CHECK(db.find_by_object(std::string(32, 'c'), found) && found.path == "C:\\docs\\cv.docx");
+        // A picture, under a keyed identifier that its SHA-256 does not give, kept first without description.
         picture_record p;
-        p.id = std::string(16, 'd');
-        p.sha256 = std::string(16, 'd') + std::string(48, 'e');
+        p.id = "0123456789abcdef";
+        p.sha256 = std::string(64, 'e');
         p.media_type = "image/png";
         p.blob = v.put("png");
-        p.description = "a chart";
         db.add_picture(p);
         db.link_picture(rec, p.id);
         picture_record q;
-        CHECK(db.find_picture(p.sha256, q) && q.description == "a chart");
+        std::string text, before;
+        CHECK(db.get_picture(p.id, q) && q.sha256 == p.sha256 && q.blob == p.blob && q.description.empty());
+        // The description received later, encrypted in the vault; the blob named before would leave it.
+        p.description = v.put("a chart");
+        CHECK(db.set_picture_description(p.id, p.description, before) && before.empty());
+        CHECK(db.get_picture(p.id, q) && q.description == p.description && v.get(q.description, text) &&
+              text == "a chart");
+        CHECK(!db.set_picture_description("fedcba9876543210", p.description, before));
+        // A picture that no record names, the protection that kept it having failed, leaves at the start.
+        picture_record lone = p;
+        lone.id = "fedcba9876543210";
+        lone.blob = v.put("gif");
+        lone.description.clear();
+        db.add_picture(lone);
+        CHECK(db.remove_unlinked_pictures() == 1 && !db.get_picture(lone.id, q) && db.get_picture(p.id, q));
+        CHECK(db.referenced_blobs().count(lone.blob) == 0 && db.remove_unlinked_pictures() == 0);
         // A record whose file left the drive keeps its original until its time is over.
         CHECK(found.removed == 0 && db.files_removed_before(now_unix()).empty());
         db.set_file_removed(rec, now_unix() - 31 * 86400);
         CHECK(db.get_file(rec, found) && found.removed > 0);
         CHECK(db.files_removed_before(now_unix() - 30 * 86400).size() == 1);
         CHECK(db.files_removed_before(now_unix() - 32 * 86400).empty());
-        CHECK(db.referenced_blobs().count(r.original_blob) == 1 && db.referenced_blobs().count(p.blob) == 1);
+        CHECK(db.referenced_blobs().count(r.original_blob) == 1 && db.referenced_blobs().count(p.blob) == 1 &&
+              db.referenced_blobs().count(p.description) == 1);
         std::vector<std::string> blobs;
         int64_t when = 0;
         std::string reason;
         CHECK(!db.find_forgotten(std::string(64, 'b'), std::string(32, 'c'), when, reason));
         // An original forgotten: its protected file is remembered, by its hash and its object identifier.
-        CHECK(db.remove_file(rec, blobs, "forgotten") && blobs.size() == 2 && db.count_files() == 0);
+        CHECK(db.remove_file(rec, blobs, "forgotten") && blobs.size() == 3 && db.count_files() == 0);
         CHECK(db.find_forgotten(std::string(64, 'b'), std::string(), when, reason) && reason == "forgotten");
         CHECK(db.find_forgotten(std::string(64, 'f'), std::string(32, 'c'), when, reason) && when > 0);
         CHECK(!db.find_forgotten(std::string(64, 'f'), std::string(), when, reason));
@@ -160,6 +178,28 @@ int main()
         const long long next = db.add_file(r);
         // A record that leaves without reason (the drive replaces its file) leaves no trace.
         CHECK(next > rec && db.remove_file(next, blobs) && db.count_files() == 0);
+
+        // A database of the version 1 of the schema: the descriptions that it kept in clear are erased.
+        const std::string old_path = join_path(dir, "version1.db");
+        {
+            store fresh(old_path);
+        }
+        const std::string kept = v.put("a map");
+        sqlite3* raw = nullptr;
+        CHECK(sqlite3_open(old_path.c_str(), &raw) == SQLITE_OK);
+        const std::string old_rows =
+            "INSERT INTO pictures VALUES('aaaaaaaaaaaaaaaa', '" + std::string(64, 'a') + "', 'image/png', '"
+            + v.put("old") + "', 'Portrait of Jean Dupont', 1);"
+            "INSERT INTO pictures VALUES('bbbbbbbbbbbbbbbb', '" + std::string(64, 'b') + "', 'image/png', '"
+            + v.put("new") + "', '" + kept + "', 1);"
+            "PRAGMA user_version = 1;";
+        CHECK(sqlite3_exec(raw, old_rows.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
+        sqlite3_close(raw);
+        {
+            store migrated(old_path);
+            CHECK(migrated.get_picture("aaaaaaaaaaaaaaaa", q) && q.description.empty() && !q.blob.empty());
+            CHECK(migrated.get_picture("bbbbbbbbbbbbbbbb", q) && q.description == kept);
+        }
 
         // The files of the folder of the drive as the service left them, and what they weigh.
         folder_file note;

@@ -19,7 +19,9 @@
 #include <cpuid.h>
 #endif
 
+#include "build_stamp.h"
 #include "platform.h"
+#include "version.h"
 
 namespace pseudalis
 {
@@ -127,6 +129,28 @@ namespace pseudalis
 #endif
     }
 
+#if defined(_WIN32) && !defined(PSEUDALIS_ENGINE_STATIC)
+    namespace
+    {
+        // The build an engine library holds in its resources, read without running any of its code.
+        std::string resource_build(const std::string& path)
+        {
+            HMODULE m = LoadLibraryExW(widen(path).c_str(), nullptr,
+                                       LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE);
+            if (!m) return std::string();
+            std::string out;
+            HRSRC r = FindResourceW(m, L"PSEUDALIS_BUILD", MAKEINTRESOURCEW(10));
+            HGLOBAL g = r ? LoadResource(m, r) : nullptr;
+            const char* data = g ? static_cast<const char*>(LockResource(g)) : nullptr;
+            const DWORD size = r ? SizeofResource(m, r) : 0;
+            if (data && size > 0 && size < 256) out.assign(data, size);
+            FreeLibrary(m);
+            while (!out.empty() && out.back() == '\0') out.pop_back();
+            return out;
+        }
+    }
+#endif
+
     engine_library::~engine_library()
     {
         // The library is never unloaded (see engine_loader.h): a restart of the service
@@ -141,6 +165,7 @@ namespace pseudalis
         (void)error;
         api_version = psd_api_version;
         variant = psd_variant;
+        build = psd_build;
         models = psd_models;
         create = psd_create;
         destroy = psd_destroy;
@@ -162,6 +187,14 @@ namespace pseudalis
             const std::string path = join_path(folder, names[k]);
             if (!file_exists(path)) continue;
 #if defined(_WIN32)
+            // The build first, in the resources: a library of another build never runs here.
+            const std::string stamp = resource_build(path);
+            if (stamp != PSEUDALIS_BUILD_STAMP)
+            {
+                error = path + " is the engine of another build of Pseudalis (" + (stamp.empty() ? "none" : stamp) +
+                        ", this program " + PSEUDALIS_BUILD_STAMP + ")";
+                return false;
+            }
             handle_ = LoadLibraryExW(widen(path).c_str(), nullptr,
                                      LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
 #else
@@ -184,6 +217,7 @@ namespace pseudalis
 #define PSD_RESOLVE(member, name) member = reinterpret_cast<decltype(member)>(get(name))
         PSD_RESOLVE(api_version, "psd_api_version");
         PSD_RESOLVE(variant, "psd_variant");
+        PSD_RESOLVE(build, "psd_build");
         PSD_RESOLVE(models, "psd_models");
         PSD_RESOLVE(create, "psd_create");
         PSD_RESOLVE(destroy, "psd_destroy");
@@ -192,10 +226,20 @@ namespace pseudalis
         PSD_RESOLVE(alloc, "psd_alloc");
         PSD_RESOLVE(free_buffer, "psd_free");
 #undef PSD_RESOLVE
-        if (!api_version || !variant || !models || !create || !destroy || !process || !key_fingerprint || !alloc ||
-            !free_buffer || api_version() != PSEUDALIS_ENGINE_API_VERSION)
+        if (!api_version || !variant || !build || !models || !create || !destroy || !process || !key_fingerprint ||
+            !alloc || !free_buffer || api_version() != PSEUDALIS_ENGINE_API_VERSION)
         {
             error = path_ + " is not an engine of this version of Pseudalis";
+            create = nullptr;
+            return false;
+        }
+        // The engine of this build alone, which the installer placed beside the program.
+        const std::string own = PSEUDALIS_VERSION "+" PSEUDALIS_BUILD_STAMP;
+        const char* theirs = build();
+        if (!theirs || own != theirs)
+        {
+            error = path_ + " is the engine of another build of Pseudalis (" + (theirs ? theirs : "none") +
+                    ", this program " + own + ")";
             create = nullptr;
             return false;
         }
@@ -265,6 +309,12 @@ namespace pseudalis
     std::string engine_client::variant() const
     {
         return lib_ && lib_->variant ? lib_->variant() : std::string();
+    }
+
+    std::string engine_client::build() const
+    {
+        const char* b = lib_ && lib_->build ? lib_->build() : nullptr;
+        return b ? b : std::string();
     }
 
     json engine_client::models() const

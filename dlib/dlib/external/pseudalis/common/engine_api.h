@@ -40,12 +40,13 @@
     name or a property edited since, is not replaced again.
 
     picture, when not null, receives each picture found: in a document (Word, PowerPoint,
-    PDF), in an archive, or the file itself, with its identifier (the first 16 hexadecimal
-    digits of its SHA-256), its SHA-256 and its media type, and returns 1 with its
-    description in clear in *description (a buffer the engine releases with psd_free(),
-    allocated with psd_alloc()), or 0 without description.  The engine protects the
-    description and writes "[Image@<identifier> : <description>]" in the place of the
-    picture, or "[Image@<identifier>]" without description.
+    PDF), in an archive, or the file itself, with its identifier (16 hexadecimal digits of a
+    digest of the picture keyed by the key of the engine), its SHA-256 and its media type, and
+    returns 1 with its description in clear in *description (a buffer the engine releases with
+    psd_free(), allocated with psd_alloc()), or 0 without description.  The engine protects the
+    description with the detector, with what the document taught it besides, and writes
+    "[Image@<identifier> : <description>]" in the place of the picture, or "[Image@<identifier>]"
+    without description.
 
     Each function returns 1 on success, 0 on failure with the reason in error (UTF-8).
 */
@@ -64,7 +65,7 @@
 #define PSD_CALL
 #endif
 
-#define PSEUDALIS_ENGINE_API_VERSION 2
+#define PSEUDALIS_ENGINE_API_VERSION 3
 
 #ifdef __cplusplus
 extern "C" {
@@ -94,6 +95,11 @@ typedef struct psd_engine psd_engine;
 PSD_API int PSD_CALL psd_api_version(void);
 // "avx2" or "baseline".
 PSD_API const char* PSD_CALL psd_variant(void);
+/*
+    The version and the build of the engine, "1.0.0+20261103170000-0123abcd": the service loads
+    only the engine of its own build, which the installer placed beside it.
+*/
+PSD_API const char* PSD_CALL psd_build(void);
 // The models of the engine: {"tagger": source, "span_model": source, "size": "tiny"}.
 PSD_API int PSD_CALL psd_models(psd_buffer* description);
 

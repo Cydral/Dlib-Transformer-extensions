@@ -36,7 +36,7 @@ copy edited since included, as long as the substitutes stay in place.
 ### The kinds of files
 
 A file is processed when its extension names one of the kinds of Pseudalis and its content is of that
-kind:
+kind, or, of any other extension or without one, when its content is text through and through:
 
 | Kind | Extensions |
 |---|---|
@@ -46,13 +46,35 @@ kind:
 | Pictures | `.png` `.jpg` `.jpeg` `.jpe` `.jfif` `.gif` `.bmp` `.tif` `.tiff` `.webp` |
 | Archives | `.zip` `.tar` `.tgz` `.tar.gz` |
 
-A file without extension, `README` for instance, takes the kind of its content. Any other file is of
-another kind, and so is a file whose content is not the kind its name gives: an OpenDocument, an
-e-mail, a document of an older Office format, a program, a text named `.docx`. Its content would come
-out half protected, compressed or encoded as it lies, so Pseudalis never writes it in an anonymized
-place: the drive moves it out, the commands leave it as it is, an anonymized archive or copy of a
-folder leaves it out, and the interface refuses it with the code `unsupported` or `kind_mismatch`. A
-ZIP archive named `.zip` is an archive whatever it holds, an Office document renamed included.
+A file of any other extension, or without extension, `journal.log2` or `README` for instance, is
+processed as a text when its content is text through and through, which the engine checks with the
+detection of dlib (`dlib/data_io`): no binary signature (pictures, sounds, videos, programs, archives,
+PDF), the proportion of printable characters and the entropy of a text over its start and over its whole
+content, every character decoded, in UTF-8, UTF-16 or Windows-1252, with no control character but the
+tabulation, the ends of lines and the form feed, and no encoded part that would keep values from the
+detector. An encoded part is a block of base64, base64url or hexadecimal digits (1024 characters in a
+row, or 16 runs in a row of 60 or more, the lines of a block, in a string of JSON or of a program too,
+which a line of dashes or a path does not make), data or JSON in base64 (the tokens of OpenID Connect,
+`eyJ...`), bytes written in hexadecimal, a dump or an array (64 in a row, or 4 lines in a row of 8 or
+more, with letters or marks among them, `4a 65`, `0x4a`, `\x4a`, the groups of 4 or 8 digits of xxd or
+od counting in the lines that open with an offset), or a format that writes its values encoded: a
+message with parts in base64, quoted-printable or uuencode, or with encoded words in its headers
+(`=?UTF-8?B?...?=`), an RTF document, a vCard or an iCalendar, LDIF with values in base64 (`cn:: ...`),
+a block armored by PEM or OpenPGP (`-----BEGIN ...-----` and its body), in a string too, a block of
+uuencode or of ASCII85, and, by its first line, a PostScript program or an export of the registry of
+Windows. The interface refuses such a text with the code `encoded_content`. Without extension, a
+picture, an Office document, an archive or a PDF is also taken by its signature. A file of an extension
+of the table keeps its rules: its content must be of the kind of its extension, and a text is read as it
+lies. For a file of an extension of no kind, the drive and the commands read the first 64 KB first, and
+leave a file whose start is not a text without reading the rest, unless the drive holds a protected file
+of that size, which may be one renamed.
+
+Any other file is of another kind, and so is a file whose content is not the kind its name gives: an
+OpenDocument, a document of an older Office format, a program, a text named `.docx`. Its content would
+come out half protected, compressed or encoded as it lies, so Pseudalis never writes it in an anonymized
+place: the drive moves it out, the commands leave it as it is, an anonymized archive or copy of a folder
+leaves it out, and the interface refuses it with the code `unsupported` or `kind_mismatch`. A ZIP
+archive named `.zip` is an archive whatever it holds, an Office document renamed included.
 
 A folder goes through whole, its subfolders and their files included, on the drive, through the
 commands of the Explorer, and through the web application, which sends it as a ZIP archive and gives
@@ -100,8 +122,10 @@ web application and the interface, from any copy of the anonymized file.
 
 ### The commands of the Explorer
 
-A right click on a file Pseudalis processes, or on a folder, shows, under Show more options on Windows
-11, a menu Pseudalis with four commands, which `pseudalis.exe` carries out through the service:
+A right click on a file of one of the extensions above, or on a folder, shows, under Show more options
+on Windows 11, a menu Pseudalis with four commands, which `pseudalis.exe` carries out through the
+service; a text of another extension goes through the commands of its folder, the drive, the web
+application or the interface, the menu staying off the programs, sounds and videos:
 
 | Command | On a file | On a folder |
 |---|---|---|
@@ -170,12 +194,20 @@ the service, opens the documentation of the interface and the About window.
 
 When Albireo, the local inference service, is installed on the same computer and one of its models reads
 images, Pseudalis finds it through its interface (its data folder, its port, its local authority) and
-asks it to describe each picture, in the language of the installation. The description is anonymized in
-turn before it is written: a picture alone becomes `<name>.txt` holding `[Image@<id> : <description>]`,
-and a picture inside a document gives the same text in its place (a run of Word, a text box of
-PowerPoint at the place of the picture, the caption of a gray box in a PDF). The identifier is the start
-of the SHA-256 of the picture, recorded in the database with the picture in the vault, so that
-restoring the text file gives the picture back. The setting `albireo` turns the descriptions off.
+asks it to describe each picture, in the language of the installation, naming no person and copying no
+name, address, number or identifier the picture shows. A description may still name what the picture
+shows: the engine reads it with the detector before it writes it, with what the text of the document
+taught the detector besides, a name that the description repeats bare for instance, its values replaced
+by tags and counted in the report with those of the file, so that it brings no personal data back into
+the anonymized file; only then is it cut at 1000 bytes, outside its tags. A picture alone becomes
+`<name>.txt` holding `[Image@<id> : <description>]`, and a picture inside a document gives the same text
+in its place (a run of Word, a text box of PowerPoint at the place of the picture, the caption of a gray
+box in a PDF). The identifier is a digest of the picture keyed by the key of the installation, which
+tells nothing of the picture to whoever does not hold the key and links no picture from one installation
+to another; it is recorded in the database with the picture and its description in the vault, both
+encrypted, so that restoring the text file gives the picture back and a picture met again keeps its
+description, protected again each time it is written. The setting `albireo` turns the descriptions off,
+those kept included.
 
 ### Languages
 
@@ -210,8 +242,18 @@ processed, `refused\`.
 - The master key, 32 random bytes, is encrypted with DPAPI for the account of the service (LocalSystem)
   in `keys\master.key`, whose permissions admit SYSTEM and the administrators alone. HKDF-SHA-256
   derives from it the key of the pseudonymization and the two keys of the vault.
-- Each original is kept in the vault encrypted with AES-256-CTR and authenticated with HMAC-SHA-256; the
-  database holds the names, the sizes, the hashes and the places of the files, never their content.
+- Each original, each picture and each description of a picture by Albireo is kept in the vault
+  encrypted with AES-256-CTR and authenticated with HMAC-SHA-256; the database holds the names, the
+  sizes, the hashes and the places of the files, never their content nor a description: those that a
+  database of an earlier build kept in clear are erased when the service opens it.
+- The programs and the engines link the runtime of the compiler statically and import the libraries of
+  Windows alone, which the build checks. Built with Visual C++, the service, the icon, the commands and
+  the installer take the libraries they import from System32 alone (`/DEPENDENTLOADFLAG`), never from
+  the folder of the program, a folder of downloads for the installer for instance, and their later loads
+  from System32, and from its own folder for the service (`SetDefaultDllDirectories()`). The service
+  loads only the engine of its own build, by its full path, in the folder of the programs, whose
+  permissions admit SYSTEM and the administrators alone for any change: a library of the same name that
+  another installation placed elsewhere is never loaded.
 - The key can be exported, protected by a passphrase of 12 characters or more (PBKDF2-SHA-256 with
   600 000 iterations, AES-256-CTR and HMAC-SHA-256), and imported into a new installation that keeps no
   original yet. Without its key, an anonymized document cannot be restored anywhere: the export is the
@@ -329,6 +371,15 @@ engines compile the models of the header
 [`examples/slm_document_anonymizer_ex.h`](../../../examples/slm_document_anonymizer_ex.h)
 (`PSEUDALIS_MODELS_HEADER`). `-Tests` also builds and runs the tests.
 
+The build checks, before it packs the installer and once it is linked, that each program and each engine
+imports the libraries of Windows alone, found in System32, or its API sets
+([`tools/check_imports.cpp`](tools/check_imports.cpp)): a runtime of the compiler (`vcruntime`, `msvcp`,
+`ucrtbase`, the sets `api-ms-win-crt`) or any other library stops the build, so that the installer
+carries no library of a third party and the programs run on Windows as it is installed. Each
+configuration of the build tree gives the programs and the engines a build stamp of their own
+(`psd_build()` of the engines): the service loads its engine by its full path, beside it in the folder
+of the programs, and refuses an engine of another version or of another build.
+
 ### Linux
 
 The service builds on Linux with its engine inside and its drive as a folder without letter, for the
@@ -344,6 +395,10 @@ bash dlib/dlib/external/pseudalis/tools/test_linux.sh
 cmake -S dlib/dlib/external/pseudalis -B build-pseudalis-win -DCMAKE_TOOLCHAIN_FILE=dlib/dlib/external/pseudalis/cmake/mingw-w64.cmake
 cmake --build build-pseudalis-win
 ```
+
+A cross build checks the libraries of the programs only when it can run a program of Windows:
+`-DCMAKE_CROSSCOMPILING_EMULATOR=<wine>` gives it one; without it, the configuration says that the check
+is left out.
 
 ## Publishing a version
 
@@ -401,10 +456,17 @@ from the menu of the icon. Their messages and logs never name the places they re
 - The recognizers read French and English first; a document in another language keeps more values in
   clear. A protected document should be read again before it is shared.
 - A scanned page without text layer is kept as a gray box: no OCR is performed.
+- A description of Albireo is read as the text of its document is, with the same limits: a value that
+  the detector misses stays in clear in it. The setting `albireo` turns the descriptions off.
 - The drive takes files of 256 MB at most by default (`max_file_mb`): a larger file goes to the folder
   of the files not processed. A folder sent by the web application is one archive, under the same limit.
 - A file written to the drive lies there in clear until its processing, a few seconds for most
   documents (see the choices above).
+- A value written encoded stays as it is: in a text of an extension of the table, whose content is
+  read as it lies (a message saved as `.txt`, a key in a `.md`), and in a text of another extension
+  when its encoding escapes the rules of the kinds of files (a block of base64 shorter than their
+  thresholds, bytes in hexadecimal written with digits alone, the percent-encoding of an address). A
+  text that may hold such values should be read again before it is shared.
 - A restored archive gives back its pictures as their text files, unless the archive is the one the
   service made: its original then comes back whole from the vault.
 - The analysis reads some tens of kilobytes per second on each processor when nearly every word is

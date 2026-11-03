@@ -24,7 +24,11 @@ namespace pseudalis
                 The engine library of this computer, loaded at run time: on Windows
                 pseudalis-engine-avx2.dll beside the program when the processor runs AVX2,
                 else pseudalis-engine.dll; elsewhere the engine compiled into the program
-                (PSEUDALIS_ENGINE_STATIC) or libpseudalis-engine.so beside it.  The library
+                (PSEUDALIS_ENGINE_STATIC) or libpseudalis-engine.so beside it.  The library is
+                loaded by its full path, the libraries it imports from its folder and System32
+                alone, and is taken only when it is of the version and of the build of the
+                program (psd_build()): a library of the same name that another installation
+                or another build left is refused.  The library
                 stays loaded until the process ends, whatever becomes of the object: the pool
                 of threads its networks run on, the one of dlib, would be joined by its
                 unloading, which Windows runs under its loader lock that the ending threads
@@ -43,6 +47,7 @@ namespace pseudalis
 
         int (PSD_CALL* api_version)(void) = nullptr;
         const char* (PSD_CALL* variant)(void) = nullptr;
+        const char* (PSD_CALL* build)(void) = nullptr;
         int (PSD_CALL* models)(psd_buffer*) = nullptr;
         psd_engine* (PSD_CALL* create)(const char*, size_t, const char*, psd_buffer*) = nullptr;
         void (PSD_CALL* destroy)(psd_engine*) = nullptr;
@@ -92,6 +97,8 @@ namespace pseudalis
                 std::function<std::vector<std::string>(const std::string&)>()) const;
         std::string key_fingerprint() const;
         std::string variant() const;
+        // The version and the build of the engine (psd_build()).
+        std::string build() const;
         json models() const;
 
     private:

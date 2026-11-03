@@ -254,10 +254,11 @@ namespace pseudalis
             return true;
         }
 
-        bool read_all(file_handle h, std::string& data, uint64_t size)
+        // Reads size bytes more from h after the from bytes data holds.
+        bool read_all(file_handle h, std::string& data, uint64_t size, size_t from = 0)
         {
-            data.resize(static_cast<size_t>(size));
-            size_t done = 0;
+            data.resize(from + static_cast<size_t>(size));
+            size_t done = from;
             while (done < data.size())
             {
                 DWORD got = 0;
@@ -481,10 +482,11 @@ namespace pseudalis
             return true;
         }
 
-        bool read_all(file_handle h, std::string& data, uint64_t size)
+        // Reads size bytes more from h after the from bytes data holds.
+        bool read_all(file_handle h, std::string& data, uint64_t size, size_t from = 0)
         {
-            data.resize(static_cast<size_t>(size));
-            size_t done = 0;
+            data.resize(from + static_cast<size_t>(size));
+            size_t done = from;
             while (done < data.size())
             {
                 const ssize_t got = ::read(h, &data[done], data.size() - done);
@@ -1015,9 +1017,34 @@ namespace pseudalis
                 if (before.record > 0) svc.mark_removed(before.record);
                 return 0;
             }
+            /*
+                A name whose extension gives no kind is processed when its content is text through
+                and through, which the engine decides: a start that is not a text leaves the drive
+                before the rest of the file is read, unless the file may be a protected file renamed,
+                of a size the database knows.  A name without extension goes to the engine, which
+                also takes a document, a picture or an archive by its signature.
+            */
+            const std::string base = base_of(path);
+            const bool by_content = !supported_name(base) && !name_extension(base).empty();
             std::string data;
-            if (!read_all(h, data, static_cast<uint64_t>(size)))
+            // Reserved whole, so that the rest read after the start moves no byte of it in memory.
+            data.reserve(static_cast<size_t>(size));
+            const uint64_t head = by_content ? std::min<uint64_t>(size, 65536) : static_cast<uint64_t>(size);
+            bool read = read_all(h, data, head);
+            if (read && head < static_cast<uint64_t>(size))
             {
+                if (!text_head(data.data(), data.size()) && !svc.db().output_size_known(size))
+                {
+                    wipe(data);
+                    refuse(f, path, h, "this kind of file is not processed");
+                    if (before.record > 0) svc.mark_removed(before.record);
+                    return 0;
+                }
+                read = read_all(h, data, static_cast<uint64_t>(size) - head, data.size());
+            }
+            if (!read)
+            {
+                wipe(data);
                 close_file(h);
                 keep(f, path, std::string(), 0, "kept", false);
                 return 0;
@@ -1040,8 +1067,8 @@ namespace pseudalis
                 keep(f, path, sha, 0, "kept", true);
                 return 0;
             }
-            // A name of another kind is refused at once; the content decides for a name without extension.
-            if (!possible_name(base_of(path)))
+            // A name of no kind whose content does not start as a text, and is no protected file.
+            if (by_content && !text_head(data.data(), std::min<size_t>(data.size(), 65536)))
             {
                 wipe(data);
                 refuse(f, path, h, "this kind of file is not processed");

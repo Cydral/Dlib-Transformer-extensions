@@ -248,6 +248,26 @@ namespace pseudalis
             return ok;
         }
 
+        /*
+            Whether the start of the file at path may be a text (text_head()), for a name whose
+            extension gives no kind: a file of another kind is left before it is read whole.  A
+            name without extension passes, the engine also taking a document, a picture or an
+            archive by its signature, and so does a file that cannot be opened here, its reading
+            then telling why.
+        */
+        bool head_is_text(const std::wstring& path, const std::string& name)
+        {
+            if (supported_name(name) || name_extension(name).empty()) return true;
+            HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+            if (h == INVALID_HANDLE_VALUE) return true;
+            std::string head(65536, '\0');
+            DWORD got = 0;
+            const bool ok = ReadFile(h, &head[0], static_cast<DWORD>(head.size()), &got, nullptr) != 0;
+            CloseHandle(h);
+            return !ok || text_head(head.data(), got);
+        }
+
         // Writes a new file, which must not exist, flushed to the disk.
         bool write_new(const std::wstring& path, const std::string& data, DWORD& error,
                        DWORD attributes = FILE_ATTRIBUTE_NORMAL)
@@ -584,8 +604,8 @@ namespace pseudalis
                 const DWORD attributes = GetFileAttributesW(path.c_str());
                 if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY))
                     return run_folder(protect, path, name);
-                // A name without extension: its content decides.
-                if (!possible_name(name)) return failure(name, tr("shell_unsupported", { { "f", name } }));
+                // A name of no kind is processed when its content is text through and through.
+                if (!head_is_text(path, name)) return failure(name, tr("shell_unsupported", { { "f", name } }));
                 return run_file(protect, path, name, std::string());
             }
 
@@ -818,7 +838,7 @@ namespace pseudalis
                     }
                     const std::wstring path = from + L"\\" + x.name;
                     const std::string name = narrow(x.name);
-                    if (!possible_name(name))
+                    if (!head_is_text(path, name))
                     {
                         other_kind(protect, path, name, into, t);
                         continue;
@@ -835,7 +855,7 @@ namespace pseudalis
                         ++t.already;
                         if (!into.empty()) copy_as_is(path, name, into, t);
                     }
-                    else if (o.code == "unsupported" || o.code == "kind_mismatch")
+                    else if (o.code == "unsupported" || o.code == "kind_mismatch" || o.code == "encoded_content")
                     {
                         other_kind(protect, path, name, into, t);
                     }

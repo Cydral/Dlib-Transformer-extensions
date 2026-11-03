@@ -7,9 +7,9 @@ window.PSEUDALIS_TEXTS = {
     tagline: 'Personal data protection for your documents',
     api: 'Interface documentation',
     protect_title: 'Protect files',
-    protect_hint: 'Word, Excel, PowerPoint, PDF, text, CSV, pictures, their ZIP, TAR or TAR.GZ archives, and whole ' +
-      'folders, which come back as a ZIP archive. Each personal value is replaced by a tag that only this computer ' +
-      'can restore.',
+    protect_hint: 'Word, Excel, PowerPoint, PDF, texts of any extension, CSV, pictures, their ZIP, TAR or TAR.GZ ' +
+      'archives, and whole folders, which come back as a ZIP archive. Each personal value is replaced by a tag that ' +
+      'only this computer can restore.',
     restore_title: 'Restore files',
     restore_hint: 'A protected file, or any copy of it, gives back its original; a protected file edited since ' +
       'gets its values back.',
@@ -92,6 +92,8 @@ window.PSEUDALIS_TEXTS = {
     err_restore_failed: 'The file cannot be restored: {error}',
     err_unsupported: 'Pseudalis does not process the files of this kind.',
     err_kind_mismatch: 'The content of this file does not match its name.',
+    err_encoded_content: 'This file holds encoded parts, attachments, base64 or RTF for instance, that Pseudalis ' +
+      'cannot read: it is not processed.',
     err_not_protected: 'This file holds no value that Pseudalis protected with the key of this computer.',
     err_original_missing: 'The original of this file can no longer be read in the vault.',
     err_original_forgotten: 'The original of this file was forgotten on {date}: it can no longer be restored.',
@@ -116,9 +118,9 @@ window.PSEUDALIS_TEXTS = {
     tagline: 'Protection des données personnelles de vos documents',
     api: "Documentation de l'interface",
     protect_title: 'Protéger des fichiers',
-    protect_hint: 'Word, Excel, PowerPoint, PDF, texte, CSV, images, leurs archives ZIP, TAR ou TAR.GZ, et des ' +
-      'dossiers entiers, rendus en archive ZIP. Chaque donnée personnelle est remplacée par une balise que seul cet ' +
-      'ordinateur peut restaurer.',
+    protect_hint: 'Word, Excel, PowerPoint, PDF, textes de toute extension, CSV, images, leurs archives ZIP, TAR ou ' +
+      'TAR.GZ, et des dossiers entiers, rendus en archive ZIP. Chaque donnée personnelle est remplacée par une ' +
+      'balise que seul cet ordinateur peut restaurer.',
     restore_title: 'Restaurer des fichiers',
     restore_hint: "Un fichier protégé, ou toute copie de celui-ci, rend son original ; un fichier protégé modifié " +
       'depuis retrouve ses valeurs.',
@@ -202,6 +204,8 @@ window.PSEUDALIS_TEXTS = {
     err_restore_failed: 'Le fichier ne peut pas être restauré : {error}',
     err_unsupported: 'Pseudalis ne traite pas les fichiers de ce type.',
     err_kind_mismatch: 'Le contenu de ce fichier ne correspond pas à son nom.',
+    err_encoded_content: 'Ce fichier contient des parties encodées, pièces jointes, base64 ou RTF par exemple, que ' +
+      'Pseudalis ne sait pas lire : il n’est pas traité.',
     err_not_protected: 'Ce fichier ne contient aucune valeur protégée par Pseudalis avec la clé de cet ordinateur.',
     err_original_missing: "L'original de ce fichier ne peut plus être lu dans le coffre.",
     err_original_forgotten: "L'original de ce fichier a été oublié le {date} : il ne peut plus être restauré.",
@@ -226,9 +230,9 @@ window.PSEUDALIS_TEXTS = {
     tagline: 'Schutz personenbezogener Daten in Ihren Dokumenten',
     api: 'Dokumentation der Schnittstelle',
     protect_title: 'Dateien schützen',
-    protect_hint: 'Word, Excel, PowerPoint, PDF, Text, CSV, Bilder, ihre ZIP-, TAR- oder TAR.GZ-Archive und ganze ' +
-      'Ordner, die als ZIP-Archiv zurückkommen. Jeder personenbezogene Wert wird durch eine Markierung ersetzt, die ' +
-      'nur dieser Computer wiederherstellt.',
+    protect_hint: 'Word, Excel, PowerPoint, PDF, Texte jeder Endung, CSV, Bilder, ihre ZIP-, TAR- oder ' +
+      'TAR.GZ-Archive und ganze Ordner, die als ZIP-Archiv zurückkommen. Jeder personenbezogene Wert wird durch eine ' +
+      'Markierung ersetzt, die nur dieser Computer wiederherstellt.',
     restore_title: 'Dateien wiederherstellen',
     restore_hint: 'Eine geschützte Datei oder jede Kopie davon gibt ihr Original zurück; eine seither bearbeitete ' +
       'geschützte Datei erhält ihre Werte zurück.',
@@ -312,6 +316,8 @@ window.PSEUDALIS_TEXTS = {
     err_restore_failed: 'Die Datei kann nicht wiederhergestellt werden: {error}',
     err_unsupported: 'Pseudalis verarbeitet Dateien dieser Art nicht.',
     err_kind_mismatch: 'Der Inhalt dieser Datei entspricht nicht ihrem Namen.',
+    err_encoded_content: 'Diese Datei enthält kodierte Teile, etwa Anhänge, Base64 oder RTF, die Pseudalis nicht ' +
+      'lesen kann: Sie wird nicht verarbeitet.',
     err_not_protected: 'Diese Datei enthält keinen Wert, den Pseudalis mit dem Schlüssel dieses Computers ' +
       'geschützt hat.',
     err_original_missing: 'Das Original dieser Datei kann im Tresor nicht mehr gelesen werden.',
@@ -339,9 +345,9 @@ window.PSEUDALIS_TEXTS = {
     tagline: 'Protezione dei dati personali dei tuoi documenti',
     api: "Documentazione dell'interfaccia",
     protect_title: 'Proteggere file',
-    protect_hint: 'Word, Excel, PowerPoint, PDF, testo, CSV, immagini, i loro archivi ZIP, TAR o TAR.GZ e cartelle ' +
-      'intere, restituite come archivio ZIP. Ogni dato personale è sostituito da un tag che solo questo computer può ' +
-      'ripristinare.',
+    protect_hint: 'Word, Excel, PowerPoint, PDF, testi di qualsiasi estensione, CSV, immagini, i loro archivi ZIP, ' +
+      'TAR o TAR.GZ e cartelle intere, restituite come archivio ZIP. Ogni dato personale è sostituito da un tag che ' +
+      'solo questo computer può ripristinare.',
     restore_title: 'Ripristinare file',
     restore_hint: "Un file protetto, o qualsiasi sua copia, restituisce l'originale; un file protetto modificato " +
       'in seguito ritrova i suoi valori.',
@@ -426,6 +432,8 @@ window.PSEUDALIS_TEXTS = {
     err_restore_failed: 'Il file non può essere ripristinato: {error}',
     err_unsupported: 'Pseudalis non elabora i file di questo tipo.',
     err_kind_mismatch: 'Il contenuto di questo file non corrisponde al suo nome.',
+    err_encoded_content: 'Questo file contiene parti codificate, allegati, base64 o RTF per esempio, che Pseudalis ' +
+      'non sa leggere: non viene elaborato.',
     err_not_protected: 'Questo file non contiene alcun valore protetto da Pseudalis con la chiave di questo ' +
       'computer.',
     err_original_missing: "L'originale di questo file non può più essere letto nella cassaforte.",
@@ -452,9 +460,9 @@ window.PSEUDALIS_TEXTS = {
     tagline: 'Protección de los datos personales de sus documentos',
     api: 'Documentación de la interfaz',
     protect_title: 'Proteger archivos',
-    protect_hint: 'Word, Excel, PowerPoint, PDF, texto, CSV, imágenes, sus archivos ZIP, TAR o TAR.GZ y carpetas ' +
-      'enteras, devueltas como archivo ZIP. Cada dato personal se sustituye por una etiqueta que solo este equipo ' +
-      'puede restaurar.',
+    protect_hint: 'Word, Excel, PowerPoint, PDF, textos de cualquier extensión, CSV, imágenes, sus archivos ZIP, TAR ' +
+      'o TAR.GZ y carpetas enteras, devueltas como archivo ZIP. Cada dato personal se sustituye por una etiqueta que ' +
+      'solo este equipo puede restaurar.',
     restore_title: 'Restaurar archivos',
     restore_hint: 'Un archivo protegido, o cualquier copia, devuelve su original; un archivo protegido modificado ' +
       'después recupera sus valores.',
@@ -538,6 +546,8 @@ window.PSEUDALIS_TEXTS = {
     err_restore_failed: 'El archivo no se puede restaurar: {error}',
     err_unsupported: 'Pseudalis no procesa los archivos de este tipo.',
     err_kind_mismatch: 'El contenido de este archivo no corresponde a su nombre.',
+    err_encoded_content: 'Este archivo contiene partes codificadas, adjuntos, base64 o RTF por ejemplo, que ' +
+      'Pseudalis no sabe leer: no se procesa.',
     err_not_protected: 'Este archivo no contiene ningún valor protegido por Pseudalis con la clave de este ' +
       'equipo.',
     err_original_missing: 'El original de este archivo ya no se puede leer en la caja fuerte.',

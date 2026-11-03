@@ -22,7 +22,7 @@ namespace pseudalis
 
     struct picture_found
     {
-        std::string id;           // the first 16 hexadecimal digits of the SHA-256 of the bytes
+        std::string id;           // 16 hexadecimal digits of a digest of the bytes keyed by the key
         std::string sha256;
         std::string media_type;   // "image/png"...
         std::string location;     // the file, the entry of an archive, the part or the page
@@ -78,8 +78,9 @@ namespace pseudalis
                 keep their documents, protected, and their pictures as text files; the
                 entries of another kind are left out and listed in report["dropped"], and a
                 restoration keeps them as they are.  A file is of the kind its name gives
-                when its content is of that kind (kind_of()); a restoration also reads a
-                text under any name, since it may hold tags.
+                when its content is of that kind, and a file of any other name is a text when
+                its content is text through and through (kind_of()); a restoration also reads
+                a text under any name, since it may hold tags.
 
                 The names of the files, of the entries of the archives and of their
                 folders, and the properties of the documents (title, authors, subject,
@@ -102,11 +103,23 @@ namespace pseudalis
 
         static file_kind kind_of_name(const std::string& name);
         /*
-            The kind of a file: the kind of its content when its name has no extension, else the
-            kind its extension gives (common/file_kinds.h) when the content is of that kind, an
-            Office document, a PDF or a text for a document, any archive for an archive.  The
-            other files are unsupported: an OpenDocument or an e-mail, which hold their content
-            compressed or encoded, would come out half protected.
+            The kind of a file: the kind its extension gives (common/file_kinds.h) when the content is
+            of that kind, an Office document, a PDF or a text for a document, any archive for an
+            archive.  A name whose extension gives no kind, or without extension, is a text when its
+            content is text through and through: dlib finds in it no binary signature and the measures
+            of a text (dlib/data_io), every character decodes with no control character but the
+            tabulation, the ends of lines and the form feed, nor U+FFFE or U+FFFF, and it holds no
+            encoded part.  An encoded part is a block of base64, base64url or hexadecimal digits (1024
+            characters in a row, or 16 runs in a row of 60, the lines of a block, in a string of JSON or
+            of a program too, which a line of dashes or a path does not make), data or JSON in base64,
+            bytes in hexadecimal, a dump or an array (64 in a row, or 4 lines of 8, with letters or
+            marks among them), or a format that writes its values encoded: a message with parts in
+            base64, quoted-printable or uuencode, or with encoded words, an RTF document, a vCard or an
+            iCalendar, LDIF in base64, a block armored by PEM or OpenPGP, its header and its body, in a
+            string too, a block of uuencode or of ASCII85, and, by its first line, a PostScript program
+            or an export of the registry.  Without extension, a picture, an Office document, an archive
+            or a PDF is also taken by its signature.  The other files are unsupported: an OpenDocument,
+            or an e-mail with attachments, would come out half protected.
         */
         static file_kind kind_of(const std::string& bytes, const std::string& name);
         static std::string picture_marker(const std::string& id, const std::string& description);

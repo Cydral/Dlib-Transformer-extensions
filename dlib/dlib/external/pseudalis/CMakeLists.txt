@@ -87,6 +87,14 @@ if (NOT EXISTS "${PSEUDALIS_MODELS_HEADER}")
    message(FATAL_ERROR "No models header at ${PSEUDALIS_MODELS_HEADER}: set PSEUDALIS_MODELS_HEADER")
 endif()
 
+# The build of the programs and of the engines, new at each configuration of the build tree: the
+# service loads only an engine of its own build, never one that another installation or another
+# build left beside it (common/engine_loader.cpp).
+string(TIMESTAMP PSEUDALIS_BUILD_TIME "%Y%m%d%H%M%S" UTC)
+string(RANDOM LENGTH 8 ALPHABET "0123456789abcdef" PSEUDALIS_BUILD_RANDOM)
+set(PSEUDALIS_BUILD_STAMP "${PSEUDALIS_BUILD_TIME}-${PSEUDALIS_BUILD_RANDOM}")
+configure_file(cmake/build_stamp.h.in ${CMAKE_BINARY_DIR}/generated/build_stamp.h @ONLY)
+
 # ---------------------------------------------------------------------------------------------
 # The engines.
 
@@ -108,7 +116,7 @@ endif()
 
 function(pseudalis_engine target isa)
    add_library(${target} SHARED ${PSEUDALIS_ENGINE_SOURCES})
-   target_include_directories(${target} PRIVATE ${PSEUDALIS_INCLUDE_DIR})
+   target_include_directories(${target} PRIVATE ${PSEUDALIS_INCLUDE_DIR} ${CMAKE_BINARY_DIR}/generated)
    target_compile_definitions(${target} PRIVATE ${PSEUDALIS_ENGINE_DEFINITIONS})
    target_compile_options(${target} PRIVATE ${isa})
    target_link_libraries(${target} PRIVATE Threads::Threads)
@@ -192,6 +200,10 @@ target_include_directories(pseudalis-service PRIVATE ${CMAKE_BINARY_DIR}/generat
 target_link_libraries(pseudalis-service PRIVATE pseudalis_common pseudalis_sqlite dlib::httplib)
 if (WIN32)
    target_link_libraries(pseudalis-service PRIVATE winhttp crypt32)
+   if (MSVC)
+      # The libraries the service imports are loaded from System32 only (LOAD_LIBRARY_SEARCH_SYSTEM32).
+      target_link_options(pseudalis-service PRIVATE /DEPENDENTLOADFLAG:0x800)
+   endif()
 else()
    # The engine inside the program, outside Windows.
    target_compile_definitions(pseudalis-service PRIVATE PSEUDALIS_ENGINE_STATIC ${PSEUDALIS_ENGINE_DEFINITIONS})
@@ -223,7 +235,7 @@ endif()
 
 if (PSEUDALIS_TESTS)
    add_executable(test_engine tests/test_engine.cpp ${PSEUDALIS_ENGINE_SOURCES})
-   target_include_directories(test_engine PRIVATE ${PSEUDALIS_INCLUDE_DIR})
+   target_include_directories(test_engine PRIVATE ${PSEUDALIS_INCLUDE_DIR} ${CMAKE_BINARY_DIR}/generated)
    target_compile_definitions(test_engine PRIVATE ${PSEUDALIS_ENGINE_DEFINITIONS})
    target_link_libraries(test_engine PRIVATE Threads::Threads)
    if (WIN32)

@@ -50,14 +50,17 @@ namespace pseudalis
 
         /*
             The code of a failure of the engine: "unsupported" for a file of a kind it does not
-            process, "kind_mismatch" for a file whose content is not the kind its name gives, which
-            the clients tell apart from a file that cannot be read.
+            process, "kind_mismatch" for a file whose content is not the kind its name gives,
+            "encoded_content" for a text that holds encoded parts (attachments, base64, RTF...),
+            which the clients tell apart from a file that cannot be read.
         */
         std::string engine_code(const std::string& e, const char* code)
         {
             if (e.find(": this kind of file is not supported") != std::string::npos) return "unsupported";
             if (e.find(": the content of this file does not match its name") != std::string::npos)
                 return "kind_mismatch";
+            if (e.find(": this file holds encoded parts that the detector cannot read") != std::string::npos)
+                return "encoded_content";
             return code;
         }
 
@@ -153,7 +156,8 @@ namespace pseudalis
         wipe(key);
         if (!engine_->ok()) return false;
         key_fingerprint_ = engine_->key_fingerprint();
-        log_info("engine: " + library_->path() + " (" + engine_->variant() + "), key " + key_fingerprint_);
+        log_info("engine: " + library_->path() + " (" + engine_->variant() + ", " + engine_->build() + "), key " +
+                 key_fingerprint_);
         return true;
     }
 
@@ -207,6 +211,9 @@ namespace pseudalis
                 The blobs that nothing names any more go before anything is written: a deletion
                 that failed or was cut short, a picture kept twice by two files at once.
             */
+            // The pictures of a protection that failed, or of an entry left out, no file names.
+            const size_t unlinked = db_->remove_unlinked_pictures();
+            if (unlinked) log_info("pictures: " + std::to_string(unlinked) + " that no record names removed");
             const std::set<std::string> named = db_->referenced_blobs();
             size_t orphans = 0;
             for (const std::string& id : vault_->list_and_clean())
@@ -455,27 +462,40 @@ namespace pseudalis
         /*
             Each picture: kept, described once.  The descriptions of a file take three minutes
             at most, and none starts once the service stops: the pictures that follow keep
-            their marker alone.
+            their marker alone, as every picture does while the setting albireo is off.  A
+            description may name what the picture shows: it is kept encrypted in the vault, as
+            the picture, and the engine protects it each time it writes it.  A picture kept
+            without description, or whose description can no longer be read, receives the one
+            Albireo gives now.
         */
         const auto describe_until = std::chrono::steady_clock::now() + std::chrono::minutes(3);
         auto pictures = [&](const picture_request& p) -> std::string {
             picture_record rec;
-            if (db_->find_picture(p.sha256, rec)) return rec.description;
+            const bool known = db_->get_picture(p.id, rec) && rec.sha256 == p.sha256;
             std::string description, why;
+            if (known && st.albireo == "off") return description;
+            if (known && !rec.description.empty() && vault_->get(rec.description, description)) return description;
             if (st.albireo != "off" && !stopping_ && std::chrono::steady_clock::now() < describe_until)
             {
                 description = albireo_.describe(p.bytes, p.media_type, lang, why);
                 if (description.empty()) log_info("pictures: " + p.id + " without description: " + why);
             }
-            if (record)
+            if (!record) return description;
+            const std::string text = description.empty() ? std::string() : vault_->put(description);
+            if (known)
             {
-                rec.id = p.id;
-                rec.sha256 = p.sha256;
-                rec.media_type = p.media_type;
-                rec.blob = vault_->put(p.bytes);
-                rec.description = description;
-                if (!rec.blob.empty()) db_->add_picture(rec);
+                // The description the record lacked; the blob it named before leaves the vault.
+                std::string before;
+                if (!text.empty() && db_->set_picture_description(rec.id, text, before) && !before.empty())
+                    vault_->remove(before);
+                return description;
             }
+            rec.id = p.id;
+            rec.sha256 = p.sha256;
+            rec.media_type = p.media_type;
+            rec.blob = vault_->put(p.bytes);
+            rec.description = text;
+            if (!rec.blob.empty() && (description.empty() || !text.empty())) db_->add_picture(rec);
             return description;
         };
         json request = json::object();

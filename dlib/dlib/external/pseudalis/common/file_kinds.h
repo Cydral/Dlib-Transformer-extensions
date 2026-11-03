@@ -3,15 +3,19 @@
 #ifndef PSEUDALIS_COMMON_FILE_KINDS_H_
 #define PSEUDALIS_COMMON_FILE_KINDS_H_
 
+#include <algorithm>
 #include <cctype>
+#include <cstddef>
 #include <string>
 #include <vector>
 
 /*
     The kinds of files Pseudalis protects, from their names: the engine checks the content
-    against the kind of the name, an Office document, a PDF, a text, a picture or an archive,
-    and takes the kind of the content for a name without extension; the drive and the shell
-    refuse the other names at once.
+    against the kind of the name, an Office document, a PDF, a text, a picture or an archive.
+    A name whose extension gives no kind is taken for a text when its content is text through
+    and through, which the engine decides with dlib; the drive and the shell foresee it from the
+    start of the file (text_head()), and leave the other files at once.  A name without
+    extension goes to the engine, which takes its content for what it is.
 */
 
 namespace pseudalis
@@ -96,13 +100,58 @@ namespace pseudalis
     }
 
     /*
-        Whether a name may hold a file Pseudalis protects: a name of its kinds, or a name without
-        extension ("README", "LICENSE"), whose content then decides.  The other names are refused
-        at once, whatever their content.
+        Whether the start of a file may be the start of a text: UTF-16, with its byte order mark or
+        its zero bytes, whose code units hold no control character but the tabulation, the ends of
+        lines and the form feed, no U+FFFE or U+FFFF and no unpaired surrogate, or else bytes with no
+        such control character, which the engine also requires through the whole content.  The
+        drive and the shell leave at once a file of an extension of no kind whose start is not a
+        text, without reading the rest of it.
     */
-    inline bool possible_name(const std::string& name)
+    inline bool text_head(const char* data, size_t size)
     {
-        return supported_name(name) || name_extension(name).empty();
+        const unsigned char* d = reinterpret_cast<const unsigned char*>(data);
+        int order = 0;      // 1: UTF-16 little endian, 2: big endian
+        const bool bom = size >= 2 && ((d[0] == 0xFF && d[1] == 0xFE) || (d[0] == 0xFE && d[1] == 0xFF));
+        const size_t at = bom ? 2 : 0;
+        if (bom)
+        {
+            order = d[0] == 0xFF ? 1 : 2;
+        }
+        else
+        {
+            const size_t pairs = std::min<size_t>(size, 4096) / 2;
+            size_t zero_even = 0, zero_odd = 0;
+            for (size_t i = 0; i < pairs; ++i)
+            {
+                if (d[2 * i] == 0) ++zero_even;
+                if (d[2 * i + 1] == 0) ++zero_odd;
+            }
+            if (pairs >= 4 && 10 * zero_odd >= 4 * pairs && 20 * zero_even < pairs) order = 1;
+            else if (pairs >= 4 && 10 * zero_even >= 4 * pairs && 20 * zero_odd < pairs) order = 2;
+        }
+        if (order != 0)
+        {
+            bool high = false;
+            for (size_t i = at; i + 1 < size; i += 2)
+            {
+                const unsigned u = order == 1 ? d[i] | (static_cast<unsigned>(d[i + 1]) << 8)
+                                              : (static_cast<unsigned>(d[i]) << 8) | d[i + 1];
+                const bool low = u >= 0xDC00 && u <= 0xDFFF;
+                if (high != low) return false;
+                high = u >= 0xD800 && u <= 0xDBFF;
+                if (low || high) continue;
+                if (u < 0x20 ? u != '\t' && u != '\n' && u != '\r' && u != '\f'
+                             : u == 0x7F || (u >= 0x80 && u < 0xA0) || u == 0xFFFE || u == 0xFFFF)
+                    return false;
+            }
+            return true;
+        }
+        for (size_t i = 0; i < size; ++i)
+        {
+            const unsigned char c = d[i];
+            if (c < 0x20 ? c != '\t' && c != '\n' && c != '\r' && c != '\f' : c == 0x7F) return false;
+        }
+        return true;
     }
 }
 
