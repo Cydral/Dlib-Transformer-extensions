@@ -3323,10 +3323,10 @@
        "cpu",
        "cpu-avx2",
        "cpu-avxvnni",
-       "cpu-avx512",
        "openvino",
        "cuda"
-      ]
+      ],
+      "description": "auto: the accelerator of the computer, the NVIDIA card (cuda), else the NPU and the graphics processor of Intel together, else the one of them present, with the processor computing the products its device does not take; the processor engine when no accelerator is usable or when a measure found the accelerator slower. best: the fastest measured engine. A variant: that engine, with the device of accelerator for the engines that have several."
      },
      "accelerator": {
       "type": "string",
@@ -3570,7 +3570,7 @@
         },
         "reason_code": {
          "type": "string",
-         "description": "The code of the reason: isa_avx2, isa_avx_vnni, isa_avx512, no_nvidia_driver, old_nvidia_driver, no_nvidia_card, old_nvidia_card, no_intel_device, intel_device_unusable, library_failed, probe_timeout."
+         "description": "The code of the reason: isa_avx2, isa_avx_vnni, no_nvidia_driver, old_nvidia_driver, no_nvidia_card, old_nvidia_card, no_intel_device, intel_device_unusable, library_failed, probe_timeout."
         },
         "reason_args": {
          "type": "object",

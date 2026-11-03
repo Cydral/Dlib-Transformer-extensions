@@ -33,7 +33,7 @@ namespace albireo
     std::wstring reason_text(const json& engine);
 
     // The runtime of an engine variant, "CUDA" or "OpenVINO", and the name of the variant
-    // ("OpenVINO AVX-512"); the variant itself for the processor engines.
+    // ("OpenVINO AVX-VNNI"); the variant itself for the processor engines.
     std::string runtime_name(const std::string& variant);
     std::string engine_name(const std::string& variant);
 

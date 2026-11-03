@@ -98,12 +98,13 @@ application, the description of the interface and the list of the programs of Wi
 - **An interface for other programs**: `/v1/chat/completions`, `/v1/completions`,
   `/v1/embeddings`, `/v1/audio/speech` and `/v1/models` follow the OpenAI interface, streaming
   and images included, with its documentation as a Swagger page at `/docs/`.
-- **Engines for each kind of processor**: portable, AVX2, AVX-VNNI, AVX-512, Intel NPU and
-  integrated GPU through OpenVINO, NVIDIA GPU through CUDA, behind a single C interface. The
-  service measures them on the machine and runs the fastest, and the Accelerator menu of the
-  icon chooses the automatic choice, the processor alone, or a device by its name.
+- **Engines for each kind of processor**: portable, AVX2, AVX-VNNI, Intel NPU and integrated
+  GPU through OpenVINO, NVIDIA GPU through CUDA, behind a single C interface. The automatic choice
+  runs the accelerator of the computer, the processor computing what its device does not take, and
+  the Accelerator menu of the icon chooses it, the processor alone, or a device by its name, and
+  measures the engines on the machine.
 - **Models from a signed catalog**, downloaded in parallel parts from the publication space of
-  Albireo, the only source of the downloads, checked against their hashes, or imported from a disk
+  Albireo, else from their official sources, checked against their hashes, or imported from a disk
   or a memory card.
 - **Updates** announced by a signed feed of the publication space, their installers published
   there, downloaded in the background and installed when the service restarts.
@@ -141,31 +142,31 @@ models). Every variant is built from the same sources:
 |---------------|-----------------------------------------------------------------------|------------------------------|
 | `cpu`         | quantized kernels, every x86-64 processor                             | the main build tree          |
 | `cpu-avx2`    | quantized kernels, AVX2, FMA and F16C (Intel Haswell, AMD Zen and later) | the main build tree       |
-| `cpu-avxvnni` | `cpu-avx2` with the dot products of AVX-VNNI (Intel Core from Alder Lake on, AMD Zen 5) | the main build tree |
-| `cpu-avx512`  | AVX-512 F, BW, DQ and VL with VNNI (Intel Xeon from Cascade Lake on, Intel Core Ice Lake, Tiger Lake and Rocket Lake, AMD Zen 4 and later) | the main build tree |
+| `cpu-avxvnni` | `cpu-avx2` with the dot products of AVX-VNNI (Intel Core from Alder Lake on, Intel Xeon from Sapphire Rapids on, AMD Zen 5) | the main build tree |
 | `openvino`    | NPU and integrated GPU of Intel processors, kernels of `cpu-avx2`     | `ALBIREO_ENGINE_OPENVINO=ON` |
 | `openvino-avxvnni` | `openvino` with the kernels of `cpu-avxvnni`                     | `ALBIREO_ENGINE_OPENVINO=ON` |
-| `openvino-avx512`  | `openvino` with the kernels of `cpu-avx512`                      | `ALBIREO_ENGINE_OPENVINO=ON` |
 | `cuda`        | NVIDIA graphics processors, AVX2 kernels                              | `ALBIREO_ENGINE_CUDA=ON`     |
+
+A processor with AVX-512 and without AVX-VNNI (Intel Core Ice Lake, Tiger Lake and Rocket Lake,
+Intel Xeon of Cascade Lake and Ice Lake, AMD Zen 4) runs `cpu-avx2`; an update removes from the
+installation the libraries of the engines of AVX-512 that earlier versions installed.
 
 The half precision conversions of F16C belong to `cpu-avx2`: every processor with AVX2 has them,
 and the keys and values of the attention, kept in half precision, go through them. The variants
 differ in their quantized kernels only ([`engine/qkernels.cpp`](engine/qkernels.cpp)), compiled for
-the instructions of each variant (`/arch:AVX2`, `/arch:AVX512` with Visual Studio; `-mavxvnni`,
-`-mavx512f -mavx512bw -mavx512dq -mavx512vl -mavx512vnni` with GCC and Clang) while the rest of the
-library stays at AVX2: the description of a library runs on any processor with AVX2 and reports the
-instructions the processor lacks, so that the service passes to the next variant. VNNI adds up four
-products of bytes, or two products of 16-bit integers, in one instruction (`vpdpbusd`,
-`vpdpwssd`): the kernels of Q4_0 and Q8_0 take the offsets of their weights from the sums of the
-activations, those of Q4_K, Q5_K and Q6_K apply their scales with `vpdpwssd`, and the AVX-512
-kernels take two blocks, or two sub-blocks of a super-block, per vector, with the products of the
-prompts on 512-bit vectors. The AVX-VNNI intrinsics need Visual Studio 2022 (GCC 11, Clang 12);
-an older compiler builds the other variants.
+the instructions of each variant (`/arch:AVX2` and the macro `ALBIREO_AVX_VNNI` with Visual Studio;
+`-mavxvnni` with GCC and Clang) while the rest of the library stays at AVX2: the description of a
+library runs on any processor with AVX2 and reports the instructions the processor lacks, so that the
+service passes to the next variant. VNNI adds up four products of bytes, or two products of 16-bit
+integers, in one instruction (`vpdpbusd`, `vpdpwssd`): the kernels of Q4_0 and Q8_0 take the offsets
+of their weights from the sums of the activations, and those of Q4_K, Q5_K and Q6_K apply their
+scales with `vpdpwssd`. The AVX-VNNI intrinsics need Visual Studio 2022 (GCC 11, Clang 12); an older
+compiler builds the other variants.
 
 The products the NPU or the graphics processor does not take, and every product the routing of
 dlib leaves to the processor, run on the quantized kernels of the engine. The OpenVINO engine is
-therefore built once per family of kernels, so that a processor with AVX-VNNI or AVX-512 keeps its
-kernels when the NPU or the GPU serves the models. The service describes the OpenVINO engine of the
+therefore built once per family of kernels, so that a processor with AVX-VNNI keeps its kernels
+when the NPU or the GPU serves the models. The service describes the OpenVINO engine of the
 richest family the processor runs and offers its devices (`openvino:npu`, `openvino:gpu`,
 `openvino:both`); the setting `"engine": "openvino"` names that engine. A library whose kernels
 need instructions the processor lacks is reported as such without being loaded, since the runtime
@@ -174,11 +175,11 @@ of a device takes seconds to start.
 The forward pass ([`engine/cpu_runtime.cpp`](engine/cpu_runtime.cpp)) keeps the weights in the
 memory mapping of the GGUF file, in their quantized form, and multiplies them with kernels that
 quantize the activations to 8 bits per block, so that a generated token reads each weight once.
-When several answers are written together, the Q4_K and Q6_K kernels of AVX2, AVX-VNNI and AVX-512 compute
+When several answers are written together, the Q4_K and Q6_K kernels of AVX2 and AVX-VNNI compute
 two to four tokens for each weight they unpack, each token with the arithmetic it would get
 alone: with four answers at once, a step takes 32 to 40 % less time (Qwen3 0.6B and 1.7B, two
 cores). A pass of eight tokens or more computes in single precision, with a packed matrix product
-from 32 tokens with AVX-512 and from 256 tokens with AVX2; the weights of Q6_K are expanded by a
+from 256 tokens; the weights of Q6_K are expanded by a
 vector kernel of their own, bit for bit with dlib; the work buffers lie on lines of 64 bytes.
 These paths keep each result within the tolerances of the tests, and the numbers of a pass
 depend on its size: at temperature 0, the first answer to a prompt, whose last token is read
@@ -215,11 +216,16 @@ all the models fit in a budget:
 - with OpenVINO, the routing of the NPU module of dlib times the processor kernels against the NPU
   and the GPU, shape by shape, and keeps the faster;
 - with CUDA, the engine makes these measures itself, on two matrices of each shape, and checks its
-  choice at growing intervals; the extended device memory of dlib (V²RAM) lets the copies exceed
-  the memory of the card, the blocks that do not fit moving to the memory of the host or to a file
-  and coming back ahead of their use. Only the rows of a product cross the bus, and once the copies
-  exceed the memory of the card, the products of fewer than eight tokens, the generated tokens
-  among them, stay on the processor.
+  choice at growing intervals. The copies are written on the card by blocks of 64 MB that a buffer
+  of the host holds in turn, without an image in the memory of the host, and stay within the memory
+  of the card that the extended device memory of dlib (V²RAM) manages, less 1 GiB (a quarter of it
+  on a smaller card) for the products, the matrices that cross the bus and cuBLAS. A matrix left
+  out of the copies is computed by the processor from its quantized weights for a product of fewer
+  than 128 tokens, a generated token among them, and crosses the bus for that product alone from
+  128 tokens on. A size given to the file of V²RAM (`v2ram_max_mb`) lets the copies go beyond the
+  card into it, the blocks that do not fit moving to the memory of the host or to that file and
+  coming back ahead of their use; once the copies exceed the memory of the card, the products of
+  fewer than eight tokens stay on the processor. Only the rows of a product cross the bus.
 
 The products of a single token often stay on the processor, which serves them from the compact
 weights; the products of the prompts go to the device. The image encoder of a model sends its
@@ -227,14 +233,15 @@ products to the device of the engine too, its copies leaving the device for the 
 two images.
 
 The models loaded together share the budget of the device (`device_mb`, automatic by default:
-80 % of the free memory of the card, or the card and the extended memory with V²RAM, a quarter of
-the memory of the host with OpenVINO). A model with requests in progress or waiting keeps its
+80 % of the free memory of the card without V²RAM, the memory of the card V²RAM manages less its
+reserve with it, and its file too when `v2ram_max_mb` gives it a size, a quarter of the memory of
+the host with OpenVINO). A model with requests in progress or waiting keeps its
 copies. When it needs room, the models without requests give theirs, the least recently used model
 first, each giving the room asked and keeping its other copies; those copies come back when their
 model answers again. The embedding model takes part like the language models: while no document is
 being indexed or searched, its room goes to the models that answer. When every model has requests
-and the budget is full, a matrix without room is expanded at each product (CUDA) or computed by the
-processor, so that the requests of all the models go on together. The statistics of the device
+and the budget is full, a matrix without room is computed by the processor, or crosses the bus for
+a product of 128 tokens or more (CUDA), so that the requests of all the models go on together. The statistics of the device
 count the copies that left (`evictions`, `evicted_bytes`).
 
 A model replaced or deactivated in the Models window leaves the engine once its requests are served
@@ -245,14 +252,39 @@ end with the unloading). The window shows it as unloading meanwhile; activated a
 leaves, the model stays loaded. A model deleted while it answers is deleted the same way, once its
 requests are served, and is shown as being deleted until then.
 
+### Measures of the engines
+
+"Measure the engines", in the Accelerator menu (`POST /albireo/v1/engines/benchmark`), measures each
+engine the computer runs, each device of an engine that has several, in a process of its own
+(`--bench-engine`) with the general model, or the smallest installed one: a first request of 16
+tokens reads the model from the disk, lets a device compile its graphs and make its copies, and
+lets the routing of the products settle; two requests of 64 tokens follow, and the faster of the
+two gives the measure, in tokens generated per second. The engine of the service computes nothing
+meanwhile: each measure waits until it serves no request, two minutes at most, and is made again
+once when the service received a request during it, so that a discussion, an indexing of documents
+or the work in the background does not share the processor with the engine measured. The automatic
+choice then gives the processor engine the place of an accelerator measured slower than it, and
+the service restarts when its choice changes. The Accelerator menu and the window of the computer
+give the measures in the language of the interface ("23.5 tokens/s", "23,5 jetons/s").
+
+The CUDA engine computes on the card, one product at a time, the products of the matrices whose
+copies in single precision it holds, and the attention on the processor: each product of a
+generated token sends its row to the card and reads its result back, and the products the card
+lacks room for run on the processor from their quantized weights. The prompts gain the most from
+the card; for the generated tokens, the gain over the processor engine depends on the share of the
+model the card holds.
+
 The conversation formats are written natively ([`engine/chat_format.cpp`](engine/chat_format.cpp)),
 the chat template of a model naming its format: ChatML (Qwen2.5, Qwen3, Qwen3-VL, EuroLLM, with the
 reasoning between `<think>` and `</think>`), Mistral (Ministral 3, Devstral Small 2), Llama 3,
 Granite 3, Granite 4.2 (ChatML with the tool calls in the XML form `<function=...>`), Phi-4-mini
 and the format of Foundation-Sec-8B-Reasoning. The tests compare the prompts with those of the
 reference templates rendered by Jinja, byte for byte. A model that always reasons, such as the
-Thinking variants of Qwen3-VL, answers at once when the request asks for no reasoning: the prompt
-then closes its reasoning before it starts, as the switchable templates do. The tokenizer of dlib
+Thinking variants of Qwen3-VL and Foundation-Sec-8B-Reasoning, answers at once when the request
+asks for no reasoning: the prompt then closes its reasoning before it starts, as the switchable
+templates do. The prompt of Foundation-Sec-8B-Reasoning opens its reasoning with `<think>`, as the
+current template of the model does; the template of its GGUF file, an earlier one, leaves that
+marker to the model, whose answer written without it would read as a reasoning. The tokenizer of dlib
 reads the byte-level BPE vocabularies, with the pre-tokenizers of GPT-2, Llama 3, Qwen2, tekken and
 GPT-4o (Phi-4-mini) among others, and the SentencePiece ones (EuroLLM), whose leading space it puts
 after each control token as the reference tokenizers do; the token identifiers of the tests are
@@ -319,7 +351,8 @@ and, for development, in a console with `--console`. It:
   and the usual punctuation alone, so that no markup of the synthesizer reaches it, and two such
   programs run at a time;
 - describes each engine library in a child process (`--probe-engine`), so that a library that
-  cannot load leaves the service running, and measures them the same way (`--bench-engine`); a
+  cannot load leaves the service running, and measures them the same way (`--bench-engine`, see
+  [Measures of the engines](#measures-of-the-engines)); a
   description takes 60 seconds at most, and its log line gives the devices each engine found and,
   for those its runtime left out, the reason that runtime gives (the message of each plugin of
   OpenVINO, for instance);
@@ -431,7 +464,13 @@ and by words (BM25); the two rankings are fused (reciprocal rank fusion), the pa
 that they do not repeat each other (maximal marginal relevance), and the consecutive passages of
 a document merged into one excerpt. The engine computes the vectors of every client in the same
 passes and keeps these passes short while a conversation is answered, so that indexing documents
-never delays an answer.
+never delays an answer. The page of a project lists each document with its format, the estimate of
+its tokens and the number of its passages ("MD · ≈ 265 tokens · 3 passages", "(by words)" while
+they have no vectors of the embedding model), and its card of the knowledge takes the files dropped
+on it as its button does; a file dropped where nothing takes it is refused instead of being opened
+by the browser. The counts of the interface take their singular and their plural in each language
+(`tn()` of [`web/js/i18n.js`](web/js/i18n.js), through `Intl.PluralRules`), and its decimals and its
+sizes the forms of the language ("23,5 jetons/s", "2,4 Mo").
 
 The prompt of a question is built for the cache of the engine, which keeps the keys and values of
 each conversation and computes again only the tokens that differ from what it already read
@@ -747,16 +786,16 @@ cmake --build build-albireo-win -j
 
 | Program          | Checks                                                                               |
 |------------------|--------------------------------------------------------------------------------------|
-| `test_qkernels`  | every quantized kernel against its portable version and a reference in floats, the attention by tiles against a reference in double precision, and the expansion of Q6_K bit for bit with dlib; `test_qkernels_avxvnni` and `test_qkernels_avx512` check the kernels of the other variants, and skip the processors without their instructions, and `test_qkernels_vnni256` (GCC, Clang) runs the 256-bit VNNI kernels through the AVX-512 form of their instructions |
+| `test_qkernels`  | every quantized kernel against its portable version and a reference in floats, the attention by tiles against a reference in double precision, and the expansion of Q6_K bit for bit with dlib; `test_qkernels_avxvnni` checks the kernels of AVX-VNNI, and skips the processors without its instructions, and `test_qkernels_vnni256` (GCC, Clang) runs the 256-bit VNNI kernels through the AVX-512 form of their instructions |
 | `test_runtime`   | the logits of a model against `tests/reference_forward.py`, and the same results whatever the cut of the batches |
 | `test_tokenizer` | the tokenizer of a GGUF file against reference token sequences                     |
 | `test_offload`   | the products of a device against the processor kernels, the small budget path and the measured routing |
 | `test_model_file` | a small Qwen3 model built in memory and 144 damaged forms of it (names given twice and tensors off the alignment among them), which the loader must all refuse without allocating more than 256 MB, then a sparse file of more than 2 GiB whose last tensor lies beyond 2 GiB, read mapped and streamed, each value of that tensor checked and the logits compared with those of the same model in a small file |
 | `test_engine_api` | the refusals of the C interface, three threads of requests with cancellations under the pressure of the keys and values, the unloading and the destruction during requests, one final event per request, and the history of an answer read ahead of the next question |
 | `test_chat_format` | the prompts of the agent mode and of each chat format against those of its template rendered by Jinja, the marker tokens and the parsing of the tool calls, whole or cut in pieces, the calls of Mistral with and without their identifier, the Llama 3 answers that are no call and an earlier answer holding `</think>` |
-| `test_host`      | in a data folder of its own: the files of the downloads and of the imports through no link, the refusals of the import route, the copies of models already installed, the identifiers of the imports, the replacement of a model file, the ranges of the downloads, a damaged database, the downloads from the publication space alone through a local interface of pCloud (its listing, the copies it holds, a copy of another size and a file it lacks that fail with the name of the file in the space, no request to an official address, the catalog and the feed of the updates from the space, a refused password), each failure of the space with the bounds of the tests shortened (web pages with 200 and 403 and a proxy that asks for its authentication from each method of the interface and from a content server, connections reset or refused, a JSON cut short or of other types, sizes of another type, negative or beyond the integers, a server that stalls or answers byte by byte) failing with its message, without exception, the local server still answering, and no message or line of the log naming pCloud, the link or its code, the last guard of the messages and of the log files of an earlier version, the settings of an earlier version written again without the link and the search providers, and the web access through a local server (the public addresses on both sides of each range, the addresses refused before any connection, a page, a text cut at 2 MB, a type refused, the PDF files above 20 MB, a redirection to a private address, the search of Wikipedia, the refusals offline, with the web access turned off and without provider) |
-| `engine_chat`    | drives an engine library through its C interface: chat, images with their projector (`--image`, `--detail`), tools, reasoning, parallel requests, turns with pauses (`--turns --pause`), embeddings compared with a reference; it ends without unloading the engine of a device, as the service does |
-| `bench_runtime`  | tokens per second of the prompt and of the generation, also as `bench_runtime_avxvnni` and `bench_runtime_avx512` |
+| `test_host`      | in a data folder of its own: the files of the downloads and of the imports through no link, the refusals of the import route, the copies of models already installed, the identifiers of the imports, the replacement of a model file, the ranges of the downloads, a damaged database, the downloads through a local interface of pCloud and a local server of official addresses (the listing of the space and the copies it holds; a part it lacks, a copy of another size or of other bytes, a web page in place of a copy, an interface that refuses the connections and a space not set, each taken from its official address, the segments that follow a failure of the space sent there at once and one line of the log for each change of source; a file that neither source holds failing with the name of the file in the space, the official address and the failure of each; a download from an official address cancelled at once; the catalog from the space, or from its official address when the space refuses it, lacks it or holds it with another signature; the feed of the updates from the space alone, with no request to an official address; a refused password), each failure of the space with the bounds of the tests shortened (web pages with 200 and 403 and a proxy that asks for its authentication from each method of the interface and from a content server, connections reset or refused, a JSON cut short or of other types, sizes of another type, negative or beyond the integers, a server that stalls or answers byte by byte) failing with its message, without exception, the local server still answering, and no message or line of the log naming pCloud, the link or its code, the last guard of the messages and of the log files of an earlier version, the settings of an earlier version written again without the link and the search providers, and the web access through a local server (the public addresses on both sides of each range, the addresses refused before any connection, a page, a text cut at 2 MB, a type refused, the PDF files above 20 MB, a redirection to a private address, the search of Wikipedia, the refusals offline, with the web access turned off and without provider) |
+| `engine_chat`    | drives an engine library through its C interface: chat, images with their projector (`--image`, `--detail`), tools, the results of the tool calls given back to the model as the agent mode gives them (`--tools --tool-result`), reasoning, parallel requests, turns with pauses (`--turns --pause`), embeddings compared with a reference; it ends without unloading the engine of a device, as the service does |
+| `bench_runtime`  | tokens per second of the prompt and of the generation, also as `bench_runtime_avxvnni` and `bench_runtime_vnni256` |
 
 `test_offload model.gguf CPU` validates the OpenVINO engine on a machine without NPU, with the CPU
 plugin of OpenVINO; `ALBIREO_ENGINE_DLIB=ON` builds the same test on the host code of dlib.
@@ -896,10 +935,10 @@ and another provider of the search, read as `wikipedia`, leave it at the next st
 | `port`          | 8443    | port of `https://localhost`; a port the service cannot open at its start gives way to the last one it served on |
 | `models_dir`    | `""`    | folder of the models, `<data>\models` when empty                          |
 | `language`      | `auto`  | `auto`, `en`, `fr`, `de`, `it`, `es`                                      |
-| `engine`        | `auto`  | `auto` (fastest measured, else the first usable of cuda, cpu-avx512, cpu-avxvnni, cpu-avx2, cpu), `best` (measured first), or a variant |
-| `accelerator`   | `auto`  | `none`, `npu`, `gpu`, `both`: the device of the engines that have several |
+| `engine`        | `auto`  | `auto` (the accelerator of the computer: cuda, else `openvino:both`, `openvino:gpu` or `openvino:npu`, the processor computing what its device does not take; the processor engine, the fastest measured or the one of the richest kernels, when no accelerator is usable or when a measure found the accelerator slower), `best` (the fastest measured), or a variant |
+| `accelerator`   | `auto`  | `none` (the processor engine), `npu`, `gpu`, `both`: the device of the engines that have several |
 | `v2ram`         | true    | extended device memory of the CUDA engine                                  |
-| `v2ram_max_mb`  | 0       | size of its file in megabytes, 0 for automatic; on a volume without sparse files (exFAT, FAT32), the budget and half of the free space at most |
+| `v2ram_max_mb`  | 0       | size of its file in megabytes, 0 for automatic; a size lets the copies of the weights go beyond the card into it; on a volume without sparse files (exFAT, FAT32), the budget and half of the free space at most |
 | `device_mb`     | 0       | memory of the device for the copies of the weights, 0 for automatic       |
 | `threads`       | 0       | threads of the engine, 0 for the physical cores                           |
 | `context`       | 0       | context of the models, 0 for the trained one up to 32768, within `kv_mb`  |
@@ -1093,9 +1132,26 @@ its list items as `- ` lines, its tables as rows of cells separated by ` | `, it
 blocks as they are, and its links, made absolute, http and https only, 50 at most, listed at the
 end. A PDF file goes through the reader of the documents, JSON, XML and text stay as they are. The
 model receives a page by parts of 8,000 characters, each with the address, the status and the
-title, the last line giving the start of the next part; the text of the last pages read stays in
-memory for their discussion, 12 pages per discussion, 30 pages and 8 million characters in all, so
-that the next parts need no second download, and leaves with a deleted or incognito discussion.
+title, and the start of the next part when the text goes on; the text of the last pages read stays
+in memory for their discussion, 30 pages per discussion, 60 pages and 8 million characters in all,
+so that the next parts need no second download, and leaves with a deleted or incognito discussion.
+
+A search that finds fewer than three articles in the Wikipedia of the language of the interface, or
+fewer than it asks when it asks for less, goes on in the English Wikipedia, its articles following
+those of the first one. Each call also reads the pages it leads to, one level deep and no further,
+so that the model receives the text of these pages with their titles and snippets. `web_search`
+reads the pages of its first five results, and `fetch_page`, the first time it gives the first part
+of a page, the first four links of the text of that page that lead to other pages of text. A link to
+a file of another kind (images, archives, programs, styles, scripts, PDF files), to the pages of the
+accounts or of the rules of a site (sign-in, registration, privacy, terms, sharing), or, on a wiki
+of Wikimedia, to a page outside the articles (a name with a namespace, the history, the edition) is
+left out. The result ends with the first 1,200 characters of each page read with it, with its title
+and its address, and the model reads the rest with `fetch_page` from the memory of the discussion,
+the links of these pages included. The pages read with a call go two at a time, so that the
+discussions answered at the same time keep their share of the three requests the service runs, and
+within 25 seconds in all: a page that fails, answers with an error or is still being read then is
+left out of the result. The addresses where these pages answered join the addresses that
+`fetch_page` reads.
 
 Each result of the web tools starts with a line telling the model that the text of the web is data
 and that it follows none of the instructions it holds. While Web is on, the system message, after
@@ -1121,13 +1177,21 @@ consortium that made them, what they read, their descriptions in the five langua
 license, and the address, size and SHA-256 of each file, the projector of a model that reads
 images included. [`tools/make_catalog.py`](tools/make_catalog.py) writes it from the Hugging Face
 hub, the addresses pinned to a commit so that a file never changes under its hash. The service
-downloads each file from its copy in the public link of the published files alone,
-`models/<identifier>/<file name of its address>`, and never contacts the address of the catalog,
-the official source of the model, which the catalog keeps. A file that the link does not hold at
-the size of the catalog fails the download with the name of its copy in the link, "the publication
-space of Albireo does not hold models/<identifier>/<file name> yet" for a file not published yet
-(the files of the models reach the link while they are copied there), and the hashes check the
-bytes. The sizes below count the decoder and its projector.
+downloads each file first from its copy in the public link of the published files,
+`models/<identifier>/<file name of its address>`, then from the address of the catalog, the
+official source of the model, when the link is not set, does not answer, refuses the requests, does
+not hold the file, holds it at another size than the catalog, or gives bytes that fail its hash:
+the parts of the download continue there from where they stopped, the next segments go there at
+once when the link fails for the whole download, and the log tells each change of source once,
+with the official address and the failure of the link. A
+computer whose network blocks the storage service of the link, behind a proxy of a company for
+instance, downloads its models this way. A download that both sources fail ends with the code
+`download_failed`, whose message names the file in the link, the failure of the link, the official
+address and its failure. The catalog comes the same way from the link, else from its official
+address in the repository of Albireo, `dist/albireo/catalog.json` and its signature, and the log
+tells which source served it; the updates come from the link alone (see [Updates](#updates)). The
+signature and the hashes check the bytes, whatever their source. The sizes below count the decoder
+and its projector.
 
 | Model                          | Publisher          | Functions               | Inputs        | Size     | License |
 |--------------------------------|--------------------|-------------------------|---------------|----------|---------|
@@ -1333,12 +1397,14 @@ pCloud read only, a constant of the build that no setting, route or document giv
 folder `dist` holds `feed.json`, `catalog.json`, their signatures, the installer of the updates,
 `albireo-setup-online-<version>.exe`, and the complete installer,
 `albireo-setup-complete-<version>.exe`; its folder `models` holds each file of the catalog at
-`<identifier>/<file name of its official address>`. The service reads the feed, the catalog, the
-installer and the model files there alone, through the API of pCloud, and never their official
-addresses: a space that does not answer or that does not hold a file makes the operation fail with
-a message that names the file in the space and the kind of failure ("the publication space of
-Albireo cannot be reached for dist/feed.json: the request is answered with the status 403"), and
-the signatures and the hashes check every file. No message, window or log of the service, the tray
+`<identifier>/<file name of its official address>`. The service reads the feed and the installer
+there alone, through the API of pCloud: a space that does not answer or that does not hold a file
+makes the update fail with a message that names the file in the space and the kind of failure ("the
+publication space of Albireo cannot be reached for dist/feed.json: the request is answered with the
+status 403"). The catalog and the model files come from there first, and from their official
+addresses when the space does not serve them (see [Models](#models)), the message of a failure of
+both naming the file in the space, its failure, the official address and its failure. The
+signatures and the hashes check every file. No message, window or log of the service, the tray
 or the installer names the link, its code, an address of the API or of a content server, or a host
 of pCloud: the messages name the files of the space, and the log, the errors of the routes, the
 windows of the tray and the log of the installer pass their texts through a last guard that
@@ -1436,15 +1502,16 @@ size and its SHA-256, and run it in update mode at their next start.
   the signed offline bundles (see [Models](#models)). Every error of the updates carries a code
   with its values (`update_signature`, `update_installer_mismatch`, `update_package_manager`...),
   which the tray explains in the language of the user.
-- The publication space, the only source of the downloads, brings nothing the signed feed and
-  catalog do not name, at the size and with the SHA-256 they give: a file of the space that differs
-  is refused, and no other source takes its place. A web page that a proxy or a filter of the
-  network sends in its place, a body cut short, a JSON of other types, a stalled server and a
-  connection reset fail the operation with its message, bounded in time, and no exception leaves
-  the threads of the downloads and of the checks. The password of its link never lies in the
-  repository: the configuration reads it from a file of the publisher and builds it into the
-  service masked, and the messages and the logs never name the link, its code or the addresses of
-  pCloud. It keeps the link from being read outside Albireo, not from someone who studies the
+- The publication space, the only source of the updates and the first one of the catalog and of the
+  models, brings nothing the signed feed and catalog do not name, at the size and with the SHA-256
+  they give: a file of the space that differs is refused, and only the official address of the
+  catalog or of the model, checked the same way, takes its place. A web page that a proxy or a
+  filter of the network sends in place of an answer, a body cut short, a JSON of other types, a
+  stalled server and a connection reset end the attempt with its message, bounded in time, and no
+  exception leaves the threads of the downloads and of the checks. The password of its link never
+  lies in the repository: the configuration reads it from a file of the publisher and builds it into
+  the service masked, and the messages and the logs never name the link, its code or the addresses
+  of pCloud. It keeps the link from being read outside Albireo, not from someone who studies the
   program.
 - The JavaScript the agent mode runs executes in a sandboxed frame of opaque origin, in a worker
   stopped after 15 s; the page builds its own copy of each answer of the frame, with checked and

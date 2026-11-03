@@ -431,12 +431,7 @@ namespace albireo
             else if (loading) tip += L" · " + tr("tip_loading");
             else if (active > 0) tip += L" · " + tr("tip_active", { { "n", std::to_string(active) } });
             else tip += L" · " + tr("tip_idle");
-            if (tps > 0.05)
-            {
-                char buf[32];
-                snprintf(buf, sizeof(buf), "%.1f", tps);
-                tip += L"\n" + tr("tokens_s", { { "n", buf } });
-            }
+            if (tps > 0.05) tip += L"\n" + tr("tokens_s", { { "n", ui::format_decimal(tps, 1) } });
             // The server answers while the engines start and the models load.
             const bool starting = s["state"].as_string() == "starting";
             if (starting) tip = tr("tip_starting");
@@ -533,12 +528,10 @@ namespace albireo
                 std::string text;
                 for (const auto& kv : (*r)["results"].items())
                 {
-                    char buf[64];
                     const double v = kv.second["tokens_per_second"].as_double(0);
-                    if (v > 0) snprintf(buf, sizeof(buf), "%.1f", v);
-                    else snprintf(buf, sizeof(buf), "-");
                     if (!text.empty()) text += ", ";
-                    text += kv.first + " " + buf;
+                    text += kv.first + " " + (v > 0 ? narrow(tr("tokens_s", { { "n", ui::format_decimal(v, 1) } }))
+                        : std::string("-"));
                 }
                 if (r->contains("error")) text = (*r)["error"].as_string();
                 notify(L"Albireo", tr("notify_measures", { { "r", text } }));

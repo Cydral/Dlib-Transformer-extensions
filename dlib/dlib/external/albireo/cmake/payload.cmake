@@ -11,6 +11,22 @@ file(MAKE_DIRECTORY ${STAGE}/licenses)
 file(COPY ${BIN_DIR}/albireo-service.exe ${BIN_DIR}/albireo-tray.exe ${BIN_DIR}/albireo-speech.exe
    DESTINATION ${STAGE})
 file(COPY ${BIN_DIR}/engines DESTINATION ${STAGE} FOLLOW_SYMLINK_CHAIN)
+# The processor engines are those of this build (PROCESSOR_ENGINES, their file names separated by
+# commas): an engine an earlier build left in the folder, of a variant no longer built, stays out.
+if (PROCESSOR_ENGINES)
+   string(REPLACE "," ";" built "${PROCESSOR_ENGINES}")
+   string(TOLOWER "${built}" built)
+   file(GLOB staged_engines LIST_DIRECTORIES false "${STAGE}/engines/albireo-engine-cpu*")
+   foreach (f ${staged_engines})
+      get_filename_component(name "${f}" NAME)
+      string(TOLOWER "${name}" name)
+      list(FIND built "${name}" index)
+      if (index EQUAL -1)
+         file(REMOVE "${f}")
+         message(STATUS "Left out of the payload: ${name}, an engine no longer built")
+      endif()
+   endforeach()
+endif()
 file(COPY ${SOURCE_DIR}/web DESTINATION ${STAGE})
 # The voices of the speech synthesis.
 file(MAKE_DIRECTORY ${STAGE}/speech)

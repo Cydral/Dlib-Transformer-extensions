@@ -494,7 +494,7 @@ namespace albireo
     {
         struct chunk
         {
-            std::string url;          // the official address of the resource, which names its copy in the link
+            std::string url;          // the official address of the resource, read when the space does not serve it
             std::string link_path;    // the copy of the resource in the publication space (public_link.h)
             uint64_t resource = 0;    // bytes of the resource
             uint64_t from = 0;        // byte range in the resource
@@ -624,16 +624,81 @@ namespace albireo
         return true;
     }
 
+    namespace
+    {
+        /*
+            The official address of the catalog: the repository of Albireo, which keeps the signed catalog the
+            publisher places in the publication space.  Its signature lies at the same address with ".sig".
+        */
+        const char* const official_catalog = "https://raw.githubusercontent.com/Cydral/Dlib-Transformer-extensions/"
+            "main/dist/albireo/catalog.json";
+
+        // The address official_catalog_for_tests() gives in place of the official one, empty otherwise.
+        std::mutex catalog_address_m;
+        std::string catalog_address_of_tests;
+
+        // The address the catalog is read from when the publication space does not serve it.
+        std::string catalog_address()
+        {
+            std::lock_guard<std::mutex> lock(catalog_address_m);
+            return catalog_address_of_tests.empty() ? std::string(official_catalog) : catalog_address_of_tests;
+        }
+    }
+
+    void official_catalog_for_tests(const std::string& url)
+    {
+        std::lock_guard<std::mutex> lock(catalog_address_m);
+        catalog_address_of_tests = url;
+    }
+
     bool model_manager::refresh_catalog(std::string& error)
     {
-        // The catalog and its signature come from the folder dist of the publication space alone.
-        std::string body, sig;
-        if (!public_link_get("dist/catalog.json", body, error, 16u << 20)
-            || !public_link_get("dist/catalog.json.sig", sig, error, 4096))
-            return false;
+        /*
+            The catalog and its signature come from the folder dist of the publication space, and from their
+            official address when the space does not serve them: a space that is not set, does not hold them,
+            does not answer, or gives a catalog whose signature fails.  The signature checks the catalog of either.
+        */
+        std::string body, sig, space;
         json result = json::object();
-        if (!install_catalog(body, sig, true, result, error)) return false;
-        log_info("models: catalog read from the publication space of Albireo");
+        if (public_link_get("dist/catalog.json", body, space, 16u << 20)
+            && public_link_get("dist/catalog.json.sig", sig, space, 4096))
+        {
+            std::string refused;
+            if (install_catalog(body, sig, true, result, refused))
+            {
+                log_info("models: catalog read from the publication space of Albireo");
+                return true;
+            }
+            space = "the catalog of the publication space of Albireo is refused: " + refused;
+        }
+        // A service that stops or goes offline asks no other source.
+        if (http_cancelled())
+        {
+            error = space;
+            return false;
+        }
+        const std::string url = catalog_address();
+        std::string e;
+        body.clear();
+        sig.clear();
+        if (!http_get(url, body, e, 16u << 20))
+        {
+            error = space + "; the catalog cannot be downloaded from its official address " + url + " either: " + e;
+            return false;
+        }
+        if (!http_get(url + ".sig", sig, e, 4096))
+        {
+            error = space + "; the signature of the catalog cannot be downloaded from its official address " + url
+                + ".sig either: " + e;
+            return false;
+        }
+        if (!install_catalog(body, sig, true, result, e))
+        {
+            error = space + "; the catalog of its official address " + url + " is refused: " + e;
+            return false;
+        }
+        log_warning("models: catalog read from its official address " + url + ", the publication space of Albireo "
+            "did not serve it (" + space + ")");
         return true;
     }
 
@@ -954,7 +1019,7 @@ namespace albireo
                 const long long given = f["size"].as_int(0);
                 const uint64_t size = given > 0 && given <= (1ll << 40) ? static_cast<uint64_t>(given) : 0;
                 const bool gz = f["compression"].as_string() == "gzip";
-                // The part is downloaded from its copy in the publication space, named after its official address.
+                // The copy of the part in the publication space, named after its official address, serves it first.
                 const std::string link_path = public_link_model_path(id, url);
                 if (url.empty() || size == 0 || link_path.empty())
                 {
@@ -1178,6 +1243,16 @@ namespace albireo
             }
             return s.hex();
         }
+
+        // How a transfer of a segment of a download ends (run_job()).
+        enum class transfer_end
+        {
+            complete,
+            failed,       // the request fails
+            corrupt,      // a compressed part that does not inflate to its size
+            other_size,   // the server announces the resource at another size than the catalog
+            local         // the partial file refuses the bytes, or the inflation cannot start
+        };
     }
 
     bool model_manager::place(const std::string& from, const std::string& target)
@@ -1215,6 +1290,30 @@ namespace albireo
             if (!j->abandoned) db_.set_download_state(j->id, st);
         };
         const bool with_projector = j->files.size() > 1;
+        /*
+            The sources of the parts, which the transfers share under source_m.  The publication space serves
+            first.  space_down tells why it failed for the download, with the file of the space it names
+            (down_path), once it is not set, does not answer or refuses the requests for a segment: the next
+            segments go to their official addresses at once.  lacking tells why it does not serve a part, a part
+            it does not hold, holds at another size or whose bytes from it fail their hash, which goes to its
+            official address with all its segments.  The log tells each of these changes once.
+        */
+        typedef std::pair<size_t, size_t> part_key;   // the file of the model, and the part in it
+        const int by_space = 1, by_official = 2;
+        std::mutex source_m;
+        std::string space_down, down_path;
+        std::map<part_key, std::string> lacking;
+        std::map<part_key, int> sources;              // the sources that gave bytes of each part in this run
+        // Records that the source gave bytes of the part.
+        auto gave = [&](const part_key& part, int source) {
+            std::lock_guard<std::mutex> lock(source_m);
+            sources[part] |= source;
+        };
+        // Tells that the download continues from the official address url, the space not serving path.
+        auto tell = [&](const std::string& url, const std::string& path, const std::string& why) {
+            log_warning("models: download of " + j->id + " continues from its official address " + without_queries(url)
+                + ", the publication space of Albireo did not serve " + path + " (" + why + ")");
+        };
 
         log_info("models: downloading " + j->id + " (" + std::to_string(j->total >> 20) + " MB, "
             + std::to_string(j->chunks.size()) + " segments" + (with_projector ? ", with its projector)" : ")"));
@@ -1242,12 +1341,115 @@ namespace albireo
             size_t next = 0;
             std::atomic<bool> failed{false};
             std::string failure;
-            // The file of the publication space the failure names when the space does not hold it.
-            std::string unpublished;
             // The first failure of the download; chunk_m is held.
             auto fail_with = [&](const std::string& why) {
                 if (!failed) failure = why;
                 failed = true;
+            };
+            // The transfers end: the download is cancelled, or a segment failed it.
+            auto ended = [&]() { return j->cancel || failed; };
+            // The pause before the attempt number attempt, 2 s for each attempt made, which an end of the
+            // transfers or of the downloads of the service ends.
+            auto pause = [&](int attempt) {
+                for (int t = 0; t < 20 * attempt && !ended() && !http_cancelled(); ++t)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            };
+
+            /*
+                One transfer of the segment c from address into its partial file: its range from where it
+                stopped, or the whole resource of a compressed part, inflated as it arrives.  With sized, a
+                resource the server announces at another size than the catalog stops before any of its bytes is
+                written.  wrote receives the bytes written; a compressed part that fails takes them back from the
+                progress, and restarts from its beginning.  reason tells why a transfer fails, or the local
+                failure (a partial file that refuses the bytes).
+            */
+            auto fetch = [&](job::chunk& c, const std::string& address, bool sized, std::string& reason,
+                uint64_t& wrote) {
+                random_access_file& file = *outputs[c.file];
+                reason.clear();
+                wrote = 0;
+                uint64_t total = 0;
+                bool ok = false, unwritten = false, corrupt = false, other_size = false;
+                // The size of the resource, which the server announces before its first bytes.
+                auto resized = [&]() {
+                    other_size = other_size || (sized && total != 0 && total != c.resource);
+                    return other_size;
+                };
+                if (c.gzip)
+                {
+                    // Inflated as it arrives, written at the offsets of the part.
+                    z_stream zs;
+                    std::memset(&zs, 0, sizeof(zs));
+                    if (inflateInit2(&zs, 15 + 32) != Z_OK)
+                    {
+                        reason = "the compressed part " + std::to_string(c.part) + " cannot be inflated";
+                        return transfer_end::local;
+                    }
+                    uint64_t produced = 0;
+                    std::vector<char> out(1 << 20);
+                    ok = http_get_range(address, 0, -1, [&](const char* data, size_t n) {
+                        if (j->cancel || resized()) return false;
+                        zs.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(data));
+                        zs.avail_in = static_cast<uInt>(n);
+                        while (zs.avail_in > 0)
+                        {
+                            zs.next_out = reinterpret_cast<Bytef*>(out.data());
+                            zs.avail_out = static_cast<uInt>(out.size());
+                            const int r = inflate(&zs, Z_NO_FLUSH);
+                            const size_t got = out.size() - zs.avail_out;
+                            if ((r != Z_OK && r != Z_STREAM_END) || produced + got > c.output)
+                            {
+                                corrupt = true;
+                                return false;
+                            }
+                            if (!file.write_at(c.offset + produced, out.data(), got))
+                            {
+                                unwritten = true;
+                                return false;
+                            }
+                            produced += got;
+                            j->received += got;
+                            if (r == Z_STREAM_END) break;
+                        }
+                        return true;
+                    }, reason, &total);
+                    inflateEnd(&zs);
+                    corrupt = corrupt || (ok && produced != c.output);
+                    ok = ok && !corrupt;
+                    if (ok) c.done = c.length;
+                    else j->received -= produced;
+                    wrote = produced;
+                }
+                else
+                {
+                    const uint64_t before = c.done;
+                    ok = http_get_range(address, c.from + c.done, static_cast<int64_t>(c.from + c.length - 1),
+                        [&](const char* data, size_t n) {
+                            if (j->cancel || resized()) return false;
+                            const uint64_t done = c.done;
+                            const size_t take = static_cast<size_t>(std::min<uint64_t>(n, c.length - done));
+                            if (!file.write_at(c.offset + done, data, take))
+                            {
+                                unwritten = true;
+                                return false;
+                            }
+                            c.done = done + take;
+                            j->received += take;
+                            return true;
+                        }, reason, &total);
+                    ok = ok && c.done == c.length;
+                    wrote = c.done - before;
+                }
+                if (ok) return transfer_end::complete;
+                if (unwritten)
+                {
+                    reason = "cannot write " + j->files[c.file].partial;
+                    return transfer_end::local;
+                }
+                if (corrupt) return transfer_end::corrupt;
+                if (other_size) return transfer_end::other_size;
+                if (reason.empty()) reason = "the answer ends too soon";
+                return transfer_end::failed;
             };
 
             auto transfer = [&]() {
@@ -1261,114 +1463,124 @@ namespace albireo
                         cp = j->chunks[next++].get();
                     }
                     job::chunk& c = *cp;
-                    random_access_file& file = *outputs[c.file];
-                    std::string error;
-                    bool ok = false;
-                    bool absent = false;
-                    for (int attempt = 0; attempt < 4 && !ok && !j->cancel; ++attempt)
+                    const part_key part(c.file, c.part);
+                    std::string space_error, reason, error;
+                    uint64_t wrote = 0;
+                    transfer_end end = transfer_end::failed;
+                    // Whether space_error names the file of this segment, which a failure of another part may not.
+                    bool here = true;
+                    // Whether the space failed for the download or does not serve the part; space_error tells why.
+                    auto refused = [&]() {
+                        std::lock_guard<std::mutex> lock(source_m);
+                        const auto it = lacking.find(part);
+                        if (it != lacking.end())
+                        {
+                            space_error = it->second;
+                            here = true;
+                            return true;
+                        }
+                        if (space_down.empty()) return false;
+                        space_error = space_down;
+                        here = down_path == c.link_path;
+                        return true;
+                    };
+                    bool skipped = refused();
+                    // Whether the failure of the space concerns the whole download, or this part alone.
+                    bool whole = true;
+                    /*
+                        The copy of the resource in the publication space, its address asked again after a failure.
+                        A space that does not hold the resource at its size ends the attempts, and so does another
+                        segment that finds the space failing.  The messages name the file in the space, never its
+                        address.
+                    */
+                    for (int attempt = 0; attempt < 4 && !skipped && !ended(); ++attempt)
                     {
                         // A pause before each new attempt, which a cancellation ends.
-                        for (int t = 0; t < 20 * attempt && !j->cancel && !http_cancelled(); ++t)
-                            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                        if (j->cancel) break;
-                        /*
-                            The copy of the resource in the publication space, its address asked
-                            again after a failure; the hashes of the catalog check its bytes.  The
-                            official address of the catalog is never read: a space that does not
-                            hold the resource at its size ends the attempts.  The messages name the
-                            file in the space, never its address.
-                        */
+                        pause(attempt);
+                        if (ended() || (attempt > 0 && (skipped = refused()))) break;
                         std::string address;
                         uint64_t listed = 0;
                         link_status status = link_status::ok;
-                        absent = false;
-                        if (!public_link_file(c.link_path, address, listed, error, attempt > 0, &status))
+                        if (!public_link_file(c.link_path, address, listed, space_error, attempt > 0, &status))
                         {
-                            absent = status == link_status::missing;
+                            whole = status != link_status::missing;
                             // A file the space lacks is looked for once more in a new listing.
-                            if (status == link_status::unset || (absent && attempt > 0) || http_cancelled()) break;
+                            if (status == link_status::unset || (!whole && attempt > 0) || http_cancelled()) break;
                             continue;
                         }
                         if (listed != c.resource)
                         {
-                            error = "the copy of " + c.link_path + " in the publication space of Albireo does not "
-                                "have the size the catalog gives";
+                            space_error = "the copy of " + c.link_path + " in the publication space of Albireo does "
+                                "not have the size the catalog gives";
+                            whole = false;
                             if (attempt > 0) break;
                             continue;
                         }
-                        std::string reason;
-                        bool unwritten = false, corrupt = false;
-                        if (c.gzip)
+                        end = fetch(c, address, false, reason, wrote);
+                        if (wrote > 0) gave(part, by_space);
+                        if (end == transfer_end::complete || end == transfer_end::local) break;
+                        whole = end != transfer_end::corrupt;
+                        space_error = end == transfer_end::corrupt ? "the compressed copy of " + c.link_path
+                            + " in the publication space of Albireo is corrupt" : "the copy of " + c.link_path
+                            + " in the publication space of Albireo cannot be downloaded: " + reason;
+                        // The downloads ended for the whole service (it stops, or goes offline) are not
+                        // attempted again; they resume later.
+                        if (http_cancelled()) break;
+                    }
+                    bool ok = end == transfer_end::complete;
+                    error = end == transfer_end::local ? reason : space_error;
+                    /*
+                        The official address of the part, the "url" of the catalog, when the space does not serve
+                        the segment: the same ranges, in three attempts.  The failure of the space is kept for the
+                        next segments, of the download or of the part, which go there at once; the log tells it
+                        when it changes the source of the download or of the part.
+                    */
+                    if (!ok && end != transfer_end::local && !ended() && !http_cancelled())
+                    {
+                        if (space_error.empty()) space_error = "the publication space of Albireo does not serve "
+                            + c.link_path;
+                        const std::string official = without_queries(c.url);
+                        bool changed = false;
                         {
-                            // Inflated as it arrives, written at the offsets of the part.
-                            z_stream zs;
-                            std::memset(&zs, 0, sizeof(zs));
-                            if (inflateInit2(&zs, 15 + 32) != Z_OK) break;
-                            uint64_t produced = 0;
-                            std::vector<char> out(1 << 20);
-                            ok = http_get_range(address, 0, -1, [&](const char* data, size_t n) {
-                                if (j->cancel) return false;
-                                zs.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(data));
-                                zs.avail_in = static_cast<uInt>(n);
-                                while (zs.avail_in > 0)
-                                {
-                                    zs.next_out = reinterpret_cast<Bytef*>(out.data());
-                                    zs.avail_out = static_cast<uInt>(out.size());
-                                    const int r = inflate(&zs, Z_NO_FLUSH);
-                                    const size_t got = out.size() - zs.avail_out;
-                                    if ((r != Z_OK && r != Z_STREAM_END) || produced + got > c.output)
-                                    {
-                                        corrupt = true;
-                                        return false;
-                                    }
-                                    if (!file.write_at(c.offset + produced, out.data(), got))
-                                    {
-                                        unwritten = true;
-                                        return false;
-                                    }
-                                    produced += got;
-                                    j->received += got;
-                                    if (r == Z_STREAM_END) break;
-                                }
-                                return true;
-                            }, reason);
-                            inflateEnd(&zs);
-                            corrupt = corrupt || (ok && produced != c.output);
-                            ok = ok && !corrupt;
-                            if (ok) c.done = c.length;
-                            else j->received -= produced;
+                            std::lock_guard<std::mutex> lock(source_m);
+                            if (!skipped && whole && space_down.empty())
+                            {
+                                space_down = space_error;
+                                down_path = c.link_path;
+                                changed = true;
+                            }
+                            if (!skipped && !whole) changed = lacking.emplace(part, space_error).second;
                         }
-                        else
+                        if (changed) tell(c.url, c.link_path, space_error);
+                        bool tried = false;
+                        for (int attempt = 0; attempt < 3 && !ok && !ended(); ++attempt)
                         {
-                            ok = http_get_range(address, c.from + c.done, static_cast<int64_t>(c.from + c.length - 1),
-                                [&](const char* data, size_t n) {
-                                    if (j->cancel) return false;
-                                    const uint64_t done = c.done;
-                                    const size_t take = static_cast<size_t>(std::min<uint64_t>(n, c.length - done));
-                                    if (!file.write_at(c.offset + done, data, take))
-                                    {
-                                        unwritten = true;
-                                        return false;
-                                    }
-                                    c.done = done + take;
-                                    j->received += take;
-                                    return true;
-                                }, reason);
-                            ok = ok && c.done == c.length;
+                            pause(attempt);
+                            if (ended()) break;
+                            tried = true;
+                            end = fetch(c, c.url, true, reason, wrote);
+                            if (wrote > 0) gave(part, by_official);
+                            ok = end == transfer_end::complete;
+                            if (end == transfer_end::local || (!ok && http_cancelled())) break;
                         }
-                        if (unwritten) error = "cannot write " + j->files[c.file].partial;
-                        else if (corrupt) error = "the compressed part " + std::to_string(c.part) + " is corrupt";
-                        else if (!ok)
-                            error = "the copy of " + c.link_path + " in the publication space of Albireo cannot be "
-                                "downloaded: " + (reason.empty() ? std::string("the answer ends too soon") : reason);
-                        // The downloads ended for the whole service (it stops, or goes
-                        // offline) are not attempted again; they resume later.
-                        if (!ok && http_cancelled()) break;
+                        if (end == transfer_end::local)
+                        {
+                            error = reason;
+                        }
+                        else if (tried && !ok)
+                        {
+                            // Both sources failed: the file in the space, its official address, the failure of each.
+                            const std::string why = end == transfer_end::corrupt
+                                ? "the compressed file it gives is corrupt" : end == transfer_end::other_size
+                                ? "the file it gives does not have the size the catalog gives" : reason;
+                            error = space_error + (here ? "; its official address " + official
+                                + " cannot be downloaded either: " : "; " + c.link_path
+                                + " cannot be downloaded from its official address " + official + " either: ") + why;
+                        }
                     }
                     if (!ok && !j->cancel)
                     {
                         std::lock_guard<std::mutex> lock(chunk_m);
-                        if (!failed && absent) unpublished = c.link_path;
                         fail_with(error.empty() ? "download failed" : error);
                         return;
                     }
@@ -1442,11 +1654,7 @@ namespace albireo
             save();
             if (failed)
             {
-                // A file the publication space does not hold yet has its own code, which names it.
-                if (!unpublished.empty())
-                    set_state("error", user_error().set(failure, "download_not_published").arg("file", unpublished));
-                else
-                    set_state("error", user_error().set(failure, "download_failed").arg("e", failure));
+                set_state("error", user_error().set(failure, "download_failed").arg("e", failure));
                 log_error("models: download of " + j->id + " failed: " + failure);
                 // A cancellation that came while the download failed drops its partial files all the same.
                 if (j->abandoned) drop_partials();
@@ -1457,7 +1665,8 @@ namespace albireo
             /*
                 Each file written, read through no link from the models folder, is checked against
                 its own hash; it is closed before it is renamed or deleted, which its handle would
-                refuse on Windows.  The parts whose own hash fails are fetched again, once.
+                refuse on Windows.  The parts whose own hash fails are fetched again, once, from
+                their official addresses when the publication space gave bytes of them.
             */
             std::vector<std::string> shas(j->files.size());
             bool all_match = true;
@@ -1496,15 +1705,30 @@ namespace albireo
                     const std::string expected = p["sha256"].as_string();
                     if (round == 0 && !expected.empty() && sha256_range(written, offset, size) != expected)
                     {
+                        std::string path, url;
                         for (auto& c : j->chunks)
                             if (c->file == fi && c->part == part)
                             {
                                 j->received -= c->gzip ? c->output : c->done.load();
                                 c->done = 0;
+                                path = c->link_path;
+                                url = c->url;
                             }
                         any = true;
                         log_warning("models: part " + std::to_string(part) + " of " + (fi == 0 ? std::string()
                             : std::string("the projector of ")) + j->id + " is corrupt, fetched again");
+                        // Bytes the space gave fail their hash: the part comes from its official address.
+                        const std::string why = "the copy of " + path + " in the publication space of Albireo does "
+                            "not match the hash of the catalog";
+                        bool changed = false;
+                        {
+                            std::lock_guard<std::mutex> lock(source_m);
+                            const part_key key(fi, part);
+                            if ((sources[key] & by_space) && lacking.emplace(key, why).second)
+                                changed = space_down.empty();
+                            sources[key] = 0;
+                        }
+                        if (changed) tell(url, path, why);
                     }
                     offset += size;
                     ++part;
@@ -1541,8 +1765,13 @@ namespace albireo
                 db_.remove_download_state(j->id);
                 if (with_projector) drop_pending_copy(shas[1]);
                 set_state("done");
-                log_info("models: " + j->id + " installed" + (with_projector ? ", with its projector" : "")
-                    + ", from the publication space of Albireo");
+                // The sources of the bytes of this run; a download resumed complete has none.
+                int all = 0;
+                for (const auto& s : sources) all |= s.second;
+                const char* const from = all == (by_space | by_official) ? ", from the publication space of Albireo "
+                    "and its official addresses" : all == by_official ? ", from its official addresses"
+                    : all == by_space ? ", from the publication space of Albireo" : "";
+                log_info("models: " + j->id + " installed" + (with_projector ? ", with its projector" : "") + from);
                 return;
             }
             if (!any) break;

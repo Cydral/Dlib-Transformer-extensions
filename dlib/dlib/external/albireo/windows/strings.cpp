@@ -297,13 +297,6 @@ namespace albireo
                 "Die heruntergeladene Datei entspricht nicht dem Fingerabdruck des Katalogs; sie wurde gelöscht.",
                 "Il file scaricato non corrisponde all'impronta del catalogo; è stato eliminato.",
                 "El archivo descargado no coincide con la huella del catálogo; se ha eliminado." } },
-            { "err_download_not_published", { "The publication space of Albireo does not hold {file} yet: the "
-                "model can be downloaded once it is published there.", "L'espace de publication d'Albireo ne "
-                "contient pas encore {file} : le modèle pourra être téléchargé une fois publié.", "Der "
-                "Veröffentlichungsbereich von Albireo enthält {file} noch nicht: Das Modell kann heruntergeladen "
-                "werden, sobald es dort veröffentlicht ist.", "Lo spazio di pubblicazione di Albireo non contiene "
-                "ancora {file}: il modello potrà essere scaricato una volta pubblicato.", "El espacio de publicación "
-                "de Albireo aún no contiene {file}: el modelo se podrá descargar una vez publicado." } },
             { "err_download_install", { "The downloaded model could not be installed: {e}",
                 "Le modèle téléchargé n'a pas pu être installé : {e}",
                 "Das heruntergeladene Modell konnte nicht installiert werden: {e}",
@@ -449,14 +442,6 @@ namespace albireo
                 "dem Prozessor fehlt AVX-VNNI (Intel Core ab der 12. Generation, AMD Zen 5)",
                 "il processore non dispone di AVX-VNNI (Intel Core dalla 12ª generazione, AMD Zen 5)",
                 "el procesador no dispone de AVX-VNNI (Intel Core desde la 12.ª generación, AMD Zen 5)" } },
-            { "why_isa_avx512", { "the processor lacks AVX-512 with VNNI (Intel Xeon from Cascade Lake on, Intel Core "
-                "Ice Lake, Tiger Lake and Rocket Lake, AMD Zen 4 and later)", "le processeur ne dispose pas "
-                "d'AVX-512 avec VNNI (Intel Xeon depuis Cascade Lake, Intel Core Ice Lake, Tiger Lake et Rocket Lake, "
-                "AMD Zen 4 et suivants)", "dem Prozessor fehlt AVX-512 mit VNNI (Intel Xeon ab Cascade Lake, Intel "
-                "Core Ice Lake, Tiger Lake und Rocket Lake, AMD Zen 4 und neuer)", "il processore non dispone di "
-                "AVX-512 con VNNI (Intel Xeon da Cascade Lake, Intel Core Ice Lake, Tiger Lake e Rocket Lake, AMD "
-                "Zen 4 e successivi)", "el procesador no dispone de AVX-512 con VNNI (Intel Xeon desde Cascade Lake, "
-                "Intel Core Ice Lake, Tiger Lake y Rocket Lake, AMD Zen 4 y posteriores)" } },
             { "why_no_nvidia_driver", { "no NVIDIA driver is installed", "aucun pilote NVIDIA n'est installé",
                 "kein NVIDIA-Treiber installiert", "nessun driver NVIDIA installato",
                 "no hay ningún controlador NVIDIA instalado" } },

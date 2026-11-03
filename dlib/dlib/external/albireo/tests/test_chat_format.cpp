@@ -354,17 +354,41 @@ int main()
         m[3].role = "user";
         m[3].content = "Give an example.";
         render_options fopt;
-        expect(render(*f2, m, fopt) == "<|begin_of_text|><|system|>\nYou are a security analyst.<|user|>\nWhat is "
-            "XSS?<|assistant|>Cross-site scripting is an injection.<|end_of_text|><|user|>\nGive an example."
-            "<|assistant|>", "Foundation-Sec prompt");
+        fopt.reasoning = true;
+        // The prompts the template of the model gives for these conversations, line breaks included.
+        expect(render(*f2, m, fopt) == "<|begin_of_text|>\n<|system|>\nYou are a security analyst.\n<|user|>\nWhat "
+            "is XSS?\n<|assistant|>\nCross-site scripting is an injection.\n<|end_of_text|>\n<|user|>\nGive an "
+            "example.\n<|assistant|>\n<think>", "Foundation-Sec prompt: " + render(*f2, m, fopt));
         std::vector<chat_message> q(m.begin() + 3, m.end());
-        expect(render(*f2, q, fopt) == "<|begin_of_text|><|system|>\nYou are Metis.<|user|>\nGive an example."
-            "<|assistant|>", "the system prompt of the template");
+        expect(render(*f2, q, fopt) == "<|begin_of_text|>\n<|system|>\nYou are Metis.\n<|user|>\nGive an example."
+            "\n<|assistant|>\n<think>", "the system prompt of the template");
+        /*
+            The tokens of the prompt end with the token <think> of the vocabulary, an added token of the model,
+            and a control token in its GGUF file.
+        */
+        std::vector<prompt_piece> pieces;
+        f2->render(q, fopt, pieces);
+        const std::vector<int> ids = chat_format::tokenize(ftok, pieces);
+        expect(!ids.empty() && ids.back() == ftok.token_id("<think>"), "the prompt ends with the token <think>");
+        const dlib::hf_tokenizer gtok = tokenizer({ "<|begin_of_text|>", "<|end_of_text|>", "<|system|>", "<|user|>",
+            "<|assistant|>", "<think>", "</think>" }, {});
+        const std::unique_ptr<chat_format> f3 = chat_format::detect(gtok, ftmpl);
+        std::vector<prompt_piece> gpieces;
+        f3->render(q, fopt, gpieces);
+        const std::vector<int> gids = chat_format::tokenize(gtok, gpieces);
+        expect(gids.size() >= 2 && gids.back() == gtok.token_id("<think>")
+            && gtok.token_bytes(gids[gids.size() - 2]) == "\n", "the GGUF file: a line break, then <think>");
         const parsed p = read_all_ways(*f2, fopt, "\nThe user wants an example.</think>\n\n<script>", "reasoning");
         expect(p.reasoning == "The user wants an example." && p.content == "<script>", "reasoning, answer: "
             + p.reasoning + " / " + p.content);
         const parsed r = read_all_ways(*f2, fopt, "<think>\nShort.\n</think>\nDone.", "reasoning opened again");
         expect(r.reasoning == "Short." && r.content == "Done.", "opening marker written again: " + r.reasoning);
+        // A request without reasoning: the prompt closes the reasoning, and the output is the answer.
+        render_options plain;
+        expect(render(*f2, q, plain) == "<|begin_of_text|>\n<|system|>\nYou are Metis.\n<|user|>\nGive an example."
+            "\n<|assistant|>\n<think>\n\n</think>\n\n", "the reasoning closed: " + render(*f2, q, plain));
+        const parsed a = read_all_ways(*f2, plain, "An example: <script>.", "an answer without reasoning");
+        expect(a.reasoning.empty() && a.content == "An example: <script>.", "answer: " + a.content);
     }
 
     // Phi-4-mini.

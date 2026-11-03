@@ -11,12 +11,16 @@
     update feed, the catalog of the models, their signatures and the installers, and whose
     folder models holds the files of the models of the catalog, each in the folder of its
     identifier under the name of the file of its official source (models/<identifier>/<file
-    name>).  It is the only source of the downloads of the service: the feed, the catalog, the
-    installers and the model files come from it alone, and the official addresses the catalog
-    keeps (the hub of each model) are never contacted.  A file it does not hold, or a space that
-    does not answer, makes the operation fail with a message that names the file in the
-    publication space.  The signatures and the hashes check its files, so that it brings nothing
-    the catalog and the feed do not name.
+    name>).  It is the only source of the updates: the feed, its signature and the installers
+    come from it alone, and a file it does not hold, or a space that does not answer, makes the
+    update fail with a message that names the file in the publication space (updater.h).  It is
+    the first source of the catalog and of the model files, and their official addresses the
+    second: when the space is not set, does not answer, does not hold a file, or holds one that
+    its size, its signature or its hash refuses, the catalog comes from its official address in
+    the repository of Albireo, and each part of a model from the official address the catalog
+    gives for it, its hub (model_manager in models.h).  The signatures and the hashes check
+    every file, whatever its source, so that neither source brings anything the catalog and the
+    feed do not name.
 
     The folder is a public link of pCloud, a constant of the build that no setting, route or
     document gives.  It answers through the interface of pCloud: showpublink lists the folder
@@ -29,11 +33,12 @@
     No message names the link, its code, its password, the address of its interface or of a
     content server, or a host of pCloud: a failure names the file in the publication space and
     the kind of failure ("the publication space of Albireo cannot be reached for dist/feed.json:
-    the server answers with the status 403").  The code and the password go to
-    hide_in_messages() (common/log.h), which the log and the errors of the routes apply last.
-    An answer other than the JSON of the interface (a web page that a proxy or a filter of the
-    network sends, a body cut short, values of other types) fails the same way, and so does an
-    entry of the listing without a valid identifier or size.
+    the request is answered with the status 403").  When the official address fails as well,
+    the message adds that address, which is public, and its failure.  The code and the password
+    go to hide_in_messages() (common/log.h), which the log and the errors of the routes apply
+    last.  An answer other than the JSON of the interface (a web page that a proxy or a filter
+    of the network sends, a body cut short, values of other types) fails the same way, and so
+    does an entry of the listing without a valid identifier or size.
 
     Every request goes through http_fetch.h: it follows the proxy of the settings, is bounded
     in time, and fails at once when the service stops or goes offline.

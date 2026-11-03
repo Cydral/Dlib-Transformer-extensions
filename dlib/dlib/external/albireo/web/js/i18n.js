@@ -2,7 +2,8 @@
 // License: Boost Software License   See LICENSE.txt for the full license.
 
 // Texts of the interface in English, French, German, Italian and Spanish; a key missing in
-// a language falls back on English.
+// a language falls back on English.  A text that agrees with a count it shows has one variant
+// per plural category of the language, key_one and key_other, from which tn chooses.
 const texts = {
   en: {
     newChat: 'New chat', incognito: 'Incognito', incognitoBanner: 'Incognito discussion: nothing is saved in this browser.',
@@ -86,13 +87,15 @@ const texts = {
     memoryIntro: 'Albireo keeps short notes about you from your discussions, private discussions excepted, and gives them to the model at the start of each discussion. The notes stay short, to leave the context to the questions.',
     memorySensitive: 'Keep sensitive information',
     memorySensitiveHelp: 'Off by default: the model leaves out health, finances, opinions, identifiers and what concerns other people.',
-    memoryEmpty: 'Nothing yet: the notes come from the discussions.', memorySize: '{n} words of {max} at most',
+    memoryEmpty: 'Nothing yet: the notes come from the discussions.', memorySize_one: '{n} word of {max} at most',
+    memorySize_other: '{n} words of {max} at most',
     memoryUpdated: 'updated {date}', memoryReset: 'Reset the memory',
-    memoryLearnedOne: 'Memory updated: 1 new fact about you.', memoryLearned: 'Memory updated: {n} new facts about you.',
+    memoryLearned_one: 'Memory updated: {n} new fact about you.',
+    memoryLearned_other: 'Memory updated: {n} new facts about you.',
     memoryResetText: 'Albireo forgets its notes, and the discussions so far no longer feed them. The discussions themselves stay.',
     searchProjects: 'Search the projects', searchDiscussions: 'Search the discussions',
     searchMoreProjects: 'Search among the {n} projects…', searchMoreDiscussions: 'Search among the {n} discussions…',
-    searchPlaceholder: 'Words, even incomplete…', resultsCount: '{n} results',
+    searchPlaceholder: 'Words, even incomplete…', resultsCount_one: '{n} result', resultsCount_other: '{n} results',
     searchHint: 'Case and accents do not matter, and a word may be incomplete. The titles come first, then the content.',
     found_title: 'Title', found_question: 'In a question', found_answer: 'In an answer', found_messages: 'In the messages',
     found_name: 'Name', found_description: 'Description', found_instructions: 'Instructions',
@@ -126,12 +129,15 @@ const texts = {
     systemPromptHelp: 'Added to every discussion, for instance your role or the style you prefer.',
     exportAll: 'Export everything', importAll: 'Import', clearAll: 'Delete all discussions and projects',
     clearAllText: 'Every discussion and every project stored in this browser will be deleted.',
-    storageUsage: 'Stored in this browser: {n} discussions, {p} projects, {i} images ({size}).', imported: '{n} discussions and {p} projects imported.',
+    storageUsage: 'Stored in this browser: {discussions}, {projects}, {images} ({size}).',
+    imported: '{discussions} and {projects} imported.',
+    discussionsCount_one: '{n} discussion', discussionsCount_other: '{n} discussions', projectsCount_one: '{n} project',
+    projectsCount_other: '{n} projects', imagesCount_one: '{n} image', imagesCount_other: '{n} images',
     importFailed: 'This file is not an Albireo export.',
     exportFailed: 'The export could not be written: {reason}', exportUser: 'User',
     dbBlocked: 'A tab of an earlier version of Albireo keeps the data of this browser open: close it, then reload ' +
       'this page.',
-    tokensCount: '{n} tokens', vramWorkspace: 'workspace',
+    tokensCount_one: '{n} token', tokensCount_other: '{n} tokens', vramWorkspace: 'workspace',
     errSpeechUnavailable: 'The speech synthesis or its voices are not installed.',
     errSpeechFailed: 'The speech synthesis failed.',
     errTooManyImages: 'The request carries more images than the service reads at once (16).',
@@ -143,7 +149,9 @@ const texts = {
     errXmlInvalid: 'its content is damaged (invalid XML)',
     engine: 'Engine', speed: 'Speed', tokensPerSecond: '{n} tokens/s', version: 'Version', service: 'Service',
     memory: 'Memory', processor: 'Processor', models: 'Models', usage: 'Usage over 30 days', requests: 'Requests',
-    usageDay: '{date}: {generated} tokens generated, {read} tokens read', usageGenerated: 'Tokens generated',
+    usageDay: '{date}: {generated}, {read}', tokensGenerated_one: '{n} token generated',
+    tokensGenerated_other: '{n} tokens generated', tokensRead_one: '{n} token read', tokensRead_other: '{n} tokens read',
+    usageGenerated: 'Tokens generated',
     usageRead: 'Tokens read', usageChart: 'Tokens generated and read per day over the last 30 days',
     tokensIn: 'Tokens read', tokensOut: 'Tokens written', vram: 'Graphics memory', v2ram: 'Extended memory (V²RAM)',
     vramResident: 'on the device', vramHost: 'in system memory', vramStore: 'on disk', vramFree: 'free',
@@ -154,19 +162,20 @@ const texts = {
     inputRefused: '{name}: the model of this function ({model}) reads {inputs} only; this file cannot be attached.',
     attachInputs: 'Attach files (the model reads: {inputs})',
     readFailed: '{name} could not be read: {error}', generatedFile: 'File created by the agent', download: 'Download',
-    indexing: 'Indexing…', indexingProgress: 'Indexing… {p}%', indexed: 'Searchable · {n} passages',
-    indexedWords: 'Searchable by words · {n} passages', tokensEstimate: '≈ {n} tokens',
-    knowledgeWhole: 'About {n} tokens, {p}% of the context of the model: the documents are read whole in each discussion.',
-    knowledgeSearch: 'About {n} tokens, {p}% of the context of the model: the passages closest to each question are given with it.',
+    indexing: 'Indexing…', indexingProgress: 'Indexing… {p}%', indexed_one: '{n} passage', indexed_other: '{n} passages',
+    indexedWords_one: '{n} passage (by words)', indexedWords_other: '{n} passages (by words)',
+    tokensEstimate_one: '≈ {n} token', tokensEstimate_other: '≈ {n} tokens',
+    knowledgeWhole: 'About {tokens}, {p}% of the context of the model: the documents are read whole in each discussion.',
+    knowledgeSearch: 'About {tokens}, {p}% of the context of the model: the passages closest to each question are given with it.',
     knowledgeNoVectors: 'No embedding model is active: the search uses the words of the documents.',
     legacyFormat: '{name}: this Office format predates 2007; save it as .docx, .xlsx or .pptx.',
     pdfImagesTitle: 'PDF without text',
     pdfImagesText: '{name} contains only images, such as scanned pages. Its text cannot be read without character ' +
       'recognition (OCR), which Albireo does not perform. The file was not added.',
-    pdfPageWithoutText: '{name} was added, but one of its {total} pages has no readable text because it contains ' +
-      'only images.',
-    pdfPagesWithoutText: '{name} was added, but {n} of its {total} pages have no readable text because they contain ' +
-      'only images.',
+    pdfPagesWithoutText_one: '{name} was added, but one of its {total} pages has no readable text because it ' +
+      'contains only images.',
+    pdfPagesWithoutText_other: '{name} was added, but {n} of its {total} pages have no readable text because they ' +
+      'contain only images.',
     pdfPassword: '{name} is protected by a password and cannot be opened. Remove the password, then attach the file ' +
       'again.',
     pdfInvalid: '{name} is not a valid PDF file, or it is damaged.',
@@ -174,10 +183,11 @@ const texts = {
       'version of Microsoft Edge or Google Chrome, then reload the page.',
     searchedDocument: 'searched', removeAttachment: 'Remove this document',
     indexingDocument: 'Indexing {name} for the search…',
-    imagesNotAdded: 'Not added: {names}. The context of a discussion holds at most {max} images; places left in ' +
-      'this one: {left}. The images of the oldest exchanges leave the context once the discussion summarizes them, ' +
-      'which frees their places.',
-    projectImagesNotAdded: 'Not added: {names}. A project holds at most {max} images; places left in this one: {left}.',
+    notAddedImages_one: 'Not added: {names}.', notAddedImages_other: 'Not added: {names}.',
+    imagesNotAdded: '{notAdded} The context of a discussion holds at most {max} images; places left in this one: ' +
+      '{left}. The images of the oldest exchanges leave the context once the discussion summarizes them, which ' +
+      'frees their places.',
+    projectImagesNotAdded: '{notAdded} A project holds at most {max} images; places left in this one: {left}.',
     replayImagesFull: 'Images of this question: {n}; places left in the context of this discussion: {left} of {max}. ' +
       'The images of the oldest exchanges leave the context once the discussion summarizes them.',
     imagePlaces: 'image places left in the context: {left} of {max}',
@@ -204,13 +214,13 @@ const texts = {
     scanOffer: '{name} contains only images, such as scanned pages, and the model of this function reads images: ' +
       'its pages can be attached as images. Pages: {pages}; image places left in the context of this discussion: ' +
       '{left}.',
-    scanFirstPages: 'The pages attached go from page 1 to page {n}.',
+    scanFirstPages_one: 'Only page 1 is attached.', scanFirstPages_other: 'The pages attached go from page 1 to page {n}.',
     scanAttach: 'Attach the pages as images',
     scanNoRoom: '{name} contains only images, such as scanned pages. Its pages could be attached as images, but ' +
       'the context of this discussion has no image place left ({max} at most). The images of the oldest exchanges ' +
       'leave the context once the discussion summarizes them.',
     scanPageName: '{name}, page {n}', scanRendering: 'Drawing the pages of {name}…',
-    stepsCount: '{n} steps', agentLimit: 'The agent stopped after {n} steps.',
+    stepsCount_one: '{n} step', stepsCount_other: '{n} steps', agentLimit: 'The agent stopped after {n} steps.',
     aboutText: 'Albireo Community Edition runs language models locally, on the processor, the graphics processor or the neural processor of this computer, based on the open source Dlib-Transformer-extensions library.',
     createdBy: 'Created by {author}', license: 'License',
     thirdParty: 'Third-party components', apiDocs: 'Interface documentation', close: 'Close', confirm: 'Confirm',
@@ -248,7 +258,8 @@ const texts = {
     program_pico: 'Reading of the answers aloud, with its voices of six languages',
     program_runtime: 'Runtime of an engine',
     errorPrefix: 'Error: {message}', retry: 'Retry', cancelled: 'Stopped.', emptyAnswer: '(no answer)',
-    filesInProject: '{n} documents', characters: '{n} characters', newProjectDiscussion: 'New discussion in {name}',
+    filesInProject_one: '{n} document', filesInProject_other: '{n} documents', characters_one: '{n} character',
+    characters_other: '{n} characters', newProjectDiscussion: 'New discussion in {name}',
     moveTo: 'Move to', none: 'None', searchIn: 'Search in the discussions', share: 'Share', addToProject: 'Add to a project',
     suggest_general_1: 'Explain a concept|How does public key cryptography work, with a simple analogy?',
     suggest_general_2: 'Write|Draft a clear and polite email to postpone a meeting to next week.',
@@ -349,13 +360,15 @@ const texts = {
     memoryIntro: 'Albireo garde de courtes notes sur vous à partir de vos discussions, hors discussions privées, et les donne au modèle au début de chaque discussion. Elles restent courtes pour laisser le contexte aux questions.',
     memorySensitive: 'Retenir les informations sensibles',
     memorySensitiveHelp: 'Désactivé par défaut : le modèle écarte la santé, les finances, les opinions, les identifiants et ce qui concerne d\'autres personnes.',
-    memoryEmpty: 'Rien pour l\'instant : les notes viennent des discussions.', memorySize: '{n} mots sur {max} au plus',
+    memoryEmpty: 'Rien pour l\'instant : les notes viennent des discussions.', memorySize_one: '{n} mot sur {max} au plus',
+    memorySize_other: '{n} mots sur {max} au plus',
     memoryUpdated: 'mise à jour le {date}', memoryReset: 'Réinitialiser la mémoire',
-    memoryLearnedOne: 'Mémoire mise à jour : 1 nouvelle information vous concernant.', memoryLearned: 'Mémoire mise à jour : {n} nouvelles informations vous concernant.',
+    memoryLearned_one: 'Mémoire mise à jour : {n} nouvelle information vous concernant.',
+    memoryLearned_other: 'Mémoire mise à jour : {n} nouvelles informations vous concernant.',
     memoryResetText: 'Albireo oublie ses notes, et les discussions passées ne les alimentent plus. Les discussions elles-mêmes restent.',
     searchProjects: 'Rechercher dans les projets', searchDiscussions: 'Rechercher dans les discussions',
     searchMoreProjects: 'Rechercher parmi les {n} projets…', searchMoreDiscussions: 'Rechercher parmi les {n} discussions…',
-    searchPlaceholder: 'Mots, même incomplets…', resultsCount: '{n} résultats',
+    searchPlaceholder: 'Mots, même incomplets…', resultsCount_one: '{n} résultat', resultsCount_other: '{n} résultats',
     searchHint: 'La casse et les accents sont ignorés, et un mot peut être incomplet. Les titres passent en premier, puis le contenu.',
     found_title: 'Titre', found_question: 'Dans une question', found_answer: 'Dans une réponse',
     found_messages: 'Dans les messages', found_name: 'Nom', found_description: 'Description',
@@ -391,12 +404,15 @@ const texts = {
     systemPromptHelp: 'Ajoutées à chaque discussion, par exemple votre fonction ou le style que vous préférez.',
     exportAll: 'Tout exporter', importAll: 'Importer', clearAll: 'Supprimer toutes les discussions et tous les projets',
     clearAllText: 'Toutes les discussions et tous les projets enregistrés dans ce navigateur seront supprimés.',
-    storageUsage: 'Enregistrés dans ce navigateur : {n} discussions, {p} projets, {i} images ({size}).', imported: '{n} discussions et {p} projets importés.',
+    storageUsage: 'Enregistrés dans ce navigateur : {discussions}, {projects}, {images} ({size}).',
+    imported: '{discussions} et {projects} importés.',
+    discussionsCount_one: '{n} discussion', discussionsCount_other: '{n} discussions', projectsCount_one: '{n} projet',
+    projectsCount_other: '{n} projets', imagesCount_one: '{n} image', imagesCount_other: '{n} images',
     importFailed: 'Ce fichier n\'est pas un export Albireo.',
     exportFailed: 'L\'export n\'a pas pu être écrit : {reason}', exportUser: 'Utilisateur',
     dbBlocked: 'Un onglet d\'une version précédente d\'Albireo garde ouvertes les données de ce navigateur : ' +
       'fermez-le, puis rechargez cette page.',
-    tokensCount: '{n} jetons', vramWorkspace: 'espace de travail',
+    tokensCount_one: '{n} jeton', tokensCount_other: '{n} jetons', vramWorkspace: 'espace de travail',
     errSpeechUnavailable: 'La synthèse vocale ou ses voix ne sont pas installées.',
     errSpeechFailed: 'La synthèse vocale a échoué.',
     errTooManyImages: 'La requête contient plus d\'images que le service n\'en lit à la fois (16).',
@@ -408,7 +424,9 @@ const texts = {
     errXmlInvalid: 'son contenu est endommagé (XML non valide)',
     engine: 'Moteur', speed: 'Vitesse', tokensPerSecond: '{n} jetons/s', version: 'Version', service: 'Service',
     memory: 'Mémoire', processor: 'Processeur', models: 'Modèles', usage: 'Utilisation sur 30 jours', requests: 'Requêtes',
-    usageDay: '{date} : {generated} jetons générés, {read} jetons lus', usageGenerated: 'Jetons générés',
+    usageDay: '{date} : {generated}, {read}', tokensGenerated_one: '{n} jeton généré',
+    tokensGenerated_other: '{n} jetons générés', tokensRead_one: '{n} jeton lu', tokensRead_other: '{n} jetons lus',
+    usageGenerated: 'Jetons générés',
     usageRead: 'Jetons lus', usageChart: 'Jetons générés et lus par jour sur les 30 derniers jours',
     tokensIn: 'Jetons lus', tokensOut: 'Jetons écrits', vram: 'Mémoire graphique', v2ram: 'Mémoire étendue (V²RAM)',
     vramResident: 'sur le périphérique', vramHost: 'en mémoire système', vramStore: 'sur disque', vramFree: 'libre',
@@ -419,19 +437,20 @@ const texts = {
     inputRefused: '{name} : le modèle de cette fonction ({model}) ne lit que : {inputs} ; ce fichier ne peut pas être joint.',
     attachInputs: 'Joindre des fichiers (le modèle lit : {inputs})',
     readFailed: '{name} n\'a pas pu être lu : {error}', generatedFile: 'Fichier créé par l\'agent', download: 'Télécharger',
-    indexing: 'Indexation…', indexingProgress: 'Indexation… {p} %', indexed: 'Consultable · {n} passages',
-    indexedWords: 'Consultable par mots · {n} passages', tokensEstimate: '≈ {n} jetons',
-    knowledgeWhole: 'Environ {n} jetons, {p} % du contexte du modèle : les documents sont lus en entier dans chaque discussion.',
-    knowledgeSearch: 'Environ {n} jetons, {p} % du contexte du modèle : les passages les plus proches de chaque question l\'accompagnent.',
+    indexing: 'Indexation…', indexingProgress: 'Indexation… {p} %', indexed_one: '{n} passage',
+    indexed_other: '{n} passages', indexedWords_one: '{n} passage (par mots)', indexedWords_other: '{n} passages (par mots)',
+    tokensEstimate_one: '≈ {n} jeton', tokensEstimate_other: '≈ {n} jetons',
+    knowledgeWhole: 'Environ {tokens}, {p} % du contexte du modèle : les documents sont lus en entier dans chaque discussion.',
+    knowledgeSearch: 'Environ {tokens}, {p} % du contexte du modèle : les passages les plus proches de chaque question l\'accompagnent.',
     knowledgeNoVectors: 'Aucun modèle d\'embeddings n\'est actif : la recherche porte sur les mots des documents.',
     legacyFormat: '{name} : ce format Office est antérieur à 2007 ; enregistrez-le en .docx, .xlsx ou .pptx.',
     pdfImagesTitle: 'PDF sans texte',
     pdfImagesText: '{name} ne contient que des images, comme des pages numérisées. Son texte ne peut pas être lu ' +
       'sans reconnaissance optique de caractères (OCR), qu\'Albireo n\'effectue pas. Le fichier n\'a pas été ajouté.',
-    pdfPageWithoutText: '{name} a été ajouté, mais une de ses {total} pages n\'a pas de texte lisible, car elle ne ' +
-      'contient que des images.',
-    pdfPagesWithoutText: '{name} a été ajouté, mais {n} de ses {total} pages n\'ont pas de texte lisible, car elles ' +
-      'ne contiennent que des images.',
+    pdfPagesWithoutText_one: '{name} a été ajouté, mais une de ses {total} pages n\'a pas de texte lisible, car elle ' +
+      'ne contient que des images.',
+    pdfPagesWithoutText_other: '{name} a été ajouté, mais {n} de ses {total} pages n\'ont pas de texte lisible, car ' +
+      'elles ne contiennent que des images.',
     pdfPassword: '{name} est protégé par un mot de passe et ne peut pas être ouvert. Retirez le mot de passe, puis ' +
       'joignez de nouveau le fichier.',
     pdfInvalid: '{name} n\'est pas un fichier PDF valide, ou il est endommagé.',
@@ -439,11 +458,12 @@ const texts = {
       'Utilisez une version récente de Microsoft Edge ou de Google Chrome, puis rechargez la page.',
     searchedDocument: 'consulté par recherche', removeAttachment: 'Retirer ce document',
     indexingDocument: 'Indexation de {name} pour la recherche…',
-    imagesNotAdded: 'Non ajoutées : {names}. Le contexte d\'une discussion contient au plus {max} images ; places ' +
-      'restantes dans celle-ci : {left}. Les images des échanges les plus anciens quittent le contexte une fois que ' +
-      'la discussion les résume, ce qui libère leurs places.',
-    projectImagesNotAdded: 'Non ajoutées : {names}. Un projet contient au plus {max} images ; places restantes dans ' +
-      'celui-ci : {left}.',
+    notAddedImages_one: 'Non ajoutée : {names}.', notAddedImages_other: 'Non ajoutées : {names}.',
+    imagesNotAdded: '{notAdded} Le contexte d\'une discussion contient au plus {max} images ; places restantes dans ' +
+      'celle-ci : {left}. Les images des échanges les plus anciens quittent le contexte une fois que la discussion ' +
+      'les résume, ce qui libère leurs places.',
+    projectImagesNotAdded: '{notAdded} Un projet contient au plus {max} images ; places restantes dans celui-ci : ' +
+      '{left}.',
     replayImagesFull: 'Images de cette question : {n} ; places restantes dans le contexte de cette discussion : ' +
       '{left} sur {max}. Les images des échanges les plus anciens quittent le contexte une fois que la discussion ' +
       'les résume.',
@@ -471,13 +491,14 @@ const texts = {
     scanOffer: '{name} ne contient que des images, comme des pages numérisées, et le modèle de cette fonction lit ' +
       'les images : ses pages peuvent être jointes comme images. Pages : {pages} ; places d\'images restantes dans ' +
       'le contexte de cette discussion : {left}.',
-    scanFirstPages: 'Les pages jointes vont de la page 1 à la page {n}.',
+    scanFirstPages_one: 'Seule la page 1 est jointe.',
+    scanFirstPages_other: 'Les pages jointes vont de la page 1 à la page {n}.',
     scanAttach: 'Joindre les pages comme images',
     scanNoRoom: '{name} ne contient que des images, comme des pages numérisées. Ses pages pourraient être jointes ' +
       'comme images, mais le contexte de cette discussion n\'a plus de place d\'image ({max} au plus). Les images ' +
       'des échanges les plus anciens quittent le contexte une fois que la discussion les résume.',
     scanPageName: '{name}, page {n}', scanRendering: 'Rendu des pages de {name}…',
-    stepsCount: '{n} étapes', agentLimit: 'L\'agent s\'est arrêté après {n} étapes.',
+    stepsCount_one: '{n} étape', stepsCount_other: '{n} étapes', agentLimit: 'L\'agent s\'est arrêté après {n} étapes.',
     aboutText: 'Albireo Community Edition exécute des modèles de langage localement, sur le processeur, le processeur graphique ou le processeur neuronal de cet ordinateur, en reposant sur la bibliothèque open source Dlib-Transformer-extensions.',
     createdBy: 'Créé par {author}', license: 'Licence',
     thirdParty: 'Composants tiers', apiDocs: 'Documentation de l\'interface', close: 'Fermer', confirm: 'Confirmer',
@@ -518,7 +539,8 @@ const texts = {
     program_pico: 'Lecture des réponses à voix haute, avec ses voix de six langues',
     program_runtime: 'Environnement d\'exécution d\'un moteur',
     errorPrefix: 'Erreur : {message}', retry: 'Réessayer', cancelled: 'Interrompu.', emptyAnswer: '(aucune réponse)',
-    filesInProject: '{n} documents', characters: '{n} caractères', newProjectDiscussion: 'Nouvelle discussion dans {name}',
+    filesInProject_one: '{n} document', filesInProject_other: '{n} documents', characters_one: '{n} caractère',
+    characters_other: '{n} caractères', newProjectDiscussion: 'Nouvelle discussion dans {name}',
     moveTo: 'Déplacer vers', none: 'Aucun', searchIn: 'Rechercher dans les discussions', share: 'Partager', addToProject: 'Ajouter à un projet',
     suggest_general_1: 'Expliquer une notion|Comment fonctionne la cryptographie à clé publique, avec une analogie simple ?',
     suggest_general_2: 'Rédiger|Rédige un courriel clair et courtois pour reporter une réunion à la semaine prochaine.',
@@ -618,13 +640,15 @@ const texts = {
     memoryIntro: 'Albireo führt kurze Notizen über Sie aus Ihren Unterhaltungen, private ausgenommen, und gibt sie dem Modell zu Beginn jeder Unterhaltung. Sie bleiben kurz, damit der Kontext den Fragen bleibt.',
     memorySensitive: 'Sensible Informationen behalten',
     memorySensitiveHelp: 'Standardmäßig aus: Das Modell lässt Gesundheit, Finanzen, Meinungen, Kennungen und Angaben über andere Personen weg.',
-    memoryEmpty: 'Noch nichts: Die Notizen kommen aus den Unterhaltungen.', memorySize: '{n} von höchstens {max} Wörtern',
+    memoryEmpty: 'Noch nichts: Die Notizen kommen aus den Unterhaltungen.',
+    memorySize_one: '{n} von höchstens {max} Wörtern', memorySize_other: '{n} von höchstens {max} Wörtern',
     memoryUpdated: 'aktualisiert am {date}', memoryReset: 'Gedächtnis zurücksetzen',
-    memoryLearnedOne: 'Gedächtnis aktualisiert: 1 neue Information über Sie.', memoryLearned: 'Gedächtnis aktualisiert: {n} neue Informationen über Sie.',
+    memoryLearned_one: 'Gedächtnis aktualisiert: {n} neue Information über Sie.',
+    memoryLearned_other: 'Gedächtnis aktualisiert: {n} neue Informationen über Sie.',
     memoryResetText: 'Albireo vergisst seine Notizen, und die bisherigen Unterhaltungen fließen nicht mehr ein. Die Unterhaltungen selbst bleiben.',
     searchProjects: 'In den Projekten suchen', searchDiscussions: 'In den Unterhaltungen suchen',
     searchMoreProjects: 'Unter den {n} Projekten suchen…', searchMoreDiscussions: 'Unter den {n} Unterhaltungen suchen…',
-    searchPlaceholder: 'Wörter, auch unvollständig…', resultsCount: '{n} Treffer',
+    searchPlaceholder: 'Wörter, auch unvollständig…', resultsCount_one: '{n} Treffer', resultsCount_other: '{n} Treffer',
     searchHint: 'Groß- und Kleinschreibung sowie Akzente spielen keine Rolle, und ein Wort darf unvollständig sein. Zuerst die Titel, dann der Inhalt.',
     found_title: 'Titel', found_question: 'In einer Frage', found_answer: 'In einer Antwort',
     found_messages: 'In den Nachrichten', found_name: 'Name', found_description: 'Beschreibung',
@@ -658,12 +682,15 @@ const texts = {
     systemPromptHelp: 'Werden jeder Unterhaltung hinzugefügt, zum Beispiel Ihre Rolle oder Ihr bevorzugter Stil.',
     exportAll: 'Alles exportieren', importAll: 'Importieren', clearAll: 'Alle Unterhaltungen und Projekte löschen',
     clearAllText: 'Alle in diesem Browser gespeicherten Unterhaltungen und Projekte werden gelöscht.',
-    storageUsage: 'In diesem Browser gespeichert: {n} Unterhaltungen, {p} Projekte, {i} Bilder ({size}).', imported: '{n} Unterhaltungen und {p} Projekte importiert.',
+    storageUsage: 'In diesem Browser gespeichert: {discussions}, {projects}, {images} ({size}).',
+    imported: '{discussions} und {projects} importiert.',
+    discussionsCount_one: '{n} Unterhaltung', discussionsCount_other: '{n} Unterhaltungen', projectsCount_one: '{n} Projekt',
+    projectsCount_other: '{n} Projekte', imagesCount_one: '{n} Bild', imagesCount_other: '{n} Bilder',
     importFailed: 'Diese Datei ist kein Albireo-Export.',
     exportFailed: 'Der Export konnte nicht geschrieben werden: {reason}', exportUser: 'Benutzer',
     dbBlocked: 'Ein Tab einer früheren Version von Albireo hält die Daten dieses Browsers geöffnet: ' +
       'Schließen Sie ihn und laden Sie diese Seite neu.',
-    tokensCount: '{n} Token', vramWorkspace: 'Arbeitsbereich',
+    tokensCount_one: '{n} Token', tokensCount_other: '{n} Token', vramWorkspace: 'Arbeitsbereich',
     errSpeechUnavailable: 'Die Sprachausgabe oder ihre Stimmen sind nicht installiert.',
     errSpeechFailed: 'Die Sprachausgabe ist fehlgeschlagen.',
     errTooManyImages: 'Die Anfrage enthält mehr Bilder, als der Dienst auf einmal liest (16).',
@@ -675,7 +702,9 @@ const texts = {
     errXmlInvalid: 'ihr Inhalt ist beschädigt (ungültiges XML)',
     engine: 'Engine', speed: 'Geschwindigkeit', tokensPerSecond: '{n} Token/s', version: 'Version', service: 'Dienst',
     memory: 'Arbeitsspeicher', processor: 'Prozessor', models: 'Modelle', usage: 'Nutzung der letzten 30 Tage', requests: 'Anfragen',
-    usageDay: '{date}: {generated} Token erzeugt, {read} Token gelesen', usageGenerated: 'Erzeugte Token',
+    usageDay: '{date}: {generated}, {read}', tokensGenerated_one: '{n} Token erzeugt',
+    tokensGenerated_other: '{n} Token erzeugt', tokensRead_one: '{n} Token gelesen', tokensRead_other: '{n} Token gelesen',
+    usageGenerated: 'Erzeugte Token',
     usageRead: 'Gelesene Token', usageChart: 'Erzeugte und gelesene Token pro Tag in den letzten 30 Tagen',
     tokensIn: 'Gelesene Token', tokensOut: 'Geschriebene Token', vram: 'Grafikspeicher', v2ram: 'Erweiterter Speicher (V²RAM)',
     vramResident: 'auf dem Gerät', vramHost: 'im Arbeitsspeicher', vramStore: 'auf dem Datenträger', vramFree: 'frei',
@@ -686,19 +715,20 @@ const texts = {
     inputRefused: '{name}: Das Modell dieser Funktion ({model}) liest nur {inputs}; diese Datei kann nicht angehängt werden.',
     attachInputs: 'Dateien anhängen (das Modell liest: {inputs})',
     readFailed: '{name} konnte nicht gelesen werden: {error}', generatedFile: 'Vom Agenten erstellte Datei', download: 'Herunterladen',
-    indexing: 'Indexierung…', indexingProgress: 'Indexierung… {p} %', indexed: 'Durchsuchbar · {n} Passagen',
-    indexedWords: 'Nach Wörtern durchsuchbar · {n} Passagen', tokensEstimate: '≈ {n} Token',
-    knowledgeWhole: 'Etwa {n} Token, {p} % des Kontexts des Modells: Die Dokumente werden in jeder Unterhaltung vollständig gelesen.',
-    knowledgeSearch: 'Etwa {n} Token, {p} % des Kontexts des Modells: Die Passagen, die jeder Frage am nächsten sind, werden mit ihr übergeben.',
+    indexing: 'Indexierung…', indexingProgress: 'Indexierung… {p} %', indexed_one: '{n} Passage',
+    indexed_other: '{n} Passagen', indexedWords_one: '{n} Passage (nach Wörtern)',
+    indexedWords_other: '{n} Passagen (nach Wörtern)', tokensEstimate_one: '≈ {n} Token', tokensEstimate_other: '≈ {n} Token',
+    knowledgeWhole: 'Etwa {tokens}, {p} % des Kontexts des Modells: Die Dokumente werden in jeder Unterhaltung vollständig gelesen.',
+    knowledgeSearch: 'Etwa {tokens}, {p} % des Kontexts des Modells: Die Passagen, die jeder Frage am nächsten sind, werden mit ihr übergeben.',
     knowledgeNoVectors: 'Kein Embedding-Modell ist aktiv: Die Suche verwendet die Wörter der Dokumente.',
     legacyFormat: '{name}: Dieses Office-Format stammt aus der Zeit vor 2007; speichern Sie es als .docx, .xlsx oder .pptx.',
     pdfImagesTitle: 'PDF ohne Text',
     pdfImagesText: '{name} enthält nur Bilder, etwa eingescannte Seiten. Sein Text lässt sich nur mit Texterkennung ' +
       '(OCR) lesen, die Albireo nicht durchführt. Die Datei wurde nicht hinzugefügt.',
-    pdfPageWithoutText: '{name} wurde hinzugefügt, aber eine seiner {total} Seiten enthält keinen lesbaren Text, da ' +
-      'sie nur aus Bildern besteht.',
-    pdfPagesWithoutText: '{name} wurde hinzugefügt, aber {n} seiner {total} Seiten enthalten keinen lesbaren Text, ' +
-      'da sie nur aus Bildern bestehen.',
+    pdfPagesWithoutText_one: '{name} wurde hinzugefügt, aber eine seiner {total} Seiten enthält keinen lesbaren Text, ' +
+      'da sie nur aus Bildern besteht.',
+    pdfPagesWithoutText_other: '{name} wurde hinzugefügt, aber {n} seiner {total} Seiten enthalten keinen lesbaren ' +
+      'Text, da sie nur aus Bildern bestehen.',
     pdfPassword: '{name} ist durch ein Kennwort geschützt und kann nicht geöffnet werden. Entfernen Sie das Kennwort ' +
       'und hängen Sie die Datei erneut an.',
     pdfInvalid: '{name} ist keine gültige PDF-Datei oder ist beschädigt.',
@@ -706,11 +736,11 @@ const texts = {
       'Verwenden Sie eine aktuelle Version von Microsoft Edge oder Google Chrome und laden Sie die Seite neu.',
     searchedDocument: 'durchsucht', removeAttachment: 'Dieses Dokument entfernen',
     indexingDocument: '{name} wird für die Suche indexiert…',
-    imagesNotAdded: 'Nicht hinzugefügt: {names}. Der Kontext einer Unterhaltung enthält höchstens {max} Bilder; ' +
-      'freie Plätze in dieser: {left}. Die Bilder der ältesten Beiträge verlassen den Kontext, sobald die ' +
-      'Unterhaltung sie zusammenfasst, und geben ihre Plätze frei.',
-    projectImagesNotAdded: 'Nicht hinzugefügt: {names}. Ein Projekt enthält höchstens {max} Bilder; freie Plätze in ' +
-      'diesem: {left}.',
+    notAddedImages_one: 'Nicht hinzugefügt: {names}.', notAddedImages_other: 'Nicht hinzugefügt: {names}.',
+    imagesNotAdded: '{notAdded} Der Kontext einer Unterhaltung enthält höchstens {max} Bilder; freie Plätze in ' +
+      'dieser: {left}. Die Bilder der ältesten Beiträge verlassen den Kontext, sobald die Unterhaltung sie ' +
+      'zusammenfasst, und geben ihre Plätze frei.',
+    projectImagesNotAdded: '{notAdded} Ein Projekt enthält höchstens {max} Bilder; freie Plätze in diesem: {left}.',
     replayImagesFull: 'Bilder dieser Frage: {n}; freie Plätze im Kontext dieser Unterhaltung: {left} von {max}. Die ' +
       'Bilder der ältesten Beiträge verlassen den Kontext, sobald die Unterhaltung sie zusammenfasst.',
     imagePlaces: 'freie Bildplätze im Kontext: {left} von {max}',
@@ -739,13 +769,13 @@ const texts = {
     scanOffer: '{name} enthält nur Bilder, etwa eingescannte Seiten, und das Modell dieser Funktion liest Bilder: ' +
       'Seine Seiten können als Bilder angehängt werden. Seiten: {pages}; freie Bildplätze im Kontext dieser ' +
       'Unterhaltung: {left}.',
-    scanFirstPages: 'Angehängt werden die Seiten 1 bis {n}.',
+    scanFirstPages_one: 'Angehängt wird nur Seite 1.', scanFirstPages_other: 'Angehängt werden die Seiten 1 bis {n}.',
     scanAttach: 'Seiten als Bilder anhängen',
     scanNoRoom: '{name} enthält nur Bilder, etwa eingescannte Seiten. Seine Seiten könnten als Bilder angehängt ' +
       'werden, aber der Kontext dieser Unterhaltung hat keinen freien Bildplatz mehr (höchstens {max}). Die Bilder ' +
       'der ältesten Beiträge verlassen den Kontext, sobald die Unterhaltung sie zusammenfasst.',
     scanPageName: '{name}, Seite {n}', scanRendering: 'Die Seiten von {name} werden gezeichnet…',
-    stepsCount: '{n} Schritte', agentLimit: 'Der Agent hat nach {n} Schritten angehalten.',
+    stepsCount_one: '{n} Schritt', stepsCount_other: '{n} Schritte', agentLimit: 'Der Agent hat nach {n} Schritten angehalten.',
     aboutText: 'Albireo Community Edition führt Sprachmodelle lokal aus, auf dem Prozessor, dem Grafikprozessor oder dem neuronalen Prozessor dieses Computers, auf Basis der Open-Source-Bibliothek Dlib-Transformer-extensions.',
     createdBy: 'Erstellt von {author}', license: 'Lizenz',
     thirdParty: 'Komponenten von Drittanbietern', apiDocs: 'Dokumentation der Schnittstelle', close: 'Schließen', confirm: 'Bestätigen',
@@ -783,7 +813,8 @@ const texts = {
     program_pico: 'Vorlesen der Antworten, mit seinen Stimmen in sechs Sprachen',
     program_runtime: 'Laufzeitumgebung einer Engine',
     errorPrefix: 'Fehler: {message}', retry: 'Erneut versuchen', cancelled: 'Angehalten.', emptyAnswer: '(keine Antwort)',
-    filesInProject: '{n} Dokumente', characters: '{n} Zeichen', newProjectDiscussion: 'Neue Unterhaltung in {name}',
+    filesInProject_one: '{n} Dokument', filesInProject_other: '{n} Dokumente', characters_one: '{n} Zeichen',
+    characters_other: '{n} Zeichen', newProjectDiscussion: 'Neue Unterhaltung in {name}',
     moveTo: 'Verschieben nach', none: 'Keines', searchIn: 'In den Unterhaltungen suchen', share: 'Teilen', addToProject: 'Zu einem Projekt hinzufügen',
     suggest_general_1: 'Begriff erklären|Wie funktioniert Public-Key-Kryptographie, mit einer einfachen Analogie?',
     suggest_general_2: 'Schreiben|Verfasse eine klare und höfliche E-Mail, um ein Treffen auf nächste Woche zu verschieben.',
@@ -883,14 +914,15 @@ const texts = {
       'modello all\'inizio di ogni conversazione. Restano brevi per lasciare il contesto alle domande.',
     memorySensitive: 'Conserva le informazioni sensibili',
     memorySensitiveHelp: 'Disattivato per impostazione predefinita: il modello esclude salute, finanze, opinioni, identificativi e ciò che riguarda altre persone.',
-    memoryEmpty: 'Ancora niente: le note vengono dalle conversazioni.', memorySize: '{n} parole su {max} al massimo',
+    memoryEmpty: 'Ancora niente: le note vengono dalle conversazioni.', memorySize_one: '{n} parola su {max} al massimo',
+    memorySize_other: '{n} parole su {max} al massimo',
     memoryUpdated: 'aggiornata il {date}', memoryReset: 'Reimposta la memoria',
-    memoryLearnedOne: 'Memoria aggiornata: 1 nuova informazione su di te.',
-    memoryLearned: 'Memoria aggiornata: {n} nuove informazioni su di te.',
+    memoryLearned_one: 'Memoria aggiornata: {n} nuova informazione su di te.',
+    memoryLearned_other: 'Memoria aggiornata: {n} nuove informazioni su di te.',
     memoryResetText: 'Albireo dimentica le sue note e le conversazioni passate non le alimentano più. Le conversazioni restano.',
     searchProjects: 'Cerca nei progetti', searchDiscussions: 'Cerca nelle conversazioni',
     searchMoreProjects: 'Cerca tra i {n} progetti…', searchMoreDiscussions: 'Cerca tra le {n} conversazioni…',
-    searchPlaceholder: 'Parole, anche incomplete…', resultsCount: '{n} risultati',
+    searchPlaceholder: 'Parole, anche incomplete…', resultsCount_one: '{n} risultato', resultsCount_other: '{n} risultati',
     searchHint: 'Maiuscole e accenti non contano e una parola può essere incompleta. Prima i titoli, poi il contenuto.',
     found_title: 'Titolo', found_question: 'In una domanda', found_answer: 'In una risposta', found_messages: 'Nei messaggi',
     found_name: 'Nome', found_description: 'Descrizione', found_instructions: 'Istruzioni',
@@ -924,12 +956,15 @@ const texts = {
     systemPromptHelp: 'Aggiunte a ogni conversazione, ad esempio il tuo ruolo o lo stile che preferisci.',
     exportAll: 'Esporta tutto', importAll: 'Importa', clearAll: 'Elimina tutte le conversazioni e tutti i progetti',
     clearAllText: 'Tutte le conversazioni e tutti i progetti salvati in questo browser saranno eliminati.',
-    storageUsage: 'Salvati in questo browser: {n} conversazioni, {p} progetti, {i} immagini ({size}).', imported: '{n} conversazioni e {p} progetti importati.',
+    storageUsage: 'Salvati in questo browser: {discussions}, {projects}, {images} ({size}).',
+    imported: '{discussions} e {projects} importati.',
+    discussionsCount_one: '{n} conversazione', discussionsCount_other: '{n} conversazioni', projectsCount_one: '{n} progetto',
+    projectsCount_other: '{n} progetti', imagesCount_one: '{n} immagine', imagesCount_other: '{n} immagini',
     importFailed: 'Questo file non è un\'esportazione di Albireo.',
     exportFailed: 'Non è stato possibile scrivere l\'esportazione: {reason}', exportUser: 'Utente',
     dbBlocked: 'Una scheda di una versione precedente di Albireo tiene aperti i dati di questo browser: chiudila, ' +
       'poi ricarica questa pagina.',
-    tokensCount: '{n} token', vramWorkspace: 'area di lavoro',
+    tokensCount_one: '{n} token', tokensCount_other: '{n} token', vramWorkspace: 'area di lavoro',
     errSpeechUnavailable: 'La sintesi vocale o le sue voci non sono installate.',
     errSpeechFailed: 'La sintesi vocale non è riuscita.',
     errTooManyImages: 'La richiesta contiene più immagini di quante il servizio ne legga in una volta (16).',
@@ -941,7 +976,9 @@ const texts = {
     errXmlInvalid: 'il suo contenuto è danneggiato (XML non valido)',
     engine: 'Motore', speed: 'Velocità', tokensPerSecond: '{n} token/s', version: 'Versione', service: 'Servizio',
     memory: 'Memoria', processor: 'Processore', models: 'Modelli', usage: 'Utilizzo negli ultimi 30 giorni', requests: 'Richieste',
-    usageDay: '{date}: {generated} token generati, {read} token letti', usageGenerated: 'Token generati',
+    usageDay: '{date}: {generated}, {read}', tokensGenerated_one: '{n} token generato',
+    tokensGenerated_other: '{n} token generati', tokensRead_one: '{n} token letto', tokensRead_other: '{n} token letti',
+    usageGenerated: 'Token generati',
     usageRead: 'Token letti', usageChart: 'Token generati e letti al giorno negli ultimi 30 giorni',
     tokensIn: 'Token letti', tokensOut: 'Token scritti', vram: 'Memoria grafica', v2ram: 'Memoria estesa (V²RAM)',
     vramResident: 'sul dispositivo', vramHost: 'nella memoria di sistema', vramStore: 'su disco', vramFree: 'libera',
@@ -952,19 +989,20 @@ const texts = {
     inputRefused: '{name}: il modello di questa funzione ({model}) legge solo {inputs}; questo file non può essere allegato.',
     attachInputs: 'Allega file (il modello legge: {inputs})',
     readFailed: 'Impossibile leggere {name}: {error}', generatedFile: 'File creato dall\'agente', download: 'Scarica',
-    indexing: 'Indicizzazione…', indexingProgress: 'Indicizzazione… {p}%', indexed: 'Consultabile · {n} passaggi',
-    indexedWords: 'Consultabile per parole · {n} passaggi', tokensEstimate: '≈ {n} token',
-    knowledgeWhole: 'Circa {n} token, {p}% del contesto del modello: i documenti vengono letti per intero in ogni conversazione.',
-    knowledgeSearch: 'Circa {n} token, {p}% del contesto del modello: i passaggi più vicini a ogni domanda la accompagnano.',
+    indexing: 'Indicizzazione…', indexingProgress: 'Indicizzazione… {p}%', indexed_one: '{n} passaggio',
+    indexed_other: '{n} passaggi', indexedWords_one: '{n} passaggio (per parole)',
+    indexedWords_other: '{n} passaggi (per parole)', tokensEstimate_one: '≈ {n} token', tokensEstimate_other: '≈ {n} token',
+    knowledgeWhole: 'Circa {tokens}, {p}% del contesto del modello: i documenti vengono letti per intero in ogni conversazione.',
+    knowledgeSearch: 'Circa {tokens}, {p}% del contesto del modello: i passaggi più vicini a ogni domanda la accompagnano.',
     knowledgeNoVectors: 'Nessun modello di embedding è attivo: la ricerca usa le parole dei documenti.',
     legacyFormat: '{name}: questo formato Office è anteriore al 2007; salvalo come .docx, .xlsx o .pptx.',
     pdfImagesTitle: 'PDF senza testo',
     pdfImagesText: '{name} contiene solo immagini, come pagine scansionate. Il suo testo non può essere letto senza ' +
       'il riconoscimento dei caratteri (OCR), che Albireo non esegue. Il file non è stato aggiunto.',
-    pdfPageWithoutText: '{name} è stato aggiunto, ma una delle sue {total} pagine non ha testo leggibile perché ' +
+    pdfPagesWithoutText_one: '{name} è stato aggiunto, ma una delle sue {total} pagine non ha testo leggibile perché ' +
       'contiene solo immagini.',
-    pdfPagesWithoutText: '{name} è stato aggiunto, ma {n} delle sue {total} pagine non hanno testo leggibile perché ' +
-      'contengono solo immagini.',
+    pdfPagesWithoutText_other: '{name} è stato aggiunto, ma {n} delle sue {total} pagine non hanno testo leggibile ' +
+      'perché contengono solo immagini.',
     pdfPassword: '{name} è protetto da una password e non può essere aperto. Rimuovi la password, poi allega di ' +
       'nuovo il file.',
     pdfInvalid: '{name} non è un file PDF valido o è danneggiato.',
@@ -972,11 +1010,11 @@ const texts = {
       'una versione recente di Microsoft Edge o di Google Chrome, poi ricarica la pagina.',
     searchedDocument: 'consultato tramite ricerca', removeAttachment: 'Rimuovi questo documento',
     indexingDocument: 'Indicizzazione di {name} per la ricerca…',
-    imagesNotAdded: 'Non aggiunte: {names}. Il contesto di una conversazione contiene al massimo {max} immagini; ' +
-      'posti liberi in questa: {left}. Le immagini degli scambi più vecchi lasciano il contesto quando la ' +
-      'conversazione li riassume, liberando i loro posti.',
-    projectImagesNotAdded: 'Non aggiunte: {names}. Un progetto contiene al massimo {max} immagini; posti liberi in ' +
-      'questo: {left}.',
+    notAddedImages_one: 'Non aggiunta: {names}.', notAddedImages_other: 'Non aggiunte: {names}.',
+    imagesNotAdded: '{notAdded} Il contesto di una conversazione contiene al massimo {max} immagini; posti liberi in ' +
+      'questa: {left}. Le immagini degli scambi più vecchi lasciano il contesto quando la conversazione li riassume, ' +
+      'liberando i loro posti.',
+    projectImagesNotAdded: '{notAdded} Un progetto contiene al massimo {max} immagini; posti liberi in questo: {left}.',
     replayImagesFull: 'Immagini di questa domanda: {n}; posti liberi nel contesto di questa conversazione: {left} ' +
       'su {max}. Le immagini degli scambi più vecchi lasciano il contesto quando la conversazione li riassume.',
     imagePlaces: 'posti liberi per immagini nel contesto: {left} su {max}',
@@ -1004,13 +1042,14 @@ const texts = {
     scanOffer: '{name} contiene solo immagini, come pagine scansionate, e il modello di questa funzione legge le ' +
       'immagini: le sue pagine possono essere allegate come immagini. Pagine: {pages}; posti liberi per immagini nel ' +
       'contesto di questa conversazione: {left}.',
-    scanFirstPages: 'Le pagine allegate vanno dalla pagina 1 alla pagina {n}.',
+    scanFirstPages_one: 'Viene allegata solo la pagina 1.',
+    scanFirstPages_other: 'Le pagine allegate vanno dalla pagina 1 alla pagina {n}.',
     scanAttach: 'Allega le pagine come immagini',
     scanNoRoom: '{name} contiene solo immagini, come pagine scansionate. Le sue pagine potrebbero essere allegate ' +
       'come immagini, ma il contesto di questa conversazione non ha più posti per immagini ({max} al massimo). Le ' +
       'immagini degli scambi più vecchi lasciano il contesto quando la conversazione li riassume.',
     scanPageName: '{name}, pagina {n}', scanRendering: 'Disegno delle pagine di {name}…',
-    stepsCount: '{n} passaggi', agentLimit: 'L\'agente si è fermato dopo {n} passaggi.',
+    stepsCount_one: '{n} passaggio', stepsCount_other: '{n} passaggi', agentLimit: 'L\'agente si è fermato dopo {n} passaggi.',
     aboutText: 'Albireo Community Edition esegue modelli linguistici in locale, sul processore, sul processore grafico o sul processore neurale di questo computer, basandosi sulla libreria open source Dlib-Transformer-extensions.',
     createdBy: 'Creato da {author}', license: 'Licenza',
     thirdParty: 'Componenti di terze parti', apiDocs: 'Documentazione dell\'interfaccia', close: 'Chiudi', confirm: 'Conferma',
@@ -1048,7 +1087,8 @@ const texts = {
     program_libjpeg: 'Lettura delle immagini JPEG da parte dei motori',
     program_pico: 'Lettura ad alta voce delle risposte, con le sue voci in sei lingue',
     errorPrefix: 'Errore: {message}', retry: 'Riprova', cancelled: 'Interrotto.', emptyAnswer: '(nessuna risposta)',
-    filesInProject: '{n} documenti', characters: '{n} caratteri', newProjectDiscussion: 'Nuova conversazione in {name}',
+    filesInProject_one: '{n} documento', filesInProject_other: '{n} documenti', characters_one: '{n} carattere',
+    characters_other: '{n} caratteri', newProjectDiscussion: 'Nuova conversazione in {name}',
     moveTo: 'Sposta in', none: 'Nessuno', searchIn: 'Cerca nelle conversazioni', share: 'Condividi', addToProject: 'Aggiungi a un progetto',
     suggest_general_1: 'Spiegare un concetto|Come funziona la crittografia a chiave pubblica, con un\'analogia semplice?',
     suggest_general_2: 'Scrivere|Scrivi un\'e-mail chiara e cortese per rinviare una riunione alla settimana prossima.',
@@ -1147,13 +1187,16 @@ const texts = {
     memoryIntro: 'Albireo guarda notas breves sobre usted a partir de sus conversaciones, salvo las privadas, y las da al modelo al comienzo de cada conversación. Siguen siendo breves para dejar el contexto a las preguntas.',
     memorySensitive: 'Conservar la información sensible',
     memorySensitiveHelp: 'Desactivado de forma predeterminada: el modelo deja fuera la salud, las finanzas, las opiniones, los identificadores y lo que concierne a otras personas.',
-    memoryEmpty: 'Nada todavía: las notas proceden de las conversaciones.', memorySize: '{n} palabras de {max} como máximo',
+    memoryEmpty: 'Nada todavía: las notas proceden de las conversaciones.',
+    memorySize_one: '{n} palabra de {max} como máximo', memorySize_other: '{n} palabras de {max} como máximo',
     memoryUpdated: 'actualizada el {date}', memoryReset: 'Restablecer la memoria',
-    memoryLearnedOne: 'Memoria actualizada: 1 nueva información sobre usted.', memoryLearned: 'Memoria actualizada: {n} nuevas informaciones sobre usted.',
+    memoryLearned_one: 'Memoria actualizada: {n} nueva información sobre usted.',
+    memoryLearned_other: 'Memoria actualizada: {n} nuevas informaciones sobre usted.',
     memoryResetText: 'Albireo olvida sus notas y las conversaciones pasadas ya no las alimentan. Las conversaciones se conservan.',
     searchProjects: 'Buscar en los proyectos', searchDiscussions: 'Buscar en las conversaciones',
     searchMoreProjects: 'Buscar entre los {n} proyectos…', searchMoreDiscussions: 'Buscar entre las {n} conversaciones…',
-    searchPlaceholder: 'Palabras, aunque estén incompletas…', resultsCount: '{n} resultados',
+    searchPlaceholder: 'Palabras, aunque estén incompletas…', resultsCount_one: '{n} resultado',
+    resultsCount_other: '{n} resultados',
     searchHint: 'Las mayúsculas y los acentos no cuentan, y una palabra puede estar incompleta. Primero los títulos, después el contenido.',
     found_title: 'Título', found_question: 'En una pregunta', found_answer: 'En una respuesta', found_messages: 'En los mensajes',
     found_name: 'Nombre', found_description: 'Descripción', found_instructions: 'Instrucciones',
@@ -1188,12 +1231,15 @@ const texts = {
     systemPromptHelp: 'Se añaden a cada conversación, por ejemplo su función o el estilo que prefiere.',
     exportAll: 'Exportar todo', importAll: 'Importar', clearAll: 'Eliminar todas las conversaciones y proyectos',
     clearAllText: 'Se eliminarán todas las conversaciones y todos los proyectos guardados en este navegador.',
-    storageUsage: 'Guardado en este navegador: {n} conversaciones, {p} proyectos, {i} imágenes ({size}).', imported: '{n} conversaciones y {p} proyectos importados.',
+    storageUsage: 'Guardado en este navegador: {discussions}, {projects}, {images} ({size}).',
+    imported: '{discussions} y {projects} importados.',
+    discussionsCount_one: '{n} conversación', discussionsCount_other: '{n} conversaciones', projectsCount_one: '{n} proyecto',
+    projectsCount_other: '{n} proyectos', imagesCount_one: '{n} imagen', imagesCount_other: '{n} imágenes',
     importFailed: 'Este archivo no es una exportación de Albireo.',
     exportFailed: 'No se pudo escribir la exportación: {reason}', exportUser: 'Usuario',
     dbBlocked: 'Una pestaña de una versión anterior de Albireo mantiene abiertos los datos de este navegador: ' +
       'ciérrela y vuelva a cargar esta página.',
-    tokensCount: '{n} tokens', vramWorkspace: 'espacio de trabajo',
+    tokensCount_one: '{n} token', tokensCount_other: '{n} tokens', vramWorkspace: 'espacio de trabajo',
     errSpeechUnavailable: 'La síntesis de voz o sus voces no están instaladas.',
     errSpeechFailed: 'La síntesis de voz falló.',
     errTooManyImages: 'La solicitud contiene más imágenes de las que el servicio lee a la vez (16).',
@@ -1206,7 +1252,9 @@ const texts = {
     errXmlInvalid: 'su contenido está dañado (XML no válido)',
     engine: 'Motor', speed: 'Velocidad', tokensPerSecond: '{n} tokens/s', version: 'Versión', service: 'Servicio',
     memory: 'Memoria', processor: 'Procesador', models: 'Modelos', usage: 'Uso en 30 días', requests: 'Solicitudes',
-    usageDay: '{date}: {generated} tokens generados, {read} tokens leídos', usageGenerated: 'Tokens generados',
+    usageDay: '{date}: {generated}, {read}', tokensGenerated_one: '{n} token generado',
+    tokensGenerated_other: '{n} tokens generados', tokensRead_one: '{n} token leído', tokensRead_other: '{n} tokens leídos',
+    usageGenerated: 'Tokens generados',
     usageRead: 'Tokens leídos', usageChart: 'Tokens generados y leídos por día en los últimos 30 días',
     tokensIn: 'Tokens leídos', tokensOut: 'Tokens escritos', vram: 'Memoria gráfica', v2ram: 'Memoria ampliada (V²RAM)',
     vramResident: 'en el dispositivo', vramHost: 'en la memoria del sistema', vramStore: 'en disco', vramFree: 'libre',
@@ -1217,19 +1265,21 @@ const texts = {
     inputRefused: '{name}: el modelo de esta función ({model}) solo lee {inputs}; este archivo no se puede adjuntar.',
     attachInputs: 'Adjuntar archivos (el modelo lee: {inputs})',
     readFailed: 'No se pudo leer {name}: {error}', generatedFile: 'Archivo creado por el agente', download: 'Descargar',
-    indexing: 'Indexando…', indexingProgress: 'Indexando… {p} %', indexed: 'Consultable · {n} pasajes',
-    indexedWords: 'Consultable por palabras · {n} pasajes', tokensEstimate: '≈ {n} tokens',
-    knowledgeWhole: 'Unos {n} tokens, {p} % del contexto del modelo: los documentos se leen enteros en cada conversación.',
-    knowledgeSearch: 'Unos {n} tokens, {p} % del contexto del modelo: los pasajes más cercanos a cada pregunta la acompañan.',
+    indexing: 'Indexando…', indexingProgress: 'Indexando… {p} %', indexed_one: '{n} pasaje', indexed_other: '{n} pasajes',
+    indexedWords_one: '{n} pasaje (por palabras)', indexedWords_other: '{n} pasajes (por palabras)',
+    tokensEstimate_one: '≈ {n} token', tokensEstimate_other: '≈ {n} tokens',
+    knowledgeWhole: 'Alrededor de {tokens}, {p} % del contexto del modelo: los documentos se leen enteros en cada conversación.',
+    knowledgeSearch: 'Alrededor de {tokens}, {p} % del contexto del modelo: los pasajes más cercanos a cada pregunta la ' +
+      'acompañan.',
     knowledgeNoVectors: 'No hay ningún modelo de embeddings activo: la búsqueda usa las palabras de los documentos.',
     legacyFormat: '{name}: este formato de Office es anterior a 2007; guárdelo como .docx, .xlsx o .pptx.',
     pdfImagesTitle: 'PDF sin texto',
     pdfImagesText: '{name} solo contiene imágenes, como páginas escaneadas. Su texto no se puede leer sin ' +
       'reconocimiento de caracteres (OCR), que Albireo no realiza. El archivo no se ha añadido.',
-    pdfPageWithoutText: 'Se ha añadido {name}, pero una de sus {total} páginas no tiene texto legible porque solo ' +
-      'contiene imágenes.',
-    pdfPagesWithoutText: 'Se ha añadido {name}, pero {n} de sus {total} páginas no tienen texto legible porque solo ' +
-      'contienen imágenes.',
+    pdfPagesWithoutText_one: 'Se ha añadido {name}, pero una de sus {total} páginas no tiene texto legible porque ' +
+      'solo contiene imágenes.',
+    pdfPagesWithoutText_other: 'Se ha añadido {name}, pero {n} de sus {total} páginas no tienen texto legible porque ' +
+      'solo contienen imágenes.',
     pdfPassword: '{name} está protegido con contraseña y no se puede abrir. Quite la contraseña y vuelva a adjuntar ' +
       'el archivo.',
     pdfInvalid: '{name} no es un archivo PDF válido o está dañado.',
@@ -1237,11 +1287,11 @@ const texts = {
       'versión reciente de Microsoft Edge o de Google Chrome y vuelva a cargar la página.',
     searchedDocument: 'consultado por búsqueda', removeAttachment: 'Quitar este documento',
     indexingDocument: 'Indexando {name} para la búsqueda…',
-    imagesNotAdded: 'No añadidas: {names}. El contexto de una conversación contiene como máximo {max} imágenes; ' +
-      'plazas libres en esta: {left}. Las imágenes de los intercambios más antiguos salen del contexto cuando la ' +
-      'conversación los resume, lo que libera sus plazas.',
-    projectImagesNotAdded: 'No añadidas: {names}. Un proyecto contiene como máximo {max} imágenes; plazas libres en ' +
-      'este: {left}.',
+    notAddedImages_one: 'No añadida: {names}.', notAddedImages_other: 'No añadidas: {names}.',
+    imagesNotAdded: '{notAdded} El contexto de una conversación contiene como máximo {max} imágenes; plazas libres en ' +
+      'esta: {left}. Las imágenes de los intercambios más antiguos salen del contexto cuando la conversación los ' +
+      'resume, lo que libera sus plazas.',
+    projectImagesNotAdded: '{notAdded} Un proyecto contiene como máximo {max} imágenes; plazas libres en este: {left}.',
     replayImagesFull: 'Imágenes de esta pregunta: {n}; plazas libres en el contexto de esta conversación: {left} de ' +
       '{max}. Las imágenes de los intercambios más antiguos salen del contexto cuando la conversación los resume.',
     imagePlaces: 'plazas libres para imágenes en el contexto: {left} de {max}',
@@ -1267,13 +1317,14 @@ const texts = {
     scanOffer: '{name} solo contiene imágenes, como páginas escaneadas, y el modelo de esta función lee imágenes: ' +
       'sus páginas se pueden adjuntar como imágenes. Páginas: {pages}; plazas libres para imágenes en el contexto de ' +
       'esta conversación: {left}.',
-    scanFirstPages: 'Las páginas adjuntas van de la página 1 a la página {n}.',
+    scanFirstPages_one: 'Solo se adjunta la página 1.',
+    scanFirstPages_other: 'Las páginas adjuntas van de la página 1 a la página {n}.',
     scanAttach: 'Adjuntar las páginas como imágenes',
     scanNoRoom: '{name} solo contiene imágenes, como páginas escaneadas. Sus páginas podrían adjuntarse como ' +
       'imágenes, pero el contexto de esta conversación ya no tiene plazas para imágenes ({max} como máximo). Las ' +
       'imágenes de los intercambios más antiguos salen del contexto cuando la conversación los resume.',
     scanPageName: '{name}, página {n}', scanRendering: 'Dibujando las páginas de {name}…',
-    stepsCount: '{n} pasos', agentLimit: 'El agente se detuvo tras {n} pasos.',
+    stepsCount_one: '{n} paso', stepsCount_other: '{n} pasos', agentLimit: 'El agente se detuvo tras {n} pasos.',
     aboutText: 'Albireo Community Edition ejecuta modelos de lenguaje localmente, en el procesador, el procesador gráfico o el procesador neuronal de este ordenador, basándose en la biblioteca de código abierto Dlib-Transformer-extensions.',
     createdBy: 'Creado por {author}', license: 'Licencia',
     thirdParty: 'Componentes de terceros', apiDocs: 'Documentación de la interfaz', close: 'Cerrar', confirm: 'Confirmar',
@@ -1311,7 +1362,8 @@ const texts = {
     program_libjpeg: 'Lectura de las imágenes JPEG por los motores',
     program_pico: 'Lectura de las respuestas en voz alta, con sus voces de seis idiomas',
     errorPrefix: 'Error: {message}', retry: 'Reintentar', cancelled: 'Detenido.', emptyAnswer: '(sin respuesta)',
-    filesInProject: '{n} documentos', characters: '{n} caracteres', newProjectDiscussion: 'Nueva conversación en {name}',
+    filesInProject_one: '{n} documento', filesInProject_other: '{n} documentos', characters_one: '{n} carácter',
+    characters_other: '{n} caracteres', newProjectDiscussion: 'Nueva conversación en {name}',
     moveTo: 'Mover a', none: 'Ninguno', searchIn: 'Buscar en las conversaciones', share: 'Compartir', addToProject: 'Añadir a un proyecto',
     suggest_general_1: 'Explicar un concepto|¿Cómo funciona la criptografía de clave pública, con una analogía sencilla?',
     suggest_general_2: 'Redactar|Redacta un correo claro y cortés para aplazar una reunión a la semana que viene.',
@@ -1350,8 +1402,34 @@ export function setLanguage(code) {
 
 export function language() { return current; }
 
-export function t(key, vars) {
-  let s = (texts[current] && texts[current][key]) || texts.en[key] || key;
+// The text s with the value of each variable of vars in place of its name in braces.
+function fillIn(s, vars) {
   if (vars) for (const k of Object.keys(vars)) s = s.split('{' + k + '}').join(String(vars[k]));
   return s;
+}
+
+export function t(key, vars) {
+  return fillIn((texts[current] && texts[current][key]) || texts.en[key] || key, vars);
+}
+
+// The plural rules of the languages, made at their first use.
+const pluralRules = {};
+
+/*
+    The text of key that agrees with the count n, its variables filled in as t fills them, n as {n} unless vars
+    gives {n} itself, formatted for instance.  The text is the variant of key for the plural category of n in the
+    language of the interface (Intl.PluralRules): key_one, key_other, then key_other for a category the language
+    has no variant for (the "many" of the exact millions in French, Italian and Spanish), then key itself.  A
+    language that has none of them falls back on English, as t does.
+*/
+export function tn(key, n, vars) {
+  for (const code of [current, 'en']) {
+    const own = texts[code] || {};
+    if (!pluralRules[code]) pluralRules[code] = new Intl.PluralRules(code);
+    const category = pluralRules[code].select(Number(n));
+    for (const k of [key + '_' + category, key + '_other', key]) {
+      if (own[k]) return fillIn(own[k], Object.assign({ n }, vars));
+    }
+  }
+  return key;
 }

@@ -421,21 +421,27 @@ namespace ui
         }).detach();
     }
 
+    std::string format_decimal(double value, int digits)
+    {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%.*f", std::max(0, std::min(digits, 6)), value);
+        std::string s = buf;
+        // French, German, Italian and Spanish write the decimals after a comma.
+        if (current_language() != "en")
+            for (char& c : s)
+                if (c == '.') c = ',';
+        return s;
+    }
+
     std::string format_size(unsigned long long n)
     {
         // French writes the units in octets.
         const bool fr = current_language() == "fr";
         const char* units[] = { fr ? "o" : "B", fr ? "Ko" : "KB", fr ? "Mo" : "MB", fr ? "Go" : "GB" };
-        char buf[64];
-        if (n < 1024ull) snprintf(buf, sizeof(buf), "%llu %s", n, units[0]);
-        else if (n < (1ull << 20)) snprintf(buf, sizeof(buf), "%.1f %s", n / 1024.0, units[1]);
-        else if (n < (1ull << 30)) snprintf(buf, sizeof(buf), "%.1f %s", n / 1048576.0, units[2]);
-        else snprintf(buf, sizeof(buf), "%.2f %s", n / 1073741824.0, units[3]);
-        std::string s = buf;
-        if (fr)
-            for (char& c : s)
-                if (c == '.') c = ',';
-        return s;
+        if (n < 1024ull) return std::to_string(n) + " " + units[0];
+        if (n < (1ull << 20)) return format_decimal(n / 1024.0, 1) + " " + units[1];
+        if (n < (1ull << 30)) return format_decimal(n / 1048576.0, 1) + " " + units[2];
+        return format_decimal(n / 1073741824.0, 2) + " " + units[3];
     }
 
 }

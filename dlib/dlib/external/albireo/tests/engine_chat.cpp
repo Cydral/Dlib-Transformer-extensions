@@ -21,6 +21,10 @@
                              reads the history of the answer meanwhile)
         --no-warm            does not read the histories ahead ("warm_history": false)
         --tools              offers a weather tool to the model
+        --tool-result TEXT   with --tools, gives TEXT as the result of the calls of the weather tool
+                             and asks the model again with the calls and their results, as the agent
+                             mode of the web application does: the second answer shows whether the
+                             model reads the results of its tools
         --system TEXT        system message of the conversations
         --render FILE        prints the prompt the model receives for the conversation of FILE,
                              a JSON object {"messages", "tools", "reasoning"}, and exits
@@ -329,7 +333,8 @@ int main(int argc, char** argv)
     int threads = 0;
     long context = 4096;
     std::vector<std::string> questions;
-    std::string system, device, routing, reference, projector, detail;
+    std::string system, device, routing, reference, projector, detail, tool_result;
+    bool with_result = false;
     std::vector<std::string> images;
     for (int i = 3; i < argc; ++i)
     {
@@ -342,6 +347,11 @@ int main(int argc, char** argv)
         else if (a == "--pause" && i + 1 < argc) pause = std::atof(argv[++i]);
         else if (a == "--no-warm") warm = false;
         else if (a == "--tools") tools = true;
+        else if (a == "--tool-result" && i + 1 < argc)
+        {
+            tool_result = argv[++i];
+            with_result = true;
+        }
         else if (a == "--system" && i + 1 < argc) system = argv[++i];
         else if (a == "--render" && i + 1 < argc) ++i;
         else if (a == "--threads" && i + 1 < argc) threads = std::atoi(argv[++i]);
@@ -543,6 +553,63 @@ int main(int argc, char** argv)
             const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
             std::printf("\n%s--- %s (%.2f s)\n", p->tools.c_str(), p->final_json.c_str(), s);
             if (p->failed) ++failures;
+            if (tools && with_result && !p->failed && !p->tools.empty())
+            {
+                // The calls as the assistant message that made them, each followed by its result.
+                json calls = json::array();
+                json results = json::array();
+                size_t from = 0;
+                while (from < p->tools.size())
+                {
+                    size_t end = p->tools.find('\n', from);
+                    if (end == std::string::npos) end = p->tools.size();
+                    const json c = json::parse_or_null(p->tools.substr(from, end - from));
+                    from = end + 1;
+                    if (!c.is_object()) continue;
+                    json call = json::object();
+                    call["id"] = c["id"];
+                    call["type"] = "function";
+                    json fn = json::object();
+                    fn["name"] = c["name"];
+                    fn["arguments"] = c["arguments"].is_string() ? c["arguments"] : json(c["arguments"].dump());
+                    call["function"] = fn;
+                    calls.push_back(call);
+                    json result = json::object();
+                    result["role"] = "tool";
+                    result["tool_call_id"] = c["id"];
+                    result["name"] = c["name"];
+                    result["content"] = tool_result;
+                    results.push_back(result);
+                }
+                json next = req;
+                json assistant = json::object();
+                assistant["role"] = "assistant";
+                assistant["content"] = p->content;
+                if (!p->reasoning.empty()) assistant["reasoning_content"] = p->reasoning;
+                assistant["tool_calls"] = calls;
+                json list = next["messages"];
+                list.push_back(assistant);
+                for (const auto& r : results.elements()) list.push_back(r);
+                next["messages"] = list;
+                std::unique_ptr<pending> second(new pending());
+                second->index = static_cast<int>(q);
+                const auto t1 = std::chrono::steady_clock::now();
+                if (lib.submit(e, next.dump().c_str(), on_event, second.get(), &id, err, sizeof(err)) != ALBIREO_OK)
+                {
+                    std::printf("submit: %s\n", err);
+                    ++failures;
+                }
+                else
+                {
+                    std::printf("\n=== the results of the calls given back\n");
+                    std::unique_lock<std::mutex> again(second->m);
+                    second->cv.wait(again, [&]() { return second->done; });
+                    const double s2 = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
+                    std::printf("\n%s--- %s (%.2f s)\n", second->tools.c_str(), second->final_json.c_str(), s2);
+                    if (second->failed) ++failures;
+                }
+                all.push_back(std::move(second));
+            }
             if (turns)
             {
                 json answer = json::object();

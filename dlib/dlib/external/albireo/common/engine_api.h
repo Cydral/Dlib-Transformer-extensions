@@ -102,8 +102,8 @@ ALBIREO_ENGINE_EXPORT uint32_t ALBIREO_ENGINE_CALL albireo_engine_abi_version(vo
    {"variant","version","backend","build","kernels","devices":[...],"usable":true|false,
    "reason","reason_code","reason_args","missing"}.  An engine that cannot run here gives the
    reason in English, and a code with its values for the windows, which explain it in the
-   language of the user: isa_avx2, isa_avx_vnni, isa_avx512 (the processor lacks the
-   instructions of the kernels), no_nvidia_driver, old_nvidia_driver {driver, runtime},
+   language of the user: isa_avx2, isa_avx_vnni (the processor lacks the instructions of
+   the kernels), no_nvidia_driver, old_nvidia_driver {driver, runtime},
    no_nvidia_card, old_nvidia_card {card, cc}, no_intel_device, intel_device_unusable
    {detail} (the message of each plugin of OpenVINO).  An engine that runs gives in missing
    why the other devices it looks for were left out, as their runtime reports it.

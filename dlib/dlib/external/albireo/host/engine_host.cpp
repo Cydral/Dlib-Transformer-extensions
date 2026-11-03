@@ -25,8 +25,8 @@ namespace albireo
             std::string model;
         };
 
-        const char* const variant_order[] = { "cuda", "openvino-avx512", "openvino-avxvnni", "openvino", "cpu-avx512",
-            "cpu-avxvnni", "cpu-avx2", "cpu" };
+        const char* const variant_order[] = { "cuda", "openvino-avxvnni", "openvino", "cpu-avxvnni", "cpu-avx2",
+            "cpu" };
 
         bool ends_with(const std::string& s, const std::string& tail)
         {
@@ -38,7 +38,6 @@ namespace albireo
         unsigned variant_isa(const std::string& variant)
         {
             if (variant == "cpu") return 0;
-            if (ends_with(variant, "-avx512")) return qk_isa_avx2 | qk_isa_avx512;
             if (ends_with(variant, "-avxvnni")) return qk_isa_avx2 | qk_isa_avx_vnni;
             return qk_isa_avx2;
         }
@@ -373,6 +372,7 @@ namespace albireo
                 return false;
             }
             ++in_flight_[model];
+            ++submitted_;
         }
         sink_holder* h = new sink_holder{ std::move(sink), this, model };
         char err[2048] = { 0 };
@@ -386,6 +386,14 @@ namespace albireo
             return false;
         }
         return true;
+    }
+
+    unsigned long long engine_host::activity(long& active) const
+    {
+        std::lock_guard<std::mutex> lock(flight_m_);
+        active = 0;
+        for (const auto& kv : in_flight_) active += kv.second;
+        return submitted_;
     }
 
     void engine_host::cancel(uint64_t id)

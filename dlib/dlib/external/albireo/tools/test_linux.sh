@@ -66,7 +66,7 @@ ENGINES=$BUILD/bin/engines
 CHAT=$BUILD/tests/engine_chat
 
 # The kernels of each family of processors, skipped by the processors without their instructions.
-for family in "" _avxvnni _avx512 _vnni256; do
+for family in "" _avxvnni _vnni256; do
   test=$BUILD/tests/test_qkernels$family
   name="quantized kernels${family:+ ${family#_}}"
   if [ ! -x "$test" ]; then
@@ -100,7 +100,7 @@ if [ -x "$BUILD/tests/test_host" ]; then
 else skip "models folder and imports" "no $BUILD/tests/test_host"
 fi
 
-for variant in cpu-avx512 cpu-avxvnni cpu-avx2 cpu; do
+for variant in cpu-avxvnni cpu-avx2 cpu; do
   lib=$ENGINES/libalbireo-engine-$variant.so
   if [ ! -f "$lib" ]; then skip "engine $variant" "no $lib"
   elif [ ! -f "$MODEL" ]; then skip "engine $variant" "no $MODEL"

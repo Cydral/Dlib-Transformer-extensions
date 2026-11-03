@@ -142,7 +142,6 @@ namespace albireo
     std::string engine_name(const std::string& variant)
     {
         if (variant == "openvino-avxvnni") return "OpenVINO AVX-VNNI";
-        if (variant == "openvino-avx512") return "OpenVINO AVX-512";
         return runtime_name(variant);
     }
 
@@ -291,24 +290,25 @@ namespace albireo
         }
 
         /*
-            The text of a measure of the engines: tokens per second, with the kind of the
-            device before it when the engine offers several devices.
+            The text of a measure of the engines: tokens per second in the language of the
+            interface ("7.3 tokens/s", "7,3 jetons/s"), with the kind of the device before it when
+            the engine offers several devices.
         */
         std::wstring measures_text(const json& engines, const std::string& variant)
         {
             int count = 0;
             for (const auto& o : engines["options"].elements()) count += o["variant"].as_string() == variant;
-            std::string text;
+            std::wstring text;
             for (const auto& o : engines["options"].elements())
             {
                 if (o["variant"].as_string() != variant || !o["measure"]["tokens_per_second"].is_number()) continue;
-                char buf[48];
-                snprintf(buf, sizeof(buf), "%.1f tok/s", o["measure"]["tokens_per_second"].as_double());
+                const std::wstring rate = tr("tokens_s",
+                    { { "n", ui::format_decimal(o["measure"]["tokens_per_second"].as_double(), 1) } });
                 const std::string kind = o["kind"].as_string();
-                const std::string prefix = count > 1 && kind != "cpu" ? tr_utf8(device_key(kind)) + " " : "";
-                text += (text.empty() ? "" : ", ") + prefix + buf;
+                const std::wstring prefix = count > 1 && kind != "cpu" ? widen(tr_utf8(device_key(kind))) + L" " : L"";
+                text += (text.empty() ? L"" : L", ") + prefix + rate;
             }
-            return widen(text);
+            return text;
         }
 
         /*
@@ -1577,12 +1577,7 @@ namespace albireo
                     current += L" (" + widen(e["device"].as_string()) + L")";
                 const double tps = e["stats"]["generation_tokens_per_second"].as_double(0);
                 std::wstring line = tr("lbl_engine") + L": " + current;
-                if (tps > 0.05)
-                {
-                    char buf[32];
-                    snprintf(buf, sizeof(buf), "%.1f", tps);
-                    line += L"  ·  " + tr("tokens_s", { { "n", buf } });
-                }
+                if (tps > 0.05) line += L"  ·  " + tr("tokens_s", { { "n", ui::format_decimal(tps, 1) } });
                 if (!e["error"].as_string().empty()) line += L"  ·  " + widen(e["error"].as_string());
                 ui::set_text(engine, line);
 

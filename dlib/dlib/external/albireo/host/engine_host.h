@@ -21,8 +21,7 @@ namespace albireo
 
     struct engine_candidate
     {
-        // "cpu", "cpu-avx2", "cpu-avxvnni", "cpu-avx512", "openvino", "openvino-avxvnni",
-        // "openvino-avx512", "cuda"
+        // "cpu", "cpu-avx2", "cpu-avxvnni", "openvino", "openvino-avxvnni", "cuda"
         std::string variant;
         std::string path;
         json description;
@@ -122,6 +121,13 @@ namespace albireo
         void cancel(uint64_t id);
         json query(const json& request);
 
+        /*!
+            ensures
+                - Returns the number of requests the engine accepted since this object was
+                  created, and gives in active the number of those still in progress.
+        !*/
+        unsigned long long activity(long& active) const;
+
     private:
         static void ALBIREO_ENGINE_CALL on_event(void* user, int kind, const char* data, size_t size);
         void request_ended(const std::string& model);
@@ -146,6 +152,8 @@ namespace albireo
         std::map<std::string, long> in_flight_;
         std::map<std::string, bool> draining_;
         bool stopping_ = false;
+        // The requests accepted since the creation of this object, under flight_m_.
+        unsigned long long submitted_ = 0;
     };
 
 }

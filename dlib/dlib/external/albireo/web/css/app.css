@@ -360,6 +360,8 @@ a { color: var(--blue); }
 .page h2 { font-family: var(--font-display); margin: 0 0 4px; font-size: 24px; display: flex; align-items: center; gap: 10px; }
 .page .sub { color: var(--text-soft); margin: 0 0 20px; }
 .card { border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-elevated); padding: 16px; margin-bottom: 16px; }
+/* A card that takes files, while files are dragged over it, as the composer shows it. */
+.card.drag { border-color: var(--blue); box-shadow: 0 0 0 4px rgba(61, 107, 255, 0.15); }
 .card h3 { margin: 0 0 4px; font-size: 15px; display: flex; align-items: center; gap: 8px; }
 .card h3 svg, .dialog h2 svg, .page h2 svg { width: 17px; height: 17px; flex: 0 0 17px; color: var(--text-soft); }
 .list .row svg { width: 16px; height: 16px; flex: 0 0 16px; color: var(--text-soft); }

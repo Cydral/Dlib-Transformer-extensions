@@ -178,24 +178,19 @@ if (MSVC)
    set(ALBIREO_ISA_avx2 /arch:AVX2)
    set(ALBIREO_ISA_avxvnni /arch:AVX2)
    set(ALBIREO_ISA_avxvnni_DEFS ALBIREO_AVX_VNNI)
-   set(ALBIREO_ISA_avx512 /arch:AVX512)
-   set(ALBIREO_ISA_avx512_DEFS ALBIREO_AVX512_VNNI)
    # The intrinsics of AVX-VNNI came with Visual Studio 2022.
    if (MSVC_VERSION GREATER_EQUAL 1930)
       set(ALBIREO_HAS_avxvnni ON)
    endif()
-   set(ALBIREO_HAS_avx512 ON)
 else()
    set(ALBIREO_ISA_avx2 -mavx2 -mfma -mf16c)
    set(ALBIREO_ISA_avxvnni ${ALBIREO_ISA_avx2} -mavxvnni)
-   set(ALBIREO_ISA_avx512 ${ALBIREO_ISA_avx2} -mavx512f -mavx512bw -mavx512dq -mavx512vl -mavx512vnni)
    # The 256-bit VNNI kernels through the AVX-512 form of their instructions, to test them
    # on the processors that have AVX-512 VNNI and lack AVX-VNNI.
    set(ALBIREO_ISA_vnni256 ${ALBIREO_ISA_avx2} -mavx512vl -mavx512vnni)
    set(ALBIREO_ISA_vnni256_DEFS ALBIREO_QK_VNNI_EVEX)
    check_cxx_compiler_flag(-mavxvnni ALBIREO_HAS_avxvnni)
-   check_cxx_compiler_flag(-mavx512vnni ALBIREO_HAS_avx512)
-   set(ALBIREO_HAS_vnni256 ${ALBIREO_HAS_avx512})
+   check_cxx_compiler_flag(-mavx512vnni ALBIREO_HAS_vnni256)
 endif()
 set(ALBIREO_HAS_portable ON)
 set(ALBIREO_HAS_avx2 ON)
@@ -271,18 +266,12 @@ if (ALBIREO_PROGRAMS)
    albireo_engine(cpu portable)
    # Engine for the processors with AVX2, FMA and F16C (2013 and later).
    albireo_engine(cpu-avx2 avx2)
-   # AVX-VNNI: Intel Core 12th generation and later, AMD Zen 5.
+   # AVX-VNNI: Intel Core 12th generation and later, AMD Zen 5.  The processors with AVX-512
+   # and without AVX-VNNI run the engine of AVX2.
    if (ALBIREO_HAS_avxvnni)
       albireo_engine(cpu-avxvnni avxvnni)
    else()
       message(STATUS "The compiler lacks AVX-VNNI: no cpu-avxvnni engine.")
-   endif()
-   # AVX-512 with VNNI: Intel Xeon from Cascade Lake on, Core 10th and 11th generation for
-   # laptops and desktops (Ice Lake, Tiger Lake, Rocket Lake), AMD Zen 4 and Zen 5.
-   if (ALBIREO_HAS_avx512)
-      albireo_engine(cpu-avx512 avx512)
-   else()
-      message(STATUS "The compiler lacks AVX-512 VNNI: no cpu-avx512 engine.")
    endif()
 endif()
 
@@ -375,8 +364,7 @@ endfunction()
 
 # Engines whose products go to a device through the tensors of dlib.  Their processor side
 # is the one of cpu-avx2, which every machine with such a device has, or the quantized kernels
-# of the family given after the variant (avxvnni, avx512), the rest of the library staying at
-# AVX2.
+# of the family given after the variant (avxvnni), the rest of the library staying at AVX2.
 function(albireo_tensor_engine variant)
    set(ALBIREO_DEVICE_ENGINE ON)
    set(family "${ARGN}")
@@ -492,10 +480,6 @@ if (ALBIREO_ENGINE_OPENVINO)
    if (ALBIREO_HAS_avxvnni)
       albireo_tensor_engine(openvino-avxvnni avxvnni)
       list(APPEND openvino_engines albireo-engine-openvino-avxvnni)
-   endif()
-   if (ALBIREO_HAS_avx512)
-      albireo_tensor_engine(openvino-avx512 avx512)
-      list(APPEND openvino_engines albireo-engine-openvino-avx512)
    endif()
    # The folder of the runtime of OpenVINO, which loads the plugins of the devices by name.
    find_package(OpenVINO QUIET COMPONENTS Runtime PATHS "${OpenVINO_DIR}" NO_DEFAULT_PATH)
@@ -802,7 +786,7 @@ if (ALBIREO_TESTS AND ALBIREO_PROGRAMS)
    albireo_output_dir(test_chat_format ${CMAKE_BINARY_DIR}/tests)
    # The kernels of the other families: their checks and their speed, on the processors
    # that have their instructions (the others skip them).
-   foreach (family avxvnni avx512 vnni256)
+   foreach (family avxvnni vnni256)
       if (NOT ALBIREO_HAS_${family})
          continue()
       endif()

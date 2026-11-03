@@ -35,8 +35,10 @@ namespace albireo
                 when their model needs them again.  The copies of a model with requests in
                 progress or waiting stay, so that the requests of several models are served
                 together, each model keeping the room it holds.  Beyond the budget, a matrix
-                is expanded again at each product it is given (CUDA), or left to the
-                processor (OpenVINO), until a model has no more requests or copies leave.
+                is left to the processor (OpenVINO, and CUDA for a product of fewer than
+                staged_min_tokens tokens, a generated token among them), or crosses the bus
+                for the product alone (CUDA, a long prompt), until a model has no more
+                requests or copies leave.
 
                 Where a product runs is measured, shape by shape: the first products of a
                 shape run on the device and on the processor in turn, the faster place keeps
@@ -44,12 +46,18 @@ namespace albireo
                 OpenVINO, the routing of dlib makes these measures itself, against the
                 processor kernels of the engine.
 
-                On a CUDA device, the extended memory of dlib (V²RAM) lets the copies exceed
-                the memory of the card: the blocks that do not fit move to the memory of the
-                host or to a file, and come back ahead of their use.  Once the copies exceed
-                the memory of the card, the products of fewer than qk_float_product_tokens
-                tokens, the generated tokens, stay on the processor: their matrices would cross
-                the bus at each pass.  Only the rows of a product cross the bus, each way.
+                On a CUDA device, the copies are written on the card from a buffer of the
+                host of bounded size, without an image in the memory of the host, and their
+                budget is the memory of the card that the extended memory of dlib (V²RAM)
+                manages, less a reserve for the products, the matrices that cross the bus
+                and cuBLAS: a model whose copies exceed it computes the products of the
+                matrices left out on the processor, from its quantized weights.  A size
+                given to the file of the extended memory (v2ram_max_mb) lets the copies go
+                beyond the card into it, the blocks that do not fit moving to the memory of
+                the host or to that file and coming back ahead of their use; once the copies
+                exceed the memory of the card, the products of fewer than
+                qk_float_product_tokens tokens stay on the processor.  Only the rows of a
+                product cross the bus, each way.
 
             CONFIGURATION
                 The object the engine receives at its creation (engine_api.h), of which this

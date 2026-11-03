@@ -251,7 +251,7 @@ namespace albireo
         // The OpenVINO engine with the richest processor kernels that run here: its devices
         // make the choices of the NPU and of the graphics processor.
         const engine_candidate* openvino = nullptr;
-        for (const char* v : { "openvino-avx512", "openvino-avxvnni", "openvino" })
+        for (const char* v : { "openvino-avxvnni", "openvino" })
             for (const auto& c : candidates)
                 if (!openvino && c.usable && c.variant == v) openvino = &c;
         std::vector<engine_choice> out;
@@ -342,6 +342,9 @@ namespace albireo
             if (named) return *named;
             log_warning("engines: the engine '" + s.engine + "' of the settings is not usable, automatic selection");
         }
+        // The processor engine: the fastest measured one, else the one of the richest kernels.
+        const engine_choice* processor = fastest(is_cpu);
+        if (!processor) processor = first({ "cpu-avxvnni", "cpu-avx2", "cpu" });
         const engine_choice* e = nullptr;
         if (s.accelerator == "npu")
         {
@@ -360,11 +363,22 @@ namespace albireo
         }
         else if (s.accelerator == "none")
         {
-            e = fastest(is_cpu);
-            if (!e) e = first({ "cpu-avx512", "cpu-avxvnni", "cpu-avx2", "cpu" });
+            e = processor;
         }
-        if (!e) e = fastest([](const engine_choice&) { return true; });
-        if (!e) e = first({ "cuda", "cpu-avx512", "cpu-avxvnni", "cpu-avx2", "cpu" });
+        else
+        {
+            // The engine "best": the fastest measured one.
+            if (s.engine == "best") e = fastest([](const engine_choice&) { return true; });
+            /*
+                The accelerator of the computer, the processor computing what its device does not:
+                the NVIDIA card, else the NPU and the graphics processor of Intel together, else
+                the one of them present.  A measure that found it slower than the processor engine
+                gives way to the processor engine.
+            */
+            if (!e) e = first({ "cuda", "openvino:both", "openvino:gpu", "openvino:npu" });
+            if (e && processor && rate(*e) > 0 && rate(*processor) > rate(*e)) e = processor;
+        }
+        if (!e) e = processor;
         if (!e && !options.empty()) e = &options.front();
         return e ? *e : engine_choice();
     }
@@ -2087,6 +2101,16 @@ namespace albireo
             return out;
         }
         json results = json::object();
+        // Waits until the engine of the service serves no request, two minutes at most.
+        auto wait_idle = [&]() {
+            for (int i = 0; i < 240 && !stopping_; ++i)
+            {
+                long active = 0;
+                engine_.activity(active);
+                if (active == 0) return;
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            }
+        };
         for (const auto& o : engine_options(candidates_))
         {
             if (stopping_) break;
@@ -2096,10 +2120,22 @@ namespace albireo
             // measure reflects the device.
             config["benchmark"] = true;
             std::string output;
-            log_info("engines: measuring " + o.key + " with " + model.id);
+            int code = -1;
             const std::vector<std::string> args = { "--bench-engine", o.candidate->path, model.file, config.dump() };
-            // The measure ends with the service, which then waits for no child process.
-            const int code = run_process(executable_path(), args, &output, 600000, &stopping_);
+            for (int attempt = 0; attempt < 2 && !stopping_; ++attempt)
+            {
+                wait_idle();
+                long active = 0;
+                const unsigned long long before = engine_.activity(active);
+                log_info("engines: measuring " + o.key + " with " + model.id);
+                output.clear();
+                // The measure ends with the service, which then waits for no child process.
+                code = run_process(executable_path(), args, &output, 600000, &stopping_);
+                // A measure during which the service computed shared the processor with it.
+                if (engine_.activity(active) == before && active == 0) break;
+                log_info("engines: the service served requests during the measure of " + o.key
+                    + (attempt == 0 ? ", which is made again" : ", which is kept"));
+            }
             const size_t start = output.rfind("\n{");
             const json r = json::parse_or_null(start == std::string::npos ? output : output.substr(start + 1));
             if (code == 0 && r["tokens_per_second"].as_double(0) > 0)
@@ -2225,15 +2261,27 @@ namespace albireo
             done = json::parse_or_null(w.result);
             return done["usage"].is_object();
         };
-        json warm, done;
-        // A first short request warms the caches and lets a device compile its graphs.
-        const bool ok = run(8, warm) && run(64, done);
+        /*
+            A first request reads the model from the disk into the memory of the system, lets a
+            device compile its graphs and copy its matrices, and lets the engines of the devices
+            measure where each product runs faster.  Two requests are then measured: the faster
+            of the two is kept, so that a pause of the system during one of them does not set
+            the measure.
+        */
+        json warm, done, again;
+        const bool ok = run(16, warm) && run(64, done) && run(64, again);
         lib.unload_model(e, "bench");
         lib.destroy(e);
-        if (!ok) return fail(done["message"].str("the measure did not complete"));
+        if (!ok)
+        {
+            const json& failed = again.is_object() ? again : done.is_object() ? done : warm;
+            return fail(failed["message"].str("the measure did not complete"));
+        }
         const json& t = done["timings"];
+        const json& u = again["timings"];
         json r = json::object();
-        r["tokens_per_second"] = t["generation_per_second"];
+        r["tokens_per_second"] = std::max(t["generation_per_second"].as_double(0),
+            u["generation_per_second"].as_double(0));
         r["prompt_tokens_per_second"] = t["prompt_per_second"];
         r["generated"] = done["usage"]["completion_tokens"];
         std::cout << r.dump() << std::endl;

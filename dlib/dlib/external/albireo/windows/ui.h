@@ -94,8 +94,11 @@ namespace ui
     */
     void run_async(HWND target, UINT msg, WPARAM tag, std::function<json()> work);
 
-    // Formats a size in bytes: "2.4 GB".
+    // Formats a size in bytes in the language of the interface: "2.4 GB", "2,4 Go", "2,4 GB".
     std::string format_size(unsigned long long bytes);
+
+    // Formats a number with digits decimals and the decimal separator of the language of the interface: "7.3", "7,3".
+    std::string format_decimal(double value, int digits);
 
 }
 }

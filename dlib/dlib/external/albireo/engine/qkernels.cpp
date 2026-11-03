@@ -19,21 +19,14 @@
 #endif
 
 /*
-    The instructions beyond AVX2, each the kernels of a processor engine:
-        ALBIREO_QK_AVX512   AVX-512 F, BW, DQ and VL with VNNI (cpu-avx512): the products on
-                            512-bit vectors, and the 256-bit kernels of ALBIREO_QK_VNNI;
+    The instructions beyond AVX2, the kernels of the processor engine cpu-avxvnni:
         ALBIREO_QK_VNNI     the dot products of bytes and of 16-bit integers in one
                             instruction, on 256-bit vectors: AVX-VNNI (cpu-avxvnni), or its
                             AVX-512 form (ALBIREO_QK_VNNI_EVEX, which tests these kernels on
                             the processors that have AVX-512 VNNI and lack AVX-VNNI).
-    MSVC defines no macro for VNNI: the build names it (ALBIREO_AVX_VNNI, ALBIREO_AVX512_VNNI).
+    MSVC defines no macro for VNNI: the build names it (ALBIREO_AVX_VNNI).
 */
-#if ALBIREO_QK_AVX2 && defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512DQ__) \
-    && defined(__AVX512VL__) && (defined(__AVX512VNNI__) || defined(ALBIREO_AVX512_VNNI))
-#define ALBIREO_QK_AVX512 1
-#define ALBIREO_QK_VNNI 1
-#define ALBIREO_QK_VNNI_FORM_EVEX 1
-#elif ALBIREO_QK_AVX2 && defined(ALBIREO_QK_VNNI_EVEX) && defined(__AVX512VNNI__) && defined(__AVX512VL__)
+#if ALBIREO_QK_AVX2 && defined(ALBIREO_QK_VNNI_EVEX) && defined(__AVX512VNNI__) && defined(__AVX512VL__)
 #define ALBIREO_QK_VNNI 1
 #define ALBIREO_QK_VNNI_FORM_EVEX 1
 #elif ALBIREO_QK_AVX2 && (defined(__AVXVNNI__) || defined(ALBIREO_AVX_VNNI))
@@ -143,9 +136,7 @@ namespace albireo
 
     const char* qk_isa()
     {
-#if ALBIREO_QK_AVX512
-        return "AVX-512+VNNI";
-#elif ALBIREO_QK_VNNI && ALBIREO_QK_VNNI_FORM_EVEX
+#if ALBIREO_QK_VNNI && ALBIREO_QK_VNNI_FORM_EVEX
         return "AVX2+FMA+F16C+VNNI (AVX-512 form)";
 #elif ALBIREO_QK_VNNI
         return "AVX2+FMA+F16C+AVX-VNNI";
@@ -164,7 +155,7 @@ namespace albireo
 #if ALBIREO_QK_AVX2
         isa |= qk_isa_avx2;
 #endif
-#if ALBIREO_QK_AVX512 || ALBIREO_QK_VNNI_FORM_EVEX
+#if ALBIREO_QK_VNNI_FORM_EVEX
         isa |= qk_isa_avx512;
 #elif ALBIREO_QK_VNNI
         isa |= qk_isa_avx_vnni;
@@ -1171,7 +1162,6 @@ namespace albireo
 #endif
         }
 
-#if !ALBIREO_QK_AVX512
         // acc + the sums of the products of two signed 16-bit integers of a by those of b.
         inline __m256i dpwssd(__m256i acc, __m256i a, __m256i b)
         {
@@ -1181,7 +1171,6 @@ namespace albireo
             return _mm256_dpwssd_avx_epi32(acc, a, b);
 #endif
         }
-#endif
 
         /*
             The weights of Q4_0 enter the unsigned operand as they are stored, 0 to 15, and
@@ -1217,7 +1206,6 @@ namespace albireo
             return hsum_ps(acc);
         }
 
-#if !ALBIREO_QK_AVX512
         // The kernels of AVX2 with the scales applied and summed by dpwssd.
         float dot_q4_K_vnni(const uint8_t* w, const block_q8_K* y, long n)
         {
@@ -1484,371 +1472,6 @@ namespace albireo
             }
             for (int t = 0; t < NT; ++t) out[t] = hsum_ps(acc[t]);
         }
-#endif
-    }
-#endif
-
-// AVX-512 dot products and products of floats
-
-#if ALBIREO_QK_AVX512
-    namespace
-    {
-        inline float hsum512_ps(__m512 x)
-        {
-            return hsum_ps(_mm256_add_ps(_mm512_castps512_ps256(x), _mm512_extractf32x8_ps(x, 1)));
-        }
-
-        // Two vectors of 256 bits as one of 512, a in the low half.
-        inline __m512i join256(__m256i a, __m256i b)
-        {
-            return _mm512_inserti64x4(_mm512_castsi256_si512(a), b, 1);
-        }
-
-        inline __m512 join256_ps(float a, float b)
-        {
-            return _mm512_insertf32x8(_mm512_castps256_ps512(_mm256_set1_ps(a)), _mm256_set1_ps(b), 1);
-        }
-
-        inline __m256i load256(const void* p)
-        {
-            return _mm256_loadu_si256(static_cast<const __m256i*>(p));
-        }
-
-        // Sixteen 16-bit lanes of value a, then sixteen of value b.
-        inline __m512i halves_epi16(short a, short b)
-        {
-            return join256(_mm256_set1_epi16(a), _mm256_set1_epi16(b));
-        }
-
-        // Eight 16-bit lanes of each of a, a+1, a+2 and a+3.
-        inline __m512i quarters_epi16(short a)
-        {
-            const __m256i lo = _mm256_set_m128i(_mm_set1_epi16(static_cast<short>(a + 1)), _mm_set1_epi16(a));
-            const __m256i hi = _mm256_set_m128i(_mm_set1_epi16(static_cast<short>(a + 3)),
-                _mm_set1_epi16(static_cast<short>(a + 2)));
-            return join256(lo, hi);
-        }
-
-        // Two blocks of Q8_0 at a time, the last odd one by the 256-bit kernel.
-        float dot_q8_0_avx512(const uint8_t* w, const block_q8_0x* y, long n)
-        {
-            const long nb = n / 32;
-            __m512 acc = _mm512_setzero_ps();
-            long b = 0;
-            for (; b + 2 <= nb; b += 2, w += 68)
-            {
-                const __m512i qx = join256(load256(w + 2), load256(w + 36));
-                const __m512i qy = join256(load256(y[b].qs), load256(y[b + 1].qs));
-                // |x| times the activations with the signs of x.
-                const __m512i sy = _mm512_mask_sub_epi8(qy, _mm512_movepi8_mask(qx), _mm512_setzero_si512(), qy);
-                const __m512i dot = _mm512_dpbusd_epi32(_mm512_setzero_si512(), _mm512_abs_epi8(qx), sy);
-                acc = _mm512_fmadd_ps(join256_ps(h2f(w) * y[b].d, h2f(w + 34) * y[b + 1].d),
-                    _mm512_cvtepi32_ps(dot), acc);
-            }
-            float s = hsum512_ps(acc);
-            if (b < nb) s += dot_q8_0_vnni(w, y + b, 32);
-            return s;
-        }
-
-        float dot_q4_0_avx512(const uint8_t* w, const block_q8_0x* y, long n)
-        {
-            const long nb = n / 32;
-            __m512 acc = _mm512_setzero_ps();
-            float offset = 0.0f;
-            long b = 0;
-            for (; b + 2 <= nb; b += 2, w += 36)
-            {
-                const float d0 = h2f(w), d1 = h2f(w + 18);
-                const __m512i qx = join256(nibbles_to_bytes(w + 2), nibbles_to_bytes(w + 20));
-                const __m512i qy = join256(load256(y[b].qs), load256(y[b + 1].qs));
-                const __m512i dot = _mm512_dpbusd_epi32(_mm512_setzero_si512(), qx, qy);
-                acc = _mm512_fmadd_ps(join256_ps(d0 * y[b].d, d1 * y[b + 1].d), _mm512_cvtepi32_ps(dot), acc);
-                offset += d0 * y[b].s + d1 * y[b + 1].s;
-            }
-            float s = hsum512_ps(acc) - 8.0f * offset;
-            if (b < nb) s += dot_q4_0_vnni(w, y + b, 32);
-            return s;
-        }
-
-        /*
-            Q4_K and Q5_K: two sub-blocks of 32 weights per vector, the one of the low nibbles
-            in the low half and the one of the high nibbles in the high half, which is the
-            order of their 64 activations.
-        */
-        float dot_q4_K_avx512(const uint8_t* w, const block_q8_K* y, long n)
-        {
-            const __m256i m4 = _mm256_set1_epi8(0x0F);
-            __m512 acc = _mm512_setzero_ps();
-            __m128 acc_m = _mm_setzero_ps();
-            for (long b = 0; b < n / 256; ++b, w += 144)
-            {
-                const float d = y[b].d * h2f(w);
-                const float dmin = -y[b].d * h2f(w + 2);
-                uint32_t utmp[4];
-                unpack_k4_scales(w + 4, utmp);
-                const __m256i mins_and_scales = _mm256_cvtepu8_epi16(
-                    _mm_set_epi32(static_cast<int>(utmp[3]), static_cast<int>(utmp[2]),
-                                  static_cast<int>(utmp[1]), static_cast<int>(utmp[0])));
-                const __m256i q8sums = load256(y[b].bsums);
-                const __m128i q8s = _mm_hadd_epi16(_mm256_extracti128_si256(q8sums, 0),
-                                                   _mm256_extracti128_si256(q8sums, 1));
-                const __m128i prod = _mm_madd_epi16(_mm256_extracti128_si256(mins_and_scales, 1), q8s);
-                acc_m = _mm_fmadd_ps(_mm_set1_ps(dmin), _mm_cvtepi32_ps(prod), acc_m);
-
-                const __m512i scales = _mm512_castsi256_si512(mins_and_scales);
-                const uint8_t* q4 = w + 16;
-                const int8_t* q8 = y[b].qs;
-                __m512i sumi = _mm512_setzero_si512();
-                for (int j = 0; j < 4; ++j)
-                {
-                    const __m256i bits = load256(q4 + 32 * j);
-                    const __m512i q = join256(_mm256_and_si256(bits, m4),
-                        _mm256_and_si256(_mm256_srli_epi16(bits, 4), m4));
-                    const __m512i a = _mm512_loadu_si512(q8 + 64 * j);
-                    const __m512i sc = _mm512_permutexvar_epi16(
-                        halves_epi16(static_cast<short>(2 * j), static_cast<short>(2 * j + 1)), scales);
-                    sumi = _mm512_dpwssd_epi32(sumi, sc, _mm512_maddubs_epi16(q, a));
-                }
-                acc = _mm512_fmadd_ps(_mm512_set1_ps(d), _mm512_cvtepi32_ps(sumi), acc);
-            }
-            acc_m = _mm_add_ps(acc_m, _mm_movehl_ps(acc_m, acc_m));
-            acc_m = _mm_add_ss(acc_m, _mm_movehdup_ps(acc_m));
-            return hsum512_ps(acc) + _mm_cvtss_f32(acc_m);
-        }
-
-        float dot_q5_K_avx512(const uint8_t* w, const block_q8_K* y, long n)
-        {
-            const __m256i m4 = _mm256_set1_epi8(0x0F);
-            const __m512i mone = _mm512_set1_epi8(1);
-            __m512 acc = _mm512_setzero_ps();
-            float summs = 0.0f;
-            for (long b = 0; b < n / 256; ++b, w += 176)
-            {
-                const float d = y[b].d * h2f(w);
-                const float dmin = -y[b].d * h2f(w + 2);
-                uint32_t utmp[4];
-                unpack_k4_scales(w + 4, utmp);
-                const __m256i mins_and_scales = _mm256_cvtepu8_epi16(
-                    _mm_set_epi32(static_cast<int>(utmp[3]), static_cast<int>(utmp[2]),
-                                  static_cast<int>(utmp[1]), static_cast<int>(utmp[0])));
-                const __m256i q8sums = load256(y[b].bsums);
-                const __m128i q8s = _mm_hadd_epi16(_mm256_extracti128_si256(q8sums, 0),
-                                                   _mm256_extracti128_si256(q8sums, 1));
-                const __m128i prod = _mm_madd_epi16(_mm256_extracti128_si256(mins_and_scales, 1), q8s);
-                summs += dmin * static_cast<float>(hsum_epi32_128(prod));
-
-                const __m512i scales = _mm512_castsi256_si512(mins_and_scales);
-                const __m256i hbits = load256(w + 16);
-                const __m512i h = join256(hbits, hbits);
-                const uint8_t* q5 = w + 48;
-                const int8_t* q8 = y[b].qs;
-                __m512i sumi = _mm512_setzero_si512();
-                for (int j = 0; j < 4; ++j)
-                {
-                    const __m256i bits = load256(q5 + 32 * j);
-                    const __m512i pair = halves_epi16(static_cast<short>(2 * j), static_cast<short>(2 * j + 1));
-                    // Bit 2j of the bytes of hbits for the low half, bit 2j+1 for the high half.
-                    const __m512i high = _mm512_slli_epi16(_mm512_and_si512(_mm512_srlv_epi16(h, pair), mone), 4);
-                    const __m512i q = _mm512_or_si512(join256(_mm256_and_si256(bits, m4),
-                        _mm256_and_si256(_mm256_srli_epi16(bits, 4), m4)), high);
-                    const __m512i a = _mm512_loadu_si512(q8 + 64 * j);
-                    sumi = _mm512_dpwssd_epi32(sumi, _mm512_permutexvar_epi16(pair, scales),
-                        _mm512_maddubs_epi16(q, a));
-                }
-                acc = _mm512_fmadd_ps(_mm512_set1_ps(d), _mm512_cvtepi32_ps(sumi), acc);
-            }
-            return hsum512_ps(acc) + summs;
-        }
-
-        /*
-            Q6_K on 64 weights per vector, in the order of their activations: the low nibbles
-            of 64 bytes, then their high nibbles, with the two bits of qh that each takes.
-            The offset of 32 comes from the sums of the activations by 16, as in the 256-bit
-            kernel.
-        */
-        float dot_q6_K_avx512(const uint8_t* w, const block_q8_K* y, long n)
-        {
-            const __m512i m4 = _mm512_set1_epi8(0x0F);
-            const __m512i m2 = _mm512_set1_epi8(3);
-            __m256 acc = _mm256_setzero_ps();
-            for (long b = 0; b < n / 256; ++b, w += 210)
-            {
-                const float d = y[b].d * h2f(w + 208);
-                const uint8_t* q4 = w;
-                const uint8_t* qh = w + 128;
-                const int8_t* q8 = y[b].qs;
-                const __m256i sc16 = _mm256_cvtepi8_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(w + 192)));
-                const __m512i scales = _mm512_castsi256_si512(sc16);
-                const __m256i offset = _mm256_madd_epi16(sc16, load256(y[b].bsums));
-                __m512i sumi = _mm512_setzero_si512();
-                for (int j = 0; j < 2; ++j)
-                {
-                    const __m512i bits = _mm512_loadu_si512(q4 + 64 * j);
-                    const __m256i h256 = load256(qh + 32 * j);
-                    const __m512i h = join256(h256, h256);
-                    const __m512i qa = _mm512_or_si512(_mm512_and_si512(bits, m4), _mm512_slli_epi16(
-                        _mm512_and_si512(_mm512_srlv_epi16(h, halves_epi16(0, 2)), m2), 4));
-                    const __m512i qb = _mm512_or_si512(_mm512_and_si512(_mm512_srli_epi16(bits, 4), m4),
-                        _mm512_slli_epi16(_mm512_and_si512(_mm512_srlv_epi16(h, halves_epi16(4, 6)), m2), 4));
-                    const __m512i aa = _mm512_loadu_si512(q8 + 128 * j);
-                    const __m512i ab = _mm512_loadu_si512(q8 + 128 * j + 64);
-                    sumi = _mm512_dpwssd_epi32(sumi,
-                        _mm512_permutexvar_epi16(quarters_epi16(static_cast<short>(8 * j)), scales),
-                        _mm512_maddubs_epi16(qa, aa));
-                    sumi = _mm512_dpwssd_epi32(sumi,
-                        _mm512_permutexvar_epi16(quarters_epi16(static_cast<short>(8 * j + 4)), scales),
-                        _mm512_maddubs_epi16(qb, ab));
-                }
-                __m256i s = _mm256_add_epi32(_mm512_castsi512_si256(sumi), _mm512_extracti64x4_epi64(sumi, 1));
-                s = _mm256_sub_epi32(s, _mm256_slli_epi32(offset, 5));
-                acc = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(s), acc);
-            }
-            return hsum_ps(acc);
-        }
-
-        // The kernels of NT rows of activations, as those of AVX2 above.
-        template <int NT>
-        void dot_q4_K_avx512_rows(const uint8_t* w, const block_q8_K* const* y, long n, float* out)
-        {
-            const __m256i m4 = _mm256_set1_epi8(0x0F);
-            __m512 acc[NT];
-            __m128 acc_m[NT];
-            for (int t = 0; t < NT; ++t)
-            {
-                acc[t] = _mm512_setzero_ps();
-                acc_m[t] = _mm_setzero_ps();
-            }
-            for (long b = 0; b < n / 256; ++b, w += 144)
-            {
-                const float wd = h2f(w), wmin = h2f(w + 2);
-                uint32_t utmp[4];
-                unpack_k4_scales(w + 4, utmp);
-                const __m256i mins_and_scales = _mm256_cvtepu8_epi16(
-                    _mm_set_epi32(static_cast<int>(utmp[3]), static_cast<int>(utmp[2]),
-                                  static_cast<int>(utmp[1]), static_cast<int>(utmp[0])));
-                const __m128i mins = _mm256_extracti128_si256(mins_and_scales, 1);
-                const __m512i scales = _mm512_castsi256_si512(mins_and_scales);
-                const uint8_t* q4 = w + 16;
-                __m512i q[4], sc[4];
-                for (int j = 0; j < 4; ++j)
-                {
-                    const __m256i bits = load256(q4 + 32 * j);
-                    q[j] = join256(_mm256_and_si256(bits, m4), _mm256_and_si256(_mm256_srli_epi16(bits, 4), m4));
-                    sc[j] = _mm512_permutexvar_epi16(
-                        halves_epi16(static_cast<short>(2 * j), static_cast<short>(2 * j + 1)), scales);
-                }
-                for (int t = 0; t < NT; ++t)
-                {
-                    const block_q8_K& yb = y[t][b];
-                    const __m256i q8sums = load256(yb.bsums);
-                    const __m128i q8s = _mm_hadd_epi16(_mm256_extracti128_si256(q8sums, 0),
-                                                       _mm256_extracti128_si256(q8sums, 1));
-                    acc_m[t] = _mm_fmadd_ps(_mm_set1_ps(-yb.d * wmin), _mm_cvtepi32_ps(_mm_madd_epi16(mins, q8s)),
-                        acc_m[t]);
-                    __m512i sumi = _mm512_setzero_si512();
-                    for (int j = 0; j < 4; ++j)
-                        sumi = _mm512_dpwssd_epi32(sumi, sc[j],
-                            _mm512_maddubs_epi16(q[j], _mm512_loadu_si512(yb.qs + 64 * j)));
-                    acc[t] = _mm512_fmadd_ps(_mm512_set1_ps(yb.d * wd), _mm512_cvtepi32_ps(sumi), acc[t]);
-                }
-            }
-            for (int t = 0; t < NT; ++t)
-            {
-                __m128 m = _mm_add_ps(acc_m[t], _mm_movehl_ps(acc_m[t], acc_m[t]));
-                m = _mm_add_ss(m, _mm_movehdup_ps(m));
-                out[t] = hsum512_ps(acc[t]) + _mm_cvtss_f32(m);
-            }
-        }
-
-        template <int NT>
-        void dot_q6_K_avx512_rows(const uint8_t* w, const block_q8_K* const* y, long n, float* out)
-        {
-            const __m512i m4 = _mm512_set1_epi8(0x0F);
-            const __m512i m2 = _mm512_set1_epi8(3);
-            __m256 acc[NT];
-            for (int t = 0; t < NT; ++t) acc[t] = _mm256_setzero_ps();
-            for (long b = 0; b < n / 256; ++b, w += 210)
-            {
-                const float wd = h2f(w + 208);
-                const uint8_t* q4 = w;
-                const uint8_t* qh = w + 128;
-                const __m256i sc16 = _mm256_cvtepi8_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(w + 192)));
-                const __m512i scales = _mm512_castsi256_si512(sc16);
-                __m512i qa[2], qb[2], sa[2], sb[2];
-                for (int j = 0; j < 2; ++j)
-                {
-                    const __m512i bits = _mm512_loadu_si512(q4 + 64 * j);
-                    const __m256i h256 = load256(qh + 32 * j);
-                    const __m512i h = join256(h256, h256);
-                    qa[j] = _mm512_or_si512(_mm512_and_si512(bits, m4), _mm512_slli_epi16(
-                        _mm512_and_si512(_mm512_srlv_epi16(h, halves_epi16(0, 2)), m2), 4));
-                    qb[j] = _mm512_or_si512(_mm512_and_si512(_mm512_srli_epi16(bits, 4), m4),
-                        _mm512_slli_epi16(_mm512_and_si512(_mm512_srlv_epi16(h, halves_epi16(4, 6)), m2), 4));
-                    sa[j] = _mm512_permutexvar_epi16(quarters_epi16(static_cast<short>(8 * j)), scales);
-                    sb[j] = _mm512_permutexvar_epi16(quarters_epi16(static_cast<short>(8 * j + 4)), scales);
-                }
-                for (int t = 0; t < NT; ++t)
-                {
-                    const block_q8_K& yb = y[t][b];
-                    const __m256i offset = _mm256_madd_epi16(sc16, load256(yb.bsums));
-                    __m512i sumi = _mm512_setzero_si512();
-                    for (int j = 0; j < 2; ++j)
-                    {
-                        sumi = _mm512_dpwssd_epi32(sumi, sa[j],
-                            _mm512_maddubs_epi16(qa[j], _mm512_loadu_si512(yb.qs + 128 * j)));
-                        sumi = _mm512_dpwssd_epi32(sumi, sb[j],
-                            _mm512_maddubs_epi16(qb[j], _mm512_loadu_si512(yb.qs + 128 * j + 64)));
-                    }
-                    __m256i r = _mm256_add_epi32(_mm512_castsi512_si256(sumi), _mm512_extracti64x4_epi64(sumi, 1));
-                    r = _mm256_sub_epi32(r, _mm256_slli_epi32(offset, 5));
-                    acc[t] = _mm256_fmadd_ps(_mm256_set1_ps(yb.d * wd), _mm256_cvtepi32_ps(r), acc[t]);
-                }
-            }
-            for (int t = 0; t < NT; ++t) out[t] = hsum_ps(acc[t]);
-        }
-
-        // The first lanes of a vector of 16 floats, left of them or all 16.
-        inline __mmask16 tail_mask(long left)
-        {
-            return left >= 16 ? static_cast<__mmask16>(0xFFFF) : static_cast<__mmask16>((1u << left) - 1u);
-        }
-
-        float dot_f32_avx512(const float* a, const float* b, long n)
-        {
-            __m512 s0 = _mm512_setzero_ps(), s1 = _mm512_setzero_ps();
-            __m512 s2 = _mm512_setzero_ps(), s3 = _mm512_setzero_ps();
-            long i = 0;
-            for (; i + 64 <= n; i += 64)
-            {
-                s0 = _mm512_fmadd_ps(_mm512_loadu_ps(a + i), _mm512_loadu_ps(b + i), s0);
-                s1 = _mm512_fmadd_ps(_mm512_loadu_ps(a + i + 16), _mm512_loadu_ps(b + i + 16), s1);
-                s2 = _mm512_fmadd_ps(_mm512_loadu_ps(a + i + 32), _mm512_loadu_ps(b + i + 32), s2);
-                s3 = _mm512_fmadd_ps(_mm512_loadu_ps(a + i + 48), _mm512_loadu_ps(b + i + 48), s3);
-            }
-            for (; i < n; i += 16)
-            {
-                const __mmask16 m = tail_mask(n - i);
-                s0 = _mm512_fmadd_ps(_mm512_maskz_loadu_ps(m, a + i), _mm512_maskz_loadu_ps(m, b + i), s0);
-            }
-            return hsum512_ps(_mm512_add_ps(_mm512_add_ps(s0, s1), _mm512_add_ps(s2, s3)));
-        }
-
-        float dot_f16_avx512(const uint8_t* w, const float* x, long n)
-        {
-            const uint16_t* h = reinterpret_cast<const uint16_t*>(w);
-            __m512 s0 = _mm512_setzero_ps(), s1 = _mm512_setzero_ps();
-            long i = 0;
-            for (; i + 32 <= n; i += 32)
-            {
-                s0 = _mm512_fmadd_ps(_mm512_cvtph_ps(load256(h + i)), _mm512_loadu_ps(x + i), s0);
-                s1 = _mm512_fmadd_ps(_mm512_cvtph_ps(load256(h + i + 16)), _mm512_loadu_ps(x + i + 16), s1);
-            }
-            for (; i + 16 <= n; i += 16)
-                s0 = _mm512_fmadd_ps(_mm512_cvtph_ps(load256(h + i)), _mm512_loadu_ps(x + i), s0);
-            float s = hsum512_ps(_mm512_add_ps(s0, s1));
-            for (; i < n; ++i) s += h2f(h[i]) * x[i];
-            return s;
-        }
     }
 #endif
 
@@ -1878,20 +1501,7 @@ namespace albireo
 
     float qk_dot(ggml_type t, const uint8_t* w, const void* act, long n)
     {
-#if ALBIREO_QK_AVX512
-        switch (t)
-        {
-        case ggml_type::Q4_0: return dot_q4_0_avx512(w, static_cast<const block_q8_0x*>(act), n);
-        case ggml_type::Q8_0: return dot_q8_0_avx512(w, static_cast<const block_q8_0x*>(act), n);
-        case ggml_type::Q4_K: return dot_q4_K_avx512(w, static_cast<const block_q8_K*>(act), n);
-        case ggml_type::Q5_K: return dot_q5_K_avx512(w, static_cast<const block_q8_K*>(act), n);
-        case ggml_type::Q6_K: return dot_q6_K_avx512(w, static_cast<const block_q8_K*>(act), n);
-        case ggml_type::F32:
-            return dot_f32_avx512(reinterpret_cast<const float*>(w), static_cast<const float*>(act), n);
-        case ggml_type::F16: return dot_f16_avx512(w, static_cast<const float*>(act), n);
-        default: break;
-        }
-#elif ALBIREO_QK_VNNI
+#if ALBIREO_QK_VNNI
         switch (t)
         {
         case ggml_type::Q4_0: return dot_q4_0_vnni(w, static_cast<const block_q8_0x*>(act), n);
@@ -1934,9 +1544,7 @@ namespace albireo
             {
                 const block_q8_K* y[4];
                 for (long i = 0; i < nt; ++i) y[i] = reinterpret_cast<const block_q8_K*>(act[i]);
-#if ALBIREO_QK_AVX512
-#define ALBIREO_QK_ROWS(type, k) dot_##type##_avx512_rows<k>(w, y, n, out)
-#elif ALBIREO_QK_VNNI
+#if ALBIREO_QK_VNNI
 #define ALBIREO_QK_ROWS(type, k) dot_##type##_vnni_rows<k>(w, y, n, out)
 #else
 #define ALBIREO_QK_ROWS(type, k) dot_##type##_avx2_rows<k>(w, y, n, out)
@@ -2099,7 +1707,7 @@ namespace albireo
             *out = accumulate ? *out + v : v;
         }
 
-#if ALBIREO_QK_AVX2 && !ALBIREO_QK_AVX512
+#if ALBIREO_QK_AVX2
         /*
             Y[t][r] (+)= sum_k X[t][k] * W[r][k] for 3 tokens and 4 rows, the rows of W
             being contiguous floats of length K.  Every pair keeps its own accumulator,
@@ -2168,85 +1776,6 @@ namespace albireo
         }
 #endif
 
-#if ALBIREO_QK_AVX512
-        /*
-            The products of 4 tokens and 4 rows on vectors of 16 floats: 16 accumulators,
-            4 vectors of X and one of W, among the 32 registers of AVX-512.  The last columns,
-            fewer than 16, are read through a mask.
-        */
-        void gemm_4x4_avx512(const float* X, long xs, const float* W, long K, float* Y, long ys, bool accumulate)
-        {
-            const float* x0 = X;
-            const float* x1 = X + xs;
-            const float* x2 = X + 2 * xs;
-            const float* x3 = X + 3 * xs;
-            const float* w0 = W;
-            const float* w1 = W + K;
-            const float* w2 = W + 2 * K;
-            const float* w3 = W + 3 * K;
-            const __m512 zero = _mm512_setzero_ps();
-            __m512 a00 = zero, a01 = zero, a02 = zero, a03 = zero;
-            __m512 a10 = zero, a11 = zero, a12 = zero, a13 = zero;
-            __m512 a20 = zero, a21 = zero, a22 = zero, a23 = zero;
-            __m512 a30 = zero, a31 = zero, a32 = zero, a33 = zero;
-            for (long k = 0; k < K; k += 16)
-            {
-                const __mmask16 m = tail_mask(K - k);
-                const __m512 v0 = _mm512_maskz_loadu_ps(m, x0 + k);
-                const __m512 v1 = _mm512_maskz_loadu_ps(m, x1 + k);
-                const __m512 v2 = _mm512_maskz_loadu_ps(m, x2 + k);
-                const __m512 v3 = _mm512_maskz_loadu_ps(m, x3 + k);
-                __m512 w = _mm512_maskz_loadu_ps(m, w0 + k);
-                a00 = _mm512_fmadd_ps(v0, w, a00); a10 = _mm512_fmadd_ps(v1, w, a10);
-                a20 = _mm512_fmadd_ps(v2, w, a20); a30 = _mm512_fmadd_ps(v3, w, a30);
-                w = _mm512_maskz_loadu_ps(m, w1 + k);
-                a01 = _mm512_fmadd_ps(v0, w, a01); a11 = _mm512_fmadd_ps(v1, w, a11);
-                a21 = _mm512_fmadd_ps(v2, w, a21); a31 = _mm512_fmadd_ps(v3, w, a31);
-                w = _mm512_maskz_loadu_ps(m, w2 + k);
-                a02 = _mm512_fmadd_ps(v0, w, a02); a12 = _mm512_fmadd_ps(v1, w, a12);
-                a22 = _mm512_fmadd_ps(v2, w, a22); a32 = _mm512_fmadd_ps(v3, w, a32);
-                w = _mm512_maskz_loadu_ps(m, w3 + k);
-                a03 = _mm512_fmadd_ps(v0, w, a03); a13 = _mm512_fmadd_ps(v1, w, a13);
-                a23 = _mm512_fmadd_ps(v2, w, a23); a33 = _mm512_fmadd_ps(v3, w, a33);
-            }
-            store_result(Y, hsum512_ps(a00), accumulate);
-            store_result(Y + 1, hsum512_ps(a01), accumulate);
-            store_result(Y + 2, hsum512_ps(a02), accumulate);
-            store_result(Y + 3, hsum512_ps(a03), accumulate);
-            store_result(Y + ys, hsum512_ps(a10), accumulate);
-            store_result(Y + ys + 1, hsum512_ps(a11), accumulate);
-            store_result(Y + ys + 2, hsum512_ps(a12), accumulate);
-            store_result(Y + ys + 3, hsum512_ps(a13), accumulate);
-            store_result(Y + 2 * ys, hsum512_ps(a20), accumulate);
-            store_result(Y + 2 * ys + 1, hsum512_ps(a21), accumulate);
-            store_result(Y + 2 * ys + 2, hsum512_ps(a22), accumulate);
-            store_result(Y + 2 * ys + 3, hsum512_ps(a23), accumulate);
-            store_result(Y + 3 * ys, hsum512_ps(a30), accumulate);
-            store_result(Y + 3 * ys + 1, hsum512_ps(a31), accumulate);
-            store_result(Y + 3 * ys + 2, hsum512_ps(a32), accumulate);
-            store_result(Y + 3 * ys + 3, hsum512_ps(a33), accumulate);
-        }
-
-        // One token against 4 rows, for the tokens left over by gemm_4x4_avx512.
-        void gemm_1x4_avx512(const float* X, const float* W, long K, float* Y, bool accumulate)
-        {
-            const __m512 zero = _mm512_setzero_ps();
-            __m512 a0 = zero, a1 = zero, a2 = zero, a3 = zero;
-            for (long k = 0; k < K; k += 16)
-            {
-                const __mmask16 m = tail_mask(K - k);
-                const __m512 v = _mm512_maskz_loadu_ps(m, X + k);
-                a0 = _mm512_fmadd_ps(v, _mm512_maskz_loadu_ps(m, W + k), a0);
-                a1 = _mm512_fmadd_ps(v, _mm512_maskz_loadu_ps(m, W + K + k), a1);
-                a2 = _mm512_fmadd_ps(v, _mm512_maskz_loadu_ps(m, W + 2 * K + k), a2);
-                a3 = _mm512_fmadd_ps(v, _mm512_maskz_loadu_ps(m, W + 3 * K + k), a3);
-            }
-            store_result(Y, hsum512_ps(a0), accumulate);
-            store_result(Y + 1, hsum512_ps(a1), accumulate);
-            store_result(Y + 2, hsum512_ps(a2), accumulate);
-            store_result(Y + 3, hsum512_ps(a3), accumulate);
-        }
-#endif
 
         // The products of n_rows contiguous float rows of W with n_tokens rows of X,
         // written to the first n_rows columns of Y.
@@ -2255,17 +1784,7 @@ namespace albireo
         {
             long t = 0;
             long r4 = 0;
-#if ALBIREO_QK_AVX512
-            r4 = n_rows / 4 * 4;
-            for (; t + 4 <= n_tokens; t += 4)
-                for (long r = 0; r < r4; r += 4)
-                    gemm_4x4_avx512(X + t * x_stride, x_stride, W + r * K, K, Y + t * y_stride + r, y_stride,
-                        accumulate);
-            for (long u = t; u < n_tokens; ++u)
-                for (long r = 0; r < r4; r += 4)
-                    gemm_1x4_avx512(X + u * x_stride, W + r * K, K, Y + u * y_stride + r, accumulate);
-            t = 0;
-#elif ALBIREO_QK_AVX2
+#if ALBIREO_QK_AVX2
             r4 = n_rows / 4 * 4;
             for (; t + 3 <= n_tokens; t += 3)
                 for (long r = 0; r < r4; r += 4)
@@ -2293,25 +1812,16 @@ namespace albireo
             multiplies one load of weights by each token: every value read serves several
             multiply-adds, and the panels of a slice stay in the caches while they are read.
         */
-#if ALBIREO_QK_AVX512
-        const long packed_rows = 32;    // two vectors of 16 floats
-#else
         const long packed_rows = 16;    // two vectors of 8 floats
-#endif
         const long packed_tokens = 6;
         const long packed_depth = 256;  // a multiple of the block of every quantization type
         const long packed_tile = 64;    // rows of weights per task
         /*
             Below these passes, expanding and laying out the weights costs more than the
-            packed kernel saves (measured on Qwen3 1.7B with two threads: with AVX-512, as
-            fast as the kernel of the rows at 32 tokens, 1.2 times faster at 48 and twice at
-            128; with AVX2, even at 128 tokens and 1.05 to 1.25 times faster at 512).
+            packed kernel saves (measured with two threads: the packed kernel is as fast as the
+            kernel of the rows at 128 tokens, and 1.05 to 1.25 times faster at 512).
         */
-#if ALBIREO_QK_AVX512
-        const long packed_min_tokens = 32;
-#else
         const long packed_min_tokens = 256;
-#endif
         // The floats of the packed tokens a thread keeps from one product to the next (16 MB).
         const size_t packed_tokens_kept = size_t(1) << 22;
 
@@ -2327,34 +1837,6 @@ namespace albireo
         // weights w and a panel of tokens x.
         void packed_kernel(const float* w, const float* x, long depth, float* c)
         {
-#if ALBIREO_QK_AVX512
-            const __m512 zero = _mm512_setzero_ps();
-            __m512 c00 = zero, c01 = zero, c10 = zero, c11 = zero, c20 = zero, c21 = zero;
-            __m512 c30 = zero, c31 = zero, c40 = zero, c41 = zero, c50 = zero, c51 = zero;
-            for (long k = 0; k < depth; ++k, w += 32, x += 6)
-            {
-                const __m512 w0 = _mm512_load_ps(w);
-                const __m512 w1 = _mm512_load_ps(w + 16);
-                __m512 b = _mm512_set1_ps(x[0]);
-                c00 = _mm512_fmadd_ps(w0, b, c00); c01 = _mm512_fmadd_ps(w1, b, c01);
-                b = _mm512_set1_ps(x[1]);
-                c10 = _mm512_fmadd_ps(w0, b, c10); c11 = _mm512_fmadd_ps(w1, b, c11);
-                b = _mm512_set1_ps(x[2]);
-                c20 = _mm512_fmadd_ps(w0, b, c20); c21 = _mm512_fmadd_ps(w1, b, c21);
-                b = _mm512_set1_ps(x[3]);
-                c30 = _mm512_fmadd_ps(w0, b, c30); c31 = _mm512_fmadd_ps(w1, b, c31);
-                b = _mm512_set1_ps(x[4]);
-                c40 = _mm512_fmadd_ps(w0, b, c40); c41 = _mm512_fmadd_ps(w1, b, c41);
-                b = _mm512_set1_ps(x[5]);
-                c50 = _mm512_fmadd_ps(w0, b, c50); c51 = _mm512_fmadd_ps(w1, b, c51);
-            }
-            _mm512_store_ps(c, c00); _mm512_store_ps(c + 16, c01);
-            _mm512_store_ps(c + 32, c10); _mm512_store_ps(c + 48, c11);
-            _mm512_store_ps(c + 64, c20); _mm512_store_ps(c + 80, c21);
-            _mm512_store_ps(c + 96, c30); _mm512_store_ps(c + 112, c31);
-            _mm512_store_ps(c + 128, c40); _mm512_store_ps(c + 144, c41);
-            _mm512_store_ps(c + 160, c50); _mm512_store_ps(c + 176, c51);
-#else
             const __m256 zero = _mm256_setzero_ps();
             __m256 c00 = zero, c01 = zero, c10 = zero, c11 = zero, c20 = zero, c21 = zero;
             __m256 c30 = zero, c31 = zero, c40 = zero, c41 = zero, c50 = zero, c51 = zero;
@@ -2381,7 +1863,6 @@ namespace albireo
             _mm256_store_ps(c + 48, c30); _mm256_store_ps(c + 56, c31);
             _mm256_store_ps(c + 64, c40); _mm256_store_ps(c + 72, c41);
             _mm256_store_ps(c + 80, c50); _mm256_store_ps(c + 88, c51);
-#endif
         }
 
         // Expands rows [r0, r0 + n) of W, columns [k0, k0 + depth), into panels of packed_rows
@@ -2613,9 +2094,7 @@ namespace albireo
 
     float qk_dot_f32(const float* a, const float* b, long n)
     {
-#if ALBIREO_QK_AVX512
-        return dot_f32_avx512(a, b, n);
-#elif ALBIREO_QK_AVX2
+#if ALBIREO_QK_AVX2
         return dot_f32_avx2(a, b, n);
 #else
         return dot_f32_ref(a, b, n);
@@ -2624,9 +2103,7 @@ namespace albireo
 
     float qk_dot_f32_f16(const float* a, const uint16_t* b, long n)
     {
-#if ALBIREO_QK_AVX512
-        return dot_f16_avx512(reinterpret_cast<const uint8_t*>(b), a, n);
-#elif ALBIREO_QK_AVX2
+#if ALBIREO_QK_AVX2
         return dot_f16_avx2(reinterpret_cast<const uint8_t*>(b), a, n);
 #else
         return dot_f16_ref(reinterpret_cast<const uint8_t*>(b), a, n);
@@ -2636,14 +2113,6 @@ namespace albireo
     void qk_axpy_f16(float alpha, const uint16_t* x, float* y, long n)
     {
         long i = 0;
-#if ALBIREO_QK_AVX512
-        const __m512 a16 = _mm512_set1_ps(alpha);
-        for (; i + 16 <= n; i += 16)
-        {
-            const __m512 xv = _mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(x + i)));
-            _mm512_storeu_ps(y + i, _mm512_fmadd_ps(a16, xv, _mm512_loadu_ps(y + i)));
-        }
-#endif
 #if ALBIREO_QK_AVX2
         const __m256 a = _mm256_set1_ps(alpha);
         for (; i + 8 <= n; i += 8)
@@ -2777,12 +2246,6 @@ namespace albireo
             return _mm_add_ps(_mm256_castps256_ps128(s), _mm256_extractf128_ps(s, 1));
         }
 #endif
-#if ALBIREO_QK_AVX512
-        inline __m256 fold512(__m512 a)
-        {
-            return _mm256_add_ps(_mm512_castps512_ps256(a), _mm512_extractf32x8_ps(a, 1));
-        }
-#endif
 
         /*
             The dot products of R rows of queries (R being 1 or 2) with four consecutive keys
@@ -2792,34 +2255,7 @@ namespace albireo
         void dot_rows_x4(const float* const* q, const float* k, long hd, float* const* s)
         {
             long i = 0;
-#if ALBIREO_QK_AVX512
-            __m512 w[R][4];
-            for (int r = 0; r < R; ++r)
-                for (int c = 0; c < 4; ++c) w[r][c] = _mm512_setzero_ps();
-            for (; i + 16 <= hd; i += 16)
-            {
-                __m512 x[R];
-                for (int r = 0; r < R; ++r) x[r] = _mm512_loadu_ps(q[r] + i);
-                for (int c = 0; c < 4; ++c)
-                {
-                    const __m512 kv = _mm512_loadu_ps(k + c * hd + i);
-                    for (int r = 0; r < R; ++r) w[r][c] = _mm512_fmadd_ps(x[r], kv, w[r][c]);
-                }
-            }
-            if (i < hd)
-            {
-                const __mmask16 mk = tail_mask(hd - i);
-                __m512 x[R];
-                for (int r = 0; r < R; ++r) x[r] = _mm512_maskz_loadu_ps(mk, q[r] + i);
-                for (int c = 0; c < 4; ++c)
-                {
-                    const __m512 kv = _mm512_maskz_loadu_ps(mk, k + c * hd + i);
-                    for (int r = 0; r < R; ++r) w[r][c] = _mm512_fmadd_ps(x[r], kv, w[r][c]);
-                }
-            }
-            for (int r = 0; r < R; ++r)
-                _mm_storeu_ps(s[r], hsum4_ps(fold512(w[r][0]), fold512(w[r][1]), fold512(w[r][2]), fold512(w[r][3])));
-#elif ALBIREO_QK_AVX2
+#if ALBIREO_QK_AVX2
             __m256 w[R][4];
             for (int r = 0; r < R; ++r)
                 for (int c = 0; c < 4; ++c) w[r][c] = _mm256_setzero_ps();
@@ -2861,39 +2297,7 @@ namespace albireo
         void add_weighted_rows(const float* const* p, const float* v, long g, long hd, float* const* o)
         {
             long i = 0;
-#if ALBIREO_QK_AVX512
-            for (; i + 64 <= hd; i += 64)
-            {
-                __m512 a[R][4];
-                for (int r = 0; r < R; ++r)
-                    for (int c = 0; c < 4; ++c) a[r][c] = _mm512_loadu_ps(o[r] + i + 16 * c);
-                for (long j = 0; j < g; ++j)
-                {
-                    const float* vr = v + j * hd + i;
-                    __m512 wr[R];
-                    for (int r = 0; r < R; ++r) wr[r] = _mm512_set1_ps(p[r][j]);
-                    for (int c = 0; c < 4; ++c)
-                    {
-                        const __m512 x = _mm512_loadu_ps(vr + 16 * c);
-                        for (int r = 0; r < R; ++r) a[r][c] = _mm512_fmadd_ps(wr[r], x, a[r][c]);
-                    }
-                }
-                for (int r = 0; r < R; ++r)
-                    for (int c = 0; c < 4; ++c) _mm512_storeu_ps(o[r] + i + 16 * c, a[r][c]);
-            }
-            for (; i < hd; i += 16)
-            {
-                const __mmask16 mk = tail_mask(hd - i);
-                __m512 a[R];
-                for (int r = 0; r < R; ++r) a[r] = _mm512_maskz_loadu_ps(mk, o[r] + i);
-                for (long j = 0; j < g; ++j)
-                {
-                    const __m512 x = _mm512_maskz_loadu_ps(mk, v + j * hd + i);
-                    for (int r = 0; r < R; ++r) a[r] = _mm512_fmadd_ps(_mm512_set1_ps(p[r][j]), x, a[r]);
-                }
-                for (int r = 0; r < R; ++r) _mm512_mask_storeu_ps(o[r] + i, mk, a[r]);
-            }
-#elif ALBIREO_QK_AVX2
+#if ALBIREO_QK_AVX2
             for (; i + 32 <= hd; i += 32)
             {
                 __m256 a[R][4];
@@ -3133,44 +2537,16 @@ namespace albireo
         // against them take 32 kilobytes.
         const long encoder_block_keys = 128;
 
-#if ALBIREO_QK_AVX512
-        inline __mmask16 lanes(long left)
-        {
-            return left >= 16 ? static_cast<__mmask16>(0xFFFF)
-                : left <= 0 ? static_cast<__mmask16>(0) : static_cast<__mmask16>((1u << left) - 1u);
-        }
-#endif
 
         /*
             S[r * lds + j] = sum over d < hd of Q[r * hd + d] * Kt[d * ldk + j], for R rows and the
-            n keys of a group: up to 32 with AVX-512, exactly 16 with AVX2, any number otherwise.
+            n keys of a group: exactly 16 with AVX2, any number otherwise.
             Each key of Kt is read once for the R rows, without any horizontal sum.
         */
         template <int R>
         void encoder_scores_group(const float* Q, long hd, const float* Kt, long ldk, long n, float* S, long lds)
         {
-#if ALBIREO_QK_AVX512
-            const __mmask16 m0 = lanes(n), m1 = lanes(n - 16);
-            __m512 a0[R], a1[R];
-            for (int r = 0; r < R; ++r) a0[r] = a1[r] = _mm512_setzero_ps();
-            for (long d = 0; d < hd; ++d)
-            {
-                const float* k = Kt + d * ldk;
-                const __m512 k0 = _mm512_maskz_loadu_ps(m0, k);
-                const __m512 k1 = _mm512_maskz_loadu_ps(m1, k + 16);
-                for (int r = 0; r < R; ++r)
-                {
-                    const __m512 q = _mm512_set1_ps(Q[r * hd + d]);
-                    a0[r] = _mm512_fmadd_ps(q, k0, a0[r]);
-                    a1[r] = _mm512_fmadd_ps(q, k1, a1[r]);
-                }
-            }
-            for (int r = 0; r < R; ++r)
-            {
-                _mm512_mask_storeu_ps(S + r * lds, m0, a0[r]);
-                _mm512_mask_storeu_ps(S + r * lds + 16, m1, a1[r]);
-            }
-#elif ALBIREO_QK_AVX2
+#if ALBIREO_QK_AVX2
             (void)n;
             __m256 a0[R], a1[R];
             for (int r = 0; r < R; ++r) a0[r] = a1[r] = _mm256_setzero_ps();
@@ -3204,11 +2580,7 @@ namespace albireo
 
         void encoder_scores(const float* Q, long rows, long hd, const float* Kt, long ldk, long n, float* S, long lds)
         {
-#if ALBIREO_QK_AVX512
-            const long G = 32;
-#else
             const long G = 16;
-#endif
             for (long r = 0; r < rows; r += 6)
             {
                 const long R = std::min<long>(6, rows - r);
@@ -3217,7 +2589,7 @@ namespace albireo
                 {
                     const long g = std::min(G, n - j);
                     float* s = S + r * lds + j;
-#if ALBIREO_QK_AVX2 && !ALBIREO_QK_AVX512
+#if ALBIREO_QK_AVX2
                     if (g < G)
                     {
                         // The last keys of a block, fewer than a vector pair.
@@ -3246,33 +2618,14 @@ namespace albireo
 
         /*
             O[r * ldo + i] += sum over j < n of P[r * lds + j] * V[j * ldv + i], for R rows and
-            the w dimensions of a group: up to 64 with AVX-512, exactly 32 with AVX2, any number
-            otherwise.  Each row of V is read once for the R rows.
+            the w dimensions of a group: exactly 32 with AVX2, any number otherwise.  Each row of
+            V is read once for the R rows.
         */
         template <int R>
         void encoder_values_group(const float* P, long lds, const float* V, long ldv, long n, long w, float* O,
             long ldo)
         {
-#if ALBIREO_QK_AVX512
-            __mmask16 m[4];
-            for (int c = 0; c < 4; ++c) m[c] = lanes(w - 16 * c);
-            __m512 a[R][4];
-            for (int r = 0; r < R; ++r)
-                for (int c = 0; c < 4; ++c) a[r][c] = _mm512_maskz_loadu_ps(m[c], O + r * ldo + 16 * c);
-            for (long j = 0; j < n; ++j)
-            {
-                const float* v = V + j * ldv;
-                __m512 x[4];
-                for (int c = 0; c < 4; ++c) x[c] = _mm512_maskz_loadu_ps(m[c], v + 16 * c);
-                for (int r = 0; r < R; ++r)
-                {
-                    const __m512 p = _mm512_set1_ps(P[r * lds + j]);
-                    for (int c = 0; c < 4; ++c) a[r][c] = _mm512_fmadd_ps(p, x[c], a[r][c]);
-                }
-            }
-            for (int r = 0; r < R; ++r)
-                for (int c = 0; c < 4; ++c) _mm512_mask_storeu_ps(O + r * ldo + 16 * c, m[c], a[r][c]);
-#elif ALBIREO_QK_AVX2
+#if ALBIREO_QK_AVX2
             (void)w;
             __m256 a[R][4];
             for (int r = 0; r < R; ++r)
@@ -3303,9 +2656,7 @@ namespace albireo
         void encoder_values(const float* P, long lds, long rows, const float* V, long ldv, long n, long hd, float* O,
             long ldo)
         {
-#if ALBIREO_QK_AVX512
-            const long RG = 6, W = 64;
-#elif ALBIREO_QK_AVX2
+#if ALBIREO_QK_AVX2
             const long RG = 2, W = 32;
 #else
             const long RG = 1, W = hd;
@@ -3318,7 +2669,7 @@ namespace albireo
                     const long w = std::min(W, hd - i);
                     const float* p = P + r * lds;
                     float* o = O + r * ldo + i;
-#if ALBIREO_QK_AVX2 && !ALBIREO_QK_AVX512
+#if ALBIREO_QK_AVX2
                     if (w < W)
                     {
                         for (long e = 0; e < R; ++e)
@@ -3330,12 +2681,6 @@ namespace albireo
 #if ALBIREO_QK_AVX2
                     switch (R)
                     {
-#if ALBIREO_QK_AVX512
-                    case 6: encoder_values_group<6>(p, lds, V + i, ldv, n, w, o, ldo); break;
-                    case 5: encoder_values_group<5>(p, lds, V + i, ldv, n, w, o, ldo); break;
-                    case 4: encoder_values_group<4>(p, lds, V + i, ldv, n, w, o, ldo); break;
-                    case 3: encoder_values_group<3>(p, lds, V + i, ldv, n, w, o, ldo); break;
-#endif
                     case 2: encoder_values_group<2>(p, lds, V + i, ldv, n, w, o, ldo); break;
                     default: encoder_values_group<1>(p, lds, V + i, ldv, n, w, o, ldo); break;
                     }

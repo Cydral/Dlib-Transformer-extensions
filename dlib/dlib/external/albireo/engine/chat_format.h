@@ -117,9 +117,10 @@ namespace albireo
                   <tool_call>) and a reasoning closed at once by "<think></think>" when the
                   request asks for none.
                 - phi: Phi-4-mini, each message between <|role|> and <|end|>.
-                - foundation-sec: Foundation-Sec-8B-Reasoning, turns opened by <|system|>,
-                  <|user|> and <|assistant|>, answers ended by the end of text token, and a
-                  reasoning the model always writes before its answer.
+                - foundation-sec: Foundation-Sec-8B-Reasoning, turns opened on a new line by
+                  <|system|>, <|user|> and <|assistant|>, answers ended by the end of text
+                  token, and a reasoning that the prompt opens with <think> and the model
+                  closes with </think> before its answer.
         !*/
     public:
         virtual ~chat_format() {}

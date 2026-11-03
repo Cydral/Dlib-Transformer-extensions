@@ -205,6 +205,19 @@ namespace albireo
         // the processor computes it.
         const size_t max_staged_bytes = size_t(512) << 20;
 
+        /*
+            The tokens of a product from which a matrix without a copy on the device crosses the
+            bus for that product alone: below, the processor computes it from the quantized weights
+            faster than the matrix in single precision crosses the bus.
+        */
+        const long staged_min_tokens = 128;
+
+        // The bytes of a matrix in single precision that cross the bus at a time when its copy is made.
+        const size_t upload_block_bytes = size_t(64) << 20;
+
+        // The memory of the card the copies leave to the products, the staged matrices and cuBLAS.
+        const size_t card_reserve_bytes = size_t(1) << 30;
+
         // Samples of each place before the first choice of a shape.
         const int samples_per_place = 2;
 
@@ -527,19 +540,53 @@ namespace albireo
             d_.device_us += static_cast<unsigned long long>(seconds * 1e6);
         }
 
-        // Expands the rows of W to single precision floats, with the threads of the engine.
-        void expand(const weight_matrix& W, float* dst)
+        // Expands the rows [first, first + count) of W to single precision floats, with the threads of the engine.
+        void expand_rows(const weight_matrix& W, long first, long count, float* dst)
         {
             const long cols = W.cols;
             const long rows_per_task = std::max<long>(1, 262144 / std::max<long>(1, cols));
-            const long tasks = (W.rows + rows_per_task - 1) / rows_per_task;
+            const long tasks = (count + rows_per_task - 1) / rows_per_task;
             d_.pool.parallel_for(tasks, [&](long task, int) {
                 const long a = task * rows_per_task;
-                const long b = std::min(W.rows, a + rows_per_task);
+                const long b = std::min(count, a + rows_per_task);
                 for (long r = a; r < b; ++r)
-                    qk_dequantize_row(W.type, W.data + static_cast<size_t>(r) * W.row_bytes, dst + r * cols, cols);
+                    qk_dequantize_row(W.type, W.data + static_cast<size_t>(first + r) * W.row_bytes, dst + r * cols,
+                        cols);
             });
         }
+
+        // Expands the rows of W to single precision floats, with the threads of the engine.
+        void expand(const weight_matrix& W, float* dst)
+        {
+            expand_rows(W, 0, W.rows, dst);
+        }
+
+#if defined(DLIB_USE_CUDA)
+        /*
+            Expands W into the memory of the card at dst, by blocks of rows of upload_block_bytes at
+            most that a buffer of the host holds in turn: the copy has no image in the memory of the
+            host, and the extended memory gives the block of its tensor a place on the card alone.
+        */
+        void upload_expanded(const weight_matrix& W, float* dst)
+        {
+            const long cols = W.cols;
+            const size_t row_bytes = sizeof(float) * static_cast<size_t>(std::max<long>(1, cols));
+            const long block = std::max<long>(1,
+                std::min<long>(W.rows, static_cast<long>(upload_block_bytes / row_bytes)));
+            const size_t values = static_cast<size_t>(block) * static_cast<size_t>(cols);
+            if (expanded_.size() < values) expanded_.resize(values);
+            for (long first = 0; first < W.rows; first += block)
+            {
+                const long count = std::min(block, W.rows - first);
+                expand_rows(W, first, count, expanded_.data());
+                cuda_check(cudaMemcpy(dst + static_cast<size_t>(first) * cols, expanded_.data(),
+                    sizeof(float) * static_cast<size_t>(count) * cols, cudaMemcpyHostToDevice),
+                    "copy of a matrix to the device");
+            }
+            // The buffer of a large matrix goes back to the system.
+            if (expanded_.size() * sizeof(float) > upload_block_bytes) std::vector<float>().swap(expanded_);
+        }
+#endif
 
         // The copy of W, made when it fits in the budget; null otherwise.  created tells
         // whether this call made it.
@@ -566,7 +613,11 @@ namespace albireo
             {
                 c.t.reset(new dlib::resizable_tensor());
                 c.t->set_size(W.rows, W.cols);
+#if defined(DLIB_USE_CUDA)
+                upload_expanded(W, c.t->device_write_only());
+#else
                 expand(W, c.t->host_write_only());
+#endif
             }
             catch (...)
             {
@@ -641,20 +692,30 @@ namespace albireo
                 for (long t = 0; t < n; ++t) std::memcpy(Y + t * y_stride, yp + t * rows, sizeof(float) * rows);
         }
 
+        // The outcome of device_product().
+        enum class placed
+        {
+            steady,     // computed on the device, in a time that reflects the products to come
+            created,    // computed on the device after the copy of the matrix was made
+            declined    // left to the processor: a matrix without a copy, for a product of few tokens
+        };
+
         /*
-            The product on the device.  Returns false when the time it took does not reflect
-            the products to come, because it made the copy of the weights.  Throws when the
-            matrix cannot go to the device at all.
+            The product on the device.  A matrix without a copy, whose copy does not fit, crosses
+            the bus for this product alone when it has staged_min_tokens tokens at least, and is
+            declined otherwise.  Throws when the matrix cannot go to the device at all.
         */
-        bool device_product(const weight_matrix& W, const float* X, long n, long x_stride, float* Y, long y_stride)
+        placed device_product(const weight_matrix& W, const float* X, long n, long x_stride, float* Y,
+            long y_stride)
         {
             bool created = false;
             const dlib::tensor* w = resident_copy(W, created);
             if (w)
             {
                 device_gemm(*w, W.rows, W.cols, X, n, x_stride, Y, y_stride);
-                return !created;
+                return created ? placed::created : placed::steady;
             }
+            if (n < staged_min_tokens) return placed::declined;
             const size_t values = static_cast<size_t>(W.rows) * static_cast<size_t>(W.cols);
             if (values * sizeof(float) > max_staged_bytes) throw beyond_budget();
             reserve_buffer(w_, values);
@@ -670,7 +731,7 @@ namespace albireo
             expand(W, staged.host_write_only());
 #endif
             device_gemm(staged, W.rows, W.cols, X, n, x_stride, Y, y_stride);
-            return true;
+            return placed::steady;
         }
 
         void decide(route& r, const std::tuple<long, long, int>& key)
@@ -727,7 +788,15 @@ namespace albireo
                 const clock_type::time_point t0 = clock_type::now();
                 try
                 {
-                    steady = device_product(W, X, n, x_stride, Y, y_stride);
+                    const placed p = device_product(W, X, n, x_stride, Y, y_stride);
+                    if (p == placed::declined)
+                    {
+                        // A matrix the card does not hold, for a few tokens: the processor computes
+                        // it, and the measures of the shape, which the matrices it holds give, stay.
+                        host_product(host);
+                        return;
+                    }
+                    steady = p == placed::steady;
                     r.memory_failures = 0;
                 }
                 catch (const beyond_budget&)
@@ -1000,11 +1069,17 @@ namespace albireo
         else if (d.v2ram)
         {
             const dlib::extended_memory_stats s = dlib::get_extended_memory_stats();
-            // Beyond the card, the file of the extended memory stays mostly in the memory of
-            // the host when it is not given a size.
-            const size_t beyond = config["v2ram_max_mb"].as_int(0) > 0 ? s.store_capacity
-                : std::min<size_t>(s.store_capacity > 0 ? s.store_capacity : s.vram_budget, available / 2);
-            d.budget = s.vram_budget + beyond;
+            /*
+                The copies stay within the memory of the card, less what the products, the matrices
+                that cross the bus for a long prompt and cuBLAS take: beyond it, the extended memory
+                would bring them over the bus and through its file at each pass, which a generated
+                token then waits for, and the matrices left out run on the processor from their
+                quantized weights.  A size given to the file of the extended memory (v2ram_max_mb)
+                lets the copies go beyond the card into it.
+            */
+            const size_t reserve = std::min(card_reserve_bytes, s.vram_budget / 4);
+            d.budget = s.vram_budget - reserve;
+            if (config["v2ram_max_mb"].as_int(0) > 0) d.budget += s.store_capacity;
         }
         else
         {

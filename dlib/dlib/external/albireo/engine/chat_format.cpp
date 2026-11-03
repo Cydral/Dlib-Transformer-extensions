@@ -1595,11 +1595,17 @@ namespace albireo
         };
 
         /*
-            The format of Foundation-Sec-8B-Reasoning: <|system|>, <|user|> and <|assistant|>
-            each open a turn, the first two followed by a line break, and the answers end with
-            the end of text token.  The template gives its own system prompt when the
-            conversation has none, and keeps of the earlier answers the text after their
-            reasoning.  The other roles are left out, as the template leaves them.
+            The format of Foundation-Sec-8B-Reasoning, as the current template of the model lays
+            it out: each turn starts on a new line with <|system|>, <|user|> or <|assistant|>
+            followed by a line break, and an answer ends with a line break and the end of text
+            token.  The template gives its own system prompt when the conversation has none, and
+            keeps of the earlier answers the text after their reasoning.  The other roles are
+            left out, as the template leaves them.  The prompt opens the reasoning with <think>
+            after <|assistant|>, as the template of the model does since its update of February
+            2026, everything before </think> being the reasoning.  The template of the GGUF file
+            of the catalog, an earlier one, leaves that marker to the model, which then may answer
+            without reasoning, an answer read as a reasoning never closed.  A request without
+            reasoning finds it closed at once, "<think>\n\n</think>\n\n", and the model answers.
         */
         class foundation_sec_format : public chat_format
         {
@@ -1631,18 +1637,18 @@ namespace albireo
                 piece_writer w{ out };
                 w.markup(bos_);
                 const bool has_system = !messages.empty() && messages[0].role == "system";
-                if (!has_system && !default_system_.empty()) w.markup("<|system|>\n" + default_system_);
+                if (!has_system && !default_system_.empty()) w.markup("\n<|system|>\n" + default_system_);
                 for (size_t i = 0; i < messages.size(); ++i)
                 {
                     const chat_message& m = messages[i];
                     if (i == 0 && has_system)
                     {
-                        w.markup("<|system|>\n");
+                        w.markup("\n<|system|>\n");
                         w.text(m.content);
                     }
                     else if (m.role == "user")
                     {
-                        w.markup("<|user|>\n");
+                        w.markup("\n<|user|>\n");
                         w.text(m.content);
                     }
                     else if (m.role == "assistant")
@@ -1651,12 +1657,13 @@ namespace albireo
                         const size_t close = content.rfind("</think>");
                         if (i + 1 < messages.size() && close != std::string::npos)
                             content = strip_spaces(content.substr(close + 8));
-                        w.markup("<|assistant|>");
+                        w.markup("\n<|assistant|>\n");
                         w.text(content);
-                        w.markup(eos_);
+                        w.markup("\n" + eos_);
                     }
                 }
-                if (opt.add_generation_prompt) w.markup("<|assistant|>");
+                if (opt.add_generation_prompt)
+                    w.markup(opt.reasoning ? "\n<|assistant|>\n<think>" : "\n<|assistant|>\n<think>\n\n</think>\n\n");
             }
 
             std::unique_ptr<output_parser> make_parser(const render_options& opt) const override
@@ -1664,7 +1671,7 @@ namespace albireo
                 parser_config c;
                 c.think_open = "<think>";
                 c.think_close = "</think>";
-                c.starts_in_reasoning = opt.add_generation_prompt;
+                c.starts_in_reasoning = opt.add_generation_prompt && opt.reasoning;
                 return std::unique_ptr<output_parser>(new tag_parser(c));
             }
 

@@ -257,8 +257,12 @@ schemas = {
                  "restarts the service.", "properties": {
         "port": {"type": "integer", "minimum": 1024, "maximum": 65535},
         "language": {"type": "string", "enum": ["auto", "en", "fr", "de", "it", "es"]},
-        "engine": {"type": "string", "enum": ["auto", "best", "cpu", "cpu-avx2", "cpu-avxvnni", "cpu-avx512",
-                                              "openvino", "cuda"]},
+        "engine": {"type": "string", "enum": ["auto", "best", "cpu", "cpu-avx2", "cpu-avxvnni", "openvino", "cuda"],
+                   "description": "auto: the accelerator of the computer, the NVIDIA card (cuda), else the NPU and "
+                   "the graphics processor of Intel together, else the one of them present, with the processor "
+                   "computing the products its device does not take; the processor engine when no accelerator is "
+                   "usable or when a measure found the accelerator slower. best: the fastest measured engine. A "
+                   "variant: that engine, with the device of accelerator for the engines that have several."},
         "accelerator": {"type": "string", "enum": ["auto", "none", "npu", "gpu", "both"]},
         "v2ram": {"type": "boolean", "description": "Extended device memory of the graphics engines."},
         "v2ram_max_mb": {"type": "integer", "description": "Limit of the extended memory, 0 for automatic."},
@@ -328,7 +332,7 @@ schemas = {
                 "name": {"type": "string"}}}},
             "reason": {"type": "string", "description": "Why the engine cannot run here, in English."},
             "reason_code": {"type": "string", "description": "The code of the reason: isa_avx2, isa_avx_vnni, "
-                            "isa_avx512, no_nvidia_driver, old_nvidia_driver, no_nvidia_card, old_nvidia_card, "
+                            "no_nvidia_driver, old_nvidia_driver, no_nvidia_card, old_nvidia_card, "
                             "no_intel_device, intel_device_unusable, library_failed, probe_timeout."},
             "reason_args": {"type": "object", "additionalProperties": {"type": "string"}},
             "missing": {"type": "string", "description": "For an engine that runs: why its runtime left out the "

@@ -837,8 +837,7 @@ namespace albireo
             }
             return one_of("web_search", { "wikipedia", "none" }) && boolean("web_access")
                 && one_of("language", { "auto", "en", "fr", "de", "it", "es" })
-                && one_of("engine", { "auto", "best", "cpu", "cpu-avx2", "cpu-avxvnni", "cpu-avx512", "openvino",
-                    "cuda" })
+                && one_of("engine", { "auto", "best", "cpu", "cpu-avx2", "cpu-avxvnni", "openvino", "cuda" })
                 && one_of("accelerator", { "auto", "none", "npu", "gpu", "both" })
                 && in_range("port", 1024, 65535) && in_range("threads", 0, 1024) && in_range("context", 0, 1 << 20)
                 && in_range("max_sequences", 1, 64) && in_range("kv_mb", 0, 1 << 24)

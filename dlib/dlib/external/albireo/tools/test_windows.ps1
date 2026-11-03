@@ -76,7 +76,7 @@ $haveChat = Test-Path $chat
 $noChat = "no $chat (build_windows.ps1 -Tests)"
 
 # The kernels of each family of processors, skipped by the processors without their instructions.
-foreach ($family in @("", "_avxvnni", "_avx512")) {
+foreach ($family in @("", "_avxvnni")) {
     $test = Join-Path $main "tests\test_qkernels$family.exe"
     $name = "quantized kernels" + $family.Replace("_", " ")
     if (-not (Test-Path $test)) {
@@ -97,7 +97,7 @@ Invoke-Check "model files" "all checks passed" (Join-Path $main "tests\test_mode
 $savedPath = $env:PATH
 $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
 try {
-    foreach ($variant in @("cpu-avx512", "cpu-avxvnni", "cpu-avx2", "cpu")) {
+    foreach ($variant in @("cpu-avxvnni", "cpu-avx2", "cpu")) {
         $engine = Join-Path $main "bin\engines\albireo-engine-$variant.dll"
         if (-not $haveModel) { Add-Result "engine $variant" "SKIP" "no $Model" 0; continue }
         if (-not (Test-Path $engine)) { Add-Result "engine $variant" "SKIP" "no $engine" 0; continue }
@@ -119,7 +119,7 @@ try {
             $Device) | Out-Null
         Remove-Item Env:DLIB_NPU_DEVICE
         # One OpenVINO engine per family of processor kernels, skipped by the processors that lack them.
-        foreach ($variant in @("openvino-avx512", "openvino-avxvnni", "openvino")) {
+        foreach ($variant in @("openvino-avxvnni", "openvino")) {
             $engine = Join-Path $openvino "bin\engines\albireo-engine-$variant.dll"
             if (-not (Test-Path $engine)) { Add-Result "engine $variant" "SKIP" "no $engine" 0; continue }
             if (-not $haveChat) { Add-Result "engine $variant" "SKIP" $noChat 0; continue }

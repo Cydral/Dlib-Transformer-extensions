@@ -32,7 +32,7 @@
         receives the names of the images.
 */
 
-import { t, setLanguage, language, languages } from './i18n.js';
+import { t, tn, setLanguage, language, languages } from './i18n.js';
 import { icon } from './icons.js';
 import * as store from './store.js';
 import { renderMarkdown, attachCodeButtons, escapeHtml } from './markdown.js';
@@ -152,16 +152,23 @@ function iconButton(name, title, onclick, cls) {
   return h('button', { class: cls || 'icon-button', title, 'aria-label': title, type: 'button', onclick, html: icon(name) });
 }
 
-function formatSize(n) {
-  if (n < 1024) return n + ' B';
-  if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
-  if (n < 1073741824) return (n / 1048576).toFixed(1) + ' MB';
-  return (n / 1073741824).toFixed(2) + ' GB';
+// The units of the sizes in the language of the interface: French writes them in octets.
+function sizeUnits() {
+  return language() === 'fr' ? ['o', 'Ko', 'Mo', 'Go'] : ['B', 'KB', 'MB', 'GB'];
 }
 
-// A limit of size in whole megabytes, "100 MB".
+// A size in bytes, with the decimal separator and the units of the language of the interface: "2.4 MB", "2,4 Mo".
+function formatSize(n) {
+  const units = sizeUnits();
+  if (n < 1024) return formatNumber(n) + ' ' + units[0];
+  if (n < 1048576) return formatDecimal(n / 1024, 1) + ' ' + units[1];
+  if (n < 1073741824) return formatDecimal(n / 1048576, 1) + ' ' + units[2];
+  return formatDecimal(n / 1073741824, 2) + ' ' + units[3];
+}
+
+// A limit of size in whole megabytes, "100 MB", "100 Mo".
 function formatLimit(n) {
-  return formatNumber(Math.round(n / 1048576)) + ' MB';
+  return formatNumber(Math.round(n / 1048576)) + ' ' + sizeUnits()[2];
 }
 
 function formatDuration(ms) {
@@ -172,6 +179,11 @@ function formatDuration(ms) {
 
 function formatNumber(n) {
   return new Intl.NumberFormat(language()).format(n);
+}
+
+// A number with digits decimals, written as the language of the interface writes it: "23.5", "23,5".
+function formatDecimal(n, digits) {
+  return new Intl.NumberFormat(language(), { minimumFractionDigits: digits, maximumFractionDigits: digits }).format(n);
 }
 
 // A short duration, such as the time a tool took, in milliseconds below one second.
@@ -769,6 +781,10 @@ async function pollStatus() {
     const previous = rag.embeddingModel();
     rag.setEmbeddingModel(embedder ? { id: embedder.id, dimensions: embedder.dimensions } : null);
     if (embedder && (!previous || previous.id !== embedder.id)) indexProjects();
+    // The documents shown before the embedding model was known, or with another one, show their state again.
+    if ((previous ? previous.id : null) !== (embedder ? embedder.id : null)) {
+      for (const el of document.querySelectorAll('[data-index-doc]')) showIndexState(el);
+    }
   } catch (e) {
     changed = !state.statusError;
     state.statusError = true;
@@ -814,7 +830,8 @@ function renderStatusLine() {
     } else {
       led = stats && stats.active > 0 ? 'busy' : 'ok';
       const tps = stats ? stats.generation_tokens_per_second : 0;
-      text = modelName(model) + ' · ' + (s.engine.variant || '?') + (tps > 0.05 ? ' · ' + t('tokensPerSecond', { n: tps.toFixed(1) }) : '');
+      text = modelName(model) + ' · ' + (s.engine.variant || '?')
+        + (tps > 0.05 ? ' · ' + t('tokensPerSecond', { n: formatDecimal(tps, 1) }) : '');
     }
   }
   ui.statusLine.replaceChildren(h('span', { class: 'led ' + led }), h('span', { class: 'grow', title: text }, text));
@@ -1103,7 +1120,7 @@ function searchDialog(kind) {
         count.textContent = t('searchHint');
         return;
       }
-      count.textContent = t('resultsCount', { n: hits.length });
+      count.textContent = tn('resultsCount', hits.length);
       for (const hit of hits) {
         const title = projects ? hit.project.name : (hit.conversation.title || t('untitled'));
         const date = new Date(projects ? projectActivity(hit.project) : hit.conversation.updated);
@@ -1663,20 +1680,26 @@ function pruneImages(listed) {
   return images.prune(listed, references);
 }
 
-// The state of a document on the page of its project.
+/*
+    The state of a document on the page of its project: its indexing in progress, or its passages, searched by
+    their vectors, or by their words alone while they have no vectors of the embedding model.
+*/
 async function indexText(owner, docId) {
   const run = indexing.get(docId);
   if (run) return run.total ? t('indexingProgress', { p: Math.floor(100 * run.done / run.total) }) : t('indexing');
   const st = (await rag.status(owner)).get(docId);
   if (!st) return '';
-  if (rag.embeddingModel() && st.vectors === st.passages) return t('indexed', { n: formatNumber(st.passages) });
-  return t('indexedWords', { n: formatNumber(st.passages) });
+  const key = rag.embeddingModel() && st.vectors === st.passages ? 'indexed' : 'indexedWords';
+  return tn(key, st.passages, { n: formatNumber(st.passages) });
+}
+
+// Writes in el the state of its document, after a middle dot that separates it from the estimate of the tokens.
+function showIndexState(el) {
+  indexText(el.dataset.indexOwner, el.dataset.indexDoc).then((text) => { el.textContent = text ? ' · ' + text : ''; });
 }
 
 function showIndexing(docId) {
-  for (const el of document.querySelectorAll('[data-index-doc="' + docId + '"]')) {
-    indexText(el.dataset.indexOwner, docId).then((text) => { el.textContent = text; });
-  }
+  for (const el of document.querySelectorAll('[data-index-doc="' + docId + '"]')) showIndexState(el);
 }
 
 // Indexes the documents of the projects that have no passages, or no vectors of the
@@ -1997,9 +2020,8 @@ function renderProject(p) {
   const fileInput = h('input', {
     type: 'file', multiple: true, class: 'hidden', accept: documentAccept() + (places() ? ',image/*' : '')
   });
-  fileInput.addEventListener('change', async () => {
-    const files = Array.from(fileInput.files);
-    fileInput.value = '';
+  // Adds the files chosen with the button or dropped on the card of the knowledge to the project.
+  const addFiles = async (files) => {
     const added = await readFiles(files, null, places());
     const docs = added.filter((a) => a.kind !== 'image');
     const pictures = added.filter((a) => a.kind === 'image')
@@ -2017,20 +2039,27 @@ function renderProject(p) {
     renderProject(p);
     for (const f of docs) queueIndex(p.id, f, true);
     for (const img of pictures) queueDescription(p.id, img.id);
+  };
+  fileInput.addEventListener('change', () => {
+    const files = Array.from(fileInput.files);
+    fileInput.value = '';
+    return addFiles(files);
   });
+  // Each document with its format, the estimate of its tokens and the state of its indexing on one line.
   const fileList = h('div', { class: 'list' });
   for (const f of p.files || []) {
+    const tokens = estimateTokens(f.text);
     const indexState = h('span', { class: 'faint index-state', 'data-index-doc': f.id, 'data-index-owner': p.id });
     fileList.append(h('div', { class: 'row' }, formatBadge(f), h('span', { class: 'label' }, f.name),
-      h('span', { class: 'faint' }, f.format + ' · ' + t('tokensEstimate', { n: formatNumber(estimateTokens(f.text)) })),
-      indexState,
+      h('span', { class: 'faint' }, f.format + ' · ' + tn('tokensEstimate', tokens, { n: formatNumber(tokens) }),
+        indexState),
       iconButton('trash', t('delete'), async () => {
         const removed = forgetDocument(p.id, f.id);
         await save((x) => { x.files = (x.files || []).filter((y) => y.id !== f.id); });
         await removed;
         renderProject(p);
       })));
-    indexText(p.id, f.id).then((text) => { indexState.textContent = text; });
+    showIndexState(indexState);
   }
   // The images, each with the state of its description.
   ui.projectPage = {
@@ -2059,7 +2088,8 @@ function renderProject(p) {
     const mode = knowledgeMode(p, contextTokens);
     const share = contextTokens ? Math.round(100 * totalTokens / contextTokens) : 0;
     capacity.textContent = t(mode === 'whole' ? 'knowledgeWhole' : 'knowledgeSearch',
-      { n: formatNumber(totalTokens), p: share }) + (rag.embeddingModel() ? '' : ' ' + t('knowledgeNoVectors'));
+      { p: share, tokens: tn('tokensCount', totalTokens, { n: formatNumber(totalTokens) }) })
+      + (rag.embeddingModel() ? '' : ' ' + t('knowledgeNoVectors'));
   }
   const convList = h('div', { class: 'list' });
   for (const c of convs) {
@@ -2068,6 +2098,16 @@ function renderProject(p) {
       h('span', { class: 'faint' }, new Date(c.updated).toLocaleDateString(language()))));
   }
   if (!convs.length) convList.append(h('div', { class: 'empty-note' }, t('noDiscussions')));
+  // The card of the knowledge, which also takes the files dropped on it.
+  const knowledge = h('div', { class: 'card' }, h('h3', { html: icon('book') + escapeHtml(t('knowledge')) }),
+    h('p', { class: 'help' }, t('knowledgeHelp')), capacity, fileList, imagesBlock,
+    h('div', { class: 'buttons', style: { marginTop: '10px' } },
+      h('button', {
+        class: 'button', type: 'button', onclick: () => fileInput.click(),
+        html: icon('upload') + '<span>' + escapeHtml(t('addFiles')) + '</span>'
+      }),
+      fileInput));
+  dropFiles(knowledge, addFiles);
 
   main.replaceChildren(h('div', { class: 'page' }, heading, sub,
     h('div', { class: 'buttons', style: { marginBottom: '16px' } },
@@ -2078,11 +2118,7 @@ function renderProject(p) {
       h('div', { class: 'field' }, h('label', null, t('color')), colors)),
     h('div', { class: 'card' }, h('h3', { html: icon('edit') + escapeHtml(t('instructions')) }),
       h('p', { class: 'help' }, t('instructionsHelp')), h('div', { class: 'field' }, instructions)),
-    h('div', { class: 'card' }, h('h3', { html: icon('book') + escapeHtml(t('knowledge')) }),
-      h('p', { class: 'help' }, t('knowledgeHelp')), capacity, fileList, imagesBlock,
-      h('div', { class: 'buttons', style: { marginTop: '10px' } },
-        h('button', { class: 'button', type: 'button', onclick: () => fileInput.click(), html: icon('upload') + '<span>' + escapeHtml(t('addFiles')) + '</span>' }),
-        fileInput)),
+    knowledge,
     h('div', { class: 'card' }, h('h3', { html: icon('chat') + escapeHtml(t('projectDiscussions')) }), convList),
     h('div', { class: 'buttons' },
       h('button', {
@@ -2154,8 +2190,7 @@ async function readFiles(files, role, room) {
       const r = await extractText(f);
       out.push({ id: store.uid(), name: f.name, size: f.size, format: r.format, text: r.text, added: Date.now() });
       if (r.unreadablePages) {
-        toast(t(r.unreadablePages === 1 ? 'pdfPageWithoutText' : 'pdfPagesWithoutText',
-          { name: f.name, n: r.unreadablePages, total: r.pages }), false, 9000);
+        toast(tn('pdfPagesWithoutText', r.unreadablePages, { total: r.pages, name: f.name }), false, 9000);
       }
     } catch (e) {
       if (e.message === 'pdf-images') scans.push({ file: f, pages: e.pages || 0 });
@@ -2195,7 +2230,7 @@ async function scanPages(scan, left) {
   const count = Math.min(scan.pages || left, left);
   const accepted = await dialog((box, close) => {
     const text = left > 0 ? t('scanOffer', { name, pages: scan.pages || '?', left })
-      + (scan.pages > left ? ' ' + t('scanFirstPages', { n: count }) : '')
+      + (scan.pages > left ? ' ' + tn('scanFirstPages', count) : '')
       : t('scanNoRoom', { name, max: maxContextImages });
     box.append(h('h2', { html: icon('image') + escapeHtml(t('pdfImagesTitle')) }), h('p', null, text),
       h('div', { class: 'actions' }, left > 0 ? [
@@ -2260,8 +2295,10 @@ function imageRoom(c) {
 
 // Why images were not added: their names, the limit of a discussion or of a project, and the places left.
 function imageLimitText(names, left, project) {
-  return t(project ? 'projectImagesNotAdded' : 'imagesNotAdded',
-    { names: names.join(', '), max: project ? maxProjectImages : maxContextImages, left: Math.max(0, left) });
+  return t(project ? 'projectImagesNotAdded' : 'imagesNotAdded', {
+    max: project ? maxProjectImages : maxContextImages, left: Math.max(0, left),
+    notAdded: tn('notAddedImages', names.length, { names: names.join(', ') })
+  });
 }
 
 // The description of an image as a question or a project keeps it.
@@ -2407,6 +2444,60 @@ function pastedFiles(e) {
     const ext = ((f.type || '').split('/')[1] || 'png').replace('jpeg', 'jpg');
     const name = t('pastedImage', { date }) + (files.length > 1 ? ' (' + (i + 1) + ')' : '') + '.' + ext;
     return new File([f], name, { type: f.type, lastModified: f.lastModified });
+  });
+}
+
+// Whether the drag of the event e carries files, from the system or another application.
+function carriesFiles(e) {
+  return !!e.dataTransfer && Array.from(e.dataTransfer.types || []).includes('Files');
+}
+
+/*
+    Makes el take the files dropped on it, given to onFiles, with the class drag on el while files are dragged over
+    it.  The pointer that crosses the children of el enters each child before it leaves the element it was on: el
+    counts the entries and the exits of the drag, and loses the class once they balance.  A drag without files, of
+    a text or a link, is left to the browser.
+*/
+function dropFiles(el, onFiles) {
+  let depth = 0;
+  const end = () => {
+    depth = 0;
+    el.classList.remove('drag');
+  };
+  el.addEventListener('dragenter', (e) => {
+    if (!carriesFiles(e)) return;
+    e.preventDefault();
+    ++depth;
+    el.classList.add('drag');
+  });
+  el.addEventListener('dragover', (e) => {
+    if (carriesFiles(e)) e.preventDefault();
+  });
+  el.addEventListener('dragleave', (e) => {
+    if (carriesFiles(e) && --depth <= 0) end();
+  });
+  el.addEventListener('drop', (e) => {
+    if (!carriesFiles(e)) return;
+    e.preventDefault();
+    end();
+    if (e.dataTransfer.files.length) onFiles(Array.from(e.dataTransfer.files));
+  });
+}
+
+/*
+    A file dropped where nothing takes it would be opened by the browser in place of the application: outside the
+    places that take files (the composer, the edit of a question, the knowledge of a project), which cancel the
+    events of the drag before the window receives them, a drag of files shows that it cannot be dropped, and its
+    drop is cancelled.
+*/
+function guardFileDrops() {
+  window.addEventListener('dragover', (e) => {
+    if (e.defaultPrevented || !carriesFiles(e)) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'none';
+  });
+  window.addEventListener('drop', (e) => {
+    if (!e.defaultPrevented && carriesFiles(e)) e.preventDefault();
   });
 }
 
@@ -3302,9 +3393,11 @@ function statsText(m) {
   const parts = [];
   if (m.model) parts.push(modelName(m.model));
   if (m.usage && m.usage.completion_tokens) {
-    parts.push(t('tokensCount', { n: formatNumber(m.usage.completion_tokens) }));
+    parts.push(tn('tokensCount', m.usage.completion_tokens, { n: formatNumber(m.usage.completion_tokens) }));
   }
-  if (m.timings && m.timings.generation_per_second) parts.push(t('tokensPerSecond', { n: m.timings.generation_per_second.toFixed(1) }));
+  if (m.timings && m.timings.generation_per_second) {
+    parts.push(t('tokensPerSecond', { n: formatDecimal(m.timings.generation_per_second, 1) }));
+  }
   return parts.join(' · ');
 }
 
@@ -4074,10 +4167,13 @@ function systemPrompt(c, contextTokens, set) {
     if (knowledgeMode(p, contextTokens) === 'whole') {
       parts.push('Documents of the project:\n' + files.map((f) => '<document name="' + f.name + '">\n' + f.text + '\n</document>').join('\n'));
     } else if (files.length) {
-      parts.push('The project holds ' + files.length + ' documents, too long to be read whole: '
-        + files.map((f) => f.name + ' (' + f.format + ')').join(', ') + '. The excerpts of these documents closest to '
-        + 'each question come with it, in <excerpts>; say so when they do not hold the answer.'
-        + (agent ? ' Use search_documents, document_outline and read_document to read more of them.' : ''));
+      const one = files.length === 1;
+      parts.push('The project holds ' + (one ? '1 document' : files.length + ' documents') + ', too long to be read '
+        + 'whole: ' + files.map((f) => f.name + ' (' + f.format + ')').join(', ') + '. The excerpts of '
+        + (one ? 'this document' : 'these documents') + ' closest to each question come with it, in <excerpts>; say '
+        + 'so when they do not hold the answer.'
+        + (agent ? ' Use search_documents, document_outline and read_document to read more of '
+          + (one ? 'it.' : 'them.') : ''));
     }
     const pictures = p.images || [];
     if (pictures.length) {
@@ -4185,7 +4281,8 @@ function apiMessages(c, system, cuts, media) {
     let steps = m.steps || [];
     let left = '';
     if (cuts && cuts.steps && m === messages[messages.length - 1]) {
-      left = '[The first ' + cuts.steps + ' steps of this answer, their tool calls and their results, left the '
+      left = (cuts.steps === 1 ? '[The first step of this answer, its tool calls and their results, left the '
+        : '[The first ' + cuts.steps + ' steps of this answer, their tool calls and their results, left the ')
         + 'context.]';
       steps = steps.slice(cuts.steps);
     }
@@ -5424,7 +5521,7 @@ async function updateMemory(force) {
       await saveSetting('memoryLanguage', target);
     }
     if (enough) await markRead(pending.items);
-    if (added) toast(t(added === 1 ? 'memoryLearnedOne' : 'memoryLearned', { n: added }), false, 4500);
+    if (added) toast(tn('memoryLearned', added), false, 4500);
     else if (rewritten) toast(t('memoryRewritten'), false, 4500);
   } finally {
     memoryRunning = false;
@@ -5928,7 +6025,7 @@ function memoryTab(body) {
   const size = h('p', { class: 'help', style: { margin: 0, color: 'var(--text-faint)', fontSize: '12.5px' } });
   const showSize = () => {
     const n = text.value.split(/\s+/).filter(Boolean).length;
-    size.textContent = t('memorySize', { n, max: words })
+    size.textContent = tn('memorySize', n, { max: words })
       + (state.settings.memoryUpdated ? ' · ' + t('memoryUpdated', { date: new Date(state.settings.memoryUpdated).toLocaleString(language()) }) : '');
   };
   showSize();
@@ -5995,7 +6092,9 @@ function dataTab(body, close) {
       for (const id of r.ids) deleted.delete(id);
       broadcast({ type: 'lists' });
       await syncLists();
-      toast(t('imported', { n: r.conversations, p: r.projects }));
+      toast(t('imported', {
+        discussions: tn('discussionsCount', r.conversations), projects: tn('projectsCount', r.projects)
+      }));
       // The documents of the projects and the searched documents of the discussions are indexed, since an export
       // carries no passages; the images of the projects are described, and the discussions left waiting are named.
       indexProjects();
@@ -6015,7 +6114,9 @@ function dataTab(body, close) {
   const stored = h('p', { class: 'storage-usage' });
   const showUsage = (u) => {
     stored.textContent = t('storageUsage', {
-      n: state.conversations.length, p: state.projects.length, i: u.count, size: formatSize(u.bytes)
+      discussions: tn('discussionsCount', state.conversations.length),
+      projects: tn('projectsCount', state.projects.length),
+      images: tn('imagesCount', u.count), size: formatSize(u.bytes)
     });
   };
   showUsage({ count: 0, bytes: 0 });
@@ -6172,8 +6273,10 @@ async function aboutTab(body, close) {
       body.append(h('h4', null, t('usage')),
         h('div', { class: 'usage-bars', role: 'img', 'aria-label': t('usageChart') }, days.map((d) => h('div', {
           class: 'usage-day', style: { height: Math.max(2, 80 * (d.read + d.generated) / max) + 'px' },
-          title: t('usageDay',
-            { date: dateOf(d.day), generated: formatNumber(d.generated), read: formatNumber(d.read) })
+          title: t('usageDay', {
+            date: dateOf(d.day), generated: tn('tokensGenerated', d.generated, { n: formatNumber(d.generated) }),
+            read: tn('tokensRead', d.read, { n: formatNumber(d.read) })
+          })
         }, h('div', { class: 'generated', style: { flexGrow: String(d.generated) } }),
         h('div', { class: 'read', style: { flexGrow: String(d.read) } })))),
         h('div', { class: 'usage-axis' }, h('span', null, dateOf(days[0].day)), h('span', null, dateOf(days[29].day))),
@@ -6513,6 +6616,7 @@ async function init() {
     if (!state.incognito) pruneDrafts();
   }
   buildLayout();
+  guardFileDrops();
   if (blocked) toast(t('dbBlocked'), true, 30000);
   window.addEventListener('hashchange', route);
   // The text being typed stays when the page is left, reloaded or hidden.

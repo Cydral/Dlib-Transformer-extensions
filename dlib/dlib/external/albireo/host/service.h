@@ -40,13 +40,19 @@ namespace albireo
         ensures
             - Returns the engine to run for the settings s among the candidates found
               next to the service:
-                - engine names a variant: that variant, when usable;
-                - accelerator "npu", "gpu" or "both" (the setting of the tray, offered
-                  when the processor engine runs): the engine of that device, the
+                - engine names a variant: that variant, when usable, with the device the
+                  accelerator names for the engines that have several;
+                - accelerator "npu", "gpu" or "both": the engine of that device, the
                   fastest measured one for "both";
-                - otherwise the fastest measured engine, or, without measures, the
-                  graphics processor engine (cuda) when usable, then the processor
-                  engines (cpu-avx512, cpu-avxvnni, cpu-avx2, cpu).
+                - accelerator "none": the processor engine, the fastest measured one,
+                  else the one of the richest kernels (cpu-avxvnni, cpu-avx2, cpu);
+                - engine "best": the fastest measured engine;
+                - otherwise, the automatic choice: the accelerator of the computer, the
+                  NVIDIA card (cuda), else the NPU and the graphics processor of Intel
+                  together (openvino:both), else the one of them present, each engine
+                  computing on the processor the products its device does not take; the
+                  processor engine when no accelerator is usable, or when a measure
+                  found the accelerator slower than the processor engine.
             - The returned candidate is null when no engine is usable.
     !*/
     engine_choice choose_engine(const std::vector<engine_candidate>& candidates, const host_settings& s);
@@ -55,8 +61,8 @@ namespace albireo
         ensures
             - Returns the engines a set of candidates offers, one per device: what the tray
               lists.  Among the OpenVINO engines, one per family of processor kernels
-              (openvino-avx512, openvino-avxvnni, openvino), the richest usable one offers
-              the NPU, the graphics processor and both.
+              (openvino-avxvnni, openvino), the richest usable one offers the NPU, the
+              graphics processor and both.
     !*/
     std::vector<engine_choice> engine_options(const std::vector<engine_candidate>& candidates);
     bool is_openvino_variant(const std::string& variant);
@@ -238,7 +244,10 @@ namespace albireo
             Measures every usable engine on this machine with the active general model (or
             the smallest installed one) and records the measures in the settings.  One
             measure runs at a time: a call during another one returns at once with the code
-            "benchmark_running".
+            "benchmark_running".  Each engine is measured while the engine of the service
+            serves no request: the measure waits for its requests to end, two minutes at
+            most, and is made again once when the service received requests meanwhile, so
+            that the engines measured do not share the processor with it.
         */
         json benchmark_engines();
 

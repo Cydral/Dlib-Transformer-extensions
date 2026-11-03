@@ -30,8 +30,9 @@ namespace albireo
                 folder dist of the publication space (public_link.h), a signed JSON document
                 listing the models, their descriptions in each language, their files and
                 their hashes, the official source of each model among them, read from the
-                space alone; the installed models, the downloads in progress and the imports
-                from removable media.
+                space, or from its official address in the repository of Albireo when the
+                space does not serve it; the installed models, the downloads in progress and
+                the imports from removable media.
 
             MODELS THAT READ IMAGES
                 Such a model comes as two GGUF files: its decoder, and a projector
@@ -56,17 +57,27 @@ namespace albireo
                 a hash that still fails or a model the database cannot record leaves
                 neither file under its final name.
 
-                Each segment comes from the copy of its part in the publication space
-                alone, models/<identifier>/<file name of the official address of the part>:
-                the first attempt with the address of the cache, the next ones with a new
-                one.  The official address the catalog gives is never read.  A space that
-                does not answer, or that does not hold the part at its size in a new
-                listing, ends the download in error, named by the file in the space and
-                never by an address; a part the space does not hold has the code
-                download_not_published, which names it ("file"), since the files of the
-                models reach the space while they are published.  The hashes of the
-                catalog check the bytes.  An exception of a transfer fails the download
-                and never leaves its thread.
+                Each segment comes first from the copy of its part in the publication space,
+                models/<identifier>/<file name of the official address of the part>: four
+                attempts, the first with the address of the cache, the next ones with a new
+                one, and a part the listing lacks is looked for once more in a new listing.
+                When the space does not serve the segment, it comes from the official address
+                of its part, the "url" of the catalog, with the same ranges, from where the
+                segment stopped, in three attempts separated by pauses that a cancellation
+                ends; an answer that announces the part at another size than the catalog ends
+                its attempt before any byte is written.  Once the space is not set, does not
+                answer or refuses the requests for a segment, the other segments of the
+                download go to their official addresses at once.  A part the space does not
+                hold, holds at another size, or whose bytes from the space fail its hash goes
+                there with all its segments.  The log tells each of these changes of source
+                once: the download continues from the official address it names, with the
+                failure of the space.  When the official address fails as well, the download
+                ends in error with the code download_failed, whose message ("e") names the
+                file in the space, the failure of the space, the official address and its
+                failure.  The messages and the log name the official addresses, which are
+                public, and never an address of the space.  The hashes of the catalog check
+                the bytes, whatever source served them.  An exception of a transfer fails the
+                download and never leaves its thread.
 
             OFFLINE INSTALLATION
                 import_path() installs the GGUF files of the import folder of the data
@@ -121,8 +132,19 @@ namespace albireo
         model_manager(store& db, const std::string& models_dir);
         ~model_manager();
 
-        // Fetches the catalog from the publication space and checks its signature; keeps the last
-        // valid one, and the one in use when the fetched one was published before it.
+        /*!
+            ensures
+                - Reads the catalog and its signature from the folder dist of the publication
+                  space, or from their official address in the repository of Albireo when
+                  the space is not set, does not hold them, does not answer, or gives a
+                  catalog whose signature fails, and checks the signature of either.  The
+                  log tells which source served it.
+                - Keeps the last valid catalog, and the one in use when the fetched one was
+                  published before it.
+                - Returns false with error when neither source gives a valid catalog: error
+                  names the failure of the space, the official address and its failure.  A
+                  service that stops or goes offline asks no other source.
+        !*/
         bool refresh_catalog(std::string& error);
         // The same on a thread of its own, one refresh at a time; the caller never waits.
         void refresh_catalog_async();
@@ -434,6 +456,16 @@ namespace albireo
 
     // The inputs of a catalog entry: those it names, with "image" only when it names a projector.
     json entry_inputs(const json& entry);
+
+    /*!
+        Reserved for the tests (tests/test_host.cpp), which serve the catalog from a local
+        server.  No setting and no route reaches it.
+        ensures
+            - model_manager::refresh_catalog() reads the catalog at url and its signature at
+              url + ".sig" in place of their official address; an empty url gives the official
+              address back.
+    !*/
+    void official_catalog_for_tests(const std::string& url);
 
 }
 

@@ -38,12 +38,13 @@ namespace albireo
 
     cpu_info read_cpu_info();
 
-    // The instruction sets beyond SSE2 that the kernels of the engines use.
+    // The instruction sets beyond SSE2 that the kernels of the engines and of their tests use.
     enum qk_isa_flags : unsigned
     {
         qk_isa_avx2 = 1,       // AVX2, FMA and F16C
         qk_isa_avx_vnni = 2,   // AVX-VNNI
-        qk_isa_avx512 = 4      // AVX-512 F, BW, DQ and VL, with VNNI
+        qk_isa_avx512 = 4      // AVX-512 F, BW, DQ and VL, with VNNI: the kernels of AVX-VNNI in their
+                               // AVX-512 form, which test_qkernels_vnni256 checks
     };
 
     /*!
