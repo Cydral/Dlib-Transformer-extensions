@@ -413,30 +413,44 @@ is left out.
 
 ## Publishing a version
 
-A version is published on GitHub alone, in [`dist/pseudalis`](../../../../dist/pseudalis): its installer,
-`pseudalis-setup-<version>.exe`, which anyone downloads there, and the update feed that names it, with
-its signature (ECDSA P-256), which the installed copies read there. The programs check the signature
-with the public key of `resources/feed-public-key.pem`, built into them. The publisher made the pair
-once, on Linux, the private key outside the repository:
+A version is published on GitHub alone, in [`dist/pseudalis`](../../../../dist/pseudalis): its
+installer, `pseudalis-setup-<version>.exe`, which anyone downloads there, and the update feed that names
+it, with its signature (ECDSA P-256), which the installed copies read there. The programs check the
+signature with the public key of `resources/feed-public-key.pem`, built into them. The publisher makes
+the pair once, on Linux, the private key in a folder of its own outside the repository, readable by its
+owner alone, and commits the public key before the installer is built; the copies installed before trust
+the former key alone, and are installed again by hand. A copy of the private key kept apart is the only
+way to publish an update that the installed copies take.
 
 ```
-build-pseudalis-linux/bin/pseudalis-sign keygen ~/keys/pseudalis-feed-signing.key dlib/dlib/external/pseudalis/resources/feed-public-key.pem
+python3 dlib/dlib/external/pseudalis/tools/publish_release.py --create-key --key ~/keys/pseudalis-feed-signing.key
 ```
 
-Each version goes through three steps, each on the system that holds what it needs:
+Each version goes through three steps, each on the system that holds what it needs, each stopping at its
+first failure:
 
-1. Linux: the sources change and are tested there (`tools/test_linux.sh`), then committed and pushed.
-   `PSEUDALIS_VERSION` of [`common/version.h`](common/version.h) increases for each version that the
-   installed copies are to receive: a feed that announces the version a copy holds installs nothing.
-   `publish_release.py --check-key` then checks that the private key signs what the public key of the
-   sources verifies, before an installer is built for nothing.
-2. Windows: the installer is built from the sources pushed (`tools/build_windows.ps1 -Tests`), which
-   prints its size and its SHA-256.
+1. Linux: the sources change and are tested there (`tools/test_linux.sh`), the key is checked, then the
+   sources are committed and pushed. `PSEUDALIS_VERSION` of [`common/version.h`](common/version.h)
+   increases for each version that the installed copies are to receive: a feed that announces the
+   version a copy holds installs nothing.
+2. Windows: the installer is built from the sources pushed, tested and installed in place
+   (`tools/build_windows.ps1 -Tests -Install`), which prints its size, its SHA-256 and its path under WSL.
 3. Linux, where the private key lies: the installer, which Linux reads under `/mnt/c`, goes into
-   `dist/pseudalis` with the feed written and signed for it, then both are committed and pushed.
+   `dist/pseudalis` with the feed written and signed for it, then both are committed and pushed, and the
+   publication ends once GitHub serves them.
 
 ```
-python3 dlib/dlib/external/pseudalis/tools/publish_release.py --check-key --key ~/keys/pseudalis-feed-signing.key
+bash dlib/dlib/external/pseudalis/tools/test_linux.sh &&
+python3 dlib/dlib/external/pseudalis/tools/publish_release.py --check-key --key ~/keys/pseudalis-feed-signing.key &&
+git add dlib/dlib/external/pseudalis && git commit -m "<message>" -- dlib/dlib/external/pseudalis && git push
+```
+
+```
+git pull --ff-only; if ($LASTEXITCODE -eq 0) { powershell -ExecutionPolicy Bypass -File .\dlib\dlib\external\pseudalis\tools\build_windows.ps1 -Tests -Install }
+```
+
+```
+git pull --ff-only &&
 python3 dlib/dlib/external/pseudalis/tools/publish_release.py /mnt/c/<repository on Windows>/build-pseudalis/bin/pseudalis-setup.exe --key ~/keys/pseudalis-feed-signing.key --notes notes.json --push
 ```
 

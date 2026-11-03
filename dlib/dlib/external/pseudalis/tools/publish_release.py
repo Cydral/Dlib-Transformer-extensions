@@ -8,6 +8,7 @@ repository, beside the update feed that announces it, written and signed.
                                [--notes <notes.json>] [--sign <pseudalis-sign>]
                                [--dist <folder>] [--dry-run] [--push [--wait <seconds>]]
     python3 publish_release.py --check-key --key <private key> [--sign <pseudalis-sign>]
+    python3 publish_release.py --create-key --key <private key> [--sign <pseudalis-sign>]
     python3 publish_release.py --check [--dist <folder>] [--wait <seconds>]
 
 The version is that of common/version.h, which must also be the version the installer carries
@@ -30,7 +31,11 @@ commands that publish the folder.  --check makes that last check alone, for the 
 
 --check-key checks, before the installer is even built, that the private key signs what the
 public key of the sources verifies: a feed signed with another key would be ignored by every
-installed copy.
+installed copy.  --create-key makes the pair once, on the system of the publisher: the private
+key at --key, which must not exist yet, readable by its owner alone in a folder of its own, and
+the public key of the sources (resources/feed-public-key.pem), which it replaces and which is
+committed before the installer is built.  The copies installed before trust the former key
+alone: they ignore the feeds of the new one until they are installed again.
 
 notes.json holds the release notes by language,
 {"en": "...", "fr": "...", "de": "...", "it": "...", "es": "..."}.  --dry-run checks the
@@ -182,6 +187,23 @@ def check_key(signer, key):
         shutil.rmtree(folder, ignore_errors=True)
 
 
+def create_key(signer, key):
+    """Makes the key pair of the feed: the private key at key, which must not exist, and the public
+    key of the sources, which it replaces."""
+    if os.path.lexists(key):
+        raise RuntimeError("%s exists: --check-key checks it, and a new pair would make every installed copy "
+                           "ignore the feeds it signs" % key)
+    folder = os.path.dirname(os.path.abspath(key))
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    temp = tempfile.mkdtemp(prefix="pseudalis-key-")
+    try:
+        public = os.path.join(temp, "feed-public-key.pem")
+        subprocess.run([signer, "keygen", key, public], check=True, stdout=subprocess.DEVNULL)
+        shutil.copyfile(public, PUBLIC_KEY)
+    finally:
+        shutil.rmtree(temp, ignore_errors=True)
+
+
 def git(*args):
     """The output of git run in the repository; raises RuntimeError with its message when it fails."""
     r = subprocess.run(["git", "-C", ROOT] + list(args), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -275,12 +297,20 @@ def main():
     p.add_argument("--push", action="store_true")
     p.add_argument("--check", action="store_true")
     p.add_argument("--check-key", action="store_true")
+    p.add_argument("--create-key", action="store_true")
     p.add_argument("--wait", type=int, default=900)
     a = p.parse_args()
     # The steps print in their order, before the messages of pseudalis-sign and of git.
     sys.stdout.reconfigure(line_buffering=True)
-    if a.check_key or a.check:
+    if a.check_key or a.check or a.create_key:
         try:
+            if a.create_key:
+                if not a.key:
+                    raise RuntimeError("--key names the private key to make")
+                create_key(find_signer(a.sign), a.key)
+                print("%s made; the public key of the sources, resources/feed-public-key.pem, is replaced: commit it "
+                      "before the installer is built, and keep a copy of the private key apart, without which no "
+                      "installed copy receives an update" % a.key)
             if a.check_key:
                 if not a.key:
                     raise RuntimeError("--key names the private key that signs the feed")

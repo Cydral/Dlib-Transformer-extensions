@@ -305,18 +305,25 @@ PY
   else record "forgotten comes back" FAIL "$(ls "$DRIVE" | tr '\n' ' '), records $COUNT then $(total)"
   fi
   # A protected file copied on the drive: its record stays while a copy remains, and goes with the last.
-  ANON_ID=$(record_of "$ANON" | cut -d'|' -f1)
-  cp "$ANON" "$DRIVE/copie.txt"
+  printf 'Copie pour Lucie Marchal, 3 place du Champ de Foire, 29000 Quimper.\n' > "$DRIVE/copies.txt"
+  copies_done() { ! grep -q Marchal "$DRIVE/copies.txt" 2>/dev/null && [ -n "$(record_of "$DRIVE/copies.txt")" ]; }
+  wait_for 60 copies_done
+  COPIES_ID=$(record_of "$DRIVE/copies.txt" | cut -d'|' -f1)
+  COUNT=$(total)
+  cp "$DRIVE/copies.txt" "$DRIVE/copies (2).txt"
+  # The copy rests, then its record is the one of the file: no new original.
   sleep 6
-  rm -f "$ANON"
+  rm -f "$DRIVE/copies.txt"
   sleep 4
-  KEPT=$(record_of "" "$ANON_ID" | cut -d'|' -f2)
-  rm -f "$DRIVE/copie.txt"
-  sleep 4
-  GONE=$(record_of "" "$ANON_ID" | cut -d'|' -f2)
-  if [ -n "$ANON_ID" ] && [ "$KEPT" = "-" ] && [ -n "$GONE" ] && [ "$GONE" != "-" ]; then
-    record "copies on the drive" PASS "the record stays with a copy, removed with the last"
-  else record "copies on the drive" FAIL "record '$ANON_ID', with the copy '$KEPT', after it '$GONE'"
+  KEPT=$(record_of "" "$COPIES_ID" | cut -d'|' -f2)
+  rm -f "$DRIVE/copies (2).txt"
+  copies_gone() { [ "$(record_of "" "$COPIES_ID" | cut -d'|' -f2)" != "-" ]; }
+  wait_for 30 copies_gone
+  GONE=$(record_of "" "$COPIES_ID" | cut -d'|' -f2)
+  if [ -n "$COPIES_ID" ] && [ "$(total)" = "$COUNT" ] && [ "$KEPT" = "-" ] && [ -n "$GONE" ] && [ "$GONE" != "-" ]
+  then
+    record "copies on the drive" PASS "one record, kept with a copy, removed with the last"
+  else record "copies on the drive" FAIL "record '$COPIES_ID', with the copy '$KEPT', after it '$GONE'"
   fi
 else
   tail -20 "$WORK/service.log" > "$WORK/service_start.log"
