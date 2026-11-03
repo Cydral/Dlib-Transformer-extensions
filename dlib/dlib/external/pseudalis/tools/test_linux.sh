@@ -11,8 +11,9 @@
 # engine and of the host run first; the service then runs in a data folder of its own, on port
 # 18444 (PSEUDALIS_TEST_PORT), anonymizes and restores through its interface a text, a CSV file,
 # a name and the archive of a folder as the web application sends it, then files and a folder
-# through its drive, whose originals come back through the interface, and stops.  The exit code
-# is the number of failed steps.
+# through its drive, whose originals come back through the interface, an archive extracted on the
+# drive, an archive whose original was forgotten coming back and the copies of a file, and stops.
+# The exit code is the number of failed steps.
 
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -214,6 +215,108 @@ PY
      [ "$(name_call restore "$(basename "$FOLDER")")" = "Dossier jean.dupont@exemple.fr" ]; then
     record "drive restored" PASS "the original, its name and the name of the folder"
   else record "drive restored" FAIL "name '$BACK_NAME', folder $(basename "$FOLDER")"
+  fi
+
+  # The records of the originals, through the interface of the administrators.
+  TOKEN=$(cat "$HOME_DIR/admin.token" 2>/dev/null)
+  records() { api -H "X-Pseudalis-Admin: $TOKEN" "$URL/v1/records?limit=1000"; }
+  # The record of a protected file, by the SHA-256 of $1 or by its identifier $2: "<id>|<removed>|<original name>".
+  record_of() {
+    records | python3 -c 'import json, sys
+sha, ident = sys.argv[1], sys.argv[2]
+for r in json.load(sys.stdin)["records"]:
+    if r["output_sha256"] == sha or str(r["id"]) == ident:
+        print("%s|%s|%s" % (r["id"], r["removed"] or "-", r["original_name"]))
+        break' "$( [ -f "$1" ] && sha256sum "$1" | cut -c1-64)" "${2:-}"
+  }
+  total() { records | python3 -c 'import json, sys; print(json.load(sys.stdin)["total"])'; }
+  quoted() { python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1]))' "$1"; }
+  restore_to() { # file output
+    api -X POST --data-binary @"$1" -o "$2" "$URL/v1/restore?name=$(quoted "$(basename "$1")")"
+  }
+  # An archive anonymized on the drive, then extracted on the drive: its files stay as they are, each
+  # recorded under its original name with the original of its entry, and restored and forgotten alone.
+  python3 - "$WORK/envoi.zip" <<'PY'
+import sys, zipfile
+z = zipfile.ZipFile(sys.argv[1], "w", zipfile.ZIP_DEFLATED)
+z.writestr("Dossier Jean Dupont/lettre.txt", "Je suis Jean Dupont, joignable au 06 12 34 56 78.\n")
+z.writestr("note Marie Curie.txt", "Courrier de Marie Curie, 14 avenue des Tilleuls, 69003 Lyon.\n")
+z.writestr("reste.txt", "Rendez-vous avec Paul Martin le 3 mars.\n")
+z.close()
+PY
+  cp "$WORK/envoi.zip" "$DRIVE/envoi.zip"
+  envoi_done() { [ -f "$DRIVE/envoi.zip" ] && ! cmp -s "$WORK/envoi.zip" "$DRIVE/envoi.zip" &&
+    [ -n "$(record_of "$DRIVE/envoi.zip")" ]; }
+  wait_for 60 envoi_done
+  cp "$DRIVE/envoi.zip" "$WORK/envoi.anon.zip"
+  # Two files extracted on the drive, the third elsewhere.
+  python3 - "$WORK/envoi.anon.zip" "$WORK/extrait" "$WORK/ailleurs" <<'PY'
+import os, sys, zipfile
+z = zipfile.ZipFile(sys.argv[1])
+for n in z.namelist():
+    if n.endswith("/"):
+        continue
+    path = os.path.join(sys.argv[3] if os.path.basename(n) == "reste.txt" else sys.argv[2], n)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(z.read(n))
+PY
+  OUTSIDE=$WORK/ailleurs/reste.txt
+  mkdir -p "$DRIVE/extrait"
+  cp -r "$WORK/extrait/." "$DRIVE/extrait/"
+  extracted_done() {
+    local f n=0
+    while IFS= read -r f; do
+      [ -n "$(record_of "$f")" ] || return 1
+      n=$((n + 1))
+    done < <(find "$DRIVE/extrait" -type f)
+    [ "$n" -eq 2 ]
+  }
+  wait_for 60 extracted_done
+  SAME=0
+  while IFS= read -r f; do
+    cmp -s "$f" "$DRIVE/extrait/${f#"$WORK/extrait/"}" && SAME=$((SAME + 1))
+  done < <(find "$WORK/extrait" -type f)
+  NAMES=$(find "$DRIVE/extrait" -type f | while IFS= read -r f; do record_of "$f" | cut -d'|' -f3; done | sort |
+    tr '\n' ',')
+  if [ "$SAME" -eq 2 ] && [ "$NAMES" = "lettre.txt,note Marie Curie.txt," ]; then
+    record "archive extracted" PASS "2 files kept as they are, recorded under their original names"
+  else record "archive extracted" FAIL "unchanged $SAME, names $NAMES"
+  fi
+  LETTRE=$(find "$DRIVE/extrait" -type f -name 'lettre.txt' | head -1)
+  restore_to "$LETTRE" "$WORK/lettre.extrait.txt"
+  restore_to "$OUTSIDE" "$WORK/reste.back.txt"
+  ZIP_ID=$(record_of "$WORK/envoi.anon.zip" | cut -d'|' -f1)
+  api -X DELETE -H "X-Pseudalis-Admin: $TOKEN" -o /dev/null "$URL/v1/records/$ZIP_ID"
+  restore_to "$LETTRE" "$WORK/lettre.apres.txt"
+  restore_to "$OUTSIDE" "$WORK/reste.apres.txt"
+  if grep -q 'Jean Dupont, joignable' "$WORK/lettre.extrait.txt" && grep -q 'Paul Martin' "$WORK/reste.back.txt" &&
+     grep -q 'Jean Dupont, joignable' "$WORK/lettre.apres.txt" && grep -q 'original_forgotten' "$WORK/reste.apres.txt"
+  then
+    record "extracted restored" PASS "from their own originals once the archive forgotten, the file outside refused"
+  else record "extracted restored" FAIL "see lettre.extrait.txt, reste.back.txt, lettre.apres.txt, reste.apres.txt"
+  fi
+  # The archive forgotten comes back to the drive: it stays as it is, without a new original.
+  COUNT=$(total)
+  cp "$WORK/envoi.anon.zip" "$DRIVE/revenu.zip"
+  sleep 8
+  if cmp -s "$WORK/envoi.anon.zip" "$DRIVE/revenu.zip" && [ "$(total)" = "$COUNT" ]; then
+    record "forgotten comes back" PASS "kept as it is, no new original"
+  else record "forgotten comes back" FAIL "$(ls "$DRIVE" | tr '\n' ' '), records $COUNT then $(total)"
+  fi
+  # A protected file copied on the drive: its record stays while a copy remains, and goes with the last.
+  ANON_ID=$(record_of "$ANON" | cut -d'|' -f1)
+  cp "$ANON" "$DRIVE/copie.txt"
+  sleep 6
+  rm -f "$ANON"
+  sleep 4
+  KEPT=$(record_of "" "$ANON_ID" | cut -d'|' -f2)
+  rm -f "$DRIVE/copie.txt"
+  sleep 4
+  GONE=$(record_of "" "$ANON_ID" | cut -d'|' -f2)
+  if [ -n "$ANON_ID" ] && [ "$KEPT" = "-" ] && [ -n "$GONE" ] && [ "$GONE" != "-" ]; then
+    record "copies on the drive" PASS "the record stays with a copy, removed with the last"
+  else record "copies on the drive" FAIL "record '$ANON_ID', with the copy '$KEPT', after it '$GONE'"
   fi
 else
   tail -20 "$WORK/service.log" > "$WORK/service_start.log"

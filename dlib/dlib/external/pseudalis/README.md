@@ -114,8 +114,19 @@ written is deleted.
   files of the editors, whose names start with `~` or end with `.tmp`, are left as they are.
 - Deleting a file, a folder or the whole tree removes them from the drive. The original of a file
   deleted or replaced by a new version stays restorable from the copies of the file for 30 days (the
-  setting `removed_days`), then leaves the vault with the pictures no other file shows. A file moved or
-  renamed within the drive keeps its original.
+  setting `removed_days`) once the last copy of the drive left it, then leaves the vault with the
+  pictures no other file shows. A file moved, renamed or copied within the drive keeps its original,
+  which all its copies share.
+- A file extracted on the drive from an anonymized archive that the service recorded stays as it is, and
+  the list of the originals kept shows it under its original name, its original being the entry of the
+  original archive, which the vault keeps apart: the archive and each file extracted from it are
+  restored and forgotten alone. A file extracted elsewhere is restored from the original of the archive
+  while the service keeps it.
+- An anonymized file whose original was forgotten, or left the vault once its time was over, stays as it
+  is when it comes back to the drive, unrecorded: it is not anonymized again, which would keep a new
+  original whose tags restore it, and its restoration stays refused, as for the files extracted from
+  such an archive. A document edited on the drive and anonymized again keeps its name in clear in the
+  list of the originals, and its original comes back with the values of its tags.
 
 The drive never gives back an original: the originals come back through Restore in the Explorer, the
 web application and the interface, from any copy of the anonymized file.
@@ -417,30 +428,35 @@ Each version goes through three steps, each on the system that holds what it nee
 1. Linux: the sources change and are tested there (`tools/test_linux.sh`), then committed and pushed.
    `PSEUDALIS_VERSION` of [`common/version.h`](common/version.h) increases for each version that the
    installed copies are to receive: a feed that announces the version a copy holds installs nothing.
+   `publish_release.py --check-key` then checks that the private key signs what the public key of the
+   sources verifies, before an installer is built for nothing.
 2. Windows: the installer is built from the sources pushed (`tools/build_windows.ps1 -Tests`), which
    prints its size and its SHA-256.
 3. Linux, where the private key lies: the installer, which Linux reads under `/mnt/c`, goes into
    `dist/pseudalis` with the feed written and signed for it, then both are committed and pushed.
 
 ```
-python3 dlib/dlib/external/pseudalis/tools/publish_release.py /mnt/c/<repository on Windows>/build-pseudalis/bin/pseudalis-setup.exe --key ~/keys/pseudalis-feed-signing.key --notes notes.json
-git add dist/pseudalis
-git commit -m "Publish version <version> of Pseudalis" -- dist/pseudalis
-git push
+python3 dlib/dlib/external/pseudalis/tools/publish_release.py --check-key --key ~/keys/pseudalis-feed-signing.key
+python3 dlib/dlib/external/pseudalis/tools/publish_release.py /mnt/c/<repository on Windows>/build-pseudalis/bin/pseudalis-setup.exe --key ~/keys/pseudalis-feed-signing.key --notes notes.json --push
 ```
 
-`publish_release.py` checks that the installer carries the version of [`common/version.h`](common/version.h),
-that the feed announces no later one and that the installer stays under the limits of GitHub (it refuses
-95 MB and more, and warns from 50 MB), copies it as
-`pseudalis-setup-<version>.exe`, writes the feed with its name, its size, its SHA-256 and the notes of
-each language (`{"en": "...", "fr": "...", "de": "...", "it": "...", "es": "..."}`), signs it, checks the
-signature with the public key of the sources, then puts the installer, the signature and the feed in
-place of the published ones; the installers of the earlier versions leave the folder and stay in the
-history of the repository. A failure leaves the published files as they are, and `--dry-run` checks
-everything without writing. The services read the feed and its signature on GitHub five minutes after
-their start, then every day, check the signature, download the installer beside the feed in the
-background, check its size and its SHA-256, and install it at the next start of the service, or at once
-from the menu of the icon. Their messages and logs never name the places they read.
+`publish_release.py` checks that the installer carries the version of
+[`common/version.h`](common/version.h), that the feed announces no later one, that the installer stays
+under the limits of GitHub (it refuses 95 MB and more, and warns from 50 MB) and that the key is the one
+of the public key of the sources, copies the installer as `pseudalis-setup-<version>.exe`, writes the
+feed with its name, its size, its SHA-256 and the notes of each language
+(`{"en": "...", "fr": "...", "de": "...", "it": "...", "es": "..."}`), signs it, checks the signature
+with the public key of the sources, then puts the installer, the signature and the feed in place of the
+published ones; the installers of the earlier versions leave the folder and stay in the history of the
+repository. With `--push`, it first checks that the branch lags behind its remote one in nothing, then
+commits and pushes the folder, and ends once GitHub serves the feed and its signature as they were
+written and the installer by its size and its SHA-256, as the installed copies will read them; a step
+that fails prints the commands that end the publication, and `--check` makes the last check again. A
+failure before the writing leaves the published files as they are, and `--dry-run` checks everything
+without writing. The services read the feed and its signature on GitHub five minutes after their start,
+then every day, check the signature, download the installer beside the feed in the background, check its
+size and its SHA-256, and install it at the next start of the service, or at once from the menu of the
+icon. Their messages and logs never name the places they read.
 
 ## Editions and licenses
 
@@ -458,7 +474,7 @@ from the menu of the icon. Their messages and logs never name the places they re
 - A scanned page without text layer is kept as a gray box: no OCR is performed.
 - A description of Albireo is read as the text of its document is, with the same limits: a value that
   the detector misses stays in clear in it. The setting `albireo` turns the descriptions off.
-- The drive takes files of 256 MB at most by default (`max_file_mb`): a larger file goes to the folder
+- The drive takes files of 150 MB at most by default (`max_file_mb`): a larger file goes to the folder
   of the files not processed. A folder sent by the web application is one archive, under the same limit.
 - A file written to the drive lies there in clear until its processing, a few seconds for most
   documents (see the choices above).

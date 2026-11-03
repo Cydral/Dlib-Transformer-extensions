@@ -156,6 +156,43 @@ int main()
         db.add_picture(lone);
         CHECK(db.remove_unlinked_pictures() == 1 && !db.get_picture(lone.id, q) && db.get_picture(p.id, q));
         CHECK(db.referenced_blobs().count(lone.blob) == 0 && db.remove_unlinked_pictures() == 0);
+        // The entries of a protected archive: found by what was written, those inside an archive taken from inside it.
+        file_record archive = r;
+        archive.original_name = "Dossier Jean Dupont.zip";
+        archive.output_sha256 = std::string(64, '9');
+        archive.original_blob = v.put("archive");
+        const long long zip = db.add_file(archive);
+        std::vector<entry_record> entries(3);
+        entries[0].name = "Dossier X/lettre.txt";
+        entries[0].original = "Dossier Jean Dupont/lettre.txt";
+        entries[0].sha256 = std::string(64, '1');
+        entries[0].kind = "txt";
+        entries[1].name = "notes.tar.gz";
+        entries[1].original = "notes.tar.gz";
+        entries[1].sha256 = std::string(64, '2');
+        entries[1].kind = "tar.gz";
+        entries[2].name = "notes.tar.gz!Y/note.txt";
+        entries[2].original = "notes.tar.gz!Marie Curie/note.txt";
+        entries[2].sha256 = std::string(64, '3');
+        entries[2].kind = "txt";
+        db.add_entries(zip, entries);
+        entry_record entry_found;
+        CHECK(db.find_entry(std::string(64, '1'), entry_found) && entry_found.record == zip &&
+              entry_found.original == "Dossier Jean Dupont/lettre.txt" && entry_found.kind == "txt");
+        CHECK(!db.find_entry(std::string(64, '4'), entry_found));
+        CHECK(db.find_entry(std::string(64, '2'), entry_found));
+        const std::vector<entry_record> inside = db.entries_inside(entry_found);
+        CHECK(inside.size() == 1 && inside[0].name == "Y/note.txt" && inside[0].original == "Marie Curie/note.txt" &&
+              inside[0].sha256 == std::string(64, '3'));
+        // Forgotten with its archive: its entries go, and are remembered as forgotten.
+        std::vector<std::string> zip_blobs;
+        CHECK(db.remove_file(zip, zip_blobs, "forgotten") && zip_blobs.size() == 1);
+        int64_t entry_time = 0;
+        std::string entry_reason;
+        CHECK(!db.find_entry(std::string(64, '1'), entry_found) && !db.find_entry(std::string(64, '3'), entry_found));
+        CHECK(db.find_forgotten(std::string(64, '3'), std::string(), entry_time, entry_reason) &&
+              entry_reason == "forgotten");
+
         // A record whose file left the drive keeps its original until its time is over.
         CHECK(found.removed == 0 && db.files_removed_before(now_unix()).empty());
         db.set_file_removed(rec, now_unix() - 31 * 86400);

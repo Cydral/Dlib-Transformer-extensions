@@ -31,10 +31,13 @@ namespace pseudalis
 
                 No driver: the file written lies in its folder, in clear, from its last write
                 to its processing, a few seconds for most documents, during which the service
-                holds it alone (sharing violation).  Deleting a file of the drive marks its
-                record (service::mark_removed()), whose original stays for the days of the
-                setting removed_days; a file found again in the drive, renamed or moved there,
-                keeps it.  The files already processed are recorded in the database, so that a
+                holds it alone (sharing violation).  Deleting the last file of the drive that
+                shows a record marks it (service::mark_removed()), its original staying for the
+                days of the setting removed_days; a file found again in the drive, renamed, moved
+                or copied there, keeps it.  A file extracted from a protected archive that the
+                database records stays as it is, recorded with the original of its entry
+                (service::adopt()); a protected file whose original was forgotten stays as it is,
+                unrecorded.  The files already processed are recorded in the database, so that a
                 restart processes only what changed.
 
                 Outside Windows, the folder works without letter.

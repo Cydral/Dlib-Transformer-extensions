@@ -4,12 +4,15 @@
 // Tests of the engine through its C interface: documents, pictures and archives.
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <iostream>
 #include <map>
 #include <string>
 #include <vector>
 
+#include <dlib/crypto/crypto_utils.h>
+#include <dlib/crypto/sha256.h>
 #include <dlib/documents/document_image.h>
 #include <dlib/zip/zip_archive.h>
 
@@ -75,6 +78,38 @@ namespace
 
     // The error of the last call of process(), which it prints unless the call was meant to fail.
     std::string last_error;
+
+    std::string sha256_of(const std::string& data)
+    {
+        const std::array<unsigned char, 32> d = dlib::sha256_digest(data);
+        return dlib::to_hex(d.data(), d.size());
+    }
+
+    // The entry path of the archive data named name, as the service asks the engine for it.
+    bool extract(psd_engine* e, const std::string& name, const std::string& data, const std::string& path,
+                 std::string& output)
+    {
+        json req = json::object();
+        req["operation"] = "extract";
+        req["name"] = name;
+        req["entry"] = path;
+        psd_buffer r = { nullptr, 0 }, o = { nullptr, 0 }, err = { nullptr, 0 };
+        const int ok = psd_process(e, req.dump().c_str(), data.data(), data.size(), nullptr, nullptr, nullptr, &r,
+                                   &o, &err);
+        output = ok ? std::string(o.data, o.size) : std::string();
+        psd_free(&r);
+        psd_free(&o);
+        psd_free(&err);
+        return ok == 1;
+    }
+
+    // The entry of the result res of an archive whose original path is original, or null.
+    const json* entry_of(const json& res, const std::string& original)
+    {
+        for (const json& w : res["entries"].elements())
+            if (w["original"].str() == original) return &w;
+        return nullptr;
+    }
 
     bool process(psd_engine* e, const std::string& op, const std::string& name, const std::string& data, json& result,
                  std::string& output, bool pictures = true, bool failure_expected = false)
@@ -239,6 +274,31 @@ int main()
         const std::vector<pseudalis::archive_entry> t =
             pseudalis::read_archive(pseudalis::archive_kind::tar_gz, z.read("archive.tar.gz"));
         CHECK(t.size() == 1 && t[0].name == inner[0].name && t[0].data.find("Curie") == std::string::npos);
+        /* Each entry written, by which a copy extracted from the archive is known: its paths in
+           both archives, the SHA-256 of what was written and its kind, the entries of the TAR.GZ
+           after it; the entries left out have none. */
+        CHECK(res["entries"].size() == 5 && entry_of(res, "outil.exe") == nullptr);
+        const json* l = entry_of(res, "dossier/lettre.txt");
+        CHECK(l && (*l)["name"].str() == "dossier/lettre.txt" && (*l)["kind"].str() == "txt" &&
+              (*l)["sha256"].str() == sha256_of(z.read("dossier/lettre.txt")));
+        const json* ph = entry_of(res, "dossier/photo.png");
+        CHECK(ph && (*ph)["kind"].str() == "image" && z.contains((*ph)["name"].str()) &&
+              (*ph)["sha256"].str() == sha256_of(z.read((*ph)["name"].str())));
+        const json* a = entry_of(res, "archive.tar.gz");
+        CHECK(a && (*a)["kind"].str() == "tar.gz" && (*a)["sha256"].str() == sha256_of(z.read("archive.tar.gz")));
+        const json* n = entry_of(res, "archive.tar.gz!" + inner[0].name);
+        CHECK(n && (*n)["name"].str() == "archive.tar.gz!" + inner[0].name &&
+              (*n)["sha256"].str() == sha256_of(t[0].data));
+    }
+    // The original of an entry, in the archive and in an archive inside it; none for an entry left out.
+    {
+        std::string original;
+        CHECK(extract(e, "envoi.zip", zip, "dossier/lettre.txt", original) && original == letter);
+        CHECK(extract(e, "envoi.zip", zip, "dossier/photo.png", original) && original == png);
+        CHECK(extract(e, "envoi.zip", zip, "archive.tar.gz", original) && original == tgz);
+        CHECK(extract(e, "envoi.zip", zip, "archive.tar.gz!" + inner[0].name, original) && original == inner[0].data);
+        CHECK(!extract(e, "envoi.zip", zip, "dossier/absent.txt", original));
+        CHECK(!extract(e, "envoi.zip", zip, "dossier/lettre.txt!x", original));
     }
     CHECK(process(e, "restore", "envoi.zip", out, res, back));
     {

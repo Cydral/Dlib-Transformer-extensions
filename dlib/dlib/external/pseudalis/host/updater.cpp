@@ -291,10 +291,10 @@ namespace pseudalis
         set("state", "checking");
         set("checked_at", static_cast<long long>(now_unix()));
         std::string body, sig, error;
-        // The feed and its signature, beside the installers of the publication.
+        // The feed and its signature, beside the installers of the publication: a failure there is one of the check.
         if (!http_get(feed_url_, body, error, 1u << 20) || !http_get(feed_url_ + ".sig", sig, error, 4096))
         {
-            fail(user_error().set(error, "update_download").arg("e", error));
+            fail(user_error().set(error, "update_check").arg("e", error));
             if (!ended()) log_warning("updates: " + error);
             return;
         }

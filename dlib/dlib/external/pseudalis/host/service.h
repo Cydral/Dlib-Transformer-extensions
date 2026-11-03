@@ -138,8 +138,24 @@ namespace pseudalis
 
         bool protect(const std::string& bytes, const std::string& name, const std::string& source, bool record,
             protect_result& out, user_error& error);
+        /*!
+            The original of a protected file: the original of its record, that of an entry of
+            a protected archive when it was extracted from one, a picture from its marker, else
+            the file with the values of its tags put back.
+        !*/
         bool restore(const std::string& bytes, const std::string& name, const std::string& object_id,
             restore_result& out, user_error& error);
+        // The original of record r as restore() gives it: its tags restored when it holds some.
+        bool recorded_original(const file_record& r, restore_result& out, user_error& error);
+        /*!
+            A file of the drive whose content is an entry of a protected archive that the
+            database records, extracted from it, is recorded with the original of that entry,
+            which the vault keeps apart from the original of the archive: each one is restored
+            and forgotten alone.  Returns 1 with its new record, 0 when the content is no such
+            entry or its original cannot be read, -1 when the engine or the vault cannot do it
+            now.
+        !*/
+        int adopt(const std::string& sha256, const std::string& name, long long size, long long& record);
         // A name alone, a folder of the drive for instance: its values become substitutes, recorded.
         bool protect_name(const std::string& name, std::string& out, user_error& error);
         // A name with the substitutes the database knows given back, or the name as it is.
@@ -165,6 +181,14 @@ namespace pseudalis
 
     private:
         bool start_engine(std::string& error);
+        /*
+            The original of the entry e, from the original of its archive, in bytes: 1, 0 when the
+            record of the archive is gone, -1 when the engine cannot do it now, -2 when the original
+            cannot be read.
+        */
+        int extract_entry(const entry_record& e, file_record& archive, std::string& bytes, user_error& error);
+        // Removes a record half written, its original being removed by the caller.
+        void discard(long long record);
         void background_loop();
         // The lookup of the engine: the tags recorded for a substitute.
         std::function<std::vector<std::string>(const std::string&)> substitute_lookup();

@@ -552,7 +552,7 @@
     const r = await postJson('v1/settings', {
       language: document.getElementById('set-language').value,
       drive_letter: document.getElementById('set-drive').value.trim().toUpperCase(),
-      max_file_mb: parseInt(document.getElementById('set-max').value, 10) || 256,
+      max_file_mb: parseInt(document.getElementById('set-max').value, 10) || 150,
       removed_days: parseInt(document.getElementById('set-removed').value, 10) || 30,
       albireo: document.getElementById('set-albireo').checked ? 'auto' : 'off',
       check_updates: document.getElementById('set-updates').checked

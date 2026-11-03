@@ -41,6 +41,22 @@ namespace pseudalis
         int64_t removed = 0;            // when its file left the drive (Unix time), else 0
     };
 
+    struct entry_record
+    {
+        /*!
+            WHAT THIS OBJECT REPRESENTS
+                An entry of a protected archive that the database records: a file extracted
+                from that archive is known by the SHA-256 of its bytes, and its original is the
+                entry original of the archive kept in the vault.  The paths of the entries of an
+                archive inside the archive follow its own and '!' (engine_api.h).
+        !*/
+        long long record = 0;           // the record of the archive
+        std::string name;               // its path in the protected archive
+        std::string original;           // its path in the original archive
+        std::string sha256;             // of the entry written
+        std::string kind;
+    };
+
     struct picture_record
     {
         std::string id;                 // 16 hexadecimal digits of a keyed digest (picture_found)
@@ -74,10 +90,11 @@ namespace pseudalis
         /*!
             WHAT THIS OBJECT REPRESENTS
                 The database of the service, pseudalis.db in a folder of SYSTEM and the
-                administrators: the files protected and their originals, the pictures and
-                their descriptions, the files of the drive and the recent events.  Every
-                method takes the lock of the connection, so that the threads of the server
-                and of the drive share it.
+                administrators: the files protected and their originals, the entries of the
+                protected archives, the pictures and their descriptions, the protected files
+                whose original was forgotten, the files of the drive and the recent events.
+                Every method takes the lock of the connection, so that the threads of the
+                server and of the drive share it.
             THROWS
                 std::runtime_error when the database cannot be opened or written.
         !*/
@@ -106,16 +123,25 @@ namespace pseudalis
         std::vector<long long> files_removed_before(int64_t when);
         /*!
             ensures
-                - Removes the record and its links to its pictures; blobs receives the blobs
-                  nothing refers to any more: its original, and the pictures no other file
-                  shows.
-                - With a reason ("forgotten", "expired"), the protected file of the record is
-                  remembered as forgotten (find_forgotten()), in the same transaction.
+                - Removes the record, its entries and its links to its pictures; blobs receives
+                  the blobs nothing refers to any more: its original, and the pictures no other
+                  file shows.
+                - With a reason ("forgotten", "expired"), the protected file of the record and
+                  the entries of a protected archive are remembered as forgotten
+                  (find_forgotten()), in the same transaction: a copy extracted from the archive
+                  is not restored either, unless a record of its own holds it.
         !*/
         bool remove_file(long long id, std::vector<std::string>& blobs, const std::string& reason = std::string());
         // The last original forgotten of a protected file, by its SHA-256 or its object identifier.
         bool find_forgotten(const std::string& sha256, const std::string& object_id, int64_t& time,
             std::string& reason);
+
+        // The entries of the protected archive of record (entry_record).
+        void add_entries(long long record, const std::vector<entry_record>& entries);
+        // The entry written with this SHA-256, of the latest record that holds one.
+        bool find_entry(const std::string& sha256, entry_record& e);
+        // The entries inside the entry e of its record, an archive, their paths taken from inside it.
+        std::vector<entry_record> entries_inside(const entry_record& e);
 
         bool get_picture(const std::string& id, picture_record& r);
         void add_picture(const picture_record& r);

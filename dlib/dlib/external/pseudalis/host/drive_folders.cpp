@@ -16,7 +16,11 @@
     The files processed are recorded with their size and the time of their last write, in
     memory and in the database: a scan passes them while they keep both.  A file whose content
     is a protected file of the vault (a copy, a move, a rename) is recorded without being
-    processed again, and its record leaves the list of the removed ones.
+    processed again, and its record leaves the list of the removed ones; the record is marked
+    removed once the last file of the drive that shows it leaves.  A protected file whose
+    original was forgotten stays as it is, unrecorded, so that nothing restores it.  A file
+    extracted from a protected archive that the database records stays as it is too, recorded
+    with the original of its entry (service::adopt()).
 
     A folder that comes in takes its name once nothing changed under it for six seconds and
     nothing under it waits: a copy in progress keeps its folders.  Its name is protected like
@@ -534,6 +538,7 @@ namespace pseudalis
             bool active = false;
             std::string error;
             std::map<std::string, folder_file> known;          // key -> as left
+            std::map<long long, int> shown;                     // record -> the protected files of known
             std::map<std::string, pending_file> pending;       // key -> changing or waiting
             std::set<std::string> busy;                         // keys in the queue or processed
             std::map<std::string, int64_t> seen_folders;       // new folders: key -> first seen
@@ -588,10 +593,22 @@ namespace pseudalis
             }
         }
 
+        // m held.  Counts the protected files of the drive that show each record.
+        static void count(folder_state& f, const folder_file& r, int delta)
+        {
+            if (r.record <= 0 || r.state != "protected") return;
+            int& n = f.shown[r.record];
+            n += delta;
+            if (n <= 0) f.shown.erase(r.record);
+        }
+
         // m held.
         void remember(folder_state& f, const folder_file& r)
         {
+            const auto before = f.known.find(key_of(r.path));
+            if (before != f.known.end()) count(f, before->second, -1);
             f.known[key_of(r.path)] = r;
+            count(f, r, 1);
             try
             {
                 svc.db().set_folder_file(r);
@@ -615,7 +632,19 @@ namespace pseudalis
             {
                 log_error("drive: " + std::string(e.what()));
             }
+            count(f, it->second, -1);
             f.known.erase(it);
+        }
+
+        // m not held.  A record that a file of the drive no longer shows: marked removed unless a copy shows it.
+        void release(folder_state& f, long long record)
+        {
+            if (record <= 0) return;
+            {
+                std::lock_guard<std::mutex> lock(m);
+                if (f.shown.count(record)) return;
+            }
+            svc.mark_removed(record);
         }
 
         void wake()
@@ -741,8 +770,10 @@ namespace pseudalis
                 }
                 const folder_file gone = it->second;
                 ++it;
-                if (gone.state == "protected" && gone.record > 0) svc.mark_removed(gone.record);
                 forget_path(f, key_of(gone.path));
+                // The record goes with the last file of the drive that shows it: a copy keeps it.
+                if (gone.state == "protected" && gone.record > 0 && !f.shown.count(gone.record))
+                    svc.mark_removed(gone.record);
             }
             for (auto it = f.pending.begin(); it != f.pending.end();)
                 it = present.count(it->first) ? std::next(it) : f.pending.erase(it);
@@ -1014,7 +1045,7 @@ namespace pseudalis
             if (static_cast<uint64_t>(size) > max_bytes)
             {
                 refuse(f, path, h, "the file is larger than " + std::to_string(st.max_file_mb) + " MB");
-                if (before.record > 0) svc.mark_removed(before.record);
+                release(f, before.record);
                 return 0;
             }
             /*
@@ -1037,7 +1068,7 @@ namespace pseudalis
                 {
                     wipe(data);
                     refuse(f, path, h, "this kind of file is not processed");
-                    if (before.record > 0) svc.mark_removed(before.record);
+                    release(f, before.record);
                     return 0;
                 }
                 read = read_all(h, data, static_cast<uint64_t>(size) - head, data.size());
@@ -1047,6 +1078,7 @@ namespace pseudalis
                 wipe(data);
                 close_file(h);
                 keep(f, path, std::string(), 0, "kept", false);
+                release(f, before.record);
                 return 0;
             }
             const std::string sha = sha256_hex(data);
@@ -1059,12 +1091,49 @@ namespace pseudalis
                 close_file(h);
                 if (known_record.removed) svc.db().set_file_removed(known_record.id, 0);
                 keep(f, path, sha, known_record.id, "protected", true);
+                if (before.record != known_record.id) release(f, before.record);
+                // A file gone meanwhile shows its record no more.
+                release(f, known_record.id);
                 return 0;
             }
             if (data.empty())
             {
                 close_file(h);
                 keep(f, path, sha, 0, "kept", true);
+                release(f, before.record);
+                return 0;
+            }
+            /*
+                A protected file whose original was forgotten, or kept its time after its file left
+                the drive: kept as it is and unrecorded, so that no new original restores its tags.
+            */
+            int64_t forgotten_at = 0;
+            std::string forgotten_why;
+            if (svc.db().find_forgotten(sha, std::string(), forgotten_at, forgotten_why))
+            {
+                wipe(data);
+                close_file(h);
+                keep(f, path, sha, 0, "kept", true);
+                release(f, before.record);
+                event("kept", path, "a protected file whose original is " + forgotten_why + ", kept as it is");
+                return 0;
+            }
+            // A file extracted from a protected archive: kept as it is, recorded with the original of its entry.
+            long long adopted = 0;
+            const int entry = svc.adopt(sha, base_of(path), size, adopted);
+            if (entry < 0)
+            {
+                wipe(data);
+                return failure_retry_ms;
+            }
+            if (entry > 0)
+            {
+                wipe(data);
+                close_file(h);
+                keep(f, path, sha, adopted, "protected", true);
+                if (before.record != adopted) release(f, before.record);
+                release(f, adopted);
+                event("protected", path, "a file extracted from a protected archive, recorded with its original");
                 return 0;
             }
             // A name of no kind whose content does not start as a text, and is no protected file.
@@ -1072,7 +1141,7 @@ namespace pseudalis
             {
                 wipe(data);
                 refuse(f, path, h, "this kind of file is not processed");
-                if (before.record > 0) svc.mark_removed(before.record);
+                release(f, before.record);
                 return 0;
             }
             protect_result r;
@@ -1091,7 +1160,7 @@ namespace pseudalis
             {
                 if (transient(e)) return failure_retry_ms;
                 refuse(f, path, h, e.text.empty() ? std::string("the file cannot be protected") : e.text);
-                if (before.record > 0) svc.mark_removed(before.record);
+                release(f, before.record);
                 return 0;
             }
             const std::string target = replace(f, path, h, r.bytes, r.name);
@@ -1100,12 +1169,14 @@ namespace pseudalis
                 if (r.record) svc.forget(r.record);
                 return failure_retry_ms;
             }
-            if (before.record > 0 && before.record != r.record) svc.mark_removed(before.record);
             {
                 std::lock_guard<std::mutex> lock(m);
                 if (target != path) forget_path(f, key_of(path));
             }
             keep(f, target, r.sha256, r.record, "protected", false);
+            // The record of the file before it changed, an edited protected file for instance.
+            if (before.record != r.record) release(f, before.record);
+            release(f, r.record);
             event("protected", target, std::to_string(r.report["total"].as_int(0)) + " values, " +
                                        std::to_string(r.report["dropped"].size()) + " entries left out");
             return 0;
@@ -1144,6 +1215,7 @@ namespace pseudalis
                         {
                             log_error("drive: " + std::string(x.what()));
                         }
+                        count(f, it->second, -1);
                         it = f.known.erase(it);
                     }
                     else ++it;
@@ -1356,7 +1428,13 @@ namespace pseudalis
         {
             try
             {
-                for (const folder_file& r : svc.db().folder_files(f.kind)) f.known[key_of(r.path)] = r;
+                f.known.clear();
+                f.shown.clear();
+                for (const folder_file& r : svc.db().folder_files(f.kind))
+                {
+                    f.known[key_of(r.path)] = r;
+                    count(f, r, 1);
+                }
             }
             catch (const std::exception& e)
             {

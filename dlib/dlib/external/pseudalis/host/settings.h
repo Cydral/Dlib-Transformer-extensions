@@ -29,7 +29,7 @@ namespace pseudalis
         std::string drive_letter = "A";         // the letter of the drive, empty without drive
         std::string date_order = "dmy";         // dmy or mdy: the numeric dates the detector reads
         std::string albireo = "auto";           // auto: the pictures are described when Albireo answers; off
-        int max_file_mb = 256;                  // the largest file processed
+        int max_file_mb = 150;                  // the largest file processed, in MB
         int removed_days = 30;                  // the days an original stays kept once its file left the drive
         static const int max_removed_days = 3650;
         bool check_updates = true;              // a check every day

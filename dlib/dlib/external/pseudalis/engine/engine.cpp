@@ -1334,12 +1334,29 @@ namespace pseudalis
                 {
                     engine_result r = any(e.data, e.name, handler, restoring, lookup, depth + 1, budget,
                                           restoring ? nullptr : &kind);
+                    const std::string read_as = e.name;
                     const std::string renamed =
                         entry_folders(folder_of(e.name), restoring, lookup, folders, out) + base_name(r.name);
                     if (renamed != e.name)
                     {
                         names.erase(lower(e.name));
                         e.name = free_name(renamed, names, next_number);
+                    }
+                    // The entry written, by which a copy extracted from the archive is known again.
+                    if (!restoring)
+                    {
+                        entry_written w;
+                        w.original = read_as;
+                        w.name = e.name;
+                        w.sha256 = sha256_hex(r.bytes);
+                        w.kind = r.kind;
+                        out.entries.push_back(std::move(w));
+                        for (entry_written& inner : r.entries)
+                        {
+                            inner.original = read_as + "!" + inner.original;
+                            inner.name = e.name + "!" + inner.name;
+                            out.entries.push_back(std::move(inner));
+                        }
                     }
                     e.data = std::move(r.bytes);
                     merge_report(out.report, r.report, e.name);
@@ -1376,6 +1393,38 @@ namespace pseudalis
             }
             out.bytes = write_archive(ak, kept);
             return out;
+        }
+
+        /*
+            The entry at path of an archive (engine::extract()).  An archive inside it is entered by
+            its name and '!': the longest name of an entry that starts the path, so that a name that
+            holds '!' is read whole.
+        */
+        std::string extract(const std::string& bytes, const std::string& name, const std::string& path) const
+        {
+            std::string data = bytes, label = name, rest = path;
+            for (int depth = 0; depth <= 3; ++depth)
+            {
+                archive_kind ak = archive_kind_of(data);
+                if (ak == archive_kind::none) ak = archive_kind_of_name(label);
+                if (ak == archive_kind::none) break;
+                std::vector<archive_entry> entries = read_archive(ak, data, archive_limits());
+                std::size_t inner = entries.size();
+                for (std::size_t k = 0; k < entries.size(); ++k)
+                {
+                    const archive_entry& e = entries[k];
+                    if (e.directory || !e.regular) continue;
+                    if (e.name == rest) return std::move(entries[k].data);
+                    const bool starts = rest.size() > e.name.size() + 1 && rest[e.name.size()] == '!' &&
+                                        rest.compare(0, e.name.size(), e.name) == 0;
+                    if (starts && (inner == entries.size() || e.name.size() > entries[inner].name.size())) inner = k;
+                }
+                if (inner == entries.size()) break;
+                rest = rest.substr(entries[inner].name.size() + 1);
+                label = entries[inner].name;
+                data = std::move(entries[inner].data);
+            }
+            throw std::runtime_error(base_name(name) + ": the archive holds no such entry");
         }
     };
 
@@ -1417,6 +1466,11 @@ namespace pseudalis
     {
         text_verdict verdict;
         return kind_of_content(bytes, base_name(name), verdict);
+    }
+
+    std::string engine::extract(const std::string& bytes, const std::string& name, const std::string& path) const
+    {
+        return p_->extract(bytes, name, path);
     }
 
     std::string engine::picture_marker(const std::string& id, const std::string& description)

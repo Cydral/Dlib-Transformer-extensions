@@ -511,16 +511,17 @@ namespace pseudalis
         srv.Get(R"(/v1/records/(\d+)/original)", [s, admin](const httplib::Request& req, httplib::Response& res) {
             if (!admin(req, res)) return;
             file_record r;
-            std::string bytes;
-            if (!s->db().get_file(std::atoll(req.matches[1].str().c_str()), r) ||
-                !s->blobs().get(r.original_blob, bytes))
+            restore_result out;
+            user_error e;
+            // The original as a restoration gives it: an edited protected file, its tags restored.
+            if (!s->db().get_file(std::atoll(req.matches[1].str().c_str()), r) || !s->recorded_original(r, out, e))
             {
                 send_error(res, 404, "no such record", "not_found");
                 return;
             }
             json meta = json::object();
             meta["record"] = r.id;
-            send_file(req, res, bytes, r.original_name, meta);
+            send_file(req, res, out.bytes, out.name, meta);
         });
         srv.Delete(R"(/v1/records/(\d+))", [s, admin](const httplib::Request& req, httplib::Response& res) {
             if (!admin(req, res)) return;

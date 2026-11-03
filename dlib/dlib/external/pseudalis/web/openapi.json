@@ -202,7 +202,7 @@
      "Files"
     ],
     "summary": "Restore a file",
-    "description": "Gives back the original of a protected file: the original kept when the body is a protected file this installation recorded (X-Pseudalis-restored: original), the picture of a text file holding a picture marker (picture), else the file with the values of its tags put back (tags), and those of the substitutes of its name and of its properties that the service recorded. The original name is in X-Pseudalis-Name. A restoration reads the tags of a text under any name, and keeps the entries of an archive that it cannot read as they are, under their names restored. 404 when the file holds no value this key protected; 410 when the original of the file was forgotten (code original_forgotten) or kept for its time after the file left the drive (code original_expired), its date in args.date: such a file is not restored from its tags either. A body larger than the route takes is refused before it is read (413): the files up to max_file_mb of the settings, the JSON bodies up to 16 MB. When every slot of work stays taken for a minute, the answer is 503 with Retry-After (code busy).",
+    "description": "Gives back the original of a protected file: the original kept when the body is a protected file this installation recorded, or an entry of a protected archive that it recorded, extracted from that archive (X-Pseudalis-restored: original), the picture of a text file holding a picture marker (picture), else the file with the values of its tags put back (tags), and those of the substitutes of its name and of its properties that the service recorded. The original name is in X-Pseudalis-Name. A restoration reads the tags of a text under any name, and keeps the entries of an archive that it cannot read as they are, under their names restored. 404 when the file holds no value this key protected; 410 when the original of the file was forgotten (code original_forgotten) or kept for its time after the file left the drive (code original_expired), its date in args.date: such a file is not restored from its tags either. A body larger than the route takes is refused before it is read (413): the files up to max_file_mb of the settings, the JSON bodies up to 16 MB. When every slot of work stays taken for a minute, the answer is 503 with Retry-After (code busy).",
     "parameters": [
      {
       "name": "name",
@@ -805,6 +805,7 @@
      "Administration"
     ],
     "summary": "An original kept",
+    "description": "The original of the record as a restoration gives it: a document edited on the drive and anonymized again comes back with the values of its tags.",
     "security": [
      {
       "admin": []
@@ -866,6 +867,7 @@
      "Administration"
     ],
     "summary": "Forget an original, and the pictures no other file shows",
+    "description": "Deletes the original of the record from the vault and remembers its protected file as forgotten, with the entries of a protected archive: their restoration is refused from then on, and the drive keeps such a file as it is when it comes back. A file extracted on the drive from a protected archive has a record and an original of its own, which this route forgets alone.",
     "security": [
      {
       "admin": []
@@ -1314,7 +1316,8 @@
       ]
      },
      "max_file_mb": {
-      "type": "integer"
+      "type": "integer",
+      "description": "The largest file processed, in MB, 1 to 2048: 150 by default"
      },
      "removed_days": {
       "type": "integer",

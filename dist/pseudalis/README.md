@@ -26,4 +26,5 @@ A version is published once its sources are pushed and its installer built on Wi
 (`dlib/dlib/external/pseudalis/README.md`, Publishing a version): on Linux,
 `tools/publish_release.py` copies the installer here, writes the feed of the version of
 `common/version.h` and signs it with the private key of the publisher, which never enters the
-repository, then the folder is committed and pushed.
+repository; with `--push`, it commits and pushes the folder, then waits until GitHub serves the
+feed, its signature and the installer as they were written.

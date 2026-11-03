@@ -17,9 +17,10 @@
 
     request is a JSON object:
         "operation"     "anonymize", "restore", "anonymize_text", "restore_text", "detect",
-                        "anonymize_name" or "restore_name"
+                        "anonymize_name", "restore_name" or "extract"
         "name"          the name of the file, whose extension tells its kind when its
                         content does not
+        "entry"         "extract": the path of an entry in the archive given as data
     result receives a JSON object: "name" (the name of the output, protected or restored:
     "photo.png.txt" for a picture), "kind" ("txt", "csv", "xml", "docx", "xlsx", "pptx",
     "pdf", "image", "zip", "tar", "tar.gz" or "text"), "report" ({"values": {type: count},
@@ -31,6 +32,13 @@
     "detect".  output receives the bytes of the file written.  "anonymize_name" and
     "restore_name" take a name alone as data, a folder for instance, and give the new name
     as output and as "name".
+    "anonymize" of an archive also gives "entries", each entry written: [{"original" (its
+    path in the archive read), "name" (its path in the archive written), "sha256" (of the
+    bytes written), "kind"}], the entries of an archive inside the archive after it, their
+    paths after its own and '!' ("dossier/notes.tar.gz!a.txt").  The caller knows by them a
+    file extracted from a protected archive.  "extract" gives as output the bytes of the
+    entry "entry" of the archive given as data, read as "anonymize" read it: an "original"
+    of "entries", whose original archive the caller kept.
 
     lookup, when not null, receives each candidate substitute that "restore" and
     "restore_name" meet in the names and the properties, and returns 1 with the tags

@@ -32,6 +32,11 @@ namespace pseudalis
             "CREATE INDEX IF NOT EXISTS pictures_sha ON pictures(sha256);"
             "CREATE TABLE IF NOT EXISTS file_pictures(file INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,"
             " picture TEXT NOT NULL, PRIMARY KEY(file, picture));"
+            // The entries of the protected archives, by which a file extracted from one is known.
+            "CREATE TABLE IF NOT EXISTS entries(record INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,"
+            " name TEXT NOT NULL, original TEXT NOT NULL, sha256 TEXT NOT NULL, kind TEXT NOT NULL,"
+            " PRIMARY KEY(record, name));"
+            "CREATE INDEX IF NOT EXISTS entries_sha ON entries(sha256);"
             // The originals forgotten, by the protected files that showed them: their restoration is refused.
             "CREATE TABLE IF NOT EXISTS forgotten(id INTEGER PRIMARY KEY AUTOINCREMENT, time INTEGER NOT NULL,"
             " reason TEXT NOT NULL, output_sha256 TEXT NOT NULL, object_id TEXT NOT NULL DEFAULT '');"
@@ -85,6 +90,12 @@ namespace pseudalis
                          : std::string();
             }
             long long integer(int i) { return sqlite3_column_int64(s_, i); }
+            // Ready to run again with other values.
+            void reset()
+            {
+                sqlite3_reset(s_);
+                sqlite3_clear_bindings(s_);
+            }
 
         private:
             sqlite3* db_;
@@ -319,7 +330,14 @@ namespace pseudalis
                                  " SELECT ?2, ?3, output_sha256, object_id FROM files WHERE id = ?1");
                 f.bind(1, id).bind(2, static_cast<long long>(now_unix())).bind(3, reason);
                 f.step();
+                statement fe(db_, "INSERT INTO forgotten(time, reason, output_sha256, object_id)"
+                                  " SELECT DISTINCT ?2, ?3, sha256, '' FROM entries WHERE record = ?1");
+                fe.bind(1, id).bind(2, static_cast<long long>(now_unix())).bind(3, reason);
+                fe.step();
             }
+            statement de(db_, "DELETE FROM entries WHERE record = ?1");
+            de.bind(1, id);
+            de.step();
             statement d(db_, "DELETE FROM files WHERE id = ?1");
             d.bind(1, id);
             d.step();
@@ -364,6 +382,65 @@ namespace pseudalis
         time = s.integer(0);
         reason = s.text(1);
         return true;
+    }
+
+    void store::add_entries(long long record, const std::vector<entry_record>& entries)
+    {
+        if (entries.empty()) return;
+        std::lock_guard<std::mutex> lock(m_);
+        exec("BEGIN IMMEDIATE");
+        try
+        {
+            statement s(db_, "INSERT OR REPLACE INTO entries(record, name, original, sha256, kind)"
+                             " VALUES(?1, ?2, ?3, ?4, ?5)");
+            for (const entry_record& e : entries)
+            {
+                s.reset();
+                s.bind(1, record).bind(2, e.name).bind(3, e.original).bind(4, e.sha256).bind(5, e.kind);
+                s.step();
+            }
+            exec("COMMIT");
+        }
+        catch (...)
+        {
+            sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+            throw;
+        }
+    }
+
+    bool store::find_entry(const std::string& sha256, entry_record& e)
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        statement s(db_, "SELECT record, name, original, sha256, kind FROM entries WHERE sha256 = ?1"
+                         " ORDER BY record DESC LIMIT 1");
+        s.bind(1, sha256);
+        if (!s.step()) return false;
+        e.record = s.integer(0);
+        e.name = s.text(1);
+        e.original = s.text(2);
+        e.sha256 = s.text(3);
+        e.kind = s.text(4);
+        return true;
+    }
+
+    std::vector<entry_record> store::entries_inside(const entry_record& e)
+    {
+        std::lock_guard<std::mutex> lock(m_);
+        const std::string name = e.name + "!", original = e.original + "!";
+        statement s(db_, "SELECT name, original, sha256, kind FROM entries WHERE record = ?1"
+                         " AND substr(name, 1, length(?2)) = ?2 AND substr(original, 1, length(?3)) = ?3");
+        s.bind(1, e.record).bind(2, name).bind(3, original);
+        std::vector<entry_record> out;
+        while (s.step())
+        {
+            entry_record r;
+            r.name = s.text(0).substr(name.size());
+            r.original = s.text(1).substr(original.size());
+            r.sha256 = s.text(2);
+            r.kind = s.text(3);
+            out.push_back(r);
+        }
+        return out;
     }
 
     bool store::get_picture(const std::string& id, picture_record& r)

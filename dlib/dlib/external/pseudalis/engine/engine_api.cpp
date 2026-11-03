@@ -73,6 +73,20 @@ namespace
         for (const std::string& id : r.pictures) ids.push_back(id);
         j["pictures"] = ids;
         j["substitutions"] = substitutions_of(r.substitutions);
+        if (!r.entries.empty())
+        {
+            pseudalis::json entries = pseudalis::json::array();
+            for (const pseudalis::entry_written& w : r.entries)
+            {
+                pseudalis::json e = pseudalis::json::object();
+                e["original"] = w.original;
+                e["name"] = w.name;
+                e["sha256"] = w.sha256;
+                e["kind"] = w.kind;
+                entries.push_back(e);
+            }
+            j["entries"] = entries;
+        }
         return j;
     }
 }
@@ -239,6 +253,16 @@ PSD_API int PSD_CALL psd_process(psd_engine* engine, const char* request, const 
         else if (op == "detect")
         {
             res["spans"] = engine->e->detect(bytes);
+        }
+        else if (op == "extract")
+        {
+            const std::string entry = req["entry"].str();
+            out = engine->e->extract(bytes, name, entry);
+            const std::size_t cut = entry.find_last_of("!/");
+            res["name"] = cut == std::string::npos ? entry : entry.substr(cut + 1);
+            res["kind"] = "entry";
+            res["report"] = pseudalis::json::object();
+            res["pictures"] = pseudalis::json::array();
         }
         else
         {

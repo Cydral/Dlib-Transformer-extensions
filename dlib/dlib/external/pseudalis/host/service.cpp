@@ -525,7 +525,8 @@ namespace pseudalis
             }
             file_record r;
             r.source = source;
-            r.original_name = name;
+            // A protected file protected again, edited on the drive for instance: its name in clear.
+            r.original_name = restore_name(name);
             r.output_name = out.name;
             r.original_sha256 = sha256_hex(bytes);
             r.output_sha256 = out.sha256;
@@ -533,13 +534,26 @@ namespace pseudalis
             r.original_size = static_cast<long long>(bytes.size());
             r.output_size = static_cast<long long>(out.bytes.size());
             r.kind = out.kind;
+            std::vector<entry_record> entries;
+            for (const json& w : result["entries"].elements())
+            {
+                entry_record en;
+                en.name = w["name"].str();
+                en.original = w["original"].str();
+                en.sha256 = w["sha256"].str();
+                en.kind = w["kind"].str();
+                if (!en.name.empty() && en.sha256.size() == 64) entries.push_back(en);
+            }
             try
             {
                 out.record = db_->add_file(r);
                 for (const json& id : result["pictures"].elements()) db_->link_picture(out.record, id.str());
+                db_->add_entries(out.record, entries);
             }
             catch (const std::exception& x)
             {
+                discard(out.record);
+                out.record = 0;
                 vault_->remove(blob);
                 error.set(x.what(), "database");
                 return false;
@@ -548,50 +562,148 @@ namespace pseudalis
         return true;
     }
 
+    void service::discard(long long record)
+    {
+        if (record <= 0) return;
+        try
+        {
+            std::vector<std::string> blobs;
+            db_->remove_file(record, blobs);
+        }
+        catch (const std::exception& x)
+        {
+            log_error("records: record " + std::to_string(record) + " half written stays: " + x.what());
+        }
+    }
+
+    bool service::recorded_original(const file_record& r, restore_result& out, user_error& error)
+    {
+        if (!vault_->get(r.original_blob, out.bytes))
+        {
+            error.set("the original of this file can no longer be read in the vault", "original_missing");
+            return false;
+        }
+        out.name = r.original_name;
+        out.how = "original";
+        out.record = r.id;
+        out.report = json::object();
+        /* The original of a protected file edited on the drive is that file with its edits:
+           the tags it kept are restored too, with the substitutes of its properties.  The
+           parts of an Office document, of a PDF or of an archive are compressed: only a
+           text shows its tags to a search. */
+        const bool text = r.kind == "txt" || r.kind == "csv" || r.kind == "xml" || r.kind == "text";
+        if (engine_ && r.kind != "image" && (!text || out.bytes.find("[[") != std::string::npos))
+        {
+            json request = json::object(), result;
+            request["operation"] = "restore";
+            request["name"] = r.original_name;
+            std::string restored, e;
+            const bool done =
+                engine_->process(request, out.bytes, result, restored, nullptr, e, substitute_lookup());
+            const long long put_back = done ? result["report"]["tags_restored"].as_int(0) +
+                                              result["report"]["substitutes_restored"].as_int(0) : 0;
+            if (put_back > 0)
+            {
+                out.bytes = restored;
+                out.report = result["report"];
+            }
+        }
+        return true;
+    }
+
+    int service::extract_entry(const entry_record& e, file_record& archive, std::string& bytes, user_error& error)
+    {
+        if (!db_->get_file(e.record, archive)) return 0;
+        std::string original;
+        if (!vault_->get(archive.original_blob, original))
+        {
+            error.set("the original of the archive can no longer be read in the vault", "original_missing");
+            return -2;
+        }
+        if (!engine_)
+        {
+            error.set("the engine is not ready", "engine");
+            return -1;
+        }
+        json request = json::object(), result;
+        request["operation"] = "extract";
+        request["name"] = archive.original_name;
+        request["entry"] = e.original;
+        std::string why;
+        const bool done = engine_->process(request, original, result, bytes, nullptr, why, substitute_lookup());
+        wipe(original);
+        if (!done)
+        {
+            error.set(why, "original_missing");
+            return -2;
+        }
+        return 1;
+    }
+
+    int service::adopt(const std::string& sha256, const std::string& name, long long size, long long& record)
+    {
+        record = 0;
+        entry_record e;
+        file_record archive;
+        std::string bytes;
+        user_error error;
+        if (!db_->find_entry(sha256, e)) return 0;
+        const int extracted = extract_entry(e, archive, bytes, error);
+        if (extracted <= 0)
+        {
+            if (extracted == -2) log_warning("records: an entry of record " + std::to_string(e.record) +
+                                             " cannot be extracted from its original: " + error.text);
+            return extracted == -1 ? -1 : 0;
+        }
+        const std::string blob = vault_->put(bytes);
+        if (blob.empty())
+        {
+            wipe(bytes);
+            return -1;
+        }
+        file_record r;
+        r.source = "drive";
+        const std::size_t cut = e.original.find_last_of("!/");
+        r.original_name = cut == std::string::npos ? e.original : e.original.substr(cut + 1);
+        r.output_name = name;
+        r.original_sha256 = sha256_hex(bytes);
+        r.output_sha256 = sha256;
+        r.original_blob = blob;
+        r.original_size = static_cast<long long>(bytes.size());
+        r.output_size = size;
+        r.kind = e.kind;
+        wipe(bytes);
+        try
+        {
+            record = db_->add_file(r);
+            // An archive extracted from the archive keeps the entries inside it, for the files extracted from it.
+            db_->add_entries(record, db_->entries_inside(e));
+        }
+        catch (const std::exception& x)
+        {
+            log_error("records: " + std::string(x.what()));
+            discard(record);
+            record = 0;
+            vault_->remove(blob);
+            return -1;
+        }
+        log_info("records: an entry of record " + std::to_string(e.record) + " extracted on the drive, recorded as " +
+                 std::to_string(record));
+        return 1;
+    }
+
     bool service::restore(const std::string& bytes, const std::string& name, const std::string& object_id,
                           restore_result& out, user_error& error)
     {
         file_record r;
-        if (db_->find_by_output(sha256_hex(bytes), r, name))
-        {
-            if (!vault_->get(r.original_blob, out.bytes))
-            {
-                error.set("the original of this file can no longer be read in the vault", "original_missing");
-                return false;
-            }
-            out.name = r.original_name;
-            out.how = "original";
-            out.record = r.id;
-            out.report = json::object();
-            /* The original of a protected file edited on the drive is that file with its edits:
-               the tags it kept are restored too, with the substitutes of its properties.  The
-               parts of an Office document, of a PDF or of an archive are compressed: only a
-               text shows its tags to a search. */
-            const bool text = r.kind == "txt" || r.kind == "csv" || r.kind == "xml" || r.kind == "text";
-            if (engine_ && r.kind != "image" && (!text || out.bytes.find("[[") != std::string::npos))
-            {
-                json request = json::object(), result;
-                request["operation"] = "restore";
-                request["name"] = r.original_name;
-                std::string restored, e;
-                const bool done =
-                    engine_->process(request, out.bytes, result, restored, nullptr, e, substitute_lookup());
-                const long long put_back = done ? result["report"]["tags_restored"].as_int(0) +
-                                                  result["report"]["substitutes_restored"].as_int(0) : 0;
-                if (put_back > 0)
-                {
-                    out.bytes = restored;
-                    out.report = result["report"];
-                }
-            }
-            return true;
-        }
+        const std::string sha = sha256_hex(bytes);
+        if (db_->find_by_output(sha, r, name)) return recorded_original(r, out, error);
         /* The original was forgotten: the file is not restored, from its tags either.  Its object
            identifier tells it only while no live record holds it since. */
         int64_t when = 0;
         std::string reason;
         const bool tracked = db_->find_by_object(object_id, r);
-        if (db_->find_forgotten(sha256_hex(bytes), tracked ? std::string() : object_id, when, reason))
+        if (db_->find_forgotten(sha, tracked ? std::string() : object_id, when, reason))
         {
             const std::string day = iso_time(when).substr(0, 10);
             if (reason == "expired")
@@ -602,6 +714,28 @@ namespace pseudalis
                           "original_forgotten");
             error.arg("date", day);
             return false;
+        }
+        // A file extracted from a protected archive: the entry of the original archive.
+        entry_record entry;
+        if (db_->find_entry(sha, entry))
+        {
+            file_record archive;
+            const int extracted = extract_entry(entry, archive, out.bytes, error);
+            if (extracted == -1) return false;
+            if (extracted > 0)
+            {
+                const std::size_t cut = entry.original.find_last_of("!/");
+                out.name = cut == std::string::npos ? entry.original : entry.original.substr(cut + 1);
+                out.how = "original";
+                out.record = archive.id;
+                out.report = json::object();
+                return true;
+            }
+            // An original that cannot be read: the tags of the file are restored rather.
+            if (extracted == -2) log_warning("records: an entry of record " + std::to_string(entry.record) +
+                                             " cannot be extracted from its original: " + error.text);
+            error = user_error();
+            out.bytes.clear();
         }
         const std::string id = marker_id(bytes);
         picture_record pic;

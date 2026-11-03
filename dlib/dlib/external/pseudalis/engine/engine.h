@@ -51,6 +51,19 @@ namespace pseudalis
         std::string context = "default";    // the context of the pseudonymization
     };
 
+    /*
+        An entry that anonymize() wrote in an archive: its path in the archive read, its path in the
+        archive written, the SHA-256 of the bytes written and its kind.  The entries of an archive
+        inside the archive follow it, their paths after its own and '!' ("dossier/notes.tar.gz!a.txt").
+    */
+    struct entry_written
+    {
+        std::string original;
+        std::string name;
+        std::string sha256;
+        std::string kind;
+    };
+
     struct engine_result
     {
         std::string bytes;                  // the file written
@@ -59,6 +72,7 @@ namespace pseudalis
         json report = json::object();
         std::vector<std::string> pictures;  // the identifiers of the pictures found, once each
         std::vector<substitution> substitutions;   // anonymize(): the substitutes written
+        std::vector<entry_written> entries;        // anonymize() of an archive: its entries written
     };
 
     class engine
@@ -137,6 +151,12 @@ namespace pseudalis
         */
         engine_result restore(const std::string& bytes, const std::string& name,
             const substitute_lookup& lookup = substitute_lookup()) const;
+        /*
+            The bytes of the entry at path in the archive bytes named name, read as anonymize()
+            reads it: path is entry_written::original, the archives inside joined by '!'.  Throws
+            std::runtime_error when the archive holds no such entry.
+        */
+        std::string extract(const std::string& bytes, const std::string& name, const std::string& path) const;
 
         // A name alone, a folder for instance: its values become substitutes, its extension stays.
         std::string anonymize_name(const std::string& name, const substitute_lookup& lookup,
