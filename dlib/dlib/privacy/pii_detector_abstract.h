@@ -24,7 +24,8 @@ namespace dlib
                                     left in place
                 date_order        - how numeric dates such as 03/04/2026 are read
                 profile_urls_only - when true, a web address is reported only if it is
-                                    personal data: a profile on a social network, an
+                                    personal data: a profile on a social network, its
+                                    scheme written or not ("linkedin.com/in/jdupont"), an
                                     address holding an e-mail address, credentials or an
                                     IP address, or a word of a name or of an e-mail
                                     address seen in the document. The other addresses
@@ -115,7 +116,8 @@ namespace dlib
     {
         /*!
             WHAT THIS OBJECT REPRESENTS
-                Finds personal data in UTF-8 text, French and English first.
+                Finds personal data in UTF-8 text in French, English, Italian, Spanish and
+                German.
 
                 Five channels contribute candidates. Overlaps are resolved by priority,
                 then length, then position: the validated scanners first, then the user
@@ -140,22 +142,32 @@ namespace dlib
                    Bulgaria, Croatia, Estonia and Lithuania, Slovenia, Greece, Canada
                    (SIN), Quebec (RAMQ), Brazil (CPF), Argentina, Chile, Mexico (CURP),
                    India (Aadhaar), China, Japan, Korea, Turkey, Israel, South Africa,
-                   Australia (TFN) and the Maghreb (CIN, NIN). Each value is accepted
+                   Australia (TFN) and the Maghreb (CIN, NIN), the VAT numbers of Italy
+                   (partita IVA), Spain (CIF), Germany (USt-IdNr.), France and the United
+                   Kingdom, and the plates of Italy, Spain, Germany and the United Kingdom
+                   after the word of a plate, of a vehicle or a make of car ("Ford Fiesta,
+                   YD68 KWP", "matrícula 4821 LKV", "Der Wagen (HH-LA 2307)"). Each value is accepted
                    only when its check digits verify, or after the label that announces
                    it for the numbers that have none (RAMQ, CIN, NIN); a number whose
                    check leaves one chance in ten or eleven also needs its label ("BSN",
-                   "PESEL", "CPR-nr."), as do phone numbers outside the French and
-                   international layouts, social handles, pre-2009 French plates
+                   "PESEL", "CPR-nr."), as do phone numbers outside the French, Italian,
+                   Spanish, German and international layouts, social handles, pre-2009
+                   French plates
                    and the references of files, customers, contracts, claims, invoices,
                    requests, applications, permits or asset tags ("dossier n° 2024-00123",
-                   reference "B4694342", "Ref: 2476486"), a file name excepted; a reference
+                   reference "B4694342", "Ref: 2476486", "pratica n. 2025/0041736",
+                   "expediente 2024-0871", "Aktenzeichen 2511-004712"), a file name
+                   excepted, a value after such a cue or a number sign being no phone
+                   number ("Polizza n. 0471/882331"); a reference
                    that carries a year between capitals and digits needs none, since its
                    year would also tell how far the dates moved ("INC-2026-0147"). A cue is a
                    whole word: "SIM" is not found in "Simon", nor "tel" in "hotel"; a cue
                    written with a final '*' in this implementation is a prefix ("tél." and
                    "téléphone"). These scanners work in time linear in the length of the
-                   text. Dates are those of find_dates(): complete dates, a month with its
-                   year ("mars 2022", "03/2022") and a year that dates a fact ("en 2019",
+                   text. Dates are those of find_dates(): complete dates in the five
+                   languages ("3 aprile 2024", "5 de mayo de 2024", "12. März 2024"), a
+                   month with its year ("mars 2022", "03/2022", "marzo de 2022") and a
+                   year that dates a fact ("en 2019",
                    "depuis 2021", the years of a CV line), since a month or a year left in
                    clear would tell how far the protected dates moved; a date that names a
                    street ("rue du 18 Juin 1940") belongs to the address, the numbers of a
@@ -163,7 +175,8 @@ namespace dlib
                    stays a date ("entretien téléphonique du 16-02-2027").
 
                 2. Linguistic evidence. Person names are scored from civilities and titles
-                   (M., Mme, Dr), field labels ("Nom :", "Signé par"), the first-name lexicon
+                   (M., Mme, Dr, Sig.ra, Sra., D., Herrn), field labels ("Nom :", "Signé
+                   par", "Cognome:", "Nachname:"), the first-name lexicon
                    (given names from all regions of the world, their short forms, nicknames
                    and stage names), shape (Jean DUPONT, Amadou BA), surrounding cues ("né
                    le", "épouse", "je soussigné") and the document lexicon; particles ("M. Le
@@ -176,22 +189,35 @@ namespace dlib
                    « Jojo »", "surnommée Mimi", "a.k.a. 'Smithy'", "sous le pseudonyme de
                    Vernon Sullivan"), while reported speech stays readable ("Il a dit
                    « bonjour »"). Organisations come from legal forms before or after the
-                   name ("SAS Iroise", "Dupont Conseil SAS"), head nouns ("Cabinet Martin",
+                   name ("SAS Iroise", "Dupont Conseil SAS", "Bauer Logistik GmbH", forms
+                   written with their periods, after a comma too: "Bianchi Costruzioni
+                   S.r.l.", "Construcciones Duero, S.A."), head nouns ("Cabinet Martin",
                    "Universidad de Sevilla"), with the adjectives that qualify them ("Hôpital
                    privé des Glénan", "Centre hospitalier de Brest", "Auto-école du Steir",
                    above the place they hold), sector words after a name ("Zorvane Finance",
                    "Ulmeo Seguros"), partners ("Martin et Fils"), public body names, and
                    about two thousand organisations of all countries known by their own name
                    ("Airbus", "Johnson & Johnson", "La Banque postale"), with a legal form, a
-                   trade or a country after them ("AXA France"); such a name followed by
+                   trade, a country or the division of a group after them ("AXA France",
+                   "Veolia Water", "Enel Green Power"); such a name followed by
                    another capitalized word is a product or a longer name and is left to the
                    other channels ("Microsoft Teams", "Airbus A320"). Products, applications
                    and the intergovernmental organisations of the United Nations system are
-                   left out of that table. "La société" introduces a name and stays outside
-                   it. Addresses come from street types, and in other countries from the
+                   left out of that table. "La société", "die Firma", "la empresa"
+                   introduce a name and stay outside it, and a German public body takes the
+                   place written after it ("Finanzamt Köln"). Laws, regulations and
+                   standards in capitals ("RGPD", "DSGVO", "LOPDGDD", "NIS2", "ISO 27001",
+                   "DORA" next to another one or after a word that announces it) are never
+                   a person, a place or an organisation, whoever reads them so. Addresses
+                   come from street types, and in other countries from the
                    types written before, after or at the end of the name when the house
                    number follows it ("ul. Długa 5", "Calle Sol, 86", "Kossuth Lajos utca
-                   16", "Hauptstraße 12"); places from postal codes ("CEDEX" stays readable),
+                   16", "Hauptstraße 12", with the Spanish floor and door and "s/n":
+                   "Calle de los Almendros, 6, 1.º A", "Calle Cervantes, 14, 2.º izq.",
+                   "Gran Vía de Don Diego López de Haro, 41", "Avda. Manuel Siurot, s/n"; a
+                   street that a recognizer reads on the same line takes the number, the
+                   floor and the door that the rules read after it);
+                   places from postal codes ("CEDEX" stays readable),
                    from "City, ST 90012" and British postcodes, from the postal codes of
                    other countries written before or after their town, after a street, before
                    a country or alone on their line, as in a paragraph of a letter ("8004
@@ -205,7 +231,8 @@ namespace dlib
 
                    A civility before a name is reported as title, since it tells the sex
                    of the person: "M. Dupont", "M. et Mme Martin", "Titulaire : Mme
-                   VAILLANT", "MmeLamia Chaoui" when a space was lost; after another
+                   VAILLANT", "MmeLamia Chaoui" when a space was lost, "Herrn" on a line of
+                   its own above the name in an address block; after another
                    title, "M." is an initial ("Monsieur M. Denis"). A civility without a
                    name ("Madame, Monsieur,", "Monsieur le Procureur") stays readable.
                    Sexes and nationalities are reported as gender and nationality in
@@ -339,8 +366,9 @@ namespace dlib
                   before a login joins it ("@hpetit38"). A span that names nothing is then
                   ignored: a piece of a word that no other piece completes ("Rem" in
                   "Remplacez"), a login inside a longer token, a file name
-                  ("rapport_final.docx"), a single character or a common word in lower case
-                  ("month"), for addresses, a field label or a common word alone
+                  ("rapport_final.docx", "journal.log2"), a single character or one repeated,
+                  a common word in lower case ("month"; a place too, but for the towns among
+                  the common words: "copies"), for addresses, a field label or a common word alone
                   ("Rédacteur"), a number alone before a unit ("14" in "à 14 h") and a
                   number before common words in lower case, none of them a word of an
                   address ("212 doublons", while "9e étage" and "220 broadway" stay) and,
@@ -361,7 +389,15 @@ namespace dlib
                   the line after "Douala", "Sud" in "Afrique du Sud"; a country that is also
                   the name of its capital, such as "Luxembourg", stays a place), a state or
                   a province in capitals beside a town or its postal code ("NSW" in "Sydney
-                  NSW 2010", which then makes two places), the civility "M." before a name
+                  NSW 2010", which then makes two places), regions, provinces and Länder,
+                  alone or joined by "and" ("Bretagne", "Puglia e Sicilia"), a country read
+                  as a person, the number of a standard ("27001" in "ISO 27001", "50600" in
+                  "EN 50600"), a greeting with the common words after it ("Guten Tag",
+                  "Buona serata"), a common word read alone as a person inside a sentence,
+                  after no civility, title, given name or field label ("Anhang",
+                  "Collega", "WARN"; the common words of the five languages hold no
+                  family name, and a first name or a region after a civility stays a
+                  name: "Sr. Aragón"), the civility "M." before a name
                   ("avec M. Martin", while "Monsieur M. Denis" keeps its initial), a
                   participle that opens a line before "à" ("Fait à Lyon"), a common word, a
                   head noun, a legal form or a title alone read as an organisation

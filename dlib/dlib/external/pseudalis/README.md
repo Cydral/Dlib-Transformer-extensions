@@ -483,8 +483,8 @@ icon. Their messages and logs never name the places they read.
 
 ## Limitations
 
-- The recognizers read French and English first; a document in another language keeps more values in
-  clear. A protected document should be read again before it is shared.
+- The recognizers read French, English, Italian, Spanish and German; a document in another language
+  keeps more values in clear. A protected document should be read again before it is shared.
 - A scanned page without text layer is kept as a gray box: no OCR is performed.
 - A description of Albireo is read as the text of its document is, with the same limits: a value that
   the detector misses stays in clear in it. The setting `albireo` turns the descriptions off.

@@ -1689,7 +1689,11 @@ namespace dlib
                 body = format_date(s, date_format());
             }
             if (!f.is_iso())
-                body += "~" + privacy_impl::crockford_encode(f.pack(), 4);
+            {
+                // Four characters hold the formats of French and English dates, five the others.
+                const std::uint32_t packed = f.pack();
+                body += "~" + privacy_impl::crockford_encode(packed, packed < (1u << 20) ? 4 : 5);
+            }
             return true;
         }
 

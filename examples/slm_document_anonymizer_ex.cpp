@@ -4,8 +4,8 @@
     to a language model or used outside the organisation that owns them, and restores
     them afterwards. It handles Word, Excel and PowerPoint files (DOCX, XLSX, PPTX and
     their variants), PDF files and text files of every kind (plain text, CSV, XML, HTML,
-    JSON, logs), in French and English, and is built entirely on dlib: no external
-    library is needed.
+    JSON, logs), in French, English, Italian, Spanish and German, and is built entirely
+    on dlib: no external library is needed.
 
     Every personal value found in a document is replaced by a tag such as
 
@@ -121,10 +121,12 @@
     load_pii_dataset():
 
         python3 slm_tools/build_pii_dataset.py --out-dir pii-data --train 100000
-            writes the splits; --abroad-share sets the share of places, organisations,
-            phone numbers and IBANs of other countries.
+            writes the splits in the five languages, in equal shares (--languages and
+            --shares choose them, --by-language also writes each test split by language);
+            --abroad-share sets the share of places, organisations, phone numbers and
+            IBANs of other countries.
         ./slm_document_anonymizer_ex train-tagger pii-data/train.tsv --dev pii-data/dev.tsv
-            --examples 70000 --threads 4 --out pii_tagger.dat
+            --examples 100000 --threads 4 --out pii_tagger.dat
             trains the tagger afresh, in minutes; --cache 5 trains about three times
             faster with about six times the memory.
         ./slm_document_anonymizer_ex train-model pii-data/train.tsv --dev pii-data/dev.tsv

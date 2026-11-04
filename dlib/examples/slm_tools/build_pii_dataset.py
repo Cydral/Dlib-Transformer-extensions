@@ -5,10 +5,11 @@
 #
 # Synthetic training data for the learned personal data recognizers of dlib/privacy.
 #
-# Writes annotated French and English texts in the format read by load_pii_dataset():
-# one example per line, the text with \\, \t, \n and \r escaped, a tab, then the spans
-# as begin:end:LABEL items, byte offsets into the UTF-8 text. The two languages come in
-# equal numbers unless --fr-share sets the share of French.
+# Writes annotated French, English, Italian, Spanish and German texts in the format read
+# by load_pii_dataset(): one example per line, the text with \\, \t, \n and \r escaped, a
+# tab, then the spans as begin:end:LABEL items, byte offsets into the UTF-8 text.
+# --languages chooses the languages (the five by default, in equal shares) and --shares
+# their shares; with French and English alone, --fr-share sets the share of French.
 #
 # WHY SYNTHETIC DATA
 #
@@ -28,8 +29,10 @@
 #   FAMILY_NAME     family names with their particles (de La Fontaine, Le Goff), birth
 #                   names after "née", double-barrelled names
 #   USERNAME        logins, handles and account names (jdupont, @jdupont35)
-#   STREET_ADDRESS  the street line (12 bis rue Victor Hugo) and each address complement
-#                   (Bâtiment C, BP 1234, Lieu-dit Kerbrat) as a span of its own
+#   STREET_ADDRESS  the street line (12 bis rue Victor Hugo), with the flat that opens it
+#                   and the floor and door that close it (Flat 3, 12 High Street; Calle
+#                   Mayor, 12, 3.º B), and each complement on a line of its own (Bâtiment C,
+#                   BP 1234, Lieu-dit Kerbrat) as a span of its own
 #   POSTAL_CODE     the postal code of an address
 #   CITY            every town or village, wherever it appears: like the Safe Harbor rule
 #                   of HIPAA, any place smaller than a region is replaced
@@ -49,6 +52,20 @@
 # rejoint Kerlys en 2019"), not the year of a report, a plan or a file name. Models ignore
 # these labels when they train; they make the annotation complete, so that the whole
 # detection system, rules and models together, can be scored.
+#
+# FIVE LANGUAGES
+#
+# Each language writes the documents of its country: Italian texts are set in Italy,
+# Spanish texts in Spain and German texts in Germany, with their dates ("3 aprile 2024",
+# "5 de mayo de 2024", "12. März 2024"), telephone numbers, IBANs, postal codes, street
+# lines ("Via Garibaldi 15", "Calle Mayor, 12, 3.º B", "Hauptstraße 12"), civilities (Sig.ra,
+# Sra., Frau), legal forms (S.r.l., S.L., GmbH), public bodies (Comune di Bergamo,
+# Ayuntamiento de Sevilla, Amtsgericht Hamburg), plates, national numbers (codice fiscale,
+# DNI, Steuer-ID) and VAT numbers (Partita IVA, CIF, USt-IdNr.). The places abroad of each
+# language are the other countries, France included. The words before a slot agree with the
+# value in every language: French elision and contraction, English "an", Italian and Spanish
+# contractions ("di" and "il" give "del", "de" and "el" give "del"), German contractions
+# ("bei dem" gives "beim") and German cases.
 #
 # HOW TEXTS ARE MADE
 #
@@ -80,7 +97,15 @@
 # or {ADDRESS:abroad#2}, puts place 2 in another country. {YEAR} writes a year left
 # unlabelled (a report, a file name, a plan); {YEAR:date} a year that dates a fact of a
 # person's life ("a rejoint {ORG#1} en {YEAR:date}"), labelled DATE together with the
-# month name written just before it ("Bulletin de paie – mars 2022").
+# month name written just before it ("Bulletin de paie – mars 2022", "nómina de marzo de 2022").
+#
+# {NATNUM#1} writes the national number of person 1 alone, after a label the template
+# writes ("Codice fiscale: {NATNUM#1}"), and {VAT#2} the VAT number of organisation 2 in the
+# country of the text, both labelled ID. German slots take a case: {TITLE:dat#1} writes
+# "Herrn" or "Frau", {ART:dat#2} the dative article of public body 2 ("bei {ART:dat#2}{ORG:
+# court#2}" gives "beim Amtsgericht Hamburg", {ART:gen#2} "des Amtsgerichts Hamburg"), and
+# {INSTITUTION:dat} or {NEGATIVE:law,dat} put the article of their value in that case. The
+# Italian, Spanish and German templates write their agreements with {g#1:masculine|feminine}.
 #
 # Names are drawn from lexicons by origin and gender, or synthesized from the
 # morphology of the family names of about twenty naming traditions (French, Breton,
@@ -90,8 +115,10 @@
 # than memorizing a list. Places and organisation names follow the same two routes;
 # streets come from their lexicon. Some organisations are known by their own name: a
 # share of the companies, banks, universities, hospitals and associations is drawn from
-# known_orgs.txt ("BNP Paribas", "Siemens Healthineers"), while the names of products and
-# applications stay unlabelled (products.txt).
+# known_orgs.txt ("BNP Paribas", "Siemens Healthineers"), and a group sometimes takes the
+# word of a division, a trade or a country after its name ("Veolia Water", "Siemens
+# Energy", "Telefónica España"), the whole being the organisation; the names of products
+# and applications stay unlabelled (products.txt).
 #
 # PLACES ABROAD
 #
@@ -124,7 +151,8 @@
 # capitalized words that are not personal data, test_documents longer texts of several
 # paragraphs, and test_abroad texts whose places, organisations, phone numbers and IBANs
 # all belong to other countries (--abroad-share 1 for that split). No evaluation split
-# repeats a text of train: an example drawn again is replaced by another.
+# repeats a text of train: an example drawn again is replaced by another. --by-language
+# also writes each evaluation split language by language (test.it.tsv, test.de.tsv...).
 #
 # CONTEXT
 #
@@ -165,6 +193,9 @@
 #   build_pii_dataset.py --out-dir pii-data
 #   build_pii_dataset.py --out-dir pii-data --resources path/to/resources \
 #       --train 60000 --seed 7
+#   build_pii_dataset.py --out-dir pii-data --shares fr=0.3,en=0.25,it=0.15,es=0.15,de=0.15 \
+#       --by-language
+#   build_pii_dataset.py --out-dir pii-data --languages fr,en --fr-share 0.6
 #   build_pii_dataset.py --sample 5            print five examples with their spans
 
 import argparse
@@ -301,6 +332,14 @@ Johannesburg	2196	za
 Cape Town	8001	za
 Moskva	125009	ru
 Kyiv	01001	ua
+Paris	75008	fr
+Lyon	69002	fr
+Marseille	13001	fr
+Lille	59000	fr
+Toulouse	31000	fr
+Nice	06000	fr
+Strasbourg	67000	fr
+Rennes	35000	fr
 """
 
 WORLD_STREETS_BUILTIN = """
@@ -360,6 +399,10 @@ Kenyatta Avenue	ke
 Long Street	za
 Tverskaya ulitsa	ru
 vulytsia Khreshchatyk	ua
+rue de la République	fr
+avenue Jean Jaurès	fr
+boulevard Victor Hugo	fr
+place de la Mairie	fr
 """
 
 KNOWN_ORGS_BUILTIN = """
@@ -611,6 +654,269 @@ negative	2	{NEGATIVE} approved the budget on {DATE}. The next review with {INSTI
     "fr/nicknames.txt": NICKNAMES_BUILTIN["fr"],
     "en/nicknames.txt": NICKNAMES_BUILTIN["en"],
 }
+
+# The built-in resources of Italian, Spanish and German: enough to exercise every slot.
+BUILTIN.update({
+    "it/given_female.txt": """
+Giulia italy\nFrancesca italy\nChiara italy\nSara italy\nMartina italy\nValentina italy\nAlessandra italy
+Federica italy\nElena italy\nSilvia italy\nAnna italy\nMaria Grazia italy\nRoberta italy\nPaola italy
+Laura italy\nGiorgia italy\nAurora italy\nBeatrice italy\nAndreea east_europe\nFatima maghreb\nMei china
+""",
+    "it/given_male.txt": """
+Marco italy\nAlessandro italy\nGiuseppe italy\nFrancesco italy\nLuca italy\nAndrea italy\nMatteo italy
+Lorenzo italy\nDavide italy\nStefano italy\nGiovanni italy\nRoberto italy\nPaolo italy\nGian Marco italy
+Antonio italy\nSalvatore italy\nRiccardo italy\nTommaso italy\nIonut east_europe\nYoussef maghreb\nWei china
+""",
+    "it/family.txt": """
+Rossi italy\nRusso italy\nFerrari italy\nEsposito italy\nBianchi italy\nRomano italy\nColombo italy
+Ricci italy\nMarino italy\nGreco italy\nBruno italy\nGallo italy\nConti italy\nDe Luca italy
+Mancini italy\nCosta italy\nGiordano italy\nRizzo italy\nLombardi italy\nMoretti italy\nD'Angelo italy
+Barbieri italy\nFontana italy\nSantoro italy\nPopescu east_europe\nEl Amrani maghreb\nChen china
+""",
+    "it/cities.txt": """
+Roma\t00184\nRoma\t00198\nMilano\t20121\nMilano\t20145\nNapoli\t80134\nTorino\t10123\nPalermo\t90133
+Genova\t16121\nBologna\t40121\nFirenze\t50122\nBari\t70121\nCatania\t95124\nVenezia\t30124\nVerona\t37121
+Padova\t35122\nTrieste\t34121\nBrescia\t25121\nBergamo\t24121\nParma\t43121\nModena\t41121\nPerugia\t06121
+Monza\t20900\nVicenza\t36100\nLecce\t73100\nSan Donà di Piave\t30027\nReggio nell'Emilia\t42121
+""",
+    "it/streets.txt": """
+Roma\nGaribaldi\nGiuseppe Mazzini\nCavour\nVittorio Emanuele II\nXX Settembre\nDante Alighieri
+della Repubblica\ndei Mille\nGiacomo Matteotti\nAntonio Gramsci\nGuglielmo Marconi\ndella Libertà
+San Francesco\nIV Novembre\nUmberto I\nNazionale\ndel Corso
+""",
+    "it/street_types.txt": """
+Via\t10\nViale\t2\nPiazza\t2\nCorso\t1\nLargo\t1\nVicolo\t0.5\nPiazzale\t0.5
+""",
+    "it/org_words.txt": """
+Altrys\nNovexa\nBriovia\nKerlys\nZentiq\nArmoris\nVelatis\nOptimea\nSolvane\nTerranis
+""",
+    "it/institutions.txt": """
+l'[INPS]\nl'[INAIL]\nl'[Agenzia delle Entrate]\nla [Guardia di Finanza]\nil [Ministero della Salute]
+il [Garante per la protezione dei dati personali]\nla [Corte di Cassazione]\nl'ufficio anagrafe\nil comune
+la prefettura\nil tribunale\nl'[Agenzia delle Entrate-Riscossione]
+""",
+    "it/jobs.txt": """
+impiegato amministrativo\ninfermiera\nsviluppatore software\nresponsabile delle risorse umane
+direttore commerciale\nassistente di direzione\ntecnico di manutenzione\ncapo progetto\nmedico del lavoro\nconsulente legale
+""",
+    "it/regions.txt": """
+Lombardia\nLazio\nCampania\nSicilia\nVeneto\nPiemonte\nToscana\nEmilia-Romagna\nPuglia\nSardegna
+""",
+    "it/countries.txt": """
+Italia\nFrancia\nSpagna\nGermania\nSvizzera\nAustria\nRomania\nMarocco\nAlbania\nStati Uniti
+""",
+    "it/negatives.txt": """
+il Consiglio di amministrazione\tbody\nl'Assemblea dei soci\tbody\nil Collegio sindacale\tbody
+il Regolamento generale sulla protezione dei dati\tlaw\nil GDPR\tlaw\nil D.Lgs. 196/2003\tlaw
+il Codice civile\tlaw\nlo Statuto dei lavoratori\tlaw\nla ISO 27001\tlaw\nFerragosto\tevent\nil Natale\tevent
+la Festa della Repubblica\tevent\nGentile Direttore\ttitle\nEgregio Presidente\ttitle\nl'Unione europea\tmisc
+il Po\tmisc\nil Giro d'Italia\tmisc
+""",
+    "it/products.txt": """
+Excel\nWord\nWindows\nOutlook\nTeams\nSAP\nSalesforce\nAndroid\niPhone\nFiat Panda
+""",
+    "it/sentences.txt": r"""
+La pratica è completa e sarà trasmessa all'ufficio competente.
+La riunione di aggiornamento è rinviata a {?giovedì|venerdì|la prossima settimana}.
+Si prega di compilare il modulo entro la scadenza indicata.
+In allegato il verbale della riunione.
+Il trattamento dei dati avviene ai sensi del GDPR e del D.Lgs. 196/2003.
+Il software {PRODUCT} deve essere aggiornato su tutte le postazioni.
+Il file {?relazione_finale|verbale|budget_2025}.{?docx|xlsx|pdf} è allegato alla presente.
+Cordiali saluti,
+Distinti saluti,
+Il documento è strettamente riservato.
+""",
+    "it/templates.txt": r"""
+form	4	Cognome: {FAMILY#1}\nNome: {GIVEN#1}\nData di nascita: {BIRTHDATE#1}\nLuogo di nascita: {CITY#2}\nIndirizzo: {STREET#3}\n{CITYLINE#3}\nTelefono: {PHONE#1}\nE-mail: {EMAIL#1}
+form	2	{g#1:Il|La} sottoscritt{g#1:o|a} {PERSON:formal#1}, nat{g#1:o|a} a {CITY#2} il {BIRTHDATE#1}, residente in {ADDRESS#3}, codice fiscale {NATNUM:it#1}, dichiara quanto segue.
+form	1	Sesso: {SEX:short#1}\nCittadinanza: {NATIONALITY#1}\nDocumento: {NATID#1}
+letter	3	{PERSON#1}\n{ADDRESS_BLOCK#1}\n\nSpett.le {ORG#2}\n{ADDRESS_BLOCK#3}\n\n{CITY#1}, {DATE:long}\n\nOggetto: disdetta del contratto n. {REF}\n\nGentile {g#4:Signore|Signora},\ncon la presente comunico la disdetta del contratto.\n\nCordiali saluti,\n{PERSON:signature#1}
+email	3	Da: {PERSON:signature#1} <{EMAIL#1@2}>\nA: {PERSON:signature#3} <{EMAIL#3@2}>\nOggetto: aggiornamento\n\nCiao {GIVEN#3},\npuoi inoltrare il documento a {TITLE#4} {FAMILY#4} entro {?giovedì|venerdì}?\n\nGrazie,\n{GIVEN#1}
+admin	1	{TITLE#1} {PERSON#1} ha presentato domanda presso {INSTITUTION} e presso {ART#2}{ORG:council#2}; la risposta di {ART#3}{ORG:court#3} è attesa.
+hr	2	La società {ORG#1}, P.IVA {VAT#1}, con sede in {ADDRESS#2}, assume {TITLE#3} {PERSON#3} a decorrere dal {DATE} in qualità di {JOB}.
+banking	2	Titolare del conto: {TITLE#1} {PERSON#1}\nIBAN: {IBAN}\nBanca: {ORG:bank#2}, filiale di {CITY#3}
+chat	2	[{TIME}] {USERNAME#1}: ciao {GIVEN#2}, hai visto la mail di {GIVEN#3} {FAMILY#3}?\n[{TIME}] {USERNAME#2}: sì, la chiamo al {PHONE#3}
+log	2	{DATE:iso} {TIME} INFO login ok user={USERNAME#1} ip={IP}
+narrative	2	{PERSON#1}, {AGE} anni, di {CITY#1}, lavora presso {ORG#2} dal {YEAR:date} insieme a {PERSON#3}.
+negative	2	Ai sensi del GDPR, {NEGATIVE:body} ha approvato la proposta il {DATE}. La riunione con {INSTITUTION} si terrà in {REGION}.
+auto	1	Veicolo: {PRODUCT}\nTarga: {PLATE}\nProprietario: {PERSON#1}, {ADDRESS#2}
+""",
+    "es/given_female.txt": """
+María iberia\nLucía iberia\nCarmen iberia\nAna iberia\nLaura iberia\nMarta iberia\nPaula iberia\nElena iberia
+Sara iberia\nCristina iberia\nIsabel iberia\nMaría José iberia\nMaría del Carmen iberia\nAinhoa basque
+Nerea basque\nValentina latam\nFátima maghreb\nIoana east_europe
+""",
+    "es/given_male.txt": """
+Javier iberia\nDavid iberia\nDaniel iberia\nAlejandro iberia\nPablo iberia\nManuel iberia\nCarlos iberia
+Sergio iberia\nJorge iberia\nAntonio iberia\nJosé Luis iberia\nJuan Carlos iberia\nMiguel Ángel iberia
+Iker basque\nAitor basque\nMateo latam\nMohamed maghreb\nAndrei east_europe
+""",
+    "es/family.txt": """
+García iberia\nRodríguez iberia\nGonzález iberia\nFernández iberia\nLópez iberia\nMartínez iberia
+Sánchez iberia\nPérez iberia\nGómez iberia\nMartín iberia\nJiménez iberia\nRuiz iberia\nHernández iberia
+Díaz iberia\nMoreno iberia\nMuñoz iberia\nÁlvarez iberia\nRomero iberia\nde la Fuente iberia\ndel Río iberia
+Etxeberria basque\nAguirre basque\nEl Idrissi maghreb\nPopa east_europe
+""",
+    "es/cities.txt": """
+Madrid\t28013\nMadrid\t28045\nBarcelona\t08002\nBarcelona\t08029\nValencia\t46002\nSevilla\t41004
+Zaragoza\t50001\nMálaga\t29015\nMurcia\t30001\nPalma\t07001\nBilbao\t48001\nAlicante\t03001\nCórdoba\t14001
+Valladolid\t47001\nVigo\t36201\nGijón\t33201\nGranada\t18001\nOviedo\t33003\nPamplona\t31001\nSantander\t39001
+L'Hospitalet de Llobregat\t08901\nAlcalá de Henares\t28801\nSan Sebastián\t20001\nTorrejón de Ardoz\t28850
+""",
+    "es/streets.txt": """
+Mayor\nReal\nde la Constitución\nde España\ndel Sol\nGran Vía\nde Alcalá\nde Cervantes\nde Goya
+San Juan\nde Colón\nde Andalucía\ndel Carmen\nde la Paz\nNueva\nde Velázquez\ndel Prado
+""",
+    "es/street_types.txt": """
+Calle\t10\nC/\t3\nAvenida\t3\nAvda.\t1\nPlaza\t2\nPaseo\t1\nCamino\t0.5\nRonda\t0.5\nTravesía\t0.5
+""",
+    "es/org_words.txt": """
+Altrys\nNovexa\nBriovia\nKerlys\nZentiq\nArmoris\nVelatis\nOptimea\nSolvane\nTerranis
+""",
+    "es/institutions.txt": """
+la [Agencia Tributaria]\nla [Seguridad Social]\nla [Tesorería General de la Seguridad Social]\nel [SEPE]
+el [INSS]\nla [AEPD]\nla [Agencia Española de Protección de Datos]\nla [Dirección General de Tráfico]
+la [Guardia Civil]\nel ayuntamiento\nel juzgado\n[Hacienda]
+""",
+    "es/jobs.txt": """
+administrativo\nenfermera\ndesarrollador de software\nresponsable de recursos humanos\ndirector comercial
+asistente de dirección\ntécnico de mantenimiento\njefe de proyecto\nmédico del trabajo\nasesor jurídico
+""",
+    "es/regions.txt": """
+Andalucía\nCataluña\nComunidad de Madrid\nComunidad Valenciana\nGalicia\nCastilla y León\nPaís Vasco
+Aragón\nCanarias\nNavarra
+""",
+    "es/countries.txt": """
+España\nFrancia\nPortugal\nItalia\nAlemania\nMarruecos\nRumanía\nArgentina\nMéxico\nReino Unido
+""",
+    "es/negatives.txt": """
+el Consejo de Administración\tbody\nla Junta General de Accionistas\tbody\nel Comité de Empresa\tbody
+el Reglamento General de Protección de Datos\tlaw\nel RGPD\tlaw\nla LOPDGDD\tlaw\nel Estatuto de los Trabajadores\tlaw
+el Código Civil\tlaw\nla ISO 27001\tlaw\nla Semana Santa\tevent\nla Nochebuena\tevent\nel Día de Reyes\tevent
+Estimado Director\ttitle\nMuy señores míos\ttitle\nla Unión Europea\tmisc\nel Ebro\tmisc\nla Vuelta\tmisc
+""",
+    "es/products.txt": """
+Excel\nWord\nWindows\nOutlook\nTeams\nSAP\nSalesforce\nAndroid\niPhone\nSeat Ibiza
+""",
+    "es/sentences.txt": r"""
+El expediente está completo y se enviará al departamento correspondiente.
+La reunión de seguimiento se aplaza al {?jueves|viernes|próximo lunes}.
+Rogamos cumplimente el formulario antes de la fecha límite.
+Adjuntamos el acta de la reunión.
+El tratamiento de los datos se realiza conforme al RGPD y a la LOPDGDD.
+El programa {PRODUCT} debe actualizarse en todos los equipos.
+Se adjunta el archivo {?informe_final|acta|presupuesto_2025}.{?docx|xlsx|pdf}.
+Atentamente,
+Un saludo,
+Este documento es estrictamente confidencial.
+""",
+    "es/templates.txt": r"""
+form	4	Apellidos: {FAMILY#1}\nNombre: {GIVEN#1}\nFecha de nacimiento: {BIRTHDATE#1}\nLugar de nacimiento: {CITY#2}\nDomicilio: {STREET#3}\n{CITYLINE#3}\nTeléfono: {PHONE#1}\nCorreo electrónico: {EMAIL#1}
+form	2	{TITLE#1} {PERSON#1}, nacid{g#1:o|a} en {CITY#2} el {BIRTHDATE#1}, con DNI {NATNUM:es#1} y domicilio en {ADDRESS#3}, solicita el empadronamiento.
+form	1	Sexo: {SEX:short#1}\nNacionalidad: {NATIONALITY#1}\nDocumento: {NATID#1}
+letter	3	{PERSON#1}\n{ADDRESS_BLOCK#1}\n\n{ORG#2}\n{ADDRESS_BLOCK#3}\n\n{CITY#1}, a {DATE:long}\n\nAsunto: baja del contrato n.º {REF}\n\nEstimad{g#4:o|a} {TITLE#4} {FAMILY#4}:\nPor la presente le comunico mi decisión de dar de baja el contrato.\n\nAtentamente,\n{PERSON:signature#1}
+email	3	De: {PERSON:signature#1} <{EMAIL#1@2}>\nPara: {PERSON:signature#3} <{EMAIL#3@2}>\nAsunto: seguimiento\n\nHola, {GIVEN#3}:\n¿Puedes enviar el documento a {TITLE#4} {FAMILY#4} antes del {?jueves|viernes}?\n\nGracias,\n{GIVEN#1}
+admin	1	{TITLE#1} {PERSON#1} presentó su solicitud ante {INSTITUTION} y ante {ART#2}{ORG:council#2}; queda pendiente la resolución de {ART#3}{ORG:court#3}.
+hr	2	La empresa {ORG#1}, con CIF {VAT#1} y domicilio social en {ADDRESS#2}, contrata a {TITLE#3} {PERSON#3} a partir del {DATE} como {JOB}.
+banking	2	Titular de la cuenta: {TITLE#1} {PERSON#1}\nIBAN: {IBAN}\nEntidad: {ORG:bank#2}, oficina de {CITY#3}
+chat	2	[{TIME}] {USERNAME#1}: hola {GIVEN#2}, ¿has visto el correo de {GIVEN#3} {FAMILY#3}?\n[{TIME}] {USERNAME#2}: sí, la llamo al {PHONE#3}
+log	2	{DATE:iso} {TIME} INFO login ok user={USERNAME#1} ip={IP}
+narrative	2	{PERSON#1}, de {AGE} años, vecin{g#1:o|a} de {CITY#1}, trabaja en {ORG#2} desde {YEAR:date} con {PERSON#3}.
+negative	2	Según el RGPD, {NEGATIVE:body} aprobó la propuesta el {DATE}. La reunión con {INSTITUTION} tendrá lugar en {REGION}.
+auto	1	Vehículo: {PRODUCT}\nMatrícula: {PLATE}\nTitular: {PERSON#1}, {ADDRESS#2}
+""",
+    "de/given_female.txt": """
+Anna germanic\nLaura germanic\nJulia germanic\nLea germanic\nSophie germanic\nKatharina germanic
+Sabine germanic\nPetra germanic\nClaudia germanic\nMonika germanic\nAnna-Lena germanic\nHannah germanic
+Lena germanic\nUrsula germanic\nAyşe turkey\nAgnieszka poland\nElena italy
+""",
+    "de/given_male.txt": """
+Thomas germanic\nMichael germanic\nAndreas germanic\nStefan germanic\nMarkus germanic\nJan germanic
+Lukas germanic\nFelix germanic\nJonas germanic\nKarl-Heinz germanic\nHans-Peter germanic\nWolfgang germanic
+Jürgen germanic\nTobias germanic\nMehmet turkey\nPiotr poland\nLuca italy
+""",
+    "de/family.txt": """
+Müller germanic\nSchmidt germanic\nSchneider germanic\nFischer germanic\nWeber germanic\nMeyer germanic
+Wagner germanic\nBecker germanic\nSchulz germanic\nHoffmann germanic\nSchäfer germanic\nKoch germanic
+Bauer germanic\nRichter germanic\nKlein germanic\nWolf germanic\nSchröder germanic\nNeumann germanic
+von der Heide germanic\nYılmaz turkey\nKowalski poland\nRossi italy
+""",
+    "de/cities.txt": """
+Berlin\t10115\nBerlin\t10557\nHamburg\t20095\nMünchen\t80331\nMünchen\t80802\nKöln\t50667\nFrankfurt am Main\t60311
+Stuttgart\t70173\nDüsseldorf\t40213\nLeipzig\t04109\nDortmund\t44135\nEssen\t45127\nBremen\t28195\nDresden\t01067
+Hannover\t30159\nNürnberg\t90402\nDuisburg\t47051\nBochum\t44787\nBonn\t53111\nMannheim\t68159\nKarlsruhe\t76133
+Münster\t48143\nHalle\t06108\nBad Homburg vor der Höhe\t61348
+""",
+    "de/streets.txt": """
+Hauptstraße\nBahnhofstraße\nSchulstraße\nGartenstraße\nDorfstraße\nBergstraße\nLindenstraße\nKirchstraße
+Goethestraße\nSchillerstraße\nAm Markt\nMarktplatz\nLindenweg\nBirkenweg\nAm Bahnhof\nFriedrich-Ebert-Straße
+Goethestr.\nKaiser-Wilhelm-Allee
+""",
+    "de/street_types.txt": "\n",
+    "de/org_words.txt": """
+Altrys\nNovexa\nBriovia\nKerlys\nZentiq\nArmoris\nVelatis\nOptimea\nSolvane\nTerranis
+""",
+    "de/institutions.txt": """
+die [Bundesagentur für Arbeit]\ndie [Deutsche Rentenversicherung]\ndas [Bundesamt für Migration und Flüchtlinge]
+das [Bundeszentralamt für Steuern]\ndie [AOK]\nder [BfDI]\ndas [Statistische Bundesamt]\ndie [BaFin]
+das Finanzamt\ndas Bürgeramt\ndas Jobcenter\ndas Standesamt
+""",
+    "de/jobs.txt": """
+Sachbearbeiter\nPflegekraft\nSoftwareentwickler\nPersonalleiterin\nVertriebsleiter\nAssistentin der Geschäftsführung
+Servicetechniker\nProjektleiter\nBetriebsarzt\nJurist
+""",
+    "de/regions.txt": """
+Bayern\nNordrhein-Westfalen\nBaden-Württemberg\nNiedersachsen\nHessen\nSachsen\nBerlin-Brandenburg
+Schleswig-Holstein\nThüringen\nRheinland-Pfalz
+""",
+    "de/countries.txt": """
+Deutschland\nÖsterreich\nSchweiz\nFrankreich\nItalien\nPolen\nTürkei\nNiederlande\nSpanien\nVereinigte Staaten
+""",
+    "de/negatives.txt": """
+der Aufsichtsrat\tbody\ndie Hauptversammlung\tbody\nder Betriebsrat\tbody\ndie Geschäftsführung\tbody
+die Datenschutz-Grundverordnung\tlaw\ndie DSGVO\tlaw\ndas BDSG\tlaw\ndas Bürgerliche Gesetzbuch\tlaw
+das Grundgesetz\tlaw\ndie ISO 27001\tlaw\nOstern\tevent\nder Tag der Deutschen Einheit\tevent
+Sehr geehrte Damen und Herren\ttitle\nSehr geehrter Herr Vorsitzender\ttitle\ndie Europäische Union\tmisc
+der Rhein\tmisc\ndie Bundesliga\tmisc
+""",
+    "de/products.txt": """
+Excel\nWord\nWindows\nOutlook\nTeams\nSAP\nSalesforce\nAndroid\niPhone\nVW Golf
+""",
+    "de/sentences.txt": r"""
+Die Unterlagen sind vollständig und werden an die zuständige Abteilung weitergeleitet.
+Die Besprechung wird auf {?Donnerstag|Freitag|nächste Woche} verschoben.
+Bitte füllen Sie das Formular bis zum Ablauf der Frist aus.
+Anbei erhalten Sie das Protokoll der Sitzung.
+Die Verarbeitung der Daten erfolgt gemäß Art. 6 DSGVO und dem BDSG.
+Die Software {PRODUCT} muss auf allen Arbeitsplätzen aktualisiert werden.
+Die Datei {?Abschlussbericht|Protokoll|Budget_2025}.{?docx|xlsx|pdf} liegt dieser Nachricht bei.
+Mit freundlichen Grüßen
+Viele Grüße
+Dieses Dokument ist streng vertraulich.
+""",
+    "de/templates.txt": r"""
+form	4	Name: {FAMILY#1}\nVorname: {GIVEN#1}\nGeburtsdatum: {BIRTHDATE#1}\nGeburtsort: {CITY#2}\nAnschrift: {STREET#3}\n{CITYLINE#3}\nTelefon: {PHONE#1}\nE-Mail: {EMAIL#1}
+form	2	{TITLE#1} {PERSON#1}, geboren am {BIRTHDATE#1} in {CITY#2}, wohnhaft {ADDRESS#3}, Steuer-ID {NATNUM:de#1}, beantragt eine Meldebescheinigung.
+form	1	Geschlecht: {SEX:short#1}\nStaatsangehörigkeit: {NATIONALITY#1}\nAusweis: {NATID#1}
+letter	3	{PERSON#1}\n{ADDRESS_BLOCK#1}\n\n{ORG#2}\n{ADDRESS_BLOCK#3}\n\n{CITY#1}, {DATE:long}\n\nKündigung des Vertrags Nr. {REF}\n\nSehr geehrte{g#4:r|} {TITLE#4} {FAMILY#4},\nhiermit kündige ich den oben genannten Vertrag fristgerecht.\n\nMit freundlichen Grüßen\n{PERSON:signature#1}
+email	3	Von: {PERSON:signature#1} <{EMAIL#1@2}>\nAn: {PERSON:signature#3} <{EMAIL#3@2}>\nBetreff: Rückfrage\n\nHallo {GIVEN#3},\nkannst du die Unterlagen bis {?Donnerstag|Freitag} an {TITLE:dat#4} {FAMILY#4} schicken?\n\nDanke und Gruß\n{GIVEN#1}
+admin	1	{TITLE#1} {PERSON#1} hat den Antrag bei {INSTITUTION:dat} und bei {ART:dat#2}{ORG:council#2} gestellt; die Entscheidung {ART:gen#3}{ORG:court#3} steht noch aus.
+hr	2	Die Firma {ORG#1}, USt-IdNr. {VAT#1}, mit Sitz in {ADDRESS#2}, stellt {TITLE:dat#3} {PERSON#3} ab dem {DATE} als {JOB} ein.
+banking	2	Kontoinhaber{g#1:|in}: {TITLE#1} {PERSON#1}\nIBAN: {IBAN}\nBank: {ORG:bank#2}, Filiale {CITY#3}
+chat	2	[{TIME}] {USERNAME#1}: hi {GIVEN#2}, hast du die Mail von {GIVEN#3} {FAMILY#3} gesehen?\n[{TIME}] {USERNAME#2}: ja, ich rufe sie unter {PHONE#3} an
+log	2	{DATE:iso} {TIME} INFO login ok user={USERNAME#1} ip={IP}
+narrative	2	{PERSON#1}, {AGE} Jahre alt, aus {CITY#1}, arbeitet seit {YEAR:date} bei {ORG#2} zusammen mit {PERSON#3}.
+negative	2	Gemäß DSGVO hat {NEGATIVE:body} den Vorschlag am {DATE} angenommen. Die Besprechung mit {INSTITUTION:dat} findet in {REGION} statt.
+auto	1	Fahrzeug: {PRODUCT}\nKennzeichen: {PLATE}\nHalter{g#1:|in}: {PERSON#1}, {ADDRESS#2}
+""",
+})
+for _lang in ("it", "es", "de"):
+    for _name in ("world_cities.txt", "world_streets.txt", "known_orgs.txt"):
+        BUILTIN[_lang + "/" + _name] = BUILTIN["en/" + _name]
+BUILTIN["it/nicknames.txt"] = "\nPeppe\tm\nBeppe\tm\nGigi\tm\nTotò\tm\nPino\tm\nLella\tf\nTitti\tf\nMimmo\tm\n"
+BUILTIN["es/nicknames.txt"] = "\nPepe\tm\nPaco\tm\nNacho\tm\nLola\tf\nCuca\tf\nChema\tm\nMaite\tf\nCharo\tf\n"
+BUILTIN["de/nicknames.txt"] = "\nSepp\tm\nUschi\tf\nKalle\tm\nBabsi\tf\nHansi\tm\nSteffi\tf\nWilli\tm\nMoni\tf\n"
 
 
 # ----------------------------------------------------------------------------------
@@ -927,7 +1233,7 @@ SLOT_NAMES = {
     "POSTAL", "CITYLINE", "STREET", "COMPLEMENT", "ADDRESS", "ADDRESS_BLOCK", "ORG", "DOMAIN", "SIRET", "SIREN",
     "DATE", "TIME", "YEAR", "AGE", "AMOUNT", "IBAN", "CARD", "IP", "IPV6", "MAC", "PLATE", "GEO", "REF", "NINO",
     "SSN", "PASSPORT", "IMEI", "UUID", "VIN", "NEGATIVE", "JOB", "INSTITUTION", "REGION", "COUNTRY", "PRODUCT",
-    "SEX", "NATIONALITY", "NATID", "ART", "Art", "NICK",
+    "SEX", "NATIONALITY", "NATID", "NATNUM", "VAT", "ART", "Art", "NICK",
 }
 
 
@@ -989,6 +1295,8 @@ class Place:
         self.street = None
         self.complement = None
         self.flat_first = False
+        self.complement_after = False
+        self.other_complement = None
         self.cedex = False
         self.country = None     # a code of WORLD for a place abroad, None at home
 
@@ -1000,6 +1308,7 @@ class Org:
         self.domain = ""
         self.siren = None
         self.siret = None
+        self.vat = None
 
 
 FR_MONTHS = ["janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août", "septembre", "octobre",
@@ -1375,6 +1684,343 @@ ORIGIN_MAIL = {
 
 
 # ----------------------------------------------------------------------------------
+# The five languages
+#
+# French and English came first; Italian, Spanish and German texts are written the way
+# Italy, Spain and Germany write them: their dates, telephone numbers, addresses, civilities,
+# legal forms, public bodies and identifiers. The tables below hold what each language
+# needs; the generator reads them through its language.
+
+LANGUAGES = ["fr", "en", "it", "es", "de"]
+
+# The country of the places, organisations, phones and IBANs at home in each language.
+HOME_COUNTRY = {"fr": "fr", "en": "gb", "it": "it", "es": "es", "de": "de"}
+
+IT_MONTHS = ["gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno", "luglio", "agosto", "settembre",
+             "ottobre", "novembre", "dicembre"]
+ES_MONTHS = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre",
+             "noviembre", "diciembre"]
+DE_MONTHS = ["Januar", "Februar", "März", "April", "Mai", "Juni", "Juli", "August", "September", "Oktober",
+             "November", "Dezember"]
+MONTHS = {"fr": FR_MONTHS, "en": EN_MONTHS, "it": IT_MONTHS, "es": ES_MONTHS, "de": DE_MONTHS}
+
+FREE_MAIL.update({
+    "it": ["gmail.com", "libero.it", "virgilio.it", "alice.it", "tiscali.it", "hotmail.it", "outlook.it", "yahoo.it",
+           "tim.it", "fastwebnet.it", "icloud.com", "pec.it"],
+    "es": ["gmail.com", "hotmail.es", "outlook.es", "yahoo.es", "telefonica.net", "movistar.es", "ono.com",
+           "icloud.com", "proton.me", "hotmail.com"],
+    "de": ["gmail.com", "web.de", "gmx.de", "gmx.net", "t-online.de", "outlook.de", "yahoo.de", "freenet.de",
+           "posteo.de", "icloud.com", "mail.de"],
+})
+
+ORG_FORMS.update({
+    "it": ["S.r.l.", "S.r.l.", "S.p.A.", "S.n.c.", "S.a.s.", "S.r.l.s.", "Srl", "SpA"],
+    "es": ["S.L.", "S.L.", "S.A.", "S.L.U.", "S. Coop.", "SL", "SA"],
+    "de": ["GmbH", "GmbH", "AG", "GmbH & Co. KG", "KG", "UG (haftungsbeschränkt)", "OHG", "e.K.", "GbR"],
+})
+
+ORG_SECTORS.update({
+    "it": ["Costruzioni", "Servizi", "Immobiliare", "Trasporti", "Consulting", "Impianti", "Logistica", "Informatica",
+           "Ingegneria", "Assicurazioni", "Elettronica", "Meccanica", "Alimentari", "Edilizia", "Energia", "Ambiente",
+           "Sistemi", "Tecnologie", "Distribuzione", "Medical"],
+    "es": ["Construcciones", "Servicios", "Inmobiliaria", "Transportes", "Consultores", "Asesores", "Ingeniería",
+           "Logística", "Informática", "Seguros", "Instalaciones", "Distribuciones", "Energía", "Soluciones",
+           "Sistemas", "Tecnología", "Reformas", "Alimentación", "Medioambiente", "Gestión"],
+    "de": ["Logistik", "Bau", "Immobilien", "Beratung", "Versicherungen", "Elektrotechnik", "Maschinenbau", "Systeme",
+           "Technik", "Software", "Consulting", "Haustechnik", "Transporte", "Medizintechnik", "Energie",
+           "Umwelttechnik", "Handel", "Dienstleistungen", "Automation", "Solutions"],
+})
+
+# Words that groups write after their own name for a division, a trade or a country: "Veolia
+# Water", "Siemens Energy", "Enel Green Power", "Telefónica Tech". An organisation known by its
+# own name takes one now and then, and the whole name is the organisation.
+DIVISION_WORDS = {
+    "any": ["Group", "Holding", "International", "Solutions", "Services", "Technologies", "Systems", "Digital",
+            "Energy", "Water", "Mobility", "Healthcare", "Finance", "Capital", "Consulting", "Logistics", "Tech",
+            "Industries", "Infrastructure", "Real Estate", "Renewables", "Power", "Labs", "Europe",
+            "Aerospace", "Defence", "Automotive", "Cloud", "Business", "Retail", "Leasing", "Ventures"],
+    "fr": ["France", "Eau", "Énergie", "Énergies", "Solutions", "Services", "Ouest", "Sud-Est", "Assurances",
+           "Immobilier", "Entreprises", "Développement", "Participations", "Énergies renouvelables"],
+    "en": ["UK", "Ireland", "North America", "USA", "Holdings", "Group", "Solutions", "Services", "Partners"],
+    "it": ["Italia", "Energia", "Servizi", "Ambiente", "Green Power", "Private Banking", "Assicurazioni",
+           "Sistemi", "Holding", "Real Estate", "Distribuzione"],
+    "es": ["España", "Energía", "Renovables", "Servicios", "Soluciones", "Seguros", "Ibérica", "Tech",
+           "Distribución", "Inmobiliaria", "Infraestructuras"],
+    "de": ["Deutschland", "Energie", "Energy", "Systeme", "Solutions", "Services", "Versicherung", "Immobilien",
+           "Technik", "Mobility", "Industrie", "IT", "Digital", "Holding"],
+}
+
+# The places of the other languages, as each language names the countries of WORLD.
+WORLD_NAMES = {
+    # code: (Italian, Spanish, German)
+    "de": ("Germania", "Alemania", "Deutschland"), "at": ("Austria", "Austria", "Österreich"),
+    "ch": ("Svizzera", "Suiza", "Schweiz"), "lu": ("Lussemburgo", "Luxemburgo", "Luxemburg"),
+    "be": ("Belgio", "Bélgica", "Belgien"), "nl": ("Paesi Bassi", "Países Bajos", "Niederlande"),
+    "es": ("Spagna", "España", "Spanien"), "pt": ("Portogallo", "Portugal", "Portugal"),
+    "it": ("Italia", "Italia", "Italien"), "pl": ("Polonia", "Polonia", "Polen"),
+    "cz": ("Repubblica Ceca", "República Checa", "Tschechien"), "se": ("Svezia", "Suecia", "Schweden"),
+    "dk": ("Danimarca", "Dinamarca", "Dänemark"), "no": ("Norvegia", "Noruega", "Norwegen"),
+    "fi": ("Finlandia", "Finlandia", "Finnland"), "ie": ("Irlanda", "Irlanda", "Irland"),
+    "gr": ("Grecia", "Grecia", "Griechenland"), "ro": ("Romania", "Rumanía", "Rumänien"),
+    "hu": ("Ungheria", "Hungría", "Ungarn"), "ma": ("Marocco", "Marruecos", "Marokko"),
+    "dz": ("Algeria", "Argelia", "Algerien"), "tn": ("Tunisia", "Túnez", "Tunesien"),
+    "sn": ("Senegal", "Senegal", "Senegal"), "ci": ("Costa d'Avorio", "Costa de Marfil", "Elfenbeinküste"),
+    "cm": ("Camerun", "Camerún", "Kamerun"), "ca": ("Canada", "Canadá", "Kanada"),
+    "us": ("Stati Uniti", "Estados Unidos", "Vereinigte Staaten"), "gb": ("Regno Unito", "Reino Unido",
+                                                                          "Vereinigtes Königreich"),
+    "au": ("Australia", "Australia", "Australien"), "nz": ("Nuova Zelanda", "Nueva Zelanda", "Neuseeland"),
+    "in": ("India", "India", "Indien"), "jp": ("Giappone", "Japón", "Japan"), "cn": ("Cina", "China", "China"),
+    "kr": ("Corea del Sud", "Corea del Sur", "Südkorea"), "sg": ("Singapore", "Singapur", "Singapur"),
+    "br": ("Brasile", "Brasil", "Brasilien"), "mx": ("Messico", "México", "Mexiko"),
+    "ar": ("Argentina", "Argentina", "Argentinien"), "tr": ("Turchia", "Turquía", "Türkei"),
+    "il": ("Israele", "Israel", "Israel"), "ae": ("Emirati Arabi Uniti", "Emiratos Árabes Unidos",
+                                                  "Vereinigte Arabische Emirate"),
+    "lb": ("Libano", "Líbano", "Libanon"), "eg": ("Egitto", "Egipto", "Ägypten"),
+    "ng": ("Nigeria", "Nigeria", "Nigeria"), "ke": ("Kenya", "Kenia", "Kenia"),
+    "za": ("Sudafrica", "Sudáfrica", "Südafrika"), "ru": ("Russia", "Rusia", "Russland"),
+    "ua": ("Ucraina", "Ucrania", "Ukraine"), "fr": ("Francia", "Francia", "Frankreich"),
+}
+
+# The weight of each country of WORLD among the places abroad of an Italian, Spanish or German
+# text; the countries not named take the English weight, or 0.5.
+WORLD_WEIGHTS = {
+    "it": {"fr": 7, "ch": 6, "de": 6, "at": 3, "es": 4, "gb": 3, "us": 3, "ro": 3, "ma": 2, "be": 2, "nl": 2,
+           "pt": 1.5, "pl": 1.5, "gr": 1.5, "br": 1.5, "ar": 1.5, "tn": 1.5, "it": 0},
+    "es": {"fr": 7, "pt": 6, "gb": 5, "de": 4, "it": 4, "us": 3, "mx": 3, "ar": 3, "ma": 3, "ro": 2, "be": 1.5,
+           "nl": 1.5, "ch": 1.5, "br": 1.5, "es": 0},
+    "de": {"at": 7, "ch": 7, "fr": 5, "nl": 4, "pl": 4, "it": 3, "es": 3, "gb": 3, "us": 3, "tr": 3, "cz": 2,
+           "dk": 2, "be": 2, "lu": 1.5, "se": 1.5, "hu": 1, "ro": 1.5, "de": 0},
+}
+
+# The home of each new language, for its orgs abroad the other way round: the places of a
+# French or English text in France stay out, the ones of WORLD["fr"] serving the others.
+WORLD["fr"] = dict(fr="France", en="France", w=(0, 2), street="before", line="pc",
+                   phone=("+33", ["1 ## ## ## ##", "6 ## ## ## ##", "4 ## ## ## ##", "2 ## ## ## ##"]),
+                   iban="23n", tld="fr", origin="fr", forms=["SAS", "SARL", "SA", "EURL"],
+                   sectors=["Conseil", "Services", "Immobilier", "Transports", "Industrie"],
+                   orgs={"company": ["{w} {F}", "{f} {s} {F}", "Groupe {w}", "{w} {s}"],
+                         "public": ["Mairie de {c}", "Tribunal judiciaire de {c}", "Préfecture de {c}"],
+                         "school": ["Université de {c}", "Lycée {g} {f}"],
+                         "health": ["Centre hospitalier de {c}", "Clinique {w}"],
+                         "bank": ["Banque {w}", "Crédit {w}"], "association": ["Association {w}"]})
+
+# The nationalities in Italian and Spanish (masculine, feminine) and in German (the adjective).
+NATIONALITY_WORDS = {
+    "it": {"fr": ("francese", "francese"), "be": ("belga", "belga"), "ch": ("svizzero", "svizzera"),
+           "lu": ("lussemburghese", "lussemburghese"), "es": ("spagnolo", "spagnola"),
+           "pt": ("portoghese", "portoghese"), "it": ("italiano", "italiana"), "de": ("tedesco", "tedesca"),
+           "nl": ("olandese", "olandese"), "pl": ("polacco", "polacca"), "at": ("austriaco", "austriaca"),
+           "se": ("svedese", "svedese"), "dk": ("danese", "danese"), "fi": ("finlandese", "finlandese"),
+           "no": ("norvegese", "norvegese"), "ie": ("irlandese", "irlandese"), "ro": ("rumeno", "rumena"),
+           "bg": ("bulgaro", "bulgara"), "hr": ("croato", "croata"), "cz": ("ceco", "ceca"),
+           "gb": ("britannico", "britannica"), "us": ("statunitense", "statunitense"),
+           "ca": ("canadese", "canadese"), "br": ("brasiliano", "brasiliana"), "in": ("indiano", "indiana"),
+           "tr": ("turco", "turca"), "ma": ("marocchino", "marocchina"), "dz": ("algerino", "algerina"),
+           "tn": ("tunisino", "tunisina"), "cn": ("cinese", "cinese"), "au": ("australiano", "australiana")},
+    "es": {"fr": ("francés", "francesa"), "be": ("belga", "belga"), "ch": ("suizo", "suiza"),
+           "lu": ("luxemburgués", "luxemburguesa"), "es": ("español", "española"),
+           "pt": ("portugués", "portuguesa"), "it": ("italiano", "italiana"), "de": ("alemán", "alemana"),
+           "nl": ("neerlandés", "neerlandesa"), "pl": ("polaco", "polaca"), "at": ("austriaco", "austriaca"),
+           "se": ("sueco", "sueca"), "dk": ("danés", "danesa"), "fi": ("finlandés", "finlandesa"),
+           "no": ("noruego", "noruega"), "ie": ("irlandés", "irlandesa"), "ro": ("rumano", "rumana"),
+           "bg": ("búlgaro", "búlgara"), "hr": ("croata", "croata"), "cz": ("checo", "checa"),
+           "gb": ("británico", "británica"), "us": ("estadounidense", "estadounidense"),
+           "ca": ("canadiense", "canadiense"), "br": ("brasileño", "brasileña"), "in": ("indio", "india"),
+           "tr": ("turco", "turca"), "ma": ("marroquí", "marroquí"), "dz": ("argelino", "argelina"),
+           "tn": ("tunecino", "tunecina"), "cn": ("chino", "china"), "au": ("australiano", "australiana")},
+    "de": {"fr": "französisch", "be": "belgisch", "ch": "schweizerisch", "lu": "luxemburgisch", "es": "spanisch",
+           "pt": "portugiesisch", "it": "italienisch", "de": "deutsch", "nl": "niederländisch", "pl": "polnisch",
+           "at": "österreichisch", "se": "schwedisch", "dk": "dänisch", "fi": "finnisch", "no": "norwegisch",
+           "ie": "irisch", "ro": "rumänisch", "bg": "bulgarisch", "hr": "kroatisch", "cz": "tschechisch",
+           "gb": "britisch", "us": "US-amerikanisch", "ca": "kanadisch", "br": "brasilianisch", "in": "indisch",
+           "tr": "türkisch", "ma": "marokkanisch", "dz": "algerisch", "tn": "tunesisch", "cn": "chinesisch",
+           "au": "australisch"},
+}
+
+# The weight of the country of a person in an Italian, Spanish or German text; the others 0.3.
+PERSON_COUNTRY_WEIGHTS = {
+    "it": {"it": 70, "ro": 5, "ma": 3, "cn": 2, "de": 2, "fr": 2, "es": 1, "ch": 1, "gb": 1, "us": 1, "br": 1,
+           "in": 1, "tn": 1, "pl": 1, "pt": 0.5},
+    "es": {"es": 72, "ma": 4, "ro": 4, "gb": 2, "fr": 2, "it": 2, "de": 1, "pt": 1, "br": 1, "cn": 1, "us": 1},
+    "de": {"de": 70, "tr": 6, "pl": 4, "it": 2, "ro": 2, "hr": 1, "at": 2, "ch": 1, "es": 1, "fr": 1, "gb": 1,
+           "us": 1, "bg": 1, "nl": 1},
+}
+
+# The labels of a national number in a text of another language than French: the native terms
+# of each country, as foreign documents quote them.
+NATIVE_ID_LABELS = {
+    "be": ("NISS", "INSZ", "Rijksregisternummer"), "ch": ("AHV", "AVS"), "lu": ("matricule",),
+    "it": ("codice fiscale", "C.F.", "cod. fiscale"), "pl": ("PESEL",), "cz": ("rodné číslo",),
+    "gb": ("NHS number", "NHS no."), "ca": ("SIN",), "ma": ("CIN", "CNIE"), "dz": ("NIN",),
+    "cn": ("resident identity card",),
+}
+# The passport of a French person in the other languages, and how a number follows its label.
+PASSPORT_LABELS = {"it": ("passaporto", "passaporto n."), "es": ("pasaporte", "pasaporte n.º"),
+                   "de": ("Reisepass", "Reisepass-Nr.", "Pass-Nr."), "en": ("passport", "passport no.")}
+NUMBER_CONNECTORS = {"fr": [" ", " : ", ": ", " n° "], "en": [" ", " : ", ": ", " no. "],
+                     "it": [" ", ": ", ": ", " n. "], "es": [" ", ": ", ": ", " n.º "],
+                     "de": [" ", ": ", ": ", " Nr. "]}
+
+SEX_VALUES_MORE = {"it": {"f": ["F", "F", "Femmina", "Donna"], "m": ["M", "M", "Maschio", "Uomo"]},
+                   "es": {"f": ["F", "F", "Femenino", "Mujer"], "m": ["M", "M", "Masculino", "Hombre"]},
+                   "de": {"f": ["W", "w", "weiblich", "Frau"], "m": ["M", "m", "männlich", "Mann"]}}
+
+# The procedural towns of the new languages.
+IT_CITY = {
+    "saints": ["San Martino", "San Giorgio", "San Pietro", "San Lorenzo", "San Michele", "Santa Maria",
+               "Sant'Angelo", "Santo Stefano", "San Giovanni", "Santa Croce", "San Vito", "San Donato",
+               "Sant'Andrea", "San Biagio", "Santa Lucia"],
+    "after": [" di Piave", " in Colle", " al Tagliamento", " del Garda", " sul Naviglio", " in Valle", " a Mare",
+              " Lomellina", " Canavese", " di Lupari", " in Bosco", " Valdarno", " in Persiceto", " Ionico",
+              " Vercellese"],
+    "roots": ["Castel", "Monte", "Villa", "Borgo", "Rocca", "Torre", "Ponte", "Colle", "Valle", "Fonte", "Casal",
+              "Pieve", "Campo", "Serra", "Bagno"],
+    "ends": ["nuovo", "franco", "vecchio", "bianca", "lungo", "rosso", "verde", "forte", "alto", "basso",
+             "marino", "fiorito", "chiaro", "maggiore", "piano", "secco"],
+    "onsets": ["Bru", "Cas", "Ma", "Lis", "Se", "Cor", "Al", "Ro", "Ga", "Ve", "Tre", "Mo", "Ca", "Pa", "Sa",
+               "Vi", "Bo", "Fi", "Me", "Po"],
+    "middles": ["gna", "ssa", "ria", "so", "re", "ma", "bi", "la", "na", "ro", "ve", "ci"],
+    "codas": ["no", "ne", "ra", "go", "sco", "llo", "tta", "ate", "ano", "ello", "ago", "ate", "ino", "aro"],
+}
+ES_CITY = {
+    "saints": ["San Martín", "San Juan", "San Pedro", "Santa María", "San Vicente", "Santiago", "San Sebastián",
+               "Santa Cruz", "San Miguel", "San Andrés", "San Lorenzo", "Santa Eulalia", "San Román"],
+    "after": [" de la Vega", " del Rey", " de los Llanos", " del Monte", " de Valdeiglesias", " de Mar",
+              " de Arriba", " de Abajo", " del Campo", " de la Sierra", " del Río", " de los Caballeros",
+              " de la Frontera", " del Pinar"],
+    "roots": ["Villa", "Torre", "Castro", "Puerto", "Monte", "Fuente", "Val", "Peña", "Alcalá", "Mota", "Navas",
+              "Campo", "Vega", "Ribera"],
+    "ends": ["nueva", "franca", "real", "alta", "blanca", "seca", "verde", "rubia", "mayor", "llana", "fría",
+             "hermosa"],
+    "onsets": ["Al", "Be", "Ca", "To", "Ma", "Mon", "Va", "Ar", "Bu", "Ga", "Lo", "Te", "Za", "Pa", "Ce"],
+    "middles": ["ra", "la", "ga", "ce", "do", "ri", "ma", "na", "ba", "se"],
+    "codas": ["ejo", "illa", "ares", "eda", "ón", "ena", "uela", "ales", "anco", "ete", "ilo", "ar"],
+}
+DE_CITY = {
+    "prefixes": ["", "", "", "Bad ", "Neu", "Ober", "Unter", "Groß", "Klein", "Alt", "Nieder", "Hohen"],
+    "roots": ["Wald", "Berg", "Linden", "Eichen", "Rosen", "Stein", "Bach", "Mühl", "Kirch", "Holz", "Wester",
+              "Sonnen", "Rhein", "Hasel", "Erlen", "Buchen", "Hagen", "Weiden", "Fels", "Hirsch", "Tann", "Ahl"],
+    "ends": ["dorf", "hausen", "heim", "burg", "stadt", "feld", "bach", "ingen", "brück", "hofen", "rode",
+             "kirchen", "berg", "au", "beck", "stedt", "weiler", "furt", "born"],
+}
+
+# The district codes of German plates.
+DE_PLATE_DISTRICTS = ["M", "B", "K", "HH", "F", "S", "D", "DU", "E", "DO", "KA", "MA", "HD", "BN", "N", "H",
+                      "HB", "L", "DD", "A", "R", "WÜ", "FR", "UL", "OS", "MS", "BI", "AC", "KI", "LU"]
+
+# The heads of the names of public bodies, by gender, for their articles: Italian (masculine
+# with "il", "lo" or "l'"), Spanish and German. A German head is also read at the end of a
+# compound ("Polizeipräsidium", "Landratsamt").
+IT_FEMININE_HEADS = {"prefettura", "questura", "provincia", "regione", "città", "agenzia", "azienda", "asl", "camera",
+                     "corte", "procura", "polizia", "guardia", "direzione", "cassa", "scuola", "università", "unione",
+                     "comunità", "stazione", "caserma", "sezione", "conferenza", "fondazione", "biblioteca"}
+IT_MASCULINE_HEADS = {"comune", "tribunale", "commissariato", "consiglio", "ministero", "ufficio", "consorzio",
+                      "centro", "giudice", "comando", "istituto", "liceo", "ospedale", "municipio", "dipartimento",
+                      "provveditorato", "servizio", "registro", "studio", "sportello", "archivio"}
+ES_FEMININE_HEADS = {"subdelegación", "delegación", "comisaría", "diputación", "comunidad", "agencia", "tesorería",
+                     "consejería", "dirección", "junta", "audiencia", "policía", "guardia", "oficina",
+                     "mancomunidad", "universidad", "fiscalía", "jefatura", "inspección", "intervención",
+                     "gerencia", "concejalía", "secretaría", "biblioteca", "fundación"}
+ES_MASCULINE_HEADS = {"ayuntamiento", "juzgado", "tribunal", "consejo", "ministerio", "cabildo", "servicio",
+                      "registro", "instituto", "hospital", "centro", "consorcio", "colegio", "departamento",
+                      "organismo", "área", "distrito", "puesto", "cuartel", "archivo"}
+DE_HEADS = {
+    "f": ["stadt", "gemeinde", "verwaltung", "polizei", "inspektion", "agentur", "behörde", "kasse", "universität",
+          "hochschule", "schule", "klinik", "direktion", "schaft", "kammer", "anstalt", "stelle", "versicherung",
+          "kommission", "bank", "stiftung", "akademie"],
+    "m": ["landkreis", "kreis", "magistrat", "bezirk", "zoll", "rat", "verband", "senat", "dienst"],
+    "n": ["amt", "gericht", "präsidium", "revier", "zentrum", "center", "haus", "klinikum", "ministerium",
+          "gymnasium", "institut", "büro", "referat", "kommissariat", "landratsamt", "jobcenter"],
+}
+DE_ARTICLES = {"m": {"nom": "der", "acc": "den", "dat": "dem", "gen": "des"},
+               "f": {"nom": "die", "acc": "die", "dat": "der", "gen": "der"},
+               "n": {"nom": "das", "acc": "das", "dat": "dem", "gen": "des"}}
+
+# Italian, Spanish and German prepositions fused with the article that follows them.
+IT_CONTRACTED = {}
+for _prep, _stem in (("di", "de"), ("a", "a"), ("da", "da"), ("in", "ne"), ("su", "su")):
+    for _art, _end in (("il", "l"), ("lo", "llo"), ("la", "lla"), ("l'", "ll'"), ("i", "i"), ("gli", "gli"),
+                       ("le", "lle")):
+        IT_CONTRACTED[(_prep, _art)] = _stem + _end
+ES_CONTRACTED = {("de", "el"): "del", ("a", "el"): "al"}
+DE_CONTRACTED = {("bei", "dem"): "beim", ("von", "dem"): "vom", ("zu", "dem"): "zum", ("zu", "der"): "zur",
+                 ("in", "dem"): "im", ("an", "dem"): "am", ("in", "das"): "ins", ("an", "das"): "ans",
+                 ("auf", "das"): "aufs"}
+
+
+def german_gender(name: str) -> Optional[str]:
+    """The gender of the head of a German public body, from its first word or the end of it:
+    "Stadt München" f, "Landkreis Starnberg" m, "Amtsgericht Hamburg" n; None for a name that
+    has none of these heads."""
+    head = name.split(" ", 1)[0].lower()
+    if head.endswith("-"):
+        return None
+    best, gender = 0, None
+    for g, words in DE_HEADS.items():
+        for w in words:
+            if head.endswith(w) and len(w) > best:
+                best, gender = len(w), g
+    return gender
+
+
+def german_genitive(word: str) -> str:
+    """The genitive of a masculine or neuter noun: "Finanzamt" "Finanzamts", "Landkreis"
+    "Landkreises", "Wetterdienst" "Wetterdienstes"; acronyms ("BAMF", "BfDI") stay as they are."""
+    if not word or word.isupper() or any(c.isupper() for c in word[1:]):
+        return word
+    if word[-1] in "sßxz" or word.endswith(("sch", "st", "tz")):
+        return word + "es"
+    return word + "s"
+
+
+# The endings of the weak adjectives that open the names of German public bodies: "die Deutsche
+# Rentenversicherung", "das Statistische Bundesamt", "das Auswärtige Amt".
+DE_ADJECTIVE_ENDINGS = ("sche", "che", "ige", "ale", "ene", "ere", "ute", "ste", "eue", "eie", "ohe", "lte", "nte",
+                        "rte")
+
+
+def german_case(phrase: str, case: str) -> str:
+    """A German phrase that opens with its definite article, put in another case: "die
+    Bundesagentur" "der Bundesagentur" in the dative, "das [Finanzamt Köln]" "des [Finanzamts
+    Köln]" in the genitive. The weak adjectives after the article take -n in the dative and the
+    genitive, and in the accusative of a masculine noun: "der [Deutschen Rentenversicherung]",
+    "des [Statistischen Bundesamts]", "den [Deutschen Wetterdienst]". The brackets of an
+    institution are kept around the name."""
+    if case not in ("acc", "dat", "gen"):
+        return phrase
+    first, sep, rest = phrase.partition(" ")
+    gender = {"der": "m", "die": "f", "das": "n"}.get(first.lower())
+    if gender is None or not sep:
+        return phrase
+    article = DE_ARTICLES[gender][case]
+    if first[:1].isupper():
+        article = article.capitalize()
+    bracket = rest.startswith("[")
+    words = (rest[1:] if bracket else rest).split(" ")
+
+    def adjective(k: int) -> bool:
+        w = words[k]
+        return k + 1 < len(words) and w[:1].isupper() and not w.isupper() and w.endswith(DE_ADJECTIVE_ENDINGS) \
+            and words[k + 1][:1].isupper()
+
+    k = 0
+    while adjective(k):
+        if case in ("dat", "gen") or gender == "m":
+            words[k] += "n"
+        k += 1
+    if case == "gen" and gender in ("m", "n") and k < len(words):
+        # "Statistisches Bundesamt" without an article: the strong adjective takes -en.
+        if k == 0 and len(words) > 1 and words[0].endswith("es") and words[0][:1].isupper() and \
+                not words[0].isupper() and words[1][:1].isupper():
+            words[0] = words[0][:-2] + "en"
+            k = 1
+        noun = words[k]
+        close = noun.endswith("]")
+        words[k] = german_genitive(noun[:-1] if close else noun) + ("]" if close else "")
+    return article + " " + ("[" if bracket else "") + " ".join(words)
+
+
+# ----------------------------------------------------------------------------------
 # Nationalities and the national numbers of other countries
 #
 # A country gives the nationality of a person in French (masculine and feminine) and in
@@ -1681,6 +2327,30 @@ COUNTRIES = {
 # Values of a sex field, short and long.
 SEX_VALUES = {"fr": {"f": ["F", "F", "Féminin", "Femme"], "m": ["M", "M", "Masculin", "Homme"]},
               "en": {"f": ["F", "F", "Female", "Woman"], "m": ["M", "M", "Male", "Man"]}}
+SEX_VALUES.update(SEX_VALUES_MORE)
+
+# Per language: the share of family names in capitals (formal documents, others), of names
+# written family name first, and the layouts of dates drawn for a document.
+UPPER_FAMILY = {"fr": (0.45, 0.12), "en": (0.0, 0.0), "it": (0.3, 0.08), "es": (0.25, 0.06), "de": (0.15, 0.04)}
+FAMILY_FIRST = {"fr": 0.25, "en": 0.04, "it": 0.15, "es": 0.08, "de": 0.06}
+DATE_LAYOUTS = {"fr": ["slash", "slash", "long", "dash", "dot", "iso"],
+                "en": ["slash", "slash", "long", "dash", "dot", "iso"],
+                "it": ["slash", "slash", "long", "long", "dash", "dot", "iso"],
+                "es": ["slash", "slash", "long", "long", "dash", "iso"],
+                "de": ["dot", "dot", "dot", "long", "long", "slash", "iso"]}
+# The naming traditions of the procedural family names of a text without an origin.
+FAMILY_TRADITIONS = {
+    "fr": (["fr", "breton", "alsace", "occitan", "italy", "iberia", "poland", "anglo", "arabic", "germanic", "turkish",
+            "slavic_east", "greek", "nigeria"], [36, 13, 7, 7, 7, 7, 4, 3, 6, 3, 2, 2, 2, 1]),
+    "en": (["anglo", "gaelic", "fr", "italy", "iberia", "poland", "germanic", "nordic", "south_asia", "nigeria",
+            "slavic_east", "japan", "dutch"], [55, 6, 5, 6, 6, 4, 3, 2, 5, 3, 2, 1, 2]),
+    "it": (["italy", "fr", "iberia", "germanic", "arabic", "poland", "slavic_east", "greek", "anglo"],
+           [72, 3, 4, 3, 6, 3, 3, 4, 2]),
+    "es": (["iberia", "fr", "italy", "germanic", "arabic", "poland", "slavic_east", "anglo"],
+           [76, 4, 4, 2, 7, 2, 2, 3]),
+    "de": (["germanic", "turkish", "poland", "italy", "slavic_east", "greek", "arabic", "dutch", "fr", "anglo"],
+           [70, 8, 6, 3, 4, 3, 2, 2, 1, 1]),
+}
 
 
 # ----------------------------------------------------------------------------------
@@ -1704,6 +2374,7 @@ class Generator:
         self.genders: Dict[str, str] = {}
         self.org_kinds: Dict[str, str] = {}
         self.abroad_places = set()
+        self.genitive_orgs = set()
         self.style = {}
 
     # -- document style ---------------------------------------------------------------
@@ -1714,7 +2385,7 @@ class Generator:
         self.abroad_places = set()
         formal = genre in ("form", "letter", "hr", "legal", "medical", "table", "banking", "real_estate", "admin")
         self.style = {
-            "upper_family": r.random() < (0.45 if formal else 0.12) and self.lang == "fr",
+            "upper_family": r.random() < UPPER_FAMILY[self.lang][0 if formal else 1],
             "upper_city": r.random() < (0.25 if formal else 0.05),
             "all_upper": r.random() < 0.02 * self.noise,
             "all_lower": r.random() < (0.35 if genre == "chat" else 0.02) * max(self.noise, 0.3),
@@ -1722,8 +2393,8 @@ class Generator:
             "nbsp_colon": self.lang == "fr" and r.random() < 0.3,
             "ocr": r.random() < 0.06 * self.noise,
             "double_space": r.random() < 0.05 * self.noise,
-            "name_order": "family_first" if r.random() < (0.25 if self.lang == "fr" else 0.04) else "given_first",
-            "date_format": r.choice(["slash", "slash", "long", "dash", "dot", "iso"]),
+            "name_order": "family_first" if r.random() < FAMILY_FIRST[self.lang] else "given_first",
+            "date_format": r.choice(DATE_LAYOUTS[self.lang]),
             "phone_format": r.choice(["spaced", "spaced", "spaced", "dotted", "compact", "intl"]),
         }
 
@@ -1802,14 +2473,9 @@ class Generator:
         if r.random() < self.procedural and (origin is None or origin in self.TRADITIONS):
             if origin:
                 tradition = r.choice(self.TRADITIONS[origin])
-            elif self.lang == "fr":
-                tradition = r.choices(["fr", "breton", "alsace", "occitan", "italy", "iberia", "poland", "anglo",
-                                       "arabic", "germanic", "turkish", "slavic_east", "greek", "nigeria"],
-                                      [36, 13, 7, 7, 7, 7, 4, 3, 6, 3, 2, 2, 2, 1])[0]
             else:
-                tradition = r.choices(["anglo", "gaelic", "fr", "italy", "iberia", "poland", "germanic", "nordic",
-                                       "south_asia", "nigeria", "slavic_east", "japan", "dutch"],
-                                      [55, 6, 5, 6, 6, 4, 3, 2, 5, 3, 2, 1, 2])[0]
+                traditions, weights = FAMILY_TRADITIONS[self.lang]
+                tradition = r.choices(traditions, weights)[0]
             name = self.procedural_family(tradition)
         else:
             where = (lambda f: len(f) > 1 and f[1] == origin) if origin else None
@@ -1825,6 +2491,12 @@ class Generator:
                 name = "d'" + name
             else:
                 name = r.choice(["de ", "du ", "de La ", "Le "]) + name
+        elif self.lang == "es" and origin in (None, "iberia", "latam", "hispanic", "basque") and x < 0.62 and \
+                " " not in name:
+            # The two family names of Spain, the father's and the mother's: "García López".
+            second = self.pick("family", lambda f: len(f) > 1 and f[1] in ("iberia", "basque"), ("origin", "es2"))
+            if second and second != name:
+                name = name + r.choice([" ", " ", " ", " ", "-", " y "]) + second
         return name
 
     def make_given(self, gender: str, with_origin: bool = False):
@@ -1945,7 +2617,10 @@ class Generator:
         """The country of a person, drawn once with the weights of the language of the text."""
         if p.country is None:
             codes = list(COUNTRIES)
-            weights = [COUNTRIES[c][3 if self.lang == "fr" else 4] for c in codes]
+            if self.lang in PERSON_COUNTRY_WEIGHTS:
+                weights = [PERSON_COUNTRY_WEIGHTS[self.lang].get(c, 0.3) for c in codes]
+            else:
+                weights = [COUNTRIES[c][3 if self.lang == "fr" else 4] for c in codes]
             p.country = self.rng.choices(codes, weights)[0]
         return p.country
 
@@ -1953,18 +2628,74 @@ class Generator:
         masc, fem, english = COUNTRIES[self.country(p)][:3]
         if self.lang == "en":
             return english
+        if self.lang in NATIONALITY_WORDS:
+            words = NATIONALITY_WORDS[self.lang][self.country(p)]
+            if isinstance(words, str):
+                return words
+            masc, fem = words
         return fem if (p.gender == "f" if feminine is None else feminine) else masc
+
+    def national_value(self, p: Person) -> Tuple[str, str]:
+        """The label and the national number of a person, drawn once."""
+        if p.natid is None:
+            code = self.country(p)
+            make, labels = COUNTRIES[code][5], COUNTRIES[code][6]
+            if self.lang not in ("fr",):
+                if code == "fr":
+                    labels = PASSPORT_LABELS.get(self.lang, labels)
+                else:
+                    labels = NATIVE_ID_LABELS.get(code, labels)
+            p.natid = (self.rng.choice(labels), make(self.rng))
+        return p.natid
 
     def national_number(self, p: Person) -> list:
         """The label and the value of the national number of a person of another country:
         "BSN 123456782", "PESEL : 85010112345"."""
-        if p.natid is None:
-            code = self.country(p)
-            make, labels = COUNTRIES[code][5], COUNTRIES[code][6]
-            p.natid = (self.rng.choice(labels), make(self.rng))
-        label, value = p.natid
-        return [(label + self.rng.choice([" ", " : ", ": ", " n° " if self.lang == "fr" else " no. "]), None),
-                (value, "ID")]
+        label, value = self.national_value(p)
+        return [(label + self.rng.choice(NUMBER_CONNECTORS[self.lang]), None), (value, "ID")]
+
+    def vat_number(self, o: Org) -> str:
+        """The VAT or tax number of an organisation in the country of the text, valid where it
+        carries a check: Partita IVA (Luhn), CIF (its control character), USt-IdNr. (ISO 7064
+        MOD 11-10), French TVA number (its key over the SIREN), British VAT number (mod 97)."""
+        if o.vat is None:
+            r = self.rng
+            if self.lang == "it":
+                payload = "%07d" % r.randint(0, 9999999) + "%03d" % r.choice([r.randint(1, 100), 120, 121, 888])
+                o.vat = payload + str(luhn_digit(payload))
+            elif self.lang == "es":
+                letter = r.choice("BBBBAAGEFJNPQRSUVW")
+                digits = "%07d" % r.randint(0, 9999999)
+                odd = sum(sum(int(c) for c in str(2 * int(d))) for d in digits[0::2])
+                even = sum(int(d) for d in digits[1::2])
+                control = (10 - (odd + even) % 10) % 10
+                if letter in "NPQRSW":
+                    tail = "JABCDEFGHI"[control]
+                elif letter in "ABEH":
+                    tail = str(control)
+                else:
+                    tail = r.choice([str(control), "JABCDEFGHI"[control]])
+                o.vat = letter + digits + tail
+            elif self.lang == "de":
+                digits = str(r.randint(1, 9)) + "%07d" % r.randint(0, 9999999)
+                product = 10
+                for d in digits:
+                    total = (int(d) + product) % 10
+                    product = (2 * (total or 10)) % 11
+                check = (11 - product) % 10
+                value = digits + str(check)
+                o.vat = "DE" + value if r.random() < 0.85 else "DE " + value[:3] + " " + value[3:6] + " " + value[6:]
+            elif self.lang == "fr":
+                key = (12 + 3 * (int(o.siren) % 97)) % 97
+                o.vat = "FR" + "%02d" % key + o.siren if r.random() < 0.7 else \
+                    "FR %02d %s %s %s" % (key, o.siren[:3], o.siren[3:6], o.siren[6:])
+            else:
+                digits = "%07d" % r.randint(1000000, 9999999)
+                total = sum(int(d) * w for d, w in zip(digits, range(8, 1, -1)))
+                check = (-total) % 97
+                value = digits + "%02d" % check
+                o.vat = "GB" + value if r.random() < 0.6 else "GB " + value[:3] + " " + value[3:7] + " " + value[7:]
+        return o.vat
 
     def birth(self, p: Person):
         if p.birth is None:
@@ -1996,6 +2727,24 @@ class Generator:
         if self.lang == "en":
             a, b, c = PROCEDURAL_CITY["en"]
             return r.choice(a) + r.choice(b) + r.choice(c)
+        if self.lang in ("it", "es"):
+            t = IT_CITY if self.lang == "it" else ES_CITY
+            x = r.random()
+            if x < 0.3:
+                return r.choice(t["saints"]) + (r.choice(t["after"]) if r.random() < 0.6 else "")
+            if x < 0.6:
+                return r.choice(t["roots"]) + r.choice(t["ends"]) + (r.choice(t["after"]) if r.random() < 0.25 else "")
+            name = r.choice(t["onsets"]) + (r.choice(t["middles"]) if r.random() < 0.6 else "") + r.choice(t["codas"])
+            return name + (r.choice(t["after"]) if r.random() < 0.15 else "")
+        if self.lang == "de":
+            prefix = r.choice(DE_CITY["prefixes"])
+            root = r.choice(DE_CITY["roots"])
+            if prefix and not prefix.endswith(" "):
+                root = root.lower()
+            name = prefix + root + r.choice(DE_CITY["ends"])
+            if r.random() < 0.08:
+                name += r.choice([" am Main", " an der Donau", " im Allgäu", " (Saale)", " am Rhein", " in Holstein"])
+            return name
         x = r.random()
         if x < 0.35:
             saints, suffixes = PROCEDURAL_CITY["fr_saint"]
@@ -2012,9 +2761,20 @@ class Generator:
 
     def world_country(self) -> str:
         """A country of WORLD other than the home country of the language, by weight."""
-        codes = [c for c in WORLD if WORLD[c]["w"][0 if self.lang == "fr" else 1] > 0]
-        weights = [WORLD[c]["w"][0 if self.lang == "fr" else 1] for c in codes]
+        codes = [c for c in WORLD if self.world_weight(c) > 0]
+        weights = [self.world_weight(c) for c in codes]
         return self.rng.choices(codes, weights)[0]
+
+    def world_weight(self, code: str) -> float:
+        """The weight of a country of WORLD among the places abroad of the language."""
+        if self.lang in WORLD_WEIGHTS:
+            if code == HOME_COUNTRY[self.lang]:
+                return 0.0
+            w = WORLD_WEIGHTS[self.lang].get(code)
+            if w is not None:
+                return w
+            return WORLD[code]["w"][1] or 0.5
+        return WORLD[code]["w"][0 if self.lang == "fr" else 1]
 
     def place(self, ident: Optional[str], abroad: Optional[bool] = None) -> Place:
         """Place ident, drawn once: abroad when a slot asked for it or for the share of places
@@ -2038,6 +2798,13 @@ class Generator:
                 pl.city = self.procedural_city()
                 if self.lang == "fr":
                     pl.postal = "%02d%03d" % (self.rng.randint(1, 95), self.rng.randint(0, 99) * 10)
+                elif self.lang == "it":
+                    pl.postal = "%02d%03d" % (self.rng.choice([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]) * 10 +
+                                              self.rng.randint(0, 9), self.rng.randint(1, 99) * 10)
+                elif self.lang == "es":
+                    pl.postal = "%02d%03d" % (self.rng.randint(1, 52), self.rng.randint(1, 999))
+                elif self.lang == "de":
+                    pl.postal = "%05d" % self.rng.randint(1067, 99998)
                 else:
                     pl.postal = self.rng.choice(["%05d" % self.rng.randint(1000, 99950),
                                                  "%s%d %d%s" % (self.rng.choice(["AB", "BS", "CF", "EX", "LS", "NG"]),
@@ -2055,6 +2822,10 @@ class Generator:
         return pl.city.upper() if self.style["upper_city"] else pl.city
 
     def country_name(self, pl: Place) -> str:
+        if self.lang in ("it", "es", "de"):
+            names = WORLD_NAMES.get(pl.country)
+            if names:
+                return names[("it", "es", "de").index(self.lang)]
         return WORLD[pl.country]["fr" if self.lang == "fr" else "en"]
 
     def world_city_line(self, pl: Place, country_separator: Optional[str]) -> list:
@@ -2125,6 +2896,18 @@ class Generator:
             return [city, (", " + state + " ", None), (pl.postal, "POSTAL_CODE")]
         return [city, (separator if separator != ", " else " ", None), (pl.postal, "POSTAL_CODE")]
 
+    def home_city_line(self, pl: Place, upper: bool) -> list:
+        """The city line of Italy, Spain and Germany, the postal code first: "20121 Milano
+        (MI)", "28013 Madrid", "50667 Köln"; the province of an Italian town stays unlabelled."""
+        r = self.rng
+        out = [(pl.postal, "POSTAL_CODE"), (" ", None)] if pl.postal else []
+        out.append((pl.city.upper() if upper else self.city_text(pl), "CITY"))
+        if self.lang == "it" and r.random() < 0.3:
+            letters = re.sub(r"[^A-Z]", "", ascii_fold(pl.city).upper())
+            if len(letters) >= 2:
+                out.append((" (" + letters[:2] + ")", None))
+        return out
+
     def street(self, pl: Place, numbered: bool = False) -> str:
         """The street line of a place, drawn once; numbered guarantees a house number, for
         the templates that write "au {STREET:numbered#1}"."""
@@ -2144,13 +2927,43 @@ class Generator:
                 pl.street = number + sep + stype + " " + name
                 if r.random() < 0.06 and not numbered:
                     pl.street = stype[:1].upper() + stype[1:] + " " + name
+            elif self.lang == "it":
+                # "Via Garibaldi 15", "Via Garibaldi, 15", "Corso Italia 5/B", "Piazza Dante 3".
+                stype = self.pick("street_types") or "Via"
+                number = str(r.choice([r.randint(1, 40), r.randint(1, 180)]))
+                if r.random() < 0.07:
+                    number += r.choice(["/A", "/B", "/1", " bis", "A", "/C"])
+                pl.street = stype + " " + name + r.choice([" ", " ", ", "]) + number
+                if r.random() < 0.04 and not numbered:
+                    pl.street = stype + " " + name
+            elif self.lang == "es":
+                # "Calle Mayor, 12", "C/ Mayor 12", "Avda. de la Constitución, 5", and the floor and
+                # the door after it, a span of their own: "Calle Mayor, 12, 3.º B".
+                stype = self.pick("street_types") or "Calle"
+                number = str(r.choice([r.randint(1, 40), r.randint(1, 160)]))
+                if r.random() < 0.05:
+                    number = r.choice(["s/n", number + " bis", number + "-" + str(int(number) + 2)])
+                pl.street = stype + " " + name + r.choice([", ", ", ", ", ", " "]) + number
+                if r.random() < 0.35 and pl.complement is None:
+                    pl.complement = r.choice(["%d.º %s" % (r.randint(1, 9), r.choice("ABCDEF")),
+                                              "%dº %s" % (r.randint(1, 9), r.choice("ABCD")),
+                                              "%d.º izq." % r.randint(1, 8), "%d.º dcha." % r.randint(1, 8),
+                                              "bajo %s" % r.choice("AB"), "%d.º %d.ª" % (r.randint(1, 8), r.randint(1, 4)),
+                                              "esc. %d, %d.º %s" % (r.randint(1, 3), r.randint(1, 9), r.choice("ABC"))])
+                    pl.complement_after = True
+            elif self.lang == "de":
+                # "Hauptstraße 12", "Am Markt 5", "Goethestr. 12a": the name holds its type.
+                number = str(r.choice([r.randint(1, 40), r.randint(1, 150)]))
+                if r.random() < 0.1:
+                    number += r.choice(["a", "b", "c", " a", "-" + str(int(number) + 2)])
+                pl.street = name + " " + number
             else:
                 number = str(r.randint(1, 450))
                 if r.random() < 0.05:
                     number += "B"
                 pl.street = number + " " + name
                 if r.random() < 0.08 and pl.complement is None:
-                    # "Flat 3, 12 High Street": the flat is a complement, a span of its own.
+                    # "Flat 3, 12 High Street": the flat opens the street line, one span with it.
                     pl.complement = r.choice(["Flat %d" % r.randint(1, 30), "Apt %d" % r.randint(1, 30),
                                               "Unit %d" % r.randint(1, 12)])
                     pl.flat_first = True
@@ -2159,11 +2972,14 @@ class Generator:
         return pl.street
 
     def street_fragments(self, pl: Place, numbered: bool = False) -> list:
-        """The street line, after the flat it opens with in English ("Flat 3, 12 High
-        Street"), each a span of its own."""
+        """The street line, with the flat it opens with in English ("Flat 3, 12 High
+        Street") or the floor and door it ends with in Spanish ("Calle Mayor, 12, 3.º B"): one
+        span, the whole line."""
         street = self.street(pl, numbered)
         if pl.flat_first:
-            return [(pl.complement, "STREET_ADDRESS"), (", ", None), (street, "STREET_ADDRESS")]
+            return [(pl.complement + ", " + street, "STREET_ADDRESS")]
+        if pl.complement_after:
+            return [(street + ", " + pl.complement, "STREET_ADDRESS")]
         return [(street, "STREET_ADDRESS")]
 
     def complement(self) -> str:
@@ -2174,6 +2990,22 @@ class Generator:
                              "Résidence Les %s" % r.choice(["Mimosas", "Tilleuls", "Hortensias", "Glycines"]),
                              "BP %d" % r.randint(10, 9999), "CS %d" % r.randint(10000, 99999),
                              "Lieu-dit %s" % self.procedural_city(), "Escalier %d" % r.randint(1, 6)])
+        if self.lang == "it":
+            return r.choice(["Scala %s" % r.choice("ABCDE"), "Interno %d" % r.randint(1, 40),
+                             "int. %d" % r.randint(1, 40), "Piano %d" % r.randint(1, 8),
+                             "Palazzina %s" % r.choice("ABCD"), "Casella postale %d" % r.randint(10, 9999),
+                             "Località %s" % self.procedural_city(), "Frazione %s" % self.procedural_city()])
+        if self.lang == "es":
+            return r.choice(["Portal %d" % r.randint(1, 6), "Escalera %s" % r.choice("ABC"),
+                             "Apartado de correos %d" % r.randint(10, 9999), "Urbanización Los %s" %
+                             r.choice(["Pinos", "Olivos", "Almendros", "Naranjos", "Rosales"]),
+                             "Polígono Industrial %s" % r.choice(["Norte", "Sur", "El Pla", "La Estación"]),
+                             "Bloque %d" % r.randint(1, 12), "Nave %d" % r.randint(1, 40)])
+        if self.lang == "de":
+            return r.choice(["Hinterhaus", "Gartenhaus", "Haus %s" % r.choice("ABCD"), "%d. OG" % r.randint(1, 6),
+                             "Wohnung %d" % r.randint(1, 40), "Postfach %d" % r.randint(100, 99999),
+                             "Aufgang %s" % r.choice("ABC"), "Gebäude %d" % r.randint(1, 12),
+                             "Ortsteil %s" % self.procedural_city()])
         return r.choice(["Suite %d" % r.randint(100, 999), "PO Box %d" % r.randint(10, 9999),
                          "Building %s" % r.choice("ABCD"), "Floor %d" % r.randint(1, 20)])
 
@@ -2206,7 +3038,16 @@ class Generator:
         name = self.pick("known_orgs", lambda f: len(f) > 1 and f[1] in categories, ("categories", categories))
         if not name:
             return None
-        return name, re.sub(r"[^a-z0-9]", "", ascii_fold(name).lower())
+        base = re.sub(r"[^a-z0-9]", "", ascii_fold(name).lower())
+        # A division, a trade or a country after the name of a group, as groups name their
+        # subsidiaries: "Veolia Water", "Siemens Energy", "Telefónica España". The whole is
+        # the organisation.
+        if kind in ("company", "bank") and len(name.split()) <= 2 and r.random() < 0.22:
+            words = DIVISION_WORDS[self.lang] if r.random() < 0.6 else DIVISION_WORDS["any"]
+            division = r.choice(words)
+            if division.lower() not in name.lower():
+                name = name + " " + division
+        return name, base
 
     def world_org_name(self, kind: str, pl: Place) -> Optional[str]:
         """The name of an organisation of a place abroad, in the forms of its country."""
@@ -2286,6 +3127,128 @@ class Generator:
                 "bank": ["Banque " + word, "Crédit " + word + " de l'Ouest", word + " Assurances", "Mutuelle " + word,
                          "Caisse " + word, word + " Finance"],
             }
+        elif self.lang == "it":
+            given = self.make_given(r.choice("fm"))
+            patterns = {
+                "company": [word + " " + r.choice(forms), word + " " + r.choice(sectors),
+                            fam + " " + r.choice(sectors) + " " + r.choice(forms), fam + " & C. S.n.c.",
+                            fam + " " + r.choice(forms), "F.lli " + fam, "Fratelli " + fam + " " + r.choice(forms),
+                            word + " Italia " + r.choice(forms), "Gruppo " + word, word.upper() + " " + r.choice(forms),
+                            fam + " e " + fam2 + " " + r.choice(forms), r.choice(sectors) + " " + fam + " " +
+                            r.choice(forms)],
+                "shop": ["Panificio " + fam, "Macelleria " + fam, "Farmacia " + r.choice(["Centrale", "San Marco",
+                                                                                        "Comunale", fam]),
+                         "Ferramenta " + fam, "Autofficina " + fam, "Pizzeria " + r.choice(["Bella Napoli", "Il Vesuvio",
+                                                                                          "La Lanterna", "Da " + given]),
+                         "Trattoria " + r.choice(["Da " + given, "Il Gambero", "La Pergola"]), "Ottica " + fam,
+                         "Parrucchiere " + given, "Tabaccheria " + fam, "Autoscuola " + word, "Bar " + word],
+                "health": ["Ospedale " + r.choice(["San Raffaele", "Santa Maria Nuova", "Sacro Cuore", "Maggiore",
+                                                   "Civile di " + city]), "Azienda Ospedaliera di " + city,
+                           "Policlinico " + r.choice(["Universitario di " + city, word]), "ASL " + city,
+                           "Casa di Cura " + word, "Studio Medico " + fam, "Studio Dentistico " + fam,
+                           "Laboratorio Analisi " + word, "Poliambulatorio " + word, "RSA Villa " + word],
+                "school": ["Liceo Scientifico " + given + " " + fam, "Istituto Comprensivo " + city,
+                           "Istituto Tecnico " + given + " " + fam, "Università degli Studi di " + city,
+                           "Politecnico di " + city, "Scuola Primaria " + given + " " + fam,
+                           "Scuola dell'Infanzia " + word, "Liceo Classico " + given + " " + fam],
+                "public": ["Comune di " + city, "Città di " + city, "Provincia di " + city, "Tribunale di " + city,
+                           "Corte d'Appello di " + city, "Giudice di Pace di " + city, "Prefettura di " + city,
+                           "Questura di " + city, "Camera di Commercio di " + city, "ASL " + city,
+                           "Centro per l'Impiego di " + city, "Agenzia delle Entrate – Direzione Provinciale di " + city,
+                           "Commissariato di P.S. di " + city, "Ufficio Anagrafe del Comune di " + city],
+                "court": ["Tribunale di " + city, "Tribunale Ordinario di " + city, "Corte d'Appello di " + city,
+                          "Giudice di Pace di " + city, "Tribunale per i Minorenni di " + city,
+                          "Tribunale del Lavoro di " + city],
+                "police": ["Questura di " + city, "Commissariato di P.S. di " + city,
+                           "Comando Stazione Carabinieri di " + city, "Polizia Locale di " + city],
+                "council": ["Comune di " + city, "Comune di " + city, "Città di " + city],
+                "prefecture": ["Prefettura di " + city, "Prefettura – Ufficio Territoriale del Governo di " + city],
+                "association": ["Associazione " + r.choice(["Culturale ", "Sportiva Dilettantistica ", "Amici di "]) +
+                                word, "Circolo Tennis " + city, "Pro Loco di " + city, "A.S.D. " + word,
+                                "Polisportiva " + city, "Cooperativa Sociale " + word, "Fondazione " + fam],
+                "law": ["Studio Legale " + fam, "Studio Legale " + fam + " & Associati", "Studio " + fam + " & Partners",
+                        "Studio Notarile " + fam, "Studio Commercialista " + fam],
+                "bank": ["Banca " + word, "Banca Popolare di " + city, "Cassa di Risparmio di " + city,
+                         "Credito " + word, word + " Assicurazioni", "BCC di " + city],
+            }
+        elif self.lang == "es":
+            given = self.make_given(r.choice("fm"))
+            n = r.randint(1, 12)
+            patterns = {
+                "company": [word + " " + r.choice(forms), word + " " + r.choice(sectors) + " " + r.choice(forms),
+                            r.choice(sectors) + " " + fam + " " + r.choice(forms), fam + " e Hijos " + r.choice(forms),
+                            fam + " y Asociados", "Grupo " + word, word + " Ibérica " + r.choice(forms),
+                            fam + " " + r.choice(forms), word.upper() + " " + r.choice(forms),
+                            "Hermanos " + fam + " " + r.choice(forms), fam + " y " + fam2 + " " + r.choice(forms)],
+                "shop": ["Panadería " + fam, "Carnicería " + fam, "Farmacia " + r.choice(["Central", "del Carmen", fam]),
+                         "Ferretería " + fam, "Taller " + fam, "Bar " + r.choice(["El Rincón", "La Plaza", given]),
+                         "Restaurante " + r.choice(["Casa " + given, "El Mesón", "La Bodeguita"]),
+                         "Peluquería " + given, "Óptica " + fam, "Autoescuela " + word, "Floristería " + word],
+                "health": ["Hospital Universitario de " + city, "Hospital General de " + city,
+                           "Centro de Salud " + r.choice([city, "Norte", "Las Delicias", "San Blas"]), "Clínica " + word,
+                           "Clínica Dental " + fam, "Policlínica " + word, "Laboratorio " + word,
+                           "Residencia " + r.choice(["Los Olivos", "San José", "El Pilar"])],
+                "school": ["IES " + given + " " + fam, "CEIP " + given + " " + fam, "Colegio " + word,
+                           "Universidad de " + city, "Universidad Politécnica de " + city,
+                           "Escuela Oficial de Idiomas de " + city, "Instituto " + word],
+                "public": ["Ayuntamiento de " + city, "Diputación de " + city,
+                           "Juzgado de Primera Instancia n.º %d de %s" % (n, city), "Audiencia Provincial de " + city,
+                           "Subdelegación del Gobierno en " + city, "Comisaría de Policía Nacional de " + city,
+                           "Oficina de Empleo de " + city, "Registro Civil de " + city,
+                           "Delegación de la Agencia Tributaria de " + city],
+                "court": ["Juzgado de Primera Instancia n.º %d de %s" % (n, city), "Juzgado de lo Social n.º %d de %s" %
+                          (n, city), "Juzgado de Instrucción n.º %d de %s" % (n, city),
+                          "Audiencia Provincial de " + city, "Juzgado de Paz de " + city],
+                "police": ["Comisaría de Policía Nacional de " + city, "Policía Local de " + city,
+                           "Puesto de la Guardia Civil de " + city, "Comisaría Provincial de " + city],
+                "council": ["Ayuntamiento de " + city, "Ayuntamiento de " + city, "Excmo. Ayuntamiento de " + city],
+                "prefecture": ["Subdelegación del Gobierno en " + city, "Delegación del Gobierno en " + city],
+                "association": ["Asociación " + r.choice(["Cultural ", "Deportiva ", "Amigos de "]) + word,
+                                "Club Deportivo " + city, "Peña " + word, "Fundación " + fam,
+                                "Asociación de Vecinos de " + city],
+                "law": ["Bufete " + fam, fam + " Abogados", fam + " & Asociados", "Notaría " + fam,
+                        "Despacho " + fam + " y " + fam2, "Asesoría " + word],
+                "bank": ["Banco " + word, "Caja Rural de " + city, "Caja " + word, word + " Seguros", "Mutua " + word],
+            }
+        elif self.lang == "de":
+            given = self.make_given(r.choice("fm"))
+            patterns = {
+                "company": [word + " " + r.choice(forms), fam + " " + r.choice(sectors) + " " + r.choice(forms),
+                            fam + " & Söhne", word + " " + r.choice(sectors), fam + " & " + fam2 + " " + r.choice(forms),
+                            word + " Deutschland " + r.choice(forms), fam + " " + r.choice(forms),
+                            word.upper() + " " + r.choice(forms), "Gebr. " + fam + " " + r.choice(forms),
+                            r.choice(sectors) + " " + fam + " " + r.choice(forms)],
+                "shop": ["Bäckerei " + fam, "Metzgerei " + fam, r.choice(["Apotheke am Markt", "Rathaus-Apotheke",
+                                                                         "Stern-Apotheke", fam + "-Apotheke"]),
+                         "Autohaus " + fam, "Friseursalon " + given, "Blumen " + fam,
+                         "Gasthaus " + r.choice(["Zum Hirschen", "Zur Linde", "Krone"]), "Optik " + fam,
+                         "Fahrschule " + fam, "Malerbetrieb " + fam, "Elektro " + fam],
+                "health": ["Klinikum " + city, "Universitätsklinikum " + city,
+                           "Krankenhaus " + r.choice(["St. Elisabeth", "St. Josef", "Bethanien", "Maria Hilf"]),
+                           "Praxis Dr. " + fam, "Zahnarztpraxis " + fam, "Gemeinschaftspraxis " + fam + " & " + fam2,
+                           "MVZ " + word, "Labor " + word, "Seniorenzentrum " + word],
+                "school": [r.choice(["Goethe", "Schiller", "Humboldt", "Kepler", "Lessing"]) + "-Gymnasium " + city,
+                           "Grundschule " + word, "Realschule " + city, "Universität " + city,
+                           "Technische Universität " + city, "Hochschule " + city, "Volkshochschule " + city,
+                           "Berufskolleg " + city],
+                "public": ["Stadt " + city, "Gemeinde " + city, "Stadtverwaltung " + city, "Landratsamt " + city,
+                           "Amtsgericht " + city, "Landgericht " + city, "Finanzamt " + city, "Jobcenter " + city,
+                           "Agentur für Arbeit " + city, "Polizeipräsidium " + city, "Bürgeramt " + city,
+                           "Standesamt " + city, "Kreisverwaltung " + city],
+                "court": ["Amtsgericht " + city, "Landgericht " + city, "Arbeitsgericht " + city, "Sozialgericht " + city,
+                          "Verwaltungsgericht " + city, "Oberlandesgericht " + city],
+                "police": ["Polizeipräsidium " + city, "Polizeiinspektion " + city, "Polizeirevier " + city,
+                           "Polizeidirektion " + city],
+                "council": ["Stadt " + city, "Gemeinde " + city, "Stadtverwaltung " + city, "Magistrat der Stadt " + city],
+                "prefecture": ["Landratsamt " + city, "Regierungspräsidium " + city, "Bezirksregierung " + city,
+                               "Kreisverwaltung " + city],
+                "association": ["Sportverein " + city, "TSV " + city, word + " e.V.", "Förderverein " + word + " e.V.",
+                                "Musikverein " + city, "Freiwillige Feuerwehr " + city, "Stiftung " + fam],
+                "law": ["Kanzlei " + fam, fam + " & Partner Rechtsanwälte", "Rechtsanwälte " + fam + " & " + fam2,
+                        "Notariat " + fam, "Steuerberatung " + fam],
+                "bank": ["Sparkasse " + city, "Volksbank " + city, "Raiffeisenbank " + city, word + " Bank",
+                         "Kreissparkasse " + city, word + " Versicherung"],
+            }
         else:
             patterns = {
                 "company": [word + " " + r.choice(forms), word + " " + r.choice(sectors), fam + " & Sons",
@@ -2324,6 +3287,23 @@ class Generator:
         if self.lang == "en":
             return "the "
         head = name.split(" ", 1)[0].lower()
+        if self.lang == "it":
+            if head in IT_FEMININE_HEADS:
+                return "l'" if head[:1] in "aeiouàèéìòù" else "la "
+            if head in IT_MASCULINE_HEADS:
+                if head[:1] in "aeiouàèéìòù":
+                    return "l'"
+                return "lo " if re.match(r"s[^aeiou]|z|gn|ps|x|y", head) else "il "
+            return ""
+        if self.lang == "es":
+            if head in ES_FEMININE_HEADS:
+                return "la "
+            if head in ES_MASCULINE_HEADS:
+                return "el "
+            return ""
+        if self.lang == "de":
+            gender = german_gender(name)
+            return DE_ARTICLES[gender]["nom"] + " " if gender else ""
         if head not in self.FEMININE_HEADS and head not in self.MASCULINE_HEADS:
             return ""
         if french_elides_before(name):
@@ -2342,6 +3322,8 @@ class Generator:
             pl = self.places.get("_org" + key)
             if pl is not None and pl.country and r.random() < 0.7:
                 o.domain = base + "." + WORLD[pl.country]["tld"]
+            elif self.lang in ("it", "es", "de"):
+                o.domain = base + "." + r.choice([self.lang, self.lang, self.lang, "com", "eu", "net"])
             else:
                 o.domain = base + "." + r.choice(["fr", "fr", "com", "eu", "net"] if self.lang == "fr"
                                                   else ["com", "co.uk", "com", "io", "net"])
@@ -2365,6 +3347,25 @@ class Generator:
                 return ("1er" if d == 1 else str(d)) + " " + FR_MONTHS[m - 1] + " " + str(y)
             sep = {"slash": "/", "dash": "-", "dot": "."}.get(fmt, "/")
             return "%02d%s%02d%s%04d" % (d, sep, m, sep, y)
+        if self.lang == "it":
+            if fmt == "long":
+                return ("1°" if d == 1 and r.random() < 0.5 else str(d)) + " " + IT_MONTHS[m - 1] + " " + str(y)
+            sep = {"slash": "/", "dash": "-", "dot": "."}.get(fmt, "/")
+            return "%02d%s%02d%s%04d" % (d, sep, m, sep, y)
+        if self.lang == "es":
+            if fmt == "long":
+                return "%d de %s de %d" % (d, ES_MONTHS[m - 1], y)
+            sep = {"slash": "/", "dash": "-", "dot": "."}.get(fmt, "/")
+            if r.random() < 0.15:
+                return "%d%s%d%s%04d" % (d, sep, m, sep, y)
+            return "%02d%s%02d%s%04d" % (d, sep, m, sep, y)
+        if self.lang == "de":
+            if fmt == "long":
+                return "%d. %s %d" % (d, DE_MONTHS[m - 1], y)
+            sep = {"slash": "/", "dash": "-", "dot": "."}.get(fmt, ".")
+            if sep == "." and r.random() < 0.15:
+                return "%d.%d.%04d" % (d, m, y)
+            return "%02d%s%02d%s%04d" % (d, sep, m, sep, y)
         if fmt == "long" or fmt in ("dash", "dot"):
             return r.choice(["%s %d, %d" % (EN_MONTHS[m - 1], d, y), "%d %s %d" % (d, EN_MONTHS[m - 1], y)])
         return "%d %s %d" % (d, EN_MONTHS[m - 1], y)
@@ -2376,11 +3377,12 @@ class Generator:
         number = "".join(str(r.randint(0, 9)) if ch == "#" else ch for ch in r.choice(layouts))
         return prefix + " " + number
 
-    def world_iban(self) -> str:
-        """The IBAN of another country, with valid check digits."""
+    def world_iban(self, code: Optional[str] = None) -> str:
+        """The IBAN of another country, or of the country code, with valid check digits."""
         r = self.rng
-        codes = [c for c in WORLD if WORLD[c]["iban"] and WORLD[c]["w"][0 if self.lang == "fr" else 1] > 0]
-        code = r.choices(codes, [WORLD[c]["w"][0 if self.lang == "fr" else 1] for c in codes])[0]
+        if code is None:
+            codes = [c for c in WORLD if WORLD[c]["iban"] and self.world_weight(c) > 0]
+            code = r.choices(codes, [self.world_weight(c) for c in codes])[0]
         bban = ""
         for count, kind in re.findall(r"(\d+)([an])", WORLD[code]["iban"]):
             alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ" if kind == "a" else "0123456789"
@@ -2403,6 +3405,8 @@ class Generator:
                 return digits
             sep = "." if fmt == "dotted" else " "
             return sep.join(digits[i:i + 2] for i in range(0, 10, 2))
+        if self.lang in ("it", "es", "de"):
+            return self.home_phone()
         kind = r.random()
         if kind < 0.5:
             return r.choice(["+44 20 %04d %04d" % (r.randint(1000, 9999), r.randint(0, 9999)),
@@ -2411,10 +3415,92 @@ class Generator:
             return "(%03d) %03d-%04d" % (r.randint(201, 989), r.randint(200, 999), r.randint(0, 9999))
         return "+1 %03d %03d %04d" % (r.randint(201, 989), r.randint(200, 999), r.randint(0, 9999))
 
+    def home_phone(self) -> str:
+        """A telephone number of Italy, Spain or Germany in the layouts of its documents."""
+        r = self.rng
+        fmt = self.style["phone_format"]
+        if self.lang == "it":
+            if r.random() < 0.55:
+                digits = "3" + r.choice(["20", "28", "29", "31", "33", "35", "38", "39", "40", "45", "47", "48", "49"]) + \
+                    _digits(r, 7)
+                groups = r.choice([(3, 7), (3, 3, 4), (3, 4, 3), (3, 2, 2, 3)])
+            else:
+                area = r.choice(["02", "06", "011", "010", "051", "055", "081", "091", "041", "045", "049", "0444",
+                                 "035", "030", "080", "095", "070", "0521", "0331", "0832"])
+                digits = area + _digits(r, 10 - len(area) if r.random() < 0.8 else 9 - len(area))
+                groups = (len(area), len(digits) - len(area)) if r.random() < 0.6 else \
+                    (len(area), 4, len(digits) - len(area) - 4)
+            prefix = "+39 "
+        elif self.lang == "es":
+            digits = r.choice(["6", "6", "6", "7", "9", "9"]) + _digits(r, 8)
+            if digits[0] == "9" and r.random() < 0.5:
+                groups = (2, 3, 2, 2)
+            else:
+                groups = r.choice([(3, 3, 3), (3, 2, 2, 2), (3, 3, 3)])
+            prefix = "+34 "
+        else:
+            if r.random() < 0.4:
+                digits = "01" + r.choice(["51", "52", "57", "59", "60", "62", "70", "71", "72", "73", "75", "76", "77"]) + \
+                    _digits(r, r.choice([7, 7, 8]))
+                area = 4
+            else:
+                code = r.choice(["30", "40", "89", "69", "221", "211", "711", "341", "511", "911", "421", "351", "201",
+                                 "231", "6221", "7531", "8031", "4321", "2131", "9131"])
+                digits = "0" + code + _digits(r, max(5, 10 - len(code) - r.choice([0, 0, 1])))
+                area = len(code) + 1
+            groups = (area, len(digits) - area)
+            prefix = "+49 "
+            if fmt != "intl":
+                x = r.random()
+                if x < 0.15:
+                    return "(" + digits[:area] + ") " + digits[area:]
+                if x < 0.3:
+                    return digits[:area] + "/" + digits[area:]
+                if x < 0.4:
+                    return digits[:area] + "-" + digits[area:]
+        if fmt == "intl":
+            # Germany drops the trunk prefix 0 after +49; Italy keeps the 0 of its area codes.
+            national = digits[1:] if self.lang == "de" and digits[0] == "0" else digits
+            first = groups[0] - (len(digits) - len(national))
+            return prefix + national[:first] + " " + national[first:]
+        if fmt == "compact":
+            return digits
+        sep = "." if fmt == "dotted" and self.lang != "de" else " "
+        out, k = [], 0
+        for g in groups:
+            out.append(digits[k:k + g])
+            k += g
+        if k < len(digits):
+            out[-1] += digits[k:]
+        return sep.join(part for part in out if part)
+
+    def plate_text(self) -> str:
+        r = self.rng
+        letters = "ABCDEFGHJKLMNPRSTVWXYZ"
+        if self.lang == "it":
+            sep = r.choice([" ", " ", ""])
+            return "%s%s%s%03d%s%s%s" % (r.choice(letters), r.choice(letters), sep, r.randint(1, 999), sep,
+                                          r.choice(letters), r.choice(letters))
+        if self.lang == "es":
+            consonants = "BCDFGHJKLMNPRSTVWXYZ"
+            return "%04d%s%s" % (r.randint(0, 9999), r.choice([" ", "-", " ", ""]),
+                                 "".join(r.choice(consonants) for _ in range(3)))
+        if self.lang == "de":
+            district = r.choice(DE_PLATE_DISTRICTS)
+            middle = "".join(r.choice(letters) for _ in range(r.choice([1, 2, 2])))
+            number = str(r.randint(1, 9999 if len(district) + len(middle) < 4 else 999))
+            return district + r.choice(["-", " ", "-"]) + middle + " " + number + (r.choice(["E", "H"])
+                                                                                    if r.random() < 0.03 else "")
+        letters = "ABCDEFGHJKLMNPQRSTVWXYZ"
+        return "%s%s-%03d-%s%s" % (r.choice(letters), r.choice(letters), r.randint(1, 999), r.choice(letters),
+                                   r.choice(letters))
+
     def iban_text(self) -> str:
         r = self.rng
         if self.abroad and r.random() < self.abroad * 0.5:
             return self.world_iban()
+        if self.lang in ("it", "es", "de"):
+            return self.world_iban(self.lang)
         if self.lang == "en" and r.random() < 0.8:
             bban = "".join(r.choice("ABCDEFGHIJKLMNOPQRSTUVWXYZ") for _ in range(4)) + "%06d%08d" % (
                 r.randint(0, 999999), r.randint(0, 99999999))
@@ -2532,6 +3618,22 @@ class Generator:
                     return [("Mme" if p.gender == "f" else "M.", "TITLE")]
                 return [(r.choice(["Mme", "Mme", "Madame"]) if p.gender == "f" else r.choice(["M.", "M.", "Monsieur"]),
                          "TITLE")]
+            if self.lang in ("it", "es", "de"):
+                f = p.gender == "f"
+                if self.lang == "it":
+                    forms = {"long": ("Signor", "Signora"), "short": ("Sig.", "Sig.ra")}.get(variant)
+                    if forms is None:
+                        return [(r.choice(["Sig.ra", "Sig.ra", "Signora", "Sig.ra", "Sig.na"]) if f else
+                                 r.choice(["Sig.", "Sig.", "Signor", "Sig"]), "TITLE")]
+                elif self.lang == "es":
+                    forms = {"long": ("Señor", "Señora"), "short": ("Sr.", "Sra.")}.get(variant)
+                    if forms is None:
+                        return [(r.choice(["Sra.", "Sra.", "Dña.", "Sra", "D.ª"]) if f else
+                                 r.choice(["Sr.", "Sr.", "D.", "Sr"]), "TITLE")]
+                else:
+                    forms = {"long": ("Herr", "Frau"), "short": ("Hr.", "Fr."), "dat": ("Herrn", "Frau")}.get(
+                        variant, ("Herr", "Frau"))
+                return [(forms[1] if f else forms[0], "TITLE")]
             if variant == "long":
                 return [("Madam" if p.gender == "f" else "Sir", "TITLE")]
             return [(r.choice(["Mrs", "Ms", "Ms.", "Mrs."]) if p.gender == "f" else r.choice(["Mr", "Mr."]), "TITLE")]
@@ -2543,11 +3645,16 @@ class Generator:
         if name == "NATIONALITY":
             p = self.person(ident)
             return [(self.nationality(p, True if variant == "f" else None), "NATIONALITY")]
-        if name == "NATID":
+        if name in ("NATID", "NATNUM"):
             p = self.person(ident)
             if variant and variant in COUNTRIES and COUNTRIES[variant][5] is not None:
                 p.country = variant
+            if name == "NATNUM":
+                # The number alone, after a label the template writes: "Codice fiscale: {NATNUM#1}".
+                return [(self.national_value(p)[1], "ID")]
             return self.national_number(p)
+        if name == "VAT":
+            return [(self.vat_number(self.org(ident)), "ID")]
         if name == "EMAIL":
             p = self.person(ident)
             o = self.org(extra) if extra else None
@@ -2598,11 +3705,18 @@ class Generator:
                 if pl.cedex:
                     out.append((" CEDEX" + (" %d" % r.randint(1, 9) if r.random() < 0.4 else ""), None))
                 return out
+            if self.lang in ("it", "es", "de"):
+                return self.home_city_line(pl, upper=r.random() < (0.3 if self.lang == "it" else 0.15))
             return self.english_city_line(pl, "\n" if r.random() < 0.5 else " ")
         if name == "STREET":
             return self.street_fragments(self.place(ident), variant == "numbered")
         if name == "COMPLEMENT":
             pl = self.place(ident)
+            if pl.complement_after:
+                # The floor and the door already follow the street: another complement.
+                if pl.other_complement is None:
+                    pl.other_complement = self.complement()
+                return [(pl.other_complement, "STREET_ADDRESS")]
             if pl.complement is None:
                 pl.complement = self.complement()
             return [(pl.complement, "STREET_ADDRESS")]
@@ -2615,11 +3729,13 @@ class Generator:
                 if pl.postal:
                     out += [(pl.postal, "POSTAL_CODE"), (" ", None)]
                 return out + [(self.city_text(pl), "CITY")]
+            if self.lang in ("it", "es", "de"):
+                return out + self.home_city_line(pl, upper=False)
             return out + self.english_city_line(pl, ", " if r.random() < 0.5 else " ")
         if name == "ADDRESS_BLOCK":
             pl = self.place(ident)
             out = self.street_fragments(pl) + [("\n", None)]
-            if r.random() < 0.3 and not pl.flat_first:
+            if r.random() < 0.3 and not pl.flat_first and not pl.complement_after:
                 if pl.complement is None:
                     pl.complement = self.complement()
                 out += [(pl.complement, "STREET_ADDRESS"), ("\n", None)]
@@ -2627,12 +3743,26 @@ class Generator:
                 return out + self.world_city_line(pl, "\n" if r.random() < 0.7 else None)
             return out + self.slot(("slot", "CITYLINE", None, ident, None))
         if name == "ORG":
-            return [(self.org(ident, variant).name, "ORGANIZATION")]
+            value = self.org(ident, variant).name
+            if ident in self.genitive_orgs:
+                self.genitive_orgs.discard(ident)
+                head, sep, tail = value.partition(" ")
+                value = german_genitive(head) + sep + tail
+            return [(value, "ORGANIZATION")]
         if name == "DOMAIN":
             return [(self.org(ident).domain, None)]
         if name in ("ART", "Art"):
-            # The article of an organisation: "{ART#2}{ORG:public#2}" gives "la Mairie de Brest".
-            a = self.org(ident).article
+            # The article of an organisation: "{ART#2}{ORG:public#2}" gives "la Mairie de Brest";
+            # German takes the case of the variant: "{ART:dat#2}" gives "dem Amtsgericht".
+            o = self.org(ident)
+            a = o.article
+            if a and self.lang == "de" and variant in ("acc", "dat", "gen"):
+                gender = german_gender(o.name)
+                if gender:
+                    a = DE_ARTICLES[gender][variant] + " "
+                    # "des Amtsgerichts Hamburg": the name that follows takes the genitive.
+                    if variant == "gen" and gender in ("m", "n"):
+                        self.genitive_orgs.add(ident)
             return [(a[:1].upper() + a[1:] if name == "Art" else a, None)] if a else []
         if name == "SIRET":
             s = self.org(ident).siret
@@ -2657,6 +3787,16 @@ class Generator:
             if fr:
                 unit = " €" if x < 0.88 else r.choice([" CHF", " $ CA", " MAD", " DA", " FCFA", " $"])
                 return [(("%.2f" % v).replace(".", ",") + unit, None)]
+            if self.lang in ("it", "es", "de"):
+                # "1.234,56 €", "€ 1.234,56", "EUR 1.234,56".
+                txt = ("{:,.2f}".format(v)).replace(",", " ").replace(".", ",").replace(" ", ".")
+                if x < 0.7:
+                    return [(txt + " €", None)]
+                if x < 0.85:
+                    return [(("€ " if self.lang == "it" else "EUR ") + txt, None)]
+                if x < 0.95:
+                    return [(txt + " EUR", None)]
+                return [(txt + r.choice([" CHF", " $", " £"]), None)]
             if x < 0.55:
                 return [("£%.2f" % v, None)]
             if x < 0.8:
@@ -2677,11 +3817,11 @@ class Generator:
         if name == "MAC":
             return [(":".join("%02X" % r.randint(0, 255) for _ in range(6)), "MAC")]
         if name == "PLATE":
-            letters = "ABCDEFGHJKLMNPQRSTVWXYZ"
-            return [("%s%s-%03d-%s%s" % (r.choice(letters), r.choice(letters), r.randint(1, 999), r.choice(letters),
-                                         r.choice(letters)), "PLATE")]
+            return [(self.plate_text(), "PLATE")]
         if name == "GEO":
-            return [("%.5f, %.5f" % (r.uniform(42.0, 51.0), r.uniform(-4.8, 7.9)), "GEO")]
+            lat, lon = {"it": ((37.0, 46.5), (7.0, 18.4)), "es": ((36.1, 43.7), (-9.2, 3.2)),
+                        "de": ((47.4, 54.9), (6.0, 14.9))}.get(self.lang, ((42.0, 51.0), (-4.8, 7.9)))
+            return [("%.5f, %.5f" % (r.uniform(*lat), r.uniform(*lon)), "GEO")]
         if name == "REF":
             return [(self.ref_text(), "ID")]
         if name in ("NINO", "SSN", "PASSPORT", "IMEI", "UUID", "VIN"):
@@ -2689,14 +3829,21 @@ class Generator:
         if name == "NEGATIVE":
             # Capitalized words that are not personal data: {NEGATIVE:body}, {NEGATIVE:event},
             # {NEGATIVE:law}, {NEGATIVE:title}, {NEGATIVE:misc}; any category when none is given.
-            category = (variant or "").replace("cap", "").strip(",") or None
+            # German may add a case: {NEGATIVE:law,dat}.
+            parts = [x for x in (variant or "").split(",") if x]
+            category = next((x for x in parts if x not in ("cap", "nom", "acc", "dat", "gen")), None)
+            case = next((x for x in parts if x in ("acc", "dat", "gen")), None)
             value = self.pick("negatives", (lambda f: len(f) > 1 and f[1] == category) if category else None)
-            if variant and "cap" in variant and value:
+            if case and self.lang == "de" and value:
+                value = german_case(value, case)
+            if "cap" in parts and value:
                 value = value[:1].upper() + value[1:]
             return [(value, None)]
         if name == "INSTITUTION":
             # "la [CAF]": the name between brackets is an organisation, a generic reference is not.
             value = self.pick("institutions")
+            if variant in ("acc", "dat", "gen") and self.lang == "de" and value:
+                value = german_case(value, variant)
             if variant == "cap" and value:
                 value = value[:1].upper() + value[1:] if value[0] != "[" else "[" + value[1:2].upper() + value[2:]
             b, e = value.find("["), value.find("]")
@@ -2754,10 +3901,14 @@ def settle_titles(fragments: list) -> list:
         nxt, nxt2, prev = after(k, 1), after(k, 2), after(k, -1)
         before_name = nxt is not None and nxt[1] is None and nxt[0] in (" ", "\u00a0") and nxt2 is not None and \
             nxt2[1] in ("GIVEN_NAME", "FAMILY_NAME")
-        joined = nxt is not None and nxt[1] is None and nxt[0] in (" et ", " and ") and nxt2 is not None and \
+        # "Herrn\nThomas Müller": the civility alone on its line, the name opening the next one.
+        own_line = nxt is not None and nxt[1] is None and nxt[0] == "\n" and nxt2 is not None and \
+            nxt2[1] in ("GIVEN_NAME", "FAMILY_NAME") and (starts[k] == 0 or full[starts[k] - 1] == "\n")
+        joined = nxt is not None and nxt[1] is None and nxt[0] in (" et ", " and ", " e ", " y ", " und ") and \
+            nxt2 is not None and \
             nxt2[1] == "TITLE"
         labelled = prev is not None and prev[1] is None and prev[0].rstrip(" \u00a0").endswith(":")
-        if not (before_name or joined or labelled or in_cell(k)):
+        if not (before_name or own_line or joined or labelled or in_cell(k)):
             out[k][1] = None
     return [tuple(f) for f in out]
 
@@ -2859,6 +4010,15 @@ def apply_articles(fragments: list, lang: str) -> list:
                 out[k][0] = text[:m.start(1)] + (elided.capitalize() if word[0].isupper() else elided)
         elif lang == "en" and lower == "a" and english_takes_an(value):
             out[k][0] = text[:m.start(1)] + word + "n "
+        elif lang in ("it", "es", "de") and out[n][1] is None:
+            # "di" and "il" give "del", "de" and "el" "del", "bei" and "dem" "beim".
+            table = {"it": IT_CONTRACTED, "es": ES_CONTRACTED, "de": DE_CONTRACTED}[lang]
+            article = value[:-1] if value.endswith(" ") else value
+            fused = table.get((lower, article.lower()))
+            if fused and (value.endswith(" ") or article.endswith("'")):
+                fused = fused.capitalize() if word[0].isupper() else fused
+                out[k][0] = text[:m.start(1)] + fused + ("" if fused.endswith("'") else " ")
+                out[n][0] = ""
     return [tuple(f) for f in out]
 
 
@@ -2904,8 +4064,9 @@ def apply_style(fragments: list, style: dict, rng: random.Random) -> list:
 # as unlabelled text, until assemble() labels it: the noise and the style then draw the
 # same random numbers as for any other year, and the texts stay those of a plain {YEAR}.
 DATE_OPEN, DATE_CLOSE = "\ue000", "\ue001"
-MONTH_BEFORE = re.compile(r"(?i)(?<![^\W\d_])(%s),? {1,2}$" % "|".join(
-    sorted({m for m in FR_MONTHS + EN_MONTHS} | {strip_accents(m) for m in FR_MONTHS}, key=len, reverse=True)))
+MONTH_BEFORE = re.compile(r"(?i)(?<![^\W\d_])(%s)(?:,? {1,2}| de )$" % "|".join(
+    sorted({m for m in FR_MONTHS + EN_MONTHS + IT_MONTHS + ES_MONTHS + DE_MONTHS} |
+           {strip_accents(m) for m in FR_MONTHS + DE_MONTHS + ["Maerz"]}, key=len, reverse=True)))
 
 
 def assemble(fragments: list) -> Tuple[str, list]:
@@ -2913,9 +4074,16 @@ def assemble(fragments: list) -> Tuple[str, list]:
     and trailing spaces of a labelled fragment are left outside its span. A year between
     date marks is labelled DATE, with the month name written just before it."""
     text_parts, spans, dates, pos = [], [], [], 0
+    last_label = None
     for text, label in fragments:
         if not text:
             continue
+        # "Construcciones López S.L." at the end of a sentence: one period, which stays in the name.
+        if label is None and text.startswith(".") and last_label and text_parts and text_parts[-1].endswith("."):
+            text = text[1:]
+            if not text:
+                continue
+        last_label = label
         if label:
             data = text.encode("utf-8")
             stripped = text.strip()
@@ -3063,17 +4231,33 @@ def with_context(gen, res: Resources, lang: str, rng: random.Random, fragments: 
     return out
 
 
+def pick_language(rng: random.Random, languages: List[str], shares: List[float]) -> str:
+    """A language drawn by its share. With French and English alone, one draw against the share
+    of French, as the generator always did, so that a seed still writes the same texts."""
+    if len(languages) == 1:
+        return languages[0]
+    x = rng.random()
+    total = 0.0
+    for lang, share in zip(languages, shares):
+        total += share
+        if x < total:
+            return lang
+    return languages[-1]
+
+
 def build_split(res: Resources, name: str, count: int, pool: str, procedural: float, noise: float, genres,
-                seed: int, languages: List[str], fr_share: float, stats: dict, context_rate: float = 0.0,
-                prose_share: float = 0.0, exclude: Optional[set] = None, abroad: float = 0.0) -> List[str]:
+                seed: int, languages: List[str], shares: List[float], stats: dict, context_rate: float = 0.0,
+                prose_share: float = 0.0, exclude: Optional[set] = None, abroad: float = 0.0,
+                langs_out: Optional[list] = None) -> List[str]:
     """count examples; with exclude, the texts it holds are drawn again, a few times at
-    most, so that an evaluation split repeats no training text."""
+    most, so that an evaluation split repeats no training text. langs_out, when given,
+    receives the language of each example."""
     rng = random.Random("%s|%d" % (name, seed))
     lines = []
     split_stats = {"examples": 0, "spans": {}, "genres": {}, "languages": {}, "redrawn": 0}
     for _ in range(count):
         for attempt in range(30):
-            lang = languages[0] if len(languages) == 1 else ("fr" if rng.random() < fr_share else "en")
+            lang = pick_language(rng, languages, shares)
             gen = Generator(res, lang, rng, pool, procedural, noise, abroad)
             prose_genre = genres is not None and genres != "documents" and "prose" in genres
             if genres == "documents":
@@ -3114,6 +4298,8 @@ def build_split(res: Resources, name: str, count: int, pool: str, procedural: fl
             continue
         check_example(text, spans)
         lines.append(format_example(text, spans))
+        if langs_out is not None:
+            langs_out.append(lang)
         split_stats["examples"] += 1
         split_stats["genres"][genre] = split_stats["genres"].get(genre, 0) + 1
         split_stats["languages"][lang] = split_stats["languages"].get(lang, 0) + 1
@@ -3142,14 +4328,21 @@ def write_card(out_dir: str, args, res: Resources, stats: dict):
 
 
 def main():
-    p = argparse.ArgumentParser(description="Builds synthetic French and English texts annotated with the spans "
-                                            "of personal data, for the recognizers of dlib/privacy.")
+    p = argparse.ArgumentParser(description="Builds synthetic French, English, Italian, Spanish and German texts "
+                                            "annotated with the spans of personal data, for the recognizers of "
+                                            "dlib/privacy.")
     p.add_argument("--out-dir", default="pii-data", help="output directory")
     p.add_argument("--resources", default=None, help="directory of lexicons and templates replacing the built-in "
                                                        "ones (<lang>/<file>.txt)")
-    p.add_argument("--languages", default="fr,en", help="comma separated languages among fr and en")
-    p.add_argument("--fr-share", type=float, default=0.5, help="share of French examples when both languages "
-                                                                "are generated")
+    p.add_argument("--languages", default="fr,en,it,es,de",
+                   help="comma separated languages among fr, en, it, es and de")
+    p.add_argument("--fr-share", type=float, default=0.5, help="share of French examples when French and English "
+                                                                "alone are generated")
+    p.add_argument("--shares", default=None, help="the share of each language, as lang=share pairs separated by "
+                                                   "commas (fr=0.3,en=0.25,it=0.15,es=0.15,de=0.15); equal shares "
+                                                   "by default for more than two languages")
+    p.add_argument("--by-language", action="store_true", help="also write each evaluation split by language, "
+                                                               "<split>.<lang>.tsv")
     p.add_argument("--unseen-percent", type=int, default=15, help="percent of each lexicon held out for "
                                                                    "test_unseen")
     p.add_argument("--seed", type=int, default=1, help="random seed")
@@ -3172,10 +4365,29 @@ def main():
     if not languages:
         sys.exit("error: no language given")
     for lang in languages:
-        if lang not in ("fr", "en"):
-            sys.exit("error: unsupported language: %s (fr and en are supported)" % lang)
+        if lang not in LANGUAGES:
+            sys.exit("error: unsupported language: %s (%s are supported)" % (lang, ", ".join(LANGUAGES)))
     if not 0 <= args.fr_share <= 1:
         sys.exit("error: --fr-share lies between 0 and 1")
+    if args.shares:
+        given = {}
+        for item in args.shares.split(","):
+            lang, _, value = item.partition("=")
+            try:
+                given[lang.strip()] = float(value)
+            except ValueError:
+                sys.exit("error: bad --shares item %r" % item)
+        if set(given) != set(languages) or any(v < 0 for v in given.values()) or sum(given.values()) <= 0:
+            sys.exit("error: --shares gives one share of zero or more to each of the languages %s" %
+                     ",".join(languages))
+        total = sum(given.values())
+        shares = [given[lang] / total for lang in languages]
+    elif languages == ["fr", "en"]:
+        shares = [args.fr_share, 1 - args.fr_share]
+    elif languages == ["en", "fr"]:
+        shares = [1 - args.fr_share, args.fr_share]
+    else:
+        shares = [1.0 / len(languages)] * len(languages)
     if not 0 <= args.context_rate <= 1 or not 0 <= args.prose_share <= 1 or not 0 <= args.abroad_share <= 1:
         sys.exit("error: --context-rate, --prose-share and --abroad-share lie between 0 and 1")
     if not 0 <= args.unseen_percent <= 100:
@@ -3188,7 +4400,7 @@ def main():
     if args.sample:
         stats = {}
         lines = build_split(res, "sample", args.sample, "all", 0.25, 1.0, None, args.seed, languages,
-                            args.fr_share, stats, args.context_rate, args.prose_share, None, args.abroad_share)
+                            shares, stats, args.context_rate, args.prose_share, None, args.abroad_share)
         for line in lines:
             text, _, spans = line.rpartition("\t")
             raw = unescape(text)
@@ -3208,16 +4420,25 @@ def main():
         count = getattr(args, name)
         if count <= 0:
             continue
+        langs = []
         lines = build_split(res, name, count, pool, procedural, noise, genres, args.seed, languages,
-                            args.fr_share, stats, args.context_rate, args.prose_share,
+                            shares, stats, args.context_rate, args.prose_share,
                             None if name == "train" else train_texts,
-                            1.0 if name in ABROAD_SPLITS else args.abroad_share)
+                            1.0 if name in ABROAD_SPLITS else args.abroad_share, langs)
         if name == "train":
             train_texts = set(unescape(line.rpartition("\t")[0]) for line in lines)
         with open(os.path.join(args.out_dir, name + ".tsv"), "w", encoding="utf-8", newline="\n") as f:
             f.write("# dlib pii dataset: text<TAB>begin:end:LABEL,... (byte offsets)\n")
             for line in lines:
                 f.write(line + "\n")
+        if args.by_language and name != "train" and len(languages) > 1:
+            for lang in languages:
+                with open(os.path.join(args.out_dir, "%s.%s.tsv" % (name, lang)), "w", encoding="utf-8",
+                          newline="\n") as f:
+                    f.write("# dlib pii dataset: text<TAB>begin:end:LABEL,... (byte offsets), %s only\n" % lang)
+                    for line, l in zip(lines, langs):
+                        if l == lang:
+                            f.write(line + "\n")
         print("%-15s %6d examples, %6d spans" % (name, len(lines), sum(stats[name]["spans"].values())))
     with open(os.path.join(args.out_dir, "labels.txt"), "w", encoding="utf-8") as f:
         for label in MODEL_LABELS + RULE_LABELS:

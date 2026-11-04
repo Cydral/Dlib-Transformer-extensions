@@ -81,13 +81,20 @@ namespace dlib
         std::uint8_t month_case = 0;
         std::uint8_t two_digit_year = 0;
         std::uint8_t comma = 0;
+        std::uint8_t connector = 0;
 
+        /* The fields in 21 bits. The bits of the formats that French and English dates
+           needed come first, in the 17 bits they always took, so that a tag written before
+           the other languages decodes the same; the connector and the two high bits of the
+           month name variant follow. */
         std::uint32_t pack() const
         {
             return static_cast<std::uint32_t>(layout) | (static_cast<std::uint32_t>(separator) << 3) |
-                   (static_cast<std::uint32_t>(day_style) << 5) | (static_cast<std::uint32_t>(month_style) << 7) |
+                   (static_cast<std::uint32_t>(day_style) << 5) |
+                   (static_cast<std::uint32_t>(month_style & 63) << 7) |
                    (static_cast<std::uint32_t>(month_case) << 13) | (static_cast<std::uint32_t>(two_digit_year) << 15) |
-                   (static_cast<std::uint32_t>(comma) << 16);
+                   (static_cast<std::uint32_t>(comma) << 16) | (static_cast<std::uint32_t>(connector & 3) << 17) |
+                   (static_cast<std::uint32_t>(month_style >> 6) << 19);
         }
 
         static date_format unpack(std::uint32_t v)
@@ -96,10 +103,11 @@ namespace dlib
             f.layout = static_cast<std::uint8_t>(v & 7);
             f.separator = static_cast<std::uint8_t>((v >> 3) & 3);
             f.day_style = static_cast<std::uint8_t>((v >> 5) & 3);
-            f.month_style = static_cast<std::uint8_t>((v >> 7) & 63);
+            f.month_style = static_cast<std::uint8_t>(((v >> 7) & 63) | (((v >> 19) & 3) << 6));
             f.month_case = static_cast<std::uint8_t>((v >> 13) & 3);
             f.two_digit_year = static_cast<std::uint8_t>((v >> 15) & 1);
             f.comma = static_cast<std::uint8_t>((v >> 16) & 1);
+            f.connector = static_cast<std::uint8_t>((v >> 17) & 3);
             return f;
         }
 
@@ -145,9 +153,110 @@ namespace dlib
                 {1, "jan"}, {2, "feb"}, {3, "mar"}, {4, "apr"}, {6, "jun"}, {7, "jul"}, {8, "aug"},
                 {9, "sep"}, {9, "sept"}, {10, "oct"}, {11, "nov"}, {12, "dec"},
                 {1, "jan."}, {2, "feb."}, {3, "mar."}, {4, "apr."}, {6, "jun."}, {7, "jul."}, {8, "aug."},
-                {9, "sep."}, {12, "dec."}
+                {9, "sep."}, {12, "dec."},
+                // 62: Italian, full names then abbreviations.
+                {1, "gennaio"}, {2, "febbraio"}, {3, "marzo"}, {4, "aprile"}, {5, "maggio"}, {6, "giugno"},
+                {7, "luglio"}, {8, "agosto"}, {9, "settembre"}, {10, "ottobre"}, {11, "novembre"}, {12, "dicembre"},
+                {1, "gen."}, {2, "feb."}, {3, "mar."}, {4, "apr."}, {5, "mag."}, {6, "giu."}, {7, "lug."},
+                {8, "ago."}, {9, "set."}, {10, "ott."}, {11, "nov."}, {12, "dic."},
+                // 86: Spanish.
+                {1, "enero"}, {2, "febrero"}, {3, "marzo"}, {4, "abril"}, {5, "mayo"}, {6, "junio"}, {7, "julio"},
+                {8, "agosto"}, {9, "septiembre"}, {10, "octubre"}, {11, "noviembre"}, {12, "diciembre"},
+                {1, "ene."}, {2, "feb."}, {3, "mar."}, {4, "abr."}, {5, "may."}, {6, "jun."}, {7, "jul."},
+                {8, "ago."}, {9, "sep."}, {10, "oct."}, {11, "nov."}, {12, "dic."},
+                // 110: German, full names, "März" without its umlaut, then abbreviations.
+                {1, "januar"}, {2, "februar"}, {3, "m\xC3\xA4rz"}, {4, "april"}, {5, "mai"}, {6, "juni"},
+                {7, "juli"}, {8, "august"}, {9, "september"}, {10, "oktober"}, {11, "november"}, {12, "dezember"},
+                {3, "marz"}, {3, "maerz"},
+                {1, "jan."}, {2, "feb."}, {3, "m\xC3\xA4r."}, {4, "apr."}, {6, "jun."}, {7, "jul."}, {8, "aug."},
+                {9, "sep."}, {10, "okt."}, {11, "nov."}, {12, "dez."}
             };
             return v;
+        }
+
+        /* The languages of the month name variants, by the first index of each: French (0),
+           English (29), Italian (62), Spanish (86) and German (110). */
+        enum class month_language { french = 0, english = 1, italian = 2, spanish = 3, german = 4 };
+
+        inline month_language language_of_variant(std::size_t v)
+        {
+            if (v < 29) return month_language::french;
+            if (v < 62) return month_language::english;
+            if (v < 86) return month_language::italian;
+            if (v < 110) return month_language::spanish;
+            return month_language::german;
+        }
+
+        /* The first and last index of the family of variant v, names written alike, and the
+           family of full names of its language, used when a month has no abbreviation. */
+        inline void variant_family(std::size_t v, std::size_t& first, std::size_t& last, std::size_t& full)
+        {
+            static const std::size_t starts[] = { 0, 15, 25, 29, 41, 53, 62, 74, 86, 98, 110, 124, 135 };
+            std::size_t k = 0;
+            while (k + 2 < sizeof(starts) / sizeof(starts[0]) && v >= starts[k + 1]) ++k;
+            first = starts[k];
+            last = starts[k + 1];
+            // The names of French without accents (12 to 14) take the accented ones of 0 to 11.
+            if (first == 0) last = 12;
+            if (first == 110) last = 122;
+            const month_language lang = language_of_variant(v);
+            full = lang == month_language::french ? 0 : lang == month_language::english ? 29 :
+                   lang == month_language::italian ? 62 : lang == month_language::spanish ? 86 : 110;
+        }
+
+        /* The variant of language lang written like variant v, or v when that language
+           writes the name otherwise: "novembre" French or Italian, "August" English or German. */
+        inline int variant_in_language(int v, month_language lang)
+        {
+            const auto& variants = month_name_variants();
+            if (v < 0 || language_of_variant(static_cast<std::size_t>(v)) == lang) return v;
+            const std::string text = variants[static_cast<std::size_t>(v)].text;
+            for (std::size_t k = 0; k < variants.size(); ++k)
+                if (language_of_variant(k) == lang && text == variants[k].text) return static_cast<int>(k);
+            return v;
+        }
+
+        /* The language that the word written just before code point i gives to a month name
+           that several languages share, or -1: "il 3 novembre" is Italian, "le 3 novembre"
+           French, "am 3. August" German. */
+        inline int language_before(const utf8_text& t, std::size_t i)
+        {
+            std::size_t k = i;
+            while (k > 0 && t.cps[k - 1] == ' ') --k;
+            if (k == i && !(k > 0 && is_apostrophe(t.cps[k - 1]))) return -1;
+            std::size_t e = k;
+            if (e > 0 && is_apostrophe(t.cps[e - 1])) --e;
+            std::size_t b = e;
+            while (b > 0 && is_letter(t.cps[b - 1])) --b;
+            std::string w;
+            for (std::size_t q = b; q < e; ++q)
+                utf8_append(w, to_lower(t.cps[q]));
+            w = fold_key(w);
+            if (e < k)
+            {
+                // "dall'8 marzo", "nell'aprile": an elided Italian preposition.
+                if (w == "dall" || w == "dell" || w == "nell" || w == "all" || w == "l" || w == "sull")
+                    return static_cast<int>(month_language::italian);
+                return -1;
+            }
+            static const char* const italian[] = { "il", "del", "dal", "al", "nel", "entro", "fino", "giorno", "data",
+                                                   "li", "addi", "sabato", "domenica", "lunedi", "martedi",
+                                                   "mercoledi", "giovedi", "venerdi" };
+            static const char* const spanish[] = { "el", "desde", "hasta", "dia", "fecha", "a", "lunes", "martes",
+                                                   "miercoles", "jueves", "viernes", "sabado", "domingo" };
+            static const char* const french[] = { "le", "du", "au", "des", "depuis", "lundi", "mardi", "mercredi",
+                                                  "jeudi", "vendredi", "samedi", "dimanche" };
+            static const char* const german[] = { "am", "vom", "zum", "bis", "seit", "ab", "den", "im", "montag",
+                                                  "dienstag", "mittwoch", "donnerstag", "freitag", "samstag",
+                                                  "sonntag", "stand" };
+            static const char* const english[] = { "on", "of", "by", "from", "since", "monday", "tuesday",
+                                                   "wednesday", "thursday", "friday", "saturday", "sunday" };
+            for (const char* x : italian) if (w == x) return static_cast<int>(month_language::italian);
+            for (const char* x : spanish) if (w == x) return static_cast<int>(month_language::spanish);
+            for (const char* x : french) if (w == x) return static_cast<int>(month_language::french);
+            for (const char* x : german) if (w == x) return static_cast<int>(month_language::german);
+            for (const char* x : english) if (w == x) return static_cast<int>(month_language::english);
+            return -1;
         }
 
         inline std::string apply_case(const std::string& lower_text, int case_style)
@@ -257,10 +366,17 @@ namespace dlib
                 "en", "depuis", "avant", "apres", "fin", "debut", "courant", "vers", "annee", "printemps",
                 "ete", "automne", "hiver", "session", "promotion", "promo", "in", "since", "until", "till",
                 "before", "after", "around", "circa", "early", "late", "spring", "summer", "autumn", "fall",
-                "winter", "year", "born"
+                "winter", "year", "born",
+                // Italian, Spanish and German.
+                "nel", "dal", "fino", "anno", "entro", "estate", "inverno", "primavera", "autunno", "inizio",
+                "nato", "nata", "desde", "hasta", "ano", "verano", "invierno", "otono", "principios", "finales",
+                "mediados", "nacido", "nacida", "seit", "bis", "jahr", "jahre", "sommer", "fruhjahr", "fruhling",
+                "herbst", "anfang", "ende", "mitte", "geboren"
             };
-            static const std::vector<std::string> range = { "de", "entre", "from", "between" };
-            static const std::vector<std::string> labels = { "naissance", "birth", "dob" };
+            static const std::vector<std::string> range = { "de", "entre", "from", "between", "da", "tra", "fra",
+                                                             "von", "zwischen" };
+            static const std::vector<std::string> labels = { "naissance", "birth", "dob", "nascita", "nacimiento",
+                                                             "geburt", "geburtsjahr", "jahrgang" };
             auto in = [](const std::vector<std::string>& v, const std::string& w) {
                 for (const std::string& s : v)
                     if (s == w) return true;
@@ -357,7 +473,13 @@ namespace dlib
                 "metres", "meter", "meters", "kilometres", "kilometers", "miles", "pas", "steps", "kcal",
                 "participants", "candidats", "candidates", "eleves", "students", "etudiants", "enfants",
                 "children", "clients", "customers", "utilisateurs", "users", "visiteurs", "visitors",
-                "entreprises", "companies", "logements", "emplois", "jobs", "postes", "projets", "projects"
+                "entreprises", "companies", "logements", "emplois", "jobs", "postes", "projets", "projects",
+                "anni", "anno", "mesi", "giorni", "ore", "persone", "dipendenti", "abitanti", "pezzi", "copie",
+                "pagine", "utenti", "clienti", "studenti", "posti", "anos", "meses", "dias", "horas", "personas",
+                "empleados", "habitantes", "unidades", "copias", "paginas", "usuarios", "alumnos", "plazas",
+                "jahren", "monate", "monaten", "tage", "tagen", "stunden", "personen", "mitarbeiter",
+                "mitarbeitende", "einwohner", "stuck", "seiten", "nutzer", "kunden", "exemplare", "schuler",
+                "platze", "betten"
             };
             std::size_t k = j;
             if (t.at(k) == ' ')
@@ -409,7 +531,8 @@ namespace dlib
         inline bool second_year(const utf8_text& t, std::size_t j, std::size_t& b, std::size_t& e, int& year)
         {
             static const std::vector<std::string> links = {
-                "a", "au", "et", "to", "and", "until", "till", "through", "thru"
+                "a", "au", "et", "to", "and", "until", "till", "through", "thru", "al", "e", "y", "und", "bis",
+                "hasta", "fino"
             };
             std::size_t k = j;
             if (t.at(k) == ' ')
@@ -460,7 +583,9 @@ namespace dlib
             const std::string w = fold_key(letters_before(t, k, b));
             return w == "no" || w == "nr" || w == "num" || w == "numero" || w == "ref" || w == "reference" ||
                    w == "dossier" || w == "affaire" || w == "lot" || w == "facture" || w == "invoice" ||
-                   w == "number" || w == "version";
+                   w == "number" || w == "version" || w == "n" || w == "rif" || w == "prot" || w == "protocollo" ||
+                   w == "pratica" || w == "fattura" || w == "factura" || w == "expediente" || w == "rechnung" ||
+                   w == "az" || w == "aktenzeichen" || w == "nummer";
         }
     }
 
@@ -546,7 +671,10 @@ namespace dlib
                     }
                 }
 
-                // Text layout "12 mars 1985", "1er mars 1985", "12th March 1985".
+                /* Text layout "12 mars 1985", "1er mars 1985", "12th March 1985", and those of
+                   German, Spanish and Italian: "12. März 1985", "12 de marzo de 1985", "1° marzo
+                   1985". A month name that several languages write alike takes the language
+                   its connector or the word before the date gives it. */
                 if (!matched)
                 {
                     std::size_t j = i;
@@ -566,14 +694,56 @@ namespace dlib
                                                       static_cast<char>(to_lower(t.at(j + 1))) };
                             if (suf == "st" || suf == "nd" || suf == "rd" || suf == "th") { f.day_style = 3; j += 2; }
                         }
+                        else if (t.at(j) == '.' && t.at(j + 1) == ' ')
+                        {
+                            f.connector = 1;
+                            ++j;
+                        }
+                        else if (t.at(j) == 0xB0 && day == 1)
+                        {
+                            f.connector = 3;
+                            ++j;
+                        }
                         if (j < n && is_date_space(t.cps[j]) && t.cps[j] == ' ')
                         {
                             std::size_t k = j + 1, mend = 0;
+                            const bool de = f.connector == 0 && to_lower(t.at(k)) == 'd' &&
+                                            to_lower(t.at(k + 1)) == 'e' && t.at(k + 2) == ' ';
+                            if (de)
+                            {
+                                f.connector = 2;
+                                k += 3;
+                            }
                             int cs = 0;
-                            const int variant = match_month_name(t, k, mend, cs);
+                            int variant = match_month_name(t, k, mend, cs);
+                            if (variant >= 0)
+                            {
+                                static const month_language by_connector[] = {
+                                    month_language::french, month_language::german, month_language::spanish,
+                                    month_language::italian };
+                                if (f.connector != 0)
+                                {
+                                    const month_language lang = by_connector[f.connector];
+                                    variant = variant_in_language(variant, lang);
+                                    if (language_of_variant(static_cast<std::size_t>(variant)) != lang) variant = -1;
+                                }
+                                else
+                                {
+                                    const int lang = language_before(t, i);
+                                    if (lang >= 0)
+                                        variant = variant_in_language(variant, static_cast<month_language>(lang));
+                                }
+                            }
                             if (variant >= 0 && mend < n && t.cps[mend] == ' ')
                             {
                                 std::size_t y = mend + 1;
+                                if (f.connector == 2)
+                                {
+                                    if (to_lower(t.at(y)) == 'd' && to_lower(t.at(y + 1)) == 'e' && t.at(y + 2) == ' ')
+                                        y += 3;
+                                    else
+                                        y = n;
+                                }
                                 int year, ly;
                                 if (read_digits(t, y, 4, year, ly) && ly == 4 && !is_word_char(t.at(y)) &&
                                     plausible_year(year))
@@ -713,11 +883,28 @@ namespace dlib
                     }
                 }
 
-                // Month and year: "mars 2022", "March, 2022", "sept. 2019".
+                // Month and year: "mars 2022", "March, 2022", "sept. 2019", "marzo de 2022".
                 if (!matched && variant >= 0)
                 {
                     std::size_t j = mend;
-                    std::uint8_t comma = 0;
+                    std::uint8_t comma = 0, connector = 0;
+                    int month_variant = variant;
+                    if (t.at(j) == ' ' && to_lower(t.at(j + 1)) == 'd' && to_lower(t.at(j + 2)) == 'e' &&
+                        t.at(j + 3) == ' ' && is_ascii_digit(t.at(j + 4)))
+                    {
+                        const int spanish = variant_in_language(variant, month_language::spanish);
+                        if (language_of_variant(static_cast<std::size_t>(spanish)) == month_language::spanish)
+                        {
+                            month_variant = spanish;
+                            connector = 2;
+                            j += 3;
+                        }
+                    }
+                    else
+                    {
+                        const int lang = language_before(t, i);
+                        if (lang >= 0) month_variant = variant_in_language(variant, static_cast<month_language>(lang));
+                    }
                     if (t.at(j) == ',')
                     {
                         comma = 1;
@@ -735,13 +922,14 @@ namespace dlib
                         f.layout = 5;
                         f.separator = static_cast<std::uint8_t>(spaces - 1);
                         f.day_style = 0;
-                        f.month_style = static_cast<std::uint8_t>(variant);
+                        f.month_style = static_cast<std::uint8_t>(month_variant);
                         f.month_case = static_cast<std::uint8_t>(cs);
                         f.comma = comma;
+                        f.connector = connector;
                         m.begin = t.offsets[i];
                         m.end = t.offsets[y];
                         m.date.year = year;
-                        m.date.month = month_name_variants()[static_cast<std::size_t>(variant)].month;
+                        m.date.month = month_name_variants()[static_cast<std::size_t>(month_variant)].month;
                         m.date.day = 0;
                         m.format = f;
                         matched = true;
@@ -812,32 +1000,33 @@ namespace dlib
             }
             else
             {
-                const std::size_t family_start = f.month_style < 15 ? 0 :
-                                                 f.month_style < 25 ? 15 :
-                                                 f.month_style < 29 ? 25 :
-                                                 f.month_style < 41 ? 29 :
-                                                 f.month_style < 53 ? 41 : 53;
                 /* Families: 0-11 French full, 15-24/25-28 French abbreviations, 29-40 English
-                   full, 41-52 English abbreviations, 53-61 English abbreviations with period. */
-                const std::size_t family_end = family_start == 0 ? 12 : family_start == 15 ? 25 :
-                                               family_start == 25 ? 29 : family_start == 29 ? 41 :
-                                               family_start == 41 ? 53 : variants.size();
-                for (std::size_t v = family_start; v < family_end && name.empty(); ++v)
+                   full, 41-52 and 53-61 English abbreviations, 62-73 and 74-85 Italian, 86-97 and
+                   98-109 Spanish, 110-121 and 124-134 German. */
+                std::size_t first, last, full;
+                variant_family(f.month_style, first, last, full);
+                for (std::size_t v = first; v < last && name.empty(); ++v)
                     if (variants[v].month == d.month) name = variants[v].text;
-                if (name.empty())
-                {
-                    // Months without an abbreviation in this family are written in full.
-                    const std::size_t full_start = (family_start >= 29) ? 29 : 0;
-                    for (std::size_t v = full_start; v < full_start + 12 && name.empty(); ++v)
-                        if (variants[v].month == d.month) name = variants[v].text;
-                }
+                // Months without an abbreviation in this family are written in full.
+                for (std::size_t v = full; v < full + 12 && name.empty(); ++v)
+                    if (variants[v].month == d.month) name = variants[v].text;
             }
         }
         name = apply_case(name, f.month_case);
         if (f.layout == 3)
+        {
+            // "12. März 1985", "12 de marzo de 1985", "1° marzo 1985".
+            if (f.connector == 1) return day_text() + ". " + name + " " + year_text;
+            if (f.connector == 2) return day_text() + " de " + name + " de " + year_text;
+            if (f.connector == 3) return (d.day == 1 ? std::string("1\xC2\xB0") : day_text()) + " " + name + " " +
+                                         year_text;
             return day_text() + " " + name + " " + year_text;
+        }
         if (f.layout == 5)
+        {
+            if (f.connector == 2) return name + " de " + year_text;
             return name + (f.comma ? "," : "") + (f.separator == 1 ? "  " : " ") + year_text;
+        }
         return name + " " + day_text() + (f.comma ? "," : "") + " " + year_text;
     }
 

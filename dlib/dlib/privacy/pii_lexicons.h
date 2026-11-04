@@ -4,10 +4,11 @@
 #define DLIB_PII_LEXICONS_H_
 
 /*
-    Built-in word lists used by pii_detector and pseudonymizer, French and English.
+    Built-in word lists used by pii_detector and pseudonymizer, in French, English,
+    Italian, Spanish and German.
 
     Every entry is a lookup key in the form produced by privacy_impl::fold_key(): lower
-    case, without Latin accents, apostrophes unified. The lists hold common words of both
+    case, without Latin accents, apostrophes unified. The lists hold common words of these
     languages; organisations extend them at run time with their own dictionaries through
     pii_detector::add_person_name(), add_term() and add_allowed_term().
 
@@ -418,7 +419,12 @@ namespace dlib
                 "presidente ministre senateur depute maire chairman chairwoman chairperson speaker mayor governor "
                 "senator congressman congresswoman "
                 "abbe rabbin commissaire inspecteur brigadier amiral reverend captain sergeant inspector "
-                "detective");
+                "detective "
+                // Italian, Spanish and German civilities and professional titles.
+                "herr herrn frau hr fr sig sigg signor signora signore signorina dott dottssa dottoressa "
+                "dottore avv avvocato avvocata ing ingegnere arch architetto geom rag profssa notaio sr sra srta "
+                "senor senora senorita don dona dna dra lic licenciado licenciada abogado abogada notario notaria "
+                "dipl mag doktor professorin rechtsanwalt rechtsanwaltin notarin");
             return s;
         }
 
@@ -430,6 +436,18 @@ namespace dlib
             return s;
         }
 
+        inline const std::unordered_set<std::string>& role_words()
+        {
+            /* Roles and forms of address that follow a civility without naming anybody: "Signor
+               Sindaco", "Caro Collega", "Señor Alcalde", "Herr Bürgermeister", "Votre Excellence". */
+            static const std::unordered_set<std::string> s = make_word_set(
+                "sindaco sindaca assessore assessora consigliere consigliera direttore direttrice collega "
+                "colleghi colleghe alcalde alcaldesa concejal concejala consejero consejera colega director "
+                "directora burgermeister burgermeisterin vorsitzender vorsitzende direktor direktorin kollege "
+                "kollegin exzellenz excellence eccellenza excelencia");
+            return s;
+        }
+
         inline const std::unordered_set<std::string>& person_cues_before()
         {
             // Words that announce a person name right after them.
@@ -438,7 +456,13 @@ namespace dlib
                 "patient patiente salarie salariee employe employee candidat candidate temoin dear hello "
                 "hi bonjour cher chere chers cheres stagiaire collaborateur collaboratrice "
                 "beneficiaire assure assuree locataire proprietaire conjoint conjointe defunt defunte "
-                "soussigne soussignee soussignes soussignees");
+                "soussigne soussignee soussignes soussignees "
+                "sottoscritto sottoscritta paziente dipendente candidato candidata richiedente dichiarante "
+                "intestatario intestataria titolare locatario conduttore coniuge vedovo vedova suscrito suscrita "
+                "paciente trabajador trabajadora solicitante declarante titular arrendatario arrendataria conyuge "
+                "viudo viuda unterzeichner unterzeichnerin patientin mitarbeiter mitarbeiterin antragsteller "
+                "antragstellerin mieter mieterin ehegatte ehegattin witwe witwer soy llamo chiamo heisse heise "
+                "appelle");
             return s;
         }
 
@@ -447,7 +471,9 @@ namespace dlib
             // Words that typically follow a person name: "Jean Dupont, ne le".
             static const std::unordered_set<std::string> s = make_word_set(
                 "ne nee nes nees epouse epoux veuve veuf demeurant domicilie domiciliee residant "
-                "residante born aged age agee");
+                "residante born aged age agee "
+                "nato nata nati nate residente domiciliato domiciliata nacido nacida domiciliado domiciliada "
+                "geboren geb wohnhaft");
             return s;
         }
 
@@ -633,7 +659,218 @@ namespace dlib
                 {"ecole", pii_type::organization}, {"school", pii_type::organization},
                 {"universite", pii_type::organization}, {"university", pii_type::organization},
                 {"employeur precedent", pii_type::organization}, {"previous employer", pii_type::organization},
-                {"former employer", pii_type::organization}
+                {"former employer", pii_type::organization},
+                // Italian, Spanish and German.
+                {"cognome", pii_type::person}, {"nome", pii_type::person}, {"nome e cognome", pii_type::person},
+                {"cognome e nome", pii_type::person}, {"cognome, nome", pii_type::person},
+                {"nome, cognome", pii_type::person}, {"nominativo", pii_type::person},
+                {"nome completo", pii_type::person}, {"cognome da nubile", pii_type::person},
+                {"cognome di nascita", pii_type::person}, {"secondo nome", pii_type::person},
+                {"autore", pii_type::person}, {"redatto da", pii_type::person}, {"firmato da", pii_type::person},
+                {"approvato da", pii_type::person}, {"verificato da", pii_type::person},
+                {"preparato da", pii_type::person}, {"a cura di", pii_type::person},
+                {"intestatario", pii_type::person}, {"intestataria", pii_type::person},
+                {"rappresentante legale", pii_type::person}, {"referente", pii_type::person},
+                {"destinatario", pii_type::person}, {"mittente", pii_type::person}, {"paziente", pii_type::person},
+                {"medico curante", pii_type::person}, {"medico", pii_type::person},
+                {"beneficiario", pii_type::person}, {"beneficiaria", pii_type::person},
+                {"assicurato", pii_type::person}, {"assicurata", pii_type::person},
+                {"contraente", pii_type::person}, {"coniuge", pii_type::person},
+                {"proprietario", pii_type::person}, {"proprietaria", pii_type::person},
+                {"conduttore", pii_type::person}, {"locatore", pii_type::person}, {"locatario", pii_type::person},
+                {"dipendente", pii_type::person}, {"lavoratore", pii_type::person},
+                {"lavoratrice", pii_type::person}, {"candidato", pii_type::person},
+                {"candidata", pii_type::person}, {"contatto", pii_type::person},
+                {"responsabile", pii_type::person}, {"richiedente", pii_type::person},
+                {"dichiarante", pii_type::person}, {"alla cortese attenzione di", pii_type::person},
+                {"all'attenzione di", pii_type::person}, {"tutore", pii_type::person},
+                {"studente", pii_type::person}, {"studentessa", pii_type::person}, {"alunno", pii_type::person},
+                {"alunna", pii_type::person}, {"figlio", pii_type::person}, {"figlia", pii_type::person},
+                {"persona di riferimento", pii_type::person}, {"persona da contattare", pii_type::person},
+                {"nome del paziente", pii_type::person}, {"nome del padre", pii_type::person},
+                {"nome della madre", pii_type::person}, {"sottoscritto", pii_type::person},
+                {"sottoscritta", pii_type::person}, {"da", pii_type::person}, {"apellidos", pii_type::person},
+                {"apellido", pii_type::person}, {"nombre", pii_type::person}, {"nombres", pii_type::person},
+                {"nombre y apellidos", pii_type::person}, {"apellidos y nombre", pii_type::person},
+                {"apellidos, nombre", pii_type::person}, {"nombre completo", pii_type::person},
+                {"primer apellido", pii_type::person}, {"segundo apellido", pii_type::person},
+                {"apellido de soltera", pii_type::person}, {"autor", pii_type::person},
+                {"redactado por", pii_type::person}, {"firmado por", pii_type::person},
+                {"aprobado por", pii_type::person}, {"revisado por", pii_type::person},
+                {"preparado por", pii_type::person}, {"titular", pii_type::person},
+                {"representante legal", pii_type::person}, {"interlocutor", pii_type::person},
+                {"destinatario", pii_type::person}, {"remitente", pii_type::person},
+                {"paciente", pii_type::person}, {"medico de cabecera", pii_type::person},
+                {"beneficiaria", pii_type::person}, {"asegurado", pii_type::person},
+                {"asegurada", pii_type::person}, {"tomador", pii_type::person}, {"conyuge", pii_type::person},
+                {"propietario", pii_type::person}, {"propietaria", pii_type::person},
+                {"arrendatario", pii_type::person}, {"arrendataria", pii_type::person},
+                {"arrendador", pii_type::person}, {"empleado", pii_type::person}, {"empleada", pii_type::person},
+                {"trabajador", pii_type::person}, {"trabajadora", pii_type::person},
+                {"candidato", pii_type::person}, {"candidata", pii_type::person}, {"contacto", pii_type::person},
+                {"responsable", pii_type::person}, {"solicitante", pii_type::person},
+                {"declarante", pii_type::person}, {"a la atencion de", pii_type::person},
+                {"a/a", pii_type::person}, {"att", pii_type::person}, {"tutor", pii_type::person},
+                {"alumno", pii_type::person}, {"alumna", pii_type::person}, {"estudiante", pii_type::person},
+                {"hijo", pii_type::person}, {"hija", pii_type::person}, {"persona de contacto", pii_type::person},
+                {"nombre del paciente", pii_type::person}, {"nombre del padre", pii_type::person},
+                {"nombre de la madre", pii_type::person}, {"para", pii_type::person},
+                {"vorname", pii_type::person}, {"vornamen", pii_type::person}, {"nachname", pii_type::person},
+                {"familienname", pii_type::person}, {"geburtsname", pii_type::person},
+                {"vor- und nachname", pii_type::person}, {"vor- und zuname", pii_type::person},
+                {"zuname", pii_type::person}, {"rufname", pii_type::person}, {"ledigenname", pii_type::person},
+                {"name, vorname", pii_type::person}, {"nachname, vorname", pii_type::person},
+                {"verfasser", pii_type::person}, {"verfasserin", pii_type::person},
+                {"erstellt von", pii_type::person}, {"unterzeichnet von", pii_type::person},
+                {"genehmigt von", pii_type::person}, {"gepruft von", pii_type::person},
+                {"bearbeitet von", pii_type::person}, {"sachbearbeiter", pii_type::person},
+                {"sachbearbeiterin", pii_type::person}, {"ansprechpartner", pii_type::person},
+                {"ansprechpartnerin", pii_type::person}, {"kontoinhaber", pii_type::person},
+                {"kontoinhaberin", pii_type::person}, {"inhaber", pii_type::person},
+                {"inhaberin", pii_type::person}, {"vertreten durch", pii_type::person},
+                {"empfanger", pii_type::person}, {"empfangerin", pii_type::person}, {"absender", pii_type::person},
+                {"absenderin", pii_type::person}, {"patient", pii_type::person}, {"patientin", pii_type::person},
+                {"hausarzt", pii_type::person}, {"hausarztin", pii_type::person}, {"arzt", pii_type::person},
+                {"arztin", pii_type::person}, {"versicherter", pii_type::person},
+                {"versicherte", pii_type::person}, {"versicherungsnehmer", pii_type::person},
+                {"ehegatte", pii_type::person}, {"ehegattin", pii_type::person}, {"ehepartner", pii_type::person},
+                {"eigentumer", pii_type::person}, {"eigentumerin", pii_type::person}, {"mieter", pii_type::person},
+                {"mieterin", pii_type::person}, {"vermieter", pii_type::person}, {"vermieterin", pii_type::person},
+                {"arbeitnehmer", pii_type::person}, {"arbeitnehmerin", pii_type::person},
+                {"mitarbeiter", pii_type::person}, {"mitarbeiterin", pii_type::person},
+                {"bewerber", pii_type::person}, {"bewerberin", pii_type::person}, {"kontakt", pii_type::person},
+                {"verantwortlich", pii_type::person}, {"antragsteller", pii_type::person},
+                {"antragstellerin", pii_type::person}, {"zu handen", pii_type::person},
+                {"z. hd.", pii_type::person}, {"z.hd.", pii_type::person}, {"vormund", pii_type::person},
+                {"schuler", pii_type::person}, {"schulerin", pii_type::person}, {"student", pii_type::person},
+                {"studentin", pii_type::person}, {"kind", pii_type::person}, {"notfallkontakt", pii_type::person},
+                {"name des patienten", pii_type::person}, {"name des vaters", pii_type::person},
+                {"name der mutter", pii_type::person}, {"von", pii_type::person}, {"an", pii_type::person},
+                {"indirizzo", pii_type::address}, {"indirizzo di residenza", pii_type::address},
+                {"residenza", pii_type::address}, {"domicilio", pii_type::address},
+                {"indirizzo postale", pii_type::address}, {"indirizzo di fatturazione", pii_type::address},
+                {"indirizzo di consegna", pii_type::address}, {"indirizzo di spedizione", pii_type::address},
+                {"recapito", pii_type::address}, {"direccion", pii_type::address},
+                {"direccion postal", pii_type::address}, {"domicilio social", pii_type::address},
+                {"domicilio fiscal", pii_type::address}, {"direccion de envio", pii_type::address},
+                {"direccion de facturacion", pii_type::address}, {"direccion de entrega", pii_type::address},
+                {"residencia", pii_type::address}, {"calle", pii_type::address}, {"anschrift", pii_type::address},
+                {"adresse", pii_type::address}, {"wohnanschrift", pii_type::address},
+                {"strasse", pii_type::address}, {"strase", pii_type::address},
+                {"strasse und hausnummer", pii_type::address}, {"strase und hausnummer", pii_type::address},
+                {"postanschrift", pii_type::address}, {"lieferadresse", pii_type::address},
+                {"rechnungsadresse", pii_type::address}, {"lieferanschrift", pii_type::address},
+                {"rechnungsanschrift", pii_type::address}, {"wohnadresse", pii_type::address},
+                {"citta", pii_type::location}, {"comune", pii_type::location},
+                {"comune di nascita", pii_type::location}, {"luogo di nascita", pii_type::location},
+                {"comune di residenza", pii_type::location}, {"localita", pii_type::location},
+                {"nato a", pii_type::location}, {"nata a", pii_type::location},
+                {"residente a", pii_type::location}, {"residente in", pii_type::location},
+                {"cap", pii_type::location}, {"codice postale", pii_type::location},
+                {"ciudad", pii_type::location}, {"localidad", pii_type::location},
+                {"municipio", pii_type::location}, {"poblacion", pii_type::location},
+                {"lugar de nacimiento", pii_type::location}, {"ciudad de nacimiento", pii_type::location},
+                {"municipio de nacimiento", pii_type::location}, {"codigo postal", pii_type::location},
+                {"cp", pii_type::location}, {"c.p.", pii_type::location}, {"nacido en", pii_type::location},
+                {"nacida en", pii_type::location}, {"residente en", pii_type::location},
+                {"ort", pii_type::location}, {"wohnort", pii_type::location}, {"stadt", pii_type::location},
+                {"gemeinde", pii_type::location}, {"geburtsort", pii_type::location}, {"plz", pii_type::location},
+                {"postleitzahl", pii_type::location}, {"geboren in", pii_type::location},
+                {"wohnhaft in", pii_type::location}, {"plz/ort", pii_type::location},
+                {"plz ort", pii_type::location}, {"data di nascita", pii_type::date},
+                {"data nascita", pii_type::date}, {"nato il", pii_type::date}, {"nata il", pii_type::date},
+                {"fecha de nacimiento", pii_type::date}, {"fecha nacimiento", pii_type::date},
+                {"f. nacimiento", pii_type::date}, {"nacido el", pii_type::date}, {"nacida el", pii_type::date},
+                {"geburtsdatum", pii_type::date}, {"geboren am", pii_type::date}, {"geb. am", pii_type::date},
+                {"geburtstag", pii_type::date}, {"telefono", pii_type::phone}, {"cellulare", pii_type::phone},
+                {"numero di telefono", pii_type::phone}, {"recapito telefonico", pii_type::phone},
+                {"telefono fisso", pii_type::phone}, {"telefono cellulare", pii_type::phone},
+                {"tel. cellulare", pii_type::phone}, {"movil", pii_type::phone}, {"tfno", pii_type::phone},
+                {"telf", pii_type::phone}, {"tlf", pii_type::phone}, {"numero de telefono", pii_type::phone},
+                {"telefono movil", pii_type::phone}, {"telefono fijo", pii_type::phone},
+                {"telefon", pii_type::phone}, {"handy", pii_type::phone}, {"mobil", pii_type::phone},
+                {"mobiltelefon", pii_type::phone}, {"telefonnummer", pii_type::phone},
+                {"rufnummer", pii_type::phone}, {"festnetz", pii_type::phone}, {"tel. privat", pii_type::phone},
+                {"telefon privat", pii_type::phone}, {"telefon geschaftlich", pii_type::phone},
+                {"posta elettronica", pii_type::email}, {"indirizzo email", pii_type::email},
+                {"indirizzo e-mail", pii_type::email}, {"pec", pii_type::email},
+                {"indirizzo pec", pii_type::email}, {"correo", pii_type::email},
+                {"correo electronico", pii_type::email}, {"direccion de correo", pii_type::email},
+                {"direccion de correo electronico", pii_type::email}, {"e-mail-adresse", pii_type::email},
+                {"email-adresse", pii_type::email}, {"e-mail adresse", pii_type::email},
+                {"coordinate bancarie", pii_type::iban}, {"cuenta bancaria", pii_type::iban},
+                {"bankverbindung", pii_type::iban}, {"codice fiscale", pii_type::identifier},
+                {"cod. fiscale", pii_type::identifier}, {"c.f.", pii_type::identifier},
+                {"cf", pii_type::identifier}, {"partita iva", pii_type::identifier},
+                {"p.iva", pii_type::identifier}, {"p. iva", pii_type::identifier},
+                {"numero di passaporto", pii_type::identifier}, {"passaporto", pii_type::identifier},
+                {"carta d'identita", pii_type::identifier}, {"numero carta d'identita", pii_type::identifier},
+                {"patente", pii_type::identifier}, {"numero di patente", pii_type::identifier},
+                {"matricola", pii_type::identifier}, {"numero di matricola", pii_type::identifier},
+                {"codice cliente", pii_type::identifier}, {"numero cliente", pii_type::identifier},
+                {"numero pratica", pii_type::identifier}, {"numero di pratica", pii_type::identifier},
+                {"numero di polizza", pii_type::identifier}, {"polizza", pii_type::identifier},
+                {"tessera sanitaria", pii_type::identifier}, {"numero tessera sanitaria", pii_type::identifier},
+                {"permesso di soggiorno", pii_type::identifier}, {"codice dipendente", pii_type::identifier},
+                {"dni", pii_type::identifier}, {"nie", pii_type::identifier}, {"nif", pii_type::identifier},
+                {"cif", pii_type::identifier}, {"numero de identificacion fiscal", pii_type::identifier},
+                {"pasaporte", pii_type::identifier}, {"numero de pasaporte", pii_type::identifier},
+                {"permiso de conducir", pii_type::identifier}, {"carne de conducir", pii_type::identifier},
+                {"numero de cliente", pii_type::identifier}, {"numero de expediente", pii_type::identifier},
+                {"expediente", pii_type::identifier}, {"numero de poliza", pii_type::identifier},
+                {"poliza", pii_type::identifier}, {"numero de afiliacion", pii_type::identifier},
+                {"numero de la seguridad social", pii_type::identifier}, {"nss", pii_type::identifier},
+                {"tarjeta sanitaria", pii_type::identifier}, {"numero de empleado", pii_type::identifier},
+                {"tarjeta de residencia", pii_type::identifier}, {"documento de identidad", pii_type::identifier},
+                {"steuer-id", pii_type::identifier}, {"steuer-idnr", pii_type::identifier},
+                {"steueridentifikationsnummer", pii_type::identifier}, {"steuernummer", pii_type::identifier},
+                {"ust-idnr", pii_type::identifier}, {"ust-id", pii_type::identifier},
+                {"umsatzsteuer-identifikationsnummer", pii_type::identifier},
+                {"personalausweis", pii_type::identifier}, {"ausweisnummer", pii_type::identifier},
+                {"personalausweisnummer", pii_type::identifier}, {"reisepass", pii_type::identifier},
+                {"reisepassnummer", pii_type::identifier}, {"passnummer", pii_type::identifier},
+                {"fuhrerschein", pii_type::identifier}, {"fuhrerscheinnummer", pii_type::identifier},
+                {"kundennummer", pii_type::identifier}, {"kunden-nr", pii_type::identifier},
+                {"personalnummer", pii_type::identifier}, {"versicherungsnummer", pii_type::identifier},
+                {"sozialversicherungsnummer", pii_type::identifier},
+                {"rentenversicherungsnummer", pii_type::identifier},
+                {"krankenversicherungsnummer", pii_type::identifier}, {"versichertennummer", pii_type::identifier},
+                {"aktenzeichen", pii_type::identifier}, {"vertragsnummer", pii_type::identifier},
+                {"policennummer", pii_type::identifier}, {"mitgliedsnummer", pii_type::identifier},
+                {"matrikelnummer", pii_type::identifier}, {"aufenthaltstitel", pii_type::identifier},
+                {"idnr", pii_type::identifier}, {"targa", pii_type::license_plate},
+                {"numero di targa", pii_type::license_plate}, {"matricula", pii_type::license_plate},
+                {"kennzeichen", pii_type::license_plate}, {"amtliches kennzeichen", pii_type::license_plate},
+                {"kfz-kennzeichen", pii_type::license_plate}, {"indirizzo ip", pii_type::ipv4},
+                {"direccion ip", pii_type::ipv4}, {"ip-adresse", pii_type::ipv4},
+                {"ragione sociale", pii_type::organization}, {"denominazione", pii_type::organization},
+                {"denominazione sociale", pii_type::organization}, {"societa", pii_type::organization},
+                {"azienda", pii_type::organization}, {"impresa", pii_type::organization},
+                {"datore di lavoro", pii_type::organization}, {"ente", pii_type::organization},
+                {"scuola", pii_type::organization}, {"universita", pii_type::organization},
+                {"banca", pii_type::organization}, {"assicurazione", pii_type::organization},
+                {"compagnia assicurativa", pii_type::organization}, {"razon social", pii_type::organization},
+                {"denominacion social", pii_type::organization}, {"empresa", pii_type::organization},
+                {"sociedad", pii_type::organization}, {"entidad", pii_type::organization},
+                {"empleador", pii_type::organization}, {"empleadora", pii_type::organization},
+                {"organismo", pii_type::organization}, {"colegio", pii_type::organization},
+                {"universidad", pii_type::organization}, {"banco", pii_type::organization},
+                {"aseguradora", pii_type::organization}, {"compania", pii_type::organization},
+                {"firmenname", pii_type::organization},
+                {"unternehmen", pii_type::organization}, {"arbeitgeber", pii_type::organization},
+                {"arbeitgeberin", pii_type::organization}, {"gesellschaft", pii_type::organization},
+                {"einrichtung", pii_type::organization}, {"schule", pii_type::organization},
+                {"hochschule", pii_type::organization}, {"universitat", pii_type::organization},
+                {"kreditinstitut", pii_type::organization}, {"versicherung", pii_type::organization},
+                {"krankenkasse", pii_type::organization}, {"appellativo", pii_type::title},
+                {"tratamiento", pii_type::title}, {"anrede", pii_type::title}, {"sesso", pii_type::gender},
+                {"genere", pii_type::gender}, {"sexo", pii_type::gender}, {"genero", pii_type::gender},
+                {"geschlecht", pii_type::gender}, {"nazionalita", pii_type::nationality},
+                {"cittadinanza", pii_type::nationality}, {"nacionalidad", pii_type::nationality},
+                {"staatsangehorigkeit", pii_type::nationality}, {"nationalitat", pii_type::nationality},
+                {"staatsburgerschaft", pii_type::nationality}, {"coordinate gps", pii_type::geolocation},
+                {"coordenadas gps", pii_type::geolocation}, {"gps-koordinaten", pii_type::geolocation},
+                {"koordinaten", pii_type::geolocation}
             };
             return m;
         }
@@ -677,7 +914,8 @@ namespace dlib
                 "inc incorporated ltd limited llc llp plc corp corporation co gmbh ag kg ohg ug bv nv spa "
                 "srl sl pty ltee asbl sprl scrl bvba vzw kgaa oyj ltda pte pllc sca "
                 "mbh gbr aktiengesellschaft kommanditgesellschaft sau slu sll sapa sicav eireli ehf aps lllp bhd sdn "
-                "pvt pjsc jsc oao zao tov nyrt asa kft zrt dac suarl sae kk");
+                "pvt pjsc jsc oao zao tov nyrt asa kft zrt dac suarl sae kk "
+                "snc sas srls scoop ohg gbr ug ek kgaa");
             return s;
         }
 
@@ -685,7 +923,8 @@ namespace dlib
         {
             static const std::unordered_set<std::string> s = make_word_set(
                 "societe ste cabinet groupe group association fondation foundation banque bank clinique "
-                "hopital centre center institut institute universite university ecole school lycee "
+                "hopital hospital hostal hotel albergo centre center institut institute universite university "
+                "ecole school lycee "
                 "college laboratoire laboratoires mairie ministere ministry agence agency entreprise "
                 "entreprises etablissements ets federation syndicat cooperative mutuelle caisse "
                 "tribunal etude pharmacie ehpad club compagnie imprimerie boulangerie garage atelier conservatoire "
@@ -695,7 +934,14 @@ namespace dlib
                 "fondazione verein asociacion associacao associazione vereniging banco banca sparkasse volksbank "
                 "ospedale klinik clinica klinikum krankenhaus policlinico museo museum musee "
                 "teatro theater theatre orquesta orchestra orchestre conservatorio akademie accademia "
-                "compania compagnia gesellschaft grupo gruppo gruppe verlag");
+                "compania compagnia gesellschaft grupo gruppo gruppe verlag "
+                "studio azienda impresa ditta officina panificio pasticceria macelleria farmacia ferramenta "
+                "pizzeria trattoria ristorante autoscuola autofficina poliambulatorio laboratorio cooperativa "
+                "consorzio circolo empresa sociedad bufete despacho notaria asesoria panaderia carniceria "
+                "ferreteria restaurante autoescuela clinica policlinica residencia fundacion hermanos kanzlei "
+                "praxis apotheke backerei metzgerei autohaus fahrschule gaststatte notariat steuerburo verein "
+                "genossenschaft muebles talleres taller optica peluqueria floristeria libreria papeleria joyeria "
+                "zapateria gestoria");
             return s;
         }
 
@@ -716,7 +962,9 @@ namespace dlib
                 "immobiliare trasporti consulenza imobiliaria seguradora verzekeringen building "
                 "architectes architects automobiles emballages agencement menuiserie plomberie nettoyage catering "
                 "haulage joinery interiors landscapes removals roofing recruitment logistiek logistika kuljetus "
-                "maschinenbau installatietechniek impianti tekstil treuhand import-export");
+                "maschinenbau installatietechniek impianti tekstil treuhand import-export abogados ingenieros "
+                "arquitectos notarios avvocati commercialisti ingegneri architetti notai consulenti rechtsanwalte "
+                "steuerberater architekten ingenieure notare");
             return s;
         }
 
@@ -807,7 +1055,10 @@ namespace dlib
             // "ne a", "domicilie a": the place follows the preposition.
             static const std::unordered_set<std::string> s = make_word_set(
                 "ne nee domicilie domiciliee demeurant residant residante habitant habitante originaire fait "
-                "installe installee lives living born based residing resides");
+                "installe installee lives living born based residing resides "
+                "nato nata nati nate residente residenti domiciliato domiciliata domiciliati abitante originario "
+                "originaria nacido nacida nacidos residentes domicilio domiciliado domiciliada vecino vecina "
+                "natural geboren wohnhaft wohnt ansassig geburtig");
             return s;
         }
 
@@ -875,7 +1126,7 @@ namespace dlib
                     "fiches fusions adherent adherents adherente mensuel mensuelle trimestriel trimestrielle cheffe "
                     "consultante deleguee milestone milestones deliverable deliverables kickoff rollout cutover "
                     "backlog steering stakeholders assumptions dependencies attendees approvals signoff steps ");
-                // Frequent words of French and English that are neither given names nor family names
+                // Frequent words of the five languages that are neither given names nor family names
                 const char* const frequent[] = {
                     "one like time get also only after see make think back want because most very need really work being "
                     "too going before off made still take got many never life through last while such look something "
@@ -1545,7 +1796,170 @@ namespace dlib
                     "administratives assiette cahier calculer cannabis carburant certificat chroniques circulaire "
                     "confirmation construite continuite croise cuivre dessert diplomatique dirigee discret definit defis "
                     "effacer efficaces embrasse engages enseigner excuser exploiter filiale feter golfe generique "
-                    "individuelles interdite interroger integralite irai lave nerfs nette neveu"
+                    "individuelles interdite interroger integralite irai lave nerfs nette neveu",
+                    // Italian, Spanish and German.
+                    "recursos humanos soporte nominas contabilidad compras ventas comercial facturacion tesoreria "
+                    "calidad mantenimiento sistemas informatica logistica almacen recepcion gerencia alcalde hostal "
+                    "risorse umane supporto contabilita acquisti vendite qualita manutenzione sistemi magazzino "
+                    "personale personalabteilung buchhaltung einkauf vertrieb verkauf kundenservice kundendienst "
+                    "geschaftsfuhrung empfang lager logistik qualitat wartung kollegin kollege kolleginnen "
+                    "kollegen ministerin prasidentin burgermeister burgermeisterin vorsitzende vorsitzender "
+                    "arrendadora arrendatario arrendataria arrendador reclamaciones denuncia siniestro guardias "
+                    "urgencias alergia trabajadores accesso neueinstellung lebenslauf speiseplan vorsatz anhang "
+                    "oggetto pagina totale allegato allegati firma nota note documento documenti contratto contratti "
+                    "fattura fatture pratica pratiche richiesta richieste domanda risposta comunicazione informativa "
+                    "avviso verbale riunione assemblea relazione rapporto riepilogo elenco tabella sezione capitolo "
+                    "articolo comma paragrafo pagamento importo saldo scadenza ufficio servizio servizi reparto "
+                    "direzione amministrazione segreteria dipendenti fornitore fornitori progetto progetti attivita "
+                    "lavoro lavori orario numero codice indirizzo telefono distinti spettabile oggi domani ieri "
+                    "prego grazie informiamo comunichiamo inviamo allego confermo conferma trasmettiamo ricevuto "
+                    "ricevuta nuovo nuova nuovi nuove primo secondo seconda ultimo ultima presente presenti "
+                    "successivo successiva precedente generale generali tecnico tecnica tecnici amministrativo "
+                    "amministrativa personali nazionale regionale provinciale comunale pubblico pubblica privato "
+                    "privata sanitario sanitaria legale legali fiscale fiscali gentili cordiali egregi saluti dati "
+                    "privacy trattamento consenso informazioni dettagli scheda modulo certificato dichiarazione "
+                    "autocertificazione delega ricevute bonifico conto busta paga cedolino stipendio retribuzione "
+                    "ferie permesso malattia visita referto ricetta esame esami analisi diagnosi terapia sintomi "
+                    "anamnesi controllo prossimo prossima questo questa quanto inoltre pertanto tuttavia quindi "
+                    "infine dopo prima durante entro oltre circa tramite presso salvo ogni tutti tutte alcuni alcune "
+                    "ciascun nessun ancora sempre gia molto poco bene male sono siamo sara stato stata stati state "
+                    "viene vengono deve devono puo possono abbiamo avete hanno essere avere fare dare caso casi "
+                    "parte parti anno anni mese mesi giorno giorni ora ore settimana settimane asunto total anexo "
+                    "anexos documentos contrato contratos factura facturas expediente expedientes solicitud "
+                    "solicitudes respuesta comunicacion aviso acta reunion informe resumen lista tabla seccion "
+                    "capitulo articulo apartado punto pago importe vencimiento oficina servicio servicios "
+                    "departamento direccion administracion secretaria empleados cliente clientes proveedor "
+                    "proveedores proyecto proyectos actividad trabajo horario codigo correo atentamente saludos hoy "
+                    "manana ayer informamos comunicamos enviamos adjunto adjuntamos confirmo confirmamos recibido "
+                    "recibida nuevo nueva nuevos nuevas primero primera segundo segunda siguiente anterior general "
+                    "generales administrativo administrativa nacional regional provincial municipal publico publica "
+                    "privado privada legal fiscal datos privacidad tratamiento consentimiento informacion detalles "
+                    "ficha formulario certificado declaracion autorizacion recibo transferencia cuenta nomina "
+                    "salario vacaciones permiso baja receta prueba pruebas analisis diagnostico sintomas "
+                    "antecedentes revision proximo proxima esto esta cuanto ademas por tanto sin embargo luego "
+                    "despues antes dentro mediante cada todos todas algunos algunas ningun ninguna todavia siempre "
+                    "ya muy bien mal somos sera sido vienen debe deben puede pueden hemos habeis tienen ser estar "
+                    "hacer dar casos partes ano anos mes meses dia dias hora horas semana semanas estimados "
+                    "estimadas senores betreff datum seite gesamt anlage anlagen unterschrift hinweis hinweise "
+                    "dokument dokumente unterlagen vertrag vertrage rechnung rechnungen antrag antrage anfrage "
+                    "antwort mitteilung bescheid protokoll sitzung versammlung bericht berichte zusammenfassung "
+                    "liste tabelle abschnitt kapitel artikel absatz punkt zahlung betrag frist abteilung dienst "
+                    "verwaltung sekretariat personal kunde kunden lieferant lieferanten projekt projekte tatigkeit "
+                    "arbeit arbeitszeit nummer telefon daten datenschutz information informationen angaben auskunft "
+                    "frage fragen termin termine besprechung kundigung bestatigung bitte danke vielen grusen "
+                    "freundlichen sehr geehrte geehrter damen herren hiermit anbei beiliegend gemas laut bezuglich "
+                    "betreffend ihnen vertraulich wichtig dringend neu neue neuer neues erste erster zweite letzte "
+                    "aktuell aktuelle allgemein allgemeine technisch technische offentlich offentliche privat "
+                    "private rechtlich steuerlich medizinisch heute gestern ist sind hat haben wird werden wurde "
+                    "wurden kann konnen muss mussen soll sollen darf durfen mochten teilen mitteilen senden "
+                    "ubersenden erhalten bestatigen einwilligung verarbeitung auftrag auftrage angebot bestellung "
+                    "lieferung leistung leistungen vorgang vorgange akte unterlage formular bescheinigung erklarung "
+                    "vollmacht quittung uberweisung konto gehalt lohn lohnabrechnung urlaub krankmeldung "
+                    "untersuchung befund diagnose therapie behandlung anamnese kontrolle nachste nachster dieses "
+                    "diese dieser jedoch daher deshalb ausserdem auserdem sowie danach vorher wahrend innerhalb "
+                    "jeder jede jedes alle einige keine immer bereits viel wenig gut schlecht jahr jahre monat monate "
+                    "tag tage "
+                    "stunde stunden woche wochen sachverhalt grundlage beschluss entscheidung genehmigung prufung "
+                    "ergebnis ergebnisse massnahme massnahmen masnahme masnahmen mangel schaden schadensfall "
+                    "versicherungsfall unfall "
+                    "zeitraum stichtag zeitpunkt anschreiben schreiben brief nachricht kenntnis kenntnisnahme "
+                    "ruckfragen ruckfrage verfugung",
+                    // Frequent words of Italian, Spanish and German texts, chats and messages included.
+                    "ordine tre messaggio seguito dichiara fino bilancio disponibile annuale saranno clienti "
+                    "aziendale carico trasmessa sito aggiornamento corso previsto gestione preventivo sinistro chiede "
+                    "sicurezza identita atto confermato lunedi segue competente assistenza sei senza iscrizione "
+                    "eventuali cinque attesa risultati consegnato abitazione verso anche rilascio prevista immobile "
+                    "utente ritiro incontro resta prega conformita approvazione appuntamento aver veicolo locazione "
+                    "seguente sindacale assunzione spese rispetto offerta trenta presentazione incidente minuti piu "
+                    "seduta legge tempo partenza ritardo unanimita riscontro posizione copia propria responsabilita "
+                    "disposizione periodo unico visto targato prestazione trattati assenza priorita notifica dieci "
+                    "fornitura procedura qualsiasi regolamento formazione quota dolore presa occasione nominato "
+                    "protocollo comunica disdetta chiarimento rappresentata mezzo presentata rientro dimissioni "
+                    "lasciato pacco aggiornato prenotazione rimborso amministratore tutto guida conducente valido "
+                    "presenza durata interessi sopralluogo scritta livello arteriosa copertura emergenza previste "
+                    "dichiarazioni visione proposta chiusi presentati ricorda poi inviare chiuso rischi medio puoi "
+                    "giornata fuori arrivo partire entra accedere area merito inviato saluto lavorazione colloquio "
+                    "risulta quindici ricevimento inviata contesta venditrice iscritta valutazione qualifica "
+                    "preavviso aperto racconta sia intervento presentato certifica atti pomeriggio dove richiesto "
+                    "consegnata pronto sessione struttura appartamento condominiale rischio contatore vendita quadro "
+                    "precedenza fase punti validita foglio elettrica deposito letto deliberare organizzazione "
+                    "direttiva resa almeno tirocinio base bancario quale magistrale annuo ricorrente conduttrice "
+                    "ricorso addominale destra trasporto partecipazione sanzioni penali mendaci finalita esercizio "
+                    "conservati necessario trasmette resteranno obbligatorio disponibili completa compilare "
+                    "destinazione ordini lavorativi settore aziendali osserveranno vista parere dispone finanziato "
+                    "inoltro stamattina assente ricezione preghiamo trasmesso lavora presto indirizzato sotto entrare "
+                    "accolta provvedimento acquirente contro difesa confronti uso mensile pieno beni funzione decreto "
+                    "decorrere assegnato obbligatoria proprie giovedi bloccato lettera confermare lavorato cambio "
+                    "diritto registrato agli accessi contabile informa favore verifica previa medica odierna riposo "
+                    "prescrittore aperta ospite figli salute attivo approvata acquisto prodotto migrazione vacanze "
+                    "stipulato perito danni interverra fissato rilasciata contestazione violazione associativa dovuto "
+                    "esclusivamente scrivo emessa persone vanno stasera ulteriore convenuto versione titolo invio "
+                    "cordiale applicazione ematochimici effettuato cauzionale visitatori programma crescita cantiere "
+                    "altro accordo applica digitalmente addebito lettura effettuata etico versato solare competenza "
+                    "reclamo rivolgersi competenze godute svolto controllata audit aspettative mandato identificativo "
+                    "accetta quattro obblighi credito valori rilevati medicina ipertensione articolare inizio ammesso "
+                    "calo registro nominale rifacimento esecutrice sostituzione operatore contributo triennale "
+                    "convocazione sto sta stai stiamo stanno stavo stavolta stanotte stamani rimandi rimando "
+                    "rimandare allora magari boh vabbe cmq xke perche comunque adesso subito tardi forse proprio "
+                    "troppo niente nulla qualcosa qualcuno nessuno ognuno ciascuno cosa cose ecco scusa scusate certo "
+                    "tipo arriva torno pranzo cena colazione domattina dopodomani scorsa "
+                    "plazo inferior ante saludo vivienda cualquier presupuesto acceso sesion anual edad puesto pedido "
+                    "vehiculo equipo profesional cita derecho queda efectos contra mensaje lunes consulta curso "
+                    "acuerdo arterial cordial resolucion tras relacion ejercicio evaluacion paquete presentacion "
+                    "asistencia actualizacion celebrara cinco formacion familia usuario sigue declara otra cantidad "
+                    "laboral jornada seguimiento tiene peticion salida realizada equipos practicas prevencion escrito "
+                    "obra llamada revisar trabaja propietarios siendo representacion oferta abierta fue ingreso "
+                    "preguntas renta propuesta cuentas noche reclamacion categoria seis salud proceso masa corporal "
+                    "riesgos contrasena autoriza personales comunico empadronamiento presentar disposicion presentado "
+                    "quince conste convocatoria representada edificio vez quiere inscripcion confirmada supresion "
+                    "tarde seguro presenta calendario recogida compradora reparacion aprobo aplicacion procedimiento "
+                    "treinta duracion realizara habiles referencia objetivo consultas estudios urgencia cotizacion "
+                    "abajo firmante hechos tratar encuentra bajo situada notificaciones menor resuelto recurso ruego "
+                    "asi entregara incorporacion completar remitido archivo solicita adelante habiendo autos demanda "
+                    "haber derechos concepto cambiar entregado hace incidencia donde estoy actualizado realizado "
+                    "perdida estudio interes valoracion reposo enfermedad hijos reembolso inicio origen asignado "
+                    "resultados compra producto incluido pasado portabilidad vendedora convenio danos accidente "
+                    "suministro encargo conservaran tiempo necesario recuerda revisara correspondiente programa "
+                    "reservas juridica clausula enviara llame recomienda lectura incluye levanta aumento "
+                    "certificacion electronica menos intereses planta sustitucion pagas extraordinarias auditoria "
+                    "proteccion evolucion dolor perfil externas afectados traves turismo empleo establecimiento "
+                    "responsabilidad aclaracion pendiente termino fianza presento licencia complace fuera escribo "
+                    "enviado documentacion abrazo presentara validacion enviar mensualidad regimen juicio ejercer "
+                    "extincion sustituye gastos concedida liquidacion llamara jueves llamar pide llaman oposicion "
+                    "piso figura renovacion concedido inmueble situado alguien viernes tienes hablamos algo fichero "
+                    "prestamo legales gestionar primaria remito conexion estancia habitual vuelo calificaciones "
+                    "prioridad notificacion junto consejo instalacion ventana todo publicacion era colaboracion "
+                    "minutos contador directiva cuota cumplimiento anuales tendra permaneceran cerradas dirigirse "
+                    "obligatorio retraso cierra conformidad publicaran urgente valida siete abre espera caracter "
+                    "informativo cambios buen otro titulo corriente incidencias analitica normal unanimidad "
+                    "obligatoria problema plantilla cifras obras asuntos politica plazos aplicable presentarse "
+                    "protocolo cuatro averia contrario recuerdo tambien seran tratados seleccion suministrados fiebre "
+                    "alteraciones lumbalgia mecanica comun ayunas extraccion lipidico descenso vigilar cardiaca "
+                    "laborales regulable cargas frente acude consciente clinico copias limitada extravio pues buena "
+                    "ahora entonces nadie nunca aqui alli ahi mucho demasiado quizas quiza vamos venga oye perfecto "
+                    "claro igual tampoco porfa perdona perdon disculpa disculpad ojala anoche comida desayuno llego "
+                    "llegas vengo voy estamos tengo tenemos hago haces puedo puedes "
+                    "mich statt findet erfolgt drei zwei geschlossen betragt liegt genannt ubernimmt meiner letzten "
+                    "beschaftigt zusammen wegen nachfolgend moglich bestatigt vollstandig unserer abgeschlossen "
+                    "bereit unauffallig gilt sechs bin mochte empfohlen steht oben weitergeleitet wenden morgen "
+                    "ausschlieslich zehn arbeitet bleibt spatestens habe meines kannst tatig zahlen erreichbar "
+                    "zustandige informiert zugestellt geplant hast funf wechselt gelten genannten fristgerecht sofort "
+                    "melde verschoben beginnt unserem eingestellt stets monatlich aufgenommen ubermittelt "
+                    "aktualisiert nachsten veroffentlicht vereinbart finden bestanden nachstmoglichen derzeit "
+                    "bestatige telefonisch offen uberweisen eingegangen lautet dir stellt verarbeitet bestellt "
+                    "personenbezogene kollegialen behandelt gesperrt sagt meldet fehlgeschlagen erteilt stehen "
+                    "geliefert gesetzlichen liegen offenen vorgelegt mehr gemeldet ersten jahrlich lauft hoch "
+                    "beigefugt kommt enthalt tragt mittel genommen besprochen laden herzlich meinen beantrage weiter "
+                    "gegenuber schicken folgende einschlieslich insbesondere folgender eingetragen vereinbarten "
+                    "erreicht bitten bestehende hilfsweise ausgewiesen geleitet erstattet gesehen weiteren uberwiesen "
+                    "befand stationar arbeitsunfahig deren jemand etwa zuruck einstimmig lebt teilt uberschritten "
+                    "zulassige erforderlich bleiben daran melden ubergeben beschrieben beauftragt aktiv markiert "
+                    "bescheinigt ausgestellt alles brutto fallig geht zahlbar versandt verlangert zwolf sollte gultig "
+                    "ersetzt regelmasig eingeschrankt pro unverandert hin verschickt offnet geben zustandigen "
+                    "elektronisch meinem erheben vertritt absolviert monatliche taglich rechten netto "
+                    "wiederhergestellt jetzt gleich nichts etwas niemand wieder vielleicht gerne genau klar bald "
+                    "spater fruh leider sonst trotzdem eigentlich ubrigens ziemlich wirklich naturlich sicher eben "
+                    "halt doch serata notte nottata mattinata tardes noches nacht abend wochenende brexit"
                 };
                 for (const char* part : frequent)
                 {
@@ -1607,7 +2021,19 @@ namespace dlib
                 "vous ils elles me m te t se s moi toi lui eux y en qui que qu quoi dont ou ceci cela ca "
                 "the an and nor but if of in on at to for from by with as is are was were be been this "
                 "that these those it its he she they we you i my your his her their our him us them who "
-                "whom what which when where why how not no yes so than then there here");
+                "whom what which when where why how not no yes so than then there here "
+                "il lo gli i uno una di da con su per tra fra del dello della dei degli delle dal dallo dalla "
+                "dai dagli dalle nel nello nella nei negli nelle sul sullo sulla sui sugli sulle col e o ma che "
+                "chi cui non questo questa questi queste quello quella quelli quelle mio mia miei mie tuo tua "
+                "suo sua suoi sue nostro nostra vostro vostra loro io lei noi voi essi esse ci vi ne si come "
+                "el los las unos unas al por para sin sobre entre hacia hasta desde ni pero sino quien cuyo cuya "
+                "este esta estos estas ese esa esos esas aquel aquella mis tus sus nuestro nuestra vuestro "
+                "vuestra yo usted ustedes nosotros vosotros ellos ellas les como "
+                "der die das den dem des ein eine einen einem einer eines und oder aber sondern denn dass ob "
+                "wenn als wie mit von zu zum zur bei beim im ins am ans auf aus fur gegen ohne um durch uber "
+                "unter vor hinter neben zwischen nach seit bis ich du er sie es wir ihr mein meine dein deine "
+                "sein seine unser unsere euer eure ihre ihren ihrem ihrer ihres nicht kein keine sich auch noch "
+                "nur schon");
             return s;
         }
 
@@ -1631,7 +2057,14 @@ namespace dlib
                 "bonjour bonsoir salut coucou allo merci cordialement amicalement bien bises bisous "
                 "salutations bienvenue bravo felicitations pardon desole desolee cher chere chers cheres "
                 "madame monsieur mademoiselle mesdames messieurs hello hi hey greetings dear thanks "
-                "thank cheers regards best sincerely welcome congratulations sorry sir madam");
+                "thank cheers regards best sincerely welcome congratulations sorry sir madam "
+                "egregio egregia egregi egr gentile gentili gentilissimo gentilissima gentmo gentma spett spettle "
+                "spettabile caro cara cari ciao buongiorno buonasera salve grazie saluti cordiali cordialmente "
+                "distinti ossequi benvenuto estimado estimada estimados estimadas querido querida queridos "
+                "apreciado apreciada distinguido distinguida hola buenos buenas gracias saludos atentamente "
+                "cordiales bienvenido bienvenida geehrte geehrter geehrtes liebe lieber liebes hallo moin "
+                "servus gruss grus grusse gruse grussen danke freundlichen herzliche herzlichen mfg willkommen "
+                "buon buona buonanotte muchas guten good bjr bsr slt");
             return s;
         }
 
@@ -1641,7 +2074,10 @@ namespace dlib
                TITLE. Professional titles (Dr, Me, Pr) stay readable. */
             static const std::unordered_set<std::string> s = make_word_set(
                 "m mr mrs ms mx miss mme mmes mlle mlles madame monsieur mademoiselle messieurs mesdames "
-                "sir madam");
+                "sir madam "
+                // Italian, Spanish and German; "Sig.ra" and "D." are read by the detector.
+                "herr herrn frau hr fr sig sigg signor signora signore signorina sr sra srta senor senora "
+                "senorita don dona dna");
             return s;
         }
 
@@ -1650,7 +2086,9 @@ namespace dlib
             // Values of a sex or gender field, folded with spaces and hyphens removed.
             static const std::unordered_set<std::string> s = make_word_set(
                 "m f h x masculin feminin homme femme male female man woman garcon fille boy girl "
-                "nonbinaire nonbinary neutre neutral autre other");
+                "nonbinaire nonbinary neutre neutral autre other "
+                "femmina maschio femminile maschile donna uomo mujer hombre femenino masculino varon "
+                "weiblich mannlich weibl mannl divers frau mann w d");
             return s;
         }
 
@@ -1714,13 +2152,43 @@ namespace dlib
                 "turkmene|vanuatais|vanuataise|bahraini|barbadian|bhutanese|motswana|bruneian|fijian|"
                 "grenadian|guyanese|kazakhstani|kyrgyz|laotian|liechtensteiner|malawian|maldivian|"
                 "micronesian|sammarinese|surinamese|swazi|timorese|tongan|"
-                "trinidadian|turkmen|tuvaluan|ni-vanuatu|kosovan|azeri");
+                "trinidadian|turkmen|tuvaluan|ni-vanuatu|kosovan|azeri|"
+                // Italian, Spanish and German.
+                "italiano|italiana|francese|tedesco|tedesca|spagnolo|spagnola|inglese|britannico|britannica|"
+                "americano|americana|statunitense|rumeno|rumena|albanese|marocchino|marocchina|cinese|ucraino|"
+                "ucraina|polacco|polacca|tunisino|tunisina|egiziano|egiziana|indiano|indiana|filippino|filippina|"
+                "brasiliano|brasiliana|argentino|argentina|peruviano|peruviana|svizzero|svizzera|austriaco|"
+                "austriaca|belga|olandese|portoghese|turco|turca|senegalese|nigeriano|nigeriana|pakistano|"
+                "pakistana|bengalese|srilankese|ecuadoriano|ecuadoriana|moldavo|moldava|serbo|serba|croato|"
+                "croata|bulgaro|bulgara|ceco|ceca|slovacco|slovacca|ungherese|giapponese|coreano|coreana|"
+                "canadese|australiano|australiana|messicano|messicana|colombiano|colombiana|venezuelano|"
+                "venezuelana|cubano|cubana|algerino|algerina|libico|libica|siriano|siriana|iraniano|iraniana|"
+                "afghano|afghana|irlandese|scozzese|svedese|norvegese|danese|finlandese|lussemburghese|ivoriano|"
+                "ivoriana|camerunese|vietnamita|espanol|espanola|frances|francesa|aleman|alemana|portugues|"
+                "portuguesa|britanico|britanica|ingles|inglesa|estadounidense|norteamericano|norteamericana|"
+                "marroqui|rumano|rumana|ecuatoriano|ecuatoriana|venezolano|venezolana|peruano|peruana|boliviano|"
+                "boliviana|chino|ucraniano|ucraniana|polaco|polaca|argelino|argelina|senegales|senegalesa|"
+                "paquistani|pakistani|dominicano|dominicana|mexicano|mexicana|brasileno|brasilena|chileno|"
+                "chilena|paraguayo|paraguaya|uruguayo|uruguaya|hondureno|hondurena|suizo|suiza|neerlandes|"
+                "neerlandesa|holandes|holandesa|sueco|sueca|noruego|noruega|danes|danesa|finlandes|finlandesa|"
+                "irlandes|irlandesa|griego|griega|ruso|rusa|japones|japonesa|canadiense|sirio|siria|irani|"
+                "egipcio|egipcia|tunecino|tunecina|nicaraguense|salvadoreno|salvadorena|guatemalteco|"
+                "guatemalteca|panameno|panamena|costarricense|georgiano|georgiana|armenio|armenia|marfileno|"
+                "marfilena|camerunes|camerunesa|deutsch|deutsche|deutscher|osterreichisch|schweizerisch|"
+                "italienisch|spanisch|franzosisch|britisch|englisch|amerikanisch|us-amerikanisch|turkisch|"
+                "polnisch|rumanisch|bulgarisch|kroatisch|serbisch|griechisch|russisch|ukrainisch|syrisch|"
+                "afghanisch|irakisch|iranisch|marokkanisch|tunesisch|algerisch|niederlandisch|belgisch|"
+                "portugiesisch|tschechisch|slowakisch|ungarisch|chinesisch|japanisch|indisch|kanadisch|"
+                "australisch|brasilianisch|mexikanisch|schwedisch|norwegisch|danisch|finnisch|irisch|"
+                "luxemburgisch|kosovarisch|albanisch|bosnisch|nigerianisch|eritreisch|somalisch|vietnamesisch|"
+                "pakistanisch|ivorisch|kamerunisch|senegalesisch|slowenisch|litauisch|lettisch|estnisch|"
+                "moldauisch");
             return s;
         }
 
         inline const std::unordered_set<std::string>& country_names()
         {
-            // Countries, French and English, accepted as the value of a nationality field.
+            // Countries in the five languages, accepted as the value of a nationality field.
             static const std::unordered_set<std::string> s = make_phrase_set(
                 "afghanistan|albanie|algerie|allemagne|andorre|angola|argentine|armenie|australie|autriche|"
                 "azerbaidjan|bangladesh|belgique|benin|bielorussie|birmanie|bolivie|bosnie-herzegovine|bresil|"
@@ -1744,7 +2212,55 @@ namespace dlib
                 "new zealand|norway|poland|romania|russia|saudi arabia|scotland|senegal|serbia|slovakia|"
                 "slovenia|south africa|spain|sweden|switzerland|syria|tunisia|turkey|united kingdom|uk|"
                 "great britain|united states|united states of america|usa|us|wales|northern ireland|"
-                "ukraine|vietnam|afrique du sud|singapore|united arab emirates|uae");
+                "ukraine|vietnam|afrique du sud|singapore|united arab emirates|uae|"
+                // Italian, Spanish and German.
+                "italia|francia|germania|spagna|svizzera|regno unito|stati uniti|marocco|cina|ucraina|polonia|"
+                "egitto|filippine|brasile|peru|grecia|turchia|paesi bassi|belgio|portogallo|irlanda|svezia|"
+                "norvegia|danimarca|finlandia|giappone|messico|algeria|tunisia|libia|siria|albania|romania|"
+                "croazia|serbia|ungheria|repubblica ceca|slovacchia|bulgaria|russia|espana|alemania|reino unido|"
+                "estados unidos|marruecos|rumania|suiza|belgica|paises bajos|suecia|noruega|dinamarca|japon|"
+                "mexico|argelia|tunez|egipto|filipinas|brasil|turquia|hungria|republica checa|ucrania|rusia|"
+                "deutschland|osterreich|schweiz|frankreich|italien|spanien|vereinigtes konigreich|"
+                "vereinigte staaten|turkei|polen|rumanien|bulgarien|kroatien|serbien|griechenland|russland|"
+                "syrien|irak|marokko|tunesien|algerien|niederlande|belgien|tschechien|ungarn|japan|indien|kanada|"
+                "australien|brasilien|mexiko|schweden|norwegen|danemark|finnland|irland|luxemburg|albanien|"
+                "slowakei|ukraine|agypten");
+            return s;
+        }
+
+        inline const std::unordered_set<std::string>& region_names()
+        {
+            /* Regions, provinces, Länder and islands of the five languages, which hold many towns
+               and name no place to replace: "Bretagne", "Puglia", "Cataluña", "Nordrhein-Westfalen".
+               The regions that are also a town or a common first name ("Madrid", "Murcia",
+               "Brandenburg", "Lorraine", "Emilia", "Victoria") are left out. */
+            static const std::unordered_set<std::string> s = make_phrase_set(
+                "bretagne|normandie|occitanie|ile-de-france|nouvelle-aquitaine|hauts-de-france|grand est|"
+                "auvergne-rhone-alpes|bourgogne-franche-comte|centre-val de loire|pays de la loire|"
+                "provence-alpes-cote d'azur|corse|alsace|aquitaine|picardie|bourgogne|auvergne|limousin|"
+                "poitou-charentes|champagne-ardenne|franche-comte|languedoc-roussillon|midi-pyrenees|rhone-alpes|"
+                "provence|cote d'azur|wallonie|flandre|flandres|romandie|guadeloupe|martinique|la reunion|guyane|"
+                "mayotte|"
+                "yorkshire|lancashire|cumbria|northumberland|sussex|east anglia|the midlands|west midlands|"
+                "east midlands|greater london|greater manchester|new england|california|texas|florida|ohio|"
+                "massachusetts|new york state|washington state|ontario|british columbia|manitoba|saskatchewan|"
+                "nova scotia|queensland|new south wales|tasmania|wallonia|flanders|catalonia|andalusia|"
+                "basque country|lombardy|tuscany|sicily|sardinia|piedmont|apulia|bavaria|saxony|thuringia|"
+                "lower saxony|north rhine-westphalia|rhineland-palatinate|"
+                "lombardia|lazio|campania|sicilia|veneto|emilia-romagna|piemonte|puglia|toscana|calabria|"
+                "sardegna|liguria|marche|abruzzo|friuli-venezia giulia|friuli venezia giulia|trentino-alto adige|"
+                "trentino alto adige|umbria|basilicata|molise|valle d'aosta|alto adige|sudtirol|trentino|friuli|"
+                "romagna|brianza|salento|mezzogiorno|"
+                "andalucia|aragon|asturias|cantabria|castilla y leon|castilla-la mancha|castilla la mancha|"
+                "cataluna|catalunya|comunidad valenciana|comunitat valenciana|extremadura|galicia|navarra|"
+                "euskadi|pais vasco|la rioja|canarias|islas canarias|baleares|islas baleares|illes balears|"
+                "comunidad de madrid|region de murcia|mallorca|menorca|tenerife|gran canaria|lanzarote|"
+                "fuerteventura|la gomera|el hierro|la palma|la mancha|costa brava|costa del sol|costa blanca|"
+                "baden-wurttemberg|bayern|hessen|mecklenburg-vorpommern|niedersachsen|nordrhein-westfalen|"
+                "rheinland-pfalz|saarland|sachsen|sachsen-anhalt|schleswig-holstein|thuringen|oberbayern|"
+                "niederbayern|oberfranken|mittelfranken|unterfranken|oberpfalz|franken|schwaben|ostfriesland|"
+                "westfalen|rheinhessen|allgau|ruhrgebiet|tirol|vorarlberg|karnten|steiermark|oberosterreich|"
+                "niederosterreich|burgenland");
             return s;
         }
 
@@ -2147,7 +2663,32 @@ namespace dlib
                 "wuxi apptec|wwf|xerox|xiaomi|xinhua|xpeng|xpo logistics|yale|yale university|yamaha motor|yandex|"
                 "yara international|ymca|yomiuri shimbun|yougov|ypf|zalando|zdf|zendesk|zenith bank|"
                 "zf friedrichshafen|zimmer biomet|zscaler|zte|zurcher kantonalbank|zurich insurance|"
-                "zurich insurance group|zydus");
+                "zurich insurance group|zydus|"
+                // Italian, Spanish and German.
+                "agenzia delle entrate|agenzia delle entrate-riscossione|guardia di finanza|polizia di stato|"
+                "arma dei carabinieri|vigili del fuoco|corte di cassazione|corte costituzionale|"
+                "consiglio di stato|corte dei conti|garante per la protezione dei dati personali|garante privacy|"
+                "ministero dell'interno|ministero della salute|ministero dell'economia e delle finanze|"
+                "ministero del lavoro e delle politiche sociali|ministero della giustizia|"
+                "presidenza del consiglio dei ministri|camera dei deputati|senato della repubblica|"
+                "banca d'italia|motorizzazione civile|pubblico registro automobilistico|agenzia delle dogane|"
+                "ispettorato del lavoro|ispettorato nazionale del lavoro|servizio sanitario nazionale|"
+                "protezione civile|agencia tributaria|agencia estatal de administracion tributaria|"
+                "seguridad social|tesoreria general de la seguridad social|"
+                "instituto nacional de la seguridad social|servicio publico de empleo estatal|"
+                "direccion general de trafico|agencia espanola de proteccion de datos|guardia civil|"
+                "policia nacional|mossos d'esquadra|ertzaintza|tribunal supremo|tribunal constitucional|"
+                "audiencia nacional|banco de espana|ministerio del interior|ministerio de sanidad|"
+                "ministerio de hacienda|ministerio de trabajo|congreso de los diputados|inspeccion de trabajo|"
+                "bundesagentur fur arbeit|agentur fur arbeit|deutsche rentenversicherung|"
+                "bundesamt fur migration und fluchtlinge|bundeszentralamt fur steuern|bundeskriminalamt|"
+                "bundespolizei|landeskriminalamt|bundesverfassungsgericht|bundesgerichtshof|bundesarbeitsgericht|"
+                "bundessozialgericht|bundesfinanzhof|bundesverwaltungsgericht|deutsche bundesbank|"
+                "bundesministerium des innern|bundesministerium fur gesundheit|bundesministerium der finanzen|"
+                "deutscher bundestag|bundestag|bundesrat|bundesamt fur sicherheit in der informationstechnik|"
+                "statistisches bundesamt|kraftfahrt-bundesamt|"
+                "bundesbeauftragte fur den datenschutz und die informationsfreiheit|bundesnetzagentur|"
+                "bundeskartellamt|zoll|familienkasse");
             return s;
         }
 
@@ -2161,7 +2702,13 @@ namespace dlib
                 "gendarmerie inspection autorite authority commission ambassade consulat embassy consulate "
                 "parquet greffe ville commune brigade "
                 "ministerio ministero ministerium bundesministerium bundesamt bundesagentur agencia agenzia agentur "
-                "prefettura questura ayuntamiento municipio prefeitura gemeinde landgericht amtsgericht tribunale");
+                "prefettura questura ayuntamiento municipio prefeitura gemeinde landgericht amtsgericht tribunale "
+                "comune provincia regione procura commissariato juzgado audiencia subdelegacion delegacion "
+                "comisaria diputacion consejeria tesoreria landratsamt finanzamt jobcenter polizeiprasidium "
+                "polizeiinspektion polizeidirektion polizeirevier stadtverwaltung kreisverwaltung bezirksregierung "
+                "regierungsprasidium standesamt burgeramt ordnungsamt sozialamt jugendamt gesundheitsamt "
+                "sozialgericht arbeitsgericht verwaltungsgericht oberlandesgericht finanzgericht landesamt "
+                "jefatura");
             return s;
         }
 
@@ -2179,7 +2726,10 @@ namespace dlib
                 "culture travail emploi famille familles allocations familiales assurance maladie vieillesse "
                 "retraite retraites solidarite solidarites agriculture ecologie transports logement sports "
                 "affaires etrangeres europe recherche enseignement jeunesse securite civile douanes impots "
-                "statistique protection populations enfance handicap");
+                "statistique protection populations enfance handicap "
+                "ordinario ordinaria amministrativo amministrativa regionale provinciale penale minorile lavoro "
+                "centrale territoriale nacional provincial superior penal instancia mercantil administrativo "
+                "administrativa contencioso-administrativo");
             return s;
         }
 
@@ -2188,7 +2738,69 @@ namespace dlib
             static const std::unordered_set<std::string> s = make_word_set(
                 "rgpd cnil gdpr pdf url api rh it ue eu usa onu oms tva ttc ht cdi cdd ceo cto cfo coo "
                 "dsi rssi dpo pme tpe eti sncf edf ratp cpam caf urssaf insee anssi iso iec nist ia ai "
-                "sla kpi roi crm erp sap aws gcp cdr pki vpn ssl tls http https ok nb ps pj ref fyi asap");
+                "sla kpi roi crm erp sap aws gcp cdr pki vpn ssl tls http https ok nb ps pj ref fyi asap "
+                "siem soc sso mfa ldap edr xdr ndr dmz wifi vlan dns dhcp tcp udp ssh ftp sftp smtp imap sql json "
+                "xml html css csv iot ics scada hmi saas paas iaas cmdb itsm itil cve cvss owasp waf ids ips dlp "
+                "iam mdm byod rpa etl ocr llm gpu cpu ssd hdd usb hdmi bios uefi tpm hsm mwst rrhh hr");
+            return s;
+        }
+
+
+        inline const std::unordered_set<std::string>& regulation_terms()
+        {
+            /* Laws, regulations, standards and frameworks written as acronyms or as a name of
+               their own: never personal data, whatever a learned recognizer reads there ("au
+               sens du RGPD", "gemäß DSGVO", "ISO 27001", "NIS2"). */
+            static const std::unordered_set<std::string> s = make_word_set(
+                "rgpd gdpr dsgvo bdsg lopd lopdgdd lssi lssice ccpa cpra hipaa ferpa glba sox pcidss eidas lcen "
+                "dsa dma dga csrd sfdr mifid mifir psd2 dsp2 ifrs gaap kyc aml fatca nis2 iso iec nist itil "
+                "cobit togaf soc2 hds secnumcloud ebios pssi rgs gxp gmp haccp tisax dlgs gdpdu gobd dsg nfadp "
+                "lpd lgpd pipeda appi pdpa it-grundschutz datenschutz-grundverordnung datenschutzgrundverordnung "
+                "ai-act");
+            return s;
+        }
+
+        inline const std::unordered_set<std::string>& ambiguous_regulation_terms()
+        {
+            /* Acronyms of regulations that are also names or common words ("DORA", "NIS",
+               "SOC"): regulations when written in capitals before a number ("NIS 2", "SOC 2") or
+               after a word that announces a text of law or a standard ("le règlement DORA"). */
+            static const std::unordered_set<std::string> s = make_word_set(
+                "dora nis soc pci dss ens ai act data");
+            return s;
+        }
+
+        inline const std::unordered_set<std::string>& regulation_cues()
+        {
+            // Words announcing a law, a regulation, a standard or a framework.
+            static const std::unordered_set<std::string> s = make_word_set(
+                "reglement regulation regolamento reglamento verordnung directive directiva direttiva richtlinie "
+                "loi law ley legge gesetz norme norma norm standard certification certificazione certificacion "
+                "zertifizierung conformite compliance conformita cumplimiento konformitat referentiel framework "
+                "quadro marco rahmenwerk audit exigences requirements requisiti requisitos anforderungen");
+            return s;
+        }
+
+        inline const std::unordered_set<std::string>& organization_division_words()
+        {
+            /* Words that groups write after their own name for a division, a trade or a
+               country, the whole being the organisation: "Veolia Water", "Siemens Energy",
+               "Enel Green Power", "Telefónica España". */
+            static const std::unordered_set<std::string> s = make_word_set(
+                "water eau acqua agua wasser energy energie energia power renewables renouvelables rinnovabili "
+                "renovables solutions services servizi servicios dienstleistungen systems systemes sistemi "
+                "sistemas systeme digital technologies technology tech technik group groupe gruppo grupo gruppe "
+                "holding holdings international mobility healthcare health finance capital consulting logistics "
+                "logistik logistica logistique industries industrie infrastructure infrastructures immobilier "
+                "immobiliare inmobiliaria immobilien labs research aerospace defence defense automotive cloud "
+                "business retail leasing ventures europe france italia espana deutschland iberica uk ireland usa "
+                "suisse schweiz austria osterreich benelux nordic nordics green private banking assicurazioni "
+                "seguros versicherung insurance assurances distribuzione distribucion distribution gas oil "
+                "networks network telecom mobile media entertainment pharma pharmaceuticals chemicals materials "
+                "steel electric electronics engineering ingenieria ingegneria construction costruzioni "
+                "construcciones transport transporte trasporti airlines real estate north america partners "
+                "ambiente entreprises developpement participations ouest sud-est sud-ouest nord-est nord-ouest "
+                "energies soluciones infraestructuras space rail cargo regio netz netze reseau voyageurs it");
             return s;
         }
 

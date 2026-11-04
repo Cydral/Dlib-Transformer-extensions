@@ -733,6 +733,65 @@ namespace dlib
             const int group = static_cast<int>(id_number(d, 3, 5));
             return (group >= 70 && group <= 88) || (group >= 90 && group <= 92) || (group >= 94 && group <= 99);
         }
+
+        // Italian VAT number (partita IVA): 11 digits, an office code and a Luhn check digit.
+        inline bool it_vat_ok(const std::string& d)
+        {
+            if (d.size() != 11 || !id_all_digits(d) || id_number(d, 0, 7) == 0) return false;
+            const int office = static_cast<int>(id_number(d, 7, 10));
+            return ((office >= 1 && office <= 100) || office == 120 || office == 121 || office == 888 ||
+                    office == 999) && luhn_ok(d);
+        }
+
+        // Spanish tax code of a company (CIF): a letter, 7 digits and a control digit or letter.
+        inline bool es_cif_ok(const std::string& s)
+        {
+            static const std::string kinds = "ABCDEFGHJNPQRSUVW";
+            if (s.size() != 9 || kinds.find(s[0]) == std::string::npos || !id_all_digits(s, 1, 8)) return false;
+            int sum = 0;
+            for (std::size_t i = 1; i < 8; ++i)
+            {
+                int v = id_digit(s, i);
+                if (i % 2 == 1)
+                {
+                    v *= 2;
+                    v = v / 10 + v % 10;
+                }
+                sum += v;
+            }
+            const int control = (10 - sum % 10) % 10;
+            const char letter = "JABCDEFGHI"[control];
+            const char last = s[8];
+            if (std::string("NPQRSW").find(s[0]) != std::string::npos) return last == letter;
+            if (std::string("ABEH").find(s[0]) != std::string::npos) return last == static_cast<char>('0' + control);
+            return last == letter || last == static_cast<char>('0' + control);
+        }
+
+        // German VAT number (USt-IdNr.): 9 digits after DE, ISO 7064 MOD 11,10.
+        inline bool de_vat_ok(const std::string& d)
+        {
+            return d.size() == 9 && d[0] != '0' && iso7064_mod11_10_ok(d);
+        }
+
+        // French VAT number: a key of 2 digits computed from the SIREN that follows, itself Luhn valid.
+        inline bool fr_vat_ok(const std::string& d)
+        {
+            if (d.size() != 11 || !id_all_digits(d)) return false;
+            const std::string siren = d.substr(2);
+            if (!luhn_ok(siren)) return false;
+            return id_number(d, 0, 2) == (12 + 3 * (id_number(siren, 0, 9) % 97)) % 97;
+        }
+
+        // British VAT number: 9 digits whose weighted sum and last two digits verify modulo 97.
+        inline bool gb_vat_ok(const std::string& d)
+        {
+            if (d.size() != 9 || !id_all_digits(d)) return false;
+            long long total = 0;
+            for (std::size_t i = 0; i < 7; ++i)
+                total += id_digit(d, i) * static_cast<int>(8 - i);
+            total += id_number(d, 7, 9);
+            return total % 97 == 0 || (total + 55) % 97 == 0;
+        }
     }
 }
 

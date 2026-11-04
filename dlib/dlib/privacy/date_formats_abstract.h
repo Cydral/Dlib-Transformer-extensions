@@ -12,8 +12,9 @@ namespace dlib
 {
 
     /*!
-        Calendar dates as written in French and English documents: recognition with the
-        layout of the source text, and rendering of any date in that same layout.
+        Calendar dates as written in French, English, Italian, Spanish and German
+        documents: recognition with the layout of the source text, and rendering of any
+        date in that same layout.
 
         The pair is what makes date pseudonymization reversible. A date such as "1er mars
         1985" or "03/12/85" is reduced to a civil date and a date_format that records what
@@ -113,11 +114,16 @@ namespace dlib
                                  3 English ordinal ("1st", "12th")
                 month_style    - numeric layouts: 0 plain or 1 padded; text layouts: the
                                  index of the month name variant (full name, abbreviation,
-                                 with or without accents and final period)
+                                 with or without accents and final period) in French,
+                                 English, Italian, Spanish or German
                 month_case     - 0 lower, 1 title, 2 upper
                 two_digit_year - 1 when the year has two digits
                 comma          - 1 when a comma follows the day ("March 12, 1985") or the
                                  month ("March, 1985")
+                connector      - text layouts: 0 none, 1 a period after the day ("12. März
+                                 1985"), 2 "de" between the parts ("12 de marzo de 1985",
+                                 "marzo de 1985"), 3 the ordinal mark of the first day ("1° marzo
+                                 1985")
         !*/
         std::uint8_t layout = 2;
         std::uint8_t separator = 1;
@@ -126,11 +132,15 @@ namespace dlib
         std::uint8_t month_case = 0;
         std::uint8_t two_digit_year = 0;
         std::uint8_t comma = 0;
+        std::uint8_t connector = 0;
 
         std::uint32_t pack() const;
         /*!
             ensures
-                - Returns the fields packed into 17 bits, for a tag.
+                - Returns the fields packed into 21 bits, for a tag. The formats of French and
+                  English dates, connector 0 and month_style below 64, fit in the first 17
+                  bits, as they did before the other languages: a value packed by an earlier
+                  version unpacks to the same format.
         !*/
 
         static date_format unpack(std::uint32_t v);
@@ -183,7 +193,9 @@ namespace dlib
             - Returns the non-overlapping dates of the UTF-8 text, left to right, each with
               its byte span, value and format: numeric dates with '/', '-' or '.' (years
               of two or four digits), ISO dates (a following time "T10:30" allowed), and
-              text dates in French and English with full or abbreviated month names.
+              text dates in French, English, Italian, Spanish and German with full or
+              abbreviated month names ("3 aprile 2024", "1° marzo", "5 de mayo de 2024",
+              "12. März 2024").
             - A complete date has a year from 1800 to 2199 and a day that exists in its
               month. A two digit year below 50 reads 20YY, the others 19YY.
             - Dates without a day have a year of four digits from 1900 to 2099 that no
