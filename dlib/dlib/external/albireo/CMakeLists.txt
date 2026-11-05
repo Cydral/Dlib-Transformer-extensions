@@ -18,6 +18,29 @@
 cmake_minimum_required(VERSION 3.16)
 project(albireo VERSION 1.0.9 LANGUAGES C CXX)
 
+# The version is written in four places that must agree: project() above, the numbers of
+# common/version.h, which the version resources of the programs and of the installer carry and
+# which the installer compares before it replaces an installation, the text of common/version.h,
+# which the service, the engines and the update feed give, and the description of the interface.
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/common/version.h" version_lines REGEX "^#define ALBIREO_VERSION")
+set(version_numbers)
+foreach (part MAJOR MINOR PATCH)
+   string(REGEX MATCH "#define ALBIREO_VERSION_${part} +([0-9]+)" found "${version_lines}")
+   list(APPEND version_numbers "${CMAKE_MATCH_1}")
+endforeach()
+string(REPLACE ";" "." version_numbers "${version_numbers}")
+string(REGEX MATCH "#define ALBIREO_VERSION +\"([0-9.]+)\"" found "${version_lines}")
+set(version_text "${CMAKE_MATCH_1}")
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/web/openapi.json" openapi_text)
+string(REGEX MATCH "\"version\" *: *\"([0-9.]+)\"" found "${openapi_text}")
+set(openapi_version "${CMAKE_MATCH_1}")
+if (NOT version_numbers STREQUAL PROJECT_VERSION OR NOT version_text STREQUAL PROJECT_VERSION OR
+    NOT openapi_version STREQUAL PROJECT_VERSION)
+   message(FATAL_ERROR "the version differs between project() (${PROJECT_VERSION}), the numbers of "
+      "common/version.h (${version_numbers}), its text (${version_text}) and web/openapi.json "
+      "(${openapi_version}): the four must agree")
+endif()
+
 option(ALBIREO_PROGRAMS "Build the service, the tray, the installer and the processor engines" ON)
 option(ALBIREO_ENGINE_CUDA "Build the engine for NVIDIA graphics processors (dlib built with CUDA)" OFF)
 option(ALBIREO_ENGINE_OPENVINO "Build the engine for Intel NPU and graphics processors (dlib built with OpenVINO)" OFF)
